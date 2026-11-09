@@ -17,7 +17,9 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use fluxbee_ai_sdk::{AiAccount, AiProvider, HiveAiConfig, TenantSource, UsageRecorder};
+use fluxbee_ai_sdk::{
+    AiAccount, AiProvider, EffectiveAiEngine, HiveAiConfig, TenantSource, UsageRecorder,
+};
 use fluxbee_sdk::message_trace;
 use fluxbee_sdk::message_writer::{self, IlkFacts};
 use fluxbee_sdk::payload::TextV1Payload;
@@ -38,6 +40,7 @@ use fluxbee_sdk::{
     OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned,
     VaultClient, NODE_CONFIG_APPLY_MODE_REPLACE,
 };
+use json_router::ai_settings;
 use json_router::shm::{
     memory_shm_name_for_hive, MemoryRegionWriter, MemoryShmSnapshot, MemoryShmThreadEntry,
     MEMORY_MAX_DATA_SIZE,
@@ -277,6 +280,15 @@ struct CognitionControlState {
     ai_secret_source: CognitionAiSecretSource,
     thresholds: CognitionThresholds,
     semantic_tagger: CognitionSemanticTaggerConfig,
+    /// Where the provider and the model came from, read at the start
+    /// (docs/hive-config-update-v1.md §4): the installation file, with its version and hash, or
+    /// hive.yaml while the hive holds none (`ai_settings::ai_source_json`). Null when they could
+    /// not be read.
+    ai_settings_source: Value,
+    /// Why the `ai` settings cannot be used, when they cannot: an installation file no reader can
+    /// use (never a fallback to hive.yaml), or hive.yaml's `ai` while the hive holds none. Every
+    /// turn then skips its semantic work with this reason, as without a key.
+    ai_settings_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,8 +684,30 @@ struct ReasonCandidate {
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
+    /// Where the hive's dist is, and so its installation file (docs/hive-config-update-v1.md §4).
     #[serde(default)]
-    ai: Option<HiveAiConfig>,
+    dist: Option<ai_settings::DistPathSection>,
+    /// Read as raw YAML: the provider and model are the installation file's once the hive holds
+    /// one, and this section is typed only until then (`cognition_ai_settings`).
+    #[serde(default)]
+    ai: Option<serde_yaml::Value>,
+}
+
+/// SY.cognition's provider and model, read at the start: the installation file's once the hive
+/// holds one, its hive.yaml's until then; with where they came from. The error is the reason they
+/// cannot be used, in its own words.
+fn cognition_ai_settings(hive: &HiveFile) -> Result<(EffectiveAiEngine, Value), String> {
+    let settings = ai_settings::reader_ai_settings(hive.dist.as_ref(), hive.ai.as_ref())
+        .map_err(|err| ai_settings::plain_error(&err))?;
+    let engine =
+        ai_settings::reader_engine(&settings).map_err(|err| ai_settings::plain_error(&err))?;
+    tracing::info!(
+        source = %ai_settings::ai_source_label(&settings.source),
+        provider = %engine.provider,
+        model = %engine.model,
+        "sy.cognition ai settings"
+    );
+    Ok((engine, ai_settings::ai_source_json(&settings.source)))
 }
 
 #[tokio::main]
@@ -690,13 +724,19 @@ async fn main() -> Result<(), CognitionError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir)?;
-    let ai_engine = hive
-        .ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| -> CognitionError { err.into() })?
-        .unwrap_or_else(HiveAiConfig::fallback);
+    // docs/hive-config-update-v1.md §4: settings no reader can use never stop the node, which keeps
+    // its communications' turns; every turn's semantic work is skipped with the reason instead.
+    let (ai_engine, ai_settings_source, ai_settings_error) = match cognition_ai_settings(&hive) {
+        Ok((engine, source)) => (engine, source, None),
+        Err(reason) => {
+            tracing::error!(
+                reason = %reason,
+                "sy.cognition cannot use its ai settings: every turn skips its semantic work with \
+                 this reason until they are fixed and the node restarts"
+            );
+            (HiveAiConfig::fallback(), Value::Null, Some(reason))
+        }
+    };
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
     let self_ilk_id =
         fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.cognition@{}", hive.hive_id));
@@ -718,6 +758,8 @@ async fn main() -> Result<(), CognitionError> {
         bootstrap_cognition_control_state(&node_name, CognitionAiSecretSource::Missing)?;
     initial_control_state.semantic_tagger.provider = ai_engine.provider;
     initial_control_state.semantic_tagger.model = ai_engine.model;
+    initial_control_state.ai_settings_source = ai_settings_source;
+    initial_control_state.ai_settings_error = ai_settings_error;
     let control_state = Arc::new(Mutex::new(initial_control_state));
     let runtime_state = Arc::new(Mutex::new(CognitionRuntimeState::default()));
 
@@ -2011,11 +2053,12 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         None
     };
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
-    let (thresholds, semantic_tagger_config) = {
+    let (thresholds, semantic_tagger_config, ai_settings_error) = {
         let control_state = app_state.control_state.lock().await;
         (
             control_state.thresholds.clone(),
             control_state.semantic_tagger.clone(),
+            control_state.ai_settings_error.clone(),
         )
     };
     let ts = chrono::Utc::now().to_rfc3339();
@@ -2027,6 +2070,25 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         state.semantic_tagger_calls_total = state.semantic_tagger_calls_total.saturating_add(1);
         state.last_semantic_model = Some(semantic_tagger_config.model.clone());
         state.last_semantic_impl = Some(format!("{}_sdk", semantic_tagger_config.provider));
+    }
+
+    // docs/hive-config-update-v1.md §4: `ai` settings no reader can use skip the turn's semantic
+    // work, with their reason, as a missing key does; never a fallback to another `ai`.
+    if let Some(reason) = ai_settings_error {
+        let mut state = app_state.runtime_state.lock().await;
+        state.semantic_tagger_failures_total =
+            state.semantic_tagger_failures_total.saturating_add(1);
+        state.last_trace_id = Some(msg.routing.trace_id.clone());
+        state.last_thread_id = Some(thread_id.clone());
+        state.last_src_ilk = src_ilk.clone();
+        state.last_ich = ich.clone();
+        tracing::warn!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            reason = %reason,
+            "sy.cognition semantic tagger skipped turn because its ai settings cannot be used"
+        );
+        return;
     }
 
     let Some(api_key) = resolve_cognition_ai_api_key(&app_state, VaultWait::Once).await else {
@@ -3697,7 +3759,8 @@ fn build_status_payload(
     let ai_provider = json!({
         "provider": control_state.semantic_tagger.provider,
         "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
-        "source": control_state.ai_secret_source.as_str()
+        "source": control_state.ai_secret_source.as_str(),
+        "settings": cognition_ai_settings_json(control_state)
     });
     let semantic_tagger = json!({
         "provider": control_state.semantic_tagger.provider,
@@ -3840,7 +3903,11 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "AI credentials live in SY.vault. The hive-wide AI provider selects resource_type=openai|anthropic."
+            "AI credentials live in SY.vault. The installation's AI provider selects resource_type=openai|anthropic."
+                .to_string(),
+        ),
+        Value::String(
+            "The provider and the model are read at the start from the installation file, or from this hive's hive.yaml while it holds none (ai.settings says which); settings that cannot be used skip every turn's semantic work with their reason (ai.settings.error)."
                 .to_string(),
         ),
         Value::String(
@@ -3878,7 +3945,8 @@ fn build_cognition_config_get_payload(
         "ai": {
             "default_provider": control_state.semantic_tagger.provider,
             "model": control_state.semantic_tagger.model,
-            "resolved_from": format!("vault://resource_type={}", control_state.semantic_tagger.provider)
+            "resolved_from": format!("vault://resource_type={}", control_state.semantic_tagger.provider),
+            "settings": cognition_ai_settings_json(control_state)
         },
         "semantic_tagger": {
             "provider": control_state.semantic_tagger.provider,
@@ -4139,6 +4207,9 @@ fn config_error_response(
 }
 
 fn cognition_state_label(control_state: &CognitionControlState) -> &'static str {
+    if control_state.ai_settings_error.is_some() {
+        return "degraded_ai_settings_invalid";
+    }
     match control_state.ai_secret_source {
         CognitionAiSecretSource::Missing => "degraded_no_ai_provider",
         CognitionAiSecretSource::LocalFile => "ready_semantic_ai",
@@ -4147,10 +4218,27 @@ fn cognition_state_label(control_state: &CognitionControlState) -> &'static str 
 
 fn cognition_degraded_reasons(control_state: &CognitionControlState) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    if control_state.ai_settings_error.is_some() {
+        reasons.push("ai_settings_invalid");
+    }
     if control_state.ai_secret_source == CognitionAiSecretSource::Missing {
         reasons.push("ai_provider_missing");
     }
     reasons
+}
+
+/// Where the provider and the model came from (docs/hive-config-update-v1.md §4), and why they
+/// cannot be used when they cannot: `{from, version, sha256}` or `{from: "hive_yaml"}`, with
+/// `error`.
+fn cognition_ai_settings_json(control_state: &CognitionControlState) -> Value {
+    let mut settings = match &control_state.ai_settings_source {
+        Value::Object(_) => control_state.ai_settings_source.clone(),
+        _ => json!({}),
+    };
+    if let Some(error) = &control_state.ai_settings_error {
+        settings["error"] = json!(error);
+    }
+    settings
 }
 
 fn bootstrap_cognition_control_state(
@@ -4200,6 +4288,8 @@ fn bootstrap_cognition_control_state(
         ai_secret_source,
         thresholds,
         semantic_tagger,
+        ai_settings_source: Value::Null,
+        ai_settings_error: None,
     };
     persist_cognition_config_state(node_name, &state)?;
     Ok(state)
@@ -4266,7 +4356,9 @@ fn reject_cognition_secret_fields(body: &Value) -> Result<(), CognitionError> {
     }
     if config_root.get("ai_providers").is_some() || config_root.get("ai").is_some() {
         return Err(
-            "AI provider/model are hive-wide; configure the ai section in hive.yaml".into(),
+            "AI provider/model are the installation's: its installation file holds them \
+             (docs/hive-config-update-v1.md §4), not this node's config"
+                .into(),
         );
     }
     if let Some(storage) = config_root.get("storage") {
@@ -4357,7 +4449,9 @@ fn extract_cognition_semantic_tagger_config(
     };
     if config.get("provider").is_some() || config.get("model").is_some() {
         return Err(
-            "config.semantic_tagger.provider/model are hive-wide; configure ai in hive.yaml".into(),
+            "config.semantic_tagger.provider/model are the installation's: its installation file \
+             holds them (docs/hive-config-update-v1.md §4)"
+                .into(),
         );
     }
     let mut merged = current.clone();
@@ -5892,6 +5986,8 @@ mod tests {
             ai_secret_source: CognitionAiSecretSource::Missing,
             thresholds: CognitionThresholds::default(),
             semantic_tagger: CognitionSemanticTaggerConfig::default(),
+            ai_settings_source: serde_json::json!({ "from": "hive_yaml" }),
+            ai_settings_error: None,
         }
     }
 
@@ -5900,6 +5996,79 @@ mod tests {
             state_dir: PathBuf::from("/var/lib/fluxbee/test"),
             store_path: PathBuf::from("/var/lib/fluxbee/test/cognition.db"),
         }
+    }
+
+    /// docs/hive-config-update-v1.md §4: cognition's provider and model are the installation
+    /// file's once its hive holds one, whatever hive.yaml's `ai` says, and hive.yaml's until then;
+    /// settings it cannot use are its degraded reason, never a fallback and never a stop.
+    #[test]
+    fn cognition_reads_the_installation_file_once_its_hive_holds_one() {
+        let root = std::env::temp_dir().join(format!(
+            "cognition-installation-{}",
+            Uuid::new_v4().simple()
+        ));
+        let dist = root.join("dist");
+        let file = fluxbee_ai_sdk::installation_file_path(&dist);
+        fs::create_dir_all(file.parent().expect("its dir")).expect("dist");
+        let hive = |ai: &str| -> HiveFile {
+            serde_yaml::from_str(&format!(
+                "hive_id: worker1\ndist:\n  path: \"{}\"\nai:\n{ai}",
+                dist.display()
+            ))
+            .expect("an ai no reader uses still loads")
+        };
+
+        let (engine, source) = cognition_ai_settings(&hive(
+            "  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n",
+        ))
+        .expect("hive.yaml");
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::OpenAi, "gpt-5.5")
+        );
+        assert_eq!(source, json!({"from": "hive_yaml"}));
+
+        let bytes = fluxbee_ai_sdk::InstallationFile {
+            schema_version: fluxbee_ai_sdk::INSTALLATION_SCHEMA_VERSION,
+            version: 1,
+            ai: Some(
+                serde_yaml::from_str(
+                    "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+                )
+                .expect("ai"),
+            ),
+        }
+        .render()
+        .expect("renders");
+        fs::write(&file, &bytes).expect("the file");
+        let (engine, source) =
+            cognition_ai_settings(&hive("  default_provider: gemini\n")).expect("the file");
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::Anthropic, "claude-sonnet-5-5")
+        );
+        assert_eq!(source["from"], json!("installation_file"));
+        assert_eq!(source["version"], json!(1));
+
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("broken");
+        let reason = cognition_ai_settings(&hive(
+            "  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n",
+        ))
+        .expect_err("no fallback");
+        assert!(reason.contains("version 0"), "{reason}");
+        let mut control = test_control_state();
+        control.ai_settings_error = Some(reason.clone());
+        control.ai_secret_source = CognitionAiSecretSource::LocalFile;
+        assert_eq!(
+            cognition_state_label(&control),
+            "degraded_ai_settings_invalid"
+        );
+        assert_eq!(
+            cognition_degraded_reasons(&control),
+            vec!["ai_settings_invalid"]
+        );
+        assert_eq!(cognition_ai_settings_json(&control)["error"], json!(reason));
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn config_set_message(config: Value) -> Message {

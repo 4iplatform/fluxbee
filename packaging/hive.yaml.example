@@ -1,10 +1,15 @@
 hive_id: "motherbee"
 role: motherbee
 
-# Hive-wide AI engine used by SY.* consumers, and by every AI node (ai.generic)
-# that names no provider or model of its own: such a node takes the model listed
-# here for its provider. Credentials remain in SY.vault under the selected
-# provider's resource_type (openai or anthropic).
+# The installation's AI engine, for the SY.* consumers and for every AI node
+# (ai.generic) that names no provider or model of its own: such a node takes the
+# model listed for its provider. The orchestrator's first start on the motherbee
+# writes this section as version 1 of the installation file
+# (<dist.path>/installation/installation.json), which reaches every hive and which
+# every reader reads from then on (docs/hive-config-update-v1.md §4): once a hive
+# holds that file, this section is ignored. Every provider listed needs its model.
+# Credentials remain in SY.vault under the selected provider's resource_type
+# (openai or anthropic).
 ai:
   default_provider: openai
   providers:

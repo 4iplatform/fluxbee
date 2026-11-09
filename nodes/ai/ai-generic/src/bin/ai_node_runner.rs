@@ -9,19 +9,20 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fluxbee_ai_sdk::errors::{ProviderError, ProviderErrorKind, PROVIDER_FAILURE_TEXT};
 use fluxbee_ai_sdk::{
-    build_ai_behavior_response, build_model_user_content_parts,
+    ai_settings_at, build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, build_text_response,
     control_request, create_function_calling_model, create_llm_client, extract_text,
-    is_infrastructure_message, note_infrastructure_message, resolve_message_contract,
-    resolve_model_input_from_payload_with_options, set_reply_evaluation, AgentTool, AiAccount,
-    AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, ContractAnswer,
-    ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
-    FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider,
-    FunctionToolRegistry, HiveAiConfig, LanceDbThreadStateStore, LlmClient, LlmRequest,
-    MenuContract, Message, MessageContract, ModelInputOptions, ModelSettings, NodeRuntime,
-    ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool,
-    ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog,
-    ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
+    installation_file_path, is_infrastructure_message, note_infrastructure_message,
+    resolve_message_contract, resolve_model_input_from_payload_with_options, set_reply_evaluation,
+    AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiSdkError,
+    AiSettings, AiSettingsSource, AiUserArtifact, ContractAnswer, ControlRequest,
+    FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem,
+    FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider, FunctionToolRegistry,
+    HiveAiConfig, LanceDbThreadStateStore, LlmClient, LlmRequest, MenuContract, Message,
+    MessageContract, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput,
+    RuntimeConfig, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool,
+    ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch,
+    UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -278,6 +279,13 @@ struct GenericAiNode {
     self_tenant_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
+    /// The hive's installation file (docs/hive-config-update-v1.md §4), under the dist its
+    /// hive.yaml names (`installation_file_of_hive`): read at each request for what the node leaves
+    /// to the hive, and hive.yaml only while the hive holds none.
+    installation_file: PathBuf,
+    /// Where the hive's `ai` came from at the last read, or why it could not be read: logged when
+    /// it changes (`ai_engine_in_effect`).
+    hive_ai_settings_seen: std::sync::Mutex<Option<String>>,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`. `None` when
     /// `self_ilk_id` / hive suffix is missing — the node still boots in a
@@ -862,7 +870,7 @@ impl AiNode for GenericAiNode {
             }
             NodeBehavior::AiChat(ai) => {
                 // What this request runs on: the node's provider and model, or the hive's.
-                let engine = match effective_ai_engine(ai, &self.config_dir).for_request() {
+                let engine = match self.ai_engine_in_effect(ai).for_request() {
                     Ok(engine) => engine,
                     Err(err) => {
                         tracing::warn!(
@@ -966,6 +974,49 @@ impl AiNode for GenericAiNode {
 }
 
 impl GenericAiNode {
+    /// The provider and the model `ai` runs on now (`effective_ai_engine`), reading the hive's `ai`
+    /// from the installation file once the hive holds one. Where that came from, or why it could not
+    /// be read, is logged when it changes (docs/hive-config-update-v1.md §4).
+    fn ai_engine_in_effect(&self, ai: &AiChatRuntime) -> AiEngineInEffect {
+        let engine = effective_ai_engine(ai, &self.config_dir, &self.installation_file);
+        if let Some(label) = hive_ai_settings_label(&engine) {
+            let mut seen = self
+                .hive_ai_settings_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if seen.as_deref() != Some(label.as_str()) {
+                let unusable = matches!(
+                    (&engine.provider, &engine.model),
+                    (
+                        Err(AiEngineError::Installation(_) | AiEngineError::Hive(_)),
+                        _
+                    ) | (
+                        _,
+                        Err(AiEngineError::Installation(_) | AiEngineError::Hive(_))
+                    )
+                );
+                if unusable {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        hive_ai = %label,
+                        previous = seen.as_deref().unwrap_or("none"),
+                        "the hive's ai settings cannot be read; requests that leave the provider or \
+                         the model to the hive fail with the reason"
+                    );
+                } else {
+                    tracing::info!(
+                        node_name = %self.node_name,
+                        hive_ai = %label,
+                        previous = seen.as_deref().unwrap_or("none"),
+                        "the hive's ai settings this node reads"
+                    );
+                }
+                *seen = Some(label);
+            }
+        }
+        engine
+    }
+
     async fn run_ai_chat(
         &self,
         ai: &AiChatRuntime,
@@ -1503,11 +1554,11 @@ impl GenericAiNode {
         };
         // A model the node cannot resolve now would fail every message (missing_ai_model), so the
         // config is refused: a provider other than the hive's default needs its model, unless the
-        // hive's hive.yaml lists one for it (a worker add_hive made lists only the default's). So
-        // is a provider left to a hive.yaml that cannot be read.
+        // hive's ai settings list one for it. So is a provider left to an installation file that
+        // cannot be used, or to a hive.yaml that cannot be read while the hive holds no file.
         let engine = match &next_behavior {
             NodeBehavior::AiChat(ai) => {
-                let engine = effective_ai_engine(ai, &self.config_dir);
+                let engine = self.ai_engine_in_effect(ai);
                 if let Err(err) = engine.provider.as_ref().and(engine.model.as_ref()) {
                     return self.invalid_config_response(
                         Some(schema_version),
@@ -1649,9 +1700,7 @@ impl GenericAiNode {
     /// runs on, its own or the hive's as hive.yaml says now; both null when it is not ai_chat.
     fn engine_in_effect(&self, behavior: Option<&NodeBehavior>) -> (Value, Value) {
         match behavior {
-            Some(NodeBehavior::AiChat(ai)) => {
-                effective_ai_engine(ai, &self.config_dir).config_json()
-            }
+            Some(NodeBehavior::AiChat(ai)) => self.ai_engine_in_effect(ai).config_json(),
             _ => (Value::Null, Value::Null),
         }
     }
@@ -1765,8 +1814,8 @@ impl GenericAiNode {
                 ],
                 "notes": [
                     "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
-                    "The AI provider is config.behavior.provider (openai or anthropic), or the hive's when it is absent (hive.yaml ai.default_provider, OpenAI without an ai section); ai_provider shows the one in effect.",
-                    "The model is config.behavior.model, or the hive's model for the node's provider when it is absent (hive.yaml ai.providers.<provider>.model; gpt-5.5 for OpenAI without an ai section); ai_model shows the one in effect. Name a model only when the node needs its own, and always one of the node's provider. A provider other than the hive's default needs its model unless the hive's hive.yaml lists one (a worker added by add_hive lists only the default's): CONFIG_SET refuses a config whose model it cannot resolve (invalid_config), and its answer shows ai_provider and ai_model. Without either later (hive.yaml changed), every message fails with missing_ai_model.",
+                    "The AI provider is config.behavior.provider (openai or anthropic), or the hive's when it is absent (ai.default_provider of the installation file, or of hive.yaml while the hive holds none; OpenAI without an ai section); ai_provider shows the one in effect.",
+                    "The model is config.behavior.model, or the hive's model for the node's provider when it is absent (ai.providers.<provider>.model of the installation file, or of hive.yaml while the hive holds none; gpt-5.5 for OpenAI without an ai section); ai_model shows the one in effect. Name a model only when the node needs its own, and always one of the node's provider. A provider other than the hive's default needs its model unless the hive's ai settings list one: CONFIG_SET refuses a config whose model it cannot resolve (invalid_config), and its answer shows ai_provider and ai_model. Without either later (the hive's ai settings changed), every message fails with missing_ai_model.",
                     "AI credentials are not config: the provider's key is read from SY.vault by resource_type openai|anthropic on each request, only in the node's tenant: one this node owns, one assigned to it, or its tenant's general one.",
                     "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
@@ -5489,8 +5538,9 @@ impl ManagedNodeConfigContract for AiGenericContract {
              (behavior.provider, or the hive's without it) from SY.vault by resource_type \
              openai|anthropic, in its tenant (owned by it, assigned to it, or its tenant's general \
              one).",
-            "Without behavior.model the node runs on the hive's model for its provider (hive.yaml \
-             ai.providers.<provider>.model); a model it names must be one of its provider.",
+            "Without behavior.model the node runs on the hive's model for its provider \
+             (ai.providers.<provider>.model of the installation file, or of hive.yaml while the \
+             hive holds none); a model it names must be one of its provider.",
             "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
              set_ilk_definition, not through CONFIG_SET.",
         ]
@@ -5757,12 +5807,15 @@ async fn run_managed_node(
             .await?;
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let usage = UsageRecorder::start(dispatcher.clone());
+    let installation_file = installation_file_of_hive(Path::new(&node_config_dir));
     let ai_node = GenericAiNode {
         node_name,
         self_ilk_id,
         self_tenant_id,
         behavior: Arc::new(RwLock::new(behavior)),
         config_dir: PathBuf::from(node_config_dir),
+        installation_file,
+        hive_ai_settings_seen: std::sync::Mutex::new(None),
         thread_state_store,
         vault,
         usage,
@@ -6244,8 +6297,13 @@ struct AiEngine {
 /// Why a request of the node has no provider or no model.
 #[derive(Debug, Clone, PartialEq)]
 enum AiEngineError {
-    /// hive.yaml cannot be read, and the node leaves its provider or its model to the hive.
+    /// hive.yaml cannot be read, and the node leaves its provider or its model to the hive, whose
+    /// dist holds no installation file.
     Hive(String),
+    /// The hive's installation file is there and no reader can use it (docs/hive-config-update-v1.md
+    /// §4), and the node leaves its provider or its model to the hive: never a fallback to
+    /// hive.yaml.
+    Installation(String),
     /// Neither `behavior.model` nor the hive's model for the node's provider (FINDINGS A-104).
     NoModel(AiProvider),
 }
@@ -6253,11 +6311,11 @@ enum AiEngineError {
 impl std::fmt::Display for AiEngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Hive(reason) => f.write_str(reason),
+            Self::Hive(reason) | Self::Installation(reason) => f.write_str(reason),
             Self::NoModel(provider) => write!(
                 f,
-                "no model for the provider {provider}: behavior.model is not set, and hive.yaml \
-                 has no ai.providers.{provider}.model"
+                "no model for the provider {provider}: behavior.model is not set, and the hive's \
+                 ai settings have no ai.providers.{provider}.model"
             ),
         }
     }
@@ -6265,10 +6323,13 @@ impl std::fmt::Display for AiEngineError {
 
 /// The node's provider and model as they stand now, each with where it comes from: its own
 /// `behavior.provider` and `behavior.model`, or else the hive's (agent-tools-v1 T8, FINDINGS
-/// A-104).
+/// A-104); and where the hive's came from, when they were read.
 struct AiEngineInEffect {
     provider: Result<(AiProvider, &'static str), AiEngineError>,
     model: Result<(String, &'static str), AiEngineError>,
+    /// The installation file (with its version and hash) or hive.yaml, when the node left
+    /// anything to the hive and its `ai` could be read; None when it read nothing of the hive's.
+    hive_settings: Option<AiSettingsSource>,
 }
 
 impl AiEngineInEffect {
@@ -6295,11 +6356,11 @@ impl AiEngineInEffect {
 fn unresolved_model_reason(err: &AiEngineError) -> String {
     match err {
         AiEngineError::NoModel(provider) => format!(
-            "no model for the provider {provider}: behavior.model is not set, and this hive's \
-             hive.yaml has no ai.providers.{provider}.model; set behavior.model to a model of \
+            "no model for the provider {provider}: behavior.model is not set, and this hive's ai \
+             settings have no ai.providers.{provider}.model; set behavior.model to a model of \
              {provider}"
         ),
-        AiEngineError::Hive(reason) => format!(
+        AiEngineError::Hive(reason) | AiEngineError::Installation(reason) => format!(
             "it leaves its provider or its model to the hive, and {reason}; set behavior.provider \
              and behavior.model"
         ),
@@ -6307,30 +6368,121 @@ fn unresolved_model_reason(err: &AiEngineError) -> String {
 }
 
 /// Resolves the node's provider, then its model: `behavior.provider`, or the hive's; then
-/// `behavior.model`, or the hive's model for that provider. hive.yaml is read as it is at this
-/// moment, once, and only for what the node leaves to the hive: a node that names both never
-/// reads it.
-fn effective_ai_engine(ai: &AiChatRuntime, config_dir: &Path) -> AiEngineInEffect {
-    let mut section = None;
+/// `behavior.model`, or the hive's model for that provider. The hive's `ai` is read as it is at
+/// this moment, once, and only for what the node leaves to the hive: a node that names both never
+/// reads it. It is the installation file's (`installation_file`) once the hive holds one, and its
+/// hive.yaml's until then (docs/hive-config-update-v1.md §4).
+fn effective_ai_engine(
+    ai: &AiChatRuntime,
+    config_dir: &Path,
+    installation_file: &Path,
+) -> AiEngineInEffect {
+    let mut settings = None;
     let mut hive = || {
-        section
-            .get_or_insert_with(|| hive_ai_section(config_dir))
+        settings
+            .get_or_insert_with(|| hive_ai_settings(config_dir, installation_file))
             .clone()
     };
     let provider = match ai.provider {
         Some(provider) => Ok((provider, "behavior.provider")),
-        None => hive().map(|section| (hive_ai_provider(section.as_ref()), "hive")),
+        None => hive().map(|settings| (hive_ai_provider(settings.ai.as_ref()), "hive")),
     };
     let model = match (&ai.model, &provider) {
         (Some(model), _) => Ok((model.clone(), "behavior.model")),
-        (None, Ok((provider, _))) => hive().and_then(|section| {
-            hive_ai_model(section.as_ref(), *provider)
+        (None, Ok((provider, _))) => hive().and_then(|settings| {
+            hive_ai_model(settings.ai.as_ref(), *provider)
                 .map(|model| (model, "hive"))
                 .ok_or(AiEngineError::NoModel(*provider))
         }),
         (None, Err(err)) => Err(err.clone()),
     };
-    AiEngineInEffect { provider, model }
+    let hive_settings = settings.and_then(|read| read.ok()).map(|read| read.source);
+    AiEngineInEffect {
+        provider,
+        model,
+        hive_settings,
+    }
+}
+
+/// The hive's `ai`: the installation file's once the hive holds one, else hive.yaml's
+/// (`hive_ai_section`), which is read only then. A file that is there and that no reader can use
+/// is an error, never a fallback to hive.yaml.
+fn hive_ai_settings(
+    config_dir: &Path,
+    installation_file: &Path,
+) -> Result<AiSettings, AiEngineError> {
+    let mut hive_error = None;
+    let settings = ai_settings_at(installation_file, || {
+        hive_ai_section(config_dir).map_err(|err| {
+            let text = err.to_string();
+            hive_error = Some(err);
+            AiSdkError::Protocol(text)
+        })
+    });
+    settings.map_err(|err| {
+        hive_error.unwrap_or_else(|| {
+            AiEngineError::Installation(match err {
+                AiSdkError::Protocol(detail) => detail,
+                other => other.to_string(),
+            })
+        })
+    })
+}
+
+/// The installation file of the hive whose hive.yaml is in `config_dir`: under the dist it names
+/// (`dist.path`), the default dist without one or without a hive.yaml it can read.
+fn installation_file_of_hive(config_dir: &Path) -> PathBuf {
+    let dist_root = fs::read_to_string(config_dir.join("hive.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<HiveDistFile>(&raw).ok())
+        .and_then(|hive| hive.dist)
+        .and_then(|dist| dist.path)
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| DEFAULT_DIST_ROOT.to_string());
+    installation_file_path(Path::new(&dist_root))
+}
+
+/// The dist root of a hive whose hive.yaml has no `dist.path`.
+const DEFAULT_DIST_ROOT: &str = "/var/lib/fluxbee/dist";
+
+/// hive.yaml as far as `installation_file_of_hive` reads it.
+#[derive(Debug, Deserialize)]
+struct HiveDistFile {
+    #[serde(default)]
+    dist: Option<HiveDistSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HiveDistSection {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Where the hive's `ai` came from, or why it cannot be read, as ai.generic logs it when it
+/// changes; None when the node read nothing of the hive's.
+fn hive_ai_settings_label(engine: &AiEngineInEffect) -> Option<String> {
+    if let Some(source) = &engine.hive_settings {
+        return Some(match source {
+            AiSettingsSource::Installation { version, sha256 } => format!(
+                "installation file v{version} (sha256 {})",
+                sha256.get(..12).unwrap_or(sha256)
+            ),
+            AiSettingsSource::HiveYaml => {
+                "hive.yaml: this hive holds no installation file yet".to_string()
+            }
+        });
+    }
+    [engine.provider.as_ref().err(), engine.model.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .find_map(|err| match err {
+            AiEngineError::Installation(reason) => {
+                Some(format!("the installation file cannot be used: {reason}"))
+            }
+            AiEngineError::Hive(reason) => Some(format!("hive.yaml cannot be read: {reason}")),
+            AiEngineError::NoModel(_) => None,
+        })
 }
 
 /// hive.yaml's `ai` section, the one every SY.* AI consumer reads; `None` when it has none.
@@ -6375,8 +6527,9 @@ fn in_effect_json(part: Result<(&str, &str), &AiEngineError>) -> Value {
     }
 }
 
-/// What the sender gets for a request with no provider or no model. Either is the operator's to
-/// fix, in the node's config or in hive.yaml, so neither is retryable.
+/// What the sender gets for a request with no provider or no model. Each is the operator's to
+/// fix, in the node's config or in the hive's `ai` settings (the installation file, or hive.yaml
+/// while the hive holds none), so none is retryable.
 fn ai_engine_error_payload(err: &AiEngineError) -> Value {
     match err {
         AiEngineError::NoModel(provider) => json!({
@@ -6384,7 +6537,7 @@ fn ai_engine_error_payload(err: &AiEngineError) -> Value {
             "code": "missing_ai_model",
             "message": format!(
                 "This AI node has no model for its provider, {provider}: set behavior.model in \
-                 its config, or ai.providers.{provider}.model in the hive's hive.yaml."
+                 its config, or ai.providers.{provider}.model in the hive's ai settings."
             ),
             "retryable": false
         }),
@@ -6393,6 +6546,14 @@ fn ai_engine_error_payload(err: &AiEngineError) -> Value {
             "code": "hive_ai_config_unreadable",
             "message": "This AI node takes its provider or its model from the hive, and the \
                 hive's hive.yaml cannot be read.",
+            "retryable": false,
+            "details": { "reason": reason }
+        }),
+        AiEngineError::Installation(reason) => json!({
+            "type": "error",
+            "code": "installation_ai_settings_invalid",
+            "message": "This AI node takes its provider or its model from the hive, and the \
+                hive's installation file cannot be used.",
             "retryable": false,
             "details": { "reason": reason }
         }),
@@ -7726,6 +7887,11 @@ mod tests {
             self_tenant_id: None,
             behavior: Arc::new(RwLock::new(None)),
             config_dir: PathBuf::from("/tmp"),
+            // A dist that holds no installation file: the hive's ai is its hive.yaml's.
+            installation_file: installation_file_path(
+                &std::env::temp_dir().join(format!("ai-generic-no-dist-{}", Uuid::new_v4())),
+            ),
+            hive_ai_settings_seen: std::sync::Mutex::new(None),
             thread_state_store: None,
             vault: None,
             usage: UsageRecorder::disabled(),
@@ -11365,8 +11531,10 @@ mod tests {
             fs::write(dir.join("hive.yaml"), format!("hive_id: motherbee\n{yaml}"))
                 .expect("write hive.yaml")
         };
+        // A dist that holds no installation file: the hive's ai is its hive.yaml's.
+        let no_file = installation_file_path(&dir.join("dist"));
         let engine = |provider: Option<AiProvider>, model: Option<&str>| {
-            effective_ai_engine(&chat_runtime(provider, model), &dir).for_request()
+            effective_ai_engine(&chat_runtime(provider, model), &dir, &no_file).for_request()
         };
         let runs = |provider: AiProvider, model: &str| {
             Ok(AiEngine {
@@ -11412,8 +11580,8 @@ mod tests {
         assert_eq!(err, AiEngineError::NoModel(AiProvider::Anthropic));
         assert_eq!(
             err.to_string(),
-            "no model for the provider anthropic: behavior.model is not set, and hive.yaml has no \
-             ai.providers.anthropic.model"
+            "no model for the provider anthropic: behavior.model is not set, and the hive's ai \
+             settings have no ai.providers.anthropic.model"
         );
 
         // Without hive.yaml, only what the node leaves to the hive fails.
@@ -11429,6 +11597,112 @@ mod tests {
         assert_eq!(
             engine(Some(AiProvider::OpenAi), Some("gpt-5.5")),
             runs(AiProvider::OpenAi, "gpt-5.5")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// docs/hive-config-update-v1.md §4: once the hive holds the installation file, what a node
+    /// leaves to the hive is the file's, whatever hive.yaml's `ai` says (or whether it can be read);
+    /// a file that no reader can use fails the request with its reason, never with hive.yaml's
+    /// `ai`; and the node logs where the hive's `ai` came from when that changes.
+    #[tokio::test]
+    async fn the_hive_s_ai_is_the_installation_file_s_once_the_hive_holds_one() {
+        let dir = std::env::temp_dir().join(format!("ai-generic-installation-{}", Uuid::new_v4()));
+        let dist = dir.join("dist");
+        let file = installation_file_path(&dist);
+        fs::create_dir_all(file.parent().expect("its dir")).expect("temp dist");
+        fs::write(
+            dir.join("hive.yaml"),
+            format!(
+                "hive_id: worker1\ndist:\n  path: \"{}\"\nai:\n  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n",
+                dist.display()
+            ),
+        )
+        .expect("write hive.yaml");
+        assert_eq!(installation_file_of_hive(&dir), file);
+        assert_eq!(
+            installation_file_of_hive(&dir.join("nowhere")),
+            PathBuf::from(fluxbee_ai_sdk::INSTALLATION_FILE_PATH)
+        );
+        let mut node = test_node();
+        node.config_dir = dir.clone();
+        node.installation_file = file.clone();
+        let seen = |node: &GenericAiNode| node.hive_ai_settings_seen.lock().unwrap().clone();
+
+        // No file yet: hive.yaml's.
+        let engine = node.ai_engine_in_effect(&chat_runtime(None, None));
+        assert_eq!(
+            engine.for_request(),
+            Ok(AiEngine {
+                provider: AiProvider::OpenAi,
+                model: "gpt-5.5".to_string(),
+            })
+        );
+        assert!(seen(&node).is_some_and(|label| label.starts_with("hive.yaml")));
+
+        // The file: both providers, Anthropic the default; hive.yaml's ai is not read.
+        let bytes = fluxbee_ai_sdk::InstallationFile {
+            schema_version: fluxbee_ai_sdk::INSTALLATION_SCHEMA_VERSION,
+            version: 1,
+            ai: Some(
+                serde_yaml::from_str(
+                    "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+                )
+                .expect("ai"),
+            ),
+        }
+        .render()
+        .expect("renders");
+        fs::write(&file, &bytes).expect("write the file");
+        fs::write(dir.join("hive.yaml"), "hive_id: worker1\nai: [\n").expect("break hive.yaml");
+        let engine = node.ai_engine_in_effect(&chat_runtime(None, None));
+        assert_eq!(
+            engine.hive_settings,
+            Some(AiSettingsSource::Installation {
+                version: 1,
+                sha256: fluxbee_ai_sdk::sha256_hex(&bytes),
+            })
+        );
+        assert_eq!(
+            engine.for_request(),
+            Ok(AiEngine {
+                provider: AiProvider::Anthropic,
+                model: "claude-sonnet-5-5".to_string(),
+            })
+        );
+        assert_eq!(
+            node.ai_engine_in_effect(&chat_runtime(Some(AiProvider::OpenAi), None))
+                .for_request(),
+            Ok(AiEngine {
+                provider: AiProvider::OpenAi,
+                model: "gpt-5.5".to_string(),
+            }),
+            "every provider the file names has its model"
+        );
+        assert!(seen(&node).is_some_and(|label| label.starts_with("installation file v1")));
+
+        // A file no reader can use: the request fails with its reason; a node that names both
+        // its provider and its model reads nothing of the hive's.
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("break the file");
+        let err = node
+            .ai_engine_in_effect(&chat_runtime(None, None))
+            .for_request()
+            .expect_err("no fallback");
+        assert!(
+            matches!(&err, AiEngineError::Installation(reason) if reason.contains("version 0")),
+            "{err:?}"
+        );
+        let payload = ai_engine_error_payload(&err);
+        assert_eq!(payload["code"], json!("installation_ai_settings_invalid"));
+        assert_eq!(payload["retryable"], json!(false));
+        assert!(seen(&node).is_some_and(|label| label.starts_with("the installation file")));
+        assert_eq!(
+            node.ai_engine_in_effect(&chat_runtime(Some(AiProvider::OpenAi), Some("gpt-5.5")))
+                .for_request(),
+            Ok(AiEngine {
+                provider: AiProvider::OpenAi,
+                model: "gpt-5.5".to_string(),
+            })
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -11771,8 +12045,8 @@ mod tests {
             json!({
                 "name": null,
                 "source": "hive",
-                "error": "no model for the provider openai: behavior.model is not set, and \
-                    hive.yaml has no ai.providers.openai.model"
+                "error": "no model for the provider openai: behavior.model is not set, and the \
+                    hive's ai settings have no ai.providers.openai.model"
             })
         );
 

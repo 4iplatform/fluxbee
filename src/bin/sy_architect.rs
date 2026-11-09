@@ -44,9 +44,9 @@ use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, create_function_calling_model_with_call_timeout, extract_text,
-    resolve_model_input_from_payload_with_options, AiAccount, AiProvider, ConversationSummary,
-    FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem,
-    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    resolve_model_input_from_payload_with_options, AiAccount, AiProvider, AiSettings,
+    ConversationSummary, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
+    FunctionLoopItem, FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
     FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, ImmediateInteraction,
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
     UsageRecorder, UsageWork,
@@ -67,6 +67,7 @@ use fluxbee_sdk::{
     RouteTarget, RpcCommandReceiver, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
+use json_router::ai_settings;
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, RuntimeManifest, RuntimeManifestEntry,
 };
@@ -217,8 +218,12 @@ const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 struct HiveFile {
     hive_id: String,
     architect: Option<ArchitectSection>,
-    ai: Option<HiveAiConfig>,
+    /// Read as raw YAML: Archi's provider is the installation file's once the hive holds one, and
+    /// this section is typed only until then (`architect_hive_ai`).
+    ai: Option<serde_yaml::Value>,
     blob: Option<BlobSection>,
+    /// Where the hive's dist is, and so its installation file (docs/hive-config-update-v1.md §4).
+    dist: Option<ai_settings::DistPathSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +382,10 @@ struct ArchitectState {
     usage: UsageRecorder,
     ai_configured: AtomicBool,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
+    /// Why Archi has no AI runtime when its `ai` settings are the cause: an installation file no
+    /// reader can use, or hive.yaml's `ai` while the hive holds none
+    /// (docs/hive-config-update-v1.md §4). The chat answers with it.
+    ai_settings_error: std::sync::Mutex<Option<String>>,
     messages_db_configured: AtomicBool,
     messages_db_url: Arc<RwLock<Option<String>>>,
     messages_db: Arc<RwLock<Option<Arc<messages_db::MessagesDb>>>>,
@@ -6368,6 +6377,8 @@ async fn main() -> Result<(), ArchitectError> {
     // it does (the SDK's `resolve_resource_awaiting_vault`, as SY.storage and SY.identity do;
     // FINDINGS A-26), both secrets at once; VAULT_SECRET_CHANGED still covers later changes.
     let own_model = architect_own_model(&hive.hive_id);
+    // Where Archi's provider comes from, said once (docs/hive-config-update-v1.md §4).
+    log_architect_ai_source(&hive);
     let (ai_runtime, initial_messages_db_url) = tokio::join!(
         build_architect_ai_runtime(
             Arc::clone(&rpc),
@@ -6385,6 +6396,10 @@ async fn main() -> Result<(), ArchitectError> {
             VaultWait::UntilReachable,
         ),
     );
+    let (ai_runtime, initial_ai_settings_error) = match ai_runtime {
+        Ok(runtime) => (runtime, None),
+        Err(reason) => (None, Some(reason)),
+    };
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -6440,6 +6455,7 @@ async fn main() -> Result<(), ArchitectError> {
         usage: UsageRecorder::start(Arc::clone(&rpc)),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
+        ai_settings_error: std::sync::Mutex::new(initial_ai_settings_error),
         messages_db_configured: AtomicBool::new(initial_messages_db_configured),
         messages_db_url: Arc::new(RwLock::new(initial_messages_db_url)),
         messages_db: Arc::new(RwLock::new(initial_messages_db)),
@@ -6631,8 +6647,9 @@ fn architect_own_model(hive_id: &str) -> Option<String> {
 
 /// The config a CONFIG_SET leaves (its `config`, or the body itself): `ai.model` sets Archi's own
 /// model, and `null` gives it back the hive's. As ai.generic takes `behavior.model` (FINDINGS
-/// A-104), a model is a name that is not empty, and its provider is the hive's (hive.yaml
-/// `ai.default_provider`): `ai` takes nothing else. A CONFIG_SET without `ai` changes nothing.
+/// A-104), a model is a name that is not empty, and its provider is the installation's (the
+/// installation file's `ai.default_provider`): `ai` takes nothing else. A CONFIG_SET without `ai`
+/// changes nothing.
 fn architect_config_after_set(
     current: &ArchitectNodeConfig,
     body: &Value,
@@ -6647,7 +6664,7 @@ fn architect_config_after_set(
     if let Some(other) = ai.keys().find(|key| key.as_str() != "model") {
         return Err(format!(
             "config.ai.{other} is not SY.architect's: it takes only ai.model, and its provider is \
-             the hive's (hive.yaml ai.default_provider)"
+             the installation's (the installation file's ai.default_provider)"
         ));
     }
     const MODEL: &str = "a model of the hive's provider, or null for the hive's model";
@@ -6693,6 +6710,31 @@ fn architect_ai_engine(
     }
 }
 
+/// The hive's `ai` for Archi (docs/hive-config-update-v1.md §4): the installation file's once the
+/// hive holds one, its hive.yaml's until then. The error is the reason, in its own words: a file
+/// no reader can use (never a fallback to hive.yaml), or hive.yaml's `ai` while the hive holds none.
+fn architect_hive_ai(hive: &HiveFile) -> Result<AiSettings, String> {
+    ai_settings::reader_ai_settings(hive.dist.as_ref(), hive.ai.as_ref())
+        .map_err(|err| ai_settings::plain_error(&err))
+}
+
+/// Archi's start says once where its provider comes from, or why it cannot use its `ai`.
+fn log_architect_ai_source(hive: &HiveFile) {
+    match architect_hive_ai(hive) {
+        Ok(settings) => tracing::info!(
+            source = %ai_settings::ai_source_label(&settings.source),
+            "sy.architect ai settings"
+        ),
+        Err(reason) => tracing::error!(
+            reason = %reason,
+            "sy.architect cannot use its ai settings: its AI stays off, and the chat answers with \
+             this reason, until they are fixed and the node restarts"
+        ),
+    }
+}
+
+/// Archi's AI runtime: `Ok(None)` without its key; the error is why its `ai` settings cannot be
+/// used, which the chat then answers with.
 async fn build_architect_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     node_name: &str,
@@ -6700,12 +6742,14 @@ async fn build_architect_ai_runtime(
     hive: &HiveFile,
     own_model: Option<&str>,
     wait: VaultWait,
-) -> Option<ArchitectAiRuntime> {
-    let engine = match architect_ai_engine(hive.ai.as_ref(), own_model) {
+) -> Result<Option<ArchitectAiRuntime>, String> {
+    let engine = match architect_hive_ai(hive)
+        .and_then(|settings| architect_ai_engine(settings.ai.as_ref(), own_model))
+    {
         Ok((engine, _)) => engine,
         Err(err) => {
             tracing::error!(error = %err, "invalid hive ai configuration");
-            return None;
+            return Err(err);
         }
     };
     let api_key = match resolve_architect_ai_api_key_from_vault(
@@ -6719,23 +6763,41 @@ async fn build_architect_ai_runtime(
     .await
     {
         Ok(Some(api_key)) => api_key,
-        Ok(None) => return None,
+        Ok(None) => return Ok(None),
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 provider = %engine.provider,
                 "sy.architect AI vault resource lookup failed"
             );
-            return None;
+            return Ok(None);
         }
     };
-    Some(ArchitectAiRuntime {
+    Ok(Some(ArchitectAiRuntime {
         provider: engine.provider,
         model: engine.model,
         instructions: build_archi_prompt(read_handbook_text().as_deref()),
         model_settings: architect_model_settings(),
         api_key,
-    })
+    }))
+}
+
+/// What the chat answers without an AI runtime: why Archi cannot use its `ai` settings when that
+/// is the cause, else that its provider has no key.
+fn architect_ai_unavailable_reason(state: &ArchitectState) -> String {
+    match state
+        .ai_settings_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_deref()
+    {
+        Some(reason) => format!(
+            "AI provider not configured: Archi cannot use its ai settings ({reason}). Chat \
+             remains available for SCMD system operations."
+        ),
+        None => "AI provider not configured. Chat remains available for SCMD system operations."
+            .to_string(),
+    }
 }
 
 /// Every call of Archi's asks for answers of up to `ARCHITECT_MAX_OUTPUT_TOKENS`.
@@ -6799,7 +6861,7 @@ fn vault_response_openai_api_key(value: &Value) -> Option<String> {
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
     let own_model = architect_own_model(&state.hive_id);
-    let runtime = build_architect_ai_runtime(
+    let built = build_architect_ai_runtime(
         Arc::clone(&state.rpc),
         &state.node_name,
         &state.self_ilk_id,
@@ -6808,6 +6870,14 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
         VaultWait::Once,
     )
     .await;
+    let (runtime, settings_error) = match built {
+        Ok(runtime) => (runtime, None),
+        Err(reason) => (None, Some(reason)),
+    };
+    *state
+        .ai_settings_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings_error;
     state
         .ai_configured
         .store(runtime.is_some(), Ordering::Relaxed);
@@ -7426,15 +7496,16 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
             return;
         }
     };
-    // Audit B1: do NOT swallow a hive.yaml load/parse error into a silent openai fallback
-    // (§3.3). A missing ai section is the documented openai default and stays quiet; only a
-    // genuine error warns.
+    // Audit B1: do NOT swallow a load/parse error of the hive's `ai` settings (the installation
+    // file, or hive.yaml while the hive holds none) into a silent openai fallback (§3.3). No `ai`
+    // at all is the documented openai default and stays quiet; only a genuine error warns.
     let provider = match load_hive(&state.config_dir) {
-        Ok(hive) => match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
-            Ok(Some(engine)) => engine.provider,
-            Ok(None) => HiveAiConfig::fallback().provider,
-            Err(err) => {
-                tracing::warn!(error = %err, "hive.yaml ai section is invalid; VAULT_SECRET_CHANGED interest defaulting to openai");
+        Ok(hive) => match architect_hive_ai(&hive).and_then(|settings| {
+            ai_settings::reader_engine(&settings).map_err(|err| ai_settings::plain_error(&err))
+        }) {
+            Ok(engine) => engine.provider,
+            Err(reason) => {
+                tracing::warn!(reason = %reason, "the ai settings cannot be used; VAULT_SECRET_CHANGED interest defaulting to openai");
                 HiveAiConfig::fallback().provider
             }
         },
@@ -10910,11 +10981,7 @@ async fn handle_ai_chat(
         .lock()
         .await
         .clone()
-        .ok_or_else(|| -> ArchitectError {
-            "AI provider not configured. Chat remains available for SCMD system operations."
-                .to_string()
-                .into()
-        })?;
+        .ok_or_else(|| -> ArchitectError { architect_ai_unavailable_reason(state).into() })?;
     let tool_context = admin_tool_context(state, Some(&session.session_id));
     let account = tool_context
         .usage_account("chat", None)
@@ -12033,7 +12100,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.sales@motherbee\",\"runtime\":\"ai.generic\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
-                "Configure the hive-wide ai.default_provider and ai.providers.<provider>.model in hive.yaml; SY.architect's own model, of that provider: SCMD: curl -X POST /architect/control/config-set -d '{\"config\":{\"ai\":{\"model\":\"<model>\"}}}' (null for the hive's)."
+                "The installation's ai.default_provider and ai.providers.<provider>.model are in its installation file (docs/hive-config-update-v1.md §4); SY.architect's own model, of that provider: SCMD: curl -X POST /architect/control/config-set -d '{\"config\":{\"ai\":{\"model\":\"<model>\"}}}' (null for the hive's)."
             ]
         }
     }))
@@ -12109,8 +12176,8 @@ async fn handle_architect_local_config_get(
                 "optional_fields": ["ai.model"],
                 "resources": resources,
                 "notes": [
-                    "The AI provider is hive-wide: hive.yaml ai.default_provider. CONFIG_SET does not change it.",
-                    "ai.model is SY.architect's own model, a model of the hive's provider, kept in its own config; without it (or after ai.model null) SY.architect runs on the hive's model for that provider (hive.yaml ai.providers.<provider>.model). ai_model shows the model in effect and its source: ai.model or hive.",
+                    "The AI provider is the installation's: ai.default_provider of the installation file (of hive.yaml while this hive holds none; ai_provider.settings says which). CONFIG_SET does not change it.",
+                    "ai.model is SY.architect's own model, a model of the installation's provider, kept in its own config; without it (or after ai.model null) SY.architect runs on the installation's model for that provider (ai.providers.<provider>.model). ai_model shows the model in effect and its source: ai.model or hive.",
                     "A CONFIG_SET with ai.model rebuilds SY.architect's AI runtime at once, with no restart.",
                     "CONFIG_SET on SY.architect takes no secret-bearing fields (api_key/api_key_ref/messages_db_url/messages_db_url_ref are rejected).",
                     "The postgres resource is optional; if present, architect enables the messages log viewer against ARCHITECT_MESSAGES_DB_NAME on the resolved cluster."
@@ -12121,14 +12188,21 @@ async fn handle_architect_local_config_get(
 }
 
 /// CONFIG_GET's and CONFIG_SET's `ai_provider` and `ai_model`: what Archi's calls run on, each
-/// `{name, source}` (`architect_ai_engine`).
+/// `{name, source}` (`architect_ai_engine`); the provider's `settings` say where the hive's `ai`
+/// came from (docs/hive-config-update-v1.md §4).
 fn architect_ai_in_effect(
     hive: &HiveFile,
     own: &ArchitectNodeConfig,
 ) -> Result<(Value, Value), ArchitectError> {
-    let (engine, model_source) = architect_ai_engine(hive.ai.as_ref(), own.ai.model.as_deref())?;
+    let settings = architect_hive_ai(hive)?;
+    let (engine, model_source) =
+        architect_ai_engine(settings.ai.as_ref(), own.ai.model.as_deref())?;
     Ok((
-        json!({ "name": engine.provider.to_string(), "source": "hive" }),
+        json!({
+            "name": engine.provider.to_string(),
+            "source": "hive",
+            "settings": ai_settings::ai_source_json(&settings.source),
+        }),
         json!({ "name": engine.model, "source": model_source }),
     ))
 }
@@ -12196,7 +12270,7 @@ fn reject_architect_secret_fields(body: &Value) -> Result<(), ArchitectError> {
     let config_root = body.get("config").unwrap_or(body);
     if config_root.get("ai_providers").is_some() {
         return Err(
-            "the AI provider is hive-wide; configure the ai section in hive.yaml (SY.architect takes only ai.model)".into(),
+            "the AI provider is the installation's, in its installation file (docs/hive-config-update-v1.md §4); SY.architect takes only ai.model".into(),
         );
     }
     let storage = config_root.get("storage");
@@ -29274,6 +29348,75 @@ mod tests {
         let facts = build_plan_compiler_prompt(&[], &[], None);
         assert!(facts.contains("`wf_rules_check` is never an executor step"));
         assert!(facts.contains("never add a `restart_node` after it"));
+    }
+
+    /// docs/hive-config-update-v1.md §4: Archi's provider and the hive's model are the installation
+    /// file's once its hive holds one, whatever hive.yaml's `ai` says (an invalid one included),
+    /// hive.yaml's until then; a file no reader can use is the reason the chat answers with, never
+    /// hive.yaml's `ai`.
+    #[test]
+    fn archis_ai_is_the_installation_file_s_once_its_hive_holds_one() {
+        let root = test_temp_dir("archi-installation");
+        let dist = root.join("dist");
+        let file = fluxbee_ai_sdk::installation_file_path(&dist);
+        std::fs::create_dir_all(file.parent().expect("its dir")).expect("dist");
+        let hive_with = |ai: &str| -> HiveFile {
+            serde_yaml::from_str(&format!(
+                "hive_id: motherbee\ndist:\n  path: \"{}\"\nai:\n{ai}",
+                dist.display()
+            ))
+            .expect("hive.yaml")
+        };
+        let openai_hive = hive_with(
+            "  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n",
+        );
+
+        // No file: hive.yaml's, as before.
+        let settings = architect_hive_ai(&openai_hive).expect("hive.yaml");
+        assert_eq!(settings.source, fluxbee_ai_sdk::AiSettingsSource::HiveYaml);
+        let (engine, _) = architect_ai_engine(settings.ai.as_ref(), None).expect("engine");
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::OpenAi, "gpt-5.5")
+        );
+
+        // The file: its provider and model, hive.yaml's ai not even typed.
+        let bytes = fluxbee_ai_sdk::InstallationFile {
+            schema_version: fluxbee_ai_sdk::INSTALLATION_SCHEMA_VERSION,
+            version: 1,
+            ai: Some(
+                serde_yaml::from_str(
+                    "default_provider: anthropic\nproviders:\n  anthropic:\n    model: claude-sonnet-5-5\n",
+                )
+                .expect("ai"),
+            ),
+        }
+        .render()
+        .expect("renders");
+        std::fs::write(&file, &bytes).expect("written");
+        let stale_hive = hive_with("  default_provider: gemini\n");
+        let settings = architect_hive_ai(&stale_hive).expect("the file");
+        assert!(matches!(
+            settings.source,
+            fluxbee_ai_sdk::AiSettingsSource::Installation { version: 1, .. }
+        ));
+        let (engine, _) =
+            architect_ai_engine(settings.ai.as_ref(), Some("claude-opus-5-5")).expect("its own");
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::Anthropic, "claude-opus-5-5")
+        );
+        let own = ArchitectNodeConfig::default();
+        let (provider, model) = architect_ai_in_effect(&stale_hive, &own).expect("in effect");
+        assert_eq!(provider["name"], json!("anthropic"));
+        assert_eq!(provider["settings"]["from"], json!("installation_file"));
+        assert_eq!(model["name"], json!("claude-sonnet-5-5"));
+
+        // A file no reader can use: the reason, never hive.yaml's ai.
+        std::fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("broken");
+        let reason = architect_hive_ai(&openai_hive).expect_err("no fallback");
+        assert!(reason.contains("version 0"), "{reason}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// WF Case 5: Archi's own model, set through CONFIG_SET as `ai.model`, of the hive's provider;

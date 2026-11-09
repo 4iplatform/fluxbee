@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    build_model_user_content_parts, build_reply_message_runtime_src, build_text_response,
-    control_request, create_function_calling_model, create_llm_client, extract_response_envelope,
-    extract_text, is_infrastructure_message, note_infrastructure_message,
-    resolve_model_input_from_payload_with_options, set_reply_act, AiAccount, AiNode, AiProvider,
-    ControlRequest, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    ai_settings_at, build_model_user_content_parts, build_reply_message_runtime_src,
+    build_text_response, control_request, create_function_calling_model, create_llm_client,
+    extract_response_envelope, extract_text, installation_file_path, is_infrastructure_message,
+    note_infrastructure_message, resolve_model_input_from_payload_with_options, set_reply_act,
+    AiAccount, AiNode, AiProvider, AiSdkError, AiSettings, AiSettingsSource, ControlRequest,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
     LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime, ProviderError,
     ProviderErrorKind, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool,
@@ -172,9 +173,25 @@ fn frontdesk_default_instructions_snapshot() -> Value {
 #[derive(Debug, Deserialize)]
 struct FrontdeskBootstrapHiveFile {
     hive_id: String,
+    /// Where the hive's dist is, and so its installation file (docs/hive-config-update-v1.md §4).
     #[serde(default)]
-    ai: Option<HiveAiConfig>,
+    dist: Option<FrontdeskDistSection>,
+    /// Read as raw YAML: the provider and model are the installation file's once the hive holds
+    /// one, and this section is typed only until then (`frontdesk_ai_settings`), so an `ai` no
+    /// reader uses any more never stops the frontdesk.
+    #[serde(default)]
+    ai: Option<serde_yaml::Value>,
 }
+
+/// hive.yaml's `dist:` section, as far as the frontdesk needs it.
+#[derive(Debug, Default, Deserialize)]
+struct FrontdeskDistSection {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// The dist root of a hive whose hive.yaml has no `dist.path`.
+const DEFAULT_DIST_ROOT: &str = "/var/lib/fluxbee/dist";
 
 #[derive(Debug)]
 struct NodeSection {
@@ -809,7 +826,8 @@ impl ImmediateMemoryStore {
 
 /// The frontdesk's lifecycle is the SDK's managed one: CONFIGURED when its AI key resolves (the
 /// conversation runs), UNCONFIGURED without one, FAILED_CONFIG when its baked AI runtime cannot be
-/// built (a bad hive.yaml `ai` section). The deterministic handoff works in all three.
+/// built (`ai` settings it cannot use: docs/hive-config-update-v1.md §4). The deterministic handoff
+/// works in all three.
 type NodeLifecycleState = ManagedNodeLifecycleState;
 
 #[derive(Debug)]
@@ -847,12 +865,13 @@ fn missing_secret_error(provider: AiProvider) -> ControlPlaneErrorInfo {
     }
 }
 
-/// FAILED_CONFIG: the baked AI runtime cannot be built from hive.yaml.
+/// FAILED_CONFIG: the baked AI runtime cannot be built from the hive's `ai` settings: the
+/// installation file, or hive.yaml while the hive holds none (docs/hive-config-update-v1.md §4).
 fn invalid_ai_config_error(reason: &str) -> ControlPlaneErrorInfo {
     ControlPlaneErrorInfo {
         code: "invalid_ai_config".to_string(),
         message: format!(
-            "the AI runtime cannot be built from hive.yaml (the deterministic handoff still works): {reason}"
+            "the AI runtime cannot be built from the hive's ai settings (the installation file, or hive.yaml while the hive holds none; the deterministic handoff still works): {reason}"
         ),
     }
 }
@@ -2213,7 +2232,7 @@ impl GenericAiNode {
             return self.error_response(
                 "config_not_accepted",
                 format!(
-                    "{field} is not accepted: SY.frontdesk.gov is autonomous — AI provider/model are hive-wide (hive.yaml) and the credential lives in SY.vault (resource_type=openai); CONFIG_SET only re-resolves the vault token."
+                    "{field} is not accepted: SY.frontdesk.gov is autonomous — AI provider/model are the installation's (its installation file, docs/hive-config-update-v1.md §4) and the credential lives in SY.vault (resource_type=openai); CONFIG_SET only re-resolves the vault token."
                 ),
                 schema_version,
                 config_version,
@@ -2302,7 +2321,7 @@ impl GenericAiNode {
             .resolve_ai_api_key_with_source(provider, VaultWait::Once)
             .await
             .1;
-        // Baked engine (hive-wide provider/model from hive.yaml) — reported for diagnostics, mirroring
+        // Baked engine (the installation's provider/model, read at the start) — reported for diagnostics, mirroring
         // architect's config.ai block.
         let (engine_provider, engine_model) = match self.behavior.read().await.as_ref() {
             Some(NodeBehavior::OpenAiChat(rt)) => (rt.provider.to_string(), rt.model.clone()),
@@ -2341,7 +2360,7 @@ impl GenericAiNode {
                 }],
                 "notes": [
                     "SY.frontdesk.gov is autonomous: its behavior is a baked ai_chat frontdesk (runtime-owned prompt) and is NOT settable via CONFIG_SET.",
-                    "The AI provider/model are hive-wide and configured only in hive.yaml (a baked fallback applies otherwise).",
+                    "The AI provider/model are the installation's: its installation file, or hive.yaml while this hive holds none (a baked fallback applies when neither names one).",
                     "The AI credential is resolved from SY.vault (resource_type=openai) at boot and on VAULT_SECRET_CHANGED; CONFIG_SET only RE-RESOLVES it — no config accepted, nothing persisted.",
                     "Secret plaintext is never persisted in node-local config or returned by CONFIG_GET."
                 ]
@@ -3015,17 +3034,73 @@ fn build_behavior_from_effective_config(
     }
 }
 
+/// The frontdesk's provider and model, read at its start: the installation file's once the hive
+/// holds one, its hive.yaml's until then (docs/hive-config-update-v1.md §4), logged with where they
+/// came from. A file that is there and that no reader can use is an error, never a fallback to
+/// hive.yaml: the frontdesk boots FAILED_CONFIG with it.
 fn load_hive_ai_engine(
     config_dir: &str,
 ) -> Result<fluxbee_ai_sdk::EffectiveAiEngine, Box<dyn std::error::Error + Send + Sync>> {
     let raw = fs::read_to_string(PathBuf::from(config_dir).join("hive.yaml"))?;
     let hive: FrontdeskBootstrapHiveFile = serde_yaml::from_str(&raw)?;
-    hive.ai
+    let settings = frontdesk_ai_settings(&hive).map_err(plain_ai_error)?;
+    let engine = settings
+        .ai
         .as_ref()
         .map(HiveAiConfig::effective)
         .transpose()
-        .map_err(Into::into)
-        .map(|engine| engine.unwrap_or_else(HiveAiConfig::fallback))
+        .map_err(plain_ai_error)?
+        .unwrap_or_else(HiveAiConfig::fallback);
+    tracing::info!(
+        source = %frontdesk_ai_source_label(&settings.source),
+        provider = %engine.provider,
+        model = %engine.model,
+        "SY.frontdesk.gov ai settings"
+    );
+    Ok(engine)
+}
+
+/// The hive's `ai` for the frontdesk: the installation file's under its dist once the hive holds
+/// one, else hive.yaml's, typed only then.
+fn frontdesk_ai_settings(hive: &FrontdeskBootstrapHiveFile) -> fluxbee_ai_sdk::Result<AiSettings> {
+    let dist_root = hive
+        .dist
+        .as_ref()
+        .and_then(|dist| dist.path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(DEFAULT_DIST_ROOT);
+    ai_settings_at(&installation_file_path(Path::new(dist_root)), || {
+        hive.ai
+            .as_ref()
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_yaml::from_value::<HiveAiConfig>(value.clone())
+                    .map_err(|err| AiSdkError::Protocol(format!("hive.yaml's ai: {err}")))
+            })
+            .transpose()
+    })
+}
+
+/// Where the frontdesk's `ai` came from, for its log line.
+fn frontdesk_ai_source_label(source: &AiSettingsSource) -> String {
+    match source {
+        AiSettingsSource::Installation { version, sha256 } => format!(
+            "installation file v{version} (sha256 {})",
+            sha256.get(..12).unwrap_or(sha256)
+        ),
+        AiSettingsSource::HiveYaml => {
+            "hive.yaml: this hive holds no installation file yet".to_string()
+        }
+    }
+}
+
+/// An AI SDK error in its own words, without the "protocol error:" its Display adds.
+fn plain_ai_error(err: AiSdkError) -> Box<dyn std::error::Error + Send + Sync> {
+    match err {
+        AiSdkError::Protocol(detail) => detail.into(),
+        other => other.to_string().into(),
+    }
 }
 
 /// Model D' — extract the openai api_key from a vault `value`. Vault may
@@ -3044,7 +3119,7 @@ fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
 }
 
 /// Model D' (cf. `reject_architect_secret_fields`): SY.frontdesk.gov accepts NO config on CONFIG_SET —
-/// its behavior is baked (ai_chat + the frontdesk prompt), its provider/model are hive-wide (hive.yaml),
+/// its behavior is baked (ai_chat + the frontdesk prompt), its provider/model are the installation's,
 /// and its credential lives in SY.vault. Every field under `config` is refused (`behavior` with the
 /// prompt, `runtime`, any other); an empty `config` is the vault re-resolve trigger. Without the
 /// `config` wrapper, the known fields are looked for next to the request's own. Returns the first
@@ -5040,6 +5115,77 @@ mod tests {
 
         let inferred = infer_frontdesk_node_name_from_hive(root.as_path());
         assert_eq!(inferred.as_deref(), Some("SY.frontdesk.gov@motherbee"));
+        // An `ai` no reader can use any more never stops it: that section is not typed here.
+        fs::write(
+            root.join("hive.yaml"),
+            "hive_id: motherbee\nai:\n  default_provider: gemini\n",
+        )
+        .expect("write hive.yaml");
+        let inferred = infer_frontdesk_node_name_from_hive(root.as_path());
+        assert_eq!(inferred.as_deref(), Some("SY.frontdesk.gov@motherbee"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// docs/hive-config-update-v1.md §4: the frontdesk's provider and model are the installation
+    /// file's once its hive holds one, whatever hive.yaml's `ai` says, hive.yaml's until then; a
+    /// file no reader can use is the FAILED_CONFIG reason, never hive.yaml's `ai`.
+    #[test]
+    fn the_frontdesk_reads_the_installation_file_once_its_hive_holds_one() {
+        let root = std::env::temp_dir().join(format!(
+            "frontdesk-installation-{}",
+            Uuid::new_v4().simple()
+        ));
+        let dist = root.join("dist");
+        let file = installation_file_path(&dist);
+        fs::create_dir_all(file.parent().expect("its dir")).expect("create temp dist");
+        let config_dir = root.to_string_lossy().to_string();
+        let write_hive = |ai: &str| {
+            fs::write(
+                root.join("hive.yaml"),
+                format!(
+                    "hive_id: motherbee\ndist:\n  path: \"{}\"\nai:\n{ai}",
+                    dist.display()
+                ),
+            )
+            .expect("write hive.yaml");
+        };
+
+        // No file: hive.yaml's, as before.
+        write_hive("  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n");
+        let engine = load_hive_ai_engine(&config_dir).expect("hive.yaml");
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::OpenAi, "gpt-5.5")
+        );
+
+        // The file: its default provider and model, with an old hive.yaml ai no reader uses.
+        let bytes = fluxbee_ai_sdk::InstallationFile {
+            schema_version: fluxbee_ai_sdk::INSTALLATION_SCHEMA_VERSION,
+            version: 1,
+            ai: Some(
+                serde_yaml::from_str(
+                    "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+                )
+                .expect("ai"),
+            ),
+        }
+        .render()
+        .expect("renders");
+        fs::write(&file, &bytes).expect("write the file");
+        write_hive("  default_provider: gemini\n");
+        let engine = load_hive_ai_engine(&config_dir).expect("the file");
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::Anthropic, "claude-sonnet-5-5")
+        );
+
+        // A file no reader can use: the reason, never hive.yaml's ai.
+        write_hive("  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n");
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("break the file");
+        let err = load_hive_ai_engine(&config_dir).expect_err("no fallback");
+        assert!(err.to_string().contains("version 0"), "{err}");
+        assert!(!err.to_string().contains("protocol error"), "{err}");
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -11,7 +11,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
-use fluxbee_ai_sdk::{EffectiveAiEngine, HiveAiConfig};
+use fluxbee_ai_sdk::{
+    installation_file_path, installation_file_state, sha256_hex, InstallationFile,
+    InstallationFileState, INSTALLATION_SCHEMA_VERSION,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +45,7 @@ use fluxbee_sdk::{
     MSG_STORAGE_METRICS_RESPONSE,
 };
 use json_router::{
+    ai_settings,
     release_settings::{self, HiveRole},
     runtime_manifest::{
         load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared, RuntimeManifest,
@@ -118,6 +122,11 @@ const SYNCTHING_FOLDER_DIST_RUNTIMES_ID: &str = "fluxbee-dist-runtimes";
 /// a manifest under `dist/policy/opa/`). EVERY hive: each one's SY.opa.rules installs it from its
 /// local copy, so a hive that was down or cut off catches up as soon as the folder syncs.
 const SYNCTHING_FOLDER_DIST_POLICY_ID: &str = "fluxbee-dist-policy";
+/// The installation file (docs/hive-config-update-v1.md §4): the operator's settings for the whole
+/// installation, today `ai`, one version on every hive. The motherbee's orchestrator writes it, the
+/// only writer, and sends it; EVERY hive receives it, since every hive's readers read their own
+/// copy (`dist/installation/installation.json`). Its members follow vendor's, as policy's do.
+const SYNCTHING_FOLDER_DIST_INSTALLATION_ID: &str = "fluxbee-dist-installation";
 /// Agent assets: the JSON files SY.architect writes as `blob/agent-assets/<sha256>.json` on the
 /// motherbee, which ai.generic reads from its own disk. WORKER ONLY, like runtimes: the workers
 /// run the agents (FINDINGS A-72). Its path is under `blob/`, but it is a `fluxbee-dist` folder:
@@ -172,6 +181,9 @@ const NODE_FILES_ROOT: &str = "/var/lib/fluxbee/nodes";
 /// `/etc/fluxbee/hive.yaml`: the hive's own settings. What the release defines for each role (its
 /// SY nodes, the blob's and dist's topology) is in `json_router::release_settings`; a file that
 /// still holds those keys parses as before, and they are ignored (`warn_superseded_hive_keys`).
+/// `ai` is untyped: on the motherbee it is the installation file's first version, typed only when
+/// the start writes it, and once a hive holds the file it is ignored (docs/hive-config-update-v1.md
+/// §4), so an `ai` no reader uses never stops the start.
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
@@ -184,7 +196,7 @@ struct HiveFile {
     government: Option<GovernmentSection>,
     egress: Option<EgressSection>,
     ingress: Option<HiveIngressSection>,
-    ai: Option<HiveAiConfig>,
+    ai: Option<serde_yaml::Value>,
 }
 
 /// The `ingress:` section of an ingress hive's own hive.yaml (docs/control-path-hardening-v1.md
@@ -650,7 +662,10 @@ struct OrchestratorState {
     egress: Option<EgressSection>,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
-    ai: EffectiveAiEngine,
+    /// The motherbee only: why its start did not write the installation file's first version
+    /// (`write_installation_file_at_start`); None when it wrote it or found it there, and on a
+    /// spoke. `/versions` shows it as `config.not_written`.
+    installation_not_written: std::sync::Mutex<Option<String>>,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
     // F18: serialize add_hive/remove_hive per hive_id. The TOCTOU window is the
     // exists-check -> remove_dir_all -> create_dir_all -> info.yaml write sequence;
@@ -933,13 +948,6 @@ async fn main() -> Result<(), OrchestratorError> {
     // The release's settings for this role, from the code (docs/hive-config-update-v1.md §3).
     let system_nodes = system_nodes_for_role(role);
     warn_superseded_hive_keys(&config_dir);
-    let ai = hive
-        .ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| -> OrchestratorError { err.into() })?
-        .unwrap_or_else(HiveAiConfig::fallback);
     let runtime_manifest = load_runtime_manifest();
     let state = Arc::new(OrchestratorState {
         hive_id: hive.hive_id.clone(),
@@ -963,7 +971,7 @@ async fn main() -> Result<(), OrchestratorError> {
         egress: hive.egress.clone(),
         blob: blob_runtime.clone(),
         dist: dist_runtime,
-        ai,
+        installation_not_written: std::sync::Mutex::new(None),
         blob_sync_last_desired: Mutex::new(blob_runtime),
         hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
         node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
@@ -1001,6 +1009,17 @@ async fn main() -> Result<(), OrchestratorError> {
         state.role,
         &state.hive_id,
     )?;
+    // docs/hive-config-update-v1.md §4: the motherbee writes the installation file's first version
+    // before its boot (re)starts the SY nodes, so its readers read it from this start on. Never a
+    // reason not to start.
+    if state.is_motherbee {
+        *installation_not_written_slot(&state) = write_installation_file_at_start(
+            &installation_file_path(&state.dist.path),
+            &installation_versions_path(),
+            hive.ai.as_ref(),
+        );
+    }
+    report_installation_file_at_start(&state.dist.path, hive.ai.is_some());
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
@@ -6485,6 +6504,437 @@ fn warn_superseded_hive_keys(config_dir: &Path) {
     }
 }
 
+// ===========================================================================
+// The installation file (docs/hive-config-update-v1.md §4): the operator's settings for the whole
+// installation, today `ai`. The motherbee's orchestrator is its only writer; every hive receives it
+// in the `fluxbee-dist-installation` folder, and each hive's readers read their own copy
+// (`fluxbee_ai_sdk::ai_settings_at`): SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and
+// ai.generic. Stage 3b writes its first version from the motherbee's hive.yaml `ai`, the values
+// the readers ran on, so nothing changes in behavior.
+// ===========================================================================
+
+/// Why the motherbee recorded a version: the first one, from its hive.yaml's `ai`.
+const INSTALLATION_SOURCE_MIGRATION: &str = "migration";
+
+/// Where the motherbee records each version of the installation file it wrote.
+fn installation_versions_path() -> PathBuf {
+    orchestrator_runtime_dir().join("installation-versions.json")
+}
+
+/// One version of the installation file as the motherbee wrote it: the sha256 of its bytes, when,
+/// and why. A file whose hash is not its version's recorded one was edited by hand (§4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstallationVersionRecord {
+    version: u64,
+    sha256: String,
+    written_at_ms: u64,
+    source: String,
+}
+
+/// The motherbee's record of every version it wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct InstallationVersions {
+    #[serde(default)]
+    versions: Vec<InstallationVersionRecord>,
+}
+
+impl InstallationVersions {
+    fn record_for(&self, version: u64) -> Option<&InstallationVersionRecord> {
+        self.versions
+            .iter()
+            .find(|record| record.version == version)
+    }
+
+    fn knows_hash(&self, sha256: &str) -> bool {
+        self.versions.iter().any(|record| record.sha256 == sha256)
+    }
+
+    fn latest_version(&self) -> Option<u64> {
+        self.versions.iter().map(|record| record.version).max()
+    }
+
+    /// Records `record`, in place of an earlier record of its version.
+    fn upsert(&mut self, record: InstallationVersionRecord) {
+        self.versions.retain(|old| old.version != record.version);
+        self.versions.push(record);
+        self.versions.sort_by_key(|record| record.version);
+    }
+}
+
+/// The records at `path`: none while it does not exist; an error when it cannot be read or does
+/// not decode.
+fn read_installation_versions(path: &Path) -> Result<InstallationVersions, String> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| format!("'{}' does not decode: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(InstallationVersions::default())
+        }
+        Err(err) => Err(format!("'{}' unreadable: {err}", path.display())),
+    }
+}
+
+fn write_installation_versions(
+    path: &Path,
+    versions: &InstallationVersions,
+) -> Result<(), OrchestratorError> {
+    let mut bytes = serde_json::to_vec_pretty(versions)?;
+    bytes.push(b'\n');
+    write_new_file_atomic(path, &bytes, 0o644)
+}
+
+/// What the motherbee's start found at the installation file's place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallationMigration {
+    /// A file was there (valid or not): nothing was written.
+    Present,
+    /// Its first version was written, with this sha256.
+    Written { sha256: String },
+}
+
+/// The migration of docs/hive-config-update-v1.md §4, on the motherbee: when its dist holds no
+/// installation file, writes version 1 from its hive.yaml's `ai` (`InstallationFile::render`,
+/// which validates; an absent `ai` gives a file without one, the fallback engine, as a hive.yaml
+/// without one). The version is recorded before the file is written, so a file is never there
+/// without its record; a start that stops in between writes it again. The error says why nothing
+/// was written: an `ai` no reader can use, a file missing after a later version was recorded, or
+/// a write that failed.
+fn write_installation_file_first_version(
+    file: &Path,
+    records_path: &Path,
+    hive_ai: Option<&serde_yaml::Value>,
+    now_ms: u64,
+) -> Result<InstallationMigration, String> {
+    match installation_file_state(file) {
+        Ok(InstallationFileState::Absent) => {}
+        Ok(_) => return Ok(InstallationMigration::Present),
+        Err(err) => return Err(ai_settings::plain_error(&err)),
+    }
+    let mut versions = read_installation_versions(records_path)
+        .map_err(|err| format!("its versions' record cannot be read: {err}"))?;
+    if let Some(latest) = versions.latest_version().filter(|latest| *latest > 1) {
+        return Err(format!(
+            "the file is missing while version {latest} was recorded: put that version back \
+             from a hive that holds it"
+        ));
+    }
+    let unusable = |err: fluxbee_ai_sdk::AiSdkError| {
+        format!(
+            "hive.yaml's ai is not one every reader can use ({})",
+            ai_settings::plain_error(&err)
+        )
+    };
+    let ai = ai_settings::hive_yaml_ai(hive_ai).map_err(unusable)?;
+    let bytes = InstallationFile {
+        schema_version: INSTALLATION_SCHEMA_VERSION,
+        version: 1,
+        ai,
+    }
+    .render()
+    .map_err(unusable)?;
+    let sha256 = sha256_hex(&bytes);
+    versions.upsert(InstallationVersionRecord {
+        version: 1,
+        sha256: sha256.clone(),
+        written_at_ms: now_ms,
+        source: INSTALLATION_SOURCE_MIGRATION.to_string(),
+    });
+    write_installation_versions(records_path, &versions)
+        .map_err(|err| format!("its version could not be recorded: {err}"))?;
+    write_file_atomic(file, &bytes).map_err(|err| format!("it could not be written: {err}"))?;
+    Ok(InstallationMigration::Written { sha256 })
+}
+
+/// The motherbee's start: the migration (`write_installation_file_first_version`), logged. Returns
+/// why it wrote nothing when the file was missing (`/versions`: `config.not_written`). Never a
+/// reason not to start: without a file every reader keeps reading its hive.yaml.
+fn write_installation_file_at_start(
+    file: &Path,
+    records_path: &Path,
+    hive_ai: Option<&serde_yaml::Value>,
+) -> Option<String> {
+    match write_installation_file_first_version(file, records_path, hive_ai, now_epoch_ms()) {
+        Ok(InstallationMigration::Present) => None,
+        Ok(InstallationMigration::Written { sha256 }) => {
+            tracing::info!(
+                file = %file.display(),
+                version = 1,
+                sha256 = %sha256,
+                source = INSTALLATION_SOURCE_MIGRATION,
+                "wrote the installation file's first version from hive.yaml's ai \
+                 (docs/hive-config-update-v1.md §4)"
+            );
+            None
+        }
+        Err(reason) => {
+            tracing::warn!(
+                file = %file.display(),
+                reason = %reason,
+                "the installation file was not written; every reader keeps reading its hive.yaml's \
+                 ai, and /versions shows why (config.not_written)"
+            );
+            Some(reason)
+        }
+    }
+}
+
+fn installation_not_written_slot(
+    state: &OrchestratorState,
+) -> std::sync::MutexGuard<'_, Option<String>> {
+    state
+        .installation_not_written
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The line a start logs for an `ai` its hive.yaml still holds once the hive holds an installation
+/// file: ignored from then on, as stage 2's superseded keys are (`warn_superseded_hive_keys`).
+fn ignored_hive_ai_warning(copy: &InstallationFileState, hive_yaml_has_ai: bool) -> Option<String> {
+    if !hive_yaml_has_ai {
+        return None;
+    }
+    let holds = match copy {
+        InstallationFileState::Absent => return None,
+        InstallationFileState::Valid(installed) => {
+            format!("the installation file (version {})", installed.file.version)
+        }
+        InstallationFileState::Invalid { .. } => "an installation file".to_string(),
+    };
+    Some(format!(
+        "hive.yaml holds ai, and this hive holds {holds}: its readers read the file, and \
+         hive.yaml's ai is ignored. Keep it while this hive may go back to a release whose readers \
+         read it (docs/hive-config-update-v1.md §4)"
+    ))
+}
+
+/// Each start names what this hive holds at the installation file's place and, once it holds a
+/// file, the `ai` its hive.yaml still has.
+fn report_installation_file_at_start(dist_root: &Path, hive_yaml_has_ai: bool) {
+    let file = installation_file_path(dist_root);
+    let copy = match installation_file_state(&file) {
+        Ok(copy) => copy,
+        Err(err) => {
+            tracing::warn!(
+                file = %file.display(),
+                error = %ai_settings::plain_error(&err),
+                "the installation file cannot be read; this hive's AI readers fail with the reason"
+            );
+            return;
+        }
+    };
+    match &copy {
+        InstallationFileState::Absent => tracing::info!(
+            file = %file.display(),
+            "this hive holds no installation file: its readers read their hive.yaml's ai until it \
+             holds one (a spoke's comes through Syncthing; on the motherbee, /versions' \
+             config.not_written says why its start wrote none)"
+        ),
+        InstallationFileState::Valid(installed) => tracing::info!(
+            file = %file.display(),
+            version = installed.file.version,
+            sha256 = %installed.sha256,
+            "installation file"
+        ),
+        InstallationFileState::Invalid { sha256, error } => tracing::warn!(
+            file = %file.display(),
+            sha256 = %sha256,
+            error = %error,
+            "this hive's installation file is not one any reader can use: its AI readers fail with \
+             the reason and never fall back to hive.yaml"
+        ),
+    }
+    if let Some(warning) = ignored_hive_ai_warning(&copy, hive_yaml_has_ai) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// A hive's copy of the installation file as its `/versions` shows it (docs/hive-config-update-v1.md
+/// §7): absent, valid or invalid, its version (a valid one's) and the sha256 of its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallationCopy {
+    file: InstallationCopyFile,
+    version: Option<u64>,
+    sha256: Option<String>,
+    /// Why an invalid one is.
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallationCopyFile {
+    Absent,
+    Valid,
+    /// There, and no reader can use it (or read it).
+    Invalid,
+}
+
+impl InstallationCopyFile {
+    fn as_str(self) -> &'static str {
+        match self {
+            InstallationCopyFile::Absent => "absent",
+            InstallationCopyFile::Valid => "valid",
+            InstallationCopyFile::Invalid => "invalid",
+        }
+    }
+}
+
+impl InstallationCopy {
+    fn read(dist_root: &Path) -> Self {
+        let file = installation_file_path(dist_root);
+        match installation_file_state(&file) {
+            Ok(InstallationFileState::Absent) => Self {
+                file: InstallationCopyFile::Absent,
+                version: None,
+                sha256: None,
+                error: None,
+            },
+            Ok(InstallationFileState::Valid(installed)) => Self {
+                file: InstallationCopyFile::Valid,
+                version: Some(installed.file.version),
+                sha256: Some(installed.sha256),
+                error: None,
+            },
+            Ok(InstallationFileState::Invalid { sha256, error }) => Self {
+                file: InstallationCopyFile::Invalid,
+                version: None,
+                sha256: Some(sha256),
+                error: Some(error),
+            },
+            Err(err) => Self {
+                file: InstallationCopyFile::Invalid,
+                version: None,
+                sha256: None,
+                error: Some(ai_settings::plain_error(&err)),
+            },
+        }
+    }
+
+    /// What a hive's `/versions` reported as its `config`; None when it reports none (an
+    /// orchestrator older than the installation file).
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let file = match value.get("file").and_then(|file| file.as_str())? {
+            "absent" => InstallationCopyFile::Absent,
+            "valid" => InstallationCopyFile::Valid,
+            _ => InstallationCopyFile::Invalid,
+        };
+        Some(Self {
+            file,
+            version: value.get("version").and_then(|version| version.as_u64()),
+            sha256: value
+                .get("sha256")
+                .and_then(|sha256| sha256.as_str())
+                .map(str::to_string),
+            error: value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .map(str::to_string),
+        })
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut out = serde_json::json!({
+            "file": self.file.as_str(),
+            "version": self.version,
+            "sha256": self.sha256,
+        });
+        if let Some(error) = &self.error {
+            out["error"] = serde_json::json!(error);
+        }
+        out
+    }
+}
+
+/// The motherbee's own copy against its records: `pending` while it holds none (its start did not
+/// write one); `current` when its hash is its version's recorded one; `edited_by_hand` otherwise.
+/// `unknown` when the records cannot be read.
+fn installation_motherbee_state(
+    own: &InstallationCopy,
+    records: Result<&InstallationVersions, &String>,
+) -> &'static str {
+    if own.file == InstallationCopyFile::Absent {
+        return "pending";
+    }
+    let Ok(records) = records else {
+        return "unknown";
+    };
+    let recorded = own
+        .version
+        .and_then(|version| records.record_for(version))
+        .map(|record| record.sha256.as_str());
+    if own.file == InstallationCopyFile::Valid
+        && recorded.is_some()
+        && recorded == own.sha256.as_deref()
+    {
+        "current"
+    } else {
+        "edited_by_hand"
+    }
+}
+
+/// A spoke's copy against the motherbee's: `pending` while it holds none; `current` with the
+/// motherbee's file's hash; `behind` with another version the motherbee recorded; `edited_by_hand`
+/// with anything else (an invalid file, or a hash no version was recorded with). `unknown` when the
+/// motherbee's records cannot be read and the copy is not the motherbee's.
+fn installation_spoke_state(
+    copy: &InstallationCopy,
+    motherbee: &InstallationCopy,
+    records: Result<&InstallationVersions, &String>,
+) -> &'static str {
+    if copy.file == InstallationCopyFile::Absent {
+        return "pending";
+    }
+    if motherbee.file != InstallationCopyFile::Absent
+        && copy.sha256.is_some()
+        && copy.sha256 == motherbee.sha256
+    {
+        return "current";
+    }
+    let Ok(records) = records else {
+        return "unknown";
+    };
+    match (copy.file, copy.sha256.as_deref()) {
+        (InstallationCopyFile::Valid, Some(sha256)) if records.knows_hash(sha256) => "behind",
+        _ => "edited_by_hand",
+    }
+}
+
+/// The motherbee's `config` section of its own `/versions`: its copy, its `state`, and why its
+/// start did not write the file when it did not (`not_written`).
+fn installation_motherbee_section(
+    own: &InstallationCopy,
+    records: &Result<InstallationVersions, String>,
+    not_written: Option<&str>,
+) -> serde_json::Value {
+    let mut section = own.to_json();
+    section["state"] = serde_json::json!(installation_motherbee_state(own, records.as_ref()));
+    if let Some(reason) = not_written {
+        section["not_written"] = serde_json::json!(reason);
+    }
+    if let Err(err) = records {
+        section["records_error"] = serde_json::json!(err);
+    }
+    section
+}
+
+/// On the motherbee: a spoke's `/versions` answer gets its copy's `state`, against the motherbee's
+/// own file and records. An answer without `config` (an older orchestrator) is left as it is.
+fn add_installation_state_to_answer(
+    answer: &mut serde_json::Value,
+    motherbee: &InstallationCopy,
+    records: &Result<InstallationVersions, String>,
+) {
+    let Some(config) = answer
+        .get_mut("hive")
+        .and_then(|hive| hive.get_mut("config"))
+    else {
+        return;
+    };
+    let Some(copy) = InstallationCopy::from_json(config) else {
+        return;
+    };
+    config["state"] =
+        serde_json::json!(installation_spoke_state(&copy, motherbee, records.as_ref()));
+}
+
 /// The SY nodes this release runs on `role`, in start order, and the ones the start waits for.
 fn system_nodes_for_role(role: HiveRole) -> RoleSystemNodes {
     let nodes = role.settings().system_nodes;
@@ -6585,13 +7035,13 @@ fn schedule_orchestrator_self_restart() {
 }
 
 /// A worker's hive.yaml, as its join writes it: its identity and control path, the motherbee's
-/// paths, ports, blob GC and `ai`, and its egress route. What the release defines for the role (its
-/// SY nodes, the blob's and dist's topology) is not written: the worker's orchestrator holds it
-/// (docs/hive-config-update-v1.md §3). Every interpolated scalar was checked by the caller
-/// (`validate_yaml_scalar`).
+/// paths, ports and blob GC, and its egress route. What the release defines for the role (its SY
+/// nodes, the blob's and dist's topology) is not written: the worker's orchestrator holds it
+/// (docs/hive-config-update-v1.md §3). Nor is `ai`: the worker's readers read the installation
+/// file, which the join copies to its dist before they first start (§4). Every interpolated scalar
+/// was checked by the caller (`validate_yaml_scalar`).
 fn render_worker_hive_yaml(
     hive_id: &str,
-    ai_yaml: &str,
     uplink: &str,
     storage_path: &str,
     identity_frontdesk: &str,
@@ -6601,7 +7051,7 @@ fn render_worker_hive_yaml(
     egress_yaml: &str,
 ) -> String {
     format!(
-        "hive_id: {hive_id}\nrole: worker\n{ai_yaml}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\ngovernment:\n  identity_frontdesk: \"{identity_frontdesk}\"\nidentity:\n  sync:\n    upstream: \"{identity_sync_upstream}\"\n    auth: required\nblob:\n  path: \"{blob_path}\"\n  sync:\n    api_port: {api_port}\n    data_dir: \"{data_dir}\"\n  gc:\n    enabled: {gc_enabled}\n    interval_secs: {gc_interval_secs}\n    apply: {gc_apply}\n    staging_ttl_hours: {gc_staging_ttl_hours}\n    active_retain_days: {gc_active_retain_days}\ndist:\n  path: \"{dist_path}\"\n{egress_yaml}",
+        "hive_id: {hive_id}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\ngovernment:\n  identity_frontdesk: \"{identity_frontdesk}\"\nidentity:\n  sync:\n    upstream: \"{identity_sync_upstream}\"\n    auth: required\nblob:\n  path: \"{blob_path}\"\n  sync:\n    api_port: {api_port}\n    data_dir: \"{data_dir}\"\n  gc:\n    enabled: {gc_enabled}\n    interval_secs: {gc_interval_secs}\n    apply: {gc_apply}\n    staging_ttl_hours: {gc_staging_ttl_hours}\n    active_retain_days: {gc_active_retain_days}\ndist:\n  path: \"{dist_path}\"\n{egress_yaml}",
         blob_path = blob.path.display(),
         api_port = blob.sync_api_port,
         data_dir = blob.sync_data_dir.display(),
@@ -6804,6 +7254,9 @@ fn ensure_dirs(
     fs::create_dir_all(dist.path.join("vendor"))?;
     // Before the ownership pass: on a spoke it is a receive-only folder syncthing must write.
     fs::create_dir_all(dist.path.join("policy"))?;
+    // The installation file's folder, the same way: on the motherbee root's and readable by the
+    // Syncthing user's group, which sends it; on a spoke the Syncthing user's, who writes it.
+    fs::create_dir_all(installation_dist_dir(&dist.path))?;
     // The motherbee's dist is root's whatever syncs it (A-51); a spoke's is the Syncthing user's,
     // who writes what it receives there. A failed pass (chown -R exits 1 when a file vanishes
     // mid-walk) is reported and runs again at the next start: never a reason not to start.
@@ -6883,6 +7336,15 @@ fn ensure_dirs(
 
 fn blob_sync_folder_path(blob: &BlobRuntimeConfig) -> PathBuf {
     blob.path.join("active")
+}
+
+/// The installation file's dist folder, `dist/installation`: the directory the SDK places the file
+/// in (`installation_file_path`).
+fn installation_dist_dir(dist_root: &Path) -> PathBuf {
+    installation_file_path(dist_root)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dist_root.join("installation"))
 }
 
 fn blob_public_sync_folder_path(blob: &BlobRuntimeConfig) -> PathBuf {
@@ -10942,6 +11404,8 @@ struct DistSyncFolder {
 ///     `dist/core` would hand the DMZ box the 181 MB motherbee-only `sy_architect` for
 ///     nothing.
 ///   * vendor  — everyone. Without it `update category=vendor` is permanently unsatisfiable.
+///   * policy and installation — everyone: each hive's own readers read them (the global user
+///     OPA policy; the installation file, docs/hive-config-update-v1.md §4).
 ///   * runtimes— worker only. Tenant workflow packages live here; this is the subtree that
 ///     must never reach the DMZ.
 ///   * agent assets — worker only, where the agents run; `blob/agent-assets` (FINDINGS A-72).
@@ -10979,6 +11443,11 @@ fn dist_sync_folders_for_role(
         id: SYNCTHING_FOLDER_DIST_POLICY_ID.to_string(),
         path: dist.path.join("policy"),
         label: "Fluxbee Dist Policy",
+    });
+    out.push(DistSyncFolder {
+        id: SYNCTHING_FOLDER_DIST_INSTALLATION_ID.to_string(),
+        path: installation_dist_dir(&dist.path),
+        label: "Fluxbee Dist Installation",
     });
     if spoke_role == HiveRole::Worker {
         out.push(DistSyncFolder {
@@ -12835,14 +13304,19 @@ fn reconcile_syncthing_folders_xml(
                 updated = next;
             }
         }
-        // Policy goes to every role, like vendor, so it is shared with exactly vendor's peers;
-        // agent assets go to the workers, like runtimes, so they follow runtimes' (FINDINGS A-72).
-        // Peer links are written only when a hive joins (add_hive / finalize); without this a
-        // folder added by a later release would stay local on the hives that joined before it.
+        // Policy and the installation file go to every role, like vendor, so they are shared
+        // with exactly vendor's peers; agent assets go to the workers, like runtimes, so they
+        // follow runtimes' (FINDINGS A-72). Peer links are written only when a hive joins
+        // (add_hive / finalize); without this a folder added by a later release would stay local
+        // on the hives that joined before it.
         for (members_of, folder_id) in [
             (
                 SYNCTHING_FOLDER_DIST_VENDOR_ID,
                 SYNCTHING_FOLDER_DIST_POLICY_ID,
+            ),
+            (
+                SYNCTHING_FOLDER_DIST_VENDOR_ID,
+                SYNCTHING_FOLDER_DIST_INSTALLATION_ID,
             ),
             (
                 SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
@@ -14452,6 +14926,20 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
         }),
     };
 
+    // docs/hive-config-update-v1.md §7: this hive's copy of the installation file. The motherbee
+    // judges its own against the versions it recorded; a spoke's `state` is the motherbee's to give
+    // (`add_installation_state_to_answer`), against its own file.
+    let own_copy = InstallationCopy::read(&state.dist.path);
+    let config = if state.is_motherbee {
+        installation_motherbee_section(
+            &own_copy,
+            &read_installation_versions(&installation_versions_path()),
+            installation_not_written_slot(state).as_deref(),
+        )
+    } else {
+        own_copy.to_json()
+    };
+
     serde_json::json!({
         "hive_id": state.hive_id,
         // Which sections this hive is even supposed to carry depends on its role: only workers
@@ -14461,6 +14949,7 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
         "core": core,
         "runtimes": runtimes,
         "vendor": vendor,
+        "config": config,
         // Host posture stage 3: the persisted Syncthing facts the motherbee waits on.
         "syncthing_posture": syncthing_posture_snapshot(state),
     })
@@ -14915,7 +15404,18 @@ async fn get_versions_flow(
     )
     .await;
     match forwarded {
-        Ok(payload) => payload,
+        Ok(mut payload) => {
+            // The motherbee compares each hive's copy of the installation file with its own
+            // (docs/hive-config-update-v1.md §7), for `/versions` and `/hives/{hive}/versions`.
+            if state.is_motherbee {
+                add_installation_state_to_answer(
+                    &mut payload,
+                    &InstallationCopy::read(&state.dist.path),
+                    &read_installation_versions(&installation_versions_path()),
+                );
+            }
+            payload
+        }
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "VERSIONS_FAILED",
@@ -25047,6 +25547,96 @@ fn sync_vendor_to_worker(
     Ok(())
 }
 
+/// add_hive: copy the motherbee's installation file (docs/hive-config-update-v1.md §4) into the
+/// new spoke's dist, with its core and vendor, so the spoke's readers read it from their first
+/// start; Syncthing keeps it current from then on. These are the bytes the motherbee's Syncthing
+/// sends, so the spoke's receive-only copy matches its source once the peer is linked. A motherbee
+/// that holds no file (its start did not write one, `/versions` says why) has nothing to copy: the
+/// join goes on, and the spoke's readers read their hive.yaml, which has no `ai`, until the file
+/// arrives. Any other failure fails the join in all three flows (INSTALLATION_SYNC_FAILED).
+fn sync_installation_to_worker(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    dist_root: &Path,
+) -> Result<(), OrchestratorError> {
+    let local = installation_file_path(dist_root);
+    match fs::symlink_metadata(&local) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err(format!("'{}' is not a regular file", local.display()).into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                hive_id = hive_id,
+                file = %local.display(),
+                "the motherbee holds no installation file to copy; the spoke's readers read its \
+                 hive.yaml until Syncthing brings one"
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let remote_stage = format!(
+        "/tmp/fluxbee-installation-sync-{}",
+        sanitize_unit_suffix(hive_id)
+    );
+    ssh_with_key(
+        address,
+        key_path,
+        &format!(
+            "rm -rf '{stage}' && mkdir -p '{stage}'",
+            stage = shell_single_quote(&remote_stage)
+        ),
+        user,
+    )?;
+    let source = local.display().to_string();
+    scp_with_key(
+        address,
+        key_path,
+        &[source.as_str()],
+        &format!("{remote_stage}/"),
+        user,
+    )?;
+    let promote = installation_sync_promote_command(&remote_stage, dist_root);
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&promote))),
+        user,
+    )?;
+    tracing::info!(
+        hive_id = hive_id,
+        "copied the installation file to the spoke"
+    );
+    Ok(())
+}
+
+/// The spoke's side of `sync_installation_to_worker`: the staged copy installed at the same place
+/// in the spoke's dist (the join writes the motherbee's `dist.path` into the spoke's hive.yaml),
+/// mode 0644 as the motherbee writes it, since Syncthing compares the mode too.
+fn installation_sync_promote_command(remote_stage: &str, dist_root: &Path) -> String {
+    let target = installation_file_path(dist_root);
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "installation.json".to_string());
+    [
+        "set -euo pipefail".to_string(),
+        format!(
+            "mkdir -p '{dir}'",
+            dir = shell_single_quote_path(&installation_dist_dir(dist_root))
+        ),
+        format!(
+            "install -m 0644 '{stage}/{name}' '{target}'",
+            stage = shell_single_quote(remote_stage),
+            name = shell_single_quote(&name),
+            target = shell_single_quote_path(&target),
+        ),
+        format!("rm -rf '{stage}'", stage = shell_single_quote(remote_stage)),
+    ]
+    .join(" && ")
+}
+
 fn sync_core_to_worker(
     hive_id: &str,
     address: &str,
@@ -27367,6 +27957,21 @@ async fn add_hive_flow(
             "message": err.to_string(),
         });
     }
+    // The installation file (docs/hive-config-update-v1.md §4), so the worker's readers read it
+    // from their first start: its hive.yaml carries no `ai`.
+    if let Err(err) = sync_installation_to_worker(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &desired_dist.path,
+    ) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INSTALLATION_SYNC_FAILED",
+            "message": err.to_string(),
+        });
+    }
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
     let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
@@ -27428,7 +28033,6 @@ async fn add_hive_flow(
         (blob_path_str.as_str(), "blob.path"),
         (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
         (dist_path_str.as_str(), "dist.path"),
-        (state.ai.model.as_str(), "ai.providers.<default>.model"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return serde_json::json!({
@@ -27438,13 +28042,8 @@ async fn add_hive_flow(
             });
         }
     }
-    let ai_yaml = format!(
-        "ai:\n  default_provider: {}\n  providers:\n    {}:\n      model: \"{}\"\n",
-        state.ai.provider, state.ai.provider, state.ai.model
-    );
     let hive_yaml = render_worker_hive_yaml(
         hive_id,
-        &ai_yaml,
         &worker_uplink,
         &storage_path,
         &identity_frontdesk_node_name,
@@ -28172,6 +28771,16 @@ async fn add_egress_hive_flow(
         );
         return err_payload("VENDOR_SYNC_FAILED", err.to_string());
     }
+    // The installation file (docs/hive-config-update-v1.md §4), as every join copies it.
+    if let Err(err) = sync_installation_to_worker(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &state.dist.path,
+    ) {
+        return err_payload("INSTALLATION_SYNC_FAILED", err.to_string());
+    }
 
     if let Err(err) = ssh_with_key(
         address,
@@ -28889,6 +29498,16 @@ async fn add_ingress_hive_flow(
             local_syncthing_vendor_hash().ok().flatten(),
         );
         return err_payload("VENDOR_SYNC_FAILED", err.to_string());
+    }
+    // The installation file (docs/hive-config-update-v1.md §4), as every join copies it.
+    if let Err(err) = sync_installation_to_worker(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &state.dist.path,
+    ) {
+        return err_payload("INSTALLATION_SYNC_FAILED", err.to_string());
     }
 
     if let Err(err) = ssh_with_key(
@@ -31755,6 +32374,24 @@ mod tests {
                 body.contains("\"VENDOR_SYNC_FAILED\""),
                 "{flow} must fail the join when the vendor push fails, for the same reason"
             );
+            // docs/hive-config-update-v1.md §4: the installation file, so the spoke's readers read
+            // it from their first start; no join writes `ai` into a hive.yaml.
+            let vendor_at = body.find("sync_vendor_to_worker(").expect("vendor");
+            let installation_at = body
+                .find("sync_installation_to_worker(")
+                .unwrap_or_else(|| panic!("{flow} must copy the installation file"));
+            assert!(
+                vendor_at < installation_at,
+                "{flow} copies it with the core and the vendor"
+            );
+            assert!(
+                body.contains("\"INSTALLATION_SYNC_FAILED\""),
+                "{flow} must fail the join when the installation file cannot be copied"
+            );
+            assert!(
+                !body.contains("ai_yaml") && !body.contains("default_provider"),
+                "{flow} must not write ai into the spoke's hive.yaml"
+            );
             let issue_at = body
                 .find("issue_hive_tls(")
                 .unwrap_or_else(|| panic!("{flow} must issue the hive's leaf"));
@@ -34423,7 +35060,6 @@ mod tests {
         let dist = sample_dist_config();
         let worker = render_worker_hive_yaml(
             "worker9",
-            "ai:\n  default_provider: openai\n  providers:\n    openai:\n      model: \"gpt-5.5\"\n",
             "10.0.0.1:9000",
             "/var/lib/fluxbee",
             "SY.frontdesk.gov@motherbee",
@@ -36190,6 +36826,7 @@ mod tests {
             ("fluxbee-dist-core-egress", [true, true, false]),
             ("fluxbee-dist-vendor", [false, false, false]),
             ("fluxbee-dist-policy", [false, false, false]),
+            ("fluxbee-dist-installation", [false, false, false]),
             ("fluxbee-something-new", [false, false, false]),
         ];
         for (folder, expected) in table {
@@ -38488,6 +39125,492 @@ blob:
         assert!(!ingress.contains(&format!(
             "<folder id=\"{SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID}\""
         )));
+    }
+
+    // --- The installation file (docs/hive-config-update-v1.md §4, stage 3b) ---
+
+    /// Every role gets the installation file's folder, on `dist/installation` where the SDK places
+    /// the file: send-only on the motherbee, receive-only on every spoke, and never one a role is
+    /// taken out of.
+    #[test]
+    fn every_role_gets_the_installation_folder_send_only_from_the_motherbee() {
+        let dist = sample_dist_config();
+        let blob = sample_blob_config();
+        assert_eq!(
+            installation_dist_dir(&dist.path),
+            PathBuf::from("/var/lib/fluxbee/dist/installation")
+        );
+        assert_eq!(
+            installation_file_path(&dist.path).parent(),
+            Some(installation_dist_dir(&dist.path).as_path())
+        );
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            for is_motherbee in [true, false] {
+                let folders: Vec<DistSyncFolder> =
+                    dist_sync_folders_for_role(&dist, &blob.path, role, is_motherbee)
+                        .into_iter()
+                        .filter(|f| f.id == SYNCTHING_FOLDER_DIST_INSTALLATION_ID)
+                        .collect();
+                assert_eq!(folders.len(), 1, "{} ({is_motherbee})", role.as_str());
+                assert_eq!(folders[0].path, dist.path.join("installation"));
+            }
+            assert!(!folder_forbidden_for_role(
+                SYNCTHING_FOLDER_DIST_INSTALLATION_ID,
+                role
+            ));
+        }
+        let declared = |is_motherbee: bool, role: HiveRole| {
+            reconcile_syncthing_folders_xml(
+                &sample_syncthing_config_with_peer(),
+                &blob,
+                &dist,
+                is_motherbee,
+                role,
+            )
+            .expect("folder reconcile must succeed")
+        };
+        let (motherbee, changed) = declared(true, HiveRole::Motherbee);
+        assert!(changed.contains(&SYNCTHING_FOLDER_DIST_INSTALLATION_ID.to_string()));
+        assert!(motherbee.contains(
+            "<folder id=\"fluxbee-dist-installation\" label=\"Fluxbee Dist Installation\" path=\"/var/lib/fluxbee/dist/installation\" type=\"sendonly\""
+        ));
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            let (spoke, _) = declared(false, role);
+            assert!(
+                spoke.contains(
+                    "<folder id=\"fluxbee-dist-installation\" label=\"Fluxbee Dist Installation\" path=\"/var/lib/fluxbee/dist/installation\" type=\"receiveonly\""
+                ),
+                "{}",
+                role.as_str()
+            );
+        }
+    }
+
+    /// A hive that joined before the installation folder existed gets it shared with the peers it
+    /// shares vendor with, on both ends, at the next start of each side's orchestrator: no re-join.
+    /// Its join links it like any dist folder, and its removal unlinks it.
+    #[test]
+    fn the_installation_folder_follows_vendor_s_members_and_leaves_with_the_hive() {
+        let dist = sample_dist_config();
+        let mut blob = sample_blob_config();
+        blob.public_sync_enabled = false;
+        let joined_before = format!(
+            "<configuration version=\"37\">
+  <device id=\"{local}\" name=\"sandbox\"></device>
+  <device id=\"{peer}\" name=\"egress-1\"></device>
+  <folder id=\"{vendor}\" label=\"Fluxbee Dist Vendor\" path=\"/var/lib/fluxbee/dist/vendor\" type=\"sendonly\">
+    <device id=\"{local}\" introducedBy=\"\"/>
+    <device id=\"{peer}\" introducedBy=\"\"/>
+  </folder>
+</configuration>",
+            local = LOCAL_DEVICE_ID,
+            peer = PEER_DEVICE_ID,
+            vendor = SYNCTHING_FOLDER_DIST_VENDOR_ID,
+        );
+        for (is_motherbee, role) in [
+            (true, HiveRole::Motherbee),
+            (false, HiveRole::Worker),
+            (false, HiveRole::Ingress),
+            (false, HiveRole::Egress),
+        ] {
+            let (updated, changed) =
+                reconcile_syncthing_folders_xml(&joined_before, &blob, &dist, is_motherbee, role)
+                    .expect("folder reconcile must succeed");
+            assert!(changed.contains(&SYNCTHING_FOLDER_DIST_INSTALLATION_ID.to_string()));
+            assert_eq!(
+                syncthing_folder_device_ids(&updated, SYNCTHING_FOLDER_DIST_INSTALLATION_ID)
+                    .unwrap(),
+                vec![LOCAL_DEVICE_ID.to_string(), PEER_DEVICE_ID.to_string()],
+                "{} (motherbee side: {is_motherbee})",
+                role.as_str()
+            );
+            let (again, changed_again) =
+                reconcile_syncthing_folders_xml(&updated, &blob, &dist, is_motherbee, role)
+                    .expect("second reconcile must succeed");
+            assert!(
+                changed_again.is_empty(),
+                "not idempotent: {changed_again:?}"
+            );
+            assert_eq!(again, updated);
+
+            // remove_hive unlinks it with every other dist folder.
+            let (removed, removal_changed) =
+                reconcile_syncthing_peer_removal_xml(&updated, &blob, &dist, PEER_DEVICE_ID)
+                    .expect("peer removal must succeed");
+            assert!(removal_changed);
+            assert_eq!(
+                syncthing_folder_device_ids(&removed, SYNCTHING_FOLDER_DIST_INSTALLATION_ID)
+                    .unwrap(),
+                vec![LOCAL_DEVICE_ID.to_string()]
+            );
+        }
+
+        // A join links the new peer to it, on the motherbee's side for every role.
+        const SPOKE: &str = "SPOKE-DEVICE-ID-1234567890";
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            let (linked, _) = reconcile_syncthing_peer_xml(
+                &sample_syncthing_config_with_peer(),
+                &blob,
+                &dist,
+                SPOKE,
+                "spoke-1",
+                SyncthingPeerAddress::AcceptOnly,
+                true,
+                role,
+            )
+            .expect("peer link must succeed");
+            assert!(
+                syncthing_folder_device_ids(&linked, SYNCTHING_FOLDER_DIST_INSTALLATION_ID)
+                    .unwrap()
+                    .contains(&SPOKE.to_string()),
+                "{}",
+                role.as_str()
+            );
+        }
+    }
+
+    fn installation_temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "fbinst-{tag}-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    fn installation_yaml(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).expect("yaml")
+    }
+
+    /// The motherbee's start writes the installation file's first version from its hive.yaml's
+    /// `ai`, mode 0644, recorded with its hash, when and why; once the file is there it never
+    /// writes it again, whatever hive.yaml says.
+    #[test]
+    fn the_motherbee_writes_version_1_from_hive_yaml_s_ai_once() {
+        let root = installation_temp_root("migrate");
+        let dist = root.join("dist");
+        let file = installation_file_path(&dist);
+        let records = root.join("orchestrator").join("installation-versions.json");
+        let ai = installation_yaml(
+            "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+        );
+
+        let written = write_installation_file_first_version(&file, &records, Some(&ai), 1234)
+            .expect("written");
+        let bytes = fs::read(&file).expect("the file");
+        let sha256 = sha256_hex(&bytes);
+        assert_eq!(
+            written,
+            InstallationMigration::Written {
+                sha256: sha256.clone()
+            }
+        );
+        let parsed = InstallationFile::parse(&bytes).expect("a file every reader can use");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(
+            parsed.ai,
+            Some(serde_yaml::from_value::<fluxbee_ai_sdk::HiveAiConfig>(ai.clone()).expect("ai"))
+        );
+        assert_eq!(
+            fs::metadata(&file).expect("meta").permissions().mode() & 0o777,
+            0o644
+        );
+        let recorded = read_installation_versions(&records).expect("records");
+        assert_eq!(
+            recorded.versions,
+            vec![InstallationVersionRecord {
+                version: 1,
+                sha256: sha256.clone(),
+                written_at_ms: 1234,
+                source: "migration".to_string(),
+            }]
+        );
+        assert_eq!(
+            installation_motherbee_state(&InstallationCopy::read(&dist), Ok(&recorded)),
+            "current"
+        );
+
+        // There already: nothing written, whatever hive.yaml's ai is now.
+        let other = installation_yaml(
+            "default_provider: openai\nproviders:\n  openai:\n    model: gpt-5.5\n",
+        );
+        assert_eq!(
+            write_installation_file_first_version(&file, &records, Some(&other), 5678),
+            Ok(InstallationMigration::Present)
+        );
+        assert_eq!(fs::read(&file).expect("the file"), bytes);
+        assert_eq!(
+            read_installation_versions(&records).expect("records"),
+            recorded
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// No `ai` gives a file without one (the fallback engine, as a hive.yaml without one); an `ai`
+    /// no reader can use writes nothing and records nothing, and the start says why; a file
+    /// missing after a later version was recorded is not written again as version 1.
+    #[test]
+    fn the_first_version_has_no_ai_without_one_and_none_is_written_from_an_invalid_one() {
+        let root = installation_temp_root("noai");
+        let file = installation_file_path(&root.join("dist"));
+        let records = root.join("installation-versions.json");
+        assert!(matches!(
+            write_installation_file_first_version(&file, &records, None, 1),
+            Ok(InstallationMigration::Written { .. })
+        ));
+        let bytes = fs::read(&file).expect("the file");
+        assert_eq!(InstallationFile::parse(&bytes).expect("parses").ai, None);
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"ai\""));
+        let _ = fs::remove_dir_all(&root);
+
+        for invalid in [
+            "default_provider: gemini\n",
+            "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n",
+            "default_provider: openai\nproviders:\n  openai:\n    model: \" \"\n",
+            "default_provider: openai\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: \"\"\n",
+        ] {
+            let root = installation_temp_root("invalid");
+            let file = installation_file_path(&root.join("dist"));
+            let records = root.join("installation-versions.json");
+            let reason = write_installation_file_first_version(
+                &file,
+                &records,
+                Some(&installation_yaml(invalid)),
+                1,
+            )
+            .expect_err(invalid);
+            assert!(
+                reason.starts_with("hive.yaml's ai is not one every reader can use"),
+                "{reason}"
+            );
+            assert!(!reason.contains("protocol error"), "{reason}");
+            assert!(!file.exists(), "{invalid}");
+            assert!(!records.exists(), "{invalid}");
+            assert_eq!(
+                write_installation_file_at_start(
+                    &file,
+                    &records,
+                    Some(&installation_yaml(invalid))
+                ),
+                Some(reason)
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        let root = installation_temp_root("later");
+        let file = installation_file_path(&root.join("dist"));
+        let records = root.join("installation-versions.json");
+        let mut later = InstallationVersions::default();
+        for version in [1, 2] {
+            later.upsert(InstallationVersionRecord {
+                version,
+                sha256: format!("{version:064}"),
+                written_at_ms: version,
+                source: "migration".to_string(),
+            });
+        }
+        write_installation_versions(&records, &later).expect("records");
+        let reason =
+            write_installation_file_first_version(&file, &records, None, 1).expect_err("later");
+        assert!(reason.contains("version 2"), "{reason}");
+        assert!(!file.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// What a hive holds at the installation file's place, for its `/versions`; and the line a
+    /// start logs for the `ai` its hive.yaml still holds once the hive holds a file.
+    #[test]
+    fn each_hive_reports_its_own_copy_and_names_hive_yaml_s_ignored_ai() {
+        let root = installation_temp_root("copy");
+        let dist = root.join("dist");
+        let file = installation_file_path(&dist);
+        let absent = InstallationCopy::read(&dist);
+        assert_eq!(absent.file, InstallationCopyFile::Absent);
+        assert_eq!(
+            absent.to_json(),
+            serde_json::json!({"file": "absent", "version": null, "sha256": null})
+        );
+        assert!(ignored_hive_ai_warning(&InstallationFileState::Absent, true).is_none());
+
+        write_installation_file_first_version(&file, &root.join("records.json"), None, 1)
+            .expect("written");
+        let bytes = fs::read(&file).expect("the file");
+        let valid = InstallationCopy::read(&dist);
+        assert_eq!(
+            valid.to_json(),
+            serde_json::json!({"file": "valid", "version": 1, "sha256": sha256_hex(&bytes)})
+        );
+        assert_eq!(InstallationCopy::from_json(&valid.to_json()), Some(valid));
+        let state = installation_file_state(&file).expect("state");
+        let warning = ignored_hive_ai_warning(&state, true).expect("named");
+        assert!(warning.contains("version 1"), "{warning}");
+        assert!(warning.contains("ignored"), "{warning}");
+        assert!(ignored_hive_ai_warning(&state, false).is_none());
+
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("edited");
+        let invalid = InstallationCopy::read(&dist);
+        assert_eq!(invalid.file, InstallationCopyFile::Invalid);
+        assert_eq!(
+            invalid.sha256.as_deref(),
+            Some(sha256_hex(b"{\"schema_version\":1,\"version\":0}").as_str())
+        );
+        assert!(invalid
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("version 0")));
+        let state = installation_file_state(&file).expect("state");
+        assert!(ignored_hive_ai_warning(&state, true).is_some());
+        let _ = fs::remove_dir_all(&root);
+
+        // An `ai` no reader can use never stops the orchestrator's start.
+        let hive: HiveFile = serde_yaml::from_str(
+            "hive_id: worker1\nrole: worker\nai:\n  default_provider: gemini\n  providers: 7\n",
+        )
+        .expect("hive.yaml still loads");
+        assert!(hive.ai.is_some());
+    }
+
+    /// `/versions`' `config`: the motherbee's own file against the versions it recorded, and each
+    /// spoke's copy against the motherbee's file.
+    #[test]
+    fn versions_judge_each_copy_against_the_motherbee_s_file() {
+        let record = |version: u64, sha256: &str| InstallationVersionRecord {
+            version,
+            sha256: sha256.to_string(),
+            written_at_ms: version,
+            source: "migration".to_string(),
+        };
+        let records = InstallationVersions {
+            versions: vec![record(1, "aaa"), record(2, "bbb")],
+        };
+        let copy = |file: InstallationCopyFile, version: Option<u64>, sha256: Option<&str>| {
+            InstallationCopy {
+                file,
+                version,
+                sha256: sha256.map(str::to_string),
+                error: None,
+            }
+        };
+        use InstallationCopyFile::{Absent, Invalid, Valid};
+        let unreadable = "unreadable".to_string();
+
+        let motherbee = copy(Valid, Some(2), Some("bbb"));
+        for (own, expected) in [
+            (motherbee.clone(), "current"),
+            (copy(Valid, Some(2), Some("ccc")), "edited_by_hand"),
+            (copy(Valid, Some(3), Some("ddd")), "edited_by_hand"),
+            (copy(Invalid, None, Some("eee")), "edited_by_hand"),
+            (copy(Absent, None, None), "pending"),
+        ] {
+            assert_eq!(
+                installation_motherbee_state(&own, Ok(&records)),
+                expected,
+                "{own:?}"
+            );
+        }
+        assert_eq!(
+            installation_motherbee_state(&motherbee, Err(&unreadable)),
+            "unknown"
+        );
+
+        for (spoke, expected) in [
+            (copy(Valid, Some(2), Some("bbb")), "current"),
+            (copy(Valid, Some(1), Some("aaa")), "behind"),
+            (copy(Absent, None, None), "pending"),
+            (copy(Valid, Some(1), Some("fff")), "edited_by_hand"),
+            (copy(Invalid, None, Some("aaa")), "edited_by_hand"),
+            (copy(Invalid, None, None), "edited_by_hand"),
+        ] {
+            assert_eq!(
+                installation_spoke_state(&spoke, &motherbee, Ok(&records)),
+                expected,
+                "{spoke:?}"
+            );
+        }
+        assert_eq!(
+            installation_spoke_state(
+                &copy(Valid, Some(1), Some("aaa")),
+                &motherbee,
+                Err(&unreadable)
+            ),
+            "unknown"
+        );
+        // A motherbee that holds no file has nothing a copy can match.
+        assert_eq!(
+            installation_spoke_state(
+                &copy(Valid, Some(1), Some("aaa")),
+                &copy(Absent, None, None),
+                Ok(&records)
+            ),
+            "behind"
+        );
+
+        // A spoke's answer gets its state; an older orchestrator's, without config, is left as is.
+        let mut answer = serde_json::json!({
+            "status": "ok",
+            "hive": {"hive_id": "worker1", "config": copy(Valid, Some(1), Some("aaa")).to_json()},
+        });
+        add_installation_state_to_answer(&mut answer, &motherbee, &Ok(records.clone()));
+        assert_eq!(
+            answer["hive"]["config"]["state"],
+            serde_json::json!("behind")
+        );
+        let mut older = serde_json::json!({"status": "ok", "hive": {"hive_id": "egress1"}});
+        add_installation_state_to_answer(&mut older, &motherbee, &Ok(records.clone()));
+        assert!(older["hive"].get("config").is_none());
+
+        // The motherbee's own section: its state, and why its start wrote nothing.
+        let section = installation_motherbee_section(
+            &copy(Absent, None, None),
+            &Ok(InstallationVersions::default()),
+            Some("hive.yaml's ai is not one every reader can use (x)"),
+        );
+        assert_eq!(section["state"], serde_json::json!("pending"));
+        assert_eq!(
+            section["not_written"],
+            serde_json::json!("hive.yaml's ai is not one every reader can use (x)")
+        );
+        assert_eq!(section["version"], serde_json::Value::Null);
+        let section =
+            installation_motherbee_section(&motherbee, &Err("bad record".to_string()), None);
+        assert_eq!(section["state"], serde_json::json!("unknown"));
+        assert_eq!(section["records_error"], serde_json::json!("bad record"));
+        assert!(section.get("not_written").is_none());
+    }
+
+    /// The join copies the motherbee's installation file to the spoke's dist, at the same place
+    /// and mode as the motherbee's, before the spoke's readers first start.
+    #[test]
+    fn the_join_copies_the_installation_file_where_the_spoke_reads_it() {
+        let command = installation_sync_promote_command(
+            "/tmp/fluxbee-installation-sync-worker9",
+            Path::new("/var/lib/fluxbee/dist"),
+        );
+        assert!(command.starts_with("set -euo pipefail && "), "{command}");
+        assert!(
+            command.contains("mkdir -p '/var/lib/fluxbee/dist/installation'"),
+            "{command}"
+        );
+        assert!(
+            command.contains(
+                "install -m 0644 '/tmp/fluxbee-installation-sync-worker9/installation.json' '/var/lib/fluxbee/dist/installation/installation.json'"
+            ),
+            "{command}"
+        );
+        assert!(command.ends_with("rm -rf '/tmp/fluxbee-installation-sync-worker9'"));
+        // The worker's hive.yaml carries no ai: its readers read the file.
+        let worker = render_worker_hive_yaml(
+            "worker9",
+            "10.0.0.1:9000",
+            "/var/lib/fluxbee",
+            "SY.frontdesk.gov@motherbee",
+            "10.0.0.1:9100",
+            &sample_blob_config(),
+            &sample_dist_config(),
+            "",
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&worker).expect("yaml");
+        assert!(value.get("ai").is_none(), "{worker}");
     }
 
     fn sample_core_manifest() -> CoreManifest {
@@ -41528,7 +42651,7 @@ blob:
             egress: None,
             blob: sample_blob_config(),
             dist: sample_dist_config(),
-            ai: HiveAiConfig::fallback(),
+            installation_not_written: StdMutex::new(None),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
             hive_topology_locks: StdMutex::new(HashMap::new()),
             node_lifecycle_locks: StdMutex::new(HashMap::new()),

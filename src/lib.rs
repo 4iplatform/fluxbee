@@ -1,3 +1,4 @@
+pub mod ai_settings;
 pub mod config;
 pub mod instance_lock;
 pub mod mesh_hmac;

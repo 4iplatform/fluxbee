@@ -26,8 +26,8 @@ use zip::ZipArchive;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    create_function_calling_model, AiAccount, AiProvider, FunctionCallingConfig,
-    FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
+    create_function_calling_model, AiAccount, AiProvider, AiSettings, EffectiveAiEngine,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ModelSettings, UsageRecorder,
     UsageWork,
 };
@@ -57,6 +57,7 @@ use fluxbee_sdk::{
     MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
     NODE_SECRET_REDACTION_TOKEN, USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
 };
+use json_router::ai_settings;
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
     write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
@@ -169,7 +170,11 @@ struct HiveFile {
     admin: Option<AdminSection>,
     blob: Option<BlobSection>,
     storage: Option<StorageSection>,
-    ai: Option<HiveAiConfig>,
+    /// Where the hive's dist is, and so its installation file (docs/hive-config-update-v1.md §4).
+    dist: Option<ai_settings::DistPathSection>,
+    /// Read as raw YAML: the executor's `ai` is the installation file's once the hive holds one,
+    /// and this section is typed only until then (`hive_ai_settings`).
+    ai: Option<serde_yaml::Value>,
     /// The ACME client's section (docs/acme-edge-certificates-v1.md §3), read as raw YAML: a
     /// section that cannot work turns ACME off with a reason, it never fails the boot.
     acme: Option<serde_yaml::Value>,
@@ -323,6 +328,10 @@ struct AdminContext {
     self_ilk_id: String,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
+    /// Why the executor has no AI runtime when its `ai` settings are the cause: an installation
+    /// file no reader can use, or hive.yaml's `ai` while the hive holds none
+    /// (docs/hive-config-update-v1.md §4). The executor answers with it.
+    executor_ai_error: Arc<std::sync::Mutex<Option<String>>>,
     /// Canonical admin dispatcher — reused by the executor's Vault
     /// hot-refresh path so refreshes flow through the same router
     /// connection as ordinary admin/system traffic.
@@ -630,14 +639,12 @@ async fn main() -> Result<(), AdminError> {
         self_ilk_id = %self_ilk_id,
         "self system ILK computed deterministically"
     );
-    // An invalid `ai` section stops the start. The executor's key itself is read in a task of its
-    // own, next to the loops below, so the admin serves while it waits for the vault
-    // (`boot_admin_executor_ai_runtime`).
-    hive.ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| -> AdminError { err.into() })?;
+    // Where the executor's `ai` comes from, said once: the installation file, or hive.yaml while the
+    // hive holds none (docs/hive-config-update-v1.md §4). Settings no reader can use never stop the
+    // start: the executor answers with the reason, and the orchestrator's /versions shows the file.
+    // The executor's key itself is read in a task of its own, next to the loops below, so the admin
+    // serves while it waits for the vault (`boot_admin_executor_ai_runtime`).
+    log_admin_ai_source(&hive);
     let executor_configured = Arc::new(AtomicBool::new(false));
     let executor_runtime = Arc::new(Mutex::new(None));
     let public_edge_node = std::env::var("SY_ADMIN_PUBLIC_EDGE_NODE")
@@ -714,6 +721,7 @@ async fn main() -> Result<(), AdminError> {
         self_ilk_id,
         executor_runtime,
         executor_configured,
+        executor_ai_error: Arc::new(std::sync::Mutex::new(None)),
         rpc: Arc::clone(&router_client),
         usage: UsageRecorder::start(Arc::clone(&router_client)),
         public_edge_node,
@@ -1732,24 +1740,16 @@ async fn resolve_admin_executor_api_key(
 /// - the secret value doesn't carry a non-empty `api_key`.
 ///
 /// Async because vault is a router round-trip. Caller (`refresh_*`, which the boot runs too)
-/// logs the outcome.
+/// logs the outcome, and gives it the engine its `ai` settings name (`hive_ai_settings`).
 async fn build_admin_executor_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
     my_tenant: &str,
+    engine: EffectiveAiEngine,
     wait: VaultWait,
 ) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
-    let hive_raw = fs::read_to_string(json_router::paths::config_dir().join("hive.yaml"))?;
-    let hive: HiveFile = serde_yaml::from_str(&hive_raw)?;
-    let engine = hive
-        .ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| -> AdminError { err.into() })?
-        .unwrap_or_else(HiveAiConfig::fallback);
     let vault_client = fluxbee_sdk::VaultClient::new(
         rpc,
         hive_id.to_string(),
@@ -1793,16 +1793,81 @@ fn admin_executor_extract_openai_api_key(
     Ok(None)
 }
 
+/// The executor's `ai` (docs/hive-config-update-v1.md §4): the installation file's once the hive
+/// holds one, its hive.yaml's until then, and the engine it names. The error is the reason, in its
+/// own words: a file no reader can use, or hive.yaml's `ai` while the hive holds none.
+fn hive_ai_settings(hive: &HiveFile) -> Result<(AiSettings, EffectiveAiEngine), String> {
+    let settings = ai_settings::reader_ai_settings(hive.dist.as_ref(), hive.ai.as_ref())
+        .map_err(|err| ai_settings::plain_error(&err))?;
+    let engine =
+        ai_settings::reader_engine(&settings).map_err(|err| ai_settings::plain_error(&err))?;
+    Ok((settings, engine))
+}
+
+/// SY.admin's start says once where its `ai` comes from, or why it cannot use it.
+fn log_admin_ai_source(hive: &HiveFile) {
+    match hive_ai_settings(hive) {
+        Ok((settings, engine)) => tracing::info!(
+            source = %ai_settings::ai_source_label(&settings.source),
+            provider = %engine.provider,
+            model = %engine.model,
+            "SY.admin's ai settings"
+        ),
+        Err(reason) => tracing::warn!(
+            reason = %reason,
+            "SY.admin's ai settings cannot be used: the executor answers with this reason until \
+             they are fixed"
+        ),
+    }
+}
+
+/// Why the executor cannot run a model: its `ai` settings when they are the cause, else its key.
+fn admin_executor_unavailable_reason(ctx: &AdminContext) -> String {
+    match ctx
+        .executor_ai_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_deref()
+    {
+        Some(reason) => format!("SY.admin executor cannot use its ai settings: {reason}"),
+        // Provider-neutral (audit B2): the executor derives its provider from the hive, so this
+        // must not name OpenAI under an Anthropic hive.
+        None => "SY.admin executor is not configured with a valid AI provider key (load it into \
+                 SY.vault for the hive's configured provider)"
+            .to_string(),
+    }
+}
+
 async fn refresh_admin_executor_ai_runtime(
     ctx: &AdminContext,
     wait: VaultWait,
 ) -> Result<bool, AdminError> {
+    let settings = load_hive(&ctx.config_dir)
+        .map_err(|err| format!("hive.yaml: {err}"))
+        .and_then(|hive| hive_ai_settings(&hive));
+    let engine = match settings {
+        Ok((_, engine)) => {
+            *ctx.executor_ai_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            engine
+        }
+        Err(reason) => {
+            *ctx.executor_ai_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.clone());
+            ctx.executor_configured.store(false, Ordering::Relaxed);
+            *ctx.executor_runtime.lock().await = None;
+            return Err(format!("the executor's ai settings cannot be used: {reason}").into());
+        }
+    };
     let runtime = build_admin_executor_ai_runtime(
         Arc::clone(&ctx.rpc),
         &ctx.hive_id,
         &ctx.node_name,
         &ctx.self_ilk_id,
         fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        engine,
         wait,
     )
     .await?;
@@ -3542,11 +3607,7 @@ async fn execute_admin_executor_plan(
         .lock()
         .await
         .clone()
-        .ok_or_else(|| -> AdminError {
-            // Provider-neutral (audit B2): the executor derives its provider from the hive, so
-            // this must not name OpenAI under an Anthropic hive.
-            "SY.admin executor is not configured with a valid AI provider key (load it into SY.vault for the hive's configured provider)".into()
-        })?;
+        .ok_or_else(|| -> AdminError { admin_executor_unavailable_reason(ctx).into() })?;
     let mut all_events = Vec::<AdminExecutorStepEvent>::new();
     let mut completed_steps = 0usize;
     let mut failed_step_id = None::<String>;
@@ -3901,15 +3962,15 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
             return;
         }
     };
-    // Audit B1: derive the interest provider from hive.yaml, but do NOT swallow a load/parse
-    // error into a silent openai fallback (§3.3 forbids silent fallback). A missing ai section
-    // is the documented openai default and stays quiet; only a genuine error warns.
+    // Audit B1: derive the interest provider from the hive's `ai` settings (the installation
+    // file, or hive.yaml while the hive holds none), but do NOT swallow a load/parse error into a
+    // silent openai fallback (§3.3 forbids silent fallback). No `ai` at all is the documented
+    // openai default and stays quiet; only a genuine error warns.
     let provider = match load_hive(&ctx.config_dir) {
-        Ok(hive) => match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
-            Ok(Some(engine)) => engine.provider,
-            Ok(None) => HiveAiConfig::fallback().provider,
-            Err(err) => {
-                tracing::warn!(error = %err, "hive.yaml ai section is invalid; VAULT_SECRET_CHANGED interest defaulting to openai");
+        Ok(hive) => match hive_ai_settings(&hive) {
+            Ok((_, engine)) => engine.provider,
+            Err(reason) => {
+                tracing::warn!(reason = %reason, "the ai settings cannot be used; VAULT_SECRET_CHANGED interest defaulting to openai");
                 HiveAiConfig::fallback().provider
             }
         },
@@ -11922,7 +11983,9 @@ fn reject_admin_executor_secret_fields(payload: &serde_json::Value) -> Result<()
     let config_root = payload.get("config").unwrap_or(payload);
     if config_root.get("ai_providers").is_some() || config_root.get("ai").is_some() {
         return Err(
-            "AI provider/model are hive-wide; configure the ai section in hive.yaml".into(),
+            "AI provider/model are the installation's: its installation file holds them \
+             (docs/hive-config-update-v1.md §4), not this node's config"
+                .into(),
         );
     }
     Ok(())
@@ -11993,13 +12056,9 @@ fn build_admin_executor_config_get_payload(
 ) -> Result<serde_json::Value, AdminError> {
     let node_config = load_admin_executor_node_config(&ctx.hive_id)?;
     let hive = load_hive(&json_router::paths::config_dir())?;
-    let engine = hive
-        .ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| -> AdminError { err.into() })?
-        .unwrap_or_else(HiveAiConfig::fallback);
+    let (settings, engine) = hive_ai_settings(&hive).map_err(|reason| -> AdminError {
+        format!("SY.admin's ai settings cannot be used: {reason}").into()
+    })?;
     let config_version = node_config
         .as_ref()
         .map(|cfg| cfg.config_version)
@@ -12029,7 +12088,8 @@ fn build_admin_executor_config_get_payload(
         "config": {
             "ai": {
                 "default_provider": engine.provider.to_string(),
-                "model": engine.model
+                "model": engine.model,
+                "source": ai_settings::ai_source_json(&settings.source)
             },
             "catalog": {
                 "mode": admin_executor_catalog_mode(node_config.as_ref()),
@@ -12052,7 +12112,7 @@ fn build_admin_executor_config_get_payload(
             ],
             "resources": resources,
             "notes": [
-                "The AI provider/model are configured hive-wide in hive.yaml and cannot be overridden by CONFIG_SET.",
+                "The AI provider/model are the installation's, in its installation file (hive.yaml's ai while this hive holds none; config.ai.source says which), and cannot be overridden by CONFIG_SET.",
                 "Catalog mode defaults to full. Use subset only when intentionally constraining the executor-visible action set."
             ]
         },
@@ -12502,8 +12562,10 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Restore this hive's core binaries from a stamped backup generation (undo a core update)."
         }
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
-        "list_versions" => "List core and runtime versions across hives.",
-        "get_versions" => "Read core and runtime versions for one hive.",
+        "list_versions" => {
+            "List core and runtime versions across hives, and each hive's installation file."
+        }
+        "get_versions" => "Read core and runtime versions for one hive, and its installation file.",
         "list_runtimes" => "List runtimes for one hive.",
         "get_runtime" => "Read one runtime definition in a hive: its versions, readiness, materialization, health and usage, and as tool_catalog the tool cards its version ships (ai.generic's base tools; null for a runtime that ships none).",
         "remove_runtime_version" => {
@@ -14807,6 +14869,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
             "For runtime-backed nodes, use the runtime the node was spawned from (get_node_config -> config._system.runtime): every AI.* node runs ai.generic, so AI.sales@motherbee -> runtimes.runtimes['ai.generic'].current.",
             "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> io.slack and WF.blob.consume.diag.x@y -> wf.blob.consume.diag when present.",
+            "config is the hive's copy of the installation file, which holds the installation's ai settings (docs/hive-config-update-v1.md §7): file (absent, valid or invalid), version, sha256, and state against the motherbee's file: current (its hash), behind (an older version the motherbee recorded), pending (not arrived yet) or edited_by_hand; unknown when the motherbee's record of its versions cannot be read. The motherbee's own config adds not_written when its start did not write the file, and why.",
             "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
         ],
         "update" => vec![
@@ -22334,6 +22397,7 @@ mod tests {
             self_ilk_id: String::new(),
             executor_runtime: Arc::new(Mutex::new(None)),
             executor_configured: Arc::new(AtomicBool::new(false)),
+            executor_ai_error: Arc::new(std::sync::Mutex::new(None)),
             rpc: client,
             usage: UsageRecorder::disabled(),
             public_edge_node: None,
@@ -22350,6 +22414,80 @@ mod tests {
             connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
         };
         (ctx, harness)
+    }
+
+    /// docs/hive-config-update-v1.md §4: the executor's `ai` is the installation file's once the
+    /// hive holds one, whatever hive.yaml's says (an `ai` no reader uses still loads), and
+    /// hive.yaml's until then; settings it cannot use are the reason the executor answers with,
+    /// never a fallback, and never a stop of SY.admin.
+    #[tokio::test]
+    async fn the_executor_s_ai_is_the_installation_file_s_once_the_hive_holds_one() {
+        let (ctx, _harness) = opa_test_admin("sy-admin-installation");
+        let root = ctx.config_dir.parent().expect("root").to_path_buf();
+        let dist = root.join("dist");
+        let file = fluxbee_ai_sdk::installation_file_path(&dist);
+        fs::create_dir_all(file.parent().expect("its dir")).expect("dist");
+        fs::create_dir_all(&ctx.config_dir).expect("config dir");
+        let write_hive = |ai: &str| {
+            fs::write(
+                ctx.config_dir.join("hive.yaml"),
+                format!(
+                    "hive_id: motherbee\nrole: motherbee\ndist:\n  path: \"{}\"\nai:\n{ai}",
+                    dist.display()
+                ),
+            )
+            .expect("hive.yaml");
+        };
+
+        // No file: hive.yaml's, as before.
+        write_hive("  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n");
+        let (settings, engine) =
+            hive_ai_settings(&load_hive(&ctx.config_dir).expect("hive")).expect("hive.yaml");
+        assert_eq!(settings.source, fluxbee_ai_sdk::AiSettingsSource::HiveYaml);
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::OpenAi, "gpt-5.5")
+        );
+
+        // The file: its provider and model, with an old hive.yaml ai no reader uses.
+        let bytes = fluxbee_ai_sdk::InstallationFile {
+            schema_version: fluxbee_ai_sdk::INSTALLATION_SCHEMA_VERSION,
+            version: 1,
+            ai: Some(
+                serde_yaml::from_str(
+                    "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+                )
+                .expect("ai"),
+            ),
+        }
+        .render()
+        .expect("renders");
+        fs::write(&file, &bytes).expect("the file");
+        write_hive("  default_provider: gemini\n");
+        let hive = load_hive(&ctx.config_dir).expect("an ai no reader uses still loads");
+        let (settings, engine) = hive_ai_settings(&hive).expect("the file");
+        assert!(matches!(
+            settings.source,
+            fluxbee_ai_sdk::AiSettingsSource::Installation { version: 1, .. }
+        ));
+        assert_eq!(
+            (engine.provider, engine.model.as_str()),
+            (AiProvider::Anthropic, "claude-sonnet-5-5")
+        );
+
+        // A file no reader can use: the executor answers with its reason, nothing stops.
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("broken");
+        let err = refresh_admin_executor_ai_runtime(&ctx, VaultWait::Once)
+            .await
+            .expect_err("settings it cannot use");
+        assert!(err.to_string().contains("version 0"), "{err}");
+        assert!(!ctx.executor_configured.load(Ordering::Relaxed));
+        let reason = admin_executor_unavailable_reason(&ctx);
+        assert!(
+            reason.contains("cannot use its ai settings") && reason.contains("version 0"),
+            "{reason}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn opa_rules_answer(action: &str, version: u64, status: &str, hash: &str) -> Message {
