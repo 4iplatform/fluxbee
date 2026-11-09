@@ -90,7 +90,8 @@ fails with `missing_ai_api_key`.
   `UNAUTHORIZED` and the `*_PROTECTED` codes 403, the `*_NOT_FOUND` codes 404, state conflicts
   (`HIVE_EXISTS`, `JOIN_IN_PROGRESS`, `KEY_TAKEN`, `TENANT_HAS_NODES`, ...) 409, `COMPILE_ERROR`
   422, `TIMEOUT` 504, any code not in the list 500. A forwarded answer with status `accepted` or
-  `sync_pending` becomes 202 (`build_admin_http_response`).
+  `sync_pending` becomes 202 (`build_admin_http_response`), and so does `set_installation_ai`'s
+  `partial` ([The installation's ai](#the-installations-ai)).
 - **Unknown route.** `404 UNKNOWN_ROUTE`, or `405 METHOD_NOT_ALLOWED` with `allowed_methods` when
   the path exists with another method; both carry `"see": "GET /admin/actions"`
   (`admin_unknown_route_response`).
@@ -145,7 +146,7 @@ caller and the action; a command with no stamped caller is refused too.
 | Caller | May ask for | Checked in |
 | --- | --- | --- |
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
-| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`) | `authorize_llm_usage_scope` |
+| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`) | `authorize_llm_usage_scope` |
 | `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`); payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
@@ -165,9 +166,11 @@ caller and the action; a command with no stamped caller is refused too.
   warning for each one that gets none (`log_registry_caller_roles`).
 - **Only Archi and the HTTP API** ask for `executor_validate_plan`, `executor_execute_plan` and
   `publish_cloud_endpoint`. The executor then runs every step of the plan as the operator.
-- **Closed to the whole mesh,** Archi included: `cognition_clear` and `reset_base_runtime`
-  (`MeshAccess::Nobody`). The operator asks for them on loopback, or Archi stages them in a plan
-  the operator confirms and the executor runs ([A hive's cognition](#a-hives-cognition-the-clear)).
+- **Closed to the whole mesh,** Archi included: `cognition_clear`, `reset_base_runtime` and
+  `set_installation_ai` (`MeshAccess::Nobody`). The operator asks for them on loopback, or Archi
+  stages them in a plan the operator confirms and the executor runs
+  ([A hive's cognition](#a-hives-cognition-the-clear),
+  [The installation's ai](#the-installations-ai)). Its read, `get_installation`, is Archi's.
 - **`remove_runtime_version` keeps a base runtime's `package_version`** (`RUNTIME_PACKAGE_VERSION`):
   it is the way back with `reset_base_runtime` (FINDINGS A-122).
 - **SY.wf-rules@H's packages**, with only the fields its deploys and deletes send
@@ -253,7 +256,9 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | identity actions | `SY.identity@motherbee`, the primary, whatever hive the path names, writes and reads alike: a spoke's replica refuses SY.admin of another hive (F-07; writes A-143, reads 2026-11-07), and every replica holds the primary's identities | `ILK_*`, `TNT_*` (`handle_identity_command`, `identity_command_hive`, `handle_identity_query`) |
 | vault actions | `SY.vault@motherbee`; another hive is refused with `400 INVALID_REQUEST` ("SY.vault runs only on the motherbee") | `VAULT_*` (`handle_vault_command`) |
 | `teardown_node` | `SY.identity@motherbee`, then `SY.vault@motherbee`, then SY.identity again | `ILK_GET`, `VAULT_LIST`, `VAULT_DELETE`, `ILK_DELETE`, `ILK_PURGE` ([Node teardown](#node-teardown)) |
-| `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core or vendor; default runtime), `SYSTEM_SYNC_HINT` |
+| `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core, vendor or config; default runtime), `SYSTEM_SYNC_HINT` |
+| `get_installation` | `SY.orchestrator@motherbee` | `list_versions` (`msg_type: admin`), shown as the installation's view (`installation_view`) |
+| `set_installation_ai` | `SY.orchestrator@motherbee` for its `/versions`, the nodes' configs (A-11), the write and the scan; then every connected hive's `SY.orchestrator` at once | `get_versions`, `list_nodes`, `get_node_config` (`msg_type: admin`); `SYSTEM_UPDATE` category config with `write`; `SYSTEM_SYNC_HINT` of `fluxbee-dist-installation`; `SYSTEM_UPDATE` category config ([The installation's ai](#the-installations-ai)) |
 | `opa_*` writes | `SY.opa.rules@motherbee`, then waits for every hive's answer | `CONFIG_CHANGED`, subsystem `opa` (`send_opa_config_changed`) |
 | `opa_check` | `SY.opa.rules@motherbee` only; nothing is announced | `CONFIG_CHANGED`, action `check`, `version: 0` (a check takes no number from the counter); the answer is matched on the `config.check_id` it echoes (`send_opa_check`) |
 | `wf_rules_*` | `SY.wf-rules@<hive>` | the writes as `CONFIG_SET` with `operation` (`send_wf_rules_config_set`); `delete_workflow` and the reads as `command` / `query` messages (`send_l2_action_request`) |
@@ -273,6 +278,9 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
 (`JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS`; the join itself runs in the background), `update` 60,
+`set_installation_ai` 210, its ceiling (twice the 30 of an orchestrator's answer, for the node
+check and the write, plus each hive's 90 of `sync_pending`,
+`JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS`, plus an update's 60),
 `sync_hint` 45, `core_rollback` 300, `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
 `node_help` 10 (the node's hive gives the node 3 s, the motherbee gives that hive 7 s),
 `kill_node` and `remove_node_instance` 180 (a purge waits for the node's teardown: the
@@ -490,6 +498,118 @@ other hives keep theirs.
 }
 ```
 
+## The installation's ai
+
+The installation file holds the installation's `ai`, the default provider and each provider's
+model, one version on every hive; the motherbee's orchestrator is its only writer
+([hive-config-update-v1](../hive-config-update-v1.md) §4, "As built (stage 3c)";
+[SY.orchestrator](sy-orchestrator.md#the-installation-file)). Two actions read and change it
+(`InternalActionRoute::Installation`), and `update` takes category `config` for one hive.
+
+**`GET /installation` (`get_installation`)**, a read, not in the command log; Archi may ask for it
+over the mesh. It takes no parameter. SY.admin reads the motherbee's `/versions` (`list_versions`)
+and answers its view (`installation_view`):
+
+- `motherbee`: its file, `file`, `version`, `sha256`, `state`, `ai` (the values its readers run
+  on), and `not_written` when its start wrote none;
+- `expected_version`: the version a change names, the file's, or the last one recorded for a file
+  no reader can use (`installation_expected_version`); null while the motherbee holds no file;
+- `versions`: every version recorded, `{version, sha256, written_at_ms, source, ai}`, `source`
+  being `migration` (version 1) or `operator`;
+- `hives`: each hive's copy, `{state, version, sha256, applied}`, `applied` being the config update
+  it applied last (`{version, sha256, applied_at_ms, ai, restarted}`, null before its first). A
+  hive whose `/versions` failed is `unknown`, with the error; one on an orchestrator older than
+  0.1.121 reports no copy.
+
+**`PUT /installation/ai` (`set_installation_ai`)**, the operator's word: on loopback, or a step of a
+plan Archi stages and the operator confirms (`confirmation_required`). Closed to the whole mesh,
+Archi's own `ADMIN_COMMAND` included (`MeshAccess::Nobody`). The command log keeps it. Body
+`{ai, expected_version, replace_hand_edit?}` (`parse_installation_ai_change`):
+
+- `ai` is the whole new `ai`, taken exactly (`ai_settings::parse_operator_ai`): `default_provider`
+  and `providers`, each provider with its `model`; any other field, an empty model, a provider
+  named twice or values a reader cannot use is refused (`400 INVALID_REQUEST`, `422
+  INVALID_AI_SETTINGS`). A provider given as null is not listed, as `get_installation` shows one;
+- `expected_version` is `get_installation`'s; `replace_hand_edit` (false by default; null is
+  absent) replaces a hand edit of the motherbee's file, the operator's choice.
+
+What it does (`handle_set_installation_ai`):
+
+1. **The node check (A-11).** Against the values the motherbee's file holds now (its `/versions`,
+   `installation_current_values`), and only when the change switches the default provider or drops
+   a provider (`ai_change_needs_node_check`). It reads, each hive at once, the managed nodes of the
+   motherbee and of each connected worker (`installation_node_check_hives`, `list_nodes` with
+   `managed`), then each `AI.*` node's config (`get_node_config`: `behavior.provider`,
+   `behavior.model`), and SY.architect's own `config.ai.model` (`scan_node_ai_names`). It refuses,
+   writing nothing:
+   - `409 NODES_LEFT_WITHOUT_ENGINE`, naming each node and why (`nodes_left_without_an_engine`): a
+     node that names its model and not its provider, Archi's own model included, when the default
+     provider switches; a node that names its provider and not its model, when that provider is
+     dropped. The payload lists `nodes` (`{node, why}`) and `unchecked`;
+   - `503 HIVES_NOT_CHECKED`, naming each hive (or SY.architect's config) it could not read.
+
+   When the motherbee's values are not known (its file is one no reader can use, and its last
+   version recorded none), the check is skipped and `node_check` says so.
+2. **The write.** `SYSTEM_UPDATE {category: "config", write: {ai, expected_version,
+   replace_hand_edit}}` to `SY.orchestrator@motherbee`, 30 s. Its refusal passes through with its
+   code and payload: `409` `JOIN_IN_PROGRESS`, `INSTALLATION_EDITED_BY_HAND`, `VERSION_CONFLICT`,
+   `INSTALLATION_UNCHANGED`, `INSTALLATION_NOT_WRITTEN` or `NOT_PRIMARY`; `422 INVALID_AI_SETTINGS`;
+   `502` `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE` or
+   `INSTALLATION_WRITE_FAILED`.
+   No answer is `TIMEOUT` (or `TRANSPORT_ERROR`): `get_installation` shows whether a version was
+   written.
+3. **The scan.** The motherbee's Syncthing scans `fluxbee-dist-installation` (`SYSTEM_SYNC_HINT`,
+   3 s, waited 5 s; `scan_installation_folder`), as a policy's write does: a hint, never a gate.
+4. **The apply.** Every hive at once, the motherbee and each one the registry calls connected
+   (`connected_hives_with`): `SYSTEM_UPDATE {category: "config", manifest_version,
+   manifest_hash}` (`apply_installation_version`). A `sync_pending` hive is asked again 2 s later,
+   then half again as long each time up to 5 s, for up to 90 s
+   (`JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS`, `apply_installation_on_hive`); a hive it cannot
+   reach is asked again within that bound, and a timeout (60 s, an update's) ends the asking. Each
+   hive's apply ends by the action's ceiling (210 s). Each restarts only its readers whose engine
+   changed; SY.admin and SY.architect are never restarted.
+
+The answer's payload is `{version, sha256, previous_version, previous_sha256, hives, node_check,
+timings_ms}`:
+
+- `hives.<hive>`: `status` `ok` (with `restarted` and `unchanged`), `sync_pending` (its copy had
+  not arrived at the bound; `local_version`, `local_sha256`), `error` (`error_code`,
+  `error_detail`: `VERSION_MISMATCH` for a copy past the version, `RESTART_FAILED`,
+  `CONFIG_RECORD_FAILED` (its readers took the version, and its record could not be written), or
+  `MANIFEST_INVALID` from an orchestrator before 0.1.122, which takes no category `config`) or
+  `not_answered` (`detail`), with `attempts` and `elapsed_ms`; a hive not ok gets `next`, where to
+  look and how to finish it (`installation_hive_json`). Never "not applied" (P-13): a hive that
+  did not answer may hold the version already;
+- `node_check`: `{ran: true, hives, nodes}`, or `{ran: false, reason}`;
+- `timings_ms`: `check`, `write`, `scan`, `apply`, `total`, and `hives`, each hive's time to its
+  final answer.
+
+The status is `ok` (200) when every hive is ok, and `partial` (202) otherwise: the version is
+written, `pending` names the hives that are not ok and `message` says what finishes them.
+
+```json
+{
+  "status": "partial", "action": "set_installation_ai",
+  "payload": { "version": 2, "sha256": "…", "previous_version": 1, "previous_sha256": "…",
+    "hives": {
+      "motherbee": { "status": "ok", "restarted": [], "unchanged": ["sy-cognition", "sy-frontdesk-gov"],
+                     "attempts": 1, "elapsed_ms": 140 },
+      "worker1": { "status": "sync_pending", "local_version": 1, "local_sha256": "…",
+                   "attempts": 20, "elapsed_ms": 89620, "next": "GET /versions shows its copy; …" } },
+    "node_check": { "ran": false, "reason": "the change keeps the default provider and every provider listed" },
+    "timings_ms": { "check": 12, "write": 35, "scan": 410, "apply": 89625, "total": 90090,
+                    "hives": { "motherbee": 140, "worker1": 89620 } },
+    "pending": ["worker1 (sync_pending)"], "message": "version 2 is written, and not every hive …" },
+  "error_code": null, "error_detail": null
+}
+```
+
+**`POST /hives/{hive}/update` with category `config`** (`handle_hive_update_command`) applies one
+version on one hive: `{"category": "config", "manifest_version": <n>, "manifest_hash": "<sha256>"}`,
+both from `get_installation`. It answers as the other categories do: `sync_pending` (202) until the
+hive's copy is that version, then `restarted` and `unchanged`; the same version again restarts
+nothing.
+
 ## The executor
 
 The executor runs an `executor_plan`: a list of admin actions with their arguments, written by
@@ -554,6 +674,14 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   with their reason (`admin_executor_unavailable_reason`), and CONFIG_GET fails with it. A
   `VAULT_SECRET_CHANGED` for that provider rebuilds the runtime in place
   (`handle_vault_secret_changed_admin`).
+- **A new version of the installation file** is taken at the executor's next use, never by a
+  restart: no config update restarts SY.admin, which may be running the very change
+  ([The installation's ai](#the-installations-ai)). Each build records the stamp of the file it
+  read, the sha256 of its bytes (`ai_settings::InstallationBuiltFrom`); before each plan it runs or
+  reviews, the executor reads that one small file and hashes it, and only a changed file rebuilds
+  the runtime, its key read once from the vault (`executor_takes_new_installation_ai`). The log
+  then says once where its `ai` comes from. Before the boot's build recorded a stamp, nothing is
+  rebuilt: that build reads the file itself.
 - **Usage records**: every model call is charged to the root tenant (`AiAccount::root`, tenant
   source `root`), with work `{execution_id, caller, stage}` where stage is `executor` or
   `executor_review` (`executor_usage_account`). The record goes to the node's router stream
@@ -925,7 +1053,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 19, 112 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 22, 115 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -941,6 +1069,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives, and each hive's installation file. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive, and its installation file. |
+| `get_installation` | `GET /installation` | Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), every version recorded with its values, and each hive's copy with the config update it applied last. |
+| `set_installation_ai` | `PUT /installation/ai` | Change the installation's ai (the default provider and each provider's model) on every hive: the motherbee's orchestrator writes the next version of the installation file, and each hive restarts only the readers whose engine changed. Closed to the mesh, confirmed by the operator ([The installation's ai](#the-installations-ai)). |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
 | `get_runtime` | `GET /hives/{hive}/runtimes/{runtime}` | Read one runtime definition in a hive; `tool_catalog` is the tool catalog its version ships (ai.generic's base tools), or null. |
 | `remove_runtime_version` | `DELETE /hives/{hive}/runtimes/{runtime}/versions/{runtime_version}` | Delete one published runtime version from motherbee dist/manifest. |

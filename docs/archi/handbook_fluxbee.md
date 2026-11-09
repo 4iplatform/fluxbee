@@ -204,7 +204,8 @@ not name a Vault key: it uses the key SY.vault gives it for its provider (resour
 `anthropic`): one it owns, one assigned to it, or its tenant's general one (no owner, no assigned
 node). The root tenant's keys are the core's; a tenant's node never falls back to them. So a node
 runs on a provider only when its tenant has that provider's key (`vault_list` shows the metadata).
-The SY nodes (Archi, cognition, the frontdesk) keep the hive's provider.
+The SY nodes (Archi, cognition, the frontdesk) keep the hive's provider. The installation's provider
+and models change only with `set_installation_ai` (§4.4.3).
 
 When an agent's provider gives no answer (no key for it, an error status after the AI SDK's
 retries, no connection, none in time, an answer with no text, or the model's refusal), the person
@@ -1055,6 +1056,71 @@ agents lose the memory of every conversation.
   its communication again.
 - Each hive keeps its own copy of each episode: clearing one hive leaves the other hives' copies.
 - The factory reset clears every hive's cognition itself.
+
+### 4.4.3 The installation's AI settings
+
+The installation's `ai` is its default provider and each provider's model. The SY nodes run on
+it (you, SY.admin's executor, SY.cognition, SY.frontdesk.gov), and so does every AI node that names
+no provider or model of its own. It is one installation file, the same version on every hive.
+Only the motherbee's orchestrator writes it, and only through `set_installation_ai`. It holds no
+credential: each provider's key is in SY.vault (`resource_type` `openai` or `anthropic`).
+
+- **Read it** with `get_installation` (`GET /installation`, a read):
+  - `motherbee.ai`, the values now, and `motherbee.state`;
+  - `expected_version`, the version a change names;
+  - `versions`, every version with its values and its `source` (`migration`, `operator`);
+  - `hives`, each hive's copy: `state` (`current`, `behind`, `pending`, `edited_by_hand`,
+    `unknown`), `version`, and `applied`, the version it applied last and what it restarted.
+
+  `GET /versions` holds the same, in each hive's `config` (the motherbee's lists `versions`).
+- **Change it** only when the operator asks. Tell them what changes and what restarts (below),
+  then stage it with `fluxbee_plan_compiler`: one `set_installation_ai` step, args `ai` and
+  `expected_version`.
+  - `ai` is the whole new `ai`: `motherbee.ai` from `get_installation` with what changes, every
+    provider listed with its model, the default provider among them.
+  - `expected_version` is `get_installation`'s.
+  - The operator confirms the plan, and SY.admin's executor runs it as the operator. It is closed
+    to the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as SCMD.
+  - Switching the default provider: check first that the root tenant holds that provider's key
+    (`vault_list`), since the SY nodes read theirs there.
+- **Undo a change** by setting a previous version's values: its `ai` from `versions`, with the
+  current `expected_version`. It becomes a new version. A core rollback never touches the file.
+- **The refusals** write nothing:
+  - `NODES_LEFT_WITHOUT_ENGINE` (A-11): the change switches the default provider or drops a
+    provider, and the nodes it names would lose their engine. A node that names its model and not
+    its provider would ask the new default provider for a model of the old one; a node that names
+    its provider and not its model loses that model when the provider is dropped. Fix each first,
+    as the operator decides: give it `behavior.provider` and `behavior.model` with
+    `set_node_config`, the ones it runs now. For your own `config.ai.model`: set it to null before
+    the switch, and to a model of the new provider after it.
+  - `HIVES_NOT_CHECKED`: a hive's AI nodes could not be read for that check. Retry once it
+    answers.
+  - `JOIN_IN_PROGRESS`: a hive is joining or being removed. Change it once that ends.
+  - `INSTALLATION_EDITED_BY_HAND`: someone edited the motherbee's file by hand (`motherbee.state`
+    is `edited_by_hand`). Tell the operator: they restore it, or choose to replace the hand edit
+    with this change. Only on that choice add `replace_hand_edit: true`; never choose it yourself.
+  - `VERSION_CONFLICT`: the file changed since you read it. Read `get_installation` again, show the
+    operator what changed, and decide again with them.
+  - `INSTALLATION_UNCHANGED`: the current version holds these values already.
+  - `INVALID_AI_SETTINGS`: a provider listed without its model, the default provider not listed,
+    or a field `ai` does not take.
+  - `INSTALLATION_NOT_WRITTEN`: the motherbee holds no file yet. The operator fixes `ai` in the
+    motherbee's hive.yaml and restarts `sy-orchestrator`, which writes version 1.
+- **What restarts where:** only the nodes that read `ai` at their start, and only when their
+  engine, the default provider with its model, changed: SY.cognition and SY.frontdesk.gov on the
+  motherbee, SY.cognition on each worker, nothing on an ingress or an egress. AI nodes take it at
+  their next message. You and the executor take it at your next use, never restarted, so the
+  change's answer reaches you. Another provider's model restarts nothing.
+- **The answer:** `version` and each hive's `status`. `ok` on every hive is done; `partial` names
+  the hives that are not ok:
+  - `sync_pending`: the file had not reached it within 90 s;
+  - `not_answered`: it did not answer, and it may hold the version already;
+  - `error`: its `error_code` says why. A hive on a release before 0.1.122 answers
+    `MANIFEST_INVALID` (it takes no category `config`): its core update comes first.
+
+  None of these means "not applied". Check with `GET /versions` (each hive's `config`), and finish
+  a hive with `update` for that hive: `category: config`, `manifest_version` and `manifest_hash`
+  the new version's (`get_installation`). The run is not verified until every hive applied it.
 
 ### 4.5 Secrets and vault (Model D')
 

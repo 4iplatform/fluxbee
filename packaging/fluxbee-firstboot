@@ -144,9 +144,13 @@ cat <<EOF
     NOTE: the provider is the installation file's (/var/lib/fluxbee/dist/installation/
     installation.json), written by this first start from 'ai' in /etc/fluxbee/hive.yaml, then
     hive.yaml's 'ai' is ignored. For an Anthropic key (resource_type "anthropic") the file must say
-    'default_provider: anthropic', or the AI nodes keep resolving the openai pool and stay
-    degraded: set it in hive.yaml, delete that file, restart sy-orchestrator (it writes version 1
-    again while it is the only one recorded) and restart the AI nodes.
+    "default_provider": "anthropic", or the core's AI keeps resolving the openai pool and stays
+    degraded. Change it with SY.admin's set_installation_ai (or ask Archi), which writes the
+    installation's next version and restarts what reads it, on every hive. Read its ai and
+    expected_version first, then send the whole new ai:
+      curl -sS $ADMIN/installation
+      curl -sS -X PUT $ADMIN/installation/ai -H 'content-type: application/json' \\
+        -d '{"ai":{"default_provider":"anthropic","providers":{"anthropic":{"model":"claude-sonnet-5-5"}}},"expected_version":1}'
 
   - IO channel nodes are not started here, and none runs in the root tenant: each one
     (IO.api.<label>, IO.slack.<label>, IO.wapp.<label>, ...) is launched with run_node by the

@@ -67,7 +67,8 @@ Every role also runs `rt-gateway` (started first) and `sy-orchestrator`. The nod
    `wan.listen`). The orchestrator's first start writes its `ai` as version 1 of the installation
    file, which every hive's readers read from then on and which reaches every hive
    ([hive-config-update-v1](../hive-config-update-v1.md) §4); after that, this section is
-   ignored.
+   ignored, and the installation's `ai` changes with `set_installation_ai`
+   ([The installation's AI settings](#the-installations-ai-settings)).
 5. **First boot**: `sudo fluxbee-firstboot` (`packaging/fluxbee-firstboot`):
    1. starts PostgreSQL, creates the role (`FLUXBEE_DB_USER`/`FLUXBEE_DB_PASSWORD`, default
       `fluxbee`/`fluxbee`) and the databases `fluxbee`, `fluxbee_identity`, `fluxbee_storage`;
@@ -312,7 +313,8 @@ one version on every hive, written only by the motherbee's orchestrator. It reac
 joined before it at the next start of each side's orchestrator, which shares the folder with
 vendor's members, and a new spoke gets it from its join
 ([SY.orchestrator](../nodes/sy-orchestrator.md#the-installation-file),
-[hive-config-update-v1](../hive-config-update-v1.md) §4).
+[hive-config-update-v1](../hive-config-update-v1.md) §4). A new version, the operator's, arrives
+through the same folder ([The installation's AI settings](#the-installations-ai-settings)).
 
 **Announcing a package to workers.** There is no announce message: the motherbee's Syncthing
 announces a change after its own scan. To make a worker pull a package now, scan the folder **on
@@ -388,14 +390,66 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
   `core.awaiting_update`, with why each. It runs what `/usr/bin` holds until a core update
   installs the binaries. The check every minute only closes the report once dist is consistent
   ([SY.orchestrator](../nodes/sy-orchestrator.md#updates)). Each hive's `config` is its copy of
-  the installation file: `version`, `sha256` and `state` against the motherbee's file (`current`,
-  `behind`, `pending`, `edited_by_hand`), the motherbee's own included
+  the installation file: `version`, `sha256`, `ai` and `state` against the motherbee's file
+  (`current`, `behind`, `pending`, `edited_by_hand`), the motherbee's own included, with
+  `applied`, the config update the hive applied last; the motherbee's lists `versions`
   ([SY.orchestrator](../nodes/sy-orchestrator.md#the-installation-file)).
 
 The lab routine `lab/ops.py deploy <version>` does all of this in order: snapshots every VM,
 installs the version on the motherbee, waits for its core to report it, waits until each spoke's
 orchestrator answers, sends the core update to every spoke, waits until each spoke reports the
 motherbee's hash, then runs `health` (`cmd_deploy`).
+
+## The installation's AI settings
+
+The installation's `ai`, its default provider and each provider's model, is one file,
+`dist/installation/installation.json`, the same version on every hive, written only by the
+motherbee's orchestrator ([hive-config-update-v1](../hive-config-update-v1.md) §4;
+[SY.admin](../nodes/sy-admin.md#the-installations-ai)). The motherbee's hive.yaml `ai` is only its
+first version. On the motherbee:
+
+1. **Read it**: `curl -s http://127.0.0.1:8080/installation` (`get_installation`): `motherbee.ai`,
+   `expected_version`, every version recorded with its values (`versions`), and each hive's copy
+   (`hives`).
+2. **Change it** with the whole new `ai` and the version you read, or ask Archi, which stages it as
+   a plan you confirm:
+
+   ```bash
+   curl -sS -X PUT http://127.0.0.1:8080/installation/ai \
+     -H 'content-type: application/json' \
+     -d '{"ai":{"default_provider":"anthropic","providers":{"openai":{"model":"gpt-5.5"},"anthropic":{"model":"claude-sonnet-5-5"}}},"expected_version":1}'
+   ```
+
+   A new default provider needs its key in the root tenant first (`resource_type` `openai` or
+   `anthropic`): the core (SY.admin's executor, Archi, SY.cognition, SY.frontdesk.gov) reads its
+   keys there.
+3. **What happens**: SY.admin checks the AI nodes when the change switches the default provider or
+   drops a provider (A-11); the motherbee's orchestrator writes the next version; Syncthing takes it
+   to every hive; SY.admin applies it on every hive at once. A hive restarts only what reads `ai` at
+   its start, and only when its engine (the default provider with its model) changed:
+   `sy-cognition` and `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker. AI nodes take
+   it at their next request, SY.admin's executor and Archi at their next use. Nothing else restarts.
+4. **The answer**: `ok` (200) when every hive applied it; `partial` (202) names the hives that have
+   not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered` or `error`.
+   The version is written either way. `GET /versions` shows each hive's copy (`config.state`,
+   `config.applied`), and this finishes one hive:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8080/hives/worker1/update \
+     -H 'content-type: application/json' \
+     -d '{"category":"config","manifest_version":2,"manifest_hash":"<its sha256, from GET /installation>"}'
+   ```
+
+5. **Undo** a change by setting a previous version's values (from `versions`) the same way: it
+   becomes the next version. A core rollback never touches the file.
+6. **Refusals**, with nothing written: `409 NODES_LEFT_WITHOUT_ENGINE` (the named nodes would lose
+   their engine: give each its `behavior.provider` and `behavior.model` first, or set
+   SY.architect's own `config.ai.model` to null), `409 JOIN_IN_PROGRESS`, `409 VERSION_CONFLICT`
+   (read it again), `409 INSTALLATION_EDITED_BY_HAND` (restore the file, or add
+   `"replace_hand_edit": true` to make the change over the hand edit), `409 INSTALLATION_UNCHANGED`,
+   `409 INSTALLATION_NOT_WRITTEN` (the motherbee holds no file: fix its hive.yaml `ai` and restart
+   `sy-orchestrator`, which writes version 1), `422 INVALID_AI_SETTINGS` and `503
+   HIVES_NOT_CHECKED`.
 
 ## Node lifecycle
 
@@ -653,7 +707,8 @@ ingress and io.web's on the motherbee say why.
 | `GET /hives/{hive}` | one hive's join record (`status`, `join`) |
 | `GET /inventory`, `/inventory/summary`, `/inventory/{hive}` | the live view from the router's LSA; answers while the orchestrator boots |
 | `GET /hives/{hive}/nodes`, `.../nodes/{name}/status` | nodes and one node's lifecycle and health |
-| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds, and `vendor.awaiting_update` the vendored Syncthing, while it runs the one already installed; `config` the hive's installation file, with its `state` against the motherbee's (`current`, `behind`, `pending`, `edited_by_hand`) |
+| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds, and `vendor.awaiting_update` the vendored Syncthing, while it runs the one already installed; `config` the hive's installation file, with its `state` against the motherbee's (`current`, `behind`, `pending`, `edited_by_hand`) and `applied`, the config update it applied last |
+| `GET /installation` | the installation's `ai`: the motherbee's file, its versions and each hive's copy ([The installation's AI settings](#the-installations-ai-settings)) |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
 | `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes. A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |

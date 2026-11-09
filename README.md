@@ -325,9 +325,17 @@ For Anthropic, use `"resource_type": "anthropic"`. The provider and its model ar
 installation file's (`/var/lib/fluxbee/dist/installation/installation.json`), which the
 orchestrator's first start writes from `ai` in `/etc/fluxbee/hive.yaml`: set
 `ai.default_provider: anthropic` there before `fluxbee-firstboot`. After it, hive.yaml's `ai` is
-ignored. To take it again, while version 1 is the only one recorded, delete that file on the
-motherbee, restart `sy-orchestrator` (it writes version 1 again from hive.yaml), and restart the AI
-nodes ([hive-config-update-v1](docs/hive-config-update-v1.md) §4).
+ignored: change the installation's provider or a model with SY.admin's `set_installation_ai`, or
+ask Archi. It writes the file's next version and applies it on every hive, restarting only what
+reads it ([hive-config-update-v1](docs/hive-config-update-v1.md) §4). Read the current `ai` and
+its `expected_version`, then send the whole new `ai`:
+
+```bash
+curl -sS http://127.0.0.1:8080/installation
+curl -sS -X PUT http://127.0.0.1:8080/installation/ai \
+  -H 'Content-Type: application/json' \
+  -d '{"ai":{"default_provider":"anthropic","providers":{"anthropic":{"model":"claude-sonnet-5-5"}}},"expected_version":1}'
+```
 
 ### 3. Open Archi
 

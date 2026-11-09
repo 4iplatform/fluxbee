@@ -66,8 +66,10 @@ The installation's AI provider and models (`ai`, `HiveAiConfig` in `crates/fluxb
 in one installation file, `dist/installation/installation.json`, one version on every hive
 ([hive-config-update-v1](../hive-config-update-v1.md) §4; `fluxbee_ai_sdk::installation`). The
 motherbee's orchestrator writes it, the only writer: its first version from the motherbee's
-hive.yaml `ai`. Syncthing takes it to every hive (§5.4), and each hive's readers read their own
-copy: SY.admin, SY.architect, SY.cognition and SY.frontdesk.gov at their start, ai.generic at each
+hive.yaml `ai`, every later one the operator's, through SY.admin's `set_installation_ai`.
+Syncthing takes it to every hive (§5.4), and each hive's readers read their own copy:
+SY.cognition and SY.frontdesk.gov at their start (a new version restarts them when their engine
+changed), SY.admin and SY.architect at their start and then at their next use, ai.generic at each
 request that leaves its provider or model to the hive. A hive.yaml `ai` is read only while its
 hive holds no file; a joined spoke's hive.yaml has none.
 

@@ -13,11 +13,13 @@
   release's keys and ran its role from the table. Its join failed at the finalize, for a reason
   stage 2 does not touch (FINDINGS A-190).
 - **Stage 3, in three releases** (§10):
-  - 3a, built for 0.1.120: the AI SDK alone, the installation file's type and reader
+  - 3a, live on 8.x (0.1.120): the AI SDK alone, the installation file's type and reader
     (`fluxbee_ai_sdk::installation`).
-  - 3b, built: the motherbee writes the file's first version and distributes it, the readers
-    switch to it, and `/versions` shows it, with nothing changed in behavior (§4, "As built").
-  - **Next:** 3c, the operator's action and the update with category `config`.
+  - 3b, live and checked on 8.x (0.1.121): the motherbee writes the file's first version and
+    distributes it, the readers switch to it, and `/versions` shows it, with nothing changed in
+    behavior (§4, "As built (stage 3b)").
+  - 3c, built for 0.1.122: the operator's action, SY.admin's `set_installation_ai`, and the update
+    with category `config` (§4, "As built (stage 3c)"). **Next:** its gate on 8.x (§10).
 
 This is the single place for the topic.
 
@@ -138,17 +140,22 @@ Three cases bite today:
 - **The operator's change**, an SY.admin action that Archi can call:
   1. **SY.admin checks the new settings** with every reader's rules: `HiveAiConfig::effective` and
      each provider's model.
-     - It refuses to switch the default provider while a node names a model of the old one, and
-       names those nodes (A-11).
-     - It refuses while a join is running (A-12).
+     - It refuses to switch the default provider while a node names a model of the old one, or to
+       drop a provider a node names without a model of its own, and names those nodes (A-11).
+     - It refuses while a join is running (A-12). As built, the motherbee's orchestrator refuses it
+       at the write.
   2. **The motherbee's orchestrator writes the file,** the only writer, atomically, with the next
      version.
   3. **SY.admin runs the installation's update for it** (§6). Each hive answers `sync_pending` until
      its copy's hash is the new one. Then it restarts only the readers of the settings that
      changed, by role.
-  4. **On the motherbee, SY.admin restarts last,** after the update has reported.
-- **An operator's version is undone by another one:** SY.admin keeps each version's values, so
-  Archi can put the previous ones back. A core rollback never touches the file (D-8, A-6, P-10).
+  4. **No config update restarts SY.admin or SY.architect.** Each takes a new version at its next
+     use: SY.admin's executor before it runs or reviews a plan, Archi at each chat turn. Archi may
+     be the caller of the very change, and a restart of either would cut the action's reply and
+     the operator's chat. This replaces the first draft's "SY.admin restarts last".
+- **An operator's version is undone by another one:** each version's values are kept, so Archi can
+  put the previous ones back (as built, the motherbee's record of its versions, which
+  `get_installation` shows). A core rollback never touches the file (D-8, A-6, P-10).
 - **A hand edit of the file is caught:** the motherbee records each version's hash, and a file
   that no longer matches is reported in `/versions`. Changes are refused until the operator makes
   the edit a version or restores the file (A-7).
@@ -233,9 +240,140 @@ Nothing changes in behavior: version 1 holds the values every reader ran on.
     Until then SY.cognition runs on its hive.yaml's `ai`, which holds the same values on 8.x.
   - **On a new spoke it ends at the join:** the bootstrap copies the file before the readers first
     start.
-- **Not built yet (3c):** the operator's action and the update with category `config`, which
-  restarts the readers. Until then nothing writes a version past 1, and a hand edit of the
-  motherbee's file shows as `edited_by_hand`.
+- **Built in stage 3c** (below): the operator's action and the update with category `config`,
+  which restarts the readers. Before it nothing wrote a version past 1.
+
+### As built (stage 3c)
+
+The operator's change and the update with category `config`, built for 0.1.122; its gate is next
+(§10).
+
+- **SY.admin's two actions** (`InternalActionRoute::Installation`), and one more category:
+  - `get_installation`, `GET /installation`: a read, which Archi may ask for over the mesh
+    (`MeshAccess::Archi`). It is a view of the motherbee's `/versions` (`installation_view`): the
+    motherbee's file (`file`, `version`, `sha256`, `state`, `ai`, `not_written`),
+    `expected_version`, every version recorded with its values (`versions`), and each hive's copy
+    (`state`, `version`, `sha256`, `applied`).
+  - `set_installation_ai`, `PUT /installation/ai`, body `{ai, expected_version,
+    replace_hand_edit?}`: the operator's word, confirmed first and closed to the whole mesh, Archi
+    included (`MeshAccess::Nobody`). The operator calls it on loopback, or Archi stages it as one
+    step of a plan the operator confirms. The command log keeps it.
+  - `update` takes category `config` for one hive, with `manifest_version` and `manifest_hash`
+    from `get_installation`: it finishes a hive that did not apply a version.
+- **The body is taken exactly** (`ai_settings::parse_operator_ai`): `ai` is the whole new `ai`,
+  `default_provider` and `providers`, each provider with its `model` and nothing else, so a field
+  no reader reads is refused rather than dropped, and the values must be ones every reader can use
+  (`INVALID_AI_SETTINGS`). A provider given as null is not listed, as `get_installation` shows one.
+- **1. The node check (A-11)**, in SY.admin, only when the change switches the default provider or
+  drops a provider (`ai_change_needs_node_check`) against the values the motherbee's file holds
+  now (its `/versions`):
+  - it reads the AI nodes of the motherbee and of each connected worker
+    (`installation_node_check_hives`; an ingress or an egress receives no runtime, so it runs
+    none): each hive's managed nodes (`list_nodes` with `managed`), then each `AI.*` node's config
+    (`get_node_config`), its `behavior.provider` and `behavior.model`; and SY.architect's own
+    `config.ai.model`, a model with no provider. A node without a config names nothing;
+  - it refuses, naming each node and why (`nodes_left_without_an_engine`, `409
+    NODES_LEFT_WITHOUT_ENGINE`), a node that names its model and not its provider when the default
+    provider switches, Archi's own model among them, and a node that names its provider and not its
+    model when that provider is dropped;
+  - a hive, or SY.architect's config, it cannot read refuses the change, naming it (`503
+    HIVES_NOT_CHECKED`): retry once it answers;
+  - when the motherbee's current values are not known (its file is one no reader can use, and its
+    last version recorded none), it skips the check, and the answer's `node_check` says so.
+- **2. The write**, by the motherbee's orchestrator alone: SYSTEM_UPDATE `{category: config,
+  write: {ai, expected_version, replace_hand_edit}}` to `SY.orchestrator@motherbee`
+  (`write_installation_operator_version`), admitted by policy rule (2) as every update, answered
+  within 30 s (`JSR_ADMIN_ORCH_TIMEOUT_SECS`). It refuses, writing nothing, with the reason in plain
+  words, and SY.admin passes the refusal through with its code:
+  - `NOT_PRIMARY`: on a spoke, which never writes it;
+  - `JOIN_IN_PROGRESS`: a join or a removal is running (`any_hive_topology_busy`, A-12), and a
+    join copies the file to its spoke;
+  - `INSTALLATION_NOT_WRITTEN`: the motherbee holds no file. While version 1 is the only one
+    recorded, its start writes it from hive.yaml's `ai`: fix that `ai` (`/versions`'
+    `config.not_written` says why it was not written), restart `sy-orchestrator`, then change it.
+    A file missing after a later version was recorded is put back first, the same bytes from a hive
+    that holds it;
+  - `INSTALLATION_EDITED_BY_HAND` (A-7): the file is one no reader can use, or its hash is not the
+    one its version was written with. `replace_hand_edit: true`, the operator's choice, makes this
+    change the next version over it;
+  - `VERSION_CONFLICT`: `expected_version` is not the motherbee's version, which changed since it
+    was read. That version is the file's, or the last one recorded for a file no reader can use;
+    `get_installation` shows it as `expected_version`;
+  - `INVALID_AI_SETTINGS`: values a reader cannot use (`InstallationFile::render` validates);
+  - `INSTALLATION_UNCHANGED`: the current version holds these values already. Values are compared,
+    not bytes, which differ by the version number anyway;
+  - `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE`, `INSTALLATION_WRITE_FAILED`: the
+    record or the file cannot be read or written.
+- **The next version** is one past the last recorded, or past the file's when a hand edit raised it,
+  so a version number never goes back. It is recorded first, with `source: operator` and its
+  values, then the file is written atomically, mode 0644, as version 1 is; a record whose file could
+  not be written is taken back. The answer: `{status: ok, version, sha256, previous_version,
+  previous_sha256}`.
+- **Each version's values** are in its record (`ai`, provider and model names only,
+  `ai_settings::ai_values`; a file without `ai` records the fallback engine written out, on which
+  every reader runs the same), so a previous version can be put back as a new one. Stage 3b
+  recorded version 1 without them: the motherbee's start fills them in from the file while its hash
+  is still the recorded one (`record_current_version_values_at_start`), and so does the first
+  write. A file edited by hand fills in nothing.
+- **Then the motherbee's Syncthing scans `fluxbee-dist-installation`** (`SYSTEM_SYNC_HINT`, 3 s,
+  waited 5 s; a hint, never a gate), as a policy's write does, so the rename reaches the spokes
+  without waiting for the watcher.
+- **3. The apply, on every hive at once:** the motherbee and each hive the registry calls
+  connected (`connected_hives_with`, as a policy's rollout) get SYSTEM_UPDATE `{category: config,
+  manifest_version, manifest_hash}` (`apply_installation_version`):
+  - a hive answers `sync_pending` until its copy is that version with that hash
+    (`local_system_manifest_state`, `manifest_match`), and `VERSION_MISMATCH` for a copy past it;
+    an orchestrator older than 0.1.122 takes no category `config` (`MANIFEST_INVALID`);
+  - SY.admin asks again 2 s later, then half again as long each time, up to 5 s, for up to 90 s
+    (`JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS`). A hive it cannot reach is asked again within that
+    bound; a timeout (an update's 60 s) ends the asking, since the hive may still be applying it;
+  - each hive's apply also ends at the change's ceiling, `admin_action_timeout` of
+    `set_installation_ai`: 210 s by default, 2 × 30 for the check and the write, then 90 and 60.
+- **What a hive restarts** (`apply_config_update_local`, under the orchestrator's update lock as
+  any update):
+  - only its start readers, by role (`installation_start_readers`): SY.cognition and
+    SY.frontdesk.gov on the motherbee, SY.cognition on a worker, none on an ingress or an egress.
+    ai.generic takes the new version at its next request, SY.admin's executor and Archi at their
+    next use;
+  - only those its release runs and systemd has active: one that does not run reads the file at its
+    next start;
+  - only when their engine changed (`config_update_plan`): `ai_settings::engine_of` the version's
+    values, the default provider with its model, against the one this hive applied last, recorded
+    in `/var/lib/fluxbee/orchestrator/config-applied.json` (`{version, sha256, applied_at_ms, ai,
+    restarted}`). Another provider's model restarts nothing. Without a record (a hive's first
+    config update, or a record it cannot read), every start reader restarts: nothing says what they
+    run. The same version and hash again restarts nothing, and answers ok;
+  - each behind the core's health gate (`restart_core_service_with_health_gate`, 30 s). The record
+    is written after the restarts, and only when they all succeeded: otherwise the answer is
+    `error`, `RESTART_FAILED` with the reasons, and the same update run again restarts them again.
+    A record that cannot be written once they all restarted answers `error`,
+    `CONFIG_RECORD_FAILED`: the readers run the version, and the next update restarts them again.
+  - The answer lists `restarted`, `unchanged` and `errors`, as the other categories do. A copy no
+    reader can use stays `sync_pending`: no version has its hash.
+- **`set_installation_ai`'s answer:** `{version, sha256, previous_version, previous_sha256, hives,
+  node_check, timings_ms}`.
+  - Each hive's `status` is `ok` (with `restarted` and `unchanged`), `sync_pending` (its copy had
+    not arrived at the bound; `local_version`, `local_sha256`), `error` (`error_code`,
+    `error_detail`) or `not_answered`, with `attempts` and `elapsed_ms`. A hive not ok gets `next`:
+    `GET /versions`, and the update with category `config` that finishes it. None says "not
+    applied" (P-13): a hive that did not answer may hold the version already.
+  - `timings_ms`: `check`, `write`, `scan`, `apply`, `total`, and each hive's (`hives`).
+  - `ok` (200) when every hive is ok; otherwise `partial` (202), with `pending` naming the hives and
+    a `message`. The version is written either way.
+- **SY.admin and Archi take a new version at their next use**, never restarted by a config update
+  (above). Each records the stamp of the file its AI runtime was built from
+  (`ai_settings::InstallationBuiltFrom`), and before each use reads that one small file and hashes
+  it: SY.admin's executor before each plan it runs or reviews
+  (`executor_takes_new_installation_ai`), Archi at each chat turn
+  (`architect_takes_new_installation_ai`). Only a changed file rebuilds the runtime, its key read
+  once from the vault, and the log says once where its `ai` comes from now.
+  Archi's own `config.ai.model` stays its node config.
+- **Archi** waits 240 s more for each `set_installation_ai` step of a plan
+  (`EXECUTOR_INSTALLATION_WAIT_SECS`, past SY.admin's 210 s), and verifies a run only once every
+  hive applied the change: a `partial` answer names the hives in the run's reason
+  (`installation_changes_not_applied`).
+- **`/versions`** (§7): each copy's `ai` values; `applied` on every hive; `versions` on the
+  motherbee.
 
 ## 5. `hive.yaml`, the hive's own
 
@@ -267,6 +405,11 @@ Nothing changes in behavior: version 1 holds the values every reader ran on.
   by the operator, and the automatic step leaves it alone (A-5).
 - **The installation's rollback:** install the previous release on the motherbee, then run the
   installation's update.
+- **As built (stage 3c):** the per-hive update with category `config` (§4, "As built (stage 3c)").
+  `set_installation_ai` runs it on every hive once, in parallel, and keeps no state: a hive not on
+  the version is named in its answer, and `update` with category `config` finishes it. The one
+  action for the core and the file, with its state on disk and the automatic step, is stage 4
+  (§10).
 
 ## 7. `/versions`
 
@@ -276,9 +419,15 @@ Nothing changes in behavior: version 1 holds the values every reader ran on.
   - its state: current, behind, pending or edited by hand.
 - **Each hive is compared** with the motherbee's file.
   - **As built (stage 3b):** by the motherbee's orchestrator, which builds `/versions` for SY.admin
-    (§4, "As built"). A state no version record can decide is `unknown`.
+    (§4, "As built (stage 3b)"). A state no version record can decide is `unknown`.
+- **As built (stage 3c):** each hive's `config` adds `ai`, a valid copy's values, and `applied`, the
+  config update it applied last (`{version, sha256, applied_at_ms, ai, restarted}`, null before its
+  first). The motherbee's adds `versions`: every version it recorded, with its sha256,
+  `written_at_ms`, `source` (`migration` or `operator`) and `ai`, so SY.admin and Archi read the
+  history without reading the orchestrator's files.
 - **An update's result says `not_answered`** for a hive that did not answer, never "not applied",
-  and points to `/versions` (P-13).
+  and points to `/versions` (P-13). As built (stage 3c): `set_installation_ai`'s answer, with
+  `sync_pending` and `error` beside it.
 
 ## 8. A-186, A-181 and A-188 in this design
 
@@ -335,8 +484,13 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
      set and back. Every hive must be current, the readers restarted only where they read it,
      AI.pruebas still answering, and the action's reply arriving.
    - In three releases: 3a, the AI SDK alone (its type and reader); 3b, the file's first version,
-     its folder, the readers and `/versions` (§4, "As built"), with nothing changed in behavior;
-     3c, the operator's action and category `config`, with the gate above.
+     its folder, the readers and `/versions` (§4, "As built (stage 3b)"), with nothing changed in
+     behavior; 3c, the operator's action and category `config`, with the gate above.
+   - ✅ 3a live on 8.x (0.1.120); ✅ 3b live and checked on 8.x (0.1.121): the file current on
+     every hive, every reader on it.
+   - 3c built for 0.1.122 (§4, "As built (stage 3c)"): its tests run in CI over temporary roots;
+     the gate above is next. The answer's `timings_ms` and each hive's `elapsed_ms` give the gate
+     its times.
 4. **The installation's update in SY.admin,** with the automatic step. `ops.py deploy` calls it.
    - Gate: a deploy through it.
    - Gate: egress1 down across a config change, then back: finished once and reported.
@@ -400,7 +554,8 @@ They raised 70 findings, many of them the same seen from several lenses:
     (`materialize_role_core_trees`, `:23366`).
 - **`/versions`** (`local_versions_snapshot`, `:13359`): the core's manifest hash, its components,
   what is installed, the last update and the rollback generations. It shows nothing of the config
-  (since stage 3b, each hive's `config`: §4, "As built").
+  (since stage 3b, each hive's `config`: §4, "As built (stage 3b)"; since stage 3c with `applied`,
+  `ai` and the motherbee's `versions`: §7).
 - **The join** writes a spoke's whole `hive.yaml` over SSH, from three templates:
   - the worker's: `:25968`, written at `:25992`;
   - the egress's: `:26785`;
@@ -420,5 +575,7 @@ They raised 70 findings, many of them the same seen from several lenses:
   - the watchdog's list: read at the orchestrator's start (`:971`);
   - `ai`: at the start, SY.cognition, SY.admin, SY.architect, SY.frontdesk.gov, and rt-gateway
     for its check only; ai.generic at each request (since stage 3b from the installation file,
-    and from hive.yaml only while a hive holds none: §4, "As built");
+    and from hive.yaml only while a hive holds none: §4, "As built (stage 3b)"; since stage 3c,
+    SY.admin's executor and Archi at their next use too, and a config update restarts SY.cognition
+    and SY.frontdesk.gov when their engine changed: §4, "As built (stage 3c)");
   - `government.identity_frontdesk`: the router and SY.identity, at their start.

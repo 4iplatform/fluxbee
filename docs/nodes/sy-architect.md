@@ -79,7 +79,9 @@ above are in `dynamic_handler`.
 
 ## Chat
 
-`handle_chat_message` looks at each message in this order:
+Each chat turn first takes a new version of the installation file, when there is one
+(`architect_takes_new_installation_ai`, [LLM, key and usage records](#llm-key-and-usage-records)).
+Then `handle_chat_message` looks at each message in this order:
 
 1. `CONFIRM`: runs what is waiting for confirmation (a pipeline checkpoint, or a plan the plan
    compiler prepared, sent with labels `{"origin": "plan_compiler_confirmed"}`). `CANCEL` or
@@ -140,6 +142,16 @@ operator writes `CONFIRM`. Then `execute_executor_plan_with_context` sends
 `executor_validate_plan` and `executor_execute_plan` to SY.admin, which runs the steps (see
 [SY.admin, the executor](sy-admin.md#the-executor)). Plans sent to `POST /api/executor/plan` or
 pasted in the chat run without that confirmation, unless one is already pending in the session.
+
+A confirmed run is verified (`verify_execution_result`): done, no step failed, each workflow it
+deployed has its node running (`wf_deploys_left_not_running`), and each change of the
+installation's `ai` applied on every hive. SY.admin's `set_installation_ai` writes the version and
+answers `partial` while a hive has not applied it; the run's reason then names those hives, with
+`GET /versions` and the update with category `config` that finishes one
+(`installation_changes_not_applied`;
+[SY.admin, the installation's ai](sy-admin.md#the-installations-ai)).
+The installation's `ai` is changed only that way: `set_installation_ai` is closed to Archi's own
+`ADMIN_COMMAND`, and its read, `get_installation`, is open to it.
 
 ## Pipelines
 
@@ -295,7 +307,17 @@ skills, handbooks and a personality.
 - **Model**: Archi's own, `config.ai.model`, set by `CONFIG_SET` and kept in its node directory's
   `config.json`; `null` goes back to the installation's, `ai.providers.<provider>.model`. The AI
   runtime is rebuilt at once, with no restart. `CONFIG_GET` shows the model and its source
-  (`ai.model` or `hive`).
+  (`ai.model` or `hive`). Its provider is always the installation's default, so SY.admin's
+  `set_installation_ai` refuses to switch the default provider while Archi names its own model
+  (A-11, `NODES_LEFT_WITHOUT_ENGINE`): set it to `null` first, and again once the switch is done.
+- **A new version of the installation file** is taken at the next chat turn, never by a restart:
+  no config update restarts Archi, which may be the caller of the very change, and a restart would
+  cut its reply and the chat ([hive-config-update-v1](../hive-config-update-v1.md) §4, "As built
+  (stage 3c)"). Each build records the stamp of the file it read, the sha256 of its bytes
+  (`ai_settings::InstallationBuiltFrom`), at the start and at every rebuild; each turn reads that
+  one small file and hashes it, and only a changed file rebuilds the runtime
+  (`refresh_architect_ai_runtime`, its key read once from the vault). The log then says once where
+  its `ai` comes from. Its own `config.ai.model` stays its node config.
 - **Limits**: every model call asks for up to 32,000 output tokens and may take 600 s
   (`ARCHITECT_MODEL_CALL_TIMEOUT`); a pipeline task's budget is 1,000,000 tokens
   (`TASK_AGENT_TOKEN_BUDGET`).
@@ -331,7 +353,10 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
   the status), vault reads, usage records, impersonation messages. Admin timeouts: 120 s for the
   executor (`JSR_ADMIN_EXECUTOR_TIMEOUT_SECS`), and 35 min more for each `add_hive` step of the
   plan it runs, since SY.admin's executor follows each join to its end, for up to 30 min, before
-  the next step; 30 s default (`JSR_ADMIN_ORCH_TIMEOUT_SECS`) (`architect_admin_action_timeout`).
+  the next step; 90 s more for each workflow deploy or removal; 240 s more for each
+  `set_installation_ai` step (`EXECUTOR_INSTALLATION_WAIT_SECS`), past SY.admin's 210 s ceiling for
+  it; 35 s for `get_installation`, past SY.admin's own 30 s read of `/versions`; 30 s default
+  (`JSR_ADMIN_ORCH_TIMEOUT_SECS`) (`architect_admin_action_timeout`).
   While a plan that joins hives runs, the chat's execution hint says so (`execution_hint` on the
   pending confirmation).
 

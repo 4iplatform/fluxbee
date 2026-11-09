@@ -240,9 +240,12 @@ curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
 # (resource_type "anthropic" for an Anthropic key. CAREFUL: the provider is the installation
 #  file's, /var/lib/fluxbee/dist/installation/installation.json, written by the orchestrator's
 #  first start from `ai` in /etc/fluxbee/hive.yaml and ignored there after it. Set
-#  `ai.default_provider: anthropic` in hive.yaml before fluxbee-firstboot; after it, while version
-#  1 is the only one recorded, delete that file, restart sy-orchestrator (it writes version 1
-#  again) and restart the AI nodes, or they keep resolving the openai pool.)
+#  `ai.default_provider: anthropic` in hive.yaml before fluxbee-firstboot; after it, change it
+#  with SY.admin's set_installation_ai, or ask Archi, or the core keeps resolving the openai pool:
+#  read GET /installation, then send the whole new ai with its expected_version, as below. It
+#  writes the next version and restarts what reads it, on every hive.)
+# curl -sS -X PUT http://127.0.0.1:8080/installation/ai -H 'content-type: application/json' \
+#   -d '{"ai":{"default_provider":"anthropic","providers":{"anthropic":{"model":"claude-sonnet-5-5"}}},"expected_version":1}'
 
 # Slack tokens for an IO.slack binding (its tenant launches it): resource_type "slack", value {app_token, bot_token}.
 ```

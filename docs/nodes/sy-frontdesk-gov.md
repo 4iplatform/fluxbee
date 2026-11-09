@@ -49,7 +49,10 @@ Source: `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (the whole node),
    typed only while the hive holds no file, so an old `ai` never stops the name or the start. If
    that fails (hive.yaml unreadable, an installation file no reader can use, which is never a
    fallback to hive.yaml, or an invalid hive.yaml `ai` while the hive holds no file) it boots
-   `FAILED_CONFIG` with the reason; otherwise `UNCONFIGURED`.
+   `FAILED_CONFIG` with the reason; otherwise `UNCONFIGURED`. A new version of the installation
+   file restarts it through the motherbee's orchestrator (the update with category `config`) only
+   when its engine, the default provider with that provider's model, changed
+   ([hive-config-update-v1](../hive-config-update-v1.md) §4, "As built (stage 3c)").
 4. Connects to the router (`RouterDispatcher::connect_with_retry`, every 1 s); every message goes
    to the AI runtime channel (`build_frontdesk_gov_rpc_profile`).
 5. Asks SY.vault for the AI key (`boot_self_configure`). On an upgrade the whole hive restarts at

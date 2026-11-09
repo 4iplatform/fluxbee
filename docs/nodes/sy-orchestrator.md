@@ -43,9 +43,11 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    a hive.yaml that still holds those keys loads, and one warning at the start names the ones it
    ignores (`warn_superseded_hive_keys`). Creates its directories (`ensure_dirs`), `dist/installation`
    among them. On the motherbee, writes the installation file's first version when its dist holds
-   none ([The installation file](#the-installation-file)). On every hive, logs what it holds at the
-   installation file's place, and, once it holds a file, warns once that hive.yaml's `ai` is
-   ignored (`report_installation_file_at_start`). Then it writes the PID file.
+   none, and records the values of the version its file holds when its record has none
+   (`record_current_version_values_at_start`; [The installation file](#the-installation-file)).
+   On every hive, logs what it holds at the installation file's place, and, once it holds a file,
+   warns once that hive.yaml's `ai` is ignored (`report_installation_file_at_start`). Then it
+   writes the PID file.
 3. **`bootstrap_local`**, before joining the router:
    1. reads `dist/core/manifest.json` (missing or invalid, it is fatal) and lists the core
       components of its role (`core_components_listed_for_role`): on the motherbee every
@@ -438,12 +440,17 @@ deletes the key of any hive with no directory under `hives/`, when both listings
 ## Updates
 
 SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `category`
-(`runtime`, `core` or `vendor`) and the `manifest_hash` the hive should have
+(`runtime`, `core`, `vendor` or `config`) and the `manifest_hash` the hive should have
 (`handle_system_update_message`). If the local manifest does not match yet, the answer is
-`sync_pending` (Syncthing has not delivered it).
+`sync_pending` (Syncthing has not delivered it); a local version past the one named is refused
+(`VERSION_MISMATCH`; `manifest_match`).
 
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
   applies retention.
+- **config** (stage 3c): the installation file, its version and the sha256 of its bytes. No binary
+  step: once the hive's copy is that version, it restarts only its readers whose engine changed
+  ([The installation file](#the-installation-file)). The same message with a `write`, on the
+  motherbee, writes the file's next version.
 - **vendor**: brings the running Syncthing in line with the vendored one
   (`ensure_blob_sync_runtime`), when sync is enabled. It is strict (`VendorPolicy::Strict`): a
   vendored binary that does not match `dist/vendor/manifest.json` fails the update, and nothing
@@ -585,9 +592,9 @@ the hive holds no file).
   (temp and rename), mode 0644, in `dist/installation`, which `ensure_dirs` made root's and
   readable by the `fluxbee` group. A hive.yaml without `ai` gives a file without one, the
   fallback engine. The version is recorded first, in
-  `/var/lib/fluxbee/orchestrator/installation-versions.json` (its sha256, `written_at_ms`, and
-  `source: migration`), so a file is never there without its record: that record is how a hand
-  edit is caught.
+  `/var/lib/fluxbee/orchestrator/installation-versions.json` (its sha256, `written_at_ms`,
+  `source: migration` and, since stage 3c, its `ai` values), so a file is never there without its
+  record: that record is how a hand edit is caught. Every later version is the operator's (below).
 - **An `ai` no reader can use** (an unknown provider, a default provider or any provider named
   without its model) writes nothing: a warning, `config.not_written` in `/versions`, and every
   reader stays on its hive.yaml. A file missing after a later version was recorded is not written
@@ -602,17 +609,67 @@ the hive holds no file).
   copy when the motherbee holds none), so its readers read it from their first start. The join
   writes no `ai` into a spoke's hive.yaml.
 - **`/versions`:** each hive's snapshot has `config`: `file` (`absent`, `valid` or `invalid`),
-  `version`, `sha256` and, for an invalid one, `error`. The motherbee adds each copy's `state`
-  (`add_installation_state_to_answer`, `installation_spoke_state`): `current` with the
-  motherbee's file's hash, `behind` with another version it recorded, `pending` while the copy has
-  not arrived, `edited_by_hand` otherwise (an invalid file, or a hash no version was recorded
+  `version`, `sha256`, a valid copy's `ai` values and, for an invalid one, `error`; and `applied`,
+  the config update it applied last (below; null before its first). The motherbee adds each
+  copy's `state` (`add_installation_state_to_answer`, `installation_spoke_state`): `current` with
+  the motherbee's file's hash, `behind` with another version it recorded, `pending` while the copy
+  has not arrived, `edited_by_hand` otherwise (an invalid file, or a hash no version was recorded
   with). Its own `state` is `current` while its file's hash is its version's recorded one,
   `edited_by_hand` otherwise, and `pending` without a file, with `not_written` saying why.
-  `unknown` means the record cannot be read (`records_error`). A hive on an older orchestrator
-  has no `config`. The fleet's `comparison` does not include it.
-- **Not built yet (stage 3c):** the operator's change, through SY.admin, and the update with
-  category `config` that restarts the readers of what changed. Until then nothing writes a
-  version past 1, and a hand edit of the motherbee's file shows as `edited_by_hand`.
+  `unknown` means the record cannot be read (`records_error`). Its own `config` also lists
+  `versions`, every version it recorded with its `sha256`, `written_at_ms`, `source` and `ai`
+  (`installation_motherbee_section`). A hive on an older orchestrator has no `config`. The
+  fleet's `comparison` does not include it.
+
+**The operator's change** (stage 3c, [hive-config-update-v1](../hive-config-update-v1.md) §4, "As
+built (stage 3c)"). SY.admin's `set_installation_ai` sends two `SYSTEM_UPDATE`s with category
+`config`: the write to the motherbee's orchestrator, then the apply to every hive's.
+
+- **The write**, `{category: "config", write: {ai, expected_version, replace_hand_edit?}}`
+  (`is_installation_write`, `installation_write_answer`, `write_installation_operator_version`).
+  The `ai` is taken exactly (`ai_settings::parse_operator_ai`). One write at a time. It refuses,
+  writing nothing, with `error_code` and the reason:
+  - `NOT_PRIMARY` on a spoke; `JOIN_IN_PROGRESS` while an `add_hive` or a `remove_hive` holds its
+    hive's lock (`any_hive_topology_busy`): a join copies the file to its spoke;
+  - `INSTALLATION_NOT_WRITTEN` without a file: the start writes version 1 while it is the only
+    one recorded; a file missing after a later version is put back first;
+  - `INSTALLATION_EDITED_BY_HAND` for a file no reader can use, or a hash its version was not
+    recorded with, unless `replace_hand_edit` is true;
+  - `VERSION_CONFLICT` when `expected_version` is not its version: the file's, or the last one
+    recorded for a file no reader can use;
+  - `INVALID_AI_SETTINGS` (`InstallationFile::render` validates); `INSTALLATION_UNCHANGED` when the
+    current version holds these values (values compared, not bytes);
+  - `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE`, `INSTALLATION_WRITE_FAILED`.
+
+  The next version is one past the last recorded, or past the file's when a hand edit raised it.
+  It is recorded first in `installation-versions.json`, with `source: operator` and its `ai`
+  values, then written as version 1 is; a record whose file could not be written is taken back.
+  The answer is `{status: "ok", version, sha256, previous_version, previous_sha256}`. A version's
+  `ai` is its values (`ai_settings::ai_values`: a file without `ai` records the fallback engine
+  written out). Version 1 as stage 3b recorded it, without values, gets them from its file while
+  its hash is still the recorded one, at the start and at the first write.
+- **The apply**, `{category: "config", manifest_version, manifest_hash}`, on every hive
+  (`apply_config_update_local`, under the update lock):
+  - `sync_pending` until the hive's copy is that version with that hash
+    (`local_system_manifest_state`);
+  - it restarts only its start readers (`installation_start_readers`): `sy-cognition` and
+    `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker, none on an ingress or an
+    egress; and of those, only the ones its role runs that systemd has active, since one that does
+    not run reads the file at its next start;
+  - only when their engine changed (`config_update_plan`): the version's default provider with its
+    model (`ai_settings::engine_of`) against the one in
+    `/var/lib/fluxbee/orchestrator/config-applied.json`, the update this hive applied last
+    (`{version, sha256, applied_at_ms, ai, restarted}`). Without that record (a hive's first config
+    update, or one it cannot read) every start reader restarts; the same version and hash again
+    restarts nothing;
+  - each restart behind the core's 30 s health gate (`restart_core_service_with_health_gate`).
+    The record is written after the restarts, only when they all succeeded; otherwise the answer is
+    `error` with `RESTART_FAILED`, and running the update again restarts them again. A record that
+    cannot be written once they all restarted is `error` with `CONFIG_RECORD_FAILED`
+    (`config_update_error_code`): the readers run the version, and the next update restarts them.
+
+  The answer lists `restarted`, `unchanged` and `errors`. SY.admin and SY.architect are never
+  restarted: they take a new version at their next use, and ai.generic at its next request.
 
 ## Host posture
 
@@ -801,7 +858,7 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 | `/var/lib/fluxbee/hives/<hive>/info.yaml` | the hive registry (motherbee): role, address, status, join phase, Syncthing device |
 | `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json` | managed node config with `_system` |
 | `/var/lib/fluxbee/state/orchestrator/identity-node-ilk-map.json` | node → ILK and tenant, used on relaunch |
-| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, and on the motherbee `installation-versions.json` |
+| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `config-applied.json` (the config update applied last), `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, and on the motherbee `installation-versions.json` |
 | `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees, and `installation/installation.json` |
 | `/var/lib/fluxbee/tls/` | mesh CA (motherbee) and the hive's TLS leaf |
 | `/var/lib/fluxbee/ssh/motherbee.key` | the join key (motherbee) |
@@ -823,6 +880,10 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 - **The installation file cannot be written, or is not valid.** No error: the motherbee's start
   warns and `/versions` shows `config.not_written` or the copy's `state`; the orchestrator runs
   either way, and so do the readers, each failing only its AI work with the reason.
+- **A config update's reader does not restart.** The answer is `error` with `RESTART_FAILED` and
+  the reasons, the record of the update applied last is left as it was, and the same update run
+  again restarts the readers again. When they all restarted and the record cannot be written, the
+  answer is `error` with `CONFIG_RECORD_FAILED`.
 - **No database (motherbee).** If `sy-storage` is not active, or its database does not answer
   within 30 s, `finish_bootstrap` fails and the process exits; until then admin callers get
   `ORCHESTRATOR_BOOTING`.
@@ -838,8 +899,9 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 - `curl -s http://127.0.0.1:8080/hive/status` on the motherbee: `hive_id`, `pid`, `uptime_ms`
   of the motherbee's orchestrator.
 - `GET /hives`, `GET /hives/{hive}` (join status), `GET /versions` (core, runtime and vendor per
-  hive, with the last core update, `core.awaiting_update` and `vendor.awaiting_update`),
-  `GET /drift-alerts` on SY.admin.
+  hive, with the last core update, `core.awaiting_update` and `vendor.awaiting_update`, and each
+  hive's installation file with the config update it applied last), `GET /installation` (the
+  installation file's view), `GET /drift-alerts` on SY.admin.
 
 ## Links
 

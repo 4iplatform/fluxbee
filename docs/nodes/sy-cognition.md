@@ -35,7 +35,11 @@ Source: `src/bin/sy_cognition.rs` and `src/bin/sy_cognition/` (the two LLM calls
   reader can use, never a fallback to hive.yaml; or an invalid hive.yaml `ai` while the hive holds
   no file) never stop it: it logs the reason as an error and runs on, every turn's semantic work
   skipped with that reason, as without a key (`degraded_ai_settings_invalid`). A file that
-  arrives after it started is read at its next start.
+  arrives after it started is read at its next start. A new version of the file restarts it
+  through its hive's orchestrator (the update with category `config`) only when its engine, the
+  default provider with that provider's model, changed; another provider's model restarts nothing
+  ([hive-config-update-v1](../hive-config-update-v1.md) §4, "As built (stage 3c)";
+  [SY.orchestrator](sy-orchestrator.md#the-installation-file)).
 - Its AI key comes from SY.vault on the motherbee (`VaultClient::for_primary`): the resource type
   is the hive's provider (`openai` or `anthropic`) in the root tenant. It waits up to 60 s for
   the vault at start. Without a key it runs degraded and skips turns.
