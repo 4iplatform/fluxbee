@@ -463,7 +463,8 @@ The operator's change and the update with category `config`, built for 0.1.122; 
 
 ### As built (stage 4)
 
-Built for 0.1.123; its gates are next (§10). The machinery is SY.admin's
+Built for 0.1.123, with its review round's fixes (F1 to F12, below where each one changed the
+design); its gates are next (§10). The machinery is SY.admin's
 `src/bin/sy_admin/installation_update.rs`; the actions are wired in `src/bin/sy_admin.rs`.
 
 - **The target is what the motherbee holds now** (`target_of`, read from its `/versions`):
@@ -476,29 +477,49 @@ Built for 0.1.123; its gates are next (§10). The machinery is SY.admin's
 - **A hive is on the target** when both hold:
   - it runs that core, with its update settled and nothing open (`core_settle`, `ops.py`'s
     `update_open_items`): no restarts under way, the orchestrator the update installed settled
-    it, nothing `left_out`, no settle pending, no `awaiting_update`. The motherbee's core is always
-    on it;
+    it, no settle pending, no `awaiting_update`. When the update has a settle, the settle judges
+    it and `left_out` is not read (F4): a release that drops a node leaves it in `left_out`, which
+    the settle never rewrites. Without one, nothing `left_out`. The motherbee's core is always on
+    it;
   - its `config.applied` names the target's version and sha256.
 - **One update at a time, on disk:** `/var/lib/fluxbee/state/sy-admin/installation-update.json`,
   written atomically (a temporary file, then a rename, mode 0640), as `acme.json` is.
   - It holds the open update: `id`, `opened_at_ms`, `origin` (`http` for loopback, `executor` for
-    a confirmed plan, `set_installation_ai`), `reason`, `target`, and per hive `role`, `core` and
-    `config` (each `{state, reason, outcome, next}`) and `automatic`; the registry's hives whose
-    join did not finish, in `skipped`; and the last 20 closed updates, newest first (`done` or
-    `superseded`).
+    a confirmed plan, `set_installation_ai`), `reason`, `target`, `last_run_at_ms` (the last
+    explicit run's start, on the motherbee's clock), `stale_target`, and per hive `role`, `core` and
+    `config` (each `{state, reason, exclusion, outcome, next}`) and `automatic`; the registry's
+    hives whose join did not finish, in `skipped`; and the last 20 closed updates, newest first
+    (`done` or `superseded`).
+  - **Its states** (F2): `open`; `held`, open while the only hives off the target are those the
+    operator rolled back (their core excluded as `rolled_back`, their config on the target), A-5's
+    one allowed divergence, named in `held`; `done`; `superseded`. Anything else off the target
+    keeps it `open`: a copy edited by hand, a motherbee file that is not a recorded version, an
+    error, a pending hive, one that did not answer. A held hive moved by its per-hive `update` is
+    looked at at once, and the update closes `done`. **Why:** without `held`, an installation with
+    one hive rolled back on purpose would keep its update open forever, read again every so often.
+  - **A stale target** (F5): the motherbee may hold another target than the open update's (a
+    downgrade, a new file). Before the background task acts (the config after a followed core, the
+    automatic step), and at SY.admin's start, it compares them; while they differ the update
+    carries `stale_target` (said once in the log), is never `held` or `done`, and nothing acts on
+    it: the next explicit run supersedes it.
   - A run with the same target resumes the open update. A run with another target closes it as
     `superseded`, kept in the history, and opens a new one; a new update's hives start `unknown`.
   - With no update open and every hive already on the target, a run answers ok with
     `nothing_to_do` and records nothing, so the history keeps real updates.
-  - SY.admin's start picks an open update up from disk and looks at every hive again: a core
-    whose update answered stays in flight and is followed; an update a previous process sent with
-    no answer recorded is `not_answered`, which the automatic step finishes once. Every step is
-    idempotent: a core update that replaces nothing restarts nothing (A-190), and the same config
-    version again restarts nothing.
+  - SY.admin's start picks an open update up from disk and looks at every hive again: a category
+    in flight stays in flight and is followed, a core sent with no answer recorded included (F6:
+    it becomes `not_answered` only when its `/versions` never shows the update within the settle
+    bound); a config apply sent with no answer is sent again. Every step is idempotent: a core
+    update that replaces nothing restarts nothing (A-190), and the same config version again
+    restarts nothing.
   - A file that does not parse is moved aside (`installation-update.json.unreadable-<ms>`), and
     the state starts empty.
-- **The hives** are the motherbee and each one the registry calls connected
-  (`connected_hives_with`); the registry's others are named in `skipped`, as in stage 3c.
+- **The hives** are the motherbee and each one the registry calls connected (`registry_hives`);
+  the registry's others are named in `skipped`, as in stage 3c. A registry that cannot be read is
+  no list (F1): the explicit run refuses, `503 HIVE_REGISTRY_UNREADABLE`, and the background task
+  neither refreshes the update's hives nor closes it on that look (said once in the log). **Why:**
+  read as "the motherbee alone", one failed listing closed the open update as done. A registry
+  directory that does not exist yet (no hive ever added) is the motherbee alone.
 - **The decision per hive and category** (`decide`) is a pure function of the hive's `/versions`,
   the target, the run's kind (explicit or automatic) and `include_rolled_back`:
   - **Core**, when not on the target: `SYSTEM_UPDATE` category core with the target's hash.
@@ -527,10 +548,18 @@ Built for 0.1.123; its gates are next (§10). The machinery is SY.admin's
     one of them with a newer version is ahead. A hash it never recorded counts as behind, never as
     ahead; that takes a downgraded motherbee and a hive on a release SY.admin never targeted, both
     at once.
-- **`update_installation`, the explicit run** (`run_explicit`): the motherbee's `/versions` gives
-  the target; every hive is read once, at once; then the update is opened or resumed, and each
-  hive's pass runs in a task of its own (`run_hive`):
-  - it waits until the hive's orchestrator answers (60 s,
+- **`update_installation`, the explicit run** (`run_explicit`): one at a time (F8: a second, or a
+  `set_installation_ai`, answers `409 INSTALLATION_UPDATE_RUNNING` naming the running one, its
+  origin, since when and its update); the motherbee's `/versions` gives the target (F10: a
+  motherbee whose own core is rolled back runs a hash its dist's version does not name, so the run
+  refuses, `409 MOTHERBEE_ROLLED_BACK`: install a release on the motherbee first); every hive is
+  read once, at once; then the update is opened or resumed, and each hive's pass runs in a task of
+  its own (`run_hive`):
+  - a hive another task holds (F7): one that only reads it is waited for, within its read's bound;
+    one that acts on it (the follow applying its config, the automatic step) keeps it, and the hive
+    is recorded as left to that task, naming it and its update (this one or the superseded one),
+    with `next`: never skipped without a word;
+  - it waits until the hive's orchestrator answers (120 s from the run's start,
     `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`): right after an install the motherbee's router
     may not have the spokes back (0.1.56);
   - each update is asked again while `sync_pending` or unreachable, first after 0.5 s, then half
@@ -540,37 +569,64 @@ Built for 0.1.123; its gates are next (§10). The machinery is SY.admin's
     flight, and the background task follows it to its settle, then applies its config. **Why:**
     the call stays short (about 20 s on 8.x, as the deploy's core calls were), Archi's plan and
     `ops.py` read the progress from the record, and the follow survives a restart of SY.admin.
-  - The call waits for its tasks up to its ceiling, `admin_action_timeout` 390 s (30 for the
-    motherbee's read, 60 for an answer, then a core and a config update, each 90 and 60); a task
-    past it goes on, and its outcome lands in the record.
-  - Its answer: `ok` (200) when every hive is on the target and the update is done, `partial`
-    (202) while it stays open, with `pending` naming each hive not on the target and how it
-    stands; `{update, opening, superseded, include_rolled_back, message}`.
+  - a core update with no answer in time (F6) is followed the same way, since the hive may be
+    applying it: it is `not_answered` only when its `/versions` never shows the update within the
+    settle bound;
+  - a core that did not settle (F9), its record unchanged since, gets its core update again: it
+    installs what is pending.
+  - The call waits for its tasks up to its ceiling, `admin_action_timeout` 550 s (30 for the
+    motherbee's read; then 120 for an answer, two reads of 50, and a core and a config update, each
+    90 and 60); a task past it goes on, and its outcome lands in the record.
+  - Its answer: `ok` (200) when the update is done, or held (with `held` and a message naming the
+    hives the operator rolled back); `partial` (202) while it stays open, with `pending` naming each
+    hive not on the target and how it stands; `{update, opening, superseded, include_rolled_back,
+    message}`.
 - **Outcomes** per hive and category, each with its times (`started_at_ms`, `at_ms`, `elapsed_ms`;
   a core's `answered_ms`, `installed_ms`, `settled_ms`; a config's `restarted`): `ok`,
   `restarting`, `settled`, `sync_pending` at the bound, `error` with its code, `not_answered`
   (never "not applied", P-13), and `excluded` with its reason. A core watched past its bound
   (300 s, `JSR_ADMIN_INSTALLATION_SETTLE_TIMEOUT_SECS`) ends `CORE_NOT_SETTLED` (it runs the
-  target, something open) or `CORE_NOT_INSTALLED`; one whose health gate rolled it back,
-  `CORE_UPDATE_ROLLED_BACK`; a `/versions` silent past the bound, `not_answered`. Each `next` says
-  what moves it.
+  target, something open) or `CORE_NOT_INSTALLED`, and stays pending until its record changes
+  (F9: another update's start, or a new settle): its `next` says to run the update again or the
+  per-hive `update`, and nothing warns about it again in the meantime. One whose health gate rolled
+  it back is `CORE_UPDATE_ROLLED_BACK`; a `/versions` silent past the bound, `not_answered`. Each
+  `next` says what moves it; a hive that did not answer is promised the automatic step "unless it
+  leaves the hive alone" (rolled back, ahead, edited by hand).
 - **The background task** (`run_background`), in SY.admin, the motherbee only, while an update is
-  open:
+  open: it looks at each hive when its time comes, in a task of its own, and sleeps until the next
+  one is due (F2):
+  - **one read of a hive at a time, everywhere:** the explicit run, the follow, the re-read and the
+    automatic step share each hive's read, so at most one `GET_VERSIONS` of a hive is outstanding,
+    and the background task reads one hive at a time. **Why:** the reads go through the
+    motherbee's orchestrator, whose single admin worker forwards each within its own 45 s
+    (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), and whose queue keeps what SY.admin gave up. A read
+    waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), past that bound; one that timed out
+    anyway keeps the hive unread for another 50 s, so a second is never queued behind it;
   - a hive in flight is read every 3 s (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`) until it
-    settles; then its config goes, as part of the run that sent its core;
-  - a hive not on the target is read again about every 30 s
-    (`JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS`), with a 10 s read
-    (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`); its state is set as a run would decide it,
-    nothing is sent. So a hive the operator moves with a per-hive `update` counts, and the update
-    closes. An unreachable hive is read only once shared memory shows its orchestrator
-    (`connected_nodes_from_shm`): a cheap check, which asks no one;
+    settles; then its config goes, `by` the run that sent its core, or `by: background` for a core
+    the task found under way (F12);
+  - a hive that did not answer, or not read yet (`unknown`): a check of shared memory every 30 s
+    (`JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS`), which asks no one; it is read only once shared
+    memory shows its orchestrator (`connected_nodes_from_shm`), and read anyway when shared memory
+    cannot be read;
+  - a hive left as it is (excluded), in error, `sync_pending` at its bound, or pending: read every
+    10 min (`JSR_ADMIN_INSTALLATION_SLOW_CHECK_SECS`). A read sets its states as a run would decide
+    them, nothing sent: a hive the operator moves with a per-hive `update` counts, and the update
+    closes;
+  - **an immediate look,** which never blocks the action: a per-hive `update` or `core_rollback`
+    on a hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at
+    once; a read of `get_installation_update` or of `/versions` makes it look at each hive off the
+    target it has not looked at for 30 s;
   - **the automatic step** (§6): a hive whose outcome in this update was `not_answered`, and that
     answers again, gets the update finished, once per hive and target, by the same pass as an
-    explicit run's, core then config, with the same bounds. The attempt is recorded before it acts
-    (`automatic`, with its start, end and result), so a second never happens, a restart of SY.admin
-    included; its outcomes carry `by: automatic`. It never acts on an excluded hive: the decision
-    leaves those alone. An error, or `sync_pending` at its bound, is left for the operator with its
-    `next`;
+    explicit run's, core then config, with the same bounds. A core it finds under way is followed
+    instead, and the attempt is not spent on it (F6). The attempt is recorded before it acts
+    (`automatic`, with its start, end and result; the result says `followed` while what it started
+    is in flight, and lands with it), so a second never happens, a restart of SY.admin included;
+    its outcomes carry `by: automatic`. It never acts on an excluded hive: the decision leaves those
+    alone. An error, or `sync_pending` at its bound, is left for the operator with its `next`. Its
+    log says `deciding what it finishes`, then `decided` (each category's step and what it leaves
+    alone), then `ended its pass` with its result;
   - every outcome is one line of SY.admin's log, `installation update: outcome`, with the update's
     id, the hive, the category, the outcome and its duration (`ops.py timeline` takes the line).
 - **The reads go through the motherbee's orchestrator** (`get_versions` for one hive), which
@@ -582,18 +638,35 @@ Built for 0.1.123; its gates are next (§10). The machinery is SY.admin's
   history's 20 updates and the update, for three times 8.x's hives with every text at its
   longest (texts are cut at 400 characters), stay under 96 KiB, inside one mesh frame
   (128 KiB). `/versions` (`list_versions`, `get_versions`) and `get_installation` carry its
-  summary: id, state, target and each hive's state (§7).
-- **`set_installation_ai`** opens the update with the version it wrote as the target's file and the
-  motherbee's core as its core (superseding an open one: the target differs). Its pass is stage
-  3c's apply, each hive's outcome recorded; it reads no hive's core, so the background task reads
-  them. A hive that did not answer stays pending, and the automatic step finishes it when it
-  answers again: the gate "egress1 down across a config change, then back". Its answer is 3c's,
-  with `update: {id, state}`.
+  summary: id, state, target, `stale_target`, `held` and each hive's state (§7).
+- **`set_installation_ai`** is an explicit run too (one at a time), and opens the update with the
+  version it wrote as the target's file and the motherbee's core as its core, the reference: a hive
+  that comes back behind on its core gets its core too, once, by the automatic step, then the
+  version. The target differs from an open update's, so it supersedes it, and the new update
+  starts with every hive `unknown`: the background task reads each one again (the motherbee alone
+  is recorded on its core at once). Its pass is stage 3c's apply, each hive's outcome recorded. A
+  hive that did not answer stays pending, and the automatic step finishes it when it answers
+  again: the gate "egress1 down across a config change, then back". A hive that joins after the
+  change has applied no version: it gets it at the next explicit run, whose config update restarts
+  its readers once (the background task only reads it). When the registry cannot be read or the
+  motherbee's own core is rolled back, no update opens and the answer says why. Its answer is
+  3c's, with `update: {id, state}` (or `{id: null, not_opened}`).
 - **`ops.py deploy`** calls `POST /installation/update` with `{reason: "deploy <version>"}` once the
   motherbee is on the release and the spokes answer, from 0.1.123 on, and reads the update every 3
-  s until it is done, or until nothing moves a hive any more (900 s at most), printing each hive's
-  transitions as they happen: answered, installed, settled, config applied. A release before
-  0.1.123 keeps the core update per spoke: deploying 0.1.122 again, the rollback, needs it.
+  s until it is done or held, or until nothing moves a hive any more (900 s at most; a hive that did
+  not answer still moves, for its automatic step). It follows only this call's update (the one its
+  answer names; before the answer, one the call opened or resumed, never one left from before) and
+  prints each hive's transitions as this run's outcomes show them: answered, installed, settled,
+  config applied, or once "on target" for a hive it did not move; the times are this script's from
+  the call and SY.admin's own durations, never the two clocks compared (F11). A held update passes
+  with a warning naming the hives the operator rolled back. A release before 0.1.123 keeps the core
+  update per spoke: deploying 0.1.122 again, the rollback, needs it.
+- **Archi** follows an update its plan ran past the executor's answer (F3): every 10 s, up to
+  600 s, while its hives only move (a core in flight, its config after it, a hive not read yet). A
+  run is verified once the update is done or held (the held hives named, the operator's
+  divergence); a hive in error, without an answer, `sync_pending` at its bound or left as it is, a
+  stale target or a superseded update is not verified, each hive named with its `next`. Its wait
+  for each `update_installation` step is SY.admin's ceiling with a margin, 580 s.
 
 ## 7. `/versions`
 
@@ -696,10 +769,15 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
      different target supersedes, the same resumes, the history bounded); the automatic step
      against a fake mesh (once per hive and target, only for a hive that comes back after
      `not_answered`, never for an excluded one, its outcome recorded); the actions' wiring; and
-     `set_installation_ai` opening an update that keeps a silent hive pending.
+     `set_installation_ai` opening an update that keeps a silent hive pending. The review round
+     added one for each fix: a registry that cannot be read (no `done`, and a refusal), one read
+     of a hive at a time, the cadence, the immediate looks, `held`, a dropped node, a stale target,
+     a core update's `TIMEOUT` and a core found under way, a hive another task holds, one explicit
+     run at a time, a core that did not settle, and a rolled-back motherbee; Archi's verdict and
+     its follow; and `ops.py`'s deploy against a scripted SY.admin.
    - Gate: a deploy through it.
    - Gate: egress1 down across a config change, then back: finished once and reported.
-   - Gate: a rolled-back egress1 is left alone.
+   - Gate: a rolled-back egress1 is left alone, and the update is held.
    - Built for 0.1.123 (§6, "As built (stage 4)"); the gates are next.
 5. **A-181's blob members, and A-188.**
    - A-72's tests for both blob folders, and a removal without flags.

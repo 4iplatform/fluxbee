@@ -447,7 +447,11 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
 motherbee, SY.admin's installation update sends each hive its core update and then its config
 update, and follows each to its settle through `/versions`
 ([SY.admin](sy-admin.md#the-installations-update)); the per-hive `update` stays the operator's tool
-for one hive.
+for one hive. Those reads are this orchestrator's `get_versions` on the motherbee, which its admin
+worker forwards as `GET_VERSIONS`, one message at a time, within
+`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s): SY.admin keeps at most one read of a hive
+outstanding, waits 50 s for it (past that bound, so a read it gave up is not queued behind another),
+and paces them (a hive in flight every 3 s, one left as it is every 10 min).
 
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
   applies retention.

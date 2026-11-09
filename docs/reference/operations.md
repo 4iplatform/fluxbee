@@ -406,9 +406,12 @@ every VM, installs the version on the motherbee, waits for its core to report it
 spoke's orchestrator answers, then:
 
 - from 0.1.123, calls `POST /installation/update` with `{"reason": "deploy <version>"}` and reads
-  `GET /installation/update` every 3 s until the update is done, or until nothing moves a hive any
-  more (900 s at most), printing each hive's transitions as they happen (answered, installed,
-  settled, config applied) and each hive left out with what moves it;
+  `GET /installation/update` every 3 s until the update is done or held, or until nothing moves a
+  hive any more (900 s at most; a hive that did not answer still moves, for its automatic step). It
+  follows only this call's update, and prints each hive's transitions in this run as they happen
+  (answered, installed, settled, config applied, or once "on target" for a hive the run did not
+  move), with the seconds since the call and the record's own, and each hive left out with what
+  moves it. A held update passes with a warning naming the hives rolled back by the operator;
 - below 0.1.123 (deploying an older release again, the rollback), sends the core update to every
   spoke and waits until each spoke reports the motherbee's hash and settles;
 
@@ -431,24 +434,36 @@ On the motherbee:
    ```
 
    Each hive gets its core first (`SYSTEM_UPDATE` category core), then its config. It answers once
-   every core update answered: `ok` when every hive is on the target, `partial` (202) while the
-   update stays open, with `pending`. A core `restarting` is followed by SY.admin to its settle,
-   then its config goes. With every hive on the target and no update open, `nothing_to_do`.
+   every core update answered: `ok` when every hive is on the target, or when the update is held
+   (below); `partial` (202) while the update stays open, with `pending`. A core `restarting` is
+   followed by SY.admin to its settle, then its config goes. With every hive on the target and no
+   update open, `nothing_to_do`. It refuses, changing nothing: `409 INSTALLATION_UPDATE_RUNNING`
+   while another run (or `PUT /installation/ai`) is under way; `503 HIVE_REGISTRY_UNREADABLE` when
+   SY.admin cannot read `/var/lib/fluxbee/hives`; `409 MOTHERBEE_ROLLED_BACK` when the motherbee's
+   own core is rolled back (install a release on it first).
 2. **Read it**: `curl -s http://127.0.0.1:8080/installation/update` (add `?history=true` for the
-   closed ones). Each hive's `core` and `config` have a `state` (`on_target`, `pending`,
-   `in_flight`, `excluded`, `unknown`), the last `outcome` with its times, and `next`, what moves
-   it. `GET /versions` carries the summary (`installation_update`).
+   closed ones). Its `state` is `open`, `held`, `done` or `superseded`. Each hive's `core` and
+   `config` have a `state` (`on_target`, `pending`, `in_flight`, `excluded`, `unknown`), the last
+   `outcome` with its times, and `next`, what moves it. `GET /versions` carries the summary
+   (`installation_update`). A read makes SY.admin look again at the hives off the target it has not
+   looked at for 30 s.
 3. **What it leaves as it is**, with why: a hive rolled back with `core_rollback` keeps its core
    (its config still goes) unless the run names it, `{"include_rolled_back": ["egress1"]}`; a copy
    edited by hand gets no config (restore it first); a hive before 0.1.122 gets its core first.
-   `POST /hives/{hive}/update` moves any one hive.
-4. **Finishing it**: a hive that did not answer (`not_answered`) gets the update finished by
+   `POST /hives/{hive}/update` moves any one hive, and SY.admin looks at it at once.
+4. **Held**: when the only hives off the target are those rolled back with `core_rollback` (their
+   config on the target), the update is `held` and names them: the one allowed divergence. The
+   per-hive update that moves one back closes it `done`.
+5. **Finishing it**: a hive that did not answer (`not_answered`) gets the update finished by
    SY.admin, once, when it answers again (the automatic step), never a rolled-back hive, one ahead
    of the motherbee or one with a hand-edited copy. An error, or a copy that did not arrive in
    time, waits for you: fix what its `next` says, then run the update again (the same target
-   resumes the open update) or update that hive.
-5. **The installation's rollback**: install the previous release on the motherbee, then run the
-   update (a release before 0.1.123 has none: `ops.py deploy` sends the per-spoke core update).
+   resumes the open update) or update that hive. A core that did not settle stays pending until
+   its record changes: run the update again, which sends its core update again.
+6. **The installation's rollback**: install the previous release on the motherbee, then run the
+   update (a release before 0.1.123 has none: `ops.py deploy` sends the per-spoke core update). An
+   update left open for the other release says `stale_target`, and nothing acts on it until the
+   run replaces it.
 
 Every outcome is one line of SY.admin's journal, `installation update: outcome`, which
 `ops.py timeline` shows.

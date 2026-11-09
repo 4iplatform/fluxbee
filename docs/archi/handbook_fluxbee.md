@@ -1143,9 +1143,16 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
   the new version's (`get_installation`). The run is not verified until every hive applied it.
   `skipped` names each hive whose join did not finish: no change reaches it. Tell the operator:
   finish its join or remove it, then `update` it the same way.
-- **The change opens the installation's update** (§4.4.4) with the new version as its target:
-  `update` in the answer is its `{id, state}`. A hive that did not answer stays pending in it, and
-  SY.admin finishes it once by itself when the hive answers again.
+- **The change opens the installation's update** (§4.4.4) with the new version as its target's
+  file and the motherbee's core as its core: `update` in the answer is its `{id, state}`.
+  - A hive that did not answer stays pending in it, and SY.admin finishes it once by itself when
+    the hive answers again: its core too, when it comes back behind the motherbee's release.
+  - It replaces an open update (another target): the new one reads every hive again.
+  - A hive that joins after the change gets the version at the next `update_installation`, which
+    restarts its readers once.
+  - The change is refused while an update run is under way (`INSTALLATION_UPDATE_RUNNING`), and
+    when the registry cannot be read or the motherbee's own core is rolled back no update opens
+    (`update.not_opened` says why; the version is still applied).
 
 ### 4.4.4 The installation's update
 
@@ -1160,24 +1167,40 @@ every hive is on it.
   SY.admin's executor runs it as the operator. It is closed to the mesh: never send it as an
   `ADMIN_COMMAND` of your own, nor as SCMD.
   - Each hive gets its core first (its services restart onto the release), then its config.
-  - The answer comes once every core update answered: `ok` when every hive is on the target, done;
-    `partial` while the update stays open, with `pending` naming each hive not on it. A core that
-    answered `restarting` is normal: SY.admin follows it to its settle and then applies its config.
-  - The run is not verified until the update is done: read `get_installation_update` to follow it.
+  - The answer comes once every core update answered: `ok` when every hive is on the target
+    (`done`), or when the update is `held` (below); `partial` while the update stays open, with
+    `pending` naming each hive not on it. A core that answered `restarting` is normal: SY.admin
+    follows it to its settle and then applies its config.
+  - After the plan runs, its verification follows the update by itself, up to 10 minutes, while its
+    hives only move (a core restarting or settling, its config after it, a hive not read yet). The
+    run is verified once the update is `done` or `held`: tell the operator which hives a held
+    update leaves on the core they rolled back to. A hive in error, without an answer,
+    `sync_pending` at its bound or left as it is keeps the run unverified: name each one with its
+    `next`.
+  - One run at a time: a second is refused with `INSTALLATION_UPDATE_RUNNING`, naming the one under
+    way (wait for it; `get_installation_update` follows it). `HIVE_REGISTRY_UNREADABLE`: SY.admin
+    cannot read its registry of hives, and changed nothing; the operator checks it, then runs it
+    again. `MOTHERBEE_ROLLED_BACK`: the motherbee's own core is rolled back, so it names no release
+    to bring the hives to: the operator installs a release on the motherbee first.
 - **The installation's rollback:** the operator installs the previous release on the motherbee,
-  then runs the update. It moves every hive back to the motherbee's release.
+  then runs the update. It moves every hive back to the motherbee's release. An update left open
+  for another release says `stale_target`: nothing acts on it until the next run replaces it.
 - **Read it** with `get_installation_update` (`GET /installation/update`, a read; `history: true`
   adds the closed ones):
-  - `update`: the open update, or the last one closed: its `id`, `state` (`open`, `done`,
-    `superseded`), `target` (`core.version`, `config.version`), and `hives`;
-  - each hive's `core` and `config`: `state` (`on_target`, `pending`, `in_flight`, `excluded`,
-    `unknown`), `reason`, `outcome` (`status`: `ok`, `restarting`, `settled`, `sync_pending`,
-    `error` with its `error_code`, `not_answered`, `excluded`; `by`: `explicit` or `automatic`),
-    and `next`, what moves it;
+  - `update`: the open update, or the last one closed: its `id`, `state` (`open`; `held`, every
+    hive on the target but those the operator rolled back, named in `held`; `done`; `superseded`),
+    `target` (`core.version`, `config.version`), `stale_target`, and `hives`;
+  - each hive's `core` and `config`: `state` (`on_target`, `pending`, `in_flight`, `excluded` with
+    its `exclusion`, `unknown`), `reason`, `outcome` (`status`: `sent`, `ok`, `restarting`,
+    `settled`, `sync_pending`, `error` with its `error_code`, `not_answered`, `excluded`; `by`:
+    `explicit`, `automatic` or `background`), and `next`, what moves it;
   - `automatic`: the automatic step's one attempt on the hive, when it made one.
 
   `GET /versions` and `get_installation` carry its summary (`installation_update`, `update`).
   `not_answered` never means "not applied": the hive may hold the target already.
+- **A held update** is A-5's one allowed divergence: every hive is on the target but those the
+  operator rolled back (`core_rollback`), each with its config on the target. It needs nothing
+  from you: the operator's per-hive `update` that moves such a hive back closes it `done`.
 - **The exclusions**, each with its reason and the per-hive action that moves it, which only the
   operator decides:
   - **A hive the operator rolled back** (`core_rollback`): the update keeps its core as it is, the
@@ -1190,10 +1213,17 @@ every hive is on it.
     `target.config_note` says so. The operator restores it, or makes it a version (§4.4.3).
 - **The automatic step**, SY.admin's own while an update is open: a hive that did not answer
   (`not_answered`) and answers again gets the update finished, once per hive and target, core then
-  config, with the same waits. It never acts on a hive rolled back by the operator, one ahead of the
-  motherbee (on a newer release), or one with a copy edited by hand: each is recorded `excluded`. It
-  never tries a hive twice: an error, or a copy that did not arrive in time, is left for the
-  operator with its `next`. It opens nothing: only a run opens an update.
+  config, with the same waits. A core it finds already under way is only followed, and the step
+  stays for later. It never acts on a hive rolled back by the operator, one ahead of the motherbee
+  (on a newer release), or one with a copy edited by hand: each is recorded `excluded`. It never
+  tries a hive twice: an error, or a copy that did not arrive in time, is left for the operator
+  with its `next`. It opens nothing: only a run opens an update.
+- **What SY.admin reads by itself** while an update is open: a hive in flight every 3 s; a hive
+  that did not answer, only once it shows up connected again (checked every 30 s, without asking
+  it); a hive left as it is, or in error, every 10 minutes. The operator's per-hive `update` or
+  `core_rollback`, a join and a removal make it look at that hive at once, and so does your read
+  of `get_installation_update`. A core that did not settle stays pending until its record changes:
+  run the update again, or the per-hive `update`.
 
 ### 4.5 Secrets and vault (Model D')
 
