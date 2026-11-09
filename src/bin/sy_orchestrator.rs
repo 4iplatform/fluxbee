@@ -36887,6 +36887,7 @@ mod tests {
                             "fluxbee-blob",
                             "fluxbee-dist-agent-assets",
                             "fluxbee-dist-core-worker",
+                            "fluxbee-dist-installation",
                             "fluxbee-dist-policy",
                             "fluxbee-dist-runtimes",
                             "fluxbee-dist-vendor",
@@ -36894,11 +36895,13 @@ mod tests {
                         HiveRole::Ingress => &[
                             "fluxbee-blob-public",
                             "fluxbee-dist-core-ingress",
+                            "fluxbee-dist-installation",
                             "fluxbee-dist-policy",
                             "fluxbee-dist-vendor",
                         ],
                         _ => &[
                             "fluxbee-dist-core-egress",
+                            "fluxbee-dist-installation",
                             "fluxbee-dist-policy",
                             "fluxbee-dist-vendor",
                         ],
