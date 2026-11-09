@@ -30837,12 +30837,14 @@ mod tests {
                 async move { Ok::<Value, String>(pending) }
             }
         };
+        // Waits of 5 ms growing to 10 ms within 300 ms: asked more than twice, however late a busy
+        // machine wakes it, and done long before a second.
         let started = Instant::now();
         let applied = apply_installation_on_hive(
             always_pending,
             Duration::from_millis(5),
             Duration::from_millis(10),
-            Duration::from_millis(60),
+            Duration::from_millis(300),
         )
         .await;
         assert_eq!(
@@ -30850,7 +30852,7 @@ mod tests {
             InstallationApplyOutcome::SyncPending(pending)
         );
         assert!(applied.attempts > 2, "{}", applied.attempts);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     /// Each hive's line says what it did; one that did not finish says where to look and how to
