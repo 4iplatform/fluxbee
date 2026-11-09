@@ -150,7 +150,12 @@ outcome. Archi takes it as a run that ran, never as a failed plan
 the command log where each step's outcome is and the run's full log on the motherbee; the report
 carries the run's summary with no events and `answer_too_large`, so its verdict is never verified
 (`verify_execution_result`) and the plan teaches no cookbook. A plan that stopped at a step fails
-as before, naming that step.
+as before, naming that step. An `update_installation` step whose answer SY.admin cut to fit the
+frame (`output_truncated`: its hives cut or dropped) is never judged on that answer: its update
+is marked `answer_cut` (`executor_installation_updates`), counts as moving, and is read again with
+`get_installation_update` before the verdict, as an update still moving is
+(`follow_installation_updates_with`); a cut answer's `done` or `held` stands, its state kept
+whole.
 
 **What an agent can do**: the base tools every AI agent has ([agent-tools-v1](../agent-tools-v1.md)
 T4). Their catalog is first `GET /hives/motherbee/runtimes/ai.generic` → `get_runtime`, whose

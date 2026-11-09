@@ -23727,25 +23727,36 @@ fn wf_deploys_left_not_running(execution_report: &Value) -> Vec<String> {
 /// (`payload.events[*].result_preview`, SY.admin's answer), by step id: a step the executor ran
 /// again counts by its last run.
 fn executor_step_answers<'a>(execution_report: &'a Value, action: &str) -> Vec<&'a Value> {
+    executor_step_events(execution_report, action)
+        .into_iter()
+        .filter_map(|event| event.get("result_preview"))
+        .collect()
+}
+
+/// Each step of the run named `action` that ran, by its last event with an answer
+/// (`executor_step_answers`): the event says too whether SY.admin cut the answer to fit the mesh
+/// frame (`output_truncated`, FINDINGS A-198).
+fn executor_step_events<'a>(execution_report: &'a Value, action: &str) -> Vec<&'a Value> {
     let Some(events) = execution_report
         .pointer("/payload/events")
         .and_then(Value::as_array)
     else {
         return Vec::new();
     };
-    let mut answers: BTreeMap<&str, &Value> = BTreeMap::new();
+    let mut answered: BTreeMap<&str, &Value> = BTreeMap::new();
     for event in events {
         let field = |key: &str| event.get(key).and_then(Value::as_str);
         if field("step_action") == Some(action)
             && field("tool_name") == Some(action)
             && field("status").is_some_and(|status| status.eq_ignore_ascii_case("done"))
+            && event.get("result_preview").is_some()
         {
-            if let (Some(step), Some(answer)) = (field("step_id"), event.get("result_preview")) {
-                answers.insert(step, answer);
+            if let Some(step) = field("step_id") {
+                answered.insert(step, event);
             }
         }
     }
-    answers.into_values().collect()
+    answered.into_values().collect()
 }
 
 /// The hives a change of the installation's `ai` in the run has not reached yet
@@ -23843,6 +23854,13 @@ fn installation_update_standing(update: &Value) -> InstallationUpdateStanding {
                 .to_string(),
         ]);
     }
+    // An answer SY.admin cut to fit the mesh frame (FINDINGS A-198) shows no hive, or not all of
+    // them: the update is read again (`follow_installation_updates_with`), never judged on it.
+    if update.get("answer_cut").and_then(Value::as_bool) == Some(true) {
+        return InstallationUpdateStanding::Moving(vec![
+            "its hives (its answer was cut to fit the mesh frame)".to_string(),
+        ]);
+    }
     let state = |slot: &Value| {
         slot.get("state")
             .and_then(Value::as_str)
@@ -23912,14 +23930,20 @@ fn installation_update_standing(update: &Value) -> InstallationUpdateStanding {
 }
 
 /// The installation updates a run's `update_installation` steps opened or resumed, by id, with
-/// SY.admin's view of each in their answer.
+/// SY.admin's view of each in their answer. A view SY.admin cut to fit the mesh frame
+/// (`output_truncated`, FINDINGS A-198) is marked `answer_cut`, so it is read again before any
+/// verdict (`installation_update_standing`).
 fn executor_installation_updates(execution_report: &Value) -> Vec<(String, Value)> {
-    executor_step_answers(execution_report, "update_installation")
+    executor_step_events(execution_report, "update_installation")
         .into_iter()
-        .filter_map(|answer| {
-            let update = answer.pointer("/payload/update")?;
+        .filter_map(|event| {
+            let update = event.pointer("/result_preview/payload/update")?;
             let id = update.get("id").and_then(Value::as_str)?;
-            Some((id.to_string(), update.clone()))
+            let mut update = update.clone();
+            if event.get("output_truncated").and_then(Value::as_bool) == Some(true) {
+                update["answer_cut"] = json!(true);
+            }
+            Some((id.to_string(), update))
         })
         .collect()
 }
@@ -31447,6 +31471,53 @@ mod tests {
         follow_installation_updates_with(&mut report, Duration::from_secs(10), period, no_read)
             .await;
         assert_eq!(report, before);
+    }
+
+    /// FINDINGS A-198 on stage 4's follow: an update_installation answer SY.admin cut to fit the
+    /// mesh frame (its hives dropped, `output_truncated`) is never judged on: Archi reads the update
+    /// again, and the run is verified only on what that read shows.
+    #[tokio::test]
+    async fn an_installation_update_whose_answer_was_cut_is_read_again() {
+        let on = json!({ "state": "on_target" });
+        let cut = |state: &str| {
+            let mut run = update_run(
+                "partial",
+                json!({ "id": "upd-1731160000000", "state": state }),
+            );
+            run["payload"]["events"][0]["output_truncated"] = json!(true);
+            run["payload"]["events"][0]["output_bytes"] = json!(400_000);
+            run
+        };
+        // Judged on the cut answer alone it is not finished: no hive is known.
+        let verdict = verify_execution_result(&cut("open"));
+        assert!(!verdict.verified_success);
+        assert!(
+            verdict
+                .reason
+                .contains("its answer was cut to fit the mesh frame"),
+            "{}",
+            verdict.reason
+        );
+        // Followed, the fresh read decides.
+        let done = update_view(
+            "done",
+            json!({ "worker1": update_hive(on.clone(), on.clone()) }),
+        );
+        let mut report = cut("open");
+        follow_installation_updates_with(
+            &mut report,
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            || {
+                let done = done.clone();
+                async move { Some(json!({ "update": done, "open": false, "history": [] })) }
+            },
+        )
+        .await;
+        let verdict = verify_execution_result(&report);
+        assert!(verdict.verified_success, "{}", verdict.reason);
+        // A cut answer's done or held stands: its state is kept whole.
+        assert!(verify_execution_result(&cut("done")).verified_success);
     }
 
     /// Archi waits for SY.admin's ceiling of each change of the installation's `ai` in a plan, and

@@ -4191,8 +4191,10 @@ fn drop_executor_previews(envelope: &mut serde_json::Value) {
 
 /// What a step's output keeps once outputs are dropped: its status and error code, and of its
 /// payload the ids it names and the small fields Archi reads of a step's answer (a deploy's
-/// `wf_node` and `warning`, a change's `version` and `pending`, an installation update's `id` and
-/// `state`), each cut short.
+/// `wf_node` and `warning`, a change's `version` and `pending`, `nothing_to_do`, the hives an
+/// installation update holds, and of the update its `id`, `state`, `held`, `stale_target` and
+/// `superseded_by`, never its hives: Archi reads an update whose answer was cut again), each cut
+/// short.
 fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value {
     let mut kept = serde_json::Map::new();
     for key in ["status", "error_code"] {
@@ -4208,22 +4210,31 @@ fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value 
         if let Some(fields) = small.as_object_mut() {
             fields.remove("status");
             fields.remove("error_code");
-            for (key, max_bytes) in [("wf_node", 512), ("warning", 256), ("pending", 512)] {
+            for (key, max_bytes) in [
+                ("wf_node", 512),
+                ("warning", 256),
+                ("pending", 512),
+                ("held", 512),
+                ("nothing_to_do", 16),
+            ] {
                 if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
                     fields.insert(key.to_string(), mesh_reply::bounded_value(value, max_bytes));
                 }
             }
             if let Some(update) = payload.get("update").filter(|update| update.is_object()) {
-                let mut id = serde_json::Map::new();
-                for key in ["id", "state"] {
-                    if let Some(value) = update
-                        .get(key)
-                        .filter(|value| mesh_reply::is_outcome_value(value))
-                    {
-                        id.insert(key.to_string(), value.clone());
+                let mut view = serde_json::Map::new();
+                for (key, max_bytes) in [
+                    ("id", 256),
+                    ("state", 64),
+                    ("held", 512),
+                    ("stale_target", 256),
+                    ("superseded_by", 256),
+                ] {
+                    if let Some(value) = update.get(key).filter(|value| !value.is_null()) {
+                        view.insert(key.to_string(), mesh_reply::bounded_value(value, max_bytes));
                     }
                 }
-                fields.insert("update".to_string(), serde_json::Value::Object(id));
+                fields.insert("update".to_string(), serde_json::Value::Object(view));
             }
         }
         kept.insert("payload".to_string(), small);
@@ -25786,6 +25797,62 @@ mod tests {
         assert!(mesh_reply::oversized(&reply).is_none());
     }
 
+    /// FINDINGS A-198 on stage 4's answers: the installation update's refusals (a run under way,
+    /// with what it is) and its held answer go over the mesh through the reply guard as they are.
+    #[tokio::test]
+    async fn the_installation_update_s_answers_go_through_the_reply_guard() {
+        let (ctx, mut harness) = opa_test_admin("update-answers-guard");
+        let request = mesh_admin_request("get_installation_update", "SY.architect@motherbee");
+        let running = installation_update::Running {
+            origin: "executor".to_string(),
+            since_ms: 1,
+            update: Some("upd-1".to_string()),
+        };
+        let (status, body) = installation_update::run_under_way("update_installation", &running);
+        let refusal = parse_internal_response_envelope("update_installation", status, &body);
+        let held = json!({
+            "update": {
+                "id": "upd-1",
+                "state": "held",
+                "held": ["egress1"],
+                "hives": { "egress1": { "core": { "state": "excluded", "exclusion": "rolled_back" } } },
+            },
+            "open": true,
+        });
+        for (action, envelope) in [
+            ("update_installation", refusal),
+            (
+                "get_installation_update",
+                json!({ "status": "ok", "payload": held, "error_code": null, "error_detail": null }),
+            ),
+        ] {
+            send_admin_command_response(
+                &ctx.rpc,
+                &request,
+                action,
+                envelope["status"].as_str().expect("status"),
+                internal_response_payload_value(&envelope),
+                envelope["error_code"].as_str().map(str::to_string),
+                envelope
+                    .get("error_detail")
+                    .cloned()
+                    .filter(|detail| !detail.is_null()),
+                Some("req-1".to_string()),
+            )
+            .await
+            .expect("answered");
+            let reply = harness
+                .next_outgoing_within(Duration::from_secs(1))
+                .await
+                .expect("a reply");
+            assert_eq!(
+                reply.payload["error_code"], envelope["error_code"],
+                "{action}"
+            );
+            assert_eq!(reply.payload["payload"], envelope["payload"], "{action}");
+        }
+    }
+
     /// FINDINGS A-198: a read without pages names its HTTP route, but never to Fluxbee Cloud's
     /// relay, which reaches SY.admin only through IO.cloud: Cloud is told the pages, or that the
     /// answer has no smaller form.
@@ -26178,7 +26245,14 @@ mod tests {
             "status": "partial",
             "action": "update_installation",
             "payload": {
-                "update": { "id": "upd-1", "state": "open", "hives": { "w": { "detail": "x".repeat(5_000) } } },
+                "update": {
+                    "id": "upd-1",
+                    "state": "held",
+                    "held": ["egress1"],
+                    "stale_target": null,
+                    "hives": { "w": { "detail": "x".repeat(5_000) } },
+                },
+                "held": ["egress1"],
                 "pending": ["worker7"],
                 "version": 4,
                 "wf_node": { "status": "error", "node_name": "WF.a@motherbee", "error": "spawn failed" },
@@ -26188,10 +26262,12 @@ mod tests {
         });
         let kept = executor_result_essentials(&preview);
         assert_eq!(kept["status"], json!("partial"));
+        // Never the update's hives: Archi reads an update whose answer was cut again.
         assert_eq!(
             kept["payload"]["update"],
-            json!({ "id": "upd-1", "state": "open" })
+            json!({ "id": "upd-1", "state": "held", "held": ["egress1"] })
         );
+        assert_eq!(kept["payload"]["held"], json!(["egress1"]));
         assert_eq!(kept["payload"]["pending"], json!(["worker7"]));
         assert_eq!(kept["payload"]["version"], json!(4));
         assert_eq!(

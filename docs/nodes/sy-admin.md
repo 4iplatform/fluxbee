@@ -997,10 +997,11 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
      bytes is no use, and the next step follows.
   3. **The outputs dropped.** Every output and args goes; each event keeps its step, status, tool,
      error code and error text (cut to 256 bytes), and of its output its status, its error code,
-     its ids and the fields Archi reads (`wf_node`, `warning`, `pending`, `version`, an
-     installation update's `id` and `state`; `executor_result_essentials`). Its run id, time and
-     summary line go. If the answer still does not fit, each step keeps only its last event
-     (`collapse_executor_events`).
+     its ids and the fields Archi reads (`wf_node`, `warning`, `pending`, `version`, `held`,
+     `nothing_to_do`, and of an installation update its `id`, `state`, `held`, `stale_target` and
+     `superseded_by`, never its hives: Archi reads an update whose answer was cut again;
+     `executor_result_essentials`). Its run id, time and summary line go. If the answer still does
+     not fit, each step keeps only its last event (`collapse_executor_events`).
   4. **REPLY_TOO_LARGE.** An answer past all of it goes as `REPLY_TOO_LARGE`, with `action_ran`
      and an `outcome` that keeps the run's `execution_id`, `plan_status`, `completed_steps`,
      `total_steps`, `failed_step_id` and `log_path`.
