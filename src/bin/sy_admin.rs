@@ -332,6 +332,13 @@ struct AdminContext {
     /// file no reader can use, or hive.yaml's `ai` while the hive holds none
     /// (docs/hive-config-update-v1.md §4). The executor answers with it.
     executor_ai_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// The hive's installation file, under the dist its hive.yaml names: the executor takes a new
+    /// version at its next use (`executor_takes_new_installation_ai`, stage 3c).
+    installation_file: PathBuf,
+    /// The installation file the executor's runtime was built from.
+    executor_ai_built_from: Arc<ai_settings::InstallationBuiltFrom>,
+    /// One rebuild at a time when the executor takes a new installation file.
+    executor_ai_refresh: Arc<Mutex<()>>,
     /// Canonical admin dispatcher — reused by the executor's Vault
     /// hot-refresh path so refreshes flow through the same router
     /// connection as ordinary admin/system traffic.
@@ -722,6 +729,9 @@ async fn main() -> Result<(), AdminError> {
         executor_runtime,
         executor_configured,
         executor_ai_error: Arc::new(std::sync::Mutex::new(None)),
+        installation_file: ai_settings::installation_file(hive.dist.as_ref()),
+        executor_ai_built_from: Arc::new(ai_settings::InstallationBuiltFrom::default()),
+        executor_ai_refresh: Arc::new(Mutex::new(())),
         rpc: Arc::clone(&router_client),
         usage: UsageRecorder::start(Arc::clone(&router_client)),
         public_edge_node,
@@ -1845,6 +1855,9 @@ async fn refresh_admin_executor_ai_runtime(
     // A hive.yaml that cannot be read right now (`set_storage` rewriting it, say) leaves the
     // executor as it is, as before: only settings that were read and cannot be used take it down.
     let hive = load_hive(&ctx.config_dir).map_err(|err| format!("hive.yaml: {err}"))?;
+    // Stage 3c: the installation file this build reads, stamped before it reads it and recorded
+    // with the runtime it leaves (`executor_takes_new_installation_ai`).
+    let stamp = ai_settings::installation_file_stamp(&ctx.installation_file);
     let settings = hive_ai_settings(&hive);
     let engine = match settings {
         Ok((_, engine)) => {
@@ -1859,6 +1872,7 @@ async fn refresh_admin_executor_ai_runtime(
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.clone());
             ctx.executor_configured.store(false, Ordering::Relaxed);
             *ctx.executor_runtime.lock().await = None;
+            ctx.executor_ai_built_from.record(stamp);
             return Err(format!("the executor's ai settings cannot be used: {reason}").into());
         }
     };
@@ -1875,7 +1889,31 @@ async fn refresh_admin_executor_ai_runtime(
     ctx.executor_configured
         .store(runtime.is_some(), Ordering::Relaxed);
     *ctx.executor_runtime.lock().await = runtime;
+    ctx.executor_ai_built_from.record(stamp);
     Ok(ctx.executor_configured.load(Ordering::Relaxed))
+}
+
+/// Before each use of the executor (docs/hive-config-update-v1.md §4, stage 3c): no config update
+/// restarts SY.admin, which may be running the very action that wrote the new version, so the
+/// executor takes a new installation file at its next use. One small file read and hashed; the
+/// runtime is rebuilt, its key read once from the vault, only when the file changed, and the line
+/// says once where its `ai` comes from now.
+async fn executor_takes_new_installation_ai(ctx: &AdminContext) {
+    let _one_rebuild = ctx.executor_ai_refresh.lock().await;
+    if !ctx.executor_ai_built_from.changed(&ctx.installation_file) {
+        return;
+    }
+    match refresh_admin_executor_ai_runtime(ctx, VaultWait::Once).await {
+        Ok(configured) => tracing::info!(
+            source = %ai_settings::installation_file_label(&ctx.installation_file),
+            configured = configured,
+            "the installation file changed: the executor took it at its next use"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "the installation file changed, and the executor could not take it"
+        ),
+    }
 }
 
 /// The executor's key at boot, in a task of its own (FINDINGS A-141). On an upgrade the whole hive
@@ -3603,6 +3641,7 @@ async fn execute_admin_executor_plan(
 ) -> Result<serde_json::Value, AdminError> {
     let account = executor_usage_account(ctx, Some(&request.execution_id), caller, "executor");
     validate_executor_plan(&request.plan).map_err(|detail| -> AdminError { detail.into() })?;
+    executor_takes_new_installation_ai(ctx).await;
     let runtime = ctx
         .executor_runtime
         .lock()
@@ -4255,6 +4294,9 @@ enum InternalActionRoute {
     /// SY.admin's own view of the web door: the web hosts, the certificate's names, the routes
     /// the edge acknowledged and io.web (docs/io-web-v2.md §11.2).
     WebStatus,
+    /// SY.admin's view of the installation file and the operator's change of its `ai`
+    /// (docs/hive-config-update-v1.md §4, stage 3c).
+    Installation,
 }
 
 #[derive(Clone, Copy)]
@@ -4265,7 +4307,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "21";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "22";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4328,6 +4370,21 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         action: "get_versions",
         route: InternalActionRoute::Query("get_versions"),
         requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    // The installation file (docs/hive-config-update-v1.md §4, stage 3c): the motherbee's, its
+    // versions and every hive's copy; and the operator's change of its `ai`, written by the
+    // motherbee's orchestrator and applied on every hive (`handle_set_installation_ai`).
+    InternalActionSpec {
+        action: "get_installation",
+        route: InternalActionRoute::Installation,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "set_installation_ai",
+        route: InternalActionRoute::Installation,
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -5003,6 +5060,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         // Every node that follows a base runtime moves onto another build: the operator's word
         // (FINDINGS A-122).
         "reset_base_runtime" => MeshAccess::Nobody,
+        // Every hive's AI engine changes, and readers restart: the operator's word
+        // (docs/hive-config-update-v1.md §4, stage 3c).
+        "set_installation_ai" => MeshAccess::Nobody,
         // Off the catalog: the executor, which runs every step as the operator.
         "executor_validate_plan" | "executor_execute_plan" => MeshAccess::Archi,
         "hive_status"
@@ -5012,6 +5072,7 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "get_admin_action_help"
         | "list_versions"
         | "get_versions"
+        | "get_installation"
         | "list_runtimes"
         | "get_runtime"
         | "list_routes"
@@ -7471,6 +7532,7 @@ async fn dispatch_internal_admin_command(
                 Ok(plan) => plan,
                 Err(detail) => return Ok(internal_invalid_request(action, &detail)),
             };
+            executor_takes_new_installation_ai(ctx).await;
             let runtime = ctx.executor_runtime.lock().await.clone();
             if let Some(runtime) = runtime {
                 let account = executor_usage_account(ctx, None, caller_l2_name, "executor_review");
@@ -7736,6 +7798,23 @@ async fn dispatch_internal_admin_command(
         }
         // A read, so not in the audit log.
         InternalActionRoute::WebStatus => handle_web_status(ctx, client, &params).await,
+        // The change is the operator's, in the audit log; the read is not.
+        InternalActionRoute::Installation => {
+            let started = Instant::now();
+            let logged_params = admin_command_log_params(&params);
+            let (status, body) = match action {
+                "set_installation_ai" => handle_set_installation_ai(ctx, client, &params).await,
+                _ => handle_get_installation(ctx, client, &params).await,
+            };
+            if !admin_action_is_read_only(action) {
+                let result = Ok(InternalAdminDispatchResult {
+                    http_status: status,
+                    envelope: parse_internal_response_envelope(action, status, &body),
+                });
+                append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
+            }
+            (status, body)
+        }
     };
 
     Ok(InternalAdminDispatchResult {
@@ -9213,6 +9292,37 @@ async fn handle_http(
                 let (status, resp) = handle_admin_query(ctx, client, "list_versions", None).await?;
                 respond_json(stream, status, &resp).await?;
             }
+        }
+        // The installation file and the operator's change of its ai
+        // (docs/hive-config-update-v1.md §4, stage 3c).
+        ("GET", "/installation") => {
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "get_installation",
+                None,
+                serde_json::json!({}),
+                AdminOrigin::Http,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("PUT", "/installation/ai") => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "set_installation_ai",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/deployments") => {
             let hive = query.get("hive").cloned();
@@ -10984,9 +11094,18 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // was removed.
         | "NODE_ILK_MISMATCH"
         | "NODE_STILL_CONNECTED"
+        // set_installation_ai (docs/hive-config-update-v1.md §4): what the motherbee's file holds,
+        // or a node it would leave without an engine, refuses the change; nothing was written.
+        | "NOT_PRIMARY"
+        | "INSTALLATION_EDITED_BY_HAND"
+        | "INSTALLATION_UNCHANGED"
+        | "INSTALLATION_NOT_WRITTEN"
+        | "NODES_LEFT_WITHOUT_ENGINE"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
+        // An installation ai a reader cannot use (set_installation_ai).
+        | "INVALID_AI_SETTINGS"
         | "INVALID_PACKAGE_LAYOUT"
         | "UNSUPPORTED_APPLY_MODE"
         | "PACKAGE_PUBLISH_FAILED"
@@ -11025,7 +11144,13 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "TEARDOWN_INCOMPLETE"
         // SY.wf-rules made a definition current, and its WF node does not run it: the spawn or
         // the restart failed (`wf_node` in the payload says which).
-        | "WF_NODE_NOT_DEPLOYED" => 502,
+        | "WF_NODE_NOT_DEPLOYED"
+        // The motherbee's installation file or its record could not be read or written; a hive's
+        // readers took a config update whose record it could not write.
+        | "INSTALLATION_RECORDS_UNREADABLE"
+        | "INSTALLATION_UNREADABLE"
+        | "INSTALLATION_WRITE_FAILED"
+        | "CONFIG_RECORD_FAILED" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"
@@ -11033,6 +11158,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "VAULT_UNAVAILABLE"
         // The connected nodes cannot be read from shared memory: retry.
         | "INVENTORY_UNAVAILABLE"
+        // set_installation_ai could not read every hive's AI nodes for its check: retry once they
+        // answer.
+        | "HIVES_NOT_CHECKED"
         | "MASTER_KEY_NOT_AVAILABLE" => 503,
         _ => 500,
     }
@@ -12265,6 +12393,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::LlmUsage => ("llm_usage", None),
         InternalActionRoute::Acme => ("acme", None),
         InternalActionRoute::WebStatus => ("web_status", None),
+        InternalActionRoute::Installation => ("installation", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -12422,6 +12551,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "wf_rules_delete"
             | "wf_cancel_instance"
             | "cognition_clear"
+            | "set_installation_ai"
             | "acme_renew"
             | "acme_test"
             | "acme_reload"
@@ -12478,6 +12608,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "unpublish_artifact"
             // A hive's cognition forgets every conversation, and it cannot be undone.
             | "cognition_clear"
+            // Every hive's AI engine changes, and readers restart.
+            | "set_installation_ai"
     )
 }
 
@@ -12567,6 +12699,12 @@ fn admin_action_summary(action: &str) -> &'static str {
             "List core and runtime versions across hives, and each hive's installation file."
         }
         "get_versions" => "Read core and runtime versions for one hive, and its installation file.",
+        "get_installation" => {
+            "Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), every version recorded with its values, and each hive's copy with the config update it applied last."
+        }
+        "set_installation_ai" => {
+            "Change the installation's ai (the default provider and each provider's model) on every hive: the motherbee's orchestrator writes the next version of the installation file, and each hive restarts only the readers whose engine changed. Refuses a change that leaves a node unable to resolve its engine, and names it."
+        }
         "list_runtimes" => "List runtimes for one hive.",
         "get_runtime" => "Read one runtime definition in a hive: its versions, readiness, materialization, health and usage, and as tool_catalog the tool cards its version ships (ai.generic's base tools; null for a runtime that ships none).",
         "remove_runtime_version" => {
@@ -12812,6 +12950,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         ],
         "list_versions" => vec!["GET /versions"],
         "get_versions" => vec!["GET /hives/{hive}/versions"],
+        "get_installation" => vec!["GET /installation"],
+        "set_installation_ai" => vec!["PUT /installation/ai"],
         "list_runtimes" => vec!["GET /hives/{hive}/runtimes"],
         "get_runtime" => vec!["GET /hives/{hive}/runtimes/{runtime}"],
         "remove_runtime_version" => {
@@ -13182,6 +13322,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "vault_put"
             | "vault_rotate"
             | "update"
+            | "set_installation_ai"
             | "set_ilk_definition"
             | "create_tenant"
             | "update_tenant"
@@ -13321,8 +13462,20 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
         "update" => vec![admin_action_body_field(
             "manifest_hash",
             "string",
-            "Core/runtime/vendor manifest hash to apply.",
+            "Core/runtime/vendor manifest hash to apply; for category=config, the sha256 of the installation file's version (get_installation).",
         )],
+        "set_installation_ai" => vec![
+            admin_action_body_field(
+                "ai",
+                "object",
+                "The installation's new ai, whole: {\"default_provider\": \"openai|anthropic\", \"providers\": {\"<provider>\": {\"model\": \"<model>\"}}}. Every provider listed needs its model, the default provider among them; nothing else is taken. To change one model, send the current ai (get_installation) with that model changed.",
+            ),
+            admin_action_body_field(
+                "expected_version",
+                "u64",
+                "The version of the motherbee's installation file the change was decided on: get_installation's expected_version. A change made since then refuses this one (VERSION_CONFLICT).",
+            ),
+        ],
         "opa_compile_apply" | "opa_compile" | "opa_check" => vec![admin_action_body_field(
             "rego",
             "string",
@@ -13794,16 +13947,21 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional metadata context forwarded with the message.",
             ),
         ],
+        "set_installation_ai" => vec![admin_action_body_field(
+            "replace_hand_edit",
+            "bool",
+            "True only when get_installation shows the motherbee's file edited_by_hand and the operator chose to replace the hand edit with this change (false by default: a hand edit refuses every change).",
+        )],
         "update" => vec![
             admin_action_body_field(
                 "category",
-                "enum(runtime|core|vendor)",
-                "Update category. Defaults to runtime.",
+                "enum(runtime|core|vendor|config)",
+                "Update category. Defaults to runtime. config applies a version of the installation file on one hive (set_installation_ai applies it on every hive).",
             ),
             admin_action_body_field(
                 "manifest_version",
                 "u64",
-                "Expected manifest version. Defaults to 0.",
+                "Expected manifest version. Defaults to 0. For category=config, the installation file's version (get_installation).",
             ),
             admin_action_body_field(
                 "runtime",
@@ -14132,6 +14290,17 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "runtime": "ai.generic",
             "runtime_version": "0.1.2"
         }),
+        // 8.x's values, with OpenAI's model changed: the whole ai, as get_installation shows it.
+        "set_installation_ai" => serde_json::json!({
+            "ai": {
+                "default_provider": "anthropic",
+                "providers": {
+                    "openai": {"model": "gpt-5.5-mini"},
+                    "anthropic": {"model": "claude-sonnet-5-5"}
+                }
+            },
+            "expected_version": 1
+        }),
         "sync_hint" => serde_json::json!({
             "channel": "blob",
             "wait_for_idle": true,
@@ -14435,6 +14604,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "inventory" => "curl -X GET /inventory",
         "list_versions" => "curl -X GET /versions",
         "get_versions" => "curl -X GET /hives/motherbee/versions",
+        "get_installation" => "curl -X GET /installation",
+        "set_installation_ai" => {
+            r#"curl -X PUT /installation/ai -d '{"ai":{"default_provider":"anthropic","providers":{"openai":{"model":"gpt-5.5-mini"},"anthropic":{"model":"claude-sonnet-5-5"}}},"expected_version":1}'"#
+        }
         "list_runtimes" => "curl -X GET /hives/motherbee/runtimes",
         "get_runtime" => "curl -X GET /hives/motherbee/runtimes/ai.generic",
         "remove_runtime_version" => {
@@ -14870,11 +15043,26 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
             "For runtime-backed nodes, use the runtime the node was spawned from (get_node_config -> config._system.runtime): every AI.* node runs ai.generic, so AI.sales@motherbee -> runtimes.runtimes['ai.generic'].current.",
             "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> io.slack and WF.blob.consume.diag.x@y -> wf.blob.consume.diag when present.",
-            "config is the hive's copy of the installation file, which holds the installation's ai settings (docs/hive-config-update-v1.md §7): file (absent, valid or invalid), version, sha256, and state against the motherbee's file: current (its hash), behind (an older version the motherbee recorded), pending (not arrived yet) or edited_by_hand; unknown when the motherbee's record of its versions cannot be read. The motherbee's own config adds not_written when its start did not write the file, and why.",
+            "config is the hive's copy of the installation file, which holds the installation's ai settings (docs/hive-config-update-v1.md §7): file (absent, valid or invalid), version, sha256, a valid copy's ai values, applied (the config update the hive applied last: version, sha256, applied_at_ms, ai, restarted; null before its first), and state against the motherbee's file: current (its hash), behind (an older version the motherbee recorded), pending (not arrived yet) or edited_by_hand; unknown when the motherbee's record of its versions cannot be read. The motherbee's own config adds not_written when its start did not write the file, and why, and versions: every version it recorded with its sha256, written_at_ms, source and ai. get_installation shows the same as the installation's view.",
             "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
+        ],
+        "get_installation" => vec![
+            "The installation file holds the installation's ai: the default provider and each provider's model, the same on every hive (docs/hive-config-update-v1.md §4). Credentials are never in it: each provider's key is in SY.vault.",
+            "The answer, from the motherbee's GET /versions: motherbee {file, version, sha256, state, ai, not_written}, expected_version (the version a set_installation_ai names: the file's, or the last one recorded when the file is one no reader can use), versions (every version recorded: version, sha256, written_at_ms, source migration or operator, ai) and hives {<hive>: {state, version, sha256, applied}}.",
+            "state is the copy against the motherbee's file: current, behind (an older version), pending (not arrived yet), edited_by_hand (on the motherbee: a hash its version was not written with, or a file no reader can use) or unknown. applied is the config update the hive applied last: {version, sha256, applied_at_ms, ai, restarted}, null before its first.",
+            "To undo a change, set a previous version's ai (from versions) with set_installation_ai: it becomes the next version. A core rollback never touches the installation file.",
+        ],
+        "set_installation_ai" => vec![
+            "Confirm with the operator first: every hive's readers take the new ai, and the ones that take it at their start restart where their engine (the default provider and its model) changed. Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler as one step, and the executor runs it once the operator confirms.",
+            "Read get_installation first: ai is the whole new ai (send the current one with what changes), and expected_version its expected_version. A change made in between refuses this one with 409 VERSION_CONFLICT: read it again and decide again.",
+            "SY.admin checks first (A-11): when the change switches the default provider or drops a provider, it reads every AI node's config on the motherbee and the workers, and SY.architect's own config.ai.model. It refuses with 409 NODES_LEFT_WITHOUT_ENGINE, naming them, a change that leaves a node naming its model and not its provider on another provider (Archi's own model included), or a node naming its provider and not its model without that provider's model. Give such a node its provider and model (set_node_config), or remove Archi's own model, first. A hive it cannot read refuses with 503 HIVES_NOT_CHECKED, naming it.",
+            "The motherbee's orchestrator, the only writer, writes the next version, recorded with its values. It refuses, writing nothing: 409 JOIN_IN_PROGRESS while a hive joins or is removed; 409 INSTALLATION_EDITED_BY_HAND while the motherbee's file is edited by hand (restore it, or pass replace_hand_edit: true, the operator's choice, to make this change the next version over it); 409 INSTALLATION_UNCHANGED when its version holds these values already; 422 INVALID_AI_SETTINGS for values a reader cannot use (a provider listed without its model, the default provider not listed); 409 INSTALLATION_NOT_WRITTEN while the motherbee holds no file (its orchestrator's start writes version 1 from hive.yaml's ai: /versions config.not_written says why it did not).",
+            "Then every hive applies it, in parallel: the motherbee and each connected spoke get update with category config, retried while the hive's copy has not arrived (sync_pending), up to 90 s (JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS). Each restarts only its start readers whose engine changed: SY.cognition and SY.frontdesk.gov on the motherbee, SY.cognition on a worker, none on an ingress or an egress. ai.generic nodes take it at their next request; SY.admin's executor and Archi at their next use, never restarted (either may be running this very action).",
+            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms}}, node_check, timings_ms: {check, write, scan, apply, hives, total}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail) or not_answered: never read either as not applied. status is ok when every hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive.",
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
+            "category=config applies a version of the installation file on the hive (docs/hive-config-update-v1.md §4): manifest_version and manifest_hash from get_installation (its version and sha256). The hive answers sync_pending until its copy is that version, then restarts only its readers whose engine changed and answers restarted and unchanged; the same version again restarts nothing. set_installation_ai runs it on every hive; run it for one hive that did not finish.",
             "For category=runtime you may optionally scope the update with runtime + runtime_version.",
             "Scoped runtime update uses targeted readiness for that runtime/version and no longer blocks on unrelated missing runtimes in the same manifest.",
             "The response still includes global_runtime_health so operators can see overall runtime drift without turning it into a hard blocker for the targeted deploy.",
@@ -18761,12 +18949,15 @@ async fn handle_hive_update_command(
             .filter(|v| !v.is_empty())
             .map(|v| v.to_ascii_lowercase())
         {
-            Some(category) if matches!(category.as_str(), "runtime" | "core" | "vendor") => {
+            // config: a version of the installation file (docs/hive-config-update-v1.md §4).
+            Some(category)
+                if matches!(category.as_str(), "runtime" | "core" | "vendor" | "config") =>
+            {
                 category
             }
             _ => {
                 return Ok(invalid_request(
-                    "category must be one of runtime/core/vendor",
+                    "category must be one of runtime/core/vendor/config",
                 ))
             }
         },
@@ -18914,6 +19105,987 @@ async fn handle_hive_update_command(
             ))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The installation file (docs/hive-config-update-v1.md §4, stage 3c). `get_installation` is a view
+// of the motherbee's `/versions`; `set_installation_ai` is the operator's change of its `ai`:
+// SY.admin's check of the nodes (A-11), the write by the motherbee's orchestrator, the only writer,
+// and every hive's apply (SYSTEM_UPDATE category config), in parallel.
+// ---------------------------------------------------------------------------
+
+/// How long `set_installation_ai` keeps asking a hive whose copy has not arrived yet
+/// (`sync_pending`): `JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS`, 90 s by default.
+fn installation_apply_bound() -> Duration {
+    Duration::from_secs(env_timeout_secs("JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS").unwrap_or(90))
+}
+
+/// The wait before asking a hive again, at first, and the longest it grows to.
+const INSTALLATION_APPLY_FIRST_WAIT: Duration = Duration::from_secs(2);
+const INSTALLATION_APPLY_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// The Syncthing folder of the installation file, what the motherbee's scan of it may spend, and
+/// how long the change waits for that answer (a hint, never a gate), as a policy's write does.
+const INSTALLATION_SYNC_FOLDER: &str = "fluxbee-dist-installation";
+const INSTALLATION_SCAN_TIMEOUT_MS: u64 = 3_000;
+const INSTALLATION_SCAN_WAIT_SECS: u64 = 5;
+
+/// An orchestrator's answer to one admin read or write: `JSR_ADMIN_ORCH_TIMEOUT_SECS`, 30 s.
+fn admin_orchestrator_timeout() -> Duration {
+    Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30))
+}
+
+/// The envelope of an installation action's answer.
+fn installation_answer(
+    action: &str,
+    http_status: u16,
+    status: &str,
+    payload: serde_json::Value,
+    error: Option<(&str, String)>,
+) -> (u16, String) {
+    let (error_code, error_detail) = match error {
+        Some((code, detail)) => (serde_json::json!(code), serde_json::json!(detail)),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+    (
+        http_status,
+        serde_json::json!({
+            "status": status,
+            "action": action,
+            "payload": payload,
+            "error_code": error_code,
+            "error_detail": error_detail,
+        })
+        .to_string(),
+    )
+}
+
+/// A refusal or a failure, its HTTP status by its code.
+fn installation_refusal(
+    action: &str,
+    code: &str,
+    detail: String,
+    payload: serde_json::Value,
+) -> (u16, String) {
+    installation_answer(
+        action,
+        error_code_to_http_status(code),
+        "error",
+        payload,
+        Some((code, detail)),
+    )
+}
+
+/// The motherbee orchestrator's `/versions`: every hive's (`list_versions`) or its own
+/// (`get_versions`). The error is its code and why.
+async fn installation_versions(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+) -> Result<serde_json::Value, (String, String)> {
+    let hive = (action == "get_versions").then(|| ctx.hive_id.clone());
+    let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
+    let request = build_admin_request(ctx, action, payload, hive);
+    match send_admin_request(
+        client,
+        request,
+        admin_action_timeout(action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await
+    {
+        Ok(answer) if payload_is_ok(&answer) => Ok(answer),
+        Ok(answer) => Err((
+            payload_error_code(&answer).unwrap_or_else(|| "SERVICE_FAILED".to_string()),
+            payload_error_detail(&answer).unwrap_or_else(|| answer.to_string()),
+        )),
+        Err(err) => {
+            let detail = err.to_string();
+            Err((infer_transport_error_code(&detail).to_string(), detail))
+        }
+    }
+}
+
+/// The version a `set_installation_ai` names as `expected_version`, as the motherbee's orchestrator
+/// takes it: its file's, or the last one recorded when its file is one no reader can use; none
+/// while it holds no file. `own` is its `/versions`' `config`.
+fn installation_expected_version(own: &serde_json::Value) -> Option<u64> {
+    match own.get("file").and_then(serde_json::Value::as_str) {
+        Some("valid") => own.get("version").and_then(serde_json::Value::as_u64),
+        Some("invalid") => Some(
+            own.get("versions")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|record| record.get("version").and_then(serde_json::Value::as_u64))
+                .max()
+                .unwrap_or(0),
+        ),
+        _ => None,
+    }
+}
+
+/// What the motherbee's readers run on now, for A-11: its file's values, or for a file no reader
+/// can use the values of the last version recorded; None when neither is known.
+fn installation_current_values(own: &serde_json::Value) -> Option<HiveAiConfig> {
+    let values = |ai: &serde_json::Value| serde_json::from_value::<HiveAiConfig>(ai.clone()).ok();
+    if own.get("file").and_then(serde_json::Value::as_str) == Some("valid") {
+        return own.get("ai").and_then(values);
+    }
+    own.get("versions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .max_by_key(|record| record.get("version").and_then(serde_json::Value::as_u64))?
+        .get("ai")
+        .and_then(values)
+}
+
+/// `get_installation`'s answer, from the motherbee's `/versions` (`list_versions`): the motherbee's
+/// file, `expected_version`, every version recorded with its values, and each hive's copy with the
+/// config update it applied last. A hive whose `/versions` failed is `unknown`; one on an
+/// orchestrator older than the installation file reports no copy.
+fn installation_view(versions: &serde_json::Value, motherbee: &str) -> serde_json::Value {
+    let mut hives = serde_json::Map::new();
+    let mut own = serde_json::Value::Null;
+    for snapshot in versions
+        .get("hives")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(hive) = snapshot.get("hive_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let view = match snapshot.get("config") {
+            Some(config) => {
+                if hive == motherbee {
+                    own = config.clone();
+                }
+                let mut view = serde_json::json!({
+                    "state": config.get("state"),
+                    "version": config.get("version"),
+                    "sha256": config.get("sha256"),
+                    "applied": config.get("applied"),
+                });
+                if let Some(error) = config.get("error") {
+                    view["error"] = error.clone();
+                }
+                view
+            }
+            None if snapshot.get("status").and_then(serde_json::Value::as_str) == Some("error") => {
+                serde_json::json!({
+                    "state": "unknown",
+                    "error": snapshot.get("message"),
+                })
+            }
+            None => serde_json::json!({
+                "state": serde_json::Value::Null,
+                "note": "its orchestrator reports no installation file: a release before 0.1.121",
+            }),
+        };
+        hives.insert(hive.to_string(), view);
+    }
+    let mut motherbee_file = serde_json::Map::new();
+    for key in [
+        "file",
+        "version",
+        "sha256",
+        "state",
+        "ai",
+        "not_written",
+        "error",
+        "records_error",
+    ] {
+        if let Some(value) = own.get(key) {
+            motherbee_file.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::json!({
+        "motherbee": motherbee_file,
+        "expected_version": installation_expected_version(&own),
+        "versions": own.get("versions").cloned().unwrap_or(serde_json::Value::Null),
+        "hives": hives,
+    })
+}
+
+/// `get_installation`: a read, so not in the audit log. It takes no parameter.
+async fn handle_get_installation(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    params: &serde_json::Value,
+) -> (u16, String) {
+    let action = "get_installation";
+    if let Some(field) = unexpected_parameter(params) {
+        return installation_refusal(
+            action,
+            "INVALID_REQUEST",
+            format!("{action} takes no parameters (got {field})"),
+            serde_json::Value::Null,
+        );
+    }
+    match installation_versions(ctx, client, "list_versions").await {
+        Ok(versions) => installation_answer(
+            action,
+            200,
+            "ok",
+            installation_view(&versions, &ctx.hive_id),
+            None,
+        ),
+        Err((code, detail)) => installation_refusal(
+            action,
+            &code,
+            format!("the motherbee's /versions did not answer: {detail}"),
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+/// `set_installation_ai`'s body (`{ai, expected_version, replace_hand_edit?}`).
+#[derive(Debug, Clone, PartialEq)]
+struct InstallationAiChange {
+    ai: HiveAiConfig,
+    expected_version: u64,
+    replace_hand_edit: bool,
+}
+
+/// The body, the ai taken exactly (`ai_settings::parse_operator_ai`). A null field is an absent
+/// one: the executor sends null for an optional field a plan leaves out. The error is its code and
+/// why.
+fn parse_installation_ai_change(
+    params: &serde_json::Value,
+) -> Result<InstallationAiChange, (&'static str, String)> {
+    let invalid = |detail: &str| ("INVALID_REQUEST", detail.to_string());
+    let fields = params.as_object().ok_or_else(|| {
+        invalid("the body must be an object: {ai, expected_version, replace_hand_edit}")
+    })?;
+    if let Some(other) = fields.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "ai" | "expected_version" | "replace_hand_edit"
+        )
+    }) {
+        return Err((
+            "INVALID_REQUEST",
+            format!("set_installation_ai takes ai, expected_version and replace_hand_edit (got {other})"),
+        ));
+    }
+    let present = |key: &str| fields.get(key).filter(|value| !value.is_null());
+    let ai = ai_settings::parse_operator_ai(present("ai").unwrap_or(&serde_json::Value::Null))
+        .map_err(|reason| ("INVALID_AI_SETTINGS", reason))?;
+    let expected_version = present("expected_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            invalid(
+                "expected_version is required: get_installation's expected_version, the version \
+                 the change was decided on",
+            )
+        })?;
+    let replace_hand_edit = match present("replace_hand_edit") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid("replace_hand_edit must be true or false"))?,
+    };
+    Ok(InstallationAiChange {
+        ai,
+        expected_version,
+        replace_hand_edit,
+    })
+}
+
+/// One node's own AI settings, as A-11 reads them from its config: the provider and the model it
+/// names (`behavior.provider`, `behavior.model`; SY.architect's `ai.model`), each None when it
+/// leaves it to the installation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeAiNames {
+    node: String,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+/// Whether a change from `current` to `next` can leave a node without its engine: it switches the
+/// default provider, or it drops a provider (A-11). Another model of a provider never does.
+fn ai_change_needs_node_check(current: &HiveAiConfig, next: &HiveAiConfig) -> bool {
+    let listed = ai_settings::providers_with_a_model(Some(next));
+    current.default_provider != next.default_provider
+        || ai_settings::providers_with_a_model(Some(current))
+            .iter()
+            .any(|provider| !listed.contains(provider))
+}
+
+/// Design A-11 (docs/hive-config-update-v1.md §4): the nodes a change of the installation's `ai`
+/// from `current` to `next` leaves unable to resolve their engine, each with why.
+/// - A node that names its model and not its provider runs that model on the default provider:
+///   switching the default sends it to another provider, which does not have it.
+/// - A node that names its provider and not its model runs that provider's model in the
+///   installation's `ai`: dropping the provider leaves it with none.
+///
+/// A node that names both, or neither, never depends on the change; one whose provider names no
+/// provider fails already, and the change does not make it worse.
+fn nodes_left_without_an_engine(
+    current: &HiveAiConfig,
+    next: &HiveAiConfig,
+    nodes: &[NodeAiNames],
+) -> Vec<(String, String)> {
+    let kept = ai_settings::providers_with_a_model(Some(next));
+    let dropped: Vec<AiProvider> = ai_settings::providers_with_a_model(Some(current))
+        .into_iter()
+        .filter(|provider| !kept.contains(provider))
+        .collect();
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let named = node
+                .provider
+                .as_deref()
+                .map(|provider| provider.parse::<AiProvider>());
+            let why = match (named, node.model.as_deref()) {
+                (None, Some(model)) if current.default_provider != next.default_provider => {
+                    format!(
+                        "it names its model ({model}) and leaves its provider to the installation: \
+                         the default provider moves from {} to {}",
+                        current.default_provider, next.default_provider
+                    )
+                }
+                (Some(Ok(provider)), None) if dropped.contains(&provider) => format!(
+                    "it names its provider ({provider}) and leaves its model to the installation, \
+                     which no longer lists ai.providers.{provider}"
+                ),
+                _ => return None,
+            };
+            Some((node.node.clone(), why))
+        })
+        .collect()
+}
+
+/// A-11's hives: the motherbee and each connected worker, where the runtimes, and so the AI nodes,
+/// run (an ingress or an egress receives no runtime).
+fn installation_node_check_hives(self_hive: &str, registry: &HiveRegistry) -> Vec<String> {
+    let mut hives = vec![self_hive.to_string()];
+    for entry in registry.entries().unwrap_or_default() {
+        let worker = entry
+            .field("role")
+            .is_some_and(|role| role.trim().eq_ignore_ascii_case("worker"));
+        if entry.field("status") != Some("connected") || !worker {
+            continue;
+        }
+        if let Some(hive) = entry
+            .field("hive_id")
+            .map(str::trim)
+            .filter(|hive| !hive.is_empty())
+        {
+            if !hives.iter().any(|known| known == hive) {
+                hives.push(hive.to_string());
+            }
+        }
+    }
+    hives.sort();
+    hives
+}
+
+/// What the node check read: every node's own AI settings, and the hives (or nodes) it could not
+/// read, each with why.
+#[derive(Debug, Default)]
+struct NodeAiScan {
+    hives: Vec<String>,
+    nodes: Vec<NodeAiNames>,
+    unchecked: Vec<(String, String)>,
+}
+
+/// One admin read through the motherbee's orchestrator, its payload or why it failed.
+async fn installation_admin_read(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: &str,
+) -> Result<serde_json::Value, String> {
+    let payload = normalize_admin_payload(action, payload, Some(hive));
+    let request = build_admin_request(ctx, action, payload, Some(hive.to_string()));
+    send_admin_request(
+        client,
+        request,
+        admin_action_timeout(action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await
+    .map_err(|err| err.to_string())
+}
+
+/// The AI nodes of one hive and what each names of its own (`behavior.provider`, `behavior.model`),
+/// read through the existing admin paths: its managed nodes (`list_nodes`), then each AI node's
+/// config (`get_node_config`). A node without a config names nothing. The first read that fails
+/// stops the hive: it cannot be checked.
+async fn read_hive_node_ai_names(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    hive: &str,
+) -> Result<Vec<NodeAiNames>, String> {
+    let listed = installation_admin_read(
+        ctx,
+        client,
+        "list_nodes",
+        serde_json::json!({ "managed": true }),
+        hive,
+    )
+    .await?;
+    if !payload_is_ok(&listed) {
+        return Err(payload_error_detail(&listed).unwrap_or_else(|| listed.to_string()));
+    }
+    let names: Vec<String> = listed
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("node_name").and_then(serde_json::Value::as_str))
+        .filter(|name| name.starts_with("AI."))
+        .map(str::to_string)
+        .collect();
+    let mut found = Vec::new();
+    for node in names {
+        let answer = installation_admin_read(
+            ctx,
+            client,
+            "get_node_config",
+            serde_json::json!({ "node_name": node }),
+            hive,
+        )
+        .await
+        .map_err(|err| format!("{node}: {err}"))?;
+        if payload_error_code(&answer).as_deref() == Some("NODE_CONFIG_NOT_FOUND") {
+            continue;
+        }
+        if !payload_is_ok(&answer) {
+            return Err(format!(
+                "{node}: {}",
+                payload_error_detail(&answer).unwrap_or_else(|| answer.to_string())
+            ));
+        }
+        let behavior = answer.pointer("/config/behavior");
+        found.push(NodeAiNames {
+            node,
+            provider: node_names_text(behavior, "provider"),
+            model: node_names_text(behavior, "model"),
+        });
+    }
+    Ok(found)
+}
+
+/// A name a node's config gives, trimmed: None when it gives none.
+fn node_names_text(section: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    section
+        .and_then(|section| section.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// SY.architect's own model (`config.ai.model`): a model with no provider, Archi's provider being
+/// the installation's default. A node without a config names nothing.
+async fn read_architect_ai_names(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+) -> Result<Option<NodeAiNames>, String> {
+    let node = format!("SY.architect@{}", ctx.hive_id);
+    let answer = installation_admin_read(
+        ctx,
+        client,
+        "get_node_config",
+        serde_json::json!({ "node_name": node }),
+        &ctx.hive_id,
+    )
+    .await?;
+    if payload_error_code(&answer).as_deref() == Some("NODE_CONFIG_NOT_FOUND") {
+        return Ok(None);
+    }
+    if !payload_is_ok(&answer) {
+        return Err(payload_error_detail(&answer).unwrap_or_else(|| answer.to_string()));
+    }
+    Ok(Some(NodeAiNames {
+        node,
+        provider: None,
+        model: node_names_text(answer.pointer("/config/ai"), "model"),
+    }))
+}
+
+/// A-11's read: the AI nodes of the motherbee and of every connected worker, each hive at once, and
+/// SY.architect's own model.
+async fn scan_node_ai_names(ctx: &AdminContext, client: &RouterDispatcher) -> NodeAiScan {
+    let hives = installation_node_check_hives(&ctx.hive_id, &hive_registry(ctx));
+    let (per_hive, architect) = tokio::join!(
+        futures::future::join_all(
+            hives
+                .iter()
+                .map(|hive| read_hive_node_ai_names(ctx, client, hive))
+        ),
+        read_architect_ai_names(ctx, client),
+    );
+    let mut scan = NodeAiScan {
+        hives: hives.clone(),
+        ..NodeAiScan::default()
+    };
+    for (hive, read) in hives.into_iter().zip(per_hive) {
+        match read {
+            Ok(nodes) => scan.nodes.extend(nodes),
+            Err(why) => scan.unchecked.push((hive, why)),
+        }
+    }
+    match architect {
+        Ok(Some(names)) => scan.nodes.push(names),
+        Ok(None) => {}
+        Err(why) => scan
+            .unchecked
+            .push((format!("SY.architect@{}", ctx.hive_id), why)),
+    }
+    scan
+}
+
+/// One hive's outcome of a config update (`set_installation_ai`). Never "not applied" (P-13): a
+/// hive that did not answer may hold the version already.
+#[derive(Debug, Clone, PartialEq)]
+enum InstallationApplyOutcome {
+    /// It applied it: its answer, with what it restarted.
+    Ok(serde_json::Value),
+    /// Its copy had not arrived at the bound: its last answer.
+    SyncPending(serde_json::Value),
+    /// It refused the update or failed it.
+    Error {
+        code: String,
+        detail: String,
+        answer: serde_json::Value,
+    },
+    /// No answer came, or none in time.
+    NotAnswered(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InstallationApplied {
+    outcome: InstallationApplyOutcome,
+    attempts: u32,
+}
+
+/// Asks one hive to apply a version (`send`) until it answers other than `sync_pending`, waiting
+/// `first_wait`, then half again as long each time up to `max_wait`, between asks, for at most
+/// `bound`. A failure to reach it is asked again within the bound; a timeout ends the asking, since
+/// the hive may still be applying it.
+async fn apply_installation_on_hive<F, Fut>(
+    mut send: F,
+    first_wait: Duration,
+    max_wait: Duration,
+    bound: Duration,
+) -> InstallationApplied
+where
+    F: FnMut() -> Fut,
+    Fut: future::Future<Output = Result<serde_json::Value, String>>,
+{
+    let deadline = time::Instant::now() + bound;
+    let mut wait = first_wait;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let outcome = match send().await {
+            Ok(answer) => match answer.get("status").and_then(serde_json::Value::as_str) {
+                Some("ok") => {
+                    return InstallationApplied {
+                        outcome: InstallationApplyOutcome::Ok(answer),
+                        attempts,
+                    }
+                }
+                Some("sync_pending") => InstallationApplyOutcome::SyncPending(answer),
+                _ => {
+                    return InstallationApplied {
+                        outcome: InstallationApplyOutcome::Error {
+                            code: payload_error_code(&answer)
+                                .unwrap_or_else(|| "SERVICE_FAILED".to_string()),
+                            detail: payload_error_detail(&answer)
+                                .unwrap_or_else(|| answer.to_string()),
+                            answer,
+                        },
+                        attempts,
+                    }
+                }
+            },
+            Err(detail) if infer_transport_error_code(&detail) == "TIMEOUT" => {
+                return InstallationApplied {
+                    outcome: InstallationApplyOutcome::NotAnswered(detail),
+                    attempts,
+                }
+            }
+            Err(detail) => InstallationApplyOutcome::NotAnswered(detail),
+        };
+        if time::Instant::now() + wait > deadline {
+            return InstallationApplied { outcome, attempts };
+        }
+        time::sleep(wait).await;
+        wait = (wait * 3 / 2).min(max_wait);
+    }
+}
+
+/// One hive's apply of version `version` (`sha256`): SYSTEM_UPDATE category config to its
+/// orchestrator, asked again while it is `sync_pending` (`apply_installation_on_hive`), and ended at
+/// `within` whatever it does. With how long it took.
+async fn apply_installation_version(
+    client: &RouterDispatcher,
+    hive: &str,
+    version: u64,
+    sha256: &str,
+    within: Duration,
+) -> (InstallationApplied, Duration) {
+    let started = Instant::now();
+    let target = format!("SY.orchestrator@{hive}");
+    let payload = serde_json::json!({
+        "category": "config",
+        "manifest_version": version,
+        "manifest_hash": sha256,
+    });
+    let (target, payload) = (&target, &payload);
+    let asked = apply_installation_on_hive(
+        move || async move {
+            send_system_request(
+                client,
+                target,
+                "SYSTEM_UPDATE",
+                "SYSTEM_UPDATE_RESPONSE",
+                payload.clone(),
+                admin_action_timeout("update"),
+            )
+            .await
+            .map_err(|err| err.to_string())
+        },
+        INSTALLATION_APPLY_FIRST_WAIT,
+        INSTALLATION_APPLY_MAX_WAIT,
+        installation_apply_bound(),
+    );
+    let applied = time::timeout(within, asked)
+        .await
+        .unwrap_or_else(|_| InstallationApplied {
+            outcome: InstallationApplyOutcome::NotAnswered(format!(
+                "no final answer within the change's {} s",
+                within.as_secs()
+            )),
+            attempts: 0,
+        });
+    (applied, started.elapsed())
+}
+
+/// One hive's line of `set_installation_ai`'s answer, with where to look and how to finish it when
+/// it is not ok.
+fn installation_hive_json(
+    hive: &str,
+    applied: &InstallationApplied,
+    elapsed: Duration,
+    version: u64,
+    sha256: &str,
+) -> serde_json::Value {
+    let next = format!(
+        "GET /versions shows its copy; POST /hives/{hive}/update with {{\"category\": \"config\", \
+         \"manifest_version\": {version}, \"manifest_hash\": \"{sha256}\"}} finishes it"
+    );
+    let mut line = match &applied.outcome {
+        InstallationApplyOutcome::Ok(answer) => serde_json::json!({
+            "status": "ok",
+            "restarted": answer.get("restarted").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "unchanged": answer.get("unchanged").cloned().unwrap_or_else(|| serde_json::json!([])),
+        }),
+        InstallationApplyOutcome::SyncPending(answer) => serde_json::json!({
+            "status": "sync_pending",
+            "local_version": answer.get("local_manifest_version"),
+            "local_sha256": answer.get("local_manifest_hash"),
+            "next": next,
+        }),
+        InstallationApplyOutcome::Error { code, detail, .. } => serde_json::json!({
+            "status": "error",
+            "error_code": code,
+            "error_detail": detail,
+            "next": next,
+        }),
+        InstallationApplyOutcome::NotAnswered(detail) => serde_json::json!({
+            "status": "not_answered",
+            "detail": detail,
+            "next": next,
+        }),
+    };
+    line["attempts"] = serde_json::json!(applied.attempts);
+    line["elapsed_ms"] = serde_json::json!(elapsed.as_millis() as u64);
+    line
+}
+
+/// The motherbee's Syncthing scans the installation folder at once, not when its watcher gets to the
+/// rename: the spokes get the new version a scan sooner. Best effort and bounded, as a policy's
+/// write does (`scan_published_opa_policy`).
+async fn scan_installation_folder(client: &RouterDispatcher) {
+    let request = serde_json::json!({
+        "channel": "dist",
+        "folder_id": INSTALLATION_SYNC_FOLDER,
+        "wait_for_idle": true,
+        "timeout_ms": INSTALLATION_SCAN_TIMEOUT_MS,
+    });
+    match send_system_request(
+        client,
+        &format!("SY.orchestrator@{PRIMARY_HIVE_ID}"),
+        "SYSTEM_SYNC_HINT",
+        "SYSTEM_SYNC_HINT_RESPONSE",
+        request,
+        Duration::from_secs(INSTALLATION_SCAN_WAIT_SECS),
+    )
+    .await
+    {
+        Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            tracing::info!("installation: the new version scanned on the motherbee")
+        }
+        Ok(payload) => tracing::warn!(
+            payload = %payload,
+            "installation: the scan of the new version did not complete; the hives get it on the \
+             next scan"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "installation: no answer to the scan of the new version; the hives get it on the next \
+             scan"
+        ),
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
+/// `set_installation_ai` (docs/hive-config-update-v1.md §4, stage 3c), the operator's alone:
+/// 1. A-11, when the change switches the default provider or drops a provider: every AI node of the
+///    motherbee and the workers, and SY.architect's own model, must still resolve its engine.
+/// 2. The motherbee's orchestrator writes the next version (SYSTEM_UPDATE category config with a
+///    `write`); its refusals pass through with their codes. Then its Syncthing scans the folder.
+/// 3. Every hive applies it at once (SYSTEM_UPDATE category config), each asked again while
+///    `sync_pending`, up to the bound, and each restarting only its readers whose engine changed.
+///
+/// `ok` when every hive is ok; else `partial`, the version written, naming the hives. No config
+/// update restarts SY.admin or SY.architect: either takes the new version at its next use.
+async fn handle_set_installation_ai(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    params: &serde_json::Value,
+) -> (u16, String) {
+    let action = "set_installation_ai";
+    let started = Instant::now();
+    let change = match parse_installation_ai_change(params) {
+        Ok(change) => change,
+        Err((code, detail)) => {
+            return installation_refusal(action, code, detail, serde_json::Value::Null)
+        }
+    };
+
+    // 1. A-11, against what the motherbee's file holds now.
+    let check_started = Instant::now();
+    let own = match installation_versions(ctx, client, "get_versions").await {
+        Ok(answer) => answer
+            .pointer("/hive/config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        Err((code, detail)) => {
+            return installation_refusal(
+                action,
+                &code,
+                format!(
+                    "the motherbee's orchestrator did not give its installation file ({detail}): \
+                     nothing was written"
+                ),
+                serde_json::Value::Null,
+            )
+        }
+    };
+    let node_check = match installation_current_values(&own) {
+        Some(current) if ai_change_needs_node_check(&current, &change.ai) => {
+            let scan = scan_node_ai_names(ctx, client).await;
+            let left = nodes_left_without_an_engine(&current, &change.ai, &scan.nodes);
+            let unchecked: Vec<serde_json::Value> = scan
+                .unchecked
+                .iter()
+                .map(|(what, why)| serde_json::json!({ "hive": what, "why": why }))
+                .collect();
+            if !left.is_empty() {
+                let named: Vec<String> = left
+                    .iter()
+                    .map(|(node, why)| format!("{node}: {why}"))
+                    .collect();
+                return installation_refusal(
+                    action,
+                    "NODES_LEFT_WITHOUT_ENGINE",
+                    format!(
+                        "this change leaves nodes unable to resolve their engine, and nothing was \
+                         written. {}. Give each node its provider and model first (set_node_config, \
+                         behavior.provider and behavior.model), or remove SY.architect's own \
+                         config.ai.model",
+                        named.join("; ")
+                    ),
+                    serde_json::json!({
+                        "nodes": left
+                            .iter()
+                            .map(|(node, why)| serde_json::json!({ "node": node, "why": why }))
+                            .collect::<Vec<_>>(),
+                        "unchecked": unchecked,
+                    }),
+                );
+            }
+            if !unchecked.is_empty() {
+                let named: Vec<String> = scan
+                    .unchecked
+                    .iter()
+                    .map(|(what, why)| format!("{what} ({why})"))
+                    .collect();
+                return installation_refusal(
+                    action,
+                    "HIVES_NOT_CHECKED",
+                    format!(
+                        "this change switches the default provider or drops a provider, and the AI \
+                         nodes of {} could not be read to check that each still resolves its \
+                         engine: nothing was written; retry once they answer",
+                        named.join(", ")
+                    ),
+                    serde_json::json!({ "unchecked": unchecked }),
+                );
+            }
+            serde_json::json!({
+                "ran": true,
+                "hives": scan.hives,
+                "nodes": scan.nodes.len(),
+            })
+        }
+        Some(_) => serde_json::json!({
+            "ran": false,
+            "reason": "the change keeps the default provider and every provider listed",
+        }),
+        None => serde_json::json!({
+            "ran": false,
+            "reason": "the motherbee's current values are not known: its file is not one any \
+                       reader can use, and its last version recorded none",
+        }),
+    };
+    let check_ms = elapsed_ms(check_started);
+
+    // 2. The write, by the motherbee's orchestrator, and its Syncthing's scan.
+    let write_started = Instant::now();
+    let written = send_system_request(
+        client,
+        &format!("SY.orchestrator@{}", ctx.hive_id),
+        "SYSTEM_UPDATE",
+        "SYSTEM_UPDATE_RESPONSE",
+        serde_json::json!({
+            "category": "config",
+            "write": {
+                "ai": change.ai,
+                "expected_version": change.expected_version,
+                "replace_hand_edit": change.replace_hand_edit,
+            },
+        }),
+        admin_orchestrator_timeout(),
+    )
+    .await;
+    let written = match written {
+        Ok(answer) if answer.get("status").and_then(serde_json::Value::as_str) == Some("ok") => {
+            answer
+        }
+        Ok(answer) => {
+            let code = payload_error_code(&answer).unwrap_or_else(|| "SERVICE_FAILED".to_string());
+            let detail = payload_error_detail(&answer).unwrap_or_else(|| answer.to_string());
+            return installation_refusal(action, &code, detail, answer);
+        }
+        Err(err) => {
+            let detail = err.to_string();
+            return installation_refusal(
+                action,
+                infer_transport_error_code(&detail),
+                format!(
+                    "the motherbee's orchestrator did not answer the write ({detail}): \
+                     get_installation shows whether a version was written"
+                ),
+                serde_json::Value::Null,
+            );
+        }
+    };
+    let write_ms = elapsed_ms(write_started);
+    let version = written
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let sha256 = written
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    tracing::info!(
+        version,
+        sha256 = %sha256,
+        default_provider = %change.ai.default_provider,
+        "the installation's ai changed: the motherbee wrote its next version"
+    );
+    let scan_started = Instant::now();
+    scan_installation_folder(client).await;
+    let scan_ms = elapsed_ms(scan_started);
+
+    // 3. Every hive applies it, at once; each ends by the change's ceiling.
+    let apply_started = Instant::now();
+    let hives = connected_hives_with(&ctx.hive_id, &hive_registry(ctx));
+    let within = admin_action_timeout(action).saturating_sub(started.elapsed());
+    let applies = futures::future::join_all(
+        hives
+            .iter()
+            .map(|hive| apply_installation_version(client, hive, version, &sha256, within)),
+    )
+    .await;
+    let apply_ms = elapsed_ms(apply_started);
+
+    let mut lines = serde_json::Map::new();
+    let mut hive_ms = serde_json::Map::new();
+    let mut pending = Vec::new();
+    for (hive, (applied, elapsed)) in hives.iter().zip(&applies) {
+        let line = installation_hive_json(hive, applied, *elapsed, version, &sha256);
+        let status = line
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if status != "ok" {
+            pending.push(format!("{hive} ({status})"));
+        }
+        tracing::info!(
+            hive = %hive,
+            status = %status,
+            attempts = applied.attempts,
+            elapsed_ms = elapsed.as_millis() as u64,
+            version,
+            "installation: a hive's apply"
+        );
+        hive_ms.insert(hive.clone(), serde_json::json!(elapsed.as_millis() as u64));
+        lines.insert(hive.clone(), line);
+    }
+    let mut payload = serde_json::json!({
+        "version": version,
+        "sha256": sha256,
+        "previous_version": written.get("previous_version"),
+        "previous_sha256": written.get("previous_sha256"),
+        "hives": lines,
+        "node_check": node_check,
+        "timings_ms": {
+            "check": check_ms,
+            "write": write_ms,
+            "scan": scan_ms,
+            "apply": apply_ms,
+            "hives": hive_ms,
+            "total": elapsed_ms(started),
+        },
+    });
+    if pending.is_empty() {
+        return installation_answer(action, 200, "ok", payload, None);
+    }
+    payload["pending"] = serde_json::json!(pending);
+    payload["message"] = serde_json::json!(format!(
+        "version {version} is written, and not every hive has applied it yet: {}. GET /versions \
+         shows each hive's copy; update with category config, manifest_version {version} and \
+         manifest_hash {sha256} finishes a hive",
+        pending.join(", ")
+    ));
+    installation_answer(action, 202, "partial", payload, None)
 }
 
 async fn handle_hive_sync_hint_command(
@@ -19320,6 +20492,15 @@ fn admin_action_timeout(action: &str) -> Duration {
         }
         "update" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
+        }
+        // Its ceiling (docs/hive-config-update-v1.md §4, stage 3c): the node check and the write,
+        // each an orchestrator's answer, then every hive's apply in parallel, sync_pending retried
+        // up to the bound and the last answer an update's. Each hive's apply ends by it, and
+        // SY.architect waits longer for a plan that runs it (EXECUTOR_INSTALLATION_WAIT_SECS).
+        "set_installation_ai" => {
+            let orchestrator =
+                Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30));
+            2 * orchestrator + installation_apply_bound() + admin_action_timeout("update")
         }
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
@@ -22399,6 +23580,9 @@ mod tests {
             executor_runtime: Arc::new(Mutex::new(None)),
             executor_configured: Arc::new(AtomicBool::new(false)),
             executor_ai_error: Arc::new(std::sync::Mutex::new(None)),
+            installation_file: fluxbee_ai_sdk::installation_file_path(&root.join("dist")),
+            executor_ai_built_from: Arc::new(ai_settings::InstallationBuiltFrom::default()),
+            executor_ai_refresh: Arc::new(Mutex::new(())),
             rpc: client,
             usage: UsageRecorder::disabled(),
             public_edge_node: None,
@@ -28794,7 +29978,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "21");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "22");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
@@ -29189,6 +30373,884 @@ mod tests {
         assert_eq!(dst_of(&sent), json!("SY.cognition@worker1"));
         assert_eq!(ran.http_status, 200, "{}", ran.envelope);
         assert_eq!(ran.envelope["payload"], cognition_cleared());
+    }
+
+    // --- docs/hive-config-update-v1.md §4, stage 3c: the installation's ai ----------------------
+
+    /// An `ai` with `default` as its default provider and these models.
+    fn installation_ai(
+        default: AiProvider,
+        openai: Option<&str>,
+        anthropic: Option<&str>,
+    ) -> HiveAiConfig {
+        let model = |model: Option<&str>| {
+            model.map(|model| fluxbee_ai_sdk::AiProviderModelConfig {
+                model: model.to_string(),
+            })
+        };
+        HiveAiConfig {
+            default_provider: default,
+            providers: fluxbee_ai_sdk::AiProviderConfigs {
+                openai: model(openai),
+                anthropic: model(anthropic),
+            },
+        }
+    }
+
+    /// 8.x's values: Claude by default, both providers listed.
+    fn claude_installation() -> HiveAiConfig {
+        installation_ai(
+            AiProvider::Anthropic,
+            Some("gpt-5.5"),
+            Some("claude-sonnet-5-5"),
+        )
+    }
+
+    /// The change of every hive's AI engine is the operator's: an action of the catalog with its
+    /// route, help and example, mutating and confirmed first, one the executor runs and Archi
+    /// stages, closed to the whole mesh, Archi included, and given longer than its slowest hive.
+    #[test]
+    fn set_installation_ai_is_the_operators_and_closed_to_the_mesh() {
+        let spec =
+            resolve_internal_action_spec("set_installation_ai").expect("set_installation_ai");
+        assert!(matches!(spec.route, InternalActionRoute::Installation));
+        assert!(!spec.requires_target);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["confirmation_required"], json!(true));
+        assert_eq!(doc["executor_available"], json!(true));
+        assert_eq!(doc["path_patterns"], json!(["PUT /installation/ai"]));
+        assert_ne!(doc["summary"], json!("Admin action."));
+        assert_eq!(
+            doc["request_contract"]["body"]["kind"],
+            json!("json_object")
+        );
+        assert_eq!(doc["request_contract"]["body"]["required"], json!(true));
+        assert!(admin_action_example_scmd("set_installation_ai").is_some());
+        assert!(admin_action_request_notes("set_installation_ai").len() >= 5);
+        assert_eq!(
+            admin_methods_allowed_for_path("/installation/ai"),
+            vec!["PUT"]
+        );
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(schema["required"], json!(["ai", "expected_version"]));
+        assert_eq!(schema["properties"]["ai"]["type"], json!("object"));
+        assert_eq!(
+            schema["properties"]["expected_version"]["type"],
+            json!("integer")
+        );
+        assert_eq!(
+            schema["properties"]["replace_hand_edit"]["type"],
+            json!(["boolean", "null"])
+        );
+        // The example parses as the action takes it.
+        assert!(
+            parse_installation_ai_change(&admin_action_example_payload("set_installation_ai"))
+                .is_ok()
+        );
+        let executor_actions: Vec<&str> = executor_visible_action_specs(None)
+            .into_iter()
+            .map(|spec| spec.action)
+            .collect();
+        assert!(executor_actions.contains(&"set_installation_ai"));
+
+        assert_eq!(mesh_access("set_installation_ai"), Some(MeshAccess::Nobody));
+        for caller in [
+            "SY.architect@motherbee",
+            "IO.cloud@motherbee",
+            "SY.admin@motherbee",
+            "SY.orchestrator@worker1",
+            "SY.wf-rules@worker1",
+            "AI.support@worker1",
+        ] {
+            assert!(
+                mesh_admits(caller, "set_installation_ai", None, &json!({})).is_err(),
+                "{caller}"
+            );
+        }
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"set_installation_ai"));
+        // Its ceiling covers every hive's bound and its last answer, after the check and the write.
+        assert!(
+            admin_action_timeout("set_installation_ai")
+                > installation_apply_bound() + admin_action_timeout("update")
+        );
+        assert_eq!(
+            admin_action_timeout("set_installation_ai"),
+            Duration::from_secs(210)
+        );
+        assert_eq!(installation_apply_bound(), Duration::from_secs(90));
+    }
+
+    /// The view is a read Archi asks for over the mesh; IO.cloud may not.
+    #[test]
+    fn get_installation_is_a_read_archi_may_ask_for() {
+        let spec = resolve_internal_action_spec("get_installation").expect("get_installation");
+        assert!(matches!(spec.route, InternalActionRoute::Installation));
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(true));
+        assert_eq!(doc["confirmation_required"], json!(false));
+        assert_eq!(doc["path_patterns"], json!(["GET /installation"]));
+        assert_eq!(doc["request_contract"]["body"]["kind"], json!("none"));
+        assert!(admin_action_request_notes("get_installation").len() >= 3);
+        assert_eq!(admin_methods_allowed_for_path("/installation"), vec!["GET"]);
+        assert_eq!(mesh_access("get_installation"), Some(MeshAccess::Archi));
+        assert_eq!(
+            mesh_admits(
+                "SY.architect@motherbee",
+                "get_installation",
+                None,
+                &json!({})
+            ),
+            Ok(MeshAdmission::Admitted)
+        );
+        assert!(mesh_admits("IO.cloud@motherbee", "get_installation", None, &json!({})).is_err());
+        // `update` takes category config, for one hive.
+        let update =
+            build_admin_action_doc(resolve_internal_action_spec("update").expect("update"));
+        assert_eq!(
+            update["executor_contract"]["function_schema"]["properties"]["category"]["enum"],
+            json!(["runtime", "core", "vendor", "config"])
+        );
+    }
+
+    /// The body is taken exactly: the whole `ai`, the version it was decided on, and the operator's
+    /// choice to replace a hand edit; a null optional field is an absent one.
+    #[test]
+    fn a_change_of_the_installation_s_ai_is_taken_exactly() {
+        let ai = serde_json::to_value(claude_installation()).expect("ai");
+        let change = parse_installation_ai_change(&json!({
+            "ai": ai,
+            "expected_version": 2,
+            "replace_hand_edit": null,
+        }))
+        .expect("the change");
+        assert_eq!(
+            change,
+            InstallationAiChange {
+                ai: claude_installation(),
+                expected_version: 2,
+                replace_hand_edit: false,
+            }
+        );
+        for (params, code, reason) in [
+            (json!("x"), "INVALID_REQUEST", "the body must be an object"),
+            (
+                json!({"ai": ai, "expected_version": 2, "hive": "worker1"}),
+                "INVALID_REQUEST",
+                "(got hive)",
+            ),
+            (
+                json!({"ai": ai}),
+                "INVALID_REQUEST",
+                "expected_version is required",
+            ),
+            (
+                json!({"ai": ai, "expected_version": 2, "replace_hand_edit": 1}),
+                "INVALID_REQUEST",
+                "replace_hand_edit must be true or false",
+            ),
+            (
+                json!({"expected_version": 2}),
+                "INVALID_AI_SETTINGS",
+                "ai must be an object",
+            ),
+            (
+                json!({"ai": {"default_provider": "anthropic", "providers": {"openai": {"model": "gpt-5.5"}}}, "expected_version": 2}),
+                "INVALID_AI_SETTINGS",
+                "ai.providers.anthropic",
+            ),
+        ] {
+            let (got, detail) = parse_installation_ai_change(&params).expect_err(reason);
+            assert_eq!(got, code, "{detail}");
+            assert!(detail.contains(reason), "{detail} (expected {reason})");
+        }
+    }
+
+    /// Design A-11: a change that switches the default provider refuses the nodes that name their
+    /// model and not their provider (Archi's own model among them); one that drops a provider, the
+    /// nodes that name it and not their model. Another model of a provider checks nothing.
+    #[test]
+    fn a_change_that_leaves_a_node_without_its_engine_is_refused_by_name() {
+        let names = |node: &str, provider: Option<&str>, model: Option<&str>| NodeAiNames {
+            node: node.to_string(),
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+        };
+        let nodes = vec![
+            names("AI.own-model@worker1", None, Some("claude-opus-5-5")),
+            names("AI.own-provider@worker1", Some("openai"), None),
+            names("AI.both@worker1", Some("openai"), Some("gpt-5.5")),
+            names("AI.neither@worker1", None, None),
+            names("AI.unknown@worker1", Some("gemini"), None),
+            names("SY.architect@motherbee", None, Some("claude-opus-5-5")),
+        ];
+        let current = claude_installation();
+
+        // The gate's change, OpenAI's model: nothing to check.
+        let openai_model = installation_ai(
+            AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        assert!(!ai_change_needs_node_check(&current, &openai_model));
+        assert!(nodes_left_without_an_engine(&current, &openai_model, &nodes).is_empty());
+
+        // Switching the default provider: the nodes that name a model and no provider.
+        let openai_default = installation_ai(
+            AiProvider::OpenAi,
+            Some("gpt-5.5"),
+            Some("claude-sonnet-5-5"),
+        );
+        assert!(ai_change_needs_node_check(&current, &openai_default));
+        let left: Vec<String> = nodes_left_without_an_engine(&current, &openai_default, &nodes)
+            .into_iter()
+            .map(|(node, why)| {
+                assert!(why.contains("from anthropic to openai"), "{why}");
+                node
+            })
+            .collect();
+        assert_eq!(left, vec!["AI.own-model@worker1", "SY.architect@motherbee"]);
+
+        // Dropping a provider: the nodes that name it and no model.
+        let claude_only = installation_ai(AiProvider::Anthropic, None, Some("claude-sonnet-5-5"));
+        assert!(ai_change_needs_node_check(&current, &claude_only));
+        let left = nodes_left_without_an_engine(&current, &claude_only, &nodes);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].0, "AI.own-provider@worker1");
+        assert!(left[0].1.contains("ai.providers.openai"), "{left:?}");
+
+        // From the fallback engine (no ai), listing Claude by default: both checks.
+        let fallback = ai_settings::ai_values(None);
+        assert!(ai_change_needs_node_check(&fallback, &current));
+        let left = nodes_left_without_an_engine(&fallback, &claude_only, &nodes);
+        assert_eq!(
+            left.iter()
+                .map(|(node, _)| node.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "AI.own-model@worker1",
+                "AI.own-provider@worker1",
+                "SY.architect@motherbee"
+            ]
+        );
+    }
+
+    /// A-11 reads the hives that run AI nodes: the motherbee and each connected worker.
+    #[test]
+    fn the_node_check_reads_the_motherbee_and_the_connected_workers() {
+        let root = std::env::temp_dir().join(format!("installation-check-{}", Uuid::new_v4()));
+        for (dir, info) in [
+            (
+                "worker1",
+                "hive_id: worker1\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "egress1",
+                "hive_id: egress1\nrole: egress\nstatus: connected\n",
+            ),
+            (
+                "ingress1",
+                "hive_id: ingress1\nrole: ingress\nstatus: connected\n",
+            ),
+            (
+                "half",
+                "hive_id: half\nrole: worker\nstatus: provisioning\n",
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+        }
+        let registry = HiveRegistry::new(&root);
+        assert_eq!(
+            installation_node_check_hives("motherbee", &registry),
+            vec!["motherbee", "worker1"]
+        );
+        // The apply reaches every connected hive.
+        assert_eq!(
+            connected_hives_with("motherbee", &registry),
+            vec!["egress1", "ingress1", "motherbee", "worker1"]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The motherbee's `/versions` as its orchestrator answers it after a change: version 2 on the
+    /// motherbee, worker1 still on version 1, egress1 not answering.
+    fn versions_after_a_change() -> Value {
+        json!({
+            "status": "ok",
+            "hives": [
+                {
+                    "hive_id": "motherbee",
+                    "config": {
+                        "file": "valid",
+                        "version": 2,
+                        "sha256": "bbb",
+                        "state": "current",
+                        "ai": claude_installation(),
+                        "versions": [
+                            {"version": 1, "sha256": "aaa", "written_at_ms": 1, "source": "migration", "ai": claude_installation()},
+                            {"version": 2, "sha256": "bbb", "written_at_ms": 2, "source": "operator", "ai": claude_installation()},
+                        ],
+                        "applied": {"version": 2, "sha256": "bbb", "applied_at_ms": 3, "ai": claude_installation(), "restarted": []},
+                    },
+                },
+                {
+                    "hive_id": "worker1",
+                    "config": {"file": "valid", "version": 1, "sha256": "aaa", "state": "behind", "applied": null},
+                },
+                {"hive_id": "egress1", "status": "error", "message": "UNREACHABLE"},
+                {"hive_id": "old1", "core": {}},
+            ],
+        })
+    }
+
+    /// get_installation: the motherbee's file, the version a change names, every version with its
+    /// values, and each hive's copy with what it applied last.
+    #[test]
+    fn get_installation_shows_the_motherbee_s_file_its_versions_and_every_hive() {
+        let view = installation_view(&versions_after_a_change(), "motherbee");
+        assert_eq!(view["motherbee"]["version"], json!(2));
+        assert_eq!(view["motherbee"]["state"], json!("current"));
+        assert_eq!(
+            view["motherbee"]["ai"]["default_provider"],
+            json!("anthropic")
+        );
+        assert!(view["motherbee"].get("versions").is_none());
+        assert_eq!(view["expected_version"], json!(2));
+        assert_eq!(view["versions"][1]["source"], json!("operator"));
+        assert_eq!(view["hives"]["motherbee"]["applied"]["version"], json!(2));
+        assert_eq!(view["hives"]["worker1"]["state"], json!("behind"));
+        assert_eq!(view["hives"]["egress1"]["state"], json!("unknown"));
+        assert_eq!(view["hives"]["egress1"]["error"], json!("UNREACHABLE"));
+        assert!(view["hives"]["old1"]["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("0.1.121")));
+        let own = &versions_after_a_change()["hives"][0]["config"];
+        assert_eq!(
+            installation_current_values(own),
+            Some(claude_installation())
+        );
+
+        // A file no reader can use: a change names the last version recorded, and the readers run
+        // on its values.
+        let mut broken = own.clone();
+        broken["file"] = json!("invalid");
+        broken["version"] = Value::Null;
+        broken["ai"] = Value::Null;
+        assert_eq!(installation_expected_version(&broken), Some(2));
+        assert_eq!(
+            installation_current_values(&broken),
+            Some(claude_installation())
+        );
+        broken["versions"][1]["ai"] = Value::Null;
+        assert_eq!(installation_current_values(&broken), None);
+        // No file: nothing to name.
+        assert_eq!(
+            installation_expected_version(&json!({"file": "absent", "versions": []})),
+            None
+        );
+    }
+
+    /// A hive is asked again while its copy has not arrived, up to the bound; a refusal ends it, a
+    /// failure to reach it is asked again, a timeout ends it.
+    #[tokio::test]
+    async fn a_hive_is_asked_again_while_its_copy_has_not_arrived() {
+        let pending = json!({"status": "sync_pending", "local_manifest_version": 1});
+        let ok = json!({"status": "ok", "restarted": ["sy-cognition"], "unchanged": []});
+        let (wait, max_wait, bound) = (
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_secs(5),
+        );
+        let scripted = |answers: Vec<Result<Value, String>>| {
+            let answers = std::sync::Mutex::new(answers.into_iter());
+            move || {
+                let next = answers
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .unwrap_or_else(|| Err("asked too often".to_string()));
+                async move { next }
+            }
+        };
+
+        let applied = apply_installation_on_hive(
+            scripted(vec![
+                Ok(pending.clone()),
+                Ok(pending.clone()),
+                Ok(ok.clone()),
+            ]),
+            wait,
+            max_wait,
+            bound,
+        )
+        .await;
+        assert_eq!(applied.outcome, InstallationApplyOutcome::Ok(ok.clone()));
+        assert_eq!(applied.attempts, 3);
+
+        let applied = apply_installation_on_hive(
+            scripted(vec![
+                Err("router returned UNREACHABLE for target=SY.orchestrator@worker1".to_string()),
+                Ok(ok.clone()),
+            ]),
+            wait,
+            max_wait,
+            bound,
+        )
+        .await;
+        assert_eq!(applied.outcome, InstallationApplyOutcome::Ok(ok));
+        assert_eq!(applied.attempts, 2);
+
+        let refused = json!({"status": "error", "error_code": "VERSION_MISMATCH", "message": "local manifest version is ahead"});
+        let applied =
+            apply_installation_on_hive(scripted(vec![Ok(refused.clone())]), wait, max_wait, bound)
+                .await;
+        assert_eq!(
+            applied.outcome,
+            InstallationApplyOutcome::Error {
+                code: "VERSION_MISMATCH".to_string(),
+                detail: "local manifest version is ahead".to_string(),
+                answer: refused,
+            }
+        );
+
+        let applied = apply_installation_on_hive(
+            scripted(vec![Err(
+                "timeout waiting SYSTEM_UPDATE_RESPONSE".to_string()
+            )]),
+            wait,
+            max_wait,
+            bound,
+        )
+        .await;
+        assert!(matches!(
+            applied.outcome,
+            InstallationApplyOutcome::NotAnswered(ref detail) if detail.contains("timeout")
+        ));
+        assert_eq!(applied.attempts, 1);
+
+        // Still pending at the bound: its last answer.
+        let always_pending = {
+            let pending = pending.clone();
+            move || {
+                let pending = pending.clone();
+                async move { Ok::<Value, String>(pending) }
+            }
+        };
+        let started = Instant::now();
+        let applied = apply_installation_on_hive(
+            always_pending,
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(60),
+        )
+        .await;
+        assert_eq!(
+            applied.outcome,
+            InstallationApplyOutcome::SyncPending(pending)
+        );
+        assert!(applied.attempts > 2, "{}", applied.attempts);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Each hive's line says what it did; one that did not finish says where to look and how to
+    /// finish it, never that the version is not applied (P-13).
+    #[test]
+    fn a_hive_that_did_not_finish_is_never_called_not_applied() {
+        let line = |outcome: InstallationApplyOutcome| {
+            installation_hive_json(
+                "worker1",
+                &InstallationApplied {
+                    outcome,
+                    attempts: 4,
+                },
+                Duration::from_millis(1500),
+                2,
+                "bbb",
+            )
+        };
+        let ok = line(InstallationApplyOutcome::Ok(json!({
+            "status": "ok",
+            "restarted": ["sy-cognition"],
+            "unchanged": [],
+        })));
+        assert_eq!(ok["status"], json!("ok"));
+        assert_eq!(ok["restarted"], json!(["sy-cognition"]));
+        assert_eq!(
+            (ok["attempts"].clone(), ok["elapsed_ms"].clone()),
+            (json!(4), json!(1500))
+        );
+        assert!(ok.get("next").is_none());
+        for (outcome, status) in [
+            (
+                InstallationApplyOutcome::SyncPending(json!({"local_manifest_version": 1})),
+                "sync_pending",
+            ),
+            (
+                InstallationApplyOutcome::Error {
+                    code: "RESTART_FAILED".to_string(),
+                    detail: "sy-cognition: bootstrap timeout".to_string(),
+                    answer: json!({}),
+                },
+                "error",
+            ),
+            (
+                InstallationApplyOutcome::NotAnswered("timeout".to_string()),
+                "not_answered",
+            ),
+        ] {
+            let shown = line(outcome);
+            assert_eq!(shown["status"], json!(status));
+            let next = shown["next"].as_str().expect("next");
+            assert!(next.contains("GET /versions"), "{next}");
+            assert!(next.contains("POST /hives/worker1/update"), "{next}");
+            assert!(next.contains("\"manifest_hash\": \"bbb\""), "{next}");
+            assert!(!shown.to_string().contains("not applied"), "{shown}");
+        }
+    }
+
+    /// Answers one request the change sends, by what it asks: the motherbee's /versions, the
+    /// write, the scan and each hive's apply. Returns what it was asked.
+    async fn answer_installation_change(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        motherbee_config: &Value,
+        write_answer: &Value,
+    ) -> Message {
+        let sent = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("a request of the change");
+        let answer = if sent.meta.msg_type == "admin" {
+            assert_eq!(sent.meta.action.as_deref(), Some("get_versions"));
+            let mut answer = reply_to(
+                &sent,
+                "",
+                json!({"status": "ok", "hive": {"hive_id": "motherbee", "config": motherbee_config}}),
+            );
+            answer.meta.msg_type = "admin".to_string();
+            answer.meta.msg = None;
+            answer
+        } else {
+            match (sent.meta.msg.as_deref(), sent.payload.get("write")) {
+                (Some("SYSTEM_UPDATE"), Some(_)) => {
+                    reply_to(&sent, "SYSTEM_UPDATE_RESPONSE", write_answer.clone())
+                }
+                (Some("SYSTEM_UPDATE"), None) => reply_to(
+                    &sent,
+                    "SYSTEM_UPDATE_RESPONSE",
+                    json!({
+                        "status": "ok",
+                        "category": "config",
+                        "restarted": [],
+                        "unchanged": ["sy-cognition", "sy-frontdesk-gov"],
+                    }),
+                ),
+                (Some("SYSTEM_SYNC_HINT"), _) => {
+                    reply_to(&sent, "SYSTEM_SYNC_HINT_RESPONSE", json!({"status": "ok"}))
+                }
+                other => panic!("an unexpected request: {other:?}"),
+            }
+        };
+        harness.inject(answer).await.unwrap();
+        sent
+    }
+
+    /// The change: the motherbee's file read, no node check for another model of a provider, the
+    /// write to the motherbee's orchestrator, its scan, and the apply on every hive; the answer
+    /// names each hive and the timings.
+    #[tokio::test]
+    async fn set_installation_ai_writes_then_applies_on_every_hive() {
+        let (ctx, mut harness) = opa_test_admin("installation-change");
+        let own = versions_after_a_change()["hives"][0]["config"].clone();
+        let change = installation_ai(
+            AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        let params = json!({"ai": change, "expected_version": 2});
+        let written = json!({
+            "status": "ok",
+            "version": 3,
+            "sha256": "ccc",
+            "previous_version": 2,
+            "previous_sha256": "bbb",
+        });
+        let run = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "set_installation_ai",
+            None,
+            params,
+            AdminOrigin::Http,
+        );
+        let drive = async {
+            let mut asked = Vec::new();
+            for _ in 0..4 {
+                asked.push(answer_installation_change(&mut harness, &own, &written).await);
+            }
+            asked
+        };
+        let (ran, asked) = tokio::join!(run, drive);
+        let ran = ran.expect("answered");
+        assert_eq!(ran.http_status, 200, "{}", ran.envelope);
+        assert_eq!(ran.envelope["status"], json!("ok"));
+        let payload = &ran.envelope["payload"];
+        assert_eq!(payload["version"], json!(3));
+        assert_eq!(payload["previous_version"], json!(2));
+        assert_eq!(payload["node_check"]["ran"], json!(false));
+        assert_eq!(payload["hives"]["motherbee"]["status"], json!("ok"));
+        assert_eq!(
+            payload["hives"]["motherbee"]["unchanged"],
+            json!(["sy-cognition", "sy-frontdesk-gov"])
+        );
+        for timing in ["check", "write", "scan", "apply", "total"] {
+            assert!(payload["timings_ms"][timing].is_u64(), "{timing}");
+        }
+        assert!(payload["timings_ms"]["hives"]["motherbee"].is_u64());
+
+        let write = &asked[1];
+        assert_eq!(dst_of(write), json!("SY.orchestrator@motherbee"));
+        assert_eq!(write.payload["category"], json!("config"));
+        assert_eq!(write.payload["write"]["expected_version"], json!(2));
+        assert_eq!(write.payload["write"]["replace_hand_edit"], json!(false));
+        assert_eq!(
+            write.payload["write"]["ai"]["providers"]["openai"]["model"],
+            json!("gpt-5.6")
+        );
+        assert_eq!(
+            asked[2].payload["folder_id"],
+            json!("fluxbee-dist-installation")
+        );
+        let apply = &asked[3];
+        assert_eq!(dst_of(apply), json!("SY.orchestrator@motherbee"));
+        assert_eq!(
+            apply.payload,
+            json!({"category": "config", "manifest_version": 3, "manifest_hash": "ccc"})
+        );
+        // The change is the operator's: the audit log keeps it.
+        let logged = read_recent_admin_commands(
+            &ctx.state_dir,
+            &AdminCommandLogQuery {
+                limit: 10,
+                action: Some("set_installation_ai".to_string()),
+                ..AdminCommandLogQuery::default()
+            },
+        );
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert_eq!(logged[0]["origin"], json!("http"));
+    }
+
+    /// The motherbee's refusal passes through with its code, and nothing is applied.
+    #[tokio::test]
+    async fn set_installation_ai_passes_the_write_s_refusal_through() {
+        let (ctx, mut harness) = opa_test_admin("installation-refused");
+        let own = versions_after_a_change()["hives"][0]["config"].clone();
+        let refused = json!({
+            "status": "error",
+            "error_code": "VERSION_CONFLICT",
+            "message": "the motherbee's installation file is at version 2, not 1",
+            "category": "config",
+        });
+        let params = json!({"ai": claude_installation(), "expected_version": 1});
+        let run = handle_set_installation_ai(&ctx, &ctx.rpc, &params);
+        let drive = async {
+            for _ in 0..2 {
+                answer_installation_change(&mut harness, &own, &refused).await;
+            }
+        };
+        let ((status, body), ()) = tokio::join!(run, drive);
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("VERSION_CONFLICT"));
+        assert!(body["error_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("version 2, not 1")));
+        assert_eq!(body["payload"], refused);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// A switch of the default provider reads every AI node's config and Archi's, and refuses,
+    /// naming them, the change that leaves a node without its engine; nothing is written.
+    #[tokio::test]
+    async fn set_installation_ai_refuses_a_switch_that_leaves_a_node_without_its_engine() {
+        let (ctx, mut harness) = opa_test_admin("installation-a11");
+        let own = versions_after_a_change()["hives"][0]["config"].clone();
+        let switch = installation_ai(
+            AiProvider::OpenAi,
+            Some("gpt-5.5"),
+            Some("claude-sonnet-5-5"),
+        );
+        let params = json!({"ai": switch, "expected_version": 2});
+        let run = handle_set_installation_ai(&ctx, &ctx.rpc, &params);
+        let drive = async {
+            let mut configs_read = Vec::new();
+            // /versions, the motherbee's nodes, then each AI node's config and Archi's.
+            for _ in 0..5 {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("a read");
+                assert_eq!(sent.meta.msg_type, "admin");
+                let view = match sent.meta.action.as_deref() {
+                    Some("get_versions") => {
+                        json!({"status": "ok", "hive": {"hive_id": "motherbee", "config": own}})
+                    }
+                    Some("list_nodes") => {
+                        assert_eq!(sent.payload["managed"], json!(true));
+                        json!({"status": "ok", "nodes": [
+                            {"node_name": "AI.sales@motherbee"},
+                            {"node_name": "AI.plain@motherbee"},
+                            {"node_name": "IO.slack.sales@motherbee"},
+                        ]})
+                    }
+                    Some("get_node_config") => {
+                        let node = sent.payload["node_name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        configs_read.push(node.clone());
+                        match node.as_str() {
+                            "AI.sales@motherbee" => {
+                                json!({"status": "ok", "config": {"behavior": {"kind": "ai_chat", "model": "claude-opus-5-5"}}})
+                            }
+                            "AI.plain@motherbee" => {
+                                json!({"status": "error", "error_code": "NODE_CONFIG_NOT_FOUND", "message": "effective config file not found"})
+                            }
+                            "SY.architect@motherbee" => {
+                                json!({"status": "ok", "config": {"config_version": 2}})
+                            }
+                            other => panic!("a config it should not read: {other}"),
+                        }
+                    }
+                    other => panic!("an unexpected read: {other:?}"),
+                };
+                let mut answer = reply_to(&sent, "", view);
+                answer.meta.msg_type = "admin".to_string();
+                answer.meta.msg = None;
+                harness.inject(answer).await.unwrap();
+            }
+            configs_read
+        };
+        let ((status, body), mut configs_read) = tokio::join!(run, drive);
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("NODES_LEFT_WITHOUT_ENGINE"));
+        assert_eq!(
+            body["payload"]["nodes"][0]["node"],
+            json!("AI.sales@motherbee")
+        );
+        assert_eq!(body["payload"]["nodes"].as_array().map(Vec::len), Some(1));
+        assert!(body["error_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("AI.sales@motherbee")
+                && detail.contains("from anthropic to openai")));
+        configs_read.sort();
+        assert_eq!(
+            configs_read,
+            vec![
+                "AI.plain@motherbee",
+                "AI.sales@motherbee",
+                "SY.architect@motherbee"
+            ]
+        );
+        // Nothing was written: no SYSTEM_UPDATE left.
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The executor takes a new installation file at its next use, and only then: one built from a
+    /// file rebuilds once that file changes, and not before a build recorded one.
+    #[tokio::test]
+    async fn the_executor_takes_a_new_installation_file_at_its_next_use() {
+        let (ctx, _harness) = opa_test_admin("installation-next-use");
+        let root = ctx.config_dir.parent().expect("root").to_path_buf();
+        let dist = root.join("dist");
+        fs::create_dir_all(ctx.installation_file.parent().expect("its dir")).expect("dist");
+        fs::create_dir_all(&ctx.config_dir).expect("config dir");
+        fs::write(
+            ctx.config_dir.join("hive.yaml"),
+            format!(
+                "hive_id: motherbee\nrole: motherbee\ndist:\n  path: \"{}\"\n",
+                dist.display()
+            ),
+        )
+        .expect("hive.yaml");
+        let reason = || {
+            ctx.executor_ai_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
+        // A file no reader can use, so a rebuild answers with its reason and asks no vault.
+        fs::write(
+            &ctx.installation_file,
+            b"{\"schema_version\":1,\"version\":0}",
+        )
+        .expect("v0");
+        executor_takes_new_installation_ai(&ctx).await;
+        assert_eq!(
+            reason(),
+            None,
+            "no build recorded yet: the boot's reads the file"
+        );
+        assert!(refresh_admin_executor_ai_runtime(&ctx, VaultWait::Once)
+            .await
+            .is_err());
+        assert!(reason().is_some_and(|reason| reason.contains("version 0")));
+        // The same file: nothing rebuilt.
+        *ctx.executor_ai_error.lock().unwrap() = None;
+        executor_takes_new_installation_ai(&ctx).await;
+        assert_eq!(reason(), None);
+        // Another file: rebuilt at this use.
+        fs::write(
+            &ctx.installation_file,
+            b"{\"schema_version\":2,\"version\":1}",
+        )
+        .expect("v1");
+        executor_takes_new_installation_ai(&ctx).await;
+        assert!(reason().is_some_and(|reason| reason.contains("schema_version 2")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `update` takes category config, for one hive: SYSTEM_UPDATE to that hive's orchestrator.
+    #[tokio::test]
+    async fn update_takes_category_config_for_one_hive() {
+        let (ctx, mut harness) = opa_test_admin("installation-update");
+        let run = handle_hive_update_command(
+            &ctx,
+            &ctx.rpc,
+            "worker1".to_string(),
+            json!({"category": "config", "manifest_version": 3, "manifest_hash": "ccc"}),
+        );
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("SYSTEM_UPDATE");
+            harness
+                .inject(reply_to(
+                    &sent,
+                    "SYSTEM_UPDATE_RESPONSE",
+                    json!({"status": "sync_pending", "category": "config"}),
+                ))
+                .await
+                .unwrap();
+            sent
+        };
+        let (ran, sent) = tokio::join!(run, drive);
+        let (status, body) = ran.expect("answered");
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(dst_of(&sent), json!("SY.orchestrator@worker1"));
+        assert_eq!(sent.meta.msg.as_deref(), Some("SYSTEM_UPDATE"));
+        assert_eq!(
+            sent.payload,
+            json!({"category": "config", "manifest_version": 3, "manifest_hash": "ccc"})
+        );
     }
 
     // --- A-127: a bare node name is a node of the path's hive ----------------------------------

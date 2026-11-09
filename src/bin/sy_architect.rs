@@ -386,6 +386,13 @@ struct ArchitectState {
     /// reader can use, or hive.yaml's `ai` while the hive holds none
     /// (docs/hive-config-update-v1.md §4). The chat answers with it.
     ai_settings_error: std::sync::Mutex<Option<String>>,
+    /// The hive's installation file, under the dist its hive.yaml names: each chat turn takes a new
+    /// version (`architect_takes_new_installation_ai`, stage 3c).
+    installation_file: PathBuf,
+    /// The installation file Archi's AI runtime was built from.
+    ai_built_from: ai_settings::InstallationBuiltFrom,
+    /// One rebuild at a time when a turn takes a new installation file.
+    ai_refresh_lock: Mutex<()>,
     messages_db_configured: AtomicBool,
     messages_db_url: Arc<RwLock<Option<String>>>,
     messages_db: Arc<RwLock<Option<Arc<messages_db::MessagesDb>>>>,
@@ -6179,6 +6186,8 @@ const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
     "hive_status",
     "list_versions",
     "get_versions",
+    // The installation's current ai and expected_version, which a set_installation_ai step names.
+    "get_installation",
     "list_tenants",
     "get_tenant",
 ];
@@ -6379,6 +6388,10 @@ async fn main() -> Result<(), ArchitectError> {
     let own_model = architect_own_model(&hive.hive_id);
     // Where Archi's provider comes from, said once (docs/hive-config-update-v1.md §4).
     log_architect_ai_source(&hive);
+    // Stage 3c: the installation file this build reads, stamped before it reads it.
+    let installation_file = ai_settings::installation_file(hive.dist.as_ref());
+    let ai_built_from = ai_settings::InstallationBuiltFrom::default();
+    let built_from_stamp = ai_settings::installation_file_stamp(&installation_file);
     let (ai_runtime, initial_messages_db_url) = tokio::join!(
         build_architect_ai_runtime(
             Arc::clone(&rpc),
@@ -6400,6 +6413,7 @@ async fn main() -> Result<(), ArchitectError> {
         Ok(runtime) => (runtime, None),
         Err(reason) => (None, Some(reason)),
     };
+    ai_built_from.record(built_from_stamp);
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -6456,6 +6470,9 @@ async fn main() -> Result<(), ArchitectError> {
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
         ai_settings_error: std::sync::Mutex::new(initial_ai_settings_error),
+        installation_file,
+        ai_built_from,
+        ai_refresh_lock: Mutex::new(()),
         messages_db_configured: AtomicBool::new(initial_messages_db_configured),
         messages_db_url: Arc::new(RwLock::new(initial_messages_db_url)),
         messages_db: Arc::new(RwLock::new(initial_messages_db)),
@@ -6861,6 +6878,9 @@ fn vault_response_openai_api_key(value: &Value) -> Option<String> {
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
     let own_model = architect_own_model(&state.hive_id);
+    // Stage 3c: the installation file this build reads, stamped before it reads it and recorded
+    // with the runtime it leaves (`architect_takes_new_installation_ai`).
+    let stamp = ai_settings::installation_file_stamp(&state.installation_file);
     let built = build_architect_ai_runtime(
         Arc::clone(&state.rpc),
         &state.node_name,
@@ -6882,7 +6902,31 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
         .ai_configured
         .store(runtime.is_some(), Ordering::Relaxed);
     *state.ai_runtime.lock().await = runtime;
+    state.ai_built_from.record(stamp);
     Ok(state.ai_configured.load(Ordering::Relaxed))
+}
+
+/// At each chat turn (docs/hive-config-update-v1.md §4, stage 3c): no config update restarts Archi,
+/// which may be the caller of the very action that wrote the new version, so a turn takes a new
+/// installation file instead. One small file read and hashed; the runtime is rebuilt, its key read
+/// once from the vault, only when the file changed, and the line says once where its `ai` comes
+/// from now. Archi's own `config.ai.model` stays its node config.
+async fn architect_takes_new_installation_ai(state: &ArchitectState) {
+    let _one_rebuild = state.ai_refresh_lock.lock().await;
+    if !state.ai_built_from.changed(&state.installation_file) {
+        return;
+    }
+    match refresh_architect_ai_runtime(state).await {
+        Ok(configured) => tracing::info!(
+            source = %ai_settings::installation_file_label(&state.installation_file),
+            configured = configured,
+            "the installation file changed: sy.architect took it at this chat turn"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "the installation file changed, and sy.architect could not take it"
+        ),
+    }
 }
 
 /// Resolve architect's messages-db Postgres credentials via Model D'
@@ -10081,6 +10125,7 @@ async fn handle_chat_message(
     message: String,
     attachments: Vec<ChatAttachmentRef>,
 ) -> ChatResponse {
+    architect_takes_new_installation_ai(state).await;
     let (resolved_session_id, mut session) =
         match resolve_chat_session(state, session_id, None).await {
             Ok(values) => values,
@@ -12727,6 +12772,28 @@ const EXECUTOR_HIVE_JOIN_WAIT_SECS: u64 = 35 * 60;
 /// does, with a margin.
 const EXECUTOR_WF_RULES_WAIT_SECS: u64 = 90;
 
+/// What Archi waits for SY.admin's executor per change of the installation's `ai` in a plan
+/// (docs/hive-config-update-v1.md §4, stage 3c): SY.admin's ceiling for `set_installation_ai`
+/// (`admin_action_timeout` in sy_admin.rs: the node check and the write, 30 s each, then every
+/// hive's apply at once, up to 90 s of sync_pending and an update's last answer, 60 s, 210 s in
+/// all), with a margin.
+const EXECUTOR_INSTALLATION_WAIT_SECS: u64 = 240;
+
+/// The steps of an executor plan that change the installation's `ai`.
+fn plan_installation_changes(plan: Option<&Value>) -> u64 {
+    plan.and_then(|plan| plan.pointer("/execution/steps"))
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|step| {
+                    step.get("action").and_then(Value::as_str) == Some("set_installation_ai")
+                })
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
 /// The steps of an executor plan that deploy or remove a workflow.
 fn plan_wf_rules_writes(plan: Option<&Value>) -> u64 {
     plan.and_then(|plan| plan.pointer("/execution/steps"))
@@ -12796,8 +12863,14 @@ fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
         "executor_execute_plan" => Duration::from_secs(
             executor_secs()
                 + plan_hive_joins(params.get("plan")) * EXECUTOR_HIVE_JOIN_WAIT_SECS
-                + plan_wf_rules_writes(params.get("plan")) * EXECUTOR_WF_RULES_WAIT_SECS,
+                + plan_wf_rules_writes(params.get("plan")) * EXECUTOR_WF_RULES_WAIT_SECS
+                + plan_installation_changes(params.get("plan")) * EXECUTOR_INSTALLATION_WAIT_SECS,
         ),
+        // SY.admin reads the motherbee's /versions for it, under its own 30 s: wait longer, or a
+        // slow read is reported as Archi's timeout.
+        "get_installation" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30) + 5)
+        }
         "add_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
         }
@@ -13193,6 +13266,14 @@ fn translate_scmd(
         ("GET", ["versions"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_versions".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
+        // The installation's ai, its versions and every hive's copy (docs/hive-config-update-v1.md
+        // §4, stage 3c). Its change, set_installation_ai, is closed to the mesh: Archi stages it.
+        ("GET", ["installation"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_installation".to_string(),
             target_hive: local_hive_id.to_string(),
             params: json!({}),
         }),
@@ -23276,6 +23357,60 @@ fn wf_deploys_left_not_running(execution_report: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The hives a change of the installation's `ai` in the run has not reached yet
+/// (docs/hive-config-update-v1.md §4, stage 3c). SY.admin writes the version and answers `partial`,
+/// naming each hive whose apply is not ok (sync_pending at its bound, an error, or no answer): a
+/// change Archi made is done only once every hive applied it. Each `set_installation_ai` step's
+/// last answer in the run's events is read (`payload.events[*].result_preview`, SY.admin's answer),
+/// as a deploy's is (`wf_deploys_left_not_running`).
+fn installation_changes_not_applied(execution_report: &Value) -> Vec<String> {
+    let Some(events) = execution_report
+        .pointer("/payload/events")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut answers: BTreeMap<&str, &Value> = BTreeMap::new();
+    for event in events {
+        let field = |key: &str| event.get(key).and_then(Value::as_str);
+        if field("step_action") == Some("set_installation_ai")
+            && field("tool_name") == Some("set_installation_ai")
+            && field("status").is_some_and(|status| status.eq_ignore_ascii_case("done"))
+        {
+            if let (Some(step), Some(answer)) = (field("step_id"), event.get("result_preview")) {
+                answers.insert(step, answer);
+            }
+        }
+    }
+    answers
+        .into_values()
+        .filter(|answer| answer.get("status").and_then(Value::as_str) != Some("ok"))
+        .map(|answer| {
+            let payload = answer.get("payload");
+            let version = payload
+                .and_then(|payload| payload.get("version"))
+                .and_then(Value::as_u64)
+                .map_or_else(
+                    || "its version".to_string(),
+                    |version| format!("version {version}"),
+                );
+            let hives = payload
+                .and_then(|payload| payload.get("pending"))
+                .and_then(Value::as_array)
+                .map(|pending| {
+                    pending
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|hives| !hives.is_empty())
+                .unwrap_or_else(|| "some hives".to_string());
+            format!("the installation's {version} is not applied on {hives} yet")
+        })
+        .collect()
+}
+
 fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
     let summary = execution_report
         .get("payload")
@@ -23295,8 +23430,11 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
         .and_then(Value::as_u64);
 
     let not_running = wf_deploys_left_not_running(execution_report);
-    let verified_success =
-        matches!(status, Some("done")) && !failed_step_present && not_running.is_empty();
+    let not_applied = installation_changes_not_applied(execution_report);
+    let verified_success = matches!(status, Some("done"))
+        && !failed_step_present
+        && not_running.is_empty()
+        && not_applied.is_empty();
     let eligible_for_cookbook = verified_success
         && matches!((completed_steps, total_steps), (Some(completed), Some(total)) if completed == total);
 
@@ -23304,6 +23442,12 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
         format!(
             "the plan ran, but a workflow it deployed has no node running: {}",
             not_running.join("; ")
+        )
+    } else if !not_applied.is_empty() {
+        format!(
+            "the plan ran, but {}: GET /versions shows each hive's copy, and update with category \
+             config finishes a hive",
+            not_applied.join("; ")
         )
     } else if !verified_success {
         match status {
@@ -30299,6 +30443,80 @@ mod tests {
         let verdict =
             verify_execution_result(&report(vec![deploy("s2", failed), deploy("s2", running)]));
         assert!(verdict.verified_success, "{}", verdict.reason);
+    }
+
+    /// SY.admin writes the installation's new version and answers `partial` while a hive has not
+    /// applied it (docs/hive-config-update-v1.md §4, stage 3c): a run is verified only once every
+    /// hive did, and the reason names them.
+    #[test]
+    fn a_change_of_the_installation_not_applied_everywhere_is_not_verified() {
+        let change = |step: &str, status: &str, pending: Value| {
+            json!({
+                "step_id": step, "step_action": "set_installation_ai",
+                "tool_name": "set_installation_ai", "status": "done",
+                "result_preview": { "status": status, "action": "set_installation_ai",
+                    "payload": { "version": 3, "pending": pending } }
+            })
+        };
+        let report = |events: Vec<Value>| {
+            json!({ "status": "ok", "payload": {
+                "events": events,
+                "summary": { "status": "done", "failed_step_id": null,
+                             "completed_steps": 1, "total_steps": 1 }
+            } })
+        };
+        let verdict = verify_execution_result(&report(vec![change("s1", "ok", Value::Null)]));
+        assert!(verdict.verified_success && verdict.eligible_for_cookbook);
+
+        let pending = json!(["worker1 (sync_pending)", "egress1 (not_answered)"]);
+        let verdict = verify_execution_result(&report(vec![change("s1", "partial", pending)]));
+        assert!(!verdict.verified_success && !verdict.eligible_for_cookbook);
+        for part in [
+            "the installation's version 3 is not applied on",
+            "worker1 (sync_pending), egress1 (not_answered)",
+            "GET /versions",
+        ] {
+            assert!(verdict.reason.contains(part), "{}", verdict.reason);
+        }
+        // The step's last answer counts.
+        let verdict = verify_execution_result(&report(vec![
+            change("s1", "partial", json!(["worker1 (sync_pending)"])),
+            change("s1", "ok", Value::Null),
+        ]));
+        assert!(verdict.verified_success, "{}", verdict.reason);
+    }
+
+    /// Archi waits for SY.admin's ceiling of each change of the installation's `ai` in a plan, and
+    /// a little longer than SY.admin's own read for the view.
+    #[test]
+    fn an_executor_run_waits_for_each_change_of_the_installation() {
+        let request = |actions: &[&str]| {
+            json!({ "execution_id": "run-1", "plan": { "execution": { "steps": actions
+                .iter()
+                .map(|action| json!({ "id": action, "action": action, "args": {} }))
+                .collect::<Vec<_>>() } } })
+        };
+        let base = architect_admin_action_timeout("executor_validate_plan", &json!({}));
+        assert_eq!(
+            architect_admin_action_timeout(
+                "executor_execute_plan",
+                &request(&["get_installation", "set_installation_ai"])
+            ),
+            base + Duration::from_secs(240)
+        );
+        assert_eq!(
+            architect_admin_action_timeout("get_installation", &json!({})),
+            Duration::from_secs(35)
+        );
+        // Archi reads the view in its chat and while it compiles a plan; it never changes it
+        // itself.
+        let translated = translate_scmd("motherbee", parse("curl -X GET /installation"))
+            .expect("the installation's view");
+        assert_eq!(translated.action, "get_installation");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert!(system_get_may_run("GET", &translated.action));
+        assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"get_installation"));
+        assert!(!admin_action_allows_ai_write("set_installation_ai"));
     }
 
     #[test]

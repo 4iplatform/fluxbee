@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 use fluxbee_ai_sdk::{
-    installation_file_path, installation_file_state, sha256_hex, InstallationFile,
-    InstallationFileState, INSTALLATION_SCHEMA_VERSION,
+    installation_file_path, installation_file_state, sha256_hex, HiveAiConfig, InstallationFile,
+    InstallationFileState, InstalledSettings, INSTALLATION_SCHEMA_VERSION,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1017,6 +1017,11 @@ async fn main() -> Result<(), OrchestratorError> {
             &installation_file_path(&state.dist.path),
             &installation_versions_path(),
             hive.ai.as_ref(),
+        );
+        // Stage 3c: the current version's values, which stage 3b recorded without them.
+        record_current_version_values_at_start(
+            &installation_file_path(&state.dist.path),
+            &installation_versions_path(),
         );
     }
     report_installation_file_at_start(&state.dist.path, hive.ai.is_some());
@@ -3803,8 +3808,12 @@ struct LocalSystemManifestState {
     hash: Option<String>,
 }
 
+/// What this hive holds of `category`, its version and hash, to compare with the ones an update
+/// names. `config` is the installation file under `dist_root` (docs/hive-config-update-v1.md §4,
+/// stage 3c): a valid one's version, and the sha256 of its bytes (`installation_file_state`).
 fn local_system_manifest_state(
     category: &str,
+    dist_root: &Path,
 ) -> Result<LocalSystemManifestState, OrchestratorError> {
     match category {
         "runtime" => Ok(LocalSystemManifestState {
@@ -3819,8 +3828,63 @@ fn local_system_manifest_state(
             version: load_vendor_manifest()?.map(|manifest| manifest.version),
             hash: local_syncthing_vendor_hash()?,
         }),
+        "config" => {
+            let copy = InstallationCopy::read(dist_root);
+            Ok(LocalSystemManifestState {
+                version: copy.version,
+                hash: copy.sha256,
+            })
+        }
         _ => Err(format!("unknown system update category '{}'", category).into()),
     }
+}
+
+/// How what a hive holds stands against what an update names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestMatch {
+    /// Its version is past the one named: the update is refused (`VERSION_MISMATCH`).
+    Ahead,
+    /// Its version is before the one named: its sync channel has not brought it yet.
+    Behind,
+    /// Not the hash named: still on its way.
+    Mismatch,
+    /// The version and hash named: the update applies.
+    Matched,
+}
+
+/// The update's check (`handle_system_update_message`): a version of 0, or none held, is not
+/// compared; the hash always is.
+fn manifest_match(
+    expected_version: u64,
+    expected_hash: &str,
+    local: &LocalSystemManifestState,
+) -> ManifestMatch {
+    if expected_version != 0 {
+        if let Some(local_version) = local.version {
+            if local_version > expected_version {
+                return ManifestMatch::Ahead;
+            }
+            if local_version < expected_version {
+                return ManifestMatch::Behind;
+            }
+        }
+    }
+    let local_hash = normalize_sha256(local.hash.as_deref().unwrap_or_default());
+    if !local_hash.is_empty() && local_hash == normalize_sha256(expected_hash) {
+        ManifestMatch::Matched
+    } else {
+        ManifestMatch::Mismatch
+    }
+}
+
+/// A SYSTEM_UPDATE that writes the installation file rather than applies a version: category
+/// `config` with a `write` (stage 3c).
+fn is_installation_write(payload: &serde_json::Value) -> bool {
+    payload.get("write").is_some()
+        && payload
+            .get("category")
+            .and_then(|value| value.as_str())
+            .is_some_and(|category| category.trim().eq_ignore_ascii_case("config"))
 }
 
 fn parse_system_update_payload(
@@ -3839,8 +3903,12 @@ fn parse_system_update_payload(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "runtime".to_string());
-    if !matches!(category.as_str(), "runtime" | "core" | "vendor") {
-        return Err("category must be one of runtime/core/vendor".into());
+    if !matches!(category.as_str(), "runtime" | "core" | "vendor" | "config") {
+        return Err("category must be one of runtime/core/vendor/config".into());
+    }
+    // The write of the installation file is category config's alone (`is_installation_write`).
+    if payload.get("write").is_some() {
+        return Err("write is only for category=config, which writes the installation file".into());
     }
 
     let manifest_version = payload
@@ -4387,15 +4455,22 @@ async fn restart_local_core_services_with_health_gate(
         // would keep running the old inode. The rollback path calls this same function
         // expecting the services to come back on the restored binary — that only works
         // with a real restart either. See U-1.
-        systemd_restart(&service)?;
-        wait_for_service_active(
-            &service,
-            Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
-        )
-        .await?;
+        restart_core_service_with_health_gate(&service).await?;
         restarted.push(service);
     }
     Ok(restarted)
+}
+
+/// Restarts one core service and waits until systemd has it active again, up to
+/// `CORE_SERVICE_HEALTH_TIMEOUT_SECS`: each restart of a core update, and of a config update
+/// (`apply_config_update_local`).
+async fn restart_core_service_with_health_gate(service: &str) -> Result<(), OrchestratorError> {
+    systemd_restart(service)?;
+    wait_for_service_active(
+        service,
+        Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -6134,6 +6209,9 @@ async fn apply_system_update_local(
                 })
             }
         }
+        // The installation file (docs/hive-config-update-v1.md §4, stage 3c): no binary step, and
+        // only the readers whose engine changed restart.
+        "config" => apply_config_update_local(state, request).await,
         _ => Err(format!("unknown system update category '{}'", request.category).into()),
     }
 }
@@ -6142,6 +6220,10 @@ async fn handle_system_update_message(
     state: &Arc<OrchestratorState>,
     msg: &Message,
 ) -> serde_json::Value {
+    // The operator's change of the installation file, on the motherbee (stage 3c).
+    if is_installation_write(&msg.payload) {
+        return installation_write_answer(state, &msg.payload);
+    }
     let request = match parse_system_update_payload(&msg.payload) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -6157,7 +6239,7 @@ async fn handle_system_update_message(
     let expected_version = request.manifest_version;
     let expected_hash = request.manifest_hash.as_str();
 
-    let local = match local_system_manifest_state(category) {
+    let local = match local_system_manifest_state(category, &state.dist.path) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -6169,66 +6251,46 @@ async fn handle_system_update_message(
         }
     };
 
-    let local_version = local.version.unwrap_or(0);
-    let local_hash = local.hash.unwrap_or_default();
-    let expected_hash_norm = normalize_sha256(expected_hash);
-    let local_hash_norm = normalize_sha256(&local_hash);
-    if expected_version != 0 {
-        if let Some(local_known_version) = local.version {
-            if local_known_version > expected_version {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "VERSION_MISMATCH",
-                    "message": format!(
-                        "local manifest version is ahead of requested version (local={} requested={})",
-                        local_known_version, expected_version
-                    ),
-                    "category": category,
-                    "hive": state.hive_id.as_str(),
-                    "manifest_version": expected_version,
-                    "local_manifest_version": local.version,
-                    "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
-                    "runtime": request.runtime.clone(),
-                    "runtime_version": request.runtime_version.clone(),
-                    "errors": [],
-                });
-            }
-            if local_known_version < expected_version {
-                return serde_json::json!({
-                    "status": "sync_pending",
-                    "category": category,
-                    "hive": state.hive_id.as_str(),
-                    "manifest_version": expected_version,
-                    "local_manifest_version": local.version,
-                    "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
-                    "runtime": request.runtime.clone(),
-                    "runtime_version": request.runtime_version.clone(),
-                    "errors": [],
-                    "message": "Local manifest version is behind expected. Sync channel may still be propagating.",
-                });
-            }
+    let matched = manifest_match(expected_version, expected_hash, &local);
+    let local_hash = local.hash.clone().unwrap_or_default();
+    match matched {
+        ManifestMatch::Ahead => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "VERSION_MISMATCH",
+                "message": format!(
+                    "local manifest version is ahead of requested version (local={} requested={})",
+                    local.version.unwrap_or(0), expected_version
+                ),
+                "category": category,
+                "hive": state.hive_id.as_str(),
+                "manifest_version": expected_version,
+                "local_manifest_version": local.version,
+                "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                "runtime": request.runtime.clone(),
+                "runtime_version": request.runtime_version.clone(),
+                "errors": [],
+            });
         }
-    }
-    let version_match = if expected_version == 0 || local.version.is_none() {
-        true
-    } else {
-        local_version == expected_version
-    };
-    let hash_match = !local_hash_norm.is_empty() && local_hash_norm == expected_hash_norm;
-
-    if !(version_match && hash_match) {
-        return serde_json::json!({
-            "status": "sync_pending",
-            "category": category,
-            "hive": state.hive_id.as_str(),
-            "manifest_version": expected_version,
-            "local_manifest_version": local.version,
-            "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
-            "runtime": request.runtime.clone(),
-            "runtime_version": request.runtime_version.clone(),
-            "errors": [],
-            "message": "Local manifest does not match expected. Sync channel may still be propagating.",
-        });
+        ManifestMatch::Behind | ManifestMatch::Mismatch => {
+            return serde_json::json!({
+                "status": "sync_pending",
+                "category": category,
+                "hive": state.hive_id.as_str(),
+                "manifest_version": expected_version,
+                "local_manifest_version": local.version,
+                "local_manifest_hash": if local_hash.is_empty() { serde_json::Value::Null } else { serde_json::json!(local_hash) },
+                "runtime": request.runtime.clone(),
+                "runtime_version": request.runtime_version.clone(),
+                "errors": [],
+                "message": if matched == ManifestMatch::Behind {
+                    "Local manifest version is behind expected. Sync channel may still be propagating."
+                } else {
+                    "Local manifest does not match expected. Sync channel may still be propagating."
+                },
+            });
+        }
+        ManifestMatch::Matched => {}
     }
 
     let runtime_health_context = if category == "runtime" {
@@ -6276,35 +6338,45 @@ async fn handle_system_update_message(
             .map(|result| (result, "done"))
     };
     match applied {
-        Ok((result, phase)) => serde_json::json!({
-            "status": result.status,
-            // `restarting`: a core update whose new binaries are in place and whose services are
-            // restarting in the background; its outcome is `/versions` -> core.last_update.
-            "phase": phase,
-            "category": category,
-            "hive": state.hive_id.as_str(),
-            "manifest_version": expected_version,
-            "local_manifest_version": local.version,
-            "local_manifest_hash": local_hash,
-            "runtime": request.runtime.clone(),
-            "runtime_version": request.runtime_version.clone(),
-            "readiness_scope": if request.runtime.is_some() { "targeted" } else { "global" },
-            "targeted_runtime_health": runtime_health_context
-                .as_ref()
-                .map(|(targeted, _)| targeted.clone())
-                .unwrap_or(serde_json::Value::Null),
-            "global_runtime_health": runtime_health_context
-                .as_ref()
-                .map(|(_, global)| global.clone())
-                .unwrap_or(serde_json::Value::Null),
-            "updated": result.updated,
-            "unchanged": result.unchanged,
-            // A core update's components dist no longer holds, left as installed: the release
-            // dropped them from the role, and the orchestrator it installs settles them.
-            "left_out": result.left_out,
-            "restarted": result.restarted,
-            "errors": result.errors,
-        }),
+        Ok((result, phase)) => {
+            let mut answer = serde_json::json!({
+                "status": result.status,
+                // `restarting`: a core update whose new binaries are in place and whose services
+                // are restarting in the background; its outcome is `/versions` ->
+                // core.last_update.
+                "phase": phase,
+                "category": category,
+                "hive": state.hive_id.as_str(),
+                "manifest_version": expected_version,
+                "local_manifest_version": local.version,
+                "local_manifest_hash": local_hash,
+                "runtime": request.runtime.clone(),
+                "runtime_version": request.runtime_version.clone(),
+                "readiness_scope": if request.runtime.is_some() { "targeted" } else { "global" },
+                "targeted_runtime_health": runtime_health_context
+                    .as_ref()
+                    .map(|(targeted, _)| targeted.clone())
+                    .unwrap_or(serde_json::Value::Null),
+                "global_runtime_health": runtime_health_context
+                    .as_ref()
+                    .map(|(_, global)| global.clone())
+                    .unwrap_or(serde_json::Value::Null),
+                "updated": result.updated,
+                "unchanged": result.unchanged,
+                // A core update's components dist no longer holds, left as installed: the release
+                // dropped them from the role, and the orchestrator it installs settles them.
+                "left_out": result.left_out,
+                "restarted": result.restarted,
+                "errors": result.errors,
+            });
+            // A config update whose reader did not restart, or whose readers restarted and whose
+            // record could not be written (`apply_config_update_local`).
+            if result.status == "error" {
+                answer["error_code"] = serde_json::json!(config_update_error_code(&result.errors));
+                answer["message"] = serde_json::json!(result.errors.join("; "));
+            }
+            answer
+        }
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "UPDATE_FAILED",
@@ -6516,6 +6588,10 @@ fn warn_superseded_hive_keys(config_dir: &Path) {
 /// Why the motherbee recorded a version: the first one, from its hive.yaml's `ai`.
 const INSTALLATION_SOURCE_MIGRATION: &str = "migration";
 
+/// Why the motherbee recorded a version: the operator's change, through SY.admin's
+/// `set_installation_ai` (stage 3c).
+const INSTALLATION_SOURCE_OPERATOR: &str = "operator";
+
 /// Where the motherbee records each version of the installation file it wrote.
 fn installation_versions_path() -> PathBuf {
     orchestrator_runtime_dir().join("installation-versions.json")
@@ -6529,6 +6605,11 @@ struct InstallationVersionRecord {
     sha256: String,
     written_at_ms: u64,
     source: String,
+    /// The `ai` values this version holds, provider and model names only (`ai_settings::ai_values`),
+    /// so a later version can put them back (stage 3c). None while they are not known: version 1 as
+    /// stage 3b recorded it, until the write or a start fills them in from its file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ai: Option<HiveAiConfig>,
 }
 
 /// The motherbee's record of every version it wrote.
@@ -6628,7 +6709,7 @@ fn write_installation_file_first_version(
     let bytes = InstallationFile {
         schema_version: INSTALLATION_SCHEMA_VERSION,
         version: 1,
-        ai,
+        ai: ai.clone(),
     }
     .render()
     .map_err(unusable)?;
@@ -6638,6 +6719,7 @@ fn write_installation_file_first_version(
         sha256: sha256.clone(),
         written_at_ms: now_ms,
         source: INSTALLATION_SOURCE_MIGRATION.to_string(),
+        ai: Some(ai_settings::ai_values(ai.as_ref())),
     });
     write_installation_versions(records_path, &versions)
         .map_err(|err| format!("its version could not be recorded: {err}"))?;
@@ -6758,6 +6840,9 @@ struct InstallationCopy {
     sha256: Option<String>,
     /// Why an invalid one is.
     error: Option<String>,
+    /// A valid one's `ai` values, the ones its readers run on (`ai_settings::ai_values`): what
+    /// SY.admin's `get_installation` shows of the motherbee's file (stage 3c).
+    ai: Option<HiveAiConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6787,24 +6872,28 @@ impl InstallationCopy {
                 version: None,
                 sha256: None,
                 error: None,
+                ai: None,
             },
             Ok(InstallationFileState::Valid(installed)) => Self {
                 file: InstallationCopyFile::Valid,
                 version: Some(installed.file.version),
                 sha256: Some(installed.sha256),
                 error: None,
+                ai: Some(ai_settings::ai_values(installed.file.ai.as_ref())),
             },
             Ok(InstallationFileState::Invalid { sha256, error }) => Self {
                 file: InstallationCopyFile::Invalid,
                 version: None,
                 sha256: Some(sha256),
                 error: Some(error),
+                ai: None,
             },
             Err(err) => Self {
                 file: InstallationCopyFile::Invalid,
                 version: None,
                 sha256: None,
                 error: Some(ai_settings::plain_error(&err)),
+                ai: None,
             },
         }
     }
@@ -6828,6 +6917,9 @@ impl InstallationCopy {
                 .get("error")
                 .and_then(|error| error.as_str())
                 .map(str::to_string),
+            ai: value
+                .get("ai")
+                .and_then(|ai| serde_json::from_value(ai.clone()).ok()),
         })
     }
 
@@ -6839,6 +6931,9 @@ impl InstallationCopy {
         });
         if let Some(error) = &self.error {
             out["error"] = serde_json::json!(error);
+        }
+        if let Some(ai) = &self.ai {
+            out["ai"] = serde_json::to_value(ai).unwrap_or(serde_json::Value::Null);
         }
         out
     }
@@ -6898,8 +6993,10 @@ fn installation_spoke_state(
     }
 }
 
-/// The motherbee's `config` section of its own `/versions`: its copy, its `state`, and why its
-/// start did not write the file when it did not (`not_written`).
+/// The motherbee's `config` section of its own `/versions`: its copy, its `state`, why its start
+/// did not write the file when it did not (`not_written`), and every version it recorded with its
+/// sha256, when, why and its values (`versions`, stage 3c), so SY.admin and Archi read the history
+/// without reading the orchestrator's files.
 fn installation_motherbee_section(
     own: &InstallationCopy,
     records: &Result<InstallationVersions, String>,
@@ -6910,8 +7007,12 @@ fn installation_motherbee_section(
     if let Some(reason) = not_written {
         section["not_written"] = serde_json::json!(reason);
     }
-    if let Err(err) = records {
-        section["records_error"] = serde_json::json!(err);
+    match records {
+        Ok(records) => {
+            section["versions"] =
+                serde_json::to_value(&records.versions).unwrap_or(serde_json::Value::Null)
+        }
+        Err(err) => section["records_error"] = serde_json::json!(err),
     }
     section
 }
@@ -6934,6 +7035,661 @@ fn add_installation_state_to_answer(
     };
     config["state"] =
         serde_json::json!(installation_spoke_state(&copy, motherbee, records.as_ref()));
+}
+
+// ===========================================================================
+// The operator's change (docs/hive-config-update-v1.md §4, stage 3c). SY.admin's
+// `set_installation_ai` sends SYSTEM_UPDATE category `config` with a `write` to the motherbee's
+// orchestrator, the only writer, and then the apply, `{category: config, manifest_version,
+// manifest_hash}`, to every hive's orchestrator: each answers `sync_pending` until its copy is that
+// version, then restarts the readers that take `ai` at their start whose engine changed.
+// ===========================================================================
+
+/// The values of the version the motherbee's file holds, when its record has none (version 1 as
+/// stage 3b recorded it) and its hash is still the one recorded: true when they were filled in. A
+/// file edited by hand fills in nothing.
+fn fill_current_version_values(
+    versions: &mut InstallationVersions,
+    file: &InstallationFileState,
+) -> bool {
+    let InstallationFileState::Valid(installed) = file else {
+        return false;
+    };
+    let Some(record) = versions
+        .versions
+        .iter_mut()
+        .find(|record| record.version == installed.file.version)
+    else {
+        return false;
+    };
+    if record.ai.is_some() || record.sha256 != installed.sha256 {
+        return false;
+    }
+    record.ai = Some(ai_settings::ai_values(installed.file.ai.as_ref()));
+    true
+}
+
+/// The motherbee's start: the values of the version its file holds, recorded once (stage 3b's
+/// version 1 has none), so `/versions` lists every version with its values from this start on.
+/// Never a reason not to start.
+fn record_current_version_values_at_start(file: &Path, records_path: &Path) {
+    let (Ok(mut versions), Ok(state)) = (
+        read_installation_versions(records_path),
+        installation_file_state(file),
+    ) else {
+        return;
+    };
+    if !fill_current_version_values(&mut versions, &state) {
+        return;
+    }
+    match write_installation_versions(records_path, &versions) {
+        Ok(()) => tracing::info!(
+            records = %records_path.display(),
+            "recorded the values of the installation file's current version"
+        ),
+        Err(err) => tracing::warn!(
+            records = %records_path.display(),
+            error = %err,
+            "could not record the values of the installation file's current version; the next \
+             write records them"
+        ),
+    }
+}
+
+/// The `write` of a SYSTEM_UPDATE category config (stage 3c): the operator's new `ai`, the version
+/// of the motherbee's file the change was decided on, and whether it may replace a hand edit.
+#[derive(Debug, Clone, PartialEq)]
+struct InstallationWriteRequest {
+    ai: HiveAiConfig,
+    expected_version: u64,
+    replace_hand_edit: bool,
+}
+
+/// Why the motherbee wrote no version: an error code and the reason in plain words.
+#[derive(Debug, Clone, PartialEq)]
+struct InstallationRefusal {
+    code: &'static str,
+    message: String,
+}
+
+impl InstallationRefusal {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// The version the motherbee wrote, and the one its file held before.
+#[derive(Debug, Clone, PartialEq)]
+struct InstallationWritten {
+    version: u64,
+    sha256: String,
+    previous_version: u64,
+    previous_sha256: Option<String>,
+}
+
+/// `write`: `{ai, expected_version, replace_hand_edit?}`, the `ai` taken exactly
+/// (`ai_settings::parse_operator_ai`). A null `replace_hand_edit` is an absent one.
+fn parse_installation_write(
+    write: &serde_json::Value,
+) -> Result<InstallationWriteRequest, InstallationRefusal> {
+    let invalid = |message: String| InstallationRefusal::new("INVALID_REQUEST", message);
+    let fields = write.as_object().ok_or_else(|| {
+        invalid("write must be an object: {ai, expected_version, replace_hand_edit}".to_string())
+    })?;
+    if let Some(other) = fields.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "ai" | "expected_version" | "replace_hand_edit"
+        )
+    }) {
+        return Err(invalid(format!(
+            "write.{other} is not a field of the write: it takes ai, expected_version and \
+             replace_hand_edit"
+        )));
+    }
+    let ai = ai_settings::parse_operator_ai(fields.get("ai").unwrap_or(&serde_json::Value::Null))
+        .map_err(|reason| InstallationRefusal::new("INVALID_AI_SETTINGS", reason))?;
+    let expected_version = fields
+        .get("expected_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            invalid(
+                "write.expected_version is required: the version of the motherbee's installation \
+                 file the change was decided on"
+                    .to_string(),
+            )
+        })?;
+    let replace_hand_edit = match fields.get("replace_hand_edit") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid("write.replace_hand_edit must be true or false".to_string()))?,
+    };
+    Ok(InstallationWriteRequest {
+        ai,
+        expected_version,
+        replace_hand_edit,
+    })
+}
+
+/// The motherbee writes the operator's next version, the only writer (stage 3c), or refuses and
+/// writes nothing:
+/// - on a spoke (`NOT_PRIMARY`);
+/// - while a join or a removal runs (`JOIN_IN_PROGRESS`, A-12): a join copies the file to its spoke;
+/// - while it holds no file (`INSTALLATION_NOT_WRITTEN`): its start writes version 1;
+/// - while its file is edited by hand (`INSTALLATION_EDITED_BY_HAND`, A-7): one no reader can use,
+///   or a hash its version was not recorded with; `replace_hand_edit` makes this change the next
+///   version over it;
+/// - when `expected_version` is not its version (`VERSION_CONFLICT`): it changed since it was read;
+///   for a file no reader can use, its version is the last one recorded;
+/// - for values no reader can use (`INVALID_AI_SETTINGS`);
+/// - when nothing changes (`INSTALLATION_UNCHANGED`): its version holds these values.
+///
+/// The next version is one past the last recorded, or past the file's when a hand edit raised it.
+/// It is recorded with its values first, then the file is written, atomically and mode 0644, as the
+/// first version is (`write_installation_file_first_version`): a file is never there without its
+/// record, and a record whose file could not be written is taken back.
+fn write_installation_operator_version(
+    is_motherbee: bool,
+    topology_busy: bool,
+    file: &Path,
+    records_path: &Path,
+    request: &InstallationWriteRequest,
+    now_ms: u64,
+) -> Result<InstallationWritten, InstallationRefusal> {
+    if !is_motherbee {
+        return Err(InstallationRefusal::new(
+            "NOT_PRIMARY",
+            "only the motherbee's orchestrator writes the installation file: send the write to \
+             SY.orchestrator@motherbee",
+        ));
+    }
+    if topology_busy {
+        return Err(InstallationRefusal::new(
+            "JOIN_IN_PROGRESS",
+            "a hive is joining or being removed, and a join copies the installation file to its \
+             spoke: change it once that ends",
+        ));
+    }
+    let mut versions = read_installation_versions(records_path).map_err(|err| {
+        InstallationRefusal::new(
+            "INSTALLATION_RECORDS_UNREADABLE",
+            format!(
+                "the motherbee's record of the installation file's versions cannot be read \
+                 ({err}): nothing was written"
+            ),
+        )
+    })?;
+    let state = installation_file_state(file).map_err(|err| {
+        InstallationRefusal::new(
+            "INSTALLATION_UNREADABLE",
+            format!(
+                "the motherbee's installation file cannot be read ({}): nothing was written",
+                ai_settings::plain_error(&err)
+            ),
+        )
+    })?;
+    let latest = versions.latest_version().unwrap_or(0);
+    // The version a change names, the hash of the file now, its values, and why it is a hand edit.
+    let (current_version, current_sha256, current_ai, hand_edit) = match &state {
+        InstallationFileState::Absent => {
+            let message = if latest > 1 {
+                format!(
+                    "the motherbee holds no installation file while version {latest} was recorded: \
+                     put that version back (the same bytes, from a hive that holds it: /versions \
+                     shows which), then change it"
+                )
+            } else {
+                "the motherbee holds no installation file yet: its orchestrator writes version 1 \
+                 from hive.yaml's ai at its start, and did not (/versions: config.not_written \
+                 says why). Fix hive.yaml's ai, restart sy-orchestrator on the motherbee, and \
+                 change it once version 1 is there"
+                    .to_string()
+            };
+            return Err(InstallationRefusal::new(
+                "INSTALLATION_NOT_WRITTEN",
+                message,
+            ));
+        }
+        InstallationFileState::Invalid { sha256, error } => (
+            latest,
+            Some(sha256.clone()),
+            None,
+            Some(format!("it is not one any reader can use ({error})")),
+        ),
+        InstallationFileState::Valid(installed) => {
+            let version = installed.file.version;
+            let hand_edit = match versions.record_for(version) {
+                Some(record) if record.sha256 == installed.sha256 => None,
+                Some(_) => Some(format!(
+                    "its hash is not the one version {version} was written with"
+                )),
+                None => Some(format!("no version {version} was ever written")),
+            };
+            (
+                version,
+                Some(installed.sha256.clone()),
+                Some(ai_settings::ai_values(installed.file.ai.as_ref())),
+                hand_edit,
+            )
+        }
+    };
+    if let Some(why) = &hand_edit {
+        if !request.replace_hand_edit {
+            return Err(InstallationRefusal::new(
+                "INSTALLATION_EDITED_BY_HAND",
+                format!(
+                    "the motherbee's installation file was edited by hand: {why}. Restore it (the \
+                     same bytes as a hive that holds its version: /versions shows which), or make \
+                     this change the next version over it with replace_hand_edit: true"
+                ),
+            ));
+        }
+    }
+    if request.expected_version != current_version {
+        return Err(InstallationRefusal::new(
+            "VERSION_CONFLICT",
+            format!(
+                "the motherbee's installation file is at version {current_version}, not {}: it \
+                 changed since it was read. Read it again (get_installation) and decide on its \
+                 values",
+                request.expected_version
+            ),
+        ));
+    }
+    if hand_edit.is_none() && current_ai.as_ref() == Some(&request.ai) {
+        return Err(InstallationRefusal::new(
+            "INSTALLATION_UNCHANGED",
+            format!(
+                "nothing changes: version {current_version}, the current one, already holds these \
+                 values"
+            ),
+        ));
+    }
+    let version = latest.max(current_version) + 1;
+    let bytes = InstallationFile {
+        schema_version: INSTALLATION_SCHEMA_VERSION,
+        version,
+        ai: Some(request.ai.clone()),
+    }
+    .render()
+    .map_err(|err| {
+        InstallationRefusal::new(
+            "INVALID_AI_SETTINGS",
+            format!(
+                "these ai settings are not ones every reader can use: {}",
+                ai_settings::plain_error(&err)
+            ),
+        )
+    })?;
+    let sha256 = sha256_hex(&bytes);
+    let before = versions.clone();
+    fill_current_version_values(&mut versions, &state);
+    versions.upsert(InstallationVersionRecord {
+        version,
+        sha256: sha256.clone(),
+        written_at_ms: now_ms,
+        source: INSTALLATION_SOURCE_OPERATOR.to_string(),
+        ai: Some(request.ai.clone()),
+    });
+    write_installation_versions(records_path, &versions).map_err(|err| {
+        InstallationRefusal::new(
+            "INSTALLATION_WRITE_FAILED",
+            format!("version {version} could not be recorded ({err}): nothing was written"),
+        )
+    })?;
+    if let Err(err) = write_file_atomic(file, &bytes) {
+        let kept = match write_installation_versions(records_path, &before) {
+            Ok(()) => String::new(),
+            Err(_) => format!("; its record stays, a version {version} no hive holds"),
+        };
+        return Err(InstallationRefusal::new(
+            "INSTALLATION_WRITE_FAILED",
+            format!(
+                "version {version} could not be written ({err}): the motherbee's file is still \
+                 version {current_version}{kept}"
+            ),
+        ));
+    }
+    Ok(InstallationWritten {
+        version,
+        sha256,
+        previous_version: current_version,
+        previous_sha256: current_sha256,
+    })
+}
+
+/// The answer to a SYSTEM_UPDATE category config with a `write` (stage 3c): `{status: ok, version,
+/// sha256, previous_version, previous_sha256}`, or the refusal with its `error_code`. The system
+/// worker takes one message at a time; the lock keeps the write single all the same.
+fn installation_write_answer(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    static ONE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let refusal_json = |refusal: InstallationRefusal| {
+        tracing::warn!(
+            error_code = refusal.code,
+            reason = %refusal.message,
+            "the installation file's write was refused; nothing was written"
+        );
+        serde_json::json!({
+            "status": "error",
+            "error_code": refusal.code,
+            "message": refusal.message,
+            "category": "config",
+            "hive": state.hive_id.as_str(),
+        })
+    };
+    let request =
+        match parse_installation_write(payload.get("write").unwrap_or(&serde_json::Value::Null)) {
+            Ok(request) => request,
+            Err(refusal) => return refusal_json(refusal),
+        };
+    let _one_writer = ONE_WRITER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let written = write_installation_operator_version(
+        state.is_motherbee,
+        state.is_motherbee && state.any_hive_topology_busy(),
+        &installation_file_path(&state.dist.path),
+        &installation_versions_path(),
+        &request,
+        now_epoch_ms(),
+    );
+    match written {
+        Ok(written) => {
+            tracing::info!(
+                version = written.version,
+                sha256 = %written.sha256,
+                previous_version = written.previous_version,
+                default_provider = %request.ai.default_provider,
+                source = INSTALLATION_SOURCE_OPERATOR,
+                "wrote the installation file's next version (docs/hive-config-update-v1.md §4)"
+            );
+            serde_json::json!({
+                "status": "ok",
+                "category": "config",
+                "hive": state.hive_id.as_str(),
+                "version": written.version,
+                "sha256": written.sha256,
+                "previous_version": written.previous_version,
+                "previous_sha256": written.previous_sha256,
+            })
+        }
+        Err(refusal) => refusal_json(refusal),
+    }
+}
+
+/// Where a hive records the config update it applied last.
+fn config_applied_path() -> PathBuf {
+    orchestrator_runtime_dir().join("config-applied.json")
+}
+
+/// The config update a hive applied last (stage 3c): the version, its hash, when, its `ai` values
+/// (provider and model names only, `ai_settings::ai_values`) and the readers it restarted. The next
+/// update restarts a reader only when its engine differs from this one's; `/versions` shows it as
+/// the hive's `config.applied`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigAppliedRecord {
+    version: u64,
+    sha256: String,
+    applied_at_ms: u64,
+    ai: HiveAiConfig,
+    #[serde(default)]
+    restarted: Vec<String>,
+}
+
+/// The record at `path`: none while it does not exist (no config update applied here yet); an
+/// error when it cannot be read or does not decode.
+fn read_config_applied(path: &Path) -> Result<Option<ConfigAppliedRecord>, String> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|err| format!("'{}' does not decode: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("'{}' unreadable: {err}", path.display())),
+    }
+}
+
+fn write_config_applied(
+    path: &Path,
+    record: &ConfigAppliedRecord,
+) -> Result<(), OrchestratorError> {
+    let mut bytes = serde_json::to_vec_pretty(record)?;
+    bytes.push(b'\n');
+    write_new_file_atomic(path, &bytes, 0o644)
+}
+
+/// `/versions`' `config.applied`: the record, null before a hive's first config update, and the
+/// reason when it cannot be read.
+fn config_applied_json(record: &Result<Option<ConfigAppliedRecord>, String>) -> serde_json::Value {
+    match record {
+        Ok(Some(record)) => serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
+        Ok(None) => serde_json::Value::Null,
+        Err(err) => serde_json::json!({ "error": err }),
+    }
+}
+
+/// The SY nodes that take the installation's `ai` at their start, by role (stage 3c): a config
+/// update restarts those whose engine changed. The others take a new version without a restart:
+/// ai.generic reads it at each request, SY.admin's executor and Archi at their next use. An ingress
+/// and an egress run none.
+fn installation_start_readers(role: HiveRole) -> &'static [&'static str] {
+    match role {
+        HiveRole::Motherbee => &["SY.cognition", "SY.frontdesk.gov"],
+        HiveRole::Worker => &["SY.cognition"],
+        HiveRole::Ingress | HiveRole::Egress => &[],
+    }
+}
+
+/// The services of `role`'s start readers that its release runs (`system_nodes_for_role`).
+fn installation_start_reader_services(role: HiveRole) -> Vec<String> {
+    let runs = system_nodes_for_role(role).nodes;
+    installation_start_readers(role)
+        .iter()
+        .filter(|node| runs.iter().any(|name| name == *node))
+        .map(|node| name_to_service(node))
+        .collect()
+}
+
+/// What a config update does on a hive, against the update it applied last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigUpdatePlan {
+    /// This version, with this hash, is the one applied last: nothing restarts.
+    AlreadyApplied,
+    /// The readers to restart and those left as they are: all restart when no record says what
+    /// they run (a hive's first config update), and none when their engine is the one applied last.
+    Apply {
+        restart: Vec<String>,
+        unchanged: Vec<String>,
+    },
+}
+
+/// The restart decision (stage 3c). A reader's engine is `ai_settings::engine_of` its values: the
+/// default provider with its model. Every start reader runs that one engine, so they restart
+/// together or not at all.
+fn config_update_plan(
+    readers: &[String],
+    previous: Option<&ConfigAppliedRecord>,
+    version: u64,
+    sha256: &str,
+    ai: &HiveAiConfig,
+) -> ConfigUpdatePlan {
+    let engine_changed = match previous {
+        Some(previous)
+            if previous.version == version
+                && normalize_sha256(&previous.sha256) == normalize_sha256(sha256) =>
+        {
+            return ConfigUpdatePlan::AlreadyApplied;
+        }
+        Some(previous) => match (
+            ai_settings::engine_of(Some(&previous.ai)),
+            ai_settings::engine_of(Some(ai)),
+        ) {
+            (Ok(before), Ok(now)) => before != now,
+            _ => true,
+        },
+        None => true,
+    };
+    let readers = readers.to_vec();
+    if engine_changed {
+        ConfigUpdatePlan::Apply {
+            restart: readers,
+            unchanged: Vec::new(),
+        }
+    } else {
+        ConfigUpdatePlan::Apply {
+            restart: Vec::new(),
+            unchanged: readers,
+        }
+    }
+}
+
+/// SYSTEM_UPDATE category config once this hive holds the version it names (stage 3c): restarts the
+/// start readers whose engine changed (`config_update_plan`), only those this hive runs, each behind
+/// the core's health gate, and then records what it applied. A reader that does not run is left as
+/// it is: it reads the file at its next start. A restart that fails leaves the record as it was, so
+/// the same update run again restarts the readers again.
+async fn apply_config_update_local(
+    state: &OrchestratorState,
+    request: &SystemUpdateRequest,
+) -> Result<SystemUpdateApplyResult, OrchestratorError> {
+    let file = installation_file_path(&state.dist.path);
+    let pending = |message: String| SystemUpdateApplyResult {
+        status: "sync_pending".to_string(),
+        updated: Vec::new(),
+        unchanged: Vec::new(),
+        left_out: Vec::new(),
+        restarted: Vec::new(),
+        errors: vec![message],
+    };
+    let installed: InstalledSettings = match installation_file_state(&file) {
+        Ok(InstallationFileState::Valid(installed))
+            if normalize_sha256(&installed.sha256) == normalize_sha256(&request.manifest_hash) =>
+        {
+            installed
+        }
+        // Syncthing replaced or removed it since the check: still on its way.
+        Ok(InstallationFileState::Valid(_)) | Ok(InstallationFileState::Absent) => {
+            return Ok(pending(
+                "the installation file changed while the update ran; it is still on its way"
+                    .to_string(),
+            ))
+        }
+        Ok(InstallationFileState::Invalid { error, .. }) => {
+            return Err(format!(
+                "this hive's installation file is not one any reader can use ({error}); nothing \
+                 restarted"
+            )
+            .into())
+        }
+        Err(err) => return Err(ai_settings::plain_error(&err).into()),
+    };
+    let readers = installation_start_reader_services(state.role);
+    let applied_path = config_applied_path();
+    let previous = match read_config_applied(&applied_path) {
+        Ok(previous) => previous,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "the record of the config update applied last cannot be read: this update \
+                 restarts every reader of the installation's ai"
+            );
+            None
+        }
+    };
+    let values = ai_settings::ai_values(installed.file.ai.as_ref());
+    let version = installed.file.version;
+    let (restart, mut unchanged) = match config_update_plan(
+        &readers,
+        previous.as_ref(),
+        version,
+        &installed.sha256,
+        &values,
+    ) {
+        ConfigUpdatePlan::AlreadyApplied => {
+            tracing::info!(
+                version,
+                "config update: this version is applied already; nothing restarts"
+            );
+            return Ok(SystemUpdateApplyResult {
+                status: "ok".to_string(),
+                updated: Vec::new(),
+                unchanged: readers,
+                left_out: Vec::new(),
+                restarted: Vec::new(),
+                errors: Vec::new(),
+            });
+        }
+        ConfigUpdatePlan::Apply { restart, unchanged } => (restart, unchanged),
+    };
+    let mut restarted = Vec::new();
+    let mut errors = Vec::new();
+    for service in restart {
+        if !(systemd_unit_exists(&service) && systemd_is_active(&service)) {
+            tracing::info!(
+                service = %service,
+                "config update: not running, so not restarted; it reads the installation file at \
+                 its next start"
+            );
+            unchanged.push(service);
+            continue;
+        }
+        match restart_core_service_with_health_gate(&service).await {
+            Ok(()) => restarted.push(service),
+            Err(err) => errors.push(format!("{service}: {err}")),
+        }
+    }
+    if errors.is_empty() {
+        let record = ConfigAppliedRecord {
+            version,
+            sha256: installed.sha256.clone(),
+            applied_at_ms: now_epoch_ms(),
+            ai: values,
+            restarted: restarted.clone(),
+        };
+        if let Err(err) = write_config_applied(&applied_path, &record) {
+            errors.push(format!("{CONFIG_RECORD_UNWRITTEN} ({err}); the next config update restarts every reader again"));
+        }
+    }
+    tracing::info!(
+        version,
+        sha256 = %installed.sha256,
+        restarted = ?restarted,
+        unchanged = ?unchanged,
+        errors = ?errors,
+        "config update applied (docs/hive-config-update-v1.md §4)"
+    );
+    Ok(SystemUpdateApplyResult {
+        status: if errors.is_empty() { "ok" } else { "error" }.to_string(),
+        updated: Vec::new(),
+        unchanged,
+        left_out: Vec::new(),
+        restarted,
+        errors,
+    })
+}
+
+/// The error of a config update whose readers restarted and whose record could not be written.
+const CONFIG_RECORD_UNWRITTEN: &str = "the readers took the version, and its record could not be \
+                                       written";
+
+/// A config update's error code: `CONFIG_RECORD_FAILED` when only its record could not be written,
+/// else `RESTART_FAILED`, a reader that did not restart.
+fn config_update_error_code(errors: &[String]) -> &'static str {
+    if !errors.is_empty()
+        && errors
+            .iter()
+            .all(|error| error.starts_with(CONFIG_RECORD_UNWRITTEN))
+    {
+        "CONFIG_RECORD_FAILED"
+    } else {
+        "RESTART_FAILED"
+    }
 }
 
 /// The SY nodes this release runs on `role`, in start order, and the ones the start waits for.
@@ -14931,7 +15687,7 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     // judges its own against the versions it recorded; a spoke's `state` is the motherbee's to give
     // (`add_installation_state_to_answer`), against its own file.
     let own_copy = InstallationCopy::read(&state.dist.path);
-    let config = if state.is_motherbee {
+    let mut config = if state.is_motherbee {
         installation_motherbee_section(
             &own_copy,
             &read_installation_versions(&installation_versions_path()),
@@ -14940,6 +15696,8 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     } else {
         own_copy.to_json()
     };
+    // Stage 3c: the config update this hive applied last (`apply_config_update_local`).
+    config["applied"] = config_applied_json(&read_config_applied(&config_applied_path()));
 
     serde_json::json!({
         "hive_id": state.hive_id,
@@ -39328,6 +40086,8 @@ blob:
                 sha256: sha256.clone(),
                 written_at_ms: 1234,
                 source: "migration".to_string(),
+                // Stage 3c: the version's values, so a later one can put them back.
+                ai: parsed.ai.clone(),
             }]
         );
         assert_eq!(
@@ -39412,6 +40172,7 @@ blob:
                 sha256: format!("{version:064}"),
                 written_at_ms: version,
                 source: "migration".to_string(),
+                ai: None,
             });
         }
         write_installation_versions(&records, &later).expect("records");
@@ -39441,9 +40202,15 @@ blob:
             .expect("written");
         let bytes = fs::read(&file).expect("the file");
         let valid = InstallationCopy::read(&dist);
+        // A file without ai holds the fallback engine's values (stage 3c).
         assert_eq!(
             valid.to_json(),
-            serde_json::json!({"file": "valid", "version": 1, "sha256": sha256_hex(&bytes)})
+            serde_json::json!({
+                "file": "valid",
+                "version": 1,
+                "sha256": sha256_hex(&bytes),
+                "ai": {"default_provider": "openai", "providers": {"openai": {"model": "gpt-5.5"}, "anthropic": null}},
+            })
         );
         assert_eq!(InstallationCopy::from_json(&valid.to_json()), Some(valid));
         let state = installation_file_state(&file).expect("state");
@@ -39484,6 +40251,7 @@ blob:
             sha256: sha256.to_string(),
             written_at_ms: version,
             source: "migration".to_string(),
+            ai: None,
         };
         let records = InstallationVersions {
             versions: vec![record(1, "aaa"), record(2, "bbb")],
@@ -39494,6 +40262,7 @@ blob:
                 version,
                 sha256: sha256.map(str::to_string),
                 error: None,
+                ai: None,
             }
         };
         use InstallationCopyFile::{Absent, Invalid, Valid};
@@ -39616,6 +40385,610 @@ blob:
         );
         let value: serde_yaml::Value = serde_yaml::from_str(&worker).expect("yaml");
         assert!(value.get("ai").is_none(), "{worker}");
+    }
+
+    // --- The operator's change (docs/hive-config-update-v1.md §4, stage 3c) ---
+
+    /// An `ai` with `default` as its default provider and these models.
+    fn operator_ai(
+        default: fluxbee_ai_sdk::AiProvider,
+        openai: Option<&str>,
+        anthropic: Option<&str>,
+    ) -> HiveAiConfig {
+        let model = |model: Option<&str>| {
+            model.map(|model| fluxbee_ai_sdk::AiProviderModelConfig {
+                model: model.to_string(),
+            })
+        };
+        HiveAiConfig {
+            default_provider: default,
+            providers: fluxbee_ai_sdk::AiProviderConfigs {
+                openai: model(openai),
+                anthropic: model(anthropic),
+            },
+        }
+    }
+
+    /// 8.x's values: Claude by default, both providers listed.
+    fn claude_by_default() -> HiveAiConfig {
+        operator_ai(
+            fluxbee_ai_sdk::AiProvider::Anthropic,
+            Some("gpt-5.5"),
+            Some("claude-sonnet-5-5"),
+        )
+    }
+
+    fn write_request(ai: HiveAiConfig, expected_version: u64) -> InstallationWriteRequest {
+        InstallationWriteRequest {
+            ai,
+            expected_version,
+            replace_hand_edit: false,
+        }
+    }
+
+    /// A motherbee holding version 1 as stage 3b wrote it, from 8.x's values, its record without
+    /// them: (root, dist, file, records).
+    fn motherbee_at_version_1(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = installation_temp_root(tag);
+        let dist = root.join("dist");
+        let file = installation_file_path(&dist);
+        let records = root.join("orchestrator").join("installation-versions.json");
+        let yaml = serde_yaml::to_value(claude_by_default()).expect("yaml");
+        write_installation_file_first_version(&file, &records, Some(&yaml), 1_000).expect("v1");
+        let mut recorded = read_installation_versions(&records).expect("records");
+        recorded.versions[0].ai = None;
+        write_installation_versions(&records, &recorded).expect("as 3b recorded it");
+        (root, dist, file, records)
+    }
+
+    /// The write: the next version, its values recorded with it before the file, mode 0644; version
+    /// 1's values filled in from its file; and the answer names the version it replaced.
+    #[test]
+    fn the_motherbee_writes_the_operator_s_next_version_with_its_values() {
+        let (root, dist, file, records) = motherbee_at_version_1("write");
+        let v1_sha256 = sha256_hex(&fs::read(&file).expect("v1"));
+        let openai_set = operator_ai(
+            fluxbee_ai_sdk::AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        let written = write_installation_operator_version(
+            true,
+            false,
+            &file,
+            &records,
+            &write_request(openai_set.clone(), 1),
+            2_000,
+        )
+        .expect("written");
+        let bytes = fs::read(&file).expect("v2");
+        assert_eq!(
+            written,
+            InstallationWritten {
+                version: 2,
+                sha256: sha256_hex(&bytes),
+                previous_version: 1,
+                previous_sha256: Some(v1_sha256.clone()),
+            }
+        );
+        let parsed = InstallationFile::parse(&bytes).expect("every reader reads it");
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.ai, Some(openai_set.clone()));
+        assert_eq!(
+            fs::metadata(&file).expect("meta").permissions().mode() & 0o777,
+            0o644
+        );
+        let recorded = read_installation_versions(&records).expect("records");
+        assert_eq!(
+            recorded.versions,
+            vec![
+                InstallationVersionRecord {
+                    version: 1,
+                    sha256: v1_sha256,
+                    written_at_ms: 1_000,
+                    source: "migration".to_string(),
+                    ai: Some(claude_by_default()),
+                },
+                InstallationVersionRecord {
+                    version: 2,
+                    sha256: written.sha256.clone(),
+                    written_at_ms: 2_000,
+                    source: "operator".to_string(),
+                    ai: Some(openai_set.clone()),
+                },
+            ]
+        );
+        let own = InstallationCopy::read(&dist);
+        assert_eq!(installation_motherbee_state(&own, Ok(&recorded)), "current");
+        assert_eq!(own.ai, Some(openai_set));
+        // /versions lists every version with its values.
+        let section = installation_motherbee_section(&own, &Ok(recorded.clone()), None);
+        assert_eq!(
+            section["versions"][0]["ai"]["default_provider"],
+            "anthropic"
+        );
+        assert_eq!(section["versions"][1]["source"], "operator");
+        assert_eq!(
+            section["versions"][1]["ai"]["providers"]["openai"]["model"],
+            "gpt-5.6"
+        );
+
+        // Undo: version 1's values back, as version 3.
+        let undone = write_installation_operator_version(
+            true,
+            false,
+            &file,
+            &records,
+            &write_request(claude_by_default(), 2),
+            3_000,
+        )
+        .expect("undone");
+        assert_eq!((undone.version, undone.previous_version), (3, 2));
+        assert_eq!(
+            InstallationFile::parse(&fs::read(&file).expect("v3"))
+                .expect("v3")
+                .ai,
+            Some(claude_by_default())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Each refusal writes nothing, and says why with its code.
+    #[test]
+    fn the_write_refuses_and_writes_nothing() {
+        let (root, _dist, file, records) = motherbee_at_version_1("refuse");
+        let v1 = fs::read(&file).expect("v1");
+        let recorded_v1 = fs::read(&records).expect("records");
+        let change = operator_ai(fluxbee_ai_sdk::AiProvider::OpenAi, Some("gpt-5.6"), None);
+        let refused = |is_motherbee: bool, busy: bool, request: &InstallationWriteRequest| {
+            write_installation_operator_version(is_motherbee, busy, &file, &records, request, 9)
+                .expect_err("refused")
+        };
+        let request = write_request(change.clone(), 1);
+        assert_eq!(refused(false, false, &request).code, "NOT_PRIMARY");
+        let busy = refused(true, true, &request);
+        assert_eq!(busy.code, "JOIN_IN_PROGRESS");
+        assert!(
+            busy.message.contains("joining or being removed"),
+            "{busy:?}"
+        );
+        let conflict = refused(true, false, &write_request(change.clone(), 2));
+        assert_eq!(conflict.code, "VERSION_CONFLICT");
+        assert!(
+            conflict.message.contains("at version 1, not 2"),
+            "{conflict:?}"
+        );
+        let unchanged = refused(true, false, &write_request(claude_by_default(), 1));
+        assert_eq!(unchanged.code, "INSTALLATION_UNCHANGED");
+        assert!(unchanged.message.contains("version 1"), "{unchanged:?}");
+        assert_eq!(fs::read(&file).expect("v1"), v1);
+        assert_eq!(fs::read(&records).expect("records"), recorded_v1);
+
+        // Values no reader can use never reach the write.
+        let invalid = parse_installation_write(&serde_json::json!({
+            "ai": {"default_provider": "anthropic", "providers": {"openai": {"model": "gpt-5.5"}}},
+            "expected_version": 1,
+        }))
+        .expect_err("no model for its default provider");
+        assert_eq!(invalid.code, "INVALID_AI_SETTINGS");
+        assert!(
+            invalid.message.contains("ai.providers.anthropic"),
+            "{invalid:?}"
+        );
+
+        // A hand edit: refused, unless the change replaces it, as the next version over it.
+        let mut edited: serde_json::Value = serde_json::from_slice(&v1).expect("json");
+        edited["ai"]["providers"]["anthropic"]["model"] = serde_json::json!("claude-opus-5-5");
+        let edited = serde_json::to_vec_pretty(&edited).expect("bytes");
+        fs::write(&file, &edited).expect("edited by hand");
+        let hand = refused(true, false, &request);
+        assert_eq!(hand.code, "INSTALLATION_EDITED_BY_HAND");
+        assert!(hand.message.contains("replace_hand_edit"), "{hand:?}");
+        assert_eq!(fs::read(&file).expect("as edited"), edited);
+        let replaced = write_installation_operator_version(
+            true,
+            false,
+            &file,
+            &records,
+            &InstallationWriteRequest {
+                replace_hand_edit: true,
+                ..request.clone()
+            },
+            10,
+        )
+        .expect("replaces the hand edit");
+        assert_eq!(replaced.version, 2);
+        assert_eq!(replaced.previous_sha256, Some(sha256_hex(&edited)));
+        // Version 1's values stay unknown: the file was not version 1's any more.
+        let recorded = read_installation_versions(&records).expect("records");
+        assert_eq!(recorded.record_for(1).expect("v1").ai, None);
+
+        // A file no reader can use: its version is the last one recorded, and a hand edit that
+        // raised the version is passed by the next one.
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("broken");
+        let broken = refused(true, false, &write_request(change.clone(), 2));
+        assert_eq!(broken.code, "INSTALLATION_EDITED_BY_HAND");
+        assert!(
+            broken.message.contains("not one any reader can use"),
+            "{broken:?}"
+        );
+        let raised = InstallationFile {
+            schema_version: INSTALLATION_SCHEMA_VERSION,
+            version: 7,
+            ai: Some(claude_by_default()),
+        }
+        .render()
+        .expect("v7");
+        fs::write(&file, &raised).expect("raised by hand");
+        let over = write_installation_operator_version(
+            true,
+            false,
+            &file,
+            &records,
+            &InstallationWriteRequest {
+                ai: change.clone(),
+                expected_version: 7,
+                replace_hand_edit: true,
+            },
+            11,
+        )
+        .expect("over the raised version");
+        assert_eq!((over.version, over.previous_version), (8, 7));
+
+        // No file: version 1 is its start's to write; a later version, put back by hand.
+        fs::remove_file(&file).expect("gone");
+        let missing = refused(true, false, &write_request(change.clone(), 8));
+        assert_eq!(missing.code, "INSTALLATION_NOT_WRITTEN");
+        assert!(
+            missing.message.contains("version 8 was recorded"),
+            "{missing:?}"
+        );
+        let fresh = installation_temp_root("fresh");
+        let fresh_file = installation_file_path(&fresh.join("dist"));
+        let none = write_installation_operator_version(
+            true,
+            false,
+            &fresh_file,
+            &fresh.join("installation-versions.json"),
+            &write_request(change.clone(), 0),
+            12,
+        )
+        .expect_err("no file yet");
+        assert_eq!(none.code, "INSTALLATION_NOT_WRITTEN");
+        assert!(none.message.contains("restart sy-orchestrator"), "{none:?}");
+        assert!(!fresh_file.exists());
+        let _ = fs::remove_dir_all(&fresh);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The record is written before the file: a record that cannot be written leaves the file as
+    /// it was.
+    #[test]
+    fn a_version_whose_record_cannot_be_written_is_not_written() {
+        let (root, _dist, file, _records) = motherbee_at_version_1("record-first");
+        let v1 = fs::read(&file).expect("v1");
+        // A records directory that is a dangling link: it reads as no record, and cannot be written.
+        let gone = root.join("gone");
+        std::os::unix::fs::symlink(root.join("nowhere"), &gone).expect("link");
+        let records = gone.join("installation-versions.json");
+        let refused = write_installation_operator_version(
+            true,
+            false,
+            &file,
+            &records,
+            &InstallationWriteRequest {
+                ai: operator_ai(fluxbee_ai_sdk::AiProvider::OpenAi, Some("gpt-5.6"), None),
+                expected_version: 1,
+                // No record of version 1 there: the file reads as a hand edit.
+                replace_hand_edit: true,
+            },
+            5,
+        )
+        .expect_err("no record, no file");
+        assert_eq!(refused.code, "INSTALLATION_WRITE_FAILED");
+        assert!(
+            refused.message.contains("nothing was written"),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read(&file).expect("still v1"), v1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The write form takes exactly `{ai, expected_version, replace_hand_edit?}`; the apply form is
+    /// the usual one, and `write` belongs to category config alone.
+    #[test]
+    fn a_config_update_is_a_write_or_an_apply() {
+        let write = serde_json::json!({
+            "category": "config",
+            "write": {
+                "ai": {"default_provider": "openai", "providers": {"openai": {"model": "gpt-5.5"}}},
+                "expected_version": 3,
+                "replace_hand_edit": null,
+            },
+        });
+        assert!(is_installation_write(&write));
+        let parsed = parse_installation_write(&write["write"]).expect("the write");
+        assert_eq!(parsed.expected_version, 3);
+        assert!(!parsed.replace_hand_edit, "null is absent");
+        for (fields, code, reason) in [
+            (
+                serde_json::json!("x"),
+                "INVALID_REQUEST",
+                "write must be an object",
+            ),
+            (
+                serde_json::json!({"ai": parsed.ai, "expected_version": 3, "force": true}),
+                "INVALID_REQUEST",
+                "write.force is not a field of the write",
+            ),
+            (
+                serde_json::json!({"ai": parsed.ai}),
+                "INVALID_REQUEST",
+                "write.expected_version is required",
+            ),
+            (
+                serde_json::json!({"ai": parsed.ai, "expected_version": 3, "replace_hand_edit": "yes"}),
+                "INVALID_REQUEST",
+                "replace_hand_edit must be true or false",
+            ),
+            (
+                serde_json::json!({"expected_version": 3}),
+                "INVALID_AI_SETTINGS",
+                "ai must be an object",
+            ),
+        ] {
+            let refused = parse_installation_write(&fields).expect_err(reason);
+            assert_eq!(refused.code, code, "{refused:?}");
+            assert!(refused.message.contains(reason), "{refused:?}");
+        }
+
+        let apply = serde_json::json!({
+            "category": "config",
+            "manifest_version": 3,
+            "manifest_hash": "abc",
+        });
+        assert!(!is_installation_write(&apply));
+        let parsed = parse_system_update_payload(&apply).expect("the apply");
+        assert_eq!(
+            (parsed.category.as_str(), parsed.manifest_version),
+            ("config", 3)
+        );
+        let misplaced = parse_system_update_payload(&serde_json::json!({
+            "category": "core",
+            "manifest_hash": "abc",
+            "write": {},
+        }))
+        .expect_err("write belongs to config");
+        assert!(misplaced.to_string().contains("only for category=config"));
+        assert!(parse_system_update_payload(&serde_json::json!({
+            "category": "config",
+            "manifest_hash": "abc",
+            "runtime": "ai.generic",
+        }))
+        .is_err());
+    }
+
+    /// A hive answers `sync_pending` until its copy is the version and the hash an update names;
+    /// a copy past the version named refuses it.
+    #[test]
+    fn a_config_update_waits_until_the_hive_holds_its_version_and_hash() {
+        let root = installation_temp_root("sync");
+        let dist = root.join("dist");
+        let file = installation_file_path(&dist);
+        fs::create_dir_all(file.parent().expect("its dir")).expect("dist/installation");
+        let render = |version: u64, ai: HiveAiConfig| {
+            InstallationFile {
+                schema_version: INSTALLATION_SCHEMA_VERSION,
+                version,
+                ai: Some(ai),
+            }
+            .render()
+            .expect("renders")
+        };
+        let v2 = render(2, claude_by_default());
+        let v2_sha256 = sha256_hex(&v2);
+        let check = |version: u64, sha256: &str| {
+            manifest_match(
+                version,
+                sha256,
+                &local_system_manifest_state("config", &dist).expect("state"),
+            )
+        };
+        assert_eq!(check(2, &v2_sha256), ManifestMatch::Mismatch, "absent");
+        fs::write(&file, render(1, claude_by_default())).expect("v1");
+        assert_eq!(check(2, &v2_sha256), ManifestMatch::Behind);
+        let other = render(
+            2,
+            operator_ai(fluxbee_ai_sdk::AiProvider::OpenAi, Some("gpt-5.5"), None),
+        );
+        fs::write(&file, &other).expect("another v2");
+        assert_eq!(check(2, &v2_sha256), ManifestMatch::Mismatch);
+        fs::write(&file, &v2).expect("v2");
+        assert_eq!(check(2, &v2_sha256), ManifestMatch::Matched);
+        assert_eq!(
+            check(2, &format!("sha256:{v2_sha256}")),
+            ManifestMatch::Matched
+        );
+        assert_eq!(check(0, &v2_sha256), ManifestMatch::Matched, "no version");
+        fs::write(&file, render(3, claude_by_default())).expect("v3");
+        assert_eq!(check(2, &v2_sha256), ManifestMatch::Ahead);
+        fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("broken");
+        assert_eq!(check(2, &v2_sha256), ManifestMatch::Mismatch);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The readers a config update restarts, by role: those that take `ai` at their start and that
+    /// the role runs.
+    #[test]
+    fn each_role_restarts_only_its_start_readers() {
+        assert_eq!(
+            installation_start_reader_services(HiveRole::Motherbee),
+            vec!["sy-cognition", "sy-frontdesk-gov"]
+        );
+        assert_eq!(
+            installation_start_reader_services(HiveRole::Worker),
+            vec!["sy-cognition"]
+        );
+        assert!(installation_start_reader_services(HiveRole::Ingress).is_empty());
+        assert!(installation_start_reader_services(HiveRole::Egress).is_empty());
+        for role in HiveRole::ALL {
+            let runs = system_nodes_for_role(role).nodes;
+            for reader in installation_start_readers(role) {
+                assert!(
+                    runs.iter().any(|node| node == reader),
+                    "{reader} is not a node of {}",
+                    role.as_str()
+                );
+            }
+            // SY.admin and Archi take a new version at their next use: a restart could cut the
+            // very action that wrote it.
+            for never in ["SY.admin", "SY.architect", "SY.orchestrator"] {
+                assert!(!installation_start_readers(role).contains(&never));
+            }
+        }
+    }
+
+    /// The restart decision: without a record every reader restarts; a change of the engine (the
+    /// default provider or its model) restarts them; another provider's model, or the same
+    /// version again, restarts nothing.
+    #[test]
+    fn a_config_update_restarts_the_readers_only_when_their_engine_changes() {
+        let readers = installation_start_reader_services(HiveRole::Motherbee);
+        let applied = |version: u64, sha256: &str, ai: HiveAiConfig| ConfigAppliedRecord {
+            version,
+            sha256: sha256.to_string(),
+            applied_at_ms: 1,
+            ai,
+            restarted: Vec::new(),
+        };
+        let restart_all = ConfigUpdatePlan::Apply {
+            restart: readers.clone(),
+            unchanged: Vec::new(),
+        };
+        let restart_none = ConfigUpdatePlan::Apply {
+            restart: Vec::new(),
+            unchanged: readers.clone(),
+        };
+        // A hive's first config update: nothing says what its readers run.
+        assert_eq!(
+            config_update_plan(&readers, None, 2, "bbb", &claude_by_default()),
+            restart_all
+        );
+        let v1 = applied(1, "aaa", claude_by_default());
+        // The gate's change: OpenAI's model, not the default provider's.
+        let openai_model = operator_ai(
+            fluxbee_ai_sdk::AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        assert_eq!(
+            config_update_plan(&readers, Some(&v1), 2, "bbb", &openai_model),
+            restart_none
+        );
+        // The default provider's model.
+        let claude_model = operator_ai(
+            fluxbee_ai_sdk::AiProvider::Anthropic,
+            Some("gpt-5.5"),
+            Some("claude-opus-5-5"),
+        );
+        assert_eq!(
+            config_update_plan(&readers, Some(&v1), 2, "bbb", &claude_model),
+            restart_all
+        );
+        // The default provider.
+        let openai_default = operator_ai(
+            fluxbee_ai_sdk::AiProvider::OpenAi,
+            Some("gpt-5.5"),
+            Some("claude-sonnet-5-5"),
+        );
+        assert_eq!(
+            config_update_plan(&readers, Some(&v1), 2, "bbb", &openai_default),
+            restart_all
+        );
+        // The same version and hash again: applied already.
+        assert_eq!(
+            config_update_plan(&readers, Some(&v1), 1, "sha256:aaa", &claude_by_default()),
+            ConfigUpdatePlan::AlreadyApplied
+        );
+        // An ingress runs no reader: nothing to restart, whatever changed.
+        assert_eq!(
+            config_update_plan(&[], None, 2, "bbb", &openai_default),
+            ConfigUpdatePlan::Apply {
+                restart: Vec::new(),
+                unchanged: Vec::new(),
+            }
+        );
+        // A reader that did not restart, and a record that could not be written, by their codes.
+        let unwritten = format!("{CONFIG_RECORD_UNWRITTEN} (disk full)");
+        assert_eq!(
+            config_update_error_code(std::slice::from_ref(&unwritten)),
+            "CONFIG_RECORD_FAILED"
+        );
+        assert_eq!(
+            config_update_error_code(&["sy-cognition: bootstrap timeout".to_string(), unwritten]),
+            "RESTART_FAILED"
+        );
+    }
+
+    /// What a hive applied last: its record, and `/versions`' `config.applied`.
+    #[test]
+    fn a_hive_records_the_config_update_it_applied() {
+        let root = installation_temp_root("applied");
+        let path = root.join("orchestrator").join("config-applied.json");
+        assert_eq!(read_config_applied(&path), Ok(None));
+        assert_eq!(
+            config_applied_json(&read_config_applied(&path)),
+            serde_json::Value::Null
+        );
+        let record = ConfigAppliedRecord {
+            version: 2,
+            sha256: "bbb".to_string(),
+            applied_at_ms: 42,
+            ai: claude_by_default(),
+            restarted: vec!["sy-cognition".to_string()],
+        };
+        write_config_applied(&path, &record).expect("written");
+        assert_eq!(
+            fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(read_config_applied(&path), Ok(Some(record.clone())));
+        let shown = config_applied_json(&read_config_applied(&path));
+        assert_eq!(shown["version"], 2);
+        assert_eq!(shown["restarted"], serde_json::json!(["sy-cognition"]));
+        assert_eq!(shown["ai"]["default_provider"], "anthropic");
+        fs::write(&path, b"not json").expect("broken");
+        assert!(config_applied_json(&read_config_applied(&path))["error"]
+            .as_str()
+            .is_some_and(|err| err.contains("does not decode")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The motherbee's start fills in the values of the version its file holds, once, and never
+    /// those of a file edited by hand.
+    #[test]
+    fn the_start_records_the_current_version_s_values_once() {
+        let (root, _dist, file, records) = motherbee_at_version_1("fill");
+        record_current_version_values_at_start(&file, &records);
+        let recorded = read_installation_versions(&records).expect("records");
+        assert_eq!(
+            recorded.record_for(1).expect("v1").ai,
+            Some(claude_by_default())
+        );
+        let mut without = recorded.clone();
+        without.versions[0].ai = None;
+        write_installation_versions(&records, &without).expect("as 3b");
+        fs::write(&file, b"{\"schema_version\":1,\"version\":1}").expect("edited");
+        record_current_version_values_at_start(&file, &records);
+        assert_eq!(
+            read_installation_versions(&records)
+                .expect("records")
+                .record_for(1)
+                .expect("v1")
+                .ai,
+            None
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn sample_core_manifest() -> CoreManifest {

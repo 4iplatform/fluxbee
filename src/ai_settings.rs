@@ -10,8 +10,10 @@
 use std::path::{Path, PathBuf};
 
 use fluxbee_ai_sdk::{
-    ai_settings_at, installation_file_path, AiSdkError, AiSettings, AiSettingsSource,
-    EffectiveAiEngine, HiveAiConfig,
+    ai_settings_at, installation_file_path, installation_file_state, sha256_hex, AiProvider,
+    AiProviderConfigs, AiProviderModelConfig, AiSdkError, AiSettings, AiSettingsSource,
+    EffectiveAiEngine, HiveAiConfig, InstallationFile, InstallationFileState,
+    INSTALLATION_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -73,12 +75,202 @@ pub fn reader_ai_settings(
 /// What a reader that runs one engine runs on: its `ai`'s default provider with that provider's
 /// model, or the fallback engine without an `ai` (`HiveAiConfig::fallback`).
 pub fn reader_engine(settings: &AiSettings) -> fluxbee_ai_sdk::Result<EffectiveAiEngine> {
-    Ok(settings
-        .ai
-        .as_ref()
+    engine_of(settings.ai.as_ref())
+}
+
+/// The engine `ai` gives a reader that runs one (`reader_engine`): what a config update compares to
+/// decide which readers to restart (docs/hive-config-update-v1.md §4, stage 3c).
+pub fn engine_of(ai: Option<&HiveAiConfig>) -> fluxbee_ai_sdk::Result<EffectiveAiEngine> {
+    Ok(ai
         .map(HiveAiConfig::effective)
         .transpose()?
         .unwrap_or_else(HiveAiConfig::fallback))
+}
+
+/// The values every reader runs on with `ai`: `ai` itself, or for none the fallback engine written
+/// out, its provider with its model and no other provider. Every reader runs the same on both
+/// (ai.generic's model for another provider is none either way), so a version's record can always
+/// name the values it holds (docs/hive-config-update-v1.md §4, stage 3c).
+pub fn ai_values(ai: Option<&HiveAiConfig>) -> HiveAiConfig {
+    ai.cloned().unwrap_or_else(|| {
+        let engine = HiveAiConfig::fallback();
+        let model = Some(AiProviderModelConfig {
+            model: engine.model,
+        });
+        let providers = match engine.provider {
+            AiProvider::OpenAi => AiProviderConfigs {
+                openai: model,
+                anthropic: None,
+            },
+            AiProvider::Anthropic => AiProviderConfigs {
+                openai: None,
+                anthropic: model,
+            },
+        };
+        HiveAiConfig {
+            default_provider: engine.provider,
+            providers,
+        }
+    })
+}
+
+/// The providers `ai` gives a model, in a fixed order; the fallback engine's alone without an `ai`.
+pub fn providers_with_a_model(ai: Option<&HiveAiConfig>) -> Vec<AiProvider> {
+    let values = ai_values(ai);
+    [
+        (AiProvider::OpenAi, &values.providers.openai),
+        (AiProvider::Anthropic, &values.providers.anthropic),
+    ]
+    .into_iter()
+    .filter(|(_, config)| {
+        config
+            .as_ref()
+            .is_some_and(|config| !config.model.trim().is_empty())
+    })
+    .map(|(provider, _)| provider)
+    .collect()
+}
+
+/// The operator's `ai`, as SY.admin's `set_installation_ai` takes it and the motherbee's
+/// orchestrator writes it (docs/hive-config-update-v1.md §4, stage 3c): exactly `default_provider`
+/// and `providers`, each provider named with its `model` and nothing else, so a field no reader
+/// reads is refused rather than dropped; and values every reader can use
+/// (`InstallationFile::validate`). A provider given as null is not listed, as `get_installation`
+/// shows one. The reason is in plain words.
+pub fn parse_operator_ai(value: &serde_json::Value) -> Result<HiveAiConfig, String> {
+    let fields = value.as_object().ok_or(
+        "ai must be an object: {\"default_provider\": \"openai|anthropic\", \"providers\": \
+         {\"<provider>\": {\"model\": \"<model>\"}}}",
+    )?;
+    if let Some(other) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "default_provider" | "providers"))
+    {
+        return Err(format!(
+            "ai.{other} is not an ai setting: ai takes default_provider and providers"
+        ));
+    }
+    let default_provider = fields
+        .get("default_provider")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("ai.default_provider is required: openai or anthropic")?
+        .parse::<AiProvider>()
+        .map_err(|err| format!("ai.default_provider: {}", plain_error(&err)))?;
+    let listed = fields
+        .get("providers")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(
+            "ai.providers is required: an object with the model of each provider the installation \
+             lists, {\"<provider>\": {\"model\": \"<model>\"}}",
+        )?;
+    let mut providers = AiProviderConfigs::default();
+    for (name, provider) in listed.iter().filter(|(_, provider)| !provider.is_null()) {
+        let parsed = name
+            .parse::<AiProvider>()
+            .map_err(|_| format!("ai.providers.{name} is not a provider: openai or anthropic"))?;
+        let entry = provider
+            .as_object()
+            .ok_or_else(|| format!("ai.providers.{name} must be an object: {{\"model\": ...}}"))?;
+        if let Some(other) = entry.keys().find(|key| key.as_str() != "model") {
+            return Err(format!(
+                "ai.providers.{name}.{other} is not a provider setting: a provider takes model"
+            ));
+        }
+        let model = entry
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                format!("ai.providers.{name}.model is required and must not be empty")
+            })?;
+        let slot = match parsed {
+            AiProvider::OpenAi => &mut providers.openai,
+            AiProvider::Anthropic => &mut providers.anthropic,
+        };
+        if slot.is_some() {
+            return Err(format!("ai.providers names {parsed} twice"));
+        }
+        *slot = Some(AiProviderModelConfig {
+            model: model.to_string(),
+        });
+    }
+    let ai = HiveAiConfig {
+        default_provider,
+        providers,
+    };
+    InstallationFile {
+        schema_version: INSTALLATION_SCHEMA_VERSION,
+        version: 1,
+        ai: Some(ai.clone()),
+    }
+    .validate()
+    .map_err(|err| plain_error(&err))?;
+    Ok(ai)
+}
+
+/// The sha256 of the installation file's bytes at `file`, None while the hive holds none: what a
+/// reader built at its start compares before each use (`InstallationBuiltFrom`). A file that cannot
+/// be read stamps as its error, so a reader tries again once it can.
+pub fn installation_file_stamp(file: &Path) -> Option<String> {
+    match std::fs::read(file) {
+        Ok(bytes) => Some(sha256_hex(&bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!("unreadable: {err}")),
+    }
+}
+
+/// The installation file a reader's AI runtime was built from (docs/hive-config-update-v1.md §4,
+/// stage 3c). SY.admin's executor and Archi take the installation's `ai` when they build their
+/// runtime, and no config update restarts them: either may be serving the very action that wrote
+/// the new version. Before each use they compare the file with the one their runtime was built
+/// from, and rebuild only when it changed: one small file read and hashed.
+#[derive(Debug, Default)]
+pub struct InstallationBuiltFrom {
+    /// None until a build recorded what it read; then the file's stamp at that build
+    /// (`installation_file_stamp`).
+    stamp: std::sync::Mutex<Option<Option<String>>>,
+}
+
+impl InstallationBuiltFrom {
+    /// Records the stamp a build took before it read the file: a file that changes while the build
+    /// reads it differs from the stamp, and is taken again at the next use.
+    pub fn record(&self, stamp: Option<String>) {
+        *self
+            .stamp
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stamp);
+    }
+
+    /// Whether `file` is not the one the runtime was built from. False until a build recorded one:
+    /// a build still running at the start reads the file itself.
+    pub fn changed(&self, file: &Path) -> bool {
+        let built = self
+            .stamp
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        built.is_some_and(|built| built != installation_file_stamp(file))
+    }
+}
+
+/// Where a reader's `ai` comes from now, for the line it logs once it takes a new installation
+/// file: the file's version and hash, hive.yaml while the hive holds none, or why the file cannot
+/// be used.
+pub fn installation_file_label(file: &Path) -> String {
+    match installation_file_state(file) {
+        Ok(InstallationFileState::Valid(installed)) => {
+            ai_source_label(&AiSettingsSource::Installation {
+                version: installed.file.version,
+                sha256: installed.sha256,
+            })
+        }
+        Ok(InstallationFileState::Absent) => ai_source_label(&AiSettingsSource::HiveYaml),
+        Ok(InstallationFileState::Invalid { error, .. }) => {
+            format!("an installation file no reader can use ({error})")
+        }
+        Err(err) => plain_error(&err),
+    }
 }
 
 /// Where a reader's `ai` came from, for the line it logs: the installation file's version and
@@ -126,10 +318,6 @@ pub fn short_hash(sha256: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxbee_ai_sdk::{
-        sha256_hex, AiProvider, AiProviderConfigs, AiProviderModelConfig, InstallationFile,
-        INSTALLATION_SCHEMA_VERSION,
-    };
 
     fn temp_dist(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -272,5 +460,142 @@ mod tests {
     fn a_short_hash_is_its_first_twelve_digits() {
         assert_eq!(short_hash("0123456789abcdef"), "0123456789ab");
         assert_eq!(short_hash("abc"), "abc");
+    }
+
+    /// docs/hive-config-update-v1.md §4, stage 3c: the operator's `ai` is taken exactly as every
+    /// reader reads it, a field no reader reads refused rather than dropped, and values every reader
+    /// can use; the reason is in plain words.
+    #[test]
+    fn the_operator_s_ai_is_taken_exactly_and_with_every_reader_s_rules() {
+        let ai = parse_operator_ai(&serde_json::json!({
+            "default_provider": "anthropic",
+            "providers": {
+                "openai": {"model": " gpt-5.5 "},
+                "anthropic": {"model": "claude-sonnet-5-5"},
+            },
+        }))
+        .expect("both providers");
+        assert_eq!(ai, both_providers(), "models are trimmed");
+        // The values as get_installation shows them, a provider not listed as null, go back as
+        // they are.
+        let shown = serde_json::to_value(ai_values(None)).expect("json");
+        assert!(shown["providers"]["anthropic"].is_null(), "{shown}");
+        assert_eq!(
+            parse_operator_ai(&shown).expect("as shown"),
+            ai_values(None)
+        );
+
+        for (value, reason) in [
+            (serde_json::json!("anthropic"), "ai must be an object"),
+            (
+                serde_json::json!({"default_provider": "openai", "providers": {"openai": {"model": "x"}}, "temperature": 1}),
+                "ai.temperature is not an ai setting",
+            ),
+            (
+                serde_json::json!({"providers": {"openai": {"model": "x"}}}),
+                "ai.default_provider is required",
+            ),
+            (
+                serde_json::json!({"default_provider": "gemini", "providers": {"openai": {"model": "x"}}}),
+                "ai.default_provider: unsupported AI provider 'gemini'",
+            ),
+            (
+                serde_json::json!({"default_provider": "openai"}),
+                "ai.providers is required",
+            ),
+            (
+                serde_json::json!({"default_provider": "openai", "providers": {"gemini": {"model": "x"}}}),
+                "ai.providers.gemini is not a provider",
+            ),
+            (
+                serde_json::json!({"default_provider": "openai", "providers": {"openai": {"model": "x", "api_key": "k"}}}),
+                "ai.providers.openai.api_key is not a provider setting",
+            ),
+            (
+                serde_json::json!({"default_provider": "openai", "providers": {"openai": {"model": " "}}}),
+                "ai.providers.openai.model is required and must not be empty",
+            ),
+            (
+                serde_json::json!({"default_provider": "openai", "providers": {"openai": {"model": "x"}, "OpenAI": {"model": "y"}}}),
+                "ai.providers names openai twice",
+            ),
+            (
+                serde_json::json!({"default_provider": "anthropic", "providers": {"openai": {"model": "x"}}}),
+                "ai.providers.anthropic is required",
+            ),
+        ] {
+            let err = parse_operator_ai(&value).expect_err(reason);
+            assert!(err.contains(reason), "{err} (expected {reason})");
+            assert!(!err.contains("protocol error"), "{err}");
+        }
+    }
+
+    /// A version's values, and the providers it gives a model: an `ai` as it is, and none the
+    /// fallback engine written out, on which every reader runs the same.
+    #[test]
+    fn a_version_without_ai_holds_the_fallback_engine_s_values() {
+        let fallback = ai_values(None);
+        assert_eq!(
+            engine_of(Some(&fallback)).expect("engine"),
+            engine_of(None).expect("fallback")
+        );
+        assert_eq!(fallback.default_provider, AiProvider::OpenAi);
+        assert!(fallback.providers.anthropic.is_none());
+        assert_eq!(ai_values(Some(&both_providers())), both_providers());
+        assert_eq!(providers_with_a_model(None), vec![AiProvider::OpenAi]);
+        assert_eq!(
+            providers_with_a_model(Some(&both_providers())),
+            vec![AiProvider::OpenAi, AiProvider::Anthropic]
+        );
+        assert_eq!(
+            engine_of(Some(&both_providers())).expect("engine"),
+            EffectiveAiEngine {
+                provider: AiProvider::Anthropic,
+                model: "claude-sonnet-5-5".to_string(),
+            }
+        );
+    }
+
+    /// SY.admin's executor and Archi take a new installation file at their next use: the stamp of
+    /// the file their runtime was built from against the file now, nothing before a build recorded
+    /// one.
+    #[test]
+    fn a_reader_built_from_one_file_sees_the_next_one() {
+        let dist = temp_dist("built-from");
+        let file = installation_file_path(&dist);
+        let built = InstallationBuiltFrom::default();
+        assert!(!built.changed(&file), "no build recorded yet");
+        built.record(installation_file_stamp(&file));
+        assert!(!built.changed(&file), "built without a file, and none yet");
+        assert_eq!(
+            installation_file_label(&file),
+            "hive.yaml: this hive holds no installation file yet"
+        );
+
+        let version = |version: u64, ai: HiveAiConfig| {
+            InstallationFile {
+                schema_version: INSTALLATION_SCHEMA_VERSION,
+                version,
+                ai: Some(ai),
+            }
+            .render()
+            .expect("renders")
+        };
+        let first = version(1, both_providers());
+        std::fs::write(&file, &first).expect("version 1");
+        assert!(built.changed(&file), "the file arrived");
+        built.record(installation_file_stamp(&file));
+        assert!(!built.changed(&file));
+        assert!(installation_file_label(&file).starts_with("installation file v1 (sha256 "));
+
+        let mut openai = both_providers();
+        openai.default_provider = AiProvider::OpenAi;
+        std::fs::write(&file, version(2, openai)).expect("version 2");
+        assert!(built.changed(&file), "a new version");
+        assert!(installation_file_label(&file).starts_with("installation file v2 (sha256 "));
+
+        std::fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("edited");
+        assert!(installation_file_label(&file).contains("no reader can use"));
+        let _ = std::fs::remove_dir_all(&dist);
     }
 }
