@@ -37,7 +37,8 @@ Source: `src/bin/sy_cognition.rs` and `src/bin/sy_cognition/` (the two LLM calls
   skipped with that reason, as without a key (`degraded_ai_settings_invalid`). A file that
   arrives after it started is read at its next start. A new version of the file restarts it
   through its hive's orchestrator (the update with category `config`) only when its engine, the
-  default provider with that provider's model, changed; another provider's model restarts nothing
+  default provider with that provider's model, changed, or at its hive's first config update,
+  when no record says what it runs; another provider's model restarts nothing
   ([hive-config-update-v1](../hive-config-update-v1.md) §4, "As built (stage 3c)";
   [SY.orchestrator](sy-orchestrator.md#the-installation-file)).
 - Its AI key comes from SY.vault on the motherbee (`VaultClient::for_primary`): the resource type

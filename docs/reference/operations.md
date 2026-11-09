@@ -426,9 +426,10 @@ first version. On the motherbee:
 3. **What happens**: SY.admin checks the AI nodes when the change switches the default provider or
    drops a provider (A-11); the motherbee's orchestrator writes the next version; Syncthing takes it
    to every hive; SY.admin applies it on every hive at once. A hive restarts only what reads `ai` at
-   its start, and only when its engine (the default provider with its model) changed:
-   `sy-cognition` and `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker. AI nodes take
-   it at their next request, SY.admin's executor and Archi at their next use. Nothing else restarts.
+   its start, and only when its engine (the default provider with its model) changed, or at the
+   first change it takes, when nothing recorded yet what they run: `sy-cognition` and
+   `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker. AI nodes take it at their next
+   request, SY.admin's executor and Archi at their next use. Nothing else restarts.
 4. **The answer**: `ok` (200) when every hive applied it; `partial` (202) names the hives that have
    not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered` or `error`.
    The version is written either way. `GET /versions` shows each hive's copy (`config.state`,

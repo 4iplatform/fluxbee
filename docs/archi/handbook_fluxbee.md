@@ -1110,7 +1110,8 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
   engine, the default provider with its model, changed: SY.cognition and SY.frontdesk.gov on the
   motherbee, SY.cognition on each worker, nothing on an ingress or an egress. AI nodes take it at
   their next message. You and the executor take it at your next use, never restarted, so the
-  change's answer reaches you. Another provider's model restarts nothing.
+  change's answer reaches you. Another provider's model restarts nothing, except the first change a
+  hive takes: nothing recorded yet what its readers run, so they restart once.
 - **The answer:** `version` and each hive's `status`. `ok` on every hive is done; `partial` names
   the hives that are not ok:
   - `sync_pending`: the file had not reached it within 90 s;
