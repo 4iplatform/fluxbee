@@ -178,7 +178,9 @@ pub struct PageAsk {
 impl PageAsk {
     /// `limit` and `cursor` of a request: an absent or null field is none, and so is an empty
     /// cursor. A limit is a whole number from 1 (a query string's text of one too); anything else
-    /// is refused, with why.
+    /// is refused, with why. The refusal names the field and what it takes, never the value
+    /// (FINDINGS A-232): a link's key pasted there by mistake would go back with it, into the
+    /// caller's logs and Archi's provider.
     pub fn from_payload(payload: &Value) -> Result<Self, String> {
         let limit = match payload.get("limit") {
             None | Some(Value::Null) => None,
@@ -191,7 +193,9 @@ impl PageAsk {
                 match rows.filter(|rows| *rows >= 1) {
                     Some(rows) => Some(usize::try_from(rows).unwrap_or(usize::MAX)),
                     None => {
-                        return Err(format!("limit must be a whole number from 1, got {value}"))
+                        return Err(
+                            "limit must be a whole number from 1, a number or its text".to_string()
+                        )
                     }
                 }
             }
@@ -201,10 +205,10 @@ impl PageAsk {
             Some(Value::String(cursor)) => {
                 Some(cursor.trim().to_string()).filter(|cursor| !cursor.is_empty())
             }
-            Some(other) => {
-                return Err(format!(
-                    "cursor must be the next_cursor of the page before, a string, got {other}"
-                ))
+            Some(_) => {
+                return Err(
+                    "cursor must be the next_cursor of the page before, a string".to_string(),
+                )
             }
         };
         Ok(Self { limit, cursor })
@@ -586,6 +590,30 @@ mod tests {
         }
         .apply_to(&mut request);
         assert_eq!(request, json!({ "include_deleted": true, "limit": 3 }));
+    }
+
+    /// FINDINGS A-232: a refused limit or cursor is named with what it takes, never with its
+    /// value: a link's key pasted there by mistake does not come back.
+    #[test]
+    fn a_page_ask_refusal_names_the_field_never_the_value() {
+        let key = "3f1c0e9a8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e";
+        for (payload, field, takes) in [
+            (json!({ "limit": key }), "limit", "a whole number from 1"),
+            (json!({ "limit": [key] }), "limit", "a whole number from 1"),
+            (json!({ "limit": -7 }), "limit", "a whole number from 1"),
+            (json!({ "cursor": { "key": key } }), "cursor", "a string"),
+            (json!({ "cursor": [key] }), "cursor", "a string"),
+            (json!({ "cursor": 731 }), "cursor", "a string"),
+        ] {
+            let refusal = PageAsk::from_payload(&payload).expect_err("refused");
+            assert!(refusal.starts_with(field), "{refusal}");
+            assert!(refusal.contains(takes), "{refusal}");
+            assert!(!refusal.contains(&key[..16]), "{refusal}");
+            assert!(
+                !refusal.contains("-7") && !refusal.contains("731"),
+                "{refusal}"
+            );
+        }
     }
 
     #[test]

@@ -18929,15 +18929,17 @@ async fn handle_admin_command_with_origin(
             Ok(page) => page,
             Err(detail) => return Ok(admin_invalid_request_response(action, &detail)),
         };
-        if let Some(cursor) = page
+        // The refusal does not repeat the cursor: a link's key pasted as one would go back with it
+        // (FINDINGS A-232).
+        if page
             .cursor
             .as_deref()
-            .filter(|cursor| command_log_place(cursor).is_none())
+            .is_some_and(|cursor| command_log_place(cursor).is_none())
         {
             return Ok(admin_error_response(
                 action,
                 mesh_reply::INVALID_CURSOR,
-                &format!("cursor {cursor} is not a next_cursor of list_recent_commands"),
+                "the cursor is not a next_cursor of list_recent_commands",
             ));
         }
         let query = AdminCommandLogQuery {
@@ -20507,10 +20509,11 @@ async fn handle_vault_list(
         None | Some(serde_json::Value::Null) => 200,
         Some(limit) => match limit.as_u64() {
             Some(limit) => limit.clamp(1, 1000) as usize,
+            // Named, never repeated (FINDINGS A-232).
             None => {
                 return admin_invalid_request_response(
                     action,
-                    &format!("filter.limit must be a whole number, got {limit}"),
+                    "filter.limit must be a whole number",
                 )
             }
         },
@@ -27596,6 +27599,29 @@ mod tests {
         assert_eq!(status, 200, "{body}");
     }
 
+    /// FINDINGS A-232: vault_list refuses a filter.limit or a cursor it cannot take by naming the
+    /// field, never repeating the value, and asks SY.vault nothing.
+    #[tokio::test]
+    async fn vault_list_refuses_a_bad_limit_or_cursor_without_repeating_it() {
+        let (ctx, mut harness) = opa_test_admin("vault-list-refusals");
+        let key = mint_public_capability();
+        for payload in [
+            json!({ "filter": { "limit": key } }),
+            json!({ "filter": { "limit": [key] } }),
+            json!({ "cursor": { "key": key } }),
+        ] {
+            let (status, body) =
+                handle_vault_list(&ctx, &ctx.rpc, "SY.vault@motherbee", payload.clone()).await;
+            assert_eq!(status, 400, "{payload}");
+            assert!(body.contains("INVALID_REQUEST"), "{body}");
+            assert!(!body.contains(&key[..16]), "{body}");
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
     /// FINDINGS A-198: an assembled listing takes at most its caller's own time: each page is
     /// asked with the time left, and one not done by then answers TIMEOUT.
     #[tokio::test]
@@ -29828,7 +29854,7 @@ mod tests {
     }
 
     /// FINDINGS A-198: list_recent_commands refuses a cursor the log did not give
-    /// (INVALID_CURSOR, 400) and takes an empty one as none.
+    /// (INVALID_CURSOR, 400), without repeating it (A-232), and takes an empty one as none.
     #[tokio::test]
     async fn list_recent_commands_checks_its_cursor() {
         let (ctx, _harness) = opa_test_admin("commands-cursor");
@@ -29848,6 +29874,18 @@ mod tests {
         assert_eq!(status, 400);
         let envelope: Value = serde_json::from_str(&body).expect("envelope");
         assert_eq!(envelope["error_code"], json!(mesh_reply::INVALID_CURSOR));
+        let key = mint_public_capability();
+        let (status, body) = handle_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "list_recent_commands",
+            json!({ "cursor": key }),
+            None,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(status, 400);
+        assert!(!body.contains(&key[..16]), "{body}");
         let (status, body) = handle_admin_command(
             &ctx,
             &ctx.rpc,
