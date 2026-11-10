@@ -518,9 +518,12 @@ registered case ends saved as `completed` and is never deleted by the model.
   a notice or a reply: one the router made, without `src_l2_name` (`UNREACHABLE`,
   `TTL_EXCEEDED`), or one named as a notice or a reply (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any
   `*_RESPONSE`). `note_infrastructure_message(node_name, &msg)` logs it, a router notice as a WARN
-  with its reason.
-  An answer to the router's notice would go to the router's own UUID, and the two would bounce it
-  forever (FINDINGS A-112). SY.timer and the WF engine follow the same rule.
+  with its reason. An answer to the router's notice would go to the router's own UUID, and the two
+  would bounce it forever (FINDINGS A-112). SY.timer and the WF engine follow the same rule.
+- **A tap copy never reaches it:** the runtime takes no message with `meta.via_tap` to
+  `on_message` and answers none (`run_handler`, FINDINGS A-248), whatever its kind; it logs the
+  copy at debug. A copy is another node's message, which a router sends a tap's target to be
+  observed: it keeps the original sender, so an answer would go to that sender.
 - **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`.
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:
@@ -539,6 +542,7 @@ registered case ends saved as `completed` and is never deleted by the model.
   - its `src_ilk` is the agent's own ILK (`RuntimeConfig::self_ilk_id`, read from
     `FLUXBEE_NODE_ILK_ID` by default), never the human's;
   - it keeps `thread_id` and drops `memory_package`;
+  - it never carries `via_tap`, which only the router sets, on its copies;
   - its `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`, a WF's
     block (`wf`) and an `evaluation`, and without `final_response_contract` unless
     `ReplyContextOptions` keeps it.

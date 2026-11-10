@@ -1421,6 +1421,7 @@ Examples:
 - observer node that receives a copy of every message without participating in the flow
 
 Taps are router-level (`add_tap`); the copy is fire-and-forget and carries `meta.via_tap=true` so it never cascades.
+An AI node as a tap's target takes no part: it neither runs its model for a copy nor answers it, so a tap never makes an agent answer someone else's conversation (FINDINGS A-248).
 
 ### 5.4 Use OPA when
 

@@ -637,6 +637,9 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
   hub-relayed sender's (§6.3).
 - Best effort: a copy that cannot go (unknown target, VPN, TTL, link down) is logged as
   `router tap copy: …` and dropped. The primary delivery does not wait for it.
+- A target observes; it does not take part. An AI node that gets a copy runs no handler for it
+  and answers nothing, which would go to the original sender (the AI SDK's `run_handler`, FINDINGS
+  A-248); it logs the copy at debug.
 
 ---
 

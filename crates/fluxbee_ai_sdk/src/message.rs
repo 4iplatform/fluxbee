@@ -93,12 +93,14 @@ pub fn build_reply_message_runtime_src_with_options(
 
 /// A reply goes from the agent to whoever spoke (§6.2 of docs/router-stream-v1.md): its `dst_ilk`
 /// is the incoming `src_ilk`, and its `src_ilk` is the agent's own, which the runtime stamps when it
-/// sends it. It never carries the human's as its own.
+/// sends it. It never carries the human's as its own. Nor is it ever a tap copy: only the router
+/// sets `via_tap`, on the copy it makes for a tap's target (FINDINGS A-248).
 fn build_reply_meta(meta: &Meta, options: ReplyContextOptions) -> Meta {
     let mut reply = meta.clone();
     reply.dst_ilk = meta.src_ilk.clone();
     reply.src_ilk = None;
     reply.memory_package = None;
+    reply.via_tap = false;
     reply.context = sanitize_reply_context(reply.context, options);
     reply
 }
@@ -1338,6 +1340,38 @@ mod tests {
         assert_eq!(
             bare.meta.context,
             Some(json!({"evaluation": {"area": "sales"}}))
+        );
+    }
+
+    /// FINDINGS A-248: only the router sets `via_tap`, on its copy for a tap's target; a reply built
+    /// from a message that carries it never does, by either builder.
+    #[test]
+    fn a_reply_never_carries_via_tap() {
+        let copy = Message {
+            routing: Routing {
+                src: "uuid-of-io-slack".to_string(),
+                src_l2_name: Some("IO.slack@motherbee".to_string()),
+                dst: Destination::Unicast("AI.observer@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-of-the-copy".to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                via_tap: true,
+                ..Meta::default()
+            },
+            payload: json!({"type": "text", "content": "hello"}),
+        };
+        let payload = json!({"type": "text", "content": "hi"});
+        assert!(
+            !build_reply_message_runtime_src(&copy, payload.clone())
+                .meta
+                .via_tap
+        );
+        assert!(
+            !build_reply_message(&copy, "uuid-of-the-agent", payload)
+                .meta
+                .via_tap
         );
     }
 

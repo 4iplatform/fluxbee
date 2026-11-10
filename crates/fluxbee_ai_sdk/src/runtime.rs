@@ -498,12 +498,29 @@ fn reply_trace_note(requester: Option<&str>, response: &mut Message) -> TraceNot
 /// Runs a message's handler once. When it fails or runs out of time it may already have called a
 /// model (billed) or a tool that acts (`publish_html_page`), so it is never run again: the sender
 /// gets an error instead, and the runtime goes on with the next message.
+///
+/// A tap copy (`meta.via_tap`) never reaches the handler, and nothing answers it (FINDINGS A-248):
+/// it is the copy of another node's message that a router sends a tap's target
+/// (docs/reference/routing-and-policy.md §8.3), there to be observed. It keeps the original sender,
+/// so an answer would go to that sender, under the copy's trace, about a message it never sent this
+/// node, and the handler would run a model or a tool for it. Every message the node answers, its
+/// control plane's included, comes through here.
 async fn run_handler<N: AiNode>(
     node: &N,
     msg: Message,
     handler_timeout: Duration,
     metrics: &RuntimeMetrics,
 ) -> Option<Message> {
+    if msg.meta.via_tap {
+        tracing::debug!(
+            trace_id = %msg.routing.trace_id,
+            msg_type = %msg.meta.msg_type,
+            msg = ?msg.meta.msg,
+            src_l2_name = ?msg.routing.src_l2_name,
+            "a tap copy, there to be observed: not answered"
+        );
+        return None;
+    }
     match timeout(handler_timeout, node.on_message(msg.clone())).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
@@ -822,6 +839,35 @@ mod tests {
                 .is_none());
             assert_eq!(node.calls(), 1);
         }
+    }
+
+    /// FINDINGS A-248: a tap copy is there to be observed. Whatever its kind, the handler never runs
+    /// for it (no model, no tool, no control verb) and nothing answers it, not even with an error.
+    #[tokio::test]
+    async fn a_tap_copy_is_neither_handled_nor_answered() {
+        for kind in ["user", "system", "admin"] {
+            for outcome in [Outcome::Answers, Outcome::Fails] {
+                let node = CountingNode::new(outcome);
+                let metrics = RuntimeMetrics::default();
+                let mut copy = message(kind);
+                copy.routing.src_l2_name = Some("IO.slack.main@motherbee".to_string());
+                copy.meta.via_tap = true;
+
+                assert!(
+                    run_handler(&node, copy, SHORT, &metrics).await.is_none(),
+                    "{kind}"
+                );
+                assert_eq!(node.calls(), 0, "{kind}");
+                assert_eq!(metrics.handler_failures.load(Ordering::Relaxed), 0);
+            }
+        }
+        // The same message, not a copy, is answered.
+        let node = CountingNode::new(Outcome::Answers);
+        let metrics = RuntimeMetrics::default();
+        assert!(run_handler(&node, message("user"), SHORT, &metrics)
+            .await
+            .is_some());
+        assert_eq!(node.calls(), 1);
     }
 
     #[tokio::test]
