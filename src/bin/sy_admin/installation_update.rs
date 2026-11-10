@@ -4247,18 +4247,30 @@ pub(crate) fn parse_history_flag(params: &Value) -> Result<bool, String> {
     }
 }
 
-/// A second explicit run's refusal: the one under way, and since when.
+/// A second explicit run's refusal: the one under way, and since when. An egress action holds the
+/// run's mark too (`<action> on <hive>`, docs/edge-egress-nat-spec.md §15), and is named as one.
 pub(crate) fn run_under_way(action: &str, running: &Running) -> (u16, String) {
+    let since_s = now_epoch_ms().saturating_sub(running.since_ms) / 1000;
+    let egress = ["set_hive_egress on ", "clear_hive_egress on "]
+        .iter()
+        .any(|origin| running.origin.starts_with(origin));
     super::installation_refusal(
         action,
         "INSTALLATION_UPDATE_RUNNING",
-        format!(
-            "an installation update run is under way ({}, update {}), for {} s: one at a time. Read \
-             get_installation_update, and run it again once that one answered",
-            running.origin,
-            running.update.as_deref().unwrap_or("not opened yet"),
-            now_epoch_ms().saturating_sub(running.since_ms) / 1000
-        ),
+        if egress {
+            format!(
+                "an egress action runs ({}), for {since_s} s, and holds the installation's run: one \
+                 at a time. Run it again once that one answered",
+                running.origin
+            )
+        } else {
+            format!(
+                "an installation update run is under way ({}, update {}), for {since_s} s: one at \
+                 a time. Read get_installation_update, and run it again once that one answered",
+                running.origin,
+                running.update.as_deref().unwrap_or("not opened yet")
+            )
+        },
         json!({
             "running": {
                 "origin": running.origin,

@@ -12419,6 +12419,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "GATEWAY_NOT_ON_LINK"
         | "UPLINK_ON_DEFAULT_ROUTE"
         | "ACCESS_ON_DEFAULT_ROUTE"
+        | "DEFAULT_ROUTE_MULTIPATH"
         | "PROBE_UNAVAILABLE"
         | "PREVIOUS_GATEWAY_UNKNOWN" => 409,
         "EGRESS_DECLARATION_INVALID" => 422,
@@ -12429,7 +12430,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "EGRESS_COMMIT_FAILED"
         | "EGRESS_RECORD_FAILED"
         | "EGRESS_RECORD_UNREADABLE"
-        | "EGRESS_CONFIRM_UNREADABLE" => 502,
+        | "EGRESS_CONFIRM_UNREADABLE"
+        | "EGRESS_SWITCH_NOT_FOUND" => 502,
         "HIVE_UNREACHABLE" | "EGRESS_GUARD_UNREADABLE" => 503,
         "EGRESS_CONFIRM_MISSED" | "EGRESS_NOT_ANSWERED" => 504,
         "SHM_NOT_FOUND"
@@ -16813,7 +16815,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             EGRESS_WHO_NOTE,
             "The section is the motherbee's declaration, as add_hive writes it into a new worker: 409 NO_EGRESS_DECLARED without egress.gateway_ip in the motherbee's hive.yaml, 409 NO_REACHABILITY_URL without egress.reachability_url (the switch is judged by a probe of it), 422 EGRESS_DECLARATION_INVALID for one the join would refuse. The body names no gateway: only the optional access_from.",
             EGRESS_GUARDS_NOTE,
-            "After the switch the worker GETs reachability_url (twice at most) and reads its route to the motherbee again, answers pending_confirm, and keeps the switch only once the motherbee's confirm comes back within 15 s; hive.yaml is written only then. A failed step puts the routes, the IPv6 values and the sysctl file back: 502 EGRESS_PROBE_FAILED (with curl's reason), EGRESS_IPV6_UNMANAGED, UPLINK_ROUTE_CHANGED, EGRESS_SWITCH_FAILED or EGRESS_COMMIT_FAILED, 504 EGRESS_CONFIRM_MISSED; payload.outcome says reverted, revert_problems what the revert could not do.",
+            "After the switch the worker GETs reachability_url (twice at most) and reads its route to the motherbee again, answers pending_confirm (at most 22 s after the request), and keeps the switch only once the motherbee's confirm comes back within 15 s; hive.yaml is written only then. A failed step puts the routes, the IPv6 values and the sysctl file back: 502 EGRESS_PROBE_FAILED (with curl's reason), EGRESS_IPV6_UNMANAGED, UPLINK_ROUTE_CHANGED, EGRESS_SWITCH_FAILED or EGRESS_COMMIT_FAILED, 504 EGRESS_CONFIRM_MISSED; payload.outcome says reverted, revert_problems every step the revert could not do. 502 EGRESS_SWITCH_NOT_FOUND: the worker knows no switch with the confirm's id, and nothing was confirmed.",
             "The answer: payload {status: ok, outcome: switched (or unchanged: the section and the route are the declaration's already, and nothing moved), hive, gateway_ip, previous_gateway, ipv6_blocked, internet_reachable, probe {url, attempts, reason}, route, ssh_reachable_from, switch_id, timings_ms per step}. A worker already behind another gateway moves to the declared one, with the same guards.",
             EGRESS_NOT_ANSWERED_NOTE,
             EGRESS_CLOSED_NOTE,
@@ -19631,17 +19633,19 @@ async fn handle_cognition_clear(
 
 /// The help's texts that `set_hive_egress` and `clear_hive_egress` share.
 const EGRESS_ACCESS_FROM_FIELD: &str = "The IPv4 addresses or networks the operator manages the worker from, besides its live SSH sessions, which the guard reads by itself: each must not reach the worker through its default route, or nothing changes (409 ACCESS_ON_DEFAULT_ROUTE). An IPv6 one is refused: the worker's IPv6 is off behind the egress.";
-const EGRESS_WHO_NOTE: &str = "Only a worker of the registry whose join is done: 409 NOT_A_WORKER names why not (the motherbee, whose route Fluxbee never rewrites (PB-8); an ingress; an egress; a hive whose join is not done). 409 INSTALLATION_UPDATE_RUNNING while an installation update run is under way, or a task of the update acts on that worker: its core update restarts the worker's orchestrator. 409 JOIN_IN_PROGRESS while the worker joins or is removed, 503 HIVE_UNREACHABLE when its orchestrator is not on the mesh, 409 EGRESS_SWITCH_OPEN while another switch runs there. The hive comes from the /hives/{hive} path in HTTP, and it is the executor step's arg.";
-const EGRESS_GUARDS_NOTE: &str = "The guards, on the worker, before anything is touched (nothing changes when one refuses): 409 GATEWAY_NOT_ON_LINK, the gateway is not on a subnet the worker is connected to, or is one of its own addresses; 409 UPLINK_ON_DEFAULT_ROUTE, the worker reaches the motherbee (wan.uplinks, identity.sync.upstream) through its default route, by a host name or over IPv6; 409 ACCESS_ON_DEFAULT_ROUTE, a live SSH session or an access_from entry reaches it through its default route: the operator keeps each with a static route at the OS level (netplan) through the current gateway, which the guard then sees as a more specific route, and Fluxbee adds no route of its own; 409 PROBE_UNAVAILABLE, no curl on the worker (set only); 503 EGRESS_GUARD_UNREADABLE, a lookup could not be read within the guards' 5 s. Each refusal names the address and the route it found.";
-const EGRESS_NOT_ANSWERED_NOTE: &str = "504 EGRESS_NOT_ANSWERED never means \"not applied\": a worker on a release before this action ignores it, and nothing changed there (bring it to the motherbee's release first, update_installation); a worker whose answer was lost reverts by itself within 15 s of its pending_confirm unless the confirm reached it and it committed. GET /hives/{hive}/versions says which: egress.state (behind, not_behind, other_gateway, drifted) and egress.last_switch (state, step, error_code, reason). The worker's journal has a line per step, and SY.admin's command log the action and its outcome.";
+const EGRESS_WHO_NOTE: &str = "Only a worker of the registry whose join is done: 409 NOT_A_WORKER names why not (the motherbee, whose route Fluxbee never rewrites (PB-8); an ingress; an egress; a hive whose join is not done). One egress action at a time in the installation, and none beside an installation update run: 409 EGRESS_SWITCH_OPEN while another egress action runs (on any worker), 409 INSTALLATION_UPDATE_RUNNING while an installation update run is under way, or a task of the update acts on that worker (its core update restarts the worker's orchestrator). 409 JOIN_IN_PROGRESS while the worker joins or is removed, 503 HIVE_UNREACHABLE when its orchestrator is not on the mesh, 409 EGRESS_SWITCH_OPEN while another switch runs there. While a switch is open on a worker, its orchestrator answers a core update or a core rollback sent to it (update, update_installation, core_rollback) 409 EGRESS_SWITCH_OPEN, and nothing is done. The hive comes from the /hives/{hive} path in HTTP, and it is the executor step's arg; a body naming another hive (target, hive_id) is refused (400 INVALID_REQUEST). Every answer, a refusal included, says payload.outcome: switched, cleared, unchanged, refused (nothing changed), reverted or not_answered.";
+const EGRESS_GUARDS_NOTE: &str = "The guards, on the worker, before anything is touched (nothing changes when one refuses): 409 GATEWAY_NOT_ON_LINK, the gateway is not on a subnet the worker is connected to, is one of its own addresses, or is reached through a multipath route; 409 UPLINK_ON_DEFAULT_ROUTE, the worker reaches the motherbee (wan.uplinks, identity.sync.upstream) through its default route, by a host name, over IPv6, or through a tunnel (a tun or WireGuard device, GRE, IPIP, PPP, tap, VXLAN...), whose own packets may take the default route; 409 ACCESS_ON_DEFAULT_ROUTE, a live SSH session or an access_from entry reaches it through its default route: the operator keeps each with a static route at the OS level (netplan) through the current gateway, which the guard then sees as a more specific route, and Fluxbee adds no route of its own; 409 DEFAULT_ROUTE_MULTIPATH, the worker's default route is a multipath route or one through a nexthop object, which a revert could not put back; 409 PROBE_UNAVAILABLE, no curl on the worker (set only); 503 EGRESS_GUARD_UNREADABLE, a lookup, sshd's ports or a device's type could not be read within the guards' 5 s. Each refusal names the address and the route it found. A limit: an SSH session that reaches the worker through a tunnel passes the guard, though the tunnel's own packets may take the default route.";
+const EGRESS_NOT_ANSWERED_NOTE: &str = "504 EGRESS_NOT_ANSWERED never means \"not applied\", whatever its step: switch (a worker on a release before this action ignores it, and nothing changed there: bring it to the motherbee's release first, update_installation; a worker whose answer was lost reverts by itself within 15 s of its pending_confirm), confirm (the confirm's answer was lost), or commit (the worker took the confirm and did not answer within 7 s: its commit may still complete). The worker keeps the switch only if the confirm reached it and it committed. GET /hives/{hive}/versions says which: egress.state (behind, not_behind, other_gateway, drifted) and egress.last_switch (state, step, error_code, reason). An answer SY.admin itself did not get (TIMEOUT, TRANSPORT_ERROR) says outcome not_answered too. The worker's journal has a line per step, and SY.admin's command log the action and its outcome.";
 const EGRESS_CLOSED_NOTE: &str = "Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler, one step per worker, only when the operator asks, and the executor runs it once the operator confirms; or the operator on SY.admin's loopback HTTP API. The motherbee's orchestrator sends SYSTEM_EGRESS_ROUTE to the worker's, which only it may send (system policy rule 3), never to the motherbee.";
 
 /// `set_hive_egress` and `clear_hive_egress` (docs/edge-egress-nat-spec.md §15, FINDINGS A-219),
-/// the operator's alone. What SY.admin owns is checked before anything is sent: the hive is a worker
-/// of its registry with its join done (`hive_egress_worker_refusal`); no installation update run is
-/// under way, nor a task of the update acting on that worker, since its core update restarts the
-/// worker's orchestrator. The run is held while the motherbee's orchestrator switches the worker,
-/// so none starts meanwhile; the motherbee's checks, the worker's guards and the switch are theirs.
+/// the operator's alone. What SY.admin owns is checked before anything is sent: the body names no
+/// other hive than the path's (`hive_egress_payload`); the hive is a worker of its registry with its
+/// join done (`hive_egress_worker_refusal`); no other egress action runs, nor an installation update
+/// run, nor a task of the update acting on that worker, since its core update restarts the worker's
+/// orchestrator. The run's mark is held while the motherbee's orchestrator switches the worker, so
+/// none starts meanwhile; the motherbee's checks, the worker's guards and the switch are theirs.
+/// Every answer says its `outcome`.
 async fn handle_hive_egress_command(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -19649,50 +19653,184 @@ async fn handle_hive_egress_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let Some(hive) = hive.filter(|hive| !hive.trim().is_empty()) else {
-        return Ok(admin_invalid_request_response(
+    let Some(hive) = hive
+        .as_deref()
+        .map(str::trim)
+        .filter(|hive| !hive.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(hive_egress_refusal(
             action,
-            "missing hive: /hives/{hive}/egress names the worker",
+            None,
+            "INVALID_REQUEST",
+            "missing hive: /hives/{hive}/egress names the worker".to_string(),
         ));
     };
-    let payload = match payload {
-        serde_json::Value::Null => serde_json::json!({}),
-        serde_json::Value::Object(_) => payload,
-        _ => {
-            return Ok(admin_invalid_request_response(
+    let payload = match hive_egress_payload(&hive, payload) {
+        Ok(payload) => payload,
+        Err(why) => {
+            return Ok(hive_egress_refusal(
                 action,
-                "the body must be a JSON object",
+                Some(&hive),
+                "INVALID_REQUEST",
+                why,
             ))
         }
     };
     if let Some(why) = hive_egress_worker_refusal(&ctx.hive_id, &hive_registry(ctx), &hive) {
-        return Ok(admin_error_response(action, "NOT_A_WORKER", &why));
+        return Ok(hive_egress_refusal(
+            action,
+            Some(&hive),
+            "NOT_A_WORKER",
+            why,
+        ));
     }
-    let _run = match ctx.installation_update.start_run(action) {
+    let _run = match ctx
+        .installation_update
+        .start_run(&hive_egress_run_origin(action, &hive))
+    {
         Ok(run) => run,
-        Err(running) => return Ok(installation_update::run_under_way(action, &running)),
+        Err(running) => return Ok(hive_egress_run_refusal(action, &hive, &running)),
     };
     if let Some(holder) = ctx.installation_update.acting_on(&hive) {
-        return Ok(admin_error_response(
+        return Ok(hive_egress_refusal(
             action,
+            Some(&hive),
             "INSTALLATION_UPDATE_RUNNING",
-            &format!(
+            format!(
                 "the installation's update acts on {hive} now ({}, update {}), and its core update \
                  restarts the worker's orchestrator: run this once it ends (get_installation_update)",
                 holder.what, holder.update
             ),
         ));
     }
-    let payload = normalize_admin_payload(action, payload, Some(&hive));
-    let request = build_admin_request(ctx, action, payload, Some(hive));
-    let response = send_admin_request(
+    let request = build_admin_request(ctx, action, payload, Some(hive.clone()));
+    let response = match send_admin_request(
         client,
         request,
         admin_action_timeout(action),
         &admin_node_name(&ctx.hive_id),
     )
-    .await;
-    Ok(build_admin_http_response(action, response))
+    .await
+    {
+        Ok(answer) => answer,
+        Err(err) => hive_egress_not_answered(&hive, &err.to_string()),
+    };
+    Ok(build_admin_http_response(action, Ok(response)))
+}
+
+/// The body SY.admin sends for an egress action on `hive`: the operator's, its `target` always
+/// `hive`, the hive SY.admin checked (M1 of A-219's review). A body that names another hive, in
+/// `target` or the legacy `hive_id`, is refused; one that names the same hive is taken, its
+/// `hive_id` dropped. `Err`: why, for INVALID_REQUEST.
+fn hive_egress_payload(
+    hive: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut fields = match payload {
+        serde_json::Value::Null => serde_json::Map::new(),
+        serde_json::Value::Object(fields) => fields,
+        _ => return Err("the body must be a JSON object".to_string()),
+    };
+    for key in ["target", "hive_id"] {
+        let Some(named) = fields.remove(key) else {
+            continue;
+        };
+        if named.as_str().map(str::trim) != Some(hive) {
+            return Err(format!(
+                "the body's {key} ({named}) is not {hive}, the worker /hives/{hive}/egress names: \
+                 the path names the worker, and the body cannot name another"
+            ));
+        }
+    }
+    fields.insert("target".to_string(), serde_json::json!(hive));
+    Ok(serde_json::Value::Object(fields))
+}
+
+/// An egress action SY.admin refuses before anything is sent: its code and why, and in its payload
+/// `outcome: refused` and the hive, as every answer of the action says its outcome.
+fn hive_egress_refusal(
+    action: &str,
+    hive: Option<&str>,
+    code: &str,
+    detail: String,
+) -> (u16, String) {
+    installation_refusal(
+        action,
+        code,
+        detail,
+        serde_json::json!({ "outcome": "refused", "hive": hive }),
+    )
+}
+
+/// The run's mark an egress action holds: `<action> on <hive>`.
+fn hive_egress_run_origin(action: &str, hive: &str) -> String {
+    format!("{action} on {hive}")
+}
+
+/// An egress action refused while the run's mark is held: by another egress action (L8 of A-219's
+/// review: one at a time in the installation, EGRESS_SWITCH_OPEN, naming it), or by an installation
+/// update run (INSTALLATION_UPDATE_RUNNING).
+fn hive_egress_run_refusal(
+    action: &str,
+    hive: &str,
+    running: &installation_update::Running,
+) -> (u16, String) {
+    let egress = ["set_hive_egress", "clear_hive_egress"]
+        .iter()
+        .any(|other| running.origin.starts_with(&format!("{other} on ")));
+    let since_s = now_epoch_ms().saturating_sub(running.since_ms) / 1000;
+    let (code, detail) = if egress {
+        (
+            "EGRESS_SWITCH_OPEN",
+            format!(
+                "{} runs now (for {since_s} s): one egress action at a time in the installation. \
+                 Run this on {hive} once it answered",
+                running.origin
+            ),
+        )
+    } else {
+        (
+            "INSTALLATION_UPDATE_RUNNING",
+            format!(
+                "an installation update run is under way ({}, update {}), for {since_s} s, and its \
+                 core update restarts a worker's orchestrator: run this on {hive} once it answered \
+                 (get_installation_update)",
+                running.origin,
+                running.update.as_deref().unwrap_or("not opened yet")
+            ),
+        )
+    };
+    installation_refusal(
+        action,
+        code,
+        detail,
+        serde_json::json!({
+            "outcome": "refused",
+            "hive": hive,
+            "running": {
+                "origin": running.origin,
+                "since_ms": running.since_ms,
+                "update": running.update,
+            },
+        }),
+    )
+}
+
+/// The answer SY.admin gives when the motherbee's orchestrator did not answer the action: its
+/// transport code, and `outcome: not_answered`, which never means "not applied".
+fn hive_egress_not_answered(hive: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": infer_transport_error_code(detail),
+        "outcome": "not_answered",
+        "hive": hive,
+        "message": format!(
+            "the motherbee's orchestrator did not answer ({detail}): the switch may have run. GET \
+             /hives/{hive}/versions says where the worker stands: egress.state and \
+             egress.last_switch"
+        ),
+    })
 }
 
 /// Why `hive` is no worker an egress action takes (`NOT_A_WORKER`), from the registry's strict
@@ -34845,11 +34983,14 @@ mod tests {
             "GATEWAY_NOT_ON_LINK",
             "UPLINK_ON_DEFAULT_ROUTE",
             "ACCESS_ON_DEFAULT_ROUTE",
+            "DEFAULT_ROUTE_MULTIPATH",
+            "EGRESS_SWITCH_OPEN",
             "PREVIOUS_GATEWAY_UNKNOWN",
         ] {
             assert_eq!(error_code_to_http_status(code), 409, "{code}");
         }
         assert_eq!(error_code_to_http_status("EGRESS_PROBE_FAILED"), 502);
+        assert_eq!(error_code_to_http_status("EGRESS_SWITCH_NOT_FOUND"), 502);
         assert_eq!(error_code_to_http_status("HIVE_UNREACHABLE"), 503);
         assert_eq!(error_code_to_http_status("EGRESS_NOT_ANSWERED"), 504);
         assert_eq!(error_code_to_http_status("EGRESS_CONFIRM_MISSED"), 504);
@@ -34900,9 +35041,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// SY.admin refuses before it sends anything: a hive that is no worker (NOT_A_WORKER), an
-    /// installation update run under way (INSTALLATION_UPDATE_RUNNING), a body that is no object.
-    /// A worker's request goes to the motherbee's orchestrator, naming the worker.
+    /// SY.admin refuses before it sends anything, each refusal saying outcome refused: a hive that
+    /// is no worker (NOT_A_WORKER), a body that is no object or names another hive (M1 of the
+    /// review), another egress action (EGRESS_SWITCH_OPEN, L8) or an installation update run
+    /// (INSTALLATION_UPDATE_RUNNING) under way. A worker's request goes to the motherbee's
+    /// orchestrator, naming the worker the path names.
     #[tokio::test]
     async fn an_egress_action_is_refused_before_anything_is_sent() {
         let (ctx, mut harness) = opa_test_admin("egress-refusals");
@@ -34928,7 +35071,13 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(status, 409, "{body}");
-            assert!(body.contains("NOT_A_WORKER"), "{body}");
+            let body: Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(body["error_code"], json!("NOT_A_WORKER"));
+            assert_eq!(
+                body["payload"],
+                json!({ "outcome": "refused", "hive": hive }),
+                "{action} {hive}"
+            );
             assert!(
                 harness
                     .next_outgoing_within(Duration::from_millis(100))
@@ -34937,6 +35086,36 @@ mod tests {
                 "{action} {hive}: nothing sent"
             );
         }
+        // M1: a body naming another hive than the path's is refused; nothing is sent.
+        for body in [
+            json!({ "target": "worker2" }),
+            json!({ "hive_id": "worker2", "access_from": ["192.168.8.0/24"] }),
+            json!({ "target": 7 }),
+        ] {
+            let (status, answer) = handle_hive_egress_command(
+                &ctx,
+                &ctx.rpc,
+                "set_hive_egress",
+                body.clone(),
+                Some("worker1".into()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 400, "{body}: {answer}");
+            let answer: Value = serde_json::from_str(&answer).expect("json");
+            assert_eq!(answer["error_code"], json!("INVALID_REQUEST"));
+            assert_eq!(answer["payload"]["outcome"], json!("refused"));
+            assert!(answer["error_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("is not worker1")));
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(100))
+                .await
+                .is_none(),
+            "nothing sent"
+        );
         let (status, body) = handle_hive_egress_command(
             &ctx,
             &ctx.rpc,
@@ -34947,11 +35126,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, 400, "{body}");
-        {
-            let _run = ctx
-                .installation_update
-                .start_run("update_installation")
-                .expect("a run");
+        for (origin, code, says) in [
+            (
+                "update_installation",
+                "INSTALLATION_UPDATE_RUNNING",
+                "an installation update run is under way",
+            ),
+            // L8: another egress action, on another worker, in its own words.
+            (
+                "clear_hive_egress on worker2",
+                "EGRESS_SWITCH_OPEN",
+                "clear_hive_egress on worker2 runs now",
+            ),
+        ] {
+            let _run = ctx.installation_update.start_run(origin).expect("a run");
             let (status, body) = handle_hive_egress_command(
                 &ctx,
                 &ctx.rpc,
@@ -34962,7 +35150,16 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(status, 409, "{body}");
-            assert!(body.contains("INSTALLATION_UPDATE_RUNNING"), "{body}");
+            let body: Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(body["error_code"], json!(code), "{origin}");
+            assert_eq!(body["payload"]["outcome"], json!("refused"));
+            assert_eq!(body["payload"]["running"]["origin"], json!(origin));
+            assert!(
+                body["error_detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains(says)),
+                "{body}"
+            );
             assert!(
                 harness
                     .next_outgoing_within(Duration::from_millis(100))
@@ -34971,16 +35168,51 @@ mod tests {
                 "nothing sent"
             );
         }
-        // A worker's: the motherbee's orchestrator, the worker named, the body as it came.
-        let payload = normalize_admin_payload(
-            "set_hive_egress",
-            json!({ "access_from": ["192.168.8.0/24"] }),
-            Some("worker1"),
+        // An installation update refused while an egress action holds the run says so.
+        let _egress = ctx
+            .installation_update
+            .start_run(&hive_egress_run_origin("set_hive_egress", "worker1"))
+            .expect("a run");
+        let running = ctx
+            .installation_update
+            .start_run("update_installation")
+            .err()
+            .expect("refused");
+        let (_, body) = installation_update::run_under_way("update_installation", &running);
+        assert!(
+            body.contains("an egress action runs (set_hive_egress on worker1)"),
+            "{body}"
+        );
+        drop(_egress);
+
+        // A worker's: the motherbee's orchestrator, the worker the path names as its target.
+        let payload = hive_egress_payload(
+            "worker1",
+            json!({ "access_from": ["192.168.8.0/24"], "target": " worker1 ", "hive_id": "worker1" }),
+        )
+        .expect("the same worker");
+        assert_eq!(
+            payload,
+            json!({ "access_from": ["192.168.8.0/24"], "target": "worker1" })
+        );
+        assert_eq!(
+            hive_egress_payload("worker1", Value::Null),
+            Ok(json!({ "target": "worker1" }))
         );
         let request = build_admin_request(&ctx, "set_hive_egress", payload, Some("worker1".into()));
         assert_eq!(request.target, format!("SY.orchestrator@{PRIMARY_HIVE_ID}"));
         assert_eq!(request.payload["target"], json!("worker1"));
         assert_eq!(request.payload["access_from"], json!(["192.168.8.0/24"]));
+        // An answer SY.admin did not get says not_answered, pointing at /versions.
+        let lost = hive_egress_not_answered("worker1", "request timed out after 60s");
+        assert_eq!(lost["error_code"], json!("TIMEOUT"));
+        assert_eq!(lost["outcome"], json!("not_answered"));
+        assert!(lost["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("GET /hives/worker1/versions")));
+        let (status, body) = build_admin_http_response("set_hive_egress", Ok(lost));
+        assert_eq!(status, error_code_to_http_status("TIMEOUT"));
+        assert!(body.contains("not_answered"), "{body}");
     }
 
     /// The installation's update is the operator's (docs/hive-config-update-v1.md §6, stage 4): an
