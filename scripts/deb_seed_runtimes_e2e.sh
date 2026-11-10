@@ -294,6 +294,38 @@ check "a dist without a manifest gets one" "$rc $(q "$D12e/runtimes/manifest.jso
 check "no temp file is left beside the manifest" \
   "$(ls -A "$D12e/runtimes" "$D11/runtimes" | grep -c '^\.manifest\.json\.' || true)" "0"
 
+echo "== T13: the seed decides 'current' under the lock, and its publishes take it on its descriptor =="
+D13="$WORK/t13"; seed_artifacts "$D13" "$VER"
+L13="$D13/runtimes-manifest.lock"
+# Each publish the seed runs finds the lock held, by the seed, from before the seed read `current`.
+cat >"$WORK/t13-publish.sh" <<EOF
+#!/usr/bin/env bash
+if flock -n "$L13" true; then echo free; else echo held; fi >>"$WORK/t13-lock-states"
+exec bash "$PUBLISH" "\$@"
+EOF
+rc=0
+FLUXBEE_BASE_NODES="$BASE_NODES" FLUXBEE_DIST_ROOT="$D13" FLUXBEE_PUBLISH_RUNTIME="$WORK/t13-publish.sh" \
+  FLUXBEE_BASE_RUNTIME_VERSION="$VER" FLUXBEE_MANIFEST_SNAPSHOT="$WORK/nosnap.json" \
+  bash "$SEED" >/dev/null 2>&1 || rc=$?
+check "the seed holds the lock through every publish it runs" "$rc $(sort -u "$WORK/t13-lock-states" | tr '\n' ' ')" "0 held "
+check "and its runtimes are registered" "$(q "$D13/runtimes/manifest.json" "sorted(d['runtimes'])")" "['ai.generic', 'io.api']"
+# A caller that holds the lock names its descriptor: the publish takes the lock on it, at once.
+rc=0
+(
+  exec 8>>"$L13"
+  flock 8
+  FLUXBEE_MANIFEST_LOCK_FD=8 bash "$PUBLISH" --runtime io.api --version 9.9.13 \
+    --binary "$WORK/t12-src/io-api" --dist-root "$D13" --set-current >/dev/null 2>&1
+) || rc=$?
+check "a publish under its caller's lock goes on" "$rc $(q "$D13/runtimes/manifest.json" "d['runtimes']['io.api']['current']")" "0 9.9.13"
+# A descriptor of another file never stands for the lock: refused, the manifest as it was.
+rc=0
+FLUXBEE_MANIFEST_LOCK_FD=7 bash "$PUBLISH" --runtime io.api --version 9.9.14 \
+  --binary "$WORK/t12-src/io-api" --dist-root "$D13" --set-current 7</dev/null >/dev/null 2>&1 || rc=$?
+check "a descriptor that is not the lock file's is refused" \
+  "$([ "$rc" -ne 0 ] && echo refused || echo published) $(q "$D13/runtimes/manifest.json" "d['runtimes']['io.api']['current']")" \
+  "refused 9.9.13"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -42,7 +42,10 @@ Notes:
   - Holds the manifest's lock, <dist-root>/runtimes-manifest.lock (beside the runtimes folder,
     which Syncthing shares, never inside it), from its read of the manifest to its write, as every
     writer of it does (SY.admin, fluxbee-publish, the .deb's seed): waits for another writer up to
-    60 s, then fails with the manifest untouched.
+    60 s, then fails with the manifest untouched. A caller that holds the lock and decides on the
+    manifest under it (the .deb's seed) names its descriptor of the lock file in
+    FLUXBEE_MANIFEST_LOCK_FD; the lock is taken on that open file, and a descriptor of any other
+    file is refused.
   - A manifest that is there but cannot be read, does not parse, or is no manifest is refused
     before anything is written: merging over it would drop every other runtime. Only a manifest
     that does not exist starts empty. The manifest is written whole or not at all: a temp file
@@ -341,10 +344,28 @@ for file in ${FILES[@]+"${FILES[@]}"}; do
 done
 
 # The manifest last: from here on SY.orchestrator may launch the version, and Syncthing carries
-# it to the workers. Under its lock, from the read to the write.
-[[ -e "$MANIFEST_LOCK" ]] || $SUDO touch "$MANIFEST_LOCK"
-exec 9<"$MANIFEST_LOCK"
-if ! flock -w "$MANIFEST_LOCK_WAIT_SECS" 9; then
+# it to the workers. Under its lock, from the read to the write. A caller that holds the lock and
+# decides on the manifest under it (the .deb's seed) names its descriptor of the lock file in
+# FLUXBEE_MANIFEST_LOCK_FD: the lock is taken on that same open file, where the caller holds it,
+# never on a new one, which would wait for the caller. A descriptor that is not the lock file's is
+# refused, so a stray value never skips the lock.
+if [[ -n "${FLUXBEE_MANIFEST_LOCK_FD:-}" ]]; then
+  lock_fd="$FLUXBEE_MANIFEST_LOCK_FD"
+  if [[ ! "$lock_fd" =~ ^[0-9]+$ ]] || ! python3 -c '
+import os, sys
+held, lock = os.fstat(int(sys.argv[1])), os.stat(sys.argv[2])
+sys.exit(0 if (held.st_dev, held.st_ino) == (lock.st_dev, lock.st_ino) else 1)
+' "$lock_fd" "$MANIFEST_LOCK" 2>/dev/null; then
+    echo "Error: FLUXBEE_MANIFEST_LOCK_FD=$lock_fd is no open descriptor of $MANIFEST_LOCK;" \
+      "the manifest is untouched" >&2
+    exit 1
+  fi
+else
+  lock_fd=9
+  [[ -e "$MANIFEST_LOCK" ]] || $SUDO touch "$MANIFEST_LOCK"
+  exec 9<"$MANIFEST_LOCK"
+fi
+if ! flock -w "$MANIFEST_LOCK_WAIT_SECS" "$lock_fd"; then
   echo "Error: another writer of $MANIFEST_PATH held its lock ($MANIFEST_LOCK) for" \
     "${MANIFEST_LOCK_WAIT_SECS}s; the manifest is untouched" >&2
   exit 1
@@ -365,7 +386,8 @@ if ! $SUDO install -m 0644 "$tmp_manifest" "$staged" || ! $SUDO mv -f "$staged" 
   exit 1
 fi
 rm -f "$tmp_manifest"
-exec 9<&-
+# Its own descriptor lets the lock go; a caller's copy closed here leaves the caller holding it.
+eval "exec ${lock_fd}<&-"
 
 manifest_version="$(python3 - "$MANIFEST_PATH" <<'PY'
 import json, sys
