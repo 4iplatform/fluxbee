@@ -21519,8 +21519,9 @@ fn enumerate_routing_references_to(
 
 fn derive_ilk_type_for_node(_node_name: &str) -> &'static str {
     // Every orchestrator-managed instance is a workload principal. `system` is reserved for
-    // SY-internal ILKs minted from hive.yaml by SY.identity and is intentionally rejected by
-    // ILK_REGISTER (F-08). This covers AI.*, IO.*, WF.* and managed RT.* instances uniformly.
+    // SY-internal ILKs, which SY.identity mints from the role's list (`release_settings`), and
+    // ILK_REGISTER rejects it (F-08). This covers AI.*, IO.*, WF.* and managed RT.* instances
+    // uniformly.
     "agent"
 }
 

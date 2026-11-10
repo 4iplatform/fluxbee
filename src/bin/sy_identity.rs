@@ -7499,7 +7499,7 @@ fn ilk_record_ids_canonical(ilk: &IlkRecord) -> bool {
 /// Validator for `ilk_type` arriving via ILK_REGISTER (frontdesk/orchestrator).
 /// External registrars may only mint `human`/`agent` principals. `"system"` is
 /// reserved for SY-internal creation (`ensure_system_ilks_from_hive`, driven by
-/// hive.yaml system_nodes) and is exactly the type `sy_vault::authorize_read`
+/// the role's list, `release_settings`) and is exactly the type `sy_vault::authorize_read`
 /// treats as a root-tenant pool master key — a compromised/buggy frontdesk must
 /// not be able to stamp an external identity `system`. (F-08)
 fn validate_ilk_type(value: &str) -> Result<(), String> {
