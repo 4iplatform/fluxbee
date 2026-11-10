@@ -311,6 +311,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-251 🔵 SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500 (low).
 - A-252 🔵 A fresh worker restarts Syncthing once more about a minute after its join, for the posture options (low).
 - A-253 🔵 A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns (low).
+- A-254 🔵 A WF can lose a timer schedule without knowing it: the schedule goes without waiting for an answer, and a refusal is dropped (low; WF).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1388,6 +1389,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-254 [WF] 🔵 low (found 2026-11-10 by the Go SDK's 0.1.130 builder; read in the code, not run) — A WF can lose a timer schedule without knowing it
+
+- **Why:** wf-generic's `SDKTimerSender.sendTimerRequest` (`go/nodes/wf/wf-generic/node/actions.go`
+  ~785-799) sends `schedule_timer` without waiting for an answer, and the timer is recorded in the
+  WF's index right after (~550). A schedule the router refuses (`LINK_BUSY` since 0.1.129, or
+  `NODE_NOT_FOUND` while SY.timer restarts) comes back as a notice the WF drops, and SY.timer's own
+  refusal (`TIMER_RESPONSE` with `ok: false`) is dropped as a system message.
+- **Effect:** the index keeps a timer SY.timer does not have; while the node is healthy nothing
+  notices it until the node's next start (its reconcile with `TIMER_LIST`). The spec already says
+  cancel and reschedule work this way; `LINK_BUSY` makes a lost schedule likelier under load.
+- **Fix, later (WF):** the schedule waits for SY.timer's answer (an RPC), or a refusal of a schedule
+  the WF sent marks that timer in its index and retries it.
 
 ### A-253 [General/storage] 🔵 low (found 2026-11-10 by 0.1.129's gate; seen on 8.x, the same on 0.1.128) — A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns
 
