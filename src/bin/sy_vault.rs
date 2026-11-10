@@ -247,8 +247,8 @@ async fn main() -> Result<(), VaultError> {
         set
     };
 
-    // Well-known SY system ILKs — the SY.* entries from `system_nodes` in
-    // hive.yaml plus the admin/architect override set. Used by
+    // Well-known SY system ILKs — the SY nodes of this hive's role (the
+    // release's list, `release_settings`) plus the admin/architect override set. Used by
     // `authorize_read` to grant root-tenant pool reads to any SY system
     // caller WITHOUT requiring identity SHM to be populated. This is the
     // piece that closes the boot chicken/egg: vault can authorize reads
@@ -258,7 +258,7 @@ async fn main() -> Result<(), VaultError> {
         compute_well_known_system_ilks(&config_dir, &hive_id, &self_ilk_id, &well_known_admin_ilks);
     tracing::info!(
         count = well_known_system_ilks.len(),
-        "well-known SY system ILKs computed from hive.yaml (no SHM dependency)"
+        "well-known SY system ILKs computed from the role's system nodes (no SHM dependency)"
     );
 
     let _lock = acquire_lock(Path::new(DEFAULT_LOCK_PATH))?;

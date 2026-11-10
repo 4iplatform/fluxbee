@@ -869,8 +869,8 @@ pub fn wait_for_self_system_ilk_id(
 pub const DEFAULT_ROOT_TENANT_ID: &str = "tnt:00000000-0000-0000-0000-000000000001";
 
 /// Compute the deterministic ILK assigned by `SY.identity` to a `SY.*` system
-/// node listed in `hive.yaml system_nodes`. Non-SY packaged lifecycle entries
-/// do not receive deterministic system ILKs.
+/// node of its hive's role (the release's list, `src/release_settings.rs`).
+/// Managed nodes do not receive deterministic system ILKs.
 ///
 /// `node_name` must be the fully qualified L2 name (e.g.
 /// `"SY.admin@motherbee"`). The function is pure — same input always yields
@@ -916,8 +916,8 @@ pub const ENV_SELF_TENANT_ID: &str = "FLUXBEE_NODE_TENANT_ID";
 /// variable is missing or empty (node should run degraded and not attempt
 /// secure vault calls until a future restart re-injects it).
 ///
-/// SY system nodes listed in `hive.yaml system_nodes` should not call this:
-/// their ILK is deterministic and resolved via [`wait_for_self_system_ilk_id`].
+/// The SY system nodes of a hive's role should not call this: their ILK is
+/// deterministic and resolved via [`wait_for_self_system_ilk_id`].
 pub fn read_self_ilk_from_env() -> Option<String> {
     std::env::var(ENV_SELF_ILK_ID)
         .ok()

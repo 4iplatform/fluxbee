@@ -42,27 +42,6 @@ pub fn managed_node_instance_dir_with_root(
     Ok(root.into().join(kind).join(node_name))
 }
 
-/// The only non-`SY.*` nodes `hive.yaml` accepts in its list of lifecycle nodes.
-///
-/// **EMPTY on purpose.** The managed runtimes (io.api, io.blob, io.cloud, io.slack, ...) are NOT
-/// declared in `hive.yaml` `system_nodes`: they are born through `run_node` and the orchestrator
-/// reconciles them.
-pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &[];
-
-/// True when `hive.yaml` may list it as a lifecycle node without it being `SY.*`.
-pub fn is_allowed_non_sy_lifecycle_node(node_name: &str) -> bool {
-    node_matches(node_name, HIVE_YAML_NON_SY_LIFECYCLE_NODES)
-}
-
-fn node_matches(node_name: &str, known: &[&str]) -> bool {
-    let local = node_name
-        .split_once('@')
-        .map(|(local, _)| local)
-        .unwrap_or(node_name)
-        .trim();
-    known.iter().any(|k| k.eq_ignore_ascii_case(local))
-}
-
 /// The root tenant, in any spelling of `tnt:<uuid>` that parses to it (with or without hyphens).
 pub fn is_root_tenant(tenant_id: &str) -> bool {
     let uuid_of = |raw: &str| {
