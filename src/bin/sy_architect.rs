@@ -11018,6 +11018,23 @@ fn node_config_from_output(output: &Value) -> Option<Value> {
         .filter(Value::is_object)
 }
 
+/// The tenant a node's stored config records, as the orchestrator reads it (its
+/// `config_tenant_id`): `_system.tenant_id`, else a top-level `tenant_id`.
+fn node_tenant_from_config(config: &Value) -> Option<String> {
+    [
+        config
+            .get("_system")
+            .and_then(|system| system.get("tenant_id")),
+        config.get("tenant_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|tenant| !tenant.is_empty())
+    .map(str::to_string)
+}
+
 async fn redeploy_runtime_nodes_with_current(
     state: &ArchitectState,
     hive_id: &str,
@@ -11057,38 +11074,39 @@ async fn redeploy_runtime_nodes_with_current(
         if resolved_runtime_name.as_deref() != Some(runtime_name) {
             continue;
         }
-        let config = if preserve_node_config {
-            let output = match config_output.take() {
-                Some(output) => Ok(output),
-                None => get_node_config_for_hive(state, hive_id, &node_name).await,
-            };
-            match output {
-                Ok(output) => {
-                    let config = node_config_from_output(&output).unwrap_or(Value::Null);
-                    if !config.is_object() {
-                        errors.push(json!({
-                            "node_name": node_name,
-                            "action": "get_node_config",
-                            "status": "error",
-                            "error": "stored node config is missing or invalid",
-                        }));
-                        continue;
-                    }
-                    Some(sanitized_redeploy_config(&config))
-                }
-                Err(err) => {
-                    errors.push(json!({
-                        "node_name": node_name,
-                        "action": "get_node_config",
-                        "status": "error",
-                        "error": err.to_string(),
-                    }));
-                    continue;
-                }
-            }
-        } else {
-            None
+        // The node's tenant, read before anything is killed (FINDINGS A-235): the kill purges the
+        // node, and run_node takes its tenant as a top-level tenant_id, which the preserved config
+        // does not carry (its `_system` is dropped). A node whose tenant cannot be read is left as
+        // it is. The same read gives the config a preserved redeploy keeps.
+        let output = match config_output.take() {
+            Some(output) => Ok(output),
+            None => get_node_config_for_hive(state, hive_id, &node_name).await,
         };
+        let stored_config = match output {
+            Ok(output) => node_config_from_output(&output),
+            Err(err) => {
+                errors.push(json!({
+                    "node_name": node_name,
+                    "action": "get_node_config",
+                    "status": "error",
+                    "error": format!("{err}; the node was left as it is"),
+                }));
+                continue;
+            }
+        };
+        let Some((stored_config, tenant_id)) = stored_config.and_then(|config| {
+            let tenant_id = node_tenant_from_config(&config)?;
+            Some((config, tenant_id))
+        }) else {
+            errors.push(json!({
+                "node_name": node_name,
+                "action": "get_node_config",
+                "status": "error",
+                "error": "its stored config is missing, or names no tenant (_system.tenant_id or tenant_id): the node was left as it is",
+            }));
+            continue;
+        };
+        let config = preserve_node_config.then(|| sanitized_redeploy_config(&stored_config));
 
         let kill_translation = AdminTranslation {
             admin_target: format!("SY.admin@{}", state.hive_id),
@@ -11129,6 +11147,7 @@ async fn redeploy_runtime_nodes_with_current(
         let mut run_params = json!({
             "node_name": node_name,
             "runtime_version": "current",
+            "tenant_id": tenant_id,
         });
         if let Some(config) = config {
             if let Some(obj) = run_params.as_object_mut() {
@@ -30462,6 +30481,171 @@ mod tests {
             agent_asset_catalog: Arc::new(RwLock::new(BTreeMap::new())),
         };
         (context, router)
+    }
+
+    /// Archi's state on the motherbee whose router is the test's, as `harness_tool_context`'s.
+    fn harness_state() -> (
+        Arc<ArchitectState>,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+    ) {
+        let (rpc, router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.architect@motherbee",
+            build_architect_rpc_profile().expect("architect rpc profile"),
+        );
+        let state = ArchitectState {
+            hive_id: PRIMARY_HIVE_ID.to_string(),
+            node_name: "SY.architect@motherbee".to_string(),
+            self_ilk_id: "ilk:00000000-0000-4000-8000-000000000000".to_string(),
+            listen: "127.0.0.1:0".to_string(),
+            config_dir: PathBuf::from("/tmp/fluxbee-test-config"),
+            state_dir: PathBuf::from("/tmp/fluxbee-test-state"),
+            rpc,
+            usage: UsageRecorder::disabled(),
+            ai_configured: AtomicBool::new(false),
+            ai_runtime: Arc::new(Mutex::new(None)),
+            ai_settings_error: std::sync::Mutex::new(None),
+            installation_file: PathBuf::from("/tmp/fluxbee-test-dist/installation.yaml"),
+            ai_built_from: ai_settings::InstallationBuiltFrom::default(),
+            ai_refresh_lock: Mutex::new(()),
+            messages_db_configured: AtomicBool::new(false),
+            messages_db_url: Arc::new(RwLock::new(None)),
+            messages_db: Arc::new(RwLock::new(None)),
+            messages_stream_active: Arc::new(AtomicUsize::new(0)),
+            chat_lock: Arc::new(Mutex::new(())),
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            cached_status: Arc::new(RwLock::new(ArchitectStatus {
+                status: "loading".to_string(),
+                hive_id: PRIMARY_HIVE_ID.to_string(),
+                node_name: "SY.architect@motherbee".to_string(),
+                router_connected: false,
+                admin_available: false,
+                inventory_updated_at: None,
+                total_hives: None,
+                hives_alive: None,
+                hives_stale: None,
+                total_nodes: None,
+                nodes_by_status: BTreeMap::new(),
+                components: default_component_statuses(),
+                error: None,
+            })),
+            admin_actions_cache: Arc::new(Mutex::new(None)),
+            plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
+            active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
+            agent_asset_catalog: Arc::new(RwLock::new(BTreeMap::new())),
+        };
+        (Arc::new(state), router)
+    }
+
+    /// The next admin command Archi sends, its action checked, answered with `answer`.
+    async fn answer_admin_command(
+        router: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        action: &str,
+        answer: Value,
+    ) -> Message {
+        let sent = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| panic!("no {action} sent"));
+        assert_eq!(sent.payload["action"], action, "{}", sent.payload);
+        router
+            .inject(admin_answer(&sent, answer))
+            .await
+            .expect("answer");
+        sent
+    }
+
+    /// FINDINGS A-235: a redeploy onto the runtime's current kills each node with its instance
+    /// purged and runs it again, so it reads each node's tenant first and runs it again in it, a
+    /// top-level tenant_id, whether its config is kept or not. A node whose tenant cannot be read
+    /// is never killed, and the answer names it.
+    #[tokio::test]
+    async fn a_redeploy_runs_each_node_again_in_its_tenant() {
+        let tenant = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
+        for preserve in [false, true] {
+            let (state, mut router) = harness_state();
+            let redeploy = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    redeploy_runtime_nodes_with_current(&state, "motherbee", "ai.generic", preserve)
+                        .await
+                }
+            });
+            let nodes = json!({ "status": "ok", "action": "list_nodes", "payload": { "nodes": [
+                { "node_name": "AI.sales@motherbee", "runtime": { "name": "ai.generic" } },
+                { "node_name": "AI.lost@motherbee", "runtime": { "name": "ai.generic" } },
+                { "node_name": "IO.api.x@motherbee", "runtime": { "name": "io.api" } }
+            ] } });
+            answer_admin_command(&mut router, "list_nodes", nodes).await;
+            let stored = json!({
+                "_system": { "runtime": "ai.generic", "tenant_id": tenant },
+                "behavior": { "kind": "openai_chat" }
+            });
+            let sales = answer_admin_command(
+                &mut router,
+                "get_node_config",
+                json!({ "status": "ok", "action": "get_node_config",
+                        "payload": { "node_name": "AI.sales@motherbee", "config": stored } }),
+            )
+            .await;
+            assert_eq!(sales.payload["params"]["node_name"], "AI.sales@motherbee");
+            let kill = answer_admin_command(
+                &mut router,
+                "kill_node",
+                json!({ "status": "ok", "action": "kill_node", "payload": {} }),
+            )
+            .await;
+            assert_eq!(kill.payload["params"]["node_name"], "AI.sales@motherbee");
+            assert_eq!(kill.payload["params"]["purge_instance"], true);
+            let run = answer_admin_command(
+                &mut router,
+                "run_node",
+                json!({ "status": "ok", "action": "run_node", "payload": {} }),
+            )
+            .await;
+            let mut expected = json!({
+                "node_name": "AI.sales@motherbee",
+                "runtime_version": "current",
+                "tenant_id": tenant,
+            });
+            if preserve {
+                expected["config"] = json!({ "behavior": { "kind": "openai_chat" } });
+            }
+            assert_eq!(run.payload["params"], expected);
+
+            // A stored config that names no tenant: the node is not killed.
+            answer_admin_command(
+                &mut router,
+                "get_node_config",
+                json!({ "status": "ok", "action": "get_node_config",
+                        "payload": { "node_name": "AI.lost@motherbee",
+                                     "config": { "_system": { "runtime": "ai.generic" } } } }),
+            )
+            .await;
+            let answer = redeploy.await.expect("the redeploy").expect("answered");
+            assert!(router
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none());
+            assert_eq!(
+                answer["recreated"],
+                json!([{
+                    "node_name": "AI.sales@motherbee",
+                    "status": "ok",
+                    "config_mode": if preserve { "preserved" } else { "template_default" },
+                }])
+            );
+            let errors = answer["errors"].as_array().expect("errors");
+            assert_eq!(errors.len(), 1, "{answer}");
+            assert_eq!(errors[0]["node_name"], "AI.lost@motherbee");
+            assert_eq!(errors[0]["action"], "get_node_config");
+            assert!(
+                errors[0]["error"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("names no tenant")),
+                "{answer}"
+            );
+            assert_eq!(answer["status"], "error");
+        }
     }
 
     /// Every tool Archi offers a model, whichever agent gets it (the chat, the designer, the

@@ -334,7 +334,12 @@ skills, handbooks and a personality.
 - `POST /api/package/publish` sends `publish_runtime_package` to SY.admin with
   `{source: {kind: "bundle_upload", blob_path}, set_current, sync_to, update_to}`
   (`handle_package_publish_request`). With `set_current` (default true) it then redeploys the
-  nodes of that runtime on Archi's own hive with the new current version.
+  nodes of that runtime on Archi's own hive with the new current version
+  (`redeploy_runtime_nodes_with_current`): each node is killed with its instance purged and run
+  again, with its stored config when `preserve_node_config` asks for it. Before the kill it reads
+  the node's tenant from its stored config (`_system.tenant_id`, else `tenant_id`) and runs it
+  again in it, a top-level `tenant_id`; a node whose tenant cannot be read is not touched and
+  is named in the answer's `errors` (FINDINGS A-235).
 - `POST /api/software/publish` publishes an uploaded `.zip`, or packages a single binary first.
 - Pipeline artifacts are published inside the executor plan (`inline_package` or
   `bundle_upload`).
