@@ -62,6 +62,8 @@ Rules enforced in `main.go`:
 - **Owner.** The owner is the router-stamped `routing.src_l2_name` of the request
   (`resolveSourceL2NameFromMsg`). A message without it is one the router made itself
   (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line (`isInfrastructureMessage`).
+  Nor does a notice or a reply from a node: `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a
+  name, or any `*_RESPONSE`; the AI nodes' rule and wf-generic's, name by name (FINDINGS A-218).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
   `<kind>.<name>@<hive>`, with a dot before the `@` (`isCanonicalL2Name`).
 - **Target.** A node schedules for itself: a `target_l2_name` that names another node is
@@ -168,9 +170,10 @@ All requests are `SYSTEM` messages to `SY.timer@<hive>`. Every answer is `TIMER_
 | `TIMER_HELP` | none | anyone; returns the verb and error catalog (`respondTimerHelp`) |
 | `NODE_STATUS_GET` | | answered `HEALTHY` (`BuildDefaultNodeStatusResponse`) |
 
-Any other verb gets `TIMER_UNKNOWN_VERB`. The router does
-not gate `TIMER_*` verbs: they are not in `PROTECTED_SYSTEM_ACTIONS`
-(`src/router/system_policy.rs`).
+Any other verb gets `TIMER_UNKNOWN_VERB`; a notice or a reply gets no answer: one the router made,
+and from a node `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a name or any `*_RESPONSE`
+(`isInfrastructureMessage`, above). The router does not gate `TIMER_*` verbs: they are not in
+`PROTECTED_SYSTEM_ACTIONS` (`src/router/system_policy.rs`).
 
 Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_ABOVE_MAXIMUM`, `TIMER_LIMIT_EXCEEDED`,
 `TIMER_INVALID_PAYLOAD`, `TIMER_INVALID_CRON`,

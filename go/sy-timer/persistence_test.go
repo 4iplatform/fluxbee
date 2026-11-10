@@ -377,6 +377,79 @@ func TestTimerInfoShowsACanceledReasonOnlyWhenThereIsOne(t *testing.T) {
 	}
 }
 
+// TIMER_GET and TIMER_LIST send a timer as exactly these bytes: the SDK's TimerInfo, every field in
+// its order and under its tag, an optional one left out when the row has none; the payload always
+// goes, {} for a timer scheduled without one (FINDINGS A-239's review). testdata/timer_wire only
+// decodes, so a change to TimerInfo's fields, tags or order, or to what timerRowToInfo fills, fails
+// here, not at a client.
+func TestATimerGoesOnTheWireByteForByte(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  timerRow
+		want string
+	}{
+		{
+			name: "every optional field",
+			row: timerRow{
+				UUID:           "timer-1",
+				OwnerL2Name:    "WF.demo@motherbee",
+				TargetL2Name:   "WF.demo@motherbee",
+				ClientRef:      sql.NullString{String: "weekly-report", Valid: true},
+				Kind:           "recurring",
+				FireAtUTC:      1775577600000,
+				CronSpec:       sql.NullString{String: "0 9 * * MON", Valid: true},
+				CronTZ:         sql.NullString{String: "America/Argentina/Buenos_Aires", Valid: true},
+				MissedPolicy:   "fire_if_within",
+				MissedWithinMS: sql.NullInt64{Int64: 600000, Valid: true},
+				Payload:        `{"report":"weekly"}`,
+				Metadata:       sql.NullString{String: `{"created_by":"WF.demo"}`, Valid: true},
+				Status:         "canceled",
+				CreatedAtUTC:   1775574000000,
+				LastFiredAtUTC: sql.NullInt64{Int64: 1775576000000, Valid: true},
+				FireCount:      3,
+				CanceledReason: sql.NullString{String: "its next fire cannot be computed: invalid cron", Valid: true},
+			},
+			want: `{"uuid":"timer-1","owner_l2_name":"WF.demo@motherbee","target_l2_name":"WF.demo@motherbee",` +
+				`"client_ref":"weekly-report","kind":"recurring","fire_at_utc_ms":1775577600000,` +
+				`"cron_spec":"0 9 * * MON","cron_tz":"America/Argentina/Buenos_Aires","missed_policy":"fire_if_within",` +
+				`"missed_within_ms":600000,"status":"canceled","created_at_utc_ms":1775574000000,"fire_count":3,` +
+				`"last_fired_at_utc_ms":1775576000000,"payload":{"report":"weekly"},"metadata":{"created_by":"WF.demo"},` +
+				`"canceled_reason":"its next fire cannot be computed: invalid cron"}`,
+		},
+		{
+			name: "none",
+			row: timerRow{
+				UUID:         "timer-2",
+				OwnerL2Name:  "WF.demo@motherbee",
+				TargetL2Name: "WF.demo@motherbee",
+				Kind:         "oneshot",
+				FireAtUTC:    1775577600000,
+				MissedPolicy: "fire",
+				Payload:      `{}`,
+				Status:       "pending",
+				CreatedAtUTC: 1775574000000,
+			},
+			want: `{"uuid":"timer-2","owner_l2_name":"WF.demo@motherbee","target_l2_name":"WF.demo@motherbee",` +
+				`"kind":"oneshot","fire_at_utc_ms":1775577600000,"missed_policy":"fire","status":"pending",` +
+				`"created_at_utc_ms":1775574000000,"fire_count":0,"payload":{}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := timerRowToInfo(tc.row)
+			if err != nil {
+				t.Fatalf("timer row to info: %v", err)
+			}
+			encoded, err := json.Marshal(info)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			if string(encoded) != tc.want {
+				t.Fatalf("the timer on the wire:\n got %s\nwant %s", encoded, tc.want)
+			}
+		})
+	}
+}
+
 func TestTimerRowToInfoPreservesJsonBlobs(t *testing.T) {
 	info, err := timerRowToInfo(timerRow{
 		UUID:         "timer-1",

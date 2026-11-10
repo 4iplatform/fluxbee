@@ -697,7 +697,7 @@ UNREACHABLE, and a node that answers every message bounces it forever.
 | text/v1 blob offload | Automatic (§8) | None |
 | `compute_thread_id`, `stream::append`, vault client | Yes | No |
 | `meta.via_tap` | In `Meta` | Not in `Meta` |
-| `ECHO`, `ECHO_REPLY`, `TIME_SYNC` | Gone (FINDINGS A-218) | Gone (since 0.1.130) |
+| `ECHO`, `ECHO_REPLY`, `TIME_SYNC` | Gone (FINDINGS A-218) | `MSGEcho` and `MSGEchoReply` gone since 0.1.130; `TIME_SYNC` never there |
 
 ---
 
