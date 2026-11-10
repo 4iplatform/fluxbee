@@ -802,7 +802,8 @@ func parseTimerListCursor(cursor string) (*timerListCursor, error) {
 	fireAt, uuid, ok := strings.Cut(cursor, ":")
 	fireAtUTC, err := strconv.ParseInt(fireAt, 10, 64)
 	if !ok || err != nil || strings.TrimSpace(uuid) == "" {
-		return nil, fmt.Errorf("cursor must be a next_cursor of TIMER_LIST, got %q", cursor)
+		// A-232: a refusal names the field, never the value it was sent.
+		return nil, errors.New("cursor must be a next_cursor of TIMER_LIST")
 	}
 	return &timerListCursor{fireAtUTC: fireAtUTC, uuid: uuid}, nil
 }

@@ -227,3 +227,20 @@ func TestTimerListAnswersInPagesThatFitAFrame(t *testing.T) {
 		t.Fatalf("a cursor that is not one: %+v", answer)
 	}
 }
+
+// A cursor TIMER_LIST cannot read is refused naming the field, never the value it was sent
+// (FINDINGS A-232).
+func TestATimerListCursorRefusalNamesNoValue(t *testing.T) {
+	for _, cursor := range []string{"3f1c0e9a8b7d6c5e", "1730000000000", "notanumber:abc", "731:"} {
+		_, err := parseTimerListCursor(cursor)
+		if err == nil {
+			t.Fatalf("cursor %q: no refusal", cursor)
+		}
+		if err.Error() != "cursor must be a next_cursor of TIMER_LIST" {
+			t.Fatalf("cursor %q: refusal %q", cursor, err.Error())
+		}
+	}
+	if got, err := parseTimerListCursor("1730000000000:4b1e"); err != nil || got == nil {
+		t.Fatalf("a next_cursor: %v %v", got, err)
+	}
+}
