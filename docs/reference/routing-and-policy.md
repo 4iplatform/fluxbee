@@ -226,6 +226,7 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 | `WAN_UNAVAILABLE` | this router is the gateway and has no live WAN link to the next-hop hive |
 | `OPA_ERROR` | Resolve: no user policy loaded, or its evaluation failed (§5, §7) |
 | `OPA_NO_TARGET` | Resolve: the user policy gave no target |
+| `FRAME_TOO_LARGE` | the message's frame, as the router hands it to a link, is over 128 KiB: the sender's SDK let it through, and the router's additions (the sender's name, the action class, a resolve's trace entry) took it over; never queued, and a broadcast is answered once (A-202, since 0.1.124) |
 
 A message that came from another router gets its error over the link it came in on; that router
 hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`).
@@ -236,9 +237,10 @@ hands it to the node when the node is its own (`handle_peer_message`, `handle_wa
 - a protected system action from an origin the system policy does not allow (§6.3);
 - a frame whose `routing.src` is not the sending connection's UUID (§2);
 - a broadcast whose `trace_id` is not a UUID or was seen in the last 30 s (§4);
-- a frame over 128 KiB (`MAX_FRAME_SIZE`) on its way out: the router skips it, counts it and logs
-  `router skipped a frame over the size limit; the link goes on` (`write_link_frames`). A node that
-  sends such a frame is disconnected;
+- one of the router's own frames (an LSA, a HELLO) over 128 KiB (`MAX_FRAME_SIZE`) on its way out:
+  the link's writer skips it, counts it and logs `router skipped a frame over the size limit; the
+  link goes on` (`write_link_frames`). A sender's message over the limit is not queued and is
+  answered `FRAME_TOO_LARGE` (§3.6), and a node that sends a frame over it is disconnected;
 - a tap copy that cannot be delivered (§8.3);
 - `STREAM_APPEND`, `OPA_RELOAD` and `WITHDRAW`, which the router consumes; `WITHDRAW` also closes the
   node's connection.

@@ -105,10 +105,10 @@ fire again after 5, 10, 20 and 40 s, then each minute (`undelivered`, `retryLate
 an hour after the first attempt, sooner for a `fire_if_within` one-shot (its window from its
 scheduled time) and a recurring timer (its next instance), and a `drop` one-shot gets none
 (`deliveryDeadline`); then the fire is lost (`timer_fire_lost`). A fire the router refuses for
-another reason (`VPN_BLOCKED`, `OPA_*`) is not sent again (`timer_fire_refused`), nor one over the
-frame. A retry whose timer was purged or canceled since is dropped. The retries live in memory: a
-fire being retried when SY.timer stops is lost, and its owner covers it (a WF reconciles its timers
-when it starts).
+another reason (`VPN_BLOCKED`, `OPA_*`, `FRAME_TOO_LARGE`) is not sent again (`timer_fire_refused`),
+nor one over the frame. A retry whose timer was purged or canceled since is dropped. The retries
+live in memory: a fire being retried when SY.timer stops is lost, and its owner covers it (a WF
+reconciles its timers when it starts).
 
 ### After a restart
 

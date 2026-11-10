@@ -49,7 +49,8 @@ uses the same framing: node to router, router to sibling router, hive to hive.
 | A Rust node sending | `NodeSender::send` refuses it with `NodeError::MessageTooLarge` and logs `FRAME_TOO_LARGE`; nothing is queued. A `text` payload is offloaded to a blob before this check (§8). | `split.rs` |
 | A Go node sending | `NodeSender.Send` refuses it with `*MessageTooLargeError` and logs `FRAME_TOO_LARGE`; nothing is queued and the connection stays up. | `client.go` |
 | The router, reading from a node | The read fails; the router logs `FRAME_TOO_LARGE — node sent oversized frame; disconnecting`, ends the connection and unregisters the node. | `handle_node` |
-| The router, writing a frame it enlarged on the way (stamps, memory package) | The frame is skipped and counted, with at most one warning per link every 30 s; the link stays up. Neither side is told. | `write_link_frames` |
+| The router, handing a link a sender's frame it enlarged on the way (the sender's name, the action class, a resolve's trace entry; an agent's memory package is trimmed to fit) | Not queued: the sender is answered `UNREACHABLE` `FRAME_TOO_LARGE` over the link the message came in on, a broadcast once, with at most one warning every 30 s (since 0.1.124, FINDINGS A-202). SY.admin, SY.identity, SY.vault and SY.orchestrator keep their replies 1 KiB under the frame for these additions (A-198). | `frame_over_limit` |
+| The router, writing one of its own frames (an LSA, a HELLO) | The frame is skipped and counted, with at most one warning per link every 30 s; the link stays up. | `write_link_frames` |
 
 ---
 
@@ -322,13 +323,13 @@ sends them back over the same links. Envelope: `src` the router's UUID, `dst` th
 
 | `msg` | Payload | Values |
 | --- | --- | --- |
-| `UNREACHABLE` | `UnreachablePayload {original_dst, reason}` | `original_dst`: the failed `dst` as a string (`broadcast`, or `null` for `dst: null`). `reason`: `NODE_NOT_FOUND`, `VPN_BLOCKED`, `PEER_UNAVAILABLE` (the sibling router is gone), `GATEWAY_UNAVAILABLE`, `WAN_UNAVAILABLE`, `OPA_ERROR`, `OPA_NO_TARGET`. |
+| `UNREACHABLE` | `UnreachablePayload {original_dst, reason}` | `original_dst`: the failed `dst` as a string (`broadcast`, or `null` for `dst: null`). `reason`: `NODE_NOT_FOUND`, `VPN_BLOCKED`, `PEER_UNAVAILABLE` (the sibling router is gone), `GATEWAY_UNAVAILABLE`, `WAN_UNAVAILABLE`, `OPA_ERROR`, `OPA_NO_TARGET`, `FRAME_TOO_LARGE` (the router's additions took the frame over the limit, §1.3). |
 | `TTL_EXCEEDED` | `TtlExceededPayload {original_dst, last_hop}` | `last_hop`: `router:<router uuid>`. |
 
 The RPC helpers turn them into `RpcError::Unreachable` and `RpcError::TtlExceeded` (§10.4). Some
 drops answer nothing, and a request then times out: a foreign `src` (§2.3), a protected verb from
-an unauthorized sender (§7), a broadcast with a non-UUID `trace_id`, a drop route, a frame the
-router enlarged past the limit (§1.3).
+an unauthorized sender (§7), a broadcast with a non-UUID `trace_id`, a drop route. A frame the
+router enlarged past the limit is answered `FRAME_TOO_LARGE` since 0.1.124 (§1.3).
 
 ### 6.2 NODE_STATUS_GET and NODE_HELP
 
@@ -659,6 +660,9 @@ unknown, not failed: the peer may have done the work (`RpcError::is_timeout`). T
 `RpcError::Unreachable {reason, original_dst}` and `RpcError::TtlExceeded {original_dst,
 last_hop}`. Go returns `*RpcError` with `Kind` `RpcErrTimeout`, `RpcErrTerminalTransport`,
 `RpcErrInvalidResponse`, `RpcErrDisconnected`, `RpcErrInvalidRequest` or `RpcErrMessageTooLarge`.
+Go's `RpcErrTerminalTransport` names the transport message (`terminal transport response
+"UNREACHABLE"`) but not its `reason`: a Go caller cannot tell `FRAME_TOO_LARGE` from
+`NODE_NOT_FOUND`.
 
 ### 10.5 Answering a request
 

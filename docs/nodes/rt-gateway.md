@@ -156,7 +156,17 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   [SY.config.routes](sy-config-routes.md)).
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
   `VPN_BLOCKED`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`, `OPA_ERROR`,
-  `OPA_NO_TARGET`; and `TTL_EXCEEDED` when the TTL runs out (every IRP and WAN hop decrements it).
+  `OPA_NO_TARGET`, `FRAME_TOO_LARGE`; and `TTL_EXCEEDED` when the TTL runs out (every IRP and WAN
+  hop decrements it).
+  - **`FRAME_TOO_LARGE`** (since 0.1.124, FINDINGS A-202): the sender's frame passed its SDK's
+    128 KiB check, but the router's additions took it over the limit (the sender's name, the action
+    class, a resolve's trace entry; an agent's memory package is trimmed to fit). The router does
+    not queue it for that link, local node, sibling router or WAN peer, and answers the sender over
+    the link the message came in on, a broadcast once. It logs `router did not queue a frame over
+    the size limit (FRAME_TOO_LARGE)` with the link, the destination, the size and the limit, at
+    most once every 30 s (`frame_over_limit`). Until 0.1.124 the link's writer skipped the frame and
+    the sender waited out its own timeout. SY.admin, SY.identity, SY.vault and SY.orchestrator keep
+    their replies 1 KiB under the frame for these additions (A-198), so they never get it.
   A link to a sibling router or to a hive whose writer has stopped counts as no link:
   `PEER_UNAVAILABLE`, `GATEWAY_UNAVAILABLE` or `WAN_UNAVAILABLE` (`send_to_peer_router`,
   `send_to_wan_peer`); a local node's, as a node that left: `NODE_NOT_FOUND`, for a unicast only

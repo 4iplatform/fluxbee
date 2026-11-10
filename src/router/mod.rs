@@ -878,7 +878,12 @@ async fn handle_node(
                                 apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
                                 if msg.routing.ttl >= 2 {
                                     match broadcast_to_peers(&peers, &msg).await {
-                                        Ok(()) => tracing::info!("opa reload forwarded to peers"),
+                                        Ok(false) => {
+                                            tracing::info!("opa reload forwarded to peers")
+                                        }
+                                        Ok(true) => tracing::warn!(
+                                            "opa reload not forwarded to peers: over the size limit"
+                                        ),
                                         Err(err) => tracing::warn!(
                                             error = %err,
                                             "opa reload could not be forwarded to peers"
@@ -1088,6 +1093,8 @@ async fn handle_message(
         return Ok(());
     }
 
+    // A broadcast too large for another router's link is answered once, with its local deliveries.
+    let mut broadcast_too_large = false;
     match &msg.routing.dst {
         Destination::Unicast(dst) => {
             if let Ok(dst_uuid) = Uuid::parse_str(dst) {
@@ -1124,15 +1131,14 @@ async fn handle_message(
                                 send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                                 return Ok(());
                             }
-                            if send_to_peer_router(peers, peer_node.router_uuid, &msg).await? {
+                            let Some(reason) =
+                                send_to_peer_router(peers, peer_node.router_uuid, &msg)
+                                    .await?
+                                    .unreachable("PEER_UNAVAILABLE")
+                            else {
                                 return Ok(());
-                            }
-                            send_unreachable_to(
-                                &msg,
-                                &src_handle.sender,
-                                router_uuid,
-                                "PEER_UNAVAILABLE",
-                            )?;
+                            };
+                            send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                         } else {
                             send_unreachable_to(
                                 &msg,
@@ -1231,15 +1237,13 @@ async fn handle_message(
                             send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                             return Ok(());
                         }
-                        if send_to_peer_router(peers, peer_uuid, &msg).await? {
+                        let Some(reason) = send_to_peer_router(peers, peer_uuid, &msg)
+                            .await?
+                            .unreachable("PEER_UNAVAILABLE")
+                        else {
                             return Ok(());
-                        }
-                        send_unreachable_to(
-                            &msg,
-                            &src_handle.sender,
-                            router_uuid,
-                            "PEER_UNAVAILABLE",
-                        )?;
+                        };
+                        send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
                         forward_to_hive(
@@ -1332,10 +1336,10 @@ async fn handle_message(
                 "router broadcast fanout summary"
             );
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(peers, &msg).await?;
+                broadcast_too_large |= broadcast_to_peers(peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                forward_broadcast_to_wan(
+                broadcast_too_large |= forward_broadcast_to_wan(
                     &msg,
                     is_gateway,
                     peer_routers,
@@ -1420,10 +1424,13 @@ async fn handle_message(
                         send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
                         return Ok(());
                     }
-                    if send_to_peer_router(peers, peer_uuid, &msg).await? {
+                    let Some(reason) = send_to_peer_router(peers, peer_uuid, &msg)
+                        .await?
+                        .unreachable("PEER_UNAVAILABLE")
+                    else {
                         return Ok(());
-                    }
-                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                    };
+                    send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     forward_to_hive(
@@ -1442,8 +1449,12 @@ async fn handle_message(
         }
     }
 
-    if deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await? {
-        send_unreachable_to(&msg, &src_handle.sender, router_uuid, "NODE_NOT_FOUND")?;
+    let local = deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
+    if let Some(reason) = broadcast_too_large
+        .then_some(UNREACHABLE_FRAME_TOO_LARGE)
+        .or(local)
+    {
+        send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
     }
 
     // ROUTER-TAP-3: tap fanout. After primary unicast delivery is done,
@@ -1691,6 +1702,10 @@ async fn fanout_taps_for_unicast(
                         continue;
                     }
                 };
+                // A copy too large is dropped like any copy the tap cannot deliver.
+                if frame_over_limit(&data, &copy, "node", &target_handle.name) {
+                    continue;
+                }
                 let _ = target_handle.sender.send(data);
                 tracing::info!(
                     tap_src = %src_name,
@@ -1795,87 +1810,180 @@ fn send_ttl_exceeded_to(
     Ok(())
 }
 
-/// Hands `msg` to the IRP link of the sibling router `peer_uuid`; false when there is none or its
-/// writer has stopped, so the caller answers `PEER_UNAVAILABLE` or `GATEWAY_UNAVAILABLE`.
+/// The UNREACHABLE reason for a message whose frame, as the router hands it to a link, is over the
+/// socket's limit (A-202).
+const UNREACHABLE_FRAME_TOO_LARGE: &str = "FRAME_TOO_LARGE";
+/// Frames the router did not queue for being over the socket's size limit, process-wide. Each warn
+/// line about them carries the total; at most one line per interval.
+static OVERSIZE_FRAMES_REFUSED: AtomicU64 = AtomicU64::new(0);
+static OVERSIZE_FRAMES_REFUSED_LOGGED_AT_MS: AtomicU64 = AtomicU64::new(0);
+const OVERSIZE_FRAMES_REFUSED_LOG_INTERVAL_MS: u64 = 30_000;
+
+/// Whether `frame`, `msg` serialized for a link to `dst`, is over the socket's 128 KiB limit, past
+/// which the link's writer skips it. A sender's frame can be: the SDK checks it as sent, and the
+/// router then adds the sender's name, the action class, a resolve's trace entry and, for an
+/// agent, the memory package (trimmed to fit, never below the message itself). Every frame the
+/// router queues for a sender is checked here first: one over the limit is not queued, and the
+/// caller answers its sender `FRAME_TOO_LARGE`, where until 0.1.124 the writer dropped it and the
+/// sender waited out its own timeout (A-202). The router's own frames (HELLO, LSA, its answers)
+/// keep the writer's skip.
+fn frame_over_limit(
+    frame: &[u8],
+    msg: &Message,
+    link: &'static str,
+    dst: impl std::fmt::Display,
+) -> bool {
+    if frame.len() <= MAX_FRAME_SIZE {
+        return false;
+    }
+    let refused_total = OVERSIZE_FRAMES_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_epoch_ms();
+    let last = OVERSIZE_FRAMES_REFUSED_LOGGED_AT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= OVERSIZE_FRAMES_REFUSED_LOG_INTERVAL_MS
+        && OVERSIZE_FRAMES_REFUSED_LOGGED_AT_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            link,
+            dst = %dst,
+            src = msg.routing.src_l2_name.as_deref().unwrap_or(&msg.routing.src),
+            trace_id = %msg.routing.trace_id,
+            frame_len = frame.len(),
+            max = MAX_FRAME_SIZE,
+            refused_total,
+            "router did not queue a frame over the size limit (FRAME_TOO_LARGE)"
+        );
+    }
+    true
+}
+
+/// What became of a message handed to another router's link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handover {
+    /// Queued for the link's writer.
+    Queued,
+    /// No link, or one whose writer has stopped (A-203).
+    NoLink,
+    /// Its frame is over the socket's limit, so it was not queued (A-202).
+    TooLarge,
+}
+
+impl Handover {
+    /// The reason the message's sender is answered `UNREACHABLE` with, if any: `no_link` when there
+    /// is no link.
+    fn unreachable(self, no_link: &'static str) -> Option<&'static str> {
+        match self {
+            Handover::Queued => None,
+            Handover::NoLink => Some(no_link),
+            Handover::TooLarge => Some(UNREACHABLE_FRAME_TOO_LARGE),
+        }
+    }
+}
+
+/// Hands `msg` to the IRP link of the sibling router `peer_uuid`. With no link, or one whose writer
+/// has stopped, the caller answers `PEER_UNAVAILABLE` or `GATEWAY_UNAVAILABLE`.
 async fn send_to_peer_router(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_uuid: Uuid,
     msg: &Message,
-) -> Result<bool, RouterError> {
+) -> Result<Handover, RouterError> {
     let peer = {
         let peers_guard = peers.lock().await;
         peers_guard.get(&peer_uuid).cloned()
     };
     let Some(peer) = peer else {
-        return Ok(false);
+        return Ok(Handover::NoLink);
     };
     let mut forward = msg.clone();
     if forward.routing.ttl > 0 {
         forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
     }
     let data = serde_json::to_vec(&forward)?;
-    Ok(peer.sender.send(data).is_ok())
+    if frame_over_limit(&data, &forward, "irp", peer_uuid) {
+        return Ok(Handover::TooLarge);
+    }
+    Ok(match peer.sender.send(data) {
+        Ok(()) => Handover::Queued,
+        Err(_) => Handover::NoLink,
+    })
 }
 
-/// Hands `msg` to the WAN link of `hive_id`; false when there is none or its writer has stopped,
-/// so the caller answers `WAN_UNAVAILABLE`. Until 0.1.124 a send that failed counted as sent, and
-/// the frame was lost without an answer (A-203).
+/// Hands `msg` to the WAN link of `hive_id`. With no link, or one whose writer has stopped, the
+/// caller answers `WAN_UNAVAILABLE`. Until 0.1.124 a send that failed counted as sent, and the frame
+/// was lost without an answer (A-203).
 async fn send_to_wan_peer(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     hive_id: &str,
     msg: &Message,
-) -> Result<bool, RouterError> {
+) -> Result<Handover, RouterError> {
     let peer = {
         let peers_guard = wan_peers.lock().await;
         peers_guard.get(hive_id).cloned()
     };
     let Some(peer) = peer else {
-        return Ok(false);
+        return Ok(Handover::NoLink);
     };
     let mut forward = msg.clone();
     if forward.routing.ttl > 0 {
         forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
     }
     let data = serde_json::to_vec(&forward)?;
-    Ok(peer.sender.send(data).is_ok())
+    if frame_over_limit(&data, &forward, "wan", hive_id) {
+        return Ok(Handover::TooLarge);
+    }
+    Ok(match peer.sender.send(data) {
+        Ok(()) => Handover::Queued,
+        Err(_) => Handover::NoLink,
+    })
 }
 
+/// Hands a broadcast to every sibling router's link. True when its frame is over the socket's
+/// limit, so it went to none (A-202).
 async fn broadcast_to_peers(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     msg: &Message,
-) -> Result<(), RouterError> {
+) -> Result<bool, RouterError> {
     let peers_guard = peers.lock().await;
     if peers_guard.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut forward = msg.clone();
     if forward.routing.ttl > 0 {
         forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
     }
     let data = serde_json::to_vec(&forward)?;
+    if frame_over_limit(&data, &forward, "irp", "broadcast") {
+        return Ok(true);
+    }
     for peer in peers_guard.values() {
         let _ = peer.sender.send(data.clone());
     }
-    Ok(())
+    Ok(false)
 }
 
+/// Hands a broadcast to every WAN peer's link. True when its frame is over the socket's limit, so
+/// it went to none (A-202).
 async fn broadcast_to_wan(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     msg: &Message,
-) -> Result<(), RouterError> {
+) -> Result<bool, RouterError> {
     let peers_guard = wan_peers.lock().await;
     if peers_guard.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut forward = msg.clone();
     if forward.routing.ttl > 0 {
         forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
     }
     let data = serde_json::to_vec(&forward)?;
+    if frame_over_limit(&data, &forward, "wan", "broadcast") {
+        return Ok(true);
+    }
     for peer in peers_guard.values() {
         let _ = peer.sender.send(data.clone());
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn forward_to_hive(
@@ -1893,10 +2001,12 @@ async fn forward_to_hive(
         return Ok(());
     }
     if is_gateway {
-        if send_to_wan_peer(wan_peers, hive_id, msg).await? {
-            return Ok(());
+        if let Some(reason) = send_to_wan_peer(wan_peers, hive_id, msg)
+            .await?
+            .unreachable("WAN_UNAVAILABLE")
+        {
+            send_unreachable_to(msg, sender, router_uuid, reason)?;
         }
-        send_unreachable_to(msg, sender, router_uuid, "WAN_UNAVAILABLE")?;
         return Ok(());
     }
     let gateway_uuid = {
@@ -1910,13 +2020,18 @@ async fn forward_to_hive(
         send_unreachable_to(msg, sender, router_uuid, "GATEWAY_UNAVAILABLE")?;
         return Ok(());
     };
-    if send_to_peer_router(peers, gateway_uuid, msg).await? {
-        return Ok(());
+    if let Some(reason) = send_to_peer_router(peers, gateway_uuid, msg)
+        .await?
+        .unreachable("GATEWAY_UNAVAILABLE")
+    {
+        send_unreachable_to(msg, sender, router_uuid, reason)?;
     }
-    send_unreachable_to(msg, sender, router_uuid, "GATEWAY_UNAVAILABLE")?;
     Ok(())
 }
 
+/// Hands a broadcast with TTL for it to the other hives: on the gateway to every WAN peer, on any
+/// other router to the gateway sibling. True when its frame is over the socket's limit, so it went
+/// to none: the caller answers its sender once (A-202).
 async fn forward_broadcast_to_wan(
     msg: &Message,
     is_gateway: bool,
@@ -1925,13 +2040,12 @@ async fn forward_broadcast_to_wan(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     router_uuid: Uuid,
     sender: &mpsc::UnboundedSender<Vec<u8>>,
-) -> Result<(), RouterError> {
+) -> Result<bool, RouterError> {
     if msg.routing.ttl <= 2 {
-        return Ok(());
+        return Ok(false);
     }
     if is_gateway {
-        broadcast_to_wan(wan_peers, msg).await?;
-        return Ok(());
+        return broadcast_to_wan(wan_peers, msg).await;
     }
     let gateway_uuid = {
         let guard = peer_routers.lock().await;
@@ -1942,10 +2056,9 @@ async fn forward_broadcast_to_wan(
     };
     let Some(gateway_uuid) = gateway_uuid else {
         send_unreachable_to(msg, sender, router_uuid, "GATEWAY_UNAVAILABLE")?;
-        return Ok(());
+        return Ok(false);
     };
-    let _ = send_to_peer_router(peers, gateway_uuid, msg).await?;
-    Ok(())
+    Ok(send_to_peer_router(peers, gateway_uuid, msg).await? == Handover::TooLarge)
 }
 
 fn match_kind_label(kind: u8) -> &'static str {
@@ -3502,6 +3615,8 @@ async fn handle_wan_message(
     }
 
     let mut senders: Vec<LocalDelivery> = Vec::new();
+    // A broadcast too large for another router's link is answered once, with its local deliveries.
+    let mut broadcast_too_large = false;
     match &msg.routing.dst {
         Destination::Unicast(dst) => {
             if let Ok(dst_uuid) = Uuid::parse_str(dst) {
@@ -3538,10 +3653,14 @@ async fn handle_wan_message(
                                 send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                                 return Ok(());
                             }
-                            if send_to_peer_router(&ctx.peers, peer_node.router_uuid, &msg).await? {
+                            let Some(reason) =
+                                send_to_peer_router(&ctx.peers, peer_node.router_uuid, &msg)
+                                    .await?
+                                    .unreachable("PEER_UNAVAILABLE")
+                            else {
                                 return Ok(());
-                            }
-                            send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                            };
+                            send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                         } else {
                             send_unreachable_to(&msg, sender, ctx.router_uuid, "VPN_BLOCKED")?;
                         }
@@ -3626,10 +3745,13 @@ async fn handle_wan_message(
                             send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                             return Ok(());
                         }
-                        if send_to_peer_router(&ctx.peers, peer_uuid, &msg).await? {
+                        let Some(reason) = send_to_peer_router(&ctx.peers, peer_uuid, &msg)
+                            .await?
+                            .unreachable("PEER_UNAVAILABLE")
+                        else {
                             return Ok(());
-                        }
-                        send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                        };
+                        send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
                         forward_to_hive(
@@ -3681,10 +3803,10 @@ async fn handle_wan_message(
                 senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(&ctx.peers, &msg).await?;
+                broadcast_too_large |= broadcast_to_peers(&ctx.peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                broadcast_to_wan(&ctx.wan_peers, &msg).await?;
+                broadcast_too_large |= broadcast_to_wan(&ctx.wan_peers, &msg).await?;
             }
         }
         Destination::Resolve => {
@@ -3751,10 +3873,13 @@ async fn handle_wan_message(
                         send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
                         return Ok(());
                     }
-                    if send_to_peer_router(&ctx.peers, peer_uuid, &msg).await? {
+                    let Some(reason) = send_to_peer_router(&ctx.peers, peer_uuid, &msg)
+                        .await?
+                        .unreachable("PEER_UNAVAILABLE")
+                    else {
                         return Ok(());
-                    }
-                    send_unreachable_to(&msg, sender, ctx.router_uuid, "PEER_UNAVAILABLE")?;
+                    };
+                    send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
                     forward_to_hive(
@@ -3773,7 +3898,7 @@ async fn handle_wan_message(
         }
     }
 
-    if deliver_locally(
+    let local = deliver_locally(
         senders,
         &msg,
         &ctx.memory_reader,
@@ -3781,9 +3906,12 @@ async fn handle_wan_message(
         src_via_hub,
         &ctx.log_stream,
     )
-    .await?
+    .await?;
+    if let Some(reason) = broadcast_too_large
+        .then_some(UNREACHABLE_FRAME_TOO_LARGE)
+        .or(local)
     {
-        send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+        send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
     }
     Ok(())
 }
@@ -4455,6 +4583,8 @@ async fn handle_peer_message(
         return Ok(());
     }
 
+    // A broadcast too large for the WAN is answered once, with its local deliveries.
+    let mut broadcast_too_large = false;
     match &msg.routing.dst {
         Destination::Unicast(dst) => {
             if let Ok(dst_uuid) = Uuid::parse_str(dst) {
@@ -4565,16 +4695,14 @@ async fn handle_peer_message(
                                 return Ok(());
                             }
                         }
-                        if send_to_peer_router(peers, peer_uuid, &msg).await? {
+                        let Some(reason) = send_to_peer_router(peers, peer_uuid, &msg)
+                            .await?
+                            .unreachable("PEER_UNAVAILABLE")
+                        else {
                             return Ok(());
-                        }
+                        };
                         if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                            send_unreachable_to(
-                                &msg,
-                                &peer.sender,
-                                router_uuid,
-                                "PEER_UNAVAILABLE",
-                            )?;
+                            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
                         }
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
@@ -4620,7 +4748,7 @@ async fn handle_peer_message(
             }
             if msg.routing.ttl >= 3 {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                    forward_broadcast_to_wan(
+                    broadcast_too_large |= forward_broadcast_to_wan(
                         &msg,
                         is_gateway,
                         peer_routers,
@@ -4705,11 +4833,14 @@ async fn handle_peer_message(
                             return Ok(());
                         }
                     }
-                    if send_to_peer_router(peers, peer_uuid, &msg).await? {
+                    let Some(reason) = send_to_peer_router(peers, peer_uuid, &msg)
+                        .await?
+                        .unreachable("PEER_UNAVAILABLE")
+                    else {
                         return Ok(());
-                    }
+                    };
                     if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, "PEER_UNAVAILABLE")?;
+                        send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
                     }
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
@@ -4731,9 +4862,13 @@ async fn handle_peer_message(
         }
     }
 
-    if deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await? {
+    let local = deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
+    if let Some(reason) = broadcast_too_large
+        .then_some(UNREACHABLE_FRAME_TOO_LARGE)
+        .or(local)
+    {
         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-            send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
         }
     }
     Ok(())
@@ -6946,8 +7081,10 @@ fn cognition_copy(msg: &Message, sender_name: &str) -> Option<Vec<u8>> {
 /// package of its communication, and its router's copy of the turn for its cognition: with the
 /// copy its agent's sends make at entry, the agent's router hands its cognition both directions.
 ///
-/// True when the message is no broadcast and its destination's link took nothing, its writer
-/// stopped (A-203): the caller answers the sender as for a node that left, `NODE_NOT_FOUND`.
+/// The reason the caller answers the sender `UNREACHABLE` with, if any: `FRAME_TOO_LARGE` when the
+/// message's frame, as delivered, is over the socket's limit, so no destination got it (A-202); for
+/// a unicast, `NODE_NOT_FOUND` when its destination's link took nothing, its writer stopped, as for
+/// a node that left (A-203).
 async fn deliver_locally(
     deliveries: Vec<LocalDelivery>,
     msg: &Message,
@@ -6955,13 +7092,14 @@ async fn deliver_locally(
     hive_id: &str,
     src_via_hub: bool,
     log_stream: &stream::StreamHandle,
-) -> Result<bool, RouterError> {
+) -> Result<Option<&'static str>, RouterError> {
     if deliveries.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
-        return Ok(false);
+        return Ok(None);
     };
+    let mut too_large = false;
     let mut undelivered = false;
     let turn = is_communication_turn(&prepared);
     let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
@@ -7005,11 +7143,21 @@ async fn deliver_locally(
                 }
             },
         };
+        if frame_over_limit(&data, &prepared, "node", &delivery.node) {
+            too_large = true;
+            continue;
+        }
         if delivery.sender.send(data).is_err() {
             undelivered = true;
         }
     }
-    Ok(undelivered && !matches!(msg.routing.dst, Destination::Broadcast))
+    Ok(if too_large {
+        Some(UNREACHABLE_FRAME_TOO_LARGE)
+    } else if undelivered && !matches!(msg.routing.dst, Destination::Broadcast) {
+        Some("NODE_NOT_FOUND")
+    } else {
+        None
+    })
 }
 
 /// One message to one local node (a tap copy, the tests): the same gate, stamps and package as
@@ -7073,7 +7221,7 @@ fn serialize_with_package(
         let data = serde_json::to_vec(&enriched)?;
         let excess = data.len().saturating_sub(MAX_FRAME_SIZE);
         let Some(package) = enriched.meta.memory_package.as_mut() else {
-            // Over a frame without any package: the link skips it, as any other.
+            // Over a frame without any package: the caller does not queue it (`frame_over_limit`).
             return Ok(data);
         };
         if excess == 0 {
@@ -10778,6 +10926,369 @@ mod tests {
         }
     }
 
+    /// A message from `sender` to `dst` as its node sends it: no `src_l2_name` or action class yet,
+    /// and a payload of `pad` bytes.
+    fn padded_message(sender: Uuid, dst: Destination, pad: usize) -> Message {
+        Message {
+            routing: Routing {
+                src: sender.to_string(),
+                src_l2_name: None,
+                dst,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({ "pad": "x".repeat(pad) }),
+        }
+    }
+
+    /// The frame a local node gets of `msg` from `sender_name`: stamped with the sender's name and
+    /// prepared for delivery, as `handle_message` and `deliver_locally` do.
+    fn local_frame_len(msg: &Message, sender_name: &str) -> usize {
+        let mut stamped = msg.clone();
+        stamped.routing.src_l2_name = Some(sender_name.to_string());
+        let prepared = prepare_local_delivery("motherbee", &stamped, false).expect("delivered");
+        serde_json::to_vec(&prepared).expect("frame").len()
+    }
+
+    /// The pad that makes `frame_len(pad)` exactly `target` bytes: a byte of pad is a byte of frame.
+    fn pad_for(target: usize, frame_len: impl Fn(usize) -> usize) -> usize {
+        let pad = target - frame_len(0);
+        assert_eq!(frame_len(pad), target);
+        pad
+    }
+
+    /// A-202: a message under the frame as its node sent it, over it once the router has stamped it,
+    /// is never queued: its sender is answered FRAME_TOO_LARGE. One that stays at the limit after
+    /// the stamps is delivered.
+    #[tokio::test]
+    async fn a_message_over_the_frame_after_the_routers_additions_is_answered_frame_too_large() {
+        let sender = Uuid::new_v4();
+        let receiver = Uuid::new_v4();
+        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut delivered) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([
+            (
+                sender,
+                NodeHandle {
+                    name: "WF.demo@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: sender_tx,
+                    connected_at: 0,
+                },
+            ),
+            (
+                receiver,
+                NodeHandle {
+                    name: "SY.timer@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            ),
+        ])));
+        let to_receiver =
+            |pad| padded_message(sender, Destination::Unicast(receiver.to_string()), pad);
+        let over = pad_for(MAX_FRAME_SIZE + 1, |pad| {
+            local_frame_len(&to_receiver(pad), "WF.demo@motherbee")
+        });
+
+        let too_large = to_receiver(over);
+        assert!(
+            serde_json::to_vec(&too_large).expect("frame").len() <= MAX_FRAME_SIZE,
+            "its node's own check lets it through"
+        );
+        route_from_a_node(&too_large, &nodes).await;
+        assert!(delivered.try_recv().is_err(), "never queued");
+        let answer = unreachable_answer(&mut answers, &too_large);
+        assert_eq!(answer.reason, "FRAME_TOO_LARGE");
+        assert_eq!(answer.original_dst, receiver.to_string());
+
+        let at_the_limit = to_receiver(over - 1);
+        route_from_a_node(&at_the_limit, &nodes).await;
+        let frame = delivered.try_recv().expect("delivered");
+        assert_eq!(frame.len(), MAX_FRAME_SIZE);
+        assert!(answers.try_recv().is_err(), "nothing to answer");
+    }
+
+    /// `handle_message` on the motherbee's gateway, with `nodes`, sibling routers' and WAN links,
+    /// and an LSA.
+    async fn route_from_a_node_on_the_gateway(
+        msg: &Message,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        peers: &Arc<Mutex<HashMap<Uuid, PeerHandle>>>,
+        wan_peers: &Arc<Mutex<HashMap<String, WanPeer>>>,
+        lsa: Option<LsaSnapshot>,
+    ) {
+        handle_message(
+            msg,
+            nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            peers,
+            wan_peers,
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &stream::StreamHandle::detached(),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            "RT.gateway@motherbee",
+            Uuid::new_v4(),
+            true,
+            &Arc::new(Mutex::new(lsa)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+            None,
+        )
+        .await
+        .expect("handled");
+    }
+
+    /// A-202 over the WAN, outward: a message for another hive's node whose frame goes over the
+    /// limit once the gateway has stamped it is never queued for the WAN link, and its sender is
+    /// answered FRAME_TOO_LARGE; one at the limit goes out.
+    #[tokio::test]
+    async fn a_message_for_another_hive_over_the_frame_is_answered_frame_too_large() {
+        let sender = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([(
+            sender,
+            NodeHandle {
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                sender: sender_tx,
+                connected_at: 0,
+            },
+        )])));
+        let (wan_tx, mut wan) = mpsc::unbounded_channel::<Vec<u8>>();
+        let wan_peers = Arc::new(Mutex::new(HashMap::from([(
+            "worker1".to_string(),
+            WanPeer {
+                sender: wan_tx,
+                router_uuid: Uuid::new_v4(),
+            },
+        )])));
+        let peers = Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new()));
+        let lsa = || {
+            Some(lsa_with_remote_node(
+                "worker1",
+                remote,
+                "SY.orchestrator@worker1",
+            ))
+        };
+        let to_remote = |pad| padded_message(sender, Destination::Unicast(remote.to_string()), pad);
+        // The WAN frame: stamped with the sender's name, one hop less.
+        let wan_frame_len = |pad| {
+            let mut forward = to_remote(pad);
+            forward.routing.src_l2_name = Some("SY.admin@motherbee".to_string());
+            forward.routing.ttl -= 1;
+            serde_json::to_vec(&forward).expect("frame").len()
+        };
+        let over = pad_for(MAX_FRAME_SIZE + 1, wan_frame_len);
+
+        let too_large = to_remote(over);
+        assert!(serde_json::to_vec(&too_large).expect("frame").len() <= MAX_FRAME_SIZE);
+        route_from_a_node_on_the_gateway(&too_large, &nodes, &peers, &wan_peers, lsa()).await;
+        assert!(wan.try_recv().is_err(), "never queued for the WAN");
+        let answer = unreachable_answer(&mut answers, &too_large);
+        assert_eq!(answer.reason, "FRAME_TOO_LARGE");
+        assert_eq!(answer.original_dst, remote.to_string());
+
+        let at_the_limit = to_remote(over - 1);
+        route_from_a_node_on_the_gateway(&at_the_limit, &nodes, &peers, &wan_peers, lsa()).await;
+        assert_eq!(wan.try_recv().expect("forwarded").len(), MAX_FRAME_SIZE);
+        assert!(answers.try_recv().is_err(), "nothing to answer");
+    }
+
+    /// A-202 over the WAN, inward: a frame from another hive's node that goes over the limit once
+    /// this router has stamped it for its local node is answered FRAME_TOO_LARGE over the WAN link
+    /// it came in on; one at the limit is delivered.
+    #[tokio::test]
+    async fn a_wan_frame_over_the_frame_once_stamped_is_answered_over_its_link() {
+        let ctx = test_wan_context(None);
+        let remote = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await = Some(lsa_with_remote_node(
+            "worker1",
+            remote,
+            "SY.orchestrator@worker1",
+        ));
+        let local = Uuid::new_v4();
+        let (local_tx, mut delivered) = mpsc::unbounded_channel::<Vec<u8>>();
+        ctx.nodes.lock().await.insert(
+            local,
+            NodeHandle {
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                sender: local_tx,
+                connected_at: 0,
+            },
+        );
+        let to_local = |pad| padded_message(remote, Destination::Unicast(local.to_string()), pad);
+        let over = pad_for(MAX_FRAME_SIZE + 1, |pad| {
+            local_frame_len(&to_local(pad), "SY.orchestrator@worker1")
+        });
+        let (link, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let from_worker1 = |frame: Message| {
+            let ctx = Arc::clone(&ctx);
+            let link = link.clone();
+            async move {
+                handle_wan_message(
+                    &frame,
+                    &link,
+                    &ctx,
+                    "worker1",
+                    Uuid::new_v4(),
+                    "RT.gateway@worker1",
+                    1,
+                )
+                .await
+                .expect("handled");
+            }
+        };
+
+        let too_large = to_local(over);
+        from_worker1(too_large.clone()).await;
+        assert!(delivered.try_recv().is_err(), "never queued");
+        let answer = unreachable_answer(&mut answers, &too_large);
+        assert_eq!(answer.reason, "FRAME_TOO_LARGE");
+
+        from_worker1(to_local(over - 1)).await;
+        assert_eq!(
+            delivered.try_recv().expect("delivered").len(),
+            MAX_FRAME_SIZE
+        );
+        assert!(answers.try_recv().is_err(), "nothing to answer");
+    }
+
+    /// A-202: a broadcast over the frame goes to no local node, sibling router or other hive, and
+    /// its sender is answered FRAME_TOO_LARGE once.
+    #[tokio::test]
+    async fn a_broadcast_over_the_frame_is_answered_once() {
+        let sender = Uuid::new_v4();
+        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut nodes = HashMap::from([(
+            sender,
+            NodeHandle {
+                name: "WF.demo@motherbee".to_string(),
+                vpn_id: 0,
+                sender: sender_tx,
+                connected_at: 0,
+            },
+        )]);
+        let mut receivers = Vec::new();
+        for name in ["SY.timer@motherbee", "SY.storage@motherbee"] {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            nodes.insert(
+                Uuid::new_v4(),
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender: tx,
+                    connected_at: 0,
+                },
+            );
+            receivers.push(rx);
+        }
+        let nodes = Arc::new(Mutex::new(nodes));
+        let (sibling_tx, mut sibling) = mpsc::unbounded_channel::<Vec<u8>>();
+        let peers = Arc::new(Mutex::new(HashMap::from([(
+            Uuid::new_v4(),
+            PeerHandle { sender: sibling_tx },
+        )])));
+        let (wan_tx, mut wan) = mpsc::unbounded_channel::<Vec<u8>>();
+        let wan_peers = Arc::new(Mutex::new(HashMap::from([(
+            "worker1".to_string(),
+            WanPeer {
+                sender: wan_tx,
+                router_uuid: Uuid::new_v4(),
+            },
+        )])));
+        let broadcast = padded_message(sender, Destination::Broadcast, MAX_FRAME_SIZE);
+
+        route_from_a_node_on_the_gateway(&broadcast, &nodes, &peers, &wan_peers, None).await;
+        for receiver in &mut receivers {
+            assert!(receiver.try_recv().is_err(), "no local node got it");
+        }
+        assert!(sibling.try_recv().is_err(), "nor a sibling router");
+        assert!(wan.try_recv().is_err(), "nor another hive");
+        let answer = unreachable_answer(&mut answers, &broadcast);
+        assert_eq!(answer.reason, "FRAME_TOO_LARGE");
+        assert_eq!(answer.original_dst, "broadcast");
+        assert!(answers.try_recv().is_err(), "answered once");
+    }
+
+    /// The name of the function a source line opens, if it opens one at the top level.
+    fn function_opened_by(line: &str) -> Option<&str> {
+        let rest = ["async fn ", "fn ", "pub async fn ", "pub fn "]
+            .iter()
+            .find_map(|opening| line.strip_prefix(opening))?;
+        rest.split(['(', '<']).next()
+    }
+
+    /// Pins A-202's paths: every function that queues a frame on a link either checks the frame
+    /// against the limit before it queues it (`frame_over_limit`: a sender's message, which is
+    /// answered), or queues only the router's own frames, which keep the writer's skip. A new path
+    /// has to say which it is.
+    #[test]
+    fn every_frame_a_sender_hands_a_link_is_checked_against_the_limit() {
+        let src = include_str!("mod.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let checked = [
+            "fanout_taps_for_unicast",
+            "send_to_peer_router",
+            "send_to_wan_peer",
+            "broadcast_to_peers",
+            "broadcast_to_wan",
+            "deliver_locally",
+        ];
+        // The ANNOUNCE, UNREACHABLE and TTL_EXCEEDED, LSAs and reachability, the WAN and IRP
+        // handshakes, and another router's UNREACHABLE relayed to its node.
+        let routers_own = [
+            "handle_node",
+            "send_unreachable_to",
+            "send_ttl_exceeded_to",
+            "broadcast_lsa",
+            "broadcast_reachability",
+            "broadcast_lsa_direct",
+            "handle_wan_connection",
+            "handle_wan_message",
+            "connect_to_peer",
+            "handle_peer_message",
+        ];
+        let mut function = "";
+        let mut seen = HashSet::new();
+        for line in code.lines() {
+            if let Some(name) = function_opened_by(line) {
+                function = name;
+            }
+            if line.contains(".send(") {
+                assert!(
+                    checked.contains(&function) || routers_own.contains(&function),
+                    "{function} queues a frame: check it with frame_over_limit (A-202), or list it \
+                     as the router's own"
+                );
+                seen.insert(function);
+            }
+        }
+        for name in checked {
+            assert!(seen.contains(name), "{name} queues no frame any more");
+            let start = code
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name}"));
+            let body = &code[start..start + code[start..].find("\n}\n").expect("its end")];
+            let check = body
+                .find("frame_over_limit(")
+                .unwrap_or_else(|| panic!("{name}"));
+            let send = body.find(".send(").unwrap_or_else(|| panic!("{name}"));
+            assert!(check < send, "{name} checks its frame before it queues it");
+        }
+    }
+
     /// A message the router cannot handle is skipped; the connection stays up.
     #[tokio::test]
     async fn a_message_the_router_cannot_handle_does_not_end_the_connection() {
@@ -12484,9 +12995,12 @@ mod tests {
         );
         // And it is the new link that carries what goes to the hive.
         let request = request_to("SY.orchestrator@worker1");
-        assert!(send_to_wan_peer(&ctx.wan_peers, "worker1", &request)
-            .await
-            .expect("send"));
+        assert_eq!(
+            send_to_wan_peer(&ctx.wan_peers, "worker1", &request)
+                .await
+                .expect("send"),
+            Handover::Queued
+        );
         let forwarded = read_system_message(&mut new_link).await;
         assert_eq!(forwarded.routing.trace_id, request.routing.trace_id);
 
@@ -12517,9 +13031,12 @@ mod tests {
         let peers = Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new()));
         let router_uuid = Uuid::new_v4();
         let request = request_to("SY.orchestrator@worker1");
-        assert!(!send_to_wan_peer(&wan_peers, "worker1", &request)
-            .await
-            .expect("send"));
+        assert_eq!(
+            send_to_wan_peer(&wan_peers, "worker1", &request)
+                .await
+                .expect("send"),
+            Handover::NoLink
+        );
 
         let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
         forward_to_hive(
@@ -12552,9 +13069,12 @@ mod tests {
             .lock()
             .await
             .insert(gateway, PeerHandle { sender: dead_link });
-        assert!(!send_to_peer_router(&peers, gateway, &request)
-            .await
-            .expect("send"));
+        assert_eq!(
+            send_to_peer_router(&peers, gateway, &request)
+                .await
+                .expect("send"),
+            Handover::NoLink
+        );
         forward_to_hive(
             "worker1",
             &request,
