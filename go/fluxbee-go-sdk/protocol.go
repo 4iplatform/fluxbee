@@ -241,6 +241,22 @@ type WithdrawPayload struct {
 	UUID string `json:"uuid"`
 }
 
+// UnreachablePayload is what the router's UNREACHABLE says (docs/reference/protocol.md §6.1): the
+// destination of the message it could not deliver, as that message named it (original_dst: a name
+// or a UUID, "broadcast", or "null" for a resolve), and why (reason: NODE_NOT_FOUND, LINK_BUSY,
+// FRAME_TOO_LARGE and the others listed there). The Rust SDK's UnreachablePayload.
+type UnreachablePayload struct {
+	OriginalDst string `json:"original_dst"`
+	Reason      string `json:"reason"`
+}
+
+// TTLExceededPayload is what the router's TTL_EXCEEDED says: the destination, and the router where
+// the message's ttl ran out (last_hop: router:<uuid>). The Rust SDK's TtlExceededPayload.
+type TTLExceededPayload struct {
+	OriginalDst string `json:"original_dst"`
+	LastHop     string `json:"last_hop"`
+}
+
 const (
 	SYSTEMKind               = "system"
 	MSGHello                 = "HELLO"

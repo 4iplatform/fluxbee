@@ -19,6 +19,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -266,6 +267,16 @@ type RpcError struct {
 	Verb    string
 	Message string
 	Cause   error
+	// Notice, for RpcErrTerminalTransport, is the router's notice that ended the request:
+	// UNREACHABLE or TTL_EXCEEDED (MSGUnreachable, MSGTTLExceeded). What it says comes with it, as
+	// the Rust SDK's RpcError::Unreachable and RpcError::TtlExceeded carry it (FINDINGS A-228):
+	// Reason, UNREACHABLE's (NODE_NOT_FOUND, LINK_BUSY, FRAME_TOO_LARGE, ...), so a caller can tell
+	// a link that drains from a node that is not there; OriginalDst, the destination the router
+	// could not reach; LastHop, TTL_EXCEEDED's router. A field the notice lacks is empty.
+	Notice      string
+	Reason      string
+	OriginalDst string
+	LastHop     string
 }
 
 type RpcErrorKind int
@@ -275,6 +286,8 @@ const (
 	RpcErrTimeout
 	RpcErrDisconnected
 	RpcErrInvalidResponse
+	// RpcErrTerminalTransport means a router answered the request with its notice (Notice):
+	// UNREACHABLE, with its Reason, or TTL_EXCEEDED. The request did not reach its target.
 	RpcErrTerminalTransport
 	RpcErrUnknown
 	// RpcErrMessageTooLarge means the request's frame was over the limit:
@@ -762,15 +775,7 @@ func (d *RouterDispatcher) deliver(msg Message) {
 			case outcomeTerminalError:
 				d.removePending(traceID)
 				d.noteStale(traceID, entry.matcher)
-				entry.deliver <- pendingResult{
-					err: &RpcError{
-						Kind:    RpcErrTerminalTransport,
-						TraceID: traceID,
-						Target:  entry.target,
-						Verb:    entry.verb,
-						Message: fmt.Sprintf("terminal transport response %q", msgName),
-					},
-				}
+				entry.deliver <- pendingResult{err: terminalTransportError(entry, msg, msgName)}
 				return
 			case outcomeInvalidResponse:
 				d.removePending(traceID)
@@ -803,6 +808,43 @@ func (d *RouterDispatcher) deliver(msg Message) {
 		return
 	}
 	_ = d.routeByRules(d.profile.postPendingRules, msg, msgName)
+}
+
+// terminalTransportError is the error of the request entry that msg, named msgName, ended as one of
+// its matcher's terminal errors: the router's notice, with what it says (FINDINGS A-228), read as
+// the Rust SDK reads it (transport_error_from_message), a field the payload lacks left empty. Its
+// text names the notice and what it said, as in "UNREACHABLE reason=LINK_BUSY
+// original_dst=SY.timer@motherbee".
+func terminalTransportError(entry *pendingEntry, msg Message, msgName string) *RpcError {
+	err := &RpcError{
+		Kind:    RpcErrTerminalTransport,
+		TraceID: entry.traceID,
+		Target:  entry.target,
+		Verb:    entry.verb,
+		Notice:  msgName,
+	}
+	switch msgName {
+	case MSGUnreachable:
+		var notice UnreachablePayload
+		_ = json.Unmarshal(msg.Payload, &notice)
+		err.Reason, err.OriginalDst = notice.Reason, notice.OriginalDst
+	case MSGTTLExceeded:
+		var notice TTLExceededPayload
+		_ = json.Unmarshal(msg.Payload, &notice)
+		err.OriginalDst, err.LastHop = notice.OriginalDst, notice.LastHop
+	}
+	text := msgName
+	for _, field := range []struct{ key, value string }{
+		{"reason", err.Reason},
+		{"original_dst", err.OriginalDst},
+		{"last_hop", err.LastHop},
+	} {
+		if field.value != "" {
+			text += " " + field.key + "=" + field.value
+		}
+	}
+	err.Message = text
+	return err
 }
 
 // noteStale records the matcher that closed out a trace_id so a late

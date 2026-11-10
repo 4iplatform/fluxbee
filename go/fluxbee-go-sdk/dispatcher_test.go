@@ -585,3 +585,92 @@ func TestSendSystemRPCOversizeRequestLeavesNothingBehind(t *testing.T) {
 		t.Fatalf("left behind: %d pending requests, %d reply shapes", pending, registered)
 	}
 }
+
+// A-228 — a request a router answers UNREACHABLE or TTL_EXCEEDED fails at once, with the kind it
+// always had, RpcErrTerminalTransport, and with what the notice says: UNREACHABLE's reason, so
+// LINK_BUSY (the link drains) is told from NODE_NOT_FOUND or FRAME_TOO_LARGE, and the original
+// destination; TTL_EXCEEDED's last hop. A notice without them still fails the request. Mirror of
+// Rust `admin_waiter_completes_on_system_kind_transport_error` and `ttl_exceeded_mapped_correctly`.
+func TestATerminalNoticeCarriesWhatTheRouterSaid(t *testing.T) {
+	cases := []struct {
+		name, notice, payload             string
+		admin                             bool
+		reason, originalDst, lastHop, msg string
+	}{
+		{
+			name: "UNREACHABLE LINK_BUSY", notice: MSGUnreachable,
+			payload: `{"original_dst":"SY.timer@motherbee","reason":"LINK_BUSY"}`,
+			reason:  "LINK_BUSY", originalDst: "SY.timer@motherbee",
+			msg: "UNREACHABLE reason=LINK_BUSY original_dst=SY.timer@motherbee",
+		},
+		{
+			name: "UNREACHABLE NODE_NOT_FOUND, an admin request", notice: MSGUnreachable, admin: true,
+			payload: `{"original_dst":"SY.admin@motherbee","reason":"NODE_NOT_FOUND"}`,
+			reason:  "NODE_NOT_FOUND", originalDst: "SY.admin@motherbee",
+			msg: "UNREACHABLE reason=NODE_NOT_FOUND original_dst=SY.admin@motherbee",
+		},
+		{
+			name: "TTL_EXCEEDED", notice: MSGTTLExceeded,
+			payload:     `{"original_dst":"SY.timer@motherbee","last_hop":"router:2b9f"}`,
+			originalDst: "SY.timer@motherbee", lastHop: "router:2b9f",
+			msg: "TTL_EXCEEDED original_dst=SY.timer@motherbee last_hop=router:2b9f",
+		},
+		{name: "UNREACHABLE that says nothing", notice: MSGUnreachable, payload: `null`, msg: "UNREACHABLE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dispatcher, tx, rx := newDispatcherTestHarness(t, NewOperationalRouteProfile())
+			defer func() { _ = dispatcher.Close() }()
+			target, verb := "SY.timer@motherbee", "TIMER_GET"
+			if tc.admin {
+				target, verb = PrimaryAdminNode, MsgAdminCommand
+			}
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				if tc.admin {
+					_, err = dispatcher.SendAdminRPC(context.Background(), AdminRpcRequest{
+						AdminTarget: target,
+						Action:      "list_nodes",
+						Timeout:     5 * time.Second,
+					})
+				} else {
+					_, err = dispatcher.SendSystemRPC(context.Background(), SystemRpcRequest{
+						Target:      target,
+						RequestMsg:  verb,
+						ResponseMsg: MsgTimerResponse,
+						Payload:     map[string]any{},
+						Timeout:     5 * time.Second,
+					})
+				}
+				done <- err
+			}()
+			request := decodeTestFrame(t, <-tx)
+			notice := tc.notice
+			rx <- receivedMessage{msg: Message{
+				Routing: Routing{Src: "router-uuid", Dst: UnicastDestination("src-1"), TTL: 16, TraceID: request.Routing.TraceID},
+				Meta:    Meta{MsgType: SYSTEMKind, Msg: &notice},
+				Payload: json.RawMessage(tc.payload),
+			}}
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(time.Second):
+				t.Fatalf("the request did not fail at the router's %s", tc.notice)
+			}
+			var rpcErr *RpcError
+			if !errors.As(err, &rpcErr) || rpcErr.Kind != RpcErrTerminalTransport {
+				t.Fatalf("expected RpcErrTerminalTransport, got %v", err)
+			}
+			if rpcErr.Notice != tc.notice || rpcErr.Reason != tc.reason || rpcErr.OriginalDst != tc.originalDst || rpcErr.LastHop != tc.lastHop {
+				t.Fatalf("the notice's fields: %+v", rpcErr)
+			}
+			if rpcErr.TraceID != request.Routing.TraceID || rpcErr.Target != target || rpcErr.Verb != verb {
+				t.Fatalf("the request's labels: %+v", rpcErr)
+			}
+			if rpcErr.Message != tc.msg || err.Error() != "rpc terminal transport error: "+tc.msg {
+				t.Fatalf("the error's text: %q", err.Error())
+			}
+		})
+	}
+}

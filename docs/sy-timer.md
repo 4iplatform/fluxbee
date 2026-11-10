@@ -1092,7 +1092,7 @@ The Go client has no `TIMER_PURGE_OWNER`: only `SY.orchestrator` sends it (§7.7
 
 ### 14.4 Retry of time operations
 
-The time operations (`Now`, `NowIn`, `Convert`, `Parse`, `Format`; in Rust `now`, `now_in`, `convert`, `parse`, `format`) make up to three attempts, each waiting for its answer 100 ms, 300 ms and 1 s in turn (`TimeRetrySchedule`, `time_retry_schedule`), about 1.4 s in all. When none answers, the Go client fails with `TIMER_UNREACHABLE`, and the Rust client with its last attempt's error (a timeout, or the router's `UNREACHABLE` or `TTL_EXCEEDED`). An answer with an error is not retried. Scheduling, reading and mutations are sent once, with the call's own timeout (5 s by default).
+The time operations (`Now`, `NowIn`, `Convert`, `Parse`, `Format`; in Rust `now`, `now_in`, `convert`, `parse`, `format`) make up to three attempts, each waiting for its answer 100 ms, 300 ms and 1 s in turn (`TimeRetrySchedule`, `time_retry_schedule`), about 1.4 s in all. When none answers, the Go client fails with `TIMER_UNREACHABLE`, whose message names its last attempt's error (the router's reason with it since 0.1.130, FINDINGS A-228), and the Rust client with its last attempt's error (a timeout, or the router's `UNREACHABLE` or `TTL_EXCEEDED`). An answer with an error is not retried. Scheduling, reading and mutations are sent once, with the call's own timeout (5 s by default).
 
 ### 14.5 Handling `TIMER_FIRED` in the client node
 

@@ -248,10 +248,11 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind {
 		return nil
 	}
+	// A fire waits for no answer, so the router's UNREACHABLE for one comes here and not as an RPC
+	// error: read with the SDK's UnreachablePayload, as the SDK reads one for a request (FINDINGS
+	// A-228).
 	if stringValue(msg.Meta.Msg) == fluxbeesdk.MSGUnreachable && s.scheduler != nil {
-		var notice struct {
-			Reason string `json:"reason"`
-		}
+		var notice fluxbeesdk.UnreachablePayload
 		_ = json.Unmarshal(msg.Payload, &notice)
 		if s.scheduler.undelivered(msg.Routing.TraceID, notice.Reason) {
 			return nil

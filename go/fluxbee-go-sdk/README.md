@@ -86,6 +86,10 @@ The v1 stable surface is:
   - `RouterDispatcher.Subscribe`
   - `ParseSystemResponse`
   - `ParseSystemResponseError`
+  - `RpcError`: why a request failed, by `Kind`. A router's `UNREACHABLE` or `TTL_EXCEEDED` is
+    `RpcErrTerminalTransport`, with what the notice says: `Notice`, `Reason` (`LINK_BUSY`,
+    `NODE_NOT_FOUND`, ...), `OriginalDst` and `LastHop` (`UnreachablePayload`,
+    `TTLExceededPayload`)
 - node control-plane helpers:
   - `CONFIG_GET`
   - `CONFIG_SET`
