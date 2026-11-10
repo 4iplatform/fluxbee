@@ -45,8 +45,8 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 - **A notice or a reply is never answered,** only logged (the AI SDK's
   `is_infrastructure_message`, which SY.frontdesk.gov runs too; SY.timer's and wf-generic's rule): a
   message the router made, which carries no `src_l2_name` (`UNREACHABLE`, `TTL_EXCEEDED`), or one
-  named as a notice or a reply (`HELLO`, `ECHO_REPLY`, any `*_RESPONSE`). A router notice is a
-  WARN with its trace and its reason. An answer to one would go to the router's own UUID, and the
+  named as a notice or a reply (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any `*_RESPONSE`). A router
+  notice is a WARN with its trace and its reason. An answer to one would go to the router's own UUID, and the
   two would bounce it forever (FINDINGS A-112).
 - **`CONFIG_GET`** returns:
   - the contract;

@@ -151,8 +151,6 @@ const MSG_TNT_UPDATE: &str = "TNT_UPDATE";
 const MSG_TNT_UPDATE_RESPONSE: &str = "TNT_UPDATE_RESPONSE";
 const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
 const MSG_TNT_SET_SPONSOR_RESPONSE: &str = "TNT_SET_SPONSOR_RESPONSE";
-const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
-const MSG_TNT_APPROVE_RESPONSE: &str = "TNT_APPROVE_RESPONSE";
 // Lifecycle (2026-09-28): ILK_DELETE / TNT_DELETE only MARK; restore undoes the mark; purge is
 // the physical, final removal and requires the mark first.
 const MSG_ILK_RESTORE: &str = "ILK_RESTORE";
@@ -421,13 +419,6 @@ struct TntCreateRequest {
     settings: Option<Value>,
     #[serde(default)]
     sponsor_tenant_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TntApproveRequest {
-    tenant_id: String,
-    approved_by: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2638,25 +2629,6 @@ impl IdentityStore {
         Err("ICH_NOT_FOUND".to_string())
     }
 
-    fn approve_tenant(&mut self, req: TntApproveRequest) -> Result<Value, String> {
-        let _ = parse_prefixed_uuid(&req.tenant_id, "tnt")?;
-        let _ = parse_prefixed_uuid(&req.approved_by, "ilk")?;
-        let tenant = self
-            .tenants
-            .get_mut(&req.tenant_id)
-            .ok_or_else(|| "INVALID_TENANT".to_string())?;
-        if tenant.deleted_at_ms.is_some() {
-            return Err("TENANT_DELETED".to_string());
-        }
-        tenant.status = "active".to_string();
-
-        Ok(json!({
-            "status": "ok",
-            "tenant_id": req.tenant_id,
-            "approved_by": req.approved_by,
-        }))
-    }
-
     fn metrics(&self) -> Value {
         let deleted_ilks = self
             .ilks
@@ -3085,7 +3057,6 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.admin@", "SY.architect@"]);
         allowed_prefixes.insert(MSG_TNT_UPDATE, vec!["SY.admin@", "SY.architect@"]);
         allowed_prefixes.insert(MSG_TNT_SET_SPONSOR, vec!["SY.admin@", "SY.architect@"]);
-        allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_RESTORE, vec!["SY.admin@"]);
         // Charging a person to another tenant: the operator and Fluxbee Cloud (both through
         // SY.admin) and Archi.
@@ -4055,64 +4026,6 @@ impl IdentityRuntime {
                                 }
                             }
                             Err(code) => error_payload(&code, "failed to set tenant sponsor"),
-                        }
-                    }
-                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
-                }
-            }
-            MSG_TNT_APPROVE => {
-                match serde_json::from_value::<TntApproveRequest>(msg.payload.clone()) {
-                    Ok(req) => {
-                        let snapshot = if self.is_primary && self.db_config.is_some() {
-                            Some(self.store.clone())
-                        } else {
-                            None
-                        };
-                        match self.store.approve_tenant(req) {
-                            Ok(ok) => {
-                                if let Some(tenant_id) = ok.get("tenant_id").and_then(Value::as_str)
-                                {
-                                    if let Some(tenant) = self.store.tenants.get(tenant_id).cloned()
-                                    {
-                                        if self.is_primary {
-                                            if let Some(database_config) = self.db_config.as_ref() {
-                                                if let Err(err) =
-                                                    upsert_tenant_in_db(database_config, &tenant)
-                                                        .await
-                                                {
-                                                    if let Some(snapshot) = snapshot {
-                                                        self.store = snapshot;
-                                                    }
-                                                    db_write_error_payload(
-                                                        "failed to persist tenant approval",
-                                                        err.as_ref(),
-                                                    )
-                                                } else {
-                                                    deltas.push(delta_envelope(
-                                                        IdentityDelta::TenantUpsert { tenant },
-                                                    ));
-                                                    ok
-                                                }
-                                            } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::TenantUpsert { tenant },
-                                                ));
-                                                ok
-                                            }
-                                        } else {
-                                            deltas.push(delta_envelope(
-                                                IdentityDelta::TenantUpsert { tenant },
-                                            ));
-                                            ok
-                                        }
-                                    } else {
-                                        ok
-                                    }
-                                } else {
-                                    ok
-                                }
-                            }
-                            Err(code) => error_payload(&code, "failed to approve tenant"),
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -6864,7 +6777,6 @@ fn response_name(action: &str) -> &'static str {
         MSG_TNT_CREATE => MSG_TNT_CREATE_RESPONSE,
         MSG_TNT_UPDATE => MSG_TNT_UPDATE_RESPONSE,
         MSG_TNT_SET_SPONSOR => MSG_TNT_SET_SPONSOR_RESPONSE,
-        MSG_TNT_APPROVE => MSG_TNT_APPROVE_RESPONSE,
         MSG_ILK_RESTORE => MSG_ILK_RESTORE_RESPONSE,
         MSG_ILK_PURGE => MSG_ILK_PURGE_RESPONSE,
         MSG_TNT_DELETE => MSG_TNT_DELETE_RESPONSE,
@@ -6890,7 +6802,6 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_TNT_CREATE
             | MSG_TNT_UPDATE
             | MSG_TNT_SET_SPONSOR
-            | MSG_TNT_APPROVE
             | MSG_ILK_RESTORE
             | MSG_ILK_PURGE
             | MSG_TNT_DELETE
@@ -7728,7 +7639,6 @@ CREATE TABLE IF NOT EXISTS identity_tenants (
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     settings JSONB NOT NULL DEFAULT '{}',
     sponsor_tenant_id UUID REFERENCES identity_tenants(tenant_id),
-    approved_by UUID,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -7805,14 +7715,6 @@ CREATE INDEX IF NOT EXISTS idx_identity_ichs_ilk
 CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
     ON identity_ichs(owner_l2_name)
     WHERE owner_l2_name IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS identity_vocabulary (
-    tag VARCHAR(64) PRIMARY KEY,
-    category VARCHAR(16) NOT NULL,
-    description TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    deprecated_at TIMESTAMPTZ
-);
 "#,
         )
         .await?;
@@ -7996,6 +7898,22 @@ RETURNING ilk_id::text
              ILK of their tenant now holds their email; restore or purge them on purpose"
         );
     }
+    // v5 -- the dead identity surface goes (FINDINGS A-218): nothing wrote `identity_vocabulary` and
+    // nothing read it, and `identity_tenants.approved_by` was TNT_APPROVE's, which no node sent and
+    // which never wrote it either. The baseline creates neither any more. Every boot; idempotent.
+    // The identity shared memory keeps its vocabulary region as it is, empty: SY.identity never
+    // filled it from this table.
+    {
+        let tx = client.transaction().await?;
+        tx.batch_execute(
+            "DROP TABLE IF EXISTS identity_vocabulary;\n\
+             ALTER TABLE identity_tenants DROP COLUMN IF EXISTS approved_by;\n\
+             INSERT INTO identity_schema_migrations (version, name) \
+             VALUES (5, 'drop_vocabulary_and_approved_by') ON CONFLICT (version) DO NOTHING;",
+        )
+        .await?;
+        tx.commit().await?;
+    }
     let _ = client
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -8003,7 +7921,9 @@ RETURNING ilk_id::text
         )
         .await;
 
-    tracing::info!("identity primary schema ensured (migrations through v4, tenant_marks_no_ilk)");
+    tracing::info!(
+        "identity primary schema ensured (migrations through v5, drop_vocabulary_and_approved_by)"
+    );
     Ok(())
 }
 

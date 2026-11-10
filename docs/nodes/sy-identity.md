@@ -52,7 +52,7 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
    `VAULT_BOOT_WAIT` = 60 s, retrying only when the vault does not answer). The value is a URL
    string or `{"postgres_url": ...}` without a database name; SY.identity creates the database
    `fluxbee_identity` if it is missing (`IDENTITY_DB_NAME`, `ensure_database_exists`) and applies
-   its schema under a PostgreSQL advisory lock (`ensure_primary_schema`, migrations v1 to v4 in
+   its schema under a PostgreSQL advisory lock (`ensure_primary_schema`, migrations v1 to v5 in
    `identity_schema_migrations`). Without the secret, or if the database cannot be set up, it
    starts without a database (`sy.identity started without active DB backend`): reads work from
    memory and writes answer `DB_NOT_READY`.
@@ -122,7 +122,8 @@ Identity is created in two steps:
 - Writes are seqlock-guarded; the heartbeat is refreshed every 5 s.
 - Contents: tenants, ILKs (with `handler_node`, the node an ILK belongs to), ICHs and their
   lookup mappings, and unexpired aliases (`sync_identity_shm_mappings`). Marked (deleted)
-  tenants and ILKs are left out.
+  tenants and ILKs are left out. The vocabulary region is part of the layout and always empty:
+  nothing fills it.
 - Default limits: 8192 ILKs, 1024 tenants, 4096 vocabulary entries, aliases = the ILK limit
   (`DEFAULT_IDENTITY_SHM_MAX_*`, `identity_region_limits`); raise them with `identity.max_*`.
   A write over a limit fails and is logged, and the region keeps its previous content. Started
@@ -191,7 +192,7 @@ request gets `UNAUTHORIZED_REGISTRAR`.
 | `ILK_PURGE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes) | yes |
 | `ICH_SET_ENABLED` | `IO.*` (only for an ICH it owns), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@`, the configured frontdesk | yes |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` | yes |
-| `TNT_APPROVE`, `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` | yes |
+| `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` | yes |
 | `ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET` | `SY.admin@` | no |
 | `CONFIG_GET`, `CONFIG_SET` | `SY.admin@` (the router also allows only `SY.admin@motherbee`) | no |
 | `IDENTITY_METRICS`, `PING`, `STATUS` | anyone | no |
@@ -280,7 +281,8 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
 
 - PostgreSQL `fluxbee_identity` (primary): `identity_tenants`, `identity_ilks`,
   `identity_ilk_aliases`, `identity_ichs`, `identity_ilk_tenant_history`,
-  `identity_vocabulary` (created, unused), `identity_schema_migrations`.
+  `identity_schema_migrations`. Migration v5 drops `identity_vocabulary` and
+  `identity_tenants.approved_by`, which nothing used (FINDINGS A-218).
 - A replica has no database: its state is in memory and in its SHM region, rebuilt from the
   primary at every start.
 - `/var/lib/fluxbee/identity/keys/<hive>.key`: sync HMAC keys (0600, directory 0700).

@@ -468,8 +468,8 @@ restart) skips those. The Go SDK has no vault client. Details: [SY.vault](../nod
 `SY.identity@<hive>` keeps ILKs (interlocutors), tenants and ICHs (channels). The verbs in
 `crates/fluxbee_sdk/src/identity.rs`: `ILK_PROVISION` (an IO node creates a temporary ILK for an
 unknown sender), `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, `ILK_SET_DEFINITION`,
-`ICH_SET_ENABLED`, `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`, `TNT_APPROVE`,
-`IDENTITY_METRICS`; `src/bin/sy_identity.rs` also answers list, get, delete, restore and purge verbs.
+`ICH_SET_ENABLED`, `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`, `IDENTITY_METRICS`;
+`src/bin/sy_identity.rs` also answers list, get, delete, restore and purge verbs.
 These verbs are not in the router's protected list: SY.identity checks each one against its own
 allowlist of senders by the router-stamped `src_l2_name` (`is_authorized`; `ILK_PROVISION` is open
 to `IO.*`). Reading identity needs no message: a node reads `/jsr-identity-<hive>`
@@ -481,8 +481,6 @@ to `IO.*`). Reading identity needs no message: a node reads `/jsr-identity-<hive
 - `LSA`, `WAN_REACHABILITY`, `WAN_ACCEPT`, `WAN_REJECT` and the WAN HELLO: between routers.
 - `CONFIG_CHANGED`: from `SY.admin@motherbee` to SY.opa.rules, carrying the operator's OPA policy
   (`docs/opa-distribution.md`); protected.
-- `ECHO`, `ECHO_REPLY`, `TIME_SYNC`: builders exist in `protocol.rs`, but no router or node in the
-  repo emits or answers them (WF nodes ignore ECHO).
 
 ---
 
@@ -693,6 +691,7 @@ UNREACHABLE, and a node that answers every message bounces it forever.
 | text/v1 blob offload | Automatic (§8) | None |
 | `compute_thread_id`, `stream::append`, vault client | Yes | No |
 | `meta.via_tap` | In `Meta` | Not in `Meta` |
+| `ECHO`, `ECHO_REPLY`, `TIME_SYNC` | Gone (FINDINGS A-218) | `MSGEcho` and `MSGEchoReply` remain: nothing sends them, and SY.timer and wf-generic leave them unanswered as notices |
 
 ---
 

@@ -2,9 +2,8 @@
 //! and from whom, and which messages it never answers.
 
 use fluxbee_sdk::protocol::{
-    is_system_kind, MSG_ANNOUNCE, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_ECHO, MSG_ECHO_REPLY,
-    MSG_HELLO, MSG_NODE_HELP, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
-    PRIMARY_HIVE_ID,
+    is_system_kind, MSG_ANNOUNCE, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_HELLO, MSG_NODE_HELP,
+    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, PRIMARY_HIVE_ID,
 };
 use serde_json::Value;
 
@@ -116,8 +115,7 @@ pub fn is_infrastructure_message(msg: &Message) -> bool {
         return true;
     }
     match msg.meta.msg.as_deref().unwrap_or_default() {
-        "" | MSG_HELLO | MSG_ANNOUNCE | MSG_WITHDRAW | MSG_ECHO | MSG_ECHO_REPLY
-        | MSG_UNREACHABLE | MSG_TTL_EXCEEDED => true,
+        "" | MSG_HELLO | MSG_ANNOUNCE | MSG_WITHDRAW | MSG_UNREACHABLE | MSG_TTL_EXCEEDED => true,
         name => name.ends_with("_RESPONSE"),
     }
 }
@@ -310,7 +308,7 @@ mod tests {
             (MSG_CONFIG_SET, None),
             (MSG_CONFIG_SET, Some(" ")),
             (MSG_HELLO, Some("SY.admin@motherbee")),
-            (MSG_ECHO_REPLY, Some("SY.admin@motherbee")),
+            (MSG_WITHDRAW, Some("SY.admin@motherbee")),
             (MSG_TTL_EXCEEDED, Some("SY.admin@motherbee")),
             ("CONFIG_RESPONSE", Some("AI.other@worker1")),
             ("ADMIN_COMMAND_RESPONSE", Some("SY.admin@motherbee")),

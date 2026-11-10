@@ -350,19 +350,6 @@ pub struct TtlExceededPayload {
     pub last_hop: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EchoPayload {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EchoReplyPayload {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimeSyncPayload {
-    pub timestamp_utc: String,
-    pub epoch_ms: u64,
-    pub seq: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawPayload {
     pub uuid: String,
@@ -626,8 +613,6 @@ pub const MSG_HELLO: &str = "HELLO";
 pub const MSG_ANNOUNCE: &str = "ANNOUNCE";
 pub const MSG_UNREACHABLE: &str = "UNREACHABLE";
 pub const MSG_TTL_EXCEEDED: &str = "TTL_EXCEEDED";
-pub const MSG_ECHO: &str = "ECHO";
-pub const MSG_ECHO_REPLY: &str = "ECHO_REPLY";
 pub const MSG_LSA: &str = "LSA";
 /// Hub-authored multi-hop reachability advertisement (Option B, edge-multihop-reachability-spec-v1).
 /// Emitted ONLY by a gateway (hub) in its own authenticated bucket, listing spoke nodes reachable
@@ -637,7 +622,6 @@ pub const MSG_LSA: &str = "LSA";
 pub const MSG_WAN_REACHABILITY: &str = "WAN_REACHABILITY";
 pub const MSG_WAN_ACCEPT: &str = "WAN_ACCEPT";
 pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
-pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
 
@@ -914,32 +898,6 @@ pub fn build_wan_reachability(
     )
 }
 
-pub fn build_echo(src: &str, dst: Destination, trace_id: &str) -> Message {
-    build_system_message(src, dst, 1, trace_id, MSG_ECHO, json!(EchoPayload {}))
-}
-
-pub fn build_echo_reply(src: &str, dst: Destination, trace_id: &str) -> Message {
-    build_system_message(
-        src,
-        dst,
-        1,
-        trace_id,
-        MSG_ECHO_REPLY,
-        json!(EchoReplyPayload {}),
-    )
-}
-
-pub fn build_time_sync(
-    src: &str,
-    dst: Destination,
-    trace_id: &str,
-    payload: TimeSyncPayload,
-) -> Message {
-    let mut msg = build_system_message(src, dst, 1, trace_id, MSG_TIME_SYNC, json!(payload));
-    msg.meta.scope = Some(SCOPE_GLOBAL.to_string());
-    msg
-}
-
 pub fn build_withdraw(src: &str, dst: Destination, trace_id: &str, uuid: &str) -> Message {
     build_system_message(
         src,
@@ -1039,7 +997,7 @@ mod tests {
             Destination::Unicast("dst-uuid-1".to_string()),
             16,
             "trace-1",
-            MSG_ECHO,
+            MSG_CONFIG_GET,
             json!({}),
         );
         assert_eq!(msg.routing.src_l2_name, None);
@@ -1087,7 +1045,7 @@ mod tests {
                 "ttl": 16,
                 "trace_id": "trace-x"
             },
-            "meta": { "type": "system", "msg": "ECHO" },
+            "meta": { "type": "system", "msg": "CONFIG_GET" },
             "payload": {}
         });
         let msg: Message = serde_json::from_value(raw).expect("deserialize");
@@ -1101,7 +1059,7 @@ mod tests {
             Destination::Unicast("dst-uuid".to_string()),
             16,
             "trace-x",
-            MSG_ECHO,
+            MSG_CONFIG_GET,
             json!({}),
         );
         assert_eq!(msg.source_l2_name(), None);
@@ -1115,7 +1073,7 @@ mod tests {
             Destination::Unicast("uuid-dst".to_string()),
             8,
             "trace-rt",
-            MSG_ECHO,
+            MSG_CONFIG_GET,
             json!({"key": "value"}),
         );
         let encoded = serde_json::to_string(&msg).expect("serialize");
@@ -1140,7 +1098,7 @@ mod tests {
                 "ttl": 8,
                 "trace_id": "trace-rt2"
             },
-            "meta": { "type": "system", "msg": "ECHO" },
+            "meta": { "type": "system", "msg": "CONFIG_GET" },
             "payload": {}
         });
         let msg: Message = serde_json::from_value(raw).expect("deserialize");

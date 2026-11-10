@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use fluxbee_sdk::protocol::{
-    build_echo, build_echo_reply, build_time_sync, Destination, Message, Meta, Routing,
-    TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
-};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, MSG_OPA_RELOAD, SYSTEM_KIND};
 use fluxbee_sdk::{
     NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
 };
@@ -188,43 +185,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("sent HELLO {} (dst={:?})", seq, dst);
 
-        let trace_id = Uuid::new_v4().to_string();
-        let echo = build_echo(sender.uuid(), Destination::Broadcast, &trace_id);
-        if let Err(err) = sender.send(echo).await {
-            eprintln!("send error: {err} (reconnecting)");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
-        }
-        println!("sent ECHO (dst=Broadcast)");
-
-        let trace_id = Uuid::new_v4().to_string();
-        let echo_reply = build_echo_reply(sender.uuid(), Destination::Broadcast, &trace_id);
-        if let Err(err) = sender.send(echo_reply).await {
-            eprintln!("send error: {err} (reconnecting)");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
-        }
-        println!("sent ECHO_REPLY (dst=Broadcast)");
-
-        let trace_id = Uuid::new_v4().to_string();
-        let now_ms = now_epoch_ms();
-        let time_sync = build_time_sync(
-            sender.uuid(),
-            Destination::Broadcast,
-            &trace_id,
-            TimeSyncPayload {
-                timestamp_utc: "1970-01-01T00:00:00Z".to_string(),
-                epoch_ms: now_ms,
-                seq,
-            },
-        );
-        if let Err(err) = sender.send(time_sync).await {
-            eprintln!("send error: {err} (reconnecting)");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
-        }
-        println!("sent TIME_SYNC (dst=Broadcast)");
-
         seq += 1;
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
@@ -241,14 +201,6 @@ async fn connect_dispatcher(
     RouterDispatcher::connect_with_retry(config, delay, profile)
         .await
         .map_err(|err| err.into())
-}
-
-fn now_epoch_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn payload_summary(payload: &serde_json::Value) -> String {

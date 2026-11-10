@@ -332,9 +332,8 @@ get secrets and start (§3.4). LLM usage is recorded per tenant (`llm_usage`, `d
   `matched_by`. A marked one answers `TENANT_DELETED`.
 - **Update** (`update_tenant`) refuses a name or domain another tenant holds, marked or not
   (`TENANT_NAME_TAKEN`, `TENANT_DOMAIN_TAKEN`). Every field is checked before anything changes.
-- **`TNT_APPROVE`** sets a tenant `active` (`approve_tenant`). SY.identity accepts it from
-  `SY.admin@`, but no node in the repository sends it. Tenants become active through create or
-  `update_tenant`.
+- **Tenants become active** through create or `update_tenant`; there is no separate approval
+  (`TNT_APPROVE`, which no node sent, was removed in 0.1.128, FINDINGS A-218).
 - `settings.max_ilks` is copied into the SHM tenant entry (`tenant_entry_from_record`). Nothing in
   SY.identity enforces it.
 
@@ -499,13 +498,14 @@ workers, so an agent with a definition runs on a worker too.
   `fluxbee_identity` (`IDENTITY_DB_NAME`) and creates the database if it is missing.
 - **The schema** (`ensure_primary_schema`): numbered migrations under a PostgreSQL advisory lock,
   recorded in `identity_schema_migrations`:
-  - v1, baseline: `identity_tenants`, `identity_ilks`, `identity_ilk_aliases`, `identity_ichs`,
-    `identity_vocabulary`;
+  - v1, baseline: `identity_tenants`, `identity_ilks`, `identity_ilk_aliases`, `identity_ichs`;
   - v2: the lifecycle mark;
   - v3: the channel scope and `identity_ilk_tenant_history`;
-  - v4: un-marks the people an old tenant delete had marked.
+  - v4: un-marks the people an old tenant delete had marked;
+  - v5: drops `identity_vocabulary`, which nothing wrote or read, and `identity_tenants.approved_by`,
+    which nothing wrote (FINDINGS A-218). The identity SHM keeps its vocabulary region, empty (§6).
 - `identity_ichs.tenant_id` stores the channel's scope; `UNIQUE(channel_type, address,
-  tenant_id)` makes the key unique. `identity_vocabulary` is created, and nothing writes to it.
+  tenant_id)` makes the key unique.
 - **At boot** the primary loads the whole store from the database
   (`load_identity_store_from_db`), re-seeds the root tenant and the system ILKs, and logs the
   ambiguous account emails (`report_account_scopes`).
@@ -523,7 +523,7 @@ workers, so an agent with a definition runs on a worker too.
 - the ILK writes: `ILK_PROVISION`, `ILK_REGISTER`, `ILK_SET_TENANT`, `ILK_ADD_CHANNEL`,
   `ILK_UPDATE`, `ILK_SET_DEFINITION`;
 - the channel switch `ICH_SET_ENABLED`;
-- the tenant writes: `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`, `TNT_APPROVE`;
+- the tenant writes: `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`;
 - the lifecycle: delete, restore and purge, of ILKs and of tenants.
 
 A replica answers them with `NOT_PRIMARY`; it does not forward them. The callers target
@@ -605,7 +605,8 @@ converges to the union of the mesh.
   - ILKs not marked, with tenant, type, status, display name, `handler_node` and definition
     hashes;
   - channels with their scope, and the `(type, address, scope)` mappings;
-  - aliases.
+  - aliases;
+  - the vocabulary region, which nothing fills: it is always empty, and the layout keeps it.
 - **Sizes** (`identity_region_limits`), from `hive.yaml` `identity`:
   - `max_ilks` 8192 (`DEFAULT_IDENTITY_SHM_MAX_ILKS`), `max_tenants` 1024, `max_vocabulary` 4096;
   - `max_ilk_aliases` defaults to `max_ilks`;
@@ -663,7 +664,7 @@ All are system messages to `SY.identity@<hive>`. SY.identity checks the router-s
 | `ICH_SET_ENABLED` | `IO.*` (its own channel only), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@` (same hive), the configured frontdesk |
 | `ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET` | `SY.admin@` (same hive) |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` (same hive) |
-| `TNT_APPROVE`, `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` (same hive) |
+| `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` (same hive) |
 | `CONFIG_GET`, `CONFIG_SET` | `SY.admin@` (same hive) |
 | `IDENTITY_METRICS`, `PING`, `STATUS` | anyone |
 
@@ -765,5 +766,5 @@ the row's values (`db_error_summary`).
 
 ## 8. Known gaps
 
-Unused today: `TNT_APPROVE` (§3.2), `identity_vocabulary` (§5.2) and the `partial` status (§2.3).
+Unused today: the `partial` status (§2.3) and the SHM's vocabulary region, always empty (§6).
 A-72, agent assets missing on the workers, is fixed since 0.1.81 (§4).

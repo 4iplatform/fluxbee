@@ -96,7 +96,6 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "list_vpns"
         | "list_runtimes"
         | "get_runtime"
-        | "get_runtimes"
         | "node_control_config_get" => Some(ActionClass::Read),
         "set_node_config"
         | "node_control_config_set"
@@ -113,8 +112,6 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "opa_compile_apply"
         | "opa_rollback"
         | "opa_clear"
-        | "update_policy_matrix"
-        | "clear_override"
         | "sync_hint"
         | "update"
         | "set_storage"
@@ -128,7 +125,6 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         "run_node" | "kill_node" | "remove_node_instance" => Some(ActionClass::NodeLifecycle),
         "create_tenant"
         | "update_tenant"
-        | "approve_tenant"
         | "list_ilks"
         | "get_ilk"
         | "delete_ilk"
@@ -136,10 +132,7 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "purge_ilk"
         | "delete_tenant"
         | "restore_tenant"
-        | "purge_tenant"
-        | "list_vocabulary"
-        | "add_vocabulary"
-        | "deprecate_vocabulary" => Some(ActionClass::IdentityChange),
+        | "purge_tenant" => Some(ActionClass::IdentityChange),
         "send_node_message" => Some(ActionClass::SendMessage),
         _ => None,
     }
