@@ -12398,42 +12398,88 @@ mod tests {
         assert!(back.try_recv().is_err(), "and not answered");
     }
 
+    /// Whether any of `messages` is `msg`, by its trace_id.
+    fn has(messages: Vec<Message>, msg: &Message) -> bool {
+        messages
+            .iter()
+            .any(|got| got.routing.trace_id == msg.routing.trace_id)
+    }
+
     /// A-222: a broadcast skips a full link and goes on to every other; its sender is answered
-    /// LINK_BUSY once, by the router it entered, however many links were full. A router it reached
-    /// over the WAN skips its own full link without an answer.
+    /// LINK_BUSY once, by the router it entered, whichever link was full, a local node's, the
+    /// sibling router's or the WAN peer's, and however many. Each kind alone is answered: the
+    /// sibling's and the WAN peer's through `broadcast_link_full`, a local node's through
+    /// `deliver_locally`.
     #[tokio::test]
     async fn a_broadcast_over_full_links_is_answered_once_where_it_entered() {
-        let mut scene = BroadcastScene::new();
-        let full_node = scene
-            .nodes
-            .lock()
-            .await
-            .values()
-            .find(|node| node.name == "SY.timer@motherbee")
-            .map(|node| node.sender.clone())
-            .expect("the timer");
-        fill_to_the_senders_bound(&full_node);
-        let full_wan = scene.wan_peers.lock().await["worker1"].sender.clone();
-        fill_to_the_senders_bound(&full_wan);
-        let broadcast = scene.broadcast(0);
-        scene.route(&broadcast).await;
+        for (case, node_full, sibling_full, wan_full) in [
+            ("a local node's link", true, false, false),
+            ("the sibling router's link", false, true, false),
+            ("the WAN peer's link", false, false, true),
+            ("one of each", true, true, true),
+        ] {
+            let mut scene = BroadcastScene::new();
+            if node_full {
+                let timer = scene
+                    .nodes
+                    .lock()
+                    .await
+                    .values()
+                    .find(|node| node.name == "SY.timer@motherbee")
+                    .map(|node| node.sender.clone())
+                    .expect("the timer");
+                fill_to_the_senders_bound(&timer);
+            }
+            if sibling_full {
+                let sibling = scene
+                    .peers
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .map(|peer| peer.sender.clone())
+                    .expect("the sibling");
+                fill_to_the_senders_bound(&sibling);
+            }
+            if wan_full {
+                let wan = scene.wan_peers.lock().await["worker1"].sender.clone();
+                fill_to_the_senders_bound(&wan);
+            }
+            let broadcast = scene.broadcast(0);
+            scene.route(&broadcast).await;
 
-        let got = |messages: Vec<Message>| {
-            messages
-                .iter()
-                .any(|msg| msg.routing.trace_id == broadcast.routing.trace_id)
-        };
-        let (timer, storage) = scene.receivers.split_at_mut(1);
-        assert!(!got(messages_on(&mut timer[0])), "not on the full link");
-        assert!(got(messages_on(&mut storage[0])), "the other node got it");
-        assert!(got(messages_on(&mut scene.sibling)), "so did the sibling");
-        assert!(!got(messages_on(&mut scene.wan)), "not the full WAN link");
-        let answer = unreachable_answer(&mut scene.answers, &broadcast);
-        assert_eq!(answer.reason, "LINK_BUSY");
-        assert_eq!(answer.original_dst, "broadcast");
-        assert!(scene.answers.try_recv().is_err(), "answered once");
+            let (timer, storage) = scene.receivers.split_at_mut(1);
+            assert_eq!(
+                has(messages_on(&mut timer[0]), &broadcast),
+                !node_full,
+                "{case}: the timer"
+            );
+            assert!(
+                has(messages_on(&mut storage[0]), &broadcast),
+                "{case}: the other node got it"
+            );
+            assert_eq!(
+                has(messages_on(&mut scene.sibling), &broadcast),
+                !sibling_full,
+                "{case}: the sibling"
+            );
+            assert_eq!(
+                has(messages_on(&mut scene.wan), &broadcast),
+                !wan_full,
+                "{case}: the other hive"
+            );
+            let answer = unreachable_answer(&mut scene.answers, &broadcast);
+            assert_eq!(answer.reason, "LINK_BUSY", "{case}");
+            assert_eq!(answer.original_dst, "broadcast", "{case}");
+            assert!(scene.answers.try_recv().is_err(), "{case}: answered once");
+        }
+    }
 
-        // Reached over the WAN, a router whose local node's link is full answers nothing.
+    /// A-222: a router a broadcast reached over the WAN skips its own full links, a local node's,
+    /// a sibling router's and another hive's, and answers nothing: its sender is answered by the
+    /// router it entered. Its other nodes get it.
+    #[tokio::test]
+    async fn a_broadcast_is_not_answered_by_a_router_it_reached_over_the_wan() {
         let ctx = test_wan_context(None);
         let remote = Uuid::new_v4();
         *ctx.lsa_snapshot.lock().await = Some(lsa_with_remote_node(
@@ -12441,20 +12487,42 @@ mod tests {
             remote,
             "SY.orchestrator@worker1",
         ));
-        let (local_tx, _local_rx) = link_queue("node");
-        fill_to_the_senders_bound(&local_tx);
-        ctx.nodes.lock().await.insert(
-            Uuid::new_v4(),
-            NodeHandle {
-                name: "SY.admin@motherbee".to_string(),
-                vpn_id: 0,
-                sender: local_tx,
-                connected_at: 0,
+        let (full_tx, mut full) = link_queue("node");
+        fill_to_the_senders_bound(&full_tx);
+        let (open_tx, mut open) = link_queue("node");
+        for (name, sender) in [
+            ("SY.admin@motherbee", full_tx),
+            ("SY.storage@motherbee", open_tx),
+        ] {
+            ctx.nodes.lock().await.insert(
+                Uuid::new_v4(),
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender,
+                    connected_at: 0,
+                },
+            );
+        }
+        let (sibling_tx, mut sibling) = link_queue("irp");
+        fill_to_the_senders_bound(&sibling_tx);
+        ctx.peers
+            .lock()
+            .await
+            .insert(Uuid::new_v4(), PeerHandle { sender: sibling_tx });
+        let (worker2_tx, mut worker2) = link_queue("wan");
+        fill_to_the_senders_bound(&worker2_tx);
+        ctx.wan_peers.lock().await.insert(
+            "worker2".to_string(),
+            WanPeer {
+                sender: worker2_tx,
+                router_uuid: Uuid::new_v4(),
             },
         );
+        let broadcast = padded_message(remote, Destination::Broadcast, 0);
         let (link, mut back) = link_queue("wan");
         handle_wan_message(
-            &padded_message(remote, Destination::Broadcast, 0),
+            &broadcast,
             &link,
             &ctx,
             "worker1",
@@ -12464,6 +12532,22 @@ mod tests {
         )
         .await
         .expect("handled");
+        assert!(
+            has(messages_on(&mut open), &broadcast),
+            "the other node got it"
+        );
+        assert!(
+            !has(messages_on(&mut full), &broadcast),
+            "not the full node"
+        );
+        assert!(
+            !has(messages_on(&mut sibling), &broadcast),
+            "nor the full sibling"
+        );
+        assert!(
+            !has(messages_on(&mut worker2), &broadcast),
+            "nor full worker2"
+        );
         assert!(
             back.try_recv().is_err(),
             "no answer from a router it reached"
@@ -12478,12 +12562,14 @@ mod tests {
         rest.split(['(', '<']).next()
     }
 
-    /// Pins A-202's and A-222's paths. A frame reaches a link only through the link's bounded queue
-    /// (`link.rs`): nothing here sends on a channel. Every function that queues a sender's message
-    /// checks it against the frame first (`frame_over_limit`) and gets the queue's answer (`queue`,
-    /// `reserve`: full, the sender is answered `LINK_BUSY`); the router's own frames go through
-    /// `queue_own`, skipped on a full queue, and keep the writer's skip of a frame over the limit.
-    /// A new path has to say which it is.
+    /// Pins A-202's and A-222's paths as the source shows them. A frame reaches a link only through
+    /// the link's bounded queue (`link.rs`): nothing here sends on a channel. A sender's message is
+    /// queued (`queue`, `reserve`) only by the functions listed in `checked`, and each of them
+    /// checks the frame against the limit (`frame_over_limit`) before it queues it. The router's
+    /// own frames go through `queue_own` (skipped on a full queue, and keeping the writer's skip of
+    /// a frame over the limit) only in the functions listed in `routers_own`. A new path has to say
+    /// which it is. Whether a refused message's sender is answered `LINK_BUSY` is not read here:
+    /// each path's tests check it.
     #[test]
     fn every_frame_a_sender_hands_a_link_is_checked_against_the_limit() {
         let src = include_str!("mod.rs");
@@ -12525,8 +12611,10 @@ mod tests {
             if line.contains(".queue(") || line.contains(".reserve(") {
                 assert!(
                     checked.contains(&function),
-                    "{function} queues a sender's message: check it with frame_over_limit (A-202) \
-                     and answer its refusal (A-222), or queue it as the router's own"
+                    "{function} queues a sender's message (queue, reserve) and is not listed in \
+                     `checked`, whose functions this test pins to call frame_over_limit before \
+                     they queue (A-202): list it once it does, or queue the frame as the router's \
+                     own (queue_own)"
                 );
                 seen_checked.insert(function);
             }
