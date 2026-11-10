@@ -216,9 +216,11 @@ Current minimal state:
 reporting it. It is informational: the tenant of each attempt is read again from the ILK
 (section 4.3).
 
-`register_error` keeps the last failed registration, `{error_code, message}`.
-`register_attempted` is `true` only once a registration failed for good (`completed_error`): after
-a failure that may pass the case stays `awaiting_confirmation` (section 7.2).
+`register_error` keeps the last failed registration, `{error_code, message}`; on a case still
+`awaiting_confirmation` it is the failure that may pass of its last attempt, which the model reads
+there. `register_attempted` is `true` only once a registration failed for good
+(`completed_error`): after a failure that may pass the case stays `awaiting_confirmation`
+(section 7.2).
 
 `collected.email` is only ever a claim, whoever wrote it: the LLM writes this state (section 7.1).
 
@@ -347,16 +349,26 @@ A registration can fail for a reason that may pass: `SY.identity` did not answer
   10 s timeout is not sent again. When `SY.identity` answers at once that is a few seconds in all,
   inside what a handoff's IO node waits for the answer (io.api 10 s, io.cloud 20 s).
 - **The case stays open.** If it still fails, the tool answers the error with `retryable: true`,
-  and the case stays `awaiting_confirmation`, never `completed_error`. In the conversation the
-  person is told it could not be done right now, and their next confirmation retries it; a handoff
-  answers `IDENTITY_UNAVAILABLE`, and sending it again retries it.
+  and the case stays `awaiting_confirmation`, never `completed_error`, with the failure in
+  `register_error`. A handoff answers `IDENTITY_UNAVAILABLE`, and sending it again retries it. In
+  the conversation the person is told it could not be done right now, and their next confirmation
+  retries it.
+- **Only the turn of the attempt says so.** The result of a conversational turn comes from that
+  turn's own `ilk_register`: the turn whose attempt failed for a reason that may pass answers
+  `IDENTITY_UNAVAILABLE`, and the code saves the failure in the case even when the model did not.
+  A later turn, while the case only awaits the person's confirmation, answers what any case
+  awaiting confirmation answers (`needs_input`, `MISSING_REQUIRED_FIELDS` with no missing
+  field): no error, so io.api and Cloud show none once `SY.identity` is back. The model reads the
+  failure in `register_error`: it says the last attempt could not be done at the time and asks
+  the person to confirm to try again, not as an error.
 - **No loop within a turn.** The prompt calls `ilk_register` at most once per turn: a later
   confirmation is what retries.
 - **Final only when it cannot pass.** Any other error (`retryable: false`) closes the case as
   `completed_error`, and every later turn only repeats it.
 - **A case closed on a failure that may pass**, by an earlier version's prompt or by a model that
   did not follow this one, is reopened as `awaiting_confirmation`: when the person writes again,
-  before the model reads it, and when the turn's result is read.
+  before the model reads it, and when the turn's result is read. A turn that only reopens it made
+  no attempt, and answers as a case awaiting confirmation.
 
 ## 8. Default output
 
@@ -443,7 +455,7 @@ Closed `result_code` values:
 | `TENANT_UNRESOLVED` | `error` | there is no tenant for the case (`missing_tenant_id`, section 4.3); nothing was registered or created |
 | `TENANT_NOT_REGISTRABLE` | `error` | the case's tenant is the root tenant (`TENANT_ROOT_NOT_REGISTRABLE`, section 4.4); nothing was registered and the person stays `temporary` |
 | `REGISTER_FAILED` | `error` | `SY.identity` rejected the registration with a final verdict |
-| `IDENTITY_UNAVAILABLE` | `error` | a failure that may pass, the only retryable one: the tool already retried it and the case stays open (section 7.2); in the conversation, while the case awaits the confirmation that retries it |
+| `IDENTITY_UNAVAILABLE` | `error` | a failure that may pass, the only retryable one: the tool already retried it and the case stays open (section 7.2); in the conversation, only the turn whose own attempt failed |
 
 `human_message` is always mandatory.
 

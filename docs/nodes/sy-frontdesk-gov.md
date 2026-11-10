@@ -143,10 +143,15 @@ subject it sends, its email included ([control-path hardening](../control-path-h
   - io.api and io.cloud send a response envelope, so they get the error payload they read
     instead, with the same text in `reply`: its codes are ai.generic's (`missing_ai_api_key`,
     `provider_rate_limited`, `provider_auth_error`, …). The frontdesk takes no WF menu.
-- The reply to the person is the model's text. The result code comes from the thread state the
-  model wrote (`build_frontdesk_result_for_conversation`): `completed` → `ALREADY_COMPLETE`,
-  `completed_error` → `REGISTER_FAILED`, `awaiting_confirmation` after a failure that may pass →
-  `IDENTITY_UNAVAILABLE`, otherwise `MISSING_REQUIRED_FIELDS` or `IN_CONVERSATION`.
+- The reply to the person is the model's text. The result code
+  (`build_frontdesk_result_for_conversation`) is `IDENTITY_UNAVAILABLE` for the turn whose own
+  `ilk_register` failed for a reason that may pass (its last answer, kept in
+  `BehaviorContext::register_answer`); the code then saves that failure in the case as
+  `awaiting_confirmation`, whatever the model saved. Otherwise it comes from the thread state the
+  model wrote: `completed` → `ALREADY_COMPLETE`, `completed_error` → `REGISTER_FAILED`, otherwise
+  `MISSING_REQUIRED_FIELDS` or `IN_CONVERSATION`. So a later turn of a case awaiting
+  confirmation after such a failure is no error; the model, which reads the failure in
+  `register_error`, says the last attempt could not be done at the time and asks to confirm again.
 - A case closed as `completed_error` on a failure that may pass, by the model or by an earlier
   version's prompt, is reopened as `awaiting_confirmation` (`load_open_frontdesk_thread_state`):
   when the person writes, before the model reads the state, and when the turn's result is read.

@@ -73,7 +73,7 @@ State schema (data):
   "register_error": null
 }
 - register_attempted is true only once a registration failed for good (status=completed_error).
-- register_error keeps the last failed registration: {error_code,message}.
+- register_error keeps the last failed registration: {error_code,message}. On a case still awaiting_confirmation it means the last attempt could not be done at the time: the case is open, and that is not an error.
 
 Mandatory flow:
 1) On every user turn, call thread_state_get first.
@@ -118,13 +118,16 @@ STRICT NO-LOOP RULE (at most one ilk_register call per turn: the tool itself alr
      - send final error summary
      - stop (do not ask confirmation again)
 - A later turn's positive confirmation of a case still awaiting_confirmation calls ilk_register again: that is how a registration that could not be done right now is retried.
+- If status==awaiting_confirmation, register_error is set and the user is not confirming:
+  - say the last attempt could not be done at the time, show the summary and ask them to confirm to try again
+  - do not present it as an error
 
 - If status==completed_error:
   - send final error summary from register_error
   - stop (do not ask confirmation again)
 
 - If status==awaiting_confirmation and user is negative:
-  - set status=collecting
+  - set status=collecting, register_error=null
   - call thread_state_put
   - ask which field to correct.
 
@@ -692,6 +695,9 @@ struct IlkRegisterTool {
     identity: GovIdentityConfig,
     bridge: Option<Arc<dyn IdentityCaller>>,
     retry: RegisterRetry,
+    /// Where the conversation's turn keeps the tool's last answer (`BehaviorContext`); `None` for
+    /// the handoff, which reads the answer itself.
+    turn_answer: Option<RegisterAnswerSlot>,
 }
 
 /// How `ilk_register` retries an `ILK_REGISTER` that failed for a reason that may pass
@@ -735,6 +741,32 @@ struct BehaviorContext {
     /// Whether a tool has run in this message's tool loop (`ToolRunWatch`): a failure after that
     /// is never answered as retryable, since sending the message again would run the tool again.
     tool_ran: AtomicBool,
+    /// What `ilk_register` answered last in this message's tool loop, if it ran: the turn's result
+    /// comes from its own attempt (FINDINGS A-216).
+    register_answer: RegisterAnswerSlot,
+}
+
+/// Where a conversation's turn keeps the last answer of its `ilk_register`.
+type RegisterAnswerSlot = Arc<std::sync::Mutex<Option<Value>>>;
+
+impl BehaviorContext {
+    /// The failure of this message's `ilk_register` when its last answer was one that may pass
+    /// (`retryable`); `None` when it did not run, registered, or failed for good.
+    fn register_failed_for_now(&self) -> Option<FrontdeskRegisterErrorState> {
+        let answer = self.register_answer.lock().ok()?.clone()?;
+        let failed_for_now = answer.get("status").and_then(Value::as_str) == Some("error")
+            && answer.get("retryable").and_then(Value::as_bool) == Some(true);
+        failed_for_now.then(|| FrontdeskRegisterErrorState {
+            error_code: answer
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            message: answer
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -975,6 +1007,7 @@ impl AiNode for GenericAiNode {
             src_ilk: extract_src_ilk(&msg),
             trace_id: Some(msg.routing.trace_id.clone()),
             tool_ran: AtomicBool::new(false),
+            register_answer: RegisterAnswerSlot::default(),
         };
         // The human-registration flow has TWO methods, distinguished by the METHOD (not by being a
         // human): the "auto" method arrives as a structured JSON `frontdesk_handoff` and runs
@@ -1468,7 +1501,7 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<()> {
         // Conversational: the tenant is only the ILK's (the thread state is the LLM's to write).
         // The email the person types is a claim; one an earlier handoff vouched for comes from the
-        // case's own record (`read_vouched_email`).
+        // case's own record (`read_vouched_email`). Its answer is kept for the turn's result.
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
             informed_tenant_id: None,
@@ -1478,6 +1511,7 @@ impl GenericAiNode {
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
             retry: self.register_retry,
+            turn_answer: Some(ctx.register_answer.clone()),
         };
         registry.register(Arc::new(tool))?;
         Ok(())
@@ -1808,6 +1842,7 @@ impl GenericAiNode {
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
             retry: self.register_retry,
+            turn_answer: None,
         };
         let registered_name = name
             .clone()
@@ -1898,6 +1933,31 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<FrontdeskResultPayload> {
         // A model that closed the case on a failure that may pass leaves it open all the same.
         let after_state = self.load_open_frontdesk_thread_state(ctx).await?;
+        // The turn's result is its own attempt's (FINDINGS A-216). The turn whose ilk_register
+        // failed for a reason that may pass answers IDENTITY_UNAVAILABLE, and its case waits for
+        // the person's confirmation with that failure saved, whatever the model saved: the model
+        // reads it there on the next turn. A later turn of the case only awaits the confirmation,
+        // and answers as any case that does: no error, so the IO node shows none once SY.identity
+        // is back.
+        if let Some(error) = ctx.register_failed_for_now() {
+            let mut payload =
+                frontdesk_result_payload("error", "IDENTITY_UNAVAILABLE", human_message);
+            payload.ilk_id = ctx.src_ilk.clone();
+            payload.registration_status = Some("temporary".to_string());
+            payload.error_code = error.error_code.clone();
+            payload.error_detail = error.message.clone();
+            match after_state {
+                Some(mut state) => {
+                    payload.tenant_id = state.tenant_id.clone();
+                    state.status = Some("awaiting_confirmation".to_string());
+                    state.register_attempted = false;
+                    state.register_error = Some(error);
+                    self.store_frontdesk_thread_state(ctx, &state).await?;
+                }
+                None => payload.tenant_id = prior_state.and_then(|state| state.tenant_id),
+            }
+            return Ok(payload);
+        }
         if let Some(state) = after_state {
             if state.status.as_deref() == Some("completed") {
                 let mut payload = frontdesk_result_payload("ok", "ALREADY_COMPLETE", human_message);
@@ -1909,17 +1969,9 @@ impl GenericAiNode {
                     .or(Some("complete".to_string()));
                 return Ok(payload);
             }
-            // A case closed for good, or one whose last registration failed for a reason that may
-            // pass and that waits for the confirmation that retries it.
-            let failure = match state.status.as_deref() {
-                Some("completed_error") => Some("REGISTER_FAILED"),
-                Some("awaiting_confirmation") if state.failed_for_now() => {
-                    Some("IDENTITY_UNAVAILABLE")
-                }
-                _ => None,
-            };
-            if let Some(result_code) = failure {
-                let mut payload = frontdesk_result_payload("error", result_code, human_message);
+            if state.status.as_deref() == Some("completed_error") {
+                let mut payload =
+                    frontdesk_result_payload("error", "REGISTER_FAILED", human_message);
                 payload.ilk_id = ctx.src_ilk.clone();
                 payload.tenant_id = state.tenant_id.clone();
                 payload.registration_status = state.registration_status.clone();
@@ -2572,6 +2624,19 @@ impl FunctionTool for IlkRegisterTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let answer = self.register(arguments).await?;
+        if let Some(turn_answer) = &self.turn_answer {
+            if let Ok(mut slot) = turn_answer.lock() {
+                *slot = Some(answer.clone());
+            }
+        }
+        Ok(answer)
+    }
+}
+
+impl IlkRegisterTool {
+    /// Registers the case's person: the tool's answer, to the model or to the handoff.
+    async fn register(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
         let args: IlkRegisterArgs = serde_json::from_value(arguments).map_err(|err| {
             fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
                 "ilk_register: invalid arguments: {err}"
@@ -2718,9 +2783,7 @@ impl FunctionTool for IlkRegisterTool {
             }
         }
     }
-}
 
-impl IlkRegisterTool {
     /// Sends the case's `ILK_REGISTER`, and sends it again while it fails for a reason that may
     /// pass and `retry` allows (FINDINGS A-216). Registering again is safe: SY.identity replaces
     /// the identification of an ILK registered twice. Returns the last outcome and how many
@@ -5550,6 +5613,7 @@ mod tests {
             identity: GovIdentityConfig::default(),
             bridge: None,
             retry: NO_WAIT_RETRY,
+            turn_answer: None,
         }
     }
 
@@ -6580,42 +6644,136 @@ mod tests {
         assert_eq!(kept["register_error"]["error_code"], "TENANT_PENDING");
     }
 
-    /// The conversation: a model that closes the case on a failure that may pass does not end it.
-    /// The turn answers IDENTITY_UNAVAILABLE, never a final REGISTER_FAILED, and the case waits
-    /// for the confirmation that retries it. A final failure ends it.
-    #[tokio::test]
-    async fn the_conversation_keeps_open_a_case_closed_on_a_transient_failure() {
-        let (node, state) = test_node_with_state();
-        let ctx = BehaviorContext {
+    /// A conversational turn of the test case.
+    fn turn_ctx() -> BehaviorContext {
+        BehaviorContext {
             src_ilk: Some(TEST_ILK.to_string()),
             ..BehaviorContext::default()
-        };
-        let model_text = "The registration could not be done right now.".to_string();
+        }
+    }
+
+    /// A case whose data the person is asked to confirm, as the model saves it before asking.
+    fn awaiting_case() -> Value {
+        json!({
+            "status": "awaiting_confirmation",
+            "collected": { "name": "Ana", "email": "ana@example.com" },
+            "tenant_id": TEST_TENANT,
+            "register_attempted": false,
+            "register_error": null
+        })
+    }
+
+    fn save_case(state: &MemoryThreadState, case: Value) {
         state
             .0
             .lock()
             .expect("thread state")
-            .insert(TEST_ILK.to_string(), closed_case("UNREACHABLE"));
+            .insert(TEST_ILK.to_string(), case);
+    }
+
+    /// The model's `ilk_register` in a turn: through the turn's registry, as the runner calls it.
+    async fn register_in_turn(node: &GenericAiNode, ctx: &BehaviorContext) -> Value {
+        node.build_tool_registry(ctx)
+            .expect("registry")
+            .get("ilk_register")
+            .expect("ilk_register")
+            .call(register_ana())
+            .await
+            .expect("tool call")
+    }
+
+    /// The turn's result is its own attempt's: the turn whose `ilk_register` failed for a reason
+    /// that may pass answers IDENTITY_UNAVAILABLE, and the case awaits the confirmation with that
+    /// failure saved for the model, though the model saved nothing. A later turn, while the case
+    /// only awaits the confirmation, answers what a case awaiting it answers before any attempt:
+    /// no error.
+    #[tokio::test]
+    async fn only_the_turn_of_a_transient_failure_answers_it() {
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Rejected("DB_NOT_READY")]);
+        let (node, state) = test_node_with_identity(&identity);
+        let model_text = || "Shall I register Ana, ana@example.com?".to_string();
+
+        // Before any attempt.
+        save_case(&state, awaiting_case());
+        let before = node
+            .build_frontdesk_result_for_conversation(&turn_ctx(), model_text(), None)
+            .await
+            .expect("result");
+        assert_eq!(before.status, "needs_input");
+        assert_eq!(before.result_code, "MISSING_REQUIRED_FIELDS");
+
+        // The person confirms; SY.identity cannot write yet.
+        let ctx = turn_ctx();
+        let out = register_in_turn(&node, &ctx).await;
+        assert_eq!(out["retryable"], true);
         let result = node
-            .build_frontdesk_result_for_conversation(&ctx, model_text.clone(), None)
+            .build_frontdesk_result_for_conversation(&ctx, model_text(), None)
+            .await
+            .expect("result");
+        assert_eq!(result.status, "error");
+        assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
+        assert_eq!(result.error_code.as_deref(), Some("DB_NOT_READY"));
+        assert_eq!(result.tenant_id.as_deref(), Some(TEST_TENANT));
+        let kept = kept_case(&state);
+        assert_eq!(kept["status"], "awaiting_confirmation");
+        assert_eq!(kept["register_attempted"], false);
+        assert_eq!(kept["register_error"]["error_code"], "DB_NOT_READY");
+
+        // A later turn without an attempt: the same answer as before any, and the failure stays
+        // saved for the model.
+        let later = node
+            .build_frontdesk_result_for_conversation(&turn_ctx(), model_text(), None)
+            .await
+            .expect("result");
+        assert_eq!(later.status, before.status);
+        assert_eq!(later.result_code, before.result_code);
+        assert_eq!(later.missing_fields, before.missing_fields);
+        assert_eq!(later.error_code, None);
+        assert_eq!(
+            kept_case(&state)["register_error"]["error_code"],
+            "DB_NOT_READY"
+        );
+    }
+
+    /// A model that closes the case on a failure that may pass does not end it: the turn of that
+    /// attempt answers IDENTITY_UNAVAILABLE and the case awaits the confirmation that retries it.
+    /// One closed that way earlier, by an older prompt, is open again and no error. A final
+    /// failure ends the case.
+    #[tokio::test]
+    async fn the_conversation_keeps_open_a_case_closed_on_a_transient_failure() {
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Unreachable]);
+        let (node, state) = test_node_with_identity(&identity);
+        let model_text = || "The registration could not be done right now.".to_string();
+
+        save_case(&state, awaiting_case());
+        let ctx = turn_ctx();
+        register_in_turn(&node, &ctx).await;
+        save_case(&state, closed_case("UNREACHABLE"));
+        let result = node
+            .build_frontdesk_result_for_conversation(&ctx, model_text(), None)
             .await
             .expect("result");
         assert_eq!(result.status, "error");
         assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
         assert_eq!(result.error_code.as_deref(), Some("UNREACHABLE"));
-        assert_eq!(result.human_message, model_text);
+        assert_eq!(result.human_message, model_text());
         let kept = kept_case(&state);
         assert_eq!(kept["status"], "awaiting_confirmation");
         assert_eq!(kept["register_attempted"], false);
         assert_eq!(kept["collected"]["email"], "ana@example.com");
 
-        state
-            .0
-            .lock()
-            .expect("thread state")
-            .insert(TEST_ILK.to_string(), closed_case("TENANT_PENDING"));
+        save_case(&state, closed_case("UNREACHABLE"));
         let result = node
-            .build_frontdesk_result_for_conversation(&ctx, model_text, None)
+            .build_frontdesk_result_for_conversation(&turn_ctx(), model_text(), None)
+            .await
+            .expect("result");
+        assert_eq!(result.status, "needs_input");
+        assert_eq!(result.result_code, "MISSING_REQUIRED_FIELDS");
+        assert_eq!(kept_case(&state)["status"], "awaiting_confirmation");
+
+        save_case(&state, closed_case("TENANT_PENDING"));
+        let result = node
+            .build_frontdesk_result_for_conversation(&turn_ctx(), model_text(), None)
             .await
             .expect("result");
         assert_eq!(result.result_code, "REGISTER_FAILED");
@@ -6623,8 +6781,9 @@ mod tests {
     }
 
     /// A case the no-loop rule closed on a failure that may pass is open again when the person
-    /// writes, before the model reads it, and their confirmation retries the registration. One
-    /// closed for good stays closed.
+    /// writes, before the model reads it: that turn made no attempt, so it answers as a case
+    /// awaiting confirmation, and the confirmation retries the registration. One closed for good
+    /// stays closed.
     #[tokio::test]
     async fn a_case_closed_on_a_transient_failure_is_reopened_by_a_confirmation() {
         let identity = ScriptedIdentity::new(&[IdentityAnswer::Registered]);
@@ -6632,57 +6791,39 @@ mod tests {
         node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
         // No model here: the turn runs, and what it leaves for the model is checked.
         *node.behavior.write().await = Some(NodeBehavior::Echo);
-        let yes = || {
-            let mut msg = sample_user_request_with_context(
+        let hello = || {
+            sample_user_request_with_context(
                 json!({
                     "thread_id": "frontdesk-thread-reopen",
                     "response_envelope": producer_contract()
                 }),
                 Some(TEST_ILK),
-            );
-            msg.payload = json!({ "type": "text", "content": "yes" });
-            msg
+            )
         };
 
-        state
-            .0
-            .lock()
-            .expect("thread state")
-            .insert(TEST_ILK.to_string(), closed_case("UNREACHABLE"));
-        let reply = structured_reply(&node, yes()).await;
+        save_case(&state, closed_case("UNREACHABLE"));
+        let reply = structured_reply(&node, hello()).await;
         assert_eq!(reply["success"], false);
-        assert_eq!(reply["error_code"], "identity_unavailable");
+        assert_eq!(reply["error_code"], "missing_required_fields");
         let kept = kept_case(&state);
         assert_eq!(kept["status"], "awaiting_confirmation");
         assert_eq!(kept["register_attempted"], false);
+        assert_eq!(kept["register_error"]["error_code"], "UNREACHABLE");
 
-        // The model calls ilk_register on that confirmation: the person is registered.
-        let ctx = BehaviorContext {
-            src_ilk: Some(TEST_ILK.to_string()),
-            ..BehaviorContext::default()
-        };
-        let registry = node.build_tool_registry(&ctx).expect("registry");
-        let out = registry
-            .get("ilk_register")
-            .expect("ilk_register")
-            .call(register_ana())
-            .await
-            .expect("tool call");
+        // The model calls ilk_register on the person's confirmation: the person is registered.
+        let out = register_in_turn(&node, &turn_ctx()).await;
         assert_eq!(out["status"], "ok");
         assert_eq!(identity.calls(), 1);
 
-        state
-            .0
-            .lock()
-            .expect("thread state")
-            .insert(TEST_ILK.to_string(), closed_case("TENANT_PENDING"));
-        let reply = structured_reply(&node, yes()).await;
+        save_case(&state, closed_case("TENANT_PENDING"));
+        let reply = structured_reply(&node, hello()).await;
         assert_eq!(reply["error_code"], "register_failed");
         assert_eq!(kept_case(&state)["status"], "completed_error");
     }
 
     /// The prompt's no-loop rule: one `ilk_register` per turn, a transient failure keeps the case
-    /// awaiting confirmation, and a later confirmation retries it.
+    /// awaiting confirmation, and a later confirmation retries it; a failure saved on a case
+    /// awaiting confirmation is no error to the person.
     #[test]
     fn the_prompt_keeps_a_case_open_after_a_transient_failure() {
         let prompt = frontdesk_default_instructions();
@@ -6694,6 +6835,8 @@ mod tests {
         let closed = prompt.find("retryable=false").expect("the final branch");
         assert!(transient < keep_open && keep_open < closed);
         assert!(prompt.contains("A later turn's positive confirmation"));
+        assert!(prompt.contains("the case is open, and that is not an error"));
+        assert!(prompt.contains("do not present it as an error"));
         assert!(!prompt.contains("If register_attempted==true"));
     }
 
