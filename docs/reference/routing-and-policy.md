@@ -687,8 +687,9 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
 - **Stream copies.** The router a message enters by copies it, without waiting, to its stream
   `RT.<router>.stream@<hive>`: every kind except `system`, `admin` and `query_response` as
   `storage.turns` (`turn_copy`); a turn with a `thread_id` that a local `AI.*` node sends or
-  receives, other than a tap copy or a broadcast, as `cognition.turns` (`cognition_copy`). Nodes add
-  records with `STREAM_APPEND`, which the router consumes. See
+  receives, other than a tap copy or a broadcast, as `cognition.turns` (`cognition_copy`); one it
+  receives only once its link has taken it (A-221, since 0.1.129). Nodes add records with
+  `STREAM_APPEND`, which the router consumes. See
   [router-stream-v1.md](../router-stream-v1.md) §2 and §7.
 
 ---

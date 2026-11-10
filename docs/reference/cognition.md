@@ -72,6 +72,10 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
 - **In:** the router delivers a message to a local agent. It is copied at delivery, once per
   agent destination (`deliver_locally`). That covers messages from local nodes, from the WAN and
   from the hive's other routers (`handle_message`, `handle_wan_message`, `handle_peer_message`).
+  The copy goes only once the agent's link has taken the message, a place in its queue, and
+  before the message can reach the agent: a delivery that fails (the link gone or full, the
+  frame over the limit) leaves no copy, and its sender is answered. Until 0.1.129 the copy went
+  first, and cognition held turns the agent never got (A-221).
 - A message between two local agents is copied twice, once for each agent's communication.
 - **Relay:** a local WF sends a message to an IO node, which is how a WF passes what one person
   says to another (`copied_for_cognition_at_entry`; docs/cognition-hands-v1.md §12.4). It is
@@ -632,7 +636,8 @@ intake batch, after every worker turn and at start (`sync_held_state`):
   destination.
 - A package the sender set is removed for every destination (`prepare_local_delivery`).
 - It reads the package before it appends the turn's copy for cognition, so the message being
-  delivered is never among its own recent turns.
+  delivered is never among its own recent turns. It appends the copy only once the message has
+  its place on the agent's link, and hands the message to the link after (§2, A-221).
 - It reads the region at delivery, and reopens it when its heartbeat is older than 30 s
   (`HEARTBEAT_STALE_MS`) or a read fails. When it still cannot read it, the message goes without
   a package, and the router says so in its journal, at most every 30 s.

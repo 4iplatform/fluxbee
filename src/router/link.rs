@@ -10,6 +10,10 @@
 //! answered. A frame the queue took is never dropped to make room, and the link is never cut for
 //! it: room comes back as its writer drains it. Until 0.1.129 the queue had no bound, and every
 //! frame for a node that stopped reading without closing stayed in the router's memory.
+//!
+//! `LinkSender::reserve` takes a sender's message's place without handing it to the writer yet,
+//! for what must happen only for a frame the link took, and before its peer can have it: an
+//! agent's turn for its cognition (A-221).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -108,6 +112,24 @@ impl LinkSender {
     /// is answered. Whether it was queued.
     pub(super) fn queue_own(&self, frame: Vec<u8>) -> bool {
         self.take(frame, true).is_ok()
+    }
+
+    /// Takes a sender's message's place in the queue, refused as `queue` would refuse it, without
+    /// handing the frame to the writer yet: what must happen before the link's peer can have the
+    /// frame happens in between, and only for a frame the link took (A-221). Dropped unqueued, the
+    /// slot gives its place back.
+    pub(super) fn reserve(&self, frame: Vec<u8>) -> Result<LinkSlot<'_>, LinkRefusal> {
+        if self.tx.is_closed() {
+            return Err(LinkRefusal::Gone);
+        }
+        if !self.claim(frame.len(), false) {
+            return Err(self.full(false));
+        }
+        Ok(LinkSlot {
+            link: self,
+            frame,
+            queued: false,
+        })
     }
 
     /// Completes once the link's writer has stopped.
@@ -212,6 +234,35 @@ impl LinkSender {
             );
         }
         LinkRefusal::Full
+    }
+}
+
+/// A frame's place in a link's queue, taken by `LinkSender::reserve`.
+pub(super) struct LinkSlot<'a> {
+    link: &'a LinkSender,
+    frame: Vec<u8>,
+    queued: bool,
+}
+
+impl LinkSlot<'_> {
+    /// Hands the frame to the link's writer. `Gone` when the writer stopped since the place was
+    /// taken.
+    pub(super) fn queue(mut self) -> Result<(), LinkRefusal> {
+        self.queued = true;
+        let frame = std::mem::take(&mut self.frame);
+        let len = frame.len();
+        self.link.tx.send(frame).map_err(|_| {
+            self.link.release(len);
+            LinkRefusal::Gone
+        })
+    }
+}
+
+impl Drop for LinkSlot<'_> {
+    fn drop(&mut self) {
+        if !self.queued {
+            self.link.release(self.frame.len());
+        }
     }
 }
 
@@ -347,6 +398,43 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), link.closed())
             .await
             .expect("closed");
+    }
+
+    /// A slot holds the frame's place until it is queued or dropped; it is refused as a queued
+    /// frame would be, and one whose writer stops before it is queued says so.
+    #[test]
+    fn a_slot_holds_a_place_until_its_frame_is_queued_or_dropped() {
+        let (link, mut writer) = link_queue("node");
+        let slot = link.reserve(b"a turn".to_vec()).expect("room");
+        assert_eq!(link.depth(), (1, 6));
+        assert!(writer.try_recv().is_err(), "the writer has nothing yet");
+        slot.queue().expect("queued");
+        assert_eq!(writer.try_recv().expect("the frame"), b"a turn".to_vec());
+
+        drop(link.reserve(b"given back".to_vec()).expect("room"));
+        assert_eq!(
+            link.depth(),
+            (0, 0),
+            "a slot dropped unqueued gives its place back"
+        );
+
+        for _ in 0..LINK_QUEUE_SENDERS_FRAMES {
+            link.queue(b"x".to_vec()).expect("room");
+        }
+        assert!(matches!(
+            link.reserve(b"refused".to_vec()),
+            Err(LinkRefusal::Full)
+        ));
+
+        let (link, writer) = link_queue("node");
+        let slot = link.reserve(b"late".to_vec()).expect("room");
+        drop(writer);
+        assert_eq!(slot.queue(), Err(LinkRefusal::Gone));
+        assert_eq!(link.depth(), (0, 0));
+        assert!(matches!(
+            link.reserve(b"gone".to_vec()),
+            Err(LinkRefusal::Gone)
+        ));
     }
 
     /// The writer's lines name the link once its peer is known.

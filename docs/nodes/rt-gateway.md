@@ -254,7 +254,8 @@ pushes them in acknowledged batches to their sinks.
 - **Records:**
   - `storage.turns`: a copy of each message a local node sends, except `SYSTEM`, `admin` and
     `query_response` messages (`should_publish_turn`);
-  - `cognition.turns`: messages that local `AI.*` agents send or receive with a thread id;
+  - `cognition.turns`: messages that local `AI.*` agents send or receive with a thread id; one
+    an agent receives only once its link has taken it (A-221, since 0.1.129);
   - `STREAM_APPEND` from nodes: only `storage.usage` (LLM usage records), with SY.cognition
     accepted only on motherbee and worker hives and SY.frontdesk.gov, SY.architect and SY.admin
     only on the motherbee (`subject_allowed`). A refused append is counted. SY.cognition's

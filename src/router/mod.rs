@@ -7234,6 +7234,7 @@ fn cognition_copy(msg: &Message, sender_name: &str) -> Option<Vec<u8>> {
 /// package the sender set is dropped for every destination. An agent destination gets the memory
 /// package of its communication, and its router's copy of the turn for its cognition: with the
 /// copy its agent's sends make at entry, the agent's router hands its cognition both directions.
+/// The copy goes only for a message the agent's link took (A-221).
 ///
 /// The reason the caller answers the sender `UNREACHABLE` with, if any: `FRAME_TOO_LARGE` when the
 /// message's frame, as delivered, is over the socket's limit, so no destination got it (A-202);
@@ -7284,11 +7285,6 @@ async fn deliver_locally(
         } else {
             None
         };
-        if agent && turn {
-            if let Some(copy) = cognition_copy(&prepared, &sender_name) {
-                log_stream.append_cognition_turn(&delivery.node, copy);
-            }
-        }
         let data = match package {
             Some(package) => serialize_with_package(&prepared, package, &delivery.node)?,
             None => match &plain {
@@ -7304,10 +7300,28 @@ async fn deliver_locally(
             too_large = true;
             continue;
         }
-        match delivery.sender.queue(data) {
-            Ok(()) => {}
-            Err(LinkRefusal::Full) => busy = true,
-            Err(LinkRefusal::Gone) => undelivered = true,
+        // The frame takes its place on the link before the turn's copy goes to cognition, and goes
+        // in it after: cognition gets only a turn its agent's link took, and has it before the
+        // agent can answer it. Until 0.1.129 the copy went first, and a delivery that failed (the
+        // link gone, the frame over the limit) left cognition a turn the agent never got (A-221).
+        let slot = match delivery.sender.reserve(data) {
+            Ok(slot) => slot,
+            Err(LinkRefusal::Full) => {
+                busy = true;
+                continue;
+            }
+            Err(LinkRefusal::Gone) => {
+                undelivered = true;
+                continue;
+            }
+        };
+        if agent && turn {
+            if let Some(copy) = cognition_copy(&prepared, &sender_name) {
+                log_stream.append_cognition_turn(&delivery.node, copy);
+            }
+        }
+        if slot.queue().is_err() {
+            undelivered = true;
         }
     }
     Ok(if too_large {
@@ -10548,6 +10562,64 @@ mod tests {
         assert!(agent_rx.recv().await.is_some(), "the message");
     }
 
+    /// A-221: a turn goes to its agent's cognition only once the agent's link has taken the
+    /// message. A delivery that fails, the link gone or full or the frame over the limit, leaves no
+    /// copy, and its sender is answered; one that goes leaves one. Until 0.1.129 the copy went
+    /// first, and cognition held turns the agent never got.
+    #[tokio::test]
+    async fn a_turn_goes_to_cognition_only_once_its_agents_link_takes_it() {
+        let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let deliver = |link: LinkSender, msg: Message| {
+            let (memory_reader, log_stream) = (&memory_reader, &log_stream);
+            async move {
+                deliver_locally(
+                    vec![LocalDelivery::to("AI.sales@motherbee", link)],
+                    &msg,
+                    memory_reader,
+                    "rtcopy",
+                    false,
+                    log_stream,
+                )
+                .await
+                .expect("handled")
+            }
+        };
+        let copies = || {
+            observed
+                .drain()
+                .into_iter()
+                .filter(|(subject, _, _)| subject == fluxbee_sdk::stream::SUBJECT_COGNITION_TURNS)
+                .count()
+        };
+
+        let (gone, writer_gone) = link_queue("node");
+        drop(writer_gone);
+        let answer = deliver(gone, agent_turn("to a link whose writer stopped")).await;
+        assert_eq!(answer, Some("NODE_NOT_FOUND"));
+        assert_eq!(copies(), 0, "no copy of a turn its link did not take");
+
+        let (full, mut full_rx) = link_queue("node");
+        fill_to_the_senders_bound(&full);
+        let answer = deliver(full, agent_turn("to a full link")).await;
+        assert_eq!(answer, Some("LINK_BUSY"));
+        assert_eq!(copies(), 0, "no copy of a turn its link refused");
+        assert!(messages_on(&mut full_rx).is_empty());
+
+        let (link, mut agent_rx) = link_queue("node");
+        let answer = deliver(link.clone(), agent_turn(&"x".repeat(MAX_FRAME_SIZE))).await;
+        assert_eq!(answer, Some("FRAME_TOO_LARGE"));
+        assert_eq!(copies(), 0, "no copy of a turn over the frame");
+        assert!(agent_rx.try_recv().is_err());
+
+        let answer = deliver(link, agent_turn("hello")).await;
+        assert_eq!(answer, None);
+        assert_eq!(copies(), 1, "the copy of the turn its link took");
+        let got: Message =
+            serde_json::from_slice(&agent_rx.try_recv().expect("the message")).expect("a message");
+        assert_eq!(got.payload["content"], "hello");
+    }
+
     /// A package that would push a message past a frame loses its oldest turns, and then goes
     /// whole, so the message always reaches the agent: the router skips a frame over
     /// `MAX_FRAME_SIZE`, and the agent would never get it.
@@ -12035,10 +12107,10 @@ mod tests {
 
     /// Pins A-202's and A-222's paths. A frame reaches a link only through the link's bounded queue
     /// (`link.rs`): nothing here sends on a channel. Every function that queues a sender's message
-    /// checks it against the frame first (`frame_over_limit`) and gets the queue's answer (`queue`:
-    /// full, the sender is answered `LINK_BUSY`); the router's own frames go through `queue_own`,
-    /// skipped on a full queue, and keep the writer's skip of a frame over the limit. A new path
-    /// has to say which it is.
+    /// checks it against the frame first (`frame_over_limit`) and gets the queue's answer (`queue`,
+    /// `reserve`: full, the sender is answered `LINK_BUSY`); the router's own frames go through
+    /// `queue_own`, skipped on a full queue, and keep the writer's skip of a frame over the limit.
+    /// A new path has to say which it is.
     #[test]
     fn every_frame_a_sender_hands_a_link_is_checked_against_the_limit() {
         let src = include_str!("mod.rs");
@@ -12077,7 +12149,7 @@ mod tests {
                 "{function} sends on a channel: a frame reaches a link only through its queue \
                  (A-222)"
             );
-            if line.contains(".queue(") {
+            if line.contains(".queue(") || line.contains(".reserve(") {
                 assert!(
                     checked.contains(&function),
                     "{function} queues a sender's message: check it with frame_over_limit (A-202) \
@@ -12108,9 +12180,31 @@ mod tests {
             let check = body
                 .find("frame_over_limit(")
                 .unwrap_or_else(|| panic!("{name}"));
-            let queue = body.find(".queue(").unwrap_or_else(|| panic!("{name}"));
+            let queue = [".queue(", ".reserve("]
+                .iter()
+                .filter_map(|call| body.find(call))
+                .min()
+                .unwrap_or_else(|| panic!("{name}"));
             assert!(check < queue, "{name} checks its frame before it queues it");
         }
+    }
+
+    /// Pins A-221's order in `deliver_locally`: the frame's place on the agent's link, then the
+    /// turn's copy for cognition, then the frame in its place.
+    #[test]
+    fn a_turns_copy_goes_between_its_place_on_the_link_and_its_frame() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("async fn deliver_locally(")
+            .expect("deliver_locally");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        let place = body.find(".reserve(").expect("the place");
+        let copy = body
+            .find("append_cognition_turn(")
+            .expect("the cognition copy");
+        let frame = body.find("slot.queue()").expect("the frame");
+        assert!(place < copy && copy < frame);
+        assert_eq!(body.matches("append_cognition_turn(").count(), 1);
     }
 
     /// A message the router cannot handle is skipped; the connection stays up.
