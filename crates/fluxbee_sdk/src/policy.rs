@@ -46,12 +46,25 @@ pub enum ActionResult {
     Blocked,
     Applied,
     Failed,
-    /// Taken, but not finished — the work runs in the background and the caller polls for the
-    /// outcome (a backgrounded `add_hive`, PB-7). Distinct from `Applied`: nothing has been
-    /// applied yet. Without this, `derive_action_outcome`'s catch-all stamped every successful
-    /// acceptance as `Failed`.
+    /// Taken, but not finished: a later answer carries the outcome. A backgrounded `add_hive`
+    /// (PB-7), whose caller polls for it, and an answer in the middle of an action
+    /// (`INTERMEDIATE_STATUSES`, FINDINGS A-237). Distinct from `Applied`: nothing has been
+    /// applied for good yet. Without this, `derive_action_outcome`'s catch-all stamped every
+    /// successful acceptance as `Failed`.
     Accepted,
 }
+
+/// The statuses of an answer in the middle of an action, which is taken and not finished: their
+/// outcome is `Accepted`, never `Failed` (FINDINGS A-237).
+///
+/// - `pending_confirm`: a worker switched its default route through the egress and waits for the
+///   motherbee's confirm (A-219); the answer to the confirm says whether the switch stays.
+/// - `sync_pending`: a hive cannot apply an update until its copy of the update arrives, and the
+///   caller asks again; SY.admin answers it 202, as it answers `accepted`.
+///
+/// They take an outcome the vocabulary has, not one of their own: `action_result` is this enum, so
+/// a router or a node built before a new value would refuse the whole message that carried it.
+const INTERMEDIATE_STATUSES: [&str; 2] = ["pending_confirm", "sync_pending"];
 
 impl ActionResult {
     pub const fn as_str(self) -> &'static str {
@@ -176,7 +189,12 @@ pub fn derive_action_outcome(
         return (Some(ActionResult::Applied), None);
     }
 
-    if status.is_some_and(|value| value.eq_ignore_ascii_case("accepted")) {
+    if status.is_some_and(|value| {
+        value.eq_ignore_ascii_case("accepted")
+            || INTERMEDIATE_STATUSES
+                .iter()
+                .any(|intermediate| value.eq_ignore_ascii_case(intermediate))
+    }) {
         return (Some(ActionResult::Accepted), None);
     }
 
@@ -307,5 +325,33 @@ mod tests {
             derive_action_outcome(Some(ActionClass::Read), Some("ok"), None),
             (None, None)
         );
+    }
+
+    /// FINDINGS A-237: an answer in the middle of an action is taken and not finished, never failed:
+    /// A-219's pending_confirm between the orchestrators, an update's sync_pending. Any other status
+    /// that is not ok, accepted or blocked stays failed.
+    #[test]
+    fn an_answer_in_the_middle_of_an_action_is_accepted_not_failed() {
+        for status in [
+            "pending_confirm",
+            "sync_pending",
+            "Sync_Pending",
+            "accepted",
+        ] {
+            assert_eq!(
+                derive_action_outcome(Some(ActionClass::SystemConfig), Some(status), None),
+                (Some(ActionResult::Accepted), None),
+                "{status}"
+            );
+        }
+        for status in ["error", "not_found"] {
+            assert_eq!(
+                derive_action_outcome(Some(ActionClass::NodeLifecycle), Some(status), None),
+                (Some(ActionResult::Failed), None),
+                "{status}"
+            );
+        }
+        // The outcome is one every reader of `action_result` knows.
+        assert_eq!(ActionResult::Accepted.as_str(), "accepted");
     }
 }
