@@ -822,7 +822,8 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
 - **The blob GC** (`run_blob_gc_housekeeping`, `blob_gc_refusal`): it runs on the motherbee only.
   A spoke whose `hive.yaml` turns it on says so at its start, and again each time the GC would have
   run, and deletes nothing. A worker's join no longer writes `blob.gc` (§2: it never travels);
-  worker1's `blob.gc`, written at its join, stays and is not read.
+  worker1's `blob.gc`, written at its join, stays: it is read at the start and logged, and never
+  acted on off the motherbee.
 - **Not changed:** a worker's `staging/` is not cleaned, as before (its GC was off); a cleanup of a
   spoke's own unfinished puts, which never leave it, would be a decision of its own.
 

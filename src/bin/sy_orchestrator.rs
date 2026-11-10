@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,6 +16,7 @@ use fluxbee_ai_sdk::{
     installation_file_path, installation_file_state, sha256_hex, HiveAiConfig, InstallationFile,
     InstallationFileState, InstalledSettings, INSTALLATION_SCHEMA_VERSION,
 };
+use futures::FutureExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1219,8 +1221,29 @@ async fn run_admin_worker(
         );
         let state = Arc::clone(&state);
         lanes.run(lane, async move {
-            if let Err(err) = handle_admin(&sender, &msg, &state).await {
-                tracing::warn!("admin action error: {err}");
+            // A command whose flow panics is answered all the same (FINDINGS A-199, the review of
+            // step 1): its lane goes on either way, and its caller would wait for its own timeout.
+            match AssertUnwindSafe(handle_admin(&sender, &msg, &state))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!("admin action error: {err}"),
+                Err(_) => {
+                    let action = msg.meta.action.as_deref().unwrap_or("");
+                    tracing::error!(action, "an admin command panicked; answered INTERNAL_ERROR");
+                    if let Err(err) = send_admin_error(
+                        &sender,
+                        &msg,
+                        action,
+                        "INTERNAL_ERROR",
+                        "the orchestrator failed while running this command; its log says where",
+                    )
+                    .await
+                    {
+                        tracing::warn!("admin action error: {err}");
+                    }
+                }
             }
         });
     }
@@ -1238,28 +1261,81 @@ async fn run_system_worker(
         let lane = system_request_lane(msg.meta.msg.as_deref(), &msg.payload, &state.hive_id);
         let state = Arc::clone(&state);
         lanes.run(lane, async move {
-            if let Err(err) = handle_system_message(&sender, &msg, &state).await {
-                tracing::warn!("system message error: {err}");
+            // A request whose flow panics is answered all the same, as an admin command is.
+            match AssertUnwindSafe(handle_system_message(&sender, &msg, &state))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!("system message error: {err}"),
+                Err(_) => {
+                    let request = msg.meta.msg.as_deref().unwrap_or("");
+                    tracing::error!(msg = request, "a system message panicked");
+                    if let Some(response) = system_response_msg(request) {
+                        let _ = send_system_action_response(
+                            &sender,
+                            &msg,
+                            &response,
+                            serde_json::json!({
+                                "status": "error",
+                                "error_code": "INTERNAL_ERROR",
+                                "message": "the orchestrator failed while running this request; \
+                                            its log says where",
+                            }),
+                        )
+                        .await;
+                    }
+                }
             }
         });
     }
 }
 
-/// FINDINGS A-199, step 1: the most reads one worker runs at once (`WorkerLanes`), each on a thread
-/// of tokio's blocking pool (at most 512 threads). A read forwarded to another hive holds its place
-/// up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s) when that hive does not answer; past this
-/// many at once, a read waits for one to end, and never holds a request that changes something.
+/// The answer `handle_system_message` sends for `msg`, so a request whose flow panicked is answered
+/// all the same: `<msg>_RESPONSE`, and INVENTORY_REQUEST's INVENTORY_RESPONSE. None for
+/// node_help, which a task of its own answers. A message it does not take does nothing there, so
+/// it never panics.
+fn system_response_msg(msg: &str) -> Option<String> {
+    match msg {
+        "" | MSG_NODE_HELP => None,
+        "INVENTORY_REQUEST" => Some("INVENTORY_RESPONSE".to_string()),
+        other => Some(format!("{other}_RESPONSE")),
+    }
+}
+
+/// FINDINGS A-199, step 1: the most reads of each kind one worker runs at once (`WorkerLanes`),
+/// each on a thread of tokio's blocking pool (at most 512 threads): the reads of this hive alone,
+/// and apart the reads that wait on another hive's answer, which a forward to a hive that does not
+/// answer holds up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s). Past this many, a read waits
+/// for one of its kind to end, and never holds a request that changes something.
 const WORKER_CONCURRENT_READS_MAX: usize = 16;
 
+/// FINDINGS A-199, the review of step 1: the most reads one worker runs at once that wait on the
+/// same target (one other hive, or every hive for a fan-out). A hive that does not answer, asked
+/// again and again, then holds this many of the forwarding reads' places, and no local read's.
+const WORKER_READS_PER_TARGET_MAX: usize = 4;
+
 /// The lane a worker runs a request in (FINDINGS A-199, step 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestLane {
     /// Writes nothing, changes no state and leaves nothing another request depends on: it runs
-    /// beside every other request, off the runtime's threads.
-    Read,
+    /// beside every other request, off the runtime's threads, by where it waits for its answer.
+    Read(ReadTarget),
     /// Anything else, an unknown request included: one at a time, in arrival order, as every
     /// request ran before.
     Ordered,
+}
+
+/// Where a read waits for its answer (FINDINGS A-199, the review of step 1), as its flow finds it
+/// (`read_target`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReadTarget {
+    /// This hive alone.
+    Local,
+    /// Another hive's orchestrator, which the flow forwards the read to.
+    Hive(String),
+    /// Every other hive at once (`list_versions`, `list_tenant_nodes`).
+    EveryHive,
 }
 
 /// The lane of one of SY.admin's commands (FINDINGS A-199). The reads are the ones read in the code
@@ -1271,50 +1347,86 @@ fn admin_request_lane(action: &str, payload: &serde_json::Value, local_hive: &st
         "hive_status" | "get_storage" | "list_nodes" | "list_tenant_nodes" | "list_versions"
         | "get_versions" | "list_runtimes" | "get_runtime" | "list_deployments"
         | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
-        | "get_node_state" | "list_hives" | "get_hive" => RequestLane::Read,
+        | "get_node_state" | "list_hives" | "get_hive" => {
+            RequestLane::Read(read_target(action, payload, local_hive))
+        }
         "get_node_status" => node_status_lane(payload, local_hive),
         _ => RequestLane::Ordered,
     }
 }
 
-/// The lane of a system message (FINDINGS A-199), as `admin_request_lane` decides it.
+/// The lane of a system message (FINDINGS A-199), as `admin_request_lane` decides it: a read's
+/// target is its admin twin's, which runs the same flow.
 fn system_request_lane(
     msg: Option<&str>,
     payload: &serde_json::Value,
     local_hive: &str,
 ) -> RequestLane {
-    match msg {
-        Some(
-            "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES" | "GET_RUNTIME" | "INVENTORY_REQUEST"
-            | "NODE_CONFIG_GET" | "NODE_STATE_GET",
-        ) => RequestLane::Read,
-        Some("NODE_STATUS_GET") => node_status_lane(payload, local_hive),
-        _ => RequestLane::Ordered,
+    let twin = match msg {
+        Some("GET_VERSIONS") => "get_versions",
+        Some("GET_RUNTIMES") => "list_runtimes",
+        Some("LIST_NODES") => "list_nodes",
+        Some("GET_RUNTIME") => "get_runtime",
+        Some("NODE_CONFIG_GET") => "get_node_config",
+        Some("NODE_STATE_GET") => "get_node_state",
+        Some("INVENTORY_REQUEST") => return RequestLane::Read(ReadTarget::Local),
+        Some("NODE_STATUS_GET") => return node_status_lane(payload, local_hive),
+        _ => return RequestLane::Ordered,
+    };
+    RequestLane::Read(read_target(twin, payload, local_hive))
+}
+
+/// Where one of the reads waits for its answer: the hive its flow forwards it to, found with the
+/// function that flow finds it with, or every hive for a fan-out; this hive otherwise.
+fn read_target(action: &str, payload: &serde_json::Value, local_hive: &str) -> ReadTarget {
+    let hive = match action {
+        "list_nodes" | "get_versions" | "list_runtimes" | "get_runtime" => {
+            target_hive_from_payload(payload, local_hive)
+        }
+        "get_node_config" | "get_node_state" | "get_node_status" => {
+            node_request_target_hive(payload, local_hive)
+        }
+        "list_versions" | "list_tenant_nodes" => return ReadTarget::EveryHive,
+        _ => return ReadTarget::Local,
+    };
+    if hive == local_hive {
+        ReadTarget::Local
+    } else {
+        ReadTarget::Hive(hive)
     }
 }
 
 /// A node's status, asked of the hive `get_node_status_flow` sends it to: a read when that is
 /// another hive, ordered when it is this one, which writes the node's status version.
 fn node_status_lane(payload: &serde_json::Value, local_hive: &str) -> RequestLane {
-    if node_request_target_hive(payload, local_hive) == local_hive {
-        RequestLane::Ordered
-    } else {
-        RequestLane::Read
+    match read_target("get_node_status", payload, local_hive) {
+        ReadTarget::Local => RequestLane::Ordered,
+        target => RequestLane::Read(target),
     }
 }
 
+/// A target's read permits, by target, held by the worker's lanes (`WorkerLanes::targets`).
+type TargetPermits = HashMap<ReadTarget, Arc<tokio::sync::Semaphore>>;
+
 /// A worker's two lanes (FINDINGS A-199, step 1). The worker hands each request to its lane and
 /// takes the next one at once, whatever runs:
-/// - a read runs once it holds one of `reads`' permits, so a slow or lost read (a forward to a
-///   hive that does not answer waits 45 s) holds no other request. It runs on a thread of the
-///   blocking pool, never on the runtime's (`run`): its blocking calls (systemctl, sha256sum,
-///   `ip route`, the LSA and file reads) can then never take every thread the watchdog, the
-///   message loop and the ordered lane run on, as several reads at once could on a 2-vCPU spoke;
+/// - a read runs once it holds a permit of its kind, so a slow or lost read (a forward to a hive
+///   that does not answer waits 45 s) holds no other request. A read of this hive alone takes one
+///   of `local_reads`. A read that waits on another hive takes one of its target's
+///   (`WORKER_READS_PER_TARGET_MAX`), then one of `forwarding_reads`: a hive asked again and again
+///   while it does not answer holds a few forwarding places, never a local read's (the review of
+///   step 1). A read runs on a thread of the blocking pool, never on the runtime's (`run`): its
+///   blocking calls (systemctl, sha256sum, `ip route`, the LSA and file reads) can then never
+///   take every thread the watchdog, the message loop and the ordered lane run on, as several
+///   reads at once could on a 2-vCPU spoke;
 /// - anything else goes to the ordered lane, one task that runs each request to its end before it
 ///   takes the next, in the order the worker took them.
 struct WorkerLanes {
     worker: &'static str,
-    reads: Arc<tokio::sync::Semaphore>,
+    local_reads: Arc<tokio::sync::Semaphore>,
+    forwarding_reads: Arc<tokio::sync::Semaphore>,
+    /// Each target's own permits. A target's entry lives while a read holds or waits for one.
+    targets: Arc<std::sync::Mutex<TargetPermits>>,
     ordered: tokio::sync::mpsc::UnboundedSender<futures::future::BoxFuture<'static, ()>>,
 }
 
@@ -1337,9 +1449,24 @@ impl WorkerLanes {
         });
         Self {
             worker,
-            reads: Arc::new(tokio::sync::Semaphore::new(reads_max)),
+            local_reads: Arc::new(tokio::sync::Semaphore::new(reads_max)),
+            forwarding_reads: Arc::new(tokio::sync::Semaphore::new(reads_max)),
+            targets: Arc::default(),
             ordered,
         }
+    }
+
+    /// `target`'s permits, its entry made when no read holds or waits for one.
+    fn target_permits(&self, target: &ReadTarget) -> Arc<tokio::sync::Semaphore> {
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            targets.entry(target.clone()).or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(WORKER_READS_PER_TARGET_MAX))
+            }),
+        )
     }
 
     fn run(
@@ -1348,11 +1475,26 @@ impl WorkerLanes {
         request: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
         match lane {
-            RequestLane::Read => {
+            RequestLane::Read(target) => {
                 let worker = self.worker;
-                let reads = Arc::clone(&self.reads);
+                let (target, reads) = match target {
+                    ReadTarget::Local => (None, Arc::clone(&self.local_reads)),
+                    remote => {
+                        let permits = self.target_permits(&remote);
+                        (Some((remote, permits)), Arc::clone(&self.forwarding_reads))
+                    }
+                };
+                let targets = Arc::clone(&self.targets);
                 tokio::spawn(async move {
-                    // The semaphore is never closed, so the permit always comes.
+                    // The semaphores are never closed, so the permits always come: the target's
+                    // first, so a read waiting for its target holds no forwarding place.
+                    let target_permit = match &target {
+                        Some((_, permits)) => match Arc::clone(permits).acquire_owned().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => return,
+                        },
+                        None => None,
+                    };
                     let Ok(permit) = reads.acquire_owned().await else {
                         return;
                     };
@@ -1366,7 +1508,7 @@ impl WorkerLanes {
                     // thread only, and its awaits, a forward to another hive among them, run on
                     // it through the runtime's handle.
                     let read = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
+                        let _permits = (permit, target_permit);
                         runtime.block_on(async move {
                             tokio::select! {
                                 biased;
@@ -1378,6 +1520,10 @@ impl WorkerLanes {
                     if let Err(err) = read.await {
                         tracing::error!(worker, error = %err, "a read ended without an answer");
                     }
+                    if let Some((target, permits)) = target {
+                        drop(permits);
+                        forget_idle_target(&targets, &target);
+                    }
                 });
             }
             RequestLane::Ordered => {
@@ -1386,6 +1532,20 @@ impl WorkerLanes {
                 }
             }
         }
+    }
+}
+
+/// Drops `target`'s entry once no read holds or waits for one of its permits (the entry holds the
+/// only reference left), so a worker keeps entries only for the targets its reads wait on.
+fn forget_idle_target(targets: &std::sync::Mutex<TargetPermits>, target: &ReadTarget) {
+    let mut targets = targets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if targets
+        .get(target)
+        .is_some_and(|permits| Arc::strong_count(permits) == 1)
+    {
+        targets.remove(target);
     }
 }
 
@@ -3660,7 +3820,7 @@ fn node_page_ask(payload: &serde_json::Value) -> Result<PageAsk, serde_json::Val
             return Err(serde_json::json!({
                 "status": "error",
                 "error_code": mesh_reply::INVALID_CURSOR,
-                "message": format!("cursor {cursor} is not a next_cursor of a node listing, a <hive>|<name>"),
+                "message": "cursor is not a next_cursor of a node listing, a <hive>|<name>",
             }));
         }
     }
@@ -3681,6 +3841,9 @@ async fn handle_admin(
     // `is_motherbee` gates below answer another question (may this hive perform the change).
     tracing::info!(action = action, trace_id = %msg.routing.trace_id, "admin action received");
     let payload = match action {
+        // A command that panics, for the worker's test (FINDINGS A-199, the review of step 1).
+        #[cfg(test)]
+        "test_panic" => panic!("a command that panics, for a test"),
         "hive_status" => {
             let uptime_ms = state.started_at.elapsed().as_millis() as u64;
             serde_json::json!({
@@ -3962,6 +4125,9 @@ async fn handle_system_message(
         }
     }
     match msg.meta.msg.as_deref() {
+        // A request that panics, for the worker's test (FINDINGS A-199, the review of step 1).
+        #[cfg(test)]
+        Some("TEST_PANIC") => panic!("a request that panics, for a test"),
         Some("RUNTIME_UPDATE") => {
             let payload = serde_json::json!({
                 "status": "error",
@@ -7421,7 +7587,7 @@ impl InstallationVersionsAsk {
                     _ => None,
                 }
                 .map(Some)
-                .ok_or_else(|| format!("{key} must be a whole number, got {value}")),
+                .ok_or_else(|| format!("{key} must be a whole number")),
             }
         };
         let limit = match number("versions_limit")? {
@@ -7429,9 +7595,9 @@ impl InstallationVersionsAsk {
             Some(limit) if (1..=INSTALLATION_VERSIONS_MAX_LIMIT as u64).contains(&limit) => {
                 limit as usize
             }
-            Some(limit) => {
+            Some(_) => {
                 return Err(format!(
-                    "versions_limit must be 1 to {INSTALLATION_VERSIONS_MAX_LIMIT}, got {limit}"
+                    "versions_limit must be 1 to {INSTALLATION_VERSIONS_MAX_LIMIT}"
                 ))
             }
         };
@@ -15830,8 +15996,9 @@ fn peer_shares_public_blob(blob: &BlobRuntimeConfig, spoke_role: HiveRole) -> bo
 /// Whether a spoke of this role must never be in this Fluxbee folder, whatever hive.yaml's enable
 /// flags say: blob/active is workers' only (A-50), blob/public the ingress's, runtimes and agent
 /// assets workers' only, and each core folder its own role's. The reconcile takes a spoke out of
-/// these folders and nothing else, so a flag turned off for a while never strips anyone: the joins
-/// are the only place that adds a spoke to a folder, and they never add a forbidden one.
+/// these folders and nothing else, so a flag turned off for a while never strips anyone. What adds
+/// a spoke to a folder never adds a forbidden one: the joins, the agent assets following the
+/// runtimes (A-72) and the blob folders following their dist folder (stage 5).
 fn folder_forbidden_for_role(folder_id: &str, role: HiveRole) -> bool {
     match folder_id {
         SYNCTHING_FOLDER_BLOB_ID
@@ -16024,7 +16191,20 @@ async fn ensure_syncthing_peer_link_runtime(
              restart (FINDINGS A-196); restarting service"
         );
     }
-    restart_syncthing_for_pending(sync, &marker).await
+    // A restart owed by an earlier change that fails fails the link all the same (Syncthing is not
+    // healthy), under its own cause (FINDINGS A-196, the review).
+    restart_syncthing_for_pending(sync, &marker)
+        .await
+        .map_err(|err| {
+            if write.changed {
+                err
+            } else {
+                OrchestratorError::from(format!(
+                    "the peer link changed nothing; the Syncthing restart an earlier change still \
+                     owes failed: {err}"
+                ))
+            }
+        })
 }
 
 // ===========================================================================
@@ -17622,8 +17802,23 @@ async fn ensure_syncthing_peer_unlink_runtime(
         changed = write.changed,
         "syncthing peer config reconciled locally (unlink); restarting service"
     );
-    restart_syncthing_for_pending(sync, &marker).await?;
-    Ok(write.changed)
+    match restart_syncthing_for_pending(sync, &marker).await {
+        Ok(()) => Ok(write.changed),
+        // An unlink that changed nothing does not fail for a restart an earlier change owes
+        // (FINDINGS A-196, the review): the device is already out of config.xml, and the marker,
+        // which a failed restart keeps, has the peer reconcile restart Syncthing at its next round.
+        Err(err) if !write.changed => {
+            tracing::warn!(
+                service = SYNCTHING_SERVICE_NAME,
+                peer_name = peer_name,
+                error = %err,
+                "syncthing peer unlink changed nothing; the restart an earlier change owes failed \
+                 and is still owed"
+            );
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Every `fluxbee-dist*` folder id declared in a syncthing config, in document order. Used where
@@ -19957,15 +20152,15 @@ async fn list_versions_flow(
             })
         }
     };
-    if let Some(cursor) = page
+    if page
         .cursor
         .as_deref()
-        .filter(|cursor| !json_router::mesh_hmac::is_valid_hive_id(cursor))
+        .is_some_and(|cursor| !json_router::mesh_hmac::is_valid_hive_id(cursor))
     {
         return serde_json::json!({
             "status": "error",
             "error_code": mesh_reply::INVALID_CURSOR,
-            "message": format!("cursor {cursor} is not a next_cursor of /versions, a hive id"),
+            "message": "cursor is not a next_cursor of /versions, a hive id",
         });
     }
     let motherbee = state.hive_id.clone();
@@ -25696,7 +25891,8 @@ async fn get_node_config_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    // The hive its lane takes it for (`read_target`): the one its name names, else `target`.
+    let target_hive = node_request_target_hive(payload, &state.hive_id);
     let raw_node_name = payload
         .get("node_name")
         .and_then(|v| v.as_str())
@@ -25708,11 +25904,6 @@ async fn get_node_config_flow(
             "error_code": "INVALID_REQUEST",
             "message": "missing node_name",
         });
-    }
-    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
-        if !hive.trim().is_empty() {
-            target_hive = hive.trim().to_string();
-        }
     }
     let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
@@ -25799,7 +25990,8 @@ async fn get_node_state_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    // The hive its lane takes it for (`read_target`): the one its name names, else `target`.
+    let target_hive = node_request_target_hive(payload, &state.hive_id);
     let raw_node_name = payload
         .get("node_name")
         .and_then(|v| v.as_str())
@@ -25811,11 +26003,6 @@ async fn get_node_state_flow(
             "error_code": "INVALID_REQUEST",
             "message": "missing node_name",
         });
-    }
-    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
-        if !hive.trim().is_empty() {
-            target_hive = hive.trim().to_string();
-        }
     }
     let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
@@ -26176,8 +26363,9 @@ fn local_node_view(
 }
 
 /// The hive a request about one node goes to: the hive its `node_name` names after `@`, else its
-/// `target` (this hive by default). `get_node_status_flow` and its lane (`node_status_lane`) read
-/// it alike, so a status the flow writes here is never taken for a read.
+/// `target` (this hive by default). The status, config and state flows and their lanes
+/// (`read_target`) read it alike, so a status the flow writes here is never taken for a read, and
+/// a read waits on the hive the flow forwards it to.
 fn node_request_target_hive(payload: &serde_json::Value, local_hive: &str) -> String {
     payload
         .get("node_name")
@@ -52524,10 +52712,16 @@ blob:
         let lanes = WorkerLanes::start("test", 4);
         let log = LaneLog::default();
         let (_slow_gate, slow) = tokio::sync::oneshot::channel();
-        lanes.run(RequestLane::Read, gated_request(&log, "slow", slow));
+        lanes.run(
+            RequestLane::Read(ReadTarget::Local),
+            gated_request(&log, "slow", slow),
+        );
         wait_for_lane_entry(&log, "slow start").await;
         let (fast_gate, fast) = tokio::sync::oneshot::channel();
-        lanes.run(RequestLane::Read, gated_request(&log, "fast", fast));
+        lanes.run(
+            RequestLane::Read(ReadTarget::Local),
+            gated_request(&log, "fast", fast),
+        );
         fast_gate
             .send(())
             .expect("the fast read waits for its gate");
@@ -52544,7 +52738,10 @@ blob:
         lanes.run(RequestLane::Ordered, gated_request(&log, "change", change));
         wait_for_lane_entry(&log, "change start").await;
         let (read_gate, read) = tokio::sync::oneshot::channel();
-        lanes.run(RequestLane::Read, gated_request(&log, "read", read));
+        lanes.run(
+            RequestLane::Read(ReadTarget::Local),
+            gated_request(&log, "read", read),
+        );
         read_gate.send(()).expect("the read waits for its gate");
         wait_for_lane_entry(&log, "read end").await;
         assert!(!lane_logged(&log, "change end"));
@@ -52591,7 +52788,10 @@ blob:
         let mut gates = HashMap::new();
         for name in ["a", "b", "c"] {
             let (gate, opened) = tokio::sync::oneshot::channel();
-            lanes.run(RequestLane::Read, gated_request(&log, name, opened));
+            lanes.run(
+                RequestLane::Read(ReadTarget::Local),
+                gated_request(&log, name, opened),
+            );
             gates.insert(name, gate);
         }
         let started = |log: &LaneLog| -> Vec<String> {
@@ -52647,7 +52847,7 @@ blob:
         let lanes = WorkerLanes::start("test", 4);
         let (release, stuck) = std::sync::mpsc::channel::<()>();
         let (started, read_started) = std::sync::mpsc::channel();
-        lanes.run(RequestLane::Read, async move {
+        lanes.run(RequestLane::Read(ReadTarget::Local), async move {
             let _ = started.send(());
             // Blocks its thread until the test releases it, 10 s at most.
             let _ = stuck.recv_timeout(Duration::from_secs(10));
@@ -52666,10 +52866,15 @@ blob:
                 }
             })
         };
-        std::thread::sleep(Duration::from_millis(300));
+        // Up to 5 s on this thread's clock for five ticks: a busy runner only slows them, a runtime
+        // thread the read held would stop them.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ticks.load(Ordering::SeqCst) < 5 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let ticked = ticks.load(Ordering::SeqCst);
         let (done, read_done) = std::sync::mpsc::channel();
-        lanes.run(RequestLane::Read, async move {
+        lanes.run(RequestLane::Read(ReadTarget::Local), async move {
             let _ = done.send(());
         });
         let other_read = read_done.recv_timeout(Duration::from_secs(2));
@@ -52695,7 +52900,7 @@ blob:
         let (started, read_started) = std::sync::mpsc::channel();
         runtime.block_on(async {
             let lanes = WorkerLanes::start("test", 4);
-            lanes.run(RequestLane::Read, async move {
+            lanes.run(RequestLane::Read(ReadTarget::Local), async move {
                 let _ = started.send(());
                 std::future::pending::<()>().await;
             });
@@ -52711,6 +52916,222 @@ blob:
         runtime_stopped
             .recv_timeout(Duration::from_secs(5))
             .expect("the runtime stops with a read still waiting");
+    }
+
+    /// The reads that started, by name, from a lane test's log.
+    fn lane_started(log: &LaneLog) -> Vec<String> {
+        log.lock()
+            .expect("lane log")
+            .iter()
+            .filter_map(|entry| entry.strip_suffix(" start").map(str::to_string))
+            .collect()
+    }
+
+    async fn wait_for_lane_starts(log: &LaneLog, count: usize) {
+        let waited = time::timeout(Duration::from_secs(1), async {
+            while lane_started(log).len() < count {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "{count} reads start: {:?}",
+            lane_started(log)
+        );
+    }
+
+    /// FINDINGS A-199, the review of step 1: a target's reads past WORKER_READS_PER_TARGET_MAX wait
+    /// for one of them to end, and hold nothing meanwhile: another hive's read and a read of this
+    /// hive run to their end. Once the target's reads end, its entry is gone.
+    #[tokio::test]
+    async fn a_target_holds_at_most_its_own_reads() {
+        let lanes = WorkerLanes::start("test", WORKER_CONCURRENT_READS_MAX);
+        let log = LaneLog::default();
+        let silent = ReadTarget::Hive("silentbee".to_string());
+        let mut gates = HashMap::new();
+        for read in 0..=WORKER_READS_PER_TARGET_MAX {
+            let name = format!("silent-{read}");
+            let (gate, opened) = tokio::sync::oneshot::channel();
+            lanes.run(
+                RequestLane::Read(silent.clone()),
+                gated_request(&log, &name, opened),
+            );
+            gates.insert(name, gate);
+        }
+        wait_for_lane_starts(&log, WORKER_READS_PER_TARGET_MAX).await;
+        time::sleep(Duration::from_millis(50)).await;
+        let running = lane_started(&log);
+        assert_eq!(running.len(), WORKER_READS_PER_TARGET_MAX, "{running:?}");
+
+        let (other_gate, other) = tokio::sync::oneshot::channel();
+        lanes.run(
+            RequestLane::Read(ReadTarget::Hive("otherbee".to_string())),
+            gated_request(&log, "other", other),
+        );
+        other_gate
+            .send(())
+            .expect("the other read waits for its gate");
+        wait_for_lane_entry(&log, "other end").await;
+        let (local_gate, local) = tokio::sync::oneshot::channel();
+        lanes.run(
+            RequestLane::Read(ReadTarget::Local),
+            gated_request(&log, "local", local),
+        );
+        local_gate
+            .send(())
+            .expect("the local read waits for its gate");
+        wait_for_lane_entry(&log, "local end").await;
+
+        gates
+            .remove(running[0].as_str())
+            .expect("a running read's gate")
+            .send(())
+            .expect("the read waits for its gate");
+        wait_for_lane_starts(&log, WORKER_READS_PER_TARGET_MAX + 3).await;
+        for (_, gate) in gates.drain() {
+            let _ = gate.send(());
+        }
+        let emptied = time::timeout(Duration::from_secs(1), async {
+            while !lanes.targets.lock().expect("the targets").is_empty() {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(emptied.is_ok(), "no target is kept once its reads end");
+    }
+
+    /// Forwarded reads hold only their own places: with every forwarding place held, a read of
+    /// this hive alone still runs to its end.
+    #[tokio::test]
+    async fn forwarded_reads_never_hold_a_local_read() {
+        let lanes = WorkerLanes::start("test", 2);
+        let log = LaneLog::default();
+        let mut gates = Vec::new();
+        for hive in ["hivea", "hiveb", "hivec"] {
+            let (gate, opened) = tokio::sync::oneshot::channel();
+            lanes.run(
+                RequestLane::Read(ReadTarget::Hive(hive.to_string())),
+                gated_request(&log, hive, opened),
+            );
+            gates.push(gate);
+        }
+        wait_for_lane_starts(&log, 2).await;
+        let (local_gate, local) = tokio::sync::oneshot::channel();
+        lanes.run(
+            RequestLane::Read(ReadTarget::Local),
+            gated_request(&log, "local", local),
+        );
+        local_gate
+            .send(())
+            .expect("the local read waits for its gate");
+        wait_for_lane_entry(&log, "local end").await;
+        let forwarded = lane_started(&log)
+            .into_iter()
+            .filter(|name| name.starts_with("hive"))
+            .count();
+        assert_eq!(forwarded, 2, "the third forwarded read still waits");
+    }
+
+    /// Each read waits on the hive its flow forwards it to (`read_target`): the hive its node's
+    /// name names before `target`, `target` or `hive_id` otherwise, every hive for a fan-out, and
+    /// this hive for the reads that never forward.
+    #[test]
+    fn a_read_waits_on_the_hive_its_flow_forwards_to() {
+        let hive = |name: &str| RequestLane::Read(ReadTarget::Hive(name.to_string()));
+        let local = RequestLane::Read(ReadTarget::Local);
+        for (action, payload, lane) in [
+            ("get_versions", serde_json::json!({}), local.clone()),
+            (
+                "get_versions",
+                serde_json::json!({ "target": "motherbee" }),
+                local.clone(),
+            ),
+            (
+                "get_versions",
+                serde_json::json!({ "target": "worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "list_nodes",
+                serde_json::json!({ "hive_id": "worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "list_runtimes",
+                serde_json::json!({ "target": "worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "get_runtime",
+                serde_json::json!({ "target": "worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "get_node_config",
+                serde_json::json!({ "node_name": "AI.demo@worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "get_node_state",
+                serde_json::json!({ "node_name": "AI.demo", "target": "worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "get_node_config",
+                serde_json::json!({ "node_name": "AI.demo@motherbee", "target": "worker1" }),
+                local.clone(),
+            ),
+            (
+                "list_versions",
+                serde_json::json!({}),
+                RequestLane::Read(ReadTarget::EveryHive),
+            ),
+            (
+                "list_tenant_nodes",
+                serde_json::json!({}),
+                RequestLane::Read(ReadTarget::EveryHive),
+            ),
+            (
+                "hive_status",
+                serde_json::json!({ "target": "worker1" }),
+                local.clone(),
+            ),
+            (
+                "list_hives",
+                serde_json::json!({ "target": "worker1" }),
+                local.clone(),
+            ),
+        ] {
+            assert_eq!(
+                admin_request_lane(action, &payload, "motherbee"),
+                lane,
+                "{action} {payload}"
+            );
+        }
+        for (msg, payload, lane) in [
+            (
+                "GET_VERSIONS",
+                serde_json::json!({ "target": "worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "NODE_STATE_GET",
+                serde_json::json!({ "node_name": "AI.demo@worker1" }),
+                hive("worker1"),
+            ),
+            (
+                "INVENTORY_REQUEST",
+                serde_json::json!({ "target": "worker1" }),
+                local.clone(),
+            ),
+        ] {
+            assert_eq!(
+                system_request_lane(Some(msg), &payload, "motherbee"),
+                lane,
+                "{msg} {payload}"
+            );
+        }
     }
 
     /// Which requests are reads: the ones read in the code to write and change nothing. Every other
@@ -52737,9 +53158,11 @@ blob:
             "list_hives",
             "get_hive",
         ] {
-            assert_eq!(
-                admin_request_lane(action, &none, "motherbee"),
-                RequestLane::Read,
+            assert!(
+                matches!(
+                    admin_request_lane(action, &none, "motherbee"),
+                    RequestLane::Read(_)
+                ),
                 "{action}"
             );
         }
@@ -52776,9 +53199,11 @@ blob:
             "NODE_CONFIG_GET",
             "NODE_STATE_GET",
         ] {
-            assert_eq!(
-                system_request_lane(Some(msg), &none, "worker1"),
-                RequestLane::Read,
+            assert!(
+                matches!(
+                    system_request_lane(Some(msg), &none, "worker1"),
+                    RequestLane::Read(_)
+                ),
                 "{msg}"
             );
         }
@@ -52830,15 +53255,15 @@ blob:
             (serde_json::json!({}), RequestLane::Ordered),
             (
                 serde_json::json!({"node_name": "AI.demo@worker1"}),
-                RequestLane::Read,
+                RequestLane::Read(ReadTarget::Hive("worker1".to_string())),
             ),
             (
                 serde_json::json!({"node_name": "AI.demo", "target": "worker1"}),
-                RequestLane::Read,
+                RequestLane::Read(ReadTarget::Hive("worker1".to_string())),
             ),
             (
                 serde_json::json!({"node_name": "AI.demo", "hive_id": "worker1"}),
-                RequestLane::Read,
+                RequestLane::Read(ReadTarget::Hive("worker1".to_string())),
             ),
         ] {
             assert_eq!(
@@ -53038,8 +53463,9 @@ blob:
         assert_eq!(read.routing.trace_id, "config-meanwhile");
     }
 
-    /// The admin worker runs at most WORKER_CONCURRENT_READS_MAX reads at once: with that many
-    /// forwards waiting, one more read waits for one of them to end, and a change still goes ahead.
+    /// The admin worker runs at most WORKER_CONCURRENT_READS_MAX forwarded reads at once: with
+    /// that many forwards waiting, each on a hive of its own, one more waits for one of them to
+    /// end, and a read of this hive and a change still go ahead.
     #[tokio::test]
     async fn the_admin_worker_bounds_its_reads() {
         let mut harness = admin_worker_for_tests().await;
@@ -53048,7 +53474,7 @@ blob:
                 .inject(test_admin_command(
                     &format!("read-{read}"),
                     "get_versions",
-                    serde_json::json!({ "target": "workerbee" }),
+                    serde_json::json!({ "target": format!("hive{read}") }),
                 ))
                 .await
                 .expect("inject get_versions");
@@ -53069,6 +53495,18 @@ blob:
 
         harness
             .inject(test_admin_command(
+                "status-meanwhile",
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject hive_status");
+        let status = next_outgoing_now(&mut harness, "hive_status answered").await;
+        assert_eq!(status.meta.action.as_deref(), Some("hive_status"));
+        assert_eq!(status.routing.trace_id, "status-meanwhile");
+
+        harness
+            .inject(test_admin_command(
                 "spawn-meanwhile",
                 "run_node",
                 spawn_on_workerbee("AI.demo@workerbee"),
@@ -53083,7 +53521,7 @@ blob:
                 &forwarded[0],
                 SYSTEM_KIND,
                 "GET_VERSIONS_RESPONSE",
-                serde_json::json!({ "status": "ok", "hive": { "hive_id": "workerbee" } }),
+                serde_json::json!({ "status": "ok", "hive": { "hive_id": "hive0" } }),
             ))
             .await
             .expect("inject one answer");
@@ -53102,6 +53540,146 @@ blob:
                 .all(|ask| ask.routing.trace_id != next[1].routing.trace_id),
             "a read of its own, not one asked again"
         );
+    }
+
+    /// FINDINGS A-199, the review of step 1: a hive that does not answer, asked again and again,
+    /// holds WORKER_READS_PER_TARGET_MAX forwards and no more; a read of another hive and a read of
+    /// this one go ahead meanwhile, and one answer lets the read that waited go.
+    #[tokio::test]
+    async fn a_silent_hive_holds_only_its_own_reads() {
+        let mut harness = admin_worker_for_tests().await;
+        for read in 0..=WORKER_READS_PER_TARGET_MAX {
+            harness
+                .inject(test_admin_command(
+                    &format!("silent-{read}"),
+                    "get_versions",
+                    serde_json::json!({ "target": "workerbee" }),
+                ))
+                .await
+                .expect("inject get_versions");
+        }
+        let mut forwarded = Vec::new();
+        for _ in 0..WORKER_READS_PER_TARGET_MAX {
+            let ask = next_outgoing_now(&mut harness, "GET_VERSIONS forwarded").await;
+            assert_unicast_destination(&ask.routing.dst, "SY.orchestrator@workerbee");
+            forwarded.push(ask);
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(100))
+                .await
+                .is_none(),
+            "the silent hive's read past its bound waits"
+        );
+
+        harness
+            .inject(test_admin_command(
+                "other-meanwhile",
+                "get_versions",
+                serde_json::json!({ "target": "otherbee" }),
+            ))
+            .await
+            .expect("inject get_versions for another hive");
+        let other = next_outgoing_now(&mut harness, "another hive's read forwarded").await;
+        assert_unicast_destination(&other.routing.dst, "SY.orchestrator@otherbee");
+        harness
+            .inject(test_admin_command(
+                "status-meanwhile",
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject hive_status");
+        let status = next_outgoing_now(&mut harness, "hive_status answered").await;
+        assert_eq!(status.meta.action.as_deref(), Some("hive_status"));
+
+        harness
+            .inject(test_response_for(
+                &forwarded[0],
+                SYSTEM_KIND,
+                "GET_VERSIONS_RESPONSE",
+                serde_json::json!({ "status": "ok", "hive": { "hive_id": "workerbee" } }),
+            ))
+            .await
+            .expect("inject one answer");
+        let mut next = [
+            next_outgoing_now(&mut harness, "an answer or the read that waited").await,
+            next_outgoing_now(&mut harness, "an answer or the read that waited").await,
+        ];
+        next.sort_by_key(|msg| msg.meta.msg_type.clone());
+        assert_eq!(next[0].meta.action.as_deref(), Some("get_versions"));
+        assert_eq!(next[1].meta.msg.as_deref(), Some("GET_VERSIONS"));
+        assert_unicast_destination(&next[1].routing.dst, "SY.orchestrator@workerbee");
+        assert!(
+            forwarded
+                .iter()
+                .all(|ask| ask.routing.trace_id != next[1].routing.trace_id),
+            "the read that waited, not one asked again"
+        );
+    }
+
+    /// A command whose flow panics is answered INTERNAL_ERROR, and the next command runs.
+    #[tokio::test]
+    async fn a_command_that_panics_is_answered() {
+        let mut harness = admin_worker_for_tests().await;
+        harness
+            .inject(test_admin_command(
+                "panics",
+                "test_panic",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject test_panic");
+        let answer = next_outgoing_now(&mut harness, "the panic answered").await;
+        assert_eq!(answer.routing.trace_id, "panics");
+        assert_eq!(answer.meta.action.as_deref(), Some("test_panic"));
+        assert_eq!(answer.payload["status"], "error");
+        assert_eq!(answer.payload["error_code"], "INTERNAL_ERROR");
+        harness
+            .inject(test_admin_command(
+                "after",
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject hive_status");
+        let after = next_outgoing_now(&mut harness, "the next command answered").await;
+        assert_eq!(after.routing.trace_id, "after");
+        assert_eq!(after.payload["status"], "ok");
+    }
+
+    /// A system request whose flow panics is answered `<msg>_RESPONSE` INTERNAL_ERROR; the answers
+    /// it gets by name.
+    #[tokio::test]
+    async fn a_system_request_that_panics_is_answered() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+        tokio::spawn(run_system_worker(state, client, system_rx));
+        let mut msg = test_system_message("panics", "TEST_PANIC", serde_json::json!({}));
+        msg.routing.src_l2_name = Some("SY.orchestrator@motherbee".to_string());
+        harness.inject(msg).await.expect("inject TEST_PANIC");
+        let answer = harness
+            .next_outgoing_within(Duration::from_secs(10))
+            .await
+            .expect("the panic answered");
+        assert_eq!(answer.routing.trace_id, "panics");
+        assert_eq!(answer.meta.msg.as_deref(), Some("TEST_PANIC_RESPONSE"));
+        assert_eq!(answer.payload["error_code"], "INTERNAL_ERROR");
+
+        assert_eq!(
+            system_response_msg("GET_VERSIONS").as_deref(),
+            Some("GET_VERSIONS_RESPONSE")
+        );
+        assert_eq!(
+            system_response_msg("INVENTORY_REQUEST").as_deref(),
+            Some("INVENTORY_RESPONSE")
+        );
+        assert_eq!(system_response_msg(MSG_NODE_HELP), None);
+        assert_eq!(system_response_msg(""), None);
     }
 
     /// The system worker's reads run apart too: a NODE_CONFIG_GET forwarded to a hive that does not

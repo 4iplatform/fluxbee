@@ -74,8 +74,9 @@ launcher.
 
 - **Since 0.1.127 (FINDINGS A-199, step 1), the reads run apart:** `get_node_config`,
   `get_node_status` of another hive's node, `list_nodes`, `get_versions` and the other reads each
-  run in a task of their own, at most 16 at once per worker
-  ([SY.orchestrator](nodes/sy-orchestrator.md#messages)). A read no longer waits behind an action,
+  run in a task of their own, at most 16 of this hive's and 16 forwarded at once per worker, at
+  most 4 of them waiting on one hive ([SY.orchestrator](nodes/sy-orchestrator.md#messages)). A read
+  no longer waits behind an action,
   and a read that waits holds nothing. The node actions and every other change still run one at a
   time, in arrival order.
 - **Still future work:** running node actions on different nodes concurrently (step 2; per-node

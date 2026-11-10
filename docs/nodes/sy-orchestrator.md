@@ -910,8 +910,13 @@ handshake, is never admitted on the motherbee.
 **Reads run apart; everything else one at a time** (FINDINGS A-199, step 1, since 0.1.127). Each
 worker hands a message to one of two lanes once the checks above passed (`WorkerLanes`):
 
-- **A read** runs in a task of its own, at most 16 at once per worker
-  (`WORKER_CONCURRENT_READS_MAX`); one more waits for one of them to end. The reads are the ones
+- **A read** runs in a task of its own. A read of this hive alone takes one of 16 places per
+  worker (`WORKER_CONCURRENT_READS_MAX`); a read that waits on another hive (that hive, or every
+  hive for list_versions and list_tenant_nodes) takes one of its target's 4 places
+  (`WORKER_READS_PER_TARGET_MAX`), then one of 16 others. A hive that does not answer, asked again
+  and again, then holds 4 forwarding places and no local read's (the review of step 1). One more
+  read of a kind waits for one of its kind to end. Each read's target is the hive its flow
+  forwards it to, found with the function the flow uses (`read_target`). The reads are the ones
   read in the code to write and change nothing (`admin_request_lane`, `system_request_lane`):
   hive_status, get_storage, list_nodes, list_tenant_nodes, list_versions, get_versions,
   list_runtimes, get_runtime, list_deployments, get_deployments, list_drift_alerts,
@@ -930,9 +935,10 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 - **Everything else**, every change, `node_help` and a message it does not know included, runs one
   at a time, in arrival order, as every message did before: a change still waits for the one
   before it, a `core_rollback` (up to 240 s) or a forward to a hive that does not answer (45 s)
-  included. A message that panics ends neither lane.
-- A read forwarded to a hive that does not answer holds its place for up to 45 s, and nothing
-  else. A read whose caller gave up still runs to its bound.
+  included. A message that panics ends neither lane, and its caller is answered `INTERNAL_ERROR`
+  (an admin command; a system request with its `<msg>_RESPONSE`).
+- A read forwarded to a hive that does not answer holds its place, and one of that hive's, for up
+  to 45 s, and nothing else. A read whose caller gave up still runs to its bound.
 
 **Pages, and answers that do not fit a frame** (FINDINGS A-198):
 
