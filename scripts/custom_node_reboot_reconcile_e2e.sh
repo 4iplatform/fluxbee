@@ -573,7 +573,9 @@ cleanup() {
   remove_node_instance "$IO_NODE_NAME"
   remove_node_instance "$FRONTDESK_NODE_NAME"
   if [[ -f "$manifest_backup" ]]; then
-    as_root_local install -m 0644 "$manifest_backup" "$MANIFEST_PATH" >/dev/null 2>&1 || true
+    # Under the manifest's lock, as every writer of it (FINDINGS A-171).
+    as_root_local flock -w 60 "$MANIFEST_PATH.lock" \
+      install -m 0644 "$manifest_backup" "$MANIFEST_PATH" >/dev/null 2>&1 || true
   fi
   as_root_local rm -rf "$DIST_AI_DIR" "$DIST_IO_DIR" "$SCENARIO_DIR" >/dev/null 2>&1 || true
   rm -rf "$tmpdir"

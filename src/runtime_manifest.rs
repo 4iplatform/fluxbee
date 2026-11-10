@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -105,6 +107,76 @@ pub fn load_runtime_manifest_from_paths(
         Ok(None)
     } else {
         Err(errors.join("; "))
+    }
+}
+
+/// How long a writer of a runtimes manifest waits for its lock (`lock_runtime_manifest`): above
+/// the longest hold, SY.admin's `remove_runtime_version`, whose read of the version's use (30 s)
+/// comes between its read of the manifest and its write.
+pub const RUNTIME_MANIFEST_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// The file every writer of a runtimes manifest locks for its read-modify-write (FINDINGS A-171):
+/// `<manifest>.lock`, next to it. SY.admin (`publish_runtime_package`, `remove_runtime_version`,
+/// `reset_base_runtime`), `fluxbee-publish`, `scripts/publish-runtime.sh` and the .deb's
+/// `fluxbee-seed-runtimes` each hold one exclusive flock on it from their read of the manifest to
+/// their write, so none loses another's change. The file stays: removing it would let a writer lock
+/// a new one beside one still held.
+pub fn runtime_manifest_lock_path(manifest_path: &Path) -> PathBuf {
+    let mut path = manifest_path.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+/// The runtimes manifest's lock, held until dropped: the kernel releases the flock with its
+/// descriptor, however its holder ends.
+#[derive(Debug)]
+pub struct RuntimeManifestLock {
+    _file: fs::File,
+}
+
+/// Takes the lock of the runtimes manifest at `manifest_path` (`runtime_manifest_lock_path`),
+/// waiting up to `wait` while another writer holds it; past that, an error that says so.
+pub fn lock_runtime_manifest(
+    manifest_path: &Path,
+    wait: Duration,
+) -> Result<RuntimeManifestLock, String> {
+    let path = runtime_manifest_lock_path(manifest_path);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .open(&path)
+        .map_err(|err| {
+            format!(
+                "runtime manifest lock: open '{}' failed: {}",
+                path.display(),
+                err
+            )
+        })?;
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: the descriptor is open and owned by `file` for the whole call.
+        if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) }
+            == 0
+        {
+            return Ok(RuntimeManifestLock { _file: file });
+        }
+        let err = std::io::Error::last_os_error();
+        if !matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
+            return Err(format!(
+                "runtime manifest lock: flock '{}' failed: {}",
+                path.display(),
+                err
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "runtime manifest lock: another writer held '{}' for {}s",
+                path.display(),
+                wait.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -255,5 +327,39 @@ mod tests {
         assert!(runtime_manifest_write_v2_gate_enabled(Some("true")));
         assert!(runtime_manifest_write_v2_gate_enabled(Some("YES")));
         assert!(runtime_manifest_write_v2_gate_enabled(Some("on")));
+    }
+
+    /// FINDINGS A-171: one writer of the manifest at a time. While one holds its lock, next to the
+    /// manifest, another waits, and past its wait gives up and says so; once the first is done, the
+    /// one waiting takes it. The lock file stays.
+    #[test]
+    fn a_second_writer_waits_for_the_manifests_lock() {
+        let dir = std::env::temp_dir().join(format!("runtime-manifest-lock-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create dir");
+        let manifest = dir.join("manifest.json");
+        assert_eq!(
+            runtime_manifest_lock_path(&manifest),
+            dir.join("manifest.json.lock")
+        );
+        let first = lock_runtime_manifest(&manifest, Duration::ZERO).expect("the first");
+        let refused = lock_runtime_manifest(&manifest, Duration::from_millis(200))
+            .expect_err("held by the first");
+        assert!(refused.contains("another writer held"), "{refused}");
+
+        let waiting = std::thread::spawn({
+            let manifest = manifest.clone();
+            move || {
+                let started = Instant::now();
+                lock_runtime_manifest(&manifest, Duration::from_secs(10))
+                    .map(|lock| (lock, started.elapsed()))
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        drop(first);
+        let (second, waited) = waiting.join().expect("joined").expect("the second");
+        assert!(waited >= Duration::from_millis(250), "{waited:?}");
+        drop(second);
+        assert!(runtime_manifest_lock_path(&manifest).is_file());
+        let _ = fs::remove_dir_all(dir);
     }
 }

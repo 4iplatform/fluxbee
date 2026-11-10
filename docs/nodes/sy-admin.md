@@ -1548,7 +1548,15 @@ the same entries (`caller_hive_role`).
 - `<storage.path>/modules/`: the `/modules` store.
 - `publish_runtime_package`, `remove_runtime_version` and `reset_base_runtime` rewrite the
   motherbee's `dist/runtimes` manifest under one lock (`runtime_manifest_lock`); each refuses to
-  run off the motherbee (`NOT_PRIMARY`).
+  run off the motherbee (`NOT_PRIMARY`). Each also holds the manifest's file lock,
+  `dist/runtimes/manifest.json.lock`, from its read of the manifest to its write
+  (`lock_runtime_manifest`, FINDINGS A-171), the flock every writer outside SY.admin takes too
+  (`fluxbee-publish`, `scripts/publish-runtime.sh`, the .deb's seed): `remove_runtime_version`
+  and `reset_base_runtime` before they read it (`lock_local_runtime_manifest`, across the 30 s read
+  of the version's use for a removal), `publish_runtime_package` in the shared install. A writer
+  waits for another up to 60 s (`RUNTIME_MANIFEST_LOCK_WAIT`): past that a removal answers
+  `RUNTIME_REMOVE_FAILED`, a reset `RUNTIME_RESET_FAILED` and a publish `SERVICE_FAILED`, with the
+  manifest untouched.
 
 ## Failure behavior
 

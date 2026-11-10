@@ -223,6 +223,36 @@ bash "$PUBLISH" --runtime io.api --version "$VER" \
   --dist-root "$D6" --prune-missing >/dev/null 2>&1 || rc=$?
 check "rejected without --set-current" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
 
+echo "== T11: one writer of the manifest at a time (FINDINGS A-171) =="
+D11="$WORK/t11"; seed_artifacts "$D11" "$VER"
+run_seed "$D11" >/dev/null
+M11="$D11/runtimes/manifest.json"
+check "the lock sits next to the manifest" "$([ -f "$M11.lock" ] && echo yes || echo no)" "yes"
+mkdir -p "$WORK/t11-src"; printf '#!/bin/sh\ntrue\n' >"$WORK/t11-src/io-api"; chmod 0755 "$WORK/t11-src/io-api"
+# Another writer (SY.admin, say) holds the lock for 3 s; a hand publish waits for it, then writes.
+flock "$M11.lock" sh -c 'touch "$1"; sleep 3' _ "$WORK/t11-held" &
+holder=$!
+until [ -f "$WORK/t11-held" ]; do sleep 0.1; done
+bash "$PUBLISH" --runtime io.api --version 9.9.11 --binary "$WORK/t11-src/io-api" \
+  --dist-root "$D11" --set-current >/dev/null &
+publisher=$!
+sleep 1
+check "the publish waits while another writer holds the lock" \
+  "$(q "$M11" "'9.9.11' in d['runtimes']['io.api']['available']")" "False"
+wait "$holder"
+rc=0; wait "$publisher" || rc=$?
+check "and writes once the lock is free" "$rc $(q "$M11" "d['runtimes']['io.api']['current']")" "0 9.9.11"
+# The seed's restore waits for it too; the hand publish stays current through the seed.
+flock "$M11.lock" sh -c 'touch "$1"; sleep 2' _ "$WORK/t11-held-2" &
+holder=$!
+until [ -f "$WORK/t11-held-2" ]; do sleep 0.1; done
+started=$SECONDS
+rc=0; run_seed "$D11" >/dev/null 2>&1 || rc=$?
+waited=$((SECONDS - started))
+wait "$holder"
+check "the seed runs once the lock is free" "$rc $([ "$waited" -ge 1 ] && echo waited || echo "did not wait")" "0 waited"
+check "the hand publish stays current" "$(q "$M11" "d['runtimes']['io.api']['current']")" "9.9.11"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

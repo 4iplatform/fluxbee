@@ -31,6 +31,11 @@ SNAPSHOT="${FLUXBEE_MANIFEST_SNAPSHOT:-/var/lib/fluxbee/state/runtime-manifest.p
 
 RUNTIMES_ROOT="$DIST_ROOT/runtimes"
 LIVE_MANIFEST="$RUNTIMES_ROOT/manifest.json"
+# The manifest's lock (FINDINGS A-171): every writer of the manifest holds an flock on it from its
+# read to its write. The restore below holds it; each publish takes it on its own, so it is free
+# before the first one.
+MANIFEST_LOCK="$LIVE_MANIFEST.lock"
+MANIFEST_LOCK_WAIT_SECS=60
 
 VER="${FLUXBEE_BASE_RUNTIME_VERSION:-}"
 [ -n "$VER" ] || VER="$(cat "$VERSION_FILE" 2>/dev/null || true)"
@@ -90,22 +95,30 @@ raise SystemExit(0 if isinstance(d, dict) else 1)
 
 # Decide on VALIDITY, not existence. The merger swallows a parse error and starts from a blank
 # document, so a corrupt-but-present manifest would silently erase every hot-published runtime —
-# and then the snapshot would be deleted on the way out, taking the only copy with it.
-if ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$SNAPSHOT" ]; then
-  if [ -f "$LIVE_MANIFEST" ]; then
-    cp -p "$LIVE_MANIFEST" "$LIVE_MANIFEST.corrupt.$(date +%s)" 2>/dev/null || true
-    echo "fluxbee-seed-runtimes: the live runtimes manifest does not parse; kept a .corrupt copy" >&2
+# and then the snapshot would be deleted on the way out, taking the only copy with it. The check
+# and the restore hold the manifest's lock, as every writer of it does.
+{
+  if ! flock -w "$MANIFEST_LOCK_WAIT_SECS" 9; then
+    echo "fluxbee-seed-runtimes: ERROR another writer of $LIVE_MANIFEST held its lock" \
+      "($MANIFEST_LOCK) for ${MANIFEST_LOCK_WAIT_SECS}s; nothing was restored or registered" >&2
+    exit 1
   fi
-  install -m 0644 "$SNAPSHOT" "$LIVE_MANIFEST"
-  echo "fluxbee-seed-runtimes: restored the pre-upgrade runtimes manifest from $SNAPSHOT"
-elif ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$LIVE_MANIFEST" ]; then
-  # Present, unparseable, and no snapshot to fall back on. Refuse: merging would silently drop
-  # whatever it holds.
-  echo "fluxbee-seed-runtimes: ERROR $LIVE_MANIFEST does not parse and there is no snapshot to" >&2
-  echo "  restore from. Refusing to merge over it (that would erase hot-published runtimes)." >&2
-  echo "  Inspect it, fix or move it aside, then re-run: sudo fluxbee-seed-runtimes" >&2
-  exit 1
-fi
+  if ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$SNAPSHOT" ]; then
+    if [ -f "$LIVE_MANIFEST" ]; then
+      cp -p "$LIVE_MANIFEST" "$LIVE_MANIFEST.corrupt.$(date +%s)" 2>/dev/null || true
+      echo "fluxbee-seed-runtimes: the live runtimes manifest does not parse; kept a .corrupt copy" >&2
+    fi
+    install -m 0644 "$SNAPSHOT" "$LIVE_MANIFEST"
+    echo "fluxbee-seed-runtimes: restored the pre-upgrade runtimes manifest from $SNAPSHOT"
+  elif ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$LIVE_MANIFEST" ]; then
+    # Present, unparseable, and no snapshot to fall back on. Refuse: merging would silently drop
+    # whatever it holds.
+    echo "fluxbee-seed-runtimes: ERROR $LIVE_MANIFEST does not parse and there is no snapshot to" >&2
+    echo "  restore from. Refusing to merge over it (that would erase hot-published runtimes)." >&2
+    echo "  Inspect it, fix or move it aside, then re-run: sudo fluxbee-seed-runtimes" >&2
+    exit 1
+  fi
+} 9>>"$MANIFEST_LOCK"
 
 rc=0
 demotions=""

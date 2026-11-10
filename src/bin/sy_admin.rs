@@ -62,8 +62,9 @@ use fluxbee_sdk::{
 use json_router::ai_settings;
 use json_router::mesh_reply::{self, PageAsk, REPLY_TOO_LARGE};
 use json_router::runtime_manifest::{
-    load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
-    write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
+    load_runtime_manifest_from_paths, lock_runtime_manifest,
+    runtime_manifest_write_v2_gate_enabled_from_env, write_runtime_manifest_file_atomic,
+    RuntimeManifest, RuntimeManifestEntry, RuntimeManifestLock, RUNTIME_MANIFEST_LOCK_WAIT,
 };
 use json_router::runtime_package::{
     install_validated_package_with_options, validate_package, PackageMetadata,
@@ -360,7 +361,8 @@ struct AdminContext {
     /// Serializes the writers of the motherbee's runtime manifest (publish_runtime_package,
     /// remove_runtime_version, reset_base_runtime), held across their awaits: each reads, decides
     /// and rewrites the whole file, and since every mesh command runs in its own task (A-68) two
-    /// can overlap.
+    /// can overlap. Each also holds the manifest's file lock from its read to its write
+    /// (`lock_runtime_manifest`, FINDINGS A-171), as the writers outside SY.admin do.
     runtime_manifest_lock: Arc<Mutex<()>>,
     /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
     command_log_lock: Arc<std::sync::Mutex<()>>,
@@ -17547,6 +17549,25 @@ fn load_local_runtime_manifest() -> Result<Option<RuntimeManifest>, String> {
     load_runtime_manifest_from_paths(&[PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)])
 }
 
+/// The motherbee's runtimes manifest's file lock (FINDINGS A-171), which every writer of the
+/// manifest holds from its read to its write, the ones outside SY.admin included (a hand publish,
+/// the .deb's seed): taken off the async workers, since another writer may hold it a while. None
+/// when there is no manifest, which then has nothing to read or write.
+async fn lock_local_runtime_manifest() -> Result<Option<RuntimeManifestLock>, String> {
+    if !Path::new(DIST_RUNTIME_MANIFEST_PATH).exists() {
+        return Ok(None);
+    }
+    tokio::task::spawn_blocking(|| {
+        lock_runtime_manifest(
+            Path::new(DIST_RUNTIME_MANIFEST_PATH),
+            RUNTIME_MANIFEST_LOCK_WAIT,
+        )
+    })
+    .await
+    .map_err(|err| format!("runtime manifest lock: {err}"))?
+    .map(Some)
+}
+
 fn runtime_manifest_entry_map_local(
     manifest: &RuntimeManifest,
 ) -> Result<BTreeMap<String, RuntimeManifestEntry>, String> {
@@ -18399,6 +18420,23 @@ async fn handle_remove_runtime_version(
         time::sleep(Duration::from_millis(hold_ms)).await;
     }
 
+    // Held from the read to the write, and the write back after a failed removal (FINDINGS A-171).
+    let _manifest_file_lock = match lock_local_runtime_manifest().await {
+        Ok(lock) => lock,
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "RUNTIME_REMOVE_FAILED",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
     let manifest = match load_local_runtime_manifest() {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
@@ -18832,6 +18870,11 @@ async fn handle_reset_base_runtime(
     }
 
     let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
+    // Held from the read to the write (FINDINGS A-171).
+    let _manifest_file_lock = match lock_local_runtime_manifest().await {
+        Ok(lock) => lock,
+        Err(err) => return refuse(409, "RUNTIME_RESET_FAILED", err),
+    };
     let manifest = match load_local_runtime_manifest() {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
@@ -34780,6 +34823,34 @@ mod tests {
         assert!(is_package_version_local(base, "0.1.89"));
         assert!(!is_package_version_local(base, "0.1.88-gate1"));
         assert!(!is_package_version_local(&entries["wf.router"], "0.0.4"));
+    }
+
+    /// FINDINGS A-171: SY.admin's writers of the runtimes manifest hold its file lock from their read
+    /// to their write, as the writers outside SY.admin do: remove_runtime_version (its write back
+    /// after a failed removal included) and reset_base_runtime take it before they read the
+    /// manifest; publish_runtime_package takes it in the shared install
+    /// (`update_runtime_manifest_with_package_with_options`, tested there).
+    #[test]
+    fn the_manifest_writers_hold_its_file_lock_from_read_to_write() {
+        let source = include_str!("sy_admin.rs");
+        for handler in [
+            "async fn handle_remove_runtime_version(",
+            "async fn handle_reset_base_runtime(",
+        ] {
+            let start = source.find(handler).expect("the handler");
+            let body = &source[start..start + source[start..].find("\n}\n").expect("its end")];
+            let lock = body
+                .find("lock_local_runtime_manifest().await")
+                .expect("the file lock");
+            let read = body
+                .find("load_local_runtime_manifest()")
+                .expect("the read");
+            let last_write = body
+                .rfind("write_runtime_manifest_file_atomic(")
+                .expect("the write");
+            assert!(lock < read && read < last_write, "{handler}");
+            assert_eq!(body.matches("lock_local_runtime_manifest()").count(), 1);
+        }
     }
 
     /// The executor runs it as the operator, and no mesh caller reaches it, Archi included.

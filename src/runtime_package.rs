@@ -8,8 +8,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::runtime_manifest::{
-    load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
-    write_runtime_manifest_file_atomic, RuntimeManifestEntry,
+    load_runtime_manifest_from_paths, lock_runtime_manifest,
+    runtime_manifest_write_v2_gate_enabled_from_env, write_runtime_manifest_file_atomic,
+    RuntimeManifestEntry, RUNTIME_MANIFEST_LOCK_WAIT,
 };
 
 pub const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
@@ -697,6 +698,10 @@ pub fn update_runtime_manifest_with_package_with_options(
     validated: &ValidatedPackage,
     set_current: bool,
 ) -> Result<u64, String> {
+    // One writer of the manifest at a time, from its read to its write (FINDINGS A-171): SY.admin's
+    // publish and fluxbee-publish come here, the scripts take the same lock.
+    let _manifest_lock = lock_runtime_manifest(manifest_path, RUNTIME_MANIFEST_LOCK_WAIT)
+        .map_err(|err| format!("manifest update failed: {err}"))?;
     let maybe_manifest =
         load_runtime_manifest_from_paths(&[manifest_path.to_path_buf()]).map_err(|err| {
             format!(
@@ -1063,6 +1068,75 @@ mod tests {
                 .is_some_and(|values| values.iter().any(|value| value == "1.1.0")),
             "entry={entry:?}"
         );
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    /// FINDINGS A-171: a manifest update reads and writes under the manifest's lock. While another
+    /// writer holds it (a hand publish, the .deb's seed) between its read and its write, the update
+    /// waits, then writes on what that writer left: its runtime and this one's are both in the
+    /// manifest. Without the lock the update would read before the other's write, which would
+    /// then drop this one's runtime.
+    #[test]
+    fn a_manifest_update_waits_for_the_writer_that_holds_its_lock() {
+        use crate::runtime_manifest::lock_runtime_manifest;
+        use std::time::{Duration, Instant};
+
+        let package_dir = test_temp_dir("locked-src");
+        write_file(
+            &package_dir.join("package.json"),
+            "{\n  \"name\": \"io.api\",\n  \"version\": \"1.1.0\",\n  \"type\": \"full_runtime\"\n}",
+        );
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho ok\n");
+        make_executable(&start_sh);
+
+        let dist_root = test_temp_dir("locked-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        // Another writer takes the lock and reads the manifest; it writes its runtime a while
+        // later, then lets go.
+        let held = lock_runtime_manifest(&manifest_path, Duration::ZERO).expect("held");
+        let mut theirs = load_runtime_manifest_from_paths(std::slice::from_ref(&manifest_path))
+            .expect("load")
+            .expect("there");
+        theirs.runtimes["wf.router"] =
+            serde_json::json!({ "available": ["0.0.4"], "current": "0.0.4" });
+        let other = std::thread::spawn({
+            let manifest_path = manifest_path.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(300));
+                write_runtime_manifest_file_atomic(&manifest_path, &theirs, false)
+                    .expect("the other writer's write");
+                drop(held);
+            }
+        });
+        let validated = validate_package(&package_dir, None).expect("validate source");
+        let started = Instant::now();
+        update_runtime_manifest_with_package(&manifest_path, &validated).expect("update");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "{:?}",
+            started.elapsed()
+        );
+        other.join().expect("the other writer");
+        let updated = load_runtime_manifest_from_paths(std::slice::from_ref(&manifest_path))
+            .expect("load manifest")
+            .expect("manifest should exist");
+        assert_eq!(updated.runtimes["wf.router"]["current"], "0.0.4");
+        assert_eq!(updated.runtimes["io.api"]["current"], "1.1.0");
 
         let _ = fs::remove_dir_all(package_dir);
         let _ = fs::remove_dir_all(dist_root);

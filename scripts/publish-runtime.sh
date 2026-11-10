@@ -39,6 +39,9 @@ Notes:
   - Writes the manifest last, once every file of the version is in place:
     <dist-root>/runtimes/manifest.json. SY.orchestrator moves running nodes onto a version as
     soon as the manifest names it, so the manifest never names a version that is not all there.
+  - Holds the manifest's lock, <dist-root>/runtimes/manifest.json.lock, from its read of the
+    manifest to its write, as every writer of it does (SY.admin, fluxbee-publish, the .deb's
+    seed): waits for another writer up to 60 s, then fails with the manifest untouched.
 EOF
 }
 
@@ -161,6 +164,7 @@ done
 
 require_cmd python3
 require_cmd sha256sum
+require_cmd flock
 
 SUDO=""
 if [[ "$USE_SUDO" == "1" ]]; then
@@ -171,6 +175,14 @@ RUNTIMES_ROOT="$DIST_ROOT/runtimes"
 RUNTIME_DIR="$RUNTIMES_ROOT/$RUNTIME/$VERSION"
 BIN_DIR="$RUNTIME_DIR/bin"
 MANIFEST_PATH="$RUNTIMES_ROOT/manifest.json"
+# One writer of the manifest at a time (FINDINGS A-171): SY.admin, fluxbee-publish, this script and
+# the .deb's seed each hold an flock on this file, next to the manifest, from their read of it to
+# their write, so none loses another's change. The file stays: removing it would let a writer lock
+# a new one beside one still held.
+MANIFEST_LOCK="$MANIFEST_PATH.lock"
+# How long this script waits for another writer: above the longest hold, SY.admin's
+# remove_runtime_version, whose read of the version's use (30 s) comes between its read and write.
+MANIFEST_LOCK_WAIT_SECS=60
 START_SH="$BIN_DIR/start.sh"
 
 # The version the installed package brought is the way back from a hand publish
@@ -223,7 +235,14 @@ for file in ${FILES[@]+"${FILES[@]}"}; do
 done
 
 # The manifest last: from here on SY.orchestrator may launch the version, and Syncthing carries
-# it to the workers.
+# it to the workers. Under its lock, from the read to the write.
+[[ -e "$MANIFEST_LOCK" ]] || $SUDO touch "$MANIFEST_LOCK"
+exec 9<"$MANIFEST_LOCK"
+if ! flock -w "$MANIFEST_LOCK_WAIT_SECS" 9; then
+  echo "Error: another writer of $MANIFEST_PATH held its lock ($MANIFEST_LOCK) for" \
+    "${MANIFEST_LOCK_WAIT_SECS}s; the manifest is untouched" >&2
+  exit 1
+fi
 tmp_manifest="$(mktemp)"
 python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" "$PRUNE_MISSING" "$PACKAGE" >"$tmp_manifest" <<'PY'
 import datetime
@@ -302,6 +321,7 @@ PY
 
 $SUDO install -m 0644 "$tmp_manifest" "$MANIFEST_PATH"
 rm -f "$tmp_manifest"
+exec 9<&-
 
 manifest_version="$(python3 - "$MANIFEST_PATH" <<'PY'
 import json, sys
