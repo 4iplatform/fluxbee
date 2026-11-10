@@ -165,6 +165,8 @@ no change required
     A-213's and A-224's orchestrator, A-229 and A-230, and from its review round A-235 (Archi's
     redeploy that lost each node) and A-236 (a removed ingress's SY.edge). Its deploy saw A-199
     again. **Found:** A-237 [General/SDK], low. **Next:** A-219 (built, in review, for 0.1.126).
+17. **0.1.126, A-219 alone** ✅ live and checked on 8.x (2026-11-10): a worker goes behind the egress
+    and back by an explicit action (with A-225); worker1 left behind egress1, as the operator decided.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -285,9 +287,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-209 🔵 A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender
   (low).
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
-  0.1.125; A-210 mostly (SY.edge's part after 2026-11-22, and a few the builder found); A-218 (the
-  dead identity surface, a release alone) and A-219 (a worker behind the egress, built for 0.1.126)
-  open. Cron descriptors wait for the talk on a WF that starts on a schedule.
+  0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
+  2026-11-22, and a few the builder found); A-218 (the dead identity surface, a release alone) open. Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-220 🔵 A recurring timer the replay cannot schedule stays pending and holds its client_ref
   (low).
 - A-221 🔵 Cognition records a turn the agent never received when its delivery fails (low).
@@ -295,8 +296,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   queue for it grows without limit (latent; a design of its own).
 - A-223 🔵 io.api waits for a frontdesk handoff no longer than the frontdesk waits for
   SY.identity (low).
-- A-225 🔵 A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl
-  error, a failed probe never says why (low; with A-219).
 - A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
@@ -1509,7 +1508,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`nodes/io/io-slack/src/not_taken.rs:199-207`, `:235-241`).
 - **Fix, later (io.slack's revamp, A-148):** a text for `unavailable`.
 
-### A-225 [General/egress] 🔵 low (found 2026-11-10 by A-219's design; checked in the code) — A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl error before the probe, and a failed probe never says why
+### A-225 [General/egress] ✅ BUILT (0.1.126, 2026-11-10; the probe's reason seen on 8.x) (found 2026-11-10 by A-219's design; checked in the code) — A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl error before the probe, and a failed probe never says why
 
 - **A removed worker keeps IPv6 off:** `remove_hive`'s cleanup tears the egress down only for an
   egress (`remove_hive_cleanup_full_script`, `src/bin/sy_orchestrator.rs:18252`), so a worker that
@@ -1585,7 +1584,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (SY.timer):** a recurring timer the replay cannot schedule is closed with its
   reason, so its `client_ref` is free; error codes by type, not by text.
 
-### A-219 [General/egress] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; checked on 8.x) — A worker that joined before the egress was declared never goes out through it
+### A-219 [General/egress] ✅ VALIDATED ON 8.x (0.1.126, 2026-11-10; worker1 behind egress1, and back, and behind again) (from the sweep of 2026-11-07; checked on 8.x) — A worker that joined before the egress was declared never goes out through it
 
 - **Seen on 8.x:** the motherbee declares the egress (`gateway_ip` 10.10.10.40, egress1), and
   worker1 has no `egress` section: its default route is 10.10.10.1. Its agents' internet traffic
@@ -1610,6 +1609,31 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   route for a network they manage from); the switch stays only once the motherbee's confirm comes
   back, else the worker reverts; the minor points as the doc proposes. Its release carries the
   router's protected-action entry for the new message, with the rest.
+
+- **Built (0.1.126):** `set_hive_egress` / `clear_hive_egress` (SY.admin, `Nobody`, CONFIRM through
+  Archi), `SYSTEM_EGRESS_ROUTE` between the orchestrators (protected, motherbee to spoke only), the
+  guards G1-G3, the record, the probe, the confirm, the commit or the revert, the start's resume,
+  `/versions`' egress state; from its review round: a body naming another hive refused, a revert
+  that never stops halfway, multipath defaults refused, the worker refusing a core update or rollback
+  while its switch is open, socket-activated sshd read through `sshd_listen_ports`.
+- **Checked on 8.x (the gate, 2026-11-10):** before, worker1 read `not_behind` in `/versions`.
+  - **The switch:** `PUT /hives/worker1/egress` answered `switched` in 2.7 s (1.0 s on the worker):
+    default via 10.10.10.40, IPv6 off, the probe through egress1 ok, hive.yaml's section the join's
+    renderer writes, the record committed, `/versions` `behind`. AI.pruebas answered, and an nft
+    counter on egress1 saw 123 packets from worker1.
+  - **Again:** `unchanged` in 1.3 s. A hand route back to 10.10.10.1 was undone by the watchdog
+    within 6 s. A restart of the orchestrator logged `internet_reachable=true`.
+  - **The clear:** `cleared` in 3.0 s; worker1's routes and IPv6 identical to the baseline.
+  - **The revert:** with worker1's forwarded traffic dropped on egress1, the set answered
+    `EGRESS_PROBE_FAILED`, `reverted`, curl's reason (DNS timed out after 5 s), reverted in 47 ms;
+    worker1 identical to the baseline.
+  - **A crash mid-switch:** worker1's orchestrator killed 3 s into a switch; at its start it undid
+    the switch from its record (`interrupted`); worker1 identical to the baseline; the action
+    answered `EGRESS_NOT_ANSWERED` after its 30 s.
+  - **Refused:** egress1 (`NOT_A_WORKER`); a body naming egress1 on worker1's path
+    (`INVALID_REQUEST`).
+  - **Left, by the operator's call:** worker1 behind egress1, set through Archi's plan and CONFIRM;
+    AI.pruebas answers through egress1.
 
 ### A-218 [General/identity] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — Dead identity surface (TNT_APPROVE, the vocabulary) and ECHO/TIME_SYNC
 

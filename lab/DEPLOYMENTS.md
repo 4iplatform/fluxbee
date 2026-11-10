@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.125** | 2026-11-10 | `f39e2bb0` | motherbee + spokes (core): the sweep's calls: published pages listed (`GET /artifacts`), taken down by the factory reset, and a tenant's purge refused while one is up (A-212); no default tenant and two different tenants refused (A-213); every fixed text in English and the frontdesk answering in the person's language (A-214); a WF forward to another IO node names no one (A-215); the frontdesk retrying a transient failure (A-216); wf-generic staying up on a failed store (A-217); one-time conversions removed (A-210, mostly); hive.yaml written atomically by `set_storage` (A-224); SY.admin's HTTP answering a failed handler (A-229); Archi asking for a node's tenant (A-230); Archi's runtime redeploy keeping each node's tenant (A-235); a removed ingress's SY.edge stopped (A-236) | ✅ live, checked on 8.x | snap `pre-clean-0-1-125` (all 4 VMs) · `apt install fluxbee=0.1.124` + 0.1.124's `update_installation` (SY.identity of 0.1.124 still reads every record 0.1.125 writes) |
+| **0.1.126** | 2026-11-10 | `cf005771` | motherbee + spokes (core): A-219: an existing worker goes behind the egress, and back, by an explicit action (`set_hive_egress` / `clear_hive_egress`, the operator's word or Archi's plan with CONFIRM; `SYSTEM_EGRESS_ROUTE` between the orchestrators, protected; guards, a record, a probe, the motherbee's confirm, commit or revert, the start's resume; `/versions`' egress state); with A-225 (a removed worker's IPv6 file, the boot judging IPv6 by the kernel, the probe's reason) | ✅ live, checked on 8.x | snap `pre-egress-0-1-126` (all 4 VMs) · first `clear_hive_egress` of every worker behind the egress (a release before 0.1.126 cannot), then `apt install fluxbee=0.1.125` + 0.1.125's `update_installation` |
+| **0.1.125** | 2026-11-10 | `f39e2bb0` | motherbee + spokes (core): the sweep's calls: published pages listed (`GET /artifacts`), taken down by the factory reset, and a tenant's purge refused while one is up (A-212); no default tenant and two different tenants refused (A-213); every fixed text in English and the frontdesk answering in the person's language (A-214); a WF forward to another IO node names no one (A-215); the frontdesk retrying a transient failure (A-216); wf-generic staying up on a failed store (A-217); one-time conversions removed (A-210, mostly); hive.yaml written atomically by `set_storage` (A-224); SY.admin's HTTP answering a failed handler (A-229); Archi asking for a node's tenant (A-230); Archi's runtime redeploy keeping each node's tenant (A-235); a removed ingress's SY.edge stopped (A-236) | ✅ replaced by 0.1.126 | snap `pre-clean-0-1-125` (deleted 2026-11-10) · `apt install fluxbee=0.1.124` + 0.1.124's `update_installation` (SY.identity of 0.1.124 still reads every record 0.1.125 writes) |
 | **0.1.124** | 2026-11-10 | `bffaf4f2` | motherbee + spokes (core): the router's release: a WAN session runs its cleanup however it ends and a send into a dead link is answered (A-203, the links between sibling routers and to nodes too); a WAN peer silent for the dead interval is cut (A-207), and a WAN handshake has a deadline; a sender's message the router's additions take over the frame is answered `FRAME_TOO_LARGE`, a broadcast everywhere or nowhere (A-202); the router no longer reads hive.yaml's `ai` and blob keys; with SY.admin's installation update record (A-204, A-205, and its review round's fixes), SY.timer refusing a `TZ=`/`CRON_TZ=`/`@` cron spec (A-206), wf-generic out of the core (A-211) and A-181's leftover texts | ✅ replaced by 0.1.125 | snap `pre-router-0-1-124` (deleted 2026-11-10) · `apt install fluxbee=0.1.123` + 0.1.123's `update_installation` (the installation file v7 stays; 0.1.123's router needs hive.yaml's `ai` and blob keys valid, as they are on 8.x) |
 | **0.1.123** | 2026-11-09 | `e6f6c93f` | motherbee + spokes (core): hive-config-update-v1's stage 4: SY.admin's installation update (`update_installation`, the operator's word; `get_installation_update`, Archi's read) brings every hive to the motherbee's core and installation file, core then config, kept in SY.admin's state dir and resumed after a restart; what it leaves alone, with why (a hive rolled back with `core_rollback` keeps its core and the update is `held`; a hand-edited copy gets no config); the automatic step, once per hive and target, for a hive that did not answer and comes back; `set_installation_ai` opens it, Archi follows it, `ops.py deploy` runs it; with A-198: a mesh reply that does not fit the frame answers `REPLY_TOO_LARGE` with its outcome, optional `limit`/`cursor` pages on the listings that grow (every row without them, as before), an executor run's answer cut to fit; and A-201: Archi reads the admin command log | ✅ replaced by 0.1.124 | snap `pre-inst-0-1-123` (deleted 2026-11-10) · `apt install fluxbee=0.1.122` + `ops deploy 0.1.122`'s per-spoke core update (SY.admin's `installation-update.json` stays, ignored by 0.1.122) |
 | **0.1.122** | 2026-11-09 | `6c6d963d` | motherbee + spokes (core): hive-config-update-v1's stage 3c: the operator changes the installation's `ai` through SY.admin (`get_installation`, Archi's read; `set_installation_ai`, the operator's word, through Archi's confirmed plan or loopback), A-11's checks, the motherbee's orchestrator writes the next version and every hive applies it (`SYSTEM_UPDATE` category `config`), restarting only the start readers whose engine changed; SY.admin's executor and Archi take it at their next use; with A-197: Archi reads SY.admin's catalog in its compact view over the mesh | ✅ replaced by 0.1.123 | snap `pre-inst-0-1-122` (deleted 2026-11-09) · `apt install fluxbee=0.1.121` + core-update of the spokes (the installation file stays at its version, which 0.1.121's readers read the same) |
@@ -134,6 +135,44 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.126 — A worker behind the egress
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.125 · **Commit:** `cf005771`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** A-219, the operator's call of 2026-11-10 (*"si workers tienen que salir a internet, si
+  b)"*), its shape approved the same day (*"hacelos como recomendas"*): docs/edge-egress-nat-spec.md
+  §15. It touches the router's policy (a protected action), so it went in a release of its own.
+- **What changed:**
+  - **SY.admin:** `set_hive_egress` (`PUT /hives/{hive}/egress`) and `clear_hive_egress` (`DELETE`),
+    mesh access `Nobody`, CONFIRM through Archi's executor; a body naming another hive refused; held
+    off while an installation update runs, and one egress action at a time.
+  - **SY.orchestrator (the motherbee):** the checks (a worker, the declaration with its reachability
+    URL, no join), the forwards of the switch and the confirm; `/versions` compares each worker with
+    the declaration (`behind`, `not_behind`, `other_gateway`, `drifted`).
+  - **SY.orchestrator (the worker):** guards G1-G3 (the gateway on a connected subnet, the mesh and
+    the operator's sessions off the default route, multipath and tunnels refused), `egress-switch.json`,
+    the switch, the probe, `pending_confirm`, the commit (hive.yaml atomically, then memory) or the
+    revert, the watchdog paused meanwhile, the start finishing an open switch, a core update or
+    rollback refused while one is open; A-225's three items.
+  - **The router and the policy:** `SYSTEM_EGRESS_ROUTE` protected, sent only by the motherbee's
+    orchestrator to a spoke; system.wasm compiled again.
+  - **Archi:** the catalog, the plan's wait, the handbook's §4.4.5.
+- **Build and review:** `coa/a-219` (the design, the policy, the orchestrators, SY.admin and Archi, the
+  docs), CI green; one review round: one medium (a body `target`) and eight low, all fixed, with
+  worker1's socket-activated sshd found live and handled.
+- **The deploy:** build of `cf005771` in 27.5 min, publish in 13 s, `ops deploy 0.1.126` in 326 s,
+  health clean; snapshot `pre-egress-0-1-126`, `pre-clean-0-1-125` dropped. The update closed `done`
+  44 s after its call (no read lost this time; A-199 stays).
+- **Checked on 8.x (the gate, the operator's standing word for 8.x):** worker1 behind egress1 in
+  2.7 s and AI.pruebas through it (an nft counter on egress1: 123 packets); `unchanged`; the
+  watchdog undoing a hand route within 6 s; a restart re-applying it; the clear back to the
+  baseline; a revert on a blocked probe (47 ms) and a crash mid-switch undone at the start, each
+  back to the baseline; the refusals. Details in FINDINGS A-219.
+- **PROD after the gate:** all four hives on 0.1.126 (`a61136d5`); **worker1 behind egress1**
+  (default via 10.10.10.40, IPv6 off), set through Archi's plan and CONFIRM, as the operator
+  decided; AI.pruebas answers through egress1; the installation file version 7; snapshot
+  `pre-egress-0-1-126` on each VM.
 
 ## 0.1.125 — The sweep's calls
 
