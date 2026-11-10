@@ -2851,9 +2851,8 @@ async fn run_outbound_loop(
         // into the text/v1 resolver, failed to parse (it has no `type` field), and the failure
         // path posted io-slack's own internal error INTO the channel. Observed live: an operator
         // mentioned the bot, the router bounced the message back UNREACHABLE because no handler
-        // was configured, and two seconds later the bot answered the operator with
-        // "Error (invalid_text_payload) al procesar contenido/adjuntos." Every routing failure
-        // became noise in the customer's Slack.
+        // was configured, and two seconds later the bot answered the operator with its error text
+        // for an invalid_text_payload. Every routing failure became noise in the customer's Slack.
         if is_control_plane_msg_type(&msg.meta.msg_type) {
             // UNREACHABLE is worth its own line: it means inbound Slack traffic is being accepted
             // and then dropped by the mesh, which looks like "the bot ignores me" from Slack and
@@ -3105,7 +3104,7 @@ async fn post_outbound(
                 "failed to resolve outbound text/v1 payload"
             );
             let fallback = format!(
-                "Error ({}) al procesar contenido/adjuntos.",
+                "Error ({}) while processing the content or attachments.",
                 err.canonical_code()
             );
             let posted = slack
