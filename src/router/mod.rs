@@ -1777,6 +1777,8 @@ fn send_ttl_exceeded_to(
     Ok(())
 }
 
+/// Hands `msg` to the IRP link of the sibling router `peer_uuid`; false when there is none or its
+/// writer has stopped, so the caller answers `PEER_UNAVAILABLE` or `GATEWAY_UNAVAILABLE`.
 async fn send_to_peer_router(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_uuid: Uuid,
@@ -1794,10 +1796,12 @@ async fn send_to_peer_router(
         forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
     }
     let data = serde_json::to_vec(&forward)?;
-    let _ = peer.sender.send(data);
-    Ok(true)
+    Ok(peer.sender.send(data).is_ok())
 }
 
+/// Hands `msg` to the WAN link of `hive_id`; false when there is none or its writer has stopped,
+/// so the caller answers `WAN_UNAVAILABLE`. Until 0.1.124 a send that failed counted as sent, and
+/// the frame was lost without an answer (A-203).
 async fn send_to_wan_peer(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     hive_id: &str,
@@ -1815,8 +1819,7 @@ async fn send_to_wan_peer(
         forward.routing.ttl = forward.routing.ttl.saturating_sub(1);
     }
     let data = serde_json::to_vec(&forward)?;
-    let _ = peer.sender.send(data);
-    Ok(true)
+    Ok(peer.sender.send(data).is_ok())
 }
 
 async fn broadcast_to_peers(
@@ -3197,9 +3200,13 @@ where
     // A hive removed while its link is up is cut off within one registry recheck.
     let unregistered = hive_unregistered(registry, &peer_hello.hive_id, ctx.hive_registry_recheck);
     tokio::pin!(unregistered);
-    loop {
+    // The session ends on a clean close, a read error, an error handling a frame, the end of its
+    // writer or the hive's removal, and every end runs the cleanup below (A-203). Until 0.1.124 an
+    // error returned before it: the hive kept its entry, and every frame for it went into a link
+    // whose peer was gone, without an UNREACHABLE, until the hive connected again.
+    let exit: Result<(), RouterError> = loop {
         let frame = tokio::select! {
-            frame = read_frame(&mut reader) => frame?,
+            frame = read_frame(&mut reader) => frame,
             () = &mut unregistered => {
                 tracing::warn!(
                     peer_hive = %peer_hello.hive_id,
@@ -3207,13 +3214,23 @@ where
                     reason = %WAN_REJECT_HIVE_NOT_REGISTERED,
                     "wan peer session closed: hive no longer registered"
                 );
-                break;
+                break Ok(());
+            }
+            // The writer stops only on a write error (`write_link_frames`): nothing reaches the
+            // peer any more.
+            () = tx.closed() => {
+                tracing::warn!(
+                    peer_hive = %peer_hello.hive_id,
+                    session_epoch = session_epoch,
+                    "wan peer session closed: its link no longer writes"
+                );
+                break Ok(());
             }
         };
         match frame {
-            Some(frame) => match serde_json::from_slice::<Message>(&frame) {
+            Ok(Some(frame)) => match serde_json::from_slice::<Message>(&frame) {
                 Ok(msg) => {
-                    handle_wan_message(
+                    if let Err(err) = handle_wan_message(
                         &msg,
                         &tx,
                         &ctx,
@@ -3222,7 +3239,10 @@ where
                         &peer_hello.router_name,
                         session_epoch,
                     )
-                    .await?;
+                    .await
+                    {
+                        break Err(err);
+                    }
                 }
                 Err(err) => {
                     let reject_count =
@@ -3236,15 +3256,23 @@ where
                     );
                 }
             },
-            None => break,
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err.into()),
+        }
+    };
+    {
+        // Only while the entry is still this session's: a hive that connected again meanwhile
+        // has its new session's there.
+        let mut guard = ctx.wan_peers.lock().await;
+        if guard
+            .get(&peer_hello.hive_id)
+            .is_some_and(|peer| peer.sender.same_channel(&tx))
+        {
+            guard.remove(&peer_hello.hive_id);
         }
     }
-    {
-        let mut guard = ctx.wan_peers.lock().await;
-        guard.remove(&peer_hello.hive_id);
-    }
     writer_task.abort();
-    Ok(())
+    exit
 }
 
 async fn handle_wan_message(
@@ -3961,6 +3989,17 @@ async fn connect_to_peer(
 ) -> Result<(), RouterError> {
     let socket_path = peer_socket_path(socket_dir, peer_uuid);
     let stream = UnixStream::connect(&socket_path).await?;
+    let hello = build_router_hello(
+        &self_uuid.to_string(),
+        &Uuid::new_v4().to_string(),
+        RouterHelloPayload {
+            router_id: self_uuid.to_string(),
+            router_name: self_router_name.to_string(),
+            shm_name: self_shm_name.to_string(),
+            version: "1.0".to_string(),
+        },
+    );
+    let hello = serde_json::to_vec(&hello)?;
     let (mut reader, writer) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     {
@@ -3972,22 +4011,19 @@ async fn connect_to_peer(
     }
     let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
     let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
+    let _ = tx.send(hello);
 
-    let hello = build_router_hello(
-        &self_uuid.to_string(),
-        &Uuid::new_v4().to_string(),
-        RouterHelloPayload {
-            router_id: self_uuid.to_string(),
-            router_name: self_router_name.to_string(),
-            shm_name: self_shm_name.to_string(),
-            version: "1.0".to_string(),
-        },
-    );
-    let _ = tx.send(serde_json::to_vec(&hello)?);
-
-    while let Some(frame) = read_frame(&mut reader).await? {
+    // Every end of the link runs the cleanup below, a read error or an error handling a frame
+    // included, as a WAN session's does (A-203): the sibling's entry would otherwise stay, and
+    // while it stayed no link with that router could be set up again.
+    let exit: Result<(), RouterError> = loop {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err.into()),
+        };
         if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
-            handle_peer_message(
+            if let Err(err) = handle_peer_message(
                 &msg,
                 &peer_uuid,
                 &peers,
@@ -4010,15 +4046,23 @@ async fn connect_to_peer(
                 &reachability,
                 &log_stream,
             )
-            .await?;
+            .await
+            {
+                break Err(err);
+            }
         }
-    }
+    };
     {
         let mut peers_guard = peers.lock().await;
-        peers_guard.remove(&peer_uuid);
+        if peers_guard
+            .get(&peer_uuid)
+            .is_some_and(|peer| peer.sender.same_channel(&tx))
+        {
+            peers_guard.remove(&peer_uuid);
+        }
     }
     writer_task.abort();
-    Ok(())
+    exit
 }
 
 async fn handle_peer_incoming(
@@ -4067,9 +4111,15 @@ async fn handle_peer_incoming(
     let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
     let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
 
-    while let Some(frame) = read_frame(&mut reader).await? {
+    // Every end of the link runs the cleanup below, as `connect_to_peer`'s does (A-203).
+    let exit: Result<(), RouterError> = loop {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(err) => break Err(err.into()),
+        };
         if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
-            handle_peer_message(
+            if let Err(err) = handle_peer_message(
                 &msg,
                 &peer_uuid,
                 &peers,
@@ -4092,15 +4142,23 @@ async fn handle_peer_incoming(
                 &reachability,
                 &log_stream,
             )
-            .await?;
+            .await
+            {
+                break Err(err);
+            }
         }
-    }
+    };
     {
         let mut peers_guard = peers.lock().await;
-        peers_guard.remove(&peer_uuid);
+        if peers_guard
+            .get(&peer_uuid)
+            .is_some_and(|peer| peer.sender.same_channel(&tx))
+        {
+            peers_guard.remove(&peer_uuid);
+        }
     }
     writer_task.abort();
-    Ok(())
+    exit
 }
 
 /// Frames skipped for being over the socket's size limit, process-wide, across every link. Each
@@ -4112,7 +4170,8 @@ const OVERSIZE_FRAME_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Writes the frames queued for one link (a node, a WAN peer, a sibling router) until the link
 /// ends. A frame over the socket's 128 KB limit is skipped and counted, and the link goes on: until
 /// 0.1.74 the writer stopped while the link stayed registered, so every later frame to it was lost
-/// for good (A-70, D11 of docs/router-stream-v1.md). Any other write error ends the link.
+/// for good (A-70, D11 of docs/router-stream-v1.md). Any other write error stops the writer: a send
+/// into its channel fails from then on, and a WAN session ends with it (A-203).
 async fn write_link_frames<W>(
     mut writer: W,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -10265,6 +10324,154 @@ mod tests {
         );
     }
 
+    /// The HELLO a sibling router `router` opens an IRP link with.
+    fn router_hello_frame(router: Uuid) -> Vec<u8> {
+        serde_json::to_vec(&build_router_hello(
+            &router.to_string(),
+            &Uuid::new_v4().to_string(),
+            RouterHelloPayload {
+                router_id: router.to_string(),
+                router_name: "RT.switch1@motherbee".to_string(),
+                shm_name: "/jsr-switch1".to_string(),
+                version: "1.0".to_string(),
+            },
+        ))
+        .expect("hello frame")
+    }
+
+    /// Half a frame, then the close: the other end's next read is an error.
+    async fn end_in_a_partial_frame<W>(mut link: W)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
+        link.write_all(&100u32.to_be_bytes()).await.expect("header");
+        link.write_all(&[0u8; 10]).await.expect("part of the body");
+    }
+
+    /// A-203, the link between sibling routers, the side that accepts it: a link that ends in a
+    /// read error is cleaned up like one that ends in EOF. Before, its entry stayed, and while it
+    /// stayed no link with that router could be set up again.
+    #[tokio::test]
+    async fn an_accepted_sibling_link_that_ends_in_a_read_error_is_cleaned_up() {
+        let shm = TestShm::new("rt-irpacc");
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sibling = Uuid::new_v4();
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let link = tokio::spawn(handle_peer_incoming(
+            server,
+            Uuid::new_v4(),
+            Arc::clone(&peers),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&shm.writer),
+            Arc::new(Mutex::new(OpaResolver::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            "motherbee".to_string(),
+            "SY.frontdesk.gov@motherbee".to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            stream::StreamHandle::detached(),
+            false,
+        ));
+        write_frame(&mut client, &router_hello_frame(sibling))
+            .await
+            .expect("hello");
+        // The accepting side answers nothing: its entry is the sign the link is up.
+        time::timeout(Duration::from_secs(2), async {
+            while !peers.lock().await.contains_key(&sibling) {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the link is set up");
+
+        end_in_a_partial_frame(client).await;
+        let ended = time::timeout(Duration::from_secs(5), link)
+            .await
+            .expect("the link ends")
+            .expect("join");
+        assert!(ended.is_err(), "a partial frame is a read error");
+        assert!(peers.lock().await.is_empty(), "the sibling's entry is gone");
+    }
+
+    /// A-203, the same on the side that dials the sibling.
+    #[tokio::test]
+    async fn a_dialed_sibling_link_that_ends_in_a_read_error_is_cleaned_up() {
+        let shm = TestShm::new("rt-irpdial");
+        // Short: macOS takes a socket path of at most 103 bytes, and its temp dir is half of them.
+        let socket_dir =
+            std::env::temp_dir().join(format!("rt{}", &Uuid::new_v4().simple().to_string()[..6]));
+        fs::create_dir_all(&socket_dir).expect("socket dir");
+        let sibling = Uuid::new_v4();
+        let listener = UnixListener::bind(peer_socket_path(&socket_dir, sibling))
+            .expect("the sibling's socket");
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let link = tokio::spawn({
+            let peers = Arc::clone(&peers);
+            let shm = Arc::clone(&shm.writer);
+            let socket_dir = socket_dir.clone();
+            async move {
+                connect_to_peer(
+                    sibling,
+                    Uuid::new_v4(),
+                    "RT.gateway@motherbee",
+                    "/jsr-gateway",
+                    &socket_dir,
+                    peers,
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(Vec::new())),
+                    shm,
+                    Arc::new(Mutex::new(OpaResolver::new())),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(None)),
+                    "motherbee",
+                    "SY.frontdesk.gov@motherbee",
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::new(Mutex::new(Vec::new())),
+                    stream::StreamHandle::detached(),
+                    false,
+                )
+                .await
+            }
+        });
+        let (mut server, _) = time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("dialed in time")
+            .expect("accept");
+        // The dialer sends its HELLO once it holds the sibling's entry.
+        let hello: Message = serde_json::from_slice(
+            &read_frame(&mut server)
+                .await
+                .expect("read")
+                .expect("a hello"),
+        )
+        .expect("a message");
+        assert_eq!(hello.meta.msg.as_deref(), Some(MSG_HELLO));
+        assert!(peers.lock().await.contains_key(&sibling));
+
+        end_in_a_partial_frame(server).await;
+        let ended = time::timeout(Duration::from_secs(5), link)
+            .await
+            .expect("the link ends")
+            .expect("join");
+        assert!(ended.is_err(), "a partial frame is a read error");
+        assert!(peers.lock().await.is_empty(), "the sibling's entry is gone");
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
     /// A message the router cannot handle is skipped; the connection stays up.
     #[tokio::test]
     async fn a_message_the_router_cannot_handle_does_not_end_the_connection() {
@@ -11837,6 +12044,282 @@ mod tests {
             .expect("session task")
             .expect("session result");
         assert!(established.load(Ordering::Relaxed));
+    }
+
+    /// The peer's side of an accepted link, brought up as `hive`: its HELLO, then the router's
+    /// HELLO, WAN_ACCEPT and LSA. The LSA goes out once the session holds the hive's entry.
+    async fn bring_up_accepted_link(peer: &mut tokio::io::DuplexStream, hive: &str) {
+        write_frame(peer, &wan_hello_frame(hive))
+            .await
+            .expect("send hello");
+        for expected in [MSG_HELLO, fluxbee_sdk::protocol::MSG_WAN_ACCEPT, MSG_LSA] {
+            assert_eq!(
+                read_system_message(peer).await.meta.msg.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    /// A request from a node of this hive to `dst`, a node of another hive.
+    fn request_to(dst: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast(dst.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("GET_VERSIONS".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        }
+    }
+
+    /// The UNREACHABLE the router queued for the sender of `msg`.
+    fn unreachable_answer(
+        answers: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        msg: &Message,
+    ) -> fluxbee_sdk::protocol::UnreachablePayload {
+        let frame = answers.try_recv().expect("an answer to the sender");
+        let answer: Message = serde_json::from_slice(&frame).expect("a message");
+        assert_eq!(answer.meta.msg.as_deref(), Some(MSG_UNREACHABLE));
+        assert!(
+            matches!(&answer.routing.dst, Destination::Unicast(dst) if *dst == msg.routing.src),
+            "{:?}",
+            answer.routing.dst
+        );
+        assert_eq!(answer.routing.trace_id, msg.routing.trace_id);
+        serde_json::from_value(answer.payload).expect("an UNREACHABLE payload")
+    }
+
+    /// A-203: a session that ends in a read error, as one whose peer went without a TLS
+    /// close_notify, is cleaned up like one that ends in EOF. The hive leaves the peer table, the
+    /// caller still gets the error, and a request for the hive is answered WAN_UNAVAILABLE.
+    #[tokio::test]
+    async fn a_wan_session_that_ends_in_a_read_error_is_cleaned_up() {
+        let ctx = test_wan_context(None);
+        let (server, mut worker1) = tokio::io::duplex(64 * 1024);
+        let session = spawn_accepted_link(server, &ctx);
+        bring_up_accepted_link(&mut worker1, "worker1").await;
+        assert!(ctx.wan_peers.lock().await.contains_key("worker1"));
+
+        end_in_a_partial_frame(worker1).await;
+        let err = time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends")
+            .expect("session task")
+            .expect_err("a partial frame is a read error");
+        assert!(err.to_string().contains("partial frame body"), "{err}");
+        assert!(
+            ctx.wan_peers.lock().await.is_empty(),
+            "the hive's entry is gone"
+        );
+
+        let request = request_to("SY.orchestrator@worker1");
+        let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        forward_to_hive(
+            "worker1",
+            &request,
+            true,
+            &ctx.peer_routers,
+            &ctx.peers,
+            &ctx.wan_peers,
+            ctx.router_uuid,
+            &sender,
+        )
+        .await
+        .expect("forward");
+        let answer = unreachable_answer(&mut answers, &request);
+        assert_eq!(answer.reason, "WAN_UNAVAILABLE");
+        assert_eq!(answer.original_dst, "SY.orchestrator@worker1");
+    }
+
+    /// A-203: a hive that connected again while its old session was ending keeps its new
+    /// session's entry. Until 0.1.124 the old session's close removed whichever entry the hive had.
+    #[tokio::test]
+    async fn an_old_wan_session_that_ends_leaves_the_new_sessions_entry() {
+        let ctx = test_wan_context(None);
+        let (old_server, mut old_link) = tokio::io::duplex(64 * 1024);
+        let old_session = spawn_accepted_link(old_server, &ctx);
+        bring_up_accepted_link(&mut old_link, "worker1").await;
+        let old_router = ctx.wan_peers.lock().await["worker1"].router_uuid;
+        let (new_server, mut new_link) = tokio::io::duplex(64 * 1024);
+        let new_session = spawn_accepted_link(new_server, &ctx);
+        bring_up_accepted_link(&mut new_link, "worker1").await;
+        let new_router = ctx.wan_peers.lock().await["worker1"].router_uuid;
+        assert_ne!(old_router, new_router);
+
+        drop(old_link);
+        time::timeout(Duration::from_secs(2), old_session)
+            .await
+            .expect("the old session ends")
+            .expect("session task")
+            .expect("session result");
+        assert_eq!(
+            ctx.wan_peers
+                .lock()
+                .await
+                .get("worker1")
+                .map(|peer| peer.router_uuid),
+            Some(new_router),
+            "the new session's entry stays"
+        );
+        // And it is the new link that carries what goes to the hive.
+        let request = request_to("SY.orchestrator@worker1");
+        assert!(send_to_wan_peer(&ctx.wan_peers, "worker1", &request)
+            .await
+            .expect("send"));
+        let forwarded = read_system_message(&mut new_link).await;
+        assert_eq!(forwarded.routing.trace_id, request.routing.trace_id);
+
+        drop(new_link);
+        time::timeout(Duration::from_secs(2), new_session)
+            .await
+            .expect("the new session ends")
+            .expect("session task")
+            .expect("session result");
+        assert!(ctx.wan_peers.lock().await.is_empty());
+    }
+
+    /// A-203: a link whose writer has stopped takes nothing. The send says so, and the sender gets
+    /// WAN_UNAVAILABLE, as with no link at all; through a sibling link likewise,
+    /// GATEWAY_UNAVAILABLE. Until 0.1.124 the send counted as done and the request was lost.
+    #[tokio::test]
+    async fn a_send_into_a_link_whose_writer_stopped_is_answered() {
+        let (dead_link, writer_gone) = mpsc::unbounded_channel::<Vec<u8>>();
+        drop(writer_gone);
+        let wan_peers = Arc::new(Mutex::new(HashMap::from([(
+            "worker1".to_string(),
+            WanPeer {
+                sender: dead_link.clone(),
+                router_uuid: Uuid::new_v4(),
+            },
+        )])));
+        let peer_routers = Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new()));
+        let peers = Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new()));
+        let router_uuid = Uuid::new_v4();
+        let request = request_to("SY.orchestrator@worker1");
+        assert!(!send_to_wan_peer(&wan_peers, "worker1", &request)
+            .await
+            .expect("send"));
+
+        let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        forward_to_hive(
+            "worker1",
+            &request,
+            true,
+            &peer_routers,
+            &peers,
+            &wan_peers,
+            router_uuid,
+            &sender,
+        )
+        .await
+        .expect("forward");
+        assert_eq!(
+            unreachable_answer(&mut answers, &request).reason,
+            "WAN_UNAVAILABLE"
+        );
+
+        // A router that is not the gateway hands the request to the gateway sibling.
+        let gateway = Uuid::new_v4();
+        peer_routers.lock().await.insert(
+            gateway,
+            PeerRouter {
+                uuid: gateway,
+                is_gateway: true,
+            },
+        );
+        peers
+            .lock()
+            .await
+            .insert(gateway, PeerHandle { sender: dead_link });
+        assert!(!send_to_peer_router(&peers, gateway, &request)
+            .await
+            .expect("send"));
+        forward_to_hive(
+            "worker1",
+            &request,
+            false,
+            &peer_routers,
+            &peers,
+            &wan_peers,
+            router_uuid,
+            &sender,
+        )
+        .await
+        .expect("forward");
+        assert_eq!(
+            unreachable_answer(&mut answers, &request).reason,
+            "GATEWAY_UNAVAILABLE"
+        );
+    }
+
+    /// One end of a link whose writes all fail, as on a socket the peer reset; reads come from
+    /// the peer as usual.
+    struct WritesFail(tokio::io::DuplexStream);
+
+    impl tokio::io::AsyncRead for WritesFail {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.0), cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for WritesFail {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A-203: a session whose writer stopped on a write error ends, though its peer has not
+    /// closed, and its hive leaves the peer table: nothing would reach the peer any more.
+    #[tokio::test]
+    async fn a_wan_session_whose_writer_stopped_ends() {
+        let ctx = test_wan_context(None);
+        let (server, mut worker1) = tokio::io::duplex(64 * 1024);
+        let session = tokio::spawn(handle_wan_connection(
+            WritesFail(server),
+            None,
+            Arc::clone(&ctx),
+            false,
+            None,
+        ));
+        write_frame(&mut worker1, &wan_hello_frame("worker1"))
+            .await
+            .expect("send hello");
+        time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends while its peer is still there")
+            .expect("session task")
+            .expect("session result");
+        assert!(ctx.wan_peers.lock().await.is_empty());
+        drop(worker1);
     }
 
     /// The motherbee counts the nodes a spoke's LSA lists under another hive's name, and applies the

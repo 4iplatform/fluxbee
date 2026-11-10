@@ -189,6 +189,8 @@ they count like this hive's.
 - **Another hive** (`forward_to_hive`): on the gateway, the WAN link to that hive (`wan_peers`,
   keyed by hive), else `WAN_UNAVAILABLE`; on any other router, the sibling that is the gateway, over
   IRP, else `GATEWAY_UNAVAILABLE`.
+- A link whose writer has stopped counts as no link. A link leaves its table however it ends, a
+  read error included (A-203, since 0.1.124).
 - The message travels unchanged and the next router decides again with its own tables. A Resolve
   keeps `dst: null` (§5).
 - A gateway that receives from the WAN a message for a node of a third hive forwards it again
@@ -218,7 +220,7 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 | `VPN_BLOCKED` | the VPN rules, or the edge rules, forbid the pair (§8.2) |
 | `PEER_UNAVAILABLE` | the destination is on a sibling router with no IRP link |
 | `GATEWAY_UNAVAILABLE` | the destination is in another hive and no gateway sibling is linked; also a broadcast with `ttl >= 3` from such a router |
-| `WAN_UNAVAILABLE` | this router is the gateway and has no WAN link to the next-hop hive |
+| `WAN_UNAVAILABLE` | this router is the gateway and has no live WAN link to the next-hop hive |
 | `OPA_ERROR` | Resolve: no user policy loaded, or its evaluation failed (§5, §7) |
 | `OPA_NO_TARGET` | Resolve: the user policy gave no target |
 

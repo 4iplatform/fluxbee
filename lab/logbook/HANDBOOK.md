@@ -1127,6 +1127,11 @@ Three paths:
 3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
 
+**Downgrading from 0.1.124 to an earlier version:** the router of 0.1.123 or earlier parses each
+hive's hive.yaml `ai` at its start, only to check it, and does not start on one it cannot use (an
+unknown provider, a default provider without its model, an empty model). 0.1.124's router reads
+neither `ai` nor `blob`. Before going back, make sure each hive's `ai` is valid or absent.
+
 **Downgrading from 0.1.123 to 0.1.122:** 0.1.122's SY.admin has no installation update, so
 `ops deploy 0.1.122` sends the per-spoke core update. `installation-update.json` in SY.admin's
 state dir stays, ignored. Back on 0.1.123, an update still open for the other release reads

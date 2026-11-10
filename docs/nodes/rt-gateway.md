@@ -51,9 +51,12 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   (SY.orchestrator, sibling routers).
 - Settings read from `/etc/fluxbee/hive.yaml`: `hive_id`, `role` (default `worker`),
   `wan.listen`, `wan.uplinks[].address`, `wan.gateway_name`, `wan.mtls`,
-  `government.identity_frontdesk`, `ai`. The environment: `JSR_LOG_LEVEL` (default `info`) and
-  `JSR_ROUTER_NAME`. Timers are constants: HELLO 10 s, dead 40 s, heartbeat 5 s, stale 30 s
-  (`DEFAULT_*` in `src/config/mod.rs`).
+  `government.identity_frontdesk` (`hive_settings_from`). No other key is parsed, so an old
+  `hive.yaml` keeps its `ai` and `blob` whatever they hold. Until 0.1.124 the router parsed `ai`
+  only to check it, and an invalid one stopped it at its start; the readers take `ai` from the
+  installation file since 0.1.121 ([hive-config-update-v1](../hive-config-update-v1.md) §4). The
+  environment: `JSR_LOG_LEVEL` (default `info`) and `JSR_ROUTER_NAME`. Timers are constants: HELLO
+  10 s, dead 40 s, heartbeat 5 s, stale 30 s (`DEFAULT_*` in `src/config/mod.rs`).
 - It refuses to start if the baked system policy cannot be loaded
   (`ensure_system_policy_loaded`; there is no fallback table).
 
@@ -68,7 +71,9 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - **IRP socket** `irp-<uuid hex>.sock` in the same directory, mode 0600: the link between
   routers of the same hive, which only the unsupported several-routers mode uses. Every 5 s a
   router looks in `/dev/shm` for live regions of other routers of its hive and the one with the
-  lower UUID connects.
+  lower UUID connects. A link that ends, however it ends, takes the sibling out of the router's
+  table, so a later look can link them again; until 0.1.124 one that ended on a read error stayed
+  there, and the two were not linked again until that router restarted (A-203).
 - **WAN** (gateway only): TCP on `wan.listen` when set; there is no default address in code. The
   motherbee template sets `0.0.0.0:9000` (`packaging/hive.yaml.example`); spokes have no
   `wan.listen` and connect out to `wan.uplinks`. There is no HTTP or status port.
@@ -105,6 +110,16 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - An uplink dials again 5 s after a link that got past `WAN_ACCEPT` ends. An attempt that never
   got there (no connection, a TLS or handshake error, a `WAN_REJECT`) is retried after 5 s,
   doubling up to 60 s (`UplinkRetry`).
+- **A session's end (A-203).** A session ends on a clean close, a read error (a peer gone without
+  TLS `close_notify`, as a router stopped for its update), an error handling a frame, a write
+  error on its link (`wan peer session closed: its link no longer writes`), or on the motherbee
+  the hive's removal. Every end takes the hive out of the gateway's WAN table (`wan_peers`), but
+  only the entry that session put there: a hive that connected again keeps its new session's. A
+  frame for the hive is then answered `UNREACHABLE` `WAN_UNAVAILABLE` until it connects again.
+  A read error or an error handling a frame is still logged as `wan connection error` on the
+  side that accepted the link and `wan uplink error` on the side that dialed it. Until 0.1.124 a
+  read error skipped that cleanup, and every frame for the hive was lost without an answer until
+  it connected again.
 - **Multi-hop:** a hub gateway with two or more peers sends `WAN_REACHABILITY`, so a spoke can
   reach another spoke through it. A spoke accepts this only from the motherbee's gateway (rule 6
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
@@ -135,6 +150,9 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
   `VPN_BLOCKED`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`, `OPA_ERROR`,
   `OPA_NO_TARGET`; and `TTL_EXCEEDED` when the TTL runs out (every IRP and WAN hop decrements it).
+  A link to a sibling router or to a hive whose writer has stopped counts as no link:
+  `PEER_UNAVAILABLE`, `GATEWAY_UNAVAILABLE` or `WAN_UNAVAILABLE` (`send_to_peer_router`,
+  `send_to_wan_peer`; A-203).
 
 ### System authority
 

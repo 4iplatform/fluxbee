@@ -140,9 +140,10 @@ Three cases bite today:
   - on the motherbee: SY.admin (its executor), SY.architect, SY.cognition, SY.frontdesk.gov, and
     ai.generic at each request;
   - on a worker: SY.cognition, and ai.generic at each request;
-  - rt-gateway parses `ai` today only to check it, and stops, with the router's own release:
-    until then an invalid hive.yaml `ai` still stops a router at its start, so hive.yaml's
-    `ai` is kept valid even once it is ignored.
+  - rt-gateway parsed `ai` only to check it, and stopped in 0.1.124, the router's own release:
+    until then an invalid hive.yaml `ai` stopped a router at its start. Since 0.1.124 the router
+    parses neither `ai` nor `blob`, so hive.yaml's `ai` no longer needs to stay valid for it. A
+    rollback below 0.1.124 brings the check back (HANDBOOK, "The rollback").
 - **The operator's change**, an SY.admin action that Archi can call:
   1. **SY.admin checks the new settings** with every reader's rules: `HiveAiConfig::effective` and
      each provider's model.
@@ -931,8 +932,8 @@ They raised 70 findings, many of them the same seen from several lenses:
     `current_dist_runtime_config`, `:6320`);
   - the watchdog's list: read at the orchestrator's start (`:971`);
   - `ai`: at the start, SY.cognition, SY.admin, SY.architect, SY.frontdesk.gov, and rt-gateway
-    for its check only; ai.generic at each request (since stage 3b from the installation file,
-    and from hive.yaml only while a hive holds none: §4, "As built (stage 3b)"; since stage 3c,
-    SY.admin's executor and Archi at their next use too, and a config update restarts SY.cognition
-    and SY.frontdesk.gov when their engine changed: §4, "As built (stage 3c)");
+    for its check only until 0.1.124 (§4); ai.generic at each request (since stage 3b from the
+    installation file, and from hive.yaml only while a hive holds none: §4, "As built (stage 3b)";
+    since stage 3c, SY.admin's executor and Archi at their next use too, and a config update
+    restarts SY.cognition and SY.frontdesk.gov when their engine changed: §4, "As built (stage 3c)");
   - `government.identity_frontdesk`: the router and SY.identity, at their start.
