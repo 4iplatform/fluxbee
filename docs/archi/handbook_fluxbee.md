@@ -1277,12 +1277,16 @@ time; `clear_hive_egress` takes a worker back.
   - afterwards SSH reaches the box only from its own subnets and the more specific routes it has
     (the answer's `ssh_reachable_from`), and from the hypervisor's console. A network the operator
     manages it from that is reached through the default route needs a static route at the OS level
-    first; name it in `access_from` so the check sees it.
+    first; name it in `access_from` so the check sees it. A session that comes through a tunnel (a
+    VPN) passes the check, but the switch may cut it: say so when the operator works that way;
+  - while the switch runs (under a minute), a core update or a core rollback of that worker is
+    refused (`EGRESS_SWITCH_OPEN`): run them before or after it.
 - **Stage it only when the operator asks**, with `fluxbee_plan_compiler`: one `set_hive_egress`
   step per worker, args `hive` and, when the operator names the networks they manage it from,
-  `access_from` (IPv4 addresses or networks). The operator confirms the plan, and SY.admin's executor
-  runs it as the operator. It is closed to the mesh: never send it as an `ADMIN_COMMAND` of your own,
-  nor as SCMD.
+  `access_from` (IPv4 addresses or networks). The steps run one after the other: SY.admin runs one
+  egress action at a time. The operator confirms the plan, and SY.admin's executor runs it as the
+  operator. It is closed to the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as
+  SCMD.
 - **What the worker does:** it checks before anything moves, switches its default route to the
   gateway with IPv6 off, probes the internet through the egress, and keeps the switch only once the
   motherbee confirms it within 15 s. Otherwise it puts the route, IPv6 and its files back.
@@ -1294,7 +1298,8 @@ time; `clear_hive_egress` takes a worker back.
   `gateway_ip` only when the worker refuses with `PREVIOUS_GATEWAY_UNKNOWN`). It puts back the route
   the worker had before the egress, which the worker's record keeps, and its IPv6. It is the way
   around an egress outage while the egress is fixed. Its probe is reported and decides nothing.
-- **The refusals change nothing.** Each comes with what it means and what the operator can do:
+- **The refusals change nothing** (`outcome: refused`). Each comes with what it means and what the
+  operator can do:
   - `NOT_A_WORKER`: the motherbee (Fluxbee never rewrites its route), an ingress, an egress, or a
     hive whose join is not done.
   - `NO_EGRESS_DECLARED`: the motherbee declares no `egress.gateway_ip`. `NO_REACHABILITY_URL`: its
@@ -1302,32 +1307,41 @@ time; `clear_hive_egress` takes a worker back.
     edit of the motherbee's hive.yaml and a restart of its `sy-orchestrator`, the operator's.
     `EGRESS_DECLARATION_INVALID`: a declaration the join would refuse.
   - `INSTALLATION_UPDATE_RUNNING`: an installation update is under way, or acts on that worker.
-    `JOIN_IN_PROGRESS`: the worker joins or is being removed. `EGRESS_SWITCH_OPEN`: another switch
-    runs there. Stage it again once that ends.
+    `JOIN_IN_PROGRESS`: the worker joins or is being removed. `EGRESS_SWITCH_OPEN`: another egress
+    action runs, on that worker or another (one at a time), named in the refusal. Stage it again once
+    that ends.
+  - `INVALID_REQUEST`: among others, a body that names another hive than the step's `hive`.
   - `HIVE_UNREACHABLE`: the worker's orchestrator is not on the mesh.
   - `GATEWAY_NOT_ON_LINK`: the egress' gateway is not on a subnet the worker is connected to: the
     egress' LAN leg must be on the worker's network, or the worker's own router must send its
     traffic there.
   - `UPLINK_ON_DEFAULT_ROUTE`: the worker reaches the motherbee through its default route (or by a
-    host name, or over IPv6): after the switch the mesh would go through the egress. The motherbee's
-    network needs a route of its own on the worker first.
+    host name, over IPv6, or through a tunnel, whose own packets may take the default route): after
+    the switch the mesh would go through the egress. The motherbee's network needs a route of its
+    own on the worker first, on a connected subnet or through a route that is no tunnel.
   - `ACCESS_ON_DEFAULT_ROUTE`: a live SSH session, or an `access_from` entry, reaches the worker
     through its default route: the operator adds a static route at the OS level for it through the
     current gateway, both named in the refusal. Fluxbee adds no route of its own.
+  - `DEFAULT_ROUTE_MULTIPATH`: the worker's default route is a multipath route (or goes through a
+    nexthop object), which the switch could not put back: the operator gives it a default route
+    through one gateway first.
   - `PROBE_UNAVAILABLE`: the worker has no `curl`. `EGRESS_GUARD_UNREADABLE`: a check could not
-    read the worker's routes; retry once, then tell the operator.
+    read the worker's routes, sshd's ports or a device in time; retry once, then tell the operator.
   - `PREVIOUS_GATEWAY_UNKNOWN` (a clear): the worker joined after the declaration, so it keeps no
     route from before; ask the operator for the gateway, then stage the clear with `gateway_ip`.
 - **A revert** (`outcome: reverted`) means the worker tried and put everything back:
   `EGRESS_PROBE_FAILED` (the internet does not answer through the egress; `probe.reason` says why:
   no DNS, no connection, a timeout), `EGRESS_IPV6_UNMANAGED`, `UPLINK_ROUTE_CHANGED`,
   `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`, `EGRESS_CONFIRM_MISSED`. Tell the operator which,
-  with its message; the egress is the place to look for a probe that failed.
-- **`EGRESS_NOT_ANSWERED`** never means "not applied". Read `GET /hives/<hive>/versions` and report
+  with its message; the egress is the place to look for a probe that failed. A non-empty
+  `revert_problems` lists what the revert could not put back: report each, and the operator checks
+  the worker's route from its console.
+- **`EGRESS_NOT_ANSWERED`** (`outcome: not_answered`, whatever its `step`), and an answer SY.admin
+  did not get (`TIMEOUT`), never mean "not applied". Read `GET /hives/<hive>/versions` and report
   its `egress.state` and `egress.last_switch`: the worker kept the switch only if it got the confirm
-  and committed, and otherwise reverted by itself. A worker on a release before this action ignores
-  it, and nothing changed: the operator brings it to the motherbee's release first
-  (`update_installation`).
+  and committed, and otherwise reverted by itself; with `step: commit` it took the confirm and may
+  still have committed. A worker on a release before this action ignores it, and nothing changed:
+  the operator brings it to the motherbee's release first (`update_installation`).
 
 ### 4.5 Secrets and vault (Model D')
 

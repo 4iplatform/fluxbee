@@ -1065,12 +1065,16 @@ Built as 15.1 to 15.6 say. What follows is what the build adds, or does differen
 - SY.orchestrator (`src/bin/sy_orchestrator.rs`): the motherbee's part in `hive_egress_flow`
   (its checks in `prepare_hive_egress` and `hive_egress_registry_refusal`, the forwards in
   `hive_egress_exchange`, in a task of its own, `spawn_hive_egress`); the worker's in
-  `egress_route_message`, `egress_switch_flow` (the guards in `egress_switch_guards`, the commit in
-  `egress_commit`, the revert in `egress_revert`) and `egress_confirm_answer`; the start's reading of
-  an open record in `resume_egress_switch_at_start`; `/versions` in `egress_versions_block` and
+  `egress_route_message`, `egress_switch_flow` (the guards in `egress_switch_guards`, sshd's ports
+  in `egress_sshd_ports`, the commit in `egress_commit`, the revert in `egress_revert`) and
+  `egress_confirm_answer`; the refusal of a core update or rollback while a switch is open in
+  `egress_switch_open_refusal`; the start's reading of an open record in
+  `resume_egress_switch_at_start`; `/versions` in `egress_versions_block` and
   `add_egress_state_to_answer`. The host is behind a trait (`EgressHost`), so the decisions are
-  tested against a fake; `LiveEgressHost` runs each command under coreutils' `timeout`.
-- SY.admin (`src/bin/sy_admin.rs`): `handle_hive_egress_command` and `hive_egress_worker_refusal`.
+  tested against a fake, the inbox included; `LiveEgressHost` runs each command under coreutils'
+  `timeout`.
+- SY.admin (`src/bin/sy_admin.rs`): `handle_hive_egress_command`, `hive_egress_payload`,
+  `hive_egress_worker_refusal` and `hive_egress_run_refusal`.
 - The policy: `SYSTEM_EGRESS_ROUTE` in `PROTECTED_SYSTEM_ACTIONS`, `orchestrator_mutations` and
   `spoke_only_actions`, and in the orchestrator's `SPOKE_ONLY_SYSTEM_ACTIONS`; `policy/system.wasm`
   and `policy/system_route.wasm` compiled again; `classify_system_message` and
@@ -1082,24 +1086,33 @@ switch_id (a confirm's)}`. The worker makes the switch id when it takes the swit
 
 **The route lookups** are `ip -4 route get fibmatch <address>`: the route that decides, with its
 prefix, so "through the default route" is the matched route being `default`, never a guess from a
-`via` (a more specific route may go through the same gateway). An `iproute2` without `fibmatch`
-(before 4.13) cannot be read, and the guards refuse.
+`via` (a more specific route may go through the same gateway). A multipath route's `nexthop` lines
+are read with it. An `iproute2` without `fibmatch` (before 4.13) cannot be read, and the guards
+refuse.
 
 **The answers.**
 
 - Every answer carries `outcome`: `switched`, `cleared`, `unchanged`, `refused` (nothing changed),
-  `reverted`, or `not_answered`.
+  `reverted`, or `not_answered`. A refusal before anything is sent or touched says `refused` too,
+  whoever makes it: SY.admin (in its envelope's `payload`, with the hive), the motherbee
+  (`FORBIDDEN` on a hive that is not the motherbee, `INVALID_REQUEST`), the worker (`FORBIDDEN` on
+  the motherbee, the `UNAUTHORIZED` of its local check, SO-05).
 - `unchanged` is `status: ok` with `outcome: unchanged`: SY.admin and the executor read any other
   status but `ok` as an error.
 - `not_answered` is `status: error`, `error_code: EGRESS_NOT_ANSWERED` (HTTP 504), with the step
-  whose forward got no answer (`switch` or `confirm`).
-- Codes 15.1 to 15.3 do not name: `EGRESS_GUARD_UNREADABLE` (a lookup, sshd's ports or hive.yaml
-  could not be read within the guards' 5 s; 503), `EGRESS_SWITCH_FAILED` (the route command
-  failed), `EGRESS_RECORD_FAILED` and `EGRESS_RECORD_UNREADABLE`, `HIVE_UNREACHABLE` (503, nothing
-  sent), `PREVIOUS_GATEWAY_UNKNOWN` (a clear on a worker whose record keeps no route from before the
-  egress, and no `gateway_ip`), `EGRESS_SWITCH_NOT_FOUND` (a confirm for a switch the worker does
-  not know). A record the start finds open and undoes says `interrupted`, with
-  `EGRESS_SWITCH_INTERRUPTED`.
+  whose answer did not come: `switch` or `confirm` (the motherbee's forward), or `commit` (the
+  worker took the confirm and did not answer it within 7 s, so its commit may still complete). A
+  confirm never answers `EGRESS_COMMIT_FAILED` for an answer that did not come: that code means the
+  commit failed and the switch reverted. An answer SY.admin itself did not get keeps its transport
+  code (`TIMEOUT`, `TRANSPORT_ERROR`), with `outcome: not_answered`.
+- Codes 15.1 to 15.3 do not name: `EGRESS_GUARD_UNREADABLE` (a lookup, sshd's ports, a device's
+  type or hive.yaml could not be read within the guards' 5 s; 503), `DEFAULT_ROUTE_MULTIPATH` (409,
+  below), `EGRESS_SWITCH_FAILED` (the route command failed), `EGRESS_RECORD_FAILED` and
+  `EGRESS_RECORD_UNREADABLE`, `HIVE_UNREACHABLE` (503, nothing sent), `PREVIOUS_GATEWAY_UNKNOWN` (a
+  clear on a worker whose record keeps no route from before the egress, and no `gateway_ip`),
+  `EGRESS_SWITCH_NOT_FOUND` (502, `outcome: refused`: a confirm for a switch the worker holds no
+  record of, so nothing of it is in place). A record the start finds open and undoes says
+  `interrupted`, with `EGRESS_SWITCH_INTERRUPTED`.
 - The refusals before anything changes are 409, a failed step after the switch 502, and
   `EGRESS_CONFIRM_MISSED` 504.
 
@@ -1108,22 +1121,84 @@ prefix, so "through the default route" is the matched route being `default`, nev
 - The motherbee's orchestrator reads its registry too (`NOT_A_WORKER`), and the worker's refuses on
   any role but worker. A body with another field than `access_from` (and a clear's `gateway_ip`) is
   refused (`INVALID_REQUEST`).
+- SY.admin sends the action for the hive its path names (the executor's `hive`): a body that names
+  another, in `target` or `hive_id`, is refused (`INVALID_REQUEST`), and the body's `target` is
+  always the path's hive. Otherwise a body `target` would send the switch to a hive SY.admin never
+  checked.
 - SY.admin also refuses while a task of the installation's update acts on the worker (one that may
   send it a core update; a read holds nothing back), with `INSTALLATION_UPDATE_RUNNING`. It holds
-  the explicit run's mark while the action runs, as `set_installation_ai` does, so an
-  `update_installation` started meanwhile is refused, naming it.
+  the explicit run's mark while the action runs, as `<action> on <hive>`, as `set_installation_ai`
+  holds it. So one egress action runs at a time in the installation: a second one, on any worker,
+  is refused with `EGRESS_SWITCH_OPEN`, naming the one that runs; an `update_installation` or a
+  `set_installation_ai` started meanwhile is refused with `INSTALLATION_UPDATE_RUNNING`, naming it
+  as an egress action.
+- **What else may restart the worker during its switch** (L3 of the review). While its switch is
+  open, the worker's own orchestrator refuses a core update (`SYSTEM_UPDATE`, category `core`) and a
+  core rollback (not a dry run), with `EGRESS_SWITCH_OPEN`, and does nothing: both restart its
+  orchestrator and its router. The per-hive `update`, the installation update's run and its
+  automatic step, and `core_rollback` all end there, and only the worker knows that its switch is
+  open, so that is the one place that covers them all. SY.admin's busy map is not used: a
+  background read holds it too, and it covers only the update's own tasks. The installation update
+  records the refusal as that hive's outcome, as any error, and the hive stays off the target until
+  a later pass, or the operator's `update_installation`, sends the core update again. The other
+  way round, a core update already restarting the worker when the switch arrives stops
+  the switch midway, and the start undoes it from the record (`interrupted`).
+- G1 refuses a gateway reached through a multipath route.
 - G2 refuses a worker whose hive.yaml names no `wan.uplinks` address, and an IPv6 uplink, which the
-  IPv6 block would cut.
+  IPv6 block would cut. It also refuses a motherbee reached through a tunnel
+  (`UPLINK_ON_DEFAULT_ROUTE`): a device whose link type (`/sys/class/net/<dev>/type`) is none (tun,
+  WireGuard), IPIP, IPv6-in-IPv6, SIT, GRE or PPP, or whose name says tap, ZeroTier, VXLAN, Geneve,
+  gretap or ERSPAN. The tunnel's own packets to its far end may go through the default route,
+  which the lookup cannot see.
+- G3 looks up a network of `access_from` by its first address after the network's own (for a /31
+  or a /32, its own address): a kernel before 5.19 routes a connected network's own address as a
+  `broadcast` route of table local, which would read as a more specific route.
+- G3 reads sshd's ports as the egress' rules read them: `sshd -T` within the guards' time, asked
+  once more after creating `/run/sshd` as ssh.service would (root, 0755) when that is all it
+  lacked. On a socket-activated host (8.x's worker1: `ssh.socket` active, `ssh.service` inactive)
+  the directory does not exist until the first connection, and a bare `sshd -T` exits 255, which
+  would refuse every switch with `EGRESS_GUARD_UNREADABLE`.
 - G3's refusal names every session and network at once, the current gateway to route each through,
   and where SSH still reaches the box from.
+- **A limit of G3:** an SSH session, or an `access_from` network, reached through a tunnel passes
+  the guard, though the tunnel's own packets may go through the default route; the switch may then
+  cut it. The hypervisor's console is never affected.
 
 **The switch and the revert.**
 
+- A default route that is a multipath route, or goes through a nexthop object (`nexthop` lines,
+  `nhid`), is refused before the guards (`DEFAULT_ROUTE_MULTIPATH`): `ip route replace` could not
+  put it back word for word.
 - `ip route replace default via <gateway_ip>`, as the boot, replaces the default route of the same
-  metric. The revert replaces each recorded line again (the flags `ip route` only prints dropped),
-  then deletes the default routes through the gateway it leaves that the record does not hold; a
-  default route through another gateway (a DHCP lease's) is left alone.
+  metric (0). Beside a DHCP lease's default (metric 100) it adds its own, which wins.
+- The revert replaces each recorded line again (the flags `ip route` only prints dropped), then
+  deletes the default routes through the gateway it leaves that the record does not hold, even when
+  a replace failed; every problem goes into the answer's `revert_problems` and the record's reason.
+  A default route through another gateway is left alone, and so is a lease's metric 100 that the
+  record holds, while the switch's metric 0 is deleted.
 - The record keeps the sysctl file's content, not only whether it existed.
+- A set on a worker with no section whose default route already goes through the gateway (set by
+  hand) records no `original`: that route is no way back, and the clear then names the gateway to
+  go back to (`gateway_ip`, else `PREVIOUS_GATEWAY_UNKNOWN`).
+
+**The bounds, as built.**
+
+- The guards' 5 s run from the request on: the read of the default routes, of the record and of
+  hive.yaml are inside them.
+- Each command runs with what is left of its step's bound, at most 2 s for a lookup, under
+  coreutils' `timeout` with its kill grace (0.5 s) inside that time, never a second after it. With
+  less than 0.2 s left a command does not run, and the step fails as one whose time ran out: the
+  guards refuse (`EGRESS_GUARD_UNREADABLE`), the switch and the check revert. A revert's command
+  runs with at least 0.5 s, past the revert's 5 s too: putting the worker back comes first.
+- The check keeps 1 s of its 12 s for G2's lookups again and the route `pending_confirm` shows: the
+  second GET runs only when curl's 5 s, the pause and that second still fit.
+- So `pending_confirm` goes at most 22 s after the request (5 + 5 + 12), and a revert's answer
+  before it at most about 27 s, within the motherbee's 30 s forward.
+- The commit runs no command. The confirm's answer carries the route the check read, so nothing is
+  read between the confirm and its answer; the confirm waits 7 s for that answer, within the
+  motherbee's 10 s forward, and answers `not_answered` (`commit`) past them.
+- `curl` is looked for in the directories of the orchestrator's `PATH`, where the probe runs it,
+  with no command.
 
 **The clear.**
 
@@ -1159,3 +1234,17 @@ error does: no code of Archi's reads `/versions` by itself; its handbook (§4.4.
 
 **hive-config-update-v1** names the one exception to "a worker's `egress` never travels" in §1,
 §2, §5 (its writers) and §12, and §9 records the operator's call.
+
+**The gate on 8.x: worker1 as read on the box (2026-11-10, read-only).**
+
+- Ubuntu 24.04, kernel 6.8, iproute2 6.1 (`fibmatch` since 4.13).
+- `ssh.socket` active, `ssh.service` inactive, `/run/sshd` absent: a bare `sshd -T` exits 255.
+  G3 creates the directory and reads the ports (above).
+- Its default route: `default via 10.10.10.1 dev eth0 proto static`. `ip -4 route get fibmatch`
+  of 10.10.10.40 (egress1) and of 10.10.10.10 (the motherbee) both give `10.10.10.0/24 dev eth0
+  proto kernel scope link src 10.10.10.20`, and eth0 is Ethernet: G1 and G2 pass.
+- No established inbound SSH session (the operator reaches worker1 through the hypervisor's console
+  and guest agent): G3 has only `access_from` to check, and step 2's `192.168.8.0/24` goes through
+  the default route, so it is refused, as §15.6 expects.
+- IPv6 on everywhere, with no global address; no `/etc/sysctl.d/99-fluxbee-egress.conf`. The
+  record keeps the four values and no file, and the clear puts both back.

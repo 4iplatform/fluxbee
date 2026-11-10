@@ -785,29 +785,41 @@ SY.admin sends them to the motherbee's orchestrator, which answers from a task o
   switch at a time (`EGRESS_SWITCH_OPEN`). The switch runs in a task of its own
   (`spawn_egress_switch`), so the system inbox takes the confirm meanwhile; `unchanged` when the
   section and the default route are the declaration's already (a clear: when there is no section).
-  1. The guards (`egress_switch_guards`), route lookups that only read
-     (`ip -4 route get fibmatch`, each under `timeout`, 5 s in all): G1 the gateway on a subnet it is
-     connected to (`GATEWAY_NOT_ON_LINK`); G2 the mesh's way to the motherbee, `wan.uplinks` and
-     `identity.sync.upstream`, off the default route, an IPv4 address (`UPLINK_ON_DEFAULT_ROUTE`); G3
-     the live inbound SSH sessions (on `sshd -T`'s ports) and `access_from` off it, IPv4
-     (`ACCESS_ON_DEFAULT_ROUTE`, naming each, the current gateway, and where SSH still reaches the
-     box from); a set needs `curl` (`PROBE_UNAVAILABLE`); a lookup that cannot be read refuses too
-     (`EGRESS_GUARD_UNREADABLE`).
+  Every answer says its `outcome`, a refusal (`refused`) included.
+  1. The guards (`egress_switch_guards`), reads only, 5 s in all from the request on, each command
+     under `timeout` with its kill grace inside what is left: a default route that is multipath or
+     goes through a nexthop object is refused (`DEFAULT_ROUTE_MULTIPATH`); G1 the gateway on a
+     subnet it is connected to, not through a multipath route (`GATEWAY_NOT_ON_LINK`); G2 the mesh's
+     way to the motherbee, `wan.uplinks` and `identity.sync.upstream`, an IPv4 address off the
+     default route and through no tunnel device (`UPLINK_ON_DEFAULT_ROUTE`); G3 the live inbound SSH
+     sessions (on `sshd -T`'s ports, read as the egress' rules read them, `/run/sshd` created when
+     that is all `sshd -T` lacks: `egress_sshd_ports`) and `access_from` (each network looked up by
+     its first address) off it, IPv4 (`ACCESS_ON_DEFAULT_ROUTE`, naming each, the current gateway,
+     and where SSH still reaches the box from); a set needs `curl` on the PATH
+     (`PROBE_UNAVAILABLE`); a read that fails, or does not fit the 5 s, refuses too
+     (`EGRESS_GUARD_UNREADABLE`). A session through a tunnel passes G3.
   2. The record, `/var/lib/fluxbee/orchestrator/egress-switch.json`, written atomically and `open`:
      the default routes, the four IPv6 sysctls and the sysctl file as they were, and what the worker
-     had before it first went behind an egress, carried over by later switches. The watchdog's
-     egress step skips while a switch is open.
+     had before it first went behind an egress, carried over by later switches (none when its
+     default route went through the gateway already). The watchdog's egress step skips while a
+     switch is open, and so does a core update or a core rollback sent to this worker
+     (`egress_switch_open_refusal`: `EGRESS_SWITCH_OPEN`, nothing done).
   3. The switch (5 s): a set `ip route replace default via <gateway_ip>` and the IPv6 block, judged
      by the kernel's read-back (`EGRESS_IPV6_UNMANAGED`); a clear puts the recorded routes back.
   4. The check (12 s): a GET of `reachability_url`, twice at most, 1 s apart
-     (`EGRESS_PROBE_FAILED`, with curl's reason; a clear's is reported and decides nothing), and the
-     uplinks' lookups again (`UPLINK_ROUTE_CHANGED`). Then `pending_confirm`.
+     (`EGRESS_PROBE_FAILED`, with curl's reason; a clear's is reported and decides nothing), and,
+     in the second it keeps, the uplinks' lookups again (`UPLINK_ROUTE_CHANGED`) and the route it
+     shows. Then `pending_confirm`, at most 22 s after the request.
   5. The confirm within 15 s (`EGRESS_CONFIRM_MISSED`, answered also to a confirm that comes after
      the revert), then the commit (`egress_commit`): a set writes hive.yaml (atomically,
      `write_hive_yaml_egress`: only `egress` changed, under the lock `set_storage` takes too), then
      its in-memory section; a clear removes the section from memory, then from hive.yaml, then puts
-     back the IPv6 values and the sysctl file the record kept. A failed step reverts from the record
-     (`egress_revert`; `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`).
+     back the IPv6 values and the sysctl file the record kept. The commit runs no command, and its
+     answer carries the route the check read; a confirm the switch took and did not answer within
+     7 s is `EGRESS_NOT_ANSWERED` (`step: commit`). A failed step reverts from the record
+     (`egress_revert`; `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`), every step of it even after
+     one failed, `revert_problems` naming each. A confirm for a switch the worker holds no record of
+     is `EGRESS_SWITCH_NOT_FOUND`.
 - **A start with an open record** (`resume_egress_switch_at_start`, before `reconcile_egress`): a
   commit hive.yaml holds is marked `committed` (a clear's IPv6 values put back); otherwise the switch
   is undone from the record, marked `interrupted`, and an `egress` drift alert

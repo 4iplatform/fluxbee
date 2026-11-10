@@ -642,22 +642,34 @@ executor runs them once the operator confirms.
   manages the worker from, besides its live SSH sessions. A clear may name `gateway_ip`, the gateway
   to go back to, only for a worker whose record keeps no route from before the egress. It names no
   gateway otherwise: a set's is the motherbee's declaration.
-- **What SY.admin checks** before it sends anything (`handle_hive_egress_command`): the hive is a
-  worker of the registry whose join is done (`hive_egress_worker_refusal`, `409 NOT_A_WORKER` for
-  the motherbee, an ingress, an egress, a hive whose join is not done, or none of the registry's);
-  no installation update run is under way, nor a task of the update acting on that worker
+- **What SY.admin checks** before it sends anything (`handle_hive_egress_command`): the body names
+  no other hive than the path's, in `target` or `hive_id` (`hive_egress_payload`,
+  `400 INVALID_REQUEST`); the hive is a worker of the registry whose join is done
+  (`hive_egress_worker_refusal`, `409 NOT_A_WORKER` for the motherbee, an ingress, an egress, a hive
+  whose join is not done, or none of the registry's); no other egress action runs, on any worker
+  (`409 EGRESS_SWITCH_OPEN`, naming it: one at a time in the installation); no installation update
+  run is under way, nor a task of the update acting on that worker
   (`409 INSTALLATION_UPDATE_RUNNING`): its core update restarts the worker's orchestrator. It holds
-  the run's mark while the action runs, as `set_installation_ai` does.
-- **Then** it sends the action to `SY.orchestrator@motherbee`, `payload.target` the worker, and
-  waits 60 s. The motherbee's checks, the worker's guards, the switch, the confirm and the commit or
-  the revert are the orchestrators' ([SY.orchestrator](sy-orchestrator.md#a-worker-behind-the-egress-a-219)).
+  the run's mark while the action runs, as `<action> on <hive>`, as `set_installation_ai` holds
+  it, so an `update_installation` started meanwhile is refused, naming the egress action. Each
+  refusal says `outcome: refused` and the hive in its `payload`.
+- **Then** it sends the action to `SY.orchestrator@motherbee`, `payload.target` the worker the path
+  names, and waits 60 s. The motherbee's checks, the worker's guards, the switch, the confirm and the
+  commit or the revert are the orchestrators'
+  ([SY.orchestrator](sy-orchestrator.md#a-worker-behind-the-egress-a-219)). While a switch is open
+  on a worker, its orchestrator refuses a core update or a core rollback sent to it
+  (`update`, `update_installation`, `core_rollback`): `409 EGRESS_SWITCH_OPEN`, nothing done.
 - **The answer:** `status` `ok` (`outcome` `switched`, `cleared` or `unchanged`) or an error with
   `error_code`, `step` and `outcome` (`refused`, `reverted`, `not_answered`), and the worker's
   `gateway_ip`, `previous_gateway`, `ipv6_blocked`, `internet_reachable`, `probe`,
   `ssh_reachable_from`, `switch_id` and `timings_ms` per step. A refusal before anything changed is
-  409 (`503` for `HIVE_UNREACHABLE` and `EGRESS_GUARD_UNREADABLE`, `422` for
-  `EGRESS_DECLARATION_INVALID`); a step that failed and reverted 502; `EGRESS_CONFIRM_MISSED` and
-  `EGRESS_NOT_ANSWERED` 504. `EGRESS_NOT_ANSWERED` never means "not applied": `GET
+  409 (`DEFAULT_ROUTE_MULTIPATH` among them; `503` for `HIVE_UNREACHABLE` and
+  `EGRESS_GUARD_UNREADABLE`, `422` for `EGRESS_DECLARATION_INVALID`); a step that failed and reverted
+  502 (`revert_problems` names each step the revert could not do), and so is
+  `EGRESS_SWITCH_NOT_FOUND`; `EGRESS_CONFIRM_MISSED` and `EGRESS_NOT_ANSWERED` 504.
+  `EGRESS_NOT_ANSWERED` never means "not applied", whatever its `step` (`switch`, `confirm`, or
+  `commit`: the worker took the confirm and did not answer it within 7 s); nor does an answer
+  SY.admin did not get (`TIMEOUT`, `TRANSPORT_ERROR`), which says `outcome: not_answered` too. `GET
   /hives/{hive}/versions` says where the worker stands (`egress.state`, `egress.last_switch`).
 - The command log keeps each run under the worker's hive (`GET /hives/<worker>/commands`).
 

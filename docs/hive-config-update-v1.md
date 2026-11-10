@@ -630,7 +630,10 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   pending until its record changes (F9: another update's start, or a new settle): its `next` says
   to run the update again or the per-hive `update`, and nothing warns about it again in the
   meantime. One whose health gate rolled it back is `CORE_UPDATE_ROLLED_BACK`; a `/versions`
-  silent past the bound, `not_answered`. Each `next` says what moves it; a hive that did not
+  silent past the bound, `not_answered`. A worker whose egress switch is open (A-219,
+  [edge-egress-nat-spec](edge-egress-nat-spec.md) §15.8) refuses its core update with
+  `EGRESS_SWITCH_OPEN`, nothing done, for the switch's minute at most. Each `next` says what moves
+  it; a hive that did not
   answer is promised the automatic step "unless it leaves the hive alone" (rolled back, ahead,
   edited by hand).
 - **The background task** (`run_background`), in SY.admin, the motherbee only, while an update is

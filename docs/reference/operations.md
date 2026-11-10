@@ -277,24 +277,34 @@ route (PB-8).
 
 What runs:
 
-1. **SY.admin** checks that the hive is a worker of the registry whose join is done
-   (`NOT_A_WORKER`), and that no installation update run is under way, nor a task of the update
-   acting on that worker (`INSTALLATION_UPDATE_RUNNING`).
+1. **SY.admin** checks that the body names no other hive than the path's (`target`, `hive_id`:
+   `INVALID_REQUEST`), that the hive is a worker of the registry whose join is done
+   (`NOT_A_WORKER`), that no other egress action runs, on any worker (`EGRESS_SWITCH_OPEN`: one at a
+   time), and that no installation update run is under way, nor a task of the update acting on that
+   worker (`INSTALLATION_UPDATE_RUNNING`).
 2. **The motherbee's orchestrator** checks its own `egress`: `gateway_ip` (`NO_EGRESS_DECLARED`),
    `reachability_url` (`NO_REACHABILITY_URL`: the switch is judged by a probe of it), a declaration
    the join would refuse (`EGRESS_DECLARATION_INVALID`). It holds the hive's topology lock for the
    whole action (`JOIN_IN_PROGRESS`), and sends `SYSTEM_EGRESS_ROUTE` to the worker
    (`HIVE_UNREACHABLE` when its orchestrator is not on the mesh).
-3. **The worker** runs the guards, route lookups that only read (`ip -4 route get fibmatch`, 5 s in
-   all), and refuses before anything changes:
-   - `GATEWAY_NOT_ON_LINK`: the gateway is not on a subnet the worker is connected to.
+3. **The worker** runs the guards, reads that only read (`ip -4 route get fibmatch`, `sshd -T`,
+   `ss`, 5 s in all from the request on), and refuses before anything changes:
+   - `GATEWAY_NOT_ON_LINK`: the gateway is not on a subnet the worker is connected to, or is
+     reached through a multipath route.
    - `UPLINK_ON_DEFAULT_ROUTE`: it reaches the motherbee (`wan.uplinks`, `identity.sync.upstream`)
-     through its default route, by a host name, or over IPv6.
+     through its default route, by a host name, over IPv6, or through a tunnel (tun, WireGuard,
+     GRE, IPIP, PPP, tap, VXLAN...), whose own packets may take the default route.
    - `ACCESS_ON_DEFAULT_ROUTE`: a live SSH session, or an `access_from` address or network, reaches
      it through its default route. Keep such a network with a static route at the OS level (netplan)
      through the current gateway, which the guard then sees as a more specific route; Fluxbee adds
-     no route of its own.
-   - `PROBE_UNAVAILABLE`: no `curl`. `EGRESS_GUARD_UNREADABLE`: a lookup could not be read.
+     no route of its own. A session through a tunnel passes this guard, though the tunnel's own
+     packets may take the default route: the console stays.
+   - `DEFAULT_ROUTE_MULTIPATH`: the worker's default route is a multipath route, or goes through a
+     nexthop object, which a revert could not put back. Give it a default route through one
+     gateway first.
+   - `PROBE_UNAVAILABLE`: no `curl`. `EGRESS_GUARD_UNREADABLE`: a lookup, sshd's ports or a
+     device's type could not be read in time. sshd's ports are read with `sshd -T` once more after
+     creating `/run/sshd`, which a socket-activated host lacks until its first SSH connection.
 4. It records the way back (`/var/lib/fluxbee/orchestrator/egress-switch.json`: the default routes,
    the four IPv6 sysctls, the sysctl file), pauses its watchdog's egress step, switches
    (`ip route replace default via <gateway_ip>`, the IPv6 block judged by what the kernel reads
@@ -304,7 +314,12 @@ What runs:
    it writes hive.yaml (atomically, only `egress` changed), then its in-memory section. Otherwise,
    or when a step failed, it puts the routes, the IPv6 values and the sysctl file back:
    `EGRESS_PROBE_FAILED` (with curl's reason), `EGRESS_IPV6_UNMANAGED`, `UPLINK_ROUTE_CHANGED`,
-   `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`, `EGRESS_CONFIRM_MISSED`.
+   `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`, `EGRESS_CONFIRM_MISSED`. The revert does every
+   step it can, and `revert_problems` names each one it could not do.
+
+While the switch is open (at most a minute), the worker's orchestrator refuses a core update or a
+core rollback sent to it, which would restart it (`EGRESS_SWITCH_OPEN`; `update`,
+`update_installation`, `core_rollback`): run them again once the switch ends.
 
 A clear's probe is reported and decides nothing: the way back may have no internet by design. An
 orchestrator that stops mid-switch finishes it at its next start: a commit hive.yaml holds is kept,
@@ -312,12 +327,14 @@ anything else is undone from the record (`last_switch.state: interrupted`, and a
 worker's own file).
 
 The answer: `status` (`ok`, or `error` with `error_code` and `step`), `outcome` (`switched`,
-`cleared`, `unchanged`, `refused`, `reverted`, `not_answered`), `gateway_ip`, `previous_gateway`,
-`ipv6_blocked`, `internet_reachable` and `probe` (`url`, `attempts`, `reason`),
-`ssh_reachable_from`, `switch_id`, `timings_ms` per step. `EGRESS_NOT_ANSWERED` (504) never means
-"not applied": an orchestrator on an older release ignores the message (bring the worker to the
-motherbee's release first, `update_installation`), and a worker whose answer was lost reverts by
-itself unless it got the confirm.
+`cleared`, `unchanged`, `refused`, `reverted`, `not_answered`; a refusal of SY.admin's says it in
+its `payload`), `gateway_ip`, `previous_gateway`, `ipv6_blocked`, `internet_reachable` and `probe`
+(`url`, `attempts`, `reason`), `ssh_reachable_from`, `switch_id`, `timings_ms` per step.
+`EGRESS_NOT_ANSWERED` (504) never means "not applied", whatever its `step`: an orchestrator on an
+older release ignores the message (bring the worker to the motherbee's release first,
+`update_installation`), a worker whose answer was lost reverts by itself unless it got the
+confirm, and one that took the confirm and did not answer it in time (`step: commit`) may still
+have committed. An answer SY.admin did not get (`TIMEOUT`) says `not_answered` too.
 
 `GET /versions` and `GET /hives/{hive}/versions` say where each worker stands: `egress.section`, the
 default gateway it sees, `ipv6_blocked`, `last_switch` (`state`, `step`, `error_code`, `reason`),
