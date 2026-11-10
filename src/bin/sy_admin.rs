@@ -16592,7 +16592,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Callers: the operator's HTTP API, Archi and the executor, and SY.orchestrator@<hive> for a node of its own hive, which calls it when a node is purged (kill_node with purge_instance).",
             "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, retry) when the connected nodes cannot be read from shared memory; nothing is removed.",
             NODE_HAS_PAGES_NOTE,
-            "Steps, in order: SY.identity must hold the ILK as this node's (identification.node_name), else NODE_ILK_MISMATCH and nothing is removed; then every SY.vault secret dedicated to the ILK is deleted in its own tenant; then the ILK is marked (ILK_DELETE) and purged (ILK_PURGE). An ILK SY.identity does not hold is reported not_found: the operator's HTTP API and the executor still delete its leftover secrets, a mesh caller (the orchestrator, Archi) leaves them.",
+            "Steps, in order: SY.identity must hold the ILK as this node's (identification.node_name), else NODE_ILK_MISMATCH and nothing is removed; then every SY.vault secret dedicated to the ILK is deleted in its own tenant; then the ILK is marked (ILK_DELETE) and purged (ILK_PURGE), only the ledger read again before the purge: a page of the node up by then leaves the ILK marked (TEARDOWN_INCOMPLETE, its ilk_delete NODE_HAS_PAGES). An ILK SY.identity does not hold is reported not_found: the operator's HTTP API and the executor still delete its leftover secrets, a mesh caller (the orchestrator, Archi) leaves them.",
             "The payload is the same on success and on failure: node_name, ilk_id, ilk_deleted, not_found, vault_secrets_purged {status, scanned, deleted, errors[{key, error_code, error_detail}]} and ilk_delete {status ok|error|skipped, error_code, error_detail}. A step that did not run says skipped.",
             "status ok only when every step was done; otherwise TEARDOWN_INCOMPLETE with the same payload. When a secret cannot be deleted the ILK is left in place, so a retry can still tie the remaining secrets to the node.",
             "SY.* and RT.* nodes are never torn down: run_node does not launch them.",
@@ -20627,6 +20627,19 @@ async fn handle_identity_command(
     } else {
         None
     };
+    send_identity_command(ctx, client, action, payload).await
+}
+
+/// One identity action, sent to the primary's SY.identity as such (`identity_command_hive`), with
+/// none of the checks `handle_identity_command` runs before a purge. A teardown sends its ILK's
+/// mark and purge this way: it checked the node's pages and read its ILK itself.
+async fn send_identity_command(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    let target = format!("SY.identity@{}", identity_command_hive(&ctx.hive_id));
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
@@ -21043,6 +21056,8 @@ impl TeardownReport {
 ///    ties its secrets to the node any more.
 /// 3. The secrets dedicated to the ILK, each deleted in its own tenant.
 /// 4. The ILK marked (`ILK_DELETE`), then purged (`ILK_PURGE`); `ILK_NOT_FOUND` counts as done.
+///    Before the purge only the ledger is read again (`node_pages_refusal`), and SY.identity is
+///    not asked whose the ILK is again: a page of the node found up then leaves the ILK marked.
 ///
 /// The secrets go first because the ILK is what ties them to the node: when step 3 fails, step 4
 /// does not run, so a retry can still prove which secrets are the node's. Every step is reported;
@@ -21149,18 +21164,25 @@ async fn handle_teardown_node(
         return Ok(report.answer(Some((502, "TEARDOWN_INCOMPLETE", detail))));
     }
 
-    // 4. Mark, then purge.
+    // 4. Mark, then purge, each sent as such (`send_identity_command`). Step 1 checked the node's
+    // pages and holds its publishes off, and step 2 read whose the ILK is: before the purge only
+    // the ledger is read again, and SY.identity is not asked whose the ILK is again
+    // (`purge_ilk_pages_block`), a read that, failing, would leave the ILK marked, its secrets gone.
     if !report.not_found {
         for action in ["delete_ilk", "purge_ilk"] {
+            if action == "purge_ilk" {
+                if let Some((_, code, detail)) = node_pages_refusal(ctx, &request.node_name) {
+                    report.ilk_delete = teardown_step_error(code, &detail);
+                    let detail = format!(
+                        "purge_ilk of {ilk_id} was not sent ({code}): its ILK stays marked for a \
+                         retry to finish"
+                    );
+                    return Ok(report.answer(Some((502, "TEARDOWN_INCOMPLETE", detail))));
+                }
+            }
             let answer = admin_step_envelope(
-                handle_identity_command(
-                    ctx,
-                    client,
-                    action,
-                    serde_json::json!({ "ilk_id": ilk_id }),
-                    None,
-                )
-                .await,
+                send_identity_command(ctx, client, action, serde_json::json!({ "ilk_id": ilk_id }))
+                    .await,
             );
             match admin_step_outcome(&answer) {
                 Ok(()) => {}
@@ -39702,6 +39724,89 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+        assert_node_work_idle(&ctx);
+    }
+
+    /// teardown_node's purge: its first step checked the node's pages and holds its publishes off,
+    /// and its second read whose the ILK is, so before ILK_PURGE only the ledger is read again.
+    /// SY.identity is not asked whose the ILK is a second time, though another node's page is up
+    /// (purge_ilk's own check would ask). A page of the node found up then (written here by hand:
+    /// no publish of it can start) leaves the ILK marked and its secrets deleted: the answer is
+    /// TEARDOWN_INCOMPLETE, its ILK step saying why, and ILK_PURGE is not sent.
+    #[tokio::test]
+    async fn teardown_node_reads_only_the_ledger_before_its_purge() {
+        let (ctx, mut harness) = mesh_test_admin("teardown-purge-ledger");
+        let other = published_page("AI.other@worker1");
+        seed_publications(&ctx, &[&other]);
+        let no_secrets = json!({ "status": "ok", "secrets": [] });
+        let marked = json!({ "status": "ok", "state": "deleted" });
+        let (result, sent) = tokio::join!(
+            teardown_of(&ctx, PAGE_PUBLISHER),
+            answer_teardown(
+                &mut harness,
+                vec![
+                    ("ILK_GET", ilk_of(PAGE_PUBLISHER)),
+                    (MSG_VAULT_LIST, no_secrets.clone()),
+                    ("ILK_DELETE", marked.clone()),
+                    ("ILK_PURGE", json!({ "status": "ok", "state": "purged" })),
+                ]
+            )
+        );
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(result.envelope["payload"]["ilk_deleted"], json!(true));
+        let reads = sent
+            .iter()
+            .filter(|message| message.meta.msg.as_deref() == Some("ILK_GET"))
+            .count();
+        assert_eq!(reads, 1);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        assert_node_work_idle(&ctx);
+
+        // A page of the node up by then: the ILK stays marked.
+        let up = published_page(PAGE_PUBLISHER);
+        let drive = async {
+            answer_teardown(
+                &mut harness,
+                vec![
+                    ("ILK_GET", ilk_of(PAGE_PUBLISHER)),
+                    (MSG_VAULT_LIST, no_secrets),
+                ],
+            )
+            .await;
+            let mark = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("ILK_DELETE");
+            assert_eq!(mark.meta.msg.as_deref(), Some("ILK_DELETE"));
+            seed_publications(&ctx, &[&other, &up]);
+            harness
+                .inject(reply_to(&mark, "ILK_DELETE_RESPONSE", marked))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(teardown_of(&ctx, PAGE_PUBLISHER), drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 502, "{}", result.envelope);
+        assert_eq!(result.envelope["error_code"], json!("TEARDOWN_INCOMPLETE"));
+        let payload = &result.envelope["payload"];
+        assert_eq!(payload["ilk_deleted"], json!(false));
+        assert_eq!(payload["vault_secrets_purged"]["status"], json!("ok"));
+        assert_eq!(payload["ilk_delete"]["status"], json!("error"));
+        assert_eq!(payload["ilk_delete"]["error_code"], json!("NODE_HAS_PAGES"));
+        let why = payload["ilk_delete"]["error_detail"].as_str().expect("why");
+        assert!(why.contains(&up.publication_id), "{why}");
+        assert_no_key(&result.envelope.to_string(), &[&other, &up]);
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "ILK_PURGE was sent"
+        );
         assert_node_work_idle(&ctx);
     }
 

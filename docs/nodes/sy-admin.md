@@ -465,7 +465,12 @@ executor may ask for it too. In order:
    still deletes them.
 3. **Its secrets**: `VAULT_LIST` with `filter.ilk`, then `VAULT_DELETE` of each in its own tenant,
    through `handle_vault_command` like every admin vault call.
-4. **The ILK**: `ILK_DELETE` (the mark), then `ILK_PURGE`; `ILK_NOT_FOUND` counts as done.
+4. **The ILK**: `ILK_DELETE` (the mark), then `ILK_PURGE`; `ILK_NOT_FOUND` counts as done. Both go
+   to SY.identity as such (`send_identity_command`): step 1 checked the pages and step 2 read the
+   ILK, so before the purge only the ledger is read again, and SY.identity is not asked whose the
+   ILK is a second time, as `purge_ilk`'s own check would (`purge_ilk_pages_block`). A page of the
+   node found up then leaves the ILK marked: `TEARDOWN_INCOMPLETE`, its ILK step
+   `NODE_HAS_PAGES`.
 
 The secrets go first because the ILK is what ties them to the node: when one cannot be deleted,
 step 4 does not run, so a retry can still prove which secrets are the node's. The payload is the
