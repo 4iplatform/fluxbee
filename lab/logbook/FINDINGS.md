@@ -317,6 +317,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-246 🔵 A non-gateway router with no gateway sibling answers a broadcast twice (low; multi-router hives only, not supported).
 - A-247 🔵 A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender (low; multi-router hives only, not supported).
 - A-248 🔵 An AI node used as a tap target answers the tapped message's sender (low; the AI SDK).
+- A-249 🔵 A-233's guards leave two narrow cases: a kill SY.admin stops waiting for, and the reset's step [3] (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1394,6 +1395,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-249 [General/admin] 🔵 low (found 2026-11-10 by the builder of A-233's review fixes; read in the code) — A-233's in-flight guards leave two narrow cases
+
+- **A kill SY.admin stops waiting for:** SY.admin waits 180 s for a kill with purge; past that it
+  counts the purge out while the orchestrator may still be working. A publish already queued
+  from that node could then start before the orchestrator's `teardown_node` counts its purge in:
+  the half-way teardown of A-233's race again, in this case only.
+- **The factory reset's step [3]:** a node that died by itself in the middle of a publish has its
+  ILK's `purge_ilk` refused as in flight; the reset retries it only across its normal passes, so
+  it may end as a counted problem with the ILK marked. Running the reset again finishes it.
+- **Also:** the reset recognises a refusal for a publish in flight by the text "is in flight",
+  because SY.wf-rules passes SY.admin's code on only inside its detail (A-220's lesson: a code read
+  from a text breaks when the text changes).
+- **Fix, later:** the purge count held until the orchestrator's answer whatever SY.admin's wait;
+  SY.wf-rules passing SY.admin's `error_code` on as its own.
 
 ### A-248 [General/AI SDK] 🔵 low (found 2026-11-10 by the router's 0.1.129 builder; read in the code, not live) — An AI node used as a tap target answers the tapped message's sender
 
