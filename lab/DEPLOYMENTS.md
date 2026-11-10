@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.126** | 2026-11-10 | `cf005771` | motherbee + spokes (core): A-219: an existing worker goes behind the egress, and back, by an explicit action (`set_hive_egress` / `clear_hive_egress`, the operator's word or Archi's plan with CONFIRM; `SYSTEM_EGRESS_ROUTE` between the orchestrators, protected; guards, a record, a probe, the motherbee's confirm, commit or revert, the start's resume; `/versions`' egress state); with A-225 (a removed worker's IPv6 file, the boot judging IPv6 by the kernel, the probe's reason) | ✅ live, checked on 8.x | snap `pre-egress-0-1-126` (all 4 VMs) · first `clear_hive_egress` of every worker behind the egress (a release before 0.1.126 cannot), then `apt install fluxbee=0.1.125` + 0.1.125's `update_installation` |
+| **0.1.127** | 2026-11-10 | `d2b344bb` | motherbee + spokes (core), one branch per binary: SY.orchestrator (A-199's step 1: reads apart, at most 4 waiting on one hive, a command that panics answered; hive-config stage 5: the blob folders follow their dist folder, and the blob GC runs only on the motherbee (A-188); A-196's restart marker; A-232's refusals); SY.admin (A-233: no purge while a node has a page up or a publish in flight; A-231, the ledger keeps a page down 30 days; A-234, the HTTP head and body caps; A-232; A-171, the manifest's lock file); SY.vault (A-200, one pass at the boot's announcement); SY.timer (A-220, canceled with a reason, schema v3; `LINK_BUSY` retried; A-232) | ✅ live, checked on 8.x | snap `pre-reads-0-1-127` (all 4 VMs) · `apt install fluxbee=0.1.126` + 0.1.126's `update_installation` (SY.timer of 0.1.126 reads the v3 table) |
+| **0.1.126** | 2026-11-10 | `cf005771` | motherbee + spokes (core): A-219: an existing worker goes behind the egress, and back, by an explicit action (`set_hive_egress` / `clear_hive_egress`, the operator's word or Archi's plan with CONFIRM; `SYSTEM_EGRESS_ROUTE` between the orchestrators, protected; guards, a record, a probe, the motherbee's confirm, commit or revert, the start's resume; `/versions`' egress state); with A-225 (a removed worker's IPv6 file, the boot judging IPv6 by the kernel, the probe's reason) | ✅ replaced by 0.1.127 | snap `pre-egress-0-1-126` (deleted 2026-11-10) · first `clear_hive_egress` of every worker behind the egress (a release before 0.1.126 cannot), then `apt install fluxbee=0.1.125` + 0.1.125's `update_installation` |
 | **0.1.125** | 2026-11-10 | `f39e2bb0` | motherbee + spokes (core): the sweep's calls: published pages listed (`GET /artifacts`), taken down by the factory reset, and a tenant's purge refused while one is up (A-212); no default tenant and two different tenants refused (A-213); every fixed text in English and the frontdesk answering in the person's language (A-214); a WF forward to another IO node names no one (A-215); the frontdesk retrying a transient failure (A-216); wf-generic staying up on a failed store (A-217); one-time conversions removed (A-210, mostly); hive.yaml written atomically by `set_storage` (A-224); SY.admin's HTTP answering a failed handler (A-229); Archi asking for a node's tenant (A-230); Archi's runtime redeploy keeping each node's tenant (A-235); a removed ingress's SY.edge stopped (A-236) | ✅ replaced by 0.1.126 | snap `pre-clean-0-1-125` (deleted 2026-11-10) · `apt install fluxbee=0.1.124` + 0.1.124's `update_installation` (SY.identity of 0.1.124 still reads every record 0.1.125 writes) |
 | **0.1.124** | 2026-11-10 | `bffaf4f2` | motherbee + spokes (core): the router's release: a WAN session runs its cleanup however it ends and a send into a dead link is answered (A-203, the links between sibling routers and to nodes too); a WAN peer silent for the dead interval is cut (A-207), and a WAN handshake has a deadline; a sender's message the router's additions take over the frame is answered `FRAME_TOO_LARGE`, a broadcast everywhere or nowhere (A-202); the router no longer reads hive.yaml's `ai` and blob keys; with SY.admin's installation update record (A-204, A-205, and its review round's fixes), SY.timer refusing a `TZ=`/`CRON_TZ=`/`@` cron spec (A-206), wf-generic out of the core (A-211) and A-181's leftover texts | ✅ replaced by 0.1.125 | snap `pre-router-0-1-124` (deleted 2026-11-10) · `apt install fluxbee=0.1.123` + 0.1.123's `update_installation` (the installation file v7 stays; 0.1.123's router needs hive.yaml's `ai` and blob keys valid, as they are on 8.x) |
 | **0.1.123** | 2026-11-09 | `e6f6c93f` | motherbee + spokes (core): hive-config-update-v1's stage 4: SY.admin's installation update (`update_installation`, the operator's word; `get_installation_update`, Archi's read) brings every hive to the motherbee's core and installation file, core then config, kept in SY.admin's state dir and resumed after a restart; what it leaves alone, with why (a hive rolled back with `core_rollback` keeps its core and the update is `held`; a hand-edited copy gets no config); the automatic step, once per hive and target, for a hive that did not answer and comes back; `set_installation_ai` opens it, Archi follows it, `ops.py deploy` runs it; with A-198: a mesh reply that does not fit the frame answers `REPLY_TOO_LARGE` with its outcome, optional `limit`/`cursor` pages on the listings that grow (every row without them, as before), an executor run's answer cut to fit; and A-201: Archi reads the admin command log | ✅ replaced by 0.1.124 | snap `pre-inst-0-1-123` (deleted 2026-11-10) · `apt install fluxbee=0.1.122` + `ops deploy 0.1.122`'s per-spoke core update (SY.admin's `installation-update.json` stays, ignored by 0.1.122) |
@@ -135,6 +136,59 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.127 — Reads apart, the blob folders, and no purge under a live page
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.126 · **Commit:** `d2b344bb`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the pass of the General track and its problems, the operator's call of 2026-11-10
+  (*"por cosas de mejoras de soft que no tengan dudas, avanza... en esta hace una pasada de generales
+  y problemas"*), one branch per binary ([METHOD](logbook/METHOD.md) §9).
+- **What changed:**
+  - **SY.orchestrator:** A-199's step 1: a read runs apart, on tokio's blocking pool, with 16
+    places for this hive's reads and 16 for reads that wait on another hive, at most 4 of them on
+    one target hive; changes still run one at a time; a command or system request that panics is
+    answered `INTERNAL_ERROR`. Hive-config stage 5: `fluxbee-blob` takes the members of
+    `fluxbee-dist-runtimes` and `fluxbee-blob-public` those of `fluxbee-dist-core-ingress`; the blob
+    GC runs only on the motherbee, and a spoke's `blob.gc` is warned about and ignored (A-188).
+    A-196: Syncthing's owed restart has a marker with a token. A-232's refusals name no value.
+  - **SY.admin:** A-233, a node with a page up, or with a publish in flight, is not purged (and a
+    node being purged publishes nothing); A-231, the ledger drops a page 30 days after it went
+    down; A-234, a request's head is capped at 64 KiB (431) and its body at 1 GiB (413), read to
+    the client's end; A-232; A-171, every runtime manifest writer takes
+    `/var/lib/fluxbee/dist/runtimes-manifest.lock`, which the package no longer ships.
+  - **SY.vault:** A-200, the boot's announcement reads the secrets once.
+  - **SY.timer:** A-220, a timer SY.timer closes itself is `canceled` with a `canceled_reason`
+    (schema v3, version 1.4); a fire refused `LINK_BUSY` is sent again (ahead of the router's
+    0.1.129); A-232.
+- **Build and review:** `coa/orch-127`, `coa/admin-127`, `coa/vault-127`, `coa/timer-127`, CI green on
+  each; one review round per branch. The orchestrator: four low, fixed (a target's own read places
+  among them). SY.admin: one medium (a publish in flight passed the purge check), fixed, and four
+  low. SY.timer and SY.vault: fixed before. Found by the round: A-245 to A-249, low.
+- **The deploy:** build of `d2b344bb` in 18.7 min, publish in 18 s, `ops deploy 0.1.127` in 377 s,
+  health clean; snapshot `pre-reads-0-1-127`, `pre-egress-0-1-126` dropped. The update closed `done`
+  126 s after its call: the spokes settled by +43 s, and SY.admin lost a read to each spoke's
+  self-restart (A-250).
+- **Checked on 8.x (the gate):**
+  - Syncthing's folder members on the four hives identical before and after; no restart at the
+    first start.
+  - A-199: egress1's orchestrator stopped, six reads of its versions at once: four forwarded, two
+    waiting without a place, sent on as soon as egress1 answered; meanwhile the motherbee's own
+    reads, worker1's and AI.pruebas' status answered in 0.0 to 0.7 s; 15 to 16 threads. The
+    motherbee's orchestrator restarted in 3.8 s with reads waiting, no SIGKILL.
+  - A-233 with a throwaway `AI.gate0227@worker1`: listed and `RUNNING` right after `run_node`; a
+    purge refused while its publish waited for the blob (1.2 s), and again with the page up; after
+    the page came down, purged; its tenant removed.
+  - A-234: 431 and 413 read whole by a client still sending. A-232: four refusals with no value
+    (A-251: SY.timer's comes as HTTP 500). A-231: two rows dropped. A-171: the lock file there,
+    owned by no package. A-200: 12 secrets in one pass. A-220: schema v3.
+  - Stage 5 with a throwaway worker (`gate0227`, VM 104): joined in about 143 s; the motherbee's
+    `fluxbee-blob` took it with the runtimes; taken out through Syncthing's REST, put back at the
+    orchestrator's restart; the restart marker during the link and gone after; its hive.yaml
+    without `blob.gc`, and with `blob.gc.enabled` set by hand, a warning and nothing deleted;
+    removed in 4.7 s, no folder or device left; VM 104 destroyed. Found: A-252.
+- **PROD after the gate:** all four hives on 0.1.127 (`aa629f9a`); worker1 behind egress1; no page
+  up; the installation file version 7; snapshot `pre-reads-0-1-127` on each VM.
 
 ## 0.1.126 — A worker behind the egress
 

@@ -167,6 +167,14 @@ no change required
     again. **Found:** A-237 [General/SDK], low. **Next:** A-219 (built, in review, for 0.1.126).
 17. **0.1.126, A-219 alone** ✅ live and checked on 8.x (2026-11-10): a worker goes behind the egress
     and back by an explicit action (with A-225); worker1 left behind egress1, as the operator decided.
+18. **0.1.127, one branch per binary** ✅ live and checked on 8.x (2026-11-10): the orchestrator
+    (A-199's step 1, reads apart and 4 per target; hive-config stage 5, the blob folders following
+    their dist folder, and A-188; A-196), SY.admin (A-233 and its in-flight race, A-231, A-234,
+    A-232, A-171), SY.vault (A-200), SY.timer (A-220, `LINK_BUSY` retried). **Found by its review
+    round:** A-245 to A-249, low. **Found by its gate:** A-250 [General/admin], the update's follow
+    loses a read to each spoke's self-restart; A-251 [General/admin] and A-252 [General/join], low.
+    **Next:** the Rust SDK alone (0.1.128: A-218, A-237, A-248), then the router alone (0.1.129:
+    A-222, A-209, A-221).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -263,25 +271,11 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
   later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
-- A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
 - A-175 🟡 A spoke's drift alerts stay on the spoke: with the system's log, later (the operator,
   2026-11-08; router-stream-v1 §8).
-- A-181 🔵 A hive's shared config reaches it only at its join (the blob folder, the AI model, a
-  release's new SY node). In design: one version on every hive, through the update
-  ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
-  operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
-  stage 2 ✅ 0.1.117, the release's settings in the code; 3a ✅ 0.1.120 and 3b ✅ 0.1.121, the
-  installation file in use; 3c ✅ 0.1.122, the operator's action; 4 ✅ 0.1.123, the installation's
-  update. Next, stage 5 (the blob folders' members, A-188).
-- A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
-- A-196 🟡 A join's peer link can be written to Syncthing's config and never applied (latent).
-- A-199 🔵 The motherbee orchestrator's admin worker runs one request at a time, and a request its
-  caller gave up on still runs: seen again in 0.1.125's deploy, about 90 s of its update (the
-  remaining cost of a deploy's update since A-203).
-- A-200 🟡 SY.vault's boot re-announcement covers only its newest 200 secrets (latent, low).
 - A-208 🔵 With several routers on one hive (not supported), an IRP reply goes to the wrong link
   (low).
 - A-209 🔵 A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender
@@ -289,8 +283,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
   0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
   2026-11-22, and a few the builder found); A-218 (the dead identity surface, a release alone) open. Cron descriptors wait for the talk on a WF that starts on a schedule.
-- A-220 🔵 A recurring timer the replay cannot schedule stays pending and holds its client_ref
-  (low).
 - A-221 🔵 Cognition records a turn the agent never received when its delivery fails (low).
 - A-222 🟡 A node that stops reading without an error is never disconnected, and the router's
   queue for it grows without limit (latent; a design of its own).
@@ -301,10 +293,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   IO node (low).
 - A-228 🔵 The Go SDK's RPC error for UNREACHABLE drops the router's reason (low; the Go SDK,
   alone).
-- A-231 🔵 SY.admin's publication ledger never drops a row (low).
-- A-232 🔵 A page request's refusal repeats a bad `limit` (low; shared code).
-- A-233 🔵 A purged node's pages stay public until they expire (low).
-- A-234 🔵 SY.admin's HTTP reader allocates whatever `Content-Length` a client declares (low).
 - A-237 🔵 A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata (low; the SDK).
 - A-238 🔵 A canceled timer can be deleted at the next start, aged by its creation (low).
 - A-239 🔵 The Go SDK's TimerInfo drops SY.timer's canceled_reason (low; with A-228).
@@ -318,6 +306,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-247 🔵 A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender (low; multi-router hives only, not supported).
 - A-248 🔵 An AI node used as a tap target answers the tapped message's sender (low; the AI SDK).
 - A-249 🔵 A-233's guards leave two narrow cases: a kill SY.admin stops waiting for, and the reset's step [3] (low).
+- A-250 🔵 The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 85 s late (to evaluate with 0.1.128's deploy).
+- A-251 🔵 SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500 (low).
+- A-252 🔵 A fresh worker restarts Syncthing once more about a minute after its join, for the posture options (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1396,6 +1387,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-252 [General/join] 🔵 low (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — A fresh worker restarts Syncthing once more about a minute after its join, for the posture options
+
+- **Seen:** the throwaway worker `gate0227` joined at 18:23:56 and was done at 18:26:18; at
+  18:28:04 its orchestrator's first peer reconcile logged *"switched off public discovery, relays
+  and NAT; listening on loopback"* and restarted Syncthing, its fourth start since the join.
+- **Why:** the join leaves Syncthing's own defaults for those options, and the host posture's
+  reconcile (A-47, A-50) sets them at its first round.
+- **Fix, later (with A-193's join timings):** the join writes the posture's options with the rest
+  of its config, so the reconcile finds nothing to change.
+
+### A-251 [General/admin] 🔵 low (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500
+
+- **Seen:** `GET /hives/motherbee/timer/timers?cursor=<not one>` answered HTTP 500
+  `TIMER_INVALID_PAYLOAD` (the refusal itself is right, and it names no value since 0.1.127).
+- **Why:** SY.admin's map from an error code to an HTTP status does not name `TIMER_INVALID_PAYLOAD`,
+  so it falls to 500; a client's bad request should be a 400.
+- **Fix, later (SY.admin):** the map takes SY.timer's request errors as 400.
+
+### A-250 [General/admin] 🔵 to evaluate (found 2026-11-10 by 0.1.127's deploy; seen on 8.x) — The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 85 s late
+
+- **Seen (0.1.127's deploy, `ops timeline`, t = 18:12:00):** the update was opened at 21.7 s; the
+  spokes settled by their own records at 47.3 s (egress1), 57.5 s (ingress1) and 61.1 s (worker1);
+  SY.admin marked them settled at 96.9 s, 95.7 s and 146.6 s, and closed the update at 147.9 s.
+  Not every deploy: 0.1.125's update took 131 s, 0.1.126's 44 s (no read lost).
+- **Why:** SY.admin's reads of a spoke reached its orchestrator while the old process was about to
+  restart itself for the new binary (egress1's at 18:12:39, worker1's at 18:12:53); the old
+  process exited without answering, and SY.admin waited out its 50 s read bound, then held the
+  hive unread for another 50 s (worker1: two such waits). The motherbee's orchestrator, already on
+  0.1.127, served every read meanwhile (A-199's step 1 worked: no read waited behind another).
+- **To evaluate with 0.1.128's deploy:** the spokes now run 0.1.127, whose reads run apart, so a
+  read that reaches a spoke before its self-restart is answered unless it arrives in the last
+  moment. If the lag stays, the options: the follow uses a short read bound while a hive is
+  restarting; the spoke tells SY.admin when it settles; or a forward fails at once when its target
+  orchestrator reconnects (A-195). A design call for the operator.
+
 ### A-249 [General/admin] 🔵 low (found 2026-11-10 by the builder of A-233's review fixes; read in the code) — A-233's in-flight guards leave two narrow cases
 
 - **A kill SY.admin stops waiting for:** SY.admin waits 180 s for a kill with purge; past that it
@@ -1550,7 +1576,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `_system.tenant_id`, else `tenant_id`) and send it as the top-level `tenant_id`; a node whose tenant
   cannot be read is skipped, never killed, and named in the answer.
 
-### A-234 [General/admin] 🔵 low (found 2026-11-10 by A-229's builder; read in the code) — SY.admin's HTTP reader allocates whatever `Content-Length` a client declares
+### A-234 [General/admin] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; 431 and 413 read whole by a client still sending) (found 2026-11-10 by A-229's builder; read in the code) — SY.admin's HTTP reader allocates whatever `Content-Length` a client declares
 
 - **Why:** `read_http_request` (`src/bin/sy_admin.rs` ~11973 on `coa/admin-125`) allocates a buffer
   of the declared length with no cap, so a request declaring a huge body can exhaust SY.admin's
@@ -1558,7 +1584,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   it is no boundary against a local process; a robustness item.
 - **Fix, later:** a cap above the largest body an action takes (the bundle upload's), refused 413.
 
-### A-233 [General/admin] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — A purged node's pages stay public until they expire
+### A-233 [General/admin] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; a purge refused with a page up, and with a publish in flight) (found 2026-11-10 by A-212's builder; read in the code) — A purged node's pages stay public until they expire
 
 - **Why:** `kill_node` with `purge_instance` (and `purge_ilk`) removes the node and its ILK, and
   nothing reads the publication ledger there: the pages it published stay up for their TTL (24 h
@@ -1567,7 +1593,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, to decide (SY.admin):** the tenant's rule (2026-09-28: a purge never cascades), refusing
   the purge while the node has pages up, or leaving them to expire.
 
-### A-232 [General/shared] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
+### A-232 [General/shared] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; SY.admin, the orchestrator and SY.timer; SY.identity's refusal waits, noted in A-242) (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
 
 - **Why:** `PageAsk::from_payload` (`src/mesh_reply.rs:194`, `:206`) answers a bad `limit`, or a
   cursor that is not a string, with the value in the error text. A link's key pasted there by
@@ -1575,7 +1601,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   repeat it.
 - **Fix, later (shared code, with its next release):** the refusal names the field, not the value.
 
-### A-231 [General/admin] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — SY.admin's publication ledger never drops a row
+### A-231 [General/admin] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; two rows dropped at SY.admin's start) (found 2026-11-10 by A-212's builder; read in the code) — SY.admin's publication ledger never drops a row
 
 - **Why:** a publish, an unpublish and the expiry sweep read and rewrite the whole ledger
   (`publications.json`, `src/bin/sy_admin.rs:7634`), and no row ever leaves it: it grows with every
@@ -1713,7 +1739,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (with the cognition track):** the copy follows a successful send, or cognition
   learns of the failure.
 
-### A-220 [General/SY.timer] 🔵 low (found 2026-11-10 by A-206's builder; read in the code) — A recurring timer whose next fire cannot be computed stays pending for good and holds its client_ref; and a junk spec can get the wrong error code
+### A-220 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; the schema at v3 with `canceled_reason`) (found 2026-11-10 by A-206's builder; read in the code) — A recurring timer whose next fire cannot be computed stays pending for good and holds its client_ref; and a junk spec can get the wrong error code
 
 - **Why:** at a start, `replayPending` (`go/sy-timer/scheduler.go:134-143`) logs and skips a
   recurring timer whose next fire fails, and leaves it `pending` with its old `fire_at`. Scheduling
@@ -2101,7 +2127,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `/hives/motherbee/commands?limit=3` (`list_recent_commands`) and answered with each one's
   action, status and origin.
 
-### A-200 [General/vault] 🟡 LATENT, low (found 2026-11-09 by A-198's builder; checked) — SY.vault's boot re-announcement covers only its newest 200 secrets
+### A-200 [General/vault] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; 12 secrets announced in one pass, 18 ms after the start) (found 2026-11-09 by A-198's builder; checked) — SY.vault's boot re-announcement covers only its newest 200 secrets
 
 - **Why:** `emit_bootstrap_secret_broadcasts` lists with `VaultFilter::default()`.
   `VaultStore::list` takes 200 rows by default (`sy_vault.rs:1362`).
@@ -2110,7 +2136,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **On 8.x:** 12 secrets on the motherbee, so not reached.
 - **Fix:** page the boot list with A-198's cursor.
 
-### A-199 [General/orchestrator] 🔵 TO EVALUATE (found 2026-11-09 by stage 4's review round; read in the code) — The motherbee orchestrator's admin worker runs one request at a time, and a request its caller gave up on still runs
+### A-199 [General/orchestrator] ✅ STEP 1 VALIDATED ON 8.x (0.1.127, 2026-11-10; reads apart, 4 per target hive; what is left of a deploy's update is A-250) (found 2026-11-09 by stage 4's review round; read in the code) — The motherbee orchestrator's admin worker runs one request at a time, and a request its caller gave up on still runs
 
 - **Why:**
   - SY.admin relays every hive read and node action through `SY.orchestrator@motherbee`, whose
@@ -2133,6 +2159,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   settled about 27 s late.
 - **Proposal:** answer read forwards (`GET_VERSIONS`, `list_versions`) outside the single worker,
   and drop a queued request whose caller's deadline has passed. The operator's call on when.
+- **Step 1, live (0.1.127, 2026-11-10):** reads run apart on the blocking pool (16 local places,
+  16 forwarding places, at most 4 waiting on one target hive), changes one at a time; a command
+  that panics is answered `INTERNAL_ERROR`. Checked on 8.x with egress1's orchestrator stopped:
+  six `/hives/egress1/versions` at once, four forwarded and two waiting without a place; meanwhile
+  `/hive/status`, worker1's versions, its node list and AI.pruebas' status answered in 0.0 to
+  0.7 s; the process stayed at 15 to 16 threads; the motherbee's orchestrator restarted in 3.8 s
+  with reads waiting, no SIGKILL. A node read right after `run_node` shows it. What is left of a
+  deploy's update is A-250. Step 2 (node actions on different nodes at once) stays for later.
 
 - **Seen again, 0.1.125's deploy (2026-11-10):** the installation update closed 131 s after its
   call, while the spokes settled by +42 s. The motherbee orchestrator received reads at 07:40:50 and
@@ -2197,7 +2231,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Checked on 8.x:** during 0.1.122's gate, Archi's plan compiler fetched the compact catalog in
   13 ms. No FRAME_TOO_LARGE since the deploy.
 
-### A-196 [General/join] 🟡 LATENT, low (found 2026-11-08 by A-194's review round; read in the code) — A join's peer link can be written to Syncthing's config and never applied
+### A-196 [General/join] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; the marker during a join's link, gone after its restart) (found 2026-11-08 by A-194's review round; read in the code) — A join's peer link can be written to Syncthing's config and never applied
 
 - **Why:** `ensure_syncthing_peer_link_runtime` writes the peer into config.xml, then restarts
   Syncthing, and skips the restart when nothing changed.
@@ -2397,7 +2431,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     before it stayed down.
   - **Back:** with the binary back, the report closed in 3 s.
 
-### A-188 [General/blob] 🟡 LATENT (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-16; read in the code) — A worker's blob GC, if turned on, deletes the motherbee's published sources through the shared folder
+### A-188 [General/blob] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; the GC only on the motherbee, a spoke's `blob.gc` warned about and ignored) (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-16; read in the code) — A worker's blob GC, if turned on, deletes the motherbee's published sources through the shared folder
 
 - **What happens:**
   - The blob GC pins the sources of live publications from io.blob's ledger. The ledger lives on
@@ -2546,7 +2580,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
   as before); a handshake took 11 ms.
 
-### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117, stage 3 ✅ 0.1.120–0.1.122, stage 4 ✅ 0.1.123; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+### A-181 [General/blob] ✅ ALL STAGES VALIDATED ON 8.x, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117, stage 3 ✅ 0.1.120–0.1.122, stage 4 ✅ 0.1.123, stage 5 ✅ 0.1.127; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
   them.
@@ -2932,7 +2966,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   gate tenant, each on CONFIRM and `ok` from the executor.
 - **On 8.x meanwhile:** the gate's version was removed through SY.admin's HTTP route.
 
-### A-171 [General/upgrade] 🔵 TO EVALUATE, low (found 2026-11-07, A-122's review; read in the code) — The runtime manifest's writers outside SY.admin take no lock
+### A-171 [General/upgrade] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; the lock file there, owned by no package) (found 2026-11-07, A-122's review; read in the code) — The runtime manifest's writers outside SY.admin take no lock
 
 - **What happens:** SY.admin's writers of the runtimes manifest (`publish_runtime_package`,
   `remove_runtime_version`, `reset_base_runtime`) share one in-process lock
