@@ -13012,6 +13012,12 @@ const EXECUTOR_INSTALLATION_WAIT_SECS: u64 = 240;
 /// 8.x; Archi then follows the update to its end ([`INSTALLATION_UPDATE_FOLLOW_SECS`]).
 const EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS: u64 = 580;
 
+/// What Archi waits for SY.admin's executor per worker a plan puts behind the egress or takes back
+/// (docs/edge-egress-nat-spec.md §15): SY.admin's ceiling for `set_hive_egress` and
+/// `clear_hive_egress` (`admin_action_timeout` in sy_admin.rs: the motherbee's forward of the
+/// switch, 30 s, and of the confirm, 10 s, 60 s in all), with a margin.
+const EXECUTOR_EGRESS_SWITCH_WAIT_SECS: u64 = 70;
+
 /// How long Archi follows an installation update its plan ran, past the executor's answer, while
 /// its hives only move (a core in flight to its settle and its config after it, or a hive not read
 /// yet): twice SY.admin's settle bound (300 s). A run is verified once the update is done or held.
@@ -13041,6 +13047,11 @@ fn plan_installation_changes(plan: Option<&Value>) -> u64 {
 /// The steps of an executor plan that run the installation's update.
 fn plan_installation_updates(plan: Option<&Value>) -> u64 {
     plan_steps_named(plan, "update_installation")
+}
+
+/// The steps of an executor plan that put a worker behind the egress, or take it back.
+fn plan_egress_switches(plan: Option<&Value>) -> u64 {
+    plan_steps_named(plan, "set_hive_egress") + plan_steps_named(plan, "clear_hive_egress")
 }
 
 /// The steps of an executor plan that deploy or remove a workflow.
@@ -13115,7 +13126,8 @@ fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
                 + plan_wf_rules_writes(params.get("plan")) * EXECUTOR_WF_RULES_WAIT_SECS
                 + plan_installation_changes(params.get("plan")) * EXECUTOR_INSTALLATION_WAIT_SECS
                 + plan_installation_updates(params.get("plan"))
-                    * EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS,
+                    * EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS
+                + plan_egress_switches(params.get("plan")) * EXECUTOR_EGRESS_SWITCH_WAIT_SECS,
         ),
         // SY.admin reads the motherbee's /versions for it, under its own 30 s: wait longer, or a
         // slow read is reported as Archi's timeout.
@@ -31815,6 +31827,30 @@ mod tests {
         assert!(system_get_may_run("GET", &translated.action));
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"get_installation_update"));
         assert!(!admin_action_allows_ai_write("update_installation"));
+    }
+
+    /// A worker behind the egress, or back (docs/edge-egress-nat-spec.md §15): Archi waits for
+    /// SY.admin's ceiling of each step (60 s) with a margin, and never runs one itself.
+    #[test]
+    fn an_executor_run_waits_for_each_egress_switch() {
+        let request = |actions: &[&str]| {
+            json!({ "execution_id": "run-1", "plan": { "execution": { "steps": actions
+                .iter()
+                .map(|action| json!({ "id": action, "action": action, "args": {} }))
+                .collect::<Vec<_>>() } } })
+        };
+        let base = architect_admin_action_timeout("executor_validate_plan", &json!({}));
+        assert_eq!(
+            architect_admin_action_timeout(
+                "executor_execute_plan",
+                &request(&["set_hive_egress", "set_hive_egress", "clear_hive_egress"])
+            ),
+            base + Duration::from_secs(3 * EXECUTOR_EGRESS_SWITCH_WAIT_SECS)
+        );
+        const { assert!(EXECUTOR_EGRESS_SWITCH_WAIT_SECS > 60) };
+        for action in ["set_hive_egress", "clear_hive_egress"] {
+            assert!(!admin_action_allows_ai_write(action), "{action}");
+        }
     }
 
     /// Stage 3c's review (F1): a new installation file rebuilds Archi's runtime only for another

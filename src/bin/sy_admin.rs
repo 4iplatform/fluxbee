@@ -5511,6 +5511,20 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: true,
         allow_legacy_hive_id: false,
     },
+    // A worker behind the egress, and back (docs/edge-egress-nat-spec.md §15, FINDINGS A-219):
+    // the motherbee's orchestrator switches it (`handle_hive_egress_command`).
+    InternalActionSpec {
+        action: "set_hive_egress",
+        route: InternalActionRoute::Command("set_hive_egress"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "clear_hive_egress",
+        route: InternalActionRoute::Command("clear_hive_egress"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
     InternalActionSpec {
         action: "list_deployments",
         route: InternalActionRoute::Command("list_deployments"),
@@ -5824,6 +5838,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         // Every hive's core and installation file move to the motherbee's: the operator's word
         // (docs/hive-config-update-v1.md §6, stage 4).
         "update_installation" => MeshAccess::Nobody,
+        // A worker's default route and IPv6 change, and its agents' internet with them: the
+        // operator's word (docs/edge-egress-nat-spec.md §15, FINDINGS A-219).
+        "set_hive_egress" | "clear_hive_egress" => MeshAccess::Nobody,
         // Off the catalog: the executor, which runs every step as the operator.
         "executor_validate_plan" | "executor_execute_plan" => MeshAccess::Archi,
         "hive_status"
@@ -11719,6 +11736,22 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "core_rollback", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        // A-219: a worker behind the egress, and back (docs/edge-egress-nat-spec.md §15).
+        ("PUT", ["egress"]) | ("DELETE", ["egress"]) => {
+            let action = if method == "PUT" {
+                "set_hive_egress"
+            } else {
+                "clear_hive_egress"
+            };
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, action, payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["opa", "policy"]) => {
             let (status, resp) = handle_opa_query(ctx, client, "get_policy", Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -12372,6 +12405,28 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "CONFIG_RECORD_FAILED"
         // update_installation could not name the motherbee's core, its target.
         | "INSTALLATION_TARGET_UNKNOWN" => 502,
+        // A worker behind the egress (docs/edge-egress-nat-spec.md §15): a refusal before anything
+        // changed, what the switch met and reverted, and what nobody answered.
+        "NOT_A_WORKER"
+        | "NO_EGRESS_DECLARED"
+        | "NO_REACHABILITY_URL"
+        | "EGRESS_SWITCH_OPEN"
+        | "GATEWAY_NOT_ON_LINK"
+        | "UPLINK_ON_DEFAULT_ROUTE"
+        | "ACCESS_ON_DEFAULT_ROUTE"
+        | "PROBE_UNAVAILABLE"
+        | "PREVIOUS_GATEWAY_UNKNOWN" => 409,
+        "EGRESS_DECLARATION_INVALID" => 422,
+        "EGRESS_PROBE_FAILED"
+        | "EGRESS_IPV6_UNMANAGED"
+        | "UPLINK_ROUTE_CHANGED"
+        | "EGRESS_SWITCH_FAILED"
+        | "EGRESS_COMMIT_FAILED"
+        | "EGRESS_RECORD_FAILED"
+        | "EGRESS_RECORD_UNREADABLE"
+        | "EGRESS_CONFIRM_UNREADABLE" => 502,
+        "HIVE_UNREACHABLE" | "EGRESS_GUARD_UNREADABLE" => 503,
+        "EGRESS_CONFIRM_MISSED" | "EGRESS_NOT_ANSWERED" => 504,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"
@@ -13964,6 +14019,8 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "vault_rollback"
             | "vault_assign"
             | "core_rollback"
+            | "set_hive_egress"
+            | "clear_hive_egress"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
@@ -14040,6 +14097,9 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "set_installation_ai"
             // Every hive's core and installation file move to the motherbee's.
             | "update_installation"
+            // A worker's default route and IPv6 change, and its agents' internet with them.
+            | "set_hive_egress"
+            | "clear_hive_egress"
     )
 }
 
@@ -14140,6 +14200,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "update_installation" => {
             "Bring every hive to what the motherbee holds, its core and its installation file: one update at a time, kept on disk and resumed after SY.admin restarts. Each hive gets its core update first, then its config; a hive the operator rolled back keeps its core unless named in include_rolled_back, and a hand-edited copy gets no config. A hive that did not answer gets the update finished once when it answers again."
+        }
+        "set_hive_egress" => {
+            "Put a worker behind the motherbee's egress: its hive.yaml gets the motherbee's egress section (gateway_ip, reachability_url), as add_hive writes it into a new worker, and its default route goes to the egress gateway with IPv6 off. The worker first checks that the gateway is on one of its subnets and that neither the mesh nor the operator's SSH reach it through its default route; after the switch it probes the internet through the egress, and keeps the switch only once the motherbee confirms it, else it reverts."
+        }
+        "clear_hive_egress" => {
+            "Take a worker off the egress: its default route goes back to the one it had before (its record's, or gateway_ip for a worker that joined after the declaration), its egress section leaves hive.yaml, and the IPv6 values it had come back. The same guards and confirm as set_hive_egress; the probe is reported and decides nothing."
         }
         "get_installation_update" => {
             "Read the installation's update: the current or last one, its target (the motherbee's core and installation file), and each hive's state, last outcome and next step; with history, the closed ones."
@@ -14381,6 +14447,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "vault_rotate" => vec!["POST /hives/{hive}/vault/secrets/{key}/rotate"],
         "vault_rollback" => vec!["POST /hives/{hive}/vault/secrets/{key}/rollback"],
         "core_rollback" => vec!["POST /hives/{hive}/core/rollback"],
+        "set_hive_egress" => vec!["PUT /hives/{hive}/egress"],
+        "clear_hive_egress" => vec!["DELETE /hives/{hive}/egress"],
         "inventory" => vec![
             "GET /inventory",
             "GET /inventory/summary",
@@ -14558,6 +14626,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "hive",
             "string",
             "The hive whose core goes back to a backup generation.",
+        )],
+        "set_hive_egress" | "clear_hive_egress" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "The worker, a hive of the registry whose join is done: never the motherbee, an ingress or an egress.",
         )],
         "get_llm_usage" => vec![admin_action_path_param(
             "hive",
@@ -15442,6 +15515,19 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Hives the operator rolled back (core_rollback) whose core this update moves too, the operator's choice: without it their core stays as it is (their config is still applied). Each must be a hive the update reaches.",
             ),
         ],
+        "set_hive_egress" => vec![admin_action_body_field(
+            "access_from",
+            "string[]",
+            EGRESS_ACCESS_FROM_FIELD,
+        )],
+        "clear_hive_egress" => vec![
+            admin_action_body_field("access_from", "string[]", EGRESS_ACCESS_FROM_FIELD),
+            admin_action_body_field(
+                "gateway_ip",
+                "string",
+                "Only for a worker whose record keeps no route from before the egress (it joined after the declaration, and the clear answered PREVIOUS_GATEWAY_UNKNOWN): the IPv4 gateway it goes back to, which must be on one of its subnets. A worker with a record goes back to its recorded routes and refuses another gateway.",
+            ),
+        ],
         "get_installation_update" => vec![admin_action_body_field(
             "history",
             "bool",
@@ -15799,6 +15885,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "update_installation" => serde_json::json!({
             "reason": "deploy 0.1.123"
         }),
+        // The body is optional: `{}` checks the live SSH sessions alone.
+        "set_hive_egress" | "clear_hive_egress" => serde_json::json!({}),
         "sync_hint" => serde_json::json!({
             "channel": "blob",
             "wait_for_idle": true,
@@ -16002,6 +16090,8 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220","ssh_user":"administrator","ssh_key":"<bootstrap-pem-or-omit>"}'"#
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
+        "set_hive_egress" => r#"curl -X PUT /hives/worker1/egress -d '{}'"#,
+        "clear_hive_egress" => "curl -X DELETE /hives/worker1/egress",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
         "list_streams" => "curl -X GET /hives/worker-220/streams",
         "cognition_clear" => "curl -X POST /hives/worker1/cognition/clear",
@@ -16712,6 +16802,26 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The answer: payload {runtime, previous_current, current, package_version, changed, manifest_version, manifest_hash}. changed is false, and nothing is written, when current already is the package's version.",
             "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove_runtime_version deletes it once no node runs it, except on a base that packages are built on (wf.engine with deployed workflows, ai.generic with config-only packages), which refuses it with RUNTIME_HAS_DEPENDENTS; it then stays unused, and costs only its disk. The package's own version is never removed (RUNTIME_PACKAGE_VERSION).",
             "400 INVALID_REQUEST for a missing or invalid runtime; 404 RUNTIME_NOT_FOUND for a runtime the manifest does not have, or names in two cases; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not on disk or cannot run (reinstall the package), or is on disk but not published (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_RESET_FAILED; 502 SERVICE_FAILED when the written manifest cannot be read back.",
+        ],
+        "set_hive_egress" => vec![
+            "Confirm with the operator first: from then on the worker's agents reach the internet through the egress, which becomes their dependency; a call in flight at the switch may fail once; and SSH reaches the box only from what the answer's ssh_reachable_from names (its connected subnets, its more specific routes, the hypervisor's console). Run it while the worker's agents are idle.",
+            EGRESS_WHO_NOTE,
+            "The section is the motherbee's declaration, as add_hive writes it into a new worker: 409 NO_EGRESS_DECLARED without egress.gateway_ip in the motherbee's hive.yaml, 409 NO_REACHABILITY_URL without egress.reachability_url (the switch is judged by a probe of it), 422 EGRESS_DECLARATION_INVALID for one the join would refuse. The body names no gateway: only the optional access_from.",
+            EGRESS_GUARDS_NOTE,
+            "After the switch the worker GETs reachability_url (twice at most) and reads its route to the motherbee again, answers pending_confirm, and keeps the switch only once the motherbee's confirm comes back within 15 s; hive.yaml is written only then. A failed step puts the routes, the IPv6 values and the sysctl file back: 502 EGRESS_PROBE_FAILED (with curl's reason), EGRESS_IPV6_UNMANAGED, UPLINK_ROUTE_CHANGED, EGRESS_SWITCH_FAILED or EGRESS_COMMIT_FAILED, 504 EGRESS_CONFIRM_MISSED; payload.outcome says reverted, revert_problems what the revert could not do.",
+            "The answer: payload {status: ok, outcome: switched (or unchanged: the section and the route are the declaration's already, and nothing moved), hive, gateway_ip, previous_gateway, ipv6_blocked, internet_reachable, probe {url, attempts, reason}, route, ssh_reachable_from, switch_id, timings_ms per step}. A worker already behind another gateway moves to the declared one, with the same guards.",
+            EGRESS_NOT_ANSWERED_NOTE,
+            EGRESS_CLOSED_NOTE,
+        ],
+        "clear_hive_egress" => vec![
+            "Confirm with the operator first: the worker's agents reach the internet the way they did before the egress, outside the managed chokepoint. It is the way around an egress outage while the egress is fixed.",
+            EGRESS_WHO_NOTE,
+            "It puts back the default routes the worker had before it first went behind the egress, which its record keeps. A worker with no record (one that joined after the declaration) answers 409 PREVIOUS_GATEWAY_UNKNOWN: name the gateway to go back to with gateway_ip. A gateway_ip other than the record's is refused (400 INVALID_REQUEST).",
+            EGRESS_GUARDS_NOTE,
+            "The probe is reported and decides nothing (the way back may have no internet by design); the motherbee's confirm still does. The commit removes the section from the worker's memory, then from its hive.yaml, and puts back the IPv6 values its record kept; with none kept, the IPv6 block's file is removed and IPv6 comes back at the box's next boot (payload.notes says so).",
+            "The answer: payload {status: ok, outcome: cleared (or unchanged: the worker has no egress section), hive, gateway_ip (the one it went back to), previous_gateway, ipv6_blocked, internet_reachable, probe, route, ssh_reachable_from, switch_id, notes, timings_ms per step}.",
+            EGRESS_NOT_ANSWERED_NOTE,
+            EGRESS_CLOSED_NOTE,
         ],
         "cognition_clear" => vec![
             "It cannot be undone: confirm with the operator first. The hive's agents lose the memory of every conversation (contexts, reasons, scopes, memories, feelings and last turns), and the hive loses every episode it kept, its own and those other hives sent it.",
@@ -18886,6 +18996,9 @@ async fn handle_admin_command_inner(
     if action == "cognition_clear" {
         return handle_cognition_clear(ctx, client, payload, hive).await;
     }
+    if matches!(action, "set_hive_egress" | "clear_hive_egress") {
+        return handle_hive_egress_command(ctx, client, action, payload, hive).await;
+    }
     if matches!(
         action,
         "get_ilk"
@@ -19509,6 +19622,101 @@ async fn handle_cognition_clear(
     )
     .await;
     Ok(node_verb_answer(action, response))
+}
+
+/// The help's texts that `set_hive_egress` and `clear_hive_egress` share.
+const EGRESS_ACCESS_FROM_FIELD: &str = "The IPv4 addresses or networks the operator manages the worker from, besides its live SSH sessions, which the guard reads by itself: each must not reach the worker through its default route, or nothing changes (409 ACCESS_ON_DEFAULT_ROUTE). An IPv6 one is refused: the worker's IPv6 is off behind the egress.";
+const EGRESS_WHO_NOTE: &str = "Only a worker of the registry whose join is done: 409 NOT_A_WORKER names why not (the motherbee, whose route Fluxbee never rewrites (PB-8); an ingress; an egress; a hive whose join is not done). 409 INSTALLATION_UPDATE_RUNNING while an installation update run is under way, or a task of the update acts on that worker: its core update restarts the worker's orchestrator. 409 JOIN_IN_PROGRESS while the worker joins or is removed, 503 HIVE_UNREACHABLE when its orchestrator is not on the mesh, 409 EGRESS_SWITCH_OPEN while another switch runs there. The hive comes from the /hives/{hive} path in HTTP, and it is the executor step's arg.";
+const EGRESS_GUARDS_NOTE: &str = "The guards, on the worker, before anything is touched (nothing changes when one refuses): 409 GATEWAY_NOT_ON_LINK, the gateway is not on a subnet the worker is connected to, or is one of its own addresses; 409 UPLINK_ON_DEFAULT_ROUTE, the worker reaches the motherbee (wan.uplinks, identity.sync.upstream) through its default route, by a host name or over IPv6; 409 ACCESS_ON_DEFAULT_ROUTE, a live SSH session or an access_from entry reaches it through its default route: the operator keeps each with a static route at the OS level (netplan) through the current gateway, which the guard then sees as a more specific route, and Fluxbee adds no route of its own; 409 PROBE_UNAVAILABLE, no curl on the worker (set only); 503 EGRESS_GUARD_UNREADABLE, a lookup could not be read within the guards' 5 s. Each refusal names the address and the route it found.";
+const EGRESS_NOT_ANSWERED_NOTE: &str = "504 EGRESS_NOT_ANSWERED never means \"not applied\": a worker on a release before this action ignores it, and nothing changed there (bring it to the motherbee's release first, update_installation); a worker whose answer was lost reverts by itself within 15 s of its pending_confirm unless the confirm reached it and it committed. GET /hives/{hive}/versions says which: egress.state (behind, not_behind, other_gateway, drifted) and egress.last_switch (state, step, error_code, reason). The worker's journal has a line per step, and SY.admin's command log the action and its outcome.";
+const EGRESS_CLOSED_NOTE: &str = "Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler, one step per worker, only when the operator asks, and the executor runs it once the operator confirms; or the operator on SY.admin's loopback HTTP API. The motherbee's orchestrator sends SYSTEM_EGRESS_ROUTE to the worker's, which only it may send (system policy rule 3), never to the motherbee.";
+
+/// `set_hive_egress` and `clear_hive_egress` (docs/edge-egress-nat-spec.md §15, FINDINGS A-219),
+/// the operator's alone. What SY.admin owns is checked before anything is sent: the hive is a worker
+/// of its registry with its join done (`hive_egress_worker_refusal`); no installation update run is
+/// under way, nor a task of the update acting on that worker, since its core update restarts the
+/// worker's orchestrator. The run is held while the motherbee's orchestrator switches the worker,
+/// so none starts meanwhile; the motherbee's checks, the worker's guards and the switch are theirs.
+async fn handle_hive_egress_command(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let Some(hive) = hive.filter(|hive| !hive.trim().is_empty()) else {
+        return Ok(admin_invalid_request_response(
+            action,
+            "missing hive: /hives/{hive}/egress names the worker",
+        ));
+    };
+    let payload = match payload {
+        serde_json::Value::Null => serde_json::json!({}),
+        serde_json::Value::Object(_) => payload,
+        _ => {
+            return Ok(admin_invalid_request_response(
+                action,
+                "the body must be a JSON object",
+            ))
+        }
+    };
+    if let Some(why) = hive_egress_worker_refusal(&ctx.hive_id, &hive_registry(ctx), &hive) {
+        return Ok(admin_error_response(action, "NOT_A_WORKER", &why));
+    }
+    let _run = match ctx.installation_update.start_run(action) {
+        Ok(run) => run,
+        Err(running) => return Ok(installation_update::run_under_way(action, &running)),
+    };
+    if let Some(holder) = ctx.installation_update.acting_on(&hive) {
+        return Ok(admin_error_response(
+            action,
+            "INSTALLATION_UPDATE_RUNNING",
+            &format!(
+                "the installation's update acts on {hive} now ({}, update {}), and its core update \
+                 restarts the worker's orchestrator: run this once it ends (get_installation_update)",
+                holder.what, holder.update
+            ),
+        ));
+    }
+    let payload = normalize_admin_payload(action, payload, Some(&hive));
+    let request = build_admin_request(ctx, action, payload, Some(hive));
+    let response = send_admin_request(
+        client,
+        request,
+        admin_action_timeout(action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await;
+    Ok(build_admin_http_response(action, response))
+}
+
+/// Why `hive` is no worker an egress action takes (`NOT_A_WORKER`), from the registry's strict
+/// reading (`HiveRegistry::role`): the motherbee, an ingress, an egress, a hive whose join is not
+/// done, or none of the registry's. None for a worker.
+fn hive_egress_worker_refusal(
+    admin_hive: &str,
+    registry: &HiveRegistry,
+    hive: &str,
+) -> Option<String> {
+    if hive == admin_hive {
+        return Some(format!(
+            "{hive} is the motherbee: Fluxbee never rewrites its route (PB-8). Put it behind the \
+             egress at the OS level, if at all"
+        ));
+    }
+    match registry.role(hive) {
+        Some(HiveRole::Worker) => None,
+        Some(HiveRole::Ingress) => Some(format!(
+            "{hive} is an ingress: only a worker goes behind the egress"
+        )),
+        Some(HiveRole::Egress) => Some(format!(
+            "{hive} is an egress: it is the gateway, not a worker behind it"
+        )),
+        None if registry.lists(hive) => Some(format!(
+            "{hive}'s join is not done: finish it, or remove the hive, first"
+        )),
+        None => Some(format!("{hive} is no hive of the registry")),
+    }
 }
 
 async fn handle_identity_query(
@@ -22677,6 +22885,8 @@ fn build_admin_request(
         | "list_tenant_nodes"
         | "remove_hive"
         | "core_rollback"
+        | "set_hive_egress"
+        | "clear_hive_egress"
         | "add_hive"
         // The ACME client's certificate conditions (docs/acme-edge-certificates-v1.md §7): an
         // internal call, with no HTTP route.
@@ -22931,6 +23141,12 @@ fn admin_action_timeout(action: &str) -> Duration {
         "core_rollback" => Duration::from_secs(
             env_timeout_secs("JSR_ADMIN_CORE_ROLLBACK_TIMEOUT_SECS").unwrap_or(300),
         ),
+        // The motherbee forwards the switch (30 s) and then the confirm (10 s), each under its own
+        // bound (docs/edge-egress-nat-spec.md §15.3): longer, so a worker that does not answer
+        // reads as EGRESS_NOT_ANSWERED, never as this timeout.
+        "set_hive_egress" | "clear_hive_egress" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_EGRESS_TIMEOUT_SECS").unwrap_or(60))
+        }
         // The node's hive gives the node 3 s to answer NODE_HELP and the motherbee gives that hive
         // 7 s: wait longer than both, so a silent node reads as `help: null` and a hive that does
         // not answer as NODE_HELP_FAILED, never as this timeout.
@@ -23220,6 +23436,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "list_versions"
             | "get_versions"
             | "core_rollback"
+            | "set_hive_egress"
+            | "clear_hive_egress"
             | "list_runtimes"
             | "get_runtime"
             | "remove_runtime_version"
@@ -34534,6 +34752,230 @@ mod tests {
             update["executor_contract"]["function_schema"]["properties"]["category"]["enum"],
             json!(["runtime", "core", "vendor", "config"])
         );
+    }
+
+    /// A worker behind the egress, and back (docs/edge-egress-nat-spec.md §15, FINDINGS A-219):
+    /// actions of the catalog with their routes, help and examples, mutating and confirmed first,
+    /// ones the executor runs and Archi stages, closed to the whole mesh, Archi included, and given
+    /// longer than the motherbee's forwards of the switch and the confirm.
+    #[test]
+    fn hive_egress_is_the_operators_and_closed_to_the_mesh() {
+        for (action, method, fields) in [
+            ("set_hive_egress", "PUT", vec!["access_from"]),
+            (
+                "clear_hive_egress",
+                "DELETE",
+                vec!["access_from", "gateway_ip"],
+            ),
+        ] {
+            let spec = resolve_internal_action_spec(action).expect(action);
+            assert!(
+                matches!(spec.route, InternalActionRoute::Command(canonical) if canonical == action)
+            );
+            assert!(spec.requires_target);
+            let doc = build_admin_action_doc(spec);
+            assert_eq!(doc["read_only"], json!(false), "{action}");
+            assert_eq!(doc["confirmation_required"], json!(true), "{action}");
+            assert_eq!(doc["executor_available"], json!(true), "{action}");
+            assert_eq!(
+                doc["path_patterns"],
+                json!([format!("{method} /hives/{{hive}}/egress")])
+            );
+            assert_ne!(doc["summary"], json!("Admin action."));
+            assert_eq!(doc["request_contract"]["body"]["required"], json!(false));
+            assert!(admin_action_example_scmd(action).is_some());
+            assert!(admin_action_request_notes(action).len() >= 7, "{action}");
+            let schema = &doc["executor_contract"]["function_schema"];
+            assert_eq!(schema["required"], json!(["hive"]), "{action}");
+            let mut names: Vec<&str> = schema["properties"]
+                .as_object()
+                .expect("its properties")
+                .keys()
+                .map(String::as_str)
+                .filter(|name| *name != "hive")
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, fields, "{action}");
+            assert_eq!(
+                schema["properties"]["access_from"]["type"],
+                json!(["array", "null"])
+            );
+            let executor_actions: Vec<&str> = executor_visible_action_specs(None)
+                .into_iter()
+                .map(|spec| spec.action)
+                .collect();
+            assert!(executor_actions.contains(&action));
+            assert_eq!(mesh_access(action), Some(MeshAccess::Nobody));
+            for caller in [
+                "SY.architect@motherbee",
+                "IO.cloud@motherbee",
+                "SY.admin@motherbee",
+                "SY.orchestrator@motherbee",
+                "SY.orchestrator@worker1",
+                "SY.wf-rules@worker1",
+                "AI.support@worker1",
+            ] {
+                assert!(
+                    mesh_admits(caller, action, Some("worker1"), &json!({})).is_err(),
+                    "{action}: {caller}"
+                );
+            }
+            assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&action));
+            // Over the motherbee's forward of the switch (30 s) and of the confirm (10 s).
+            assert_eq!(admin_action_timeout(action), Duration::from_secs(60));
+            assert!(action_routes_via_local_orchestrator(action));
+            assert_eq!(
+                classify_admin_action(action),
+                Some(fluxbee_sdk::ActionClass::SystemConfig)
+            );
+        }
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/worker1/egress"),
+            vec!["DELETE", "PUT"]
+        );
+        for code in [
+            "NOT_A_WORKER",
+            "NO_EGRESS_DECLARED",
+            "NO_REACHABILITY_URL",
+            "GATEWAY_NOT_ON_LINK",
+            "UPLINK_ON_DEFAULT_ROUTE",
+            "ACCESS_ON_DEFAULT_ROUTE",
+            "PREVIOUS_GATEWAY_UNKNOWN",
+        ] {
+            assert_eq!(error_code_to_http_status(code), 409, "{code}");
+        }
+        assert_eq!(error_code_to_http_status("EGRESS_PROBE_FAILED"), 502);
+        assert_eq!(error_code_to_http_status("HIVE_UNREACHABLE"), 503);
+        assert_eq!(error_code_to_http_status("EGRESS_NOT_ANSWERED"), 504);
+        assert_eq!(error_code_to_http_status("EGRESS_CONFIRM_MISSED"), 504);
+    }
+
+    /// SY.admin's own check (§15.1): a worker of the registry whose join is done; the refusal says
+    /// why not.
+    #[test]
+    fn an_egress_action_takes_only_a_joined_worker() {
+        let root = test_temp_dir("egress-registry");
+        let done = "join:\n  phase: done\n";
+        for (dir, info) in [
+            (
+                "worker1",
+                format!("hive_id: worker1\nrole: worker\nstatus: connected\n{done}"),
+            ),
+            (
+                "ingress1",
+                format!("hive_id: ingress1\nrole: ingress\nstatus: connected\n{done}"),
+            ),
+            (
+                "egress1",
+                format!("hive_id: egress1\nrole: egress\nstatus: connected\n{done}"),
+            ),
+            (
+                "worker2",
+                "hive_id: worker2\nrole: worker\nstatus: joining\njoin:\n  phase: finalize\n"
+                    .to_string(),
+            ),
+        ] {
+            write_registry_entry(&root, dir, &info);
+        }
+        let registry = HiveRegistry::new(&root);
+        assert_eq!(
+            hive_egress_worker_refusal(PRIMARY_HIVE_ID, &registry, "worker1"),
+            None
+        );
+        for (hive, why) in [
+            (PRIMARY_HIVE_ID, "never rewrites its route"),
+            ("ingress1", "an ingress"),
+            ("egress1", "the gateway"),
+            ("worker2", "join is not done"),
+            ("worker9", "no hive of the registry"),
+        ] {
+            let refusal = hive_egress_worker_refusal(PRIMARY_HIVE_ID, &registry, hive).expect(hive);
+            assert!(refusal.contains(why), "{hive}: {refusal}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// SY.admin refuses before it sends anything: a hive that is no worker (NOT_A_WORKER), an
+    /// installation update run under way (INSTALLATION_UPDATE_RUNNING), a body that is no object.
+    /// A worker's request goes to the motherbee's orchestrator, naming the worker.
+    #[tokio::test]
+    async fn an_egress_action_is_refused_before_anything_is_sent() {
+        let (ctx, mut harness) = opa_test_admin("egress-refusals");
+        let registry = ctx.state_dir.parent().expect("root").join("hives");
+        let done = "join:\n  phase: done\n";
+        write_registry_entry(
+            &registry,
+            "worker1",
+            &format!("hive_id: worker1\nrole: worker\nstatus: connected\n{done}"),
+        );
+        write_registry_entry(
+            &registry,
+            "egress1",
+            &format!("hive_id: egress1\nrole: egress\nstatus: connected\n{done}"),
+        );
+        for (action, hive) in [
+            ("set_hive_egress", "egress1"),
+            ("clear_hive_egress", PRIMARY_HIVE_ID),
+            ("set_hive_egress", "worker9"),
+        ] {
+            let (status, body) =
+                handle_hive_egress_command(&ctx, &ctx.rpc, action, json!({}), Some(hive.into()))
+                    .await
+                    .unwrap();
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("NOT_A_WORKER"), "{body}");
+            assert!(
+                harness
+                    .next_outgoing_within(Duration::from_millis(100))
+                    .await
+                    .is_none(),
+                "{action} {hive}: nothing sent"
+            );
+        }
+        let (status, body) = handle_hive_egress_command(
+            &ctx,
+            &ctx.rpc,
+            "set_hive_egress",
+            json!(["192.168.8.0/24"]),
+            Some("worker1".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 400, "{body}");
+        {
+            let _run = ctx
+                .installation_update
+                .start_run("update_installation")
+                .expect("a run");
+            let (status, body) = handle_hive_egress_command(
+                &ctx,
+                &ctx.rpc,
+                "set_hive_egress",
+                json!({}),
+                Some("worker1".into()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("INSTALLATION_UPDATE_RUNNING"), "{body}");
+            assert!(
+                harness
+                    .next_outgoing_within(Duration::from_millis(100))
+                    .await
+                    .is_none(),
+                "nothing sent"
+            );
+        }
+        // A worker's: the motherbee's orchestrator, the worker named, the body as it came.
+        let payload = normalize_admin_payload(
+            "set_hive_egress",
+            json!({ "access_from": ["192.168.8.0/24"] }),
+            Some("worker1"),
+        );
+        let request = build_admin_request(&ctx, "set_hive_egress", payload, Some("worker1".into()));
+        assert_eq!(request.target, format!("SY.orchestrator@{PRIMARY_HIVE_ID}"));
+        assert_eq!(request.payload["target"], json!("worker1"));
+        assert_eq!(request.payload["access_from"], json!(["192.168.8.0/24"]));
     }
 
     /// The installation's update is the operator's (docs/hive-config-update-v1.md §6, stage 4): an

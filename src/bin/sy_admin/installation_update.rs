@@ -1734,6 +1734,13 @@ impl Updates {
         lock(&self.busy).get(hive).cloned()
     }
 
+    /// The task of the update that acts on `hive` now, a read aside: one that may send it a core
+    /// update or a config. An egress switch is not started under it (docs/edge-egress-nat-spec.md
+    /// §15.1).
+    pub(crate) fn acting_on(&self, hive: &str) -> Option<Holder> {
+        self.holder(hive).filter(|holder| holder.what != READING)
+    }
+
     fn is_busy(&self, hive: &str) -> bool {
         lock(&self.busy).contains_key(hive)
     }

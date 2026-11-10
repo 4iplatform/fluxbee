@@ -3374,3 +3374,25 @@ async fn a_pass_is_never_left_to_a_queued_read() {
     );
     assert!(entry_of(&updates, "worker1").on_target());
 }
+
+/// A-219 (docs/edge-egress-nat-spec.md §15.1): an egress switch is not started while a task of the
+/// update acts on that worker, since its core update restarts the worker's orchestrator; a task that
+/// only reads the worker holds nothing back.
+#[test]
+fn an_egress_switch_waits_only_for_a_task_that_acts_on_its_worker() {
+    let updates = Updates::load(&temp_state("installation-update-acting-on"));
+    assert!(updates.acting_on("worker1").is_none());
+    {
+        let _read = updates.claim("worker1", READING, "upd-1").expect("claimed");
+        assert!(updates.acting_on("worker1").is_none(), "a read");
+    }
+    let _core = updates
+        .claim("worker1", "the automatic step", "upd-1")
+        .expect("claimed");
+    let holder = updates.acting_on("worker1").expect("acting on worker1");
+    assert_eq!(
+        (holder.what.as_str(), holder.update.as_str()),
+        ("the automatic step", "upd-1")
+    );
+    assert!(updates.acting_on("worker2").is_none());
+}
