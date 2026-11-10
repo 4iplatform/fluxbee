@@ -71,6 +71,9 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "INVENTORY_REQUEST",
     "ADD_HIVE_FINALIZE",
     "REMOVE_HIVE_CLEANUP",
+    // Puts a worker behind the egress, or takes it back (docs/edge-egress-nat-spec.md §15): only
+    // the motherbee's orchestrator sends it, and never to the motherbee (rule 3, spoke-only).
+    "SYSTEM_EGRESS_ROUTE",
     // Its receiver (SY.opa.rules) APPLIES the user OPA policy it carries. Only the primary Admin
     // sends it (system policy rule 2).
     "CONFIG_CHANGED",
@@ -565,8 +568,13 @@ mod tests {
         "SYSTEM_CORE_ROLLBACK",
     ];
 
-    /// The join/leave handshake: mutations that run only on the hive being added or removed.
-    const SPOKE_ONLY_ACTIONS: [&str; 2] = ["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"];
+    /// The mutations that run only on a spoke: the join/leave handshake, on the hive being added or
+    /// removed, and a worker's egress switch (docs/edge-egress-nat-spec.md §15).
+    const SPOKE_ONLY_ACTIONS: [&str; 3] = [
+        "ADD_HIVE_FINALIZE",
+        "REMOVE_HIVE_CLEANUP",
+        "SYSTEM_EGRESS_ROUTE",
+    ];
 
     /// Rule (3)'s reads (`orchestrator_reads`).
     const ORCHESTRATOR_READS: [&str; 8] = [
@@ -746,6 +754,55 @@ mod tests {
         ));
     }
 
+    /// A worker's egress switch (docs/edge-egress-nat-spec.md §15, FINDINGS A-219) comes only from
+    /// the motherbee's orchestrator, to a spoke: never to the motherbee, whose route Fluxbee never
+    /// rewrites (PB-8), never from a spoke's orchestrator, and never from the motherbee's admin or
+    /// Archi, which ask the motherbee's orchestrator for it.
+    #[test]
+    fn the_egress_switch_comes_only_from_the_motherbee_s_orchestrator_to_a_spoke() {
+        let act = "SYSTEM_EGRESS_ROUTE";
+        assert!(is_protected_system_action(act));
+        assert_eq!(
+            protected_system_action("system_egress_route"),
+            Some("SYSTEM_EGRESS_ROUTE")
+        );
+        for spoke in ["worker1", "ingress1", "egress1"] {
+            assert!(
+                authorize_system(act, Some("SY.orchestrator@motherbee"), spoke),
+                "{spoke}"
+            );
+        }
+        assert!(!authorize_system(
+            act,
+            Some("SY.orchestrator@motherbee"),
+            "motherbee"
+        ));
+        for rogue in [
+            None,
+            Some(""),
+            Some("SY.orchestrator@worker1"),
+            Some("SY.orchestrator@ingress1"),
+            Some("SY.orchestrator@egress1"),
+            Some("SY.admin@motherbee"),
+            Some("SY.architect@motherbee"),
+            Some("IO.cloud@motherbee"),
+            Some("SY.wf-rules@worker1"),
+            Some("AI.support@worker1"),
+            Some("RT.gateway@motherbee"),
+        ] {
+            assert!(
+                !authorize_system(act, rogue, "worker1"),
+                "{rogue:?} must not send {act} to worker1"
+            );
+            assert!(
+                !authorize_system(act, rogue, "motherbee"),
+                "{rogue:?} must not send {act} to the motherbee"
+            );
+        }
+        // Its answer is no command.
+        assert!(!is_protected_system_action("SYSTEM_EGRESS_ROUTE_RESPONSE"));
+    }
+
     /// NODE_HELP (docs/agent-tools-v1.md §3.3) travels as NODE_STATUS_GET does: SY.admin asks the
     /// motherbee's orchestrator, which forwards it to the node's hive, whose orchestrator asks the
     /// node. The orchestrators send it (rule (3), a read) and the same hive's admin may (rule (4));
@@ -806,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_32_actions() {
+    fn protected_set_is_the_33_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -843,6 +900,8 @@ mod tests {
             "REMOVE_HIVE_CLEANUP",
             // Swaps /usr/bin binaries and restarts the core on the TARGET hive.
             "SYSTEM_CORE_ROLLBACK",
+            // Rewrites a worker's default route and turns its IPv6 off (A-219).
+            "SYSTEM_EGRESS_ROUTE",
             // Carries the user OPA policy its receiver applies.
             "CONFIG_CHANGED",
         ] {
@@ -851,7 +910,7 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 32);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 33);
         for action in [
             "RUNTIME_UPDATE",
             "HELLO",

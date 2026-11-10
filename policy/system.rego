@@ -62,17 +62,20 @@ node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SY
 # acts locally (verified 2026-10-22), so rule (3) has a direction: a spoke's orchestrator, the DMZ
 # ingress's included, commands no hive (FINDINGS A-20, docs/control-path-hardening-v1.md §3).
 #
-# The mutations: only from the motherbee's orchestrator.
+# The mutations: only from the motherbee's orchestrator. SYSTEM_EGRESS_ROUTE puts a worker behind
+# the egress, or takes it back (docs/edge-egress-nat-spec.md §15, FINDINGS A-219).
 orchestrator_mutations := {
 	"SPAWN_NODE", "KILL_NODE", "START_NODE", "RESTART_NODE", "REMOVE_NODE_INSTANCE",
 	"NODE_CONFIG_SET", "SYSTEM_CORE_ROLLBACK", "ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP",
+	"SYSTEM_EGRESS_ROUTE",
 }
 
 # The join/leave handshake runs only on the hive being added or removed, never on the motherbee,
-# where ADD_HIVE_FINALIZE would restart the core and REMOVE_HIVE_CLEANUP stop it (its orchestrator
-# refuses them too: SPOKE_ONLY_SYSTEM_ACTIONS in sy_orchestrator). No rule admits them there, from
-# anyone: rules (3) and (4) both exclude spoke_only_action_on_motherbee.
-spoke_only_actions := {"ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"}
+# where ADD_HIVE_FINALIZE would restart the core and REMOVE_HIVE_CLEANUP stop it; a worker's
+# egress switch runs only on that worker, and Fluxbee never rewrites the motherbee's route (PB-8).
+# Their orchestrator refuses them there too (SPOKE_ONLY_SYSTEM_ACTIONS in sy_orchestrator). No rule
+# admits them there, from anyone: rules (3) and (4) both exclude spoke_only_action_on_motherbee.
+spoke_only_actions := {"ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP", "SYSTEM_EGRESS_ROUTE"}
 
 spoke_only_action_on_motherbee if {
 	input.action in spoke_only_actions

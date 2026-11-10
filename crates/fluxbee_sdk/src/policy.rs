@@ -120,6 +120,9 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "set_storage"
         // Swaps /usr/bin binaries and restarts the core.
         | "core_rollback"
+        // A worker's default route through the egress, or back (A-219).
+        | "set_hive_egress"
+        | "clear_hive_egress"
         | "remove_runtime_version" => Some(ActionClass::SystemConfig),
         "add_hive" | "remove_hive" => Some(ActionClass::TopologyChange),
         "run_node" | "kill_node" | "remove_node_instance" => Some(ActionClass::NodeLifecycle),
@@ -151,6 +154,7 @@ pub fn classify_system_message(msg: &str) -> Option<ActionClass> {
         "RUNTIME_UPDATE"
         | "SYSTEM_UPDATE"
         | "SYSTEM_CORE_ROLLBACK"
+        | "SYSTEM_EGRESS_ROUTE"
         | "SYSTEM_SYNC_HINT"
         | "OPA_APPLY"
         | "OPA_COMPILE_APPLY"
@@ -223,6 +227,13 @@ mod tests {
             classify_admin_action("get_node_status")
         );
         assert_eq!(classify_admin_action("node_help"), Some(ActionClass::Read));
+        // A worker's route through the egress, or back (A-219): its outcome is recorded.
+        for action in ["set_hive_egress", "clear_hive_egress"] {
+            assert_eq!(
+                classify_admin_action(action),
+                Some(ActionClass::SystemConfig)
+            );
+        }
     }
 
     #[test]
@@ -245,6 +256,14 @@ mod tests {
         );
         // The answer is no command.
         assert_eq!(classify_system_message("NODE_HELP_RESPONSE"), None);
+        assert_eq!(
+            classify_system_message("SYSTEM_EGRESS_ROUTE"),
+            Some(ActionClass::SystemConfig)
+        );
+        assert_eq!(
+            classify_system_message("SYSTEM_EGRESS_ROUTE_RESPONSE"),
+            None
+        );
     }
 
     #[test]
