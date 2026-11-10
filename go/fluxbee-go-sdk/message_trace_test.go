@@ -12,7 +12,7 @@ func traceTestMessage(msgType string, dst Destination, context string) Message {
 	msg := Message{
 		Routing: Routing{Src: uuid.NewString(), Dst: dst, TTL: 16, TraceID: uuid.NewString()},
 		Meta:    Meta{MsgType: msgType},
-		Payload: json.RawMessage(`{"type":"text","content":"hola"}`),
+		Payload: json.RawMessage(`{"type":"text","content":"hello"}`),
 	}
 	if context != "" {
 		msg.Meta.Context = json.RawMessage(context)

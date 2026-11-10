@@ -1435,10 +1435,10 @@ mod tests {
             wapp_message_to_content(&WappMessageKind::Media {
                 media_type: "image".into(),
                 media_id: "MID".into(),
-                caption: Some("mira".into()),
+                caption: Some("look".into()),
                 mime_type: Some("image/jpeg".into()),
             }),
-            "mira\n[image attachment]"
+            "look\n[image attachment]"
         );
         assert_eq!(
             wapp_message_to_content(&WappMessageKind::Media {

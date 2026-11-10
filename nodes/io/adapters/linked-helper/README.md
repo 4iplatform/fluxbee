@@ -152,7 +152,7 @@ Send one manual discovery:
 cd adapters/linked-helper/adapter-rs
 cargo run -- discover manual \
   --instance-id 123456 \
-  --account-display-name "Cuenta ventas"
+  --account-display-name "Sales account"
 ```
 
 Send discovery from JSON payload:

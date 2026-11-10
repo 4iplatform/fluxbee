@@ -2678,8 +2678,8 @@ mod tests {
     fn a_reply_lands_on_a_key_of_its_own() {
         // The request and its reply share the trace_id, and the old (ctx, seq) key, derived from
         // it, dropped the reply (A-70). The inbox key tells them apart.
-        let request = message("trace-1", "ilk:person", "hola");
-        let reply = message("trace-1", "ilk:ai", "hola, en qué te ayudo");
+        let request = message("trace-1", "ilk:person", "hello");
+        let reply = message("trace-1", "ilk:ai", "hello, how can I help you");
         let request_turn = parse_turn(request.clone()).expect("request parses");
         let reply_turn = parse_turn(reply.clone()).expect("reply parses");
         assert_eq!(request_turn.trace_id, reply_turn.trace_id);
@@ -2709,7 +2709,7 @@ mod tests {
         );
 
         // A WF's message to an IO node names no src_ilk: its writer's ILK stands for it.
-        let mut to_io = message("trace-3", "node-uuid", "tu nota de crédito");
+        let mut to_io = message("trace-3", "node-uuid", "your credit note");
         to_io["meta"].as_object_mut().unwrap().remove("src_ilk");
         to_io["meta"]["context"] = serde_json::json!({"writer": {"ilk": "ilk:wf"}});
         assert_eq!(
@@ -2850,7 +2850,7 @@ mod tests {
 
     #[test]
     fn a_batch_becomes_inbox_rows_keyed_as_before() {
-        let turn = copied_turn("trace-1", "IO.slack.T1@worker1", "hola");
+        let turn = copied_turn("trace-1", "IO.slack.T1@worker1", "hello");
         let batch = StreamBatch {
             stream: "RT.gateway.stream@worker1".to_string(),
             epoch: 1,

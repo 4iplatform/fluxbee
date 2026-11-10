@@ -560,13 +560,13 @@ mod tests {
     async fn model_input_uses_inline_content_for_text_v1() {
         let payload = json!({
             "type": "text",
-            "content": "hola mundo",
+            "content": "hello world",
             "attachments": []
         });
         let result = build_model_input_from_payload(&payload)
             .await
             .expect("inline should parse");
-        assert_eq!(result, "hola mundo");
+        assert_eq!(result, "hello world");
     }
 
     #[tokio::test]
@@ -595,7 +595,7 @@ mod tests {
     async fn model_input_rejects_unsupported_attachment_mime_when_not_multimodal() {
         let payload = json!({
             "type": "text",
-            "content": "hola",
+            "content": "hello",
             "attachments": [{
                 "type": "blob_ref",
                 "blob_name": "image_0123456789abcdef.png",
@@ -615,7 +615,7 @@ mod tests {
     async fn model_input_rejects_blob_too_large() {
         let payload = json!({
             "type": "text",
-            "content": "hola",
+            "content": "hello",
             "attachments": [{
                 "type": "blob_ref",
                 "blob_name": "doc_0123456789abcdef.txt",
@@ -649,7 +649,7 @@ mod tests {
             .collect();
         let payload = TextV1Payload {
             payload_type: "text".to_string(),
-            content: Some("hola".to_string()),
+            content: Some("hello".to_string()),
             content_ref: None,
             attachments,
         }
@@ -695,7 +695,7 @@ mod tests {
         let scratch_root = temp_blob_root();
         let blob_ref = blob_toolkit(Some(&scratch_root))
             .expect("scratch toolkit")
-            .put_bytes(b"hola tardio", "late.txt", "text/plain")
+            .put_bytes(b"hello, late", "late.txt", "text/plain")
             .expect("name the late blob");
         let _ = std::fs::remove_dir_all(&scratch_root);
         let target = toolkit.resolve(&blob_ref);
@@ -708,7 +708,7 @@ mod tests {
         let delayed_path = target.clone();
         tokio::spawn(async move {
             sleep(Duration::from_millis(40)).await;
-            let _ = tokio_fs::write(&delayed_path, b"hola tardio").await;
+            let _ = tokio_fs::write(&delayed_path, b"hello, late").await;
         });
 
         let payload = json!({
@@ -735,7 +735,7 @@ mod tests {
         let out = build_model_input_from_payload_with_options(&payload, &options)
             .await
             .expect("retry should resolve late blob");
-        assert_eq!(out, "hola tardio");
+        assert_eq!(out, "hello, late");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -785,7 +785,7 @@ mod tests {
         };
         let payload = json!({
             "type": "text",
-            "content": "analiza los adjuntos",
+            "content": "look at the attachments",
             "attachments": [
                 {
                     "type": text_blob.ref_type,
@@ -846,8 +846,8 @@ mod tests {
         std::fs::write(&image_path, [0_u8, 1_u8, 2_u8, 3_u8]).expect("write image bytes");
 
         let input = ResolvedModelInput {
-            main_text: "mirÃ¡".to_string(),
-            prompt_text: "mirÃ¡".to_string(),
+            main_text: "look".to_string(),
+            prompt_text: "look".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: image_blob,
                 data: Some(std::fs::read(&image_path).expect("read image bytes")),
@@ -857,7 +857,7 @@ mod tests {
         let parts = build_model_user_content_parts(&input)
             .await
             .expect("parts should build");
-        assert!(matches!(&parts[0], ModelContentPart::Text { text } if text == "mirÃ¡"));
+        assert!(matches!(&parts[0], ModelContentPart::Text { text } if text == "look"));
         assert!(matches!(
             &parts[1],
             ModelContentPart::Image { media_type, data_base64, detail }
@@ -887,8 +887,8 @@ mod tests {
         .expect("create blob parent");
         std::fs::write(&file_path, b"%PDF-test").expect("write file bytes");
         let input = ResolvedModelInput {
-            main_text: "mira".to_string(),
-            prompt_text: "mira".to_string(),
+            main_text: "look".to_string(),
+            prompt_text: "look".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: file_blob,
                 data: Some(std::fs::read(&file_path).expect("read file bytes")),
@@ -928,8 +928,8 @@ mod tests {
         .expect("create blob parent");
         std::fs::write(&file_path, b"DOCXTEST").expect("write file bytes");
         let input = ResolvedModelInput {
-            main_text: "mira".to_string(),
-            prompt_text: "mira".to_string(),
+            main_text: "look".to_string(),
+            prompt_text: "look".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: file_blob,
                 data: Some(std::fs::read(&file_path).expect("read file bytes")),
@@ -951,8 +951,8 @@ mod tests {
     #[tokio::test]
     async fn build_model_user_content_parts_rejects_attachment_without_mime() {
         let input = ResolvedModelInput {
-            main_text: "mira".to_string(),
-            prompt_text: "mira".to_string(),
+            main_text: "look".to_string(),
+            prompt_text: "look".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: BlobRef {
                     ref_type: "blob_ref".to_string(),
@@ -994,8 +994,8 @@ mod tests {
         .expect("create blob parent");
         std::fs::write(&image_path, [0_u8, 1_u8, 2_u8, 3_u8]).expect("write image bytes");
         let input = ResolvedModelInput {
-            main_text: "mira".to_string(),
-            prompt_text: "mira".to_string(),
+            main_text: "look".to_string(),
+            prompt_text: "look".to_string(),
             attachments: vec![ResolvedModelAttachment {
                 blob_ref: image_blob,
                 data: Some(std::fs::read(&image_path).expect("read image bytes")),
@@ -1156,17 +1156,17 @@ mod tests {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let csv = toolkit
-            .put_bytes(b"mes,ventas\nenero,10\n", "ventas.csv", "text/csv")
+            .put_bytes(b"month,sales\njanuary,10\n", "ventas.csv", "text/csv")
             .expect("csv");
         let html = toolkit
-            .put_bytes(b"<p>hola</p>", "pagina.html", "text/html")
+            .put_bytes(b"<p>hello</p>", "pagina.html", "text/html")
             .expect("html");
         for blob in [&csv, &html] {
             toolkit.promote(blob).expect("promote");
         }
         let payload = json!({
             "type": "text",
-            "content": "mira",
+            "content": "look",
             "attachments": [csv, html]
         });
         for multimodal in [false, true] {
@@ -1180,14 +1180,14 @@ mod tests {
                 .expect("text attachments");
             assert_eq!(
                 resolved.attachments[0].text_content.as_deref(),
-                Some("mes,ventas\nenero,10\n")
+                Some("month,sales\njanuary,10\n")
             );
             assert_eq!(
                 resolved.attachments[1].text_content.as_deref(),
-                Some("<p>hola</p>")
+                Some("<p>hello</p>")
             );
             assert!(resolved.prompt_text.contains(&format!(
-                "[attachment #1: ventas.csv | text/csv | {} | blob {}]\nmes,ventas",
+                "[attachment #1: ventas.csv | text/csv | {} | blob {}]\nmonth,sales",
                 csv.size, csv.blob_name
             )));
             let parts = build_model_user_content_parts(&resolved)
@@ -1203,7 +1203,7 @@ mod tests {
             assert!(matches!(
                 &parts[2],
                 ModelContentPart::Text { text }
-                    if text == &format!("Attachment (pagina.html, text/html, blob {}):\n<p>hola</p>", html.blob_name)
+                    if text == &format!("Attachment (pagina.html, text/html, blob {}):\n<p>hello</p>", html.blob_name)
             ));
         }
         let _ = std::fs::remove_dir_all(root);
@@ -1217,22 +1217,22 @@ mod tests {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let notes = toolkit
-            .put_bytes("año uno dos".as_bytes(), "notas.txt", "text/plain")
+            .put_bytes("naïve one two".as_bytes(), "notas.txt", "text/plain")
             .expect("notes");
         toolkit.promote(&notes).expect("promote");
-        // Five characters, six bytes: "ñ" takes two.
+        // Five characters, six bytes: "ï" takes two.
         let cut_line = format!(
-            "año u\n[cut at 5 characters: the whole text is the blob {}; read on from offset 6]",
+            "naïve\n[cut at 5 characters: the whole text is the blob {}; read on from offset 6]",
             notes.blob_name
         );
-        assert_eq!("año uno dos".get(6..), Some("no dos"));
+        assert_eq!("naïve one two".get(6..), Some(" one two"));
         let options = ModelInputOptions {
             max_attachment_text_chars: 5,
             blob_root: Some(root.clone()),
             ..ModelInputOptions::default()
         };
         let resolved = resolve_model_input_from_payload_with_options(
-            &json!({"type": "text", "content": "lee", "attachments": [notes]}),
+            &json!({"type": "text", "content": "read", "attachments": [notes]}),
             &options,
         )
         .await
@@ -1255,7 +1255,7 @@ mod tests {
         // The frontdesk reads the same line, and has no read_blob: it names no tool.
         assert!(!resolved.prompt_text.contains("read_blob"));
         // Text within the limit goes whole, with no line.
-        assert_eq!(attachment_text("año", 3, "x_0123456789abcdef.txt"), "año");
+        assert_eq!(attachment_text("café", 4, "x_0123456789abcdef.txt"), "café");
         let _ = std::fs::remove_dir_all(root);
     }
 

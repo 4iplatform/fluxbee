@@ -46,10 +46,10 @@ docs/wf-orchestration-v1.md §5.4):
 What sales read in its immediate memory before this design (the ILKs are cut short):
 
 ```text
-- [2026-11-05 10:05] ilk:7c1e… via IO.slack@motherbee: "Me cobraron dos veces la factura 123"
-- [2026-11-05 10:05] you: "Ya lo paso a facturación"
-- [2026-11-05 10:09] ilk:9a4b… via IO.slack@motherbee: "Nota de crédito NC-55 emitida"
-- [2026-11-07 10:09] ilk:7c1e… via WF.soporte@worker1: "Ana no contesta hace 2 días; mandale un recordatorio"
+- [2026-11-05 10:05] ilk:7c1e… via IO.slack@motherbee: "They charged me twice for invoice 123"
+- [2026-11-05 10:05] you: "I'm passing it to invoicing now"
+- [2026-11-05 10:09] ilk:9a4b… via IO.slack@motherbee: "Credit note NC-55 issued"
+- [2026-11-07 10:09] ilk:7c1e… via WF.soporte@worker1: "Ana has not answered in 2 days; send her a reminder"
 ```
 
 The WF's own text carried Ana's ILK. Invoice's answer looked like a second person on Slack.
@@ -59,10 +59,10 @@ as if a person had said them.
 What it reads now:
 
 ```text
-- [2026-11-05 10:05] person Ana Pérez (ilk:7c1e…) via IO.slack@motherbee: "Me cobraron dos veces la factura 123"
-- [2026-11-05 10:05] you, to person Ana Pérez (ilk:7c1e…): "Ya lo paso a facturación"
-- [2026-11-05 10:09] agent AI.invoice@worker1 (ilk:9a4b…): "Nota de crédito NC-55 emitida"
-- [2026-11-07 10:09] workflow WF.soporte@worker1 (ilk:5d0f…): "Ana no contesta hace 2 días; mandale un recordatorio"
+- [2026-11-05 10:05] person Ana Pérez (ilk:7c1e…) via IO.slack@motherbee: "They charged me twice for invoice 123"
+- [2026-11-05 10:05] you, to person Ana Pérez (ilk:7c1e…): "I'm passing it to invoicing now"
+- [2026-11-05 10:09] agent AI.invoice@worker1 (ilk:9a4b…): "Credit note NC-55 issued"
+- [2026-11-07 10:09] workflow WF.soporte@worker1 (ilk:5d0f…): "Ana has not answered in 2 days; send her a reminder"
 ```
 
 Cognition analyzes the first two lines only: a person is at their other end.

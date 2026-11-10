@@ -989,7 +989,7 @@ mod tests {
     fn a_relay_names_where_it_went_and_an_older_turn_reads_without_it() {
         let relay: MemoryTurn = serde_json::from_value(json!({
             "direction": "in", "via": "IO.a@worker1", "to_via": "IO.b@worker1",
-            "text": "hola", "ts": "2026-11-07T05:40:47.120Z"
+            "text": "hello", "ts": "2026-11-07T05:40:47.120Z"
         }))
         .expect("parse");
         assert_eq!(relay.to_via.as_deref(), Some("IO.b@worker1"));
@@ -998,7 +998,7 @@ mod tests {
             "IO.b@worker1"
         );
         let older: MemoryTurn = serde_json::from_value(json!({
-            "direction": "in", "via": "IO.a@worker1", "text": "hola", "ts": "2026-11-07T05:40:47.120Z"
+            "direction": "in", "via": "IO.a@worker1", "text": "hello", "ts": "2026-11-07T05:40:47.120Z"
         }))
         .expect("parse");
         assert_eq!(older.to_via, None);

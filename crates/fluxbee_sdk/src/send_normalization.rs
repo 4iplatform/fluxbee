@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn keeps_inline_text_under_limit() {
-        let payload = json!({"type":"text","content":"hola","attachments":[]});
+        let payload = json!({"type":"text","content":"hello","attachments":[]});
         let cfg = SendNormalizationConfig {
             enabled: true,
             blob_root: test_blob_root(),

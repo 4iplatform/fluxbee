@@ -1313,7 +1313,7 @@ mod tests {
         let trace = json!([{"t": "2026-11-04T10:17:03.120Z", "from": "IO.api@motherbee",
                             "to": "WF.sales.invoice@worker1"}]);
         let mut reply =
-            build_reply_message_runtime_src(&request, json!({"type":"text","content":"hola"}));
+            build_reply_message_runtime_src(&request, json!({"type":"text","content":"hello"}));
         assert_eq!(
             reply.meta.context,
             Some(json!({"io": {"channel": "api"}, "trace": trace}))
@@ -1332,7 +1332,7 @@ mod tests {
                 meta: Meta::default(),
                 ..request
             },
-            json!({"type":"text","content":"hola"}),
+            json!({"type":"text","content":"hello"}),
         );
         set_reply_evaluation(&mut bare, json!({"area": "sales"}));
         assert_eq!(
@@ -1409,19 +1409,19 @@ mod tests {
         let contract =
             ResponseContract::from_value(&text_field_contract(json!("reply"))).expect("contract");
         let object =
-            json!({"reply": "Te paso con facturación.", "area": "invoice", "quantity": 10});
+            json!({"reply": "I'm passing you to invoicing.", "area": "invoice", "quantity": 10});
 
         let answer = contract.answer(object.to_string()).expect("an answer");
         assert_eq!(
             answer,
             ContractAnswer {
-                text: "Te paso con facturación.".to_string(),
+                text: "I'm passing you to invoicing.".to_string(),
                 evaluation: Some(object.clone()),
             }
         );
         // In a fence or among other text, as a structured call takes it.
         let fenced = contract
-            .answer(format!("Listo:\n```json\n{object}\n```"))
+            .answer(format!("Done:\n```json\n{object}\n```"))
             .expect("an answer");
         assert_eq!(fenced, answer);
         // A blank text is still the answer.
@@ -1453,8 +1453,8 @@ mod tests {
             ResponseContract::from_value(&text_field_contract(json!("reply"))).expect("contract");
         for raw in [
             "",
-            "Te paso con facturación.",
-            r#"["Te paso con facturación."]"#,
+            "I'm passing you to invoicing.",
+            r#"["I'm passing you to invoicing."]"#,
             r#"{"area": "invoice", "quantity": 10}"#,
             r#"{"reply": 7, "area": "invoice", "quantity": 10}"#,
             r#"{"reply": "ok", "area": "refunds", "quantity": 10}"#,
@@ -1763,13 +1763,7 @@ mod tests {
 
         // A name: a lowercase letter, then lowercase letters, digits and _, 32 at most.
         for name in [
-            "Answer",
-            "1st",
-            "_answer",
-            "ask-boss",
-            "ask boss",
-            "",
-            "pregúntale",
+            "Answer", "1st", "_answer", "ask-boss", "ask boss", "", "résumé",
         ] {
             let menu = sales_menu_with(|m| m["options"][0]["name"] = json!(name));
             assert_eq!(
@@ -1846,7 +1840,7 @@ mod tests {
     fn a_menus_answer_is_its_reply_and_the_checked_object() {
         let menu = sales_menu_contract();
         let invoice = json!({
-            "reply": "Te paso la factura.",
+            "reply": "Here is your invoice.",
             "option": "invoice",
             "params": {"product": "Pro", "quantity": 10, "unit_price": 49.5}
         });
@@ -1854,7 +1848,7 @@ mod tests {
         assert_eq!(
             answer,
             ContractAnswer {
-                text: "Te paso la factura.".to_string(),
+                text: "Here is your invoice.".to_string(),
                 evaluation: Some(invoice.clone()),
             }
         );
@@ -1862,11 +1856,11 @@ mod tests {
         // starts no object, as a structured call takes it.
         for raw in [
             format!("```json\n{invoice}\n```"),
-            format!("```json\n{invoice}\n```\n¿Algo más?"),
+            format!("```json\n{invoice}\n```\nAnything else?"),
             format!("```json {invoice}```"),
-            format!("{invoice}\nListo."),
-            format!("Elijo invoice: {invoice}"),
-            format!("Elijo {{invoice}}: {invoice}"),
+            format!("{invoice}\nDone."),
+            format!("I pick invoice: {invoice}"),
+            format!("I pick {{invoice}}: {invoice}"),
         ] {
             assert_eq!(menu.answer(raw.clone()).expect(&raw), answer, "{raw}");
         }
@@ -1888,7 +1882,7 @@ mod tests {
         }
 
         // none, with its reason.
-        let none = json!({"reply": "Lo consulto.", "option": "none", "params": {"reason": "They ask for a refund."}});
+        let none = json!({"reply": "I will check.", "option": "none", "params": {"reason": "They ask for a refund."}});
         assert_eq!(
             menu.answer(none.to_string()).expect("an answer").evaluation,
             Some(none)
@@ -1898,9 +1892,9 @@ mod tests {
         let answer = menu
             .answer(
                 json!({
-                    "reply": "Lo consulto.",
+                    "reply": "I will check.",
                     "option": "consult",
-                    "params": {"question": "¿20% para 10 Pro?", "discount": 20},
+                    "params": {"question": "20% for 10 Pro?", "discount": 20},
                     "confidence": 0.9
                 })
                 .to_string(),
@@ -1909,9 +1903,9 @@ mod tests {
         assert_eq!(
             answer.evaluation,
             Some(json!({
-                "reply": "Lo consulto.",
+                "reply": "I will check.",
                 "option": "consult",
-                "params": {"question": "¿20% para 10 Pro?"}
+                "params": {"question": "20% for 10 Pro?"}
             }))
         );
 
@@ -1943,32 +1937,32 @@ mod tests {
     fn an_answer_off_the_menu_is_invalid_structured_output() {
         let menu = sales_menu_contract();
         let invoice = |params: Value| {
-            json!({"reply": "Listo.", "option": "invoice", "params": params}).to_string()
+            json!({"reply": "Done.", "option": "invoice", "params": params}).to_string()
         };
         for (raw, detail) in [
             (String::new(), "not_json"),
-            ("Te paso con facturación.".to_string(), "not_json"),
+            ("I'm passing you to invoicing.".to_string(), "not_json"),
             (r#"["invoice"]"#.to_string(), "not_json"),
             (
-                r#"{"reply": "Listo.", "option": "invoice""#.to_string(),
+                r#"{"reply": "Done.", "option": "invoice""#.to_string(),
                 "not_json",
             ),
             ("```json\n```".to_string(), "not_json"),
             (
-                r#"{"reply": "Listo.", "option": "refund"}"#.to_string(),
+                r#"{"reply": "Done.", "option": "refund"}"#.to_string(),
                 "unknown_option:refund",
             ),
             (
-                r#"{"reply": "Listo.", "option": "Invoice"}"#.to_string(),
+                r#"{"reply": "Done.", "option": "Invoice"}"#.to_string(),
                 "unknown_option:Invoice",
             ),
-            (r#"{"reply": "Listo."}"#.to_string(), "missing_param:option"),
+            (r#"{"reply": "Done."}"#.to_string(), "missing_param:option"),
             (
-                r#"{"reply": "Listo.", "option": 2}"#.to_string(),
+                r#"{"reply": "Done.", "option": 2}"#.to_string(),
                 "type_mismatch:option:string",
             ),
             (
-                r#"{"reply": "Listo.", "option": "invoice"}"#.to_string(),
+                r#"{"reply": "Done.", "option": "invoice"}"#.to_string(),
                 "missing_param:product",
             ),
             (

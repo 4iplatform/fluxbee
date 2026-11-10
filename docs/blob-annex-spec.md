@@ -179,7 +179,7 @@ What is defined here is the **`text/v1` contract**: the standard structure for c
   "meta": { "type": "user", "src_ilk": "ilk:<uuid>", "ich": "whatsapp://<entrypoint id>", "thread_id": "thread:sha256:<hex>" },
   "payload": {
     "type": "text",
-    "content": "Mirá esta factura",
+    "content": "Look at this invoice",
     "attachments": [
       {
         "type": "blob_ref",
@@ -200,7 +200,7 @@ What is defined here is the **`text/v1` contract**: the standard structure for c
 {
   "payload": {
     "type": "text",
-    "content": "Hola, necesito ayuda",
+    "content": "Hello, I need help",
     "attachments": []
   }
 }
@@ -532,8 +532,8 @@ read_blob_with_retry(blob_ref, config)
 ### 6.4 Message without attachments (common case)
 
 ```
-1. IO receives the text "Hola"
-2. IO builds the message: payload = { type: "text", content: "Hola", attachments: [] }
+1. IO receives the text "Hello"
+2. IO builds the message: payload = { type: "text", content: "Hello", attachments: [] }
 3. IO sends → router → AI
 4. No blob is involved
 ```

@@ -1174,7 +1174,7 @@ mod tests {
             current_user_message: "fallback".to_string(),
             current_user_parts: Some(vec![
                 ModelContentPart::Text {
-                    text: "hola".to_string(),
+                    text: "hello".to_string(),
                 },
                 ModelContentPart::Image {
                     media_type: "image/png".to_string(),

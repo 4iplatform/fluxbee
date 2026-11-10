@@ -54,7 +54,7 @@ fn sample_message() -> Message {
         },
         payload: json!({
             "type": "text",
-            "content": "hola mundo",
+            "content": "hello world",
             "attachments": []
         }),
     }
@@ -92,7 +92,7 @@ fn contract_reply_message_reuses_meta_and_sets_payload() {
     let message = sample_message();
     let payload = json!({
         "type": "text",
-        "content": "Echo: hola mundo",
+        "content": "Echo: hello world",
         "attachments": []
     });
 
@@ -134,7 +134,7 @@ fn contract_reply_message_runtime_src_leaves_src_for_runtime_assignment() {
     let message = sample_message();
     let payload = json!({
         "type": "text",
-        "content": "Echo: hola mundo",
+        "content": "Echo: hello world",
         "attachments": []
     });
 
@@ -149,9 +149,9 @@ fn contract_reply_message_runtime_src_leaves_src_for_runtime_assignment() {
 
 #[test]
 fn contract_text_payload_build_and_extract() {
-    let payload = build_text_response("respuesta").expect("build text payload");
+    let payload = build_text_response("answer").expect("build text payload");
     let text = extract_text(&payload);
-    assert_eq!(text.as_deref(), Some("respuesta"));
+    assert_eq!(text.as_deref(), Some("answer"));
 }
 
 #[test]

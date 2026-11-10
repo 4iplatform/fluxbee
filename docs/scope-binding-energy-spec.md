@@ -20,7 +20,7 @@ Each tag now carries metadata of the message that generated it:
 
 ```json
 {
-  "tag": "facturación",
+  "tag": "billing",
   "ilk_sender": "ilk:tenant:juan",
   "ilk_receiver": "ilk:agent:ai.soporte"
 }
@@ -33,11 +33,11 @@ Each context accumulates tags and participation profiles:
 ```json
 {
   "context_id": "ctx_001",
-  "label": "problemas de facturación",
+  "label": "billing problems",
   "status": "open",
   "ema": 5.2,
   "weight": 7,
-  "tags": ["facturación", "pago", "deuda", "mora"],
+  "tags": ["billing", "payment", "debt", "arrears"],
   "ilk_profile": {
     "ilk:tenant:juan":        { "as_sender": 12, "as_receiver": 3 },
     "ilk:agent:ai.soporte":   { "as_sender": 3,  "as_receiver": 12 }
@@ -230,18 +230,18 @@ if (active.length >= 2 && shouldChangeScope(scope)) {
 ```json
 {
   "ctx_001": {
-    "label": "facturación",
+    "label": "billing",
     "ema": 5.0,
-    "tags": ["factura", "pago", "deuda"],
+    "tags": ["invoice", "payment", "debt"],
     "ilk_profile": {
       "ilk:tenant:juan":      { "as_sender": 8, "as_receiver": 2 },
       "ilk:agent:ai.soporte": { "as_sender": 2, "as_receiver": 8 }
     }
   },
   "ctx_002": {
-    "label": "pagos pendientes",
+    "label": "pending payments",
     "ema": 3.0,
-    "tags": ["pago", "mora", "cuenta"],
+    "tags": ["payment", "arrears", "account"],
     "ilk_profile": {
       "ilk:tenant:juan":      { "as_sender": 5, "as_receiver": 1 },
       "ilk:agent:ai.soporte": { "as_sender": 1, "as_receiver": 5 }
@@ -252,10 +252,10 @@ if (active.length >= 2 && shouldChangeScope(scope)) {
 
 **Tag similarity:**
 ```
-tags_001 = {factura, pago, deuda}
-tags_002 = {pago, mora, cuenta}
-intersection = {pago} → 1
-union = {factura, pago, deuda, mora, cuenta} → 5
+tags_001 = {invoice, payment, debt}
+tags_002 = {payment, arrears, account}
+intersection = {payment} → 1
+union = {invoice, payment, debt, arrears, account} → 5
 S_tema = 1/5 = 0.20
 ```
 
@@ -281,14 +281,14 @@ M = 5.0 + 3.0 = 8.0
 
 ---
 
-### New message: the CTX "fútbol" comes in with a different participant
+### New message: the CTX "football" comes in with a different participant
 
 ```json
 {
   "ctx_003": {
-    "label": "fútbol",
+    "label": "football",
     "ema": 2.0,
-    "tags": ["gol", "partido", "cancha"],
+    "tags": ["goal", "match", "pitch"],
     "ilk_profile": {
       "ilk:tenant:juan":    { "as_sender": 3, "as_receiver": 1 },
       "ilk:tenant:pedro":   { "as_sender": 1, "as_receiver": 3 }
@@ -330,16 +330,16 @@ energy_ema = -0.047 + 0.25 * (-0.030 - (-0.047))
            = -0.043
 ```
 
-**Evaluation:** -0.043 > -0.10 → still stable. But the energy went up (from -0.047 to -0.043). If "fútbol" keeps growing and "facturación"/"pagos" decay, the energy will keep rising toward 0.
+**Evaluation:** -0.043 > -0.10 → still stable. But the energy went up (from -0.047 to -0.043). If "football" keeps growing and "billing"/"payments" decay, the energy will keep rising toward 0.
 
 ---
 
-### After several messages: fútbol dominates
+### After several messages: football dominates
 
 ```
-ctx_001 (facturación): ema = 1.0  (decayed)
-ctx_002 (pagos):       ema = 0.5  (decayed)
-ctx_003 (fútbol):      ema = 6.0  (grew)
+ctx_001 (billing):     ema = 1.0  (decayed)
+ctx_002 (payments):    ema = 0.5  (decayed)
+ctx_003 (football):    ema = 6.0  (grew)
 ```
 
 **Energy:**

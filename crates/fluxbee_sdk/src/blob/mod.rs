@@ -1687,7 +1687,7 @@ mod tests {
         producer.promote(&blob_ref).expect("producer promote");
 
         assert!(consumer.exists(&blob_ref));
-        let payload = TextV1Payload::new("mensaje", vec![blob_ref.clone()]);
+        let payload = TextV1Payload::new("message", vec![blob_ref.clone()]);
         let value = payload.to_value().expect("payload to value");
         let parsed = TextV1Payload::from_value(&value).expect("payload from value");
         let resolved = consumer.resolve(&parsed.attachments[0]);

@@ -100,11 +100,11 @@ mod tests {
 
     #[test]
     fn text_payload_inline_roundtrip() {
-        let payload = TextV1Payload::new("hola", vec![sample_blob()]);
+        let payload = TextV1Payload::new("hello", vec![sample_blob()]);
         let value = payload.to_value().expect("serialize");
         let parsed = TextV1Payload::from_value(&value).expect("parse");
         assert_eq!(parsed.payload_type, "text");
-        assert_eq!(parsed.content.as_deref(), Some("hola"));
+        assert_eq!(parsed.content.as_deref(), Some("hello"));
         assert_eq!(parsed.content_ref, None);
         assert_eq!(parsed.attachments.len(), 1);
     }
@@ -130,7 +130,7 @@ mod tests {
     fn text_payload_rejects_both_content_and_content_ref() {
         let payload = TextV1Payload {
             payload_type: "text".to_string(),
-            content: Some("hola".to_string()),
+            content: Some("hello".to_string()),
             content_ref: Some(sample_blob()),
             attachments: vec![],
         };

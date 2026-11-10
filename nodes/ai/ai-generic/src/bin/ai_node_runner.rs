@@ -8813,7 +8813,7 @@ mod tests {
                 context: Some(context),
                 ..Meta::default()
             },
-            payload: json!({"type":"text","content":"hola"}),
+            payload: json!({"type":"text","content":"hello"}),
         }
     }
 
@@ -9136,7 +9136,7 @@ mod tests {
                 "IO.a@worker1",
                 None,
                 "IO.b@worker1",
-                "Otra vez vos?",
+                "You again?",
             ),
             relay(
                 b,
@@ -9152,7 +9152,7 @@ mod tests {
             tail,
             [
                 r#"- [2026-11-07 05:40] person ilk:b via IO.b@worker1, to person Ana Pérez (ilk:a) via IO.a@worker1: "Te pido disculpas""#,
-                r#"- [2026-11-07 05:40] person Ana Pérez (ilk:a) via IO.a@worker1, to IO.b@worker1: "Otra vez vos?""#,
+                r#"- [2026-11-07 05:40] person Ana Pérez (ilk:a) via IO.a@worker1, to IO.b@worker1: "You again?""#,
                 r#"A line between other people names whom it was said to (", to ..."): it was not said to you, and its "you" is that person."#,
             ]
         );
@@ -9160,7 +9160,7 @@ mod tests {
             MemoryTurnDirection::In,
             "ilk:a",
             Some("IO.a@worker1"),
-            "hola",
+            "hello",
             "2026-11-07T05:38:40.278Z",
         )];
         let block = render_memory_package_prompt_block(Some(&package), None).expect("memory block");
@@ -9196,7 +9196,7 @@ mod tests {
                     MemoryTurnDirection::Out,
                     "ilk:sales",
                     None,
-                    "Ya lo paso a facturación",
+                    "I'm passing it to invoicing now",
                     "2026-11-05T10:05:00.000Z",
                 )
             },
@@ -9207,17 +9207,17 @@ mod tests {
                     Some("ilk:invoice"),
                 ),
                 "IO.slack@motherbee",
-                "Nota de crédito NC-55 emitida",
+                "Credit note NC-55 issued",
             ),
             said(
                 party(Some("workflow"), Some("WF.soporte@worker1"), Some("ilk:wf")),
                 "WF.soporte@worker1",
-                "Ana no contesta hace 2 días",
+                "Ana has not answered for 2 days",
             ),
             said(
                 party(None, None, Some("ilk:new")),
                 "IO.slack@motherbee",
-                "hola",
+                "hello",
             ),
             said(
                 party(None, Some("WF.soporte@worker1"), None),
@@ -9232,10 +9232,10 @@ mod tests {
             lines,
             [
                 r#"- [2026-11-05 10:05] person Ana Pérez (ilk:ana) via IO.slack@motherbee: "Me cobraron dos veces""#,
-                r#"- [2026-11-05 10:05] you, to person Ana Pérez (ilk:ana): "Ya lo paso a facturación""#,
-                r#"- [2026-11-05 10:05] agent AI.invoice@worker1 (ilk:invoice): "Nota de crédito NC-55 emitida""#,
-                r#"- [2026-11-05 10:05] workflow WF.soporte@worker1 (ilk:wf): "Ana no contesta hace 2 días""#,
-                r#"- [2026-11-05 10:05] ilk:new via IO.slack@motherbee: "hola""#,
+                r#"- [2026-11-05 10:05] you, to person Ana Pérez (ilk:ana): "I'm passing it to invoicing now""#,
+                r#"- [2026-11-05 10:05] agent AI.invoice@worker1 (ilk:invoice): "Credit note NC-55 issued""#,
+                r#"- [2026-11-05 10:05] workflow WF.soporte@worker1 (ilk:wf): "Ana has not answered for 2 days""#,
+                r#"- [2026-11-05 10:05] ilk:new via IO.slack@motherbee: "hello""#,
                 r#"- [2026-11-05 10:05] WF.soporte@worker1: "ping""#,
             ]
         );
@@ -9294,12 +9294,12 @@ mod tests {
         let block = render_memory_package_prompt_block(Some(&sample_memory_package()), None)
             .expect("memory block");
         assert_eq!(
-            inject_prompt_blocks_into_text_input("hola", &[&block], &label),
-            format!("{block}\n\n{label}\nhola")
+            inject_prompt_blocks_into_text_input("hello", &[&block], &label),
+            format!("{block}\n\n{label}\nhello")
         );
         let parts = inject_prompt_blocks_into_input_parts(
             vec![fluxbee_ai_sdk::ModelContentPart::Text {
-                text: "hola".to_string(),
+                text: "hello".to_string(),
             }],
             &[&block],
             &label,
@@ -9311,7 +9311,7 @@ mod tests {
                 _ => "",
             })
             .collect::<Vec<_>>();
-        assert_eq!(texts, [block.as_str(), label.as_str(), "hola"]);
+        assert_eq!(texts, [block.as_str(), label.as_str(), "hello"]);
     }
 
     #[test]
@@ -9539,21 +9539,21 @@ mod tests {
         let label = "Current user message, from via IO.api@motherbee:";
 
         let text = inject_prompt_blocks_into_text_input(
-            "dale, facturámelo",
+            "sure, invoice it",
             &[&memory, &trace, &wf],
             label,
         );
         assert_eq!(
             text,
-            format!("{memory}\n\n{trace}\n\n{wf}\n\n{label}\ndale, facturámelo")
+            format!("{memory}\n\n{trace}\n\n{wf}\n\n{label}\nsure, invoice it")
         );
         assert_eq!(
-            inject_prompt_blocks_into_text_input("dale, facturámelo", &[&wf], label),
-            format!("{wf}\n\n{label}\ndale, facturámelo")
+            inject_prompt_blocks_into_text_input("sure, invoice it", &[&wf], label),
+            format!("{wf}\n\n{label}\nsure, invoice it")
         );
         assert_eq!(
-            inject_prompt_blocks_into_text_input("dale, facturámelo", &[], label),
-            "dale, facturámelo"
+            inject_prompt_blocks_into_text_input("sure, invoice it", &[], label),
+            "sure, invoice it"
         );
 
         let image = fluxbee_ai_sdk::ModelContentPart::Image {
@@ -9564,7 +9564,7 @@ mod tests {
         let parts = inject_prompt_blocks_into_input_parts(
             vec![
                 fluxbee_ai_sdk::ModelContentPart::Text {
-                    text: "dale, facturámelo".to_string(),
+                    text: "sure, invoice it".to_string(),
                 },
                 image.clone(),
             ],
@@ -9580,7 +9580,7 @@ mod tests {
                     text: label.to_string(),
                 },
                 fluxbee_ai_sdk::ModelContentPart::Text {
-                    text: "dale, facturámelo".to_string(),
+                    text: "sure, invoice it".to_string(),
                 },
                 image,
             ]
@@ -9743,7 +9743,7 @@ mod tests {
         GenerateTextArtifactTool {
             files: files.clone(),
         }
-        .call(json!({"filename": "nota.txt", "content": "hola mundo"}))
+        .call(json!({"filename": "nota.txt", "content": "hello world"}))
         .await
         .expect("text tool should succeed");
         GenerateJsonArtifactTool {
@@ -9755,13 +9755,13 @@ mod tests {
         GenerateMarkdownArtifactTool {
             files: files.clone(),
         }
-        .call(json!({"filename": "readme.md", "content": "# Hola\n\n- uno\n- dos"}))
+        .call(json!({"filename": "readme.md", "content": "# Hello\n\n- one\n- two"}))
         .await
         .expect("markdown tool should succeed");
         GenerateHtmlArtifactTool {
             files: files.clone(),
         }
-        .call(json!({"filename": "page.html", "content": "<h1>Hola</h1><p>Mundo</p>"}))
+        .call(json!({"filename": "page.html", "content": "<h1>Hello</h1><p>World</p>"}))
         .await
         .expect("html tool should succeed");
 
@@ -9780,10 +9780,10 @@ mod tests {
             ]
         );
         let text = |index: usize| String::from_utf8(kept[index].bytes.clone()).expect("utf8");
-        assert_eq!(text(0), "hola mundo");
+        assert_eq!(text(0), "hello world");
         assert!(text(1).contains("\"ok\": true"));
-        assert!(text(2).contains("# Hola"));
-        assert!(text(3).contains("<h1>Hola</h1>"));
+        assert!(text(2).contains("# Hello"));
+        assert!(text(3).contains("<h1>Hello</h1>"));
     }
 
     /// Excel and LibreOffice run a quoted cell that starts with `=`, `+`, `-` or `@` as a formula:
@@ -9832,7 +9832,7 @@ mod tests {
         }
         .call(json!({
             "filename": "tabla.xlsx",
-            "headers": ["nombre", "edad"],
+            "headers": ["name", "age"],
             "rows": [["Ana", "30"], ["Luis", "41"]]
         }))
         .await
@@ -9859,9 +9859,9 @@ mod tests {
         }
         .call(json!({
             "filename": "nota.docx",
-            "title": "Nota",
-            "paragraphs": ["Parrafo 1", "Parrafo 2"],
-            "bullets": ["Uno", "Dos"]
+            "title": "Note",
+            "paragraphs": ["Paragraph 1", "Paragraph 2"],
+            "bullets": ["One", "Two"]
         }))
         .await
         .expect("docx tool should succeed");
@@ -9887,7 +9887,7 @@ mod tests {
         }
         .call(json!({
             "filename": "grafico.png",
-            "bands": ["rojo", "verde", "azul"],
+            "bands": ["red", "green", "blue"],
             "width": 320,
             "height": 180
         }))
@@ -9899,7 +9899,7 @@ mod tests {
         }
         .call(json!({
             "filename": "grafico.jpg",
-            "bands": ["uno", "dos"],
+            "bands": ["one", "two"],
             "width": 320,
             "height": 180
         }))
@@ -10019,9 +10019,9 @@ mod tests {
 
         // A title, its blank line and 120 lines: 122 lines, on pages of 50.
         let lines = (1..=120)
-            .map(|line| format!("Línea {line}"))
+            .map(|line| format!("Café line {line}"))
             .collect::<Vec<_>>();
-        let pdf = String::from_utf8(build_pdf_bytes(Some("Informe"), &lines)).expect("ASCII");
+        let pdf = String::from_utf8(build_pdf_bytes(Some("Report"), &lines)).expect("ASCII");
         assert!(pdf.contains("<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R] /Count 3 >>"));
         let streams = pdf_streams(&pdf);
         let lines_per_page = streams
@@ -10029,7 +10029,7 @@ mod tests {
             .map(|stream| stream.matches(") Tj").count())
             .collect::<Vec<_>>();
         assert_eq!(lines_per_page, [PDF_LINES_PER_PAGE, PDF_LINES_PER_PAGE, 22]);
-        assert!(streams[2].contains("(L\\355nea 120) Tj"));
+        assert!(streams[2].contains("(Caf\\351 line 120) Tj"));
 
         let xref = pdf.rfind("\nxref\n").expect("xref") + 1;
         assert!(pdf.ends_with(&format!("startxref\n{xref}\n%%EOF\n")));
@@ -10176,14 +10176,14 @@ mod tests {
             vec![
                 (
                     "generate_csv_artifact",
-                    json!({"filename": "ventas.csv", "rows": [["enero", "10"]]}),
+                    json!({"filename": "ventas.csv", "rows": [["january", "10"]]}),
                 ),
                 (
                     "generate_pdf_artifact",
-                    json!({"filename": "informe.pdf", "title": "Informe", "lines": ["Año 2026"]}),
+                    json!({"filename": "informe.pdf", "title": "Report", "lines": ["Year 2026"]}),
                 ),
             ],
-            Some("Aquí tienes la tabla y el informe."),
+            Some("Here are the table and the report."),
         );
         let output = tool_loop_reply(&model).await;
         let AiBehaviorOutput::Final(reply) = &output else {
@@ -10191,7 +10191,7 @@ mod tests {
         };
         assert_eq!(
             reply.text.as_deref(),
-            Some("Aquí tienes la tabla y el informe.")
+            Some("Here are the table and the report.")
         );
         let names = reply
             .artifacts
@@ -10241,7 +10241,7 @@ mod tests {
         let text = fluxbee_sdk::payload::TextV1Payload::from_value(&payload).expect("text/v1");
         assert_eq!(
             text.content.as_deref(),
-            Some("Aquí tienes la tabla y el informe.")
+            Some("Here are the table and the report.")
         );
         let attachments = text
             .attachments
@@ -10266,11 +10266,11 @@ mod tests {
             .map(|index| {
                 (
                     "generate_text_artifact",
-                    json!({"filename": format!("nota-{index}.txt"), "content": "hola"}),
+                    json!({"filename": format!("nota-{index}.txt"), "content": "hello"}),
                 )
             })
             .collect();
-        let model = ScriptedModel::new(calls, Some("Listo."));
+        let model = ScriptedModel::new(calls, Some("Done."));
         let AiBehaviorOutput::Final(reply) = tool_loop_reply(&model).await else {
             panic!("a reply with files");
         };
@@ -10294,8 +10294,8 @@ mod tests {
     fn a_reply_without_the_models_text_names_its_files() {
         let file = |name: &str| AiUserArtifact::new(b"x".to_vec(), "text/plain", name);
         assert_eq!(
-            tool_loop_output(Some("hola".to_string()), Vec::new(), &[]),
-            Some(AiBehaviorOutput::text("hola"))
+            tool_loop_output(Some("hello".to_string()), Vec::new(), &[]),
+            Some(AiBehaviorOutput::text("hello"))
         );
         assert_eq!(
             tool_loop_output(Some(" ".to_string()), Vec::new(), &[]),
@@ -10331,7 +10331,7 @@ mod tests {
         let note = || {
             vec![(
                 "generate_text_artifact",
-                json!({"filename": "nota.txt", "content": "hola"}),
+                json!({"filename": "nota.txt", "content": "hello"}),
             )]
         };
         let text_of = |output: AiBehaviorOutput| match output {
@@ -10340,17 +10340,17 @@ mod tests {
         };
 
         for final_text in [None, Some(""), Some("  \n")] {
-            let model = ScriptedModel::new(note(), final_text).with_call_text("Aquí va tu nota.");
+            let model = ScriptedModel::new(note(), final_text).with_call_text("Here is your note.");
             assert_eq!(
                 text_of(tool_loop_reply(&model).await),
-                (Some("Aquí va tu nota.".to_string()), 1),
+                (Some("Here is your note.".to_string()), 1),
                 "{final_text:?}"
             );
         }
-        let model = ScriptedModel::new(note(), Some("Listo.")).with_call_text("Un momento.");
+        let model = ScriptedModel::new(note(), Some("Done.")).with_call_text("One moment.");
         assert_eq!(
             text_of(tool_loop_reply(&model).await),
-            (Some("Listo.".to_string()), 1),
+            (Some("Done.".to_string()), 1),
             "the final text is the reply"
         );
         let model = ScriptedModel::new(note(), None);
@@ -10362,10 +10362,10 @@ mod tests {
 
         // Without a file: a call that fails, and its text is the reply.
         let model = ScriptedModel::new(vec![("no_such_tool", json!({}))], None)
-            .with_call_text("Lo busco y te aviso.");
+            .with_call_text("I'll look and let you know.");
         assert_eq!(
             text_of(tool_loop_reply(&model).await),
-            (Some("Lo busco y te aviso.".to_string()), 0)
+            (Some("I'll look and let you know.".to_string()), 0)
         );
         let model = ScriptedModel::new(vec![("no_such_tool", json!({}))], None);
         let ctx = BehaviorContext::default();
@@ -10405,7 +10405,7 @@ mod tests {
         let page = || {
             vec![(
                 "publish_html_page",
-                json!({"filename": "page.html", "content": "<html>hola</html>"}),
+                json!({"filename": "page.html", "content": "<html>hello</html>"}),
             )]
         };
         let reply = |answer: Value, model: ScriptedModel| async move {
@@ -10427,21 +10427,21 @@ mod tests {
         assert_eq!(
             reply(
                 published.clone(),
-                ScriptedModel::new(page(), Some("Listo.\n"))
+                ScriptedModel::new(page(), Some("Done.\n"))
             )
             .await,
-            text(format!("Listo.\n{LINK}"))
+            text(format!("Done.\n{LINK}"))
         );
         assert_eq!(
             reply(
                 published.clone(),
                 ScriptedModel::new(
                     page(),
-                    Some("Tu página: https://fluxbee.example/public/k3y")
+                    Some("Your page: https://fluxbee.example/public/k3y")
                 )
             )
             .await,
-            text(format!("Tu página: {LINK}"))
+            text(format!("Your page: {LINK}"))
         );
         assert_eq!(
             reply(
@@ -10547,7 +10547,7 @@ mod tests {
                 &tools,
                 &files,
                 &ctx,
-                "dale, facturámelo".to_string(),
+                "sure, invoice it".to_string(),
                 None,
                 Some(contract),
             )
@@ -10564,7 +10564,9 @@ mod tests {
                 "generate_csv_artifact",
                 json!({"filename": "pedido.csv", "rows": [["Pro", "10"]]}),
             )],
-            Some(r#"{"reply": "Te paso con facturación.", "area": "invoice", "quantity": 10}"#),
+            Some(
+                r#"{"reply": "I'm passing you to invoicing.", "area": "invoice", "quantity": 10}"#,
+            ),
         );
         let answer = tool_loop_answer_under(&model, &sales_contract())
             .await
@@ -10573,23 +10575,26 @@ mod tests {
         let AiBehaviorOutput::Final(reply) = &answer.output else {
             panic!("a reply with its file: {answer:?}");
         };
-        assert_eq!(reply.text.as_deref(), Some("Te paso con facturación."));
+        assert_eq!(reply.text.as_deref(), Some("I'm passing you to invoicing."));
         assert_eq!(reply.artifacts[0].filename, "pedido.csv");
         assert_eq!(
             answer.evaluation,
-            Some(json!({"reply": "Te paso con facturación.", "area": "invoice", "quantity": 10}))
+            Some(
+                json!({"reply": "I'm passing you to invoicing.", "area": "invoice", "quantity": 10})
+            )
         );
 
         // Without a call, in a fence: the object as a structured call takes it.
-        let model = ScriptedModel::new(Vec::new(), None)
-            .with_call_text("```json\n{\"reply\": \"Hola, ¿qué plan?\", \"area\": \"sales\"}\n```");
+        let model = ScriptedModel::new(Vec::new(), None).with_call_text(
+            "```json\n{\"reply\": \"Hello, which plan?\", \"area\": \"sales\"}\n```",
+        );
         assert_eq!(
             tool_loop_answer_under(&model, &sales_contract())
                 .await
                 .expect("the tool loop"),
             Some(AiChatAnswer {
-                output: AiBehaviorOutput::text("Hola, ¿qué plan?"),
-                evaluation: Some(json!({"reply": "Hola, ¿qué plan?", "area": "sales"})),
+                output: AiBehaviorOutput::text("Hello, which plan?"),
+                evaluation: Some(json!({"reply": "Hello, which plan?", "area": "sales"})),
             })
         );
 
@@ -10608,13 +10613,13 @@ mod tests {
 
         // Without a text_field, nothing changes.
         let model = ScriptedModel::new(Vec::new(), None)
-            .with_call_text(r#"{"reply": "Hola", "area": "sales"}"#);
+            .with_call_text(r#"{"reply": "Hello", "area": "sales"}"#);
         assert_eq!(
             tool_loop_answer_under(&model, &plain_sales_contract())
                 .await
                 .expect("the tool loop"),
             Some(AiChatAnswer::from(AiBehaviorOutput::text(
-                r#"{"reply": "Hola", "area": "sales"}"#
+                r#"{"reply": "Hello", "area": "sales"}"#
             )))
         );
     }
@@ -10627,9 +10632,9 @@ mod tests {
         let model = ScriptedModel::new(
             vec![(
                 "generate_text_artifact",
-                json!({"filename": "nota.txt", "content": "hola"}),
+                json!({"filename": "nota.txt", "content": "hello"}),
             )],
-            Some(r#"{"reply": "Listo.", "area": "sales"}"#),
+            Some(r#"{"reply": "Done.", "area": "sales"}"#),
         );
         let ctx = BehaviorContext::default();
         let files = Arc::new(ReplyFiles::default());
@@ -10643,7 +10648,7 @@ mod tests {
                 &tools,
                 &files,
                 &ctx,
-                "dale, facturámelo".to_string(),
+                "sure, invoice it".to_string(),
                 None,
                 contract,
             )
@@ -10678,10 +10683,10 @@ mod tests {
     #[tokio::test]
     async fn under_a_text_field_a_tool_loop_without_the_object_is_an_error() {
         for text in [
-            "Te paso con facturación.",
+            "I'm passing you to invoicing.",
             r#"{"area": "invoice"}"#,
             r#"{"reply": 7, "area": "invoice"}"#,
-            r#"{"reply": "Listo.", "area": "refunds"}"#,
+            r#"{"reply": "Done.", "area": "refunds"}"#,
         ] {
             let model = ScriptedModel::new(Vec::new(), None).with_call_text(text);
             let err = tool_loop_answer_under(&model, &sales_contract())
@@ -10704,7 +10709,7 @@ mod tests {
         let model = ScriptedModel::new(
             vec![(
                 "generate_text_artifact",
-                json!({"filename": "nota.txt", "content": "hola"}),
+                json!({"filename": "nota.txt", "content": "hello"}),
             )],
             None,
         );
@@ -10728,14 +10733,16 @@ mod tests {
     /// error, and, without a `text_field`, the model's text as it is.
     #[tokio::test]
     async fn under_a_text_field_the_call_without_tools_answers_that_field_and_the_object() {
-        let object = r#"{"reply": "Te paso con facturación.", "area": "invoice"}"#;
+        let object = r#"{"reply": "I'm passing you to invoicing.", "area": "invoice"}"#;
         assert_eq!(
             plain_call_under(object, sales_contract())
                 .await
                 .expect("an answer"),
             AiChatAnswer {
-                output: AiBehaviorOutput::text("Te paso con facturación."),
-                evaluation: Some(json!({"reply": "Te paso con facturación.", "area": "invoice"})),
+                output: AiBehaviorOutput::text("I'm passing you to invoicing."),
+                evaluation: Some(
+                    json!({"reply": "I'm passing you to invoicing.", "area": "invoice"})
+                ),
             }
         );
 
@@ -10768,7 +10775,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-5.5".to_string(),
             system: None,
-            input: "dale, facturámelo".to_string(),
+            input: "sure, invoice it".to_string(),
             input_parts: None,
             output_schema: contract.output_schema().cloned(),
             max_output_tokens: None,
@@ -10806,7 +10813,7 @@ mod tests {
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
         assert_eq!(
             reply.payload["content"],
-            format!("Echo: {memory}\n\n{trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
+            format!("Echo: {memory}\n\n{trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhello")
         );
         // The reply goes on with the cycle's trace; the runtime adds the agent's entry as it sends.
         let mut context = sample_wf_context();
@@ -10866,11 +10873,11 @@ mod tests {
             .expect("a reply");
         assert_eq!(
             reply.payload["content"],
-            format!("Echo: {memory}\n\n{trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
+            format!("Echo: {memory}\n\n{trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhello")
         );
 
         let input = inject_prompt_blocks_into_text_input(
-            "hola",
+            "hello",
             &[&memory, &trace, &wf],
             SAMPLE_MESSAGE_LABEL,
         );
@@ -10887,7 +10894,7 @@ mod tests {
             panic!("the message alone: {:?}", seen[0].items);
         };
         assert_eq!(content, &input);
-        assert!(input.ends_with(&format!("{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")));
+        assert!(input.ends_with(&format!("{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhello")));
     }
 
     /// A user message on a conversation's thread that a WF sent with `context`.
@@ -10922,7 +10929,7 @@ mod tests {
         assert!(wf.contains("\n- none: None of the options fits.\n"));
         assert_eq!(
             reply.payload["content"],
-            format!("Echo: {trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
+            format!("Echo: {trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhello")
         );
         let mut context = sample_wf_menu_context();
         context.as_object_mut().expect("an object").remove("wf");
@@ -11006,7 +11013,7 @@ mod tests {
                 json!({"filename": "pedido.csv", "rows": [["Pro", "10"]]}),
             )],
             Some(
-                r#"{"reply": "Lo consulto con un supervisor.", "option": "consult", "params": {"question": "¿20% en 10 Pro?", "discount": 20}}"#,
+                r#"{"reply": "I will check with a supervisor.", "option": "consult", "params": {"question": "20% on 10 Pro?", "discount": 20}}"#,
             ),
         );
         let answer = tool_loop_answer_under(&model, &sample_menu_contract())
@@ -11018,15 +11025,15 @@ mod tests {
         };
         assert_eq!(
             reply.text.as_deref(),
-            Some("Lo consulto con un supervisor.")
+            Some("I will check with a supervisor.")
         );
         assert_eq!(reply.artifacts[0].filename, "pedido.csv");
         assert_eq!(
             answer.evaluation,
             Some(json!({
-                "reply": "Lo consulto con un supervisor.",
+                "reply": "I will check with a supervisor.",
                 "option": "consult",
-                "params": {"question": "¿20% en 10 Pro?"}
+                "params": {"question": "20% on 10 Pro?"}
             }))
         );
 
@@ -11070,20 +11077,20 @@ mod tests {
             ("", file(), &[][..], files_line.to_string()),
             ("", Vec::new(), &link[..], LINK.to_string()),
             (
-                "Te paso la página.",
+                "Here is the page.",
                 Vec::new(),
                 &link[..],
-                format!("Te paso la página.\n{LINK}"),
+                format!("Here is the page.\n{LINK}"),
             ),
             ("", file(), &link[..], format!("{files_line}\n{LINK}")),
             // Left as the model wrote it.
             (
-                "Tu página: https://fluxbee.example/public/k3y",
+                "Your page: https://fluxbee.example/public/k3y",
                 Vec::new(),
                 &link[..],
-                format!("Tu página: {LINK}"),
+                format!("Your page: {LINK}"),
             ),
-            ("Listo.", file(), &[][..], "Listo.".to_string()),
+            ("Done.", file(), &[][..], "Done.".to_string()),
             ("", Vec::new(), &[][..], String::new()),
         ] {
             let model_text = json!({"reply": reply, "option": "answer"}).to_string();
@@ -11108,15 +11115,15 @@ mod tests {
     async fn under_a_menu_the_call_without_tools_answers_the_reply_and_the_checked_object() {
         assert_eq!(
             plain_call_under(
-                r#"Elijo: {"reply": "Hola, ¿qué plan?", "option": "answer"}"#,
+                r#"I pick: {"reply": "Hello, which plan?", "option": "answer"}"#,
                 sample_menu_contract()
             )
             .await
             .expect("an answer"),
             AiChatAnswer {
-                output: AiBehaviorOutput::text("Hola, ¿qué plan?"),
+                output: AiBehaviorOutput::text("Hello, which plan?"),
                 evaluation: Some(
-                    json!({"reply": "Hola, ¿qué plan?", "option": "answer", "params": {}})
+                    json!({"reply": "Hello, which plan?", "option": "answer", "params": {}})
                 ),
             }
         );
@@ -11127,17 +11134,17 @@ mod tests {
     #[tokio::test]
     async fn under_a_menu_an_answer_off_it_is_invalid_structured_output() {
         for (text, detail) in [
-            ("Te paso con un supervisor.", "not_json"),
+            ("I'm passing you to a supervisor.", "not_json"),
             (
-                r#"{"reply": "Listo.", "option": "invoice"}"#,
+                r#"{"reply": "Done.", "option": "invoice"}"#,
                 "unknown_option:invoice",
             ),
             (
-                r#"{"reply": "Listo.", "option": "consult"}"#,
+                r#"{"reply": "Done.", "option": "consult"}"#,
                 "missing_param:question",
             ),
             (
-                r#"{"reply": "Listo.", "option": "consult", "params": {"question": 20}}"#,
+                r#"{"reply": "Done.", "option": "consult", "params": {"question": 20}}"#,
                 "type_mismatch:question:string",
             ),
         ] {
@@ -11203,14 +11210,14 @@ mod tests {
         };
         let model = ScriptedModel::new(
             vec![
-                text_file("a.txt", "uno"),
+                text_file("a.txt", "one"),
                 (
                     "generate_csv_artifact",
                     json!({"filename": "b.csv", "rows": [["1"]]}),
                 ),
-                text_file("a.txt", "dos"),
+                text_file("a.txt", "two"),
             ],
-            Some("Listo."),
+            Some("Done."),
         );
         let AiBehaviorOutput::Final(reply) = tool_loop_reply(&model).await else {
             panic!("a reply with files");
@@ -11221,7 +11228,7 @@ mod tests {
             .map(|file| (file.filename.as_str(), file.bytes.as_slice()))
             .collect::<Vec<_>>();
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0], ("a.txt", b"dos".as_slice()));
+        assert_eq!(files[0], ("a.txt", b"two".as_slice()));
         assert_eq!(files[1].0, "b.csv");
         assert!(model
             .results()
@@ -11233,19 +11240,19 @@ mod tests {
             .map(|index| {
                 (
                     "generate_text_artifact",
-                    json!({"filename": format!("nota-{index}.txt"), "content": "uno"}),
+                    json!({"filename": format!("nota-{index}.txt"), "content": "one"}),
                 )
             })
             .collect::<Vec<_>>();
-        calls.push(text_file("nota-0.txt", "dos"));
-        calls.push(text_file("otra.txt", "tres"));
-        let model = ScriptedModel::new(calls, Some("Listo."));
+        calls.push(text_file("nota-0.txt", "two"));
+        calls.push(text_file("otra.txt", "three"));
+        let model = ScriptedModel::new(calls, Some("Done."));
         let AiBehaviorOutput::Final(reply) = tool_loop_reply(&model).await else {
             panic!("a reply with files");
         };
         assert_eq!(reply.artifacts.len(), REPLY_FILES_MAX);
         assert_eq!(reply.artifacts[0].filename, "nota-0.txt");
-        assert_eq!(reply.artifacts[0].bytes, b"dos");
+        assert_eq!(reply.artifacts[0].bytes, b"two");
         let results = model.results();
         assert_eq!(results[REPLY_FILES_MAX]["status"], json!("ok"));
         assert_eq!(
@@ -12284,12 +12291,12 @@ mod tests {
         assert!(too_long.chars().count() < ARTIFACT_FILENAME_MAX_BYTES);
 
         let made = tool
-            .call(json!({"filename": longest, "content": "hola"}))
+            .call(json!({"filename": longest, "content": "hello"}))
             .await
             .expect("the tool");
         assert_eq!(made["status"], json!("ok"), "{made}");
         let refused = tool
-            .call(json!({"filename": too_long, "content": "hola"}))
+            .call(json!({"filename": too_long, "content": "hello"}))
             .await
             .expect("the tool");
         assert_eq!(
@@ -12550,18 +12557,18 @@ mod tests {
         let (store, root) = temp_blob_store();
         let tool = read_blob_tool(&root, Duration::from_millis(50));
         for (bytes, filename, text) in [
-            (&b"modelo: claude\n"[..], "config.yaml", "modelo: claude\n"),
+            (&b"model: claude\n"[..], "config.yaml", "model: claude\n"),
             (
                 &b"<rss version=\"2.0\"/>"[..],
                 "feed.xml",
                 "<rss version=\"2.0\"/>",
             ),
             (&b"SELECT 1;"[..], "consulta.sql", "SELECT 1;"),
-            (&b"leeme primero"[..], "LEEME", "leeme primero"),
+            (&b"read me first"[..], "LEEME", "read me first"),
             (
-                &b"caf\xe9 con le\xf1a"[..],
+                &b"caf\xe9 na\xefve"[..],
                 "notas.txt",
-                "caf\u{FFFD} con le\u{FFFD}a",
+                "caf\u{FFFD} na\u{FFFD}ve",
             ),
         ] {
             let blob = stored(&store, bytes, filename, "application/octet-stream");
@@ -12629,7 +12636,7 @@ mod tests {
         );
         let csv = stored(
             &store,
-            b"producto;precio\nca\xf1a;5\nni\xf1o;7\nespa\xf1a;9\n",
+            b"product;price\njalape\xf1o;5\npi\xf1ata;7\npi\xf1on;9\n",
             "ventas.csv",
             "text/csv",
         );
@@ -12642,7 +12649,7 @@ mod tests {
         // 30 characters of the CSV hold two U+FFFD, of three bytes each, where the file has one.
         for (attachment, cut) in [(&log, 30), (&csv, 34)] {
             let resolved = resolve_model_input_from_payload_with_options(
-                &json!({"type": "text", "content": "mirá", "attachments": [attachment]}),
+                &json!({"type": "text", "content": "look", "attachments": [attachment]}),
                 &options,
             )
             .await
@@ -12832,7 +12839,7 @@ mod tests {
 
         for link in [
             format!("https://fluxbee.example/public/{PAGE_KEY}?utm=x"),
-            format!("<https://fluxbee.example/public/{PAGE_KEY}|la página>"),
+            format!("<https://fluxbee.example/public/{PAGE_KEY}|the page>"),
             format!("(https://fluxbee.example/public/{PAGE_KEY})"),
             format!("https://fluxbee.example/public/{PAGE_KEY}/."),
         ] {
@@ -12886,7 +12893,7 @@ mod tests {
             link(&format!("{PAGE_KEY}0")),
             link(&PAGE_KEY.to_ascii_uppercase()),
             link(&format!("{}g", &PAGE_KEY[1..])),
-            json!({"url": "<https://fluxbee.example/public/abc|la página>"}),
+            json!({"url": "<https://fluxbee.example/public/abc|the page>"}),
             json!({"url": "https://fluxbee.example/public/abc)"}),
         ] {
             let answer = AgentTool::call(&tool, arguments.clone())
@@ -12993,12 +13000,12 @@ mod tests {
                     json!({ "publication_id": PUBLICATION }),
                 ),
             ],
-            Some("Listo, la quité."),
+            Some("Done, I took it down."),
         );
         let files = ReplyFiles::default();
         assert_eq!(
             run_tool_loop_with(&model, &tools, &files).await,
-            Some(AiBehaviorOutput::text("Listo, la quité.")),
+            Some(AiBehaviorOutput::text("Done, I took it down.")),
         );
     }
 
@@ -13063,7 +13070,7 @@ mod tests {
         let (answer, unpublish) = tokio::join!(
             AgentTool::call(
                 &tool,
-                json!({"filename": "page.html", "content": "<html>hola</html>"})
+                json!({"filename": "page.html", "content": "<html>hello</html>"})
             ),
             admin
         );
@@ -13260,11 +13267,11 @@ mod tests {
             vec![
                 (
                     "publish_html_page",
-                    json!({"filename": "page.html", "content": "<html>hola</html>"}),
+                    json!({"filename": "page.html", "content": "<html>hello</html>"}),
                 ),
                 (
                     "generate_text_artifact",
-                    json!({"filename": "notas.txt", "content": "notas"}),
+                    json!({"filename": "notas.txt", "content": "notes"}),
                 ),
             ],
             Some("Your page is ready."),
@@ -13341,7 +13348,7 @@ mod tests {
         msg.payload = json!({
             "type": "text",
             "content": format!(
-                "Bajá <https://fluxbee.example/public/{PAGE_KEY}|la página> y leé {BLOB}, gracias"
+                "Download <https://fluxbee.example/public/{PAGE_KEY}|the page> and read {BLOB}, thanks"
             )
         });
         let (logs, _guard) = LogCapture::start();
@@ -13360,8 +13367,8 @@ mod tests {
         let text = logs.text();
         assert!(
             text.contains(
-                "input_preview=Bajá <https://fluxbee.example/public/<redacted>|la página> y leé \
-                 <blob>, gracias"
+                "input_preview=Download <https://fluxbee.example/public/<redacted>|the page> and read \
+                 <blob>, thanks"
             ),
             "{text}"
         );
@@ -13381,12 +13388,12 @@ mod tests {
     #[tokio::test]
     async fn the_preview_redacts_before_it_cuts_and_redacts_attachments() {
         assert_eq!(
-            text_preview(&format!("ver https://h/public/{PAGE_KEY}"), 40),
-            "ver https://h/public/<redacted>"
+            text_preview(&format!("see https://h/public/{PAGE_KEY}"), 40),
+            "see https://h/public/<redacted>"
         );
         assert_eq!(
-            text_preview("ver ventas_0123456789abcdef.csv ahora", 12),
-            "ver <blob> a..."
+            text_preview("see ventas_0123456789abcdef.csv now", 12),
+            "see <blob> n..."
         );
         for (text, preview) in [
             ("informe_0123456789ABCDEF.txt.", "<blob>."),
@@ -13410,12 +13417,12 @@ mod tests {
         let (store, root) = temp_blob_store();
         let csv = stored(
             &store,
-            b"mes,ventas\nenero,10\nfebrero,20\n",
+            b"month,sales\njanuary,10\nfebruary,20\n",
             "ventas.csv",
             "text/csv",
         );
         let resolved = resolve_model_input_from_payload_with_options(
-            &json!({"type": "text", "content": "mirá", "attachments": [csv]}),
+            &json!({"type": "text", "content": "look", "attachments": [csv]}),
             &ModelInputOptions {
                 max_attachment_text_chars: 12,
                 blob_root: Some(root.clone()),

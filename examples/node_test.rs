@@ -179,14 +179,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context: None,
                 ..Meta::default()
             },
-            payload: json!({"type": "text", "content": format!("HOLA {}", seq)}),
+            payload: json!({"type": "text", "content": format!("HELLO {}", seq)}),
         };
         if let Err(err) = sender.send(msg).await {
             eprintln!("send error: {err} (reconnecting)");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
-        println!("sent HOLA {} (dst={:?})", seq, dst);
+        println!("sent HELLO {} (dst={:?})", seq, dst);
 
         let trace_id = Uuid::new_v4().to_string();
         let echo = build_echo(sender.uuid(), Destination::Broadcast, &trace_id);

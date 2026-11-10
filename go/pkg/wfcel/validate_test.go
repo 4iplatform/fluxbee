@@ -1301,8 +1301,8 @@ func TestTheEvaluationReadsAreCheckedAgainstTheMenus(t *testing.T) {
 	}
 
 	// The catch's guards are checked too, and a menu in the catch counts.
-	_, err = loadCatch(t, `{"event_match": {}, "guard": "event.context.evaluation.option == 'nada'"}`)
-	assertErrorContains(t, err, `catch[0].guard: compares event.context.evaluation.option with "nada"`)
+	_, err = loadCatch(t, `{"event_match": {}, "guard": "event.context.evaluation.option == 'nothing'"}`)
+	assertErrorContains(t, err, `catch[0].guard: compares event.context.evaluation.option with "nothing"`)
 	if _, err := LoadDefinitionBytes([]byte(strings.Replace(catchWorkflowJSON(`{"event_match": {"src": "AI.sales@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.helper@motherbee", "menu": {"options": [{"name": "retry", "description": "Try again.", "params": {"hint": {"type": "string"}}}]}}]}`),
 		`"guard": "event.context.evaluation.option == 'invoice'"`, `"guard": "event.context.evaluation.option == 'retry' && event.context.evaluation.params.hint != ''"`, 1)), "", fixedClock); err != nil {
 		t.Fatalf("a menu in the catch: %v", err)

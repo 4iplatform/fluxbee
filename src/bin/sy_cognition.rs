@@ -6939,17 +6939,17 @@ mod tests {
             feeling_owner(&ana, TEST_AGENT_NODE, facts),
             Some(person("ilk:person", "Ana Pérez"))
         );
-        let mut answer = agent_says("lo resolvemos");
+        let mut answer = agent_says("we will sort it out");
         answer.meta.dst_ilk = Some("ilk:person".to_string());
         assert_eq!(
             narrator_speaker(&answer, TEST_AGENT_NODE, facts).as_deref(),
             Some("the agent, answering person Ana Pérez (ilk:person)")
         );
         assert_eq!(feeling_owner(&answer, TEST_AGENT_NODE, facts), None);
-        let mut wf_text = person_says("Ana no contesta hace 2 días");
+        let mut wf_text = person_says("Ana has not answered for 2 days");
         wf_text.meta.context = Some(json!({"writer": {"ilk": "ilk:wf"}}));
         assert_eq!(feeling_owner(&wf_text, TEST_AGENT_NODE, facts), None);
-        let unknown = turn_copy("IO.api@motherbee", Some("ilk:new"), text("hola"));
+        let unknown = turn_copy("IO.api@motherbee", Some("ilk:new"), text("hello"));
         assert_eq!(
             feeling_owner(&unknown, TEST_AGENT_NODE, facts).and_then(|owner| owner.ilk),
             Some("ilk:new".to_string())
@@ -8932,7 +8932,7 @@ mod tests {
             Some("person Ana Pérez (ilk:ana) via IO.web@worker1")
         );
 
-        let to_team = relayed("ilk:ana", "Otra vez vos?");
+        let to_team = relayed("ilk:ana", "You again?");
         let turn = turn_of(&to_team);
         assert_eq!(turn.to_via.as_deref(), Some("IO.slack.team@motherbee"));
         assert_eq!(turn.to, None);
@@ -8941,10 +8941,10 @@ mod tests {
             Some("IO.slack.team@motherbee")
         );
 
-        let got = turn_of(&person_says("hola"));
+        let got = turn_of(&person_says("hello"));
         assert_eq!((got.to, got.to_via), (None, None));
-        assert_eq!(relay_addressee(&person_says("hola"), known), None);
-        let mut answer = agent_says("Ya lo paso a facturación");
+        assert_eq!(relay_addressee(&person_says("hello"), known), None);
+        let mut answer = agent_says("I'm passing it to invoicing now");
         answer.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
         answer.meta.dst_ilk = Some("ilk:ana".to_string());
         let answer = turn_of(&answer);
@@ -8962,7 +8962,7 @@ mod tests {
             }),
             to: None,
             to_via: None,
-            text: "Lo veo yo".to_string(),
+            text: "I'll see to it".to_string(),
             attachments: 0,
             choice: None,
             ts: turn_ts(TEST_TS),
@@ -8992,7 +8992,7 @@ mod tests {
             counterpart.and_then(|party| party.ilk).as_deref(),
             Some("ilk:pedro")
         );
-        let mut to_web = relayed("ilk:juan", "Lo reviso hoy");
+        let mut to_web = relayed("ilk:juan", "I'll look at it today");
         to_web.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
         let (counterpart, people) = episode_people(
             &to_web,

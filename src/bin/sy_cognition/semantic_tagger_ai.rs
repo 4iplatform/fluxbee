@@ -401,7 +401,7 @@ mod tests {
         let input = |to| SemanticTaggerAiInput {
             api_key: "",
             account: &account,
-            text: "Voy a pedir que te saquen de mi cuenta.",
+            text: "I'll ask them to take you off my account.",
             src_ilk: Some("ilk:ana"),
             dst_ilk: None,
             ich: None,

@@ -10026,7 +10026,7 @@ mod tests {
             "user",
             None,
             to_receiver,
-            serde_json::json!({ "n": "hola" }),
+            serde_json::json!({ "n": "hello" }),
         );
         for frame in [&usage, &forged_turn, &turn] {
             write_frame(&mut client, frame).await.expect("frame");
@@ -10038,7 +10038,7 @@ mod tests {
             .expect("delivered");
         let delivered: Message = serde_json::from_slice(&delivered).expect("message");
         assert_eq!(
-            delivered.payload["n"], "hola",
+            delivered.payload["n"], "hello",
             "only the user message is routed"
         );
         assert!(
@@ -10059,7 +10059,7 @@ mod tests {
         assert_eq!(appends[1].0, "storage.turns");
         assert_eq!(appends[1].1, "AI.sales@motherbee");
         let copy: Message = serde_json::from_slice(&appends[1].2).expect("the turn copy");
-        assert_eq!(copy.payload["n"], "hola");
+        assert_eq!(copy.payload["n"], "hello");
         assert_eq!(
             copy.routing.src_l2_name.as_deref(),
             Some("AI.sales@motherbee")
@@ -10240,7 +10240,7 @@ mod tests {
         let held = Arc::clone(&memory_reader).lock_owned().await;
         let (log_stream, observed) = stream::StreamHandle::observed();
         let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let msg = agent_turn("hola");
+        let msg = agent_turn("hello");
         let delivery = tokio::spawn({
             let memory_reader = Arc::clone(&memory_reader);
             async move {
@@ -10370,7 +10370,7 @@ mod tests {
 
         // A small message keeps the whole package.
         let frame =
-            serialize_with_package(&agent_turn("hola"), package.clone(), "AI.sales@motherbee")
+            serialize_with_package(&agent_turn("hello"), package.clone(), "AI.sales@motherbee")
                 .expect("serialized");
         let delivered: Message = serde_json::from_slice(&frame).unwrap();
         assert_eq!(
@@ -11601,7 +11601,7 @@ mod tests {
             "user",
             None,
             Destination::Resolve,
-            serde_json::json!({"type": "text", "content": "hola"}),
+            serde_json::json!({"type": "text", "content": "hello"}),
         ))
         .unwrap();
         message_trace::write_entry(&mut message, "IO.sim@motherbee", TraceNote::default());

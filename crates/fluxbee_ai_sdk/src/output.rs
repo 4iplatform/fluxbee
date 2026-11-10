@@ -243,9 +243,9 @@ mod tests {
     #[test]
     fn text_output_keeps_current_text_only_contract() {
         let payload =
-            build_ai_behavior_response(AiBehaviorOutput::text("respuesta")).expect("payload");
+            build_ai_behavior_response(AiBehaviorOutput::text("answer")).expect("payload");
         let parsed = TextV1Payload::from_value(&payload).expect("text payload should parse");
-        assert_eq!(parsed.content.as_deref(), Some("respuesta"));
+        assert_eq!(parsed.content.as_deref(), Some("answer"));
         assert!(parsed.attachments.is_empty());
     }
 
@@ -257,7 +257,7 @@ mod tests {
             ..TextResponseOptions::default()
         };
         let output = AiBehaviorOutput::final_output(AiFinalOutput::new(
-            Some("aca esta".to_string()),
+            Some("here it is".to_string()),
             vec![AiUserArtifact::new(
                 b"col1,col2\n1,2\n".to_vec(),
                 "text/csv",
@@ -267,7 +267,7 @@ mod tests {
 
         let payload = build_ai_behavior_response_with_options(output, &options).expect("payload");
         let parsed = TextV1Payload::from_value(&payload).expect("text payload should parse");
-        assert_eq!(parsed.content.as_deref(), Some("aca esta"));
+        assert_eq!(parsed.content.as_deref(), Some("here it is"));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].mime, "text/csv");
         assert_eq!(parsed.attachments[0].filename_original, "reporte.csv");
@@ -297,24 +297,24 @@ mod tests {
 
     #[test]
     fn artifact_builder_rejects_mismatched_extension() {
-        let err = AiUserArtifact::from_text("reporte.csv", "hola")
+        let err = AiUserArtifact::from_text("reporte.csv", "hello")
             .expect_err("mismatched extension should fail");
         assert!(matches!(err, AiSdkError::ArtifactFilenameInvalid { .. }));
     }
 
     #[test]
     fn artifact_builders_create_supported_formats() {
-        let txt = AiUserArtifact::from_text("nota.txt", "hola").expect("txt");
+        let txt = AiUserArtifact::from_text("nota.txt", "hello").expect("txt");
         assert_eq!(txt.mime, "text/plain");
 
         let json =
             AiUserArtifact::from_json("payload.json", &serde_json::json!({"a":1})).expect("json");
         assert_eq!(json.mime, "application/json");
 
-        let md = AiUserArtifact::from_markdown("readme.md", "# Hola").expect("markdown");
+        let md = AiUserArtifact::from_markdown("readme.md", "# Hello").expect("markdown");
         assert_eq!(md.mime, "text/markdown");
 
-        let html = AiUserArtifact::from_html("index.html", "<p>Hola</p>").expect("html");
+        let html = AiUserArtifact::from_html("index.html", "<p>Hello</p>").expect("html");
         assert_eq!(html.mime, "text/html");
     }
 }

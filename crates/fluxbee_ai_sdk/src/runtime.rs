@@ -720,7 +720,7 @@ mod tests {
     fn a_reply_names_its_requester_and_the_option_the_agent_chose() {
         let mut response = message("user");
         response.meta.context = Some(json!({
-            "evaluation": {"reply": "Te paso con el equipo", "option": " handover ", "params": {}}
+            "evaluation": {"reply": "I'm passing you to the team", "option": " handover ", "params": {}}
         }));
         let note = reply_trace_note(Some("WF.ventas@worker1"), &mut response);
         assert_eq!(note.to.as_deref(), Some("WF.ventas@worker1"));

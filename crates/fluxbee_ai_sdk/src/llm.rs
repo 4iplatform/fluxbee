@@ -723,7 +723,7 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
     }
 
     // Among other text, the object is the first whole one, whatever text is around it: a `{` that
-    // starts none (`Elijo {consult}: {...}`) is the text's.
+    // starts none (`I pick {consult}: {...}`) is the text's.
     if let Some(object) = trimmed
         .match_indices('{')
         .find_map(|(start, _)| leading_json_object(&trimmed[start..]))
@@ -2430,7 +2430,7 @@ mod tests {
         let item = loop_item_to_openai_input(FunctionLoopItem::UserContentParts {
             content: vec![
                 ModelContentPart::Text {
-                    text: "hola".to_string(),
+                    text: "hello".to_string(),
                 },
                 ModelContentPart::Image {
                     media_type: "image/jpeg".to_string(),
@@ -2466,7 +2466,7 @@ mod tests {
         let req = LlmRequest {
             model: "gpt-4.1-mini".to_string(),
             system: Some("sys".to_string()),
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: None,
             max_output_tokens: None,
@@ -2475,7 +2475,7 @@ mod tests {
         let input = build_openai_input_items(&req);
         assert_eq!(input.len(), 2);
         assert_eq!(input[1]["content"][0]["type"], "input_text");
-        assert_eq!(input[1]["content"][0]["text"], "hola");
+        assert_eq!(input[1]["content"][0]["text"], "hello");
     }
 
     #[test]
@@ -2683,13 +2683,13 @@ mod tests {
         )
         .expect("schema should be valid");
         for raw in [
-            "```json\n{\"ok\":true}\n```\n¿Algo más?",
+            "```json\n{\"ok\":true}\n```\nAnything else?",
             "```json\n{\"ok\":true}\n```",
             "```\n{\"ok\":true}\n```\n",
             // FINDINGS A-131: another fenced block after the object's.
-            "```json\n{\"ok\":true}\n```\nPor ejemplo:\n```\nplan pro\n```",
+            "```json\n{\"ok\":true}\n```\nFor example:\n```\nplan pro\n```",
             // Text with braces after an object that is not fenced.
-            "Listo: {\"ok\":true} y {nada más}",
+            "Done: {\"ok\":true} and {nothing else}",
         ] {
             assert_eq!(
                 parse_structured_output(raw, &spec).expect(raw),
@@ -2701,10 +2701,10 @@ mod tests {
     /// A fence in the object's own text stays in it: the object ends where its JSON ends.
     #[test]
     fn a_fence_inside_the_objects_text_stays_in_it() {
-        let raw = "```json\n{\"reply\":\"Mirá:\\n```\\nplan pro\\n```\"}\n```\nListo.";
+        let raw = "```json\n{\"reply\":\"Look:\\n```\\nplan pro\\n```\"}\n```\nDone.";
         assert_eq!(
             extract_json_value(raw).expect(raw),
-            json!({"reply": "Mirá:\n```\nplan pro\n```"})
+            json!({"reply": "Look:\n```\nplan pro\n```"})
         );
     }
 
@@ -2713,16 +2713,16 @@ mod tests {
     #[test]
     fn a_brace_that_starts_no_object_is_the_texts() {
         let object =
-            json!({"reply": "Lo consulto.", "option": "consult", "params": {"question": "20%?"}});
+            json!({"reply": "I will check.", "option": "consult", "params": {"question": "20%?"}});
         for raw in [
-            format!("Elijo {{consult}}: {object}"),
-            format!("{{nada}} y {{\"a\": }} antes de {object} y {{después}}"),
-            format!("Elijo {{consult}}:\n```json\n{object}\n```"),
+            format!("I pick {{consult}}: {object}"),
+            format!("{{nothing}} and {{\"a\": }} before {object} and {{after}}"),
+            format!("I pick {{consult}}:\n```json\n{object}\n```"),
         ] {
             assert_eq!(extract_json_value(&raw).expect(&raw), object, "{raw}");
         }
         assert!(matches!(
-            extract_json_value("Elijo {consult} y {nada}"),
+            extract_json_value("I pick {consult} and {nothing}"),
             Err(AiSdkError::InvalidStructuredOutput { .. })
         ));
     }
@@ -2734,7 +2734,7 @@ mod tests {
     fn an_object_on_the_opening_fences_line_is_that_object() {
         for raw in [
             "```json {\"ok\":true}```",
-            "```json {\"ok\":true}\n```\n¿Algo más?",
+            "```json {\"ok\":true}\n```\nAnything else?",
             "```{\"ok\":true}```",
             "```JSON{\"ok\":\ntrue}\n```",
             "```json title=\"answer\"\n{\"ok\":true}\n```",
@@ -2753,21 +2753,21 @@ mod tests {
     fn a_blank_assistant_turn_is_left_out_of_an_anthropic_request() {
         let items = vec![
             FunctionLoopItem::UserText {
-                content: "hola".to_string(),
+                content: "hello".to_string(),
             },
             FunctionLoopItem::AssistantText {
                 content: " ".to_string(),
             },
             FunctionLoopItem::UserText {
-                content: "dale".to_string(),
+                content: "sure".to_string(),
             },
         ];
         let (_, messages) = build_anthropic_function_messages(&None, &items).expect("messages");
         assert_eq!(
             messages,
             vec![
-                json!({"role":"user","content":[{"type":"text","text":"hola"}]}),
-                json!({"role":"user","content":[{"type":"text","text":"dale"}]}),
+                json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+                json!({"role":"user","content":[{"type":"text","text":"sure"}]}),
             ]
         );
     }
@@ -2781,7 +2781,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-4.1-mini".to_string(),
             system: Some("sys".to_string()),
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: Some(
                 OutputSchemaSpec::new(
@@ -2827,7 +2827,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-4.1-mini".to_string(),
             system: Some("sys".to_string()),
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: None,
             max_output_tokens: Some(64),
@@ -2859,7 +2859,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-5.5".to_string(),
             system: Some("sys".to_string()),
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: None,
             max_output_tokens: Some(1024),
@@ -2887,7 +2887,7 @@ mod tests {
         let request = || LlmRequest {
             model: "gpt-5.5".to_string(),
             system: None,
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: None,
             max_output_tokens: None,
@@ -2899,7 +2899,7 @@ mod tests {
             "model": "gpt-5.5-2026-04-01",
             "service_tier": "default",
             "status": "completed",
-            "output_text": "hola",
+            "output_text": "hello",
             "usage": {"input_tokens": 20, "input_tokens_details": {"cached_tokens": 5},
                       "output_tokens": 9, "output_tokens_details": {"reasoning_tokens": 4}}
         }));
@@ -3045,7 +3045,7 @@ mod tests {
             let (base_url, body_rx, handle) = spawn_single_response_server(json!({
                 "id": "resp_2",
                 "status": "completed",
-                "output_text": "{\"reply\":\"listo\",\"area\":\"sales\"}"
+                "output_text": "{\"reply\":\"done\",\"area\":\"sales\"}"
             }));
             OpenAiResponsesClient::new("test-key", test_account())
                 .with_base_url(base_url)
@@ -3103,7 +3103,7 @@ mod tests {
         let request = || LlmRequest {
             model: "gpt-5.5".to_string(),
             system: None,
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: None,
             max_output_tokens: None,
@@ -3223,7 +3223,7 @@ providers:
     #[tokio::test]
     async fn anthropic_messages_client_uses_messages_shape() {
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
-            "content": [{"type":"text", "text":"hola"}],
+            "content": [{"type":"text", "text":"hello"}],
             "usage": {"input_tokens": 3, "output_tokens": 2}
         }));
         let client =
@@ -3240,7 +3240,7 @@ providers:
             })
             .await
             .expect("generate should succeed");
-        assert_eq!(response.content, "hola");
+        assert_eq!(response.content, "hello");
         let body = body_rx.recv().expect("captured body");
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["system"], "sys");
@@ -3257,7 +3257,7 @@ providers:
         output_schema: Option<OutputSchemaSpec>,
     ) -> (Value, FunctionModelTurnResponse) {
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
-            "content": [{"type": "text", "text": "listo"}],
+            "content": [{"type": "text", "text": "done"}],
             "stop_reason": "end_turn",
             "usage": {
                 "input_tokens": 3,
@@ -3281,7 +3281,7 @@ providers:
             })
             .await
             .expect("tool turn");
-        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+        assert_eq!(turn.assistant_text.as_deref(), Some("done"));
         handle.join().expect("server thread");
         (body_rx.recv().expect("captured body"), turn)
     }
@@ -3343,7 +3343,7 @@ providers:
     #[tokio::test]
     async fn an_anthropic_tool_turn_without_tools_or_prompt_stays_a_plain_request() {
         let ask = || FunctionLoopItem::UserText {
-            content: "hola".to_string(),
+            content: "hello".to_string(),
         };
         let (body, _) = anthropic_tool_turn(
             None,
@@ -3367,7 +3367,7 @@ providers:
         let (body, _) = anthropic_tool_turn(Some("  "), vec![ask()], Vec::new(), None).await;
         assert_eq!(body.get("system"), None);
         assert_eq!(body.get("tools"), None);
-        assert_eq!(body["messages"][0]["content"][0]["text"], "hola");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
     }
 
     /// A tool turn under the run's answer schema asks Anthropic for it next to the tools, in the
@@ -3395,7 +3395,7 @@ providers:
         );
 
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
-            "content": [{"type": "text", "text": "{\"reply\":\"listo\",\"area\":\"sales\"}"}],
+            "content": [{"type": "text", "text": "{\"reply\":\"done\",\"area\":\"sales\"}"}],
             "stop_reason": "end_turn"
         }));
         AnthropicMessagesClient::new("test-key", test_account())
@@ -3436,7 +3436,7 @@ providers:
             ),
             (
                 "200 OK",
-                json!({"id": "resp_2", "status": "completed", "output_text": "listo"}),
+                json!({"id": "resp_2", "status": "completed", "output_text": "done"}),
             ),
         ]);
         let turn = OpenAiResponsesClient::new("test-key", test_account())
@@ -3452,7 +3452,7 @@ providers:
             .await
             .expect("the turn, asked again");
         handle.join().expect("server thread");
-        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+        assert_eq!(turn.assistant_text.as_deref(), Some("done"));
 
         let mut refused = bodies.recv().expect("the refused request");
         let asked_again = bodies.recv().expect("the request asked again");
@@ -3491,7 +3491,7 @@ providers:
             ),
             (
                 "200 OK",
-                json!({"content": [{"type": "text", "text": "listo"}], "stop_reason": "end_turn"}),
+                json!({"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"}),
             ),
         ]);
         let turn = AnthropicMessagesClient::new("test-key", test_account())
@@ -3511,7 +3511,7 @@ providers:
             .await
             .expect("the turn, asked again");
         handle.join().expect("server thread");
-        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+        assert_eq!(turn.assistant_text.as_deref(), Some("done"));
 
         let mut refused = bodies.recv().expect("the refused request");
         let asked_again = bodies.recv().expect("the request asked again");
@@ -3526,7 +3526,7 @@ providers:
         LlmRequest {
             model: "gpt-5.5".to_string(),
             system: None,
-            input: "hola".to_string(),
+            input: "hello".to_string(),
             input_parts: None,
             output_schema: None,
             max_output_tokens: None,
@@ -3537,7 +3537,7 @@ providers:
     fn plain_turn() -> FunctionModelTurnRequest {
         FunctionModelTurnRequest {
             items: vec![FunctionLoopItem::UserText {
-                content: "hola".to_string(),
+                content: "hello".to_string(),
             }],
             tools: vec![tool_definition("thread_state_get")],
             output_schema: None,
@@ -3567,7 +3567,7 @@ providers:
             json_answer(
                 "200 OK",
                 "Content-Type: application/json\r\n",
-                json!({"id": "resp_1", "status": "completed", "output_text": "hola"}),
+                json!({"id": "resp_1", "status": "completed", "output_text": "hello"}),
             ),
         ]);
         let answer = OpenAiResponsesClient::new("test-key", account.clone())
@@ -3576,7 +3576,7 @@ providers:
             .await
             .expect("the answer, asked again");
         handle.join().expect("server thread");
-        assert_eq!(answer.content, "hola");
+        assert_eq!(answer.content, "hello");
         assert_eq!(bodies.try_iter().count(), 2);
         assert!(records.try_recv().is_ok(), "the answer is a record");
         assert!(records.try_recv().is_err(), "the 429 is none");
@@ -3590,7 +3590,7 @@ providers:
             json_answer(
                 "200 OK",
                 "Content-Type: application/json\r\n",
-                json!({"id": "resp_2", "status": "completed", "output_text": "listo"}),
+                json!({"id": "resp_2", "status": "completed", "output_text": "done"}),
             ),
         ]);
         let turn = OpenAiResponsesClient::new("test-key", account)
@@ -3600,7 +3600,7 @@ providers:
             .await
             .expect("the turn, asked again");
         handle.join().expect("server thread");
-        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+        assert_eq!(turn.assistant_text.as_deref(), Some("done"));
         assert_eq!(bodies.try_iter().count(), 2);
     }
 

@@ -156,7 +156,7 @@ mod tests {
                 context,
                 ..Meta::default()
             },
-            payload: json!({"type": "text", "content": "hola"}),
+            payload: json!({"type": "text", "content": "hello"}),
         }
     }
 

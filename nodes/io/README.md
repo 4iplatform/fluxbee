@@ -186,7 +186,7 @@ ROUTER_SOCKET="/var/run/fluxbee/routers" \
 CONFIG_DIR="/etc/fluxbee" \
 UUID_PERSISTENCE_DIR="/var/lib/fluxbee/state/nodes" \
 RUST_LOG=info,io_sim=debug,fluxbee_sdk=info \
-cargo run -p io-sim -- --once "hola router"
+cargo run -p io-sim -- --once "hello router"
 ```
 
 Optional env vars for `io-sim`:
@@ -201,8 +201,8 @@ Optional env vars for `io-sim`:
 - `SIM_REPLY_ADDRESS` (default `stdout`; for Slack use target `channel_id`)
 - `SIM_REPLY_THREAD_TS` (optional; for Slack thread replies)
 - `SIM_REPLY_WORKSPACE_ID` (optional; for Slack context metadata)
-- `SIM_ATTACHMENTS_JSON` (optional JSON array de `BlobRef` para simular adjuntos outbound)
-- `SIM_CONTENT_REF_JSON` (optional JSON object `BlobRef` para simular texto en `content_ref`)
+- `SIM_ATTACHMENTS_JSON` (optional JSON array of `BlobRef`s, to simulate outbound attachments)
+- `SIM_CONTENT_REF_JSON` (optional JSON object `BlobRef`, to simulate a text in `content_ref`)
 
 Note:
 - `SIM_DST_NODE` must match the AI registered name (`AI.chat@<hive_id>`).
