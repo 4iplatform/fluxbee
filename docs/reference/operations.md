@@ -664,7 +664,13 @@ tenant (`TENANT_ROOT_REQUIRED`; both `core_io_refusal`); a tenant that is not ac
 whose runtime is not a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`). Start, restart and the
 boot relaunch refuse the same root-tenant cases.
 
-**Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first):
+**Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first). A node
+with a public page up is not purged (FINDINGS A-233; a purge never cascades into another store):
+SY.admin answers `409 NODE_HAS_PAGES` before it sends anything, naming the node's pages by their
+`publication_id`. Take them down first: `GET /artifacts` lists them (`publisher_l2_name` is the
+node), `POST /artifacts/unpublish {"publication_id": ...}` takes one down; a ledger that cannot be
+read refuses the purge too (`PAGES_CHECK_FAILED`). The same holds for removing a stopped instance,
+`teardown_node`, and `purge_ilk` of the node's ILK. Otherwise:
 
 1. stops the unit and clears `relaunch_on_boot`, so whatever fails after, the reconcile does not
    launch the node again;
@@ -739,21 +745,25 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
 `--confirm-hive <id>`). It needs every hive alive and works through SY.admin: without SY.admin's
 answer it stops at its start, when it lists the hives, before it changes anything.
 
-1. deletes every workflow with `force` on motherbee and worker hives;
-2. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
-   instances of `base-nodes.json`), on every hive;
-3. takes down every published page that is up (FINDINGS A-212), once no workflow or user node is
-   left to publish one: SY.admin lists them (`GET /artifacts`, `list_published_artifacts`, each
-   by its `publication_id`, never by its link's key) and the reset takes each down
-   (`POST /artifacts/unpublish`): the edge stops serving its `/public/<key>` link, and IO.blob
-   releases its copy in `blob/public/`. It lists again until none is left, so a page published
-   meanwhile goes too. When SY.admin answers but does not list them (an older SY.admin without the
-   route answers 404, or its ledger cannot be read), the reset goes on, counts it as a problem,
-   and names the pages that stay public from SY.admin's ledger (`state/sy-admin/publications.json`,
-   read only); they go down when they expire, 30 days at most. The dry run lists the pages;
+1. takes down every published page that is up (FINDINGS A-212), first: a purge never cascades, so
+   a node with a page up is not purged (`NODE_HAS_PAGES`, FINDINGS A-233) and neither is its
+   tenant (`TENANT_HAS_PAGES`). SY.admin lists them (`GET /artifacts`,
+   `list_published_artifacts`, each by its `publication_id`, never by its link's key) and the
+   reset takes each down (`POST /artifacts/unpublish`): the edge stops serving its
+   `/public/<key>` link, and IO.blob releases its copy in `blob/public/`. It lists again until
+   none is left, so a page published meanwhile goes too. When SY.admin answers but does not list
+   them (an older SY.admin without the route answers 404, or its ledger cannot be read), the reset
+   goes on, counts it as a problem, and names the pages that stay public from SY.admin's ledger
+   (`state/sy-admin/publications.json`, read only); they go down when they expire, 30 days at
+   most. The dry run lists the pages;
+2. deletes every workflow with `force` on motherbee and worker hives;
+3. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
+   instances of `base-nodes.json`), on every hive. A node that published a page after step 1 has
+   its purge, or its workflow's delete, refused with `NODE_HAS_PAGES`: the pages come down again,
+   and the purge is asked once more; a page that stays up leaves that node's failure;
 4. marks and purges every non-system ILK, deletes every vault secret except
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
-   but the root. A tenant with a page still up is not purged (`TENANT_HAS_PAGES`): step 3 takes
+   but the root. A tenant with a page still up is not purged (`TENANT_HAS_PAGES`): step 1 takes
    them down first, and a page it could not take down shows again as that tenant's failure;
 5. clears the user OPA policy on every hive;
 6. has every hive that runs SY.cognition drop its state through SY.admin's `cognition_clear`, the

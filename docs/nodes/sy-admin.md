@@ -446,7 +446,9 @@ executor may ask for it too. In order:
    down then. Anyone else gets `409 NODE_STILL_CONNECTED` while the shared-memory regions list
    the node, or `503 INVENTORY_UNAVAILABLE` when they cannot be read, and nothing is removed
    (`teardown_live_node_refusal`). Otherwise a node redeployed onto the ILK of a teardown that
-   failed half-way could be purged alive.
+   failed half-way could be purged alive. **A node with a public page up** waits for it to come
+   down: `409 NODE_HAS_PAGES`, its own orchestrator's call included, and nothing is removed
+   (`node_pages_refusal`, FINDINGS A-233; [the pages](#publications-and-the-audit-log)).
 2. **The ILK is the node's**: `ILK_GET` to SY.identity, whose `identification.node_name` must be
    the node, else `409 NODE_ILK_MISMATCH` and nothing is removed. An ILK SY.identity does not
    hold is reported `not_found` and skips step 4. Over the mesh it skips step 3 too, since
@@ -1225,9 +1227,25 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `POST /artifacts/unpublish` (`purge_tenant_pages_block`, checked before the vault's
   `purge_tenant_vault_block`). A ledger that cannot be read refuses the purge too
   (`PAGES_CHECK_FAILED`).
-- **The factory reset takes every page down** through these two actions, after the workflows and
-  the user nodes are gone and before it purges the tenants (`unpublish_pages` in
-  `packaging/fluxbee-factory-reset`; see [operations](../reference/operations.md#factory-reset)).
+- **A node with pages up is not purged** (FINDINGS A-233), by the same rule. While a page whose
+  `publisher_l2_name` is the node is up, every action that purges the node answers
+  `409 NODE_HAS_PAGES` before anything is sent, with the same detail (how many pages, the first 20
+  by their `publication_id`, `GET /artifacts` and `POST /artifacts/unpublish`;
+  `node_pages_refusal`): `kill_node` with `purge_instance` and `remove_node_instance` (the node
+  `<name>@<hive>` as the orchestrator reads it, `purged_node_name`), `teardown_node` (after its
+  live-node check, so its own orchestrator's call after the kill too) and `purge_ilk`. A page's
+  record names its publisher, not its ILK: while any page is up, `purge_ilk` asks SY.identity
+  whose ILK it is (`ILK_GET`, its `identification.node_name`) before it sends `ILK_PURGE`
+  (`purge_ilk_pages_block`); an ILK of no node, one SY.identity does not hold, or an id it refuses
+  goes on to the purge, which answers the same. A ledger that cannot be read, or an ILK that cannot
+  be read while a page is up, refuses the purge (`PAGES_CHECK_FAILED`). A plain stop (`kill_node`
+  without `purge_instance`) is no purge. SY.wf-rules' `wf_rules_delete` purges its WF node through
+  `kill_node`, so a workflow whose node has a page up is not deleted either.
+- **The factory reset takes every page down** through these two actions first, before it deletes
+  the workflows and purges the user nodes and the tenants; a purge refused for a page published
+  after that takes the pages down again and is asked once more (`unpublish_pages` and
+  `purge_once_pages_are_down` in `packaging/fluxbee-factory-reset`; see
+  [operations](../reference/operations.md#factory-reset)).
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
   hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048

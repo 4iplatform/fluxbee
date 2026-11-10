@@ -1026,6 +1026,13 @@ The ownership and call path are fixed:
   page down) or expires. A tenant with a page up cannot be purged: its purge answers
   `TENANT_HAS_PAGES` and names the pages by their `publication_id`, and they come down first,
   each with an `unpublish_artifact` step the operator confirms.
+- Nor can a node with a page up (FINDINGS A-233): `kill_node` with `purge_instance`,
+  `remove_node_instance`, `teardown_node` and `purge_ilk` of its ILK answer `NODE_HAS_PAGES`,
+  naming the node's pages by their `publication_id`, and nothing is removed; a workflow whose node
+  has one is not deleted either (`wf_rules_delete`). Read `/artifacts`, take the pages whose
+  `publisher_l2_name` is the node down first (one `unpublish_artifact` step each), then purge it,
+  in the same plan if the operator wants. A plain stop (`kill_node` without `purge_instance`) is
+  never refused for a page.
 
 Rules for Archi:
 
@@ -1062,6 +1069,7 @@ Normal operator requests should not create or redesign these.
 ### 4.4.1 Node teardown semantics
 
 - `purge_instance=true` is a real tabula-rasa for orchestrator-owned node state: instance directory, timers, `node_ilk_map`, ILK, and dedicated vault secrets are removed. Routes, VPNs, and taps are not auto-deleted; teardown returns `routing_references` so the operator can clean those deliberately.
+- Public pages are not: a node with a page up is not purged (`NODE_HAS_PAGES`, FINDINGS A-233). Stage the `unpublish_artifact` steps of its pages before the purge (§4.3.1).
 
 ### 4.4.2 Clearing a hive's cognition
 

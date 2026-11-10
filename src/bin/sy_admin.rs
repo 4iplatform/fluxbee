@@ -16330,6 +16330,9 @@ const WF_RULES_DEFINITION_NOTE: &str = "A definition requires start_from: the no
 /// What the node routes that send to the node itself say of its name (`node_name_on_hive`).
 const NODE_ON_PATH_HIVE_NOTE: &str = "node_name is a node of the path's hive: a bare name is qualified with it (AI.sales on /hives/worker1 is AI.sales@worker1), and a name of another hive is refused with INVALID_REQUEST.";
 
+/// What the actions that purge a node say of its public pages (`node_pages_refusal`).
+const NODE_HAS_PAGES_NOTE: &str = "A node's purge is refused while public pages it published are up (NODE_HAS_PAGES, 409, FINDINGS A-233): SY.admin reads its publication ledger before it sends anything, and the refusal says how many pages and names their publication_ids. Take them down first: GET /artifacts lists them (publisher_l2_name), POST /artifacts/unpublish takes one down by its publication_id. A ledger that cannot be read refuses the purge too (PAGES_CHECK_FAILED).";
+
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
 const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
@@ -16382,7 +16385,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "list_published_artifacts" => vec![
             "Motherbee-only: SY.admin answers it from its publication ledger (state/sy-admin/publications.json), asking no one. Takes no hive.",
-            "A page is up until it is taken down (unpublish_artifact, which the factory reset asks for every page) or expires: the list leaves out the pages unpublished, expired, or past their expires_at, which the edge no longer serves. While a tenant has a page up, purge_tenant refuses it (TENANT_HAS_PAGES). status is published, or curated (its publish is under way or stopped half-way, and the edge may serve it) or edge_removed (its take-down is under way or stopped half-way: the edge no longer serves it, and IO.blob still holds its copy); unpublish_artifact finishes either.",
+            "A page is up until it is taken down (unpublish_artifact, which the factory reset asks for every page) or expires: the list leaves out the pages unpublished, expired, or past their expires_at, which the edge no longer serves. While a tenant has a page up, purge_tenant refuses it (TENANT_HAS_PAGES); while a node has one, its purge (kill_node with purge_instance, remove_node_instance, teardown_node, purge_ilk of its ILK) is refused (NODE_HAS_PAGES). status is published, or curated (its publish is under way or stopped half-way, and the edge may serve it) or edge_removed (its take-down is under way or stopped half-way: the edge no longer serves it, and IO.blob still holds its copy); unpublish_artifact finishes either.",
             "Each row: publication_id, status, filename_original, content_type, presentation, size (bytes), tenant_id and publisher_l2_name (the producer and its tenant when it published), edge_node, created_at and expires_at (epoch seconds).",
             "A link's key is the permission to read its page, so no row carries it, whole or in part: take a page down by its publication_id. Whoever holds a link can still take its page down by the link's key.",
             "Pages (FINDINGS A-198): newest first, with limit at most that many from cursor on, and next_cursor while pages follow; total is how many are up. Without limit, every page. A cursor the list did not give answers INVALID_CURSOR (400).",
@@ -16444,11 +16447,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
             "Without purge_instance it is a stop that lasts: the boot and periodic relaunches leave the node down (relaunch_on_boot false) until start_node or restart_node. A node that dies on its own is still relaunched.",
             "With purge_instance it is the full teardown: its timers, the secrets it owns and its identity go, and the name is free again.",
+            NODE_HAS_PAGES_NOTE,
         ],
         "teardown_node" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP; over the mesh, from node_name. Body: {\"ilk_id\": \"ilk:<uuid>\"} (node_name from the path when the body has none; a bare name is a node of the path's hive).",
             "Callers: the operator's HTTP API, Archi and the executor, and SY.orchestrator@<hive> for a node of its own hive, which calls it when a node is purged (kill_node with purge_instance).",
             "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, retry) when the connected nodes cannot be read from shared memory; nothing is removed.",
+            NODE_HAS_PAGES_NOTE,
             "Steps, in order: SY.identity must hold the ILK as this node's (identification.node_name), else NODE_ILK_MISMATCH and nothing is removed; then every SY.vault secret dedicated to the ILK is deleted in its own tenant; then the ILK is marked (ILK_DELETE) and purged (ILK_PURGE). An ILK SY.identity does not hold is reported not_found: the operator's HTTP API and the executor still delete its leftover secrets, a mesh caller (the orchestrator, Archi) leaves them.",
             "The payload is the same on success and on failure: node_name, ilk_id, ilk_deleted, not_found, vault_secrets_purged {status, scanned, deleted, errors[{key, error_code, error_detail}]} and ilk_delete {status ok|error|skipped, error_code, error_detail}. A step that did not run says skipped.",
             "status ok only when every step was done; otherwise TEARDOWN_INCOMPLETE with the same payload. When a secret cannot be deleted the ILK is left in place, so a retry can still tie the remaining secrets to the node.",
@@ -16457,6 +16462,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "remove_node_instance" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            NODE_HAS_PAGES_NOTE,
         ],
         "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -16577,6 +16583,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "purge_ilk" => vec![
             "Final: removes the ILK row, its ICHs and aliases; replicas get IlkDelete deltas.",
             "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). Operator-only: not offered to Archi's executor nor to Fluxbee Cloud.",
+            "Refused while public pages of the ILK's node (its identification.node_name) are up (NODE_HAS_PAGES, 409, FINDINGS A-233): while any page is up, SY.admin asks SY.identity whose ILK it is before it sends the purge, and the refusal names the node's pages by their publication_ids. Take them down first: GET /artifacts lists them, POST /artifacts/unpublish takes one down by its publication_id. A ledger, or an ILK, that cannot be read while a page is up refuses the purge too (PAGES_CHECK_FAILED).",
         ],
         "delete_tenant" => vec![
             "MARKS the tenant deleted, i.e. disables it: no ILK is marked, its people stay usable and can be charged elsewhere (set_ilk_tenant). Its name/domain stay reserved: create_tenant answers TENANT_DELETED.",
@@ -19053,6 +19060,22 @@ async fn handle_admin_command_inner(
     }
 
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
+    // A node's purge waits for its public pages to come down (FINDINGS A-233): nothing is sent.
+    if let Some((status, code, detail)) = purged_node_name(action, &payload, &ctx.hive_id)
+        .and_then(|node_name| node_pages_refusal(ctx, &node_name))
+    {
+        return Ok((
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        ));
+    }
     let request = build_admin_request(ctx, action, payload, hive);
     // Routes, VPNs and taps: SY.config.routes of that hive applies the change and writes its config
     // region, which the routers of that hive read on the next message. Nothing else to tell anyone.
@@ -20048,8 +20071,8 @@ fn purge_tenant_pages_block(
             .to_string(),
         ))
     };
-    let ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
-        Ok(ledger) => ledger,
+    let pages = match live_page_ids(ctx, |record| record.tenant_id == tenant_id) {
+        Ok(pages) => pages,
         Err(err) => {
             return blocked(
                 "PAGES_CHECK_FAILED",
@@ -20059,34 +20082,175 @@ fn purge_tenant_pages_block(
             )
         }
     };
-    let now = Utc::now().timestamp().max(0) as u64;
-    let pages: Vec<&str> = ledger
-        .publications
-        .values()
-        .filter(|record| record.tenant_id == tenant_id && !publication_is_down(record, now))
-        .map(|record| record.publication_id.as_str())
-        .collect();
     if pages.is_empty() {
         return None;
     }
-    // The error names the first pages by their publication_id, never by a link's key; a tenant
-    // with many says how many more.
+    blocked("TENANT_HAS_PAGES", pages_up_detail(tenant_id, &pages))
+}
+
+/// The publication_ids of the pages that are up now (not `publication_is_down`) and `whose`
+/// takes, from the publication ledger. The error is why the ledger could not be read.
+fn live_page_ids(
+    ctx: &AdminContext,
+    whose: impl Fn(&AdminPublicationRecord) -> bool,
+) -> Result<Vec<String>, String> {
+    let ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
+    let now = Utc::now().timestamp().max(0) as u64;
+    Ok(ledger
+        .publications
+        .values()
+        .filter(|record| whose(record) && !publication_is_down(record, now))
+        .map(|record| record.publication_id.clone())
+        .collect())
+}
+
+/// Why a purge waits for `pages`, the public pages of `owner` that are up: how many, the first
+/// ones by their publication_id, never by a link's key (an owner with many says how many more), and
+/// how to take them down.
+fn pages_up_detail(owner: &str, pages: &[String]) -> String {
     const NAMED: usize = 20;
     let more = pages.len().saturating_sub(NAMED);
     let named = pages[..pages.len().min(NAMED)].join(", ");
-    blocked(
-        "TENANT_HAS_PAGES",
-        format!(
-            "{} public page(s) of {tenant_id} are up; take them down first (GET /artifacts lists \
-             them, POST /artifacts/unpublish takes one down by its publication_id): {named}{}",
-            pages.len(),
-            if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            }
-        ),
+    format!(
+        "{} public page(s) of {owner} are up; take them down first (GET /artifacts lists them, \
+         POST /artifacts/unpublish takes one down by its publication_id): {named}{}",
+        pages.len(),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
     )
+}
+
+/// A node is not purged while public pages it published are up (FINDINGS A-233), by the tenant's
+/// rule (operator decision 2026-09-28: a purge never cascades into another store; clean it first):
+/// `kill_node` with `purge_instance`, `remove_node_instance`, `teardown_node`, and `purge_ilk` of
+/// its ILK. A page is the node's when its record names it as its `publisher_l2_name`. SY.admin
+/// holds the publication ledger, so the purge is refused before anything is sent: 409
+/// NODE_HAS_PAGES, naming the pages. Fail closed: a ledger that cannot be read refuses it too
+/// (PAGES_CHECK_FAILED).
+fn node_pages_refusal(ctx: &AdminContext, node_name: &str) -> Option<(u16, &'static str, String)> {
+    match live_page_ids(ctx, |record| record.publisher_l2_name == node_name) {
+        Ok(pages) if pages.is_empty() => None,
+        Ok(pages) => Some((409, "NODE_HAS_PAGES", pages_up_detail(node_name, &pages))),
+        Err(err) => Some((
+            409,
+            "PAGES_CHECK_FAILED",
+            format!("could not read the public pages of {node_name} (refusing to purge): {err}"),
+        )),
+    }
+}
+
+/// The node a purging node action names, `<name>@<hive>` as the orchestrator reads it
+/// (`target_hive_from_payload`, `normalize_node_name_for_target`): the hive a qualified name
+/// carries, else the payload's `target` or `hive_id`, else this admin's, whose orchestrator takes
+/// it. `kill_node` purges with `purge_instance` true, `remove_node_instance` always; any other
+/// action, a stop, or a request that names no node (the orchestrator refuses it) is `None`.
+fn purged_node_name(action: &str, payload: &serde_json::Value, admin_hive: &str) -> Option<String> {
+    let purges = match action {
+        "kill_node" => payload
+            .get("purge_instance")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        "remove_node_instance" => true,
+        _ => false,
+    };
+    if !purges {
+        return None;
+    }
+    let field = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let node_name = field("node_name")?;
+    Some(match node_name.rsplit_once('@') {
+        Some((local, hive)) => format!("{}@{}", local.trim(), hive.trim()),
+        None => format!(
+            "{node_name}@{}",
+            field("target")
+                .or_else(|| field("hive_id"))
+                .unwrap_or(admin_hive)
+        ),
+    })
+}
+
+/// purge_ilk is refused while public pages of the ILK's node are up (FINDINGS A-233,
+/// `node_pages_refusal`). The ledger names a page's publisher by its node, so only while a page is
+/// up does SY.admin ask SY.identity whose ILK it is (ILK_GET, its `identification.node_name`). An
+/// ILK of no node goes on to its purge, and so does one SY.identity does not hold or whose id it
+/// refuses: the purge answers the same, and purges nothing. Fail closed: a ledger that cannot be
+/// read, or an ILK that cannot be read while a page is up, refuses the purge (PAGES_CHECK_FAILED).
+async fn purge_ilk_pages_block(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    identity: &str,
+    payload: &serde_json::Value,
+) -> Option<(u16, String)> {
+    let action = "purge_ilk";
+    let ilk_id = payload
+        .get("ilk_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let blocked = |(status, code, detail): (u16, &str, String)| {
+        Some((
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        ))
+    };
+    let check_failed = |detail: String| blocked((409, "PAGES_CHECK_FAILED", detail));
+    match live_page_ids(ctx, |_| true) {
+        Ok(pages) if pages.is_empty() => return None,
+        Ok(_) => {}
+        Err(err) => {
+            return check_failed(format!(
+                "could not read the public pages (refusing to purge {ilk_id}): {err}"
+            ))
+        }
+    }
+    let response = send_system_request(
+        client,
+        identity,
+        "ILK_GET",
+        "ILK_GET_RESPONSE",
+        serde_json::json!({ "ilk_id": ilk_id }),
+        admin_action_timeout("get_ilk"),
+    )
+    .await;
+    let read = admin_step_envelope(Ok(build_admin_http_response("get_ilk", response)));
+    match admin_step_outcome(&read) {
+        Ok(()) => {}
+        Err((code, _))
+            if matches!(
+                code.as_str(),
+                "NOT_FOUND" | "ILK_NOT_FOUND" | "INVALID_REQUEST"
+            ) =>
+        {
+            return None
+        }
+        Err((code, detail)) => {
+            return check_failed(format!(
+                "could not read whose ILK {ilk_id} is while public pages are up (refusing to \
+                 purge): {code}: {detail}"
+            ))
+        }
+    }
+    let node_name = read
+        .pointer("/payload/ilk/identification/node_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    node_pages_refusal(ctx, node_name).and_then(blocked)
 }
 
 /// The hive whose SY.identity takes an identity action: the primary, SY.admin's own hive, whatever
@@ -20117,6 +20281,11 @@ async fn handle_identity_command(
         }
     }
     let target = format!("SY.identity@{}", target_hive);
+    if action == "purge_ilk" {
+        if let Some(blocked) = purge_ilk_pages_block(ctx, client, &target, &payload).await {
+            return Ok(blocked);
+        }
+    }
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
@@ -20524,6 +20693,7 @@ impl TeardownReport {
 /// stores, removed in this order.
 /// 1. The request: the node and its ILK. A node still connected is alive: only its own
 ///    orchestrator, whose call follows its kill, tears it down then (`teardown_live_node_refusal`).
+///    A node whose public pages are up waits for them to come down (`node_pages_refusal`).
 /// 2. The ILK is that node's: SY.identity's `identification.node_name` for it (`ILK_GET`) must be
 ///    the node, else `NODE_ILK_MISMATCH` and nothing is touched. An ILK SY.identity does not hold
 ///    is reported `not_found` and skips step 4; over the mesh it skips step 3 too, since nothing
@@ -20570,6 +20740,10 @@ async fn handle_teardown_node(
     if let Some(refusal) =
         teardown_live_node_refusal(&request, origin, || (ctx.connected_nodes)(&ctx.hive_id))
     {
+        return Ok(report.answer(Some(refusal)));
+    }
+    // Its public pages come down first (FINDINGS A-233): nothing is removed while one is up.
+    if let Some(refusal) = node_pages_refusal(ctx, &request.node_name) {
         return Ok(report.answer(Some(refusal)));
     }
 
@@ -38371,6 +38545,326 @@ mod tests {
         // A ledger that cannot be read refuses the purge, and nothing is sent.
         fs::write(&ctx.publication_ledger_path, b"{ not json").expect("a broken ledger");
         let (status, body) = purge_tenant().await.expect("answered");
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("PAGES_CHECK_FAILED"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    // --- a node's purge waits for its pages (FINDINGS A-233) --------------------------------
+
+    /// A node of the same hive as `PAGE_PUBLISHER` that published no page.
+    const QUIET_NODE: &str = "AI.quiet@worker1";
+
+    /// The refusal of a node's purge while `named` are up, of `pages` the ledger holds: 409
+    /// NODE_HAS_PAGES for `action`, how many pages of `PAGE_PUBLISHER` and the way to take them
+    /// down, each of `named` by its publication_id, no other page, and no link's key.
+    fn assert_node_has_pages(
+        status: u16,
+        body: &str,
+        action: &str,
+        named: &[&AdminPublicationRecord],
+        pages: &[&AdminPublicationRecord],
+    ) {
+        assert_eq!(status, 409, "{body}");
+        let refusal: Value = serde_json::from_str(body).expect("JSON");
+        assert_eq!(refusal["action"], json!(action));
+        assert_eq!(refusal["error_code"], json!("NODE_HAS_PAGES"));
+        let detail = refusal["error_detail"].as_str().expect("why");
+        assert!(
+            detail.starts_with(&format!(
+                "{} public page(s) of {PAGE_PUBLISHER} are up",
+                named.len()
+            )),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("GET /artifacts") && detail.contains("POST /artifacts/unpublish"),
+            "{detail}"
+        );
+        for page in pages {
+            assert_eq!(
+                detail.contains(&page.publication_id),
+                named
+                    .iter()
+                    .any(|named| named.publication_id == page.publication_id),
+                "{} in {detail}",
+                page.publication_id
+            );
+        }
+        assert_no_key(body, pages);
+    }
+
+    /// The orchestrator's answer to the node action SY.admin relays, `action` on `node_name`.
+    async fn answer_node_action(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        action: &str,
+        node_name: &str,
+    ) {
+        let sent = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the relay to the orchestrator");
+        assert_eq!(sent.meta.msg_type, "admin");
+        assert_eq!(sent.meta.action.as_deref(), Some(action));
+        assert_eq!(
+            dst_of(&sent),
+            json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+        );
+        assert_eq!(sent.payload["node_name"], json!(node_name));
+        let mut answer = reply_to(&sent, "", json!({ "status": "ok", "node_name": node_name }));
+        answer.meta.msg_type = "admin".to_string();
+        answer.meta.msg = None;
+        harness.inject(answer).await.unwrap();
+    }
+
+    /// The tenant's rule for a node (FINDINGS A-233): while a page it published is up, kill_node
+    /// with purge_instance and remove_node_instance are refused with NODE_HAS_PAGES before
+    /// anything is sent, a bare name on its path's hive too, naming the node's pages by their
+    /// publication_ids, never by a link's key, and no page is touched. Another node's page, or its
+    /// own down or past its expiry, refuses nothing; a stop is no purge; a ledger that cannot be
+    /// read refuses the purge too.
+    #[tokio::test]
+    async fn a_node_is_purged_only_once_its_pages_are_down() {
+        let (ctx, mut harness) = opa_test_admin("purge-node-pages");
+        let up = published_page(PAGE_PUBLISHER);
+        let mut half_down = published_page(PAGE_PUBLISHER);
+        half_down.status = "edge_removed".to_string();
+        let mut already_down = published_page(PAGE_PUBLISHER);
+        already_down.status = "unpublished".to_string();
+        let mut lapsed = published_page(PAGE_PUBLISHER);
+        lapsed.expires_at = Utc::now().timestamp().max(0) as u64;
+        let others = published_page("AI.other@worker1");
+        let pages = [&up, &half_down, &already_down, &lapsed, &others];
+        seed_publications(&ctx, &pages);
+        let ask = |action: &'static str, payload: Value| {
+            handle_admin_command(&ctx, &ctx.rpc, action, payload, Some("worker1".to_string()))
+        };
+
+        for (action, payload) in [
+            (
+                "kill_node",
+                json!({ "node_name": PAGE_PUBLISHER, "purge_instance": true }),
+            ),
+            (
+                "kill_node",
+                json!({ "node_name": "AI.sales", "purge_instance": true, "force": true }),
+            ),
+            (
+                "remove_node_instance",
+                json!({ "node_name": PAGE_PUBLISHER }),
+            ),
+        ] {
+            let (status, body) = ask(action, payload).await.expect("answered");
+            assert_node_has_pages(status, &body, action, &[&up, &half_down], &pages);
+            assert!(harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none());
+        }
+        assert_eq!(publication_status(&ctx, &up.publication_id), "published");
+
+        // A stop is no purge, and a node with no page up is purged: both go to the orchestrator.
+        for (payload, node_name) in [
+            (
+                json!({ "node_name": PAGE_PUBLISHER, "purge_instance": false }),
+                PAGE_PUBLISHER,
+            ),
+            (
+                json!({ "node_name": QUIET_NODE, "purge_instance": true }),
+                QUIET_NODE,
+            ),
+        ] {
+            let (answer, ()) = tokio::join!(
+                ask("kill_node", payload),
+                answer_node_action(&mut harness, "kill_node", node_name)
+            );
+            let (status, body) = answer.expect("answered");
+            assert_eq!(status, 200, "{body}");
+        }
+
+        // A ledger that cannot be read refuses the purge, and nothing is sent.
+        fs::write(&ctx.publication_ledger_path, b"{ not json").expect("a broken ledger");
+        let (status, body) = ask(
+            "kill_node",
+            json!({ "node_name": QUIET_NODE, "purge_instance": true }),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("PAGES_CHECK_FAILED"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The node a purging action names, as the orchestrator reads it: the hive its name carries,
+    /// else the payload's target or hive_id, else the admin's. A stop, another action, or no node
+    /// is none.
+    #[test]
+    fn the_node_a_purge_names() {
+        let named =
+            |action: &str, payload: Value| purged_node_name(action, &payload, PRIMARY_HIVE_ID);
+        for (action, payload, node_name) in [
+            (
+                "kill_node",
+                json!({ "node_name": "AI.sales@worker1", "purge_instance": true, "target": "worker2" }),
+                "AI.sales@worker1",
+            ),
+            (
+                "kill_node",
+                json!({ "node_name": "AI.sales", "purge_instance": true, "target": "worker1" }),
+                "AI.sales@worker1",
+            ),
+            (
+                "remove_node_instance",
+                json!({ "node_name": " AI.sales ", "hive_id": "worker2" }),
+                "AI.sales@worker2",
+            ),
+            (
+                "remove_node_instance",
+                json!({ "node_name": "AI.sales" }),
+                "AI.sales@motherbee",
+            ),
+        ] {
+            assert_eq!(
+                named(action, payload.clone()).as_deref(),
+                Some(node_name),
+                "{payload}"
+            );
+        }
+        for (action, payload) in [
+            ("kill_node", json!({ "node_name": "AI.sales@worker1" })),
+            (
+                "kill_node",
+                json!({ "node_name": "AI.sales@worker1", "purge_instance": false }),
+            ),
+            (
+                "kill_node",
+                json!({ "node_name": "AI.sales@worker1", "purge_instance": "true" }),
+            ),
+            ("kill_node", json!({ "purge_instance": true })),
+            ("remove_node_instance", json!({ "node_name": " " })),
+            (
+                "restart_node",
+                json!({ "node_name": "AI.sales@worker1", "purge_instance": true }),
+            ),
+        ] {
+            assert_eq!(named(action, payload.clone()), None, "{action} {payload}");
+        }
+    }
+
+    /// teardown_node of a node whose page is up, its own orchestrator's call after the kill
+    /// included (FINDINGS A-233): NODE_HAS_PAGES before its first step, nothing is read or removed,
+    /// and the report says no step ran. With the page down, the teardown goes on.
+    #[tokio::test]
+    async fn a_teardown_waits_for_the_nodes_pages() {
+        let (ctx, mut harness) = mesh_test_admin("teardown-pages");
+        let up = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&up]);
+        let result = teardown_of(&ctx, PAGE_PUBLISHER).await.expect("dispatch");
+        let body = result.envelope.to_string();
+        assert_node_has_pages(result.http_status, &body, "teardown_node", &[&up], &[&up]);
+        let payload = &result.envelope["payload"];
+        assert_eq!(payload["ilk_deleted"], json!(false));
+        assert_eq!(payload["vault_secrets_purged"]["status"], json!("skipped"));
+        assert_eq!(payload["ilk_delete"], json!({ "status": "skipped" }));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let mut down = up.clone();
+        down.status = "unpublished".to_string();
+        seed_publications(&ctx, &[&down]);
+        let not_found =
+            json!({ "status": "error", "error_code": "NOT_FOUND", "message": "failed to get ilk" });
+        let (result, _) = tokio::join!(
+            teardown_of(&ctx, PAGE_PUBLISHER),
+            answer_teardown(&mut harness, vec![("ILK_GET", not_found)])
+        );
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+    }
+
+    /// purge_ilk while a page of the ILK's node is up (FINDINGS A-233): SY.admin asks SY.identity
+    /// whose ILK it is and refuses with NODE_HAS_PAGES; nothing is purged. Another node's ILK, a
+    /// person's, and one SY.identity does not hold go on to their purge; with no page up,
+    /// SY.identity is not asked. An ILK SY.identity cannot read while a page is up, or a ledger
+    /// that cannot be read, refuses the purge.
+    #[tokio::test]
+    async fn an_ilk_is_purged_only_once_its_nodes_pages_are_down() {
+        let (ctx, mut harness) = opa_test_admin("purge-ilk-pages");
+        let up = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&up]);
+        let purge_ilk = || {
+            handle_identity_command(
+                &ctx,
+                &ctx.rpc,
+                "purge_ilk",
+                json!({ "ilk_id": TEST_ILK }),
+                None,
+            )
+        };
+        let purged = json!({ "status": "ok", "ilk_id": TEST_ILK, "state": "purged" });
+
+        let (answer, sent) = tokio::join!(
+            purge_ilk(),
+            answer_teardown(&mut harness, vec![("ILK_GET", ilk_of(PAGE_PUBLISHER))])
+        );
+        let (status, body) = answer.expect("answered");
+        assert_node_has_pages(status, &body, "purge_ilk", &[&up], &[&up]);
+        assert_eq!(sent[0].payload, json!({ "ilk_id": TEST_ILK }));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let person = json!({ "status": "ok", "ilk": { "ilk_id": TEST_ILK, "ilk_type": "human", "identification": { "email": "a@b.c" } } });
+        let not_found =
+            json!({ "status": "error", "error_code": "NOT_FOUND", "message": "failed to get ilk" });
+        for read in [ilk_of(QUIET_NODE), person, not_found] {
+            let (answer, _) = tokio::join!(
+                purge_ilk(),
+                answer_teardown(
+                    &mut harness,
+                    vec![("ILK_GET", read), ("ILK_PURGE", purged.clone())]
+                )
+            );
+            let (status, body) = answer.expect("answered");
+            assert_eq!(status, 200, "{body}");
+        }
+
+        let failed =
+            json!({ "status": "error", "error_code": "DB_NOT_READY", "message": "no database" });
+        let (answer, _) = tokio::join!(
+            purge_ilk(),
+            answer_teardown(&mut harness, vec![("ILK_GET", failed)])
+        );
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("PAGES_CHECK_FAILED"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // No page up: the purge goes straight to SY.identity.
+        let mut down = up.clone();
+        down.status = "expired".to_string();
+        seed_publications(&ctx, &[&down]);
+        let (answer, _) = tokio::join!(
+            purge_ilk(),
+            answer_teardown(&mut harness, vec![("ILK_PURGE", purged)])
+        );
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+
+        fs::write(&ctx.publication_ledger_path, b"{ not json").expect("a broken ledger");
+        let (status, body) = purge_ilk().await.expect("answered");
         assert_eq!(status, 409, "{body}");
         assert!(body.contains("PAGES_CHECK_FAILED"), "{body}");
         assert!(harness

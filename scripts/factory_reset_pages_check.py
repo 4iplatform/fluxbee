@@ -11,7 +11,10 @@ temporary directory:
 - when SY.admin does not list the pages (an older SY.admin's 404, or SY.admin gone during the
   run), the page step goes on and names the pages that stay public from SY.admin's ledger, read
   only (a reset without SY.admin at its start stops before this step);
-- no link's key is ever printed, whole or in part.
+- no link's key is ever printed, whole or in part;
+- a node's purge that SY.admin refuses with NODE_HAS_PAGES (a page it published after the page
+  step, FINDINGS A-233) is asked once more after the pages come down again; any other refusal is
+  not asked again.
 
 Usage: python3 scripts/factory_reset_pages_check.py
 """
@@ -27,6 +30,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 import uuid
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "packaging" / "fluxbee-factory-reset"
@@ -74,7 +78,8 @@ def listed_row(record):
 
 
 class FakeAdmin:
-    """SY.admin's two routes the step uses, over a set of pages that are up."""
+    """SY.admin's two routes the page step uses, over a set of pages that are up, and a node's
+    purge (kill_node), which it refuses with NODE_HAS_PAGES while a page of that node is up."""
 
     def __init__(self, pages, refuse=(), refuse_once=(), published_meanwhile=None, answer=None):
         self.up = {page["publication_id"]: page for page in pages}
@@ -83,6 +88,7 @@ class FakeAdmin:
         self.meanwhile = published_meanwhile
         self.answer = answer
         self.unpublished = []
+        self.purges = []
 
     def api(self, method, path, body=None, host=None, timeout=60):
         if self.answer is not None:
@@ -106,10 +112,30 @@ class FakeAdmin:
                 self.unpublished.append(pid)
             return 200, {"status": "ok", "action": "unpublish_artifact",
                          "payload": {"publication_id": pid, "unpublished": taken}}
+        if method == "DELETE" and path.startswith("/hives/") and "/nodes/" in path:
+            assert body == {"force": False, "purge_instance": True}, body
+            node = urllib.parse.unquote(path.rsplit("/", 1)[1])
+            self.purges.append(node)
+            mine = [pid for pid, page in self.up.items() if page["publisher_l2_name"] == node]
+            if mine:
+                return 409, {"status": "error", "action": "kill_node",
+                             "error_code": "NODE_HAS_PAGES",
+                             "error_detail": "%d public page(s) of %s are up; take them down first"
+                                             ": %s" % (len(mine), node, ", ".join(mine))}
+            return 200, {"status": "ok", "action": "kill_node", "payload": {"node_name": node}}
         return 404, {"status": "error", "error_code": "UNKNOWN_ROUTE"}
 
 
-class PageStepTest(unittest.TestCase):
+class NoKey:
+    """What every test checks of the reset's output: no link's key, whole or in part."""
+
+    def assert_no_key(self, text, records):
+        for record in records:
+            for part in (record["key"], record["key"][:16], record["key"][-16:]):
+                self.assertNotIn(part, text, "a key of %s was printed" % record["publication_id"])
+
+
+class PageStepTest(NoKey, unittest.TestCase):
     def setUp(self):
         self.reset = load_reset()
         self.tmp = tempfile.TemporaryDirectory()
@@ -129,11 +155,6 @@ class PageStepTest(unittest.TestCase):
         with open(self.reset.PUBLICATION_LEDGER, "w") as f:
             json.dump({"schema_version": 1,
                        "publications": {r["publication_id"]: r for r in records}}, f)
-
-    def assert_no_key(self, text, records):
-        for record in records:
-            for part in (record["key"], record["key"][:16], record["key"][-16:]):
-                self.assertNotIn(part, text, "a key of %s was printed" % record["publication_id"])
 
     def test_every_page_comes_down_by_its_id_a_late_one_too(self):
         pages = [ledger_record(created_at=n) for n in (3, 2)]
@@ -194,6 +215,74 @@ class PageStepTest(unittest.TestCase):
             self.assertIn(record["publication_id"], line)
             self.assertIn("report.html", line)
             self.assert_no_key(line, [record])
+
+
+class NodePurgeTest(NoKey, unittest.TestCase):
+    """The reset takes the pages down before it purges a node (FINDINGS A-233)."""
+
+    def setUp(self):
+        self.reset = load_reset()
+
+    def purge(self, admin, nodes):
+        self.reset.api = admin.api
+        pages = [2, []]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            failed = self.reset.kill_user_nodes(nodes, pages)
+        return failed, pages, out.getvalue()
+
+    def test_a_page_published_after_the_page_step_comes_down_and_the_purge_is_asked_again(self):
+        late = ledger_record()
+        admin = FakeAdmin([late])
+        failed, pages, out = self.purge(admin, [("worker1", "AI.sales@worker1"),
+                                                ("worker1", "AI.quiet@worker1")])
+        self.assertEqual(failed, [])
+        self.assertEqual(admin.purges,
+                         ["AI.sales@worker1", "AI.sales@worker1", "AI.quiet@worker1"])
+        self.assertEqual(admin.unpublished, [late["publication_id"]])
+        self.assertEqual(pages, [3, []])
+        self.assertIn("went up after [0]", out)
+        self.assertIn("OK    kill+purge AI.sales@worker1", out)
+        self.assert_no_key(out, [late])
+
+    def test_a_page_that_stays_up_fails_the_purge_once_more_and_is_counted(self):
+        stuck = ledger_record()
+        admin = FakeAdmin([stuck], refuse={stuck["publication_id"]})
+        failed, pages, out = self.purge(admin, [("worker1", "AI.sales@worker1")])
+        self.assertEqual([name for name, _, _ in failed], ["AI.sales@worker1"])
+        self.assertIn("NODE_HAS_PAGES", failed[0][2])
+        self.assertEqual(admin.purges, ["AI.sales@worker1", "AI.sales@worker1"])
+        self.assertEqual(pages[0], 2)
+        self.assertEqual([pid for pid, _ in pages[1]], [stuck["publication_id"]])
+        self.assert_no_key(out, [stuck])
+
+    def test_any_other_refusal_is_not_asked_again(self):
+        calls = []
+
+        def purge():
+            calls.append(1)
+            return 502, {"status": "error", "error_code": "ORCHESTRATOR_ERROR",
+                         "error_detail": "SY.timer did not answer"}
+
+        pages = [0, []]
+        with contextlib.redirect_stdout(io.StringIO()):
+            status, _ = self.reset.purge_once_pages_are_down(purge, pages)
+        self.assertEqual((status, len(calls), pages), (502, 1, [0, []]))
+
+    def test_a_workflows_refusal_names_the_code_in_its_detail(self):
+        # SY.wf-rules passes SY.admin's refusal on in its detail: the purge is asked again too.
+        late = ledger_record(created_at=7)
+        admin = FakeAdmin([late])
+        self.reset.api = admin.api
+        answers = [(502, {"status": "error", "error_code": "ORCHESTRATOR_ERROR",
+                          "error_detail": "NODE_HAS_PAGES: 1 public page(s) of WF.x@worker1 are up"}),
+                   (200, {"status": "ok"})]
+        pages = [0, []]
+        with contextlib.redirect_stdout(io.StringIO()):
+            status, resp = self.reset.purge_once_pages_are_down(lambda: answers.pop(0), pages)
+        self.assertEqual((status, resp), (200, {"status": "ok"}))
+        self.assertEqual(admin.unpublished, [late["publication_id"]])
+        self.assertEqual(pages, [1, []])
 
 
 if __name__ == "__main__":

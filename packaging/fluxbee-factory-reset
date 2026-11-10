@@ -9,19 +9,22 @@ Runs on the MOTHERBEE and covers the whole hive: user nodes on the spokes are ki
 their own orchestrator (kill_node is forwarded), identity deletes replicate as deltas.
 
 REMOVED (operator decisions, 2026-09-28):
+  - every published page that is up (a /public/<key> link), first: a purge never cascades, so a
+    node's purge is refused while a page it published is up (NODE_HAS_PAGES, FINDINGS A-233) and
+    a tenant's while a page of the tenant is (TENANT_HAS_PAGES, A-212). SY.admin lists them (GET
+    /artifacts, each by its publication_id, never by its link's key) and takes each down
+    (unpublish_artifact): the edge stops serving it and IO.blob releases its copy in
+    blob/public/. A node that publishes a page after that has its purge refused: the pages come
+    down again, and its purge is asked once more. The reset needs SY.admin: without its answer it
+    stops at the start (list_hives). When SY.admin answers but does not list the pages (an older
+    SY.admin without the route answers 404, or its ledger cannot be read), the reset goes on,
+    counts it as a problem, and names the pages that stay public from SY.admin's ledger, read
+    only (FINDINGS A-212);
   - workflows, on every hive that runs SY.wf-rules: wf_rules_delete with force (a workflow is not
     a normal node -- the rule is the source of truth; this removes the rule, the WF node, its
     state and its packages, running instances included);
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
-  - every published page that is up (a /public/<key> link), once no workflow or user node is left
-    to publish one: SY.admin lists them (GET /artifacts, each by its publication_id, never by its
-    link's key) and takes each down (unpublish_artifact): the edge stops serving it and IO.blob
-    releases its copy in blob/public/. The reset needs SY.admin: without its answer it stops at
-    the start (list_hives). When SY.admin answers but does not list the pages (an older SY.admin
-    without the route answers 404, or its ledger cannot be read), the reset goes on, counts it as
-    a problem, and names the pages that stay public from SY.admin's ledger, read only (FINDINGS
-    A-212);
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
@@ -448,11 +451,29 @@ def rm_path(path):
         os.remove(path)
 
 
-def kill_user_nodes(nodes):
+def purge_once_pages_are_down(purge, pages):
+    """A node's purge, a workflow's (wf_rules_delete) or a user node's (kill_node): SY.admin refuses
+    it with NODE_HAS_PAGES while a page the node published is up (FINDINGS A-233), as for one it
+    published after [0]. Then the pages come down again and the purge is asked once more. `pages`
+    is [0]'s [done, failures]: the pages this take-down takes down add to it, and the pages it
+    leaves up are the failures now."""
+    status, resp = purge()
+    if ok(status, resp) or "NODE_HAS_PAGES" not in str(resp):
+        return status, resp
+    print("    a page of the node went up after [0]: the pages come down, then the purge again")
+    done, failed = unpublish_pages()
+    pages[0] += done
+    pages[1] = failed
+    return purge()
+
+
+def kill_user_nodes(nodes, pages):
     failed = []
     for hive, name in nodes:
-        status, resp = api("DELETE", "/hives/%s/nodes/%s" % (q(hive), q(name)),
-                           {"force": False, "purge_instance": True}, timeout=120)
+        status, resp = purge_once_pages_are_down(
+            lambda: api("DELETE", "/hives/%s/nodes/%s" % (q(hive), q(name)),
+                        {"force": False, "purge_instance": True}, timeout=120),
+            pages)
         good = ok(status, resp)
         print("  %-5s kill+purge %s (on %s)" % ("OK" if good else "FAIL", name, hive))
         if not good:
@@ -564,7 +585,7 @@ def main():
 
     workflows = list_workflows()
     user_nodes, surviving, wf_nodes = classify_nodes(hives, base, hive_id, workflows)
-    # The listing counts the ILKs that go on their own (not those of the nodes removed in [0]/[1]).
+    # The listing counts the ILKs that go on their own (not those of the nodes removed in [1]/[2]).
     going = {name for _, name in user_nodes} | {name for _, name in wf_nodes}
     pages_now, pages_why = published_pages()
     ilks_now = user_ilks(hive_id, surviving | going, base)
@@ -579,20 +600,20 @@ def main():
 
     print("fluxbee-factory-reset -- hive %s (%s)" % (hive_id, "EXECUTE" if execute else "DRY-RUN"))
     print("hives: %s" % ", ".join("%s=%s" % h for h in hives))
-    print("\n[0] workflows to delete (wf_rules_delete force: rule, WF node, state, packages): %d" % len(workflows))
-    for hive, wf in workflows:
-        print("    %s  (on %s)" % (wf, hive))
-    print("[1] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
-    for hive, name in user_nodes:
-        print("    %s  (on %s)" % (name, hive))
     if pages_now is None:
-        print("[2] published pages: SY.admin did not list them (%s)" % pages_why)
+        print("\n[0] published pages: SY.admin did not list them (%s)" % pages_why)
         print_ledger_pages("    ")
     else:
-        print("[2] published pages to take down through SY.admin (unpublish_artifact; each one's copy"
+        print("\n[0] published pages to take down through SY.admin (unpublish_artifact; each one's copy"
               " in blob/public/ goes with it): %d" % len(pages_now))
         for p in pages_now:
             print("    %s" % page_line(p))
+    print("[1] workflows to delete (wf_rules_delete force: rule, WF node, state, packages): %d" % len(workflows))
+    for hive, wf in workflows:
+        print("    %s  (on %s)" % (wf, hive))
+    print("[2] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
+    for hive, name in user_nodes:
+        print("    %s  (on %s)" % (name, hive))
     print("[3] user ILKs to purge (mark + purge; already-marked ones too): %d  (plus the ILKs of the nodes above)" % len(ilks_now))
     for i in ilks_now:
         print("    %s  %-8s %s%s" % (i.get("ilk_id"), i.get("ilk_type"), i.get("display_name") or i.get("node_name") or "",
@@ -632,24 +653,28 @@ def main():
         die("confirmation does not match the hive_id -- nothing changed")
 
     t0 = time.time()
-    print("\n== [0/8] delete workflows")
+    print("\n== [0/8] take down the published pages")
+    # First: a node's purge ([1], [2]) is refused while a page it published is up (NODE_HAS_PAGES,
+    # FINDINGS A-233), a tenant's ([5]) while a page of the tenant is (TENANT_HAS_PAGES). While
+    # SY.admin, the edge and IO.blob run: nothing the reset stops serves the take-down.
+    pages_done, page_fail = unpublish_pages()
+    pages = [pages_done, page_fail]
+
+    print("== [1/8] delete workflows")
     wf_fail = []
     for hive, wf in workflows:
-        status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
-                           {"workflow_name": wf, "force": True}, timeout=180)
+        status, resp = purge_once_pages_are_down(
+            lambda: api("POST", "/hives/%s/wf-rules/delete" % q(hive),
+                        {"workflow_name": wf, "force": True}, timeout=180),
+            pages)
         good = ok(status, resp)
         print("  %-5s %s (on %s)" % ("OK" if good else "FAIL", wf, hive))
         if not good:
             wf_fail.append((wf, status, str(resp)[:200]))
             print("    %s %s" % (status, str(resp)[:200]))
-    print("== [1/8] kill+purge user nodes")
-    node_fail = kill_user_nodes(user_nodes)
-
-    print("== [2/8] take down the published pages")
-    # After [0] and [1], so no workflow or user node is left to publish a page meanwhile, and
-    # while SY.admin, the edge and IO.blob run: nothing the reset stops serves the take-down.
-    # Before [5]: a tenant with a page up is not purged (TENANT_HAS_PAGES).
-    pages_done, page_fail = unpublish_pages()
+    print("== [2/8] kill+purge user nodes")
+    node_fail = kill_user_nodes(user_nodes, pages)
+    pages_done, page_fail = pages
 
     print("== [3/8] purge user ILKs")
     # Keep the ILK of EVERY node still alive -- a kill that failed must not lose its identity.
