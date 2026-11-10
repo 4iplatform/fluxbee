@@ -185,11 +185,13 @@ defense in depth.
 
 It keeps state by `src_ilk` using `thread_state_*`.
 
-Minimal store:
+The model's state tools (its own, agent-tools-v1 T10):
 
 - `thread_state_get`
 - `thread_state_put`
-- `thread_state_delete`
+
+There is no `thread_state_delete`: a registered case ends saved as `completed`, and the turn's
+result is read back from it. Only the structured handoff deletes a registered case, in code.
 
 The effective state key is tied to the `src_ilk`.
 
