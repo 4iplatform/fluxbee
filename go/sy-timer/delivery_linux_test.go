@@ -164,6 +164,31 @@ func TestAFireItsTargetDidNotTakeIsSentAgain(t *testing.T) {
 	}
 }
 
+// A fire the router answers UNREACHABLE LINK_BUSY, its target's link queue full, is sent again as
+// one behind a link that is down (WAN_UNAVAILABLE) is: the refusal clears as the target reads (the
+// router from 0.1.129, FINDINGS A-222). Before, it was refused for good, and the fire lost.
+func TestAFireRefusedLinkBusyIsSentAgain(t *testing.T) {
+	for _, reason := range []string{"LINK_BUSY", "WAN_UNAVAILABLE"} {
+		t.Run(reason, func(t *testing.T) {
+			fastRetries(t)
+			service, tx := newTestService(t)
+			service.scheduler = newTimerScheduler(service)
+			insertDueTimer(t, service, "timer-1", "fire")
+			first := fireOnce(t, service, tx, "timer-1")
+			if err := service.handleMessage(unreachable(t, first, reason)); err != nil {
+				t.Fatalf("handle UNREACHABLE: %v", err)
+			}
+			if queuedRetries(service.scheduler) != 1 {
+				t.Fatalf("a fire refused %s must be sent again", reason)
+			}
+			service.scheduler.processDue(context.Background(), time.Now().UTC().Add(time.Second))
+			if again, fired := mustReadFire(t, tx); again == first || fired.TimerUUID != "timer-1" || fired.FireCount != 1 {
+				t.Fatalf("the retry must be the same fire under a new trace_id: %s %+v", again, fired)
+			}
+		})
+	}
+}
+
 func TestAFireIsNotSentAgainWhenItWouldNotBeOnTime(t *testing.T) {
 	for _, tc := range []struct {
 		name, policy, reason string

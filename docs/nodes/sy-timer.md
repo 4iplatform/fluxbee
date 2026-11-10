@@ -111,8 +111,10 @@ purged meanwhile (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_f
 
 Each attempt goes under a new trace id, and is kept 30 s for the router's answer (`deliver`). An
 `UNREACHABLE` with that trace id, for a target that is not connected (`NODE_NOT_FOUND`,
-`PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`), or a send that fails, sends the same
-fire again after 5, 10, 20 and 40 s, then each minute (`undelivered`, `retryLater`). The retries stop
+`PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`) or whose link queue is full
+(`LINK_BUSY`, from the router of 0.1.129, FINDINGS A-222: it clears as the target reads), or a send
+that fails, sends the same fire again after 5, 10, 20 and 40 s, then each minute (`undelivered`,
+`retryLater`). The retries stop
 an hour after the first attempt, sooner for a `fire_if_within` one-shot (its window from its
 scheduled time) and a recurring timer (its next instance), and a `drop` one-shot gets none
 (`deliveryDeadline`); then the fire is lost (`timer_fire_lost`). A fire the router refuses for

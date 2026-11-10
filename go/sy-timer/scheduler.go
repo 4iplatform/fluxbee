@@ -66,10 +66,11 @@ type timerScheduler struct {
 
 // Delivery (FINDINGS A-115). A fire is saved before it is sent, so a stop between the two loses it
 // instead of sending it twice. A fire the router answers UNREACHABLE because its target is not
-// connected (transientUnreachable) is sent again while it is still on time: up to an hour from its
-// first attempt, less for a fire_if_within one-shot (its window from its scheduled time) and for a
-// recurring timer (its next instance); a drop one-shot is not sent again. The retries live in memory:
-// a fire SY.timer is retrying when it stops is lost, as is one its target does not take in time.
+// connected, or its link is busy (transientUnreachable), is sent again while it is still on time:
+// up to an hour from its first attempt, less for a fire_if_within one-shot (its window from its
+// scheduled time) and for a recurring timer (its next instance); a drop one-shot is not sent again.
+// The retries live in memory: a fire SY.timer is retrying when it stops is lost, as is one its
+// target does not take in time.
 const (
 	// deliveryRetryWindow is how long a fire is sent again while its target cannot take it, from
 	// its first attempt.
@@ -90,13 +91,15 @@ var deliveryRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 20 
 var afterFireRead func(timerUUID string)
 
 // transientUnreachable are the router's UNREACHABLE reasons for a target that is down, restarting or
-// behind a link that is down. A fire refused for another reason (VPN_BLOCKED, OPA_*) is not sent
-// again.
+// behind a link that is down, and LINK_BUSY: its link queue is full, a refusal that clears as the
+// target reads (the router from 0.1.129, FINDINGS A-222). A fire refused for another reason
+// (VPN_BLOCKED, OPA_*) is not sent again.
 var transientUnreachable = map[string]bool{
 	"NODE_NOT_FOUND":      true,
 	"PEER_UNAVAILABLE":    true,
 	"WAN_UNAVAILABLE":     true,
 	"GATEWAY_UNAVAILABLE": true,
+	"LINK_BUSY":           true,
 }
 
 // fireAttempt is a fire on its way: the row as it was when it fired (the fire's scheduled time and
