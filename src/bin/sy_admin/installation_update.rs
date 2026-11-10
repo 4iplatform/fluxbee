@@ -2354,6 +2354,24 @@ enum CoreEnd {
     Failed,
     /// It never reached the hive.
     NotAnswered,
+    /// Its update is no longer open (superseded, done): nothing was sent.
+    Closed,
+}
+
+/// Whether the update `id` is still the open one, before a task sends `category` to `hive`: a task
+/// of an update closed meanwhile (superseded, done) sends nothing more, and says so. A send already
+/// under way when the update closes finishes, its outcome not recorded.
+fn still_open(updates: &Updates, id: &str, hive: &str, category: Category) -> bool {
+    let open = updates.read(|file| file.open.as_ref().is_some_and(|update| update.id == id));
+    if !open {
+        tracing::info!(
+            update = %id,
+            hive = %hive,
+            category = category.as_str(),
+            "installation update: no longer open (superseded or done): nothing more is sent for it"
+        );
+    }
+    open
 }
 
 /// What a hive's `next` says for an update that did not get it to the target, by category and
@@ -2818,7 +2836,7 @@ async fn run_claimed_hive(
 
 /// The core update of one hive: sent, asked again while `sync_pending` or unreachable, and, when its
 /// services restart or its answer does not come in time, left in flight for the background task to
-/// follow through `/versions`.
+/// follow through `/versions`. Not sent once its update is closed ([`still_open`]).
 #[allow(clippy::too_many_arguments)]
 async fn core_update(
     updates: &Updates,
@@ -2833,6 +2851,9 @@ async fn core_update(
     let Some(core_target) = &target.core else {
         return CoreEnd::Failed;
     };
+    if !still_open(updates, id, hive, Category::Core) {
+        return CoreEnd::Closed;
+    }
     let started = now_epoch_ms();
     // What the hive's record said before: after a restart of SY.admin, the follow tells this
     // update's record from it.
@@ -2985,6 +3006,7 @@ async fn core_update(
 }
 
 /// The config update of one hive: the version applied, asked again while its copy has not arrived.
+/// Not sent once its update is closed ([`still_open`]).
 async fn config_update(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -2997,6 +3019,9 @@ async fn config_update(
     let Some(config) = &target.config else {
         return;
     };
+    if !still_open(updates, id, hive, Category::Config) {
+        return;
+    }
     let started = now_epoch_ms();
     updates.record(
         id,

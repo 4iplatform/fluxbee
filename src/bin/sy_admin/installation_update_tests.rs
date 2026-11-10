@@ -2824,3 +2824,151 @@ async fn a_new_update_looks_at_each_hive_by_its_own_cadence() {
         "{due}"
     );
 }
+
+/// A task whose update is closed (superseded, or done) sends nothing more: an explicit run's pass
+/// still going after the run answered, the automatic step, a config apply (the follow's). A send
+/// already under way when its update closes finishes as before, its outcome not recorded.
+#[tokio::test]
+async fn a_task_of_a_closed_update_sends_nothing_more() {
+    let updates = Updates::load(&temp_state("installation-update-closed-sends"));
+    let mesh = FakeMesh::new(vec![
+        motherbee_on_target(),
+        worker_behind(),
+        config_behind("egress1"),
+    ]);
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let hives = ["motherbee", "worker1", "egress1"];
+    let old = open_update(&updates, "http", &hives);
+    // egress1 did not answer it: its automatic step would finish it.
+    for category in [Category::Core, Category::Config] {
+        let not_answered = Outcome::new(OutcomeStatus::NotAnswered, RunKind::Explicit, 1, 2);
+        updates.record(
+            &old,
+            "egress1",
+            category,
+            Standing::Pending,
+            None,
+            Some(not_answered),
+            None,
+        );
+    }
+    // A change of the installation file supersedes it.
+    let newer = Target {
+        config: Some(ConfigTarget {
+            version: 4,
+            sha256: "dddd".to_string(),
+        }),
+        ..target()
+    };
+    updates.change(|file| file.open_or_resume(&newer, "set_installation_ai", None, now_epoch_ms()));
+
+    // The old update's pass on worker1 (its core behind) and on egress1 (its config behind),
+    // egress1's automatic step and a config apply: each may read; none sends.
+    for hive in ["worker1", "egress1"] {
+        run_hive(
+            &updates,
+            dyn_mesh.as_ref(),
+            &old,
+            hive,
+            &target(),
+            &[],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &quick(),
+        )
+        .await;
+    }
+    automatic_step(
+        &updates,
+        dyn_mesh.as_ref(),
+        &old,
+        "egress1",
+        &target(),
+        &quick(),
+    )
+    .await;
+    config_update(
+        &updates,
+        dyn_mesh.as_ref(),
+        &old,
+        "egress1",
+        &target(),
+        RunKind::Background,
+        &quick(),
+    )
+    .await;
+    assert!(mesh.sent_to("worker1").is_empty());
+    assert!(mesh.sent_to("egress1").is_empty());
+
+    // A config apply under way when its update closes: it finishes, and the closed update keeps
+    // the send as it stood.
+    struct Answering {
+        began: tokio::sync::Notify,
+        answer: tokio::sync::Notify,
+        sent: AtomicUsize,
+    }
+    #[async_trait]
+    impl UpdateMesh for Answering {
+        async fn versions(&self, _hive: &str, _timeout: Duration) -> Result<Value, String> {
+            unreachable!("a config apply reads nothing")
+        }
+        async fn update(&self, _: &str, _: Value, _: Duration) -> Result<Value, String> {
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            self.began.notify_one();
+            self.answer.notified().await;
+            Ok(json!({"status": "ok", "restarted": [], "unchanged": []}))
+        }
+        fn orchestrator_connected(&self, _: &str) -> Option<bool> {
+            Some(true)
+        }
+        fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String> {
+            Ok((vec!["motherbee".to_string()], Vec::new()))
+        }
+        fn motherbee(&self) -> &str {
+            "motherbee"
+        }
+    }
+    let answering = Answering {
+        began: tokio::sync::Notify::new(),
+        answer: tokio::sync::Notify::new(),
+        sent: AtomicUsize::new(0),
+    };
+    let current = open_update(&updates, "http", &hives);
+    let the_target = target();
+    let bounds = quick();
+    let apply = config_update(
+        &updates,
+        &answering,
+        &current,
+        "egress1",
+        &the_target,
+        RunKind::Explicit,
+        &bounds,
+    );
+    let meanwhile = async {
+        answering.began.notified().await;
+        updates.change(|file| {
+            file.open_or_resume(&newer, "set_installation_ai", None, now_epoch_ms())
+        });
+        answering.answer.notify_one();
+    };
+    tokio::join!(apply, meanwhile);
+    assert_eq!(answering.sent.load(Ordering::SeqCst), 1);
+    let closed = updates
+        .read(|file| {
+            file.closed
+                .iter()
+                .find(|update| update.id == current)
+                .cloned()
+        })
+        .expect("closed");
+    assert_eq!(closed.state, UpdateState::Superseded);
+    assert_eq!(
+        closed.hives["egress1"]
+            .config
+            .outcome
+            .as_ref()
+            .map(|o| o.status),
+        Some(OutcomeStatus::Sent)
+    );
+}

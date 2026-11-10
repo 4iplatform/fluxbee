@@ -825,7 +825,10 @@ What it does (`handle_update_installation`, `run_explicit`):
    `ok` with `nothing_to_do`, and records nothing.
 5. **Opened or resumed** in `/var/lib/fluxbee/state/sy-admin/installation-update.json`: the same
    target resumes the open update (its `stale_target` cleared, `last_run_at_ms` the run's start);
-   another closes it as `superseded` and opens a new one.
+   another closes it as `superseded` and opens a new one. A task of a closed update (superseded,
+   or done) sends nothing more (since 0.1.124, `still_open`): the core update and the config apply
+   each check, before they send, that their update is still the open one, and the automatic step
+   sends through them; a send already under way finishes, its outcome not recorded.
 6. **Each hive's pass, at once** (`run_hive`), decided by `decide` from its `/versions`:
    - a hive another task holds: one that only reads it is waited for (its read's bound); one that
      acts on it (the follow applying its config, the automatic step) keeps it, and the hive is

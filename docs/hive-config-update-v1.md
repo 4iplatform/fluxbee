@@ -508,6 +508,12 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     it: the next explicit run supersedes it.
   - A run with the same target resumes the open update. A run with another target closes it as
     `superseded`, kept in the history, and opens a new one; a new update's hives start `unknown`.
+  - A task of a closed update (superseded, or done) sends nothing more: the core update and the
+    config apply each check, before they send, that their update is still the open one (the
+    automatic step sends through them, and records its attempt only in the open update); a send
+    already under way finishes, its outcome not recorded (since 0.1.124). **Why:** a pass of an
+    explicit run going on after its answer, or a superseded update's automatic step, sent the old
+    target's core or config, and held the hive from the new update meanwhile.
   - With no update open and every hive already on the target, a run answers ok with
     `nothing_to_do` and records nothing, so the history keeps real updates.
   - SY.admin's start picks an open update up from disk and looks at every hive again: a category
