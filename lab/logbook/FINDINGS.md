@@ -161,6 +161,10 @@ no change required
     (SY.admin, the operator's call to ride along), A-206 (SY.timer), A-211 (packaging) and A-181's
     leftover texts. **Found by its gate:** A-229 [General/admin], low. **Found by 0.1.125's
     builders:** A-230 [Archi], A-231 [General/admin], A-232 [General/shared], low.
+16. **0.1.125** ✅ live and checked on 8.x (2026-11-10): the sweep's A-212 to A-217, A-210 (mostly),
+    A-213's and A-224's orchestrator, A-229 and A-230, and from its review round A-235 (Archi's
+    redeploy that lost each node) and A-236 (a removed ingress's SY.edge). Its deploy saw A-199
+    again. **Found:** A-237 [General/SDK], low. **Next:** A-219 (built, in review, for 0.1.126).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -273,19 +277,17 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
 - A-196 🟡 A join's peer link can be written to Syncthing's config and never applied (latent).
 - A-199 🔵 The motherbee orchestrator's admin worker runs one request at a time, and a request its
-  caller gave up on still runs (a known limit, to evaluate).
+  caller gave up on still runs: seen again in 0.1.125's deploy, about 90 s of its update (the
+  remaining cost of a deploy's update since A-203).
 - A-200 🟡 SY.vault's boot re-announcement covers only its newest 200 secrets (latent, low).
 - A-208 🔵 With several routers on one hive (not supported), an IRP reply goes to the wrong link
   (low).
 - A-209 🔵 A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender
   (low).
-- The sweep's calls, decided by the operator on 2026-11-10: A-210 (one-time conversions go),
-  A-211 (wf-generic out of the core, ✅ 0.1.124), A-212 (the reset unpublishes the pages; an action
-  lists them), A-213 (`ORCH_DEFAULT_TENANT_ID` goes), A-214 (every fixed text in English), A-215 (a WF
-  forward clears the addressee), A-216 (the frontdesk retries), A-217 (wf-generic stays up on a
-  failed database), A-218 (the dead identity surface goes, a release alone), A-219 (a worker goes
-  out through the egress, by an action). Cron descriptors wait for the talk on a WF that starts on
-  a schedule.
+- The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
+  0.1.125; A-210 mostly (SY.edge's part after 2026-11-22, and a few the builder found); A-218 (the
+  dead identity surface, a release alone) and A-219 (a worker behind the egress, built for 0.1.126)
+  open. Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-220 🔵 A recurring timer the replay cannot schedule stays pending and holds its client_ref
   (low).
 - A-221 🔵 Cognition records a turn the agent never received when its delivery fails (low).
@@ -293,7 +295,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   queue for it grows without limit (latent; a design of its own).
 - A-223 🔵 io.api waits for a frontdesk handoff no longer than the frontdesk waits for
   SY.identity (low).
-- A-224 🟡 `set_storage` rewrites hive.yaml in place, not atomically (latent, low).
 - A-225 🔵 A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl
   error, a failed probe never says why (low; with A-219).
 - A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
@@ -301,14 +302,11 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   IO node (low).
 - A-228 🔵 The Go SDK's RPC error for UNREACHABLE drops the router's reason (low; the Go SDK,
   alone).
-- A-229 🔵 SY.admin's HTTP closes the connection without an answer when a handler fails (low).
-- A-230 🔵 Archi's prompt tells it to use the root tenant for an AI node with no tenant (low).
 - A-231 🔵 SY.admin's publication ledger never drops a row (low).
 - A-232 🔵 A page request's refusal repeats a bad `limit` (low; shared code).
 - A-233 🔵 A purged node's pages stay public until they expire (low).
 - A-234 🔵 SY.admin's HTTP reader allocates whatever `Content-Length` a client declares (low).
-- A-235 🔴 Archi's runtime redeploy purges each node and runs it again with no tenant: the node is gone (0.1.125).
-- A-236 🟡 Removing an ingress leaves its SY.edge running, still serving the published pages (0.1.125).
+- A-237 🔵 A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata (low; the SDK).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1387,7 +1385,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-236 [General/orchestrator] 🟡 (found 2026-11-10 by A-212's builder; checked in the code) — Removing an ingress leaves its SY.edge running, still serving the published pages
+### A-237 [General/SDK] 🔵 low (found 2026-11-10 by A-219's builder; read in the code) — A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata
+
+- **Why:** `derive_action_outcome` (`crates/fluxbee_sdk/src/policy.rs`) marks any status other than
+  ok, accepted or blocked as `Failed` in `meta.action_result`. A-219's `pending_confirm`, an
+  intermediate answer between the orchestrators, is labelled failed there, while the final admin
+  reply is right (ok or error).
+- **Fix, later (the Rust SDK, a release alone):** an intermediate status keeps its own outcome, or
+  the vocabulary names it.
+
+### A-236 [General/orchestrator] ✅ BUILT (0.1.125, 2026-11-10; by its test) (found 2026-11-10 by A-212's builder; checked in the code) — Removing an ingress leaves its SY.edge running, still serving the published pages
 
 - **Why:** `remove_hive`'s cleanup stops and disables a list of services that does not include
   `sy-edge` (`remove_hive_cleanup_script`, `src/bin/sy_orchestrator.rs:18193`). SY.edge's unit has
@@ -1398,7 +1405,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (SY.orchestrator, 0.1.125):** `sy-edge` in the cleanup's list (stopped, disabled, killed),
   with a test.
 
-### A-235 [Archi] 🔴 (found 2026-11-10 by 0.1.125's review round; checked in the code) — Archi's runtime redeploy kills each node with its instance purged and runs it again with no tenant, so the node is gone for good
+### A-235 [Archi] ✅ BUILT (0.1.125, 2026-11-10; by its test) (found 2026-11-10 by 0.1.125's review round; checked in the code) — Archi's runtime redeploy kills each node with its instance purged and runs it again with no tenant, so the node is gone for good
 
 - **Why:** `redeploy_runtime_nodes_with_current` (`src/bin/sy_architect.rs:11022`), used by a
   software publish that promotes to current, kills each node of the runtime with
@@ -1446,7 +1453,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** rows down for some time move out (or are dropped), with the ledger's history kept
   where the operator needs it.
 
-### A-230 [Archi] 🔵 low (found 2026-11-10 by A-213's builder; read in the code) — Archi's prompt tells it to use the root tenant for an AI node with no tenant
+### A-230 [Archi] ✅ VALIDATED ON 8.x (0.1.125, 2026-11-10; Archi asked for the tenant) (found 2026-11-10 by A-213's builder; read in the code) — Archi's prompt tells it to use the root tenant for an AI node with no tenant
 
 - **Why:** in legacy direct-task mode the prompt says to take the single active "root/default"
   tenant from `list_tenants` when an `AI.*` node names none (`src/bin/sy_architect.rs:2517`). The
@@ -1458,7 +1465,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `src/bin/sy_architect.rs:2514`, `docs/archi/handbook_fluxbee.md:1548`, `:1555`,
   `src/bin/sy_admin.rs:16220`, `:16242`.
 
-### A-229 [General/admin] 🔵 low (found 2026-11-10 by 0.1.124's gate; checked on 8.x and in the code) — SY.admin's HTTP closes the connection without an answer when a handler fails
+- **Fixed (0.1.125) and checked on 8.x:** asked to create `AI.gate0125b@worker1` with no tenant,
+  Archi asked which tenant, said AI nodes cannot run in the root tenant, and offered the two that
+  can; no plan staged.
+
+### A-229 [General/admin] ✅ VALIDATED ON 8.x (0.1.125, 2026-11-10; 413 answered) (found 2026-11-10 by 0.1.124's gate; checked on 8.x and in the code) — SY.admin's HTTP closes the connection without an answer when a handler fails
 
 - **Seen:** `POST /hives/motherbee/nodes/SY.timer@motherbee/messages` with a 131 KB payload: SY.admin's
   SDK refused the frame ("message too large: 131646 bytes (max 131072)"), and the caller got the
@@ -1466,6 +1477,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Why:** `run_http_server` logs a handler's `Err` and drops the stream (`src/bin/sy_admin.rs:9803`);
   only the handlers' own answers produce a response.
 - **Fix (SY.admin, small):** a handler's error answers 500 with SY.admin's error shape.
+
+- **Fixed (0.1.125) and checked on 8.x:** a 131,390-byte node message answered HTTP 413
+  `MESSAGE_TOO_LARGE` ("nothing was sent"); other handler failures answer 500 with a fixed text; the
+  405 and 413 status lines are right.
 
 ### A-228 [General/Go SDK] 🔵 low (found 2026-11-10 by A-202's builder; read in the code) — The Go SDK's RPC error for UNREACHABLE drops the router's reason
 
@@ -1506,7 +1521,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   failed probe cannot say whether DNS, the connection or the time failed.
 - **Fix:** with A-219's build, which uses all three.
 
-### A-224 [General/orchestrator] 🟡 LATENT, low (found 2026-11-10 by A-219's design; checked in the code) — `set_storage` rewrites hive.yaml in place, not atomically
+### A-224 [General/orchestrator] ✅ BUILT (0.1.125, 2026-11-10; by its test) (found 2026-11-10 by A-219's design; checked in the code) — `set_storage` rewrites hive.yaml in place, not atomically
 
 - **Why:** `persist_storage_path_in_hive` writes the file with `fs::write` (`src/bin/sy_orchestrator.rs`
   ~33128). A crash or a full disk during the write can leave a truncated hive.yaml, and the
@@ -1610,7 +1625,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   region are open: removing the region means a new `IDENTITY_VERSION`, with the router, every SDK
   and every published runtime moving together.
 
-### A-217 [WF] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — wf-generic exits with `log.Fatalf` when its database fails, and restarts every 5 s without ever reporting why
+### A-217 [WF] ✅ BUILT (0.1.125, 2026-11-10; by its tests) (from the sweep of 2026-11-07; read in the code) — wf-generic exits with `log.Fatalf` when its database fails, and restarts every 5 s without ever reporting why
 
 - **Why:** any error from `node.Run` ends in `log.Fatalf` (`go/nodes/wf/wf-generic/main.go:54-68`):
   a bad `db_path`, a corrupt database, a full disk or a failed recovery. The unit restarts it
@@ -1620,7 +1635,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (wf-generic, a new wf.engine runtime):** stay up DEGRADED, or FAILED_CONFIG when the cause
   is the `db_path`; refuse events with an error; try the database again on a tick.
 
-### A-216 [General/frontdesk] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — The frontdesk fails a registration for good on a transient error
+- **Built (0.1.125):** the node stays up DEGRADED (`store_unavailable`) or FAILED_CONFIG (the
+  `db_path` at fault), refuses events, retries the store every 30 s; from the review round, a
+  reconcile that cannot read its timers keeps the node DEGRADED and retrying, so a fire dropped
+  while the store was down is given once it opens.
+
+### A-216 [General/frontdesk] ✅ BUILT (0.1.125, 2026-11-10; by its tests) (from the sweep of 2026-11-07; read in the code) — The frontdesk fails a registration for good on a transient error
 
 - **Why:** the prompt's no-loop rule makes any `ilk_register` error final (`completed_error`,
   `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:96-118`), the tool marks UNREACHABLE,
@@ -1632,7 +1652,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the case awaiting confirmation so the person's next "yes" retries; final only when not
   retryable. A case already stuck on a transient code is reopened.
 
-### A-215 [WF] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — A WF forward to an IO node other than the person's keeps the original `dst_ilk` and `ich`
+- **Built (0.1.125):** a transient failure retried within one 8 s deadline (below io.api's wait),
+  then the case stays awaiting confirmation; one `ilk_register` per turn, held in the code; only
+  the failing turn answers `IDENTITY_UNAVAILABLE`; G6 left the spec.
+
+### A-215 [WF] ✅ BUILT (0.1.125, 2026-11-10; by its tests) (from the sweep of 2026-11-07; read in the code) — A WF forward to an IO node other than the person's keeps the original `dst_ilk` and `ich`
 
 - **Why:** `execForward` copies the message's `src_ilk`, `dst_ilk` and `ich`, and rewrites only a
   forward to the person's own IO node (`go/nodes/wf/wf-generic/node/actions.go:235-279`). An
@@ -1643,7 +1667,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   as `send_message` does; cognition's fallback (the last person who wrote through that node)
   covers the team's case.
 
-### A-214 [General/language] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — Fixed texts the product sends are in Spanish, and the frontdesk answers everyone in Spanish
+### A-214 [General/language] ✅ BUILT (0.1.125, 2026-11-10; the texts by tests) (from the sweep of 2026-11-07; read in the code) — Fixed texts the product sends are in Spanish, and the frontdesk answers everyone in Spanish
 
 - **Why:** about 15 fixed texts: the frontdesk's `human_message` values, which io.api and io.cloud
   pass outside; ai.generic's "Aca esta el archivo solicitado" (`ai_node_runner.rs:3071-3084`);
@@ -1655,7 +1679,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   frontdesk's model answers in the person's language. The Spanish test names and strings the
   2026-10-17 pass left go too.
 
-### A-213 [General/orchestrator] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; checked on 8.x) — The `ORCH_DEFAULT_TENANT_ID` fallback puts a node with no tenant in whatever tenant it names
+- **Built (0.1.125):** every fixed text in English (the frontdesk's, ai.generic's, io.slack's error
+  post, SY.architect's help), the frontdesk's model answers in the person's language, Spanish test
+  names and strings across the repo translated. Kept on purpose: input recognition of Spanish, the
+  operator's quotes in the logbooks and design docs, gate transcripts, people's and nodes' names.
+
+### A-213 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.125, 2026-11-10; both refusals seen) (from the sweep of 2026-11-07; checked on 8.x) — The `ORCH_DEFAULT_TENANT_ID` fallback puts a node with no tenant in whatever tenant it names
 
 - **Why:** `resolve_tenant_id_for_node` falls back to the variable after the request's tenant
   (`src/bin/sy_orchestrator.rs:21543-21565`), for the spawn, the gates and the identity
@@ -1663,7 +1692,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call:** yes, drop it: the tenant is the caller's datum.
 - **Fix (SY.orchestrator):** the fallback, its error text and its docs go.
 
-### A-212 [General/admin] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — The factory reset, and a tenant's purge, leave published pages public; no action lists them
+- **Built (0.1.125):** no fallback; a spawn with no tenant refused at the registration with "there
+  is no default tenant"; two different tenants refused `INVALID_REQUEST` before anything is written;
+  config.json records the registered tenant, trimmed. **Checked on 8.x:** `run_node` of a throwaway
+  `AI.gate0125@worker1` answered both refusals, and nothing was left on worker1.
+
+### A-212 [General/admin] ✅ VALIDATED ON 8.x (0.1.125, 2026-11-10; `GET /artifacts` answered, no key) (from the sweep of 2026-11-07; read in the code) — The factory reset, and a tenant's purge, leave published pages public; no action lists them
 
 - **Why:** the reset never touches publications (`packaging/fluxbee-factory-reset:39`), and a
   page stays at its link until it expires: 24 h by default, 30 days at most. A tenant's purge
@@ -1671,6 +1705,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call:** yes, option (a).
 - **Fix (SY.admin, the reset script, Archi's handbook):** a read-only SY.admin action that lists
   the live pages; the reset unpublishes each one through SY.admin.
+
+- **Built (0.1.125):** `list_published_artifacts` (`GET /artifacts`, paged, Archi's read, rows
+  without the link's key, `publication_id` to unpublish); the factory reset unpublishes every live
+  page first; a tenant's purge is refused `TENANT_HAS_PAGES` while one is up (the operator's
+  2026-09-28 rule: a purge never cascades); a page on a removed edge comes down without asking it.
+  **Checked on 8.x:** `GET /artifacts` answered `ok` with no page live and no key field.
 
 ### A-211 [General/packaging] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10) (from the sweep of 2026-11-07; checked on 8.x) — wf-generic ships as a core binary that nothing runs
 
@@ -1683,7 +1723,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fixed (0.1.124) and checked on 8.x:** no `/usr/bin/wf-generic` nor `dist/core/bin/wf-generic`
   on the motherbee; WF.gate0206@worker1 runs `wf.engine` 0.1.124.
 
-### A-210 [General/cleanup] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — One-time conversions for versions every hive has passed still run at each start
+### A-210 [General/cleanup] 🟡 MOSTLY BUILT (0.1.125, 2026-11-10; SY.edge's part after 2026-11-22) (from the sweep of 2026-11-07; read in the code) — One-time conversions for versions every hive has passed still run at each start
 
 - **Why:** SY.storage drops ≤0.1.82 turn columns and pre-0.1.103 cognition tables
   (`src/bin/sy_storage.rs`), ai.generic converts `behavior.capabilities` (0.1.86), SY.edge re-keys
@@ -1694,6 +1734,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the old hive.yaml keys, the command log without `seq`, the installation update's handling of an
   orchestrator before 0.1.121. SY.edge's re-keying after 2026-11-22, when the last pre-0.1.84 page
   has expired.
+
+- **Built (0.1.125):** SY.storage's two one-time drops, SY.cognition's old folders, ai.generic's
+  `behavior.capabilities` conversion, SY.identity's channel-scope fill (a scope is now required:
+  a record without one is refused), SY.admin's ACME `name` alias. **Left:** SY.edge's re-keying of
+  pre-0.1.84 pages (after 2026-11-22); and, found by the builder, `add_turns_writer` (SY.storage),
+  SY.identity's migrations v3/v4 and `move_account_to_installation_scope`, ai.generic's
+  `runtime.immediate_memory` hint, a stale runbook section ("Rolling back to 0.1.86").
 
 ### A-209 [General/router] 🔵 low (found 2026-11-09 by A-203's builder; read in the code) — A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender, under the copy's trace_id
 
@@ -1919,6 +1966,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   settled about 27 s late.
 - **Proposal:** answer read forwards (`GET_VERSIONS`, `list_versions`) outside the single worker,
   and drop a queued request whose caller's deadline has passed. The operator's call on when.
+
+- **Seen again, 0.1.125's deploy (2026-11-10):** the installation update closed 131 s after its
+  call, while the spokes settled by +42 s. The motherbee orchestrator received reads at 07:40:50 and
+  07:40:53, then nothing until 07:41:39 (46 s), and again nothing from 07:41:42 to 07:42:31 (49 s):
+  twice a read forwarded around a spoke orchestrator's restart got no answer, and the one-at-a-time
+  worker waited out its 45 s bound with every other read queued behind. Each spoke answered within
+  about a second once asked. With A-203 fixed this is the remaining cost of a deploy's update, about
+  90 s here.
 
 ### A-198 [General/admin] ✅ VALIDATED ON 8.x (0.1.123, 2026-11-09; found 2026-11-09 while fixing A-197) — Other SY.admin mesh replies can outgrow the frame, and the caller then waits to its timeout
 

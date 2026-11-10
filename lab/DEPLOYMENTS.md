@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.124** | 2026-11-10 | `bffaf4f2` | motherbee + spokes (core): the router's release: a WAN session runs its cleanup however it ends and a send into a dead link is answered (A-203, the links between sibling routers and to nodes too); a WAN peer silent for the dead interval is cut (A-207), and a WAN handshake has a deadline; a sender's message the router's additions take over the frame is answered `FRAME_TOO_LARGE`, a broadcast everywhere or nowhere (A-202); the router no longer reads hive.yaml's `ai` and blob keys; with SY.admin's installation update record (A-204, A-205, and its review round's fixes), SY.timer refusing a `TZ=`/`CRON_TZ=`/`@` cron spec (A-206), wf-generic out of the core (A-211) and A-181's leftover texts | ✅ live, checked on 8.x | snap `pre-router-0-1-124` (all 4 VMs) · `apt install fluxbee=0.1.123` + 0.1.123's `update_installation` (the installation file v7 stays; 0.1.123's router needs hive.yaml's `ai` and blob keys valid, as they are on 8.x) |
+| **0.1.125** | 2026-11-10 | `f39e2bb0` | motherbee + spokes (core): the sweep's calls: published pages listed (`GET /artifacts`), taken down by the factory reset, and a tenant's purge refused while one is up (A-212); no default tenant and two different tenants refused (A-213); every fixed text in English and the frontdesk answering in the person's language (A-214); a WF forward to another IO node names no one (A-215); the frontdesk retrying a transient failure (A-216); wf-generic staying up on a failed store (A-217); one-time conversions removed (A-210, mostly); hive.yaml written atomically by `set_storage` (A-224); SY.admin's HTTP answering a failed handler (A-229); Archi asking for a node's tenant (A-230); Archi's runtime redeploy keeping each node's tenant (A-235); a removed ingress's SY.edge stopped (A-236) | ✅ live, checked on 8.x | snap `pre-clean-0-1-125` (all 4 VMs) · `apt install fluxbee=0.1.124` + 0.1.124's `update_installation` (SY.identity of 0.1.124 still reads every record 0.1.125 writes) |
+| **0.1.124** | 2026-11-10 | `bffaf4f2` | motherbee + spokes (core): the router's release: a WAN session runs its cleanup however it ends and a send into a dead link is answered (A-203, the links between sibling routers and to nodes too); a WAN peer silent for the dead interval is cut (A-207), and a WAN handshake has a deadline; a sender's message the router's additions take over the frame is answered `FRAME_TOO_LARGE`, a broadcast everywhere or nowhere (A-202); the router no longer reads hive.yaml's `ai` and blob keys; with SY.admin's installation update record (A-204, A-205, and its review round's fixes), SY.timer refusing a `TZ=`/`CRON_TZ=`/`@` cron spec (A-206), wf-generic out of the core (A-211) and A-181's leftover texts | ✅ replaced by 0.1.125 | snap `pre-router-0-1-124` (deleted 2026-11-10) · `apt install fluxbee=0.1.123` + 0.1.123's `update_installation` (the installation file v7 stays; 0.1.123's router needs hive.yaml's `ai` and blob keys valid, as they are on 8.x) |
 | **0.1.123** | 2026-11-09 | `e6f6c93f` | motherbee + spokes (core): hive-config-update-v1's stage 4: SY.admin's installation update (`update_installation`, the operator's word; `get_installation_update`, Archi's read) brings every hive to the motherbee's core and installation file, core then config, kept in SY.admin's state dir and resumed after a restart; what it leaves alone, with why (a hive rolled back with `core_rollback` keeps its core and the update is `held`; a hand-edited copy gets no config); the automatic step, once per hive and target, for a hive that did not answer and comes back; `set_installation_ai` opens it, Archi follows it, `ops.py deploy` runs it; with A-198: a mesh reply that does not fit the frame answers `REPLY_TOO_LARGE` with its outcome, optional `limit`/`cursor` pages on the listings that grow (every row without them, as before), an executor run's answer cut to fit; and A-201: Archi reads the admin command log | ✅ replaced by 0.1.124 | snap `pre-inst-0-1-123` (deleted 2026-11-10) · `apt install fluxbee=0.1.122` + `ops deploy 0.1.122`'s per-spoke core update (SY.admin's `installation-update.json` stays, ignored by 0.1.122) |
 | **0.1.122** | 2026-11-09 | `6c6d963d` | motherbee + spokes (core): hive-config-update-v1's stage 3c: the operator changes the installation's `ai` through SY.admin (`get_installation`, Archi's read; `set_installation_ai`, the operator's word, through Archi's confirmed plan or loopback), A-11's checks, the motherbee's orchestrator writes the next version and every hive applies it (`SYSTEM_UPDATE` category `config`), restarting only the start readers whose engine changed; SY.admin's executor and Archi take it at their next use; with A-197: Archi reads SY.admin's catalog in its compact view over the mesh | ✅ replaced by 0.1.123 | snap `pre-inst-0-1-122` (deleted 2026-11-09) · `apt install fluxbee=0.1.121` + core-update of the spokes (the installation file stays at its version, which 0.1.121's readers read the same) |
 | **0.1.121** | 2026-11-08 | `84d123ae` | motherbee + spokes (core): hive-config-update-v1's stage 3b: the motherbee writes the installation file's version 1 from its hive.yaml `ai` and distributes it (`fluxbee-dist-installation`, following vendor's members); the join copies it and writes no `ai`; SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it; `/versions` shows each hive's `config` | ✅ replaced by 0.1.122 | snap `pre-inst-0-1-121` (deleted 2026-11-09) · `apt install fluxbee=0.1.120` + core-update of the spokes (keep each hive.yaml `ai`; a worker joined by 0.1.121 needs it put back, HANDBOOK) |
@@ -133,6 +134,57 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.125 — The sweep's calls
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.124 · **Commit:** `f39e2bb0`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the operator decided the sweep's list on 2026-11-10 (lab/logbook/2026-11-10.md); the
+  decided items on the product's binaries went out together, a branch per binary, and the review
+  round found two bugs of its own (A-235, A-236), fixed in the same release.
+- **What changed, by binary:**
+  - **SY.admin:** `list_published_artifacts` (`GET /artifacts`, Archi's read, no link key); a
+    tenant's purge refused `TENANT_HAS_PAGES` while a page is up; a page on a removed edge comes down
+    without asking it (A-212); the ACME `name` alias removed (A-210); a failed handler answered 413
+    `MESSAGE_TOO_LARGE` or 500 (A-229); its help says the tenant is the operator's (A-230).
+  - **SY.architect:** asks for a node's tenant, never a default (A-230); its runtime redeploy reads
+    each node's tenant first and leaves a node without one alone (A-235).
+  - **SY.orchestrator:** no `ORCH_DEFAULT_TENANT_ID`, two different tenants refused, config.json
+    with the registered tenant (A-213); hive.yaml written atomically by `set_storage` (A-224);
+    `remove_hive` stops `sy-edge` (A-236).
+  - **SY.frontdesk.gov:** a transient registration failure retried within 8 s and the case kept open,
+    one registration per turn, English texts, the model answers in the person's language (A-216,
+    A-214).
+  - **wf-generic (`wf.engine`):** a forward to another IO node clears the addressee (A-215); a failed
+    store leaves the node up DEGRADED or FAILED_CONFIG, retrying, with a fire dropped meanwhile given
+    once it opens (A-217).
+  - **SY.storage, SY.cognition, SY.identity, ai.generic:** one-time conversions removed; SY.identity
+    now requires a channel's scope (A-210). ai.generic's and io.slack's fixed texts in English, and
+    Spanish test names and strings across the repo (A-214).
+  - **Packaging:** the factory reset unpublishes every live page first (A-212).
+- **Build and review:** six branches, CI green on each and on the integrated head. One review round,
+  a reviewer per branch: nothing high; one medium (wf-generic's dropped fire) and the lows fixed;
+  A-235 (high in effect: a node lost on a runtime redeploy) and A-236 found and fixed.
+- **The deploy:** build of `f39e2bb0` in 43.3 min (most crates changed), publish in 16 s,
+  `ops deploy 0.1.125` in 372 s, health clean; snapshot `pre-clean-0-1-125`, `pre-router-0-1-124`
+  dropped. Phases: snapshots 29.0 s; apt install 123.9 s; the admin on the version 61.4 s; the spokes
+  answering 12.2 s; the update's call 34.6 s; the hives on the target 96.8 s; health 5.4 s.
+  - **The update closed `done` 131 s after its call**, while each spoke settled by +42 s (its own
+    records). The motherbee orchestrator's admin worker sat twice for its 45 s forward bound, a read
+    lost around a spoke orchestrator's restart each time, with every other read behind it (A-199).
+- **Checked on 8.x (the gates; the operator's standing word for 8.x):**
+  - **A-229:** a 131,390-byte node message through SY.admin's HTTP answered 413
+    `MESSAGE_TOO_LARGE`, "nothing was sent" (0.1.124 closed the connection).
+  - **A-213:** `run_node` of a throwaway `AI.gate0125@worker1` with no tenant answered
+    `IDENTITY_REGISTER_FAILED`, "there is no default tenant"; with two different tenants,
+    `INVALID_REQUEST`; nothing was left on worker1.
+  - **A-212:** `GET /artifacts` answered `ok`, no page live on 8.x, no key field.
+  - **A-230:** Archi, asked to create `AI.gate0125b@worker1` with no tenant, asked which tenant and
+    offered the two non-root ones; no plan staged.
+  - **AI.pruebas** answered a throwaway IO client; WF.gate0206@worker1 runs `wf.engine` 0.1.125.
+  - A-214, A-215, A-216, A-217, A-224, A-235 and A-236 by their tests (CI).
+  - **PROD after the gates:** all four hives on 0.1.125 (`6e32853b`), the installation file version
+    7, snapshot `pre-clean-0-1-125` on each VM.
 
 ## 0.1.124 — The router's release: no frame lost in silence
 
