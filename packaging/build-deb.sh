@@ -46,10 +46,10 @@ RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_r
   sy-architect:sy_architect sy-vault:sy_vault sy-orchestrator:sy_orchestrator
   sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition
   sy-edge:sy_edge)
-GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules
-  wf-generic:go/nodes/wf/wf-generic)
-# units: every core service EXCEPT wf-generic (a runtime the orchestrator spawns).
-# sy-edge gets a dedicated unit below (custom rt-gateway ordering).
+# wf-generic is not a core binary: it ships only as the wf.engine runtime, seeded below from
+# base-nodes.json, which is what every WF node runs (FINDINGS A-211).
+GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules)
+# units: every core service. sy-edge gets a dedicated unit below (custom rt-gateway ordering).
 UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
   sy-orchestrator sy-storage sy-identity sy-cognition sy-timer sy-wf-rules sy-frontdesk-gov)
 
@@ -64,7 +64,7 @@ cargo build --release --locked -p sy-frontdesk-gov --bin sy-frontdesk-gov
 # previous manual build had left the binary behind.
 cargo build --release --locked -p fluxbee-ai-nodes --bin ai_node_runner
 # Build every nodes/io crate the base-node manifest references (singleton infra nodes +
-# io.* runtimes). wf-generic (go) is built in the go step below.
+# io.* runtimes). wf-generic (go), the wf.engine runtime, is built in the go step below.
 IO_PKGS="$( { mf singletons; mf runtimes; } | awk -F'\t' '$4=="nodes/io"{print $2}' | sort -u )"
 [ -n "$IO_PKGS" ] && cargo build --release --manifest-path nodes/io/Cargo.toml $(printf -- '-p %s ' $IO_PKGS)
 echo "== [2/5] build go =="

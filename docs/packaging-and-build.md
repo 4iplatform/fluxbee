@@ -15,9 +15,10 @@ motherbee only — see [07-operaciones.md](history/07-operaciones.md) for the de
 
 - The **core** (`SY.*`): rt-gateway, sy-admin, sy-config-routes, sy-architect, sy-vault,
   sy-orchestrator, sy-storage, sy-identity, sy-cognition, sy-edge (Rust) +
-  sy-opa-rules, sy-timer, sy-wf-rules, wf-generic (Go) + sy-frontdesk-gov. Each core
+  sy-opa-rules, sy-timer, sy-wf-rules (Go) + sy-frontdesk-gov. Each core
   binary travels in `/usr/bin` **and** in `/var/lib/fluxbee/dist/core/bin` (this copy is the one the
   dist-sync replicates to the spokes; its hashes are baked into `dist/core/manifest.json`).
+  wf-generic (Go) is not core since 0.1.124: it ships only as the `wf.engine` runtime below.
 - The **base IO/AI nodes**, defined declaratively in
   [`packaging/base-nodes.json`](../packaging/base-nodes.json) (the single source of truth).
 

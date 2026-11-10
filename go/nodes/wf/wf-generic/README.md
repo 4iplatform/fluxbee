@@ -139,12 +139,13 @@ cd ~/fluxbee/go/nodes/wf/wf-generic
 ./wf-generic --config /tmp/wf.invoice.config.json
 ```
 
-Managed-runtime-style run:
+Managed-runtime-style run, with the binary built above (an installation has no
+`/usr/bin/wf-generic`: it ships only as the `wf.engine` runtime):
 
 ```bash
 sudo mkdir -p /var/lib/fluxbee/nodes/WF/WF.invoice@motherbee
 sudo cp /tmp/wf.invoice.config.json /var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/config.json
-FLUXBEE_NODE_NAME=WF.invoice@motherbee /usr/bin/wf-generic
+FLUXBEE_NODE_NAME=WF.invoice@motherbee ./wf-generic
 ```
 
 Example client from the repo (it starts an instance; the instance verbs answer only SY.admin and
