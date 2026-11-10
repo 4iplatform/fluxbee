@@ -2851,8 +2851,9 @@ async fn a_new_update_looks_at_each_hive_by_its_own_cadence() {
 }
 
 /// A task whose update is closed (superseded, or done) sends nothing more: an explicit run's pass
-/// still going after the run answered, the automatic step, a config apply (the follow's). A send
-/// already under way when its update closes finishes as before, its outcome not recorded.
+/// still going after the run answered, the automatic step (before its attempt, and between its
+/// core and its config), a config apply (the follow's). A send already under way when its update
+/// closes finishes as before, its outcome not recorded.
 #[tokio::test]
 async fn a_task_of_a_closed_update_sends_nothing_more() {
     let updates = Updates::load(&temp_state("installation-update-closed-sends"));
@@ -2995,6 +2996,104 @@ async fn a_task_of_a_closed_update_sends_nothing_more() {
             .as_ref()
             .map(|o| o.status),
         Some(OutcomeStatus::Sent)
+    );
+
+    // The automatic step's update closes after its attempt is recorded, while its core update is
+    // under way: the core is refused, and its config, which goes after a core that failed (one
+    // version everywhere), is not sent.
+    struct Refusing {
+        snapshots: HashMap<String, Value>,
+        began: tokio::sync::Notify,
+        answer: tokio::sync::Notify,
+        sent: Mutex<Vec<Value>>,
+    }
+    #[async_trait]
+    impl UpdateMesh for Refusing {
+        async fn versions(&self, hive: &str, _timeout: Duration) -> Result<Value, String> {
+            self.snapshots
+                .get(hive)
+                .cloned()
+                .ok_or_else(|| "no such hive".to_string())
+        }
+        async fn update(&self, _: &str, payload: Value, _: Duration) -> Result<Value, String> {
+            lock(&self.sent).push(payload.clone());
+            if payload["category"] == json!("core") {
+                self.began.notify_one();
+                self.answer.notified().await;
+                return Ok(json!({
+                    "status": "error",
+                    "error_code": "UPDATE_FAILED",
+                    "message": "a core binary does not match its manifest",
+                }));
+            }
+            Ok(json!({"status": "ok", "restarted": [], "unchanged": []}))
+        }
+        fn orchestrator_connected(&self, _: &str) -> Option<bool> {
+            Some(true)
+        }
+        fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String> {
+            Ok((
+                vec!["motherbee".to_string(), "worker1".to_string()],
+                Vec::new(),
+            ))
+        }
+        fn motherbee(&self) -> &str {
+            "motherbee"
+        }
+    }
+    let refusing = Refusing {
+        snapshots: [motherbee_on_target(), worker_behind()]
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot["hive_id"].as_str().expect("hive").to_string(),
+                    snapshot,
+                )
+            })
+            .collect(),
+        began: tokio::sync::Notify::new(),
+        answer: tokio::sync::Notify::new(),
+        sent: Mutex::new(Vec::new()),
+    };
+    let fresh = open_update(&updates, "http", &["motherbee", "worker1"]);
+    for category in [Category::Core, Category::Config] {
+        let not_answered = Outcome::new(OutcomeStatus::NotAnswered, RunKind::Explicit, 1, 2);
+        updates.record(
+            &fresh,
+            "worker1",
+            category,
+            Standing::Pending,
+            None,
+            Some(not_answered),
+            None,
+        );
+    }
+    let step = automatic_step(&updates, &refusing, &fresh, "worker1", &the_target, &bounds);
+    let meanwhile = async {
+        refusing.began.notified().await;
+        updates.change(|file| {
+            file.open_or_resume(&newer, "set_installation_ai", None, now_epoch_ms())
+        });
+        refusing.answer.notify_one();
+    };
+    tokio::join!(step, meanwhile);
+    let sent = lock(&refusing.sent).clone();
+    assert_eq!(
+        sent,
+        vec![json!({"category": "core", "manifest_version": 0, "manifest_hash": H_NEW})],
+        "the core update under way, and no config after it"
+    );
+    let closed = updates
+        .read(|file| {
+            file.closed
+                .iter()
+                .find(|update| update.id == fresh)
+                .cloned()
+        })
+        .expect("closed");
+    assert!(
+        closed.hives["worker1"].automatic.is_some(),
+        "the attempt was recorded before the update closed"
     );
 }
 
