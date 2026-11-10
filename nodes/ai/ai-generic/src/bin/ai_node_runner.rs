@@ -1820,7 +1820,7 @@ impl GenericAiNode {
                     "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "config.behavior.base_url needs config.behavior.provider, and it must be https on that provider's host (api.openai.com or api.anthropic.com).",
-                    "ai.generic defaults behavior.multimodal=true unless explicitly overridden; behavior.capabilities is refused (it became behavior.multimodal).",
+                    "ai.generic defaults behavior.multimodal=true unless explicitly overridden.",
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
                     "The prompt is the agent ILK's definition; while it has none (no hashes, no asset loaded, ILK not found) the model runs a fixed unconfigured prompt.",
                     "config.runtime.cognitive_definition (poll_interval_secs, blob_root) applies at the next start.",
@@ -5604,140 +5604,11 @@ fn launched_runtime_version(node_name: &str, nodes_root: &Path) -> Option<String
         .map(str::to_string)
 }
 
-/// agent-tools-v1 T9 (FINDINGS A-94): `behavior.capabilities.multimodal` became
-/// `behavior.multimodal`, and the contract refuses the old key. A config.json written before that
-/// is rewritten once, here at boot, and the conversion is reported with the copy it kept.
-fn convert_persisted_multimodal_key(node_name: &str, nodes_root: &Path) {
-    let Ok(path) = managed_node_config_path_with_root(node_name, nodes_root) else {
-        return;
-    };
-    match convert_capabilities_multimodal(&path) {
-        Ok(Some(conversion)) => tracing::info!(
-            node_name = %node_name,
-            path = %path.display(),
-            capabilities = %conversion.capabilities,
-            original_copy = %conversion.original_copy.display(),
-            "config.json: behavior.capabilities converted to behavior.multimodal (agent-tools-v1 T9)"
-        ),
-        Ok(None) => {}
-        Err(err) => tracing::warn!(
-            node_name = %node_name,
-            path = %path.display(),
-            error = %err,
-            "config.json: behavior.capabilities could not be converted to behavior.multimodal; the config is refused"
-        ),
-    }
-}
-
-/// What the T9 conversion did to a config.json: the `behavior.capabilities` it found, and where it
-/// kept the file as it was.
-#[derive(Debug, Clone, PartialEq)]
-struct MultimodalKeyConversion {
-    capabilities: Value,
-    original_copy: PathBuf,
-}
-
-/// Where the T9 conversion keeps a config.json as it found it, next to it: what a rollback to
-/// 0.1.85 restores (docs/ai-nodes-deploy-runbook.md).
-fn pre_conversion_copy_path(config_path: &Path) -> PathBuf {
-    let mut name = config_path.file_name().unwrap_or_default().to_os_string();
-    name.push(".pre-0.1.86");
-    config_path.with_file_name(name)
-}
-
-/// Writes `content` as `path`, mode 0600, through a temp file beside it: created new, synced, then
-/// renamed over `path`. Once the temp file exists, any error removes it, so a failure leaves
-/// `path` as it was and nothing beside it.
-fn write_file_0600(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    let written = file
-        .write_all(content)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written
-}
-
-/// Rewrites a config.json whose `behavior.capabilities` is the old shape, `{"multimodal": <bool
-/// or null>}` or `null`, as `behavior.multimodal` (absent when it said nothing). Before that it
-/// keeps the file as it was in `pre_conversion_copy_path` (0600), replacing an older copy, and it
-/// converts nothing when it cannot. Anything else under `capabilities`, or a value that meets a
-/// `behavior.multimodal` already there, is left as it is for the contract to refuse: nothing is
-/// dropped unseen.
-fn convert_capabilities_multimodal(
-    config_path: &Path,
-) -> Result<Option<MultimodalKeyConversion>, String> {
-    let raw = match fs::read_to_string(config_path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("cannot read it: {err}")),
-    };
-    // Not JSON: the control plane's bootstrap reports it.
-    let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
-        return Ok(None);
-    };
-    // The flat shape, or the one wrapped in `config` (`extract_effective_config`).
-    let behavior = if root.get("config").is_some() {
-        root.get_mut("config")
-            .and_then(|config| config.get_mut("behavior"))
-    } else {
-        root.get_mut("behavior")
-    };
-    let Some(behavior) = behavior.and_then(Value::as_object_mut) else {
-        return Ok(None);
-    };
-    let Some(capabilities) = behavior.get("capabilities").cloned() else {
-        return Ok(None);
-    };
-    let multimodal = match &capabilities {
-        // What the old runner saved for a behavior it did not default (an `echo` node): nothing.
-        Value::Null => Value::Null,
-        Value::Object(old) if old.keys().all(|key| key == "multimodal") => {
-            old.get("multimodal").cloned().unwrap_or(Value::Null)
-        }
-        _ => return Ok(None),
-    };
-    // A value to carry is a bool, and it does not meet a `multimodal` already there.
-    if !multimodal.is_null() && (!multimodal.is_boolean() || behavior.contains_key("multimodal")) {
-        return Ok(None);
-    }
-    behavior.remove("capabilities");
-    if multimodal.is_boolean() {
-        behavior.insert("multimodal".to_string(), multimodal);
-    }
-    let content = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    let original_copy = pre_conversion_copy_path(config_path);
-    write_file_0600(&original_copy, raw.as_bytes()).map_err(|err| {
-        format!(
-            "cannot keep it as it was in {}: {err}",
-            original_copy.display()
-        )
-    })?;
-    write_file_0600(config_path, content.as_bytes())
-        .map_err(|err| format!("cannot replace it: {err}"))?;
-    Ok(Some(MultimodalKeyConversion {
-        capabilities,
-        original_copy,
-    }))
-}
-
 async fn run_managed_node(
     node: NodeSection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
     let nodes_root = Path::new(DEFAULT_MANAGED_NODES_ROOT);
-    convert_persisted_multimodal_key(&node_name, nodes_root);
     let runtime_version = launched_runtime_version(&node_name, nodes_root);
     // Single-config control-plane: the node-dir config.json is the ONLY source of truth (SDK-owned,
     // WF model). No state/ai-nodes dynamic file, so a stale one can never shadow a fresh run_node.
@@ -6128,18 +5999,6 @@ fn parse_effective_config_doc(
         return Err(
             "behavior.vault_key is not accepted: ai.generic reads its provider's key from \
              SY.vault by resource_type (owned by it, assigned to it, or its tenant's general one)"
-                .into(),
-        );
-    }
-    // agent-tools-v1 T9: "tools" is the AI node's word for what an agent can do, and whether the
-    // model takes images is `behavior.multimodal`.
-    if behavior
-        .and_then(|behavior| behavior.get("capabilities"))
-        .is_some()
-    {
-        return Err(
-            "behavior.capabilities is not accepted: whether the model receives images and \
-             documents is behavior.multimodal (true or false)"
                 .into(),
         );
     }
@@ -12339,8 +12198,10 @@ mod tests {
 
     // --- T9: "tools" is the AI node's only word (FINDINGS A-94) ---
 
+    /// Whether the model takes images is `behavior.multimodal`, true by default. The old
+    /// `behavior.capabilities` is an unknown field like any other.
     #[tokio::test]
-    async fn config_set_refuses_the_old_multimodal_key() {
+    async fn multimodal_is_the_only_key_for_images() {
         let node = test_node();
         let response = node
             .handle_control_plane(config_set_request(json!({
@@ -12355,13 +12216,11 @@ mod tests {
             .as_str()
             .expect("message");
         assert!(
-            message.contains("behavior.capabilities is not accepted")
-                && message.contains("behavior.multimodal"),
+            message.contains("unknown field `capabilities`"),
             "{message}"
         );
         assert!(node.behavior.read().await.is_none());
 
-        // The new key, with its default.
         let doc = |behavior: Value| {
             materialize_effective_defaults(
                 "AI.sales@motherbee",
@@ -12379,167 +12238,6 @@ mod tests {
             serde_json::to_value(&default).expect("serialize")["behavior"]["multimodal"],
             json!(true)
         );
-    }
-
-    fn file_mode(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
-    }
-
-    /// The names in `dir`, sorted.
-    fn dir_names(dir: &Path) -> Vec<String> {
-        let mut names = fs::read_dir(dir)
-            .expect("read dir")
-            .map(|entry| {
-                entry
-                    .expect("entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    /// A config.json from before T9 is rewritten once at boot with the new key, and then the node
-    /// boots on it. The file as it was stays beside it for a rollback to 0.1.85. Any other shape
-    /// is left for the contract to refuse.
-    #[test]
-    fn an_old_config_json_is_converted_once_at_boot() {
-        let root = std::env::temp_dir().join(format!("ai-generic-convert-{}", Uuid::new_v4()));
-        let node = "AI.sales@motherbee";
-        let path = managed_node_config_path_with_root(node, &root).expect("path");
-        let dir = path.parent().expect("dir").to_path_buf();
-        fs::create_dir_all(&dir).expect("node dir");
-        let write = |config: Value| {
-            fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write")
-        };
-        let read = || -> Value {
-            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json")
-        };
-        let converted_capabilities = || {
-            convert_capabilities_multimodal(&path)
-                .expect("converted")
-                .map(|conversion| conversion.capabilities)
-        };
-        let system = json!({"config_version": 7, "runtime_version": "0.1.85"});
-
-        write(json!({
-            "_system": system,
-            "tenant_id": "tnt:33333333-3333-4333-8333-333333333333",
-            "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": false}}
-        }));
-        let original = fs::read_to_string(&path).expect("read");
-        let conversion = convert_capabilities_multimodal(&path)
-            .expect("converted")
-            .expect("a conversion");
-        assert_eq!(conversion.capabilities, json!({"multimodal": false}));
-        // The file as it was, 0600, beside the converted one, which is 0600 too; no temp file.
-        assert_eq!(conversion.original_copy, dir.join("config.json.pre-0.1.86"));
-        assert_eq!(
-            fs::read_to_string(&conversion.original_copy).expect("the copy"),
-            original
-        );
-        assert_eq!(file_mode(&conversion.original_copy), 0o600);
-        assert_eq!(file_mode(&path), 0o600);
-        assert_eq!(dir_names(&dir), ["config.json", "config.json.pre-0.1.86"]);
-        let converted = read();
-        assert_eq!(
-            converted["behavior"],
-            json!({"kind": "ai_chat", "model": "gpt-5.5", "multimodal": false})
-        );
-        assert_eq!(converted["_system"], system);
-        assert_eq!(
-            converted["tenant_id"],
-            json!("tnt:33333333-3333-4333-8333-333333333333")
-        );
-        assert_eq!(convert_capabilities_multimodal(&path), Ok(None), "once");
-        let contract = AiGenericContract {
-            node_name: node.to_string(),
-        };
-        let state = fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
-            node, &contract, &root,
-        )
-        .expect("bootstrap");
-        assert_eq!(state.current_state, NodeLifecycleState::Configured);
-        assert_eq!(state.config_version, 7);
-        assert_eq!(
-            state.effective_config.expect("effective")["behavior"]["multimodal"],
-            json!(false)
-        );
-
-        // The wrapped shape, and a capabilities that said nothing. A later conversion keeps the
-        // file it converted, over the older copy.
-        write(json!({
-            "_system": system,
-            "config": {"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {}}}
-        }));
-        let original = fs::read_to_string(&path).expect("read");
-        assert_eq!(converted_capabilities(), Some(json!({})));
-        assert_eq!(
-            read()["config"]["behavior"],
-            json!({"kind": "ai_chat", "model": "gpt-5.5"})
-        );
-        assert_eq!(
-            fs::read_to_string(dir.join("config.json.pre-0.1.86")).expect("the copy"),
-            original
-        );
-
-        // What the old runner saved for an echo node, which it gave no default.
-        write(json!({
-            "_system": system,
-            "behavior": {"kind": "echo", "model": null, "model_settings": null, "base_url": null, "capabilities": null}
-        }));
-        assert_eq!(converted_capabilities(), Some(Value::Null));
-        assert!(read()["behavior"].get("capabilities").is_none());
-        let state = fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
-            node, &contract, &root,
-        )
-        .expect("bootstrap");
-        assert_eq!(state.current_state, NodeLifecycleState::Configured);
-
-        // Anything else stays, and the contract refuses it with the reason.
-        for behavior in [
-            json!({"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": true, "vision": true}}),
-            json!({"kind": "ai_chat", "model": "gpt-5.5", "multimodal": true, "capabilities": {"multimodal": false}}),
-        ] {
-            write(json!({"_system": system, "behavior": behavior}));
-            assert_eq!(convert_capabilities_multimodal(&path), Ok(None));
-            assert_eq!(read()["behavior"], behavior);
-            let state =
-                fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
-                    node, &contract, &root,
-                )
-                .expect("bootstrap");
-            assert_eq!(state.current_state, NodeLifecycleState::FailedConfig);
-            assert!(state
-                .last_error
-                .expect("its reason")
-                .message
-                .contains("behavior.capabilities is not accepted"));
-        }
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// Without its copy of the file as it was, the conversion converts nothing; and a write that
-    /// fails leaves no temp file behind.
-    #[test]
-    fn a_config_json_whose_original_cannot_be_kept_is_not_converted() {
-        let root = std::env::temp_dir().join(format!("ai-generic-convert-{}", Uuid::new_v4()));
-        let path = managed_node_config_path_with_root("AI.sales@motherbee", &root).expect("path");
-        let dir = path.parent().expect("dir").to_path_buf();
-        // A directory where the copy goes: the rename onto it fails.
-        fs::create_dir_all(dir.join("config.json.pre-0.1.86").join("in-the-way")).expect("dirs");
-        let old = json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": true}}})
-            .to_string();
-        fs::write(&path, &old).expect("write");
-
-        let err = convert_capabilities_multimodal(&path).expect_err("no copy, no conversion");
-        assert!(err.contains("cannot keep it as it was"), "{err}");
-        assert_eq!(fs::read_to_string(&path).expect("read"), old);
-        assert_eq!(dir_names(&dir), ["config.json", "config.json.pre-0.1.86"]);
-        let _ = fs::remove_dir_all(root);
     }
 
     // --- The tools' descriptions fit the model APIs ---

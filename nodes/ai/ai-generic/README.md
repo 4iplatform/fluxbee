@@ -87,19 +87,6 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 `config.secrets` and `config.assets` are refused, as is any other unknown field under `behavior`,
 `behavior.instructions` included: the prompt is the agent definition (below), never config.
 
-`behavior.capabilities` is refused too: `capabilities.multimodal` became `multimodal`
-(agent-tools-v1 T9). A `config.json` that still has the old key is rewritten once when the node
-starts, when `capabilities` is `null` or holds `multimodal` alone, and the node's journal reports
-it:
-`config.json: behavior.capabilities converted to behavior.multimodal (agent-tools-v1 T9)`.
-
-- **The file as it was** stays next to it, `config.json.pre-0.1.86` (mode 0600), and the line names
-  it in `original_copy`: a rollback to 0.1.85 restores it
-  ([the runbook](../../../docs/ai-nodes-deploy-runbook.md#rolling-back-to-0185)).
-- **The rewrite is safe to interrupt:** each file is written to a temp file of its own (0600,
-  synced) and renamed into place; a failed write leaves `config.json` as it was. Without its copy,
-  nothing is converted, and the node boots FAILED_CONFIG with the reason.
-
 ### `config.runtime`
 
 - **`runtime.cognitive_definition`:** `poll_interval_secs` (default 10, between 1 and 300) and

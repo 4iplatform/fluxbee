@@ -74,7 +74,9 @@ The SY nodes (cognition, Archi, the frontdesk) keep the hive's provider.
 whether the model receives images. It is about the model, not a tool.
 
 - It becomes `behavior.multimodal`.
-- The old key is refused. PROD's AI configs are converted once, and the conversion is reported.
+- The old key is refused. PROD's AI configs are converted once, and the conversion is reported
+  (removed in 0.1.125, every node having passed it: the old key is an unknown field since;
+  FINDINGS A-210).
 - The default role's "Do not invent platform capabilities" becomes "Do not offer tools you do not
   have".
 

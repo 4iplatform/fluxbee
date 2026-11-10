@@ -124,10 +124,7 @@ EOF
     `provider_output_truncated` error;
   - `behavior.base_url`: it needs `behavior.provider`, and it must be `https` on that provider's
     host (`api.openai.com` or `api.anthropic.com`);
-  - `behavior.multimodal`: `true` by default. The old `behavior.capabilities.multimodal` is refused;
-    a `config.json` that still has it is converted once when the node starts, and its journal says
-    so in one INFO line, which names the copy of the file as it was, `config.json.pre-0.1.86`
-    ([Rolling back to 0.1.85](#rolling-back-to-0185)).
+  - `behavior.multimodal`: `true` by default.
 
   Each field is described in `nodes/ai/ai-generic/README.md`.
 - **Leave `temperature` out:** current models reject it (gpt-5.5, Claude 5; FINDINGS A-69).
@@ -142,7 +139,6 @@ EOF
 - **`CONFIG_SET` refuses:**
   - secrets: `config.secrets.*`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`;
   - `behavior.vault_key`;
-  - `behavior.capabilities` (now `behavior.multimodal`);
   - a `behavior.base_url` without `behavior.provider`, or on the other provider's host;
   - cognitive assets (`config.assets`), which go through `set_ilk_definition`;
   - `runtime.immediate_memory`: ai.generic no longer keeps a memory of its own. It kept that one
@@ -279,28 +275,6 @@ follows `current` then moves on its own; a restart through SY.admin moves it at 
 `config.json` has no `behavior.model` boots FAILED_CONFIG at 0.1.86. Before its restart at 0.1.86,
 give it the model it runs on, which `CONFIG_GET` shows in `ai_model`, or send a `CONFIG_SET` with a
 `behavior.model` after the restart.
-
-### Rolling back to 0.1.85
-
-0.1.86 renamed `behavior.capabilities.multimodal` to `behavior.multimodal` and added
-`behavior.provider`, and 0.1.85 refuses both: a node that goes back to 0.1.85 with a 0.1.86
-`config.json` boots FAILED_CONFIG. Before its restart at 0.1.85, on the node's hive, in its
-directory:
-
-- **If 0.1.86 converted its `config.json`** when it first started, the file as it was is next to
-  it, `config.json.pre-0.1.86` (mode 0600); the conversion's INFO line names it. Restore it:
-
-  ```bash
-  cd "/var/lib/fluxbee/nodes/AI/$NODE"
-  sudo cp -p config.json.pre-0.1.86 config.json
-  ```
-
-  A `CONFIG_SET` applied under 0.1.86 is not in it: apply it again after the restart.
-- **Otherwise, edit `config.json`:** turn `behavior.multimodal` back into
-  `behavior.capabilities.multimodal`, and drop `behavior.provider`. The node then runs on the
-  hive's provider, so `behavior.model` and a `behavior.base_url` must be that provider's.
-
-Then restart the node through SY.admin (step 3 above), at 0.1.85.
 
 **A new node** with the new version is a `run_node` (step 3).
 
