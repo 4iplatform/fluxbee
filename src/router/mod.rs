@@ -1471,7 +1471,7 @@ async fn handle_message(
     //     fanout semantics already)
     //   - no config snapshot available (router booted without config SHM)
     // Tap failures never affect the primary delivery; they are logged at
-    // warn and dropped.
+    // warn and dropped, and never answered to the sender (A-209).
     if !msg.meta.via_tap {
         if let Destination::Unicast(dst_label) = &msg.routing.dst {
             if let Some(snap) = snapshot {
@@ -1490,7 +1490,6 @@ async fn handle_message(
                         lsa_snapshot,
                         memory_reader,
                         hive_id,
-                        router_uuid,
                         is_gateway,
                     )
                     .await;
@@ -1510,6 +1509,10 @@ async fn handle_message(
 /// never carries a protected SYSTEM action (`prepare_local_delivery`). Failures
 /// (target unknown, VPN mismatch, remote unreachable) increment per-tap
 /// log lines and drop the copy — they NEVER bubble up to the primary path.
+/// Nor are they answered to the sender, on any path: it never sent the copy, and
+/// no request of its waits on the copy's trace_id. Until 0.1.129 a copy that
+/// could not reach another hive was answered `WAN_UNAVAILABLE`, `FRAME_TOO_LARGE`
+/// or `TTL_EXCEEDED` to the original's sender, under the copy's trace_id (A-209).
 ///
 /// `dst_label` is the literal value from `Destination::Unicast`. It may be
 /// either a UUID string or an L2 name. Tap match is by L2 name; if the
@@ -1529,7 +1532,6 @@ async fn fanout_taps_for_unicast(
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
-    router_uuid: Uuid,
     is_gateway: bool,
 ) {
     let src_name = msg.routing.src_l2_name.as_deref().unwrap_or("");
@@ -1709,16 +1711,32 @@ async fn fanout_taps_for_unicast(
                 };
                 // A copy too large is dropped like any copy the tap cannot deliver.
                 if frame_over_limit(&data, &copy, "node", &target_handle.name) {
+                    tap_copy_dropped(
+                        src_name,
+                        &dst_name_owned,
+                        &tap_target,
+                        &copy,
+                        UNREACHABLE_FRAME_TOO_LARGE,
+                    );
                     continue;
                 }
-                let _ = target_handle.sender.queue(data);
-                tracing::info!(
-                    tap_src = %src_name,
-                    tap_dst = %dst_name_owned,
-                    tap_target = %tap_target,
-                    copy_trace_id = %copy.routing.trace_id,
-                    "router tap copy delivered (local)"
-                );
+                let refusal = match target_handle.sender.queue(data) {
+                    Ok(()) => None,
+                    Err(LinkRefusal::Full) => Some(UNREACHABLE_LINK_BUSY),
+                    Err(LinkRefusal::Gone) => Some("NODE_NOT_FOUND"),
+                };
+                match refusal {
+                    None => tracing::info!(
+                        tap_src = %src_name,
+                        tap_dst = %dst_name_owned,
+                        tap_target = %tap_target,
+                        copy_trace_id = %copy.routing.trace_id,
+                        "router tap copy delivered (local)"
+                    ),
+                    Some(reason) => {
+                        tap_copy_dropped(src_name, &dst_name_owned, &tap_target, &copy, reason)
+                    }
+                }
             }
             ResolvedRoute::ForwardRouter(peer_uuid) => {
                 drop(nodes_guard);
@@ -1729,39 +1747,79 @@ async fn fanout_taps_for_unicast(
                     );
                     continue;
                 }
-                let _ = send_to_peer_router(peers, peer_uuid, &copy).await;
-                tracing::info!(
-                    tap_src = %src_name,
-                    tap_dst = %dst_name_owned,
-                    tap_target = %tap_target,
-                    copy_trace_id = %copy.routing.trace_id,
-                    "router tap copy forwarded (peer router)"
-                );
+                match send_to_peer_router(peers, peer_uuid, &copy).await {
+                    Ok(handover) => match handover.unreachable("PEER_UNAVAILABLE") {
+                        None => tracing::info!(
+                            tap_src = %src_name,
+                            tap_dst = %dst_name_owned,
+                            tap_target = %tap_target,
+                            copy_trace_id = %copy.routing.trace_id,
+                            "router tap copy forwarded (peer router)"
+                        ),
+                        Some(reason) => {
+                            tap_copy_dropped(src_name, &dst_name_owned, &tap_target, &copy, reason)
+                        }
+                    },
+                    Err(err) => tracing::warn!(
+                        tap_target = %tap_target,
+                        error = %err,
+                        "router tap copy: serialization failed, dropped"
+                    ),
+                }
             }
             ResolvedRoute::ForwardHive(remote_hive) => {
                 drop(nodes_guard);
-                let _ = forward_to_hive(
+                if copy.routing.ttl <= 1 {
+                    tracing::warn!(
+                        tap_target = %tap_target,
+                        "router tap copy: TTL exhausted before remote hive forward, dropped"
+                    );
+                    continue;
+                }
+                match hand_to_hive(
                     &remote_hive,
                     &copy,
                     is_gateway,
                     peer_routers,
                     peers,
                     wan_peers,
-                    router_uuid,
-                    &src_handle.sender,
                 )
-                .await;
-                tracing::info!(
-                    tap_src = %src_name,
-                    tap_dst = %dst_name_owned,
-                    tap_target = %tap_target,
-                    remote_hive = %remote_hive,
-                    copy_trace_id = %copy.routing.trace_id,
-                    "router tap copy forwarded (remote hive)"
-                );
+                .await
+                {
+                    Ok(None) => tracing::info!(
+                        tap_src = %src_name,
+                        tap_dst = %dst_name_owned,
+                        tap_target = %tap_target,
+                        remote_hive = %remote_hive,
+                        copy_trace_id = %copy.routing.trace_id,
+                        "router tap copy forwarded (remote hive)"
+                    ),
+                    Ok(Some(reason)) => {
+                        tap_copy_dropped(src_name, &dst_name_owned, &tap_target, &copy, reason)
+                    }
+                    Err(err) => tracing::warn!(
+                        tap_target = %tap_target,
+                        error = %err,
+                        "router tap copy: serialization failed, dropped"
+                    ),
+                }
             }
         }
     }
+}
+
+/// A tap copy that could not be handed on: logged with the reason a sender's own message would
+/// have been answered with, and dropped. Never answered: the original's sender did not send the
+/// copy, and no request of its waits on the copy's trace_id (A-209).
+fn tap_copy_dropped(src: &str, dst: &str, target: &str, copy: &Message, reason: &str) {
+    tracing::warn!(
+        tap_src = %src,
+        tap_dst = %dst,
+        tap_target = %target,
+        copy_trace_id = %copy.routing.trace_id,
+        reason,
+        "router tap copy: not handed on, dropped"
+    );
 }
 
 fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
@@ -2024,6 +2082,8 @@ async fn broadcast_to_wan(
     Ok(full)
 }
 
+/// Hands `msg` toward the hive `hive_id`, answering its sender over `sender`: `TTL_EXCEEDED` when
+/// it would arrive with none left, `UNREACHABLE` when it did not go (`hand_to_hive`).
 async fn forward_to_hive(
     hive_id: &str,
     msg: &Message,
@@ -2038,14 +2098,29 @@ async fn forward_to_hive(
         send_ttl_exceeded_to(msg, sender, router_uuid)?;
         return Ok(());
     }
+    if let Some(reason) =
+        hand_to_hive(hive_id, msg, is_gateway, peer_routers, peers, wan_peers).await?
+    {
+        send_unreachable_to(msg, sender, router_uuid, reason)?;
+    }
+    Ok(())
+}
+
+/// Hands `msg` toward the hive `hive_id`: the gateway to that hive's WAN link, another router to
+/// the gateway sibling. The reason its sender would be answered `UNREACHABLE` with when it did not
+/// go; the caller decides whether anyone is answered (a tap copy's sender is not, A-209).
+async fn hand_to_hive(
+    hive_id: &str,
+    msg: &Message,
+    is_gateway: bool,
+    peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
+    peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
+    wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
+) -> Result<Option<&'static str>, RouterError> {
     if is_gateway {
-        if let Some(reason) = send_to_wan_peer(wan_peers, hive_id, msg)
+        return Ok(send_to_wan_peer(wan_peers, hive_id, msg)
             .await?
-            .unreachable("WAN_UNAVAILABLE")
-        {
-            send_unreachable_to(msg, sender, router_uuid, reason)?;
-        }
-        return Ok(());
+            .unreachable("WAN_UNAVAILABLE"));
     }
     let gateway_uuid = {
         let guard = peer_routers.lock().await;
@@ -2055,16 +2130,11 @@ async fn forward_to_hive(
             .map(|peer| peer.uuid)
     };
     let Some(gateway_uuid) = gateway_uuid else {
-        send_unreachable_to(msg, sender, router_uuid, "GATEWAY_UNAVAILABLE")?;
-        return Ok(());
+        return Ok(Some("GATEWAY_UNAVAILABLE"));
     };
-    if let Some(reason) = send_to_peer_router(peers, gateway_uuid, msg)
+    Ok(send_to_peer_router(peers, gateway_uuid, msg)
         .await?
-        .unreachable("GATEWAY_UNAVAILABLE")
-    {
-        send_unreachable_to(msg, sender, router_uuid, reason)?;
-    }
-    Ok(())
+        .unreachable("GATEWAY_UNAVAILABLE"))
 }
 
 /// Hands a broadcast toward the WAN: the gateway to every WAN peer, another router to the gateway
@@ -8112,7 +8182,6 @@ mod tests {
                 &lsa_snapshot,
                 &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
                 "motherbee",
-                Uuid::new_v4(),
                 true,
             )
             .await;
@@ -8128,6 +8197,178 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The config region's snapshot with this hive's `taps`.
+    fn config_with_taps(taps: Vec<TapEntry>) -> ConfigSnapshot {
+        ConfigSnapshot {
+            header: crate::shm::ConfigHeaderSnapshot {
+                static_route_count: 0,
+                vpn_assignment_count: 0,
+                config_version: 1,
+                heartbeat: 0,
+                tap_count: taps.len() as u32,
+            },
+            routes: Vec::new(),
+            vpns: Vec::new(),
+            taps,
+        }
+    }
+
+    /// A-209: a tap copy that cannot go is logged and dropped, and the original's sender is never
+    /// answered for it, on any path: to a local node, a sibling router's or another hive's; with no
+    /// link, a full one, a copy over the frame or out of TTL. The sender never sent the copy, and no
+    /// request of its waits on the copy's trace_id. Until 0.1.129 a copy for another hive that could
+    /// not go was answered to the sender under the copy's trace_id.
+    #[tokio::test]
+    async fn a_tap_copy_that_cannot_go_is_never_answered_to_its_sender() {
+        let admin = Uuid::new_v4();
+        let (admin_tx, mut answers) = link_queue("node");
+        let (audit_tx, mut audit) = link_queue("node");
+        let (gone_tx, gone) = link_queue("node");
+        drop(gone);
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        for (uuid, name, sender) in [
+            (admin, "SY.admin@motherbee", admin_tx),
+            (Uuid::new_v4(), "IO.audit@motherbee", audit_tx.clone()),
+            (Uuid::new_v4(), "IO.gone@motherbee", gone_tx),
+        ] {
+            nodes.lock().await.insert(
+                uuid,
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender,
+                    connected_at: 0,
+                },
+            );
+        }
+        // A node of a sibling router, and one of worker1.
+        let sibling = Uuid::new_v4();
+        let peer_node = Uuid::new_v4();
+        let peer_nodes = Arc::new(Mutex::new(HashMap::from([(
+            peer_node,
+            PeerNode {
+                uuid: peer_node,
+                name: "IO.peer@motherbee".to_string(),
+                vpn_id: 0,
+                router_uuid: sibling,
+            },
+        )])));
+        let mut lsa = motherbee_lsa(Vec::new(), Vec::new());
+        lsa.nodes
+            .push(lsa_node_entry(Uuid::new_v4(), "IO.audit@worker1", 1));
+        let lsa_snapshot = Arc::new(Mutex::new(Some(lsa)));
+        let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+        rebuild_fib(
+            &fib,
+            &nodes,
+            &peer_nodes,
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &lsa_snapshot,
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+        )
+        .await;
+        let peers = Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new()));
+        let peer_routers = Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new()));
+        let wan_peers = Arc::new(Mutex::new(HashMap::<String, WanPeer>::new()));
+        let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
+        let src_handle = nodes.lock().await[&admin].clone();
+        // SY.admin's message to SY.vault, as this router stamped it, which the tap copies to
+        // `target`.
+        let tap_to = |target: &'static str, ttl: u8, pad: usize| {
+            let (nodes, fib, peers, peer_routers) = (&nodes, &fib, &peers, &peer_routers);
+            let (peer_nodes, wan_peers, lsa_snapshot) = (&peer_nodes, &wan_peers, &lsa_snapshot);
+            let (memory_reader, src_handle) = (&memory_reader, &src_handle);
+            async move {
+                let mut msg = padded_message(
+                    admin,
+                    Destination::Unicast("SY.vault@motherbee".to_string()),
+                    pad,
+                );
+                msg.routing.src_l2_name = Some("SY.admin@motherbee".to_string());
+                msg.routing.ttl = ttl;
+                let config = config_with_taps(vec![test_tap_entry(
+                    "SY.admin@motherbee",
+                    "SY.vault@motherbee",
+                    target,
+                )]);
+                fanout_taps_for_unicast(
+                    &msg,
+                    "SY.vault@motherbee",
+                    &config,
+                    src_handle,
+                    nodes,
+                    fib,
+                    peers,
+                    peer_routers,
+                    peer_nodes,
+                    wan_peers,
+                    lsa_snapshot,
+                    memory_reader,
+                    "motherbee",
+                    true,
+                )
+                .await;
+            }
+        };
+        let mut never_answered = |case: &str| {
+            assert!(
+                answers.try_recv().is_err(),
+                "{case}: the sender is not answered"
+            )
+        };
+
+        // Another hive. No link to it.
+        tap_to("IO.audit@worker1", 16, 0).await;
+        never_answered("no WAN link");
+        // With one, the copy goes.
+        let (worker1_tx, mut worker1) = link_queue("wan");
+        wan_peers.lock().await.insert(
+            "worker1".to_string(),
+            WanPeer {
+                sender: worker1_tx.clone(),
+                router_uuid: Uuid::new_v4(),
+            },
+        );
+        tap_to("IO.audit@worker1", 16, 0).await;
+        let copy: Message =
+            serde_json::from_slice(&worker1.try_recv().expect("the copy")).expect("a message");
+        assert!(copy.meta.via_tap);
+        never_answered("a copy that went");
+        // Over the frame, out of TTL, or the link full: nothing goes.
+        tap_to("IO.audit@worker1", 16, MAX_FRAME_SIZE).await;
+        never_answered("a copy over the frame for the WAN");
+        tap_to("IO.audit@worker1", 1, 0).await;
+        never_answered("a copy out of TTL");
+        fill_to_the_senders_bound(&worker1_tx);
+        tap_to("IO.audit@worker1", 16, 0).await;
+        never_answered("a full WAN link");
+        assert!(messages_on(&mut worker1).is_empty(), "no other copy went");
+
+        // A local node: its link full, or gone, or the copy over the frame.
+        fill_to_the_senders_bound(&audit_tx);
+        tap_to("IO.audit@motherbee", 16, 0).await;
+        never_answered("a full local link");
+        assert!(messages_on(&mut audit).is_empty(), "no copy went");
+        tap_to("IO.gone@motherbee", 16, 0).await;
+        never_answered("a local link whose writer stopped");
+        tap_to("IO.audit@motherbee", 16, MAX_FRAME_SIZE).await;
+        never_answered("a local copy over the frame");
+        assert!(messages_on(&mut audit).is_empty(), "no copy went");
+
+        // A sibling router's node: no link to it, then a full one.
+        tap_to("IO.peer@motherbee", 16, 0).await;
+        never_answered("no sibling link");
+        let (sibling_tx, mut sibling_rx) = link_queue("irp");
+        fill_to_the_senders_bound(&sibling_tx);
+        peers
+            .lock()
+            .await
+            .insert(sibling, PeerHandle { sender: sibling_tx });
+        tap_to("IO.peer@motherbee", 16, 0).await;
+        never_answered("a full sibling link");
+        assert!(messages_on(&mut sibling_rx).is_empty(), "no copy went");
     }
 
     /// A node of the LSA snapshot, listed by the hive at `hive_index`.

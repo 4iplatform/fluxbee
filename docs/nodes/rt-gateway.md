@@ -161,7 +161,9 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   reach it only as a unicast: a broadcast never does (`vpn_allows_between`,
   `vpn_allows_broadcast_between`; A-78).
 - **Taps** copy matching unicast messages to a third node, fire-and-forget (see
-  [SY.config.routes](sy-config-routes.md)).
+  [SY.config.routes](sy-config-routes.md)). A copy that cannot go is logged (`router tap copy:
+  …`) and dropped, and never answered to the original's sender, who did not send it; until
+  0.1.129 one for another hive was answered under the copy's trace_id (A-209).
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
   `VPN_BLOCKED`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`, `OPA_ERROR`,
   `OPA_NO_TARGET`, `FRAME_TOO_LARGE`, `LINK_BUSY`; and `TTL_EXCEEDED` when the TTL runs out (every

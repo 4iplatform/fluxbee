@@ -664,6 +664,12 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
   hub-relayed sender's (§6.3).
 - Best effort: a copy that cannot go (unknown target, VPN, TTL, link down) is logged as
   `router tap copy: …` and dropped. The primary delivery does not wait for it.
+- Never answered: the original's sender did not send the copy, and no request of its waits on
+  the copy's `trace_id`. A copy that a local node's, a sibling router's or a WAN peer's link does
+  not take (no link, a full one, the copy over the frame, no TTL left) is logged as `router tap
+  copy: not handed on, dropped` with the reason a message of its own would have got. Until
+  0.1.129 a copy for another hive that could not go was answered to the original's sender,
+  under the copy's `trace_id` (A-209).
 - A target observes; it does not take part. An AI node that gets a copy runs no handler for it
   and answers nothing, which would go to the original sender (the AI SDK's `run_handler`, FINDINGS
   A-248). Its journal counts the copies in `tap_copies_ignored`, in the `ai runtime metrics` line;
