@@ -101,9 +101,6 @@ const PUBLISH_EDGE_TIMEOUT: Duration = Duration::from_secs(75);
 const PUBLISH_SYNC_HINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The Syncthing folder of `active/` blobs, on every hive that has one.
 const PUBLISH_BLOB_SYNC_FOLDER: &str = "fluxbee-blob";
-/// How long a tenant's purge spends taking its public pages down (FINDINGS A-212): a page not
-/// started by then is answered as not taken down, and stays up until it expires.
-const TENANT_PURGE_PAGES_BUDGET: Duration = Duration::from_secs(60);
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -6843,11 +6840,11 @@ fn publication_is_down(record: &AdminPublicationRecord, now: u64) -> bool {
     record.status == "unpublished" || record.status == "expired" || record.expires_at <= now
 }
 
-/// Takes a page that is up down, for `unpublish_artifact` and for a tenant's purge: the edge
-/// removes it (the row goes to `edge_removed`), then IO.blob releases its copy (`unpublished`), the
-/// ledger written after each. The caller holds the publication lock and passes the ledger it
-/// loaded under it. The error is `(error_code, detail)`; the same call again finishes what a
-/// failed step left.
+/// Takes a page that is up down, `unpublish_artifact`'s work, which the factory reset asks for
+/// each page: the edge removes it (the row goes to `edge_removed`), then IO.blob releases its copy
+/// (`unpublished`), the ledger written after each. The caller holds the publication lock and
+/// passes the ledger it loaded under it. The error is `(error_code, detail)`; the same call again
+/// finishes what a failed step left.
 async fn take_down_publication(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -6985,101 +6982,6 @@ fn published_artifact_row(record: &AdminPublicationRecord) -> serde_json::Value 
         "created_at": record.created_at,
         "expires_at": record.expires_at,
     })
-}
-
-/// What a tenant's purge takes down of its public pages (FINDINGS A-212): each page the ledger
-/// holds for `tenant_id` that is up, as `unpublish_artifact` does (`take_down_publication`), one
-/// at a time under the publication lock and read again under it. The answer names the pages
-/// taken down (`unpublished`) and each one that stays up (`failed`, with its `error_code` and
-/// `error_detail`) until it expires or the operator unpublishes it. A page not started within
-/// `TENANT_PURGE_PAGES_BUDGET` is not tried (`TIMEOUT`).
-async fn take_down_tenant_publications(
-    ctx: &AdminContext,
-    client: &RouterDispatcher,
-    tenant_id: &str,
-) -> serde_json::Value {
-    let deadline = tokio::time::Instant::now() + TENANT_PURGE_PAGES_BUDGET;
-    let now = Utc::now().timestamp().max(0) as u64;
-    let due: Vec<String> = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
-        Ok(ledger) => ledger
-            .publications
-            .values()
-            .filter(|record| record.tenant_id == tenant_id && !publication_is_down(record, now))
-            .map(|record| record.publication_id.clone())
-            .collect(),
-        Err(err) => {
-            tracing::warn!(tenant_id = %tenant_id, error = %err, "a purged tenant's public pages cannot be read: they stay up until they expire");
-            return serde_json::json!({
-                "unpublished": [],
-                "failed": [],
-                "error_code": "LEDGER_FAILED",
-                "error_detail": err,
-            });
-        }
-    };
-    let failure = |publication_id: &str, error_code: &str, detail: &str| {
-        serde_json::json!({
-            "publication_id": publication_id,
-            "error_code": error_code,
-            "error_detail": detail,
-        })
-    };
-    let out_of_time = format!(
-        "not tried: the purge's {}s for its pages ran out",
-        TENANT_PURGE_PAGES_BUDGET.as_secs()
-    );
-    let mut unpublished = Vec::new();
-    let mut failed = Vec::new();
-    for publication_id in due {
-        if tokio::time::Instant::now() >= deadline {
-            failed.push(failure(&publication_id, "TIMEOUT", &out_of_time));
-            continue;
-        }
-        let Ok(_publication_guard) =
-            tokio::time::timeout_at(deadline, ctx.publication_lock.lock()).await
-        else {
-            failed.push(failure(&publication_id, "TIMEOUT", &out_of_time));
-            continue;
-        };
-        let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
-            Ok(ledger) => ledger,
-            Err(err) => {
-                failed.push(failure(&publication_id, "LEDGER_FAILED", &err));
-                continue;
-            }
-        };
-        // An unpublish or the expiry sweep may have taken it down since the read above.
-        let now = Utc::now().timestamp().max(0) as u64;
-        let Some(record) = ledger
-            .publications
-            .get(&publication_id)
-            .filter(|record| !publication_is_down(record, now))
-            .cloned()
-        else {
-            continue;
-        };
-        match take_down_publication(ctx, client, &mut ledger, record).await {
-            Ok(()) => unpublished.push(publication_id),
-            Err((error_code, detail)) => {
-                failed.push(failure(&publication_id, error_code, &detail));
-            }
-        }
-    }
-    if !failed.is_empty() {
-        tracing::warn!(
-            tenant_id = %tenant_id,
-            unpublished = unpublished.len(),
-            failed = failed.len(),
-            "some of a purged tenant's public pages stay up until they expire: the purge's answer names them"
-        );
-    } else if !unpublished.is_empty() {
-        tracing::info!(
-            tenant_id = %tenant_id,
-            unpublished = unpublished.len(),
-            "a purged tenant's public pages taken down"
-        );
-    }
-    serde_json::json!({ "unpublished": unpublished, "failed": failed })
 }
 
 /// What `unpublish_artifact` names: exactly one of `publication_id` (`pub:<uuid>`, taken in its
@@ -14109,7 +14011,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "restore_tenant" => "Undo the deleted mark of one tenant: it comes back as it was.",
         "purge_tenant" => {
-            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it; its public pages come down with it. Refused while people are charged to it, or it has vault secrets, node identities or sponsored tenants."
+            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. Refused while people are charged to it, or it has vault secrets, public pages that are up, node identities or sponsored tenants."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -16286,7 +16188,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "list_published_artifacts" => vec![
             "Motherbee-only: SY.admin answers it from its publication ledger (state/sy-admin/publications.json), asking no one. Takes no hive.",
-            "A page is up until it is taken down (unpublish_artifact, a tenant's purge, the factory reset) or expires: the list leaves out the pages unpublished, expired, or past their expires_at, which the edge no longer serves. status is published, or curated (its publish is under way or stopped half-way, and the edge may serve it) or edge_removed (its take-down is under way or stopped half-way: the edge no longer serves it, and IO.blob still holds its copy); unpublish_artifact finishes either.",
+            "A page is up until it is taken down (unpublish_artifact, which the factory reset asks for every page) or expires: the list leaves out the pages unpublished, expired, or past their expires_at, which the edge no longer serves. While a tenant has a page up, purge_tenant refuses it (TENANT_HAS_PAGES). status is published, or curated (its publish is under way or stopped half-way, and the edge may serve it) or edge_removed (its take-down is under way or stopped half-way: the edge no longer serves it, and IO.blob still holds its copy); unpublish_artifact finishes either.",
             "Each row: publication_id, status, filename_original, content_type, presentation, size (bytes), tenant_id and publisher_l2_name (the producer and its tenant when it published), edge_node, created_at and expires_at (epoch seconds).",
             "A link's key is the permission to read its page, so no row carries it, whole or in part: take a page down by its publication_id. Whoever holds a link can still take its page down by the link's key.",
             "Pages (FINDINGS A-198): newest first, with limit at most that many from cursor on, and next_cursor while pages follow; total is how many are up. Without limit, every page. A cursor the list did not give answers INVALID_CURSOR (400).",
@@ -16492,7 +16394,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "purge_tenant" => vec![
             "Final: removes the tenant, the ILKs marked in it and the channels other ILKs hold in its scope. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
             "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
-            "Once SY.identity has purged the tenant, SY.admin takes its public pages down, each as unpublish_artifact does (FINDINGS A-212), for up to 60 s, and the answer says so in publications: unpublished, the publication_ids taken down, and failed, each page that stays up with its error_code and error_detail (TIMEOUT for one not tried in time) until it expires or is unpublished. A refused purge takes no page down.",
+            "Refused while public pages of the tenant are up (TENANT_HAS_PAGES, 409, FINDINGS A-212): SY.admin reads its publication ledger before it sends anything, and the refusal says how many pages and names their publication_ids. Take them down first: GET /artifacts lists them, POST /artifacts/unpublish takes one down by its publication_id. A ledger that cannot be read refuses the purge too (PAGES_CHECK_FAILED).",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants SY.identity knows. SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
@@ -19670,6 +19572,75 @@ async fn purge_tenant_vault_block(
     }
 }
 
+/// purge_tenant is refused while public pages of the tenant are up (FINDINGS A-212), by the same
+/// rule as the vault's secrets (operator decision 2026-09-28: purge never cascades into other
+/// stores; clean them first). A page is the tenant's when its record names it: its publisher's
+/// tenant when it published. SY.admin holds the publication ledger, so it checks it before
+/// forwarding TNT_PURGE, and nothing is sent when it refuses. Fail closed: a ledger that cannot be
+/// read refuses the purge.
+fn purge_tenant_pages_block(
+    ctx: &AdminContext,
+    payload: &serde_json::Value,
+) -> Option<(u16, String)> {
+    let tenant_id = payload
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+    let blocked = |code: &str, detail: String| {
+        Some((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "purge_tenant",
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        ))
+    };
+    let ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            return blocked(
+                "PAGES_CHECK_FAILED",
+                format!(
+                    "could not read the public pages of {tenant_id} (refusing to purge): {err}"
+                ),
+            )
+        }
+    };
+    let now = Utc::now().timestamp().max(0) as u64;
+    let pages: Vec<&str> = ledger
+        .publications
+        .values()
+        .filter(|record| record.tenant_id == tenant_id && !publication_is_down(record, now))
+        .map(|record| record.publication_id.as_str())
+        .collect();
+    if pages.is_empty() {
+        return None;
+    }
+    // The error names the first pages by their publication_id, never by a link's key; a tenant
+    // with many says how many more.
+    const NAMED: usize = 20;
+    let more = pages.len().saturating_sub(NAMED);
+    let named = pages[..pages.len().min(NAMED)].join(", ");
+    blocked(
+        "TENANT_HAS_PAGES",
+        format!(
+            "{} public page(s) of {tenant_id} are up; take them down first (GET /artifacts lists \
+             them, POST /artifacts/unpublish takes one down by its publication_id): {named}{}",
+            pages.len(),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ),
+    )
+}
+
 /// The hive whose SY.identity takes an identity action: the primary, SY.admin's own hive, whatever
 /// hive the path names. Only the primary writes an ILK or a tenant (A-143), and a spoke's replica
 /// takes no request from SY.admin of another hive (F-07), reads included: a read sent there failed
@@ -19689,6 +19660,10 @@ async fn handle_identity_command(
     let _ = hive;
     let target_hive = identity_command_hive(&ctx.hive_id);
     if action == "purge_tenant" {
+        // The pages first: SY.admin's own ledger, asking no one.
+        if let Some(blocked) = purge_tenant_pages_block(ctx, &payload) {
+            return Ok(blocked);
+        }
         if let Some(blocked) = purge_tenant_vault_block(client, &target_hive, &payload).await {
             return Ok(blocked);
         }
@@ -19710,14 +19685,6 @@ async fn handle_identity_command(
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),
     };
-    let purged_tenant = (action == "purge_tenant").then(|| {
-        payload
-            .get("tenant_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    });
     let response = send_system_request(
         client,
         &target,
@@ -19727,26 +19694,6 @@ async fn handle_identity_command(
         admin_action_timeout(action),
     )
     .await;
-    // A purged tenant's public pages come down with it (FINDINGS A-212), and only once SY.identity
-    // has purged it: a refused purge leaves them up. The answer says what came down
-    // (`publications`).
-    let response = match (response, purged_tenant) {
-        (Ok(mut answer), Some(requested))
-            if answer.get("status").and_then(|status| status.as_str()) == Some("ok") =>
-        {
-            let tenant_id = answer
-                .get("tenant_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .unwrap_or(requested);
-            let pages = take_down_tenant_publications(ctx, client, &tenant_id).await;
-            if let Some(fields) = answer.as_object_mut() {
-                fields.insert("publications".to_string(), pages);
-            }
-            Ok(answer)
-        }
-        (response, _) => response,
-    };
     Ok(build_admin_http_response(action, response))
 }
 
@@ -37564,101 +37511,92 @@ mod tests {
             .unwrap();
     }
 
-    /// Once SY.identity has purged a tenant, its pages that are up come down, each as
-    /// unpublish_artifact takes one down, and the answer names them; one that does not come down
-    /// is named with why, and stays up. Another tenant's pages, and the tenant's pages already
-    /// down, are left as they are. A refused purge takes nothing down.
+    /// The rule of the vault's secrets (FINDINGS A-212): while a page of the tenant is up, its
+    /// purge is refused with TENANT_HAS_PAGES before anything is sent, saying how many and naming
+    /// them by their publication_ids, never by a link's key, and no page is touched; a ledger that
+    /// cannot be read refuses it too. Once the tenant's pages are down, another tenant's page up
+    /// or its own past their expiry, the purge goes on to SY.vault and SY.identity, and takes no
+    /// page down.
     #[tokio::test]
-    async fn a_purged_tenants_pages_come_down_with_it() {
+    async fn a_tenant_is_purged_only_once_its_pages_are_down() {
         let (ctx, mut harness) = opa_test_admin("purge-pages");
-        let mut up: Vec<AdminPublicationRecord> = (0..2)
-            .map(|_| page_at(PAGE_TENANT, 10, "published"))
-            .collect();
-        up.sort_by(|a, b| a.publication_id.cmp(&b.publication_id));
+        let up = page_at(PAGE_TENANT, 10, "published");
+        let half_down = page_at(PAGE_TENANT, 10, "edge_removed");
         let already_down = page_at(PAGE_TENANT, 10, "unpublished");
+        let mut lapsed = page_at(PAGE_TENANT, 10, "published");
+        lapsed.expires_at = Utc::now().timestamp().max(0) as u64;
         let others = page_at(OTHER_TENANT, 10, "published");
-        seed_publications(&ctx, &[&up[0], &up[1], &already_down, &others]);
-        let purge = json!({ "tenant_id": PAGE_TENANT });
+        let pages = [&up, &half_down, &already_down, &lapsed, &others];
+        seed_publications(&ctx, &pages);
+        let purge_tenant = || {
+            handle_identity_command(
+                &ctx,
+                &ctx.rpc,
+                "purge_tenant",
+                json!({ "tenant_id": PAGE_TENANT }),
+                Some(PRIMARY_HIVE_ID.to_string()),
+            )
+        };
 
-        // Refused: no page is touched.
-        let refused = handle_identity_command(
-            &ctx,
-            &ctx.rpc,
-            "purge_tenant",
-            purge.clone(),
-            Some(PRIMARY_HIVE_ID.to_string()),
+        let (status, body) = purge_tenant().await.expect("answered");
+        assert_eq!(status, 409, "{body}");
+        let refusal: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(refusal["error_code"], json!("TENANT_HAS_PAGES"));
+        let detail = refusal["error_detail"].as_str().expect("why");
+        assert!(
+            detail.starts_with(&format!("2 public page(s) of {PAGE_TENANT} are up")),
+            "{detail}"
         );
-        let not_marked = json!({
-            "status": "error",
-            "error_code": "TENANT_NOT_DELETED",
-            "error_detail": "purge requires the tenant to be marked deleted first",
-        });
-        let (answer, ()) = tokio::join!(
-            refused,
-            purge_answers(&mut harness, PAGE_TENANT, not_marked)
+        assert!(
+            detail.contains("GET /artifacts") && detail.contains("POST /artifacts/unpublish"),
+            "{detail}"
         );
-        let (status, body) = answer.expect("answered");
-        assert!(status >= 400, "{body}");
-        assert!(!body.contains("publications"), "{body}");
+        for named in [&up, &half_down] {
+            assert!(detail.contains(&named.publication_id), "{detail}");
+        }
+        for unnamed in [&already_down, &lapsed, &others] {
+            assert!(!detail.contains(&unnamed.publication_id), "{detail}");
+        }
+        assert_no_key(&body, &pages);
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
-        assert_eq!(publication_status(&ctx, &up[0].publication_id), "published");
+        assert_eq!(publication_status(&ctx, &up.publication_id), "published");
 
-        // Purged: the first page comes down, the edge refuses the second.
-        let purged = handle_identity_command(
-            &ctx,
-            &ctx.rpc,
-            "purge_tenant",
-            purge,
-            Some(PRIMARY_HIVE_ID.to_string()),
-        );
-        let drive = async {
-            let gone = json!({ "status": "ok", "tenant_id": PAGE_TENANT, "state": "purged" });
-            purge_answers(&mut harness, PAGE_TENANT, gone).await;
-            take_down(&mut harness, &up[0].publication_id).await;
-            let unpublish = harness
-                .next_outgoing_within(Duration::from_secs(5))
-                .await
-                .expect("the edge's unpublish");
-            assert_eq!(
-                unpublish.payload,
-                json!({ "publication_id": up[1].publication_id })
+        // The operator takes them down: the purge goes on, and touches no page.
+        for page in [&up, &half_down] {
+            let unpublish = handle_unpublish_artifact(
+                &ctx,
+                &ctx.rpc,
+                json!({ "publication_id": page.publication_id }),
+                None,
             );
-            harness
-                .inject(reply_to(
-                    &unpublish,
-                    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
-                    json!({ "status": "error", "error": "busy" }),
-                ))
-                .await
-                .unwrap();
-        };
-        let (answer, ()) = tokio::join!(purged, drive);
+            let (result, ()) =
+                tokio::join!(unpublish, take_down(&mut harness, &page.publication_id));
+            assert_eq!(result.expect("dispatch").http_status, 200);
+        }
+        let gone = json!({ "status": "ok", "tenant_id": PAGE_TENANT, "state": "purged" });
+        let (answer, ()) = tokio::join!(
+            purge_tenant(),
+            purge_answers(&mut harness, PAGE_TENANT, gone)
+        );
         let (status, body) = answer.expect("answered");
         assert_eq!(status, 200, "{body}");
-        let body: Value = serde_json::from_str(&body).expect("JSON");
-        let publications = &body["payload"]["publications"];
-        assert_eq!(publications["unpublished"], json!([up[0].publication_id]));
-        let failed = publications["failed"].as_array().expect("failed");
-        assert_eq!(failed.len(), 1, "{publications}");
-        assert_eq!(failed[0]["publication_id"], json!(up[1].publication_id));
-        assert_eq!(failed[0]["error_code"], json!("EDGE_UNPUBLISH_FAILED"));
-        assert_no_key(&body.to_string(), &[&up[0], &up[1], &already_down, &others]);
-        assert_eq!(
-            publication_status(&ctx, &up[0].publication_id),
-            "unpublished"
-        );
-        assert_eq!(publication_status(&ctx, &up[1].publication_id), "published");
-        assert_eq!(
-            publication_status(&ctx, &already_down.publication_id),
-            "unpublished"
-        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
         assert_eq!(
             publication_status(&ctx, &others.publication_id),
             "published"
         );
+
+        // A ledger that cannot be read refuses the purge, and nothing is sent.
+        fs::write(&ctx.publication_ledger_path, b"{ not json").expect("a broken ledger");
+        let (status, body) = purge_tenant().await.expect("answered");
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("PAGES_CHECK_FAILED"), "{body}");
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await

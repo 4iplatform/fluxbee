@@ -129,7 +129,7 @@ v1_http_only = {
 }
 # Registry actions with no HTTP route on purpose: they arrive over the mesh only.
 mesh_only = {
-    "publish_artifact",  # the producer (IO.blob) asks the admin directly
+    "publish_artifact",  # the producer (an AI.*, IO.* or WF.* node) asks the admin over the mesh
     "list_cloud_actions",  # IO.cloud asks which actions it may relay
 }
 extra_in_registry = sorted(set(extra_in_registry) - mesh_only)

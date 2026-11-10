@@ -1022,8 +1022,10 @@ The ownership and call path are fixed:
   Never ask for one, and never repeat one in a summary or the chat. When the operator pastes a
   link, its key may go in the `unpublish_artifact` step, as above (the logs keep only its
   SHA-256).
-- A page stays up until it is taken down or expires. Taking a page down, a tenant's purge (its
-  pages come down with it) and the factory reset are the ways down before its expiry.
+- A page stays up until it is taken down (`unpublish_artifact`; the factory reset takes every
+  page down) or expires. A tenant with a page up cannot be purged: its purge answers
+  `TENANT_HAS_PAGES` and names the pages by their `publication_id`, and they come down first,
+  each with an `unpublish_artifact` step the operator confirms.
 
 Rules for Archi:
 

@@ -643,6 +643,7 @@ def main():
     print("== [2/8] take down the published pages")
     # After [0] and [1], so no workflow or user node is left to publish a page meanwhile, and
     # while SY.admin, the edge and IO.blob run: nothing the reset stops serves the take-down.
+    # Before [5]: a tenant with a page up is not purged (TENANT_HAS_PAGES).
     pages_done, page_fail = unpublish_pages()
 
     print("== [3/8] purge user ILKs")

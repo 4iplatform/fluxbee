@@ -350,8 +350,8 @@ it.
 - A temporary merged into another ILK is an alias of it until the alias expires: it is not counted
   and goes with the purge.
 - People marked on their own go with the purge.
-- It is still refused while the vault holds its secrets (`TENANT_HAS_SECRETS`), node identities
-  remain or it sponsors tenants.
+- It is still refused while the vault holds its secrets (`TENANT_HAS_SECRETS`), its public pages
+  are up (`TENANT_HAS_PAGES`, FINDINGS A-212), node identities remain or it sponsors tenants.
 
 **io.api `by_ilk`: people the tenant knows (D12).** A company's API can act for a person (the
 request names their ILK) when the person is charged to the company or holds a channel in its scope,

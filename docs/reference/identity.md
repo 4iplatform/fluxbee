@@ -415,14 +415,17 @@ It is refused while:
   (`tenant_people` skips aliases);
 - SY.vault holds secrets of the tenant (`TENANT_HAS_SECRETS`). SY.admin checks this before it
   forwards the purge, and refuses when the vault cannot be listed (`VAULT_CHECK_FAILED`,
-  `purge_tenant_vault_block` in `src/bin/sy_admin.rs`).
+  `purge_tenant_vault_block` in `src/bin/sy_admin.rs`);
+- public pages of the tenant are up (`TENANT_HAS_PAGES`, FINDINGS A-212): the pages SY.admin's
+  publication ledger holds for the tenant, its publisher's when it published, that are not
+  taken down or expired. SY.admin checks this first, before it asks anyone, names how many and
+  the first 20 `publication_id`s, and refuses when the ledger cannot be read
+  (`PAGES_CHECK_FAILED`, `purge_tenant_pages_block`). Take them down first: `GET /artifacts`
+  lists them, `POST /artifacts/unpublish` takes one down.
 
 When it goes through, it removes every ILK charged to the tenant (people already marked on their
 own included), and drops the channels other ILKs still hold in its scope
-(`drop_channels_in_scope`, `dropped_channels` in the answer). SY.admin then takes down the
-tenant's public pages that are up and adds what came down to the answer (`publications`:
-`unpublished` and `failed`; FINDINGS A-212,
-[SY.admin](../nodes/sy-admin.md#publications-and-the-audit-log)).
+(`drop_channels_in_scope`, `dropped_channels` in the answer).
 
 ### 3.7 Sponsor
 
@@ -697,7 +700,7 @@ on the motherbee, so `{hive}` is `motherbee` in practice.
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor` | `set_tenant_sponsor` → `TNT_SET_SPONSOR` |
 | `DELETE /hives/{hive}/identity/tenants/{tenant_id}` | `delete_tenant` → `TNT_DELETE` |
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | `restore_tenant` → `TNT_RESTORE` |
-| `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | `purge_tenant` → `TNT_PURGE`, after the vault check; then the tenant's public pages come down |
+| `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | `purge_tenant` → `TNT_PURGE`, after the pages and vault checks |
 | `GET /hives/{hive}/identity/tenants/{tenant_id}/nodes` | `list_tenant_nodes` |
 
 - `pending_signup` keeps only the temporary people who hold a Cloud account key, wherever they
@@ -747,7 +750,7 @@ SY.admin re-checks every relayed request (`enforce_cloud_relay_content`, `stamp_
 | `SYSTEM_ILK_PROTECTED` | A system ILK. |
 | `DUPLICATE_EMAIL` | The vouched email (`identification.email`) is taken in that tenant and no merge applies. A `claimed_email` never answers it. |
 | `CLOUD_CHANNEL_RESERVED`, `INVALID_SCOPE`, `ICH_ID_CONFLICT`, `ICH_CONFLICT`, `ACCOUNT_AMBIGUOUS` | Channel and scope rules (§2.5, §2.6). `ICH_CONFLICT`: another ILK holds the channel. |
-| `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS` | A tenant lifecycle guard (§3.6). |
+| `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS`, `TENANT_HAS_PAGES` | A tenant lifecycle guard (§3.6). |
 
 Database errors map to their own codes (`map_db_write_error_code`). Their message never echoes
 the row's values (`db_error_summary`).

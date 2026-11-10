@@ -659,7 +659,8 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
    most. The dry run lists the pages;
 4. marks and purges every non-system ILK, deletes every vault secret except
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
-   but the root (a purged tenant's pages would come down with it; step 3 left none);
+   but the root. A tenant with a page still up is not purged (`TENANT_HAS_PAGES`): step 3 takes
+   them down first, and a page it could not take down shows again as that tenant's failure;
 5. clears the user OPA policy on every hive;
 6. has every hive that runs SY.cognition drop its state through SY.admin's `cognition_clear`, the
    motherbee's included (FINDINGS A-160); truncates every table of `fluxbee_storage` with
