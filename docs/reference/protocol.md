@@ -323,13 +323,15 @@ sends them back over the same links. Envelope: `src` the router's UUID, `dst` th
 
 | `msg` | Payload | Values |
 | --- | --- | --- |
-| `UNREACHABLE` | `UnreachablePayload {original_dst, reason}` | `original_dst`: the failed `dst` as a string (`broadcast`, or `null` for `dst: null`). `reason`: `NODE_NOT_FOUND`, `VPN_BLOCKED`, `PEER_UNAVAILABLE` (the sibling router is gone), `GATEWAY_UNAVAILABLE`, `WAN_UNAVAILABLE`, `OPA_ERROR`, `OPA_NO_TARGET`, `FRAME_TOO_LARGE` (the router's additions took the frame over the limit, §1.3). |
+| `UNREACHABLE` | `UnreachablePayload {original_dst, reason}` | `original_dst`: the failed `dst` as a string (`broadcast`, or `null` for `dst: null`). `reason`: `NODE_NOT_FOUND`, `VPN_BLOCKED`, `PEER_UNAVAILABLE` (the sibling router is gone), `GATEWAY_UNAVAILABLE`, `WAN_UNAVAILABLE`, `OPA_ERROR`, `OPA_NO_TARGET`, `FRAME_TOO_LARGE` (the router's additions took the frame over the limit, §1.3), `LINK_BUSY` (the link the message would take, a node's, a sibling router's or a WAN peer's, has its queue at the senders' bound: its peer reads slower than frames come, or not at all; the link stays, and takes messages again as it drains; since 0.1.129, FINDINGS A-222). |
 | `TTL_EXCEEDED` | `TtlExceededPayload {original_dst, last_hop}` | `last_hop`: `router:<router uuid>`. |
 
 The RPC helpers turn them into `RpcError::Unreachable` and `RpcError::TtlExceeded` (§10.4). Some
 drops answer nothing, and a request then times out: a foreign `src` (§2.3), a protected verb from
 an unauthorized sender (§7), a broadcast with a non-UUID `trace_id`, a drop route. A frame the
-router enlarged past the limit is answered `FRAME_TOO_LARGE` since 0.1.124 (§1.3).
+router enlarged past the limit is answered `FRAME_TOO_LARGE` since 0.1.124 (§1.3), and a message
+for a link whose queue is full `LINK_BUSY` since 0.1.129 (a broadcast once, by the router it
+entered; [routing-and-policy.md](routing-and-policy.md) §1, §4).
 
 ### 6.2 NODE_STATUS_GET and NODE_HELP
 
@@ -659,8 +661,8 @@ unknown, not failed: the peer may have done the work (`RpcError::is_timeout`). T
 last_hop}`. Go returns `*RpcError` with `Kind` `RpcErrTimeout`, `RpcErrTerminalTransport`,
 `RpcErrInvalidResponse`, `RpcErrDisconnected`, `RpcErrInvalidRequest` or `RpcErrMessageTooLarge`.
 Go's `RpcErrTerminalTransport` names the transport message (`terminal transport response
-"UNREACHABLE"`) but not its `reason`: a Go caller cannot tell `FRAME_TOO_LARGE` from
-`NODE_NOT_FOUND`.
+"UNREACHABLE"`) but not its `reason`: a Go caller cannot tell `FRAME_TOO_LARGE` or `LINK_BUSY`
+from `NODE_NOT_FOUND`.
 
 ### 10.5 Answering a request
 

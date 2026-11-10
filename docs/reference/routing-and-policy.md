@@ -51,6 +51,21 @@ envelope in [protocol.md](protocol.md).
     marks a hive stale after 40 s without one (`DEFAULT_HELLO_INTERVAL_MS`,
     `DEFAULT_DEAD_INTERVAL_MS`; fixed, not read from `hive.yaml`). A WAN session that hears no
     frame for 40 s, or for the longer dead interval its peer's `HELLO` declared, ends (A-207).
+  - **Each link has a bounded queue** (`src/router/link.rs`, A-222, since 0.1.129): a node's, a
+    WAN peer's, a sibling router's. Every frame the router hands a link waits there for the link's
+    writer, which hands it to the socket. The queue holds at most 1,024 frames or 8 MiB
+    (`LINK_QUEUE_MAX_FRAMES`, `LINK_QUEUE_MAX_BYTES`). A sender's message is refused once it holds
+    960 frames or 7 MiB (`LINK_QUEUE_SENDERS_FRAMES`, `LINK_QUEUE_SENDERS_BYTES`), and its sender
+    is answered `UNREACHABLE` `LINK_BUSY` (§3.6). The rest is kept for the router's own frames
+    (its answers, LSAs, handshakes), so senders that keep a link at their bound never crowd them
+    out; on a full queue one of them is skipped and no one is answered (§3.7). A frame the queue
+    took is never dropped to make room, and the link is never cut for being full: as its peer
+    reads, the queue drains and takes messages again. The router logs `router did not queue frames
+    for a link whose queue is full (LINK_BUSY)` with the link, its peer, its depth and how many
+    messages it refused and own frames it skipped since the last line, at most once per link every
+    30 s. Until 0.1.129 the queue had no bound: a node that stopped reading without closing (hung,
+    or stuck behind its own full queue) never made a write fail, and every frame for it stayed in
+    the router's memory.
 
 ---
 
@@ -194,6 +209,9 @@ they count like this hive's.
   read error included, and a WAN session also ends after its dead interval without a frame
   (A-203, A-207, since 0.1.124). A local node whose writer has stopped is disconnected, and a
   message for it but a broadcast (a unicast, a resolved message) is answered `NODE_NOT_FOUND`.
+- A link whose queue is at the senders' bound (§1) takes nothing more from a sender: the message
+  is answered `LINK_BUSY`, for a local node, a sibling router and a WAN peer alike, and the link
+  stays (A-222, since 0.1.129).
 - The message travels unchanged and the next router decides again with its own tables. A Resolve
   keeps `dst: null` (§5).
 - A gateway that receives from the WAN a message for a node of a third hive forwards it again
@@ -227,6 +245,7 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 | `OPA_ERROR` | Resolve: no user policy loaded, or its evaluation failed (§5, §7) |
 | `OPA_NO_TARGET` | Resolve: the user policy gave no target |
 | `FRAME_TOO_LARGE` | the message's frame, as the router hands it to a link, is over 128 KiB: the sender's SDK let it through, and the router's additions (the sender's name, the action class, a resolve's trace entry) took it over; never queued. A broadcast goes everywhere or nowhere, and is answered once, by the router it entered (§4) (A-202, since 0.1.124) |
+| `LINK_BUSY` | the link the message would take, a local node's, a sibling router's or a WAN peer's, has its queue at the senders' bound (§1): its peer reads slower than frames come for it, or has stopped reading without closing. Never queued, and the link stays: the same message may go once the link drains. A broadcast goes to every other link, and its sender is answered once, by the router it entered (§4) (A-222, since 0.1.129) |
 
 A message that came from another router gets its error over the link it came in on; that router
 hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`).
@@ -241,6 +260,9 @@ hands it to the node when the node is its own (`handle_peer_message`, `handle_wa
   the link's writer skips it, counts it and logs `router skipped a frame over the size limit; the
   link goes on` (`write_link_frames`). A sender's message over the limit is not queued and is
   answered `FRAME_TOO_LARGE` (§3.6), and a node that sends a frame over it is disconnected;
+- one of the router's own frames (an answer, an LSA, another router's answer relayed to its node)
+  for a link whose queue is full, the router's share included (§1): skipped, and counted in the
+  link's `LINK_BUSY` line (A-222);
 - a tap copy that cannot be delivered (§8.3);
 - `STREAM_APPEND`, `OPA_RELOAD` and `WITHDRAW`, which the router consumes; `WITHDRAW` also closes the
   node's connection.
@@ -265,6 +287,11 @@ A sibling delivers it to its own nodes and, with `ttl >= 3`, sends it toward the
 gateway that receives it from the WAN checks the same cache, delivers it to its nodes, and passes it
 to its siblings (`ttl >= 2`) and to its WAN peers (`ttl >= 3`). `meta.target` is matched by every
 router against its own nodes.
+
+A link whose queue is at the senders' bound (§1) skips the broadcast, and every other link gets it.
+The router it entered answers its sender `LINK_BUSY` once when any link it handed it to was full, a
+local node's, a sibling router's or a WAN peer's; a router it reached over IRP or the WAN skips its
+own full links and answers nothing (`answer_where_it_arrived`, A-222, since 0.1.129).
 
 ---
 
@@ -692,6 +719,7 @@ fixed. With one router per hive none of them applies.
 | `dst: null` lands on the frontdesk | `meta.src_ilk` absent, or the ILK `temporary` (§5) |
 | `OPA_ERROR` | `GET /hives/{hive}/opa/status` (no policy, or a router in error); the router log `opa resolve failed` |
 | `OPA_NO_TARGET` | the policy gave no string; `data.identity` lacks the sender (§7.3) |
+| `LINK_BUSY` | the router's line `router did not queue frames for a link whose queue is full (LINK_BUSY)`: which link (`link`, `peer`), its depth, how often; then that node or hive: is it alive and reading (§1) |
 | A protected verb did nothing | the sender's stamped name against §6.2 |
 | No tap copy | exact names, the destination as written, the VPN, the log `router tap copy:`; another hive's tap copies only messages to or from that hive, to its own nodes; a protected system action is never copied (§8.3) |
 | A node of another hive is unknown here | its name must be `<role>@<its hive>`; the log `lsa nodes dropped` (§2) |

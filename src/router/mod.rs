@@ -1,3 +1,4 @@
+mod link;
 pub mod stream;
 pub mod system_policy;
 
@@ -11,10 +12,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+use self::link::{link_queue, LinkReceiver, LinkRefusal, LinkSender};
 use crate::config::RouterConfig;
 use crate::opa::OpaResolver;
 use crate::shm::{
@@ -623,14 +625,8 @@ async fn handle_node(
     // Who opened this socket, for the `RT.` names only the router's own process may take.
     let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let (mut reader, writer) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let link_peer = Arc::new(std::sync::OnceLock::<String>::new());
-    let writer_task = tokio::spawn(write_link_frames(
-        writer,
-        rx,
-        "node",
-        Arc::clone(&link_peer),
-    ));
+    let (tx, rx) = link_queue("node");
+    let writer_task = tokio::spawn(write_link_frames(writer, rx));
     let frame = read_frame(&mut reader)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
@@ -668,7 +664,7 @@ async fn handle_node(
             "RT.* names are reserved for the router's own process",
         )));
     }
-    let _ = link_peer.set(node_name.clone());
+    tx.set_peer(node_name.clone());
     tracing::info!(node = %node_name, "loading config snapshot");
     let snapshot = refresh_config(
         &config_reader,
@@ -789,7 +785,7 @@ async fn handle_node(
     tracing::info!(node = %node_uuid, name = %node_name, "node registered");
     // The name this socket registered with: the authenticated origin of everything it sends.
     let conn_node_name = node_name;
-    if tx.send(announce).is_err() {
+    if !tx.queue_own(announce) {
         tracing::warn!("failed to enqueue ANNOUNCE");
     } else {
         tracing::info!("announce queued");
@@ -878,7 +874,13 @@ async fn handle_node(
                                 apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
                                 if msg.routing.ttl >= 2 {
                                     match broadcast_to_peers(&peers, &msg).await {
-                                        Ok(()) => tracing::info!("opa reload forwarded to peers"),
+                                        Ok(false) => {
+                                            tracing::info!("opa reload forwarded to peers")
+                                        }
+                                        Ok(true) => tracing::warn!(
+                                            "opa reload not forwarded to a sibling router whose \
+                                             link is full"
+                                        ),
                                         Err(err) => tracing::warn!(
                                             error = %err,
                                             "opa reload could not be forwarded to peers"
@@ -1071,6 +1073,8 @@ async fn handle_message(
         Err(_) => return Ok(()),
     };
     let mut senders: Vec<LocalDelivery> = Vec::new();
+    // A broadcast handed to a sibling router's or a WAN peer's link that was full (A-222).
+    let mut broadcast_link_full = false;
     let src_handle = {
         let nodes_guard = nodes.lock().await;
         nodes_guard.get(&src_uuid).cloned()
@@ -1338,10 +1342,10 @@ async fn handle_message(
                 "router broadcast fanout summary"
             );
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(peers, &msg).await?;
+                broadcast_link_full |= broadcast_to_peers(peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                forward_broadcast_to_wan(
+                broadcast_link_full |= forward_broadcast_to_wan(
                     &msg,
                     is_gateway,
                     peer_routers,
@@ -1451,9 +1455,10 @@ async fn handle_message(
         }
     }
 
-    if let Some(reason) =
-        deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?
-    {
+    // A broadcast is answered once, here, where it entered: `LINK_BUSY` when any link it was handed
+    // to was full, a local node's, a sibling router's or a WAN peer's (A-222).
+    let local = deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
+    if let Some(reason) = local.or(broadcast_link_full.then_some(UNREACHABLE_LINK_BUSY)) {
         send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
     }
 
@@ -1706,7 +1711,7 @@ async fn fanout_taps_for_unicast(
                 if frame_over_limit(&data, &copy, "node", &target_handle.name) {
                     continue;
                 }
-                let _ = target_handle.sender.send(data);
+                let _ = target_handle.sender.queue(data);
                 tracing::info!(
                     tap_src = %src_name,
                     tap_dst = %dst_name_owned,
@@ -1767,9 +1772,11 @@ fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Answers the sender of `msg` `UNREACHABLE` with `reason`, over `sender`, the link the message came
+/// in on. An answer is one of the router's own frames: on a full link it is skipped (A-222).
 fn send_unreachable_to(
     msg: &Message,
-    sender: &mpsc::UnboundedSender<Vec<u8>>,
+    sender: &LinkSender,
     router_uuid: Uuid,
     reason: &str,
 ) -> Result<(), RouterError> {
@@ -1785,13 +1792,13 @@ fn send_unreachable_to(
         &original_dst,
         reason,
     );
-    let _ = sender.send(serde_json::to_vec(&err)?);
+    sender.queue_own(serde_json::to_vec(&err)?);
     Ok(())
 }
 
 fn send_ttl_exceeded_to(
     msg: &Message,
-    sender: &mpsc::UnboundedSender<Vec<u8>>,
+    sender: &LinkSender,
     router_uuid: Uuid,
 ) -> Result<(), RouterError> {
     let original_dst = match &msg.routing.dst {
@@ -1806,13 +1813,17 @@ fn send_ttl_exceeded_to(
         &original_dst,
         &router_name(router_uuid),
     );
-    let _ = sender.send(serde_json::to_vec(&err)?);
+    sender.queue_own(serde_json::to_vec(&err)?);
     Ok(())
 }
 
 /// The UNREACHABLE reason for a message whose frame, as the router hands it to a link, is over the
 /// socket's limit (A-202).
 const UNREACHABLE_FRAME_TOO_LARGE: &str = "FRAME_TOO_LARGE";
+/// The UNREACHABLE reason for a message whose link, a local node's, a sibling router's or a WAN
+/// peer's, has its queue at the senders' bound: its peer reads slower than its frames come, or not
+/// at all (A-222, `link.rs`). The link stays up, and takes messages again as it drains.
+const UNREACHABLE_LINK_BUSY: &str = "LINK_BUSY";
 /// Frames the router did not queue for being over the socket's size limit, process-wide. Each warn
 /// line about them carries the total; at most one line per interval.
 static OVERSIZE_FRAMES_REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -1867,9 +1878,20 @@ enum Handover {
     NoLink,
     /// Its frame is over the socket's limit, so it was not queued (A-202).
     TooLarge,
+    /// The link's queue is at the senders' bound, so it was not queued (A-222).
+    Busy,
 }
 
 impl Handover {
+    /// What the link's queue said of the frame.
+    fn of(queued: Result<(), LinkRefusal>) -> Self {
+        match queued {
+            Ok(()) => Handover::Queued,
+            Err(LinkRefusal::Full) => Handover::Busy,
+            Err(LinkRefusal::Gone) => Handover::NoLink,
+        }
+    }
+
     /// The reason the message's sender is answered `UNREACHABLE` with, if any: `no_link` when there
     /// is no link.
     fn unreachable(self, no_link: &'static str) -> Option<&'static str> {
@@ -1877,12 +1899,14 @@ impl Handover {
             Handover::Queued => None,
             Handover::NoLink => Some(no_link),
             Handover::TooLarge => Some(UNREACHABLE_FRAME_TOO_LARGE),
+            Handover::Busy => Some(UNREACHABLE_LINK_BUSY),
         }
     }
 }
 
 /// Hands `msg` to the IRP link of the sibling router `peer_uuid`. With no link, or one whose writer
-/// has stopped, the caller answers `PEER_UNAVAILABLE` or `GATEWAY_UNAVAILABLE`.
+/// has stopped, the caller answers `PEER_UNAVAILABLE` or `GATEWAY_UNAVAILABLE`; with a full one,
+/// `LINK_BUSY`.
 async fn send_to_peer_router(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_uuid: Uuid,
@@ -1903,15 +1927,12 @@ async fn send_to_peer_router(
     if frame_over_limit(&data, &forward, "irp", peer_uuid) {
         return Ok(Handover::TooLarge);
     }
-    Ok(match peer.sender.send(data) {
-        Ok(()) => Handover::Queued,
-        Err(_) => Handover::NoLink,
-    })
+    Ok(Handover::of(peer.sender.queue(data)))
 }
 
 /// Hands `msg` to the WAN link of `hive_id`. With no link, or one whose writer has stopped, the
-/// caller answers `WAN_UNAVAILABLE`. Until 0.1.124 a send that failed counted as sent, and the frame
-/// was lost without an answer (A-203).
+/// caller answers `WAN_UNAVAILABLE`; with a full one, `LINK_BUSY`. Until 0.1.124 a send that failed
+/// counted as sent, and the frame was lost without an answer (A-203).
 async fn send_to_wan_peer(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     hive_id: &str,
@@ -1932,10 +1953,7 @@ async fn send_to_wan_peer(
     if frame_over_limit(&data, &forward, "wan", hive_id) {
         return Ok(Handover::TooLarge);
     }
-    Ok(match peer.sender.send(data) {
-        Ok(()) => Handover::Queued,
-        Err(_) => Handover::NoLink,
-    })
+    Ok(Handover::of(peer.sender.queue(data)))
 }
 
 /// Whether a broadcast is over the frame on any link it would take. On its way to a local node it
@@ -1954,14 +1972,16 @@ fn broadcast_over_limit(msg: &Message) -> Result<bool, RouterError> {
 }
 
 /// Hands a broadcast to every sibling router's link. Its handler checked it first
-/// (`broadcast_over_limit`): a frame over the limit here goes to none, and is only logged.
+/// (`broadcast_over_limit`): a frame over the limit here goes to none, and is only logged. A link
+/// whose queue is full is skipped; whether one was, for the router the broadcast entered to answer
+/// its sender `LINK_BUSY` once (A-222).
 async fn broadcast_to_peers(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     msg: &Message,
-) -> Result<(), RouterError> {
+) -> Result<bool, RouterError> {
     let peers_guard = peers.lock().await;
     if peers_guard.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut forward = msg.clone();
     if forward.routing.ttl > 0 {
@@ -1969,23 +1989,25 @@ async fn broadcast_to_peers(
     }
     let data = serde_json::to_vec(&forward)?;
     if frame_over_limit(&data, &forward, "irp", "broadcast") {
-        return Ok(());
+        return Ok(false);
     }
+    let mut full = false;
     for peer in peers_guard.values() {
-        let _ = peer.sender.send(data.clone());
+        full |= peer.sender.queue(data.clone()) == Err(LinkRefusal::Full);
     }
-    Ok(())
+    Ok(full)
 }
 
 /// Hands a broadcast to every WAN peer's link. Its handler checked it first
-/// (`broadcast_over_limit`): a frame over the limit here goes to none, and is only logged.
+/// (`broadcast_over_limit`): a frame over the limit here goes to none, and is only logged. A link
+/// whose queue is full is skipped; whether one was, as `broadcast_to_peers`.
 async fn broadcast_to_wan(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     msg: &Message,
-) -> Result<(), RouterError> {
+) -> Result<bool, RouterError> {
     let peers_guard = wan_peers.lock().await;
     if peers_guard.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut forward = msg.clone();
     if forward.routing.ttl > 0 {
@@ -1993,12 +2015,13 @@ async fn broadcast_to_wan(
     }
     let data = serde_json::to_vec(&forward)?;
     if frame_over_limit(&data, &forward, "wan", "broadcast") {
-        return Ok(());
+        return Ok(false);
     }
+    let mut full = false;
     for peer in peers_guard.values() {
-        let _ = peer.sender.send(data.clone());
+        full |= peer.sender.queue(data.clone()) == Err(LinkRefusal::Full);
     }
-    Ok(())
+    Ok(full)
 }
 
 async fn forward_to_hive(
@@ -2009,7 +2032,7 @@ async fn forward_to_hive(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     router_uuid: Uuid,
-    sender: &mpsc::UnboundedSender<Vec<u8>>,
+    sender: &LinkSender,
 ) -> Result<(), RouterError> {
     if msg.routing.ttl <= 1 {
         send_ttl_exceeded_to(msg, sender, router_uuid)?;
@@ -2044,6 +2067,8 @@ async fn forward_to_hive(
     Ok(())
 }
 
+/// Hands a broadcast toward the WAN: the gateway to every WAN peer, another router to the gateway
+/// sibling. Whether a link it was handed to was full (A-222).
 async fn forward_broadcast_to_wan(
     msg: &Message,
     is_gateway: bool,
@@ -2051,14 +2076,13 @@ async fn forward_broadcast_to_wan(
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     router_uuid: Uuid,
-    sender: &mpsc::UnboundedSender<Vec<u8>>,
-) -> Result<(), RouterError> {
+    sender: &LinkSender,
+) -> Result<bool, RouterError> {
     if msg.routing.ttl <= 2 {
-        return Ok(());
+        return Ok(false);
     }
     if is_gateway {
-        broadcast_to_wan(wan_peers, msg).await?;
-        return Ok(());
+        return broadcast_to_wan(wan_peers, msg).await;
     }
     let gateway_uuid = {
         let guard = peer_routers.lock().await;
@@ -2069,10 +2093,9 @@ async fn forward_broadcast_to_wan(
     };
     let Some(gateway_uuid) = gateway_uuid else {
         send_unreachable_to(msg, sender, router_uuid, "GATEWAY_UNAVAILABLE")?;
-        return Ok(());
+        return Ok(false);
     };
-    let _ = send_to_peer_router(peers, gateway_uuid, msg).await?;
-    Ok(())
+    Ok(send_to_peer_router(peers, gateway_uuid, msg).await? == Handover::Busy)
 }
 
 fn match_kind_label(kind: u8) -> &'static str {
@@ -2267,7 +2290,7 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
             payload.clone(),
         );
         let data = serde_json::to_vec(&msg)?;
-        let _ = peer.sender.send(data);
+        peer.sender.queue_own(data);
     }
     Ok(())
 }
@@ -2349,7 +2372,7 @@ async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
             payload,
         );
         if let Ok(data) = serde_json::to_vec(&msg) {
-            let _ = peer.sender.send(data);
+            peer.sender.queue_own(data);
         }
     }
     Ok(())
@@ -2496,7 +2519,7 @@ async fn broadcast_lsa_direct(
             payload.clone(),
         );
         let data = serde_json::to_vec(&msg)?;
-        let _ = peer.sender.send(data);
+        peer.sender.queue_own(data);
     }
     Ok(())
 }
@@ -3196,9 +3219,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut reader, writer) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let link_peer = Arc::new(std::sync::OnceLock::<String>::new());
-    let writer_task = tokio::spawn(write_link_frames(writer, rx, "wan", Arc::clone(&link_peer)));
+    let (tx, rx) = link_queue("wan");
+    let writer_task = tokio::spawn(write_link_frames(writer, rx));
 
     let hello_payload = WanHelloPayload {
         protocol: MESH_PROTOCOL_VERSION.to_string(),
@@ -3217,7 +3239,7 @@ where
             &Uuid::new_v4().to_string(),
             hello_payload.clone(),
         );
-        let _ = tx.send(serde_json::to_vec(&hello)?);
+        tx.queue_own(serde_json::to_vec(&hello)?);
     }
 
     let frame = handshake_step("the peer's HELLO", read_frame(&mut reader))
@@ -3262,7 +3284,7 @@ where
             return Ok(());
         }
     }
-    let _ = link_peer.set(peer_hello.hive_id.clone());
+    tx.set_peer(peer_hello.hive_id.clone());
 
     // A-48: the motherbee admits a hive, by the id just bound to its certificate, only while its
     // registry lists it. Its own uplinks, if any, are not checked.
@@ -3282,7 +3304,7 @@ where
                 message: format!("Hive '{}' is not registered", peer_hello.hive_id),
             },
         );
-        let _ = tx.send(serde_json::to_vec(&reject)?);
+        tx.queue_own(serde_json::to_vec(&reject)?);
         tracing::warn!(
             peer_hive = %peer_hello.hive_id,
             peer_router_id = %peer_hello.router_id,
@@ -3308,7 +3330,7 @@ where
             &Uuid::new_v4().to_string(),
             hello_payload,
         );
-        let _ = tx.send(serde_json::to_vec(&hello)?);
+        tx.queue_own(serde_json::to_vec(&hello)?);
     }
 
     // U-4a: the HELLO has always carried a protocol version and nobody ever looked at it — the
@@ -3353,7 +3375,7 @@ where
     if let Some(established) = established {
         established.store(true, Ordering::Relaxed);
     }
-    let _ = tx.send(serde_json::to_vec(&accept)?);
+    tx.queue_own(serde_json::to_vec(&accept)?);
 
     {
         let mut guard = ctx.wan_peers.lock().await;
@@ -3471,7 +3493,7 @@ where
 
 async fn handle_wan_message(
     msg: &Message,
-    sender: &mpsc::UnboundedSender<Vec<u8>>,
+    sender: &LinkSender,
     ctx: &WanContext,
     peer_hive: &str,
     peer_router_uuid: Uuid,
@@ -3588,7 +3610,7 @@ async fn handle_wan_message(
                         };
                         if let Some(dst_handle) = dst_handle {
                             let data = serde_json::to_vec(&msg)?;
-                            let _ = dst_handle.sender.send(data);
+                            dst_handle.sender.queue_own(data);
                         }
                     }
                 }
@@ -3752,7 +3774,7 @@ async fn handle_wan_message(
                     &NodeHandle {
                         name: src_info.name.clone(),
                         vpn_id: src_info.vpn_id,
-                        sender: mpsc::unbounded_channel().0,
+                        sender: link_queue("node").0,
                         connected_at: 0,
                     },
                     &nodes_guard,
@@ -3851,11 +3873,13 @@ async fn handle_wan_message(
                 }
                 senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
+            // A full link skips the broadcast without an answer here: its sender is answered once,
+            // by the router it entered (A-222).
             if msg.routing.ttl >= 2 {
-                broadcast_to_peers(&ctx.peers, &msg).await?;
+                let _full = broadcast_to_peers(&ctx.peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                broadcast_to_wan(&ctx.wan_peers, &msg).await?;
+                let _full = broadcast_to_wan(&ctx.wan_peers, &msg).await?;
             }
         }
         Destination::Resolve => {
@@ -3884,7 +3908,7 @@ async fn handle_wan_message(
                 &NodeHandle {
                     name: src_info.name.clone(),
                     vpn_id: src_info.vpn_id,
-                    sender: mpsc::unbounded_channel().0,
+                    sender: link_queue("node").0,
                     connected_at: 0,
                 },
                 &nodes_guard,
@@ -3947,7 +3971,7 @@ async fn handle_wan_message(
         }
     }
 
-    if let Some(reason) = deliver_locally(
+    let local = deliver_locally(
         senders,
         &msg,
         &ctx.memory_reader,
@@ -3955,11 +3979,20 @@ async fn handle_wan_message(
         src_via_hub,
         &ctx.log_stream,
     )
-    .await?
-    {
+    .await?;
+    if let Some(reason) = answer_where_it_arrived(local, &msg) {
         send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
     }
     Ok(())
+}
+
+/// What a router a message reached over IRP or the WAN answers its sender, of what its local
+/// delivery said: all but a broadcast's `LINK_BUSY`, which only the router the broadcast entered
+/// answers, once (A-222).
+fn answer_where_it_arrived(local: Option<&'static str>, msg: &Message) -> Option<&'static str> {
+    local.filter(|reason| {
+        *reason != UNREACHABLE_LINK_BUSY || !matches!(msg.routing.dst, Destination::Broadcast)
+    })
 }
 
 fn peer_socket_path(socket_dir: &Path, router_uuid: Uuid) -> PathBuf {
@@ -4219,7 +4252,8 @@ async fn connect_to_peer(
     );
     let hello = serde_json::to_vec(&hello)?;
     let (mut reader, writer) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = link_queue("irp");
+    tx.set_peer(peer_uuid.to_string());
     {
         let mut peers_guard = peers.lock().await;
         if peers_guard.contains_key(&peer_uuid) {
@@ -4227,9 +4261,8 @@ async fn connect_to_peer(
         }
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
-    let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
-    let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
-    let _ = tx.send(hello);
+    let writer_task = tokio::spawn(write_link_frames(writer, rx));
+    tx.queue_own(hello);
 
     // Every end of the link runs the cleanup below, a read error or an error handling a frame
     // included, as a WAN session's does (A-203): the sibling's entry would otherwise stay, and
@@ -4321,13 +4354,13 @@ async fn handle_peer_incoming(
             return Ok(());
         }
     }
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = link_queue("irp");
+    tx.set_peer(peer_uuid.to_string());
     {
         let mut peers_guard = peers.lock().await;
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
-    let link_peer = Arc::new(std::sync::OnceLock::from(peer_uuid.to_string()));
-    let writer_task = tokio::spawn(write_link_frames(writer, rx, "irp", link_peer));
+    let writer_task = tokio::spawn(write_link_frames(writer, rx));
 
     // Every end of the link runs the cleanup below, as `connect_to_peer`'s does (A-203).
     let exit: Result<(), RouterError> = loop {
@@ -4389,15 +4422,13 @@ const OVERSIZE_FRAME_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// ends. A frame over the socket's 128 KB limit is skipped and counted, and the link goes on: until
 /// 0.1.74 the writer stopped while the link stayed registered, so every later frame to it was lost
 /// for good (A-70, D11 of docs/router-stream-v1.md). Any other write error stops the writer: a send
-/// into its channel fails from then on, and a WAN session ends with it (A-203).
-async fn write_link_frames<W>(
-    mut writer: W,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    link: &'static str,
-    peer: Arc<std::sync::OnceLock<String>>,
-) where
+/// into its queue fails from then on, and a WAN session ends with it (A-203). Each frame it takes
+/// frees its place in the queue's bound (A-222).
+async fn write_link_frames<W>(mut writer: W, mut rx: LinkReceiver)
+where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let link = rx.kind();
     let mut skipped_unlogged = 0u64;
     let mut last_logged: Option<Instant> = None;
     while let Some(frame) = rx.recv().await {
@@ -4407,7 +4438,7 @@ async fn write_link_frames<W>(
             if last_logged.is_none_or(|at| at.elapsed() >= OVERSIZE_FRAME_LOG_INTERVAL) {
                 tracing::warn!(
                     link,
-                    peer = peer.get().map(String::as_str).unwrap_or("-"),
+                    peer = rx.peer(),
                     frame_len = frame.len(),
                     max = MAX_FRAME_SIZE,
                     skipped = skipped_unlogged,
@@ -4422,7 +4453,7 @@ async fn write_link_frames<W>(
         if let Err(err) = write_frame(&mut writer, &frame).await {
             tracing::warn!(
                 link,
-                peer = peer.get().map(String::as_str).unwrap_or("-"),
+                peer = rx.peer(),
                 error = %err,
                 frame_len = frame.len(),
                 "router: link write error; closing the link"
@@ -4596,7 +4627,7 @@ async fn handle_peer_message(
                             };
                             if let Some(dst_handle) = dst_handle {
                                 let data = serde_json::to_vec(&msg)?;
-                                let _ = dst_handle.sender.send(data);
+                                dst_handle.sender.queue_own(data);
                             }
                         }
                     }
@@ -4692,7 +4723,7 @@ async fn handle_peer_message(
                     &NodeHandle {
                         name: src_node.name.clone(),
                         vpn_id: src_node.vpn_id,
-                        sender: mpsc::unbounded_channel().0,
+                        sender: link_queue("node").0,
                         connected_at: 0,
                     },
                     &nodes_guard,
@@ -4803,7 +4834,8 @@ async fn handle_peer_message(
             }
             if msg.routing.ttl >= 3 {
                 if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                    forward_broadcast_to_wan(
+                    // A full link skips it without an answer here, as on the WAN (A-222).
+                    let _full = forward_broadcast_to_wan(
                         &msg,
                         is_gateway,
                         peer_routers,
@@ -4846,7 +4878,7 @@ async fn handle_peer_message(
                 &NodeHandle {
                     name: src_node.name.clone(),
                     vpn_id: src_node.vpn_id,
-                    sender: mpsc::unbounded_channel().0,
+                    sender: link_queue("node").0,
                     connected_at: 0,
                 },
                 &nodes_guard,
@@ -4917,9 +4949,8 @@ async fn handle_peer_message(
         }
     }
 
-    if let Some(reason) =
-        deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?
-    {
+    let local = deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
+    if let Some(reason) = answer_where_it_arrived(local, &msg) {
         if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
             send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
         }
@@ -5248,7 +5279,7 @@ fn local_peer_admitted(stream: &UnixStream, own_uid: u32) -> bool {
 struct NodeHandle {
     name: String,
     vpn_id: u32,
-    sender: mpsc::UnboundedSender<Vec<u8>>,
+    sender: LinkSender,
     connected_at: u64,
 }
 
@@ -5279,12 +5310,12 @@ struct PeerRouter {
 
 #[derive(Clone)]
 struct PeerHandle {
-    sender: mpsc::UnboundedSender<Vec<u8>>,
+    sender: LinkSender,
 }
 
 #[derive(Clone)]
 struct WanPeer {
-    sender: mpsc::UnboundedSender<Vec<u8>>,
+    sender: LinkSender,
     router_uuid: Uuid,
 }
 
@@ -7074,11 +7105,11 @@ fn should_enrich_with_memory_package(msg: &Message) -> bool {
 /// A local node a message is delivered to.
 struct LocalDelivery {
     node: String,
-    sender: mpsc::UnboundedSender<Vec<u8>>,
+    sender: LinkSender,
 }
 
 impl LocalDelivery {
-    fn to(node: &str, sender: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+    fn to(node: &str, sender: LinkSender) -> Self {
         Self {
             node: node.to_string(),
             sender,
@@ -7135,9 +7166,11 @@ fn cognition_copy(msg: &Message, sender_name: &str) -> Option<Vec<u8>> {
 /// copy its agent's sends make at entry, the agent's router hands its cognition both directions.
 ///
 /// The reason the caller answers the sender `UNREACHABLE` with, if any: `FRAME_TOO_LARGE` when the
-/// message's frame, as delivered, is over the socket's limit, so no destination got it (A-202); for
-/// anything but a broadcast (a unicast, a resolved message), `NODE_NOT_FOUND` when its
-/// destination's link took nothing, its writer stopped, as for a node that left (A-203).
+/// message's frame, as delivered, is over the socket's limit, so no destination got it (A-202);
+/// `LINK_BUSY` when a destination's link has its queue at the senders' bound (A-222), which for a
+/// broadcast only the router it entered answers (`answer_where_it_arrived`); for anything but a
+/// broadcast (a unicast, a resolved message), `NODE_NOT_FOUND` when its destination's link took
+/// nothing, its writer stopped, as for a node that left (A-203).
 async fn deliver_locally(
     deliveries: Vec<LocalDelivery>,
     msg: &Message,
@@ -7153,6 +7186,7 @@ async fn deliver_locally(
         return Ok(None);
     };
     let mut too_large = false;
+    let mut busy = false;
     let mut undelivered = false;
     let turn = is_communication_turn(&prepared);
     let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
@@ -7200,12 +7234,16 @@ async fn deliver_locally(
             too_large = true;
             continue;
         }
-        if delivery.sender.send(data).is_err() {
-            undelivered = true;
+        match delivery.sender.queue(data) {
+            Ok(()) => {}
+            Err(LinkRefusal::Full) => busy = true,
+            Err(LinkRefusal::Gone) => undelivered = true,
         }
     }
     Ok(if too_large {
         Some(UNREACHABLE_FRAME_TOO_LARGE)
+    } else if busy {
+        Some(UNREACHABLE_LINK_BUSY)
     } else if undelivered && !matches!(msg.routing.dst, Destination::Broadcast) {
         Some("NODE_NOT_FOUND")
     } else {
@@ -7431,6 +7469,7 @@ async fn read_memory_snapshot_for_delivery(
 
 #[cfg(test)]
 mod tests {
+    use super::link::{LINK_QUEUE_MAX_FRAMES, LINK_QUEUE_SENDERS_BYTES, LINK_QUEUE_SENDERS_FRAMES};
     use super::*;
     use crate::shm::{
         IdentityHeaderSnapshot, IdentitySnapshot, IlkAliasEntry, IlkEntry,
@@ -7831,7 +7870,7 @@ mod tests {
             &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
         )
         .await;
-        let (sender, _receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender, _receiver) = link_queue("node");
         let src = NodeHandle {
             name: "IO.slack@motherbee".to_string(),
             vpn_id: 0,
@@ -7938,9 +7977,9 @@ mod tests {
     #[tokio::test]
     async fn the_tap_fanout_copies_for_another_hive_only_what_it_is_a_party_to() {
         let admin = Uuid::new_v4();
-        let (admin_tx, _admin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (vault_tx, _vault_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (audit_tx, mut audit_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (admin_tx, _admin_rx) = link_queue("node");
+        let (vault_tx, _vault_rx) = link_queue("node");
+        let (audit_tx, mut audit_rx) = link_queue("node");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         for (uuid, name, sender) in [
             (admin, "SY.admin@motherbee", admin_tx),
@@ -7959,7 +7998,7 @@ mod tests {
         }
         let peer_nodes = Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new()));
         // worker1's link: a copy for IO.audit@worker1 goes there.
-        let (worker1_tx, mut worker1_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (worker1_tx, mut worker1_rx) = link_queue("wan");
         let wan_peers = Arc::new(Mutex::new(HashMap::from([(
             "worker1".to_string(),
             WanPeer {
@@ -9589,8 +9628,8 @@ mod tests {
         let sender_uuid = Uuid::new_v4();
         let receiver_uuid = Uuid::new_v4();
 
-        let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender_tx, _sender_rx) = link_queue("node");
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
 
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         {
@@ -9694,8 +9733,8 @@ mod tests {
         // The node it targets, and the node whose UUID it claims.
         let receiver_uuid = Uuid::new_v4();
         let victim_uuid = Uuid::new_v4();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (victim_tx, _victim_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
+        let (victim_tx, _victim_rx) = link_queue("node");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         {
             let mut g = nodes.lock().await;
@@ -9978,7 +10017,7 @@ mod tests {
         let shm = TestShm::new("rt-stream");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         let receiver_uuid = Uuid::new_v4();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
         nodes.lock().await.insert(
             receiver_uuid,
             NodeHandle {
@@ -10077,8 +10116,8 @@ mod tests {
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         let agent_uuid = Uuid::new_v4();
         let web_uuid = Uuid::new_v4();
-        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (web_tx, mut web_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (agent_tx, mut agent_rx) = link_queue("node");
+        let (web_tx, mut web_rx) = link_queue("node");
         {
             let mut guard = nodes.lock().await;
             for (uuid, name, sender) in [
@@ -10239,7 +10278,7 @@ mod tests {
         let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
         let held = Arc::clone(&memory_reader).lock_owned().await;
         let (log_stream, observed) = stream::StreamHandle::observed();
-        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (agent_tx, mut agent_rx) = link_queue("node");
         let msg = agent_turn("hello");
         let delivery = tokio::spawn({
             let memory_reader = Arc::clone(&memory_reader);
@@ -10334,7 +10373,7 @@ mod tests {
 
         // 100 KB of text and the whole package are over a frame: the oldest turns go.
         let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
-        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (agent_tx, mut agent_rx) = link_queue("node");
         deliver_locally(
             vec![LocalDelivery::to("AI.sales@motherbee", agent_tx)],
             &agent_turn(&"z".repeat(100_000)),
@@ -10855,8 +10894,8 @@ mod tests {
     async fn a_message_for_a_node_whose_writer_stopped_is_answered_node_not_found() {
         let sender = Uuid::new_v4();
         let gone = Uuid::new_v4();
-        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (gone_tx, writer_gone) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender_tx, mut answers) = link_queue("node");
+        let (gone_tx, writer_gone) = link_queue("node");
         drop(writer_gone);
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([
             (
@@ -10916,7 +10955,7 @@ mod tests {
             "SY.orchestrator@worker1",
         ));
         let gone = Uuid::new_v4();
-        let (gone_tx, writer_gone) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (gone_tx, writer_gone) = link_queue("node");
         drop(writer_gone);
         ctx.nodes.lock().await.insert(
             gone,
@@ -10941,7 +10980,7 @@ mod tests {
             },
             payload: serde_json::json!({}),
         };
-        let (link, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (link, mut answers) = link_queue("node");
         handle_wan_message(
             &frame,
             &link,
@@ -11027,8 +11066,8 @@ mod tests {
     async fn a_message_over_the_frame_after_the_routers_additions_is_answered_frame_too_large() {
         let sender = Uuid::new_v4();
         let receiver = Uuid::new_v4();
-        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (receiver_tx, mut delivered) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender_tx, mut answers) = link_queue("node");
+        let (receiver_tx, mut delivered) = link_queue("node");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([
             (
                 sender,
@@ -11114,7 +11153,7 @@ mod tests {
     async fn a_message_for_another_hive_over_the_frame_is_answered_frame_too_large() {
         let sender = Uuid::new_v4();
         let remote = Uuid::new_v4();
-        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender_tx, mut answers) = link_queue("node");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([(
             sender,
             NodeHandle {
@@ -11124,7 +11163,7 @@ mod tests {
                 connected_at: 0,
             },
         )])));
-        let (wan_tx, mut wan) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (wan_tx, mut wan) = link_queue("wan");
         let wan_peers = Arc::new(Mutex::new(HashMap::from([(
             "worker1".to_string(),
             WanPeer {
@@ -11177,7 +11216,7 @@ mod tests {
             "SY.orchestrator@worker1",
         ));
         let local = Uuid::new_v4();
-        let (local_tx, mut delivered) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (local_tx, mut delivered) = link_queue("node");
         ctx.nodes.lock().await.insert(
             local,
             NodeHandle {
@@ -11191,7 +11230,7 @@ mod tests {
         let over = pad_for(MAX_FRAME_SIZE + 1, |pad| {
             local_frame_len(&to_local(pad), "SY.orchestrator@worker1")
         });
-        let (link, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (link, mut answers) = link_queue("node");
         let from_worker1 = |frame: Message| {
             let ctx = Arc::clone(&ctx);
             let link = link.clone();
@@ -11228,19 +11267,19 @@ mod tests {
     /// nodes, a sibling router and a WAN peer.
     struct BroadcastScene {
         sender: Uuid,
-        answers: mpsc::UnboundedReceiver<Vec<u8>>,
+        answers: LinkReceiver,
         nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
-        receivers: Vec<mpsc::UnboundedReceiver<Vec<u8>>>,
+        receivers: Vec<LinkReceiver>,
         peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>>,
-        sibling: mpsc::UnboundedReceiver<Vec<u8>>,
+        sibling: LinkReceiver,
         wan_peers: Arc<Mutex<HashMap<String, WanPeer>>>,
-        wan: mpsc::UnboundedReceiver<Vec<u8>>,
+        wan: LinkReceiver,
     }
 
     impl BroadcastScene {
         fn new() -> Self {
             let sender = Uuid::new_v4();
-            let (sender_tx, answers) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (sender_tx, answers) = link_queue("node");
             let mut nodes = HashMap::from([(
                 sender,
                 NodeHandle {
@@ -11252,7 +11291,7 @@ mod tests {
             )]);
             let mut receivers = Vec::new();
             for name in ["SY.timer@motherbee", "SY.storage@motherbee"] {
-                let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (tx, rx) = link_queue("node");
                 nodes.insert(
                     Uuid::new_v4(),
                     NodeHandle {
@@ -11264,8 +11303,8 @@ mod tests {
                 );
                 receivers.push(rx);
             }
-            let (sibling_tx, sibling) = mpsc::unbounded_channel::<Vec<u8>>();
-            let (wan_tx, wan) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (sibling_tx, sibling) = link_queue("irp");
+            let (wan_tx, wan) = link_queue("wan");
             Self {
                 sender,
                 answers,
@@ -11353,6 +11392,398 @@ mod tests {
         assert!(scene.answers.try_recv().is_err(), "nothing to answer");
     }
 
+    /// Fills `link` up to the senders' bound with frames that are no message.
+    fn fill_to_the_senders_bound(link: &LinkSender) {
+        for _ in 0..=LINK_QUEUE_MAX_FRAMES {
+            if link.queue(b"filler".to_vec()).is_err() {
+                break;
+            }
+        }
+        assert_eq!(link.depth().0, LINK_QUEUE_SENDERS_FRAMES);
+    }
+
+    /// Fills `link` to its whole bound, the router's own share included.
+    fn fill_to_the_brim(link: &LinkSender) {
+        for _ in 0..=LINK_QUEUE_MAX_FRAMES {
+            if !link.queue_own(b"filler".to_vec()) {
+                break;
+            }
+        }
+        assert_eq!(link.depth().0, LINK_QUEUE_MAX_FRAMES);
+    }
+
+    /// Takes everything waiting on `link`: the messages, without the fillers.
+    fn messages_on(link: &mut LinkReceiver) -> Vec<Message> {
+        std::iter::from_fn(|| link.try_recv().ok())
+            .filter_map(|frame| serde_json::from_slice(&frame).ok())
+            .collect()
+    }
+
+    /// The next frame `client` reads within 10 s.
+    async fn next_frame(client: &mut UnixStream) -> Vec<u8> {
+        time::timeout(Duration::from_secs(10), read_frame(client))
+            .await
+            .expect("a frame in time")
+            .expect("read")
+            .expect("a frame")
+    }
+
+    /// Sends `fence`, a message for a node that is not there, and reads what the router queued for
+    /// its sender until the fence's answer. The router handles a node's messages in order and
+    /// queues its answers in that order, so these are its answers to every message before the
+    /// fence, and all of them.
+    async fn answers_before(client: &mut UnixStream, fence: &[u8]) -> Vec<Message> {
+        let fence_trace = serde_json::from_slice::<Message>(fence)
+            .expect("a message")
+            .routing
+            .trace_id;
+        write_frame(client, fence).await.expect("the fence");
+        let mut answers = Vec::new();
+        loop {
+            let answer: Message =
+                serde_json::from_slice(&next_frame(client).await).expect("a message");
+            if answer.routing.trace_id == fence_trace {
+                return answers;
+            }
+            answers.push(answer);
+        }
+    }
+
+    /// A-222, end to end: a node that stops reading, without closing, fills its link. From then on
+    /// each message for it is refused at once and its sender answered LINK_BUSY, while the node
+    /// stays connected, its queue within its bound, and the other links go on. Once it reads again,
+    /// it gets every message its link took, and a new one goes through unanswered.
+    #[tokio::test]
+    async fn a_node_that_stops_reading_fills_its_link_and_its_senders_hear_link_busy() {
+        const PAD: usize = 100 * 1024;
+        let shm = TestShm::new("rt-busy");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let connect = |name: &'static str| {
+            let shm = &shm;
+            let nodes = &nodes;
+            async move {
+                let uuid = Uuid::new_v4();
+                let (client, connection) = hello(shm, nodes, uuid, name).await;
+                (uuid, client.expect("announced"), connection)
+            }
+        };
+        let (slow, mut slow_client, _slow) = connect("AI.slow").await;
+        let (sender, mut sender_client, _sender) = connect("WF.sender").await;
+        let (other, mut other_client, _other) = connect("SY.timer").await;
+        let to = |dst: Uuid, n: usize, pad: usize| {
+            test_frame(
+                sender,
+                "user",
+                None,
+                Destination::Unicast(dst.to_string()),
+                serde_json::json!({ "n": n, "pad": "x".repeat(pad) }),
+            )
+        };
+        let fence = || to(Uuid::new_v4(), 0, 0);
+
+        // More than the slow node's link and both socket buffers hold.
+        let sent = LINK_QUEUE_SENDERS_BYTES / PAD + 24;
+        for n in 0..sent {
+            write_frame(&mut sender_client, &to(slow, n, PAD))
+                .await
+                .expect("to the slow node");
+        }
+        let answers = answers_before(&mut sender_client, &fence()).await;
+        assert!(!answers.is_empty(), "the sender heard of its link");
+        for answer in &answers {
+            assert_eq!(answer.meta.msg.as_deref(), Some(MSG_UNREACHABLE));
+            let answer: fluxbee_sdk::protocol::UnreachablePayload =
+                serde_json::from_value(answer.payload.clone()).expect("an UNREACHABLE payload");
+            assert_eq!(answer.reason, "LINK_BUSY");
+            assert_eq!(answer.original_dst, slow.to_string());
+        }
+        let taken = sent - answers.len();
+
+        // The node stays, with its queue at the senders' bound and no further, and another link
+        // goes on.
+        assert_eq!(
+            holder_name(&nodes, slow).await.as_deref(),
+            Some("AI.slow@motherbee")
+        );
+        let (frames, bytes) = nodes.lock().await[&slow].sender.depth();
+        assert!(
+            bytes <= LINK_QUEUE_SENDERS_BYTES && bytes + PAD + 1024 > LINK_QUEUE_SENDERS_BYTES,
+            "{frames} frames, {bytes} bytes"
+        );
+        write_frame(&mut sender_client, &to(other, 0, PAD))
+            .await
+            .expect("to the other node");
+        let frame: Message =
+            serde_json::from_slice(&next_frame(&mut other_client).await).expect("a message");
+        assert_eq!(frame.routing.src, sender.to_string());
+
+        // It reads again: every message its link took, in order, then a new one goes through.
+        for n in 0..taken {
+            let frame: Message =
+                serde_json::from_slice(&next_frame(&mut slow_client).await).expect("a message");
+            assert_eq!(frame.payload["n"], n);
+        }
+        assert_eq!(nodes.lock().await[&slow].sender.depth(), (0, 0));
+        write_frame(&mut sender_client, &to(slow, sent, 0))
+            .await
+            .expect("once it reads");
+        let frame: Message =
+            serde_json::from_slice(&next_frame(&mut slow_client).await).expect("a message");
+        assert_eq!(frame.payload["n"], sent);
+        assert!(
+            answers_before(&mut sender_client, &fence())
+                .await
+                .is_empty(),
+            "nothing to answer"
+        );
+    }
+
+    /// A-222 between routers: a message for a WAN peer's or a sibling router's link that is full is
+    /// not queued, and its sender is answered LINK_BUSY; once the link drains, it goes.
+    #[tokio::test]
+    async fn a_message_for_a_full_wan_or_sibling_link_is_answered_link_busy() {
+        let (wan_tx, mut wan) = link_queue("wan");
+        fill_to_the_senders_bound(&wan_tx);
+        let wan_peers = Arc::new(Mutex::new(HashMap::from([(
+            "worker1".to_string(),
+            WanPeer {
+                sender: wan_tx.clone(),
+                router_uuid: Uuid::new_v4(),
+            },
+        )])));
+        let peer_routers = Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new()));
+        let peers = Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new()));
+        let router_uuid = Uuid::new_v4();
+        let request = request_to("SY.orchestrator@worker1");
+        assert_eq!(
+            send_to_wan_peer(&wan_peers, "worker1", &request)
+                .await
+                .expect("send"),
+            Handover::Busy
+        );
+        let (sender, mut answers) = link_queue("node");
+        forward_to_hive(
+            "worker1",
+            &request,
+            true,
+            &peer_routers,
+            &peers,
+            &wan_peers,
+            router_uuid,
+            &sender,
+        )
+        .await
+        .expect("forward");
+        assert_eq!(
+            unreachable_answer(&mut answers, &request).reason,
+            "LINK_BUSY"
+        );
+        assert_eq!(
+            wan_tx.depth().0,
+            LINK_QUEUE_SENDERS_FRAMES,
+            "nothing queued"
+        );
+
+        // A router that is not the gateway hands it to the gateway sibling, whose link is full.
+        let gateway = Uuid::new_v4();
+        peer_routers.lock().await.insert(
+            gateway,
+            PeerRouter {
+                uuid: gateway,
+                is_gateway: true,
+            },
+        );
+        let (sibling_tx, _sibling) = link_queue("irp");
+        fill_to_the_senders_bound(&sibling_tx);
+        peers
+            .lock()
+            .await
+            .insert(gateway, PeerHandle { sender: sibling_tx });
+        forward_to_hive(
+            "worker1",
+            &request,
+            false,
+            &peer_routers,
+            &peers,
+            &wan_peers,
+            router_uuid,
+            &sender,
+        )
+        .await
+        .expect("forward");
+        assert_eq!(
+            unreachable_answer(&mut answers, &request).reason,
+            "LINK_BUSY"
+        );
+
+        // The WAN link drains a frame: the next message goes, unanswered.
+        wan.try_recv().expect("a filler");
+        assert_eq!(
+            send_to_wan_peer(&wan_peers, "worker1", &request)
+                .await
+                .expect("send"),
+            Handover::Queued
+        );
+        assert!(answers.try_recv().is_err());
+    }
+
+    /// A-222: the router's own frames go through a link at the senders' bound, from the rest of the
+    /// bound; on a full link they are skipped and no one is answered for them: an LSA, an answer to
+    /// a node whose own link is full, another router's answer relayed to its node.
+    #[tokio::test]
+    async fn the_routers_own_frames_are_skipped_on_a_full_link_and_never_answered() {
+        let ctx = test_wan_context(None);
+        let (wan_tx, mut wan) = link_queue("wan");
+        fill_to_the_senders_bound(&wan_tx);
+        ctx.wan_peers.lock().await.insert(
+            "worker1".to_string(),
+            WanPeer {
+                sender: wan_tx.clone(),
+                router_uuid: Uuid::new_v4(),
+            },
+        );
+        broadcast_lsa(&ctx, None).await.expect("an LSA");
+        assert_eq!(
+            wan_tx.depth().0,
+            LINK_QUEUE_SENDERS_FRAMES + 1,
+            "the LSA went though senders are refused"
+        );
+        fill_to_the_brim(&wan_tx);
+        broadcast_lsa(&ctx, None).await.expect("an LSA");
+        assert_eq!(wan_tx.depth().0, LINK_QUEUE_MAX_FRAMES, "skipped");
+        let lsas = messages_on(&mut wan)
+            .into_iter()
+            .filter(|msg| msg.meta.msg.as_deref() == Some(MSG_LSA))
+            .count();
+        assert_eq!(lsas, 1, "only the LSA that had room");
+
+        // A node whose own link is full sends to a node that is not there: its answer is skipped.
+        let sender = Uuid::new_v4();
+        let (sender_tx, mut answers) = link_queue("node");
+        fill_to_the_brim(&sender_tx);
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([(
+            sender,
+            NodeHandle {
+                name: "WF.demo@motherbee".to_string(),
+                vpn_id: 0,
+                sender: sender_tx.clone(),
+                connected_at: 0,
+            },
+        )])));
+        let lost = padded_message(sender, Destination::Unicast(Uuid::new_v4().to_string()), 0);
+        route_from_a_node(&lost, &nodes).await;
+        assert_eq!(sender_tx.depth().0, LINK_QUEUE_MAX_FRAMES);
+        assert!(messages_on(&mut answers).is_empty(), "no answer was queued");
+
+        // Another router's answer for a local node whose link is full is skipped too, and nothing
+        // goes back over the WAN for it.
+        let local = Uuid::new_v4();
+        let (local_tx, mut local_rx) = link_queue("node");
+        fill_to_the_brim(&local_tx);
+        ctx.nodes.lock().await.insert(
+            local,
+            NodeHandle {
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                sender: local_tx,
+                connected_at: 0,
+            },
+        );
+        let relayed = build_unreachable(
+            &Uuid::new_v4().to_string(),
+            &local.to_string(),
+            &Uuid::new_v4().to_string(),
+            "SY.orchestrator@worker1",
+            "NODE_NOT_FOUND",
+        );
+        let (link, mut back) = link_queue("wan");
+        handle_wan_message(
+            &relayed,
+            &link,
+            &ctx,
+            "worker1",
+            Uuid::new_v4(),
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("handled");
+        assert!(messages_on(&mut local_rx).is_empty(), "skipped");
+        assert!(back.try_recv().is_err(), "and not answered");
+    }
+
+    /// A-222: a broadcast skips a full link and goes on to every other; its sender is answered
+    /// LINK_BUSY once, by the router it entered, however many links were full. A router it reached
+    /// over the WAN skips its own full link without an answer.
+    #[tokio::test]
+    async fn a_broadcast_over_full_links_is_answered_once_where_it_entered() {
+        let mut scene = BroadcastScene::new();
+        let full_node = scene
+            .nodes
+            .lock()
+            .await
+            .values()
+            .find(|node| node.name == "SY.timer@motherbee")
+            .map(|node| node.sender.clone())
+            .expect("the timer");
+        fill_to_the_senders_bound(&full_node);
+        let full_wan = scene.wan_peers.lock().await["worker1"].sender.clone();
+        fill_to_the_senders_bound(&full_wan);
+        let broadcast = scene.broadcast(0);
+        scene.route(&broadcast).await;
+
+        let got = |messages: Vec<Message>| {
+            messages
+                .iter()
+                .any(|msg| msg.routing.trace_id == broadcast.routing.trace_id)
+        };
+        let (timer, storage) = scene.receivers.split_at_mut(1);
+        assert!(!got(messages_on(&mut timer[0])), "not on the full link");
+        assert!(got(messages_on(&mut storage[0])), "the other node got it");
+        assert!(got(messages_on(&mut scene.sibling)), "so did the sibling");
+        assert!(!got(messages_on(&mut scene.wan)), "not the full WAN link");
+        let answer = unreachable_answer(&mut scene.answers, &broadcast);
+        assert_eq!(answer.reason, "LINK_BUSY");
+        assert_eq!(answer.original_dst, "broadcast");
+        assert!(scene.answers.try_recv().is_err(), "answered once");
+
+        // Reached over the WAN, a router whose local node's link is full answers nothing.
+        let ctx = test_wan_context(None);
+        let remote = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await = Some(lsa_with_remote_node(
+            "worker1",
+            remote,
+            "SY.orchestrator@worker1",
+        ));
+        let (local_tx, _local_rx) = link_queue("node");
+        fill_to_the_senders_bound(&local_tx);
+        ctx.nodes.lock().await.insert(
+            Uuid::new_v4(),
+            NodeHandle {
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                sender: local_tx,
+                connected_at: 0,
+            },
+        );
+        let (link, mut back) = link_queue("wan");
+        handle_wan_message(
+            &padded_message(remote, Destination::Broadcast, 0),
+            &link,
+            &ctx,
+            "worker1",
+            Uuid::new_v4(),
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("handled");
+        assert!(
+            back.try_recv().is_err(),
+            "no answer from a router it reached"
+        );
+    }
+
     /// The name of the function a source line opens, if it opens one at the top level.
     fn function_opened_by(line: &str) -> Option<&str> {
         let rest = ["async fn ", "fn ", "pub async fn ", "pub fn "]
@@ -11361,9 +11792,11 @@ mod tests {
         rest.split(['(', '<']).next()
     }
 
-    /// Pins A-202's paths: every function that queues a frame on a link either checks the frame
-    /// against the limit before it queues it (`frame_over_limit`: a sender's message, which is
-    /// answered), or queues only the router's own frames, which keep the writer's skip. A new path
+    /// Pins A-202's and A-222's paths. A frame reaches a link only through the link's bounded queue
+    /// (`link.rs`): nothing here sends on a channel. Every function that queues a sender's message
+    /// checks it against the frame first (`frame_over_limit`) and gets the queue's answer (`queue`:
+    /// full, the sender is answered `LINK_BUSY`); the router's own frames go through `queue_own`,
+    /// skipped on a full queue, and keep the writer's skip of a frame over the limit. A new path
     /// has to say which it is.
     #[test]
     fn every_frame_a_sender_hands_a_link_is_checked_against_the_limit() {
@@ -11392,22 +11825,41 @@ mod tests {
             "handle_peer_message",
         ];
         let mut function = "";
-        let mut seen = HashSet::new();
+        let mut seen_checked = HashSet::new();
+        let mut seen_own = HashSet::new();
         for line in code.lines() {
             if let Some(name) = function_opened_by(line) {
                 function = name;
             }
-            if line.contains(".send(") {
+            assert!(
+                !line.contains(".send("),
+                "{function} sends on a channel: a frame reaches a link only through its queue \
+                 (A-222)"
+            );
+            if line.contains(".queue(") {
                 assert!(
-                    checked.contains(&function) || routers_own.contains(&function),
-                    "{function} queues a frame: check it with frame_over_limit (A-202), or list it \
-                     as the router's own"
+                    checked.contains(&function),
+                    "{function} queues a sender's message: check it with frame_over_limit (A-202) \
+                     and answer its refusal (A-222), or queue it as the router's own"
                 );
-                seen.insert(function);
+                seen_checked.insert(function);
+            }
+            if line.contains(".queue_own(") {
+                assert!(
+                    routers_own.contains(&function),
+                    "{function} queues one of the router's own frames: list it as such"
+                );
+                seen_own.insert(function);
             }
         }
+        for name in routers_own {
+            assert!(seen_own.contains(name), "{name} queues no frame of its own");
+        }
         for name in checked {
-            assert!(seen.contains(name), "{name} queues no frame any more");
+            assert!(
+                seen_checked.contains(name),
+                "{name} queues no frame any more"
+            );
             let start = code
                 .find(&format!("fn {name}("))
                 .unwrap_or_else(|| panic!("{name}"));
@@ -11415,8 +11867,8 @@ mod tests {
             let check = body
                 .find("frame_over_limit(")
                 .unwrap_or_else(|| panic!("{name}"));
-            let send = body.find(".send(").unwrap_or_else(|| panic!("{name}"));
-            assert!(check < send, "{name} checks its frame before it queues it");
+            let queue = body.find(".queue(").unwrap_or_else(|| panic!("{name}"));
+            assert!(check < queue, "{name} checks its frame before it queues it");
         }
     }
 
@@ -11425,7 +11877,7 @@ mod tests {
     async fn a_message_the_router_cannot_handle_does_not_end_the_connection() {
         let shm = TestShm::new("rt-badmsg");
         let receiver_uuid = Uuid::new_v4();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         nodes.lock().await.insert(
             receiver_uuid,
@@ -11477,7 +11929,7 @@ mod tests {
             ("SY.orchestrator@motherbee", false),
         ] {
             let sender_uuid = Uuid::new_v4();
-            let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (sender_tx, _sender_rx) = link_queue("node");
             let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
             let mut inboxes = Vec::new();
             {
@@ -11496,7 +11948,7 @@ mod tests {
                     "AI.chat@motherbee",
                     "SY.timer@motherbee",
                 ] {
-                    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    let (tx, rx) = link_queue("node");
                     g.insert(
                         Uuid::new_v4(),
                         NodeHandle {
@@ -11570,7 +12022,7 @@ mod tests {
         let mut inboxes = HashMap::new();
         for name in ["IO.sim@motherbee", "SY.frontdesk.gov@motherbee"] {
             let uuid = Uuid::new_v4();
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, rx) = link_queue("node");
             nodes.lock().await.insert(
                 uuid,
                 NodeHandle {
@@ -11659,7 +12111,7 @@ mod tests {
             "AI.chat@motherbee",
         ] {
             let uuid = Uuid::new_v4();
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, rx) = link_queue("node");
             nodes.lock().await.insert(
                 uuid,
                 NodeHandle {
@@ -11767,8 +12219,8 @@ mod tests {
         let sender_uuid = Uuid::new_v4();
         let receiver_uuid = Uuid::new_v4();
 
-        let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender_tx, _sender_rx) = link_queue("node");
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
 
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         {
@@ -11866,7 +12318,7 @@ mod tests {
         let peer_router_uuid = Uuid::new_v4();
         let local_receiver_uuid = Uuid::new_v4();
 
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
 
         // Local node that will receive the forwarded message.
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -11899,7 +12351,7 @@ mod tests {
         }
 
         // peer_uuid is registered in peers so TTL/unreachable replies have somewhere to go.
-        let (peer_tx, _peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (peer_tx, _peer_rx) = link_queue("irp");
         let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         peers
             .lock()
@@ -12006,17 +12458,11 @@ mod tests {
     #[tokio::test]
     async fn an_oversize_frame_is_skipped_and_the_link_goes_on() {
         let (writer, mut reader) = tokio::io::duplex(4 * MAX_FRAME_SIZE);
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let task = tokio::spawn(write_link_frames(
-            writer,
-            rx,
-            "node",
-            Arc::new(std::sync::OnceLock::from(
-                "SY.storage@motherbee".to_string(),
-            )),
-        ));
-        tx.send(vec![b'x'; MAX_FRAME_SIZE + 1]).unwrap();
-        tx.send(b"next".to_vec()).unwrap();
+        let (tx, rx) = link_queue("node");
+        tx.set_peer("SY.storage@motherbee".to_string());
+        let task = tokio::spawn(write_link_frames(writer, rx));
+        assert!(tx.queue_own(vec![b'x'; MAX_FRAME_SIZE + 1]));
+        assert!(tx.queue_own(b"next".to_vec()));
         drop(tx);
         task.await.unwrap();
         let frame = read_frame(&mut reader)
@@ -12240,7 +12686,7 @@ mod tests {
         let remote_sender_uuid = Uuid::new_v4();
         let gateway_uuid = Uuid::new_v4();
         let local_receiver_uuid = Uuid::new_v4();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         nodes.lock().await.insert(
             local_receiver_uuid,
@@ -12270,7 +12716,7 @@ mod tests {
         );
         let reachability: Arc<Mutex<HashMap<Uuid, ReachabilityEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let (peer_tx, _peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (peer_tx, _peer_rx) = link_queue("irp");
         let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
         peers
             .lock()
@@ -13037,7 +13483,7 @@ mod tests {
 
     /// The UNREACHABLE the router queued for the sender of `msg`.
     fn unreachable_answer(
-        answers: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        answers: &mut LinkReceiver,
         msg: &Message,
     ) -> fluxbee_sdk::protocol::UnreachablePayload {
         let frame = answers.try_recv().expect("an answer to the sender");
@@ -13076,7 +13522,7 @@ mod tests {
         );
 
         let request = request_to("SY.orchestrator@worker1");
-        let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender, mut answers) = link_queue("node");
         forward_to_hive(
             "worker1",
             &request,
@@ -13149,7 +13595,7 @@ mod tests {
     /// GATEWAY_UNAVAILABLE. Until 0.1.124 the send counted as done and the request was lost.
     #[tokio::test]
     async fn a_send_into_a_link_whose_writer_stopped_is_answered() {
-        let (dead_link, writer_gone) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (dead_link, writer_gone) = link_queue("node");
         drop(writer_gone);
         let wan_peers = Arc::new(Mutex::new(HashMap::from([(
             "worker1".to_string(),
@@ -13169,7 +13615,7 @@ mod tests {
             Handover::NoLink
         );
 
-        let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender, mut answers) = link_queue("node");
         forward_to_hive(
             "worker1",
             &request,
@@ -13313,7 +13759,7 @@ mod tests {
         );
 
         let request = request_to("SY.orchestrator@worker1");
-        let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (sender, mut answers) = link_queue("node");
         forward_to_hive(
             "worker1",
             &request,
@@ -13515,7 +13961,7 @@ mod tests {
             &Uuid::new_v4().to_string(),
             payload,
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, _rx) = link_queue("node");
         handle_wan_message(
             &msg,
             &tx,
@@ -13562,7 +14008,7 @@ mod tests {
             vec![lsa_node_entry(wf_rules, "SY.wf-rules@worker1", 2)],
         ));
         let receiver = Uuid::new_v4();
-        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
         ctx.nodes.lock().await.insert(
             receiver,
             NodeHandle {
@@ -13586,7 +14032,7 @@ mod tests {
             },
             payload: serde_json::json!({}),
         };
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, _rx) = link_queue("node");
 
         handle_wan_message(
             &frame,
@@ -13666,7 +14112,7 @@ mod tests {
                     .expect("lsa region"),
             );
             let vault = Uuid::new_v4();
-            let (vault_tx, _vault_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (vault_tx, _vault_rx) = link_queue("node");
             ctx.nodes.lock().await.insert(
                 vault,
                 NodeHandle {
@@ -13694,7 +14140,7 @@ mod tests {
             } else {
                 [("worker1", &worker1), ("ingress1", &ingress1)]
             };
-            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, _rx) = link_queue("node");
             for (hive, lsa) in order {
                 handle_wan_message(
                     lsa,
@@ -13745,7 +14191,7 @@ mod tests {
         let hub_node = Uuid::new_v4();
         let twice = Uuid::new_v4();
         let fine = Uuid::new_v4();
-        let (local_tx, _local_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (local_tx, _local_rx) = link_queue("node");
         ctx.nodes.lock().await.insert(
             local,
             NodeHandle {
@@ -13845,7 +14291,7 @@ mod tests {
         }
         let mut worker2_rx = None;
         for hive in ["worker1", "ingress1", "worker2"] {
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, rx) = link_queue("node");
             ctx.wan_peers.lock().await.insert(
                 hive.to_string(),
                 WanPeer {

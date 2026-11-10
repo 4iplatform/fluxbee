@@ -164,8 +164,8 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   [SY.config.routes](sy-config-routes.md)).
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
   `VPN_BLOCKED`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`, `OPA_ERROR`,
-  `OPA_NO_TARGET`, `FRAME_TOO_LARGE`; and `TTL_EXCEEDED` when the TTL runs out (every IRP and WAN
-  hop decrements it).
+  `OPA_NO_TARGET`, `FRAME_TOO_LARGE`, `LINK_BUSY`; and `TTL_EXCEEDED` when the TTL runs out (every
+  IRP and WAN hop decrements it).
   - **`FRAME_TOO_LARGE`** (since 0.1.124, FINDINGS A-202): the sender's frame passed its SDK's
     128 KiB check, but the router's additions took it over the limit (the sender's name, the action
     class, a resolve's trace entry; an agent's memory package is trimmed to fit). The router does
@@ -182,6 +182,44 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
     `GATEWAY_UNAVAILABLE` or `WAN_UNAVAILABLE` for a sibling router or a hive
     (`send_to_peer_router`, `send_to_wan_peer`); for a local node, as for a node that left,
     `NODE_NOT_FOUND` to anything but a broadcast (`deliver_locally`; A-203).
+  - **`LINK_BUSY`** (since 0.1.129, FINDINGS A-222): the link the message would take has its
+    queue at the senders' bound (below). The message is not queued and its sender is answered at
+    once, over the link it came in on; a broadcast goes to every other link, and its sender is
+    answered once, by the router it entered.
+
+### The link queue
+
+Every frame for a link, a node's, a WAN peer's or a sibling router's, waits in that link's queue
+until its writer hands it to the socket (`src/router/link.rs`, A-222, since 0.1.129).
+
+- **The bound:** 1,024 frames or 8 MiB (`LINK_QUEUE_MAX_FRAMES`, `LINK_QUEUE_MAX_BYTES`). A
+  sender's message gets 960 frames or 7 MiB of it (`LINK_QUEUE_SENDERS_FRAMES`,
+  `LINK_QUEUE_SENDERS_BYTES`). The rest is for the router's own frames: its answers, LSAs,
+  `WAN_REACHABILITY`, handshakes, another router's answer relayed to a node. So senders that keep a
+  link at their bound never crowd them out.
+- **Full:** a sender's message is refused and answered `LINK_BUSY`; one of the router's own frames
+  is skipped once the whole bound is taken, and no one is answered. A frame the queue took is never
+  dropped to make room, and the node or peer is never disconnected for it: as its peer reads, the
+  queue drains and takes messages again. Until 0.1.129 the queue had no bound, and a node that
+  stopped reading without closing kept every frame for it in the router's memory.
+- **Why this size:** a healthy link's queue is near empty, its writer handing each frame on as it
+  comes. Before it grows at all, the node's SDK holds 256 messages of its own and the socket's
+  kernel buffer is full. Against that, the bursts a link sees are small: an LSA per WAN peer every
+  10 s (at most about 90 KiB at the LSA region's 1,024 nodes), one stream batch in flight per sink
+  and stream (96 KiB), one frame per link for each broadcast. 8 MiB is 64 frames at the 128 KiB
+  limit, and a stuck link costs the router no more than that, plus the frame its writer is on.
+- **The line:** `router did not queue frames for a link whose queue is full (LINK_BUSY): senders
+  answered, its own frames skipped; the link stays up`, with `link` (`node`, `wan`, `irp`),
+  `peer` (the node's name, the hive, the sibling's UUID), `queued_frames`, `queued_bytes`, the
+  bounds, `refused` and `skipped` since the last line and `refused_total` for the process, at most
+  once per link every 30 s.
+- **The stream** is a node of its router: a batch for a full link, SY.storage's or a WAN peer's, is
+  answered `LINK_BUSY` like any node's message, and the stream retries it as after a lost ack
+  (every 0.5 to 8 s), its records kept on disk meanwhile.
+- **A WAN link whose writer is stuck** (its peer or the network takes nothing) delivers nothing,
+  LSAs included: the peer cuts the session after its dead interval, as for a silent peer (A-207),
+  and meanwhile, once the queue is at the senders' bound, senders hear `LINK_BUSY` at once instead
+  of queueing into a link that will end.
 
 ### System authority
 
@@ -279,6 +317,9 @@ counted as zero.
 - A node whose link no longer writes (a write error stopped its writer) is disconnected like one
   that closed (`router: the node's link no longer writes; disconnecting`, A-203): it leaves the
   node table and the SHM, and a message for it is answered `NODE_NOT_FOUND`.
+- A node that stops reading without closing (hung, or stuck behind its own full queue) stays
+  connected: its link's queue fills to its bound, and each message for it is answered `LINK_BUSY`
+  until it reads again (A-222; the link queue above).
 - A peer with a bad certificate fails its handshake (`wan connection error` /
   `wan uplink error`); the router keeps running. A silent peer's session ends after the dead
   interval, 40 s, and its LSA turns stale (A-207).
