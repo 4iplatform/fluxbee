@@ -37,7 +37,7 @@ A spoke's `hive.yaml` is written once, at its join: `add_hive` writes it over SS
 motherbee's settings of that moment, and nothing writes it again. `set_storage`, which changes
 `storage.path` only, writes the motherbee's own file and no spoke's: SY.admin sends it to its own
 hive's orchestrator (`action_routes_via_local_orchestrator`), which never forwards it. So whatever
-the installation decides after a join never reaches that hive. The one exception since 0.1.125 is a
+the installation decides after a join never reaches that hive. The one exception since 0.1.126 is a
 worker's `egress`, which the operator's `set_hive_egress` and `clear_hive_egress` write on that
 worker (A-219, [edge-egress-nat-spec](edge-egress-nat-spec.md) §15). Three cases bite today:
 
@@ -451,7 +451,7 @@ The operator's change and the update with category `config`, live and checked on
     orchestrator takes SY.admin's actions one after another (`run_admin_worker`).
   - **A spoke's file:** its join writes it, whole, over SSH and under the motherbee's lock on that
     hive (`lock_hive_topology`), with `sudo tee`: in place, not atomically.
-  - **A worker's `egress`** (A-219, since 0.1.125): its egress switch writes it at its commit, on
+  - **A worker's `egress`** (A-219, since 0.1.126): its egress switch writes it at its commit, on
     the worker, atomically as `set_storage` does (`write_hive_yaml_egress`: only `egress` changed),
     while the motherbee holds the same `lock_hive_topology` for the whole action. Both writers take
     one lock in the orchestrator (`lock_hive_yaml`).
@@ -810,7 +810,7 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   - The worker that joined before the egress (`egress.gateway_ip`) is apart, to be talked over
     later. Talked over on 2026-11-10 (A-219): an explicit action per worker, `set_hive_egress`,
     from Archi with the operator's CONFIRM, and its reverse, `clear_hive_egress`
-    ([edge-egress-nat-spec](edge-egress-nat-spec.md) §15, built for 0.1.125).
+    ([edge-egress-nat-spec](edge-egress-nat-spec.md) §15, built for 0.1.126).
 - **The version rule:** *"no puede pasar que los archivos de config entre hives sean de distinta
   versión"*. This draft keeps it by construction: one file, one version, and SY.admin's update
   stays open until every hive has it.
@@ -947,7 +947,7 @@ They raised 70 findings, many of them the same seen from several lenses:
   - the ingress's: `:27542`.
 
   Then `ADD_HIVE_FINALIZE` runs on the spoke (`:24236`).
-- **After the join,** nothing writes a spoke's file (since 0.1.125, but a worker's `egress`:
+- **After the join,** nothing writes a spoke's file (since 0.1.126, but a worker's `egress`:
   A-219, §5). `set_storage` writes the motherbee's own, and only `storage.path` (§1). It round-trips the YAML through serde, so the comments go; since
   0.1.125 it writes atomically (§5).
 - **The motherbee's file at an install:** `deb-postinst` copies the example only when there is no

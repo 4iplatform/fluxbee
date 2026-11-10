@@ -613,7 +613,7 @@ injection only reaches the workers provisioned **after** the field is declared â
 joined before keeps its original gateway. `GET /versions` says so: that worker's `egress.state` is
 `not_behind`.
 
-**The way (A-219, since 0.1.125):** one explicit action per worker, `set_hive_egress`: ask Archi,
+**The way (A-219, since 0.1.126):** one explicit action per worker, `set_hive_egress`: ask Archi,
 which stages it and waits for your CONFIRM, or on the motherbee
 `ops.py admin PUT /hives/worker1/egress '{}'`. The worker gets the motherbee's `egress` section and
 its route goes to the egress, IPv6 off. Before anything moves it checks that the gateway is on its

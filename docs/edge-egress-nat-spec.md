@@ -24,7 +24,7 @@
 >
 > The egress still fails loud without `nft`, because its NAT needs it.
 >
-> **Update 2026-11-10: A-219, built for 0.1.125.** §15 is the operator's explicit action that puts a
+> **Update 2026-11-10: A-219, built for 0.1.126.** §15 is the operator's explicit action that puts a
 > worker that joined before the egress declaration behind the egress (`set_hive_egress`), and takes
 > it back (`clear_hive_egress`), which §7 and §11 left out of v1. Its "As built" note says what
 > differs from the design.
@@ -412,7 +412,7 @@ Required behavior on the worker (applied locally by the worker's orchestrator):
    probe (§9).
 4. Report verification fields (§9).
 
-Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`. Writing the section into such a worker, and applying it, is the operator's explicit action, `set_hive_egress` (§15, A-219, built for 0.1.125); `clear_hive_egress` takes it back.
+Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`. Writing the section into such a worker, and applying it, is the operator's explicit action, `set_hive_egress` (§15, A-219, built for 0.1.126); `clear_hive_egress` takes it back.
 
 ---
 
@@ -561,7 +561,7 @@ These are legitimate production concerns deferred out of v1. The v1 design reser
 | Designated DNS resolver | Worker resolver config + DoT upstream on the egress hive | Avoids DNS leakage to public resolvers and spoofing in transit |
 | Egress HA (no SPOF) | keepalived/VRRP for a floating `edge_ip` | Egress hive is currently a SPOF for internet; HA is beta-later per project scope |
 | Process/host isolation | AppArmor/SELinux profile, network namespaces if co-located with RT.edge | Reduces blast radius of a host compromise |
-| Reconcile existing workers | Operator action to re-apply route to workers provisioned before egress declaration | Built for 0.1.125: `set_hive_egress` and `clear_hive_egress` (§15, A-219) |
+| Reconcile existing workers | Operator action to re-apply route to workers provisioned before egress declaration | Built for 0.1.126: `set_hive_egress` and `clear_hive_egress` (§15, A-219) |
 
 The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logging insert cleanly: the allow-list narrows the LAN→WAN accept rule, and logging adds `log` statements on the same chain. No restructuring required to add them later.
 
@@ -630,7 +630,7 @@ recorded as checked live.
 
 ## 15. An existing worker goes behind the egress (A-219)
 
-**Status:** built for 0.1.125 (A-219), as the operator approved it on 2026-11-10, every open point
+**Status:** built for 0.1.126 (A-219), as the operator approved it on 2026-11-10, every open point
 of 15.7 as recommended. 15.8 says what the build does differently. Line numbers are
 `src/bin/sy_orchestrator.rs` at `d9ca8a6e`, the design's reading, unless another file is named.
 
@@ -1056,7 +1056,7 @@ confirm.
 **The operator's call (2026-11-10):** every point as recommended, *"sobre 1, 2, 3 y 4 hacelos como
 recomendas"*, and the minor points as proposed.
 
-### 15.8 As built (0.1.125)
+### 15.8 As built (0.1.126)
 
 Built as 15.1 to 15.6 say. What follows is what the build adds, or does differently.
 

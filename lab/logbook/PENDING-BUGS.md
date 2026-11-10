@@ -427,7 +427,7 @@ declare the section yet, worker1 joined before, and the injection only reaches w
 And `packaging/hive.yaml.example` **does not even have the root-level `egress:` section**, so
 declaring it is an undocumented hand edit.
 
-**Since 0.1.125 (A-219):** a worker that joined before the declaration goes behind the egress by the
+**Since 0.1.126 (A-219):** a worker that joined before the declaration goes behind the egress by the
 operator's explicit action, `set_hive_egress`, and back with `clear_hive_egress`
 ([edge-egress-nat-spec §15](../../docs/edge-egress-nat-spec.md#15-an-existing-worker-goes-behind-the-egress-a-219));
 `/versions` shows each worker's `egress.state`. The motherbee stays out of it: the action refuses it,
