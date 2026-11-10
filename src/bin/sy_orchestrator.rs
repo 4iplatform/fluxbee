@@ -39859,7 +39859,10 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
         let script = remove_hive_cleanup_script();
         // A removed ingress's SY.edge must stop: its unit restarts on its own, and it would keep
         // serving `/public/<key>` from its own registry until each page expires (FINDINGS A-236).
-        assert!(script.contains(" sy-edge "), "sy-edge is stopped and disabled");
+        assert!(
+            script.contains(" sy-edge "),
+            "sy-edge is stopped and disabled"
+        );
         assert!(script.contains("/var/lib/fluxbee/nodes/*"));
         assert!(script.contains("/var/lib/fluxbee/state/nodes/*"));
         // The managed nodes stop before their directories go.
