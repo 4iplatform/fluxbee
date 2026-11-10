@@ -50,9 +50,15 @@ registers them in SY.identity (`ILK_REGISTER`).
   filled in) and the frontdesk answers `MERGED`. An email typed in the conversation, or one a handoff without an
   email takes from the thread state, goes in `identification.claimed_email`: SY.identity stores it but never
   merges on it, so the registration completes with the same answer whether or not the email is known.
+- **A failure that may pass** (SY.identity does not answer, is not the primary, or cannot write yet,
+  as while a deploy restarts it): `ilk_register` sends it again for a few seconds. If it still
+  fails, the case stays `awaiting_confirmation`, so the person's next confirmation, or the handoff
+  sent again, retries it. Any other failure is final (`completed_error`).
+- **Texts:** its fixed texts are English; in the conversation the model answers in the language the
+  person writes in.
 - What is shared with other `.gov` components lives in `nodes/gov/common` (`gov-common`).
 - The logs carry no personal data: from a registration it logs `ilk_id`, `tenant_id` and which fields
-  came in, never their values.
+  came in, never their values. It keeps no counters: the journal logs each outcome.
 
 ## Build and test
 
@@ -71,6 +77,5 @@ To run it you need a router and a `hive.yaml` (it takes its name from there,
 - A way to turn a claimed email into a vouched one (for example a one-time code). Until then a typed email
   never merges, and joining a claimant to the person who holds the email is the operator's explicit step,
   which SY.admin does not offer yet.
-- The spec counters (§12) and the conversational retries.
 
 The full contract is in `docs/ai-frontdesk-gov-spec.md`.

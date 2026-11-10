@@ -2,7 +2,10 @@
 
 Status: current (updated 2026-10-02: the case's tenant, no tenant creation, merge by email,
 nobody registers in the root tenant; 2026-10-22: a handoff only from an IO node, and only an
-email the channel vouches for merges, `docs/control-path-hardening-v1.md` §7)
+email the channel vouches for merges, `docs/control-path-hardening-v1.md` §7; 2026-11-10: a
+registration that fails for a reason that may pass is retried and leaves the case open, every
+fixed text in English and the conversation in the person's language, no counters, FINDINGS
+A-216 and A-214)
 
 > Deprecation note:
 > `frontdesk_result` is deprecated as the output contract of `SY.frontdesk.gov`.
@@ -162,7 +165,8 @@ of the system and its nodes; operator decision 2026-10-02). If the case's tenant
 - the frontdesk does not call `SY.identity` or save state, and it responds with a final result that is
   not retryable: `status = "error"`, `result_code = TENANT_NOT_REGISTRABLE`,
   `error_code = TENANT_ROOT_NOT_REGISTRABLE`, `registration_status = "temporary"` and the message
-  "No puedo completar el registro por este canal: no pertenece a ninguna organización." ("I cannot complete the registration through this channel: it does not belong to any organization.");
+  "I cannot complete the registration through this channel: it does not belong to any
+  organization.";
 - on the handoff, before asking for missing data; on the conversational path, before opening the
   conversation (the LLM is not needed: it responds the same even if the node is `UNCONFIGURED`); the
   `ilk_register` tool also rejects it;
@@ -208,8 +212,13 @@ Current minimal state:
 ```
 
 `tenant_id` is the case's tenant. The handoff saves it also when the registration fails
-(`completed_error`), so a retry keeps reporting it. It is informational: the tenant of each attempt
-is read again from the ILK (section 4.3).
+(`completed_error`, or `awaiting_confirmation` after a failure that may pass), so a retry keeps
+reporting it. It is informational: the tenant of each attempt is read again from the ILK
+(section 4.3).
+
+`register_error` keeps the last failed registration, `{error_code, message}`.
+`register_attempted` is `true` only once a registration failed for good (`completed_error`): after
+a failure that may pass the case stays `awaiting_confirmation` (section 7.2).
 
 `collected.email` is only ever a claim, whoever wrote it: the LLM writes this state (section 7.1).
 
@@ -233,7 +242,9 @@ Rule:
 - it takes what the handoff lacks from the previous state, if any; an email taken from there stays
   a claim, even when the handoff carries none (section 7.1). An email an earlier handoff of the case
   vouched for (section 5) stays vouched;
-- if it already has the full minimum, it tries to register;
+- if it already has the full minimum, it tries to register. A failure that may pass leaves the
+  case `awaiting_confirmation`, any other `completed_error` (section 7.2); sending the handoff
+  again tries again either way;
 - if it is still incomplete, it responds `text` with the corresponding human message.
 
 ### 6.2 Conversational
@@ -246,8 +257,10 @@ Rule:
   the LLM;
 - it can collect missing data;
 - it can ask for confirmation;
-- on a positive confirmation it calls `ilk_register`;
-- it responds with `text`.
+- on a positive confirmation it calls `ilk_register`, at most once per turn. A failure that may
+  pass leaves the case awaiting confirmation, so the person's next confirmation retries it
+  (section 7.2);
+- it responds with `text`: the model's, in the language the person writes in.
 
 ## 7. Completion tool
 
@@ -322,6 +335,29 @@ An explicit update does overwrite: an `ILK_REGISTER` of the already-registered I
 repeated `register_human` from Cloud for the same email) replaces its whole `identification`; the last
 one wins.
 
+### 7.2 A failure that may pass is retried, and the case stays open (A-216)
+
+A registration can fail for a reason that may pass: `SY.identity` did not answer (`UNREACHABLE`,
+`TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) or answered `NOT_PRIMARY`, `DB_NOT_READY` or
+`DB_WRITE_FAILED`, as while a deploy restarts it. Registering again is safe: a repeated
+`ILK_REGISTER` of the same ILK replaces its identification.
+
+- **The tool retries it.** `ilk_register` sends the `ILK_REGISTER` again after 0.5 s, 1 s and 2 s,
+  and starts no retry later than 4 s after the first attempt, so an attempt that waited out its
+  10 s timeout is not sent again. When `SY.identity` answers at once that is a few seconds in all,
+  inside what a handoff's IO node waits for the answer (io.api 10 s, io.cloud 20 s).
+- **The case stays open.** If it still fails, the tool answers the error with `retryable: true`,
+  and the case stays `awaiting_confirmation`, never `completed_error`. In the conversation the
+  person is told it could not be done right now, and their next confirmation retries it; a handoff
+  answers `IDENTITY_UNAVAILABLE`, and sending it again retries it.
+- **No loop within a turn.** The prompt calls `ilk_register` at most once per turn: a later
+  confirmation is what retries.
+- **Final only when it cannot pass.** Any other error (`retryable: false`) closes the case as
+  `completed_error`, and every later turn only repeats it.
+- **A case closed on a failure that may pass**, by an earlier version's prompt or by a model that
+  did not follow this one, is reopened as `awaiting_confirmation`: when the person writes again,
+  before the model reads it, and when the turn's result is read.
+
 ## 8. Default output
 
 Default output when there is no envelope:
@@ -334,14 +370,17 @@ Minimal canonical shape:
 ```json
 {
   "type": "text",
-  "content": "Necesito tu email para continuar."
+  "content": "I need your email to continue with the registration."
 }
 ```
 
 Rule:
 
 - without an envelope, frontdesk must not expose a custom structured payload as a mandatory contract for the consumer;
-- the human message must go out as normal text.
+- the human message must go out as normal text;
+- the frontdesk's fixed texts (the handoff's answers and the root tenant's, section 9) are English,
+  as every text the product sends (A-214); in the conversation the text is the model's, in the
+  language the person writes in.
 
 ## 8.1 Opt-in structured output through the envelope
 
@@ -356,7 +395,7 @@ In this first cut, the supported and validated shape is:
 ```json
 {
   "success": true,
-  "human_message": "Registro completado correctamente."
+  "human_message": "Registration completed successfully."
 }
 ```
 
@@ -365,7 +404,7 @@ or, if there was a functional block/error:
 ```json
 {
   "success": false,
-  "human_message": "No pude completar el registro en este momento.",
+  "human_message": "I could not complete the registration.",
   "error_code": "register_failed"
 }
 ```
@@ -404,13 +443,13 @@ Closed `result_code` values:
 | `TENANT_UNRESOLVED` | `error` | there is no tenant for the case (`missing_tenant_id`, section 4.3); nothing was registered or created |
 | `TENANT_NOT_REGISTRABLE` | `error` | the case's tenant is the root tenant (`TENANT_ROOT_NOT_REGISTRABLE`, section 4.4); nothing was registered and the person stays `temporary` |
 | `REGISTER_FAILED` | `error` | `SY.identity` rejected the registration with a final verdict |
-| `IDENTITY_UNAVAILABLE` | `error` | transient failure, the only retryable one |
+| `IDENTITY_UNAVAILABLE` | `error` | a failure that may pass, the only retryable one: the tool already retried it and the case stays open (section 7.2); in the conversation, while the case awaits the confirmation that retries it |
 
 `human_message` is always mandatory.
 
 Registration failures (`ILK_REGISTER`):
 
-- `IDENTITY_UNAVAILABLE` only for transient failures, the only retryable ones: `SY.identity` did not respond (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) or responded `NOT_PRIMARY`, `DB_NOT_READY` or `DB_WRITE_FAILED`;
+- `IDENTITY_UNAVAILABLE` only for transient failures, the only retryable ones: `SY.identity` did not respond (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) or responded `NOT_PRIMARY`, `DB_NOT_READY` or `DB_WRITE_FAILED` (section 7.2);
 - any other code `SY.identity` responds with is a final verdict, not retryable: `INVALID_*` -> `INVALID_REQUEST`; `TENANT_ROOT_NOT_REGISTRABLE` -> `TENANT_NOT_REGISTRABLE` (the same result as when the frontdesk sees it); the rest (`TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
 - `error_code` keeps the `SY.identity` code as is (or the tool's: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `tenant_mismatch`, and `TENANT_ROOT_NOT_REGISTRABLE`, the same code `SY.identity` uses).
 
@@ -470,16 +509,20 @@ so no temporary ILK with the person's email is left in the root tenant.
 
 - it runs as a system service (`sy-frontdesk-gov.service`) with no arguments and no node YAML;
   it takes `node_name` from `hive.yaml` as `SY.frontdesk.gov@<hive_id>`;
-- the prompt is embedded in the binary; it is not configured;
-- the AI provider and model are the hive's: the `ai` section of `hive.yaml` (with a fallback
-  baked in if it is missing);
+- the prompt is embedded in the binary; it is not configured. It has the model answer in the
+  language the person writes in; the frontdesk's fixed texts are English (section 8);
+- the AI provider and model are the installation's, read at the start: the installation file's
+  `ai` once the hive holds one, the `ai` section of `hive.yaml` while it holds none
+  (`docs/hive-config-update-v1.md` §4), with a fallback baked in when neither has one. Settings it
+  cannot use boot it `FAILED_CONFIG` with the reason, and an installation file no reader can use
+  is never a fallback to `hive.yaml`;
 - the provider key is read from `SY.vault` by the provider's `resource_type` (`openai` or
   `anthropic`), in the root tenant, at startup and on each `VAULT_SECRET_CHANGED`. Without a key the node
   stays `UNCONFIGURED`: the structured path keeps working and the conversational path responds
   `node_not_configured`;
-- `CONFIG_SET` does not accept configuration: it rejects `ai`, `ai_providers`, `behavior`, `api_key` and
-  `api_key_ref` with `config_not_accepted`, ignores any other field, reads the key from the vault again
-  and persists nothing;
+- `CONFIG_SET` does not accept configuration: it refuses with `config_not_accepted` any field under
+  `config`, and without that wrapper `ai`, `ai_providers`, `behavior`, `runtime`, `api_key` and
+  `api_key_ref`; otherwise it reads the key from the vault again, and it persists nothing;
 - `CONFIG_GET` reports the state, the provider and the model, and whether the key was resolved.
 
 Lifecycle: it is a singleton per hive and is updated with the `.deb`, like the rest of the `SY.*`; it is not
@@ -491,12 +534,14 @@ deleted or respawned like an `IO.*`. It keeps no local config: its only state is
 It must expose:
 
 - `state`: `UNCONFIGURED|CONFIGURED|FAILED_CONFIG`
-- suggested counters (pending, section 13):
-  - `threads_active`
-  - `identity_upgrades_ok`
-  - `identity_upgrades_error`
-  - `frontdesk_handoff_ok`
-  - `frontdesk_handoff_needs_input`
+
+It keeps no counters (the operator's call, 2026-11-10): the journal logs each outcome, and counts
+wait for the system's log (`docs/router-stream-v1.md` §8, node logs on the router stream to
+SY.storage). The lines, for either path: `received ILK_REGISTER response from identity` and
+`ILK_REGISTER failed` (with its `attempts`); for the handoff, `frontdesk handoff REGISTERED
+(ILK_REGISTER complete)`, `frontdesk handoff register FAILED (ilk stays temporary)` (with
+`error_code` and the case's `case_status`) and `frontdesk handoff incomplete → needs_input (ilk
+NOT registered)`.
 
 The logs carry no personal data: from the registration they log `ilk_id`, `tenant_id`, the codes and
 which fields came in, never their values.
@@ -506,6 +551,3 @@ which fields came in, never their values.
 - A way to turn a claimed email into a vouched one (for example a one-time code sent to it). Until
   then a typed email stays a claim and never merges (section 7.1), and joining a claimant to the
   person who holds the email is the operator's explicit step, which SY.admin does not offer yet.
-- The counters of section 12 (G6).
-- Conversational retries: the prompt's "no loop" rule makes a transient error
-  terminal (G8).

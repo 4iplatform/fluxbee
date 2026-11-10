@@ -38,9 +38,9 @@ use gov_common::{
         FrontdeskHandoffPayload, FrontdeskResultPayload, FRONTDESK_HANDOFF_MSG,
         FRONTDESK_HANDOFF_PAYLOAD_TYPE,
     },
-    gov_identity_config_from_env, identity_error_is_transient, identity_error_log_summary,
-    identity_error_to_tool_payload, resolve_case_tenant, GovIdentityConfig, CASE_TENANT_MISMATCH,
-    CASE_TENANT_MISSING, TENANT_ROOT_NOT_REGISTRABLE,
+    gov_identity_config_from_env, identity_error_code, identity_error_is_transient,
+    identity_error_log_summary, identity_error_to_tool_payload, resolve_case_tenant,
+    GovIdentityConfig, CASE_TENANT_MISMATCH, CASE_TENANT_MISSING, TENANT_ROOT_NOT_REGISTRABLE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -72,6 +72,8 @@ State schema (data):
   "register_attempted": false,
   "register_error": null
 }
+- register_attempted is true only once a registration failed for good (status=completed_error).
+- register_error keeps the last failed registration: {error_code,message}.
 
 Mandatory flow:
 1) On every user turn, call thread_state_get first.
@@ -89,29 +91,37 @@ Extraction rules:
 - If message mentions company/org/empresa, map it to company_name when clear.
 - If only one field is missing, treat concise user answer as that field unless clearly contradictory.
 
-Confirmation normalization:
-- positive: si,si,ok,confirmo,correcto,asi es,de acuerdo,dale
-- negative: no,incorrecto,corregir,hay error
+Confirmation normalization (these words, or the same answer in the person's language):
+- positive: yes,ok,confirm,confirmed,correct,right,agreed,sí,si,confirmo,correcto,así es,asi es,de acuerdo,dale
+- negative: no,wrong,incorrect,change,fix,there is an error,incorrecto,corregir,hay error
 
-STRICT NO-LOOP RULE:
+STRICT NO-LOOP RULE (at most one ilk_register call per turn: the tool itself already retries a transient failure for a few seconds):
 - If status==awaiting_confirmation and user is positive:
-  - If register_attempted==false:
-    a) Call ilk_register with identity_candidate {name,email,phone,company_name}
-    b) If tool returns status=ok:
-       - set status=completed
-       - call thread_state_put
-       - send final success message
-       - stop (do not ask confirmation again)
-    c) If tool returns status=error:
-       - set status=completed_error
-       - set register_attempted=true
-       - set register_error={error_code,message}
-       - call thread_state_put
-       - send final error summary
-       - stop (do not ask confirmation again)
-  - If register_attempted==true:
-    - send final error summary from register_error
-    - stop (do not ask confirmation again)
+  a) Call ilk_register once with identity_candidate {name,email,phone,company_name}
+  b) If tool returns status=ok:
+     - set status=completed
+     - call thread_state_put
+     - send final success message
+     - stop (do not ask confirmation again)
+  c) If tool returns status=error and retryable=true (it could not be done right now):
+     - keep status=awaiting_confirmation
+     - set register_attempted=false
+     - set register_error={error_code,message}
+     - call thread_state_put
+     - tell the user the registration could not be done right now, and that confirming again later retries it
+     - stop (do not call ilk_register again in this turn)
+  d) If tool returns status=error and retryable=false:
+     - set status=completed_error
+     - set register_attempted=true
+     - set register_error={error_code,message}
+     - call thread_state_put
+     - send final error summary
+     - stop (do not ask confirmation again)
+- A later turn's positive confirmation of a case still awaiting_confirmation calls ilk_register again: that is how a registration that could not be done right now is retried.
+
+- If status==completed_error:
+  - send final error summary from register_error
+  - stop (do not ask confirmation again)
 
 - If status==awaiting_confirmation and user is negative:
   - set status=collecting
@@ -125,10 +135,10 @@ ANTI-REASK RULE:
 
 ANTI-RECONFIRM RULE:
 - If status==awaiting_confirmation and the user reply is positive, do not restate the collected data and do not ask for confirmation again; call ilk_register immediately.
-- If registration already succeeded or failed terminally in the current turn, stop after the final message.
+- If ilk_register already ran in the current turn, stop after its message.
 
 The person registered is always the one of this conversation: never name an ILK.
-Keep replies short in Spanish.
+Answer in the language the person writes in, and keep replies short.
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +349,9 @@ struct GenericAiNode {
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
-    gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
+    gov_identity_bridge: Option<Arc<dyn IdentityCaller>>,
+    /// How `ilk_register` retries a transient failure (`REGISTER_RETRY`).
+    register_retry: RegisterRetry,
     /// Where the tenant of a case comes from: the tenant SY.identity holds for its ILK.
     ilk_tenant: IlkTenantLookup,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`.
@@ -424,15 +436,25 @@ fn missing_src_ilk_payload() -> Value {
     })
 }
 
+/// How the frontdesk asks SY.identity: through the router in production (`GovIdentityBridge`);
+/// tests script its answers.
+#[async_trait]
+trait IdentityCaller: Send + Sync {
+    /// SY.identity's `status:"ok"` answer to `action`, or why there is none.
+    async fn call_ok(
+        &self,
+        identity: &GovIdentityConfig,
+        action: &str,
+        payload: Value,
+    ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError>;
+}
+
 struct GovIdentityBridge {
     dispatcher: Arc<RouterDispatcher>,
 }
 
-impl GovIdentityBridge {
-    fn new(dispatcher: Arc<RouterDispatcher>) -> Self {
-        Self { dispatcher }
-    }
-
+#[async_trait]
+impl IdentityCaller for GovIdentityBridge {
     async fn call_ok(
         &self,
         identity: &GovIdentityConfig,
@@ -462,6 +484,12 @@ impl GovIdentityBridge {
             _ => first,
         };
         identity_reply_outcome(action, reply?)
+    }
+}
+
+impl GovIdentityBridge {
+    fn new(dispatcher: Arc<RouterDispatcher>) -> Self {
+        Self { dispatcher }
     }
 
     async fn send_action_once(
@@ -662,7 +690,41 @@ struct IlkRegisterTool {
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     ilk_tenant: IlkTenantLookup,
     identity: GovIdentityConfig,
-    bridge: Option<Arc<GovIdentityBridge>>,
+    bridge: Option<Arc<dyn IdentityCaller>>,
+    retry: RegisterRetry,
+}
+
+/// How `ilk_register` retries an `ILK_REGISTER` that failed for a reason that may pass
+/// (`identity_error_is_transient`: SY.identity did not answer, or it is not the primary or cannot
+/// write yet, as while a deploy restarts it; FINDINGS A-216). A few seconds in all, inside what a
+/// handoff's IO node waits for the answer.
+#[derive(Debug, Clone, Copy)]
+struct RegisterRetry {
+    /// The wait before each retry: one retry per wait.
+    backoff: &'static [Duration],
+    /// No retry starts later than this after the first attempt, so an attempt that waited out its
+    /// own timeout (`GOV_IDENTITY_TIMEOUT_MS`, 10 s) is not sent again.
+    window: Duration,
+}
+
+/// Three retries, after 0.5 s, 1 s and 2 s: when SY.identity answers at once, the last one starts
+/// 3.5 s after the first attempt, well inside io.api's 10 s for a handoff's answer.
+const REGISTER_RETRY: RegisterRetry = RegisterRetry {
+    backoff: &[
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    ],
+    window: Duration::from_secs(4),
+};
+
+impl RegisterRetry {
+    /// The wait before one more attempt, after `attempts` that failed for a transient reason and
+    /// took `elapsed` since the first began; `None` when the waits ran out or the window closed.
+    fn wait_before_retry(&self, attempts: usize, elapsed: Duration) -> Option<Duration> {
+        let wait = *self.backoff.get(attempts.checked_sub(1)?)?;
+        (elapsed + wait <= self.window).then_some(wait)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -713,6 +775,28 @@ struct FrontdeskRegisterErrorState {
     error_code: Option<String>,
     #[serde(default)]
     message: Option<String>,
+}
+
+impl FrontdeskThreadState {
+    /// Whether the case's last registration failed for a reason that may pass
+    /// (`identity_error_is_transient`).
+    fn failed_for_now(&self) -> bool {
+        self.register_error
+            .as_ref()
+            .and_then(|error| error.error_code.as_deref())
+            .is_some_and(identity_error_is_transient)
+    }
+
+    /// A case closed as `completed_error` on a failure that may pass waits for the person's
+    /// confirmation again, which retries it (FINDINGS A-216). Returns whether it was reopened.
+    fn reopen_failed_for_now(&mut self) -> bool {
+        if self.status.as_deref() != Some("completed_error") || !self.failed_for_now() {
+            return false;
+        }
+        self.status = Some("awaiting_confirmation".to_string());
+        self.register_attempted = false;
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1013,8 +1097,9 @@ impl AiNode for GenericAiNode {
                 "incoming user message"
             );
         }
+        // A case closed on a failure that may pass is open again before the model reads it.
         let prior_frontdesk_state = if msg.meta.msg_type.eq_ignore_ascii_case("user") {
-            Some(self.load_frontdesk_thread_state(&behavior_ctx).await?)
+            Some(self.load_open_frontdesk_thread_state(&behavior_ctx).await?)
         } else {
             None
         };
@@ -1392,6 +1477,7 @@ impl GenericAiNode {
             ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
+            retry: self.register_retry,
         };
         registry.register(Arc::new(tool))?;
         Ok(())
@@ -1440,6 +1526,31 @@ impl GenericAiNode {
                 "invalid_frontdesk_thread_state: {err}"
             ))
         })?;
+        Ok(Some(state))
+    }
+
+    /// The case's state, a case closed on a failure that may pass reopened and saved so first
+    /// (`reopen_failed_for_now`): the conversation reads it at the start of a turn and again for
+    /// its result, after the model wrote it.
+    async fn load_open_frontdesk_thread_state(
+        &self,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<Option<FrontdeskThreadState>> {
+        let Some(mut state) = self.load_frontdesk_thread_state(ctx).await? else {
+            return Ok(None);
+        };
+        if state.reopen_failed_for_now() {
+            tracing::info!(
+                node_name = %self.node_name,
+                src_ilk = ?ctx.src_ilk,
+                error_code = ?state
+                    .register_error
+                    .as_ref()
+                    .and_then(|error| error.error_code.as_deref()),
+                "frontdesk: a case closed on a transient registration failure is reopened: the next confirmation retries it"
+            );
+            self.store_frontdesk_thread_state(ctx, &state).await?;
+        }
         Ok(Some(state))
     }
 
@@ -1510,7 +1621,7 @@ impl GenericAiNode {
         let mut result = frontdesk_result_payload(
             "error",
             "INVALID_REQUEST",
-            "No pude procesar el handoff de registro.",
+            "I could not process the registration handoff.",
         );
         result.error_code = Some("invalid_request".to_string());
         result.error_detail = Some("Unsupported handoff payload".to_string());
@@ -1528,7 +1639,7 @@ impl GenericAiNode {
             return build_frontdesk_result_reply(msg, result);
         }
         if handoff.operation != "complete_registration" {
-            result.human_message = "La operación solicitada no está soportada.".to_string();
+            result.human_message = "The requested operation is not supported.".to_string();
             result.error_detail = Some(format!(
                 "Unsupported frontdesk handoff operation: {}",
                 handoff.operation
@@ -1696,6 +1807,7 @@ impl GenericAiNode {
             ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
+            retry: self.register_retry,
         };
         let registered_name = name
             .clone()
@@ -1729,6 +1841,18 @@ impl GenericAiNode {
             self.delete_frontdesk_thread_state(ctx).await?;
         } else {
             result.tenant_id.get_or_insert_with(|| tenant_id.clone());
+            // A failure that may pass, which the tool already retried, leaves the case open: the
+            // handoff sent again, or the person's confirmation in a conversation, retries it
+            // (FINDINGS A-216). Any other failure closes it.
+            let failed_for_now = result
+                .error_code
+                .as_deref()
+                .is_some_and(identity_error_is_transient);
+            let case_status = if failed_for_now {
+                "awaiting_confirmation"
+            } else {
+                "completed_error"
+            };
             // error_detail is not logged: it carries SY.identity's message, which can echo the
             // submitted identification.
             tracing::warn!(
@@ -1737,10 +1861,11 @@ impl GenericAiNode {
                 result_code = %result.result_code,
                 error_code = ?result.error_code,
                 tenant_id = ?result.tenant_id,
+                case_status,
                 "frontdesk handoff register FAILED (ilk stays temporary)"
             );
             let state = FrontdeskThreadState {
-                status: Some("completed_error".to_string()),
+                status: Some(case_status.to_string()),
                 collected: FrontdeskCollectedState {
                     name,
                     email,
@@ -1751,7 +1876,7 @@ impl GenericAiNode {
                 // The case keeps its tenant, so a retried handoff still reports it.
                 tenant_id: Some(tenant_id),
                 registration_status: result.registration_status.clone(),
-                register_attempted: true,
+                register_attempted: !failed_for_now,
                 register_error: Some(FrontdeskRegisterErrorState {
                     error_code: result.error_code.clone(),
                     message: result
@@ -1771,7 +1896,8 @@ impl GenericAiNode {
         human_message: String,
         prior_state: Option<FrontdeskThreadState>,
     ) -> fluxbee_ai_sdk::Result<FrontdeskResultPayload> {
-        let after_state = self.load_frontdesk_thread_state(ctx).await?;
+        // A model that closed the case on a failure that may pass leaves it open all the same.
+        let after_state = self.load_open_frontdesk_thread_state(ctx).await?;
         if let Some(state) = after_state {
             if state.status.as_deref() == Some("completed") {
                 let mut payload = frontdesk_result_payload("ok", "ALREADY_COMPLETE", human_message);
@@ -1783,9 +1909,17 @@ impl GenericAiNode {
                     .or(Some("complete".to_string()));
                 return Ok(payload);
             }
-            if state.status.as_deref() == Some("completed_error") {
-                let mut payload =
-                    frontdesk_result_payload("error", "REGISTER_FAILED", human_message);
+            // A case closed for good, or one whose last registration failed for a reason that may
+            // pass and that waits for the confirmation that retries it.
+            let failure = match state.status.as_deref() {
+                Some("completed_error") => Some("REGISTER_FAILED"),
+                Some("awaiting_confirmation") if state.failed_for_now() => {
+                    Some("IDENTITY_UNAVAILABLE")
+                }
+                _ => None,
+            };
+            if let Some(result_code) = failure {
+                let mut payload = frontdesk_result_payload("error", result_code, human_message);
                 payload.ilk_id = ctx.src_ilk.clone();
                 payload.tenant_id = state.tenant_id.clone();
                 payload.registration_status = state.registration_status.clone();
@@ -2413,7 +2547,7 @@ impl FunctionTool for IlkRegisterTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "ilk_register".to_string(),
-            description: "Register the person of this conversation (its temporary ILK) in SY.identity. The person's ILK and the organization (tenant) come with the case: never name an ILK, and never ask for an organization."
+            description: "Register the person of this conversation (its temporary ILK) in SY.identity. The person's ILK and the organization (tenant) come with the case: never name an ILK, and never ask for an organization. A failure that may pass is already retried for a few seconds; an error's `retryable` says whether a later confirmation can still retry it."
                 .to_string(),
             parameters_json_schema: json!({
                 "type": "object",
@@ -2524,13 +2658,7 @@ impl FunctionTool for IlkRegisterTool {
             identification_fields = ?present_identification_fields(&payload["identification"]),
             "sending ILK_REGISTER to identity"
         );
-        let result = if let Some(bridge) = &self.bridge {
-            bridge
-                .call_ok(&self.identity, MSG_ILK_REGISTER, payload)
-                .await
-        } else {
-            Err(identity_bridge_missing())
-        };
+        let (result, attempts) = self.send_register(payload).await;
 
         match result {
             Ok(out) => {
@@ -2582,11 +2710,61 @@ impl FunctionTool for IlkRegisterTool {
                 tracing::warn!(
                     op = "ilk_register",
                     target = %self.identity.target,
+                    attempts,
                     error = %identity_error_log_summary(&err),
                     "ILK_REGISTER failed"
                 );
                 Ok(identity_error_to_tool_payload(&err))
             }
+        }
+    }
+}
+
+impl IlkRegisterTool {
+    /// Sends the case's `ILK_REGISTER`, and sends it again while it fails for a reason that may
+    /// pass and `retry` allows (FINDINGS A-216). Registering again is safe: SY.identity replaces
+    /// the identification of an ILK registered twice. Returns the last outcome and how many
+    /// attempts it took.
+    async fn send_register(
+        &self,
+        payload: Value,
+    ) -> (
+        std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError>,
+        usize,
+    ) {
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let result = match &self.bridge {
+                Some(bridge) => {
+                    bridge
+                        .call_ok(&self.identity, MSG_ILK_REGISTER, payload.clone())
+                        .await
+                }
+                None => Err(identity_bridge_missing()),
+            };
+            let err = match result {
+                Ok(out) => return (Ok(out), attempts),
+                Err(err) => err,
+            };
+            let wait = if identity_error_is_transient(&identity_error_code(&err)) {
+                self.retry.wait_before_retry(attempts, started.elapsed())
+            } else {
+                None
+            };
+            let Some(wait) = wait else {
+                return (Err(err), attempts);
+            };
+            tracing::warn!(
+                op = "ilk_register",
+                target = %self.identity.target,
+                attempt = attempts,
+                retry_in_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                error = %identity_error_log_summary(&err),
+                "ILK_REGISTER failed for a reason that may pass; sending it again"
+            );
+            tokio::time::sleep(wait).await;
         }
     }
 }
@@ -2802,7 +2980,8 @@ async fn run_unconfigured_bootstrap(
             .await?;
     tracing::info!(node_name = %node_name, "frontdesk-gov connected to router");
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
-    let gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
+    let gov_identity_bridge: Option<Arc<dyn IdentityCaller>> =
+        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
     let usage = UsageRecorder::start(dispatcher.clone());
     let ai_node = GenericAiNode {
         node_name: node_name.clone(),
@@ -2812,6 +2991,7 @@ async fn run_unconfigured_bootstrap(
         immediate_memory_store,
         gov_identity,
         gov_identity_bridge,
+        register_retry: REGISTER_RETRY,
         ilk_tenant: identity_shm_ilk_tenant(&node_name),
         vault,
         control_plane: Arc::new(RwLock::new(state)),
@@ -3578,15 +3758,17 @@ fn frontdesk_missing_fields(name: Option<&str>, email: Option<&str>) -> Vec<Stri
     missing
 }
 
+/// What a handoff without the required data answers. Like every fixed text the frontdesk sends, it
+/// is English (FINDINGS A-214); the conversation's text is the model's, in the person's language.
 fn frontdesk_missing_fields_message(missing_fields: &[String]) -> String {
     match missing_fields {
         [field] if field == "display_name" => {
-            "Necesito tu nombre para continuar con el registro.".to_string()
+            "I need your name to continue with the registration.".to_string()
         }
         [field] if field == "email" => {
-            "Necesito tu email para continuar con el registro.".to_string()
+            "I need your email to continue with the registration.".to_string()
         }
-        _ => "Necesito tu nombre y tu email para continuar con el registro.".to_string(),
+        _ => "I need your name and your email to continue with the registration.".to_string(),
     }
 }
 
@@ -3608,10 +3790,10 @@ fn build_frontdesk_result_from_register_response(
             frontdesk_result_payload(
                 "ok",
                 "MERGED",
-                "Ya estabas registrado con ese email: este canal quedó asociado a tu registro.",
+                "You were already registered with that email: this channel is now linked to your registration.",
             )
         } else {
-            frontdesk_result_payload("ok", "REGISTERED", "Registro completado correctamente.")
+            frontdesk_result_payload("ok", "REGISTERED", "Registration completed successfully.")
         };
         // The ilk the person ended on, as SY.identity answered: after a merge it is not src_ilk.
         payload.ilk_id = identity
@@ -3631,26 +3813,27 @@ fn build_frontdesk_result_from_register_response(
         .get("error_code")
         .and_then(Value::as_str)
         .unwrap_or("IDENTITY_ERROR");
-    // Only a transient failure is IDENTITY_UNAVAILABLE. A code SY.identity answered with is a final
-    // verdict (TENANT_PENDING, ILK_DELETED, SYSTEM_ILK_PROTECTED, DUPLICATE_EMAIL, ...) and keeps
-    // its own error_code.
+    // Only a transient failure is IDENTITY_UNAVAILABLE: the tool already retried it, and the case
+    // stays open for another attempt. A code SY.identity answered with is a final verdict
+    // (TENANT_PENDING, ILK_DELETED, SYSTEM_ILK_PROTECTED, DUPLICATE_EMAIL, ...) and keeps its own
+    // error_code.
     let (result_code, human_message) = if identity_error_is_transient(error_code) {
         (
             "IDENTITY_UNAVAILABLE",
-            "No pude completar el registro en este momento.",
+            "I could not complete the registration right now. Please try again in a moment.",
         )
     } else if error_code == CASE_TENANT_MISSING {
         // No tenant for the case: nothing to register into, and the frontdesk creates none.
         (
             "TENANT_UNRESOLVED",
-            "No pude completar el registro: este contacto no tiene una organización asignada.",
+            "I could not complete the registration: this contact has no organization assigned.",
         )
     } else if error_code == TENANT_ROOT_NOT_REGISTRABLE {
         // The case is of the root tenant, where nobody registers: the same final answer whether
         // the frontdesk saw it or SY.identity did.
         (
             "TENANT_NOT_REGISTRABLE",
-            "No puedo completar el registro por este canal: no pertenece a ninguna organización.",
+            "I cannot complete the registration through this channel: it does not belong to any organization.",
         )
     } else if error_code.starts_with("INVALID_")
         || matches!(
@@ -3658,9 +3841,9 @@ fn build_frontdesk_result_from_register_response(
             "missing_src_ilk" | "invalid_identity_candidate" | CASE_TENANT_MISMATCH
         )
     {
-        ("INVALID_REQUEST", "No pude completar el registro.")
+        ("INVALID_REQUEST", "I could not complete the registration.")
     } else {
-        ("REGISTER_FAILED", "No pude completar el registro.")
+        ("REGISTER_FAILED", "I could not complete the registration.")
     };
     let mut payload = frontdesk_result_payload("error", result_code, human_message);
     payload.error_code = Some(error_code.to_string());
@@ -3987,7 +4170,7 @@ mod tests {
         let act = |status: &str, code: &str| {
             let mut reply = build_frontdesk_result_reply(
                 &sample_request(),
-                frontdesk_result_payload(status, code, "hola"),
+                frontdesk_result_payload(status, code, "hello"),
             )
             .expect("a reply");
             fluxbee_ai_sdk::take_reply_act(&mut reply)
@@ -4053,6 +4236,12 @@ mod tests {
         assert_eq!(res.meta.msg.as_deref(), Some(MSG_NODE_STATUS_GET_RESPONSE));
     }
 
+    /// `REGISTER_RETRY`'s attempts without its waits.
+    const NO_WAIT_RETRY: RegisterRetry = RegisterRetry {
+        backoff: &[Duration::ZERO; REGISTER_RETRY.backoff.len()],
+        window: Duration::from_secs(60),
+    };
+
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
@@ -4063,6 +4252,7 @@ mod tests {
             immediate_memory_store: None,
             gov_identity,
             gov_identity_bridge: None,
+            register_retry: NO_WAIT_RETRY,
             ilk_tenant: test_ilk_tenant(),
             vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState::default())),
@@ -4504,7 +4694,7 @@ mod tests {
         );
         assert_eq!(
             extract_text(&response.payload).as_deref(),
-            Some("Necesito tu email para continuar con el registro.")
+            Some("I need your email to continue with the registration.")
         );
     }
 
@@ -4617,7 +4807,7 @@ mod tests {
         );
         assert_eq!(
             structured.get("human_message").and_then(Value::as_str),
-            Some("Necesito tu email para continuar con el registro.")
+            Some("I need your email to continue with the registration.")
         );
     }
 
@@ -4648,7 +4838,7 @@ mod tests {
         );
         assert_eq!(
             extract_text(&response.payload).as_deref(),
-            Some("Echo: hola")
+            Some("Echo: hello")
         );
     }
 
@@ -4699,7 +4889,7 @@ mod tests {
         );
         assert_eq!(
             structured.get("human_message").and_then(Value::as_str),
-            Some("Echo: hola")
+            Some("Echo: hello")
         );
         assert_eq!(
             structured.get("error_code").and_then(Value::as_str),
@@ -4807,7 +4997,7 @@ mod tests {
                 context: Some(context),
                 ..Meta::default()
             },
-            payload: json!({"type":"text","content":"hola"}),
+            payload: json!({"type":"text","content":"hello"}),
         }
     }
 
@@ -5197,7 +5387,7 @@ mod tests {
             schema_version: 1,
             status: "ok".to_string(),
             result_code: "REGISTERED".to_string(),
-            human_message: "Registro completado correctamente.".to_string(),
+            human_message: "Registration completed successfully.".to_string(),
             missing_fields: Vec::new(),
             error_code: None,
             error_detail: None,
@@ -5213,7 +5403,7 @@ mod tests {
         );
         assert_eq!(
             structured.get("human_message").and_then(Value::as_str),
-            Some("Registro completado correctamente.")
+            Some("Registration completed successfully.")
         );
         assert!(structured.get("error_code").is_none());
     }
@@ -5225,7 +5415,7 @@ mod tests {
             schema_version: 1,
             status: "error".to_string(),
             result_code: "REGISTER_FAILED".to_string(),
-            human_message: "No pude completar el registro.".to_string(),
+            human_message: "I could not complete the registration.".to_string(),
             missing_fields: Vec::new(),
             error_code: Some("register_failed".to_string()),
             error_detail: None,
@@ -5359,6 +5549,7 @@ mod tests {
             ilk_tenant: test_ilk_tenant(),
             identity: GovIdentityConfig::default(),
             bridge: None,
+            retry: NO_WAIT_RETRY,
         }
     }
 
@@ -5453,12 +5644,12 @@ mod tests {
     }
 
     const PERSONAL_VALUES: [&str; 6] = [
-        "Juana Secreta",
-        "juana.secreta@example.com",
+        "Jane Secret",
+        "jane.secret@example.com",
         "+5491100009999",
-        "Empresa Secreta SA",
+        "Secret Company Inc",
         "crm-secret-42",
-        "Hint Secreto SRL",
+        "Secret Hint LLC",
     ];
 
     fn assert_no_personal_data(logs: &str) {
@@ -5475,12 +5666,12 @@ mod tests {
     async fn ilk_register_tool_logs_carry_no_personal_data() {
         let tool = test_tool(Some(TEST_ILK), None);
         let candidate = json!({
-            "name": "Juana Secreta",
-            "email": "juana.secreta@example.com",
+            "name": "Jane Secret",
+            "email": "jane.secret@example.com",
             "phone": "+5491100009999",
-            "company_name": "Empresa Secreta SA",
+            "company_name": "Secret Company Inc",
             "attributes": { "crm_customer_id": "crm-secret-42" },
-            "tenant_hint": "Hint Secreto SRL"
+            "tenant_hint": "Secret Hint LLC"
         });
         let (logs, _guard) = LogCapture::start();
         // Straight to ILK_REGISTER with the case's tenant (it then fails: no identity bridge).
@@ -5590,7 +5781,9 @@ mod tests {
                 Some(TENANT_ROOT_NOT_REGISTRABLE)
             );
             assert_eq!(result.registration_status.as_deref(), Some("temporary"));
-            assert!(result.human_message.contains("ninguna organización"));
+            assert!(result
+                .human_message
+                .contains("does not belong to any organization"));
             let structured = frontdesk_structured_response_payload(&result, &producer_contract());
             assert_eq!(structured["success"], false);
             assert_eq!(structured["error_code"], "tenant_not_registrable");
@@ -5642,7 +5835,7 @@ mod tests {
             }),
             Some(ROOT_ILK),
         );
-        msg.payload = json!({ "type": "text", "content": "hola, quiero registrarme" });
+        msg.payload = json!({ "type": "text", "content": "hello, I want to register" });
         let reply = structured_reply(&node, msg).await;
         assert_eq!(reply["success"], false);
         assert_eq!(reply["error_code"], "tenant_not_registrable");
@@ -5660,7 +5853,7 @@ mod tests {
             .expect("response");
         let text = extract_text(&response.payload).expect("text");
         assert!(
-            text.contains("no pertenece a ninguna organización"),
+            text.contains("it does not belong to any organization"),
             "{text}"
         );
 
@@ -5715,7 +5908,7 @@ mod tests {
         assert!(structured_minimal.get("merged").is_none());
         assert!(structured["human_message"]
             .as_str()
-            .is_some_and(|text| text.contains("Ya estabas registrado")));
+            .is_some_and(|text| text.contains("You were already registered")));
 
         let registered = build_frontdesk_result_from_register_response(
             &tool_output(json!({
@@ -5847,14 +6040,15 @@ mod tests {
     #[tokio::test]
     async fn a_failed_handoff_keeps_the_tenant_of_its_case() {
         // No tenant_id in the handoff: the case's comes from its ILK. The registration fails (no
-        // identity bridge here) and the case keeps its tenant for the retry.
+        // identity bridge here, a failure that may pass) and the case keeps its tenant for the
+        // retry.
         let (node, state) = test_node_with_state();
         let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
         assert_eq!(reply["success"], false);
         assert_eq!(reply["error_code"], "identity_unavailable");
         let kept = state.0.lock().expect("thread state").get(TEST_ILK).cloned();
         let kept = kept.expect("the failed case keeps its state");
-        assert_eq!(kept["status"], "completed_error");
+        assert_eq!(kept["status"], "awaiting_confirmation");
         assert_eq!(kept["tenant_id"], TEST_TENANT);
 
         // The retry, again without tenant_id, still knows its tenant.
@@ -5877,10 +6071,10 @@ mod tests {
             "schema_version": 1,
             "operation": "complete_registration",
             "subject": {
-                "display_name": "Juana Secreta",
-                "email": "juana.secreta@example.com",
+                "display_name": "Jane Secret",
+                "email": "jane.secret@example.com",
                 "phone": "+5491100009999",
-                "company_name": "Empresa Secreta SA",
+                "company_name": "Secret Company Inc",
                 "attributes": { "crm_customer_id": "crm-secret-42" }
             },
             "tenant_id": TEST_TENANT
@@ -5910,7 +6104,7 @@ mod tests {
         );
         msg.payload = json!({
             "type": "text",
-            "content": "soy Juana Secreta, juana.secreta@example.com"
+            "content": "I am Jane Secret, jane.secret@example.com"
         });
         let (logs, _guard) = LogCapture::start();
         node.on_message(msg)
@@ -6159,5 +6353,449 @@ mod tests {
             text.contains(TEST_ILK) && !text.contains(UNKNOWN_ILK),
             "{text}"
         );
+    }
+
+    // ---- a registration that fails for a reason that may pass is retried (A-216) ----
+
+    /// One answer of the scripted SY.identity.
+    #[derive(Debug, Clone, Copy)]
+    enum IdentityAnswer {
+        Registered,
+        /// SY.identity answers with this error code.
+        Rejected(&'static str),
+        /// The router finds no SY.identity, as while a deploy restarts it.
+        Unreachable,
+    }
+
+    /// SY.identity as a test scripts it: one answer per `ILK_REGISTER`, the last one repeated.
+    struct ScriptedIdentity {
+        answers: Vec<IdentityAnswer>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedIdentity {
+        fn new(answers: &[IdentityAnswer]) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers.to_vec(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl IdentityCaller for ScriptedIdentity {
+        async fn call_ok(
+            &self,
+            identity: &GovIdentityConfig,
+            action: &str,
+            payload: Value,
+        ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self
+                .answers
+                .get(call)
+                .or(self.answers.last())
+                .copied()
+                .expect("a scripted answer");
+            match answer {
+                IdentityAnswer::Registered => Ok(fluxbee_sdk::IdentitySystemResult {
+                    payload: json!({
+                        "status": "ok",
+                        "ilk_id": payload["ilk_id"],
+                        "tenant_id": payload["tenant_id"],
+                        "registration_status": "complete",
+                        "merged": false
+                    }),
+                    effective_target: identity.target.clone(),
+                    trace_id: format!("trace-identity-{call}"),
+                }),
+                IdentityAnswer::Rejected(error_code) => Err(IdentityError::SystemRejected {
+                    action: action.to_string(),
+                    error_code: error_code.to_string(),
+                    message: "scripted rejection".to_string(),
+                }),
+                IdentityAnswer::Unreachable => Err(IdentityError::Unreachable {
+                    reason: "NODE_NOT_FOUND".to_string(),
+                    original_dst: identity.target.clone(),
+                }),
+            }
+        }
+    }
+
+    fn test_node_with_identity(
+        identity: &Arc<ScriptedIdentity>,
+    ) -> (GenericAiNode, Arc<MemoryThreadState>) {
+        let (mut node, state) = test_node_with_state();
+        node.gov_identity_bridge = Some(identity.clone() as Arc<dyn IdentityCaller>);
+        (node, state)
+    }
+
+    fn tool_with_identity(identity: &Arc<ScriptedIdentity>) -> IlkRegisterTool {
+        let mut tool = test_tool(Some(TEST_ILK), None);
+        tool.bridge = Some(identity.clone() as Arc<dyn IdentityCaller>);
+        tool
+    }
+
+    fn register_ana() -> Value {
+        json!({ "identity_candidate": { "name": "Ana", "email": "ana@example.com" } })
+    }
+
+    /// What the no-loop rule had the model save after `ilk_register` failed with `error_code`.
+    fn closed_case(error_code: &str) -> Value {
+        json!({
+            "status": "completed_error",
+            "collected": { "name": "Ana", "email": "ana@example.com" },
+            "tenant_id": TEST_TENANT,
+            "register_attempted": true,
+            "register_error": { "error_code": error_code, "message": "failed to register ilk" }
+        })
+    }
+
+    fn kept_case(state: &MemoryThreadState) -> Value {
+        state
+            .0
+            .lock()
+            .expect("thread state")
+            .get(TEST_ILK)
+            .cloned()
+            .expect("the case's state")
+    }
+
+    /// The retries take a few seconds in all, and none starts after the window: an attempt that
+    /// waited out SY.identity's timeout is not sent again.
+    #[test]
+    fn a_transient_failure_is_retried_for_a_few_seconds() {
+        let ms = Duration::from_millis;
+        let retry = REGISTER_RETRY;
+        assert_eq!(retry.wait_before_retry(1, ms(10)), Some(ms(500)));
+        assert_eq!(retry.wait_before_retry(2, ms(520)), Some(ms(1_000)));
+        assert_eq!(retry.wait_before_retry(3, ms(1_530)), Some(ms(2_000)));
+        // Three retries, then the waits run out.
+        assert_eq!(retry.wait_before_retry(4, ms(3_540)), None);
+        // A retry that would start after the window is not sent.
+        assert_eq!(retry.wait_before_retry(3, ms(2_500)), None);
+        assert_eq!(
+            retry.wait_before_retry(1, GovIdentityConfig::default().timeout),
+            None
+        );
+        let waits: Duration = retry.backoff.iter().sum();
+        assert!(waits <= retry.window, "{waits:?}");
+        // Well inside what io.api waits for a handoff's answer.
+        assert!(retry.window < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn ilk_register_sends_a_transient_failure_again_until_it_registers() {
+        let identity = ScriptedIdentity::new(&[
+            IdentityAnswer::Unreachable,
+            IdentityAnswer::Rejected("NOT_PRIMARY"),
+            IdentityAnswer::Rejected("DB_NOT_READY"),
+            IdentityAnswer::Registered,
+        ]);
+        let out = tool_with_identity(&identity)
+            .call(register_ana())
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "ok");
+        assert_eq!(identity.calls(), 4);
+    }
+
+    /// A failure that lasts past the retries is answered as one that may pass: the case stays
+    /// open, awaiting the confirmation that retries it, and the answer says it could not be done
+    /// right now. The handoff sent again registers the person.
+    #[tokio::test]
+    async fn a_transient_failure_that_lasts_leaves_the_case_awaiting_confirmation() {
+        let attempts = 1 + REGISTER_RETRY.backoff.len();
+        let mut answers = vec![IdentityAnswer::Rejected("DB_NOT_READY"); attempts];
+        answers.push(IdentityAnswer::Registered);
+        let identity = ScriptedIdentity::new(&answers);
+
+        let out = tool_with_identity(&identity)
+            .call(register_ana())
+            .await
+            .expect("tool call");
+        assert_eq!(identity.calls(), attempts);
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], "DB_NOT_READY");
+        assert_eq!(out["retryable"], true);
+
+        let identity = ScriptedIdentity::new(&answers);
+        let (node, state) = test_node_with_identity(&identity);
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(identity.calls(), attempts);
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "identity_unavailable");
+        assert!(
+            reply["human_message"]
+                .as_str()
+                .is_some_and(|text| text.contains("right now")),
+            "{reply}"
+        );
+        let kept = kept_case(&state);
+        assert_eq!(kept["status"], "awaiting_confirmation");
+        assert_eq!(kept["register_attempted"], false);
+        assert_eq!(kept["register_error"]["error_code"], "DB_NOT_READY");
+
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(reply["success"], true);
+        assert!(state
+            .0
+            .lock()
+            .expect("thread state")
+            .get(TEST_ILK)
+            .is_none());
+    }
+
+    /// A final verdict is sent once, and it closes the case.
+    #[tokio::test]
+    async fn a_final_failure_is_not_retried_and_closes_the_case() {
+        let identity = ScriptedIdentity::new(&[
+            IdentityAnswer::Rejected("TENANT_PENDING"),
+            IdentityAnswer::Registered,
+        ]);
+        let out = tool_with_identity(&identity)
+            .call(register_ana())
+            .await
+            .expect("tool call");
+        assert_eq!(identity.calls(), 1);
+        assert_eq!(out["error_code"], "TENANT_PENDING");
+        assert_eq!(out["retryable"], false);
+
+        let identity = ScriptedIdentity::new(&[
+            IdentityAnswer::Rejected("TENANT_PENDING"),
+            IdentityAnswer::Registered,
+        ]);
+        let (node, state) = test_node_with_identity(&identity);
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(identity.calls(), 1);
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "register_failed");
+        let kept = kept_case(&state);
+        assert_eq!(kept["status"], "completed_error");
+        assert_eq!(kept["register_attempted"], true);
+        assert_eq!(kept["register_error"]["error_code"], "TENANT_PENDING");
+    }
+
+    /// The conversation: a model that closes the case on a failure that may pass does not end it.
+    /// The turn answers IDENTITY_UNAVAILABLE, never a final REGISTER_FAILED, and the case waits
+    /// for the confirmation that retries it. A final failure ends it.
+    #[tokio::test]
+    async fn the_conversation_keeps_open_a_case_closed_on_a_transient_failure() {
+        let (node, state) = test_node_with_state();
+        let ctx = BehaviorContext {
+            src_ilk: Some(TEST_ILK.to_string()),
+            ..BehaviorContext::default()
+        };
+        let model_text = "The registration could not be done right now.".to_string();
+        state
+            .0
+            .lock()
+            .expect("thread state")
+            .insert(TEST_ILK.to_string(), closed_case("UNREACHABLE"));
+        let result = node
+            .build_frontdesk_result_for_conversation(&ctx, model_text.clone(), None)
+            .await
+            .expect("result");
+        assert_eq!(result.status, "error");
+        assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
+        assert_eq!(result.error_code.as_deref(), Some("UNREACHABLE"));
+        assert_eq!(result.human_message, model_text);
+        let kept = kept_case(&state);
+        assert_eq!(kept["status"], "awaiting_confirmation");
+        assert_eq!(kept["register_attempted"], false);
+        assert_eq!(kept["collected"]["email"], "ana@example.com");
+
+        state
+            .0
+            .lock()
+            .expect("thread state")
+            .insert(TEST_ILK.to_string(), closed_case("TENANT_PENDING"));
+        let result = node
+            .build_frontdesk_result_for_conversation(&ctx, model_text, None)
+            .await
+            .expect("result");
+        assert_eq!(result.result_code, "REGISTER_FAILED");
+        assert_eq!(kept_case(&state)["status"], "completed_error");
+    }
+
+    /// A case the no-loop rule closed on a failure that may pass is open again when the person
+    /// writes, before the model reads it, and their confirmation retries the registration. One
+    /// closed for good stays closed.
+    #[tokio::test]
+    async fn a_case_closed_on_a_transient_failure_is_reopened_by_a_confirmation() {
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Registered]);
+        let (node, state) = test_node_with_identity(&identity);
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        // No model here: the turn runs, and what it leaves for the model is checked.
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let yes = || {
+            let mut msg = sample_user_request_with_context(
+                json!({
+                    "thread_id": "frontdesk-thread-reopen",
+                    "response_envelope": producer_contract()
+                }),
+                Some(TEST_ILK),
+            );
+            msg.payload = json!({ "type": "text", "content": "yes" });
+            msg
+        };
+
+        state
+            .0
+            .lock()
+            .expect("thread state")
+            .insert(TEST_ILK.to_string(), closed_case("UNREACHABLE"));
+        let reply = structured_reply(&node, yes()).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "identity_unavailable");
+        let kept = kept_case(&state);
+        assert_eq!(kept["status"], "awaiting_confirmation");
+        assert_eq!(kept["register_attempted"], false);
+
+        // The model calls ilk_register on that confirmation: the person is registered.
+        let ctx = BehaviorContext {
+            src_ilk: Some(TEST_ILK.to_string()),
+            ..BehaviorContext::default()
+        };
+        let registry = node.build_tool_registry(&ctx).expect("registry");
+        let out = registry
+            .get("ilk_register")
+            .expect("ilk_register")
+            .call(register_ana())
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "ok");
+        assert_eq!(identity.calls(), 1);
+
+        state
+            .0
+            .lock()
+            .expect("thread state")
+            .insert(TEST_ILK.to_string(), closed_case("TENANT_PENDING"));
+        let reply = structured_reply(&node, yes()).await;
+        assert_eq!(reply["error_code"], "register_failed");
+        assert_eq!(kept_case(&state)["status"], "completed_error");
+    }
+
+    /// The prompt's no-loop rule: one `ilk_register` per turn, a transient failure keeps the case
+    /// awaiting confirmation, and a later confirmation retries it.
+    #[test]
+    fn the_prompt_keeps_a_case_open_after_a_transient_failure() {
+        let prompt = frontdesk_default_instructions();
+        assert!(prompt.contains("at most one ilk_register call per turn"));
+        let transient = prompt.find("retryable=true").expect("the transient branch");
+        let keep_open = prompt
+            .find("keep status=awaiting_confirmation")
+            .expect("the case stays open");
+        let closed = prompt.find("retryable=false").expect("the final branch");
+        assert!(transient < keep_open && keep_open < closed);
+        assert!(prompt.contains("A later turn's positive confirmation"));
+        assert!(!prompt.contains("If register_attempted==true"));
+    }
+
+    // ---- every fixed text in English; the model answers in the person's language (A-214) ----
+
+    /// Spanish words the old fixed texts used, and accents: none is English.
+    fn assert_english(text: &str) {
+        const SPANISH: &str = "el la los las de del que tu este esta para con por una ya pude \
+            puedo necesito nombre registro registrado estabas correctamente momento";
+        assert!(text.is_ascii(), "{text:?}");
+        let words = text
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        for spanish in SPANISH.split_whitespace() {
+            assert!(
+                !words.iter().any(|word| word == spanish),
+                "{text:?} has {spanish:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_fixed_text_is_english() {
+        let mut texts = vec![PROVIDER_FAILURE_TEXT.to_string()];
+        for missing in [
+            &["display_name"][..],
+            &["email"],
+            &["display_name", "email"],
+        ] {
+            let missing = missing.iter().map(ToString::to_string).collect::<Vec<_>>();
+            texts.push(frontdesk_missing_fields_message(&missing));
+        }
+        for merged in [false, true] {
+            let registered = json!({
+                "status": "ok",
+                "identity_payload": { "status": "ok", "ilk_id": TEST_ILK, "merged": merged }
+            });
+            texts.push(
+                build_frontdesk_result_from_register_response(
+                    &registered,
+                    Some(TEST_ILK.to_string()),
+                )
+                .human_message,
+            );
+        }
+        for error_code in [
+            "UNREACHABLE",
+            CASE_TENANT_MISSING,
+            TENANT_ROOT_NOT_REGISTRABLE,
+            CASE_TENANT_MISMATCH,
+            "INVALID_TENANT",
+            "TENANT_PENDING",
+        ] {
+            texts.push(register_failure(error_code).human_message);
+        }
+        // The handoff's refusals: a sender that is not an IO node, an operation it does not run.
+        let (node, _state) = test_node_with_state();
+        let mut not_io = structured_handoff(TEST_ILK, None);
+        not_io.routing.src_l2_name = Some("AI.support@motherbee".to_string());
+        let mut other_operation = structured_handoff(TEST_ILK, None);
+        other_operation.payload["operation"] = json!("merge_registration");
+        for msg in [not_io, other_operation] {
+            let reply = structured_reply(&node, msg).await;
+            assert_eq!(reply["error_code"], "invalid_request");
+            texts.push(reply["human_message"].as_str().expect("text").to_string());
+        }
+        // What a sender gets while the conversation cannot run.
+        for payload in [
+            node_not_configured_payload(NodeLifecycleState::Unconfigured),
+            node_runtime_not_ready_payload(),
+            invalid_payload_missing_thread_id(),
+        ] {
+            texts.push(payload["message"].as_str().expect("text").to_string());
+        }
+        assert_eq!(texts.len(), 17);
+        for text in &texts {
+            assert_english(text);
+        }
+    }
+
+    /// The model answers in the person's language: the prompt names none, and it still reads a
+    /// confirmation in the forms it lists.
+    #[test]
+    fn the_prompt_names_no_language() {
+        let prompt = frontdesk_default_instructions().to_lowercase();
+        for language in [
+            "spanish", "english", "español", "espanol", "inglés", "ingles",
+        ] {
+            assert!(!prompt.contains(language), "{language}");
+        }
+        assert!(prompt.contains("answer in the language the person writes in"));
+        assert!(prompt.contains("keep replies short"));
+        for word in [
+            "yes",
+            "confirm",
+            "sí",
+            "confirmo",
+            "de acuerdo",
+            "incorrecto",
+        ] {
+            assert!(prompt.contains(word), "{word}");
+        }
     }
 }

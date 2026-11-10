@@ -115,18 +115,22 @@ subject it sends, its email included ([control-path hardening](../control-path-h
 ## Conversational registration
 
 - The prompt (`FRONTDESK_DEFAULT_SYSTEM_PROMPT`) asks for `name` and `email` (required) and keeps
-  `phone` and `company_name` if given. It shows a summary, waits for a positive answer ("si, ok,
-  confirmo, correcto, asi es, de acuerdo, dale"), calls `ilk_register` once, and stops. A failed
-  registration ends as `completed_error` and is not retried ("STRICT NO-LOOP RULE"). Replies are
-  "short in Spanish".
+  `phone` and `company_name` if given. It shows a summary, waits for a positive answer (the words
+  it lists in English and in Spanish, "yes, ok, confirm, correct, …, sí, confirmo, correcto, de
+  acuerdo, dale", or the same answer in the person's language), calls `ilk_register` at most once
+  per turn, and stops ("STRICT NO-LOOP RULE"). A failure that may pass leaves the case
+  `awaiting_confirmation`, and the person is told it could not be done right now: their next
+  confirmation retries it (FINDINGS A-216). Any other failure ends the case as `completed_error`,
+  and later turns only repeat it. The model answers in the language the person writes in, and
+  keeps replies short (FINDINGS A-214).
 - The email the person types is only their claim: `ilk_register` sends it as
   `identification.claimed_email` (see ILK_REGISTER). So a conversation never merges into a
   registered person on what was typed, and its outcome is the same whether or not that email is
   known. An email an earlier handoff of the case vouched for goes as `identification.email`.
-- Tools (`build_tool_registry`): `thread_state_get`, `thread_state_put`, `thread_state_delete`,
-  scoped to the sender's `src_ilk` (registered only when there is one), and `ilk_register`. No
-  tool takes an ILK from the model: `ilk_register`'s only parameter is the person's data, and its
-  description says the ILK and the tenant come with the case.
+- Tools (`build_tool_registry`): `thread_state_get` and `thread_state_put`, scoped to the sender's
+  `src_ilk` (registered only when there is one), and `ilk_register`; there is no
+  `thread_state_delete`. No tool takes an ILK from the model: `ilk_register`'s only parameter is
+  the person's data, and its description says the ILK and the tenant come with the case.
 - Memory: the immediate memory is off (`ImmediateMemorySection::default`, `enabled: false`) and
   CONFIG_SET changes nothing, so what the model keeps between turns is the thread state, one JSON
   file per `src_ilk`. The baked config carries no other `runtime` setting: timeouts, workers and
@@ -141,8 +145,12 @@ subject it sends, its email included ([control-path hardening](../control-path-h
     `provider_rate_limited`, `provider_auth_error`, …). The frontdesk takes no WF menu.
 - The reply to the person is the model's text. The result code comes from the thread state the
   model wrote (`build_frontdesk_result_for_conversation`): `completed` → `ALREADY_COMPLETE`,
-  `completed_error` → `REGISTER_FAILED`, otherwise `MISSING_REQUIRED_FIELDS` or
-  `IN_CONVERSATION`.
+  `completed_error` → `REGISTER_FAILED`, `awaiting_confirmation` after a failure that may pass →
+  `IDENTITY_UNAVAILABLE`, otherwise `MISSING_REQUIRED_FIELDS` or `IN_CONVERSATION`.
+- A case closed as `completed_error` on a failure that may pass, by the model or by an earlier
+  version's prompt, is reopened as `awaiting_confirmation` (`load_open_frontdesk_thread_state`):
+  when the person writes, before the model reads the state, and when the turn's result is read.
+  The journal says `frontdesk: a case closed on a transient registration failure is reopened`.
 
 ## Deterministic handoff
 
@@ -161,8 +169,14 @@ The contract (`frontdesk_contract.rs`):
   later turn (a handoff without an email, or the conversation) still registers it as vouched.
 - Missing name or email: `needs_input` / `MISSING_REQUIRED_FIELDS`, and the partial data is kept.
 - Otherwise it calls `ilk_register`. Success: `REGISTERED` (or `MERGED`, which only a vouched
-  email can give) and the thread state is deleted. Failure: the state is kept as
-  `completed_error`; sending the handoff again retries.
+  email can give) and the thread state is deleted. Failure: the state is kept, as
+  `awaiting_confirmation` after a failure that may pass (`IDENTITY_UNAVAILABLE`), else as
+  `completed_error`; the journal line says which (`case_status`). Sending the handoff again
+  retries either way.
+- Its `human_message`s are fixed texts in English (FINDINGS A-214), for example "I need your email
+  to continue with the registration.", "Registration completed successfully." or "I could not
+  complete the registration right now. Please try again in a moment."
+  (`frontdesk_missing_fields_message`, `build_frontdesk_result_from_register_response`).
 
 **`register_human` from Fluxbee Cloud.** Cloud → SY.edge → `IO.cloud` (`handle_register_human`
 in `nodes/io/io-cloud/src/main.rs`). It is a local IO.cloud operation that never goes through
@@ -194,8 +208,9 @@ if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
 ```
 
 - **Root-tenant case: stop.** `root_tenant_case_result` answers before any LLM, identity call or
-  state write: `TENANT_NOT_REGISTRABLE` / `TENANT_ROOT_NOT_REGISTRABLE`, "No puedo completar el
-  registro por este canal: no pertenece a ninguna organización." The ILK stays temporary.
+  state write: `TENANT_NOT_REGISTRABLE` / `TENANT_ROOT_NOT_REGISTRABLE`, "I cannot complete the
+  registration through this channel: it does not belong to any organization." The ILK stays
+  temporary.
 - **Unknown or mismatched tenant.** The conversation goes on; `ilk_register` refuses without
   sending anything (`case_tenant_error_payload`). In a handoff the answer is immediate
   (`TENANT_UNRESOLVED` or `INVALID_REQUEST`).
@@ -221,6 +236,14 @@ as `msg_type: system`, `msg: ILK_REGISTER` to `SY.identity@motherbee` (`GovIdent
 `GOV_IDENTITY_TARGET` / `IDENTITY_TARGET`, timeout 10 s, `GOV_IDENTITY_TIMEOUT_MS`). The answer
 is `ILK_REGISTER_RESPONSE`.
 
+A failure that may pass (`identity_error_is_transient`: `UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`,
+`IDENTITY_ERROR`, `NOT_PRIMARY`, `DB_NOT_READY`, `DB_WRITE_FAILED`) is sent again
+(`send_register`, `REGISTER_RETRY`; FINDINGS A-216): after 0.5 s, 1 s and 2 s, and no retry
+starts later than 4 s after the first attempt, so one that waited out the 10 s timeout is not sent
+again. Each retry logs `ILK_REGISTER failed for a reason that may pass; sending it again`, and the
+last failure `ILK_REGISTER failed` with its `attempts`. The tool's error answer says `retryable`.
+Registering again is safe: SY.identity replaces the identification of an ILK registered twice.
+
 The email goes in exactly one of the two keys (`person_identification`, with the tool's
 `email_vouched`):
 
@@ -233,8 +256,9 @@ On the identity side `ILK_REGISTER` is accepted only from names starting with
 `SY.frontdesk.gov@` or `SY.orchestrator@` (an orchestrator only for its own hive's nodes), plus
 the configured frontdesk name (`src/bin/sy_identity.rs`; otherwise `UNAUTHORIZED_REGISTRAR`).
 SY.identity's own error code is kept. The frontdesk maps outcomes to `REGISTERED`, `MERGED`,
-`IDENTITY_UNAVAILABLE` (transport errors), `TENANT_UNRESOLVED`, `TENANT_NOT_REGISTRABLE`,
-`INVALID_REQUEST` or `REGISTER_FAILED`. Logs show which fields were present, never their values.
+`IDENTITY_UNAVAILABLE` (the failures that may pass), `TENANT_UNRESOLVED`,
+`TENANT_NOT_REGISTRABLE`, `INVALID_REQUEST` or `REGISTER_FAILED`. Logs show which fields were
+present, never their values.
 
 ## LLM, key and usage records
 
@@ -286,8 +310,11 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   A later `VAULT_SECRET_CHANGED` for the key turns the conversation on.
 - **Invalid hive.yaml, installation file or `ai` section**: `FAILED_CONFIG` with the reason;
   handoffs still work. An installation file no reader can use is never a fallback to hive.yaml.
-- **SY.identity down or slow** (10 s): `IDENTITY_UNAVAILABLE`. A handoff can be sent again; a
-  conversation ends as `completed_error` (the prompt's no-loop rule).
+- **SY.identity down, restarting or slow** (10 s): `ilk_register` retries for a few seconds (see
+  ILK_REGISTER); if it still fails, `IDENTITY_UNAVAILABLE`, and the case stays
+  `awaiting_confirmation`: the handoff sent again, or the person's next confirmation, retries it.
+  A case closed as `completed_error` on such a failure (by an earlier version) is reopened when
+  the person writes again.
 - **Identity SHM unreadable**: the case tenant is unknown, so registration answers that the tenant
   is unresolved and usage goes to `fallback_root`; the conversation itself continues.
 - **Handler errors**: each message runs once under the AI runtime

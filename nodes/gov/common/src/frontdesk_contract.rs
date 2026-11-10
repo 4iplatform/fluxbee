@@ -157,7 +157,7 @@ mod tests {
             );
         }
         // The mark without a handoff payload.
-        let text = json!({ "type": "text", "content": "hola" });
+        let text = json!({ "type": "text", "content": "hello" });
         assert!(parse_frontdesk_handoff(Some(FRONTDESK_HANDOFF_MSG), &text).is_none());
     }
 
@@ -186,10 +186,10 @@ mod tests {
     #[test]
     fn builds_frontdesk_result_payload() {
         let payload =
-            frontdesk_result_payload("needs_input", "MISSING_REQUIRED_FIELDS", "Falta email");
+            frontdesk_result_payload("needs_input", "MISSING_REQUIRED_FIELDS", "Missing email");
         assert_eq!(payload.payload_type, FRONTDESK_RESULT_PAYLOAD_TYPE);
         assert_eq!(payload.schema_version, FRONTDESK_SCHEMA_VERSION_V1);
         assert_eq!(payload.result_code, "MISSING_REQUIRED_FIELDS");
-        assert_eq!(payload.human_message, "Falta email");
+        assert_eq!(payload.human_message, "Missing email");
     }
 }
