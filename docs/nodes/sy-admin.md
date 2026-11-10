@@ -119,6 +119,12 @@ fails with `missing_ai_api_key`.
 - **Headers past 64 KiB** (`HTTP_HEADER_MAX_BYTES`, the request line and headers up to the blank
   line that ends them): `431 HEADERS_TOO_LARGE`, without reading on (`read_http_request`,
   FINDINGS A-234).
+- **After either of those two answers** the request has not been read to its end, and closing the
+  socket with the client's bytes unread would send a reset, which a client still sending sees
+  instead of the answer. So SY.admin ends its side after the answer, then reads and drops what the
+  client still sends until the client ends its own, for 2 s and 8 MiB at most
+  (`HTTP_UNREAD_DRAIN_TIME`, `HTTP_UNREAD_DRAIN_BYTES`), and only then closes
+  (`close_after_unread_request`).
 - **Health.** `GET /health` answers `{"status":"ok"}` without touching the mesh.
 
 ## ADMIN_COMMAND over the mesh

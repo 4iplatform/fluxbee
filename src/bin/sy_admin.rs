@@ -10064,7 +10064,8 @@ async fn run_http_server(
 
 /// One connection of the HTTP API. A handler that fails before it answers still answers
 /// (FINDINGS A-229): an error in SY.admin's shape (`http_handler_error_response`), never a
-/// connection closed with no answer; the log line keeps the reason.
+/// connection closed with no answer; the log line keeps the reason. An answer to a request not
+/// read to its end is followed by `close_after_unread_request` (FINDINGS A-234).
 async fn serve_http_connection(
     mut stream: tokio::net::TcpStream,
     ctx: &AdminContext,
@@ -10074,7 +10075,52 @@ async fn serve_http_connection(
         tracing::warn!("http handler error: {err}");
         let (status, body) = http_handler_error_response(err.as_ref());
         // A handler that failed on its own answer, its caller gone, fails this one the same way.
-        let _ = respond_json(&mut stream, status, &body).await;
+        if respond_json(&mut stream, status, &body).await.is_ok()
+            && http_request_left_unread(err.as_ref())
+        {
+            close_after_unread_request(&mut stream).await;
+        }
+    }
+}
+
+/// How long, and how many bytes at most, SY.admin reads and drops of a request it answered before
+/// reading it to its end, whichever ends first (`close_after_unread_request`, FINDINGS A-234).
+const HTTP_UNREAD_DRAIN_TIME: Duration = Duration::from_secs(2);
+const HTTP_UNREAD_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether the error answered a request before its end was read (FINDINGS A-234): its head past
+/// `HTTP_HEADER_MAX_BYTES`, or its body past `HTTP_BODY_MAX_BYTES`, anywhere in the error's chain.
+fn http_request_left_unread(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(err);
+    while let Some(current) = cause {
+        if current.is::<HttpHeadersTooLarge>() || current.is::<HttpBodyTooLarge>() {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
+/// The close after an answer to a request SY.admin did not read to its end (FINDINGS A-234): its
+/// 431 or its 413. Closed with the client's bytes unread, the socket would send a reset, and a
+/// client still sending its request would see that reset instead of the answer. So SY.admin ends
+/// its side after the answer (a shutdown of its writes), then reads and drops what the client still
+/// sends, until the client ends its side, for `HTTP_UNREAD_DRAIN_TIME` and
+/// `HTTP_UNREAD_DRAIN_BYTES` at most, and only then closes.
+async fn close_after_unread_request(stream: &mut tokio::net::TcpStream) {
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + HTTP_UNREAD_DRAIN_TIME;
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut drained = 0usize;
+    while drained < HTTP_UNREAD_DRAIN_BYTES {
+        let room = chunk.len().min(HTTP_UNREAD_DRAIN_BYTES - drained);
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk[..room])).await {
+            Ok(Ok(read)) if read > 0 => drained += read,
+            // The client ended its side, the connection failed, or the time is up.
+            _ => break,
+        }
     }
 }
 
@@ -12187,7 +12233,9 @@ const HTTP_BODY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const _: () = assert!(HTTP_BODY_MAX_BYTES > BUNDLE_MAX_ZIP_BYTES);
 
 /// A request whose `Content-Length` passes `HTTP_BODY_MAX_BYTES`: nothing is allocated for its
-/// body, nor is it read; the connection answers `413 BODY_TOO_LARGE` (`http_handler_error_response`).
+/// body, nor is it read; the connection answers `413 BODY_TOO_LARGE` (`http_handler_error_response`),
+/// then drops what the client still sends, for a while, before it closes
+/// (`close_after_unread_request`).
 #[derive(Debug)]
 struct HttpBodyTooLarge {
     declared: u64,
@@ -12211,7 +12259,8 @@ impl std::error::Error for HttpBodyTooLarge {}
 const HTTP_HEADER_MAX_BYTES: usize = 64 * 1024;
 
 /// A request whose head passes `HTTP_HEADER_MAX_BYTES`: nothing more of it is read; the connection
-/// answers `431 HEADERS_TOO_LARGE` (`http_handler_error_response`).
+/// answers `431 HEADERS_TOO_LARGE` (`http_handler_error_response`), then drops what the client
+/// still sends, for a while, before it closes (`close_after_unread_request`).
 #[derive(Debug)]
 struct HttpHeadersTooLarge;
 
@@ -40082,6 +40131,8 @@ mod tests {
                 answer.contains("\"error_code\":\"BODY_TOO_LARGE\""),
                 "{answer}"
             );
+            // The client's end: the server stops reading on (close_after_unread_request).
+            drop(stream);
             server.await.expect("the server");
         });
     }
@@ -40151,6 +40202,99 @@ mod tests {
             within.extend_from_slice(b"\r\n\r\n");
             let answer = ask(within).await;
             assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            server.await.expect("the server");
+        });
+    }
+
+    /// FINDINGS A-234: the 431 and the 413 reach a client still sending its request. SY.admin
+    /// answers both before it reads the request to its end; had it closed with the client's bytes
+    /// unread, the socket would have sent a reset, and the client would read "connection reset"
+    /// instead of the answer. It ends its side after the answer and drops what the client still
+    /// sends before it closes (close_after_unread_request): the client here goes on writing 4 MiB
+    /// past its head, on a task of its own, and reads the whole answer, to its end. An answer to a
+    /// request read to its end closes as before.
+    #[test]
+    fn a_client_still_sending_reads_the_refusal_to_its_end() {
+        assert!(http_request_left_unread(
+            &HttpHeadersTooLarge as &dyn std::error::Error
+        ));
+        assert!(http_request_left_unread(
+            &HttpBodyTooLarge { declared: 1 } as &dyn std::error::Error
+        ));
+        let other: AdminError = "SY.admin could not complete the request".into();
+        assert!(!http_request_left_unread(other.as_ref()));
+
+        // handle_http's frames run deep in a debug build, as in the tests above.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(32 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (ctx, _harness) = opa_test_admin("http-refusal-drain");
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let addr = listener.local_addr().expect("its address");
+            let server_ctx = ctx.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.expect("a connection");
+                    serve_http_connection(stream, &server_ctx, &server_ctx.rpc).await;
+                }
+            });
+            // The head, then 4 MiB more of the same request, while the answer is read.
+            let ask_while_sending = |head: Vec<u8>| async move {
+                let stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("connected");
+                let (mut reader, mut writer) = stream.into_split();
+                let sender = tokio::spawn(async move {
+                    let more = vec![b'a'; 64 * 1024];
+                    if writer.write_all(&head).await.is_ok() {
+                        for _ in 0..64 {
+                            if writer.write_all(&more).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    // Its side stays open: the request has not ended.
+                    writer
+                });
+                let mut answer = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), reader.read_to_end(&mut answer))
+                    .await
+                    .expect("answered")
+                    .expect("the whole answer, and no reset");
+                drop(sender.await.expect("the sender"));
+                String::from_utf8(answer).expect("text")
+            };
+
+            let mut head = b"GET /health HTTP/1.1\r\nX-Pad: ".to_vec();
+            head.resize(HTTP_HEADER_MAX_BYTES + 1, b'a');
+            let answer = ask_while_sending(head).await;
+            assert!(
+                answer.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("\"error_code\":\"HEADERS_TOO_LARGE\""),
+                "{answer}"
+            );
+
+            let head = format!(
+                "POST /hives/motherbee/nodes HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                HTTP_BODY_MAX_BYTES + 1
+            );
+            let answer = ask_while_sending(head.into_bytes()).await;
+            assert!(
+                answer.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("\"error_code\":\"BODY_TOO_LARGE\""),
+                "{answer}"
+            );
             server.await.expect("the server");
         });
     }
