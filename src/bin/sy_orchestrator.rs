@@ -21541,6 +21541,9 @@ fn config_tenant_id(config: &serde_json::Value) -> Option<String> {
     .map(str::to_string)
 }
 
+/// The tenant a spawn names: the request's `tenant_id`, else its `config.tenant_id`. Nothing else
+/// supplies one: the tenant is the caller's datum (FINDINGS A-213), and a spawn that names none is
+/// refused when it registers the node's identity (`ensure_node_identity_registered`).
 fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
     let from_payload = payload
         .get("tenant_id")
@@ -21558,12 +21561,6 @@ fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string())
-        .or_else(|| {
-            std::env::var("ORCH_DEFAULT_TENANT_ID")
-                .ok()
-                .map(|raw| raw.trim().to_string())
-                .filter(|raw| !raw.is_empty())
-        })
 }
 
 fn resolve_identity_primary_hive_id(
@@ -21956,14 +21953,15 @@ async fn ensure_node_identity_registered(
     runtime: &str,
     runtime_version: &str,
 ) -> Result<Option<serde_json::Value>, OrchestratorError> {
+    // The request before the host: a spawn that names no tenant is refused on any hive, and told
+    // which field it lacks (FINDINGS A-213).
+    let Some(tenant_id) = resolve_tenant_id_for_node(payload) else {
+        return Err("identity registration required but tenant_id is missing: name the node's tenant (tnt:<uuid>) in the request's tenant_id or config.tenant_id; there is no default tenant".into());
+    };
+    parse_prefixed_uuid(&tenant_id, "tnt")?;
     if !identity_available() {
         return Err("identity registration required but sy-identity is not installed".into());
     }
-
-    let Some(tenant_id) = resolve_tenant_id_for_node(payload) else {
-        return Err("identity registration required but tenant_id is missing (use payload.tenant_id, payload.config.tenant_id, or ORCH_DEFAULT_TENANT_ID)".into());
-    };
-    parse_prefixed_uuid(&tenant_id, "tnt")?;
 
     let requested_ilk_id = resolve_node_ilk_id(state, payload, node_name)?;
     let ilk_type = derive_ilk_type_for_node(node_name);
@@ -42749,6 +42747,84 @@ blob:
         assert_eq!(
             config_tenant_id(&serde_json::json!({ "_system": { "tenant_id": " " } })),
             None
+        );
+    }
+
+    /// FINDINGS A-213: a spawn's tenant is the one its request names, `tenant_id` and then
+    /// `config.tenant_id`; nothing else supplies one. A spawn that names none is refused at its
+    /// identity registration (`IDENTITY_REGISTER_FAILED` in `run_node_flow`), before the host is
+    /// looked at, and told which field it lacks.
+    #[tokio::test]
+    async fn a_spawn_names_its_tenant_or_is_refused_with_the_field_it_lacks() {
+        let state = sample_orchestrator_state_for_tests();
+        let node = "AI.sales@motherbee";
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        let other = "tnt:5b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e";
+        let resolved = |payload: serde_json::Value| resolve_tenant_id_for_node(&payload);
+        assert_eq!(
+            resolved(serde_json::json!({ "tenant_id": format!(" {tenant} ") })).as_deref(),
+            Some(tenant)
+        );
+        assert_eq!(
+            resolved(serde_json::json!({ "config": { "tenant_id": tenant } })).as_deref(),
+            Some(tenant)
+        );
+        assert_eq!(
+            resolved(serde_json::json!({ "tenant_id": tenant, "config": { "tenant_id": other } }))
+                .as_deref(),
+            Some(tenant)
+        );
+        assert_eq!(
+            resolved(serde_json::json!({ "tenant_id": " ", "config": { "tenant_id": other } }))
+                .as_deref(),
+            Some(other)
+        );
+
+        for payload in [
+            serde_json::json!({ "node_name": node, "runtime": "ai.generic" }),
+            serde_json::json!({ "node_name": node, "tenant_id": " ", "config": { "tenant_id": "" } }),
+        ] {
+            assert_eq!(resolve_tenant_id_for_node(&payload), None, "{payload}");
+            let err = ensure_node_identity_registered(
+                &state,
+                &payload,
+                PRIMARY_HIVE_ID,
+                node,
+                "ai.generic",
+                "1.0.0",
+            )
+            .await
+            .expect_err("a spawn that names no tenant is refused")
+            .to_string();
+            assert!(err.contains("tenant_id is missing"), "{err}");
+            assert!(err.contains("config.tenant_id"), "{err}");
+        }
+
+        // With one, the registration goes on past the tenant: what stops it in a test is the host
+        // (no sy-identity, or no router), never the tenant.
+        let err = ensure_node_identity_registered(
+            &state,
+            &serde_json::json!({ "node_name": node, "tenant_id": tenant }),
+            PRIMARY_HIVE_ID,
+            node,
+            "ai.generic",
+            "1.0.0",
+        )
+        .await
+        .expect_err("no identity service in a test")
+        .to_string();
+        assert!(!err.contains("tenant_id is missing"), "{err}");
+
+        // Nothing but the request: the resolver reads no environment.
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn resolve_tenant_id_for_node(")
+            .expect("the resolver");
+        let end = start + src[start..].find("\n}\n").expect("its end");
+        assert!(
+            !src[start..end].contains("env::var"),
+            "{}",
+            &src[start..end]
         );
     }
 

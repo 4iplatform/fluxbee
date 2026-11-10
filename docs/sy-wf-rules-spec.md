@@ -509,7 +509,7 @@ When a definition is applied (compile_apply or apply operations), SY.wf-rules fi
 - Obsolete package versions are removed through SY.admin's `remove_runtime_version` on every hive; SY.wf-rules never writes the dist tree or its manifest.
 - On a worker, right after publishing, SY.wf-rules asks SY.admin for a `sync_hint` on the motherbee's `fluxbee-dist-runtimes`: the motherbee scans now and announces the package, and the worker pulls it as soon as the announcement arrives. While a node call still answers RUNTIME_NOT_PRESENT, it asks for the same scan again before each retry.
 - Publication state and deployment state are intentionally different. A package may already exist in `dist` with a newer version while the WF node still runs the older `runtime_version` recorded in its managed config. The node only changes versions after the explicit rebind/restart sequence completes successfully.
-- The only environment-level tenant fallback relevant to this path is `ORCH_DEFAULT_TENANT_ID` inside `SY.orchestrator`, which remains a platform escape hatch. `SY.wf-rules` itself must not rely on a local `tenant_id` environment variable.
+- No environment variable supplies a tenant on this path: `SY.orchestrator` refuses a spawn that names none (`IDENTITY_REGISTER_FAILED`, FINDINGS A-213), and `SY.wf-rules` itself must not rely on a local `tenant_id` environment variable.
 
 ### 7.1 Managed config.json format for WF nodes
 

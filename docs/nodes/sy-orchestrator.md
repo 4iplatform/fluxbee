@@ -175,7 +175,10 @@ same way, with `managed: false`.
    `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh` (`runtime_start_script`).
    A node whose config already exists is refused (`NODE_ALREADY_EXISTS`).
 5. The node gets an ILK: `ILK_REGISTER` to `SY.identity@motherbee` with `ilk_type: "agent"` and
-   the node's tenant (`ensure_node_identity_registered`).
+   the node's tenant (`ensure_node_identity_registered`). The tenant is the one the request names,
+   `tenant_id`, else `config.tenant_id` (`resolve_tenant_id_for_node`); there is no default. A
+   spawn that names none is refused with `IDENTITY_REGISTER_FAILED`, and its message names both
+   fields (FINDINGS A-213).
 6. Its config is written to `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json`
    (`node_instance_dir`, `write_json_atomic`): the runtime's config template, the request's
    `config`, `tenant_id`, and a `_system` block.
@@ -895,9 +898,9 @@ and dist's flags from the file, with defaults that differ by role (a missing `bl
 off). A hive whose hive.yaml never had them, joined by 0.1.117 or later, goes back below 0.1.117
 only after they are put back by hand (lab/logbook/HANDBOOK.md, "The rollback").
 
-Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that names none);
-`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and `JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS`
-(forward timeouts); `FLUXBEE_ADD_HIVE_REQUIRE_DIST_SYNC` / `JSR_ADD_HIVE_REQUIRE_DIST_SYNC` and
+Environment: `JSR_LOG_LEVEL`; `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and
+`JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS` (forward timeouts);
+`FLUXBEE_ADD_HIVE_REQUIRE_DIST_SYNC` / `JSR_ADD_HIVE_REQUIRE_DIST_SYNC` and
 `FLUXBEE_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS` / `JSR_ADD_HIVE_DIST_SYNC_TIMEOUT_SECS` (join checks).
 
 ## State on disk
