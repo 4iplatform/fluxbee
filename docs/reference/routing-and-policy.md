@@ -250,7 +250,8 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 | `LINK_BUSY` | the link the message would take, a local node's, a sibling router's or a WAN peer's, has its queue at the senders' bound (§1): its peer reads slower than frames come for it, or has stopped reading without closing. Never queued, and the link stays: the same message may go once the link drains. A broadcast goes to every other link, and its sender is answered once, by the router it entered (§4) (A-222, since 0.1.129) |
 
 A message that came from another router gets its error over the link it came in on; that router
-hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`).
+hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`). A tap
+copy gets none, on any router (§8.3).
 
 ### 3.7 Dropped without an answer
 
@@ -666,12 +667,22 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
   hub-relayed sender's (§6.3).
 - Best effort: a copy that cannot go (unknown target, VPN, TTL, link down) is logged as
   `router tap copy: …` and dropped. The primary delivery does not wait for it.
-- Never answered: the original's sender did not send the copy, and no request of its waits on
-  the copy's `trace_id`. A copy that a local node's, a sibling router's or a WAN peer's link does
-  not take (no link, a full one, the copy over the frame, no TTL left) is logged as `router tap
-  copy: not handed on, dropped` with the reason a message of its own would have got. Until
-  0.1.129 a copy for another hive that could not go was answered to the original's sender,
-  under the copy's `trace_id` (A-209).
+- Never answered, by any router: the original's sender did not send the copy, and no request of
+  its waits on the copy's `trace_id`, though the copy keeps its `src`.
+  - At the router the original entered, a copy that a local node's, a sibling router's or a WAN
+    peer's link does not take (no link, a full one, the copy over the frame, no TTL left) is
+    logged as `router tap copy: not handed on, dropped` with the reason a message of its own would
+    have got.
+  - A router the copy reaches, a sibling over IRP or another hive's over the WAN (a hub that
+    relays it included), answers it for no reason either: its target's link full or gone, its
+    target unknown, no TTL left, no link on (`tap_copy_not_answered`, in `send_unreachable_to` and
+    `send_ttl_exceeded_to`). It logs `router tap copy: not handed on here, dropped without an
+    answer` with the reason the answer would have had, the copy's `trace_id` and the count since
+    start (`unanswered_total`), at most once every 30 s.
+  - Until 0.1.129 a copy that could not go was answered under its `trace_id`: by the router the
+    original entered for a copy for another hive, and by any router the copy reached, whose answer
+    the original's router relayed to its sender (A-209). With the link bound (§1), a hung tap
+    target on another router would have had every tapped message's sender hear `LINK_BUSY`.
 - A target observes; it does not take part. An AI node that gets a copy runs no handler for it
   and answers nothing, which would go to the original sender (the AI SDK's `run_handler`, FINDINGS
   A-248). Its journal counts the copies in `tap_copies_ignored`, in the `ai runtime metrics` line;

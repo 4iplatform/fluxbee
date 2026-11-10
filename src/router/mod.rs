@@ -1830,45 +1830,91 @@ fn canonical_thread_id_from_meta(meta: &Meta) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The destination of `msg` as an answer names it: a name or UUID, `broadcast`, or `null` for a
+/// Resolve.
+fn original_dst(msg: &Message) -> String {
+    match &msg.routing.dst {
+        Destination::Unicast(value) => value.clone(),
+        Destination::Broadcast => "broadcast".to_string(),
+        Destination::Resolve => "null".to_string(),
+    }
+}
+
+/// Answers the router did not send because their message was a tap copy, process-wide. Each line
+/// about them carries the total; at most one line per interval.
+static TAP_COPIES_UNANSWERED: AtomicU64 = AtomicU64::new(0);
+static TAP_COPIES_UNANSWERED_LOGGED_AT_MS: AtomicU64 = AtomicU64::new(0);
+const TAP_COPIES_UNANSWERED_LOG_INTERVAL_MS: u64 = 30_000;
+
+/// Whether `msg` is a tap copy, which no router answers, whatever stopped it (A-209). The copy
+/// keeps the original's `src`, but its sender did not send it, and no request of its waits on the
+/// copy's trace_id. The router the original entered never answers a copy
+/// (`fanout_taps_for_unicast`); this keeps every router the copy reaches from answering it, a
+/// sibling over IRP or another hive's over the WAN, whose answer the sender's own router would
+/// relay to it. Such a copy is logged as dropped, with the reason its answer would have had, at
+/// most once every 30 s with the count since the start.
+fn tap_copy_not_answered(msg: &Message, reason: &str) -> bool {
+    if !msg.meta.via_tap {
+        return false;
+    }
+    let unanswered_total = TAP_COPIES_UNANSWERED.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_epoch_ms();
+    let last = TAP_COPIES_UNANSWERED_LOGGED_AT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= TAP_COPIES_UNANSWERED_LOG_INTERVAL_MS
+        && TAP_COPIES_UNANSWERED_LOGGED_AT_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            tap_src = msg.routing.src_l2_name.as_deref().unwrap_or(&msg.routing.src),
+            tap_target = %original_dst(msg),
+            copy_trace_id = %msg.routing.trace_id,
+            reason,
+            unanswered_total,
+            "router tap copy: not handed on here, dropped without an answer"
+        );
+    }
+    true
+}
+
 /// Answers the sender of `msg` `UNREACHABLE` with `reason`, over `sender`, the link the message came
-/// in on. An answer is one of the router's own frames: on a full link it is skipped (A-222).
+/// in on. An answer is one of the router's own frames: on a full link it is skipped (A-222). A tap
+/// copy is not answered (`tap_copy_not_answered`, A-209).
 fn send_unreachable_to(
     msg: &Message,
     sender: &LinkSender,
     router_uuid: Uuid,
     reason: &str,
 ) -> Result<(), RouterError> {
-    let original_dst = match &msg.routing.dst {
-        Destination::Unicast(value) => value.clone(),
-        Destination::Broadcast => "broadcast".to_string(),
-        Destination::Resolve => "null".to_string(),
-    };
+    if tap_copy_not_answered(msg, reason) {
+        return Ok(());
+    }
     let err = build_unreachable(
         &router_uuid.to_string(),
         &msg.routing.src,
         &msg.routing.trace_id,
-        &original_dst,
+        &original_dst(msg),
         reason,
     );
     sender.queue_own(serde_json::to_vec(&err)?);
     Ok(())
 }
 
+/// Answers the sender of `msg` `TTL_EXCEEDED`, over `sender`, as `send_unreachable_to` answers: a
+/// tap copy is not answered (A-209).
 fn send_ttl_exceeded_to(
     msg: &Message,
     sender: &LinkSender,
     router_uuid: Uuid,
 ) -> Result<(), RouterError> {
-    let original_dst = match &msg.routing.dst {
-        Destination::Unicast(value) => value.clone(),
-        Destination::Broadcast => "broadcast".to_string(),
-        Destination::Resolve => "null".to_string(),
-    };
+    if tap_copy_not_answered(msg, MSG_TTL_EXCEEDED) {
+        return Ok(());
+    }
     let err = build_ttl_exceeded(
         &router_uuid.to_string(),
         &msg.routing.src,
         &msg.routing.trace_id,
-        &original_dst,
+        &original_dst(msg),
         &router_name(router_uuid),
     );
     sender.queue_own(serde_json::to_vec(&err)?);
@@ -2083,7 +2129,8 @@ async fn broadcast_to_wan(
 }
 
 /// Hands `msg` toward the hive `hive_id`, answering its sender over `sender`: `TTL_EXCEEDED` when
-/// it would arrive with none left, `UNREACHABLE` when it did not go (`hand_to_hive`).
+/// it would arrive with none left, `UNREACHABLE` when it did not go (`hand_to_hive`). A tap copy a
+/// hub relays is not answered (A-209).
 async fn forward_to_hive(
     hive_id: &str,
     msg: &Message,
@@ -8229,11 +8276,14 @@ mod tests {
         }
     }
 
-    /// A-209: a tap copy that cannot go is logged and dropped, and the original's sender is never
-    /// answered for it, on any path: to a local node, a sibling router's or another hive's; with no
-    /// link, a full one, a copy over the frame or out of TTL. The sender never sent the copy, and no
-    /// request of its waits on the copy's trace_id. Until 0.1.129 a copy for another hive that could
-    /// not go was answered to the sender under the copy's trace_id.
+    /// A-209 at the router the original entered: a tap copy it cannot hand on is logged and
+    /// dropped, and the original's sender is never answered for it, on any path: to a local node,
+    /// a sibling router's or another hive's; with no link, a full one, a copy over the frame or out
+    /// of TTL. The sender never sent the copy, and no request of its waits on the copy's trace_id.
+    /// Until 0.1.129 a copy for another hive that could not go was answered to the sender under the
+    /// copy's trace_id. The routers a copy reaches answer nothing either:
+    /// `a_tap_copy_is_never_answered_by_the_router_it_reaches_over_the_wan` and
+    /// `a_tap_copy_is_never_answered_by_the_sibling_router_it_reaches`.
     #[tokio::test]
     async fn a_tap_copy_that_cannot_go_is_never_answered_to_its_sender() {
         let admin = Uuid::new_v4();
@@ -8383,6 +8433,327 @@ mod tests {
         tap_to("IO.peer@motherbee", 16, 0).await;
         never_answered("a full sibling link");
         assert!(messages_on(&mut sibling_rx).is_empty(), "no copy went");
+    }
+
+    /// A message of `src`'s own, named `src_name` as its router stamped it, to `dst`, and a tap's
+    /// copy to the same `dst`: the same message with `via_tap` and a trace_id of its own, as
+    /// `fanout_taps_for_unicast` makes it.
+    fn a_message_and_a_tap_copy(
+        src: Uuid,
+        src_name: &str,
+        dst: &str,
+        ttl: u8,
+        pad: usize,
+    ) -> (Message, Message) {
+        let mut own = padded_message(src, Destination::Unicast(dst.to_string()), pad);
+        own.routing.src_l2_name = Some(src_name.to_string());
+        own.routing.ttl = ttl;
+        let mut copy = own.clone();
+        copy.meta.via_tap = true;
+        copy.routing.trace_id = Uuid::new_v4().to_string();
+        (own, copy)
+    }
+
+    /// What a router's answer says, and to which message: its trace_id, and the UNREACHABLE's
+    /// reason or `TTL_EXCEEDED`.
+    fn what_was_answered(answer: &Message) -> (String, String) {
+        let said = match answer.meta.msg.as_deref() {
+            Some(MSG_UNREACHABLE) => answer.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            other => other.unwrap_or_default().to_string(),
+        };
+        (answer.routing.trace_id.clone(), said)
+    }
+
+    /// A-209 on the router a tap copy reaches over the WAN, here the motherbee's for a tap of
+    /// worker1's: whatever stops the copy there, nothing goes back for worker1 to relay to the
+    /// original's sender. Its target's link full or gone, the copy over the frame, its target
+    /// unknown by name or by UUID, no TTL left, a sibling router or a third hive without a link
+    /// to it or without the TTL for it. The sender's own message to the same target is answered
+    /// each time, as the copy was until 0.1.129, under the copy's trace_id.
+    #[tokio::test]
+    async fn a_tap_copy_is_never_answered_by_the_router_it_reaches_over_the_wan() {
+        let ctx = test_wan_context(None);
+        let orchestrator = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive("worker1", FLAG_ACTIVE),
+                lsa_hive("worker2", FLAG_ACTIVE),
+            ],
+            vec![
+                lsa_node_entry(orchestrator, "SY.orchestrator@worker1", 0),
+                lsa_node_entry(Uuid::new_v4(), "IO.audit@worker2", 1),
+            ],
+        ));
+        let (audit_tx, mut audit) = link_queue("node");
+        fill_to_the_senders_bound(&audit_tx);
+        let (gone_tx, gone) = link_queue("node");
+        drop(gone);
+        for (name, sender) in [
+            ("IO.audit@motherbee", audit_tx),
+            ("IO.gone@motherbee", gone_tx),
+        ] {
+            ctx.nodes.lock().await.insert(
+                Uuid::new_v4(),
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender,
+                    connected_at: 0,
+                },
+            );
+        }
+        // A sibling router's node, with no link to that router.
+        let peer_node = Uuid::new_v4();
+        ctx.peer_nodes.lock().await.insert(
+            peer_node,
+            PeerNode {
+                uuid: peer_node,
+                name: "IO.peer@motherbee".to_string(),
+                vpn_id: 0,
+                router_uuid: Uuid::new_v4(),
+            },
+        );
+        rebuild_fib(
+            &ctx.fib,
+            &ctx.nodes,
+            &ctx.peer_nodes,
+            &ctx.static_routes,
+            &ctx.lsa_snapshot,
+            &ctx.reachability,
+        )
+        .await;
+        let unknown = Uuid::new_v4().to_string();
+        let (link, mut back) = link_queue("wan");
+        for (case, dst, ttl, pad, reason) in [
+            (
+                "its target's link full",
+                "IO.audit@motherbee",
+                16,
+                0,
+                "LINK_BUSY",
+            ),
+            (
+                "its target's link gone",
+                "IO.gone@motherbee",
+                16,
+                0,
+                "NODE_NOT_FOUND",
+            ),
+            (
+                "the copy over the frame",
+                "IO.audit@motherbee",
+                16,
+                MAX_FRAME_SIZE,
+                "FRAME_TOO_LARGE",
+            ),
+            (
+                "its target unknown",
+                "IO.absent@motherbee",
+                16,
+                0,
+                "NODE_NOT_FOUND",
+            ),
+            (
+                "its target's UUID unknown",
+                unknown.as_str(),
+                16,
+                0,
+                "NODE_NOT_FOUND",
+            ),
+            ("no TTL left", "IO.audit@motherbee", 0, 0, MSG_TTL_EXCEEDED),
+            (
+                "no sibling link",
+                "IO.peer@motherbee",
+                16,
+                0,
+                "PEER_UNAVAILABLE",
+            ),
+            (
+                "no TTL for the sibling",
+                "IO.peer@motherbee",
+                1,
+                0,
+                MSG_TTL_EXCEEDED,
+            ),
+            (
+                "no link to worker2",
+                "IO.audit@worker2",
+                16,
+                0,
+                "WAN_UNAVAILABLE",
+            ),
+            (
+                "no TTL for worker2",
+                "IO.audit@worker2",
+                1,
+                0,
+                MSG_TTL_EXCEEDED,
+            ),
+        ] {
+            let (own, copy) =
+                a_message_and_a_tap_copy(orchestrator, "SY.orchestrator@worker1", dst, ttl, pad);
+            for frame in [&own, &copy] {
+                handle_wan_message(
+                    frame,
+                    &link,
+                    &ctx,
+                    "worker1",
+                    Uuid::new_v4(),
+                    "RT.gateway@worker1",
+                    1,
+                )
+                .await
+                .expect("handled");
+            }
+            let answers: Vec<_> = messages_on(&mut back)
+                .iter()
+                .map(what_was_answered)
+                .collect();
+            assert_eq!(
+                answers,
+                vec![(own.routing.trace_id.clone(), reason.to_string())],
+                "{case}: the sender's own message is answered, the tap copy is not"
+            );
+        }
+        assert!(messages_on(&mut audit).is_empty(), "nothing went");
+    }
+
+    /// A-209 on a sibling router a tap copy reaches over IRP: whatever stops the copy there, its
+    /// target's link full or gone, its target unknown by name or by UUID, no TTL left, no gateway
+    /// sibling toward another hive, nothing goes back for the sibling to relay to the original's
+    /// sender. The sender's own message to the same target is answered each time.
+    #[tokio::test]
+    async fn a_tap_copy_is_never_answered_by_the_sibling_router_it_reaches() {
+        let shm = TestShm::new("rt-tapirp");
+        // SY.admin is a node of the sibling the copy comes from.
+        let admin = Uuid::new_v4();
+        let sibling = Uuid::new_v4();
+        let peer_nodes = Arc::new(Mutex::new(HashMap::from([(
+            admin,
+            PeerNode {
+                uuid: admin,
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                router_uuid: sibling,
+            },
+        )])));
+        let (sibling_tx, mut back) = link_queue("irp");
+        let peers = Arc::new(Mutex::new(HashMap::from([(
+            sibling,
+            PeerHandle { sender: sibling_tx },
+        )])));
+        let (audit_tx, mut audit) = link_queue("node");
+        fill_to_the_senders_bound(&audit_tx);
+        let (gone_tx, gone) = link_queue("node");
+        drop(gone);
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        for (name, sender) in [
+            ("IO.audit@motherbee", audit_tx),
+            ("IO.gone@motherbee", gone_tx),
+        ] {
+            nodes.lock().await.insert(
+                Uuid::new_v4(),
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender,
+                    connected_at: 0,
+                },
+            );
+        }
+        let lsa_snapshot = Arc::new(Mutex::new(Some(lsa_with_remote_node(
+            "worker1",
+            Uuid::new_v4(),
+            "IO.audit@worker1",
+        ))));
+        let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+        let static_routes = Arc::new(Mutex::new(Vec::<StaticRoute>::new()));
+        let reachability = Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new()));
+        rebuild_fib(
+            &fib,
+            &nodes,
+            &peer_nodes,
+            &static_routes,
+            &lsa_snapshot,
+            &reachability,
+        )
+        .await;
+        let unknown = Uuid::new_v4().to_string();
+        for (case, dst, ttl, reason) in [
+            (
+                "its target's link full",
+                "IO.audit@motherbee",
+                16,
+                "LINK_BUSY",
+            ),
+            (
+                "its target's link gone",
+                "IO.gone@motherbee",
+                16,
+                "NODE_NOT_FOUND",
+            ),
+            (
+                "its target unknown",
+                "IO.absent@motherbee",
+                16,
+                "NODE_NOT_FOUND",
+            ),
+            (
+                "its target's UUID unknown",
+                unknown.as_str(),
+                16,
+                "NODE_NOT_FOUND",
+            ),
+            ("no TTL left", "IO.audit@motherbee", 0, MSG_TTL_EXCEEDED),
+            (
+                "no gateway sibling",
+                "IO.audit@worker1",
+                16,
+                "GATEWAY_UNAVAILABLE",
+            ),
+        ] {
+            let (own, copy) = a_message_and_a_tap_copy(admin, "SY.admin@motherbee", dst, ttl, 0);
+            for frame in [&own, &copy] {
+                handle_peer_message(
+                    frame,
+                    &sibling,
+                    &peers,
+                    &peer_nodes,
+                    &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+                    &nodes,
+                    &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+                    &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+                    &static_routes,
+                    &shm.writer,
+                    &Arc::new(Mutex::new(OpaResolver::new())),
+                    &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+                    &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                    "motherbee",
+                    "SY.frontdesk.gov@motherbee",
+                    &fib,
+                    Uuid::new_v4(),
+                    false,
+                    &lsa_snapshot,
+                    &reachability,
+                    &stream::StreamHandle::detached(),
+                )
+                .await
+                .expect("handled");
+            }
+            let answers: Vec<_> = messages_on(&mut back)
+                .iter()
+                .map(what_was_answered)
+                .collect();
+            assert_eq!(
+                answers,
+                vec![(own.routing.trace_id.clone(), reason.to_string())],
+                "{case}: the sender's own message is answered, the tap copy is not"
+            );
+        }
+        assert!(messages_on(&mut audit).is_empty(), "nothing went");
     }
 
     /// A node of the LSA snapshot, listed by the hive at `hive_index`.

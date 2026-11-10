@@ -229,7 +229,7 @@ out when empty.
 | `result_detail_code` | — | Defined in both SDKs; nothing sets it. |
 | `priority` | sender | A free hint, visible to the OPA policy; the router does not act on it. |
 | `context` | sender | Free JSON for the receiver and the OPA policy. IO nodes put the channel facts in `context.io`; the AI SDK reads `response_envelope` and `final_response_contract` from it (`crates/fluxbee_ai_sdk/src/message.rs`). A WF puts its block in `context.wf`, which ai.generic shows its model; the block's `menu` asks the agent to choose among options. An agent's answer to a menu, or to a contract with a `text_field`, carries the checked object in `context.evaluation` (`nodes/ai/ai-generic/README.md`). |
-| `via_tap` | **router only** | `true` on a tap copy, the copy a router sends to a monitoring target; such a copy is never tapped again. Serialized only when true. Missing from the Go `Meta`. An AI node never answers a tap copy, and its replies never carry `via_tap` (the AI SDK's runtime, FINDINGS A-248). |
+| `via_tap` | **router only** | `true` on a tap copy, the copy a router sends to a monitoring target; such a copy is never tapped again, and no router answers it `UNREACHABLE` or `TTL_EXCEEDED` (FINDINGS A-209, [routing-and-policy.md](routing-and-policy.md) §8.3). Serialized only when true. Missing from the Go `Meta`. An AI node never answers a tap copy, and its replies never carry `via_tap` (the AI SDK's runtime, FINDINGS A-248). |
 
 ### 3.6 Removed fields
 
