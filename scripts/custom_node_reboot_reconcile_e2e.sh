@@ -41,6 +41,8 @@ PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
 AI_BIN="$ROOT_DIR/target/release/ai-test-gov"
 IO_BIN="$ROOT_DIR/target/release/io-test"
 MANIFEST_PATH="/var/lib/fluxbee/dist/runtimes/manifest.json"
+# The manifest's lock, which every writer of it holds (FINDINGS A-171).
+MANIFEST_LOCK="/var/lib/fluxbee/dist/runtimes-manifest.lock"
 DIST_AI_DIR="/var/lib/fluxbee/dist/runtimes/$AI_RUNTIME_NAME"
 DIST_IO_DIR="/var/lib/fluxbee/dist/runtimes/$IO_RUNTIME_NAME"
 SCENARIO_ROOT="/var/lib/fluxbee/dist/.custom-node-reboot-reconcile"
@@ -574,7 +576,7 @@ cleanup() {
   remove_node_instance "$FRONTDESK_NODE_NAME"
   if [[ -f "$manifest_backup" ]]; then
     # Under the manifest's lock, as every writer of it (FINDINGS A-171).
-    as_root_local flock -w 60 "$MANIFEST_PATH.lock" \
+    as_root_local flock -w 60 "$MANIFEST_LOCK" \
       install -m 0644 "$manifest_backup" "$MANIFEST_PATH" >/dev/null 2>&1 || true
   fi
   as_root_local rm -rf "$DIST_AI_DIR" "$DIST_IO_DIR" "$SCENARIO_DIR" >/dev/null 2>&1 || true

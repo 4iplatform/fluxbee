@@ -115,16 +115,23 @@ pub fn load_runtime_manifest_from_paths(
 /// comes between its read of the manifest and its write.
 pub const RUNTIME_MANIFEST_LOCK_WAIT: Duration = Duration::from_secs(60);
 
+/// The name of the runtimes manifest's lock file, in the dist root (`runtime_manifest_lock_path`).
+pub const RUNTIME_MANIFEST_LOCK_FILE: &str = "runtimes-manifest.lock";
+
 /// The file every writer of a runtimes manifest locks for its read-modify-write (FINDINGS A-171):
-/// `<manifest>.lock`, next to it. SY.admin (`publish_runtime_package`, `remove_runtime_version`,
-/// `reset_base_runtime`), `fluxbee-publish`, `scripts/publish-runtime.sh` and the .deb's
-/// `fluxbee-seed-runtimes` each hold one exclusive flock on it from their read of the manifest to
-/// their write, so none loses another's change. The file stays: removing it would let a writer lock
-/// a new one beside one still held.
+/// `runtimes-manifest.lock` in the dist root, beside the `runtimes` folder that holds the manifest
+/// (`<dist>/runtimes/manifest.json` → `<dist>/runtimes-manifest.lock`), never inside it: Syncthing
+/// shares that folder with the workers, and the dist root itself is no folder of it. SY.admin
+/// (`publish_runtime_package`, `remove_runtime_version`, `reset_base_runtime`), `fluxbee-publish`,
+/// `scripts/publish-runtime.sh` and the .deb's `fluxbee-seed-runtimes` each hold one exclusive
+/// flock on it from their read of the manifest to their write, so none loses another's change. The
+/// file stays: removing it would let a writer lock a new one beside one still held.
 pub fn runtime_manifest_lock_path(manifest_path: &Path) -> PathBuf {
-    let mut path = manifest_path.as_os_str().to_owned();
-    path.push(".lock");
-    PathBuf::from(path)
+    let runtimes_dir = manifest_path.parent().unwrap_or_else(|| Path::new(""));
+    runtimes_dir
+        .parent()
+        .unwrap_or(runtimes_dir)
+        .join(RUNTIME_MANIFEST_LOCK_FILE)
 }
 
 /// The runtimes manifest's lock, held until dropped: the kernel releases the flock with its
@@ -329,17 +336,19 @@ mod tests {
         assert!(runtime_manifest_write_v2_gate_enabled(Some("on")));
     }
 
-    /// FINDINGS A-171: one writer of the manifest at a time. While one holds its lock, next to the
-    /// manifest, another waits, and past its wait gives up and says so; once the first is done, the
-    /// one waiting takes it. The lock file stays.
+    /// FINDINGS A-171: one writer of the manifest at a time. While one holds its lock, in the dist
+    /// root beside the synced runtimes folder, another waits, and past its wait gives up and says
+    /// so; once the first is done, the one waiting takes it. The lock file stays, and nothing is
+    /// written in the runtimes folder.
     #[test]
     fn a_second_writer_waits_for_the_manifests_lock() {
         let dir = std::env::temp_dir().join(format!("runtime-manifest-lock-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("create dir");
-        let manifest = dir.join("manifest.json");
+        let runtimes = dir.join("runtimes");
+        fs::create_dir_all(&runtimes).expect("create dir");
+        let manifest = runtimes.join("manifest.json");
         assert_eq!(
             runtime_manifest_lock_path(&manifest),
-            dir.join("manifest.json.lock")
+            dir.join("runtimes-manifest.lock")
         );
         let first = lock_runtime_manifest(&manifest, Duration::ZERO).expect("the first");
         let refused = lock_runtime_manifest(&manifest, Duration::from_millis(200))
@@ -360,6 +369,7 @@ mod tests {
         assert!(waited >= Duration::from_millis(250), "{waited:?}");
         drop(second);
         assert!(runtime_manifest_lock_path(&manifest).is_file());
+        assert_eq!(fs::read_dir(&runtimes).expect("runtimes").count(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -379,14 +379,15 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   unused). It never deletes `package_version` itself (`RUNTIME_PACKAGE_VERSION`), and
   `publish-runtime.sh` refuses a hand publish under that version.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on
-  `dist/runtimes/manifest.json.lock`, next to the manifest, from its read of the manifest to its
-  write: SY.admin's `publish_runtime_package`, `remove_runtime_version` (across its read of the
-  version's use, up to 30 s) and `reset_base_runtime`, `fluxbee-publish`, `publish-runtime.sh`
-  (and every `publish-*-runtime.sh` on it), and the seed's restore of the snapshot. A writer waits
-  for another up to 60 s, then fails with the manifest untouched; before, a hand publish and an
-  admin write that read the manifest at the same moment lost one of the two writes. The lock file
-  stays (removing it would let a writer lock a new one beside one still held); Syncthing carries
-  it to the workers as an empty file, which nothing there reads.
+  `dist/runtimes-manifest.lock` from its read of the manifest to its write: SY.admin's
+  `publish_runtime_package`, `remove_runtime_version` (across its read of the version's use, up to
+  30 s) and `reset_base_runtime`, `fluxbee-publish`, `publish-runtime.sh` (and every
+  `publish-*-runtime.sh` on it), and the seed's restore of the snapshot. A writer waits for
+  another up to 60 s, then fails with the manifest untouched; before, a hand publish and an admin
+  write that read the manifest at the same moment lost one of the two writes. The lock file sits
+  in the dist root, beside the `runtimes` folder and never inside it, since Syncthing shares that
+  folder with the workers; it stays (removing it would let a writer lock a new one beside one
+  still held).
 
 ### How dist reaches the other hives
 

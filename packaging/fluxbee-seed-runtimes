@@ -32,9 +32,9 @@ SNAPSHOT="${FLUXBEE_MANIFEST_SNAPSHOT:-/var/lib/fluxbee/state/runtime-manifest.p
 RUNTIMES_ROOT="$DIST_ROOT/runtimes"
 LIVE_MANIFEST="$RUNTIMES_ROOT/manifest.json"
 # The manifest's lock (FINDINGS A-171): every writer of the manifest holds an flock on it from its
-# read to its write. The restore below holds it; each publish takes it on its own, so it is free
-# before the first one.
-MANIFEST_LOCK="$LIVE_MANIFEST.lock"
+# read to its write. It sits in the dist root, beside the runtimes folder Syncthing shares. The
+# restore below holds it; each publish takes it on its own, so it is free before the first one.
+MANIFEST_LOCK="$DIST_ROOT/runtimes-manifest.lock"
 MANIFEST_LOCK_WAIT_SECS=60
 
 VER="${FLUXBEE_BASE_RUNTIME_VERSION:-}"

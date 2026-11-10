@@ -39,9 +39,10 @@ Notes:
   - Writes the manifest last, once every file of the version is in place:
     <dist-root>/runtimes/manifest.json. SY.orchestrator moves running nodes onto a version as
     soon as the manifest names it, so the manifest never names a version that is not all there.
-  - Holds the manifest's lock, <dist-root>/runtimes/manifest.json.lock, from its read of the
-    manifest to its write, as every writer of it does (SY.admin, fluxbee-publish, the .deb's
-    seed): waits for another writer up to 60 s, then fails with the manifest untouched.
+  - Holds the manifest's lock, <dist-root>/runtimes-manifest.lock (beside the runtimes folder,
+    which Syncthing shares, never inside it), from its read of the manifest to its write, as every
+    writer of it does (SY.admin, fluxbee-publish, the .deb's seed): waits for another writer up to
+    60 s, then fails with the manifest untouched.
 EOF
 }
 
@@ -176,10 +177,11 @@ RUNTIME_DIR="$RUNTIMES_ROOT/$RUNTIME/$VERSION"
 BIN_DIR="$RUNTIME_DIR/bin"
 MANIFEST_PATH="$RUNTIMES_ROOT/manifest.json"
 # One writer of the manifest at a time (FINDINGS A-171): SY.admin, fluxbee-publish, this script and
-# the .deb's seed each hold an flock on this file, next to the manifest, from their read of it to
-# their write, so none loses another's change. The file stays: removing it would let a writer lock
-# a new one beside one still held.
-MANIFEST_LOCK="$MANIFEST_PATH.lock"
+# the .deb's seed each hold an flock on this file from their read of the manifest to their write, so
+# none loses another's change. It sits in the dist root, beside the runtimes folder Syncthing shares
+# with the workers (runtime_manifest_lock_path). The file stays: removing it would let a writer
+# lock a new one beside one still held.
+MANIFEST_LOCK="$DIST_ROOT/runtimes-manifest.lock"
 # How long this script waits for another writer: above the longest hold, SY.admin's
 # remove_runtime_version, whose read of the version's use (30 s) comes between its read and write.
 MANIFEST_LOCK_WAIT_SECS=60
