@@ -21543,7 +21543,8 @@ fn config_tenant_id(config: &serde_json::Value) -> Option<String> {
 
 /// The tenant a spawn names: the request's `tenant_id`, else its `config.tenant_id`. Nothing else
 /// supplies one: the tenant is the caller's datum (FINDINGS A-213), and a spawn that names none is
-/// refused when it registers the node's identity (`ensure_node_identity_registered`).
+/// refused when it registers the node's identity (`ensure_node_identity_registered`). One that
+/// names two different ones never gets this far (`spawn_tenant_conflict_refusal`).
 fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
     let from_payload = payload
         .get("tenant_id")
@@ -21561,6 +21562,38 @@ fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string())
+}
+
+/// Some(error reply) when a spawn names its tenant twice, `tenant_id` and `config.tenant_id`, and
+/// the two differ: the identity and the unit's `FLUXBEE_NODE_TENANT_ID` would take the first and
+/// config.json the second (FINDINGS A-213). `run_node_flow` checks it before anything is written or
+/// forwarded. The same tenant in both, or one alone, passes; a blank one counts as not given, as in
+/// `resolve_tenant_id_for_node`.
+fn spawn_tenant_conflict_refusal(
+    node_name: &str,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    fn given(value: Option<&serde_json::Value>) -> Option<&str> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty())
+    }
+    let top = given(payload.get("tenant_id"))?;
+    let in_config = given(
+        payload
+            .get("config")
+            .and_then(|config| config.get("tenant_id")),
+    )?;
+    if top == in_config {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "INVALID_REQUEST",
+        "message": "tenant_id and config.tenant_id differ: name the node's tenant in one of them, or the same in both",
+        "node_name": node_name,
+    }))
 }
 
 fn resolve_identity_primary_hive_id(
@@ -23710,6 +23743,11 @@ async fn run_node_flow(
         });
     }
 
+    // A request that names two different tenants stops here, before anything is written or
+    // forwarded: the identity and the unit would take one, config.json the other (FINDINGS A-213).
+    if let Some(refusal) = spawn_tenant_conflict_refusal(&node_name, payload) {
+        return refusal;
+    }
     // The tenant this spawn would register and inject: the one both rules are about.
     let spawn_tenant = resolve_tenant_id_for_node(payload);
     if let Some(refusal) = genesis_refusal(&node_name, &runtime, spawn_tenant.as_deref())
@@ -42653,7 +42691,7 @@ blob:
 
     /// Every launch path checks the tenant gate before it registers, forwards, stops or starts
     /// anything, so a refused node is never stopped (its order in the source, which is the order it
-    /// runs in).
+    /// runs in). A spawn that names two different tenants is refused before all of it (A-213).
     #[test]
     fn every_launch_path_checks_the_tenant_gate_before_it_acts() {
         let src = include_str!("sy_orchestrator.rs");
@@ -42679,6 +42717,7 @@ blob:
         in_order(
             "async fn run_node_flow(",
             &[
+                "spawn_tenant_conflict_refusal(",
                 "genesis_refusal(",
                 "core_io_refusal(",
                 "tenant_gate_refusal(",
@@ -42875,6 +42914,65 @@ blob:
             "{}",
             &src[start..end]
         );
+    }
+
+    /// FINDINGS A-213: a spawn that names its tenant twice, `tenant_id` and `config.tenant_id`, and
+    /// differently, is refused (INVALID_REQUEST, naming both fields) before anything is written or
+    /// forwarded, so the identity, the unit and config.json never split. The same tenant in both,
+    /// or one alone, goes on as before.
+    #[tokio::test]
+    async fn a_spawn_that_names_two_different_tenants_is_refused_before_anything_is_written() {
+        let state = sample_orchestrator_state_for_tests();
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        let other = "tnt:5b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e";
+        let spawn = |node: &str, top: Option<&str>, in_config: Option<&str>| {
+            let mut payload = serde_json::json!({
+                "node_name": node,
+                "runtime": "ai.generic",
+                "config": { "model": "kept" },
+            });
+            if let Some(top) = top {
+                payload["tenant_id"] = serde_json::json!(top);
+            }
+            if let Some(in_config) = in_config {
+                payload["config"]["tenant_id"] = serde_json::json!(in_config);
+            }
+            payload
+        };
+
+        // This hive's node and another hive's: refused before the gates, the identity, the config
+        // and the forward.
+        for node in ["AI.sales@motherbee", "AI.sales@worker1"] {
+            let payload = spawn(node, Some(tenant), Some(other));
+            let refusal = spawn_tenant_conflict_refusal(node, &payload).expect("two tenants");
+            assert_eq!(refusal["error_code"], "INVALID_REQUEST");
+            let message = refusal["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("tenant_id and config.tenant_id differ"),
+                "{message}"
+            );
+            assert_eq!(run_node_flow(&state, &payload).await, refusal);
+        }
+
+        // The same tenant in both (blanks around one), or one alone (a blank one is not given):
+        // a spawn for another hive goes on to its forward, which finds no router in a test.
+        let padded = format!(" {tenant} ");
+        for (top, in_config) in [
+            (Some(tenant), Some(padded.as_str())),
+            (Some(tenant), None),
+            (None, Some(tenant)),
+            (Some(tenant), Some(" ")),
+            (Some(" "), Some(other)),
+        ] {
+            let payload = spawn("AI.sales@worker1", top, in_config);
+            assert_eq!(
+                spawn_tenant_conflict_refusal("AI.sales@worker1", &payload),
+                None,
+                "{payload}"
+            );
+            let reply = run_node_flow(&state, &payload).await;
+            assert_eq!(reply["error_code"], "SPAWN_FAILED", "{reply}");
+        }
     }
 
     /// A-16: the watchdog reads a receive-only folder's local changes from its status, which

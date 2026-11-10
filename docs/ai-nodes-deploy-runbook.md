@@ -75,6 +75,8 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" -H 'content-type: application/json
 
 - **`tenant_id` goes at the top level.**
   - Without a tenant the spawn fails (`IDENTITY_REGISTER_FAILED`).
+  - A `config.tenant_id` that names another tenant is refused (`INVALID_REQUEST`); the same one, or
+    none, is fine.
   - The tenant must be active (`TENANT_NOT_ACTIVE` otherwise).
   - It must not be the root tenant (`TENANT_ROOT_NOT_ALLOWED`).
 - **The orchestrator registers the node's ILK** (an `agent` ILK) and launches the node with

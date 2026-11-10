@@ -162,8 +162,11 @@ same way, with `managed: false`.
 
 1. Names are `<local>@<hive>`; `SY.*` and `RT.*` names are refused
    (`managed_spawn_disallowed_reason`).
-2. A node may not run in the root tenant unless it is core: `SY.*`, `RT.*`, or an `IO.*` node on
-   `io.cloud`, `io.blob` or `io.web` (`is_core_node`, `genesis_refusal`:
+2. A request whose `tenant_id` and `config.tenant_id` both name a tenant, and differ, is refused
+   first (`spawn_tenant_conflict_refusal`: `INVALID_REQUEST`), before anything is written or
+   forwarded; the same tenant in both, or one alone, goes on (FINDINGS A-213). A node may not run
+   in the root tenant unless it is core: `SY.*`, `RT.*`, or an `IO.*` node on `io.cloud`,
+   `io.blob` or `io.web` (`is_core_node`, `genesis_refusal`:
    `TENANT_ROOT_NOT_ALLOWED`). The mirror (`core_io_refusal`): a core IO runtime runs only as its
    own node, `IO.cloud@motherbee`, `IO.blob@motherbee` or `IO.web@motherbee`, and none of those
    names runs another runtime (`CORE_IO_NAME_MISMATCH`); and only in the root tenant

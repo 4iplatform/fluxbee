@@ -115,8 +115,10 @@ The router reads this status: a message to `Destination::Resolve` whose `src_ilk
   `src/bin/sy_orchestrator.rs` sends `ILK_REGISTER` to `SY.identity@motherbee` with
   `identification.node_name`, `display_name`, `runtime` and `runtime_version`, and the tenant
   from the request (`payload.tenant_id`, then `payload.config.tenant_id`). There is no default
-  tenant: a request that names none registers nothing and is refused (`IDENTITY_REGISTER_FAILED`).
-  A node name that already has an active ILK keeps it (`register_ilk` looks the name up first).
+  tenant: a request that names none registers nothing and is refused (`IDENTITY_REGISTER_FAILED`),
+  and one whose two fields name different tenants is refused before it registers anything
+  (`INVALID_REQUEST`). A node name that already has an active ILK keeps it (`register_ilk` looks
+  the name up first).
 - An orchestrator registers, updates, marks and purges only its own hive's nodes (§7.1). A launch
   on another hive is forwarded to that hive's orchestrator, which registers the node itself.
 - The orchestrator injects the result into the node's unit as `FLUXBEE_NODE_ILK_ID` and
