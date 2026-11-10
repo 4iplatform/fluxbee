@@ -711,6 +711,20 @@ async fn handle_node(
     }
     let vpn_id = assign_vpn(&node_name, snapshot.as_ref());
     tracing::info!(node = %node_name, vpn_id = vpn_id, "vpn assigned");
+    // Serialized before the node is registered: once it is, nothing returns before the cleanup at
+    // the end of this function, or undoes the registration itself (A-203).
+    let announce = serde_json::to_vec(&build_announce(
+        &router_uuid.to_string(),
+        &msg.routing.src,
+        &msg.routing.trace_id,
+        NodeAnnouncePayload {
+            uuid: payload.uuid,
+            name: node_name.clone(),
+            status: "registered".to_string(),
+            vpn_id,
+            router_name: router_name.to_string(),
+        },
+    ))?;
     let connected_at = now_epoch_ms();
     let handle = NodeHandle {
         name: node_name.clone(),
@@ -774,32 +788,34 @@ async fn handle_node(
 
     tracing::info!(node = %node_uuid, name = %node_name, "node registered");
     // The name this socket registered with: the authenticated origin of everything it sends.
-    let conn_node_name = node_name.clone();
-    let announce = build_announce(
-        &router_uuid.to_string(),
-        &msg.routing.src,
-        &msg.routing.trace_id,
-        NodeAnnouncePayload {
-            uuid: payload.uuid,
-            name: node_name,
-            status: "registered".to_string(),
-            vpn_id,
-            router_name: router_name.to_string(),
-        },
-    );
-    let data = serde_json::to_vec(&announce)?;
-    if tx.send(data).is_err() {
+    let conn_node_name = node_name;
+    if tx.send(announce).is_err() {
         tracing::warn!("failed to enqueue ANNOUNCE");
     } else {
         tracing::info!("announce queued");
     }
 
-    // The connection ends only on EOF, WITHDRAW or a read error, and every end runs the cleanup
-    // below (A-44): an end that skipped it left the node registered with its writer alive, so a
-    // node that was still running stayed connected while nobody read its frames, and its next
-    // HELLO found the UUID taken. A message that cannot be handled is logged and skipped.
+    // The connection ends only on EOF, WITHDRAW, a read error or the end of its writer, and every
+    // end runs the cleanup below (A-44): an end that skipped it left the node registered with its
+    // writer alive, so a node that was still running stayed connected while nobody read its
+    // frames, and its next HELLO found the UUID taken. A message that cannot be handled is logged
+    // and skipped.
     let exit: Result<(), RouterError> = loop {
-        let frame = match read_frame(&mut reader).await {
+        let read = tokio::select! {
+            read = read_frame(&mut reader) => read,
+            // The writer stops only on a write error (`write_link_frames`): nothing reaches the
+            // node any more, so it goes, and a message for it is answered as for any absent node
+            // (A-203).
+            () = tx.closed() => {
+                tracing::warn!(
+                    node = %conn_node_name,
+                    uuid = %node_uuid,
+                    "router: the node's link no longer writes; disconnecting"
+                );
+                break Ok(());
+            }
+        };
+        let frame = match read {
             Ok(Some(f)) => f,
             Ok(None) => {
                 tracing::info!(node = %node_uuid, "router: node closed connection (EOF)");
@@ -1426,7 +1442,9 @@ async fn handle_message(
         }
     }
 
-    deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
+    if deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await? {
+        send_unreachable_to(&msg, &src_handle.sender, router_uuid, "NODE_NOT_FOUND")?;
+    }
 
     // ROUTER-TAP-3: tap fanout. After primary unicast delivery is done,
     // scan installed taps and enqueue fire-and-forget secondary copies to
@@ -3200,10 +3218,19 @@ where
     // A hive removed while its link is up is cut off within one registry recheck.
     let unregistered = hive_unregistered(registry, &peer_hello.hive_id, ctx.hive_registry_recheck);
     tokio::pin!(unregistered);
+    // A-207: every router sends each WAN peer its LSA every hello interval (`lsa_broadcast_loop`),
+    // so a session that hears nothing for the dead interval has lost its peer without a close (a
+    // host gone, a network cut). The interval is the larger of ours and the one the peer's HELLO
+    // declared.
+    let dead_interval_ms = ctx.dead_interval_ms.max(peer_hello.timers.dead_interval_ms);
+    let dead_interval = Duration::from_millis(dead_interval_ms);
+    let silence = time::sleep(dead_interval);
+    tokio::pin!(silence);
     // The session ends on a clean close, a read error, an error handling a frame, the end of its
-    // writer or the hive's removal, and every end runs the cleanup below (A-203). Until 0.1.124 an
-    // error returned before it: the hive kept its entry, and every frame for it went into a link
-    // whose peer was gone, without an UNREACHABLE, until the hive connected again.
+    // writer, the peer's silence or the hive's removal, and every end runs the cleanup below
+    // (A-203). Until 0.1.124 an error returned before it: the hive kept its entry, and every frame
+    // for it went into a link whose peer was gone, without an UNREACHABLE, until the hive
+    // connected again.
     let exit: Result<(), RouterError> = loop {
         let frame = tokio::select! {
             frame = read_frame(&mut reader) => frame,
@@ -3226,7 +3253,21 @@ where
                 );
                 break Ok(());
             }
+            () = &mut silence => {
+                tracing::warn!(
+                    peer_hive = %peer_hello.hive_id,
+                    session_epoch = session_epoch,
+                    dead_interval_ms = dead_interval_ms,
+                    "wan peer session closed: nothing heard from the peer in the dead interval"
+                );
+                break Ok(());
+            }
         };
+        if let Ok(Some(_)) = &frame {
+            // A new `sleep`, not a `reset` to now plus the interval: `sleep` takes any interval a
+            // HELLO may declare, where that sum could overflow.
+            silence.set(time::sleep(dead_interval));
+        }
         match frame {
             Ok(Some(frame)) => match serde_json::from_slice::<Message>(&frame) {
                 Ok(msg) => {
@@ -3732,7 +3773,7 @@ async fn handle_wan_message(
         }
     }
 
-    deliver_locally(
+    if deliver_locally(
         senders,
         &msg,
         &ctx.memory_reader,
@@ -3740,7 +3781,10 @@ async fn handle_wan_message(
         src_via_hub,
         &ctx.log_stream,
     )
-    .await?;
+    .await?
+    {
+        send_unreachable_to(&msg, sender, ctx.router_uuid, "NODE_NOT_FOUND")?;
+    }
     Ok(())
 }
 
@@ -4687,7 +4731,11 @@ async fn handle_peer_message(
         }
     }
 
-    deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
+    if deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await? {
+        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+            send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+        }
+    }
     Ok(())
 }
 
@@ -6897,6 +6945,9 @@ fn cognition_copy(msg: &Message, sender_name: &str) -> Option<Vec<u8>> {
 /// package the sender set is dropped for every destination. An agent destination gets the memory
 /// package of its communication, and its router's copy of the turn for its cognition: with the
 /// copy its agent's sends make at entry, the agent's router hands its cognition both directions.
+///
+/// True when the message is no broadcast and its destination's link took nothing, its writer
+/// stopped (A-203): the caller answers the sender as for a node that left, `NODE_NOT_FOUND`.
 async fn deliver_locally(
     deliveries: Vec<LocalDelivery>,
     msg: &Message,
@@ -6904,13 +6955,14 @@ async fn deliver_locally(
     hive_id: &str,
     src_via_hub: bool,
     log_stream: &stream::StreamHandle,
-) -> Result<(), RouterError> {
+) -> Result<bool, RouterError> {
     if deliveries.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
-        return Ok(());
+        return Ok(false);
     };
+    let mut undelivered = false;
     let turn = is_communication_turn(&prepared);
     let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
     let mut plain: Option<Vec<u8>> = None;
@@ -6953,9 +7005,11 @@ async fn deliver_locally(
                 }
             },
         };
-        let _ = delivery.sender.send(data);
+        if delivery.sender.send(data).is_err() {
+            undelivered = true;
+        }
     }
-    Ok(())
+    Ok(undelivered && !matches!(msg.routing.dst, Destination::Broadcast))
 }
 
 /// One message to one local node (a tap copy, the tests): the same gate, stamps and package as
@@ -10472,6 +10526,258 @@ mod tests {
         let _ = fs::remove_dir_all(&socket_dir);
     }
 
+    /// A-203 on node links: a node whose link no longer writes (a write error stopped its writer)
+    /// is disconnected though it never closed. It leaves the node table and its SHM slot, and a
+    /// message for it is then answered NODE_NOT_FOUND. The message whose write failed is lost: the
+    /// router had already queued it.
+    #[tokio::test]
+    async fn a_node_whose_link_no_longer_writes_is_disconnected() {
+        use std::os::fd::AsFd;
+
+        let shm = TestShm::new("rt-nodewr");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let gone = Uuid::new_v4();
+        let (mut gone_client, server) = UnixStream::pair().expect("socket pair");
+        // The router's end of the socket, kept to stop its writes later, as a reset peer would.
+        let router_end = std::os::unix::net::UnixStream::from(
+            server
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("the router's end"),
+        );
+        let gone_connection = spawn_node_connection(server, &shm, &nodes);
+        let hello_frame = test_frame(
+            gone,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            Destination::Broadcast,
+            serde_json::json!({ "uuid": gone.to_string(), "name": "AI.gone", "version": "1" }),
+        );
+        write_frame(&mut gone_client, &hello_frame)
+            .await
+            .expect("hello");
+        read_frame(&mut gone_client)
+            .await
+            .expect("read")
+            .expect("announce");
+        let sender = Uuid::new_v4();
+        let (sender_client, _sender_connection) = hello(&shm, &nodes, sender, "WF.sender").await;
+        let mut sender_client = sender_client.expect("announced");
+        let to_gone = |n: u32| {
+            test_frame(
+                sender,
+                "user",
+                None,
+                Destination::Unicast(gone.to_string()),
+                serde_json::json!({ "n": n }),
+            )
+        };
+
+        router_end
+            .shutdown(std::net::Shutdown::Write)
+            .expect("stop the router's writes");
+        write_frame(&mut sender_client, &to_gone(1))
+            .await
+            .expect("the first message");
+        time::timeout(Duration::from_secs(5), gone_connection)
+            .await
+            .expect("the connection ends though the node never closed")
+            .expect("join")
+            .expect("its end");
+        assert_eq!(
+            holder_name(&nodes, gone).await,
+            None,
+            "the node is unregistered"
+        );
+        let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|node| node.uuid != *gone.as_bytes()),
+            "and its SHM slot is freed"
+        );
+
+        write_frame(&mut sender_client, &to_gone(2))
+            .await
+            .expect("the second message");
+        let answer = time::timeout(Duration::from_secs(5), read_frame(&mut sender_client))
+            .await
+            .expect("an answer in time")
+            .expect("read")
+            .expect("an answer");
+        let answer: Message = serde_json::from_slice(&answer).expect("a message");
+        assert_eq!(answer.meta.msg.as_deref(), Some(MSG_UNREACHABLE));
+        let answer: fluxbee_sdk::protocol::UnreachablePayload =
+            serde_json::from_value(answer.payload).expect("an UNREACHABLE payload");
+        assert_eq!(answer.reason, "NODE_NOT_FOUND");
+        assert_eq!(answer.original_dst, gone.to_string());
+        drop(gone_client);
+    }
+
+    /// `handle_message` on a motherbee router with `nodes` and no other table.
+    async fn route_from_a_node(msg: &Message, nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>) {
+        handle_message(
+            msg,
+            nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &stream::StreamHandle::detached(),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            "RT.gateway@motherbee",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+            None,
+        )
+        .await
+        .expect("handled");
+    }
+
+    /// A-203 on node links: a node whose writer has stopped, its connection not yet cleaned up,
+    /// takes nothing. The sender of a message for it is answered NODE_NOT_FOUND, as for a node that
+    /// left; a broadcast that reaches it is not answered.
+    #[tokio::test]
+    async fn a_message_for_a_node_whose_writer_stopped_is_answered_node_not_found() {
+        let sender = Uuid::new_v4();
+        let gone = Uuid::new_v4();
+        let (sender_tx, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (gone_tx, writer_gone) = mpsc::unbounded_channel::<Vec<u8>>();
+        drop(writer_gone);
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([
+            (
+                sender,
+                NodeHandle {
+                    name: "WF.demo@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: sender_tx,
+                    connected_at: 0,
+                },
+            ),
+            (
+                gone,
+                NodeHandle {
+                    name: "AI.gone@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: gone_tx,
+                    connected_at: 0,
+                },
+            ),
+        ])));
+        let message = |dst: Destination, ttl: u8| Message {
+            routing: Routing {
+                src: sender.to_string(),
+                src_l2_name: None,
+                dst,
+                ttl,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        let to_gone = message(Destination::Unicast(gone.to_string()), 16);
+        route_from_a_node(&to_gone, &nodes).await;
+        let answer = unreachable_answer(&mut answers, &to_gone);
+        assert_eq!(answer.reason, "NODE_NOT_FOUND");
+        assert_eq!(answer.original_dst, gone.to_string());
+
+        // TTL 1: the broadcast stays on this router.
+        route_from_a_node(&message(Destination::Broadcast, 1), &nodes).await;
+        assert!(answers.try_recv().is_err(), "a broadcast is not answered");
+    }
+
+    /// A-203 on node links, from the WAN: a frame for a local node whose writer stopped is answered
+    /// NODE_NOT_FOUND over the link it came in on.
+    #[tokio::test]
+    async fn a_wan_frame_for_a_node_whose_writer_stopped_is_answered_over_its_link() {
+        let ctx = test_wan_context(None);
+        let remote = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await = Some(lsa_with_remote_node(
+            "worker1",
+            remote,
+            "SY.orchestrator@worker1",
+        ));
+        let gone = Uuid::new_v4();
+        let (gone_tx, writer_gone) = mpsc::unbounded_channel::<Vec<u8>>();
+        drop(writer_gone);
+        ctx.nodes.lock().await.insert(
+            gone,
+            NodeHandle {
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                sender: gone_tx,
+                connected_at: 0,
+            },
+        );
+        let frame = Message {
+            routing: Routing {
+                src: remote.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(gone.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let (link, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        handle_wan_message(
+            &frame,
+            &link,
+            &ctx,
+            "worker1",
+            Uuid::new_v4(),
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("handled");
+        let answer = unreachable_answer(&mut answers, &frame);
+        assert_eq!(answer.reason, "NODE_NOT_FOUND");
+        assert_eq!(answer.original_dst, gone.to_string());
+    }
+
+    /// Pins A-203 on node links: `handle_node` serializes its ANNOUNCE before it registers the
+    /// node, and nothing between the registration and the loop returns with `?`, past the cleanup.
+    #[test]
+    fn nothing_returns_past_the_node_cleanup_once_the_node_is_registered() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn handle_node(").expect("handle_node");
+        let end = start + src[start..].find("\n}\n").expect("end of handle_node");
+        let body = &src[start..end];
+        let announce = body
+            .find("serde_json::to_vec(&build_announce(")
+            .expect("the ANNOUNCE");
+        let registration = body
+            .find("claim_node_uuid(&nodes")
+            .expect("the registration");
+        let session = body
+            .find("let exit: Result<(), RouterError> = loop {")
+            .expect("the loop");
+        assert!(announce < registration && registration < session);
+        for early_return in ["?;", ".await?"] {
+            assert!(
+                !body[registration..session].contains(early_return),
+                "{early_return}"
+            );
+        }
+    }
+
     /// A message the router cannot handle is skipped; the connection stays up.
     #[tokio::test]
     async fn a_message_the_router_cannot_handle_does_not_end_the_connection() {
@@ -11801,6 +12107,11 @@ mod tests {
     }
 
     fn wan_hello_frame(hive_id: &str) -> Vec<u8> {
+        wan_hello_frame_declaring(hive_id, 40_000)
+    }
+
+    /// `hive_id`'s HELLO, which declares `dead_interval_ms` as its dead interval.
+    fn wan_hello_frame_declaring(hive_id: &str, dead_interval_ms: u64) -> Vec<u8> {
         let router_id = Uuid::new_v4().to_string();
         let hello = build_wan_hello(
             &router_id,
@@ -11813,7 +12124,7 @@ mod tests {
                 capabilities: vec!["lsa".to_string(), "forwarding".to_string()],
                 timers: WanTimers {
                     hello_interval_ms: 10_000,
-                    dead_interval_ms: 40_000,
+                    dead_interval_ms,
                 },
             },
         );
@@ -12049,9 +12360,12 @@ mod tests {
     /// The peer's side of an accepted link, brought up as `hive`: its HELLO, then the router's
     /// HELLO, WAN_ACCEPT and LSA. The LSA goes out once the session holds the hive's entry.
     async fn bring_up_accepted_link(peer: &mut tokio::io::DuplexStream, hive: &str) {
-        write_frame(peer, &wan_hello_frame(hive))
-            .await
-            .expect("send hello");
+        bring_up_accepted_link_with(peer, &wan_hello_frame(hive)).await;
+    }
+
+    /// The same with the peer's HELLO given.
+    async fn bring_up_accepted_link_with(peer: &mut tokio::io::DuplexStream, hello: &[u8]) {
+        write_frame(peer, hello).await.expect("send hello");
         for expected in [MSG_HELLO, fluxbee_sdk::protocol::MSG_WAN_ACCEPT, MSG_LSA] {
             assert_eq!(
                 read_system_message(peer).await.meta.msg.as_deref(),
@@ -12320,6 +12634,116 @@ mod tests {
             .expect("session result");
         assert!(ctx.wan_peers.lock().await.is_empty());
         drop(worker1);
+    }
+
+    /// A-207: a session that hears nothing from its peer for the dead interval ends, though the
+    /// peer never closed (a host gone, a network cut). Its hive leaves the peer table, and a
+    /// request for the hive is answered WAN_UNAVAILABLE.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_wan_peer_is_cut_after_the_dead_interval() {
+        let ctx = test_wan_context(None);
+        let (server, mut worker1) = tokio::io::duplex(64 * 1024);
+        let session = spawn_accepted_link(server, &ctx);
+        bring_up_accepted_link(&mut worker1, "worker1").await;
+        let up = time::Instant::now();
+        time::timeout(Duration::from_secs(600), session)
+            .await
+            .expect("the session ends while its peer is still there")
+            .expect("session task")
+            .expect("session result");
+        let silent = up.elapsed();
+        assert!(
+            silent >= Duration::from_secs(40) && silent < Duration::from_secs(41),
+            "{silent:?}"
+        );
+        assert!(
+            ctx.wan_peers.lock().await.is_empty(),
+            "the hive's entry is gone"
+        );
+
+        let request = request_to("SY.orchestrator@worker1");
+        let (sender, mut answers) = mpsc::unbounded_channel::<Vec<u8>>();
+        forward_to_hive(
+            "worker1",
+            &request,
+            true,
+            &ctx.peer_routers,
+            &ctx.peers,
+            &ctx.wan_peers,
+            ctx.router_uuid,
+            &sender,
+        )
+        .await
+        .expect("forward");
+        assert_eq!(
+            unreachable_answer(&mut answers, &request).reason,
+            "WAN_UNAVAILABLE"
+        );
+        drop(worker1);
+    }
+
+    /// A-207: a peer that sends its LSA every hello interval, as every router does, is never cut,
+    /// however long the session lasts.
+    #[tokio::test(start_paused = true)]
+    async fn a_wan_peer_that_sends_its_lsa_every_hello_interval_stays() {
+        let ctx = test_wan_context(None);
+        let (server, mut worker1) = tokio::io::duplex(64 * 1024);
+        let session = spawn_accepted_link(server, &ctx);
+        bring_up_accepted_link(&mut worker1, "worker1").await;
+        // Five minutes, much longer than the dead interval.
+        for seq in 1..=30 {
+            time::sleep(Duration::from_millis(ctx.hello_interval_ms)).await;
+            let lsa = lsa_message("worker1", seq, &[], ctx.router_uuid);
+            write_frame(&mut worker1, &serde_json::to_vec(&lsa).expect("lsa frame"))
+                .await
+                .expect("send lsa");
+        }
+        time::sleep(Duration::from_secs(1)).await;
+        assert!(!session.is_finished(), "the session is still up");
+        assert!(ctx.wan_peers.lock().await.contains_key("worker1"));
+        assert_eq!(
+            ctx.lsa_state.lock().await["worker1"].last_seq,
+            30,
+            "every LSA was taken"
+        );
+
+        drop(worker1);
+        time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends at the close")
+            .expect("session task")
+            .expect("session result");
+    }
+
+    /// A-207: the dead interval is the larger of this router's (40 s) and the one the peer's HELLO
+    /// declared.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_wan_peer_is_cut_after_the_larger_dead_interval() {
+        for (declared_ms, expected) in [
+            (5_000, Duration::from_secs(40)),
+            (90_000, Duration::from_secs(90)),
+        ] {
+            let ctx = test_wan_context(None);
+            let (server, mut worker1) = tokio::io::duplex(64 * 1024);
+            let session = spawn_accepted_link(server, &ctx);
+            bring_up_accepted_link_with(
+                &mut worker1,
+                &wan_hello_frame_declaring("worker1", declared_ms),
+            )
+            .await;
+            let up = time::Instant::now();
+            time::timeout(Duration::from_secs(600), session)
+                .await
+                .expect("the session ends")
+                .expect("session task")
+                .expect("session result");
+            let silent = up.elapsed();
+            assert!(
+                silent >= expected && silent < expected + Duration::from_secs(1),
+                "declared {declared_ms} ms: cut after {silent:?}"
+            );
+            drop(worker1);
+        }
     }
 
     /// The motherbee counts the nodes a spoke's LSA lists under another hive's name, and applies the

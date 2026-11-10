@@ -49,7 +49,8 @@ envelope in [protocol.md](protocol.md).
     shared-memory region another user owns or may write`, since its nodes would enter the FIB.
   - Gateways talk over TCP (`wan.listen`, `wan.uplinks`). A gateway sends its LSA every 10 s and
     marks a hive stale after 40 s without one (`DEFAULT_HELLO_INTERVAL_MS`,
-    `DEFAULT_DEAD_INTERVAL_MS`; fixed, not read from `hive.yaml`).
+    `DEFAULT_DEAD_INTERVAL_MS`; fixed, not read from `hive.yaml`). A WAN session that hears no
+    frame for 40 s, or for the longer dead interval its peer's `HELLO` declared, ends (A-207).
 
 ---
 
@@ -190,7 +191,9 @@ they count like this hive's.
   keyed by hive), else `WAN_UNAVAILABLE`; on any other router, the sibling that is the gateway, over
   IRP, else `GATEWAY_UNAVAILABLE`.
 - A link whose writer has stopped counts as no link. A link leaves its table however it ends, a
-  read error included (A-203, since 0.1.124).
+  read error included, and a WAN session also ends after its dead interval without a frame
+  (A-203, A-207, since 0.1.124). A local node whose writer has stopped is disconnected, and a
+  unicast for it is answered `NODE_NOT_FOUND`.
 - The message travels unchanged and the next router decides again with its own tables. A Resolve
   keeps `dst: null` (§5).
 - A gateway that receives from the WAN a message for a node of a third hive forwards it again
@@ -216,7 +219,7 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 
 | `reason` | Meaning |
 | --- | --- |
-| `NODE_NOT_FOUND` | no FIB entry for the name; the UUID is unknown everywhere; or the node left between the FIB rebuild and the delivery |
+| `NODE_NOT_FOUND` | no FIB entry for the name; the UUID is unknown everywhere; or the node left between the FIB rebuild and the delivery, its link's writer stopped included |
 | `VPN_BLOCKED` | the VPN rules, or the edge rules, forbid the pair (§8.2) |
 | `PEER_UNAVAILABLE` | the destination is on a sibling router with no IRP link |
 | `GATEWAY_UNAVAILABLE` | the destination is in another hive and no gateway sibling is linked; also a broadcast with `ttl >= 3` from such a router |

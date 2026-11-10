@@ -110,16 +110,23 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - An uplink dials again 5 s after a link that got past `WAN_ACCEPT` ends. An attempt that never
   got there (no connection, a TLS or handshake error, a `WAN_REJECT`) is retried after 5 s,
   doubling up to 60 s (`UplinkRetry`).
-- **A session's end (A-203).** A session ends on a clean close, a read error (a peer gone without
-  TLS `close_notify`, as a router stopped for its update), an error handling a frame, a write
-  error on its link (`wan peer session closed: its link no longer writes`), or on the motherbee
-  the hive's removal. Every end takes the hive out of the gateway's WAN table (`wan_peers`), but
-  only the entry that session put there: a hive that connected again keeps its new session's. A
-  frame for the hive is then answered `UNREACHABLE` `WAN_UNAVAILABLE` until it connects again.
-  A read error or an error handling a frame is still logged as `wan connection error` on the
-  side that accepted the link and `wan uplink error` on the side that dialed it. Until 0.1.124 a
-  read error skipped that cleanup, and every frame for the hive was lost without an answer until
-  it connected again.
+- **A session's end (A-203, A-207).** A session ends on a clean close, a read error (a peer gone
+  without TLS `close_notify`, as a router stopped for its update), an error handling a frame, a
+  write error on its link (`wan peer session closed: its link no longer writes`), nothing heard
+  from the peer for the dead interval, or on the motherbee the hive's removal.
+  - **The dead interval** is the larger of the router's 40 s and the one the peer's `HELLO`
+    declares. Every gateway sends each WAN peer its LSA every 10 s, so only a peer that is gone
+    without closing (a host down, a network cut) stays silent that long:
+    `wan peer session closed: nothing heard from the peer in the dead interval`, with the hive,
+    the session's epoch and the interval.
+  - Every end takes the hive out of the gateway's WAN table (`wan_peers`), but only the entry that
+    session put there: a hive that connected again keeps its new session's. A frame for the hive
+    is then answered `UNREACHABLE` `WAN_UNAVAILABLE` until it connects again, and an uplink dials
+    again.
+  - A read error or an error handling a frame is still logged as `wan connection error` on the
+    side that accepted the link and `wan uplink error` on the side that dialed it. Until 0.1.124 a
+    read error skipped that cleanup, and a silent peer kept its session, so every frame for the
+    hive was lost without an answer until it connected again.
 - **Multi-hop:** a hub gateway with two or more peers sends `WAN_REACHABILITY`, so a spoke can
   reach another spoke through it. A spoke accepts this only from the motherbee's gateway (rule 6
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
@@ -152,7 +159,8 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   `OPA_NO_TARGET`; and `TTL_EXCEEDED` when the TTL runs out (every IRP and WAN hop decrements it).
   A link to a sibling router or to a hive whose writer has stopped counts as no link:
   `PEER_UNAVAILABLE`, `GATEWAY_UNAVAILABLE` or `WAN_UNAVAILABLE` (`send_to_peer_router`,
-  `send_to_wan_peer`; A-203).
+  `send_to_wan_peer`); a local node's, as a node that left: `NODE_NOT_FOUND`, for a unicast only
+  (`deliver_locally`; A-203).
 
 ### System authority
 
@@ -247,8 +255,12 @@ counted as zero.
   created again (its limits changed in `hive.yaml`) at once; that region is empty until
   SY.identity's start-up rebuild fills it.
 - A node frame over 128 KiB disconnects that node (`FRAME_TOO_LARGE`).
+- A node whose link no longer writes (a write error stopped its writer) is disconnected like one
+  that closed (`router: the node's link no longer writes; disconnecting`, A-203): it leaves the
+  node table and the SHM, and a message for it is answered `NODE_NOT_FOUND`.
 - A peer with a bad certificate fails its handshake (`wan connection error` /
-  `wan uplink error`); the router keeps running. A silent peer is marked stale after 40 s.
+  `wan uplink error`); the router keeps running. A silent peer's session ends after the dead
+  interval, 40 s, and its LSA turns stale (A-207).
 - On SIGTERM it logs and exits cleanly.
 
 ## Health

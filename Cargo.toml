@@ -84,3 +84,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # The HTTPS client SY.admin hands instant-acme, so the CA's TLS is checked against the same roots
 # as the directory and ARI reads: the system's, plus `acme.trust_anchor` (§3).
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+
+[dev-dependencies]
+# Paused time (`start_paused`) for the router's tests of its WAN timers (A-207).
+tokio = { version = "1.37", features = ["full", "test-util"] }
