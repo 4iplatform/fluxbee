@@ -167,7 +167,10 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   hive's, whatever stopped it there (a full or gone link, an unknown target, no TTL left). Until
   0.1.129 one that could not go was answered under the copy's trace_id: by the router the
   original entered when the copy was for another hive, and by any router the copy reached, whose
-  answer the sender's router relayed (A-209).
+  answer the sender's router relayed (A-209). Only the router marks a copy (`meta.via_tap`): on a
+  node's own message the router clears it before anything reads it, and logs `router cleared
+  meta.via_tap on a node's own message: only the router marks a tap copy` at most once every 30 s
+  per node, so that message is tapped, copied to cognition and answered as any other.
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
   `VPN_BLOCKED`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`, `OPA_ERROR`,
   `OPA_NO_TARGET`, `FRAME_TOO_LARGE`, `LINK_BUSY`; and `TTL_EXCEEDED` when the TTL runs out (every

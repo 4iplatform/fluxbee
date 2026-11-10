@@ -790,6 +790,8 @@ async fn handle_node(
     } else {
         tracing::info!("announce queued");
     }
+    // A `via_tap` the node set on its own messages, cleared and named (A-209).
+    let mut via_tap = NodeViaTap::default();
 
     // The connection ends only on EOF, WITHDRAW, a read error or the end of its writer, and every
     // end runs the cleanup below (A-44): an end that skipped it left the node registered with its
@@ -825,7 +827,7 @@ async fn handle_node(
             }
         };
         {
-            if let Ok(msg) = serde_json::from_slice::<Message>(&frame) {
+            if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
                 if !frame_is_from_connection(&msg, node_uuid) {
                     tracing::warn!(
                         node = %conn_node_name,
@@ -834,6 +836,9 @@ async fn handle_node(
                     );
                     continue;
                 }
+                // Before anything reads the message: a node's own message is no tap copy, so it
+                // is tapped, copied to cognition and answered as any other (A-209).
+                via_tap.clear(&mut msg, &conn_node_name);
                 // A node's append to this router's stream: the router consumes it and routes it
                 // to no node.
                 if is_system_kind(&msg.meta.msg_type)
@@ -1044,6 +1049,52 @@ async fn claim_node_uuid(
 /// a worker — seen live on 8.x, 2026-09-30).
 fn frame_is_from_connection(msg: &Message, node_uuid: Uuid) -> bool {
     Uuid::parse_str(&msg.routing.src).ok() == Some(node_uuid)
+}
+
+/// How often the router says that a node marked its own messages as tap copies: at most once per
+/// node connection and interval.
+const NODE_VIA_TAP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Node messages whose `meta.via_tap` the router cleared, process-wide. Each line carries the total.
+static NODE_VIA_TAP_CLEARED: AtomicU64 = AtomicU64::new(0);
+
+/// A node's link carries the node's own messages, never a tap copy. Only the router sets
+/// `meta.via_tap`, on the copy a tap makes (docs/reference/protocol.md). A node's message that
+/// carried it would pass for one: no tap would see it, nor its hive's cognition, and no router
+/// would answer it `UNREACHABLE` or `TTL_EXCEEDED` (A-209). The router clears it as it takes the
+/// message from the node's link, before anything reads it, and names the node at most once every
+/// 30 s. A copy that comes from another router, over IRP or the WAN, keeps it.
+#[derive(Default)]
+struct NodeViaTap {
+    /// Messages cleared since the connection's last line.
+    unlogged: u64,
+    logged_at: Option<Instant>,
+}
+
+impl NodeViaTap {
+    /// Clears `meta.via_tap` on `msg`, a message from `node`'s link; whether it was set.
+    fn clear(&mut self, msg: &mut Message, node: &str) -> bool {
+        if !std::mem::take(&mut msg.meta.via_tap) {
+            return false;
+        }
+        let cleared_total = NODE_VIA_TAP_CLEARED.fetch_add(1, Ordering::Relaxed) + 1;
+        self.unlogged += 1;
+        if self
+            .logged_at
+            .is_none_or(|at| at.elapsed() >= NODE_VIA_TAP_LOG_INTERVAL)
+        {
+            tracing::warn!(
+                node,
+                trace_id = %msg.routing.trace_id,
+                cleared = self.unlogged,
+                cleared_total,
+                "router cleared meta.via_tap on a node's own message: only the router marks a tap \
+                 copy"
+            );
+            self.unlogged = 0;
+            self.logged_at = Some(Instant::now());
+        }
+        true
+    }
 }
 
 async fn handle_message(
@@ -1466,7 +1517,8 @@ async fn handle_message(
     // scan installed taps and enqueue fire-and-forget secondary copies to
     // each matched tap target. Skipped when:
     //   - the inbound message is already a tap copy (via_tap=true) — single
-    //     hop tap semantics, no cascading
+    //     hop tap semantics, no cascading. A node's own message never is: the
+    //     node loop clears a via_tap the node set (`NodeViaTap`, A-209)
     //   - destination was not Unicast (broadcasts/resolves use different
     //     fanout semantics already)
     //   - no config snapshot available (router booted without config SHM)
@@ -8756,6 +8808,329 @@ mod tests {
         assert!(messages_on(&mut audit).is_empty(), "nothing went");
     }
 
+    /// The producers of the `cognition.turns` records among `appends`, in order.
+    fn cognition_producers(appends: Vec<(String, String, Vec<u8>)>) -> Vec<String> {
+        appends
+            .into_iter()
+            .filter(|(subject, _, _)| subject == fluxbee_sdk::stream::SUBJECT_COGNITION_TURNS)
+            .map(|(_, producer, _)| producer)
+            .collect()
+    }
+
+    /// A-209: a node's own message is never a tap copy. One its node marked `via_tap`, which only
+    /// the router may set, is taken with the flag cleared, through the node loop: it is delivered
+    /// without it and tapped, copied to cognition at entry (an agent sent it) and at delivery (an
+    /// agent gets it), and answered UNREACHABLE when its target is absent and TTL_EXCEEDED with no
+    /// TTL left. With the flag kept, it escaped all of these.
+    #[tokio::test]
+    async fn a_nodes_own_message_marked_as_a_tap_copy_is_routed_as_its_own() {
+        // A hive of its own, for a config region of its own: AI.sales's messages to AI.support
+        // are copied to IO.audit.
+        let hive: &'static str =
+            Box::leak(format!("vt{}", &Uuid::new_v4().simple().to_string()[..8]).into_boxed_str());
+        struct Unlinked(String);
+        impl Drop for Unlinked {
+            fn drop(&mut self) {
+                unlink_test_shm(&self.0);
+            }
+        }
+        let config_name = Unlinked(format!("/jsr-config-{hive}"));
+        unlink_test_shm(&config_name.0);
+        let mut config =
+            crate::shm::ConfigRegionWriter::open_or_create(&config_name.0, Uuid::new_v4(), hive)
+                .expect("config region");
+        config
+            .write_taps(
+                &[test_tap_entry(
+                    &format!("AI.sales@{hive}"),
+                    &format!("AI.support@{hive}"),
+                    &format!("IO.audit@{hive}"),
+                )],
+                true,
+            )
+            .expect("the tap");
+
+        let shm = TestShm::new("rt-viatap");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let support = Uuid::new_v4();
+        let (support_tx, mut support_rx) = link_queue("node");
+        let (audit_tx, mut audit_rx) = link_queue("node");
+        for (uuid, name, sender) in [
+            (support, "AI.support", support_tx),
+            (Uuid::new_v4(), "IO.audit", audit_tx),
+        ] {
+            nodes.lock().await.insert(
+                uuid,
+                NodeHandle {
+                    name: format!("{name}@{hive}"),
+                    vpn_id: 0,
+                    sender,
+                    connected_at: 0,
+                },
+            );
+        }
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let _connection = spawn_node_connection_on(hive, server, &shm, &nodes, log_stream);
+        let sales = Uuid::new_v4();
+        let hello = test_frame(
+            sales,
+            SYSTEM_KIND,
+            Some(MSG_HELLO),
+            Destination::Broadcast,
+            serde_json::json!({ "uuid": sales.to_string(), "name": "AI.sales", "version": "1" }),
+        );
+        write_frame(&mut client, &hello).await.expect("hello");
+        next_frame(&mut client).await;
+
+        // A turn of a thread, as the node sends it: marked as a tap copy.
+        let marked = |dst: Uuid, ttl: u8| Message {
+            routing: Routing {
+                src: sales.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(dst.to_string()),
+                ttl,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                via_tap: true,
+                ..Meta::default()
+            },
+            payload: serde_json::json!({ "text": "hello" }),
+        };
+        let to_support = marked(support, 16);
+        write_frame(
+            &mut client,
+            &serde_json::to_vec(&to_support).expect("a frame"),
+        )
+        .await
+        .expect("to AI.support");
+
+        let next = |link: &mut LinkReceiver| {
+            let frame = link.try_recv();
+            frame.map(|frame| serde_json::from_slice::<Message>(&frame).expect("a message"))
+        };
+        let delivered = time::timeout(Duration::from_secs(5), support_rx.recv())
+            .await
+            .expect("delivered in time")
+            .expect("delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("a message");
+        assert_eq!(delivered.routing.trace_id, to_support.routing.trace_id);
+        assert!(!delivered.meta.via_tap, "delivered as the node's own");
+        let copy = time::timeout(Duration::from_secs(5), audit_rx.recv())
+            .await
+            .expect("tapped in time")
+            .expect("the tap's copy");
+        let copy: Message = serde_json::from_slice(&copy).expect("a message");
+        assert!(copy.meta.via_tap, "the router's copy is marked");
+        assert_ne!(copy.routing.trace_id, to_support.routing.trace_id);
+        assert_eq!(copy.routing.src, sales.to_string());
+        assert!(next(&mut audit_rx).is_err(), "one copy");
+        assert_eq!(
+            cognition_producers(observed.drain()),
+            vec![format!("AI.sales@{hive}"), format!("AI.support@{hive}")],
+            "copied for the agent that sent it and for the one that got it"
+        );
+
+        let to_nobody = marked(Uuid::new_v4(), 16);
+        let out_of_ttl = marked(support, 0);
+        for msg in [&to_nobody, &out_of_ttl] {
+            write_frame(&mut client, &serde_json::to_vec(msg).expect("a frame"))
+                .await
+                .expect("sent");
+        }
+        let fence = test_frame(
+            sales,
+            "user",
+            None,
+            Destination::Unicast(Uuid::new_v4().to_string()),
+            serde_json::json!({}),
+        );
+        let answers: Vec<_> = answers_before(&mut client, &fence)
+            .await
+            .iter()
+            .map(what_was_answered)
+            .collect();
+        assert_eq!(
+            answers,
+            vec![
+                (
+                    to_nobody.routing.trace_id.clone(),
+                    "NODE_NOT_FOUND".to_string()
+                ),
+                (
+                    out_of_ttl.routing.trace_id.clone(),
+                    MSG_TTL_EXCEEDED.to_string()
+                ),
+            ]
+        );
+        assert!(next(&mut support_rx).is_err(), "nothing went with no TTL");
+    }
+
+    /// A-209: a tap copy that comes from another router keeps its flag, and is delivered as a
+    /// copy: over the WAN, and over IRP, where it is no turn for the agent's cognition either.
+    /// Only a node's own messages lose it.
+    #[tokio::test]
+    async fn a_tap_copy_from_another_router_keeps_its_flag() {
+        // Over the WAN, from worker1's tap, to the motherbee's agent.
+        let ctx = test_wan_context(None);
+        let orchestrator = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await = Some(lsa_with_remote_node(
+            "worker1",
+            orchestrator,
+            "SY.orchestrator@worker1",
+        ));
+        let agent = Uuid::new_v4();
+        let (agent_tx, mut agent_rx) = link_queue("node");
+        ctx.nodes.lock().await.insert(
+            agent,
+            NodeHandle {
+                name: "AI.audit@motherbee".to_string(),
+                vpn_id: 0,
+                sender: agent_tx,
+                connected_at: 0,
+            },
+        );
+        let (_, mut copy) = a_message_and_a_tap_copy(
+            orchestrator,
+            "SY.orchestrator@worker1",
+            &agent.to_string(),
+            16,
+            0,
+        );
+        copy.meta.thread_id = Some("thread-1".to_string());
+        let (link, _back) = link_queue("wan");
+        handle_wan_message(
+            &copy,
+            &link,
+            &ctx,
+            "worker1",
+            Uuid::new_v4(),
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("handled");
+        let delivered: Message =
+            serde_json::from_slice(&agent_rx.try_recv().expect("delivered")).expect("a message");
+        assert_eq!(delivered.routing.trace_id, copy.routing.trace_id);
+        assert!(delivered.meta.via_tap, "over the WAN");
+
+        // Over IRP, from a sibling's tap, to this router's agent.
+        let shm = TestShm::new("rt-tapkeep");
+        let admin = Uuid::new_v4();
+        let sibling = Uuid::new_v4();
+        let peer_nodes = Arc::new(Mutex::new(HashMap::from([(
+            admin,
+            PeerNode {
+                uuid: admin,
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                router_uuid: sibling,
+            },
+        )])));
+        let (sibling_tx, _back) = link_queue("irp");
+        let peers = Arc::new(Mutex::new(HashMap::from([(
+            sibling,
+            PeerHandle { sender: sibling_tx },
+        )])));
+        let (agent_tx, mut agent_rx) = link_queue("node");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::from([(
+            agent,
+            NodeHandle {
+                name: "AI.audit@motherbee".to_string(),
+                vpn_id: 0,
+                sender: agent_tx,
+                connected_at: 0,
+            },
+        )])));
+        let (_, mut copy) =
+            a_message_and_a_tap_copy(admin, "SY.admin@motherbee", &agent.to_string(), 16, 0);
+        copy.meta.thread_id = Some("thread-1".to_string());
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        handle_peer_message(
+            &copy,
+            &sibling,
+            &peers,
+            &peer_nodes,
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &nodes,
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &shm.writer,
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+            &log_stream,
+        )
+        .await
+        .expect("handled");
+        let delivered: Message =
+            serde_json::from_slice(&agent_rx.try_recv().expect("delivered")).expect("a message");
+        assert_eq!(delivered.routing.trace_id, copy.routing.trace_id);
+        assert!(delivered.meta.via_tap, "over IRP");
+        assert!(
+            cognition_producers(observed.drain()).is_empty(),
+            "a copy is no turn"
+        );
+    }
+
+    /// A-209: `NodeViaTap` clears a `via_tap` a node set and says whether it was set; it names the
+    /// node at once, then only counts until 30 s have passed.
+    #[test]
+    fn a_nodes_via_tap_is_cleared_and_named_at_most_every_30_s() {
+        let mut via_tap = NodeViaTap::default();
+        let mut msg = padded_message(Uuid::new_v4(), Destination::Broadcast, 0);
+        assert!(
+            !via_tap.clear(&mut msg, "AI.sales@motherbee"),
+            "nothing set"
+        );
+        assert!(via_tap.logged_at.is_none(), "nothing said");
+        msg.meta.via_tap = true;
+        assert!(via_tap.clear(&mut msg, "AI.sales@motherbee"));
+        assert!(!msg.meta.via_tap);
+        assert!(via_tap.logged_at.is_some(), "named at once");
+        assert_eq!(via_tap.unlogged, 0);
+        msg.meta.via_tap = true;
+        assert!(via_tap.clear(&mut msg, "AI.sales@motherbee"));
+        assert!(!msg.meta.via_tap);
+        assert_eq!(via_tap.unlogged, 1, "counted for the next line");
+    }
+
+    /// Pins A-209's place in the node loop: a `via_tap` the node set is cleared once the frame is
+    /// known to be the node's, and before anything reads the message: its stream append, its turn
+    /// copy, its cognition copy, its routing.
+    #[test]
+    fn the_node_loop_clears_via_tap_before_anything_reads_the_message() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn handle_node(").expect("handle_node");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        let check = body
+            .find("frame_is_from_connection(&msg, node_uuid)")
+            .expect("the sender's check");
+        let clear = body.find("via_tap.clear(&mut msg").expect("the clear");
+        assert!(check < clear, "cleared once the frame is the node's");
+        for reader in [
+            "take_stream_append(",
+            "turn_copy(",
+            "copied_for_cognition_at_entry(",
+            "handle_message(",
+        ] {
+            let at = body.find(reader).unwrap_or_else(|| panic!("{reader}"));
+            assert!(clear < at, "cleared before {reader}");
+        }
+    }
+
     /// A node of the LSA snapshot, listed by the hive at `hive_index`.
     fn lsa_node_entry(uuid: Uuid, name: &str, hive_index: u16) -> RemoteNodeEntry {
         let mut entry = RemoteNodeEntry {
@@ -10538,6 +10913,18 @@ mod tests {
         nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
         log_stream: stream::StreamHandle,
     ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        spawn_node_connection_on("motherbee", server, shm, nodes, log_stream)
+    }
+
+    /// `handle_node` on `server` for `hive`'s router, which reads that hive's config region, if
+    /// any, and no peers or policy.
+    fn spawn_node_connection_on(
+        hive: &'static str,
+        server: UnixStream,
+        shm: &TestShm,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        log_stream: stream::StreamHandle,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
         tokio::spawn(handle_node(
             server,
             Arc::clone(&shm.writer),
@@ -10563,7 +10950,7 @@ mod tests {
             log_stream,
             Uuid::new_v4(),
             "RT.gateway@motherbee",
-            "motherbee",
+            hive,
             "SY.frontdesk.gov@motherbee",
             false,
         ))

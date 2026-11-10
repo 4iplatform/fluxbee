@@ -85,6 +85,11 @@ wrote it, never as the sender wrote it.
   - From then on, a frame whose `routing.src` is not the connection's UUID is dropped
     (`frame_is_from_connection`), and `src_l2_name` is overwritten with the registered name
     (`handle_message`).
+  - A node's message is never a tap copy: a `meta.via_tap` the node set is cleared before
+    anything reads it, so the message is tapped, copied to cognition and answered as any other
+    (`NodeViaTap`, A-209; only the router marks a copy, §8.3). The router logs `router cleared
+    meta.via_tap on a node's own message: only the router marks a tap copy` with the node, at most
+    once every 30 s per connection. A copy from another router, over IRP or the WAN, keeps it.
 - **Over IRP.** The name comes from the sibling router's region (`peer_nodes`). A sibling that is
   the gateway may hand over a node of another hive: then the name comes from the LSA, made
   canonical as below (`remote_source_from_gateway`). An unknown sender is dropped.
@@ -661,7 +666,8 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
   at least one tap (`handle_message`).
 - The copy is the same message with `meta.via_tap: true`, a new `trace_id` and `dst` = `target`,
   resolved like any unicast name. It keeps the original `src` and `src_l2_name`, and never triggers
-  taps itself.
+  taps itself. Only the router sets the flag: on a node's own message it is cleared as the router
+  takes it (§2).
 - The target must pass the VPN check against the original sender (§8.2). A copy never carries a
   protected system action, whoever sent the original: the gate drops it at delivery, like a
   hub-relayed sender's (§6.3).
