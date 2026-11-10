@@ -719,13 +719,14 @@ node_check, timings_ms}`:
   took the version, and its record could not be written), or `MANIFEST_INVALID` from an
   orchestrator before 0.1.122, which takes no category `config`), `not_answered` (`detail`) or,
   since 0.1.124, `left_to_task` (`detail`: another task of the installation's update held the hive
-  until the change's ceiling, so the change sent it nothing; below), with `attempts` and
-  `elapsed_ms`; a hive not ok gets `next`, what finishes it by its error code
-  (`installation_next_step`): the same update for `sync_pending`, no answer, `RESTART_FAILED` and
-  `CONFIG_RECORD_FAILED`; the core first for `MANIFEST_INVALID`; the copy restored for
-  `INSTALLATION_HASH_MISMATCH`; the later version for `VERSION_MISMATCH`; `update_installation`
-  once that task ends, or the per-hive update, for `left_to_task` (`installation_hive_left_json`).
-  Never "not applied" (P-13): a hive that did not answer may hold the version already;
+  until too little of the change's time was left to apply it, so the change sent it nothing;
+  below), with `attempts` and `elapsed_ms`; a hive not ok gets `next`, what finishes it by its
+  error code (`installation_next_step`): the same update for `sync_pending`, no answer,
+  `RESTART_FAILED` and `CONFIG_RECORD_FAILED`; the core first for `MANIFEST_INVALID`; the copy
+  restored for `INSTALLATION_HASH_MISMATCH`; the later version for `VERSION_MISMATCH`;
+  `update_installation` once that task ends, or the per-hive update, for `left_to_task`
+  (`installation_hive_left_json`). Never "not applied" (P-13): a hive that did not answer may hold
+  the version already;
 - `skipped`: each hive the registry holds whose join did not finish, `{hive, role, status,
   join_phase, next}` (`installation_skipped_hives`): its join may have copied the file and started
   SY.cognition; finish its join or remove it, then `update` it with category `config`. It does not
@@ -750,9 +751,11 @@ second while one runs is refused first, `409 INSTALLATION_UPDATE_RUNNING`, writi
   `update: {id, state}` is in the answer:
   - each hive is claimed while it applies. A task holding it, one that reads it or one that acts on
     it (the follow applying its config, the automatic step or an explicit run's pass, of the update
-    the change superseded), is waited for up to the change's ceiling, and the hive applied once it
-    lets go: the operator's change reaches every hive in one go whenever it can. Only one that
-    holds it past the ceiling keeps it, and the change leaves the hive to it, recorded, its line
+    the change superseded), is waited for, and the hive applied once it lets go: the operator's
+    change reaches every hive in one go whenever it can. The wait ends while the apply still has
+    its own time before the change's ceiling, an update's answer (`JSR_ADMIN_UPDATE_TIMEOUT_SECS`,
+    60 s) and never less than 10 s, as a hive applied with less would read `not_answered`; one that
+    holds the hive longer keeps it, and the change leaves the hive to it, recorded, its line
     `left_to_task`. No read of the background task is recorded over a hive while it applies
     (FINDINGS A-205: a read taken just before the apply, its answer back after the apply's outcome,
     set the hive back to `pending`);

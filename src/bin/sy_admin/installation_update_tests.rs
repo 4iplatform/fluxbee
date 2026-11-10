@@ -2322,8 +2322,9 @@ async fn let_go_after(holder: Claim<'_>, after: Duration, let_go: &AtomicBool) {
 
 /// FINDINGS A-205: `set_installation_ai`'s apply holds each hive while it applies it: a background
 /// read neither reads nor records the hive meanwhile. A task holding a hive, one that reads it or
-/// one that acts on it, is waited for, and the hive applied once it lets go; only one that holds it
-/// past the change's ceiling keeps it, and the change leaves the hive to it, sending nothing and
+/// one that acts on it, is waited for, and the hive applied once it lets go, with its own time
+/// left; one that holds it until the apply would have less than that (one call, never under 10 s)
+/// before the change's ceiling keeps it, and the change leaves the hive to it, sending nothing and
 /// saying so in the record.
 #[tokio::test]
 async fn the_change_s_apply_holds_each_hive_it_applies() {
@@ -2341,11 +2342,14 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
         "set_installation_ai",
         &["motherbee", "worker1", "worker2", "ingress1", "egress1"],
     );
+    // The change's ceiling, 30 s away: the apply waits for a holder up to 10 s before it, its own
+    // time (one call of the quick bounds is less than the 10 s floor).
     let (the_target, bounds, deadline) = (
         target(),
         quick(),
-        tokio::time::Instant::now() + Duration::from_secs(10),
+        tokio::time::Instant::now() + Duration::from_secs(30),
     );
+    let call = bounds.update_call;
     let (updates_ref, mesh_ref, dyn_ref, id_ref, target_ref, bounds_ref) = (
         &*updates,
         &*mesh,
@@ -2363,6 +2367,7 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
         "worker1",
         &the_target,
         deadline,
+        call,
         move |_within| async move {
             recheck(
                 updates_ref,
@@ -2409,7 +2414,7 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
 
     // A task that reads ingress1 (a background read), and one that acts on egress1 (the automatic
     // step of the update the change superseded): each is waited for, and the change applies the
-    // hive once it lets go.
+    // hive once it lets go, with its own time left.
     for (hive, what, update) in [
         ("ingress1", READING, id.as_str()),
         ("egress1", "the automatic step", "upd-older"),
@@ -2423,8 +2428,10 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
             hive,
             &the_target,
             deadline,
-            move |_within| async move {
+            call,
+            move |within| async move {
                 assert!(let_go_ref.load(Ordering::SeqCst), "{hive}: it let go first");
+                assert!(within >= Duration::from_secs(10), "{hive}: {within:?}");
                 apply_target_version(mesh_ref, hive).await
             },
         );
@@ -2443,24 +2450,38 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
         );
     }
 
-    // A task that holds worker2 past the change's ceiling keeps it: the change leaves worker2 to
-    // it, sends it nothing, and the record says so.
+    // A task that lets worker2 go only when the apply would have less than its own time left before
+    // the ceiling (here 10.3 s away, the task letting go after 1 s) keeps it: the change stops
+    // waiting 10 s before the ceiling, leaves worker2 to it, sends it nothing, and the record says
+    // so. Applied then, it would read not_answered though it applies the version.
     let actor = updates
         .claim("worker2", "the automatic step", "upd-older")
         .expect("claimed");
-    let ceiling = tokio::time::Instant::now() + Duration::from_millis(300);
-    let change = apply_change_on_hive(
-        &updates,
-        &id,
-        "worker2",
-        &the_target,
-        ceiling,
-        move |_within| async move { unreachable!("nothing is sent to a hive another task holds") },
-    )
-    .await;
+    let let_go = AtomicBool::new(false);
+    let started = tokio::time::Instant::now();
+    let ceiling = started + Duration::from_millis(10_300);
+    let change = async {
+        let change =
+            apply_change_on_hive(
+                &updates,
+                &id,
+                "worker2",
+                &the_target,
+                ceiling,
+                call,
+                move |_within| async move {
+                    unreachable!("nothing is sent to a hive another task holds")
+                },
+            )
+            .await;
+        (change, tokio::time::Instant::now())
+    };
+    let ((), (change, left_at)) =
+        tokio::join!(let_go_after(actor, Duration::from_secs(1), &let_go), change);
+    let waited = left_at - started;
     assert!(
-        tokio::time::Instant::now() >= ceiling,
-        "waited up to the ceiling"
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(1),
+        "it waits until 10 s before the ceiling, not for the task: {waited:?}"
     );
     let ChangeApply::LeftToTask(why) = change else {
         panic!("left to the task: {change:?}");
@@ -2477,7 +2498,6 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
         .next
         .as_deref()
         .is_some_and(|next| next.contains("update_installation again")));
-    drop(actor);
 }
 
 /// FINDINGS A-205: a background read that began before a hive's last outcome shows the hive as it
@@ -2616,6 +2636,7 @@ async fn the_change_records_each_hive_s_own_time() {
             "worker1",
             &the_target,
             deadline,
+            quick().update_call,
             taking(Duration::from_millis(10)),
         ),
         apply_change_on_hive(
@@ -2624,6 +2645,7 @@ async fn the_change_records_each_hive_s_own_time() {
             "egress1",
             &the_target,
             deadline,
+            quick().update_call,
             taking(Duration::from_millis(300)),
         ),
     );

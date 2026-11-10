@@ -513,12 +513,12 @@ first version. On the motherbee:
    it at their next request, SY.admin's executor and Archi at their next use. Nothing else restarts.
 4. **The answer**: `ok` (200) when every hive applied it; `partial` (202) names the hives that have
    not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered`, `error` or
-   `left_to_task` (another task of the installation's update held it until the change's ceiling,
-   named in `detail`, so nothing was sent to it; one that lets it go sooner is waited for), each
-   with `next`, what finishes it. The version is written either way. `skipped` names each hive
-   whose join did not finish: finish its join or remove it, then update it as below. `GET
-   /versions` shows each hive's copy (`config.state`, `config.applied`), and this finishes one
-   hive:
+   `left_to_task` (another task of the installation's update held it until too little of the
+   change's time was left to apply it, named in `detail`, so nothing was sent to it; one that lets
+   it go sooner is waited for), each with `next`, what finishes it. The version is written either
+   way. `skipped` names each hive whose join did not finish: finish its join or remove it, then
+   update it as below. `GET /versions` shows each hive's copy (`config.state`, `config.applied`),
+   and this finishes one hive:
 
    ```bash
    curl -sS -X POST http://127.0.0.1:8080/hives/worker1/update \

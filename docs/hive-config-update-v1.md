@@ -685,11 +685,13 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   (`apply_change_on_hive`, since 0.1.124):
   - each hive is claimed while it applies. A task holding it, one that reads it or one that acts on
     it (the follow applying its config, the automatic step or an explicit run's pass, of the update
-    the change superseded), is waited for up to the change's ceiling, and the hive is applied once
-    it lets go: the operator's change reaches every hive in one go whenever it can. Only a task
-    that holds the hive past the ceiling keeps it: the change leaves the hive to it, nothing is
-    sent, the record says so, and the answer's line is `left_to_task`, naming the task in
-    `detail`, with `next`. **Why** (FINDINGS A-205): unclaimed, the apply let the background task
+    the change superseded), is waited for, and the hive is applied once it lets go: the operator's
+    change reaches every hive in one go whenever it can. The wait ends while the apply still has
+    its own time before the change's ceiling, one update's answer (60 s) and never less than 10 s:
+    given less, a hive that applies the version would read `not_answered`. A task that holds the
+    hive longer keeps it: the change leaves the hive to it, nothing is sent, the record says so,
+    and the answer's line is `left_to_task`, naming the task in `detail`, with `next`. **Why**
+    (FINDINGS A-205): unclaimed, the apply let the background task
     read a hive just before it applied the version; that read's answer, back after the apply's
     outcome, set the hive back to `pending`, and the update stayed open on a hive on the target
     (32 s on 8.x, up to 10 min when no one reads the update);

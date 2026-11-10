@@ -16320,7 +16320,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "When the change switches the default provider, SY.admin also checks the new provider's key, by names only (SY.vault's listing, never a value): each AI node that names no provider of its own reads it in its own tenant, and SY.admin's executor, SY.architect, SY.frontdesk.gov and each SY.cognition read theirs in the root tenant; each must find one it reads (its own, one assigned to it, or its tenant's general one). It refuses with 409 PROVIDER_KEYS_MISSING, naming each node, its tenant and the resource_type: put that key in SY.vault first (vault_put), or give the AI node its own provider. A tenant whose keys it cannot list refuses with 503 KEYS_NOT_CHECKED.",
             "The motherbee's orchestrator, the only writer, writes the next version, recorded with its values. It refuses, writing nothing: 409 JOIN_IN_PROGRESS while a hive joins or is removed; 409 INSTALLATION_EDITED_BY_HAND while the motherbee's file is edited by hand (restore it, or pass replace_hand_edit: true, the operator's choice, to make this change the next version over it); 409 INSTALLATION_UNCHANGED when its version holds these values already; 422 INVALID_AI_SETTINGS for values a reader cannot use (a provider listed without its model, the default provider not listed); 409 INSTALLATION_NOT_WRITTEN while the motherbee holds no file (its orchestrator's start writes version 1 from hive.yaml's ai: /versions config.not_written says why it did not). No answer within 30 s (TIMEOUT) does not mean nothing was written: the write may still land behind the orchestrator's other work; read get_installation, and when its expected_version moved, run update with category config on every hive.",
             "Then every hive applies it, in parallel: the motherbee and each connected spoke get update with category config (a hive registry SY.admin cannot read refuses the change first, 503 HIVE_REGISTRY_UNREADABLE, nothing written: it names no hive), retried while the hive's copy has not arrived (sync_pending), up to 90 s (JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS). Each restarts only its start readers whose engine changed, or that became active since the hive's record of what it applied last (nothing says what those run): SY.cognition and SY.frontdesk.gov on the motherbee, SY.cognition on a worker, none on an ingress or an egress. ai.generic nodes take it at their next request; SY.admin's executor and Archi at their next use, never restarted (either may be running this very action), rebuilding only for another engine.",
-            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms, next}}, skipped, node_check, timings_ms: {check, write, scan, apply, hives, total}, update: {id, state}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail), not_answered, or left_to_task (another task of the installation's update held it until the change's ceiling, named in detail, so nothing was sent to it; one that lets it go sooner is waited for): never read any as not applied; its next says what finishes it, by its error_code. status is ok when every connected hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive. skipped names each hive the registry holds whose join did not finish (its status and join phase): the change does not reach it; finish its join or remove it, then update it with category config.",
+            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms, next}}, skipped, node_check, timings_ms: {check, write, scan, apply, hives, total}, update: {id, state}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail), not_answered, or left_to_task (another task of the installation's update held it until the apply had no more than an update's answer time, 60 s, before the change's ceiling, named in detail, so nothing was sent to it; one that lets it go sooner is waited for): never read any as not applied; its next says what finishes it, by its error_code. status is ok when every connected hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive. skipped names each hive the registry holds whose join did not finish (its status and join phase): the change does not reach it; finish its join or remove it, then update it with category config.",
             "The change opens the installation's update (update_installation, get_installation_update) with the new version as its target: a hive that did not answer stays pending in it, and SY.admin finishes it once when the hive answers again (the automatic step).",
         ],
         "update_installation" => vec![
@@ -21581,9 +21581,10 @@ fn installation_hive_json(
 }
 
 /// One hive's line of `set_installation_ai`'s answer when another task of the installation's update
-/// held it until the change's ceiling, and the change left it to that task
-/// (`installation_update::apply_change_on_hive`, FINDINGS A-205): nothing was sent to it; `detail`
-/// names the task, and `next` says what finishes it once that task ends.
+/// held it until the apply had no more than its own time left before the change's ceiling, and the
+/// change left it to that task (`installation_update::apply_change_on_hive`, FINDINGS A-205):
+/// nothing was sent to it; `detail` names the task, and `next` says what finishes it once that task
+/// ends.
 fn installation_hive_left_json(
     hive: &str,
     why: &str,
@@ -21970,8 +21971,9 @@ async fn handle_set_installation_ai(
 
     // 3. Every hive applies it, at once; each ends by the change's ceiling. With the update open,
     // each hive's apply is its pass: the hive claimed while it applies (a task holding it waited
-    // for, up to the ceiling), so no background read of it is recorded meanwhile (FINDINGS A-205),
-    // and its outcome recorded as it ends, with its own times (A-204).
+    // for while the apply would keep an update's answer time before the ceiling), so no
+    // background read of it is recorded meanwhile (FINDINGS A-205), and its outcome recorded as it
+    // ends, with its own times (A-204).
     let apply_started = Instant::now();
     let deadline =
         time::Instant::now() + admin_action_timeout(action).saturating_sub(started.elapsed());
@@ -21989,6 +21991,7 @@ async fn handle_set_installation_ai(
                         hive,
                         target,
                         deadline,
+                        admin_action_timeout("update"),
                         apply,
                     )
                     .await

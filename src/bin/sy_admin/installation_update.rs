@@ -3117,30 +3117,37 @@ pub(crate) enum ChangeApply {
 
 /// One hive's apply of `set_installation_ai`'s version, the pass of the update the change opened:
 /// the hive claimed ([`claim_for_run`]), so no background read of it is recorded while it applies
-/// (FINDINGS A-205); the version applied (`apply`, given the time left before `deadline`); and its
-/// outcome recorded as it ends, with its own start and end (A-204), before the claim is released.
-/// A task holding the hive, reading it or acting on it, is waited for up to `deadline`, the
-/// change's ceiling: the operator's change reaches every hive in one go whenever it can. One still
-/// there then keeps the hive, which is left to it, said in the record and to the caller.
+/// (FINDINGS A-205); the version applied (`apply`, given the time left before `deadline`, the
+/// change's ceiling); and its outcome recorded as it ends, with its own start and end (A-204),
+/// before the claim is released. A task holding the hive, reading it or acting on it, is waited
+/// for, so the operator's change reaches every hive in one go whenever it can; but only while the
+/// apply would still have its own time, one call (`call`, the update's answer) and never less than
+/// 10 s, before the ceiling. One still there then keeps the hive, which is left to it, said in the
+/// record and to the caller: given less, the hive's apply would read `not_answered` though it
+/// applies it.
 pub(crate) async fn apply_change_on_hive<F, Fut>(
     updates: &Updates,
     id: &str,
     hive: &str,
     target: &Target,
     deadline: tokio::time::Instant,
+    call: Duration,
     apply: F,
 ) -> ChangeApply
 where
     F: FnOnce(Duration) -> Fut,
     Fut: std::future::Future<Output = (InstallationApplied, Duration)>,
 {
+    let wait_until = deadline
+        .checked_sub(call.max(Duration::from_secs(10)))
+        .unwrap_or_else(tokio::time::Instant::now);
     let Some(_claim) = claim_for_run(
         updates,
         hive,
         "set_installation_ai's apply",
         id,
         WaitFor::Anyone,
-        deadline,
+        wait_until,
     )
     .await
     else {
