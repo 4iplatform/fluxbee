@@ -1245,17 +1245,17 @@ async fn run_system_worker(
     }
 }
 
-/// FINDINGS A-199, step 1: the most reads one worker runs at once (`WorkerLanes`). A read
-/// forwarded to another hive holds its place up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s)
-/// when that hive does not answer; past this many at once, a read waits for one to end, and never
-/// holds a request that changes something.
+/// FINDINGS A-199, step 1: the most reads one worker runs at once (`WorkerLanes`), each on a thread
+/// of tokio's blocking pool (at most 512 threads). A read forwarded to another hive holds its place
+/// up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s) when that hive does not answer; past this
+/// many at once, a read waits for one to end, and never holds a request that changes something.
 const WORKER_CONCURRENT_READS_MAX: usize = 16;
 
 /// The lane a worker runs a request in (FINDINGS A-199, step 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestLane {
-    /// Writes nothing, changes no state and leaves nothing another request depends on: it runs in
-    /// a task of its own, beside every other request.
+    /// Writes nothing, changes no state and leaves nothing another request depends on: it runs
+    /// beside every other request, off the runtime's threads.
     Read,
     /// Anything else, an unknown request included: one at a time, in arrival order, as every
     /// request ran before.
@@ -1305,11 +1305,15 @@ fn node_status_lane(payload: &serde_json::Value, local_hive: &str) -> RequestLan
 
 /// A worker's two lanes (FINDINGS A-199, step 1). The worker hands each request to its lane and
 /// takes the next one at once, whatever runs:
-/// - a read runs in a task of its own once it holds one of `reads`' permits, so a slow or lost
-///   read (a forward to a hive that does not answer waits 45 s) holds no other request;
+/// - a read runs once it holds one of `reads`' permits, so a slow or lost read (a forward to a
+///   hive that does not answer waits 45 s) holds no other request. It runs on a thread of the
+///   blocking pool, never on the runtime's (`run`): its blocking calls (systemctl, sha256sum,
+///   `ip route`, the LSA and file reads) can then never take every thread the watchdog, the
+///   message loop and the ordered lane run on, as several reads at once could on a 2-vCPU spoke;
 /// - anything else goes to the ordered lane, one task that runs each request to its end before it
 ///   takes the next, in the order the worker took them.
 struct WorkerLanes {
+    worker: &'static str,
     reads: Arc<tokio::sync::Semaphore>,
     ordered: tokio::sync::mpsc::UnboundedSender<futures::future::BoxFuture<'static, ()>>,
 }
@@ -1332,6 +1336,7 @@ impl WorkerLanes {
             }
         });
         Self {
+            worker,
             reads: Arc::new(tokio::sync::Semaphore::new(reads_max)),
             ordered,
         }
@@ -1344,13 +1349,35 @@ impl WorkerLanes {
     ) {
         match lane {
             RequestLane::Read => {
+                let worker = self.worker;
                 let reads = Arc::clone(&self.reads);
                 tokio::spawn(async move {
                     // The semaphore is never closed, so the permit always comes.
-                    let Ok(_permit) = reads.acquire_owned().await else {
+                    let Ok(permit) = reads.acquire_owned().await else {
                         return;
                     };
-                    request.await;
+                    // Dropped with this task, as the runtime drops it when the orchestrator
+                    // stops: the read then ends at its next turn, before it waits on a timer the
+                    // stopping runtime no longer runs.
+                    let (_running, stopped) = tokio::sync::oneshot::channel::<()>();
+                    let runtime = tokio::runtime::Handle::current();
+                    // Off the runtime's threads, on one of the blocking pool's, as add_hive's
+                    // join runs (`spawn_background_join`): whatever a read blocks on holds that
+                    // thread only, and its awaits, a forward to another hive among them, run on
+                    // it through the runtime's handle.
+                    let read = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        runtime.block_on(async move {
+                            tokio::select! {
+                                biased;
+                                _ = stopped => {}
+                                () = request => {}
+                            }
+                        });
+                    });
+                    if let Err(err) = read.await {
+                        tracing::error!(worker, error = %err, "a read ended without an answer");
+                    }
                 });
             }
             RequestLane::Ordered => {
@@ -52610,6 +52637,82 @@ blob:
         wait_for_lane_entry(&log, "next end").await;
     }
 
+    /// A read stuck in a blocking call (a std channel standing in for systemctl, sha256sum or a
+    /// file read) holds none of the runtime's threads: on a runtime of one worker thread, a task
+    /// that ticks as the watchdog does keeps ticking, and another read runs to its end. The test
+    /// waits on its own thread's clock, which no runtime thread drives, and releases the stuck
+    /// read before it checks, so a read run on the runtime fails it rather than hanging it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_read_stuck_in_a_blocking_call_holds_no_runtime_thread() {
+        let lanes = WorkerLanes::start("test", 4);
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let (started, read_started) = std::sync::mpsc::channel();
+        lanes.run(RequestLane::Read, async move {
+            let _ = started.send(());
+            // Blocks its thread until the test releases it, 10 s at most.
+            let _ = stuck.recv_timeout(Duration::from_secs(10));
+        });
+        read_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the stuck read started");
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                let mut every = time::interval(Duration::from_millis(10));
+                loop {
+                    every.tick().await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let ticked = ticks.load(Ordering::SeqCst);
+        let (done, read_done) = std::sync::mpsc::channel();
+        lanes.run(RequestLane::Read, async move {
+            let _ = done.send(());
+        });
+        let other_read = read_done.recv_timeout(Duration::from_secs(2));
+        let _ = release.send(());
+        ticker.abort();
+        assert!(
+            ticked >= 5,
+            "the tick goes on while the read blocks: {ticked}"
+        );
+        assert!(other_read.is_ok(), "another read runs while one blocks");
+    }
+
+    /// A read still waiting when the orchestrator stops ends with it: the runtime drops the read's
+    /// task, and the read, on its thread of the blocking pool, stops at its next turn instead of
+    /// holding the stop (here a wait that never ends; a forward waits up to 45 s).
+    #[test]
+    fn a_waiting_read_ends_when_the_runtime_stops() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (started, read_started) = std::sync::mpsc::channel();
+        runtime.block_on(async {
+            let lanes = WorkerLanes::start("test", 4);
+            lanes.run(RequestLane::Read, async move {
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            });
+        });
+        read_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read started");
+        let (stopped, runtime_stopped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = stopped.send(());
+        });
+        runtime_stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the runtime stops with a read still waiting");
+    }
+
     /// Which requests are reads: the ones read in the code to write and change nothing. Every other
     /// action, an unknown one included, keeps the order, and a node's status is a read only where
     /// it is forwarded: this hive writes the status version of a node of its own.
@@ -53025,7 +53128,12 @@ blob:
             ))
             .await
             .expect("inject NODE_CONFIG_GET");
-        let lost = next_outgoing_now(&mut harness, "NODE_CONFIG_GET forwarded").await;
+        // The first protected SYSTEM message loads the baked system policy (SO-05's check), which a
+        // debug build compiles slowly, the more so beside other tests: room for it.
+        let lost = harness
+            .next_outgoing_within(Duration::from_secs(10))
+            .await
+            .expect("NODE_CONFIG_GET forwarded");
         assert_eq!(lost.meta.msg.as_deref(), Some("NODE_CONFIG_GET"));
         assert_unicast_destination(&lost.routing.dst, "SY.orchestrator@workerbee");
 

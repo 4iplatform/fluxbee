@@ -920,6 +920,13 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
   `NODE_STATE_GET`. A node's status (`get_node_status`, `NODE_STATUS_GET`) is a read when the node
   is another hive's, which this hive only asks; for a node of its own it writes the node's status
   version, so it keeps the order.
+- **A read runs off the runtime's threads,** on one of tokio's blocking pool, through the
+  runtime's handle, as add_hive's join does (`spawn_background_join`). The orchestrator's runtime
+  (`#[tokio::main]`) has one worker thread per CPU, two on a spoke cloned from the 2-core
+  template. A read's blocking calls (`systemctl is-active` and `is-failed`, `sha256sum`, hashing
+  the vendored Syncthing, `ip route`, the LSA's shared memory, file reads) then hold that thread
+  only, never one the watchdog, the message loop or the ordered lane needs. A read still waiting
+  when the orchestrator stops ends with it.
 - **Everything else**, every change, `node_help` and a message it does not know included, runs one
   at a time, in arrival order, as every message did before: a change still waits for the one
   before it, a `core_rollback` (up to 240 s) or a forward to a hive that does not answer (45 s)
