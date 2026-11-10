@@ -12285,9 +12285,9 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
         "payload": {
             "syntax": "SCMD: curl -X METHOD /relative/path [-d '{...}']",
             "notes": [
-                "Usa siempre paths relativos a SY.admin, por ejemplo /hives/motherbee/nodes.",
-                "Para descubrir el catálogo dinámico completo, usá GET /admin/actions.",
-                "Para ayuda detallada de una acción, usá GET /admin/actions/{action}."
+                "Always use paths relative to SY.admin, for example /hives/motherbee/nodes.",
+                "To discover the whole live catalog, use GET /admin/actions.",
+                "For the detailed help of one action, use GET /admin/actions/{action}."
             ],
             "examples": [
                 "SCMD: curl -X GET /admin/actions",
@@ -32759,14 +32759,14 @@ mod tests {
     #[test]
     fn render_user_message_with_attachment_summary_includes_attachment_lines() {
         let summary = render_user_message_with_attachment_summary(
-            "revisa esto",
+            "check this",
             &[ChatAttachmentRef {
                 attachment_id: "att_1".to_string(),
                 blob_ref: sample_blob_ref("invoice.pdf", "application/pdf", 182233),
             }],
         );
 
-        assert!(summary.contains("revisa esto"));
+        assert!(summary.contains("check this"));
         assert!(summary.contains("Attachment: invoice.pdf (application/pdf, 182233 bytes)"));
     }
 
@@ -32776,7 +32776,7 @@ mod tests {
             message_id: "msg_1".to_string(),
             session_id: "sess_1".to_string(),
             role: "user".to_string(),
-            content: "revisa esto".to_string(),
+            content: "check this".to_string(),
             timestamp_ms: 0,
             mode: "text".to_string(),
             metadata: json!({
@@ -32793,7 +32793,7 @@ mod tests {
 
         let interaction =
             immediate_interaction_from_message(&message).expect("interaction should exist");
-        assert!(interaction.content.contains("revisa esto"));
+        assert!(interaction.content.contains("check this"));
         assert!(interaction
             .content
             .contains("Attachment: invoice.pdf (application/pdf, 182233 bytes)"));
@@ -32879,7 +32879,7 @@ mod tests {
         let blob = sample_blob_ref("spec.md", "text/markdown", 4096);
         let raw = json!({
             "session_id": "sess_abc",
-            "message": "revisa el spec",
+            "message": "check the spec",
             "attachments": [{
                 "attachment_id": "att_001",
                 "blob_ref": blob
@@ -32887,7 +32887,7 @@ mod tests {
         });
         let req: ChatRequest = serde_json::from_value(raw).expect("should parse");
         assert_eq!(req.session_id.as_deref(), Some("sess_abc"));
-        assert_eq!(req.message, "revisa el spec");
+        assert_eq!(req.message, "check the spec");
         assert_eq!(req.attachments.len(), 1);
         assert_eq!(req.attachments[0].attachment_id, "att_001");
         assert_eq!(req.attachments[0].blob_ref.filename_original, "spec.md");
@@ -32895,7 +32895,7 @@ mod tests {
 
     #[test]
     fn chat_request_parses_without_attachments() {
-        let raw = json!({ "message": "hola" });
+        let raw = json!({ "message": "hello" });
         let req: ChatRequest = serde_json::from_value(raw).expect("should parse");
         assert!(req.attachments.is_empty());
     }
@@ -32951,7 +32951,7 @@ mod tests {
             message_id: "msg_1".to_string(),
             session_id: "sess_1".to_string(),
             role: "user".to_string(),
-            content: "revisa el reporte".to_string(),
+            content: "check the report".to_string(),
             timestamp_ms: 0,
             mode: "text".to_string(),
             metadata: json!({
@@ -32966,7 +32966,7 @@ mod tests {
             }),
         };
         let rendered = render_persisted_user_message(&message);
-        assert!(rendered.contains("revisa el reporte"));
+        assert!(rendered.contains("check the report"));
         assert!(rendered.contains("Attachment: report.pdf (application/pdf, 182233 bytes)"));
     }
 
@@ -32976,12 +32976,12 @@ mod tests {
             message_id: "msg_1".to_string(),
             session_id: "sess_1".to_string(),
             role: "user".to_string(),
-            content: "solo texto".to_string(),
+            content: "text only".to_string(),
             timestamp_ms: 0,
             mode: "text".to_string(),
             metadata: json!({ "kind": "text" }),
         };
-        assert_eq!(render_persisted_user_message(&message), "solo texto");
+        assert_eq!(render_persisted_user_message(&message), "text only");
     }
 
     // ARCHI-ATTACH-11: persistence metadata does not contain raw bytes

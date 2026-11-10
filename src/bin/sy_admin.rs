@@ -613,7 +613,7 @@ async fn main() -> Result<(), AdminError> {
         .into());
     }
     if !is_mother_role(hive.role.as_deref()) {
-        tracing::warn!("SY.admin solo corre en motherbee; role != motherbee");
+        tracing::warn!("SY.admin runs only on the motherbee; role != motherbee");
         return Ok(());
     }
     if hive.hive_id != PRIMARY_HIVE_ID {
