@@ -93,39 +93,6 @@ CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns (thread_id);
 "#;
 
-/// `turns.ctx` and `seq`, the message log's key until 0.1.74, are written by nothing since 0.1.83,
-/// which kept them, nullable, so that a rollback to 0.1.82 still started: its start creates the
-/// index `idx_turns_ctx_seq` on them. A table that still has them loses both, and that index, once
-/// (`drop_turns_ctx_seq`). The catalog is read first, so a start with nothing to drop skips the
-/// drop and its `ACCESS EXCLUSIVE` lock on `turns`.
-const TURNS_CTX_SEQ_COLUMNS_SQL: &str = r#"
-SELECT column_name::text FROM information_schema.columns
-WHERE table_schema = current_schema() AND table_name = 'turns' AND column_name IN ('ctx', 'seq')
-ORDER BY 1
-"#;
-/// One batch, so one transaction: the index and both columns go together. `DROP COLUMN` changes
-/// only the catalog, without rewriting the table, so it is quick once it holds its lock.
-const TURNS_CTX_SEQ_DROP_SQL: &str = r#"
-DROP INDEX IF EXISTS idx_turns_ctx_seq;
-ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq;
-"#;
-
-/// Cognition's tables, which SY.cognition wrote until 0.1.103: it keeps its state in its own file
-/// since (docs/cognition-hands-v1.md §11), and SY.storage keeps the messages. A start that finds
-/// one drops them all, and the inbox rows of their subjects, once (`drop_cognition_tables`). A
-/// rollback to 0.1.102 creates them again, empty.
-const COGNITION_TABLES_SQL: &str = r#"
-SELECT table_name::text FROM information_schema.tables
-WHERE table_schema = current_schema() AND table_name LIKE 'cognition\_%'
-ORDER BY 1
-"#;
-const COGNITION_TABLES_DROP_SQL: &str = r#"
-DROP TABLE IF EXISTS cognition_threads, cognition_contexts, cognition_reasons,
-    cognition_cooccurrences, cognition_scopes, cognition_scope_instances, cognition_memories,
-    cognition_episodes;
-DELETE FROM storage_inbox WHERE subject LIKE 'storage.cognition.%';
-"#;
-
 /// `turns.writer_ilk` and `writer_name`, who wrote each message's text (`meta.context.writer`,
 /// docs/cognition-hands-v1.md §7), added once to a table made before them (`add_turns_writer`). The
 /// catalog is read first, so a start that finds both skips the `ALTER TABLE` and its
@@ -209,13 +176,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_tenant_stored ON llm_usage (tenant_id, 
 enum SchemaStep {
     /// Statements run as one batch.
     Sql(&'static str),
-    /// `turns.ctx` and `seq` dropped, only while the catalog shows them (`drop_turns_ctx_seq`).
-    DropTurnsCtxSeq,
     /// `turns.writer_ilk` and `writer_name` added, only while the catalog lacks one
     /// (`add_turns_writer`).
     AddTurnsWriter,
-    /// Cognition's tables dropped, only while the catalog shows one (`drop_cognition_tables`).
-    DropCognitionTables,
 }
 
 /// What `ensure_schema` runs at start, in order. Each schema statement waits at most 5 s for its
@@ -223,13 +186,11 @@ enum SchemaStep {
 /// table behind it, so it fails instead, and SY.storage exits and retries
 /// (`exit_without_database`). The reset leaves the shared connection's later statements waiting as
 /// long as they need.
-const SCHEMA_STEPS: [SchemaStep; 8] = [
+const SCHEMA_STEPS: [SchemaStep; 6] = [
     SchemaStep::Sql("SET lock_timeout = '5s'"),
     SchemaStep::Sql(TURNS_SCHEMA_SQL),
-    SchemaStep::DropTurnsCtxSeq,
     SchemaStep::AddTurnsWriter,
     SchemaStep::Sql(INBOX_SCHEMA_SQL),
-    SchemaStep::DropCognitionTables,
     SchemaStep::Sql(USAGE_SCHEMA_SQL),
     SchemaStep::Sql("RESET lock_timeout"),
 ];
@@ -603,55 +564,9 @@ impl Storage {
         for step in SCHEMA_STEPS {
             match step {
                 SchemaStep::Sql(sql) => self.client.batch_execute(sql).await?,
-                SchemaStep::DropTurnsCtxSeq => self.drop_turns_ctx_seq().await?,
                 SchemaStep::AddTurnsWriter => self.add_turns_writer().await?,
-                SchemaStep::DropCognitionTables => self.drop_cognition_tables().await?,
             }
         }
-        Ok(())
-    }
-
-    /// Drops `turns.ctx` and `seq` and their index (`TURNS_CTX_SEQ_DROP_SQL`), only while the
-    /// catalog still shows one of the columns, and says so in one line. A later start finds
-    /// nothing and does nothing.
-    async fn drop_turns_ctx_seq(&self) -> Result<(), StorageError> {
-        let columns: Vec<String> = self
-            .client
-            .query(TURNS_CTX_SEQ_COLUMNS_SQL, &[])
-            .await?
-            .iter()
-            .map(|row| row.get(0))
-            .collect();
-        if columns.is_empty() {
-            return Ok(());
-        }
-        self.client.batch_execute(TURNS_CTX_SEQ_DROP_SQL).await?;
-        tracing::info!(
-            columns = %columns.join(", "),
-            "dropped the turns columns nothing writes since 0.1.83, and any index on them"
-        );
-        Ok(())
-    }
-
-    /// Drops cognition's tables and the inbox rows of their subjects (`COGNITION_TABLES_DROP_SQL`),
-    /// only while the catalog still shows one of the tables, and says so in one line. A later start
-    /// finds nothing and does nothing.
-    async fn drop_cognition_tables(&self) -> Result<(), StorageError> {
-        let tables: Vec<String> = self
-            .client
-            .query(COGNITION_TABLES_SQL, &[])
-            .await?
-            .iter()
-            .map(|row| row.get(0))
-            .collect();
-        if tables.is_empty() {
-            return Ok(());
-        }
-        self.client.batch_execute(COGNITION_TABLES_DROP_SQL).await?;
-        tracing::info!(
-            tables = %tables.join(", "),
-            "dropped cognition's tables: SY.cognition keeps its state in its own file"
-        );
         Ok(())
     }
 
@@ -1582,11 +1497,11 @@ struct StreamRow {
 }
 
 /// The records of a batch SY.storage takes, how many it drops, and why it refused each usage record
-/// it dropped. It drops a subject it has no handler for, among them cognition's of 0.1.102 and
-/// before; a record whose producer is not a node of the stream's hive (a router copies and takes
-/// only what its own nodes send); a turn whose message names another sender than its producer
-/// (Archi shows that name); a usage record `check_usage_record` refuses. A resent record lands on
-/// the same keys: the same subject and payload, the same row.
+/// it dropped. It drops a subject it has no handler for; a record whose producer is not a node of
+/// the stream's hive (a router copies and takes only what its own nodes send); a turn whose message
+/// names another sender than its producer (Archi shows that name); a usage record
+/// `check_usage_record` refuses. A resent record lands on the same keys: the same subject and
+/// payload, the same row.
 fn stream_rows(
     batch: &StreamBatch,
     from: &str,
@@ -2859,38 +2774,34 @@ mod tests {
         ] {
             assert!(TURNS_SCHEMA_SQL.contains(index), "{index}");
         }
-        // ctx, seq and their index are neither created nor changed here: 0.1.83's DROP NOT NULL is
-        // gone, and `drop_turns_ctx_seq` drops what an old table still has.
+        // ctx, seq and their index, the key until 0.1.74, are gone: a new table never has them.
         for gone in ["ctx", "seq", "ALTER TABLE", "DO $$"] {
             assert!(!TURNS_SCHEMA_SQL.contains(gone), "{gone}");
         }
         assert!(INBOX_SCHEMA_SQL.contains("source_ts    TIMESTAMPTZ,"));
     }
 
+    /// A database made from zero ends as an upgraded one: three tables, and nothing an upgrade
+    /// dropped (`turns.ctx` and `seq`, cognition's tables) is created again.
     #[test]
-    fn the_old_key_columns_are_dropped_once() {
-        // The catalog is read first: the drop runs only while `turns` still shows `ctx` or `seq`,
-        // so a start with nothing to drop takes no lock on `turns` for it.
-        for guard in [
-            "FROM information_schema.columns",
-            "table_schema = current_schema() AND table_name = 'turns'",
-            "column_name IN ('ctx', 'seq')",
-        ] {
-            assert!(TURNS_CTX_SEQ_COLUMNS_SQL.contains(guard), "{guard}");
-        }
-        // The index and both columns, in one batch, so one transaction; nothing else.
-        let statements: Vec<&str> = TURNS_CTX_SEQ_DROP_SQL
-            .split(';')
-            .map(str::trim)
-            .filter(|statement| !statement.is_empty())
+    fn a_new_database_has_only_todays_tables() {
+        let schema: String = SCHEMA_STEPS
+            .iter()
+            .filter_map(|step| match step {
+                SchemaStep::Sql(sql) => Some(*sql),
+                SchemaStep::AddTurnsWriter => None,
+            })
             .collect();
-        assert_eq!(
-            statements,
-            [
-                "DROP INDEX IF EXISTS idx_turns_ctx_seq",
-                "ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq"
-            ]
-        );
+        let tables: Vec<&str> = schema
+            .split("CREATE TABLE IF NOT EXISTS ")
+            .skip(1)
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert_eq!(tables, ["turns", "storage_inbox", "llm_usage"]);
+        assert_eq!(schema.matches("CREATE TABLE").count(), 3);
+        for gone in ["cognition", "idx_turns_ctx_seq", "DROP "] {
+            assert!(!schema.contains(gone), "{gone}");
+        }
     }
 
     #[test]
@@ -2903,49 +2814,10 @@ mod tests {
             ddl,
             [
                 SchemaStep::Sql(TURNS_SCHEMA_SQL),
-                SchemaStep::DropTurnsCtxSeq,
                 SchemaStep::AddTurnsWriter,
                 SchemaStep::Sql(INBOX_SCHEMA_SQL),
-                SchemaStep::DropCognitionTables,
                 SchemaStep::Sql(USAGE_SCHEMA_SQL),
             ]
-        );
-    }
-
-    /// Cognition's tables go once (docs/cognition-hands-v1.md §11): the catalog is read first, so a
-    /// start that finds none drops nothing; the drop takes the eight tables and the inbox rows of
-    /// their subjects in one batch.
-    #[test]
-    fn cognitions_tables_are_dropped_once() {
-        for guard in [
-            "FROM information_schema.tables",
-            "table_schema = current_schema()",
-            "table_name LIKE 'cognition\\_%'",
-        ] {
-            assert!(COGNITION_TABLES_SQL.contains(guard), "{guard}");
-        }
-        let statements: Vec<&str> = COGNITION_TABLES_DROP_SQL
-            .split(';')
-            .map(str::trim)
-            .filter(|statement| !statement.is_empty())
-            .collect();
-        assert_eq!(statements.len(), 2);
-        for table in [
-            "cognition_threads",
-            "cognition_contexts",
-            "cognition_reasons",
-            "cognition_cooccurrences",
-            "cognition_scopes",
-            "cognition_scope_instances",
-            "cognition_memories",
-            "cognition_episodes",
-        ] {
-            assert!(statements[0].contains(table), "{table}");
-        }
-        assert!(statements[0].starts_with("DROP TABLE IF EXISTS"));
-        assert_eq!(
-            statements[1],
-            "DELETE FROM storage_inbox WHERE subject LIKE 'storage.cognition.%'"
         );
     }
 
@@ -3011,37 +2883,30 @@ mod tests {
         );
     }
 
-    /// Cognition's records, which it appended until 0.1.103, have no handler: a stream still holding
-    /// some at the upgrade has them dropped and acked.
+    /// A record whose subject has no handler is dropped, and its batch acked with the rest.
     #[test]
-    fn cognitions_old_records_are_dropped() {
+    fn a_record_with_no_handler_is_dropped() {
         let batch = StreamBatch {
             stream: "RT.gateway.stream@worker1".to_string(),
             epoch: 1,
             records: vec![
                 record(
                     1,
-                    "storage.cognition.batch",
-                    "SY.cognition@worker1",
-                    serde_json::json!({"envelopes": []}),
+                    "storage.unknown",
+                    "AI.sales@worker1",
+                    serde_json::json!({"a": 1}),
                 ),
                 record(
                     2,
-                    "storage.cognition.threads",
+                    "storage.events",
                     "SY.cognition@worker1",
                     serde_json::json!({"a": 2}),
-                ),
-                record(
-                    3,
-                    "storage.unknown",
-                    "AI.sales@worker1",
-                    serde_json::json!({"a": 3}),
                 ),
             ],
         };
         let (rows, dropped, refused) = stream_rows(&batch, "RT.gateway.stream@worker1").unwrap();
         assert!(rows.is_empty());
-        assert_eq!(dropped, 3);
+        assert_eq!(dropped, 2);
         assert!(refused.is_empty());
     }
 

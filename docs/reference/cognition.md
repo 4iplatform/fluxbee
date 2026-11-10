@@ -516,8 +516,8 @@ nothing of cognition's.
   instances and its agents' own state; the VM snapshots cover it.
 - **SY.storage's tables:** until 0.1.103 cognition wrote its items to 8 `cognition_*` tables of
   SY.storage through the stream (`storage.cognition.*`) and read them back over the mesh
-  (`COGNITION_STATE_GET`). SY.storage drops those tables once at its start
-  (`drop_cognition_tables`), with the inbox rows of their subjects.
+  (`COGNITION_STATE_GET`). 0.1.103 dropped those tables, with the inbox rows of their subjects;
+  SY.storage creates none of them.
 
 ### 5.1 The clear: `COGNITION_CLEAR`
 

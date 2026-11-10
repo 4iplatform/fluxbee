@@ -562,7 +562,7 @@ calls use `/hives/motherbee/...`.
 ### Data on the motherbee
 
 - **PostgreSQL:** `fluxbee_identity` (tenants, ILKs, channels, aliases, tenant history) and
-  `fluxbee_storage` (`turns`, the `cognition_*` tables, `llm_usage`). The connection URL
+  `fluxbee_storage` (`turns`, `storage_inbox`, `llm_usage`). The connection URL
   (credentials and host, no database name) is a SY.vault secret with resource type `postgres` in
   the root tenant. `fluxbee-firstboot` stores it as `storage_postgres_url`, and each service adds
   its own database name.

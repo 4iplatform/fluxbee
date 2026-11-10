@@ -18,10 +18,11 @@ constant named without a path lives in the first one. The design and its decisio
 > `storage_inbox` into their base schema and removed the `storage_migrations` table. A database
 > created before 0.1.81 needs, once, `ALTER TABLE turns ALTER COLUMN message SET NOT NULL;` and,
 > after the upgrade, `DROP TABLE storage_migrations;` (`CREATE TABLE IF NOT EXISTS` does not change
-> an existing table). Since 0.1.83 nothing writes `turns.ctx` and `seq`; 0.1.84 drops them and their
-> index, once (§6.1). Since 0.1.103 SY.cognition keeps its state in its own file
-> (docs/cognition-hands-v1.md §11): its subjects are gone, and SY.storage drops its tables once
-> (§6.2).
+> an existing table). Since 0.1.83 nothing writes `turns.ctx` and `seq`, and 0.1.84 dropped them and
+> their index. Since 0.1.103 SY.cognition keeps its state in its own file
+> (docs/cognition-hands-v1.md §11): its subjects are gone, and 0.1.103 dropped its tables (§6.2).
+> Both drops were steps of every start until 0.1.125 removed them, every hive having passed them
+> (FINDINGS A-210).
 
 ---
 
@@ -185,11 +186,11 @@ SY.cognition: there, `cognition.turns` has no sink.
   database is `fluxbee_storage` (`STORAGE_DB_NAME`); if it does not exist, SY.storage creates it
   (`ensure_database_exists`).
 - **The schema** is ensured at every boot (`ensure_schema`): it creates the missing tables and
-  indexes (`TURNS_SCHEMA_SQL`, `INBOX_SCHEMA_SQL`, `COGNITION_SCHEMA_SQL`, `USAGE_SCHEMA_SQL`).
-  Each statement waits at most 5 s for its lock (`lock_timeout`, `SCHEMA_STEPS`); past that the
-  start fails and systemd retries, so a DDL never queues the table's readers and writers behind a
-  long transaction. There are no migrations: an existing table is left as it is, except that a
-  `turns` that still has `ctx` and `seq` loses them, once (§6.1).
+  indexes (`TURNS_SCHEMA_SQL`, `INBOX_SCHEMA_SQL`, `USAGE_SCHEMA_SQL`). Each statement waits at
+  most 5 s for its lock (`lock_timeout`, `SCHEMA_STEPS`); past that the start fails and systemd
+  retries, so a DDL never queues the table's readers and writers behind a long transaction. There
+  are no migrations: an existing table is left as it is, except that a `turns` made before the
+  writer columns gets them, once (§6.1).
 - **Three connections** (`Storage`):
   - a shared one, for processing and reads;
   - one for ingest, one transaction per batch;
@@ -300,22 +301,9 @@ One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`
   - `content`, the payload; `tags`, those of `payload.tags` or `meta.tags`, sorted and without
     repeats;
   - `message`, the whole message, as the router copied it.
-- **`ctx` and `seq`**, the key until 0.1.74, are gone; the protocol has no such fields (`Meta` in
-  `crates/fluxbee_sdk/src/protocol.rs`). 0.1.83 stopped writing them and kept them one release,
-  nullable, so that a rollback to 0.1.82 still started. A table that still has them loses both
-  once, with their index, in a step of `ensure_schema` (`drop_turns_ctx_seq`):
-  - it reads `information_schema.columns` first (`TURNS_CTX_SEQ_COLUMNS_SQL`), so a start with
-    nothing to drop takes no lock on `turns` for it;
-  - only while a column shows up, it runs `DROP INDEX IF EXISTS idx_turns_ctx_seq;` and
-    `ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq;` in one transaction,
-    under the same 5 s `lock_timeout`;
-  - then it logs `dropped the turns columns nothing writes since 0.1.83, and any index on them`,
-    with the columns it found.
-
-  A rollback to 0.1.83 still starts: it drops a `NOT NULL` only where it finds one, and writes
-  neither column. One to 0.1.82 does not: its start creates `idx_turns_ctx_seq` and exits without
-  the columns, until they are added back
-  (`ALTER TABLE turns ADD COLUMN ctx TEXT, ADD COLUMN seq BIGINT;`).
+- **`ctx` and `seq`**, the key until 0.1.74, are gone, with their index `idx_turns_ctx_seq`; the
+  protocol has no such fields (`Meta` in `crates/fluxbee_sdk/src/protocol.rs`). 0.1.84 dropped
+  them at its start, a step 0.1.125 removed (FINDINGS A-210): a new table never has them.
 - **`message`** is required (`NOT NULL`), like `content`.
 - **`ts`** is when the router copied the message (the time of the stream record). **`stored_at`**
   is when SY.storage wrote it: it is the order that a live reader follows, because a batch can
@@ -328,9 +316,8 @@ One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`
 
 SY.cognition wrote its items to 8 `cognition_*` tables until 0.1.103. It keeps its state in its own
 file since ([cognition-hands-v1](../cognition-hands-v1.md) §11; `docs/reference/cognition.md` §5).
-A start of SY.storage that finds one of those tables in the catalog drops them all, with the inbox
-rows of their subjects (`storage.cognition.%`), and says so in one line (`drop_cognition_tables`).
-A later start finds none and does nothing. A rollback to 0.1.102 creates them again, empty.
+0.1.103 dropped those tables at its start, with the inbox rows of their subjects
+(`storage.cognition.%`), a step 0.1.125 removed (FINDINGS A-210): SY.storage creates none of them.
 
 ### 6.3 `llm_usage`: LLM usage (0.1.79)
 

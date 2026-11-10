@@ -588,7 +588,8 @@ agent could come up on another hive as the same ILK. That is wrong since 0.1.83 
   - the envelopes, the reload over the mesh, the 5-minute idle check, the scope instances and the
     `cache`, `shm` and `memory.lance` paths are gone; `STATUS` reports the file (`store`).
 - **SY.storage:** the cognition handlers, tables and `COGNITION_STATE_GET` are gone;
-  `drop_cognition_tables` drops the tables and the inbox rows of their subjects once.
+  `drop_cognition_tables` drops the tables and the inbox rows of their subjects once (removed in
+  0.1.125, every hive having passed it; FINDINGS A-210).
 - **The router's stream** and **the Rust SDK:** `storage.cognition.*` and the SDK's cognition module
   are gone.
 - **`serde_json` reads floats back exactly** (`float_roundtrip`): without it a weight written to the
