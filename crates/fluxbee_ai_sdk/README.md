@@ -519,9 +519,8 @@ registered case ends saved as `completed` and is never deleted by the model.
   `TTL_EXCEEDED`), or one named as a notice or a reply (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any
   `*_RESPONSE`). `note_infrastructure_message(node_name, &msg)` logs it, a router notice as a WARN
   with its reason. An answer to the router's notice would go to the router's own UUID, and the two
-  would bounce it forever (FINDINGS A-112). SY.timer and the WF engine answer none of these either,
-  and also leave `ECHO` and `ECHO_REPLY` unanswered, which the Rust SDK no longer has (FINDINGS
-  A-218), until the Go SDK's release removes them there; nothing sends either.
+  would bounce it forever (FINDINGS A-112). SY.timer and the WF engine leave the same ones
+  unanswered (FINDINGS A-218).
 - **A tap copy never reaches it:** the runtime takes no message with `meta.via_tap` to
   `on_message` and answers none (`run_handler`, FINDINGS A-248), whatever its kind. Each copy is a
   debug line and counts in `tap_copies_ignored`, in the runtime's periodic `ai runtime metrics`

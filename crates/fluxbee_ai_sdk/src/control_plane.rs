@@ -102,12 +102,10 @@ pub fn control_caller_authorized(verb: &str, node_name: &str, sender: Option<&st
 /// request, so it gets no answer: the router made it (it carries no `src_l2_name`, which the router
 /// stamps on every message a node sends), as UNREACHABLE and TTL_EXCEEDED, or its name is a
 /// notice's or a reply's: HELLO, ANNOUNCE, WITHDRAW or any `*_RESPONSE`. SY.timer
-/// (`isInfrastructureMessage`) and wf-generic (`isNotice`) answer none of these either, and also
-/// leave ECHO and ECHO_REPLY unanswered, which the Rust SDK no longer has (FINDINGS A-218), until the
-/// Go SDK's release removes them there; nothing sends either. An answer to the router's own notice
-/// would go to the router's UUID, which no node has: the router would answer UNREACHABLE again, and
-/// the two would bounce it forever (FINDINGS A-112). The node checks it before anything else
-/// (`note_infrastructure_message` logs it).
+/// (`isInfrastructureMessage`) and wf-generic (`isNotice`) leave the same ones unanswered (FINDINGS
+/// A-218). An answer to the router's own notice would go to the router's UUID, which no node has:
+/// the router would answer UNREACHABLE again, and the two would bounce it forever (FINDINGS A-112).
+/// The node checks it before anything else (`note_infrastructure_message` logs it).
 pub fn is_infrastructure_message(msg: &Message) -> bool {
     let from_a_node = msg
         .routing

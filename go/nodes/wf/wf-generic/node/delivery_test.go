@@ -764,3 +764,44 @@ func TestASystemMessageIsNoWorkflowEvent(t *testing.T) {
 		t.Fatalf("a system message acted: %d instances, state %s, %d sends", len(rows), rows[0].CurrentState, len(disp.sent)-sent)
 	}
 }
+
+// FINDINGS A-218: the WF's notices are the AI nodes' and SY.timer's, name by name: what the router
+// made (no src_l2_name), and from a node HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED or a
+// system message without a name. Another system message from a node, as a TIMER_HELP meant for
+// SY.timer, is no notice, and is dropped unanswered all the same: it starts nothing and gets
+// nothing, from a node the WF starts from too.
+func TestTheNoticesAreTheAINodesAndSYTimers(t *testing.T) {
+	system := func(name string) sdk.Message {
+		msg := sdk.Message{
+			Routing: sdk.Routing{Src: "io-uuid", TraceID: "t-" + name},
+			Meta:    sdk.Meta{MsgType: sdk.SYSTEMKind},
+			Payload: json.RawMessage(`{}`),
+		}
+		if name != "" {
+			msg.Meta.Msg = &name
+		}
+		return onThread("conv-1", msg)
+	}
+	for _, name := range []string{sdk.MSGHello, sdk.MSGAnnounce, sdk.MSGWithdraw, sdk.MSGUnreachable, sdk.MSGTTLExceeded, ""} {
+		if !isNotice(from("IO.in@motherbee", system(name))) {
+			t.Fatalf("%q from a node is a notice", name)
+		}
+	}
+	if !isNotice(system(sdk.MsgTimerHelp)) {
+		t.Fatalf("a message the router made is a notice, whatever its name")
+	}
+
+	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
+	for _, name := range []string{sdk.MsgTimerHelp, sdk.MSGConfigChanged} {
+		msg := from("IO.in@motherbee", system(name))
+		if isNotice(msg) {
+			t.Fatalf("%s from a node is no notice", name)
+		}
+		if err := Dispatch(context.Background(), msg, rt); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(disp.sent) != 0 || rt.Registry.Count() != 0 {
+		t.Fatalf("a system message from a node was answered %v or started %d instances", disp.sent, rt.Registry.Count())
+	}
+}

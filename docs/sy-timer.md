@@ -265,7 +265,7 @@ All messages follow the standard Fluxbee envelope:
 - `meta.type`: always `"system"`. That is the wire key; the SDKs call the field `msg_type` (Rust) and `MsgType` (Go).
 - `meta.msg`: one of the verbs defined in section 7. Both SDKs also set `meta.action` to the verb.
 - Response: always `meta.msg = "TIMER_RESPONSE"`, with the same `trace_id` as the request.
-- Only requests are answered. A message the router made itself (it has no `routing.src_l2_name`: `UNREACHABLE`, `TTL_EXCEEDED`), `ECHO_REPLY` and any `*_RESPONSE` get no answer. The router's `UNREACHABLE` for a `TIMER_FIRED` (its `trace_id`) makes `SY.timer` send that fire again (§7.8). An unknown verb from a node is answered `TIMER_UNKNOWN_VERB`, and so is a request whose response does not fit in one frame (128 KiB).
+- Only requests are answered. A message the router made itself (it has no `routing.src_l2_name`: `UNREACHABLE`, `TTL_EXCEEDED`), a notice from a node (`HELLO`, `ANNOUNCE`, `WITHDRAW`, or a message without a name) and any `*_RESPONSE` get no answer: the AI nodes' rule and wf-generic's, name by name (`isInfrastructureMessage`, FINDINGS A-218). The router's `UNREACHABLE` for a `TIMER_FIRED` (its `trace_id`) makes `SY.timer` send that fire again (§7.8). An unknown verb from a node is answered `TIMER_UNKNOWN_VERB`, and so is a request whose response does not fit in one frame (128 KiB).
 
 ### 6.2 Verbs
 

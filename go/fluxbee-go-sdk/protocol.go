@@ -264,8 +264,6 @@ const (
 	MSGWithdraw              = "WITHDRAW"
 	MSGUnreachable           = "UNREACHABLE"
 	MSGTTLExceeded           = "TTL_EXCEEDED"
-	MSGEcho                  = "ECHO"
-	MSGEchoReply             = "ECHO_REPLY"
 	MSGConfigChanged         = "CONFIG_CHANGED"
 	MSGConfigGet             = "CONFIG_GET"
 	MSGConfigSet             = "CONFIG_SET"

@@ -1122,7 +1122,7 @@ Handlers:
 - Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` (since 0.1.90; the AI and IO nodes take the system kind only as control too).
 - Any other message — taken only from a node the definition names; matched against the running instance on its `meta.thread_id`, or, from a `start_from` node, if it is no reply and it matches the `input_schema`, creates a new instance on its thread; a message the WF takes nowhere may get `NOT_TAKEN` (§14.5).
 
-The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `ECHO`, `ECHO_REPLY`, `UNREACHABLE`, `TTL_EXCEEDED`, `TIMER_HELP`, or a system message without a name — SY.timer's rule and the AI nodes'.
+The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, or a system message without a name — SY.timer's rule and the AI nodes', name by name (FINDINGS A-218).
 
 Internal events emitted by `emit_internal_event` do **not** enter through this inbound loop. They are already bound to a specific instance and are drained from that instance's durable internal queue by the runtime itself.
 

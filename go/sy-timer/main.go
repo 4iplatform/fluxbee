@@ -302,10 +302,12 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 
 // isInfrastructureMessage reports whether msg gets no answer: the router made it (it carries no
 // routing.src_l2_name, which the router stamps on everything a node sends), or it is a notice or a
-// reply, not a request: wf-generic's rule (isNotice and neverAnswered), with every *_RESPONSE
-// (SY.timer awaits none). An answer to the router's UNREACHABLE would go to the router's
-// own UUID, which no node has: the router would answer UNREACHABLE again, and the two would bounce
-// it forever (a TIMER_FIRED for a node not connected yet starts it).
+// reply, not a request: HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED, a message without a
+// name, or any *_RESPONSE (SY.timer awaits none). It is the AI SDK's is_infrastructure_message, name
+// by name, and wf-generic's isNotice and neverAnswered (FINDINGS A-218). An answer to the router's
+// UNREACHABLE would go to the router's own UUID, which no node has: the router would answer
+// UNREACHABLE again, and the two would bounce it forever (a TIMER_FIRED for a node not connected yet
+// starts it).
 func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
 	if msg.SourceL2Name() == "" {
 		return true
@@ -316,8 +318,6 @@ func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
 		fluxbeesdk.MSGHello,
 		fluxbeesdk.MSGAnnounce,
 		fluxbeesdk.MSGWithdraw,
-		fluxbeesdk.MSGEcho,
-		fluxbeesdk.MSGEchoReply,
 		fluxbeesdk.MSGUnreachable,
 		fluxbeesdk.MSGTTLExceeded:
 		return true

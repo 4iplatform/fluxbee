@@ -183,18 +183,20 @@ func (rt *NodeRuntime) refuseWhileStoreDown(msg sdk.Message) error {
 
 // isNotice reports whether msg is no request and no workflow event, so it is dropped before
 // anything else and never answered: the router made it (it carries no routing.src_l2_name, which
-// the router stamps on every message a node sends), or it is a presence or liveness notice, a
-// router notice, or a system message without a name. An answer to the router's own notice would go
-// to the router's UUID, which no node has: the router would answer UNREACHABLE again, and the two
-// would bounce it forever (FINDINGS A-112). SY.timer's isInfrastructureMessage and the AI SDK's
-// is_infrastructure_message are the same rule; a WF also takes replies (isReply) as events.
+// the router stamps on every message a node sends), or it is a presence notice (HELLO, ANNOUNCE,
+// WITHDRAW), a router notice (UNREACHABLE, TTL_EXCEEDED), or a system message without a name. An
+// answer to the router's own notice would go to the router's UUID, which no node has: the router
+// would answer UNREACHABLE again, and the two would bounce it forever (FINDINGS A-112). SY.timer's
+// isInfrastructureMessage and the AI SDK's is_infrastructure_message are the same rule, name by name
+// (FINDINGS A-218); a WF also takes replies (isReply) as events. A system message that is none of
+// these, nor one of the node's verbs or a TIMER_FIRED, as a TIMER_HELP meant for SY.timer, is
+// dropped unanswered all the same: a system message is no workflow event (Dispatch).
 func isNotice(msg sdk.Message) bool {
 	if strings.TrimSpace(msg.SourceL2Name()) == "" {
 		return true
 	}
 	switch rawMsgName(msg) {
-	case sdk.MSGHello, sdk.MSGAnnounce, sdk.MSGWithdraw, sdk.MSGEcho, sdk.MSGEchoReply,
-		sdk.MSGUnreachable, sdk.MSGTTLExceeded, sdk.MsgTimerHelp:
+	case sdk.MSGHello, sdk.MSGAnnounce, sdk.MSGWithdraw, sdk.MSGUnreachable, sdk.MSGTTLExceeded:
 		return true
 	case "":
 		return sdk.IsSystemKind(msg.Meta.MsgType)

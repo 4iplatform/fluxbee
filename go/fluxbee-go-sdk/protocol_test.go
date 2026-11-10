@@ -119,7 +119,7 @@ func TestSourceL2NameReturnsStampedValue(t *testing.T) {
 			"ttl": 16,
 			"trace_id": "trace-x"
 		},
-		"meta": { "type": "system", "msg": "ECHO" },
+		"meta": { "type": "system", "msg": "NODE_STATUS_GET_RESPONSE" },
 		"payload": {}
 	}`)
 	var msg Message
@@ -132,7 +132,7 @@ func TestSourceL2NameReturnsStampedValue(t *testing.T) {
 }
 
 func TestSourceL2NameReturnsEmptyWhenAbsent(t *testing.T) {
-	msg, err := BuildSystemBroadcast("abc-uuid", "trace-x", MSGEcho, map[string]any{}, 1)
+	msg, err := BuildSystemBroadcast("abc-uuid", "trace-x", MSGOPAReload, map[string]any{}, 1)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestSourceL2NameReturnsEmptyWhenAbsent(t *testing.T) {
 // L2-LOOKUP-17: wire compatibility — src_l2_name absent in outbound, present in received
 
 func TestSerializeRoundtripWithoutSrcL2Name(t *testing.T) {
-	msg, err := BuildSystemMessage("uuid-sender", UnicastDestination("uuid-dst"), 8, "trace-rt", MSGEcho, map[string]any{"key": "value"})
+	msg, err := BuildSystemMessage("uuid-sender", UnicastDestination("uuid-dst"), 8, "trace-rt", MSGNodeStatusGet, map[string]any{"key": "value"})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestSerializeRoundtripWithSrcL2Name(t *testing.T) {
 			"ttl": 8,
 			"trace_id": "trace-rt2"
 		},
-		"meta": { "type": "system", "msg": "ECHO" },
+		"meta": { "type": "system", "msg": "NODE_STATUS_GET_RESPONSE" },
 		"payload": {}
 	}`)
 	var msg Message
