@@ -410,8 +410,9 @@ spoke's orchestrator answers, then:
   hive any more (900 s at most; a hive that did not answer still moves, for its automatic step). It
   follows only this call's update, and prints each hive's transitions in this run as they happen
   (answered, installed, settled, config applied, or once "on target" for a hive the run did not
-  move, which includes one only the background task moved or saw on the target, `by: background`),
-  with the seconds since the call and the record's own, and each hive left out with what moves it.
+  move, which includes one the background task moved, `by: background`, and one a read found
+  there, `seen`), with the seconds since the call and the record's own, and each hive left out with
+  what moves it.
   A held update passes with a warning naming the hives rolled back by the operator;
 - below 0.1.123 (deploying an older release again, the rollback), sends the core update to every
   spoke and waits until each spoke reports the motherbee's hash and settles;
@@ -445,11 +446,12 @@ On the motherbee:
 2. **Read it**: `curl -s http://127.0.0.1:8080/installation/update` (add `?history=true` for the
    closed ones). Its `state` is `open`, `held`, `done` or `superseded`. Each hive's `core` and
    `config` have a `state` (`on_target`, `pending`, `in_flight`, `excluded`, `unknown`), the last
-   `outcome` with its times, and `next`, what moves it. A hive moved onto the target outside the
-   update (its per-hive update, say) shows the read that saw it there as its outcome: `settled` for
-   a core, `ok` for a config, `by: background`, its `detail` naming the outcome it replaces. `GET
-   /versions` carries the summary (`installation_update`). A read makes SY.admin look again at the
-   hives off the target it has not looked at for 30 s.
+   `outcome` with its times, and `next`, what moves it. A hive found on the target where its last
+   outcome said it was not (moved by its per-hive update, say, or by an apply whose answer never
+   came) shows the read that found it there as its outcome: `settled` for a core, `ok` for a
+   config, marked `seen: true`, `by` whoever read it, its `detail` naming the outcome it replaces.
+   `GET /versions` carries the summary (`installation_update`). A read makes SY.admin look again at
+   the hives off the target it has not looked at for 30 s.
 3. **What it leaves as it is**, with why: a hive rolled back with `core_rollback` keeps its core
    (its config still goes) unless the run names it, `{"include_rolled_back": ["egress1"]}`; a copy
    edited by hand gets no config (restore it first); a hive before 0.1.122 gets its core first.

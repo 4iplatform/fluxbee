@@ -1200,7 +1200,8 @@ every hive is on it.
   - each hive's `core` and `config`: `state` (`on_target`, `pending`, `in_flight`, `excluded` with
     its `exclusion`, `unknown`), `reason`, `outcome` (`status`: `sent`, `ok`, `restarting`,
     `settled`, `sync_pending`, `error` with its `error_code`, `not_answered`, `excluded`; `by`:
-    `explicit`, `automatic` or `background`), and `next`, what moves it;
+    `explicit`, `automatic` or `background`; `seen: true` when a read found the hive on the target
+    and no attempt moved it there), and `next`, what moves it;
   - `automatic`: the automatic step's one attempt on the hive, when it made one.
 
   `GET /versions` and `get_installation` carry its summary (`installation_update`, `update`).

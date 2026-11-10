@@ -601,14 +601,15 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   a core's `answered_ms`, `installed_ms`, `settled_ms`; a config's `restarted`): `ok`,
   `restarting`, `settled`, `sync_pending` at the bound, `error` with its code, `not_answered`
   (never "not applied", P-13), and `excluded` with its reason; a read that finds a category on the
-  target outside the update records that too (the background task, below). A core watched past
-  its bound (300 s, `JSR_ADMIN_INSTALLATION_SETTLE_TIMEOUT_SECS`) ends `CORE_NOT_SETTLED` (it runs
-  the target, something open) or `CORE_NOT_INSTALLED`, and stays pending until its record changes
-  (F9: another update's start, or a new settle): its `next` says to run the update again or the
-  per-hive `update`, and nothing warns about it again in the meantime. One whose health gate rolled
-  it back is `CORE_UPDATE_ROLLED_BACK`; a `/versions` silent past the bound, `not_answered`. Each
-  `next` says what moves it; a hive that did not answer is promised the automatic step "unless it
-  leaves the hive alone" (rolled back, ahead, edited by hand).
+  target, its last outcome saying otherwise, records that too, marked `seen` (the background task,
+  below). A core watched past its bound (300 s, `JSR_ADMIN_INSTALLATION_SETTLE_TIMEOUT_SECS`) ends
+  `CORE_NOT_SETTLED` (it runs the target, something open) or `CORE_NOT_INSTALLED`, and stays
+  pending until its record changes (F9: another update's start, or a new settle): its `next` says
+  to run the update again or the per-hive `update`, and nothing warns about it again in the
+  meantime. One whose health gate rolled it back is `CORE_UPDATE_ROLLED_BACK`; a `/versions`
+  silent past the bound, `not_answered`. Each `next` says what moves it; a hive that did not
+  answer is promised the automatic step "unless it leaves the hive alone" (rolled back, ahead,
+  edited by hand).
 - **The background task** (`run_background`), in SY.admin, the motherbee only, while an update is
   open: it looks at each hive when its time comes, in a task of its own, and sleeps until the next
   one is due (F2):
@@ -642,10 +643,13 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
       what the read shows;
     - a category it finds on the target, its last outcome saying otherwise (`excluded`, an error,
       no answer), gets an outcome of the read: the category's own status on the target (`settled`
-      for a core, `ok` for a config), `by: background`, no attempt, the read's times, and a `detail`
-      naming the outcome it replaces. **Why** (A-204): a hive moved by its own per-hive `update`
-      read on the target with the last outcome a run had left, `excluded` by the automatic step on
-      8.x;
+      for a core, `ok` for a config), marked `seen`, no attempt, the read's times, and a `detail`
+      naming the outcome it replaces. Every read that decides does the same, `by` its own kind
+      (`record_step`, `seen_on_target`): this one (`background`), an explicit run's pass, the
+      automatic step, and the follow's config step once the core settled. **Why** (A-204): a hive
+      moved by its own per-hive `update` read on the target with the last outcome a run had left,
+      `excluded` by the automatic step on 8.x; a hive whose apply answered too late kept
+      `not_answered` once its automatic step found it applied;
   - **each hive by the open update's cadence:** the task's first look at a new update (a run's, a
     change's) forgets when the looks of the update it superseded had each hive due next (since
     0.1.124). **Why:** the due time is kept per hive, so a hive the superseded update read every
@@ -700,10 +704,10 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     given less, a hive that applies the version would read `not_answered`. A task that holds the
     hive longer keeps it: the change leaves the hive to it, nothing is sent, the record says so,
     and the answer's line is `left_to_task`, naming the task in `detail`, with `next`. **Why**
-    (FINDINGS A-205): unclaimed, the apply let the background task
-    read a hive just before it applied the version; that read's answer, back after the apply's
-    outcome, set the hive back to `pending`, and the update stayed open on a hive on the target
-    (32 s on 8.x, up to 10 min when no one reads the update);
+    (FINDINGS A-205): unclaimed, the apply let the background task read a hive just before it
+    applied the version; that read's answer, back after the apply's outcome, set the hive back to
+    `pending`, and the update stayed open on a hive on the target (32 s on 8.x, up to 10 min when
+    no one reads the update);
   - each hive's outcome is recorded as its own apply ends, from its own start to its own end, so
     its `elapsed_ms` is the answer's `timings_ms.hives`. **Why** (A-204): recorded once every apply
     had ended, every hive got the slowest one's time (85.5 s each on 8.x, for applies of about 2 s);
@@ -715,13 +719,14 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   not answer still moves, for its automatic step). It follows only this call's update (the one its
   answer names; before the answer, one the call opened or resumed, never one left from before) and
   prints each hive's transitions as this run's outcomes show them: answered, installed, settled,
-  config applied, or once "on target" for a hive it did not move. An outcome `by: background` is
-  never the run's (`this_run`, since 0.1.124): a core the background task found under way and
-  followed, or a read that saw the hive on the target, prints as "on target", never as settled or
-  config applied. The times are this script's from the call and SY.admin's own durations, never
-  the two clocks compared (F11). A held update passes
-  with a warning naming the hives the operator rolled back. A release before 0.1.123 keeps the core
-  update per spoke: deploying 0.1.122 again, the rollback, needs it.
+  config applied, or once "on target" for a hive it did not move. An outcome `by: background` (a
+  core the background task found under way and followed) or marked `seen` (a read, the run's
+  included, that found the hive on the target) is never the run's (`this_run`, since 0.1.124):
+  such a hive prints as "on target", never as settled or config applied with that outcome's times.
+  The times are this script's from the call and SY.admin's own durations, never the two clocks
+  compared (F11). A held update passes with a warning naming the hives the operator rolled back. A
+  release before 0.1.123 keeps the core update per spoke: deploying 0.1.122 again, the rollback,
+  needs it.
 - **Archi** follows an update its plan ran past the executor's answer (F3): every 10 s, up to
   600 s, while its hives only move (a core in flight, its config after it, a hive not read yet). A
   run is verified once the update is done or held (the held hives named, the operator's

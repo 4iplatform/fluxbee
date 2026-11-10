@@ -198,8 +198,8 @@ impl OutcomeStatus {
 /// Who ran an attempt: an explicit run (`update_installation`, `set_installation_ai`, and the
 /// background task finishing what that run started), the automatic step (and the background task
 /// finishing what it started), or the background task on its own, finishing an update it found
-/// under way (a core it did not send, a config apply SY.admin's restart cut), or reading a hive on
-/// the target that its last outcome said was not (moved there outside this update).
+/// under way (a core it did not send, a config apply SY.admin's restart cut). Each also reads a
+/// hive: an outcome of a read that found it on the target is marked `seen` ([`seen_on_target`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunKind {
@@ -253,6 +253,14 @@ pub(crate) struct Outcome {
     /// ([`core_record_signature`]). The hive is in flight again only once that record changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) record_seen: Option<String>,
+    /// A read found the category on the target, its last outcome saying otherwise: no attempt of
+    /// `by` moved it there ([`seen_on_target`], FINDINGS A-204). `ops.py` prints it as "on target".
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) seen: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Outcome {
@@ -271,6 +279,7 @@ impl Outcome {
             restarted: None,
             previous_update: None,
             record_seen: None,
+            seen: false,
         }
     }
 
@@ -2526,10 +2535,53 @@ async fn read_until_it_answers(
     }
 }
 
-/// A step that is not an act, as the state it leaves.
-fn record_step(updates: &Updates, id: &str, hive: &str, category: Category, step: &Step) {
+/// The outcome of a read, by `by` from `read_at` on, that found `category` on the target while its
+/// last outcome here says otherwise (excluded, an error, no answer): moved there outside the
+/// update (its per-hive update, say), or by an attempt whose answer never came. The category's own
+/// status on the target, marked `seen`, its detail naming the outcome it replaces (FINDINGS
+/// A-204). None when its last outcome says on the target, or there is none: it stands.
+fn seen_on_target(
+    updates: &Updates,
+    id: &str,
+    hive: &str,
+    category: Category,
+    by: RunKind,
+    read_at: u64,
+) -> Option<Outcome> {
+    let last = updates
+        .entry(id, hive)?
+        .category(category)
+        .outcome
+        .clone()
+        .filter(|last| last.status != category.on_target_status())?;
+    let mut seen = Outcome::new(category.on_target_status(), by, read_at, now_epoch_ms());
+    seen.seen = true;
+    seen.detail = Some(format!(
+        "a read of its /versions saw it on the target, after its last outcome here said {} ({})",
+        last.status.as_str(),
+        last.by.as_str()
+    ));
+    Some(seen)
+}
+
+/// A step that is not an act, as the state it leaves, decided by `by` on a read from `read_at` on:
+/// a category on the target its last outcome says is not gets the read's outcome
+/// ([`seen_on_target`]).
+fn record_step(
+    updates: &Updates,
+    id: &str,
+    hive: &str,
+    category: Category,
+    step: &Step,
+    by: RunKind,
+    read_at: u64,
+) {
     let (state, exclusion, reason, next) = match step {
-        Step::OnTarget => (Standing::OnTarget, None, None, None),
+        Step::OnTarget => {
+            let seen = seen_on_target(updates, id, hive, category, by, read_at);
+            updates.record(id, hive, category, Standing::OnTarget, None, seen, None);
+            return;
+        }
         Step::Act => return,
         Step::InFlight(why) => (Standing::InFlight, None, Some(why.clone()), None),
         Step::AfterCore(why) => (Standing::Pending, None, Some(why.clone()), None),
@@ -2796,7 +2848,7 @@ async fn run_claimed_hive(
             Step::Excluded { .. } => record_exclusion(updates, id, hive, category, step, kind),
             // Recorded below, with its outcome.
             Step::InFlight(_) if category == Category::Core => {}
-            _ => record_step(updates, id, hive, category, step),
+            _ => record_step(updates, id, hive, category, step, kind, started),
         }
     }
 
@@ -3519,6 +3571,7 @@ async fn follow_core(
         let now = now_epoch_ms();
         Outcome::new(OutcomeStatus::Restarting, RunKind::Background, now, now)
     });
+    let read_at = now_epoch_ms();
     let read = updates
         .read_versions(mesh, hive, Reader::Background, bounds)
         .await;
@@ -3581,7 +3634,7 @@ async fn follow_core(
                 Step::Excluded { .. } => {
                     record_exclusion(updates, id, hive, Category::Config, &decision.config, by)
                 }
-                step => record_step(updates, id, hive, Category::Config, step),
+                step => record_step(updates, id, hive, Category::Config, step, by, read_at),
             }
         }
         Some(CoreWatch::Failed { code, detail }) => {
@@ -3834,7 +3887,8 @@ pub(crate) async fn automatic_step(
 /// memory shows its orchestrator (read anyway when shared memory cannot be read). A core it finds
 /// under way becomes in flight, for the follow; one that did not settle stays pending until its
 /// record changes. A category whose last outcome came in after the read began keeps it; one the
-/// read finds on the target, its last outcome saying otherwise, records that it saw it there.
+/// read finds on the target, its last outcome saying otherwise, records that it saw it there
+/// ([`record_step`]), as every read that decides does.
 pub(crate) async fn recheck(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -3862,7 +3916,6 @@ pub(crate) async fn recheck(
     else {
         return;
     };
-    let seen_at = now_epoch_ms();
     updates.set_role(id, hive, text_of(Some(&snapshot), "role"));
     let known = updates.read(UpdatesFile::known_cores);
     let decision = decide(
@@ -3946,32 +3999,17 @@ pub(crate) async fn recheck(
                 );
                 updates.look_now(hive);
             }
-            // On the target, its last outcome saying otherwise (excluded, an error, no answer):
-            // moved there outside this update, by its per-hive update, say. The read records that
-            // it saw it there, as the category's own status on the target (FINDINGS A-204).
-            Step::OnTarget => {
-                let seen = current
-                    .outcome
-                    .as_ref()
-                    .filter(|last| last.status != category.on_target_status())
-                    .map(|last| {
-                        let mut seen = Outcome::new(
-                            category.on_target_status(),
-                            RunKind::Background,
-                            read_at,
-                            seen_at,
-                        );
-                        seen.detail = Some(format!(
-                            "a read of its /versions saw it on the target, after its last outcome \
-                             here said {} ({})",
-                            last.status.as_str(),
-                            last.by.as_str()
-                        ));
-                        seen
-                    });
-                updates.record(id, hive, category, Standing::OnTarget, None, seen, None);
-            }
-            step => record_step(updates, id, hive, category, step),
+            // On the target, its last outcome saying otherwise: the read's own outcome
+            // (FINDINGS A-204).
+            step => record_step(
+                updates,
+                id,
+                hive,
+                category,
+                step,
+                RunKind::Background,
+                read_at,
+            ),
         }
     }
 }

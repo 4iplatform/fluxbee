@@ -2242,6 +2242,7 @@ fn the_answers_stay_well_inside_a_mesh_frame() {
                 ]);
                 outcome.previous_update = Some("1731160000000".to_string());
                 outcome.record_seen = Some("1731160000000|1731160000001".to_string());
+                outcome.seen = true;
                 *entry.category_mut(category) = CategoryEntry {
                     state: Standing::Pending,
                     reason: Some(cut(&long)),
@@ -2736,8 +2737,8 @@ async fn a_read_records_a_hive_it_sees_on_the_target_after_another_outcome() {
         assert_eq!((slot.state, slot.exclusion), (Standing::OnTarget, None));
         let seen = slot.outcome.as_ref().expect("what the read saw");
         assert_eq!(
-            (seen.status, seen.by, seen.attempts),
-            (status, RunKind::Background, 0)
+            (seen.status, seen.by, seen.attempts, seen.seen),
+            (status, RunKind::Background, 0, true)
         );
         assert!(seen.started_at_ms >= read_from && seen.at_ms >= seen.started_at_ms);
         assert!(
@@ -2765,6 +2766,154 @@ async fn a_read_records_a_hive_it_sees_on_the_target_after_another_outcome() {
         (&egress.core.outcome, &egress.config.outcome)
     );
     assert_eq!(updates.settle_state(), Some(UpdateState::Done));
+}
+
+/// FINDINGS A-204, in every read that decides: the automatic step, an explicit run's pass and the
+/// follow's config step record a category they find on the target, its last outcome saying
+/// otherwise, as seen there, `by` their own kind, never keeping the old outcome; one whose last
+/// outcome says on the target keeps it.
+#[tokio::test]
+async fn every_read_records_a_hive_it_sees_on_the_target() {
+    let updates = Updates::load(&temp_state("installation-update-seen-everywhere"));
+    // egress1 did not answer the run, and comes back with the target applied after all (P-13);
+    // worker1, in error in this update, was moved by its per-hive updates; worker2's core restarts
+    // onto the release, and its copy, sync_pending at the run's bound, was applied meanwhile.
+    let mut worker2 = config_behind("worker2");
+    worker2["core"]["last_update"] =
+        json!({"phase": "restarting", "started_at_ms": "900", "updated": ["sy-orchestrator"]});
+    worker2["config"]["applied"] = json!({"version": 3, "sha256": SHA_V3});
+    let mesh = FakeMesh::new(vec![
+        motherbee_on_target(),
+        on_target("egress1"),
+        on_target("worker1"),
+        worker2,
+    ]);
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let id = open_update(
+        &updates,
+        "http",
+        &["motherbee", "egress1", "worker1", "worker2"],
+    );
+    let last = |hive: &str, category: Category, status: OutcomeStatus, state: Standing| {
+        let now = now_epoch_ms();
+        let mut outcome = Outcome::new(status, RunKind::Explicit, now, now);
+        outcome.error_code = (status == OutcomeStatus::Error).then(|| "RESTART_FAILED".to_string());
+        updates.record(&id, hive, category, state, None, Some(outcome), None);
+    };
+    for category in [Category::Core, Category::Config] {
+        last(
+            "egress1",
+            category,
+            OutcomeStatus::NotAnswered,
+            Standing::Pending,
+        );
+        last("worker1", category, OutcomeStatus::Error, Standing::Pending);
+    }
+    last(
+        "worker2",
+        Category::Core,
+        OutcomeStatus::Restarting,
+        Standing::InFlight,
+    );
+    last(
+        "worker2",
+        Category::Config,
+        OutcomeStatus::SyncPending,
+        Standing::Pending,
+    );
+    let (the_target, bounds) = (target(), quick());
+
+    automatic_step(
+        &updates,
+        dyn_mesh.as_ref(),
+        &id,
+        "egress1",
+        &the_target,
+        &bounds,
+    )
+    .await;
+    run_hive(
+        &updates,
+        dyn_mesh.as_ref(),
+        &id,
+        "worker1",
+        &the_target,
+        &[],
+        None,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        &bounds,
+    )
+    .await;
+    // The follow: worker2's core restarting, then settled; its config step after it.
+    for _ in 0..2 {
+        follow(
+            &updates,
+            dyn_mesh.as_ref(),
+            &id,
+            "worker2",
+            &the_target,
+            &bounds,
+        )
+        .await;
+    }
+
+    for (hive, by, said) in [
+        (
+            "egress1",
+            RunKind::Automatic,
+            "said not_answered (explicit)",
+        ),
+        ("worker1", RunKind::Explicit, "said error (explicit)"),
+    ] {
+        let entry = entry_of(&updates, hive);
+        for (slot, status) in [
+            (&entry.core, OutcomeStatus::Settled),
+            (&entry.config, OutcomeStatus::Ok),
+        ] {
+            assert_eq!(slot.state, Standing::OnTarget, "{hive}");
+            let seen = slot.outcome.as_ref().expect("what the read saw");
+            assert_eq!(
+                (seen.status, seen.by, seen.seen),
+                (status, by, true),
+                "{hive}"
+            );
+            assert!(
+                seen.detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(said)),
+                "{hive}: {seen:?}"
+            );
+        }
+    }
+    let worker2 = entry_of(&updates, "worker2");
+    let core = worker2.core.outcome.as_ref().expect("its core");
+    assert_eq!(
+        (worker2.core.state, core.status, core.seen),
+        (Standing::OnTarget, OutcomeStatus::Settled, false),
+        "the follow's own settle stands: {core:?}"
+    );
+    let config = worker2.config.outcome.as_ref().expect("its config");
+    assert_eq!(
+        (worker2.config.state, config.status, config.by, config.seen),
+        (
+            Standing::OnTarget,
+            OutcomeStatus::Ok,
+            RunKind::Explicit,
+            true
+        )
+    );
+    for hive in ["egress1", "worker1", "worker2"] {
+        assert!(mesh.sent_to(hive).is_empty(), "{hive}");
+    }
+    // The view says seen only of an outcome that is one.
+    let view = record_view(&updates.read(|file| file.open.clone()).expect("open"));
+    assert_eq!(
+        view["hives"]["worker1"]["core"]["outcome"]["seen"],
+        json!(true)
+    );
+    assert!(view["hives"]["worker2"]["core"]["outcome"]
+        .get("seen")
+        .is_none());
 }
 
 /// A hive's next look follows the open update's cadence: one the superseded update read every

@@ -884,12 +884,13 @@ superseded, include_rolled_back, elapsed_ms, message, pending, held?}`:
   outcome, next}`. `state` is `on_target`, `pending`, `in_flight` (a core restarting or settling,
   an update being sent), `excluded` (`exclusion`: `rolled_back`, `ahead`, `hand_edited`,
   `old_orchestrator`, `no_target`) or `unknown`. `outcome` is `{status, by, started_at_ms, at_ms,
-  elapsed_ms, attempts, error_code, detail, answered_ms, installed_ms, settled_ms, restarted}`:
-  `status` `sent`, `ok`, `restarting`, `settled`, `sync_pending`, `error` (`CORE_UPDATE_ROLLED_BACK`,
-  `CORE_NOT_SETTLED`, `CORE_NOT_INSTALLED`, `CORE_NOT_ON_TARGET`, or the hive's own code),
-  `not_answered` (never read as not applied) or `excluded`; `by` `explicit`, `automatic` or
-  `background` (a config the background task sent after a core it found under way, not one a run
-  sent; or a read of the background task's that found the category on the target, below);
+  elapsed_ms, attempts, error_code, detail, answered_ms, installed_ms, settled_ms, restarted,
+  seen}`: `status` `sent`, `ok`, `restarting`, `settled`, `sync_pending`, `error`
+  (`CORE_UPDATE_ROLLED_BACK`, `CORE_NOT_SETTLED`, `CORE_NOT_INSTALLED`, `CORE_NOT_ON_TARGET`, or the
+  hive's own code), `not_answered` (never read as not applied) or `excluded`; `by` `explicit`,
+  `automatic` or `background` (a config the background task sent after a core it found under way,
+  not one a run sent); `seen: true` (only then present) marks a read, by `by`, that found the
+  category on the target its last outcome said it was not: no attempt of its moved it (below);
 - `pending`: each hive not on the target, as `worker1 (core in_flight (restarting), config
   pending)`.
 
@@ -925,9 +926,12 @@ time comes, in a task of its own, and sleeps until the next one is due:
   stands (FINDINGS A-205: an apply that answered while the read was under way is newer than what
   the read shows); and for a category it finds on the target, its last outcome saying otherwise
   (`excluded`, an error, no answer), an outcome of the read: the category's own status on the
-  target (`settled` for a core, `ok` for a config), `by: background`, `attempts` 0, the read's
-  times, and a `detail` naming the outcome it replaces (A-204: a hive moved by its own per-hive
-  `update` kept the last outcome a run had left, `excluded` by the automatic step on 8.x);
+  target (`settled` for a core, `ok` for a config), `seen: true`, `attempts` 0, the read's times,
+  and a `detail` naming the outcome it replaces. Every read that decides does the same, `by` its
+  own kind (`record_step`): this one, an explicit run's pass, the automatic step, and the follow's
+  config step once the core settled (A-204: a hive moved by its own per-hive `update` kept the
+  last outcome a run had left, `excluded` by the automatic step on 8.x; a hive whose apply
+  answered too late kept `not_answered` once its automatic step found it applied);
 - **each hive by the open update's cadence:** the task's first look at a new update (a run's, a
   change's) forgets when the looks of the update it superseded had each hive due next (since
   0.1.124: the due time is kept per hive, and a hive the superseded update read every 10 min, which

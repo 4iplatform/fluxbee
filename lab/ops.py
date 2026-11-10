@@ -505,19 +505,22 @@ TRANSITIONS = ("on target", "answered", "installed", "settled", "config applied"
 def this_run(outcome, run_at_ms):
     """Whether an outcome is this run's: it started at or after the run's start, both on the
     motherbee's clock (an update the run resumed keeps its earlier runs' outcomes), and the run
-    made it. One `by: background` never is: the background task's own, a core it found under way
-    and followed, or a read that saw the hive on the target, moved outside the update."""
+    made it. One `by: background` never is (the background task's own: a core it found under way
+    and followed), nor one marked `seen`: a read, the run's included, that found the hive on the
+    target its last outcome said it was not, with no attempt of its own."""
     return bool(outcome) and run_at_ms is not None \
         and outcome.get("by") != "background" \
+        and not outcome.get("seen") \
         and (outcome.get("started_at_ms") or 0) >= run_at_ms
 
 
 def update_transitions(hive, entry, run_at_ms):
     """The transitions this run's outcomes show for a hive: its core update answered, the target
     installed, its update settled, its config applied. Each with the ms its record gives after the
-    attempt started (None when it gives none). A hive the run did not move (no outcome of its own:
-    older ones, or the background task's) shows once as "on target". The motherbee is the core's
-    reference: only its config."""
+    attempt started (None when it gives none). A hive on the target that the run did not move all
+    the way (a category with no outcome of its own: an older one, the background task's, or one
+    seen there) shows once as "on target", never as settled or config applied for that category.
+    The motherbee is the core's reference: only its config."""
     core = entry.get("core") or {}
     config = entry.get("config") or {}
     core_outcome = core.get("outcome") or {}
@@ -533,8 +536,8 @@ def update_transitions(hive, entry, run_at_ms):
             seen["settled"] = core_outcome.get("settled_ms")
     if config_ours and config.get("state") == "on_target":
         seen["config applied"] = config_outcome.get("elapsed_ms")
-    if not core_ours and not config_ours and core.get("state") == "on_target" \
-            and config.get("state") == "on_target":
+    moved = config_ours if hive == PRIMARY else core_ours and config_ours
+    if not moved and core.get("state") == "on_target" and config.get("state") == "on_target":
         seen["on target"] = None
     return seen
 
