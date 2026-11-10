@@ -29705,7 +29705,7 @@ async fn add_hive_flow(
 /// the SSH bootstrap / core-sync / systemd helpers but skips all worker-specific
 /// machinery (blob/dist/identity/syncthing) that an egress hive does not run.
 /// Host-specific NAT params come from the `add_hive` payload (spec §6.4); the
-/// egress host's own orchestrator applies the NAT locally at boot (§8 / Fase B).
+/// egress host's own orchestrator applies the NAT locally at boot (§8 / phase B).
 async fn add_egress_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
@@ -44233,7 +44233,7 @@ blob:
     /// Measured live: `restart_node` returned `version: 0.1.14` and the process was still
     /// `/var/lib/fluxbee/dist/runtimes/io.slack/0.1.13/bin/io-slack`.
     #[test]
-    fn reiniciar_recrea_la_unit_si_cambio_la_ruta_del_entrypoint() {
+    fn a_restart_recreates_the_unit_when_the_entrypoint_path_changed() {
         let plan = ManagedNodeLaunchPlan {
             node: PersistedManagedNode {
                 requested_runtime_version: "current".to_string(),
@@ -44290,7 +44290,7 @@ blob:
     /// It is pinned by reading the source because the property is one of ORDER: computing the
     /// intent has to come BEFORE the resolution, and the resolution has to use it.
     #[test]
-    fn arrancar_un_nodo_resuelve_la_intencion_no_la_version_guardada() {
+    fn starting_a_node_resolves_the_intent_not_the_stored_version() {
         let src = include_str!("sy_orchestrator.rs");
         let start = src
             .find("fn managed_node_launch_plan(")
@@ -44326,8 +44326,8 @@ blob:
     /// (`managed_spawn_disallowed_reason`) blocks SY.* and RT.gateway; no managed runtime has a
     /// systemd unit competing for the process.
     #[test]
-    fn io_blob_y_io_cloud_ahora_se_adoptan_como_runtimes_gestionados() {
-        for nombre in [
+    fn io_blob_and_io_cloud_are_adopted_as_managed_runtimes() {
+        for name in [
             "IO.cloud@motherbee",
             "IO.blob@motherbee",
             "io.cloud@motherbee",
@@ -44336,10 +44336,10 @@ blob:
             "WF.router@motherbee",
         ] {
             assert!(
-                managed_spawn_disallowed_reason(nombre).is_none(),
-                "{nombre} is a managed runtime: the boot pass HAS to relaunch it"
+                managed_spawn_disallowed_reason(name).is_none(),
+                "{name} is a managed runtime: the boot pass HAS to relaunch it"
             );
-            assert!(managed_reconcile_candidate_allowed(nombre));
+            assert!(managed_reconcile_candidate_allowed(name));
         }
     }
 
