@@ -15,7 +15,9 @@ REMOVED (operator decisions, 2026-09-28):
     /artifacts, each by its publication_id, never by its link's key) and takes each down
     (unpublish_artifact): the edge stops serving it and IO.blob releases its copy in
     blob/public/. A node that publishes a page after that has its purge refused: the pages come
-    down again, and its purge is asked once more. The reset needs SY.admin: without its answer it
+    down again, and its purge is asked once more. While a publish of the node is in flight, its
+    purge is refused too (the page may go up when the publish ends): it is asked again every 5 s
+    until the publish ends, 120 s at most. The reset needs SY.admin: without its answer it
     stops at the start (list_hives). When SY.admin answers but does not list the pages (an older
     SY.admin without the route answers 404, or its ledger cannot be read), the reset goes on,
     counts it as a problem, and names the pages that stay public from SY.admin's ledger, read
@@ -75,6 +77,12 @@ LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
 # SY.admin answers but does not list them. Each row holds its link's key, which is never printed.
 PUBLICATION_LEDGER = os.path.join(STATE_DIR, "state", "sy-admin", "publications.json")
 PAGE_DOWN = ("unpublished", "expired")
+# A node's purge that SY.admin refuses because a publish of the node is in flight (NODE_HAS_PAGES,
+# its detail saying so, FINDINGS A-233) is asked again every few seconds until the publish ends:
+# within SY.admin's budget for one publish (PUBLISH_ARTIFACT_BUDGET, 110 s).
+PUBLISH_IN_FLIGHT = "is in flight"
+PUBLISH_WAIT_SECS = 120
+PUBLISH_POLL_SECS = 5
 
 # Vault infrastructure that survives: edge bearers and edge TLS (two of fluxbee_sdk's
 # CLOUD_RESERVED_VAULT_KEY_PREFIXES), and the postgres secret fluxbee-firstboot writes. The third
@@ -451,20 +459,43 @@ def rm_path(path):
         os.remove(path)
 
 
+def publish_in_flight(status, resp):
+    """SY.admin refused a node's purge because a publish of the node is in flight (NODE_HAS_PAGES,
+    FINDINGS A-233): its page may go up when it ends. SY.wf-rules passes the refusal on in its
+    detail, so the text is read, as for the code."""
+    return not ok(status, resp) and "NODE_HAS_PAGES" in str(resp) and PUBLISH_IN_FLIGHT in str(resp)
+
+
+def purge_once_publishes_end(purge):
+    """The purge, asked again every PUBLISH_POLL_SECS while SY.admin refuses it for a publish of the
+    node in flight, which ends within SY.admin's budget for one (PUBLISH_WAIT_SECS at most)."""
+    status, resp = purge()
+    if not publish_in_flight(status, resp):
+        return status, resp
+    print("    a publish of the node is in flight: the purge waits for it to end")
+    deadline = time.time() + PUBLISH_WAIT_SECS
+    while publish_in_flight(status, resp) and time.time() < deadline:
+        time.sleep(PUBLISH_POLL_SECS)
+        status, resp = purge()
+    return status, resp
+
+
 def purge_once_pages_are_down(purge, pages):
     """A node's purge, a workflow's (wf_rules_delete) or a user node's (kill_node): SY.admin refuses
     it with NODE_HAS_PAGES while a page the node published is up (FINDINGS A-233), as for one it
-    published after [0]. Then the pages come down again and the purge is asked once more. `pages`
-    is [0]'s [done, failures]: the pages this take-down takes down add to it, and the pages it
-    leaves up are the failures now."""
-    status, resp = purge()
-    if ok(status, resp) or "NODE_HAS_PAGES" not in str(resp):
+    published after [0], and while a publish of the node is in flight, whose page may go up when it
+    ends. The purge waits for such a publish to end (purge_once_publishes_end), and one that did
+    not end in time is the purge's failure; then, for a page up, the pages come down again and the
+    purge is asked once more. `pages` is [0]'s [done, failures]: the pages this take-down takes
+    down add to it, and the pages it leaves up are the failures now."""
+    status, resp = purge_once_publishes_end(purge)
+    if ok(status, resp) or "NODE_HAS_PAGES" not in str(resp) or publish_in_flight(status, resp):
         return status, resp
     print("    a page of the node went up after [0]: the pages come down, then the purge again")
     done, failed = unpublish_pages()
     pages[0] += done
     pages[1] = failed
-    return purge()
+    return purge_once_publishes_end(purge)
 
 
 def kill_user_nodes(nodes, pages):

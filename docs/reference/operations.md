@@ -684,8 +684,12 @@ with a public page up is not purged (FINDINGS A-233; a purge never cascades into
 SY.admin answers `409 NODE_HAS_PAGES` before it sends anything, naming the node's pages by their
 `publication_id`. Take them down first: `GET /artifacts` lists them (`publisher_l2_name` is the
 node), `POST /artifacts/unpublish {"publication_id": ...}` takes one down; a ledger that cannot be
-read refuses the purge too (`PAGES_CHECK_FAILED`). The same holds for removing a stopped instance,
-`teardown_node`, and `purge_ilk` of the node's ILK. Otherwise:
+read refuses the purge too (`PAGES_CHECK_FAILED`). A publish of the node in flight refuses it the
+same way, `409 NODE_HAS_PAGES` saying that a publish of the node is in flight: its page is not in
+the ledger until the publish ends, within 110 s; then take its page down and purge again. From the
+purge's check until its answer, the node's own publishes answer `409 NODE_BEING_PURGED`. The same
+holds for removing a stopped instance, `teardown_node`, and `purge_ilk` of the node's ILK.
+Otherwise:
 
 1. stops the unit and clears `relaunch_on_boot`, so whatever fails after, the reconcile does not
    launch the node again;
@@ -775,7 +779,10 @@ answer it stops at its start, when it lists the hives, before it changes anythin
 3. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
    instances of `base-nodes.json`), on every hive. A node that published a page after step 1 has
    its purge, or its workflow's delete, refused with `NODE_HAS_PAGES`: the pages come down again,
-   and the purge is asked once more; a page that stays up leaves that node's failure;
+   and the purge is asked once more; a page that stays up leaves that node's failure. While a
+   publish of the node is in flight, the purge is refused the same way: it is asked again every
+   5 s until the publish ends (120 s at most), and then its page comes down like the others; a
+   publish that does not end in time leaves that node's failure;
 4. marks and purges every non-system ILK, deletes every vault secret except
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
    but the root. A tenant with a page still up is not purged (`TENANT_HAS_PAGES`): step 1 takes

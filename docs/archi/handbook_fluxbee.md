@@ -1033,6 +1033,11 @@ The ownership and call path are fixed:
   `publisher_l2_name` is the node down first (one `unpublish_artifact` step each), then purge it,
   in the same plan if the operator wants. A plain stop (`kill_node` without `purge_instance`) is
   never refused for a page.
+- While a publish of the node is in flight, its purge is refused the same way: `NODE_HAS_PAGES`,
+  its detail saying that a publish of the node is in flight. Its page is not listed yet: the
+  publish ends within 110 s. Tell the operator, then read `/artifacts` again, take the node's
+  pages down and stage the purge again. From the purge's check until its answer, the node's own
+  publishes are refused (`NODE_BEING_PURGED`).
 
 Rules for Archi:
 
@@ -1069,7 +1074,7 @@ Normal operator requests should not create or redesign these.
 ### 4.4.1 Node teardown semantics
 
 - `purge_instance=true` is a real tabula-rasa for orchestrator-owned node state: instance directory, timers, `node_ilk_map`, ILK, and dedicated vault secrets are removed. Routes, VPNs, and taps are not auto-deleted; teardown returns `routing_references` so the operator can clean those deliberately.
-- Public pages are not: a node with a page up is not purged (`NODE_HAS_PAGES`, FINDINGS A-233). Stage the `unpublish_artifact` steps of its pages before the purge (§4.3.1).
+- Public pages are not: a node with a page up, or with a publish in flight, is not purged (`NODE_HAS_PAGES`, FINDINGS A-233). Stage the `unpublish_artifact` steps of its pages before the purge (§4.3.1); for a publish in flight, wait for it to end (within 110 s) and take its page down too.
 
 ### 4.4.2 Clearing a hive's cognition
 

@@ -293,7 +293,8 @@ Delete is a reversible mark. Purge is a separate, final step.
 
 **`ILK_PURGE`** (`purge_ilk`): only a marked ILK (`ILK_NOT_DELETED` otherwise). It removes the
 ILK, its lookups and every alias that names it (`remove_ilk_physically`). SY.admin sends it only
-once the public pages of the ILK's node are down (`NODE_HAS_PAGES`, FINDINGS A-233,
+once the public pages of the ILK's node are down and no publish of the node is in flight
+(`NODE_HAS_PAGES`, FINDINGS A-233,
 [SY.admin](../nodes/sy-admin.md#publications-and-the-audit-log)).
 
 All three take two optional guards (`IlkDeleteRequest`, `check_ilk_tenant_scope`):

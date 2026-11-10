@@ -14,7 +14,10 @@ temporary directory:
 - no link's key is ever printed, whole or in part;
 - a node's purge that SY.admin refuses with NODE_HAS_PAGES (a page it published after the page
   step, FINDINGS A-233) is asked once more after the pages come down again; any other refusal is
-  not asked again.
+  not asked again;
+- a node's purge that SY.admin refuses because a publish of the node is in flight (NODE_HAS_PAGES,
+  its detail saying so, in a workflow's refusal too) is asked again until the publish ends, then
+  its page comes down; one that does not end in time fails the purge, counted.
 
 Usage: python3 scripts/factory_reset_pages_check.py
 """
@@ -77,16 +80,34 @@ def listed_row(record):
         "filename_original": record["blob_ref"]["filename_original"]}
 
 
+def in_flight_refusal(node, status=409, wrapped=False):
+    """SY.admin's refusal of a node's purge while a publish of the node is in flight, its detail as
+    publish_in_flight_detail writes it; `wrapped`, as SY.wf-rules passes it on in its own."""
+    detail = ("a publish of %s is in flight, and its page may go up when it ends (within 110s): "
+              "wait for it, take the node's pages down (GET /artifacts lists them, POST "
+              "/artifacts/unpublish takes one down by its publication_id), then purge it again"
+              % node)
+    if wrapped:
+        return status, {"status": "error", "error_code": "ORCHESTRATOR_ERROR",
+                        "error_detail": "NODE_HAS_PAGES: " + detail}
+    return status, {"status": "error", "action": "kill_node", "error_code": "NODE_HAS_PAGES",
+                    "error_detail": detail}
+
+
 class FakeAdmin:
     """SY.admin's two routes the page step uses, over a set of pages that are up, and a node's
-    purge (kill_node), which it refuses with NODE_HAS_PAGES while a page of that node is up."""
+    purge (kill_node), which it refuses with NODE_HAS_PAGES while a page of that node is up, or
+    while a publish of it is in flight: `in_flight` maps a node to how many purges its publish
+    refuses and the page it puts up when it ends (or None)."""
 
-    def __init__(self, pages, refuse=(), refuse_once=(), published_meanwhile=None, answer=None):
+    def __init__(self, pages, refuse=(), refuse_once=(), published_meanwhile=None, answer=None,
+                 in_flight=None):
         self.up = {page["publication_id"]: page for page in pages}
         self.refuse = set(refuse)
         self.refuse_once = set(refuse_once)
         self.meanwhile = published_meanwhile
         self.answer = answer
+        self.in_flight = dict(in_flight or {})
         self.unpublished = []
         self.purges = []
 
@@ -116,6 +137,14 @@ class FakeAdmin:
             assert body == {"force": False, "purge_instance": True}, body
             node = urllib.parse.unquote(path.rsplit("/", 1)[1])
             self.purges.append(node)
+            if node in self.in_flight:
+                refusals, page = self.in_flight[node]
+                if refusals > 0:
+                    self.in_flight[node] = (refusals - 1, page)
+                    return in_flight_refusal(node)
+                del self.in_flight[node]
+                if page is not None:
+                    self.up[page["publication_id"]] = page
             mine = [pid for pid, page in self.up.items() if page["publisher_l2_name"] == node]
             if mine:
                 return 409, {"status": "error", "action": "kill_node",
@@ -283,6 +312,54 @@ class NodePurgeTest(NoKey, unittest.TestCase):
         self.assertEqual((status, resp), (200, {"status": "ok"}))
         self.assertEqual(admin.unpublished, [late["publication_id"]])
         self.assertEqual(pages, [1, []])
+
+    def test_a_purge_waits_for_a_publish_in_flight_then_its_page_comes_down(self):
+        # SY.admin refuses the purge twice while the publish runs; it ends with its page up, which
+        # refuses the purge once more until the pages come down again.
+        self.reset.PUBLISH_POLL_SECS = 0
+        late = ledger_record()
+        admin = FakeAdmin([], in_flight={"AI.sales@worker1": (2, late)})
+        failed, pages, out = self.purge(admin, [("worker1", "AI.sales@worker1"),
+                                                ("worker1", "AI.quiet@worker1")])
+        self.assertEqual(failed, [])
+        self.assertEqual(admin.purges, ["AI.sales@worker1"] * 4 + ["AI.quiet@worker1"])
+        self.assertEqual(admin.unpublished, [late["publication_id"]])
+        self.assertEqual(pages, [3, []])
+        self.assertEqual(out.count("a publish of the node is in flight"), 1)
+        self.assertIn("went up after [0]", out)
+        self.assertIn("OK    kill+purge AI.sales@worker1", out)
+        self.assert_no_key(out, [late])
+
+    def test_a_publish_that_does_not_end_in_time_fails_the_purge_and_is_counted(self):
+        # No page of it is up yet: no take-down runs for it.
+        self.reset.PUBLISH_POLL_SECS = 0
+        self.reset.PUBLISH_WAIT_SECS = 0
+        admin = FakeAdmin([], in_flight={"AI.sales@worker1": (1000, None)})
+        failed, pages, out = self.purge(admin, [("worker1", "AI.sales@worker1")])
+        self.assertEqual([name for name, _, _ in failed], ["AI.sales@worker1"])
+        self.assertIn("NODE_HAS_PAGES", failed[0][2])
+        self.assertIn("in flight", failed[0][2])
+        self.assertEqual(admin.purges, ["AI.sales@worker1"])
+        self.assertEqual((pages, admin.unpublished), ([2, []], []))
+        self.assertNotIn("went up after [0]", out)
+        self.assertIn("FAIL  kill+purge AI.sales@worker1", out)
+
+    def test_a_publish_in_flight_is_read_in_a_workflows_refusal_too(self):
+        # SY.wf-rules passes SY.admin's refusal on in its detail, behind its own code.
+        self.reset.PUBLISH_POLL_SECS = 0
+        node = "WF.x@worker1"
+        for refusal in (in_flight_refusal(node), in_flight_refusal(node, 502, wrapped=True)):
+            self.assertTrue(self.reset.publish_in_flight(*refusal), refusal)
+            answers = [refusal, refusal, (200, {"status": "ok"})]
+            with contextlib.redirect_stdout(io.StringIO()):
+                status, _ = self.reset.purge_once_pages_are_down(lambda: answers.pop(0), [0, []])
+            self.assertEqual((status, answers), (200, []))
+        page_up = (409, {"status": "error", "error_code": "NODE_HAS_PAGES",
+                         "error_detail": "1 public page(s) of %s are up; take them down first" % node})
+        for answer in (page_up, (200, {"status": "ok"}),
+                       (502, {"status": "error", "error_code": "ORCHESTRATOR_ERROR",
+                              "error_detail": "SY.timer did not answer"})):
+            self.assertFalse(self.reset.publish_in_flight(*answer), answer)
 
 
 if __name__ == "__main__":
