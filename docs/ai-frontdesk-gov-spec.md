@@ -363,8 +363,10 @@ A registration can fail for a reason that may pass: `SY.identity` did not answer
   field): no error, so io.api and Cloud show none once `SY.identity` is back. The model reads the
   failure in `register_error`: it says the last attempt could not be done at the time and asks
   the person to confirm to try again, not as an error.
-- **No loop within a turn.** The prompt calls `ilk_register` at most once per turn: a later
-  confirmation is what retries.
+- **No loop within a turn.** The prompt calls `ilk_register` at most once per turn, and the code
+  holds it whatever the model does: a later call in the same turn gets the answer of the turn's
+  registration and sends nothing (a call that sent nothing, such as a candidate without its name,
+  does not count). A later confirmation is what retries.
 - **Final only when it cannot pass.** Any other error (`retryable: false`) closes the case as
   `completed_error`, and every later turn only repeats it.
 - **A case closed on a failure that may pass**, by an earlier version's prompt or by a model that

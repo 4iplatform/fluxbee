@@ -700,8 +700,8 @@ struct IlkRegisterTool {
     identity: GovIdentityConfig,
     bridge: Option<Arc<dyn IdentityCaller>>,
     retry: RegisterRetry,
-    /// Where the conversation's turn keeps the tool's last answer (`BehaviorContext`); `None` for
-    /// the handoff, which reads the answer itself.
+    /// Where the conversation's turn keeps the answer of the registration it sent
+    /// (`BehaviorContext`), one per turn; `None` for the handoff, which reads the answer itself.
     turn_answer: Option<RegisterAnswerSlot>,
 }
 
@@ -765,17 +765,18 @@ struct BehaviorContext {
     /// Whether a tool has run in this message's tool loop (`ToolRunWatch`): a failure after that
     /// is never answered as retryable, since sending the message again would run the tool again.
     tool_ran: AtomicBool,
-    /// What `ilk_register` answered last in this message's tool loop, if it ran: the turn's result
-    /// comes from its own attempt (FINDINGS A-216).
+    /// The answer of the registration `ilk_register` sent in this message's tool loop, if it sent
+    /// one: the turn's result comes from its own attempt, and a later call in the turn gets it
+    /// again instead of sending another (FINDINGS A-216).
     register_answer: RegisterAnswerSlot,
 }
 
-/// Where a conversation's turn keeps the last answer of its `ilk_register`.
+/// Where a conversation's turn keeps the answer of its one `ILK_REGISTER`.
 type RegisterAnswerSlot = Arc<std::sync::Mutex<Option<Value>>>;
 
 impl BehaviorContext {
-    /// The failure of this message's `ilk_register` when its last answer was one that may pass
-    /// (`retryable`); `None` when it did not run, registered, or failed for good.
+    /// The failure of this message's registration when it is one that may pass (`retryable`);
+    /// `None` when none was sent, it registered, or it failed for good.
     fn register_failed_for_now(&self) -> Option<FrontdeskRegisterErrorState> {
         let answer = self.register_answer.lock().ok()?.clone()?;
         let failed_for_now = answer.get("status").and_then(Value::as_str) == Some("error")
@@ -1525,7 +1526,8 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<()> {
         // Conversational: the tenant is only the ILK's (the thread state is the LLM's to write).
         // The email the person types is a claim; one an earlier handoff vouched for comes from the
-        // case's own record (`read_vouched_email`). Its answer is kept for the turn's result.
+        // case's own record (`read_vouched_email`). The turn keeps its registration's answer: the
+        // turn's result, and one ILK_REGISTER per turn.
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
             informed_tenant_id: None,
@@ -2648,13 +2650,19 @@ impl FunctionTool for IlkRegisterTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let answer = self.register(arguments).await?;
-        if let Some(turn_answer) = &self.turn_answer {
-            if let Ok(mut slot) = turn_answer.lock() {
-                *slot = Some(answer.clone());
-            }
+        // At most one ILK_REGISTER per turn, whatever the model does (the runner calls the tools
+        // one after another): a later call gets the answer of the turn's registration again, and
+        // nothing is sent. A call that sent nothing (a candidate without its name or email, a
+        // case without its ILK or tenant) leaves the turn its registration.
+        if let Some(sent) = self.turn_registration() {
+            tracing::warn!(
+                op = "ilk_register",
+                ilk_id = ?self.scoped_src_ilk,
+                "ilk_register called again in the same turn: the turn's registration answers it, nothing is sent"
+            );
+            return Ok(sent);
         }
-        Ok(answer)
+        self.register(arguments).await
     }
 }
 
@@ -2749,7 +2757,7 @@ impl IlkRegisterTool {
         );
         let (result, attempts) = self.send_register(payload).await;
 
-        match result {
+        let answer = match result {
             Ok(out) => {
                 // The ilk the person ended on: this one, or after a merge by email the one that
                 // already had that email.
@@ -2784,7 +2792,7 @@ impl IlkRegisterTool {
                         );
                     }
                 }
-                Ok(json!({
+                json!({
                     "status": "ok",
                     "registered": true,
                     "merged": merged,
@@ -2793,7 +2801,7 @@ impl IlkRegisterTool {
                     "effective_target": out.effective_target,
                     "trace_id": out.trace_id,
                     "identity_payload": out.payload
-                }))
+                })
             }
             Err(err) => {
                 tracing::warn!(
@@ -2803,9 +2811,19 @@ impl IlkRegisterTool {
                     error = %identity_error_log_summary(&err),
                     "ILK_REGISTER failed"
                 );
-                Ok(identity_error_to_tool_payload(&err))
+                identity_error_to_tool_payload(&err)
             }
+        };
+        // The turn's registration: a later call in the turn gets this answer again (`call`).
+        if let Some(Ok(mut slot)) = self.turn_answer.as_ref().map(|slot| slot.lock()) {
+            *slot = Some(answer.clone());
         }
+        Ok(answer)
+    }
+
+    /// The answer of the registration this turn sent, if it sent one (`turn_answer`).
+    fn turn_registration(&self) -> Option<Value> {
+        self.turn_answer.as_ref()?.lock().ok()?.clone()
     }
 
     /// Sends the case's `ILK_REGISTER`, and sends it again while it fails for a reason that may
@@ -6891,6 +6909,57 @@ mod tests {
             kept_case(&state)["register_error"]["error_code"],
             "DB_NOT_READY"
         );
+    }
+
+    /// At most one ILK_REGISTER per turn, whatever the model does: a later `ilk_register` in the
+    /// turn gets the answer of the turn's registration and sends nothing, so it can neither
+    /// register again without the vouched email the first one used nor turn a registration into a
+    /// failure. A call that sent nothing does not count.
+    #[tokio::test]
+    async fn a_turn_sends_at_most_one_registration() {
+        let identity = ScriptedIdentity::new(&[
+            IdentityAnswer::Registered,
+            IdentityAnswer::Rejected("DB_NOT_READY"),
+        ]);
+        let (node, state) = test_node_with_identity(&identity);
+        state.0.lock().expect("thread state").insert(
+            vouched_email_key(TEST_ILK),
+            json!({ "email": "ana@example.com" }),
+        );
+        save_case(&state, awaiting_case());
+        let ctx = turn_ctx();
+        let registry = node.build_tool_registry(&ctx).expect("registry");
+        let register = registry.get("ilk_register").expect("ilk_register");
+
+        let unnamed = register
+            .call(json!({ "identity_candidate": { "name": " ", "email": "ana@example.com" } }))
+            .await
+            .expect("tool call");
+        assert_eq!(unnamed["error_code"], "invalid_identity_candidate");
+        assert_eq!(identity.calls(), 0);
+
+        let first = register.call(register_ana()).await.expect("tool call");
+        assert_eq!(first["status"], "ok");
+        let again = register.call(register_ana()).await.expect("tool call");
+        assert_eq!(again, first);
+        assert_eq!(identity.calls(), 1);
+
+        // The model saves the case as registered: the turn answers so.
+        save_case(
+            &state,
+            json!({
+                "status": "completed",
+                "collected": { "name": "Ana", "email": "ana@example.com" },
+                "tenant_id": TEST_TENANT,
+                "registration_status": "complete"
+            }),
+        );
+        let result = node
+            .build_frontdesk_result_for_conversation(&ctx, "Done.".to_string(), None)
+            .await
+            .expect("result");
+        assert_eq!(result.status, "ok");
+        assert_eq!(kept_case(&state)["status"], "completed");
     }
 
     /// A model that closes the case on a failure that may pass does not end it: the turn of that

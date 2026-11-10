@@ -252,6 +252,12 @@ Each retry logs `ILK_REGISTER failed for a reason that may pass; sending it agai
 failure `ILK_REGISTER failed` with its `attempts`. The tool's error answer says `retryable`.
 Registering again is safe: SY.identity replaces the identification of an ILK registered twice.
 
+A conversational turn sends at most one `ILK_REGISTER`, whatever the model does
+(`IlkRegisterTool::call`): a later `ilk_register` in the same turn gets the answer of the turn's
+registration, kept in `BehaviorContext::register_answer`, and sends nothing, with a WARN `ilk_register
+called again in the same turn`. A call that sent nothing (no name or email, no ILK, no tenant) does
+not count.
+
 The email goes in exactly one of the two keys (`person_identification`, with the tool's
 `email_vouched`):
 
