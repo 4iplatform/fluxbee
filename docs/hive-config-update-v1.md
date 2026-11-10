@@ -34,9 +34,10 @@ This is the single place for the topic.
 ## 1. What it is, from outside
 
 A spoke's `hive.yaml` is written once, at its join: `add_hive` writes it over SSH from the
-motherbee's settings of that moment. Nothing writes it again but `set_storage`, which changes
-`storage.path` only. So whatever the installation decides after a join never reaches that hive.
-Three cases bite today:
+motherbee's settings of that moment, and nothing writes it again. `set_storage`, which changes
+`storage.path` only, writes the motherbee's own file and no spoke's: SY.admin sends it to its own
+hive's orchestrator (`action_routes_via_local_orchestrator`), which never forwards it. So whatever
+the installation decides after a join never reaches that hive. Three cases bite today:
 
 - **The AI model.** SY.cognition on worker1 reads its model from worker1's `hive.yaml`, written
   at its join. When the installation moved to Claude (0.1.72), worker1's file was edited by hand;
@@ -72,7 +73,7 @@ Three cases bite today:
 | --- | --- | --- | --- |
 | `hive_id`, `role` | the hive's `hive.yaml` | the join | never travels |
 | The control path: `wan.*`, `identity.sync.*` | the hive's `hive.yaml` | the join | never travels: a wrong value cuts the mesh that would carry the fix |
-| Local: `storage.path`, `blob.path`, `blob.sync.api_port`, `blob.sync.data_dir`, `dist.path`, a worker's `egress`, the ingress's `edge` and SSH table, the motherbee's `admin`, `architect`, `acme`, `web`, `egress` | the hive's `hive.yaml` | the join; the hive's own actions (`set_storage`) | never travels |
+| Local: `storage.path`, `blob.path`, `blob.sync.api_port`, `blob.sync.data_dir`, `dist.path`, a worker's `egress`, the ingress's `edge` and SSH table, the motherbee's `admin`, `architect`, `acme`, `web`, `egress` | the hive's `hive.yaml` | the join; on the motherbee, `set_storage` (its own `storage.path`, §1) | never travels |
 | `system_nodes` by role, with its order and waits | the release: the code, by role | a release | with the core's binaries |
 | The blob's and dist's topology by role (`enabled`, `sync.enabled`, `public_enabled`, the tool) | the release: the code, by role | a release | with the core's binaries |
 | The frontdesk's name (`government.identity_frontdesk`) | the hive's `hive.yaml` (since 2026-11-10; first planned in the code) | the join | never travels: on a worker it is the only key that names the motherbee |
@@ -438,8 +439,18 @@ The operator's change and the update with category `config`, live and checked on
 ## 5. `hive.yaml`, the hive's own
 
 - **It holds** the hive's identity, its control path, and its local paths, ports and sections.
-- **One writer**, under one lock, atomically: the join and the hive's own actions. `set_storage`
-  wrote it with a plain `fs::write` (D-14, P-17, A-13).
+- **One writer**, under one lock, atomically: the join and the hive's own actions (D-14, P-17,
+  A-13). As built:
+  - **The motherbee's file:** past the install (the .deb copies the example only when there is
+    none) and the operator's hand, `set_storage` alone writes it (§1). It writes atomically since
+    0.1.125: a temporary file beside it, then a rename (`write_file_atomic`, mode 0644; FINDINGS
+    A-224). It used to be a plain `fs::write`, which a crash or a full disk could leave truncated,
+    and the orchestrator does not start on such a file. Its writes come one at a time: the
+    orchestrator takes SY.admin's actions one after another (`run_admin_worker`).
+  - **A spoke's file:** its join alone writes it, whole, over SSH and under the motherbee's lock on
+    that hive (`lock_hive_topology`), with `sudo tee`: in place, not atomically.
+  - **Not built:** a lock on the file itself, so a hand edit made during a `set_storage` can be
+    lost; and an atomic write at the join.
 - **The join writes it** without the release's keys and without `ai`.
 
 ## 6. The installation's update, SY.admin's
@@ -925,8 +936,9 @@ They raised 70 findings, many of them the same seen from several lenses:
   - the ingress's: `:27542`.
 
   Then `ADD_HIVE_FINALIZE` runs on the spoke (`:24236`).
-- **After the join,** only `set_storage` writes the file, and only `storage.path`. It round-trips
-  the YAML through serde, so the comments go.
+- **After the join,** nothing writes a spoke's file. `set_storage` writes the motherbee's own, and
+  only `storage.path` (§1). It round-trips the YAML through serde, so the comments go; since
+  0.1.125 it writes atomically (§5).
 - **The motherbee's file at an install:** `deb-postinst` copies the example only when there is no
   `hive.yaml`.
 - **The start** (`bootstrap_local`, `:1658`) checked its role's binaries in `dist/core/bin` before

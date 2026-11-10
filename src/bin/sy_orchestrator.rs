@@ -33092,6 +33092,8 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// `set_storage`: writes `storage.path` into this hive's hive.yaml and keeps its other keys (the
+/// file round-trips through serde, so its comments go).
 fn persist_storage_path_in_hive(config_dir: &Path, path: &str) -> Result<(), OrchestratorError> {
     let hive_path = config_dir.join("hive.yaml");
     let data = fs::read_to_string(&hive_path)?;
@@ -33124,7 +33126,10 @@ fn persist_storage_path_in_hive(config_dir: &Path, path: &str) -> Result<(), Orc
     );
 
     let serialized = serde_yaml::to_string(&root)?;
-    fs::write(hive_path, serialized)?;
+    // ATOMIC (temp sibling + rename), not a bare `fs::write`: a crash or a full disk mid-write
+    // leaves the old file whole, where a write in place could leave a truncated hive.yaml, and the
+    // orchestrator does not start on one (FINDINGS A-224).
+    write_file_atomic(&hive_path, serialized.as_bytes())?;
     Ok(())
 }
 
@@ -39300,6 +39305,50 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(names, expected, "the write left no temp of its own");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A-224: `set_storage` replaces hive.yaml with a temp sibling and a rename, never writing the
+    /// file in place: the file it read keeps its bytes (a second name for it still reads them, as
+    /// a crash mid-write would leave them), the new one carries the path and every other key, and
+    /// no temp is left beside it.
+    #[test]
+    fn set_storage_replaces_hive_yaml_atomically_and_keeps_its_other_keys() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("fluxbee-a224-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let hive_yaml = dir.join("hive.yaml");
+        let before = "hive_id: motherbee\nrole: motherbee\nwan:\n  listen: 0.0.0.0:9000\n\
+                      storage:\n  path: /var/lib/fluxbee\n  note: kept\nblob:\n  path: /var/lib/fluxbee/blob\n";
+        fs::write(&hive_yaml, before).unwrap();
+        let read = dir.join("hive.yaml.read");
+        fs::hard_link(&hive_yaml, &read).unwrap();
+
+        persist_storage_path_in_hive(&dir, "/srv/fluxbee").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&read).unwrap(),
+            before,
+            "never written in place"
+        );
+        assert_ne!(
+            fs::metadata(&hive_yaml).unwrap().ino(),
+            fs::metadata(&read).unwrap().ino(),
+            "a new file, renamed over the old name"
+        );
+        assert_eq!(fs::metadata(&hive_yaml).unwrap().mode() & 0o7777, 0o644);
+        let after: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&hive_yaml).unwrap()).unwrap();
+        let mut expected: serde_yaml::Value = serde_yaml::from_str(before).unwrap();
+        expected["storage"]["path"] = serde_yaml::Value::String("/srv/fluxbee".to_string());
+        assert_eq!(after, expected);
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["hive.yaml", "hive.yaml.read"], "no temp left");
         fs::remove_dir_all(&dir).unwrap();
     }
 
