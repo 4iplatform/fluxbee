@@ -774,10 +774,11 @@ answer it stops at its start, when it lists the hives, before it changes anythin
 
 It keeps the installation, `/etc/fluxbee`, the vault master key, TLS, the spokes (with their SSH
 and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and the history,
-SY.admin's publication ledger included: its rows say how each page went down. It never touches
-the blob store: the blobs the nodes wrote stay in `blob/active/` and `blob/staging/`; only the
-pages' copies in `blob/public/` go with their pages (IO.blob removes a copy once no page shares
-it). Re-running is safe; a summary goes to `/var/lib/fluxbee/state/factory-reset.log`.
+SY.admin's publication ledger included: its rows say how each page went down, for 30 days after
+it did (FINDINGS A-231). It never touches the blob store: the blobs the nodes wrote stay in
+`blob/active/` and `blob/staging/`; only the pages' copies in `blob/public/` go with their pages
+(IO.blob removes a copy once no page shares it). Re-running is safe; a summary goes to
+`/var/lib/fluxbee/state/factory-reset.log`.
 
 ## Certificates (ACME)
 

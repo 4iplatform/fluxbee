@@ -1157,7 +1157,11 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/var/lib/fluxbee/state/sy-admin/publications.json`, and asks the public edge to serve it under
   `/public/<key>` (`handle_publish_artifact`). The edge is `admin.public_edge_node`, or the one
   connected ingress hive (`resolve_public_edge_node`). Expiry: default 1 day, 60 s to 30 days
-  (`PUBLICATION_*_SECS`). The sweep retires expired ones every 600 s.
+  (`PUBLICATION_*_SECS`). The sweep retires expired ones every 600 s. The ledger keeps a page's
+  row for 30 days once the page is down, `expired` or `unpublished` (since its `released_at`, or
+  its `expires_at` for a row without one); each sweep first drops the rows down for longer, and
+  keeps every other row (`drop_old_down_publications`, `PUBLICATION_LEDGER_KEEP_DOWN_SECS`,
+  FINDINGS A-231).
 - **A producer on a worker** (FINDINGS A-81) promotes its blob there, and Syncthing brings it to
   the motherbee about 10 s later. Before the publication lock, unless the blob is in the
   motherbee's `active/` already, SY.admin asks the producer's hive to scan its blob folder
@@ -1523,7 +1527,8 @@ the same entries (`caller_hive_role`).
 ## State on disk
 
 - `/var/lib/fluxbee/state/sy-admin/command-log/`: the audit log.
-- `/var/lib/fluxbee/state/sy-admin/publications.json`: the publication ledger.
+- `/var/lib/fluxbee/state/sy-admin/publications.json`: the publication ledger; a page's row stays
+  30 days after the page went down.
 - `/var/lib/fluxbee/state/sy-admin/acme.json`: the ACME client's state, written atomically (no
   key): the account URL per directory, the order in flight, a certificate waiting to be served,
   the last attempt and test, the last 20 issued certificates, the backoff, the renewal plan, the

@@ -86,6 +86,11 @@ const PUBLICATION_MIN_EXPIRES_SECS: u64 = 60;
 /// publications whose `expires_at` has passed. 10 min — coarse on purpose: TTLs are ≥60s but
 /// measured in hours/days, so a late reap is harmless and a tight loop would only add churn.
 const PUBLICATION_EXPIRY_SWEEP_SECS: u64 = 600;
+/// How long the publication ledger keeps a page's row once the page is down, `expired` or
+/// `unpublished` (FINDINGS A-231): the expiry sweep drops the rows down for longer
+/// (`drop_old_down_publications`), so the ledger no longer grows with every page published, and
+/// keeps every other row.
+const PUBLICATION_LEDGER_KEEP_DOWN_SECS: u64 = 30 * 86_400;
 /// One `publish_artifact` in all, under the 120 s ai.generic waits for its answer: each step
 /// (the wait for the blob, the publication lock, the curate, the edge's publish) gets what is
 /// left, up to its own limit.
@@ -6863,6 +6868,20 @@ fn publication_is_down(record: &AdminPublicationRecord, now: u64) -> bool {
     record.status == "unpublished" || record.status == "expired" || record.expires_at <= now
 }
 
+/// Drops from `ledger` the rows of the pages down, `expired` or `unpublished`, for longer than
+/// `PUBLICATION_LEDGER_KEEP_DOWN_SECS` at `now` (FINDINGS A-231): since their `released_at`, or
+/// their `expires_at` for a row that has none. Every other row stays: a page that is up, one whose
+/// publish or take-down stopped half-way, and one down more recently. Answers how many it dropped.
+fn drop_old_down_publications(ledger: &mut AdminPublicationLedger, now: u64) -> usize {
+    let before = ledger.publications.len();
+    ledger.publications.retain(|_, record| {
+        let down = record.status == "unpublished" || record.status == "expired";
+        let down_since = record.released_at.unwrap_or(record.expires_at);
+        !(down && now.saturating_sub(down_since) > PUBLICATION_LEDGER_KEEP_DOWN_SECS)
+    });
+    before - ledger.publications.len()
+}
+
 /// Takes a page that is up down, `unpublish_artifact`'s work, which the factory reset asks for
 /// each page: the edge removes it (the row goes to `edge_removed`), then IO.blob releases its copy
 /// (`unpublished`), the ledger written after each. The caller holds the publication lock and
@@ -7592,8 +7611,9 @@ async fn unpublish_edge_blob(
 /// actually retires them. On a fixed interval it retires every publication whose deadline has
 /// passed, driving the SAME `edge_removed -> released` transition as an operator
 /// `unpublish_artifact` so both the edge allowlist row and the curated `public/` blob are
-/// reclaimed. It NEVER deletes ledger rows: a reaped publication settles at status `"expired"`
-/// (vs `"unpublished"` for an explicit revoke) so the audit trail survives.
+/// reclaimed. A reaped publication settles at status `"expired"` (vs `"unpublished"` for an
+/// explicit revoke) so the audit trail survives; the row goes once the page has been down for
+/// `PUBLICATION_LEDGER_KEEP_DOWN_SECS` (FINDINGS A-231, `drop_old_down_publications`).
 async fn run_publication_expiry_sweep(ctx: AdminContext, client: Arc<RouterDispatcher>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(PUBLICATION_EXPIRY_SWEEP_SECS));
     // A stalled tick (io.blob/edge transiently down) must not stack up a burst of catch-up
@@ -7613,6 +7633,8 @@ async fn run_publication_expiry_sweep(ctx: AdminContext, client: Arc<RouterDispa
 /// `edge_removed` from a prior crash — resumes from where it stopped. A single record failing to
 /// retire (edge/io.blob transiently down) is logged and left for the next tick; it never blocks
 /// the rest of the batch. Returns `Err` only for a ledger load/persist failure (whole pass aborts).
+/// First, under the same short lock, the rows of pages down for longer than the ledger keeps them
+/// go (`drop_old_down_publications`).
 async fn sweep_expired_publications_once(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -7626,8 +7648,17 @@ async fn sweep_expired_publications_once(
     // the record against the freshly-loaded ledger.
     let due: Vec<String> = {
         let _publication_guard = ctx.publication_lock.lock().await;
-        let ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
+        let mut ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
         let now = Utc::now().timestamp().max(0) as u64;
+        let dropped = drop_old_down_publications(&mut ledger, now);
+        if dropped > 0 {
+            persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger)?;
+            tracing::info!(
+                dropped,
+                keep_down_secs = PUBLICATION_LEDGER_KEEP_DOWN_SECS,
+                "publication ledger dropped the rows of pages down for longer than it keeps them"
+            );
+        }
         ledger
             .publications
             .values()
@@ -38210,6 +38241,88 @@ mod tests {
             assert_eq!(entry["action"], "unpublish_artifact");
             assert_eq!(entry["params"], logged, "{params}");
         }
+    }
+
+    // --- the ledger keeps a page's row for a while once it is down (FINDINGS A-231) ----------
+
+    /// A page of `PAGE_PUBLISHER` in `status`, taken down at `released_at`, expiring at
+    /// `expires_at`.
+    fn page_down(
+        status: &str,
+        released_at: Option<u64>,
+        expires_at: u64,
+    ) -> AdminPublicationRecord {
+        let mut page = published_page(PAGE_PUBLISHER);
+        page.status = status.to_string();
+        page.released_at = released_at;
+        page.expires_at = expires_at;
+        page
+    }
+
+    /// A row of a page down, expired or unpublished, goes once it has been down for longer than
+    /// the ledger keeps it: since its released_at, else its expires_at. A row down for that long
+    /// exactly stays, and so does every other row.
+    #[test]
+    fn the_ledger_drops_only_the_rows_down_for_longer_than_it_keeps_them() {
+        let now = 100 * 86_400;
+        let keep = PUBLICATION_LEDGER_KEEP_DOWN_SECS;
+        let gone = [
+            page_down("unpublished", Some(now - keep - 1), u64::MAX),
+            page_down("expired", Some(now - keep - 1), now - keep - 60),
+            page_down("expired", None, now - keep - 1),
+        ];
+        let kept = [
+            page_down("unpublished", Some(now - keep), u64::MAX),
+            page_down("expired", Some(now - 60), now - 120),
+            page_down("unpublished", None, now - 60),
+            page_down("published", None, u64::MAX),
+            page_down("curated", None, now - keep - 1),
+            page_down("edge_removed", None, now - keep - 1),
+        ];
+        let mut ledger = AdminPublicationLedger::default();
+        for page in gone.iter().chain(kept.iter()) {
+            ledger
+                .publications
+                .insert(page.publication_id.clone(), page.clone());
+        }
+        assert_eq!(drop_old_down_publications(&mut ledger, now), gone.len());
+        let mut left: Vec<&String> = ledger.publications.keys().collect();
+        left.sort();
+        let mut expected: Vec<&String> = kept.iter().map(|page| &page.publication_id).collect();
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(drop_old_down_publications(&mut ledger, now), 0);
+    }
+
+    /// The expiry sweep drops those rows (FINDINGS A-231), and asks the edge and IO.blob nothing
+    /// when no page is due; the rows of the pages up or down lately stay.
+    #[tokio::test]
+    async fn the_expiry_sweep_drops_the_rows_of_pages_down_for_long() {
+        let (ctx, mut harness) = opa_test_admin("ledger-keep-down");
+        let now = Utc::now().timestamp().max(0) as u64;
+        let long_ago = now - PUBLICATION_LEDGER_KEEP_DOWN_SECS - 3_600;
+        let lately = now - 3_600;
+        let old_unpublished = page_down("unpublished", Some(long_ago), u64::MAX);
+        let old_expired = page_down("expired", Some(long_ago), long_ago - 60);
+        let new_unpublished = page_down("unpublished", Some(lately), u64::MAX);
+        let up = published_page(PAGE_PUBLISHER);
+        seed_publications(
+            &ctx,
+            &[&old_unpublished, &old_expired, &new_unpublished, &up],
+        );
+        sweep_expired_publications_once(&ctx, &ctx.rpc)
+            .await
+            .expect("swept");
+        let ledger = load_admin_publication_ledger(&ctx.publication_ledger_path).expect("ledger");
+        let mut left: Vec<&String> = ledger.publications.keys().collect();
+        left.sort();
+        let mut expected = vec![&new_unpublished.publication_id, &up.publication_id];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
     }
 
     // --- list_published_artifacts and a tenant's purge (FINDINGS A-212) --------------------
