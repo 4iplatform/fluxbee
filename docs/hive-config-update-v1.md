@@ -562,7 +562,9 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   - a hive another task holds (F7): one that only reads it is waited for, within its read's bound;
     one that acts on it (the follow applying its config, the automatic step) keeps it, and the hive
     is recorded as left to that task, naming it and its update (this one or the superseded one),
-    with `next`: never skipped without a word;
+    with `next`: never skipped without a word. A holder that ended meanwhile is none: the hive is
+    claimed (`claim_for_run`, since 0.1.124; before, the run left the hive "to another task, which
+    has just ended");
   - it waits until the hive's orchestrator answers (120 s from the run's start,
     `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`): right after an install the motherbee's router
     may not have the spokes back (0.1.56);
@@ -588,9 +590,10 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
 - **Outcomes** per hive and category, each with its times (`started_at_ms`, `at_ms`, `elapsed_ms`;
   a core's `answered_ms`, `installed_ms`, `settled_ms`; a config's `restarted`): `ok`,
   `restarting`, `settled`, `sync_pending` at the bound, `error` with its code, `not_answered`
-  (never "not applied", P-13), and `excluded` with its reason. A core watched past its bound
-  (300 s, `JSR_ADMIN_INSTALLATION_SETTLE_TIMEOUT_SECS`) ends `CORE_NOT_SETTLED` (it runs the
-  target, something open) or `CORE_NOT_INSTALLED`, and stays pending until its record changes
+  (never "not applied", P-13), and `excluded` with its reason; a read that finds a category on the
+  target outside the update records that too (the background task, below). A core watched past
+  its bound (300 s, `JSR_ADMIN_INSTALLATION_SETTLE_TIMEOUT_SECS`) ends `CORE_NOT_SETTLED` (it runs
+  the target, something open) or `CORE_NOT_INSTALLED`, and stays pending until its record changes
   (F9: another update's start, or a new settle): its `next` says to run the update again or the
   per-hive `update`, and nothing warns about it again in the meantime. One whose health gate rolled
   it back is `CORE_UPDATE_ROLLED_BACK`; a `/versions` silent past the bound, `not_answered`. Each
@@ -617,6 +620,16 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     10 min (`JSR_ADMIN_INSTALLATION_SLOW_CHECK_SECS`). A read sets its states as a run would decide
     them, nothing sent: a hive the operator moves with a per-hive `update` counts, and the update
     closes;
+  - **what such a read records** (`recheck`), category by category, since 0.1.124:
+    - nothing, when the category's last outcome came in after the read began: that outcome stands.
+      **Why** (FINDINGS A-205): an apply that answered while the read was under way is newer than
+      what the read shows;
+    - a category it finds on the target, its last outcome saying otherwise (`excluded`, an error,
+      no answer), gets an outcome of the read: the category's own status on the target (`settled`
+      for a core, `ok` for a config), `by: background`, no attempt, the read's times, and a `detail`
+      naming the outcome it replaces. **Why** (A-204): a hive moved by its own per-hive `update`
+      read on the target with the last outcome a run had left, `excluded` by the automatic step on
+      8.x;
   - **an immediate look,** which never blocks the action: a per-hive `update` or `core_rollback`
     on a hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at
     once; a read of `get_installation_update` or of `/versions` makes it look at each hive off the
@@ -647,14 +660,31 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   version it wrote as the target's file and the motherbee's core as its core, the reference: a hive
   that comes back behind on its core gets its core too, once, by the automatic step, then the
   version. The target differs from an open update's, so it supersedes it, and the new update
-  starts with every hive `unknown`: the background task reads each one again (the motherbee alone
-  is recorded on its core at once). Its pass is stage 3c's apply, each hive's outcome recorded. A
-  hive that did not answer stays pending, and the automatic step finishes it when it answers
-  again: the gate "egress1 down across a config change, then back". A hive that joins after the
-  change has applied no version: it gets it at the next explicit run, whose config update restarts
-  its readers once (the background task only reads it). When the registry cannot be read or the
-  motherbee's own core is rolled back, no update opens and the answer says why. Its answer is
-  3c's, with `update: {id, state}` (or `{id: null, not_opened}`).
+  starts with every hive `unknown`: the background task reads each one again once the apply ended
+  (the motherbee alone is recorded on its core at once). A hive that did not answer stays pending,
+  and the automatic step finishes it when it answers again: the gate "egress1 down across a config
+  change, then back". A hive that joins after the change has applied no version: it gets it at the
+  next explicit run, whose config update restarts its readers once (the background task only reads
+  it). When the registry cannot be read or the motherbee's own core is rolled back, no update opens
+  and the answer says why. Its answer is 3c's, with `update: {id, state}` (or `{id: null,
+  not_opened}`). Its pass is stage 3c's apply, as the update's (`apply_change_on_hive`, since
+  0.1.124):
+  - each hive is claimed while it applies, as an explicit run claims it (F7): a task that only
+    reads it is waited for, within its read's bound; one that acts on it (the follow applying its
+    config, the automatic step or an explicit run's pass, of the update the change superseded)
+    keeps it, and the change leaves the hive to it: nothing is sent, the record says so, and the
+    answer's line is `left_to_task`, naming the task in `detail`, with `next`. **Why** (FINDINGS
+    A-205): unclaimed, the apply let the background task read a hive just before it applied the
+    version; that read's answer, back after the apply's outcome, set the hive back to `pending`, and
+    the update stayed open on a hive on the target (32 s on 8.x, up to 10 min when no one reads the
+    update);
+  - each hive's outcome is recorded as its own apply ends, from its own start to its own end, so
+    its `elapsed_ms` is the answer's `timings_ms.hives`. **Why** (A-204): recorded once every apply
+    had ended, every hive got the slowest one's time (85.5 s each on 8.x, for applies of about 2 s);
+  - once the apply ended, the background task looks at each hive at once (`look_now`): not when
+    the update opens, when it would read the hives the apply is about to claim, and not when a look
+    of the superseded update had the hive due (up to 10 min later: the cadence is the hive's, not
+    the update's).
 - **`ops.py deploy`** calls `POST /installation/update` with `{reason: "deploy <version>"}` once the
   motherbee is on the release and the spokes answer, from 0.1.123 on, and reads the update every 3
   s until it is done or held, or until nothing moves a hive any more (900 s at most; a hive that did

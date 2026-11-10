@@ -717,12 +717,15 @@ node_check, timings_ms}`:
   `error_detail`: `VERSION_MISMATCH` for a copy past the version, `INSTALLATION_HASH_MISMATCH` for
   a copy of the version with another hash, `RESTART_FAILED`, `CONFIG_RECORD_FAILED` (its readers
   took the version, and its record could not be written), or `MANIFEST_INVALID` from an
-  orchestrator before 0.1.122, which takes no category `config`) or `not_answered` (`detail`), with
-  `attempts` and `elapsed_ms`; a hive not ok gets `next`, what finishes it by its error code
-  (`installation_next_step`): the same update for `sync_pending`, no answer, `RESTART_FAILED` and
-  `CONFIG_RECORD_FAILED`; the core first for `MANIFEST_INVALID`; the copy restored for
-  `INSTALLATION_HASH_MISMATCH`; the later version for `VERSION_MISMATCH`. Never "not applied"
-  (P-13): a hive that did not answer may hold the version already;
+  orchestrator before 0.1.122, which takes no category `config`), `not_answered` (`detail`) or,
+  since 0.1.124, `left_to_task` (`detail`: another task of the installation's update was acting on
+  the hive, so the change sent it nothing; below), with `attempts` and `elapsed_ms`; a hive not ok
+  gets `next`, what finishes it by its error code (`installation_next_step`): the same update for
+  `sync_pending`, no answer, `RESTART_FAILED` and `CONFIG_RECORD_FAILED`; the core first for
+  `MANIFEST_INVALID`; the copy restored for `INSTALLATION_HASH_MISMATCH`; the later version for
+  `VERSION_MISMATCH`; `update_installation` once that task ends, or the per-hive update, for
+  `left_to_task` (`installation_hive_left_json`). Never "not applied" (P-13): a hive that did not
+  answer may hold the version already;
 - `skipped`: each hive the registry holds whose join did not finish, `{hive, role, status,
   join_phase, next}` (`installation_skipped_hives`): its join may have copied the file and started
   SY.cognition; finish its join or remove it, then `update` it with category `config`. It does not
@@ -741,11 +744,22 @@ second while one runs is refused first, `409 INSTALLATION_UPDATE_RUNNING`, writi
   hive that comes back behind on its core gets its core too, once, by the automatic step, then the
   version;
 - the target differs from an open update's, so the change supersedes it, and the new update starts
-  with every hive `unknown`: the background task reads each one again (only the motherbee, the
+  with every hive `unknown`: the background task reads each one again, looking at each hive at
+  once when the apply ended, not when the superseded update had it due (only the motherbee, the
   reference, is recorded on its core at once);
-- its apply is the update's pass: each hive's outcome is recorded there, and `update: {id, state}`
-  is in the answer. A hive that did not answer stays pending, and the automatic step finishes it
-  once when it answers again;
+- its apply is the update's pass (`installation_update::apply_change_on_hive`, since 0.1.124), and
+  `update: {id, state}` is in the answer:
+  - each hive is claimed while it applies, as `update_installation`'s pass claims it: a task that
+    only reads it is waited for, within its read's bound; one that acts on it (the follow applying
+    its config, the automatic step or an explicit run's pass, of the update the change superseded)
+    keeps it, and the change leaves the hive to it, recorded, its line `left_to_task`. No read of
+    the background task is recorded over a hive while it applies (FINDINGS A-205: a read taken just
+    before the apply, its answer back after the apply's outcome, set the hive back to `pending`);
+  - each hive's outcome is recorded as its own apply ends, from its own start to its own end: its
+    `elapsed_ms` is the answer's `timings_ms.hives` (A-204: once every apply had ended, every hive
+    got the slowest one's time);
+  - a hive that did not answer stays pending, and the automatic step finishes it once when it
+    answers again;
 - a hive that joins after the change takes the file with its join and has applied no version: it
   gets the version at the next explicit run (`update_installation`), whose config update restarts
   its readers once; the background task only reads it;
@@ -815,7 +829,8 @@ What it does (`handle_update_installation`, `run_explicit`):
    - a hive another task holds: one that only reads it is waited for (its read's bound); one that
      acts on it (the follow applying its config, the automatic step) keeps it, and the hive is
      recorded as left to that task, naming it, the update (this one or the superseded one) and how
-     long it has been under way, with `next`. Never left unrecorded;
+     long it has been under way, with `next`. Never left unrecorded. A holder that ended meanwhile
+     is none: the hive is claimed (`claim_for_run`, which `set_installation_ai`'s apply shares);
    - it waits until the hive's orchestrator answers (120 s from the run's start,
      `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`);
    - its core, when not on the target: `SYSTEM_UPDATE {category: "core", manifest_version: 0,
@@ -862,7 +877,7 @@ superseded, include_rolled_back, elapsed_ms, message, pending, held?}`:
   `CORE_NOT_SETTLED`, `CORE_NOT_INSTALLED`, `CORE_NOT_ON_TARGET`, or the hive's own code),
   `not_answered` (never read as not applied) or `excluded`; `by` `explicit`, `automatic` or
   `background` (a config the background task sent after a core it found under way, not one a run
-  sent);
+  sent; or a read of the background task's that found the category on the target, below);
 - `pending`: each hive not on the target, as `worker1 (core in_flight (restarting), config
   pending)`.
 
@@ -890,6 +905,14 @@ time comes, in a task of its own, and sleeps until the next one is due:
   not settle (`CORE_NOT_SETTLED`, `CORE_NOT_INSTALLED`) stays pending while its record is the one
   it saw then: its `next` says to run the update again or the per-hive `update`, and it is in
   flight again only once its record changes;
+- **what such a read records** (`recheck`, for this look and the one above), category by category,
+  since 0.1.124: nothing when the category's last outcome came in after the read began, which
+  stands (FINDINGS A-205: an apply that answered while the read was under way is newer than what
+  the read shows); and for a category it finds on the target, its last outcome saying otherwise
+  (`excluded`, an error, no answer), an outcome of the read: the category's own status on the
+  target (`settled` for a core, `ok` for a config), `by: background`, `attempts` 0, the read's
+  times, and a `detail` naming the outcome it replaces (A-204: a hive moved by its own per-hive
+  `update` kept the last outcome a run had left, `excluded` by the automatic step on 8.x);
 - **an immediate look,** which never blocks the action: a per-hive `update` or `core_rollback` on a
   hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at once; a
   read of `get_installation_update` or of `/versions` makes it look at each hive off the target it

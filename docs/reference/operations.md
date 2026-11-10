@@ -444,9 +444,11 @@ On the motherbee:
 2. **Read it**: `curl -s http://127.0.0.1:8080/installation/update` (add `?history=true` for the
    closed ones). Its `state` is `open`, `held`, `done` or `superseded`. Each hive's `core` and
    `config` have a `state` (`on_target`, `pending`, `in_flight`, `excluded`, `unknown`), the last
-   `outcome` with its times, and `next`, what moves it. `GET /versions` carries the summary
-   (`installation_update`). A read makes SY.admin look again at the hives off the target it has not
-   looked at for 30 s.
+   `outcome` with its times, and `next`, what moves it. A hive moved onto the target outside the
+   update (its per-hive update, say) shows the read that saw it there as its outcome: `settled` for
+   a core, `ok` for a config, `by: background`, its `detail` naming the outcome it replaces. `GET
+   /versions` carries the summary (`installation_update`). A read makes SY.admin look again at the
+   hives off the target it has not looked at for 30 s.
 3. **What it leaves as it is**, with why: a hive rolled back with `core_rollback` keeps its core
    (its config still goes) unless the run names it, `{"include_rolled_back": ["egress1"]}`; a copy
    edited by hand gets no config (restore it first); a hive before 0.1.122 gets its core first.
@@ -509,11 +511,12 @@ first version. On the motherbee:
    `sy-cognition` and `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker. AI nodes take
    it at their next request, SY.admin's executor and Archi at their next use. Nothing else restarts.
 4. **The answer**: `ok` (200) when every hive applied it; `partial` (202) names the hives that have
-   not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered` or `error`,
-   each with `next`, what finishes it. The version is written either way. `skipped` names each hive
-   whose join did not finish: finish its join or remove it, then update it as below. `GET
-   /versions` shows each hive's copy (`config.state`, `config.applied`), and this finishes one
-   hive:
+   not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered`, `error` or
+   `left_to_task` (another task of the installation's update was acting on it, named in `detail`,
+   so nothing was sent to it), each with `next`, what finishes it. The version is written either
+   way. `skipped` names each hive whose join did not finish: finish its join or remove it, then
+   update it as below. `GET /versions` shows each hive's copy (`config.state`, `config.applied`),
+   and this finishes one hive:
 
    ```bash
    curl -sS -X POST http://127.0.0.1:8080/hives/worker1/update \

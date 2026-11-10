@@ -106,6 +106,14 @@ impl Category {
             Category::Config => "config",
         }
     }
+
+    /// What an outcome says of the category on the target: a core settled, a config applied.
+    fn on_target_status(self) -> OutcomeStatus {
+        match self {
+            Category::Core => OutcomeStatus::Settled,
+            Category::Config => OutcomeStatus::Ok,
+        }
+    }
 }
 
 /// Where one hive stands in one category.
@@ -190,7 +198,8 @@ impl OutcomeStatus {
 /// Who ran an attempt: an explicit run (`update_installation`, `set_installation_ai`, and the
 /// background task finishing what that run started), the automatic step (and the background task
 /// finishing what it started), or the background task on its own, finishing an update it found
-/// under way (a core it did not send, a config apply SY.admin's restart cut).
+/// under way (a core it did not send, a config apply SY.admin's restart cut), or reading a hive on
+/// the target that its last outcome said was not (moved there outside this update).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunKind {
@@ -2382,14 +2391,14 @@ fn next_unanswered(hive: &str, category: Category, target: &Target) -> String {
     )
 }
 
-/// An apply's outcome, as an [`Outcome`], with its error code.
+/// An apply's outcome, as an [`Outcome`] from `started_at_ms` to `at_ms`, with its error code.
 fn applied_outcome(
     applied: &InstallationApplied,
     by: RunKind,
     started_at_ms: u64,
+    at_ms: u64,
 ) -> (Outcome, Option<String>) {
-    let now = now_epoch_ms();
-    let mut outcome = Outcome::new(OutcomeStatus::Ok, by, started_at_ms, now);
+    let mut outcome = Outcome::new(OutcomeStatus::Ok, by, started_at_ms, at_ms);
     outcome.attempts = applied.attempts;
     let code = match &applied.outcome {
         InstallationApplyOutcome::Ok(answer) => {
@@ -2541,6 +2550,30 @@ fn core_unchanged_since_not_settled(entry: &HiveEntry, snapshot: &Value) -> bool
     })
 }
 
+/// An explicit run's mark on a hive (`update_installation`'s pass, `set_installation_ai`'s apply),
+/// as `what`: a holder that is only reading the hive is waited for, up to `wait_until`; one that
+/// acts on it keeps it, and None. A holder that ended meanwhile is no holder: the mark is taken.
+async fn claim_for_run<'a>(
+    updates: &'a Updates,
+    hive: &str,
+    what: &str,
+    id: &str,
+    wait_until: tokio::time::Instant,
+) -> Option<Claim<'a>> {
+    loop {
+        if let Some(claim) = updates.claim(hive, what, id) {
+            return Some(claim);
+        }
+        match updates.holder(hive) {
+            None => continue,
+            Some(holder) if holder.what == READING && tokio::time::Instant::now() < wait_until => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Some(_) => return None,
+        }
+    }
+}
+
 /// One explicit run's pass on one hive, once no other task acts on it: [`run_claimed_hive`]. A
 /// holder that is only reading the hive is waited for, within its read's bound; one that acts on
 /// it is not, and the hive is recorded as left to it, never left unrecorded.
@@ -2557,19 +2590,8 @@ pub(crate) async fn run_hive(
     bounds: &Bounds,
 ) {
     let wait_until = tokio::time::Instant::now() + bounds.read + Duration::from_secs(5);
-    let claim = loop {
-        if let Some(claim) = updates.claim(hive, "the explicit run", id) {
-            break Some(claim);
-        }
-        let reading = updates
-            .holder(hive)
-            .is_some_and(|holder| holder.what == READING);
-        if !reading || tokio::time::Instant::now() >= wait_until {
-            break None;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let Some(_claim) = claim else {
+    let Some(_claim) = claim_for_run(updates, hive, "the explicit run", id, wait_until).await
+    else {
         left_to_holder(updates, id, hive);
         return;
     };
@@ -2588,8 +2610,9 @@ pub(crate) async fn run_hive(
     .await;
 }
 
-/// A hive another task acts on: the run leaves it to that task and says so in the record.
-fn left_to_holder(updates: &Updates, id: &str, hive: &str) {
+/// A hive another task acts on: the run leaves it to that task and says so in the record. What it
+/// says.
+fn left_to_holder(updates: &Updates, id: &str, hive: &str) -> String {
     let holder = updates.holder(hive);
     let since = holder.as_ref().map_or(0, |holder| {
         now_epoch_ms().saturating_sub(holder.since_ms) / 1000
@@ -2626,6 +2649,7 @@ fn left_to_holder(updates: &Updates, id: &str, hive: &str) {
         }
     });
     updates.look_now(hive);
+    reason
 }
 
 /// One run on one hive (an explicit run's pass, or the automatic step), whose mark the caller
@@ -2808,7 +2832,7 @@ async fn core_update(
         "manifest_hash": core_target.manifest_hash,
     });
     let applied = ask(mesh, hive, &payload, bounds).await;
-    let (mut outcome, code) = applied_outcome(&applied, kind, started);
+    let (mut outcome, code) = applied_outcome(&applied, kind, started, now_epoch_ms());
     outcome.previous_update = previous;
     match &applied.outcome {
         InstallationApplyOutcome::Ok(answer) => {
@@ -2965,11 +2989,22 @@ async fn config_update(
         "manifest_hash": config.sha256,
     });
     let applied = ask(mesh, hive, &payload, bounds).await;
-    record_config_applied(updates, id, hive, target, &applied, kind, started);
+    record_config_applied(
+        updates,
+        id,
+        hive,
+        target,
+        &applied,
+        kind,
+        started,
+        now_epoch_ms(),
+    );
 }
 
-/// One hive's config apply, recorded: on the target when it applied it; otherwise pending, with
-/// what finishes it. `set_installation_ai`'s apply records here too.
+/// One hive's config apply, from `started_at_ms` to `at_ms`, recorded: on the target when it
+/// applied it; otherwise pending, with what finishes it. `set_installation_ai`'s apply records here
+/// too ([`apply_change_on_hive`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_config_applied(
     updates: &Updates,
     id: &str,
@@ -2978,8 +3013,9 @@ pub(crate) fn record_config_applied(
     applied: &InstallationApplied,
     kind: RunKind,
     started_at_ms: u64,
+    at_ms: u64,
 ) {
-    let (outcome, code) = applied_outcome(applied, kind, started_at_ms);
+    let (outcome, code) = applied_outcome(applied, kind, started_at_ms, at_ms);
     match outcome.status {
         OutcomeStatus::Ok => {
             updates.record(
@@ -3018,6 +3054,59 @@ pub(crate) fn record_config_applied(
             );
         }
     }
+}
+
+/// What `set_installation_ai`'s apply did with one hive of the update it opened.
+#[derive(Debug)]
+pub(crate) enum ChangeApply {
+    /// Applied, whatever it answered, and recorded: its apply and how long it took.
+    Applied(InstallationApplied, Duration),
+    /// Another task acts on the hive: the change left it to that task, as an explicit run does, and
+    /// recorded why (this text). Nothing was sent to it.
+    LeftToTask(String),
+}
+
+/// One hive's apply of `set_installation_ai`'s version, the pass of the update the change opened:
+/// the hive claimed as an explicit run claims it ([`claim_for_run`]), so no background read of it
+/// is recorded while it applies (FINDINGS A-205); the version applied (`apply`, given the time
+/// left before `deadline`); and its outcome recorded as it ends, with its own start and end
+/// (A-204), before the claim is released. A hive another task acts on is left to that task, said
+/// in the record and to the caller.
+pub(crate) async fn apply_change_on_hive<F, Fut>(
+    updates: &Updates,
+    id: &str,
+    hive: &str,
+    target: &Target,
+    bounds: &Bounds,
+    deadline: tokio::time::Instant,
+    apply: F,
+) -> ChangeApply
+where
+    F: FnOnce(Duration) -> Fut,
+    Fut: std::future::Future<Output = (InstallationApplied, Duration)>,
+{
+    let wait_until =
+        deadline.min(tokio::time::Instant::now() + bounds.read + Duration::from_secs(5));
+    let Some(_claim) =
+        claim_for_run(updates, hive, "set_installation_ai's apply", id, wait_until).await
+    else {
+        return ChangeApply::LeftToTask(left_to_holder(updates, id, hive));
+    };
+    let started = now_epoch_ms();
+    let (applied, elapsed) =
+        apply(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+    let ended = started.saturating_add(elapsed.as_millis() as u64);
+    record_config_applied(
+        updates,
+        id,
+        hive,
+        target,
+        &applied,
+        RunKind::Explicit,
+        started,
+        ended,
+    );
+    ChangeApply::Applied(applied, elapsed)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3658,7 +3747,8 @@ pub(crate) async fn automatic_step(
 /// them, nothing sent. A hive that did not answer, or was not read yet, is read only once shared
 /// memory shows its orchestrator (read anyway when shared memory cannot be read). A core it finds
 /// under way becomes in flight, for the follow; one that did not settle stays pending until its
-/// record changes.
+/// record changes. A category whose last outcome came in after the read began keeps it; one the
+/// read finds on the target, its last outcome saying otherwise, records that it saw it there.
 pub(crate) async fn recheck(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -3674,12 +3764,14 @@ pub(crate) async fn recheck(
     let Some(_claim) = updates.claim(hive, READING, id) else {
         return;
     };
+    let read_at = now_epoch_ms();
     let Ok(snapshot) = updates
         .read_versions(mesh, hive, Reader::Background, bounds)
         .await
     else {
         return;
     };
+    let seen_at = now_epoch_ms();
     updates.set_role(id, hive, text_of(Some(&snapshot), "role"));
     let known = updates.read(UpdatesFile::known_cores);
     let decision = decide(
@@ -3701,6 +3793,22 @@ pub(crate) async fn recheck(
         (Category::Config, &decision.config),
     ] {
         let current = entry.category(category);
+        // An outcome that came in while the read was under way (a config apply that answered
+        // meanwhile, FINDINGS A-205) is newer than what the read shows: it stands.
+        if current
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.at_ms > read_at)
+        {
+            tracing::info!(
+                update = %id,
+                hive = %hive,
+                category = category.as_str(),
+                "installation update: a read that began before the hive's last outcome, not \
+                 recorded"
+            );
+            continue;
+        }
         match step {
             // Left as it is, with its last outcome: what a run sent, or nothing yet.
             Step::Act | Step::AfterCore(_) => {
@@ -3746,6 +3854,31 @@ pub(crate) async fn recheck(
                     None,
                 );
                 updates.look_now(hive);
+            }
+            // On the target, its last outcome saying otherwise (excluded, an error, no answer):
+            // moved there outside this update, by its per-hive update, say. The read records that
+            // it saw it there, as the category's own status on the target (FINDINGS A-204).
+            Step::OnTarget => {
+                let seen = current
+                    .outcome
+                    .as_ref()
+                    .filter(|last| last.status != category.on_target_status())
+                    .map(|last| {
+                        let mut seen = Outcome::new(
+                            category.on_target_status(),
+                            RunKind::Background,
+                            read_at,
+                            seen_at,
+                        );
+                        seen.detail = Some(format!(
+                            "a read of its /versions saw it on the target, after its last outcome \
+                             here said {} ({})",
+                            last.status.as_str(),
+                            last.by.as_str()
+                        ));
+                        seen
+                    });
+                updates.record(id, hive, category, Standing::OnTarget, None, seen, None);
             }
             step => record_step(updates, id, hive, category, step),
         }
@@ -4219,9 +4352,11 @@ pub(crate) fn handle_get_installation_update(ctx: &AdminContext, params: &Value)
 
 /// `set_installation_ai`'s update (§4, step 3): the target its write made, opened (a run with
 /// another target), with the motherbee's core on it, the reference. Its explicit pass is the
-/// stage 3c apply, each hive's outcome recorded with [`record_config_applied`]; the background
-/// task reads the other hives' cores. Its id; why none was opened, when the hive registry cannot
-/// be read or the motherbee's own core is rolled back.
+/// stage 3c apply, each hive applied and recorded by [`apply_change_on_hive`]; once that apply
+/// ended, the caller has the background task look at each hive at once, and the task reads the
+/// other hives' cores (before, it would read the hives the apply is about to claim). Its id; why
+/// none was opened, when the hive registry cannot be read or the motherbee's own core is rolled
+/// back.
 pub(crate) fn open_for_installation_change(
     ctx: &AdminContext,
     motherbee: &Value,
@@ -4265,7 +4400,6 @@ pub(crate) fn open_for_installation_change(
         None,
         None,
     );
-    updates.wake();
     Ok(id)
 }
 

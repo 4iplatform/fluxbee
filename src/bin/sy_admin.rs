@@ -16320,7 +16320,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "When the change switches the default provider, SY.admin also checks the new provider's key, by names only (SY.vault's listing, never a value): each AI node that names no provider of its own reads it in its own tenant, and SY.admin's executor, SY.architect, SY.frontdesk.gov and each SY.cognition read theirs in the root tenant; each must find one it reads (its own, one assigned to it, or its tenant's general one). It refuses with 409 PROVIDER_KEYS_MISSING, naming each node, its tenant and the resource_type: put that key in SY.vault first (vault_put), or give the AI node its own provider. A tenant whose keys it cannot list refuses with 503 KEYS_NOT_CHECKED.",
             "The motherbee's orchestrator, the only writer, writes the next version, recorded with its values. It refuses, writing nothing: 409 JOIN_IN_PROGRESS while a hive joins or is removed; 409 INSTALLATION_EDITED_BY_HAND while the motherbee's file is edited by hand (restore it, or pass replace_hand_edit: true, the operator's choice, to make this change the next version over it); 409 INSTALLATION_UNCHANGED when its version holds these values already; 422 INVALID_AI_SETTINGS for values a reader cannot use (a provider listed without its model, the default provider not listed); 409 INSTALLATION_NOT_WRITTEN while the motherbee holds no file (its orchestrator's start writes version 1 from hive.yaml's ai: /versions config.not_written says why it did not). No answer within 30 s (TIMEOUT) does not mean nothing was written: the write may still land behind the orchestrator's other work; read get_installation, and when its expected_version moved, run update with category config on every hive.",
             "Then every hive applies it, in parallel: the motherbee and each connected spoke get update with category config, retried while the hive's copy has not arrived (sync_pending), up to 90 s (JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS). Each restarts only its start readers whose engine changed, or that became active since the hive's record of what it applied last (nothing says what those run): SY.cognition and SY.frontdesk.gov on the motherbee, SY.cognition on a worker, none on an ingress or an egress. ai.generic nodes take it at their next request; SY.admin's executor and Archi at their next use, never restarted (either may be running this very action), rebuilding only for another engine.",
-            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms, next}}, skipped, node_check, timings_ms: {check, write, scan, apply, hives, total}, update: {id, state}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail) or not_answered: never read either as not applied; its next says what finishes it, by its error_code. status is ok when every connected hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive. skipped names each hive the registry holds whose join did not finish (its status and join phase): the change does not reach it; finish its join or remove it, then update it with category config.",
+            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms, next}}, skipped, node_check, timings_ms: {check, write, scan, apply, hives, total}, update: {id, state}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail), not_answered, or left_to_task (another task of the installation's update was acting on it, named in detail, so nothing was sent to it): never read any as not applied; its next says what finishes it, by its error_code. status is ok when every connected hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive. skipped names each hive the registry holds whose join did not finish (its status and join phase): the change does not reach it; finish its join or remove it, then update it with category config.",
             "The change opens the installation's update (update_installation, get_installation_update) with the new version as its target: a hive that did not answer stays pending in it, and SY.admin finishes it once when the hive answers again (the automatic step).",
         ],
         "update_installation" => vec![
@@ -21580,6 +21580,29 @@ fn installation_hive_json(
     line
 }
 
+/// One hive's line of `set_installation_ai`'s answer when the change left it to another task of the
+/// installation's update that acts on it (`installation_update::apply_change_on_hive`, FINDINGS
+/// A-205): nothing was sent to it; `detail` names the task, and `next` says what finishes it once
+/// that task ends.
+fn installation_hive_left_json(
+    hive: &str,
+    why: &str,
+    version: u64,
+    sha256: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "left_to_task",
+        "detail": why,
+        "next": format!(
+            "once that task ends (GET /installation/update follows it), update_installation \
+             finishes it, or POST /hives/{hive}/update with {{\"category\": \"config\", \
+             \"manifest_version\": {version}, \"manifest_hash\": \"{sha256}\"}}"
+        ),
+        "attempts": 0,
+        "elapsed_ms": 0,
+    })
+}
+
 /// What finishes a hive that is not ok, by its error code (stage 3c's review, F5): `sync_pending`
 /// and no answer are finished by the same update run again; a refusal names what has to change
 /// first.
@@ -21939,24 +21962,61 @@ async fn handle_set_installation_ai(
         );
     }
 
-    // 3. Every hive applies it, at once; each ends by the change's ceiling.
+    // 3. Every hive applies it, at once; each ends by the change's ceiling. With the update open,
+    // each hive's apply is its pass: the hive claimed while it applies, so no background read of
+    // it is recorded meanwhile (FINDINGS A-205), and its outcome recorded as it ends, with its own
+    // times (A-204).
     let apply_started = Instant::now();
-    let apply_started_ms = now_epoch_ms();
     let hives = connected_hives_with(&ctx.hive_id, &hive_registry(ctx));
-    let within = admin_action_timeout(action).saturating_sub(started.elapsed());
-    let applies = futures::future::join_all(
-        hives
-            .iter()
-            .map(|hive| apply_installation_version(client, hive, version, &sha256, within)),
-    )
+    let deadline =
+        time::Instant::now() + admin_action_timeout(action).saturating_sub(started.elapsed());
+    let bounds = installation_update::Bounds::from_env();
+    let applies = futures::future::join_all(hives.iter().map(|hive| {
+        let (update_id, target, bounds, sha256) = (&update_id, &target, &bounds, &sha256);
+        async move {
+            let apply = |within: Duration| {
+                apply_installation_version(client, hive, version, sha256, within)
+            };
+            match update_id {
+                Ok(update_id) => {
+                    installation_update::apply_change_on_hive(
+                        &ctx.installation_update,
+                        update_id,
+                        hive,
+                        target,
+                        bounds,
+                        deadline,
+                        apply,
+                    )
+                    .await
+                }
+                Err(_) => {
+                    let (applied, elapsed) =
+                        apply(deadline.saturating_duration_since(time::Instant::now())).await;
+                    installation_update::ChangeApply::Applied(applied, elapsed)
+                }
+            }
+        }
+    }))
     .await;
     let apply_ms = elapsed_ms(apply_started);
 
     let mut lines = serde_json::Map::new();
     let mut hive_ms = serde_json::Map::new();
     let mut pending = Vec::new();
-    for (hive, (applied, elapsed)) in hives.iter().zip(&applies) {
-        let line = installation_hive_json(hive, applied, *elapsed, version, &sha256);
+    for (hive, applied) in hives.iter().zip(&applies) {
+        let (line, attempts, elapsed) = match applied {
+            installation_update::ChangeApply::Applied(applied, elapsed) => (
+                installation_hive_json(hive, applied, *elapsed, version, &sha256),
+                applied.attempts,
+                *elapsed,
+            ),
+            installation_update::ChangeApply::LeftToTask(why) => (
+                installation_hive_left_json(hive, why, version, &sha256),
+                0,
+                Duration::ZERO,
+            ),
+        };
         let status = line
             .get("status")
             .and_then(serde_json::Value::as_str)
@@ -21968,28 +22028,22 @@ async fn handle_set_installation_ai(
         tracing::info!(
             hive = %hive,
             status = %status,
-            attempts = applied.attempts,
+            attempts,
             elapsed_ms = elapsed.as_millis() as u64,
             version,
             "installation: a hive's apply"
         );
-        if let Ok(update_id) = &update_id {
-            installation_update::record_config_applied(
-                &ctx.installation_update,
-                update_id,
-                hive,
-                &target,
-                applied,
-                installation_update::RunKind::Explicit,
-                apply_started_ms,
-            );
-        }
         hive_ms.insert(hive.clone(), serde_json::json!(elapsed.as_millis() as u64));
         lines.insert(hive.clone(), line);
     }
     let update = match &update_id {
         Ok(update_id) => {
             ctx.installation_update.settle_state();
+            // The apply released its hives: the background task looks at each one now, whenever
+            // a look of the superseded update had it due, and reads the cores the update has not.
+            for hive in &hives {
+                ctx.installation_update.look_now(hive);
+            }
             serde_json::json!({
                 "id": update_id,
                 "state": ctx.installation_update.state_of(update_id),
@@ -34839,6 +34893,28 @@ mod tests {
         let next = later["next"].as_str().expect("next");
         assert!(next.contains("a later version than 2"), "{next}");
         assert!(!next.contains("\"manifest_hash\": \"bbb\""), "{next}");
+        // A hive the change left to another task of the installation's update (FINDINGS A-205):
+        // nothing was sent to it; its detail names the task, its next what finishes it.
+        let left = installation_hive_left_json(
+            "worker1",
+            "this run left it to the automatic step of the superseded update upd-1, under way for \
+             3 s",
+            2,
+            "bbb",
+        );
+        assert_eq!(left["status"], json!("left_to_task"));
+        assert_eq!(
+            (left["attempts"].clone(), left["elapsed_ms"].clone()),
+            (json!(0), json!(0))
+        );
+        assert!(left["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("the automatic step")));
+        let next = left["next"].as_str().expect("next");
+        assert!(next.contains("update_installation finishes it"), "{next}");
+        assert!(next.contains("POST /hives/worker1/update"), "{next}");
+        assert!(next.contains("\"manifest_hash\": \"bbb\""), "{next}");
+        assert!(!left.to_string().contains("not applied"), "{left}");
     }
 
     /// Answers one request the change sends, by what it asks: the motherbee's /versions, the
@@ -35103,6 +35179,112 @@ mod tests {
             open.hives["motherbee"].config.state,
             installation_update::Standing::OnTarget
         );
+    }
+
+    /// FINDINGS A-205 and A-204: the change holds each hive of its update while that hive applies
+    /// (no background read of it is recorded meanwhile), and records each hive's outcome as its own
+    /// apply ends: its own elapsed, the answer's timings_ms.hives, from its own start to its own
+    /// end, never the slowest hive's; each hive is released once it is recorded.
+    #[tokio::test]
+    async fn set_installation_ai_holds_each_hive_and_records_its_own_time() {
+        let (ctx, mut harness) = opa_test_admin("installation-change-own-times");
+        let registry = ctx.state_dir.parent().expect("root").join("hives");
+        fs::create_dir_all(registry.join("worker1")).expect("registry");
+        fs::write(
+            registry.join("worker1").join("info.yaml"),
+            "hive_id: worker1\nrole: worker\nstatus: connected\n",
+        )
+        .expect("worker1");
+        let own = versions_after_a_change()["hives"][0]["config"].clone();
+        let change = installation_ai(
+            AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        let params = json!({"ai": change, "expected_version": 2});
+        let written = json!({"status": "ok", "version": 3, "sha256": "ccc"});
+        let applied = json!({"status": "ok", "restarted": [], "unchanged": []});
+        let run = handle_set_installation_ai(&ctx, &ctx.rpc, &params);
+        tokio::pin!(run);
+        // worker1's apply, answered 300 ms after it was asked.
+        let mut late: Option<Message> = None;
+        let (status, body) = loop {
+            tokio::select! {
+                answered = &mut run => break answered,
+                _ = tokio::time::sleep(Duration::from_millis(300)), if late.is_some() => {
+                    // worker1 is still applying: the change holds it; the motherbee, applied and
+                    // recorded, is released.
+                    let holder = ctx.installation_update.holder("worker1").expect("held");
+                    assert_eq!(holder.what, "set_installation_ai's apply");
+                    assert!(ctx.installation_update.holder("motherbee").is_none());
+                    let sent = late.take().expect("worker1's apply");
+                    harness
+                        .inject(reply_to(&sent, "SYSTEM_UPDATE_RESPONSE", applied.clone()))
+                        .await
+                        .unwrap();
+                }
+                sent = harness.next_outgoing_within(Duration::from_secs(30)) => {
+                    let sent = sent.expect("a request of the change");
+                    if sent.meta.msg_type != "admin"
+                        && dst_of(&sent) == json!("SY.orchestrator@worker1")
+                    {
+                        late = Some(sent);
+                        continue;
+                    }
+                    // The motherbee's /versions, the write, the scan and its own apply.
+                    let answer = if sent.meta.msg_type == "admin" {
+                        let mut answer = reply_to(&sent, "", json!({"status": "ok", "hive": {
+                            "hive_id": "motherbee",
+                            "core": {"status": "ok", "manifest_hash": "abc", "components": {}},
+                            "config": own,
+                        }}));
+                        answer.meta.msg_type = "admin".to_string();
+                        answer.meta.msg = None;
+                        answer
+                    } else if sent.payload.get("write").is_some() {
+                        reply_to(&sent, "SYSTEM_UPDATE_RESPONSE", written.clone())
+                    } else if sent.meta.msg.as_deref() == Some("SYSTEM_SYNC_HINT") {
+                        reply_to(&sent, "SYSTEM_SYNC_HINT_RESPONSE", json!({"status": "ok"}))
+                    } else {
+                        reply_to(&sent, "SYSTEM_UPDATE_RESPONSE", applied.clone())
+                    };
+                    harness.inject(answer).await.unwrap();
+                }
+            }
+        };
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 200, "{body}");
+        let times = &body["payload"]["timings_ms"]["hives"];
+        // worker1's core is not read yet (no background task here): the update stays open.
+        let open = ctx
+            .installation_update
+            .read(|file| file.open.clone())
+            .expect("the update, open");
+        let outcome = |hive: &str| {
+            open.hives[hive]
+                .config
+                .outcome
+                .clone()
+                .expect("its config outcome")
+        };
+        let (motherbee, worker) = (outcome("motherbee"), outcome("worker1"));
+        for (hive, outcome) in [("motherbee", &motherbee), ("worker1", &worker)] {
+            assert_eq!(
+                json!(outcome.at_ms - outcome.started_at_ms),
+                times[hive],
+                "{hive}: {outcome:?}"
+            );
+        }
+        assert!(
+            times["worker1"].as_u64().is_some_and(|ms| ms >= 300),
+            "{times}"
+        );
+        assert!(
+            times["motherbee"].as_u64().is_some_and(|ms| ms < 300),
+            "{times}"
+        );
+        assert!(motherbee.at_ms < worker.at_ms, "{motherbee:?} {worker:?}");
+        assert!(ctx.installation_update.holder("worker1").is_none());
     }
 
     /// The motherbee's refusal passes through with its code, and nothing is applied.

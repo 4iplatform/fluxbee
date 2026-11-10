@@ -2269,3 +2269,461 @@ fn the_answers_stay_well_inside_a_mesh_frame() {
     let summary = updates.summary().to_string();
     assert!(summary.len() < 8 * 1024, "{} bytes", summary.len());
 }
+
+// ---------------------------------------------------------------------------------------------
+// set_installation_ai's apply and the background reads (FINDINGS A-205, A-204)
+// ---------------------------------------------------------------------------------------------
+
+/// A hive on the target's core, its config a version behind; its role is its name's (`worker1`, a
+/// worker).
+fn config_behind(hive: &str) -> Value {
+    let mut behind = egress_behind_config();
+    behind["hive_id"] = json!(hive);
+    behind["role"] = json!(hive.trim_end_matches(|c: char| c.is_ascii_digit()));
+    behind
+}
+
+/// An update opened on the target with these hives, all unknown.
+fn open_update(updates: &Updates, origin: &str, hives: &[&str]) -> String {
+    let hives: Vec<String> = hives.iter().map(|hive| hive.to_string()).collect();
+    updates.change(|file| {
+        let (id, _) = file.open_or_resume(&target(), origin, None, now_epoch_ms());
+        file.refresh_hives(&id, &hives, Vec::new());
+        id
+    })
+}
+
+/// `set_installation_ai`'s apply of the target's version on `hive`, as the fake mesh answers it.
+async fn apply_target_version(mesh: &FakeMesh, hive: &str) -> (InstallationApplied, Duration) {
+    let started = std::time::Instant::now();
+    let answer = mesh
+        .update(
+            hive,
+            json!({"category": "config", "manifest_version": 3, "manifest_hash": SHA_V3}),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("its answer");
+    (
+        InstallationApplied {
+            outcome: InstallationApplyOutcome::Ok(answer),
+            attempts: 1,
+        },
+        started.elapsed(),
+    )
+}
+
+/// FINDINGS A-205: `set_installation_ai`'s apply holds each hive as an explicit run does. A
+/// background read neither reads nor records a hive while the change applies it; a task that only
+/// reads the hive is waited for; one that acts on it keeps it, and the change leaves the hive to it,
+/// sending nothing and saying so in the record.
+#[tokio::test]
+async fn the_change_s_apply_holds_each_hive_it_applies() {
+    let updates = Updates::load(&temp_state("installation-update-change-holds"));
+    let mesh = FakeMesh::new(vec![
+        motherbee_on_target(),
+        config_behind("worker1"),
+        config_behind("ingress1"),
+        config_behind("egress1"),
+    ]);
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let id = open_update(
+        &updates,
+        "set_installation_ai",
+        &["motherbee", "worker1", "ingress1", "egress1"],
+    );
+    let (the_target, bounds, deadline) = (
+        target(),
+        quick(),
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    );
+    let (updates_ref, mesh_ref, dyn_ref, id_ref, target_ref, bounds_ref) = (
+        &*updates,
+        &*mesh,
+        dyn_mesh.as_ref(),
+        id.as_str(),
+        &the_target,
+        &bounds,
+    );
+
+    // A background read of worker1 while the change applies it: no read, nothing recorded.
+    let reads = mesh.reads.load(Ordering::SeqCst);
+    let change = apply_change_on_hive(
+        &updates,
+        &id,
+        "worker1",
+        &the_target,
+        &bounds,
+        deadline,
+        move |_within| async move {
+            recheck(
+                updates_ref,
+                dyn_ref,
+                id_ref,
+                "worker1",
+                target_ref,
+                bounds_ref,
+                Look::AnswerCheck,
+            )
+            .await;
+            assert_eq!(mesh_ref.reads.load(Ordering::SeqCst), reads);
+            let holder = updates_ref.holder("worker1").expect("held");
+            assert_eq!(holder.what, "set_installation_ai's apply");
+            assert_eq!(holder.update, id_ref);
+            apply_target_version(mesh_ref, "worker1").await
+        },
+    )
+    .await;
+    assert!(matches!(change, ChangeApply::Applied(..)), "{change:?}");
+    assert!(
+        updates.holder("worker1").is_none(),
+        "released once recorded"
+    );
+    let worker = entry_of(&updates, "worker1");
+    assert_eq!(worker.config.state, Standing::OnTarget);
+    assert_eq!(
+        worker.config.outcome.as_ref().map(|o| (o.status, o.by)),
+        Some((OutcomeStatus::Ok, RunKind::Explicit))
+    );
+    // Read after the change, it is on the target, both categories.
+    recheck(
+        &updates,
+        dyn_mesh.as_ref(),
+        &id,
+        "worker1",
+        &the_target,
+        &bounds,
+        Look::AnswerCheck,
+    )
+    .await;
+    let worker = entry_of(&updates, "worker1");
+    assert!(worker.on_target(), "{worker:#?}");
+
+    // A task that only reads ingress1 is waited for: the change applies it once the read let it go.
+    let reader = updates.claim("ingress1", READING, &id).expect("claimed");
+    let released = AtomicBool::new(false);
+    let released_ref = &released;
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        released.store(true, Ordering::SeqCst);
+        drop(reader);
+    };
+    let change = apply_change_on_hive(
+        &updates,
+        &id,
+        "ingress1",
+        &the_target,
+        &bounds,
+        deadline,
+        move |_within| async move {
+            assert!(
+                released_ref.load(Ordering::SeqCst),
+                "the read let it go first"
+            );
+            apply_target_version(mesh_ref, "ingress1").await
+        },
+    );
+    let ((), change) = tokio::join!(release, change);
+    assert!(matches!(change, ChangeApply::Applied(..)), "{change:?}");
+    assert_eq!(
+        entry_of(&updates, "ingress1").config.state,
+        Standing::OnTarget
+    );
+
+    // A task that acts on egress1, the automatic step of the update the change superseded, keeps
+    // it: the change leaves egress1 to it, sends it nothing, and the record says so.
+    let actor = updates
+        .claim("egress1", "the automatic step", "upd-older")
+        .expect("claimed");
+    let change = apply_change_on_hive(
+        &updates,
+        &id,
+        "egress1",
+        &the_target,
+        &bounds,
+        deadline,
+        move |_within| async move { unreachable!("nothing is sent to a hive another task acts on") },
+    )
+    .await;
+    let ChangeApply::LeftToTask(why) = change else {
+        panic!("left to the task: {change:?}");
+    };
+    assert!(
+        why.contains("the automatic step of the superseded update upd-older"),
+        "{why}"
+    );
+    assert!(mesh.sent_to("egress1").is_empty());
+    let egress = entry_of(&updates, "egress1");
+    assert_eq!(egress.config.reason.as_deref(), Some(why.as_str()));
+    assert!(egress
+        .config
+        .next
+        .as_deref()
+        .is_some_and(|next| next.contains("update_installation again")));
+    drop(actor);
+}
+
+/// FINDINGS A-205: a background read that began before a hive's last outcome shows the hive as it
+/// was before that outcome. The outcome stands for its category (the change's apply, answered while
+/// the read was under way); the read is recorded for the other category.
+#[tokio::test]
+async fn a_read_older_than_the_hive_s_last_outcome_is_not_recorded() {
+    // A read that says it began, and answers once the test lets it: the hive as it was then.
+    struct Gated {
+        snapshot: Value,
+        began: tokio::sync::Notify,
+        answer: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl UpdateMesh for Gated {
+        async fn versions(&self, _hive: &str, _timeout: Duration) -> Result<Value, String> {
+            self.began.notify_one();
+            self.answer.notified().await;
+            Ok(self.snapshot.clone())
+        }
+        async fn update(&self, _: &str, _: Value, _: Duration) -> Result<Value, String> {
+            unreachable!()
+        }
+        fn orchestrator_connected(&self, _: &str) -> Option<bool> {
+            Some(true)
+        }
+        fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String> {
+            Ok((
+                vec!["motherbee".to_string(), "worker1".to_string()],
+                Vec::new(),
+            ))
+        }
+        fn motherbee(&self) -> &str {
+            "motherbee"
+        }
+    }
+    let gated = || Gated {
+        snapshot: config_behind("worker1"),
+        began: tokio::sync::Notify::new(),
+        answer: tokio::sync::Notify::new(),
+    };
+    let updates = Updates::load(&temp_state("installation-update-stale-read"));
+    let id = open_update(&updates, "set_installation_ai", &["motherbee", "worker1"]);
+    let (the_target, bounds) = (target(), quick());
+    let before = gated();
+    let look = recheck(
+        &updates,
+        &before,
+        &id,
+        "worker1",
+        &the_target,
+        &bounds,
+        Look::AnswerCheck,
+    );
+    let meanwhile = async {
+        before.began.notified().await;
+        // worker1 applies the version, and the apply is recorded, while the read is under way.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let now = now_epoch_ms();
+        let mut applied = Outcome::new(OutcomeStatus::Ok, RunKind::Explicit, now, now);
+        applied.attempts = 1;
+        updates.record(
+            &id,
+            "worker1",
+            Category::Config,
+            Standing::OnTarget,
+            None,
+            Some(applied.clone()),
+            None,
+        );
+        before.answer.notify_one();
+        applied
+    };
+    let ((), applied) = tokio::join!(look, meanwhile);
+    let worker = entry_of(&updates, "worker1");
+    assert_eq!(worker.config.state, Standing::OnTarget, "{worker:#?}");
+    assert_eq!(worker.config.outcome.as_ref(), Some(&applied));
+    assert_eq!(worker.core.state, Standing::OnTarget, "{worker:#?}");
+
+    // A read that begins after that outcome is recorded as usual: this one shows the version not
+    // applied, and the config is pending again.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let after = gated();
+    after.answer.notify_one();
+    recheck(
+        &updates,
+        &after,
+        &id,
+        "worker1",
+        &the_target,
+        &bounds,
+        Look::Slow,
+    )
+    .await;
+    assert_eq!(
+        entry_of(&updates, "worker1").config.state,
+        Standing::Pending
+    );
+}
+
+/// FINDINGS A-204: each hive of `set_installation_ai`'s apply is recorded as its own apply ends,
+/// from its own start to its own end: its elapsed is its own (the answer's timings_ms.hives), never
+/// the slowest hive's.
+#[tokio::test]
+async fn the_change_records_each_hive_s_own_time() {
+    let updates = Updates::load(&temp_state("installation-update-change-times"));
+    let id = open_update(
+        &updates,
+        "set_installation_ai",
+        &["motherbee", "worker1", "egress1"],
+    );
+    let (the_target, bounds, deadline) = (
+        target(),
+        quick(),
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    );
+    let taking = |delay: Duration| {
+        move |_within: Duration| async move {
+            let started = std::time::Instant::now();
+            tokio::time::sleep(delay).await;
+            (
+                InstallationApplied {
+                    outcome: InstallationApplyOutcome::Ok(
+                        json!({"status": "ok", "restarted": [], "unchanged": []}),
+                    ),
+                    attempts: 1,
+                },
+                started.elapsed(),
+            )
+        }
+    };
+    let before = now_epoch_ms();
+    let (fast, slow) = tokio::join!(
+        apply_change_on_hive(
+            &updates,
+            &id,
+            "worker1",
+            &the_target,
+            &bounds,
+            deadline,
+            taking(Duration::from_millis(10)),
+        ),
+        apply_change_on_hive(
+            &updates,
+            &id,
+            "egress1",
+            &the_target,
+            &bounds,
+            deadline,
+            taking(Duration::from_millis(300)),
+        ),
+    );
+    let own = |change: &ChangeApply| match change {
+        ChangeApply::Applied(_, elapsed) => elapsed.as_millis() as u64,
+        other => panic!("applied: {other:?}"),
+    };
+    let (fast_ms, slow_ms) = (own(&fast), own(&slow));
+    let recorded = |hive: &str| {
+        entry_of(&updates, hive)
+            .config
+            .outcome
+            .expect("its outcome")
+    };
+    let (worker, egress) = (recorded("worker1"), recorded("egress1"));
+    assert_eq!(worker.elapsed_ms(), fast_ms, "{worker:?}");
+    assert_eq!(egress.elapsed_ms(), slow_ms, "{egress:?}");
+    assert!(slow_ms >= 300, "{slow_ms}");
+    assert!(worker.elapsed_ms() <= egress.elapsed_ms());
+    assert!(worker.at_ms <= egress.at_ms, "{worker:?} {egress:?}");
+    assert!(worker.started_at_ms >= before && egress.started_at_ms >= before);
+    // The view shows each one's own.
+    let view = record_view(&updates.read(|file| file.open.clone()).expect("open"));
+    assert_eq!(
+        view["hives"]["worker1"]["config"]["outcome"]["elapsed_ms"],
+        json!(fast_ms)
+    );
+}
+
+/// FINDINGS A-204: a read that finds a category on the target, its last outcome saying otherwise,
+/// records that it saw it there, as the category's own status on the target (`settled` for a core,
+/// `ok` for a config), by the background task, with the read's times: the gate's egress1, rolled
+/// back, left alone by the automatic step, then moved back by its own updates. A category whose
+/// last outcome says on the target keeps it.
+#[tokio::test]
+async fn a_read_records_a_hive_it_sees_on_the_target_after_another_outcome() {
+    let updates = Updates::load(&temp_state("installation-update-seen"));
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), egress_rolled_back((2, SHA_V2))]);
+    mesh.set_down("egress1", true);
+    let RunEnd::Update { update, .. } = explicit_run(&updates, &mesh, &[]).await else {
+        panic!("an update opened");
+    };
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    mesh.set_down("egress1", false);
+    automatic_step(
+        &updates,
+        dyn_mesh.as_ref(),
+        &update.id,
+        "egress1",
+        &target(),
+        &quick(),
+    )
+    .await;
+    let egress = entry_of(&updates, "egress1");
+    for slot in [&egress.core, &egress.config] {
+        assert_eq!(
+            slot.outcome.as_ref().map(|o| (o.status, o.by)),
+            Some((OutcomeStatus::Excluded, RunKind::Automatic))
+        );
+    }
+
+    // The operator moves it back, its core and its config, with its per-hive updates; SY.admin
+    // looks at it.
+    mesh.set_snapshot("egress1", {
+        let mut moved = egress_behind_config();
+        moved["config"]["applied"] = json!({"version": 3, "sha256": SHA_V3});
+        moved
+    });
+    let read_from = now_epoch_ms();
+    recheck(
+        &updates,
+        dyn_mesh.as_ref(),
+        &update.id,
+        "egress1",
+        &target(),
+        &quick(),
+        Look::Slow,
+    )
+    .await;
+    let egress = entry_of(&updates, "egress1");
+    for (slot, status) in [
+        (&egress.core, OutcomeStatus::Settled),
+        (&egress.config, OutcomeStatus::Ok),
+    ] {
+        assert_eq!((slot.state, slot.exclusion), (Standing::OnTarget, None));
+        let seen = slot.outcome.as_ref().expect("what the read saw");
+        assert_eq!(
+            (seen.status, seen.by, seen.attempts),
+            (status, RunKind::Background, 0)
+        );
+        assert!(seen.started_at_ms >= read_from && seen.at_ms >= seen.started_at_ms);
+        assert!(
+            seen.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("said excluded (automatic)")),
+            "{seen:?}"
+        );
+    }
+
+    // Read again: its outcomes say on the target now, and stay as they are.
+    recheck(
+        &updates,
+        dyn_mesh.as_ref(),
+        &update.id,
+        "egress1",
+        &target(),
+        &quick(),
+        Look::Slow,
+    )
+    .await;
+    let again = entry_of(&updates, "egress1");
+    assert_eq!(
+        (&again.core.outcome, &again.config.outcome),
+        (&egress.core.outcome, &egress.config.outcome)
+    );
+    assert_eq!(updates.settle_state(), Some(UpdateState::Done));
+}
