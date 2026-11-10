@@ -43,15 +43,18 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   answer under the verb's response: an `admin` message, the verb in another case (`config_set`),
   another node, another hive's orchestrator.
 - **A notice or a reply is never answered,** only logged (the AI SDK's
-  `is_infrastructure_message`, which SY.frontdesk.gov runs too; SY.timer's and wf-generic's rule): a
-  message the router made, which carries no `src_l2_name` (`UNREACHABLE`, `TTL_EXCEEDED`), or one
-  named as a notice or a reply (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any `*_RESPONSE`). A router
-  notice is a WARN with its trace and its reason. An answer to one would go to the router's own
-  UUID, and the two would bounce it forever (FINDINGS A-112).
+  `is_infrastructure_message`, which SY.frontdesk.gov runs too): a message the router made, which
+  carries no `src_l2_name` (`UNREACHABLE`, `TTL_EXCEEDED`), or one named as a notice or a reply
+  (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any `*_RESPONSE`). A router notice is a WARN with its trace and
+  its reason. An answer to one would go to the router's own UUID, and the two would bounce it
+  forever (FINDINGS A-112). SY.timer and wf-generic answer none of these either, and also leave
+  `ECHO` and `ECHO_REPLY` unanswered, which the Rust SDK no longer has (FINDINGS A-218), until the
+  Go SDK's release removes them there; nothing sends either.
 - **A tap copy is neither handled nor answered,** whatever its kind: the AI SDK's runtime takes no
-  message with `meta.via_tap` to the node and logs it at debug (FINDINGS A-248). The node used as
-  a tap's target runs no model and no control verb for another node's message, and sends nothing
-  to its sender.
+  message with `meta.via_tap` to the node (FINDINGS A-248). The node used as a tap's target runs
+  no model and no control verb for another node's message, and sends nothing to its sender. The
+  journal shows the copies as `tap_copies_ignored` in the `ai runtime metrics` line (every 30 s);
+  each copy's own line is at debug.
 - **`CONFIG_GET`** returns:
   - the contract;
   - the effective config, redacted;

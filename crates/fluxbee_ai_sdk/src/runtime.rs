@@ -106,6 +106,10 @@ struct RuntimeMetrics {
     recoverable_exhausted: AtomicU64,
     fatal_errors: AtomicU64,
     retry_attempts: AtomicU64,
+    /// Tap copies the runtime took to no handler (`run_handler`, FINDINGS A-248). Each one is a
+    /// debug line, and the nodes log at info: this count, in the periodic metrics line, is where
+    /// the journal shows them.
+    tap_copies_ignored: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +126,7 @@ struct RuntimeMetricsSnapshot {
     recoverable_exhausted: u64,
     fatal_errors: u64,
     retry_attempts: u64,
+    tap_copies_ignored: u64,
 }
 
 impl RuntimeMetrics {
@@ -139,6 +144,7 @@ impl RuntimeMetrics {
             recoverable_exhausted: self.recoverable_exhausted.load(Ordering::Relaxed),
             fatal_errors: self.fatal_errors.load(Ordering::Relaxed),
             retry_attempts: self.retry_attempts.load(Ordering::Relaxed),
+            tap_copies_ignored: self.tap_copies_ignored.load(Ordering::Relaxed),
         }
     }
 }
@@ -310,6 +316,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             recoverable_exhausted = final_metrics.recoverable_exhausted,
             fatal_errors = final_metrics.fatal_errors,
             retry_attempts = final_metrics.retry_attempts,
+            tap_copies_ignored = final_metrics.tap_copies_ignored,
             "ai runtime stopped"
         );
 
@@ -504,7 +511,8 @@ fn reply_trace_note(requester: Option<&str>, response: &mut Message) -> TraceNot
 /// (docs/reference/routing-and-policy.md §8.3), there to be observed. It keeps the original sender,
 /// so an answer would go to that sender, under the copy's trace, about a message it never sent this
 /// node, and the handler would run a model or a tool for it. Every message the node answers, its
-/// control plane's included, comes through here.
+/// control plane's included, comes through here. Each copy is a debug line and counts in
+/// `tap_copies_ignored`, which the periodic metrics line shows.
 async fn run_handler<N: AiNode>(
     node: &N,
     msg: Message,
@@ -512,6 +520,7 @@ async fn run_handler<N: AiNode>(
     metrics: &RuntimeMetrics,
 ) -> Option<Message> {
     if msg.meta.via_tap {
+        metrics.tap_copies_ignored.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             trace_id = %msg.routing.trace_id,
             msg_type = %msg.meta.msg_type,
@@ -647,6 +656,7 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
             recoverable_exhausted = snapshot.recoverable_exhausted,
             fatal_errors = snapshot.fatal_errors,
             retry_attempts = snapshot.retry_attempts,
+            tap_copies_ignored = snapshot.tap_copies_ignored,
             "ai runtime metrics"
         );
     }
@@ -867,6 +877,27 @@ mod tests {
         assert!(run_handler(&node, message("user"), SHORT, &metrics)
             .await
             .is_some());
+        assert_eq!(node.calls(), 1);
+    }
+
+    /// A-248's review: each tap copy the runtime leaves alone counts in `tap_copies_ignored`, which
+    /// the periodic metrics line shows (the copy's own line is at debug, below the nodes' level); a
+    /// message that is not a copy does not.
+    #[tokio::test]
+    async fn the_tap_copies_the_runtime_ignores_are_counted() {
+        let node = CountingNode::new(Outcome::Answers);
+        let metrics = RuntimeMetrics::default();
+        for kind in ["user", "system", "user"] {
+            let mut copy = message(kind);
+            copy.meta.via_tap = true;
+            assert!(run_handler(&node, copy, SHORT, &metrics).await.is_none());
+        }
+        assert!(run_handler(&node, message("user"), SHORT, &metrics)
+            .await
+            .is_some());
+
+        assert_eq!(metrics.tap_copies_ignored.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.snapshot().tap_copies_ignored, 3);
         assert_eq!(node.calls(), 1);
     }
 

@@ -299,7 +299,7 @@ There is nothing to configure. `handle_control_plane` answers:
 | `CONFIG_SET` | refuses every field under `config` (`config_not_accepted`), the prompt (`behavior`) and `runtime` included; an empty `config` re-reads the key from the vault. Nothing is persisted |
 | `PING`, `STATUS` | `PONG`, `STATUS_RESPONSE` |
 | a notice or a reply: no `src_l2_name` (the router's `UNREACHABLE`, `TTL_EXCEEDED`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, any `*_RESPONSE` | nothing; it is logged, a router notice as a WARN with its reason (`is_infrastructure_message`, FINDINGS A-112: an answer to the router's notice bounced between the two forever) |
-| a tap copy (`meta.via_tap`), of any kind, a conversation's included | nothing: the AI SDK's runtime takes it to no handler and logs it at debug (FINDINGS A-248) |
+| a tap copy (`meta.via_tap`), of any kind, a conversation's included | nothing: the AI SDK's runtime takes it to no handler (FINDINGS A-248); it counts in `tap_copies_ignored`, in the `ai runtime metrics` line, and its own line is at debug |
 
 The router delivers `CONFIG_GET` and `CONFIG_SET` only from `SY.admin@motherbee`
 (`policy/system.rego` rule (2)); SY.admin sends them for

@@ -639,7 +639,8 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
   `router tap copy: …` and dropped. The primary delivery does not wait for it.
 - A target observes; it does not take part. An AI node that gets a copy runs no handler for it
   and answers nothing, which would go to the original sender (the AI SDK's `run_handler`, FINDINGS
-  A-248); it logs the copy at debug.
+  A-248). Its journal counts the copies in `tap_copies_ignored`, in the `ai runtime metrics` line;
+  each copy's own line is at debug.
 
 ---
 
