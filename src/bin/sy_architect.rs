@@ -189,7 +189,7 @@ When unsure how many hives exist, call `fluxbee_system_get` on `/inventory/summa
 
 ## Asking questions — maximum one per task
 
-Do not ask multiple clarifying questions. If the task is reasonably clear, choose the correct planning tool without asking first. If one critical piece is truly missing and cannot be inferred (e.g., which `tenant_id` for a new multi-tenant node, or which hive when several exist), ask exactly one specific question. Never ask several things at once.
+Do not ask multiple clarifying questions. If the task is reasonably clear, choose the correct planning tool without asking first. If one critical piece is truly missing and the system cannot tell you (e.g., which hive when several exist), ask exactly one specific question. A new node's tenant is never guessed or defaulted: its `tenant_id`, at the top level of args, is the tenant the operator names, or the one an existing node runs in when the operator says to use it; when the operator names none, that is the one question to ask. Never the root tenant: `AI.*`, `WF.*` and non-core `IO.*` nodes are refused there (`TENANT_ROOT_NOT_ALLOWED`). Never ask several things at once.
 
 ## General
 
@@ -30218,7 +30218,8 @@ mod tests {
     /// FINDINGS A-230: an `AI.*` or `IO.*` node runs in the tenant the operator names. With none
     /// named the plan blocks for it, never takes a root tenant as a default (the orchestrator
     /// refuses every node but the core in the hive's root tenant), and no text calls a tenant a
-    /// default.
+    /// default: not the plan compiler's facts, not the chat's prompt, and not SY.admin's help,
+    /// which the plan compiler reads before each step.
     #[test]
     fn build_plan_compiler_prompt_asks_for_a_nodes_tenant() {
         let prompt = build_plan_compiler_prompt(&[], &[], None);
@@ -30231,13 +30232,36 @@ mod tests {
             "Every `AI.*` and `WF.*` node, and every other `IO.*` node, runs in another tenant"
         ));
         assert!(prompt.contains("no tenant is a default for it"));
+        let chat = build_archi_prompt(None);
+        assert!(chat.contains("A new node's tenant is never guessed or defaulted"));
+        assert!(chat.contains("`AI.*`, `WF.*` and non-core `IO.*` nodes are refused there"));
+        // SY.admin's help for run_node and list_tenants, and the executor's refusal.
+        let admin_src = include_str!("sy_admin.rs");
+        assert!(admin_src.contains(
+            "AI.* and IO.* managed nodes require tenant_id at the top level of args on first \
+             spawn: the tenant the operator names"
+        ));
+        assert!(admin_src.contains(
+            "An AI.* node, a WF.* node or any other IO.* node is refused there with \
+             TENANT_ROOT_NOT_ALLOWED"
+        ));
+        assert!(admin_src.contains("requires tenant_id at the top level of args"));
         for gone in [
             "root/default",
             "sponsor/default",
             "use that `tenant_id`",
             "root-level `tenant_id`",
+            "cannot be inferred",
         ] {
             assert!(!prompt.contains(gone), "{gone}");
+            assert!(!chat.contains(gone), "{gone}");
+        }
+        for gone in [
+            "root-level tenant_id",
+            "root/default",
+            "Required at root level",
+        ] {
+            assert!(!admin_src.contains(gone), "{gone}");
         }
     }
 

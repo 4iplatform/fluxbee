@@ -2526,7 +2526,7 @@ fn validate_executor_plan_step_semantics(
         .unwrap_or("");
     if tenant_id.is_empty() {
         return Err(format!(
-            "{step_label}.args: run_node for AI/IO identity-aware first spawn requires root-level tenant_id"
+            "{step_label}.args: run_node for an AI/IO identity-aware first spawn requires tenant_id at the top level of args: the tenant the operator names"
         ));
     }
     Ok(())
@@ -15185,7 +15185,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "tenant_id",
                 "string",
-                "Tenant id for identity-aware first spawn. Required at root level for AI.* and IO.* managed nodes during initial instance creation.",
+                "Tenant id for identity-aware first spawn: the tenant the operator names. Required at the top level of args for AI.* and IO.* managed nodes during initial instance creation.",
             ),
             admin_action_body_field("unit", "string", "Optional unit suffix override."),
             admin_action_body_field(
@@ -16280,8 +16280,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "run_node" => vec![
             "Use this only when creating/spawning a new managed instance.",
             "runtime can be omitted when it is derivable from node_name.",
-            "AI.* and IO.* managed nodes require root-level tenant_id on first spawn. Discover it with list_tenants/get_tenant or from an existing node config; do not place it only under config.",
-            "Only the core IO nodes run in the root tenant: IO.cloud, IO.blob and IO.web (runtimes io.cloud, io.blob, io.web; the orchestrator's CORE_IO_RUNTIMES). Launch any other IO.* node with the tenant it serves; in the root tenant it is refused with TENANT_ROOT_NOT_ALLOWED.",
+            "AI.* and IO.* managed nodes require tenant_id at the top level of args on first spawn: the tenant the operator names, or the one an existing node's config records when the operator says to use it. No tenant is a default; never place it only under config.",
+            "Only the core runs in the root tenant: the SY.* and RT.* nodes and the core IO nodes IO.cloud, IO.blob and IO.web (runtimes io.cloud, io.blob, io.web; the orchestrator's CORE_IO_RUNTIMES). An AI.* node, a WF.* node or any other IO.* node is refused there with TENANT_ROOT_NOT_ALLOWED: launch it with the tenant it serves.",
             "A tenant that is not active (pending or suspended) starts no node: TENANT_NOT_ACTIVE.",
             "WF.* managed nodes must use an already published workflow package runtime, for example wf.invoice. Do not spawn WF.* directly with the base runtime wf.engine; use wf_rules_compile_apply with auto_spawn=true to publish and deploy workflows.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
@@ -29463,7 +29463,7 @@ mod tests {
         }))
         .expect_err("AI run_node without tenant_id must fail validation");
 
-        assert!(err.contains("requires root-level tenant_id"));
+        assert!(err.contains("requires tenant_id at the top level of args"));
     }
 
     #[test]
