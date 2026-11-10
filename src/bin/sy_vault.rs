@@ -697,61 +697,85 @@ async fn send_secret_changed_notice(
 /// same value and continue. The cost is N small messages at boot, where
 /// N = number of secrets in vault.db — bounded by operator intent — plus
 /// one addressed to its edge for each secret an edge owns (A-78).
+///
+/// Every secret, a page at a time (FINDINGS A-200): one listing stops at
+/// its limit, so the boot follows each page's `next_cursor`, as a
+/// VAULT_LIST caller does (A-198), until no secret follows.
 async fn emit_bootstrap_secret_broadcasts(
     sender: &NodeSender,
     store: &VaultStore,
     hive_id: &str,
 ) -> VaultResult<()> {
-    let summaries = store.list(VaultFilter::default(), &Caller::default())?;
-    if summaries.is_empty() {
-        tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
-        return Ok(());
-    }
     let edges = edge_nodes(hive_id, &HiveRegistry::motherbee());
     let src_uuid = sender.uuid().to_string();
+    let mut secrets = 0usize;
     let mut emitted = 0usize;
     let mut skipped = 0usize;
     let mut edge_notices = 0usize;
-    for summary in summaries {
-        let Some(payload) = build_secret_changed_payload(
-            VaultSecretOp::Put,
-            &summary.key,
-            &summary.metadata,
-            None,
-            summary.version,
-            hive_id,
-        ) else {
-            // Secret has no resource_type — Model D' rejects this on put,
-            // but legacy records could still exist. Skip and log.
-            skipped += 1;
-            tracing::warn!(
-                key = %summary.key,
-                "bootstrap broadcast skipped: secret has no resource_type (legacy record?)"
-            );
-            continue;
-        };
-        // No originating msg here (this is boot, not a mutation): no src_ilk, and the notices
-        // are marked as the boot re-announcement.
-        let owner = secret_owner_ilk(&summary.metadata);
-        for notice in secret_changed_notices(&src_uuid, None, true, &payload, owner, &edges)? {
-            let to_edge = matches!(notice.routing.dst, Destination::Unicast(_));
-            if let Err(err) = sender.send(notice).await {
+    let mut cursor = None;
+    loop {
+        let page = store.list_page(
+            VaultFilter {
+                limit: Some(VAULT_LIST_MAX_LIMIT),
+                ..VaultFilter::default()
+            },
+            &Caller::default(),
+            cursor.take(),
+        )?;
+        for row in page.rows {
+            let summary: VaultSecretSummary = serde_json::from_value(row)?;
+            secrets += 1;
+            let Some(payload) = build_secret_changed_payload(
+                VaultSecretOp::Put,
+                &summary.key,
+                &summary.metadata,
+                None,
+                summary.version,
+                hive_id,
+            ) else {
+                // Secret has no resource_type — Model D' rejects this on put,
+                // but legacy records could still exist. Skip and log.
+                skipped += 1;
                 tracing::warn!(
-                    error = %err,
                     key = %summary.key,
-                    to_edge,
-                    "bootstrap broadcast failed for one secret; continuing with the rest"
+                    "bootstrap broadcast skipped: secret has no resource_type (legacy record?)"
                 );
                 continue;
-            }
-            if to_edge {
-                edge_notices += 1;
-            } else {
-                emitted += 1;
+            };
+            // No originating msg here (this is boot, not a mutation): no src_ilk, and the notices
+            // are marked as the boot re-announcement.
+            let owner = secret_owner_ilk(&summary.metadata);
+            for notice in secret_changed_notices(&src_uuid, None, true, &payload, owner, &edges)? {
+                let to_edge = matches!(notice.routing.dst, Destination::Unicast(_));
+                if let Err(err) = sender.send(notice).await {
+                    tracing::warn!(
+                        error = %err,
+                        key = %summary.key,
+                        to_edge,
+                        "bootstrap broadcast failed for one secret; continuing with the rest"
+                    );
+                    continue;
+                }
+                if to_edge {
+                    edge_notices += 1;
+                } else {
+                    emitted += 1;
+                }
             }
         }
+        // A page always moves on (`mesh_reply::list_page`): its next one starts after its last
+        // secret.
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    if secrets == 0 {
+        tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
+        return Ok(());
     }
     tracing::info!(
+        secrets = secrets,
         emitted = emitted,
         skipped = skipped,
         edge_notices = edge_notices,
@@ -798,9 +822,12 @@ fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultR
     Ok(page.into_answer("secrets", json!({ "status": "ok", "count": count })))
 }
 
+/// The most secrets one VAULT_LIST page may hold, whatever its filter names.
+const VAULT_LIST_MAX_LIMIT: u32 = 1000;
+
 /// VAULT_LIST's page when its filter names no limit, and the most it may name.
 fn vault_list_limit(filter: &VaultFilter) -> usize {
-    filter.limit.unwrap_or(200).clamp(1, 1000) as usize
+    filter.limit.unwrap_or(200).clamp(1, VAULT_LIST_MAX_LIMIT) as usize
 }
 
 /// The most bytes of secrets one VAULT_LIST answer carries (FINDINGS A-198): what would not fit the
@@ -1431,6 +1458,9 @@ impl VaultStore {
             .map_err(VaultError::from)
     }
 
+    /// The first secrets `filter` matches, up to its limit (200 without one): the tests' listing.
+    /// Every listing the vault answers or makes pages (`list_page`), the boot's included (A-200).
+    #[cfg(test)]
     fn list(&self, filter: VaultFilter, caller: &Caller) -> VaultResult<Vec<VaultSecretSummary>> {
         let limit = vault_list_limit(&filter);
         Ok(self
@@ -2626,6 +2656,58 @@ mod tests {
         let same_time_next_key = place("2026-11-09T10:00:00Z", "2026-01-01T00:00:00Z", "c");
         assert!(same_time_next_key.after(&newest));
         assert_eq!(VaultListPlace::parse(&newest.cursor()), Some(newest));
+    }
+
+    /// FINDINGS A-200: the boot re-announces every secret once, past one listing's limit (200
+    /// without one, 1000 at most) and past one page's bytes, each as a VAULT_SECRET_CHANGED
+    /// broadcast marked as the boot's.
+    #[tokio::test]
+    async fn the_boot_announces_every_secret_once() {
+        let (mut store, dir) = open_test_store([9u8; 32]);
+        let admin = admin_caller();
+        let mut keys = Vec::new();
+        for n in 0..250 {
+            let mut meta = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
+            meta.description = Some("d".repeat(1_000));
+            let key = format!("infra:k{n:03}");
+            store.put(&key, json!("v"), meta, &admin).expect("put");
+            keys.push(key);
+        }
+        // The pages the boot follows: more than one, by their bytes.
+        let first = store
+            .list_page(
+                VaultFilter {
+                    limit: Some(VAULT_LIST_MAX_LIMIT),
+                    ..VaultFilter::default()
+                },
+                &Caller::default(),
+                None,
+            )
+            .expect("a page");
+        assert!(first.rows.len() < keys.len(), "{} rows", first.rows.len());
+
+        let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.vault@motherbee",
+            build_vault_rpc_profile().expect("profile"),
+        );
+        let sender = client.sender_snapshot();
+        let drain = async {
+            let mut announced = Vec::new();
+            while let Some(notice) = harness.next_outgoing_within(Duration::from_secs(2)).await {
+                assert_eq!(notice.meta.msg.as_deref(), Some(MSG_VAULT_SECRET_CHANGED));
+                assert_eq!(notice.meta.action.as_deref(), Some(VAULT_BOOTSTRAP_ACTION));
+                announced.push(notice.payload["key"].as_str().expect("its key").to_string());
+            }
+            announced
+        };
+        let (result, mut announced) = tokio::join!(
+            emit_bootstrap_secret_broadcasts(&sender, &store, "motherbee"),
+            drain
+        );
+        result.expect("announced");
+        announced.sort();
+        assert_eq!(announced, keys);
+        cleanup(dir);
     }
 
     // ---- Secrets, stage 2 (docs/ilk-tenant-model-v1.md §2.2) ----

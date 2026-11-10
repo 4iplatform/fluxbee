@@ -73,8 +73,10 @@ without its secret reacts to that announcement.
 
 Details that follow from the code:
 
-- The announcement covers at most 200 secrets, the most recently written first: it calls
-  `VaultStore::list` with a default filter, whose limit defaults to 200.
+- The announcement covers every secret, the most recently written first, each once: it lists
+  them a page at a time (`VaultStore::list_page`, 1000 at most and at most 96 KiB each) and
+  follows each page's `next_cursor`, as a `VAULT_LIST` caller does (FINDINGS A-200; before 0.1.127
+  it covered the 200 newest).
 - Consumers do not depend only on the broadcast. `VaultClient::resolve_resource_awaiting_vault`
   retries transport failures (no route, timeout) every 750 ms for up to the caller's budget;
   `VAULT_BOOT_WAIT` is 60 s.
@@ -338,8 +340,9 @@ directory names (`/var/lib/fluxbee/hives`, to name the edges) and `JSR_LOG_LEVEL
 ## Health
 
 - `systemctl status sy-vault` and `journalctl -u sy-vault`. Startup logs `sy.vault started` and
-  then `sy.vault bootstrap broadcast complete` with `emitted` and `edge_notices` (or `vault.db is
-  empty, nothing to announce`). Each change logs `vault secret changed broadcast sent`, and
+  then `sy.vault bootstrap broadcast complete` with `secrets`, `emitted`, `skipped` and
+  `edge_notices` (or `vault.db is empty, nothing to announce`). Each change logs
+  `vault secret changed broadcast sent`, and
   `vault secret changed notice sent to the edge that owns the secret` with the edge's name.
 - The node answers `NODE_STATUS_GET` with the SDK default handler
   (`try_handle_default_node_status` in `crates/fluxbee_sdk/src/status.rs`).
