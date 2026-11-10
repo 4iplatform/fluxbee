@@ -306,6 +306,13 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-233 🔵 A purged node's pages stay public until they expire (low).
 - A-234 🔵 SY.admin's HTTP reader allocates whatever `Content-Length` a client declares (low).
 - A-237 🔵 A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata (low; the SDK).
+- A-238 🔵 A canceled timer can be deleted at the next start, aged by its creation (low).
+- A-239 🔵 The Go SDK's TimerInfo drops SY.timer's canceled_reason (low; with A-228).
+- A-240 🔵 A local get_node_status writes on every read (low).
+- A-241 🔵 A spoke's blob staging is never cleaned (low, to decide).
+- A-242 🔵 remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin (low).
+- A-243 🔵 Who can take a page down: IO/WF nodes publish but cannot unpublish; the Cloud can neither list nor unpublish (to decide).
+- A-244 🔵 SY.timer's per-timer lock map never drops an entry (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1384,6 +1391,69 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-244 [General/SY.timer] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — SY.timer's per-timer lock map never drops an entry
+
+- **Why:** `timerLock` (`go/sy-timer/scheduler.go` ~585) adds a small mutex per timer that ever fired,
+  and since A-220's race fix per timer canceled or rescheduled, and never removes it, for the
+  process's life (about 100 bytes each).
+- **Fix, later:** reference-counted entries, or drop a timer's lock when the timer leaves the store.
+
+### A-243 [General/admin] 🔵 to decide (found 2026-11-10 by A-233's builder; read in the code) — Who can take a page down: IO and WF nodes publish but cannot unpublish, and the Cloud can neither list nor unpublish
+
+- **Why:** IO.*, WF.* and AI.* nodes may publish a page; over the mesh only AI.* may unpublish one
+  (`src/bin/sy_admin.rs` ~5824-5825 on c7402e88); the Cloud's exposed actions have neither the list
+  nor the unpublish (`crates/fluxbee_sdk/src/cloud.rs:65-86`). With the purge rule (A-212, A-233),
+  a Cloud IO node, or a workflow whose WF node published a page, cannot be purged until the page
+  expires (up to 30 days) unless the operator takes it down.
+- **To decide:** let a publisher take its own pages down (any node allowed to publish), and give the
+  Cloud the list and the unpublish for its own tenant's pages through IO.cloud; or leave pages to
+  expire.
+
+### A-242 [General/orchestrator] 🔵 low (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
+
+- **remove_hive:** `remove_hive_flow` (`src/bin/sy_orchestrator.rs` ~21482 on c7402e88) leaves the pages
+  its nodes published up until they expire; the purge rule (A-233) does not reach it.
+- **The spawn's rollback:** `delete_node_ilk_for_spawn_rollback` (~25315) purges the ILK of a node
+  whose spawn failed without going through SY.admin; that node barely ran.
+- **Also, A-232's case in other binaries:** refusals that still repeat a cursor at
+  `src/bin/sy_identity.rs:7425`, `src/bin/sy_orchestrator.rs:3493`, `:19709` (with each binary's
+  next release).
+- **To decide (remove_hive):** refuse it while the hive's nodes have pages up, as a purge is, or take
+  them down as part of the operator's explicit removal.
+
+### A-241 [General/blob] 🔵 low (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
+
+- **Why:** since A-188 the blob GC runs only on the motherbee; a spoke's `staging/` leftovers were
+  never cleaned before either, because its GC was off. A staging-only pass on spokes, which needs
+  no publication pins, would clean them.
+- **Fix, to decide:** whether spokes get a staging-only GC pass.
+
+### A-240 [General/orchestrator] 🔵 low (found 2026-11-10 by A-199's builder; read in the code) — A local get_node_status writes on every read
+
+- **Why:** `get_node_status` / `NODE_STATUS_GET` for a node of this hive runs
+  `advance_node_status_version` (`src/bin/sy_orchestrator.rs` ~25911), which writes the status
+  version and fingerprint and recreates the node's directory; the SDK's policy classes it as a read
+  (`crates/fluxbee_sdk/src/policy.rs:86`). A-199's step 1 keeps it in the ordered lane for that
+  reason.
+- **Fix, later:** a status read that writes nothing (the version advanced where the status changes).
+
+### A-239 [General/Go SDK] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — The Go SDK's TimerInfo drops SY.timer's canceled_reason
+
+- **Why:** since A-220 (SY.timer 1.4) TIMER_GET and TIMER_LIST carry `canceled_reason` for a timer
+  SY.timer closed itself. The Go SDK's `TimerInfo` (`go/fluxbee-go-sdk/timer_client.go:39`) has no
+  such field, so `TimerClient.Get`/`List` lose it; the Rust SDK keeps it in `extra`
+  (`crates/fluxbee_sdk/src/timer.rs:199-200`); SY.admin's routes and Archi show it.
+- **Fix (the Go SDK, with A-228's release):** the field in `TimerInfo`.
+
+### A-238 [General/SY.timer] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — A canceled timer can be deleted at the next start, aged by its creation instead of its cancellation
+
+- **Why:** the history GC runs before the replay at a start (`go/sy-timer/main.go:210-214`) and ages
+  a canceled timer by its last fire or its creation, not by when it was canceled
+  (`persistence.go:311`). A timer canceled (by its owner, or by SY.timer since A-220) whose creation
+  or last fire is older than 7 days is deleted at the next start, its reason with it. Already so
+  before A-220; documented in docs/sy-timer.md §7.5.
+- **Fix, later:** age a canceled timer by its cancellation time.
+
 ### A-237 [General/SDK] 🔵 low (found 2026-11-10 by A-219's builder; read in the code) — A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata
 
 - **Why:** `derive_action_outcome` (`crates/fluxbee_sdk/src/policy.rs`) marks any status other than
@@ -1558,6 +1628,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (the router, a design of its own):** a bounded queue per link with a stated
   policy when it is full (answer the sender, drop, or disconnect), measured against the nodes'
   real load.
+- **The operator's call (2026-11-10), option (a):** a bounded queue per link; when it is full the
+  router refuses the NEW message and answers its sender (a "busy" reason), with a rate-limited log
+  line; the node is never disconnected, and the refusal lasts only while the queue is full: as the
+  node reads, room comes back. Not a circular buffer, which would drop already-accepted messages
+  whose senders believe them delivered. A node hung for good keeps answering "busy" at once,
+  instead of growing the router's memory; its restart is the orchestrator's or the operator's. For
+  the router's release (with A-209, A-221).
 
 ### A-221 [General/router] 🔵 low (found 2026-11-10 by A-203's builder; read in the code) — Cognition records a turn the agent never received when its delivery fails
 
