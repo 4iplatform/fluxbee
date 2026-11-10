@@ -1092,7 +1092,7 @@ The WF node runs on the managed control plane of the Go SDK (`go/fluxbee-go-sdk/
 
    A restart applies a corrected config. A redeploy through SY.wf-rules does that: it rebinds the node and restarts it. Before 0.1.70 the node exited and systemd relaunched it every 5 s, so the reason reached only journald.
 6. With a config in use but a store it cannot use (FINDINGS A-217): `wf_instances.db` does not open, or fails during recovery (§13.4). The engine does not run, the node stays up and connected, and it says why:
-   - `NODE_STATUS_GET`: `DEGRADED`, with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed recovery), or, when the cause is the `db_path` itself (a directory, a place the node cannot create or write), with `invalid_config` naming the path, the config `FAILED_CONFIG` meanwhile (`CONFIG_GET`);
+   - `NODE_STATUS_GET`: `DEGRADED`, with `last_error` `store_unavailable` (a corrupt file, a full disk, a file system the kernel remounted read-only, a failed recovery), or, when the cause is the `db_path` itself (a directory, a place the node cannot create or write, a journal file of the store, `<db>-wal` or `<db>-shm`, it cannot write, which makes SQLite open the store read-only), with `invalid_config` naming the path, the config `FAILED_CONFIG` meanwhile (`CONFIG_GET`). The node reads the path before SQLite opens it, and again once a failed store is closed;
    - workflow traffic: `NOT_TAKEN`, reason `unavailable`, its detail the same cause (§14.5); a `TIMER_FIRED` is dropped, never answered, since the store's open fires the timers missed meanwhile (§11.4), and the node stays `DEGRADED` until that reconcile is done;
    - `WF_*` requests: `STORE_ERROR`, or `node_not_configured` in `FAILED_CONFIG`.
 

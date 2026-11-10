@@ -965,9 +965,10 @@ person: when its provider gave no answer, the error carries the operator's text 
   An instance that waits long in one state is stuck when no timer of that state can fire: read its
   log.
 - **A WF node that cannot use its instance store stays up** and says why in `get_node_status`:
-  `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed
-  recovery), or `invalid_config` naming its `db_path` when that path cannot hold the store, its
-  config `FAILED_CONFIG` meanwhile. It takes no message (`NOT_TAKEN` `unavailable`), the instance
+  `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a file system
+  remounted read-only, a failed recovery), or `invalid_config` naming its `db_path` when that path
+  cannot hold the store (a directory, a place it cannot write, a journal file `<db>-wal` or
+  `<db>-shm` it cannot write), its config `FAILED_CONFIG` meanwhile. It takes no message (`NOT_TAKEN` `unavailable`), the instance
   verbs answer `STORE_ERROR` (`node_not_configured` for a bad `db_path`), and it opens the store
   again every 30 s, ready as soon as it opens. A `db_path` the operator changes is a config change,
   applied at the node's restart.

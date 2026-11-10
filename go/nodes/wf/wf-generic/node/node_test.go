@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -573,6 +575,88 @@ VALUES (%q, %q, 'invoice', %q, 'running', 'collecting_data', '{"customer_id":"c1
 				t.Fatalf("the event starts an instance: %d running, sent %+v", rt.Registry.Count(), answers)
 			}
 		})
+	}
+}
+
+// FINDINGS A-217's review: a store's failure is its config's (FAILED_CONFIG, invalid_config) only
+// when the db_path is at fault, which a corrected db_path fixes. A journal file of the store that the
+// node cannot write, one another user left (<db>-wal, <db>-shm), is: SQLite opens the store
+// read-only with it, and the failure read store_unavailable. A read-only file system is not: the
+// kernel remounts one read-only after I/O errors, a fault of the disk (store_unavailable), and the
+// message says the file system is read-only.
+func TestAStoreFailureIsTheConfigsOnlyWhenItsPathIsAtFault(t *testing.T) {
+	for _, journal := range []string{"-wal", "-shm"} {
+		t.Run("a "+journal+" file it cannot write", func(t *testing.T) {
+			if os.Geteuid() == 0 {
+				t.Skip("root writes a file whatever its mode")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dbPath := filepath.Join(t.TempDir(), "wf.db")
+			left, err := OpenStore(dbPath) // the store of an earlier run, closed
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := left.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dbPath+journal, nil, 0o444); err != nil {
+				t.Fatal(err)
+			}
+			document := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+			document["db_path"] = dbPath
+			plane := bootstrap(t, writeNodeConfig(t, document))
+			materialized := plane.Configured()
+			rt := &NodeRuntime{ActCtx: ActionContext{Dispatcher: &mockDispatcher{l2name: testNodeName, uuid: "wf-uuid"}, Timer: &mockTimerLister{}, Clock: fixedClock},
+				NodeUUID: "wf-uuid", NodeName: testNodeName, Plane: plane}
+			defer func() {
+				if rt.Store != nil {
+					rt.Store.Close()
+				}
+			}()
+			if rt.startEngine(ctx, materialized) || plane.State.CurrentState != sdk.ManagedFailedConfig ||
+				rt.storeDown.cause.Code != sdk.ErrCodeInvalidConfig || !strings.Contains(rt.storeDown.cause.Message, dbPath+journal) {
+				t.Fatalf("a journal file it cannot write is the db_path's fault: %+v %+v", plane.State, rt.storeDown)
+			}
+			// SQLite may have replaced the file meanwhile; the next open runs either way.
+			if err := os.Chmod(dbPath+journal, 0o644); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if !rt.startEngine(ctx, materialized) || plane.Configured() != materialized {
+				t.Fatalf("the engine runs once the journal file can be written: %+v %+v", plane.State, rt.storeDown)
+			}
+		})
+	}
+
+	// A read-only file system, as dbPathProblem finds it on the store's file.
+	const dbPath = "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf_instances.db"
+	readOnly := fmt.Errorf("a file of the store cannot be written: %w", &os.PathError{Op: "open", Path: dbPath, Err: syscall.EROFS})
+	cause, onPath := storeFailure(dbPath, errors.New("keep definition: attempt to write a readonly database (8)"), readOnly)
+	if onPath || cause.Code != errCodeStoreUnavailable || !strings.Contains(cause.Message, "read-only file system") ||
+		!strings.Contains(cause.Message, "attempt to write a readonly database") {
+		t.Fatalf("a read-only file system is the disk's fault, and the message says so: %+v %v", cause, onPath)
+	}
+
+	// What is the path's fault, and what is not.
+	for _, c := range []struct {
+		err  error
+		path bool
+	}{
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.EACCES}, true},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.EPERM}, true},
+		{&os.PathError{Op: "mkdir", Path: "x", Err: syscall.ENOTDIR}, true},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.EISDIR}, true},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.ENAMETOOLONG}, true},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.ELOOP}, true},
+		{fmt.Errorf("x is a directory: %w", errNotAFile), true},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.EROFS}, false},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.ENOSPC}, false},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.EIO}, false},
+		{nil, false},
+	} {
+		if pathFault(c.err) != c.path {
+			t.Errorf("pathFault(%v) = %v, want %v", c.err, !c.path, c.path)
+		}
 	}
 }
 

@@ -165,56 +165,73 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// dbPathProblem says why the instance store cannot be kept at path, the configured db_path,
-// whatever a database there holds (FINDINGS A-217): path names a directory, or something else that
-// is no regular file, or its directory cannot be made, or the node cannot write the file, or next to
-// it, where SQLite keeps its journal (journal_mode WAL: <db>-wal and <db>-shm). nil when nothing
-// about the path stops it: a store that still fails fails for its database (a corrupt file) or its
-// recovery, and the system's own failures (no space left, an I/O error) are no problem of the path
-// either. Call it with no store open on path: closing a descriptor of the file drops every lock
-// this process holds on it, SQLite's included.
+// errNotAFile marks a store's file that is something other than a regular file, a directory or a
+// socket, say: the path's fault, whatever the system says.
+var errNotAFile = errors.New("not a regular file")
+
+// dbPathProblem says what stops the instance store at path, the configured db_path, whatever a
+// database there holds (FINDINGS A-217): the first failure of making its directory, of writing the
+// file and the journal SQLite keeps next to it (journal_mode WAL: <db>-wal and <db>-shm) when they
+// exist, and of creating a file there; nil when none fails, and a store that still fails fails for
+// its database (a corrupt file) or its recovery. pathFault says whether a failure is the path's,
+// for a corrected db_path to fix, or the disk's. Call it with no store open on path: closing a
+// descriptor of a file drops every lock this process holds on it, SQLite's included.
 func dbPathProblem(path string) error {
 	if path == ":memory:" {
 		return nil
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return pathFault(fmt.Errorf("its directory cannot be made: %w", err))
+		return fmt.Errorf("its directory cannot be made: %w", err)
 	}
-	switch info, err := os.Stat(path); {
-	case errors.Is(err, fs.ErrNotExist):
-	case err != nil:
-		return pathFault(err)
-	case info.IsDir():
-		return fmt.Errorf("%s is a directory", path)
-	case !info.Mode().IsRegular():
-		return fmt.Errorf("%s is no regular file", path)
-	default:
-		file, err := os.OpenFile(path, os.O_RDWR, 0)
-		if err != nil {
-			return pathFault(fmt.Errorf("the file cannot be written: %w", err))
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := writableFile(file); err != nil {
+			return err
 		}
-		_ = file.Close()
 	}
 	probe, err := os.CreateTemp(dir, ".wf-db-path-*")
 	if err != nil {
-		return pathFault(fmt.Errorf("its directory cannot be written: %w", err))
+		return fmt.Errorf("its directory cannot be written: %w", err)
 	}
 	_ = probe.Close()
 	_ = os.Remove(probe.Name())
 	return nil
 }
 
-// pathFault is err when the path is at fault: a name the system will not follow, create or write
-// (permission, a read-only file system, a file where a directory should be, a name too long, a loop
-// of links); nil for the system's own failures.
-func pathFault(err error) error {
-	for _, cause := range []error{fs.ErrPermission, syscall.EROFS, syscall.ENOTDIR, syscall.EISDIR, syscall.ENAMETOOLONG, syscall.ELOOP} {
+// writableFile is nil when file does not exist, or is a regular file the node can open to write;
+// otherwise why not. A journal file another user left (root, say) makes SQLite open the store
+// read-only.
+func writableFile(file string) error {
+	info, err := os.Stat(file)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return err
+	case info.IsDir():
+		return fmt.Errorf("%s is a directory: %w", file, errNotAFile)
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("%s: %w", file, errNotAFile)
+	}
+	opened, err := os.OpenFile(file, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("a file of the store cannot be written: %w", err)
+	}
+	return opened.Close()
+}
+
+// pathFault reports whether err, what dbPathProblem found, is the path's fault, which a corrected
+// db_path fixes: a name the system will not follow, create or write (permission, a file where a
+// directory should be, a name too long, a loop of links), or something there that is no regular
+// file. A read-only file system is the disk's, as the system's other failures (no space left, an
+// I/O error): the kernel remounts one read-only after I/O errors.
+func pathFault(err error) bool {
+	for _, cause := range []error{errNotAFile, fs.ErrPermission, syscall.ENOTDIR, syscall.EISDIR, syscall.ENAMETOOLONG, syscall.ELOOP} {
 		if errors.Is(err, cause) {
-			return err
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // wfSchemaStatements create every table and index at its current shape.

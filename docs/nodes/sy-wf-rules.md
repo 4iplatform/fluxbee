@@ -256,7 +256,8 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   during recovery, the
   engine does not run and the node stays up (FINDINGS A-217): `DEGRADED` with `store_unavailable`,
   or `FAILED_CONFIG` `invalid_config` when the `db_path` itself cannot hold the store
-  (`storeFailure`, `dbPathProblem` in `node/store.go`); it refuses every event (`NOT_TAKEN`
+  (`storeFailure`; `dbPathProblem` and `pathFault` in `node/store.go`, a read-only file system
+  being the disk's fault); it refuses every event (`NOT_TAKEN`
   `unavailable`, `refuseWhileStoreDown`) and opens the store again every 30 s. Timers use
   `client_ref` `wf:<instance_id>::<timer_key>` (`node/timer.go`).
 - **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`,

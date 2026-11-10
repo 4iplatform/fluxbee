@@ -88,9 +88,10 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   left alone.
 - **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
   store does not open, or fails during recovery, the node stays up and connected: `NODE_STATUS_GET`
-  says `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed
-  recovery), or, when the cause is the `db_path` itself (a directory, a place it cannot create or
-  write), the config is `FAILED_CONFIG` (`invalid_config`, `last_error` naming the path). Meanwhile
+  says `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a file system
+  remounted read-only, a failed recovery), or, when the cause is the `db_path` itself (a directory,
+  a place it cannot create or write, a `<db>-wal` or `<db>-shm` it cannot write), the config is
+  `FAILED_CONFIG` (`invalid_config`, `last_error` naming the path). Meanwhile
   every event gets `NOT_TAKEN` `unavailable`, a `WF_*` request `STORE_ERROR` (`node_not_configured`
   in `FAILED_CONFIG`), and a `TIMER_FIRED` nothing: SY.timer does not send it again, and the timers'
   reconcile at the store's open gives it, the node `DEGRADED` until that reconcile is done. The node

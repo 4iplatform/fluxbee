@@ -209,10 +209,20 @@ const storeRetryInterval = 30 * time.Second
 // storeRetryInterval. A start after a failed one is a restart's: recovery runs again from the store,
 // and counts each event it runs again (Recover). The timer sender is the caller's to set, before;
 // the caller closes rt.Store.
+//
+// The store's path is read (dbPathProblem) before SQLite opens it, with no store open, and again
+// once a failed store is closed: a journal file the node cannot write makes SQLite open the store
+// read-only, and SQLite may have replaced that file by the time it closes. What the first read found
+// comes first.
 func (rt *NodeRuntime) startEngine(ctx context.Context, materialized *Materialized) bool {
+	dbPath := materialized.Config.DBPath
+	probed := dbPathProblem(dbPath)
 	if err := rt.openEngine(ctx, materialized); err != nil {
-		rt.stopEngine() // before storeFailure, which reads the path with no store open on it
-		cause, onPath := storeFailure(materialized.Config.DBPath, err)
+		rt.stopEngine() // first: dbPathProblem opens and closes the store's files
+		if probed == nil {
+			probed = dbPathProblem(dbPath)
+		}
+		cause, onPath := storeFailure(dbPath, err, probed)
 		rt.storeDown = &storeOutage{cause: cause, def: materialized.Definition}
 		if onPath {
 			rt.Plane.failOnDBPath(cause)
@@ -223,7 +233,7 @@ func (rt *NodeRuntime) startEngine(ctx context.Context, materialized *Materializ
 		return false
 	}
 	if rt.storeDown != nil {
-		log.Printf("wf: the instance store opened at %s: the engine runs", materialized.Config.DBPath)
+		log.Printf("wf: the instance store opened at %s: the engine runs", dbPath)
 	}
 	rt.storeDown = nil
 	rt.Plane.inUse(materialized)
@@ -273,15 +283,20 @@ func (rt *NodeRuntime) stopEngine() {
 	rt.timersPending = nil
 }
 
-// storeFailure is how the node reports err, the failure of its store at dbPath (FINDINGS A-217),
-// and whether the cause is the db_path itself (dbPathProblem): then invalid_config, the config's
-// failure, which a corrected db_path fixes; otherwise store_unavailable (a corrupt file, a full
-// disk, a failed recovery).
-func storeFailure(dbPath string, err error) (*sdk.ControlPlaneError, bool) {
-	if problem := dbPathProblem(dbPath); problem != nil {
-		return sdk.InvalidConfig("db_path %q cannot hold the instance store: %v", dbPath, problem), true
+// storeFailure is how the node reports err, the failure of its store at dbPath (FINDINGS A-217), and
+// whether the cause is the db_path itself: what probed, dbPathProblem of dbPath, found, when it is the
+// path's fault (pathFault). Then invalid_config, the config's failure, which a corrected db_path
+// fixes; otherwise store_unavailable (a corrupt file, a full disk, a file system the kernel remounted
+// read-only, a failed recovery), with what probed found, if anything.
+func storeFailure(dbPath string, err, probed error) (*sdk.ControlPlaneError, bool) {
+	if pathFault(probed) {
+		return sdk.InvalidConfig("db_path %q cannot hold the instance store: %v", dbPath, probed), true
 	}
-	return &sdk.ControlPlaneError{Code: errCodeStoreUnavailable, Message: fmt.Sprintf("the instance store at %q cannot be used: %v", dbPath, err)}, false
+	message := fmt.Sprintf("the instance store at %q cannot be used: %v", dbPath, err)
+	if probed != nil {
+		message += "; " + probed.Error()
+	}
+	return &sdk.ControlPlaneError{Code: errCodeStoreUnavailable, Message: message}, false
 }
 
 // loopTicker is a ticker the receive loop selects on only while it runs: C is nil while it is
