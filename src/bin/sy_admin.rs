@@ -35077,7 +35077,10 @@ mod tests {
     /// to their write, as the writers outside SY.admin do: remove_runtime_version (its write back
     /// after a failed removal included) and reset_base_runtime take it before they read the
     /// manifest; publish_runtime_package takes it in the shared install
-    /// (`update_runtime_manifest_with_package_with_options`, tested there).
+    /// (`update_runtime_manifest_with_package_with_options`, tested there). Held to the write: the
+    /// lock is the value of a `let` of the handler's own body, under a name that is not `_` (`let _ =`
+    /// would let it go at once) and is never named again (no drop, no move), so it lives until the
+    /// handler returns, past its last write.
     #[test]
     fn the_manifest_writers_hold_its_file_lock_from_read_to_write() {
         let source = include_str!("sy_admin.rs");
@@ -35098,6 +35101,33 @@ mod tests {
                 .expect("the write");
             assert!(lock < read && read < last_write, "{handler}");
             assert_eq!(body.matches("lock_local_runtime_manifest()").count(), 1);
+
+            // Its binding: a statement of the body itself, four spaces in, never one of a block
+            // that ends before the write, whose value is the lock.
+            let statement = body[..lock]
+                .rfind("\n    let ")
+                .map(|at| at + "\n    let ".len())
+                .expect("the lock's binding");
+            let binding = &body[statement..lock];
+            assert!(
+                !binding.contains(';'),
+                "the lock is no `let` of {handler}'s body: `{binding}`"
+            );
+            let name = binding
+                .strip_prefix("mut ")
+                .unwrap_or(binding)
+                .split(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+                .next()
+                .unwrap_or_default();
+            assert!(
+                name.len() > 1,
+                "`let {name}` in {handler} lets the lock go at once"
+            );
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{name} is named again in {handler}: dropped or moved before the write"
+            );
         }
     }
 

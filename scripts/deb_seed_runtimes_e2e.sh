@@ -245,16 +245,27 @@ check "the publish waits while another writer holds the lock" \
 wait "$holder"
 rc=0; wait "$publisher" || rc=$?
 check "and writes once the lock is free" "$rc $(q "$M11" "d['runtimes']['io.api']['current']")" "0 9.9.11"
-# The seed's restore waits for it too; the hand publish stays current through the seed.
+# The seed's restore waits for it too. dpkg removed the manifest (the first upgrade that drops it
+# from the payload) and the pre-upgrade snapshot holds it: the seed restores it only once the lock
+# is free, and the hand publish stays current through the restore and the seed's publishes.
+SNAP11="$WORK/t11-snapshot.json"
+cp "$M11" "$SNAP11"
+rm -f "$M11"
 flock "$L11" sh -c 'touch "$1"; sleep 2' _ "$WORK/t11-held-2" &
 holder=$!
 until [ -f "$WORK/t11-held-2" ]; do sleep 0.1; done
-started=$SECONDS
-rc=0; run_seed "$D11" >/dev/null 2>&1 || rc=$?
-waited=$((SECONDS - started))
+run_seed "$D11" "$SNAP11" >"$WORK/t11-seed.out" 2>&1 &
+seeder=$!
+sleep 1
+check "the seed's restore waits while another writer holds the lock" \
+  "$([ -e "$M11" ] && echo restored || echo waiting)" "waiting"
 wait "$holder"
-check "the seed runs once the lock is free" "$rc $([ "$waited" -ge 1 ] && echo waited || echo "did not wait")" "0 waited"
-check "the hand publish stays current" "$(q "$M11" "d['runtimes']['io.api']['current']")" "9.9.11"
+rc=0; wait "$seeder" || rc=$?
+check "and restores the snapshot once the lock is free" \
+  "$rc $(grep -c 'restored the pre-upgrade runtimes manifest' "$WORK/t11-seed.out" || true)" "0 1"
+check "the hand publish stays current through the restore" \
+  "$(q "$M11" "d['runtimes']['io.api']['current']")" "9.9.11"
+check "the snapshot is consumed" "$([ -f "$SNAP11" ] && echo yes || echo no)" "no"
 
 echo "== T12: a hand publish never merges over a manifest it cannot read; it writes one whole =="
 mkdir -p "$WORK/t12-src"; printf '#!/bin/sh\ntrue\n' >"$WORK/t12-src/io-api"; chmod 0755 "$WORK/t12-src/io-api"
