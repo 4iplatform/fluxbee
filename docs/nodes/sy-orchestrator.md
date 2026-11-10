@@ -184,7 +184,9 @@ same way, with `managed: false`.
    fields (FINDINGS A-213).
 6. Its config is written to `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json`
    (`node_instance_dir`, `write_json_atomic`): the runtime's config template, the request's
-   `config`, `tenant_id`, and a `_system` block.
+   `config`, `tenant_id`, and a `_system` block. Its `tenant_id` and `_system.tenant_id` are the
+   tenant the node registered, trimmed, over whatever the template or the request's config held
+   there (`assemble_spawn_config_map`), so the identity, the unit and the file name one tenant.
 7. It starts as a transient unit:
    `systemd-run --unit fluxbee-node-<name> --setenv=FLUXBEE_NODE_NAME=... [--setenv=FLUXBEE_NODE_ILK_ID=...] [--setenv=FLUXBEE_NODE_TENANT_ID=...] --collect --property Restart=always --property RestartSec=5 <start.sh>`
    (`build_managed_node_run_command`; `unit_from_node_name` turns characters outside

@@ -19996,7 +19996,8 @@ fn ensure_node_effective_config_on_spawn_with_roots(
     let template = load_runtime_config_template_with_root(runtime, runtime_version, runtimes_root)?;
     let request_patch = parse_config_patch(payload, "config")?;
     let resolved_tenant_id = resolve_tenant_id_for_node(payload);
-    let mut config = assemble_spawn_config_map(template, request_patch, resolved_tenant_id, None);
+    let mut config =
+        assemble_spawn_config_map(template, request_patch, resolved_tenant_id.clone(), None);
     // The caller's own words, before resolution.
     let requested_runtime_version = payload
         .get("runtime_version")
@@ -20012,7 +20013,7 @@ fn ensure_node_effective_config_on_spawn_with_roots(
         runtime_base,
         package_path,
         ilk_id,
-        config.get("tenant_id").and_then(|v| v.as_str()),
+        resolved_tenant_id.as_deref(),
         1,
     );
     let mut system_block = system_block;
@@ -20038,10 +20039,15 @@ fn assemble_spawn_config_map(
     for (key, value) in request_patch {
         config.insert(key, value);
     }
+    // The tenant the node registers is the one its config records, over whatever the template or
+    // the request's config held there (blank, null, padded or not a string; a different tenant
+    // never gets here, `spawn_tenant_conflict_refusal`), so the identity, the unit and the file
+    // never split (FINDINGS A-213).
     if let Some(tenant_id) = resolved_tenant_id {
-        config
-            .entry("tenant_id".to_string())
-            .or_insert(serde_json::Value::String(tenant_id));
+        config.insert(
+            "tenant_id".to_string(),
+            serde_json::Value::String(tenant_id),
+        );
     }
     if let Some(system) = forced_system {
         config.insert("_system".to_string(), system);
@@ -21565,10 +21571,11 @@ fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
 }
 
 /// Some(error reply) when a spawn names its tenant twice, `tenant_id` and `config.tenant_id`, and
-/// the two differ: the identity and the unit's `FLUXBEE_NODE_TENANT_ID` would take the first and
-/// config.json the second (FINDINGS A-213). `run_node_flow` checks it before anything is written or
+/// the two differ: the node would run in the first, and the second, the caller's word too, would be
+/// dropped without a word (FINDINGS A-213). `run_node_flow` checks it before anything is written or
 /// forwarded. The same tenant in both, or one alone, passes; a blank one counts as not given, as in
-/// `resolve_tenant_id_for_node`.
+/// `resolve_tenant_id_for_node`, and config.json records the resolved one
+/// (`assemble_spawn_config_map`).
 fn spawn_tenant_conflict_refusal(
     node_name: &str,
     payload: &serde_json::Value,
@@ -23744,7 +23751,7 @@ async fn run_node_flow(
     }
 
     // A request that names two different tenants stops here, before anything is written or
-    // forwarded: the identity and the unit would take one, config.json the other (FINDINGS A-213).
+    // forwarded: the node would run in one and the other would be dropped (FINDINGS A-213).
     if let Some(refusal) = spawn_tenant_conflict_refusal(&node_name, payload) {
         return refusal;
     }
@@ -42918,32 +42925,35 @@ blob:
 
     /// FINDINGS A-213: a spawn that names its tenant twice, `tenant_id` and `config.tenant_id`, and
     /// differently, is refused (INVALID_REQUEST, naming both fields) before anything is written or
-    /// forwarded, so the identity, the unit and config.json never split. The same tenant in both,
-    /// or one alone, goes on as before.
+    /// forwarded. The same tenant in both, or one alone, goes on as before, and its config.json
+    /// records the tenant the spawn resolved, at the top and in `_system`, whatever the other field
+    /// held (null, blank, padded, not a string): the identity, the unit and config.json never split.
     #[tokio::test]
     async fn a_spawn_that_names_two_different_tenants_is_refused_before_anything_is_written() {
         let state = sample_orchestrator_state_for_tests();
         let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
         let other = "tnt:5b1d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e";
-        let spawn = |node: &str, top: Option<&str>, in_config: Option<&str>| {
-            let mut payload = serde_json::json!({
-                "node_name": node,
-                "runtime": "ai.generic",
-                "config": { "model": "kept" },
-            });
-            if let Some(top) = top {
-                payload["tenant_id"] = serde_json::json!(top);
-            }
-            if let Some(in_config) = in_config {
-                payload["config"]["tenant_id"] = serde_json::json!(in_config);
-            }
-            payload
-        };
+        let spawn =
+            |node: &str, top: Option<serde_json::Value>, in_config: Option<serde_json::Value>| {
+                let mut payload = serde_json::json!({
+                    "node_name": node,
+                    "runtime": "ai.generic",
+                    "config": { "model": "kept" },
+                });
+                if let Some(top) = top {
+                    payload["tenant_id"] = top;
+                }
+                if let Some(in_config) = in_config {
+                    payload["config"]["tenant_id"] = in_config;
+                }
+                payload
+            };
+        let named = |tenant: &str| Some(serde_json::json!(tenant));
 
         // This hive's node and another hive's: refused before the gates, the identity, the config
         // and the forward.
         for node in ["AI.sales@motherbee", "AI.sales@worker1"] {
-            let payload = spawn(node, Some(tenant), Some(other));
+            let payload = spawn(node, named(tenant), named(other));
             let refusal = spawn_tenant_conflict_refusal(node, &payload).expect("two tenants");
             assert_eq!(refusal["error_code"], "INVALID_REQUEST");
             let message = refusal["message"].as_str().unwrap_or_default();
@@ -42954,25 +42964,57 @@ blob:
             assert_eq!(run_node_flow(&state, &payload).await, refusal);
         }
 
-        // The same tenant in both (blanks around one), or one alone (a blank one is not given):
-        // a spawn for another hive goes on to its forward, which finds no router in a test.
+        // The same tenant in both (blanks around one), or one alone (a blank one, null or not a
+        // string is not given): a spawn for another hive goes on to its forward, which finds no
+        // router in a test, and the config it writes records the resolved tenant.
+        let node = "AI.sales@worker1";
         let padded = format!(" {tenant} ");
-        for (top, in_config) in [
-            (Some(tenant), Some(padded.as_str())),
-            (Some(tenant), None),
-            (None, Some(tenant)),
-            (Some(tenant), Some(" ")),
-            (Some(" "), Some(other)),
-        ] {
-            let payload = spawn("AI.sales@worker1", top, in_config);
+        let root = std::env::temp_dir().join(format!("fluxbee-a213-tenant-{}", Uuid::new_v4()));
+        let cases = [
+            (named(tenant), named(&padded), tenant),
+            (named(tenant), None, tenant),
+            (None, named(tenant), tenant),
+            (None, named(&padded), tenant),
+            (named(&padded), None, tenant),
+            (named(tenant), Some(serde_json::Value::Null), tenant),
+            (named(tenant), named(""), tenant),
+            (named(tenant), named(" "), tenant),
+            (named(tenant), Some(serde_json::json!(7)), tenant),
+            (named(" "), named(other), other),
+        ];
+        for (case, (top, in_config, recorded)) in cases.into_iter().enumerate() {
+            let payload = spawn(node, top, in_config);
             assert_eq!(
-                spawn_tenant_conflict_refusal("AI.sales@worker1", &payload),
+                spawn_tenant_conflict_refusal(node, &payload),
                 None,
                 "{payload}"
             );
             let reply = run_node_flow(&state, &payload).await;
             assert_eq!(reply["error_code"], "SPAWN_FAILED", "{reply}");
+
+            let nodes_root = root.join(format!("nodes-{case}"));
+            ensure_node_effective_config_on_spawn_with_roots(
+                &state,
+                &payload,
+                node,
+                "worker1",
+                "ai.generic",
+                "1.0.0",
+                None,
+                None,
+                Some("ilk:11111111-1111-1111-1111-111111111111"),
+                &root.join("runtimes"),
+                &nodes_root,
+            )
+            .expect("the config is written");
+            let path = node_effective_config_path_with_root(node, &nodes_root).expect("its path");
+            let config: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).expect("read")).expect("parse");
+            assert_eq!(config["tenant_id"], recorded, "{payload}");
+            assert_eq!(config["_system"]["tenant_id"], recorded, "{payload}");
+            assert_eq!(config["model"], "kept");
         }
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A-16: the watchdog reads a receive-only folder's local changes from its status, which
@@ -48155,6 +48197,9 @@ blob:
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The template, then the request's config, then the forced `_system`; the tenant is the one
+    /// the spawn resolved, over the template's and the request's (A-213: a request whose two
+    /// fields name different tenants is refused before, so here they only differ in a test).
     #[test]
     fn assemble_spawn_config_map_applies_template_then_request_then_forced_system() {
         let template = serde_json::json!({
@@ -48191,29 +48236,45 @@ blob:
         assert_eq!(out.get("max_tokens"), Some(&serde_json::json!(4096)));
         assert_eq!(
             out.get("tenant_id"),
-            Some(&serde_json::json!("tnt:request"))
+            Some(&serde_json::json!("tnt:resolved"))
         );
         assert_eq!(out.get("_system"), Some(&forced_system));
     }
 
+    /// The resolved tenant is recorded whatever the request's config held under `tenant_id`
+    /// (nothing, null, blank or padded); with none resolved, the config is left as it came.
     #[test]
-    fn assemble_spawn_config_map_uses_resolved_tenant_only_when_missing() {
-        let request_patch = serde_json::json!({
-            "model": "gpt-5-mini"
-        })
-        .as_object()
-        .expect("request object")
-        .clone();
+    fn assemble_spawn_config_map_records_the_resolved_tenant() {
+        for held in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(" ")),
+            Some(serde_json::json!(" tnt:resolved ")),
+            Some(serde_json::json!(7)),
+        ] {
+            let mut request_patch = serde_json::Map::new();
+            request_patch.insert("model".to_string(), serde_json::json!("gpt-5-mini"));
+            if let Some(held) = held.clone() {
+                request_patch.insert("tenant_id".to_string(), held);
+            }
 
-        let out =
-            assemble_spawn_config_map(None, request_patch, Some("tnt:resolved".to_string()), None);
+            let out = assemble_spawn_config_map(
+                None,
+                request_patch.clone(),
+                Some("tnt:resolved".to_string()),
+                None,
+            );
+            assert_eq!(out.get("model"), Some(&serde_json::json!("gpt-5-mini")));
+            assert_eq!(
+                out.get("tenant_id"),
+                Some(&serde_json::json!("tnt:resolved")),
+                "{held:?}"
+            );
+            assert!(out.get("_system").is_none());
 
-        assert_eq!(out.get("model"), Some(&serde_json::json!("gpt-5-mini")));
-        assert_eq!(
-            out.get("tenant_id"),
-            Some(&serde_json::json!("tnt:resolved"))
-        );
-        assert!(out.get("_system").is_none());
+            let out = assemble_spawn_config_map(None, request_patch, None, None);
+            assert_eq!(out.get("tenant_id"), held.as_ref(), "{held:?}");
+        }
     }
 
     /// REGRESSION: `systemd_unit_exists` appends `.service` to the name, so passing it one that
