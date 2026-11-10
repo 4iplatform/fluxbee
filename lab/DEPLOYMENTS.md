@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.123** | 2026-11-09 | `e6f6c93f` | motherbee + spokes (core): hive-config-update-v1's stage 4: SY.admin's installation update (`update_installation`, the operator's word; `get_installation_update`, Archi's read) brings every hive to the motherbee's core and installation file, core then config, kept in SY.admin's state dir and resumed after a restart; what it leaves alone, with why (a hive rolled back with `core_rollback` keeps its core and the update is `held`; a hand-edited copy gets no config); the automatic step, once per hive and target, for a hive that did not answer and comes back; `set_installation_ai` opens it, Archi follows it, `ops.py deploy` runs it; with A-198: a mesh reply that does not fit the frame answers `REPLY_TOO_LARGE` with its outcome, optional `limit`/`cursor` pages on the listings that grow (every row without them, as before), an executor run's answer cut to fit; and A-201: Archi reads the admin command log | ✅ live, checked on 8.x | snap `pre-inst-0-1-123` (all 4 VMs) · `apt install fluxbee=0.1.122` + `ops deploy 0.1.122`'s per-spoke core update (SY.admin's `installation-update.json` stays, ignored by 0.1.122) |
+| **0.1.124** | 2026-11-10 | `bffaf4f2` | motherbee + spokes (core): the router's release: a WAN session runs its cleanup however it ends and a send into a dead link is answered (A-203, the links between sibling routers and to nodes too); a WAN peer silent for the dead interval is cut (A-207), and a WAN handshake has a deadline; a sender's message the router's additions take over the frame is answered `FRAME_TOO_LARGE`, a broadcast everywhere or nowhere (A-202); the router no longer reads hive.yaml's `ai` and blob keys; with SY.admin's installation update record (A-204, A-205, and its review round's fixes), SY.timer refusing a `TZ=`/`CRON_TZ=`/`@` cron spec (A-206), wf-generic out of the core (A-211) and A-181's leftover texts | ✅ live, checked on 8.x | snap `pre-router-0-1-124` (all 4 VMs) · `apt install fluxbee=0.1.123` + 0.1.123's `update_installation` (the installation file v7 stays; 0.1.123's router needs hive.yaml's `ai` and blob keys valid, as they are on 8.x) |
+| **0.1.123** | 2026-11-09 | `e6f6c93f` | motherbee + spokes (core): hive-config-update-v1's stage 4: SY.admin's installation update (`update_installation`, the operator's word; `get_installation_update`, Archi's read) brings every hive to the motherbee's core and installation file, core then config, kept in SY.admin's state dir and resumed after a restart; what it leaves alone, with why (a hive rolled back with `core_rollback` keeps its core and the update is `held`; a hand-edited copy gets no config); the automatic step, once per hive and target, for a hive that did not answer and comes back; `set_installation_ai` opens it, Archi follows it, `ops.py deploy` runs it; with A-198: a mesh reply that does not fit the frame answers `REPLY_TOO_LARGE` with its outcome, optional `limit`/`cursor` pages on the listings that grow (every row without them, as before), an executor run's answer cut to fit; and A-201: Archi reads the admin command log | ✅ replaced by 0.1.124 | snap `pre-inst-0-1-123` (deleted 2026-11-10) · `apt install fluxbee=0.1.122` + `ops deploy 0.1.122`'s per-spoke core update (SY.admin's `installation-update.json` stays, ignored by 0.1.122) |
 | **0.1.122** | 2026-11-09 | `6c6d963d` | motherbee + spokes (core): hive-config-update-v1's stage 3c: the operator changes the installation's `ai` through SY.admin (`get_installation`, Archi's read; `set_installation_ai`, the operator's word, through Archi's confirmed plan or loopback), A-11's checks, the motherbee's orchestrator writes the next version and every hive applies it (`SYSTEM_UPDATE` category `config`), restarting only the start readers whose engine changed; SY.admin's executor and Archi take it at their next use; with A-197: Archi reads SY.admin's catalog in its compact view over the mesh | ✅ replaced by 0.1.123 | snap `pre-inst-0-1-122` (deleted 2026-11-09) · `apt install fluxbee=0.1.121` + core-update of the spokes (the installation file stays at its version, which 0.1.121's readers read the same) |
 | **0.1.121** | 2026-11-08 | `84d123ae` | motherbee + spokes (core): hive-config-update-v1's stage 3b: the motherbee writes the installation file's version 1 from its hive.yaml `ai` and distributes it (`fluxbee-dist-installation`, following vendor's members); the join copies it and writes no `ai`; SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it; `/versions` shows each hive's `config` | ✅ replaced by 0.1.122 | snap `pre-inst-0-1-121` (deleted 2026-11-09) · `apt install fluxbee=0.1.120` + core-update of the spokes (keep each hive.yaml `ai`; a worker joined by 0.1.121 needs it put back, HANDBOOK) |
 | **0.1.120** | 2026-11-08 | `0f516fdd` | motherbee + spokes (core): the AI SDK alone, hive-config-update-v1's stage 3a: the installation file's type and reader (`fluxbee_ai_sdk::installation`), used by no reader yet | ✅ replaced by 0.1.121 | snap `pre-aisdk-0-1-120` (deleted 2026-11-09) · `apt install fluxbee=0.1.119` + core-update of the spokes |
@@ -132,6 +133,88 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.124 — The router's release: no frame lost in silence
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.123 · **Commit:** `bffaf4f2`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** 0.1.123's deploy lost a read to a spoke whose router was restarting (A-203), which cost
+  its update about 85 s. The router is shared code and ships alone; the operator added A-204 and
+  A-205 (*"si podes suma 2, por el tiempo que implica el deploy"*), and two clear bugs on other
+  binaries rode along (A-206, A-211), with A-181's leftover texts.
+- **What changed:**
+  - **The router (rt-gateway):**
+    - A-203: a WAN session runs its cleanup on every way out (a read error, a handler error, its
+      writer stopping, the hive unregistered, a clean close) and removes its hive's entry only
+      while it is still its own; a send into a dead link is answered (`WAN_UNAVAILABLE`,
+      `GATEWAY_UNAVAILABLE`, `PEER_UNAVAILABLE`). The links between sibling routers and to nodes
+      got the same cleanup; a node whose link no longer writes is disconnected, and a message to it
+      answered `NODE_NOT_FOUND`.
+    - A-207: a WAN session that hears nothing for the dead interval (40 s, or the peer's longer one)
+      ends; every router sends its LSA every 10 s, so a healthy one never does. Each step of a WAN
+      handshake (the TCP connect, TLS, the HELLO) is bounded at 30 s, and the peer's `WAN_ACCEPT` no
+      longer counts as a dropped frame.
+    - A-202: a sender's frame over 128 KiB once the router has stamped it is not queued, and the
+      sender is answered `UNREACHABLE` `FRAME_TOO_LARGE`; a broadcast is measured at its largest copy
+      and goes everywhere or nowhere. The router's own frames keep the writer's skip.
+    - The router no longer reads hive.yaml's `ai` (it only checked it) and blob keys.
+  - **SY.admin:** A-205, `set_installation_ai`'s apply claims each hive and a read older than a
+    hive's last outcome is dropped; A-204, each hive's own time in the record, and a read that finds
+    a category on the target records it (`seen`); from the review round: a change waits for a hive's
+    holder only while its own call still fits, a run waits for a closed update's task, a closed
+    update's task sends nothing more, a new update's first looks follow its own cadence, the first
+    look's race with the run's passes, and `set_installation_ai` refuses an unreadable registry
+    (503). `lab/ops.py` prints a `seen` or background outcome as on target.
+  - **SY.timer:** A-206, a `cron_spec` that starts with `TZ=`, `CRON_TZ=` or `@` is refused
+    (`TIMER_INVALID_CRON`) before robfig/cron's parser, which panicked on `TZ=` with no space.
+  - **Packaging:** A-211, wf-generic is no longer a core binary; it ships as the `wf.engine` runtime.
+  - **Texts:** the Rust SDK's comments, SY.vault's comment and log line, and two comments in
+    SY.identity and SY.orchestrator no longer say the SY nodes come from hive.yaml; the SDK's unused
+    `HIVE_YAML_NON_SY_LIFECYCLE_NODES` and `is_allowed_non_sy_lifecycle_node` removed.
+- **Build and review:** a branch each (`coa/a-203`, `coa/a-205`, `coa/a-206`, `coa/a-211`,
+  `coa/texts-124`), CI green on each and on the integrated head. One review round, a reviewer per
+  set: the router's (no high or medium; four fixes: the broadcast, the handshake deadline,
+  `WAN_ACCEPT`, nits), SY.admin's (no high or medium; six fixes), the small set's (two comments).
+- **The deploy:** build of `bffaf4f2` in 26.5 min, publish in 16 s, `ops deploy 0.1.124` in 413 s,
+  health clean; snapshot `pre-router-0-1-124`, `pre-inst-0-1-123` dropped.
+  - Phases: snapshots 29.7 s; apt install on the motherbee 263.8 s; the motherbee's admin on the
+    version 46.6 s; the spokes answering 10.5 s; the update's call 32.7 s; the hives on the target
+    13.9 s; health 6.5 s.
+  - The apt install: about 157 s of `apt-get update` and the download of the 242 MB package from
+    fb-build's repo (about 93 s on 0.1.123), then dpkg 82 s (unpack 64 s, configure 15 s); the
+    motherbee's orchestrator was down 80 s inside it (A-193).
+  - **The update closed `done` 46.6 s after its call** (123 s on 0.1.123, with A-203's lost read):
+    egress1 on the target at +37.0 s, ingress1 +41.1 s, worker1 +45.4 s, the motherbee +8.4 s; no
+    read lost while the three spokes' routers restarted.
+- **Checked on 8.x (the gates; the operator's standing word for 8.x, 2026-11-10):**
+  - **A-211:** no `/usr/bin/wf-generic` nor `dist/core/bin/wf-generic`; the core manifest's 14
+    components without it; WF.gate0206@worker1 runs `wf.engine` 0.1.124.
+  - **The texts:** SY.vault logs "well-known SY system ILKs computed from the role's system nodes".
+  - **A-206:** a valid raw recurring timer from SY.admin was scheduled (05:24:03) and cancelled
+    (05:24:13); two `TZ=` specs sent between them (`TZ=UTC` with tab-separated fields, and `TZ=UTC`
+    alone) were refused: no timer, and SY.timer's process the same throughout. On 0.1.123 either
+    one stopped it.
+  - **A-202:** the largest payload SY.admin's SDK accepts was 130,754 bytes; at 130,712 the router
+    logged `FRAME_TOO_LARGE` (`frame_len=131095 max=131072`, `src=SY.admin@motherbee`,
+    `dst=SY.timer@motherbee`) and queued nothing. The router stream dropped its own copies of the
+    gate's near-limit messages as oversize (14 records). Found: SY.admin's HTTP closes the
+    connection without an answer when its SDK refuses an oversize send (A-229).
+  - **A-203:** the deploy itself (above). With egress1 off the mesh (its orchestrator, then its
+    router), reads failed in 1.2-1.3 s.
+  - **A-204:** version 6 (openai's model to `gpt-5.5-mini`) with egress1 away answered in 88.9 s
+    (`partial`); the record gives each hive its own time: ingress1 1,445 ms, the motherbee 1,748 ms,
+    worker1 1,770 ms, egress1 `not_answered` 85,575 ms. The readers the deploy had restarted since
+    their last apply restarted once, as on 0.1.123.
+  - **The automatic step:** egress1 back at 05:29:10; it finished egress1 at 05:29:49 (config `ok by
+    automatic`, 49 ms), and the update closed `done`.
+  - **A-205:** version 7, the undo with every hive up, answered in 4.3 s; each hive applied it in
+    0.2-1.7 s, and the update closed `done` 6 s later (32 s on 0.1.123).
+  - **A-207:** egress1's WAN traffic to the motherbee's :9000 dropped at 05:30:53 (an nft table on
+    egress1, removed by a timer); the motherbee cut the session at 05:31:28.8, 40 s after its last
+    frame; reads failed fast meanwhile; after the drop went, egress1 reconnected and a read was `ok`.
+  - **AI.pruebas** answered a throwaway IO client ("Two plus two is four.").
+  - **PROD after the gates:** all four hives on 0.1.124 (`e9a64112`), the installation file version
+    7 with version 1's values, snapshot `pre-router-0-1-124` on each VM.
 
 ## 0.1.123 — The installation's update, and replies that fit the frame
 

@@ -136,17 +136,18 @@ no change required
     [General/vault], the vault's boot re-announcement covers only its newest 200 secrets (latent);
     A-201 [Archi], Archi could not read `list_recent_commands`, which its handbook tells it to read
     first ✅ 0.1.123, checked on 8.x. **Found by A-198's review round:** A-202 [General/router], a message just
-    under the frame passes the SDK and the router drops it (latent; the shared code, alone).
+    under the frame passes the SDK and the router drops it ✅ 0.1.124, checked on 8.x.
     **Found by 0.1.123's deploy gate:** A-203 [General/router], a WAN session that ends on a read
     error leaves its hive in the peer table, and frames to that hive are lost without UNREACHABLE
-    (seen on 8.x; the router, alone, with A-202). **Found by 0.1.123's gate:** A-204
+    ✅ 0.1.124, checked on 8.x. **Found by 0.1.123's gate:** A-204
     [General/admin], the installation update's record gives every `set_installation_ai` hive the
-    slowest one's time (low); A-205 [General/admin], a background read taken before a hive applied
-    a config change can mark it pending after it did, so the update stays open (low).
+    slowest one's time; A-205 [General/admin], a background read taken before a hive applied a
+    config change can mark it pending after it did ✅ both 0.1.124, checked on 8.x.
 13. **Found by the sweep's re-check (2026-11-09):** A-206 [General/SY.timer], a cron spec that
-    starts with `TZ=` and has no space crashes SY.timer (any node's own timer).
+    starts with `TZ=` and has no space crashes SY.timer ✅ 0.1.124, checked on 8.x.
     **Found by A-203's builder:** A-207 [General/router], a WAN peer that vanishes without
-    closing keeps its session for up to about 15 min (latent, with A-203); A-208 and A-209, low.
+    closing keeps its session for up to about 15 min ✅ 0.1.124, checked on 8.x; A-208 and A-209,
+    low.
 14. **The sweep's calls, the operator's 2026-11-10:** A-210 to A-219 (lab/logbook/2026-11-10.md),
     in releases by binary after the router's; A-218 alone (the SDKs); A-219 with its shape written
     first. **Found by A-206's builder:** A-220 [General/SY.timer], low. **Found by A-207's
@@ -155,6 +156,11 @@ no change required
     and A-225 [General/egress], low.
     **Found by A-215's and A-217's builder:** A-226 [IO/io.slack] and A-227 [WF], low.
     **Found by A-202's builder:** A-228 [General/Go SDK], low.
+15. **The router's release, 0.1.124** ✅ live and checked on 8.x (2026-11-10): A-203, A-207 and
+    A-202 (the router, with the links between routers and to nodes), with A-204 and A-205
+    (SY.admin, the operator's call to ride along), A-206 (SY.timer), A-211 (packaging) and A-181's
+    leftover texts. **Found by its gate:** A-229 [General/admin], low. **Found by 0.1.125's
+    builders:** A-230 [Archi], A-231 [General/admin], A-232 [General/shared], low.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -269,26 +275,13 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-199 🔵 The motherbee orchestrator's admin worker runs one request at a time, and a request its
   caller gave up on still runs (a known limit, to evaluate).
 - A-200 🟡 SY.vault's boot re-announcement covers only its newest 200 secrets (latent, low).
-- A-202 🟡 A message just under the frame passes the SDK's check, and the router then drops it
-  without telling the sender (latent; the SDK and the router, a release alone).
-- A-203 🟡 A WAN session that ends on a read error leaves its hive in the router's peer table:
-  frames to that hive are lost without UNREACHABLE until it reconnects (seen on 8.x; the router,
-  alone, with A-202).
-- A-204 🔵 The installation update's record gives every `set_installation_ai` hive the slowest
-  one's time, and keeps an old outcome on a hive moved by its own update (low).
-- A-205 🟡 A background read taken before a hive applied a config change can mark it pending
-  after it did: the update stays open up to 10 min when no one follows it (low).
-- A-206 🟡 A cron spec that starts with `TZ=` and has no space crashes SY.timer; with a space, a
-  `CRON_TZ=` prefix overrides `cron_tz` (any node's own timer; for 0.1.124).
-- A-207 🟡 A WAN peer that vanishes without closing keeps its session: frames to it are lost
-  without UNREACHABLE for up to about 15 min (latent; the router, with A-203, for 0.1.124).
 - A-208 🔵 With several routers on one hive (not supported), an IRP reply goes to the wrong link
   (low).
 - A-209 🔵 A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender
   (low).
 - The sweep's calls, decided by the operator on 2026-11-10: A-210 (one-time conversions go),
-  A-211 (wf-generic out of the core), A-212 (the reset unpublishes the pages; an action lists
-  them), A-213 (`ORCH_DEFAULT_TENANT_ID` goes), A-214 (every fixed text in English), A-215 (a WF
+  A-211 (wf-generic out of the core, ✅ 0.1.124), A-212 (the reset unpublishes the pages; an action
+  lists them), A-213 (`ORCH_DEFAULT_TENANT_ID` goes), A-214 (every fixed text in English), A-215 (a WF
   forward clears the addressee), A-216 (the frontdesk retries), A-217 (wf-generic stays up on a
   failed database), A-218 (the dead identity surface goes, a release alone), A-219 (a worker goes
   out through the egress, by an action). Cron descriptors wait for the talk on a WF that starts on
@@ -308,6 +301,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   IO node (low).
 - A-228 🔵 The Go SDK's RPC error for UNREACHABLE drops the router's reason (low; the Go SDK,
   alone).
+- A-229 🔵 SY.admin's HTTP closes the connection without an answer when a handler fails (low).
+- A-230 🔵 Archi's prompt tells it to use the root tenant for an AI node with no tenant (low).
+- A-231 🔵 SY.admin's publication ledger never drops a row (low).
+- A-232 🔵 A page request's refusal repeats a bad `limit` (low; shared code).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1386,6 +1383,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-232 [General/shared] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
+
+- **Why:** `PageAsk::from_payload` (`src/mesh_reply.rs:194`, `:206`) answers a bad `limit`, or a
+  cursor that is not a string, with the value in the error text. A link's key pasted there by
+  mistake comes back in the answer, and into Archi's provider. A-212's own cursor refusal does not
+  repeat it.
+- **Fix, later (shared code, with its next release):** the refusal names the field, not the value.
+
+### A-231 [General/admin] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — SY.admin's publication ledger never drops a row
+
+- **Why:** a publish, an unpublish and the expiry sweep read and rewrite the whole ledger
+  (`publications.json`, `src/bin/sy_admin.rs:7634`), and no row ever leaves it: it grows with every
+  page published.
+- **Fix, later:** rows down for some time move out (or are dropped), with the ledger's history kept
+  where the operator needs it.
+
+### A-230 [Archi] 🔵 low (found 2026-11-10 by A-213's builder; read in the code) — Archi's prompt tells it to use the root tenant for an AI node with no tenant
+
+- **Why:** in legacy direct-task mode the prompt says to take the single active "root/default"
+  tenant from `list_tenants` when an `AI.*` node names none (`src/bin/sy_architect.rs:2517`). The
+  genesis tenant is a root (`is_root` means no sponsor, `src/bin/sy_identity.rs:641`) and the
+  orchestrator refuses AI nodes there (`TENANT_ROOT_NOT_ALLOWED`); with a company tenant there are
+  two roots and Archi stops. The rule never yields a usable tenant, and A-213 makes the tenant the
+  caller's datum. The `IO.*` rule beside it already says never the root tenant (`:2516`).
+- **Fix (SY.architect and its handbook, small):** Archi asks for the tenant; related texts at
+  `src/bin/sy_architect.rs:2514`, `docs/archi/handbook_fluxbee.md:1548`, `:1555`,
+  `src/bin/sy_admin.rs:16220`, `:16242`.
+
+### A-229 [General/admin] 🔵 low (found 2026-11-10 by 0.1.124's gate; checked on 8.x and in the code) — SY.admin's HTTP closes the connection without an answer when a handler fails
+
+- **Seen:** `POST /hives/motherbee/nodes/SY.timer@motherbee/messages` with a 131 KB payload: SY.admin's
+  SDK refused the frame ("message too large: 131646 bytes (max 131072)"), and the caller got the
+  connection closed with no response; SY.admin logged `http handler error`.
+- **Why:** `run_http_server` logs a handler's `Err` and drops the stream (`src/bin/sy_admin.rs:9803`);
+  only the handlers' own answers produce a response.
+- **Fix (SY.admin, small):** a handler's error answers 500 with SY.admin's error shape.
+
 ### A-228 [General/Go SDK] 🔵 low (found 2026-11-10 by A-202's builder; read in the code) — The Go SDK's RPC error for UNREACHABLE drops the router's reason
 
 - **Why:** a Go caller's request answered `UNREACHABLE` fails at once, as it should, but with
@@ -1436,6 +1470,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   hive-config-update-v1 §1 speaks of spokes.
 - **Fix:** the write through `write_file_atomic` (`:26570`), the one A-219's commit uses; the doc's
   wording corrected.
+
+- **Also (A-213's builder):** the join writes a spoke's hive.yaml through `sudo -n tee` in place
+  (`write_remote_file`, `src/bin/sy_orchestrator.rs:32713`), under the hive's topology lock; a join
+  that fails midway is redone anyway. hive-config-update-v1 §5 lists it as not built.
+- **Being fixed:** `coa/orch-125` (0.1.125).
 
 ### A-223 [IO/io.api] 🔵 low (found 2026-11-10 by A-216's builder; checked in the code) — io.api waits for a frontdesk handoff no longer than the frontdesk waits for SY.identity
 
@@ -1579,13 +1618,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (SY.admin, the reset script, Archi's handbook):** a read-only SY.admin action that lists
   the live pages; the reset unpublishes each one through SY.admin.
 
-### A-211 [General/packaging] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; checked on 8.x) — wf-generic ships as a core binary that nothing runs
+### A-211 [General/packaging] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10) (from the sweep of 2026-11-07; checked on 8.x) — wf-generic ships as a core binary that nothing runs
 
 - **Why:** `packaging/build-deb.sh:49-50` puts wf-generic in `GO_BINS`, so the .deb installs
   `/usr/bin/wf-generic` on the motherbee and every hive's core manifest lists it. WF nodes run the
   `wf.engine` runtime's copy; on 8.x no WF unit runs `/usr/bin/wf-generic`.
 - **The operator's call:** yes.
 - **Fix (packaging):** out of `GO_BINS`; the runtime's seed stays.
+
+- **Fixed (0.1.124) and checked on 8.x:** no `/usr/bin/wf-generic` nor `dist/core/bin/wf-generic`
+  on the motherbee; WF.gate0206@worker1 runs `wf.engine` 0.1.124.
 
 ### A-210 [General/cleanup] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — One-time conversions for versions every hive has passed still run at each start
 
@@ -1631,7 +1673,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   mode, which is not supported.
 - **Fix, later:** with that mode, if it is ever supported.
 
-### A-207 [General/router] 🟡 LATENT (found 2026-11-09 by A-203's builder; read in the code) — A WAN peer that vanishes without closing its connection keeps its session, and frames to it are lost without UNREACHABLE for up to about 15 minutes
+### A-207 [General/router] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; a silent egress1 cut after the dead interval) (found 2026-11-09 by A-203's builder; read in the code) — A WAN peer that vanishes without closing its connection keeps its session, and frames to it are lost without UNREACHABLE for up to about 15 minutes
 
 - **Why:** a WAN session has no read deadline and no TCP keepalive. A peer that disappears
   without closing (a power loss, a network split) keeps its session and its peer entry until a
@@ -1651,7 +1693,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   to the same hub; `add_hive` writes only one) can churn the hive's entry, each cleanup leaving the
   other's. Not on 8.x.
 
-### A-206 [General/SY.timer] 🟡 (found 2026-11-09 by the sweep's re-check; checked in the code and the library) — A recurring timer's cron spec that starts with `TZ=` and has no space crashes SY.timer, and a `CRON_TZ=` prefix silently overrides `cron_tz`
+- **Fixed (0.1.124) and checked on 8.x:** egress1's WAN traffic to the motherbee's :9000 dropped
+  at 05:30:53 with an nft table on egress1; the motherbee cut the session at 05:31:28.8, 40 s after
+  its last frame, and reads failed fast; when the drop went, egress1 reconnected. Each step of a WAN
+  handshake is bounded at 30 s too (the review round).
+
+### A-206 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; two `TZ=` specs refused, SY.timer untouched) (found 2026-11-09 by the sweep's re-check; checked in the code and the library) — A recurring timer's cron spec that starts with `TZ=` and has no space crashes SY.timer, and a `CRON_TZ=` prefix silently overrides `cron_tz`
 
 - **Why:** SY.timer parses `cron_spec` with robfig/cron v3.0.1, at the request
   (`go/sy-timer/main.go:1208`, `scheduleRecurringFireAt`) and at each re-schedule
@@ -1673,7 +1720,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `TIMER_INVALID_CRON` before parsing. The zone goes in `cron_tz`, and v1 has no descriptors
   (docs/sy-timer.md:948-951). For 0.1.124.
 
-### A-205 [General/admin] 🟡 SEEN on 8.x, low (found 2026-11-09 by 0.1.123's gate; checked in the code) — A background read taken before a hive applied a config change can mark it pending after it did
+- **Fixed (0.1.124) and checked on 8.x:** between a valid raw recurring timer from SY.admin
+  (scheduled, then cancelled) two `TZ=` specs were refused, with no timer and SY.timer's process
+  the same throughout.
+
+### A-205 [General/admin] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; the undo's update done in 6 s) (found 2026-11-09 by 0.1.123's gate; checked in the code) — A background read taken before a hive applied a config change can mark it pending after it did
 
 - **Seen:** version 5 of the installation's `ai`, 2026-11-09 23:03 UTC, every hive up.
   - SY.admin's background read of worker1 went out at 23:03:39.30. Worker1 applied version 5 at
@@ -1692,7 +1743,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** `set_installation_ai`'s apply claims each hive while it applies, as the explicit run
   does; and `recheck` drops a read that began before the category's last outcome.
 
-### A-204 [General/admin] 🔵 SEEN on 8.x, low (found 2026-11-09 by 0.1.123's gate; checked in the code) — The installation update's record gives a set_installation_ai hive the slowest hive's time, and keeps an old outcome on a hive moved by its own update
+- **Fixed (0.1.124) and checked on 8.x:** the apply claims each hive, and a stale read is dropped;
+  the review round added the waits and the closed-update rules (DEPLOYMENTS 0.1.124). Version 7,
+  the undo, closed `done` 6 s after its call (32 s on 0.1.123).
+
+### A-204 [General/admin] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; each hive's own time in the record) (found 2026-11-09 by 0.1.123's gate; checked in the code) — The installation update's record gives a set_installation_ai hive the slowest hive's time, and keeps an old outcome on a hive moved by its own update
 
 - **Seen in the gate's version 4,** with egress1 away: the record and the journal give ingress1,
   worker1 and the motherbee about 85.5 s each (`elapsed_ms`, and `at_ms` with it). The action's own
@@ -1706,7 +1761,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** pass each hive's own elapsed, and its end as `at_ms`. A look that finds a hive moved
   outside the update could record that it saw it on target.
 
-### A-203 [General/router] 🟡 SEEN on 8.x (found 2026-11-09 by 0.1.123's deploy gate; checked in the code) — A WAN session that ends on a read error keeps its hive in the router's peer table, and frames sent to that hive are lost without UNREACHABLE until it reconnects
+- **Fixed (0.1.124) and checked on 8.x:** version 6, with egress1 away, recorded ingress1 1,445 ms,
+  the motherbee 1,748 ms and worker1 1,770 ms (85.5 s each on 0.1.123); a read that finds a category
+  on the target records it, marked `seen`, in every read that decides.
+
+### A-203 [General/router] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; the deploy's update done in 46.6 s, no read lost) (found 2026-11-09 by 0.1.123's deploy gate; checked in the code) — A WAN session that ends on a read error keeps its hive in the router's peer table, and frames sent to that hive are lost without UNREACHABLE until it reconnects
 
 - **Seen:** 0.1.123's deploy, 2026-11-09 22:52:59 UTC.
   - Egress1's router restarted for its core update. The motherbee's session with it ended on "peer
@@ -1736,7 +1795,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     this session's: the clean-close path today removes the hive's entry whichever session wrote it.
   - `send_to_wan_peer` returns false when the send fails, so the sender gets `WAN_UNAVAILABLE`.
 
-### A-202 [General/router] 🟡 LATENT (found 2026-11-09 by A-198's review round; checked in the code) — A message just under the frame passes the SDK's check, and the router then drops it without telling the sender
+- **Fixed (0.1.124) and checked on 8.x:** 0.1.124's deploy restarted the three spokes' routers and
+  lost no read: the update closed `done` 46.6 s after its call (123 s on 0.1.123). The same cleanup
+  went to the links between sibling routers and to nodes; the peer's `WAN_ACCEPT` no longer counts
+  as a dropped frame.
+
+### A-202 [General/router] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; `FRAME_TOO_LARGE` logged and answered) (found 2026-11-09 by A-198's review round; checked in the code) — A message just under the frame passes the SDK's check, and the router then drops it without telling the sender
 
 - **Why:** the SDK refuses a frame over 128 KiB before sending (`crates/fluxbee_sdk/src/split.rs:144`).
   The router then adds to the message and serializes it again:
@@ -1749,6 +1813,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   a 1 KiB reserve under the frame for the router's additions.
 - **Fix:** in the shared code, which ships alone. Either the SDK reserves room for the router's
   additions, or the router answers the sender when it must drop a frame.
+
+- **Fixed (0.1.124), the operator's approach by default (the router answers the sender):** a frame
+  over the limit once stamped is not queued and its sender is answered `FRAME_TOO_LARGE`; a
+  broadcast goes everywhere or nowhere. **Checked on 8.x:** at 130,712 bytes of payload from
+  SY.admin the router logged `frame_len=131095 max=131072` and queued nothing. A Go caller cannot
+  read the reason yet (A-228).
 
 ### A-201 [Archi] ✅ VALIDATED ON 8.x (0.1.123, 2026-11-09; found 2026-11-09 by A-198's builder; checked) — The handbook tells Archi to read `list_recent_commands` first, and its read tool had no route for it
 
@@ -1921,6 +1991,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`node_client.rs:211`). sy-config-routes reconnected 20 s after the router came back. The
   orchestrator waits for its lifecycle nodes before it connects, so the hive showed to the
   motherbee 20 s late.
+
+- **0.1.124's deploy (2026-11-10), 413 s:** the apt install on the motherbee took 263.8 s: about
+  157 s of `apt-get update` and the download of the 242 MB package from fb-build's repo (about 93 s
+  on 0.1.123), then dpkg 82 s (unpack 64 s, configure 15 s), with the motherbee's orchestrator down
+  80 s inside it. The installation's update took 46.6 s. The build took 26.5 min (12-15 min
+  before).
 
 ### A-192 [General/vault] 🟢 LAB NOTE, no change (found 2026-11-08, 0.1.117's deploy on 8.x; read in its journals) — A running IO node's secret read is refused for a moment at a motherbee restart
 

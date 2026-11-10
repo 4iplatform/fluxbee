@@ -75,7 +75,7 @@ Three cases bite today:
 | Local: `storage.path`, `blob.path`, `blob.sync.api_port`, `blob.sync.data_dir`, `dist.path`, a worker's `egress`, the ingress's `edge` and SSH table, the motherbee's `admin`, `architect`, `acme`, `web`, `egress` | the hive's `hive.yaml` | the join; the hive's own actions (`set_storage`) | never travels |
 | `system_nodes` by role, with its order and waits | the release: the code, by role | a release | with the core's binaries |
 | The blob's and dist's topology by role (`enabled`, `sync.enabled`, `public_enabled`, the tool) | the release: the code, by role | a release | with the core's binaries |
-| The frontdesk's name (`government.identity_frontdesk`) | the release: the code, by role | a release | with the core's binaries |
+| The frontdesk's name (`government.identity_frontdesk`) | the hive's `hive.yaml` (since 2026-11-10; first planned in the code) | the join | never travels: on a worker it is the only key that names the motherbee |
 | `ai`: the default provider and each provider's model | the installation file | the operator, through SY.admin (Archi) | Syncthing, then `SYSTEM_UPDATE` category `config` |
 | `blob.gc.*` | the motherbee's `hive.yaml` | the operator, on the motherbee | never travels: a worker's GC cannot pin publications (A-188) |
 
@@ -120,12 +120,17 @@ Three cases bite today:
     - Not built, since no release needs it yet: a node dropped from the **motherbee's** list. dpkg
       owns the motherbee's core, so its package has to stop and remove it. A dropped node's
       system ILK stays registered too: SY.identity's seed only adds.
-- **The frontdesk's name stays as each role has it today:**
-  - a worker names `SY.frontdesk.gov@motherbee`;
-  - the ingress and the egress have none, so their router defaults to a frontdesk on their own
-    hive, where none runs.
-
-  Changing that is a call of its own (A-15, T-11).
+- **The frontdesk's name stays in each hive's `hive.yaml`, as the join writes it** (decided
+  2026-11-10, when the router's release came to move it):
+  - the router and SY.identity read it at their start, and the join writes it, so moving it into
+    the code would touch three binaries;
+  - on a worker it is the only key that names the motherbee (its uplinks are addresses), so the
+    code would have to learn the motherbee's hive at run time, for a value that never changes in
+    an installation;
+  - a worker names `SY.frontdesk.gov@motherbee`; the ingress and the egress have none, so their
+    router defaults to a frontdesk on their own hive, where none runs. No IO node runs on either
+    on 8.x, so nothing reaches that default; changing it is a call of its own (A-15, T-11), for
+    when one does.
 - **The old keys in a `hive.yaml`** are ignored, and the orchestrator reports them once. The join
   and `hive.yaml.example` stop writing them.
 
