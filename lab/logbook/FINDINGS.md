@@ -308,6 +308,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-233 🔵 A purged node's pages stay public until they expire (low).
 - A-234 🔵 SY.admin's HTTP reader allocates whatever `Content-Length` a client declares (low).
 - A-235 🔴 Archi's runtime redeploy purges each node and runs it again with no tenant: the node is gone (0.1.125).
+- A-236 🟡 Removing an ingress leaves its SY.edge running, still serving the published pages (0.1.125).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1385,6 +1386,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-236 [General/orchestrator] 🟡 (found 2026-11-10 by A-212's builder; checked in the code) — Removing an ingress leaves its SY.edge running, still serving the published pages
+
+- **Why:** `remove_hive`'s cleanup stops and disables a list of services that does not include
+  `sy-edge` (`remove_hive_cleanup_script`, `src/bin/sy_orchestrator.rs:18193`). SY.edge's unit has
+  `Restart=always` and only `Wants` rt-gateway, so stopping the router does not stop it. A removed
+  ingress keeps serving `/public/<key>` from its own registry and its local `blob/public` until each
+  page expires, as long as the public name still points to that box; SY.admin may meanwhile mark
+  those pages unpublished (A-212's review: a page on a removed edge comes down without asking it).
+- **Fix (SY.orchestrator, 0.1.125):** `sy-edge` in the cleanup's list (stopped, disabled, killed),
+  with a test.
 
 ### A-235 [Archi] 🔴 (found 2026-11-10 by 0.1.125's review round; checked in the code) — Archi's runtime redeploy kills each node with its instance purged and runs it again with no tenant, so the node is gone for good
 
