@@ -151,7 +151,10 @@ no change required
     in releases by binary after the router's; A-218 alone (the SDKs); A-219 with its shape written
     first. **Found by A-206's builder:** A-220 [General/SY.timer], low. **Found by A-207's
     builder:** A-221 [General/router], low; A-222 [General/router], latent. **Found by A-216's
-    builder:** A-223 [IO/io.api], low.
+    builder:** A-223 [IO/io.api], low. **Found by A-219's design:** A-224 [General/orchestrator]
+    and A-225 [General/egress], low.
+    **Found by A-215's and A-217's builder:** A-226 [IO/io.slack] and A-227 [WF], low.
+    **Found by A-202's builder:** A-228 [General/Go SDK], low.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -297,6 +300,14 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   queue for it grows without limit (latent; a design of its own).
 - A-223 🔵 io.api waits for a frontdesk handoff no longer than the frontdesk waits for
   SY.identity (low).
+- A-224 🟡 `set_storage` rewrites hive.yaml in place, not atomically (latent, low).
+- A-225 🔵 A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl
+  error, a failed probe never says why (low; with A-219).
+- A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
+- A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
+  IO node (low).
+- A-228 🔵 The Go SDK's RPC error for UNREACHABLE drops the router's reason (low; the Go SDK,
+  alone).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1375,6 +1386,57 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-228 [General/Go SDK] 🔵 low (found 2026-11-10 by A-202's builder; read in the code) — The Go SDK's RPC error for UNREACHABLE drops the router's reason
+
+- **Why:** a Go caller's request answered `UNREACHABLE` fails at once, as it should, but with
+  `RpcError{Kind: RpcErrTerminalTransport}` and the message `terminal transport response
+  "UNREACHABLE"` (`go/fluxbee-go-sdk/dispatcher.go:762`): the payload's `reason` is not read. A Go
+  caller cannot tell `FRAME_TOO_LARGE` from `NODE_NOT_FOUND` or `WAN_UNAVAILABLE`. The Rust SDK
+  keeps it (`RpcError::Unreachable { reason, .. }`). SY.timer reads the reason itself.
+- **Fix, later (the Go SDK, a release alone):** the error carries the reason and the original
+  destination, as the Rust SDK's does.
+
+### A-227 [WF] 🔵 low (found 2026-11-10 by A-215's builder; read in the code) — A relay that names no one is attributed to the last other person who wrote through that IO node, who may not be the one answered
+
+- **Why:** when a WF→IO message names no addressee, cognition takes the last other person who wrote
+  through that IO node (`src/bin/sy_cognition.rs:2588-2611`); the tagger's hint names only the node
+  (`relay_addressee`, `:2431-2442`). Since A-215 a forward to a team's node names no one, so if
+  another team member wrote there after the one the agent answered, the episode names the wrong
+  person.
+- **Fix, later (the cognition track):** the relay carries whom the forwarded answer was for, as a
+  fact of the message, apart from its addressee.
+
+### A-226 [IO/io.slack] 🔵 low (found 2026-11-10 by A-217's builder; read in the code) — io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable`
+
+- **Why:** since A-217 a WF whose store is down answers `NOT_TAKEN` with the reason `unavailable`.
+  io.slack has a text per reason, and shows an unknown one as "Not taken." with a warning
+  (`nodes/io/io-slack/src/not_taken.rs:199-207`, `:235-241`).
+- **Fix, later (io.slack's revamp, A-148):** a text for `unavailable`.
+
+### A-225 [General/egress] 🔵 low (found 2026-11-10 by A-219's design; checked in the code) — A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl error before the probe, and a failed probe never says why
+
+- **A removed worker keeps IPv6 off:** `remove_hive`'s cleanup tears the egress down only for an
+  egress (`remove_hive_cleanup_full_script`, `src/bin/sy_orchestrator.rs:18252`), so a worker that
+  went out through the egress keeps `/etc/sysctl.d/99-fluxbee-egress.conf`.
+- **The boot gives up early:** the worker's reconcile returns on any `sysctl --system` error
+  (`apply_sysctl_system()?`, `:11206`), after the route and before the IPv6 read-back and the
+  probe, while the egress's own reconcile only warns and judges by the kernel's values.
+- **The probe drops its reason:** `check_internet_reachable` returns a bool (`:10721-10732`), so a
+  failed probe cannot say whether DNS, the connection or the time failed.
+- **Fix:** with A-219's build, which uses all three.
+
+### A-224 [General/orchestrator] 🟡 LATENT, low (found 2026-11-10 by A-219's design; checked in the code) — `set_storage` rewrites hive.yaml in place, not atomically
+
+- **Why:** `persist_storage_path_in_hive` writes the file with `fs::write` (`src/bin/sy_orchestrator.rs`
+  ~33128). A crash or a full disk during the write can leave a truncated hive.yaml, and the
+  orchestrator does not start on it. hive-config-update-v1 §5 says the file has one writer, under
+  one lock, atomically: not built.
+- **Also:** `set_storage` runs only on the motherbee's own orchestrator
+  (`action_routes_via_local_orchestrator`, `src/bin/sy_admin.rs:22770`), while
+  hive-config-update-v1 §1 speaks of spokes.
+- **Fix:** the write through `write_file_atomic` (`:26570`), the one A-219's commit uses; the doc's
+  wording corrected.
+
 ### A-223 [IO/io.api] 🔵 low (found 2026-11-10 by A-216's builder; checked in the code) — io.api waits for a frontdesk handoff no longer than the frontdesk waits for SY.identity
 
 - **Why:** io.api waits for the frontdesk's answer for its identity timeout, 10 s by default
@@ -1404,6 +1466,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   turn is in cognition and never reached the agent. Since A-203's fix the sender is answered
   `NODE_NOT_FOUND`, so the sender knows; cognition does not.
 - **Why it is ordered so:** a comment ties the copy's order to the package the agent reads.
+- **Also:** a message to an agent refused as too large (A-202) leaves its cognition copy too.
 - **Fix, later (with the cognition track):** the copy follows a successful send, or cognition
   learns of the failure.
 
@@ -1545,6 +1608,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Impact:** a stray transport error at the sender, which its SDK cannot match to a request. It
   happened already with no link at all; since A-203's fix it also happens when the link's writer
   is gone.
+- **Since A-202's fix:** an oversized copy to another hive is answered `FRAME_TOO_LARGE` to the
+  original sender the same way; a local or IRP copy is dropped silently.
 - **Fix, later:** a tap copy's failure is logged, and never answered to the sender.
 
 ### A-208 [General/router] 🔵 low (found 2026-11-09 by A-203's builder; read in the code) — With several routers on one hive (not supported), an IRP reply goes to the wrong link, and a sibling can register twice
@@ -1557,6 +1622,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - `handle_peer_incoming` checks for an existing entry and inserts it under two separate locks
     (~4100-4110), so two links from one sibling at once can both register. A-203's cleanup keeps
     that harmless.
+- **And a latent deadlock there** (found by 0.1.124's review round): in `handle_peer_message`,
+  `if let Some(peer) = peers.lock().await…cloned() { forward_to_hive(..).await }` keeps the
+  `peers` guard for the whole block (edition 2021); on a router that is not the gateway the call
+  reaches `send_to_peer_router`, which locks `peers` again, and the task wedges with every later
+  user of `peers`.
 - **Impact:** none on 8.x: every hive runs one router. It matters only for the several-routers
   mode, which is not supported.
 - **Fix, later:** with that mode, if it is ever supported.
@@ -1577,6 +1647,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **A limit to keep in mind:** an LSA over the frame would be skipped by the writer like any frame,
   and a quiet link would then be cut every 40 s. Within the LSA region's 1,024 nodes (about 90 bytes
   each) an LSA stays under the frame.
+- **And another, from 0.1.124's review round:** two concurrent sessions for one hive (two uplinks
+  to the same hub; `add_hive` writes only one) can churn the hive's entry, each cleanup leaving the
+  other's. Not on 8.x.
 
 ### A-206 [General/SY.timer] 🟡 (found 2026-11-09 by the sweep's re-check; checked in the code and the library) — A recurring timer's cron spec that starts with `TZ=` and has no space crashes SY.timer, and a `CRON_TZ=` prefix silently overrides `cron_tz`
 
