@@ -105,6 +105,13 @@ fails with `missing_ai_api_key`.
 - **Unknown route.** `404 UNKNOWN_ROUTE`, or `405 METHOD_NOT_ALLOWED` with `allowed_methods` when
   the path exists with another method; both carry `"see": "GET /admin/actions"`
   (`admin_unknown_route_response`).
+- **A handler that fails before it answers** (a body that does not parse, a field of the wrong
+  type, a message the SDK refuses) still answers, in the same envelope, and the log keeps the
+  reason (`http handler error: ...`; FINDINGS A-229): `413 MESSAGE_TOO_LARGE` when the message
+  is larger than a mesh frame (128 KiB), with its size and the most it may be, since nothing was
+  sent; `500 INTERNAL_ERROR` otherwise. The detail never repeats the request
+  (`serve_http_connection`, `http_handler_error_response`). Before 0.1.125 the connection closed
+  with no answer.
 - **Health.** `GET /health` answers `{"status":"ok"}` without touching the mesh.
 
 ## ADMIN_COMMAND over the mesh

@@ -9942,15 +9942,67 @@ async fn run_http_server(
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         let ctx = ctx.clone();
         let client = client.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_http(&mut stream, &ctx, &client).await {
-                tracing::warn!("http handler error: {err}");
-            }
-        });
+        tokio::spawn(async move { serve_http_connection(stream, &ctx, &client).await });
     }
+}
+
+/// One connection of the HTTP API. A handler that fails before it answers still answers
+/// (FINDINGS A-229): an error in SY.admin's shape (`http_handler_error_response`), never a
+/// connection closed with no answer; the log line keeps the reason.
+async fn serve_http_connection(
+    mut stream: tokio::net::TcpStream,
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+) {
+    if let Err(err) = handle_http(&mut stream, ctx, client).await {
+        tracing::warn!("http handler error: {err}");
+        let (status, body) = http_handler_error_response(err.as_ref());
+        // A handler that failed on its own answer, its caller gone, fails this one the same way.
+        let _ = respond_json(&mut stream, status, &body).await;
+    }
+}
+
+/// The answer to a request whose handler failed: `413 MESSAGE_TOO_LARGE` when the SDK refused a
+/// message larger than a mesh frame, anywhere in the error's chain (nothing was sent), with its
+/// size and the most it may be; `500 INTERNAL_ERROR` otherwise. The detail never repeats the
+/// error's text, which may quote the request.
+fn http_handler_error_response(err: &(dyn std::error::Error + 'static)) -> (u16, String) {
+    let answer = |status: u16, code: &str, detail: String| {
+        (
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": serde_json::Value::Null,
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+    let mut cause = Some(err);
+    while let Some(current) = cause {
+        if let Some(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) =
+            current.downcast_ref::<fluxbee_sdk::NodeError>()
+        {
+            return answer(
+                413,
+                "MESSAGE_TOO_LARGE",
+                format!(
+                    "the message is {size} bytes, past the mesh frame's {max}: nothing was sent"
+                ),
+            );
+        }
+        cause = current.source();
+    }
+    answer(
+        500,
+        "INTERNAL_ERROR",
+        "SY.admin could not complete the request; its log says why".to_string(),
+    )
 }
 
 async fn handle_http(
@@ -12117,7 +12169,9 @@ fn http_status_line(status: u16) -> &'static str {
         400 => "HTTP/1.1 400 Bad Request",
         403 => "HTTP/1.1 403 Forbidden",
         404 => "HTTP/1.1 404 Not Found",
+        405 => "HTTP/1.1 405 Method Not Allowed",
         409 => "HTTP/1.1 409 Conflict",
+        413 => "HTTP/1.1 413 Payload Too Large",
         422 => "HTTP/1.1 422 Unprocessable Entity",
         500 => "HTTP/1.1 500 Internal Server Error",
         501 => "HTTP/1.1 501 Not Implemented",
@@ -37601,5 +37655,112 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    // --- a failed HTTP handler still answers (FINDINGS A-229) -------------------------------
+
+    /// A message the SDK refused as larger than a mesh frame is 413 MESSAGE_TOO_LARGE, wherever it
+    /// is in the error's chain; any other failure 500 INTERNAL_ERROR, whose detail never repeats
+    /// the error's text, which may quote the request. Both in SY.admin's error shape, with status
+    /// lines that say so.
+    #[test]
+    fn a_failed_handler_answers_in_sy_admins_error_shape() {
+        let too_large = || fluxbee_sdk::NodeError::MessageTooLarge {
+            size: 131_646,
+            max: 131_072,
+        };
+        let direct: AdminError = Box::new(too_large());
+        let wrapped: AdminError = Box::new(fluxbee_sdk::RpcError::Node(too_large()));
+        for err in [direct, wrapped] {
+            let (status, body) = http_handler_error_response(err.as_ref());
+            assert_eq!(status, 413, "{body}");
+            let body: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(body["status"], json!("error"));
+            assert_eq!(body["error_code"], json!("MESSAGE_TOO_LARGE"));
+            let detail = body["error_detail"].as_str().expect("why");
+            assert!(
+                detail.contains("131646") && detail.contains("131072"),
+                "{detail}"
+            );
+        }
+        let quoting: AdminError = "invalid type: string \"secret-marker\", expected u8".into();
+        let (status, body) = http_handler_error_response(quoting.as_ref());
+        assert_eq!(status, 500, "{body}");
+        assert!(!body.contains("secret-marker"), "{body}");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["error_code"], json!("INTERNAL_ERROR"));
+        assert!(body["error_detail"].is_string());
+        assert_eq!(http_status_line(413), "HTTP/1.1 413 Payload Too Large");
+        assert_eq!(http_status_line(405), "HTTP/1.1 405 Method Not Allowed");
+    }
+
+    /// FINDINGS A-229 as 0.1.124's gate met it: a node message past the mesh frame, over HTTP,
+    /// gets 413 MESSAGE_TOO_LARGE instead of a connection closed with no answer; a handler that
+    /// fails otherwise gets 500 INTERNAL_ERROR. Neither answer repeats the request.
+    #[test]
+    fn the_http_api_answers_a_handler_that_failed() {
+        // handle_http's frames run deep in a debug build: the server runs on a worker thread with
+        // room for them, and the requests from the test's own thread.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(32 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (ctx, _harness) = opa_test_admin("http-handler-error");
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let addr = listener.local_addr().expect("its address");
+            let server_ctx = ctx.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.expect("a connection");
+                    serve_http_connection(stream, &server_ctx, &server_ctx.rpc).await;
+                }
+            });
+            let ask = |body: String| async move {
+                let mut stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("connected");
+                let request = format!(
+                    "POST /hives/motherbee/nodes/SY.timer@motherbee/messages HTTP/1.1\r\n\
+                     Host: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(request.as_bytes()).await.expect("sent");
+                let mut answer = Vec::new();
+                stream.read_to_end(&mut answer).await.expect("an answer");
+                String::from_utf8(answer).expect("text")
+            };
+
+            let marker = "page-content-marker";
+            let large =
+                json!({ "msg_type": "system", "payload": { "blob": marker.repeat(8_000) } });
+            let answer = ask(large.to_string()).await;
+            assert!(
+                answer.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("\"error_code\":\"MESSAGE_TOO_LARGE\""),
+                "{answer}"
+            );
+            assert!(!answer.contains(marker), "{answer}");
+
+            let quoted = json!({ "msg_type": "system", "ttl": "secret-marker" });
+            let answer = ask(quoted.to_string()).await;
+            assert!(
+                answer.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("\"error_code\":\"INTERNAL_ERROR\""),
+                "{answer}"
+            );
+            assert!(!answer.contains("secret-marker"), "{answer}");
+            server.await.expect("the server");
+        });
     }
 }
