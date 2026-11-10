@@ -612,6 +612,10 @@ motherbee behind the egress, set it up at the OS/network level.
 injection only reaches the workers provisioned **after** the field is declared — a worker that
 joined before keeps its original gateway.
 
+**Planned, not built yet (A-219):** an explicit action per worker, from Archi with your CONFIRM and
+through SY.admin, puts such a worker behind the egress, with guards and a way back:
+[edge-egress-nat-spec §15](../../docs/edge-egress-nat-spec.md#15-an-existing-worker-goes-behind-the-egress-a-219).
+
 **Do not take for granted that your motherbee goes out through the egress** without checking it:
 
 ```bash

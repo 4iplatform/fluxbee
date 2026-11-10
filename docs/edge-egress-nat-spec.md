@@ -23,6 +23,10 @@
 >   accept`, which cannot override `fluxbee_host`'s drop, and is gone at the next boot.
 >
 > The egress still fails loud without `nft`, because its NAT needs it.
+>
+> **Update 2026-11-10 (design, not yet built): A-219.** §15 designs the operator's explicit action
+> that puts a worker that joined before the egress declaration behind the egress, which §7 and §11
+> left out of v1.
 **Audience:** `SY.orchestrator` developer, deployment tooling, Ops/SRE
 **Supersedes:** `edge-egress-nat-spec.md` v0.1 (2026-05-27)
 **Related:** `edge-control-protocol.md`, `01-arquitectura.md`, `05-conectividad.md`, `07-operaciones.md`, `sy_orchestrator.rs`
@@ -407,7 +411,7 @@ Required behavior on the worker (applied locally by the worker's orchestrator):
    probe (§9).
 4. Report verification fields (§9).
 
-Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`; re-emitting their yaml to add the field is an explicit operator action (out of scope for v1, noted in §11).
+Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`; re-emitting their yaml to add the field is an explicit operator action (out of scope for v1, noted in §11; designed in §15, A-219, not built yet).
 
 ---
 
@@ -556,7 +560,7 @@ These are legitimate production concerns deferred out of v1. The v1 design reser
 | Designated DNS resolver | Worker resolver config + DoT upstream on the egress hive | Avoids DNS leakage to public resolvers and spoofing in transit |
 | Egress HA (no SPOF) | keepalived/VRRP for a floating `edge_ip` | Egress hive is currently a SPOF for internet; HA is beta-later per project scope |
 | Process/host isolation | AppArmor/SELinux profile, network namespaces if co-located with RT.edge | Reduces blast radius of a host compromise |
-| Reconcile existing workers | Operator action to re-apply route to workers provisioned before egress declaration | v1 only injects into new workers |
+| Reconcile existing workers | Operator action to re-apply route to workers provisioned before egress declaration | v1 only injects into new workers; §15 designs the action (A-219), not built yet |
 
 The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logging insert cleanly: the allow-list narrows the LAN→WAN accept rule, and logging adds `log` statements on the same chain. No restructuring required to add them later.
 
@@ -620,3 +624,429 @@ recorded as checked live.
 3. ~~**nftables include mechanism**~~ — **resolved**: the dedicated `table inet fluxbee_egress` (`EGRESS_NFT_TABLE`). Its file adds and flushes the table in one transaction, so a re-apply never leaves the host without it, and `fluxbee-egress-nft.service` loads it at boot (F17). The orchestrator changes no other host rule: an active ufw or firewalld is reported (`host_firewall_active`), never written.
 4. ~~**IP-echo endpoint for `egress_public_ip`**~~ — **resolved**: v1 verification is an HTTPS GET of the operator's `egress.reachability_url` (`internet_reachable`), confirming reachability only; without the URL there is no probe. Public-IP discovery via IP-echo is deferred to the fuller verification of the complete system.
 5. **conntrack defaults**: 262144 / hashsize 65536 are starting points. Tune to deployment scale. Built with these values as constants (`EGRESS_CONNTRACK_MAX`, `EGRESS_CONNTRACK_HASHSIZE`), not configurable.
+
+---
+
+## 15. An existing worker goes behind the egress (A-219)
+
+**Status:** a design for the operator's approval, 2026-11-10. Nothing in this section is built.
+Line numbers are `src/bin/sy_orchestrator.rs` at `d9ca8a6e` unless another file is named.
+
+**The problem (FINDINGS A-219):**
+
+- The join writes a worker's `egress` section from the motherbee's declaration
+  (`render_worker_egress_yaml`, `:8116-8143`, called at `:29213-29222`).
+- Nothing writes a worker's hive.yaml after its join. Only the three joins (`:29261`, `:30048`,
+  `:30787`) and `set_storage` (`:33096`) write a hive.yaml, and `set_storage` runs on the
+  motherbee's own orchestrator (`action_routes_via_local_orchestrator`,
+  `src/bin/sy_admin.rs:22770`).
+- So a worker that joined before the declaration never goes out through the egress. On 8.x the
+  motherbee declares `gateway_ip` 10.10.10.40 (egress1). worker1 has no `egress` section: its
+  default route is still 10.10.10.1 (the hypervisor's SNAT), its IPv6 is on, no probe runs, and
+  AI.pruebas@worker1 reaches its provider outside the egress. Nothing reports it.
+
+**The operator's call (2026-11-10):** *"si workers tienen que salir a internet, si b)"*. Workers go
+out through the egress, by an explicit action per worker, from Archi with the operator's CONFIRM,
+mediated by SY.admin.
+
+**What does not change:**
+
+- The motherbee's route. Fluxbee never rewrites it (PB-8; `verify_motherbee_egress`,
+  `:10639-10650`), and the action refuses the motherbee.
+- A worker's `egress` stays local, and no update carries it (hive-config-update-v1 §2). This action
+  is the one exception: per worker, on the operator's word.
+- §7: the boot applies the section, and the watchdog keeps the route.
+
+### 15.1 The action
+
+- **Name:** `set_hive_egress`, `PUT /hives/{hive}/egress` (open point 1). Between the
+  orchestrators it travels as a new SYSTEM message, `SYSTEM_EGRESS_ROUTE`.
+- **Who calls it:**
+  - Archi stages it with `fluxbee_plan_compiler`, one step per worker. The operator writes
+    `CONFIRM`, and SY.admin's executor runs the step as the operator.
+  - The operator, on SY.admin's loopback HTTP API (`ops.py admin PUT /hives/worker1/egress '{}'`).
+  - Nobody else. Its `mesh_access` is `Nobody` (`sy_admin.rs:5785-5787`), as for
+    `update_installation` (`sy_admin.rs:5815`): not Archi's own `ADMIN_COMMAND` or SCMD, not
+    IO.cloud.
+- **Payload:** `{}`, with an optional `access_from`: the IPv4 addresses or networks the operator
+  manages the box from (G3 below; open point 3). It names no gateway: the gateway is the
+  motherbee's declaration, never the caller's.
+- **The path:** SY.admin → `SY.orchestrator@motherbee` (an admin action through the local
+  orchestrator, as `core_rollback`) → `SY.orchestrator@<worker>` (`SYSTEM_EGRESS_ROUTE`, forwarded
+  as `core_rollback` forwards `SYSTEM_CORE_ROLLBACK`, `:3589-3635`).
+- **What SY.admin checks,** before it sends anything:
+  - The hive is a worker of the registry with its join done (`HiveRegistry::role`, the strict
+    reading, `crates/fluxbee_sdk/src/mesh/registry.rs:70`). Else `NOT_A_WORKER`, naming why: the
+    motherbee, an ingress, an egress, or a hive whose join is not done.
+  - No installation update run is under way (`INSTALLATION_UPDATE_RUNNING`, as
+    `set_installation_ai`): its core step restarts the worker's orchestrator.
+- **What the motherbee's orchestrator checks:**
+  - Its own `egress.gateway_ip` (`NO_EGRESS_DECLARED`) and `egress.reachability_url`
+    (`NO_REACHABILITY_URL`): the switch is judged by the probe, and the code never picks a target
+    of its own (§9).
+  - The section, rendered by `render_worker_egress_yaml`, the join's renderer. A declaration the
+    join would refuse is refused here (`EGRESS_DECLARATION_INVALID`).
+  - No join or removal of that hive. It takes the hive's topology lock without waiting
+    (`try_lock_hive_topology`, `:740`) and holds it for the whole action (`JOIN_IN_PROGRESS`).
+  - The worker is reachable: its orchestrator is visible in the LSA, the forward's own check
+    (`forward_system_action_to_hive_with_timeout`, `:21702`; `HIVE_UNREACHABLE`).
+  - Its part runs in a task of its own, as `node_help` does (`:3521-3525`). The motherbee's admin
+    inbox takes one message at a time (`run_admin_worker`, `:1158`), and the action may take 40 s.
+- **What the worker's orchestrator does.** It owns its routing table, so it judges the guards.
+  - It refuses on any role but worker (`NOT_A_WORKER`), and while another switch is open
+    (`EGRESS_SWITCH_OPEN`).
+  - It parses the section it got as its `EgressSection`.
+  - When its section and its default route already match, it answers `unchanged`.
+  - Otherwise it runs the guards (15.2), then switches, checks, and commits or reverts (15.3).
+  - The switch runs in a task of its own. The worker's SYSTEM inbox also takes one message at a
+    time (`run_system_worker`, `:1205`), and it must take the motherbee's confirm while the switch
+    waits for it.
+- **An older worker** ignores a SYSTEM message it does not know (`_ => {}`, `:3857`). The forward
+  ends at its timeout and nothing changes there. The answer says to bring the worker to the
+  motherbee's release first (`update_installation`).
+- **The policy:** `SYSTEM_EGRESS_ROUTE` is a protected SYSTEM action (`PROTECTED_SYSTEM_ACTIONS`,
+  `src/router/system_policy.rs:37`). It is an orchestrator mutation that only
+  `SY.orchestrator@motherbee` sends (rule (3), `orchestrator_mutations`, `policy/system.rego:66`),
+  and a spoke-only action that no rule admits on the motherbee (`spoke_only_actions`,
+  `policy/system.rego:75`; `SPOKE_ONLY_SYSTEM_ACTIONS`, `:3269`).
+
+### 15.2 The guards, before the switch
+
+The switch changes the IPv4 default route, and turns IPv6 off. A destination the worker reaches on
+a directly connected subnet, or by a more specific route, keeps its path. A destination it reaches
+by the default route moves to the egress. So each guard is a route lookup,
+`ip -4 route get <address>`, as the egress join reads `ip -o route get <client>` for
+`SSH_FROM_WAN_LOCKOUT` (`EGRESS_SSH_ARRIVAL_COMMAND` and `route_get_dev`, `:9794-9804`).
+
+- The guards only read: each command under a timeout, 5 s in all.
+- A guard that fails refuses and changes nothing. The refusal names the address and the route it
+  found.
+- A worker without `curl` cannot probe, and is refused too (`PROBE_UNAVAILABLE`).
+
+**G1. The gateway is on a directly connected subnet of the worker.**
+
+- **Check:** the lookup of `gateway_ip` has no `via`, and `gateway_ip` is not one of the worker's
+  own addresses. Refusal: `GATEWAY_NOT_ON_LINK`.
+- **Without it:** the kernel itself refuses an off-link gateway (`Nexthop has invalid gateway`), so
+  the guard prevents no break: it says why before anything is touched, instead of a kernel error in
+  the middle of the switch. A gateway off the worker's subnet means this worker cannot use the
+  egress as its gateway at all. The egress' LAN leg must be on the worker's network (§4.1), or the
+  worker's own router must send its traffic there.
+
+**G2. The mesh does not depend on the default route.**
+
+- **What:** each `wan.uplinks` address, and `identity.sync.upstream`. The join writes both with one
+  host, the motherbee's address (`resolve_worker_uplink_address`, `:32939-32954`; `:29210`).
+  Syncthing dials the motherbee at that host too (`reconcile_spoke_motherbee_address`,
+  `:13490-13502`). So one lookup covers the WAN (9000), identity (9100) and Syncthing (22000).
+- **Check:** each is an IPv4 address, and its lookup does not go through the default route: no
+  `via`, or the `via` of a more specific route. A host name is refused: its DNS would go through the
+  default route, and a redial would then depend on the egress. Refusal: `UPLINK_ON_DEFAULT_ROUTE`.
+- **Without it:** where the motherbee is on another network, reached through the LAN's router, the
+  switch sends the uplink to the egress.
+  - The live WAN session's packets leave through the egress' NAT with another source, and the
+    session dies. The worker drops off the mesh, and the action's answer is lost.
+  - At best the control path comes back through the egress' NAT: a new dependency. At worst the
+    worker is cut off until someone restores its route from the console.
+  - The second lookup and the confirm (15.3) would revert it, after up to 40 s without the mesh;
+    the guard refuses before anything moves.
+  - hive-config-update-v1 §2 keeps the control path out of every update for the same reason.
+- **On 8.x** it passes: the motherbee is on worker1's own subnet.
+
+**G3. The operator's access does not depend on the default route.**
+
+- **What:** the peers of the worker's established inbound SSH sessions, on the ports `sshd -T`
+  reports (`sshd_listen_ports`, `:9188`), and each entry of `access_from`. Archi and SY.admin run on
+  the motherbee, whose route the action never touches: this guard is about the worker's own box.
+- **Check:** each is IPv4, and its lookup (for a network, the route that covers it) does not go
+  through the default route. An established IPv6 session is refused too, since the IPv6 block cuts
+  it. Refusal: `ACCESS_ON_DEFAULT_ROUTE`.
+- **Without it:** an operator who reaches the worker from a network that is not directly connected
+  (an office or a VPN network, behind the LAN's router) sends the requests in through that router.
+  - After the switch the worker's replies leave through the egress: an asymmetric return path. The
+    egress drops them, or sends them out NATed with its own address. Either way the session breaks,
+    and new sessions never complete.
+  - On a worker with two NICs, a strict reverse-path filter drops the requests themselves.
+  - The mesh and the console still work, but the box is closed to SSH from that network, and
+    nothing says so.
+- **How it is kept:** the refusal names each peer or network, and the way to keep it: a static route
+  at the OS level (netplan) through the current gateway, which the check then sees as a more
+  specific route. Fluxbee adds no route of its own for it (open point 3), the line PB-8 draws for
+  the motherbee's route.
+- **The answer** always names where SSH still reaches the box from: its connected subnets and its
+  more specific routes. The hypervisor's console is never affected.
+- **On 8.x** it passes: worker1's network (10.10.10.0/24) is not reachable from outside, and the
+  operator reaches the VMs through the hypervisor's console and guest agent, which use no network.
+
+### 15.3 After the switch: the check, the commit, the way back
+
+**The steps on the worker:**
+
+1. **Record.** It writes `egress-switch.json` atomically, next to `config-applied.json`
+   (`orchestrator_runtime_dir`). The record holds the switch id, the target section, the default
+   routes as `ip -4 route show default` lists them, the four IPv6 sysctls' live values, whether
+   `/etc/sysctl.d/99-fluxbee-egress.conf` existed, and `state: open`. The routes and values the
+   worker had before it first went behind an egress are carried over by later switches. Then it
+   pauses the watchdog's egress step.
+2. **Switch** (5 s). `ip route replace default via <gateway_ip>`, as the boot does
+   (`:11191-11200`). Then the IPv6 block: the worker's sysctl file and `sysctl --system`
+   (`:11202-11206`). The block is judged by what the kernel reads back (`ipv6_disabled_now`,
+   `:10852`), as the egress judges it (`:11072-11085`), not by the exit code of `sysctl --system`.
+3. **Check** (12 s).
+   - The probe: an HTTPS GET of `reachability_url` (`check_internet_reachable`, curl with 5 s,
+     `:10721-10732`), up to two attempts 1 s apart, so that a cold ARP entry or DNS cache is no
+     failure. With IPv6 off it can only go out by IPv4, through the egress.
+   - A failed probe carries curl's reason (no DNS, no connection, a timeout), which
+     `check_internet_reachable` drops today.
+   - Then G2's lookups again: they must be unchanged.
+4. **Confirm** (15 s). The worker answers `pending_confirm`, with the probe and the route it sees,
+   and waits for the motherbee's confirm: a second `SYSTEM_EGRESS_ROUTE` carrying the switch id.
+   - Its answer reaching the motherbee proves the way from the worker on the new route. The confirm
+     reaching the worker proves the way back.
+   - This is the uplink check: a change that stays only once confirmed, as `netplan try` does.
+   - So the worker never keeps a switch the motherbee did not see.
+5. **Commit** (2 s). It writes the section into hive.yaml, and this write is the commit.
+   - Atomically: a temp file and a rename (`write_file_atomic`, `:26570`), changing only `egress`
+     and keeping every other key.
+   - Then it sets its in-memory section, marks the record `committed`, resumes the watchdog, and
+     answers `ok`.
+6. **Revert** (5 s), on a failure in steps 2 to 5, or when no confirm comes in time.
+   - It restores the recorded default routes, the four IPv6 values, and the sysctl file as it was.
+   - hive.yaml and the in-memory section are as they were: the commit never happened.
+   - It marks the record `reverted`, with the step and the reason, and resumes the watchdog.
+   - It answers, when the motherbee still waits: `EGRESS_PROBE_FAILED`, `EGRESS_IPV6_UNMANAGED`,
+     `UPLINK_ROUTE_CHANGED`, `EGRESS_CONFIRM_MISSED` or `EGRESS_COMMIT_FAILED`.
+
+**The bounds:**
+
+| Step | Bound | Where |
+| --- | --- | --- |
+| The guards | 5 s | the worker |
+| The switch | 5 s | the worker |
+| The probe, and the lookups again | 12 s | the worker |
+| `pending_confirm` answered | 22 s after the request | the worker |
+| The confirm window | 15 s after that answer | the worker |
+| The commit, or the revert | 5 s | the worker |
+| The forward of the switch | 30 s | the motherbee |
+| The forward of the confirm | 10 s | the motherbee |
+| The whole action | 60 s (`admin_action_timeout`) | SY.admin |
+
+When the forward of the switch times out, the motherbee sends no confirm. The worker then reverts by
+itself when its window ends, and the answer says `not_answered`. If a guard ever misses, this is the
+backstop: no confirm, no switch.
+
+**Why this order: the watchdog reads memory, not the file.**
+
+- The orchestrator reads hive.yaml's `egress` once, at its start (`egress: hive.egress.clone()`,
+  `:972`, into `OrchestratorState.egress`, `:663`). The watchdog re-applies the route from that copy
+  when it drifts, every 5 s (`:3120-3123`, `:3196-3220`).
+- So writing the section into hive.yaml alone changes nothing until a restart. Removing it from the
+  file alone does not stop the watchdog in this run, only at the next start.
+- The design therefore puts `state.egress` behind a lock, set only at the commit, right after the
+  file. A failure before the commit has nothing to remove. The clear (15.4) removes both: memory
+  first, then the file.
+- The watchdog's egress step skips while a switch is open. Otherwise, on a worker already behind
+  another gateway, it would put the old route back within 5 s of the switch.
+
+**An orchestrator that stops mid-switch.** At its start, before `reconcile_egress` (`:1739`), it
+reads the record:
+
+- `open`, and hive.yaml without the target section: the switch never committed. It restores the
+  recorded routes and IPv6 values, marks the record `interrupted`, and says so in its journal and
+  its drift alerts.
+- `open`, and hive.yaml with it: the commit happened. It marks the record `committed`, and the boot
+  applies the section as it does today (§7).
+- A host reboot loses the kernel's route anyway; the record still brings the IPv6 values back.
+
+**Connections open at the switch.** A connection that goes through the default route breaks: an AI
+node's keep-alive to its provider, say. Its next packets leave through the egress' NAT with another
+source. The node's next call opens a new connection. Run the action while the worker's agents are
+idle.
+
+### 15.4 The reverse action
+
+**Proposed:** `clear_hive_egress`, `DELETE /hives/{hive}/egress`, with the same path, record and
+confirm.
+
+- It restores the default routes the worker had before it first went behind the egress, which the
+  record keeps. On a worker with no record (one that joined after the declaration), the request
+  names the gateway to go back to, and G1 checks it.
+- The same guards. The probe is reported, but it does not revert: the way back may have no internet
+  by design. The confirm still decides.
+- The commit removes the section from memory, then from hive.yaml, and puts back the IPv6 values
+  the record kept.
+
+**Is it needed now? Recommended: yes.**
+
+- The egress is a single point of failure (§11). Once the workers are behind it, an egress outage
+  cuts every agent's provider. The clear is the way around it from Archi while the egress is fixed,
+  and G2 keeps the mesh off the egress, so the clear always reaches the worker.
+- The gate needs it, to run from zero and to leave 8.x as it found it.
+- Without it, the way out is a hand edit on the box from its console: the section out of hive.yaml,
+  a restart of `sy-orchestrator`, and the route by hand.
+- It costs little next to the set: the same message, guards, record and confirm.
+
+### 15.5 What the operator sees
+
+- **The action's answer:** `status` (`ok`, `unchanged`, or `error` with `error_code` and the step),
+  `hive`, `gateway_ip`, `previous_gateway`, `ipv6_blocked`, `internet_reachable` with the probe's
+  URL and reason, `ssh_reachable_from`, `switch_id`, and `timings_ms` per step.
+  - `not_answered` never means "not applied" (hive-config-update-v1 §7, P-13). The worker keeps
+    the switch only if it committed; otherwise it reverts within 15 s of its answer. `/versions`
+    says which.
+- **`/versions`:**
+  - Each worker gains `egress`: its section (`gateway_ip` and `reachability_url`, or null), the
+    default gateway it sees (`observed_default_gateway`, `:10609`), `ipv6_blocked`, and
+    `last_switch` from the record (id, operation, state, time, previous gateway, reason).
+  - The motherbee adds its declaration, and compares each worker against it, as it compares the
+    installation file (`add_installation_state_to_answer`, `:7209`). `egress.state` is `behind`,
+    `not_behind` (A-219's case), `other_gateway` (the declaration changed since), `drifted` (the
+    section is right, the route is not), or null where it does not apply.
+  - This is what reports A-219's case, which nothing reports today.
+- **The logs:**
+  - The worker's journal: a line per step, and the outcome with its times.
+  - SY.admin's command log (`GET /hives/<worker>/commands`; the path's hive filters it): the action
+    and its outcome.
+  - An interrupted switch: a drift alert in the worker's own file, which the motherbee does not
+    read yet (FINDINGS A-175), and `last_switch.state: interrupted` in `/versions`.
+- **Archi's text** (its handbook):
+  - Before staging, it tells the operator what changes. The worker's agents reach the internet
+    through the egress, which becomes their dependency. A call in flight at the switch may fail
+    once. Afterwards SSH reaches the box only from what the answer names.
+  - It stages the action only when the operator asks. When `/versions` shows a worker `not_behind`,
+    it tells the operator, and never stages it on its own.
+  - After the run, it reports from the answer and `/versions`. Each refusal comes with what it means
+    and what the operator can do.
+
+### 15.6 Every leg it touches
+
+- **SY.orchestrator, the motherbee's:** the admin action and its checks; the two forwards, in a
+  task of its own; the `egress.state` comparison in `/versions`.
+- **SY.orchestrator, the worker's:**
+  - `SYSTEM_EGRESS_ROUTE` on a worker only: the guards, the record, the switch in a task of its own,
+    the commit and the revert, and the clear.
+  - The start reading an open record.
+  - `state.egress` behind a lock, and the watchdog's pause.
+  - The hive.yaml writer: atomic, under one lock shared with `set_storage`. hive-config-update-v1 §5
+    asks for it, and `persist_storage_path_in_hive` still writes in place (`:33096-33130`).
+  - `/versions`' `egress`.
+  - `remove_hive`'s cleanup of a worker removes its IPv6 file and the record. Today only an egress
+    gets its teardown (`remove_hive_cleanup_full_script`, `:18254`), so a removed worker that went
+    out through the egress keeps IPv6 off.
+- **SY.admin:** the action's spec, route, help, example and function schema; `read_only: false`,
+  `confirmation_required: true`, `executor_available: true`; `mesh_access` `Nobody`; not in
+  `IO_CLOUD_EXPOSED_ACTIONS`; its timeout; the two refusals it owns; `classify_admin_action`
+  (`SystemConfig`).
+- **The policy:** `SYSTEM_EGRESS_ROUTE` in `PROTECTED_SYSTEM_ACTIONS`, in rule (3)'s
+  `orchestrator_mutations`, and in `spoke_only_actions`; the baked wasm compiled again, which CI
+  compares byte for byte (FINDINGS A-179); `classify_system_message`
+  (`crates/fluxbee_sdk/src/policy.rs:145`).
+- **Archi:**
+  - The catalog needs nothing of its own: Archi reads SY.admin's.
+  - Its wait for a plan grows with each `set_hive_egress` step (`architect_admin_action_timeout`,
+    `src/bin/sy_architect.rs:13090`), as it does for `set_installation_ai`.
+  - Its verdict reads each step's `status`, and `/versions` on `not_answered`.
+  - The handbook: a subsection next to §4.4.4, and §3.2's paragraph on egress hives
+    (`docs/archi/handbook_fluxbee.md:159`). That paragraph says workers get the route
+    "automatically": only the workers that join after the declaration do.
+- **Docs:** this spec (§7, §11, and §12's open box); the operations reference, where the action
+  replaces the hand edit at `docs/reference/operations.md:218-219`; HANDBOOK §7; PB-8's last
+  paragraph; hive-config-update-v1 §2 (the one exception) and §9; the node pages (sy-orchestrator,
+  sy-admin, sy-architect); the protocol and routing-and-policy references (rule (3)'s tables).
+- **Tests, in CI:**
+  - The route-lookup reader against fixtures: on-link, through the default route, through a more
+    specific route, a host name, IPv6.
+  - The guards as a table.
+  - The switch as a state machine against fakes: a failed probe reverts; no confirm in time
+    reverts; the confirm commits, writing only `egress` and setting memory; a failed write reverts;
+    a confirm after a revert answers `EGRESS_CONFIRM_MISSED`.
+  - The watchdog skipping while a switch is open; the start with an open record, with and without
+    the section; `unchanged`; the clear.
+  - The motherbee: its checks and their codes; no confirm after a lost answer; the `/versions`
+    comparison.
+  - SY.admin: a test like `update_installation_is_the_operators_and_closed_to_the_mesh`
+    (`sy_admin.rs:34109`): route, help, example, confirmation and executor; closed to every mesh
+    caller; a timeout above the motherbee's bound.
+  - The policy: the baked wasm's truth table for the new message.
+  - Archi: the verdict of a plan with the step: ok, an error, `not_answered`.
+
+**The gate on 8.x.** It measures every step's time, live and afterwards from each node's logs
+(`ops timeline`). It is also the first live check of a worker behind the egress, §12's open box.
+
+- **Before:**
+  - The release on every hive.
+  - The motherbee's `egress` holds `gateway_ip` 10.10.10.40 and a `reachability_url`, read on the
+    box. Without the URL the action refuses. Choosing it is the operator's, and the motherbee reads
+    its `egress` only at its start: a hand edit, and a restart of its orchestrator.
+  - One snapshot of worker1, and AI.pruebas idle.
+- **1. worker1 as it is:** default via 10.10.10.1, no `egress` in its hive.yaml, IPv6 on;
+  `/versions` says `not_behind`.
+- **2. Refusals that change nothing,** worker1's route checked after each:
+  - `access_from: ["192.168.8.0/24"]`, the admin network, which worker1 reaches through
+    10.10.10.1: `ACCESS_ON_DEFAULT_ROUTE`.
+  - egress1, ingress1 and the motherbee: `NOT_A_WORKER`.
+  - Archi's own `ADMIN_COMMAND`, and an SCMD: refused by the mesh.
+- **3. The revert:**
+  - On egress1, a throwaway table `inet gate0219` drops what egress1 forwards from 10.10.10.20.
+  - The action answers `EGRESS_PROBE_FAILED`: worker1 is back on 10.10.10.1, IPv6 as before, no
+    section. The revert's time is noted.
+  - `gate0219` is removed.
+- **4. The switch,** staged by Archi and confirmed by the operator:
+  - The answer is `ok`, with its times.
+  - On worker1: default via 10.10.10.40, IPv6 off, and the section in hive.yaml as the join's
+    renderer writes it. `/versions` says `behind`.
+  - worker1 stays connected throughout, and neither side's journal shows a WAN session lost at the
+    switch.
+  - Every node of worker1 still runs: no worker has run with IPv6 off on 8.x before.
+- **5. Through egress1:**
+  - On egress1, `gate0219` now counts what egress1 forwards from 10.10.10.20.
+  - From worker1, `ip -4 route get 1.1.1.1` says via 10.10.10.40, and a GET of the probe's URL
+    moves the counter.
+  - AI.pruebas answers a message, and the counter moves on 443 during the call.
+  - `gate0219` is removed.
+- **6. Kept:**
+  - A hand `ip route replace default via 10.10.10.1` on worker1 is undone within 5 s; the journal
+    says the route drifted.
+  - A restart of worker1's `sy-orchestrator`: the boot applies the section, and the probe logs
+    `internet_reachable=true`.
+  - The action again: `unchanged`, and nothing moves.
+- **7. The way back** (if built): the clear puts worker1 on 10.10.10.1 with IPv6 as before; then the
+  switch again. worker1 ends behind egress1, as the operator decided.
+- **Not provoked on 8.x:**
+  - An uplink lost after the switch: tested in CI against a missing confirm. Cutting worker1's
+    uplink on purpose would test A-203 and A-207 (a WAN session that ends badly lingers), not this.
+  - G1 and G2 refusing: tested in CI. On 8.x, egress1 and the motherbee are on worker1's only
+    subnet, so both guards can only pass.
+
+### 15.7 Open points for the operator
+
+1. **The names.** `set_hive_egress` and `clear_hive_egress` (`PUT /hives/{hive}/egress` and
+   `DELETE /hives/{hive}/egress`), with `SYSTEM_EGRESS_ROUTE` between the orchestrators. They follow
+   `set_storage`, `set_node_config` and `set_installation_ai`, and the section's name in hive.yaml.
+   Other names: `route_hive_through_egress`, `set_worker_egress`. **Recommended:** `set_hive_egress`
+   and `clear_hive_egress`.
+2. **Build the reverse now?** **Recommended: yes** (15.4). It is the way around an egress outage
+   from Archi, the gate needs it, and it shares the set's machinery.
+3. **How the operator's access is protected:**
+   - (a) Check and refuse: the live SSH sessions and `access_from`. A management network that must
+     stay off the egress gets a static route at the OS level from the operator, which the check then
+     passes.
+   - (b) Fluxbee keeps a route through the previous gateway for each `access_from` network, written
+     into the section and kept by the watchdog.
+   - (c) No check: the console is the access.
+
+   **Recommended: (a).** Fluxbee owns no new route, the same line PB-8 draws for the motherbee, and
+   nothing breaks silently.
+4. **The uplink check, and its bounds.** **Recommended:** the confirm round trip (15.3, step 4),
+   rather than the lookups alone, which prove the kernel's path but not the mesh; the probe twice at
+   5 s, a 15 s confirm window, 60 s for the action.
+5. **No `reachability_url` on the motherbee.** **Recommended:** refuse. A switch without a probe is
+   the silence A-219 is about.
+6. **A worker whose section names another gateway** (the declaration changed after its join or its
+   switch). **Recommended:** the same action moves it, with the same guards; `/versions` says
+   `other_gateway`.
+7. **Where the operator sees it.** **Recommended:** `/versions`: the worker's `egress` and the
+   motherbee's comparison. The hive registry would record what the motherbee did, not what the
+   worker runs.
+8. **The removal.** **Recommended:** `remove_hive` of a worker removes its IPv6 file and the record,
+   in the same change.
