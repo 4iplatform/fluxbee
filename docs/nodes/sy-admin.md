@@ -116,6 +116,9 @@ fails with `missing_ai_api_key`.
   `bundle_upload`'s 512 MiB zip): a request whose `Content-Length` declares more answers
   `413 BODY_TOO_LARGE` with the size it declared, before its body is read and with nothing
   allocated for it (`read_http_request`, FINDINGS A-234).
+- **Headers past 64 KiB** (`HTTP_HEADER_MAX_BYTES`, the request line and headers up to the blank
+  line that ends them): `431 HEADERS_TOO_LARGE`, without reading on (`read_http_request`,
+  FINDINGS A-234).
 - **Health.** `GET /health` answers `{"status":"ok"}` without touching the mesh.
 
 ## ADMIN_COMMAND over the mesh

@@ -10057,12 +10057,13 @@ async fn serve_http_connection(
     }
 }
 
-/// The answer to a request whose handler failed: `413 BODY_TOO_LARGE` when it declared a body past
-/// `HTTP_BODY_MAX_BYTES` (`HttpBodyTooLarge`, its body unread), with the size it declared and the
-/// most SY.admin reads; `413 MESSAGE_TOO_LARGE` when the SDK refused a message larger than a mesh
-/// frame, anywhere in the error's chain (nothing was sent), with its size and the most it may be;
-/// `500 INTERNAL_ERROR` otherwise. The detail never repeats the error's text, which may quote the
-/// request.
+/// The answer to a request whose handler failed: `431 HEADERS_TOO_LARGE` when its headers passed
+/// `HTTP_HEADER_MAX_BYTES` (`HttpHeadersTooLarge`, the rest unread); `413 BODY_TOO_LARGE` when it
+/// declared a body past `HTTP_BODY_MAX_BYTES` (`HttpBodyTooLarge`, its body unread), with the size
+/// it declared and the most SY.admin reads; `413 MESSAGE_TOO_LARGE` when the SDK refused a message
+/// larger than a mesh frame, anywhere in the error's chain (nothing was sent), with its size and
+/// the most it may be; `500 INTERNAL_ERROR` otherwise. The detail never repeats the error's text,
+/// which may quote the request.
 fn http_handler_error_response(err: &(dyn std::error::Error + 'static)) -> (u16, String) {
     let answer = |status: u16, code: &str, detail: String| {
         (
@@ -10079,6 +10080,16 @@ fn http_handler_error_response(err: &(dyn std::error::Error + 'static)) -> (u16,
     };
     let mut cause = Some(err);
     while let Some(current) = cause {
+        if current.downcast_ref::<HttpHeadersTooLarge>().is_some() {
+            return answer(
+                431,
+                "HEADERS_TOO_LARGE",
+                format!(
+                    "the request's headers passed the {HTTP_HEADER_MAX_BYTES} bytes SY.admin \
+                     reads: the rest was not read"
+                ),
+            );
+        }
         if let Some(HttpBodyTooLarge { declared }) = current.downcast_ref::<HttpBodyTooLarge>() {
             return answer(
                 413,
@@ -12173,6 +12184,27 @@ impl std::fmt::Display for HttpBodyTooLarge {
 
 impl std::error::Error for HttpBodyTooLarge {}
 
+/// The most bytes a request's head may take, its request line and headers up to the blank line
+/// that ends them (FINDINGS A-234). Past it, nothing more is read; the connection answers 431
+/// (`HttpHeadersTooLarge`).
+const HTTP_HEADER_MAX_BYTES: usize = 64 * 1024;
+
+/// A request whose head passes `HTTP_HEADER_MAX_BYTES`: nothing more of it is read; the connection
+/// answers `431 HEADERS_TOO_LARGE` (`http_handler_error_response`).
+#[derive(Debug)]
+struct HttpHeadersTooLarge;
+
+impl std::fmt::Display for HttpHeadersTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a request's headers passed the {HTTP_HEADER_MAX_BYTES} bytes SY.admin reads"
+        )
+    }
+}
+
+impl std::error::Error for HttpHeadersTooLarge {}
+
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<(String, String, HashMap<String, String>, Vec<u8>), AdminError> {
@@ -12189,8 +12221,14 @@ async fn read_http_request(
             header_end = Some(pos + 4);
             break;
         }
+        if buf.len() > HTTP_HEADER_MAX_BYTES {
+            return Err(Box::new(HttpHeadersTooLarge));
+        }
     }
     let header_end = header_end.ok_or("invalid http request")?;
+    if header_end > HTTP_HEADER_MAX_BYTES {
+        return Err(Box::new(HttpHeadersTooLarge));
+    }
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = header_str.split("\r\n");
     let request_line = lines.next().ok_or("missing request line")?;
@@ -12330,6 +12368,7 @@ fn http_status_line(status: u16) -> &'static str {
         409 => "HTTP/1.1 409 Conflict",
         413 => "HTTP/1.1 413 Payload Too Large",
         422 => "HTTP/1.1 422 Unprocessable Entity",
+        431 => "HTTP/1.1 431 Request Header Fields Too Large",
         500 => "HTTP/1.1 500 Internal Server Error",
         501 => "HTTP/1.1 501 Not Implemented",
         502 => "HTTP/1.1 502 Bad Gateway",
@@ -39381,6 +39420,75 @@ mod tests {
                 answer.contains("\"error_code\":\"BODY_TOO_LARGE\""),
                 "{answer}"
             );
+            server.await.expect("the server");
+        });
+    }
+
+    /// FINDINGS A-234: a request whose head passes HTTP_HEADER_MAX_BYTES before the blank line that
+    /// ends it is answered 431 HEADERS_TOO_LARGE in SY.admin's error shape, without reading on: the
+    /// client here sends one byte past the cap and no more, so a reader that waited for the blank
+    /// line would never answer. A head within the cap, however long, is read and answered.
+    #[test]
+    fn the_http_api_refuses_headers_past_their_cap() {
+        let (status, body) =
+            http_handler_error_response(&HttpHeadersTooLarge as &dyn std::error::Error);
+        assert_eq!(status, 431, "{body}");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["error_code"], json!("HEADERS_TOO_LARGE"));
+        assert_eq!(
+            http_status_line(431),
+            "HTTP/1.1 431 Request Header Fields Too Large"
+        );
+
+        // handle_http's frames run deep in a debug build, as in the tests above.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(32 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (ctx, _harness) = opa_test_admin("http-header-cap");
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let addr = listener.local_addr().expect("its address");
+            let server_ctx = ctx.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.expect("a connection");
+                    serve_http_connection(stream, &server_ctx, &server_ctx.rpc).await;
+                }
+            });
+            let ask = |request: Vec<u8>| async move {
+                let mut stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("connected");
+                stream.write_all(&request).await.expect("sent");
+                let mut answer = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+                    .await
+                    .expect("answered")
+                    .expect("an answer");
+                String::from_utf8(answer).expect("text")
+            };
+
+            let mut past = b"GET /health HTTP/1.1\r\nX-Pad: ".to_vec();
+            past.resize(HTTP_HEADER_MAX_BYTES + 1, b'a');
+            let answer = ask(past).await;
+            assert!(
+                answer.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("\"error_code\":\"HEADERS_TOO_LARGE\""),
+                "{answer}"
+            );
+
+            let mut within = b"GET /health HTTP/1.1\r\nX-Pad: ".to_vec();
+            within.resize(HTTP_HEADER_MAX_BYTES - 4, b'a');
+            within.extend_from_slice(b"\r\n\r\n");
+            let answer = ask(within).await;
+            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
             server.await.expect("the server");
         });
     }
