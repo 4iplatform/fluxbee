@@ -15905,8 +15905,23 @@ fn reconcile_syncthing_peer_xml(
     Ok((updated, changed))
 }
 
+/// What a join's link or a removal's unlink did to config.xml, and whether Syncthing must restart
+/// (FINDINGS A-196).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncthingConfigWrite {
+    /// This call changed config.xml.
+    changed: bool,
+    /// A restart is owed: this change, or one before it that Syncthing has not been restarted with
+    /// (the pending-restart marker; the change may be this same link's, written by a call whose
+    /// restart failed or that the orchestrator's death cut short).
+    restart: bool,
+}
+
+/// Links the peer in config.xml at `config_path` (`reconcile_syncthing_peer_xml`). A change records
+/// the pending restart at `marker` before it lands, as the peer reconcile's do (FINDINGS A-196).
 fn ensure_local_syncthing_peer_link(
-    sync: &BlobRuntimeConfig,
+    config_path: &Path,
+    marker: &Path,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
@@ -15914,10 +15929,9 @@ fn ensure_local_syncthing_peer_link(
     peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
     spoke_role: HiveRole,
-) -> Result<bool, OrchestratorError> {
-    let config_path = sync.sync_data_dir.join("config.xml");
-    update_syncthing_config(&config_path, |current| {
-        reconcile_syncthing_peer_xml(
+) -> Result<SyncthingConfigWrite, OrchestratorError> {
+    let changed = update_syncthing_config(config_path, |current| {
+        let (updated, changed) = reconcile_syncthing_peer_xml(
             current,
             blob,
             dist,
@@ -15926,7 +15940,15 @@ fn ensure_local_syncthing_peer_link(
             peer_address,
             is_motherbee,
             spoke_role,
-        )
+        )?;
+        if changed && updated != current {
+            mark_syncthing_restart_pending_at(marker);
+        }
+        Ok((updated, changed))
+    })?;
+    Ok(SyncthingConfigWrite {
+        changed,
+        restart: changed || marker.exists(),
     })
 }
 
@@ -15946,8 +15968,10 @@ async fn ensure_syncthing_peer_link_runtime(
     if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
         return Ok(());
     }
-    let changed = ensure_local_syncthing_peer_link(
-        sync,
+    let marker = syncthing_restart_pending_marker();
+    let write = ensure_local_syncthing_peer_link(
+        &sync.sync_data_dir.join("config.xml"),
+        &marker,
         blob,
         dist,
         peer_device_id,
@@ -15956,24 +15980,24 @@ async fn ensure_syncthing_peer_link_runtime(
         is_motherbee,
         spoke_role,
     )?;
-    if !changed {
+    if !write.restart {
         return Ok(());
     }
-    tracing::info!(
-        service = SYNCTHING_SERVICE_NAME,
-        peer_name = peer_name,
-        "syncthing peer config reconciled locally; restarting service"
-    );
-    let mut restart = Command::new("systemctl");
-    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
-    run_cmd(restart, "systemctl restart")?;
-    wait_for_service_active(
-        SYNCTHING_SERVICE_NAME,
-        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
-    wait_for_syncthing_health(sync).await?;
-    Ok(())
+    if write.changed {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            peer_name = peer_name,
+            "syncthing peer config reconciled locally; restarting service"
+        );
+    } else {
+        tracing::info!(
+            service = SYNCTHING_SERVICE_NAME,
+            peer_name = peer_name,
+            "syncthing peer link already in config.xml, which holds a change still owed its \
+             restart (FINDINGS A-196); restarting service"
+        );
+    }
+    restart_syncthing_for_pending(sync, &marker).await
 }
 
 // ===========================================================================
@@ -16624,24 +16648,77 @@ fn join_owns_syncthing(is_motherbee: bool, topology_busy: bool, finalizes_in_fli
     }
 }
 
-/// Present while config.xml may hold a reconcile change that Syncthing has not been restarted
-/// with, so a later round restarts even though it finds nothing to change. A file, so it survives
-/// an orchestrator restart; written before the change is renamed into place, so a crash between
-/// the two still leads to a restart.
+/// Present while config.xml may hold a change that Syncthing has not been restarted with, so a
+/// later round restarts even though it finds nothing to change. A file, so it survives an
+/// orchestrator restart; written before the change is renamed into place, so a crash between the
+/// two still leads to a restart. The peer reconcile records it, and so do a join's peer link and
+/// `remove_hive`'s unlink (FINDINGS A-196): a link whose restart failed, or that the
+/// orchestrator's death cut short, is applied by the link run again, or by the reconcile once the
+/// join is over.
 fn syncthing_restart_pending_marker() -> PathBuf {
     orchestrator_runtime_dir().join("syncthing-restart-pending")
 }
 
 /// Records the intent to restart. Best effort: this round restarts anyway when it wrote.
 fn mark_syncthing_restart_pending() {
-    let marker = syncthing_restart_pending_marker();
+    mark_syncthing_restart_pending_at(&syncthing_restart_pending_marker());
+}
+
+/// Records it at `marker`, under the config lock (`update_syncthing_config`'s closure), with a
+/// token of its own: the restart that applies this change clears the marker only while it still
+/// holds that token (`clear_syncthing_restart_pending`), so a change another writer recorded
+/// meanwhile keeps its restart.
+fn mark_syncthing_restart_pending_at(marker: &Path) {
+    let token = format!("{:016x}\n", rand::random::<u64>());
     let written = marker
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|_| fs::write(&marker, b""));
+        .and_then(|_| fs::write(marker, token));
     if let Err(err) = written {
         tracing::warn!(error = %err, "could not record a pending syncthing restart");
     }
+}
+
+/// What a restart about to run applies: the marker's token, None without a marker. Read under the
+/// config lock, so every change it stands for is in config.xml already: each writer records its
+/// token before its rename, under the same lock. Never called under that lock.
+fn syncthing_restart_pending_token(marker: &Path) -> Option<String> {
+    let _guard = SYNCTHING_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fs::read_to_string(marker).ok()
+}
+
+/// After a restart that began once `applied` was read: clears the marker while it still holds
+/// that token. A change recorded since holds another, and keeps the marker for the restart it is
+/// owed.
+fn clear_syncthing_restart_pending(marker: &Path, applied: Option<&str>) {
+    let _guard = SYNCTHING_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if fs::read_to_string(marker).ok().as_deref() == applied {
+        let _ = fs::remove_file(marker);
+    }
+}
+
+/// Restarts Syncthing onto what config.xml holds, and clears the pending restart that applied
+/// (FINDINGS A-196).
+async fn restart_syncthing_for_pending(
+    sync: &BlobRuntimeConfig,
+    marker: &Path,
+) -> Result<(), OrchestratorError> {
+    let applied = syncthing_restart_pending_token(marker);
+    let mut restart = Command::new("systemctl");
+    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
+    run_cmd(restart, "systemctl restart")?;
+    wait_for_service_active(
+        SYNCTHING_SERVICE_NAME,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await?;
+    wait_for_syncthing_health(sync).await?;
+    clear_syncthing_restart_pending(marker, applied.as_deref());
+    Ok(())
 }
 
 /// Stage 2 reconcile, from the watchdog. On a spoke the motherbee device gets its static
@@ -16696,10 +16773,11 @@ async fn reconcile_syncthing_peer_addresses(
         service = SYNCTHING_SERVICE_NAME,
         "syncthing peer config reconciled; restarting service"
     );
-    tokio::task::block_in_place(|| {
+    let applied = tokio::task::block_in_place(|| {
+        let applied = syncthing_restart_pending_token(&marker);
         let mut restart = Command::new("systemctl");
         restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
-        run_cmd(restart, "systemctl restart")
+        run_cmd(restart, "systemctl restart").map(|()| applied)
     })?;
     wait_for_service_active(
         SYNCTHING_SERVICE_NAME,
@@ -16707,7 +16785,8 @@ async fn reconcile_syncthing_peer_addresses(
     )
     .await?;
     wait_for_syncthing_health(&sync).await?;
-    let _ = fs::remove_file(&marker);
+    // A join's link may have recorded a change of its own since (FINDINGS A-196): its marker stays.
+    clear_syncthing_restart_pending(&marker, applied.as_deref());
     Ok(notes)
 }
 
@@ -17464,17 +17543,30 @@ fn reconcile_syncthing_peer_removal_xml(
     Ok((updated, changed))
 }
 
+/// Unlinks the peer from config.xml at `config_path` (`reconcile_syncthing_peer_removal_xml`),
+/// recording the pending restart as the join's link does (FINDINGS A-196).
 fn ensure_local_syncthing_peer_unlink(
-    sync: &BlobRuntimeConfig,
+    config_path: &Path,
+    marker: &Path,
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
-) -> Result<bool, OrchestratorError> {
-    let config_path = sync.sync_data_dir.join("config.xml");
-    update_syncthing_config(&config_path, |current| {
-        reconcile_syncthing_peer_removal_xml(current, dist, peer_device_id)
+) -> Result<SyncthingConfigWrite, OrchestratorError> {
+    let changed = update_syncthing_config(config_path, |current| {
+        let (updated, changed) =
+            reconcile_syncthing_peer_removal_xml(current, dist, peer_device_id)?;
+        if changed && updated != current {
+            mark_syncthing_restart_pending_at(marker);
+        }
+        Ok((updated, changed))
+    })?;
+    Ok(SyncthingConfigWrite {
+        changed,
+        restart: changed || marker.exists(),
     })
 }
 
+/// Whether the unlink changed config.xml. Syncthing restarts when it did, or when a change before
+/// it is still owed its restart.
 async fn ensure_syncthing_peer_unlink_runtime(
     sync: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
@@ -17487,25 +17579,24 @@ async fn ensure_syncthing_peer_unlink_runtime(
     if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
         return Ok(false);
     }
-    let changed = ensure_local_syncthing_peer_unlink(sync, dist, peer_device_id)?;
-    if !changed {
+    let marker = syncthing_restart_pending_marker();
+    let write = ensure_local_syncthing_peer_unlink(
+        &sync.sync_data_dir.join("config.xml"),
+        &marker,
+        dist,
+        peer_device_id,
+    )?;
+    if !write.restart {
         return Ok(false);
     }
     tracing::info!(
         service = SYNCTHING_SERVICE_NAME,
         peer_name = peer_name,
+        changed = write.changed,
         "syncthing peer config reconciled locally (unlink); restarting service"
     );
-    let mut restart = Command::new("systemctl");
-    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
-    run_cmd(restart, "systemctl restart")?;
-    wait_for_service_active(
-        SYNCTHING_SERVICE_NAME,
-        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
-    wait_for_syncthing_health(sync).await?;
-    Ok(true)
+    restart_syncthing_for_pending(sync, &marker).await?;
+    Ok(write.changed)
 }
 
 /// Every `fluxbee-dist*` folder id declared in a syncthing config, in document order. Used where
@@ -44782,6 +44873,66 @@ mod tests {
             .expect("the peer reconcile")..];
         let reconcile = &reconcile[..reconcile.find("\n}\n").expect("its end")];
         assert_eq!(reconcile.matches("a_join_owns_syncthing(state)").count(), 2);
+    }
+
+    /// FINDINGS A-196: a join's link records the pending restart the peer reconcile keeps, with its
+    /// change, so a restart that failed, or that the orchestrator's death cut short, is still owed
+    /// when the link runs again and finds nothing to change. A restart clears the marker it
+    /// applied, and only that: a change recorded since keeps its own. `remove_hive`'s unlink
+    /// records it the same way.
+    #[test]
+    fn a_join_s_link_keeps_its_restart_owed_until_a_restart_applies_it() {
+        const SPOKE: &str = "SPOKE-DEVICE-ID-1234567890";
+        let dir = stage2_writer_dir("a196");
+        let config = dir.join("config.xml");
+        let marker = dir.join("orchestrator").join("syncthing-restart-pending");
+        fs::write(&config, sample_syncthing_config_with_peer()).unwrap();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        let link = || {
+            ensure_local_syncthing_peer_link(
+                &config,
+                &marker,
+                &blob,
+                &dist,
+                SPOKE,
+                "spoke-1",
+                SyncthingPeerAddress::AcceptOnly,
+                true,
+                HiveRole::Worker,
+            )
+            .expect("the link")
+        };
+        let write = |changed, restart| SyncthingConfigWrite { changed, restart };
+        assert_eq!(link(), write(true, true));
+        assert!(fs::read_to_string(&config).unwrap().contains(SPOKE));
+        assert!(marker.exists(), "recorded with the change");
+        // Its restart failed, or the orchestrator died before it: the link run again changes
+        // nothing, and the restart is still owed.
+        assert_eq!(link(), write(false, true));
+        // A restart applies it and clears its marker.
+        let applied = syncthing_restart_pending_token(&marker);
+        assert!(applied.is_some());
+        clear_syncthing_restart_pending(&marker, applied.as_deref());
+        assert!(!marker.exists());
+        assert_eq!(link(), write(false, false));
+        // A change recorded after a restart read its token keeps the marker for its own restart.
+        mark_syncthing_restart_pending_at(&marker);
+        let applied = syncthing_restart_pending_token(&marker);
+        mark_syncthing_restart_pending_at(&marker);
+        clear_syncthing_restart_pending(&marker, applied.as_deref());
+        assert!(
+            marker.exists(),
+            "the later change is still owed its restart"
+        );
+        // The unlink of a removed hive.
+        fs::remove_file(&marker).unwrap();
+        let unlink =
+            ensure_local_syncthing_peer_unlink(&config, &marker, &dist, SPOKE).expect("the unlink");
+        assert_eq!(unlink, write(true, true));
+        assert!(marker.exists());
+        assert!(!fs::read_to_string(&config).unwrap().contains(SPOKE));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Readers report a state that does not decode; its writer moves it aside and derives the

@@ -741,7 +741,12 @@ orchestrator is root, so no name in it is trusted:
 
 **Restarts.** Syncthing restarts only when the reconcile wrote something. The pending restart is a
 marker file, so it survives an orchestrator restart, and it waits while a topology operation runs
-(a join waiting for its spoke to connect must not see every link drop).
+(a join waiting for its spoke to connect must not see every link drop). Since 0.1.127 a join's
+peer link records it too, so a link whose restart failed, or that the orchestrator's death cut
+short, is still applied: by the link run again, or by the reconcile once the join is over
+(FINDINGS A-196). Each write records a token of its own, read under the config lock right before a
+restart, and the restart clears the marker only while it still holds that token: a write recorded
+since keeps it for the restart it is owed.
 
 **Reports.** A condition that lasts (an ambiguous name, a kept orphan, a hive not at rest, an
 invalid id, an unknown role, a missing uplink) is logged once, when it appears. Nothing is reported

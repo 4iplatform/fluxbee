@@ -850,6 +850,11 @@ reverts. While a join runs, its Syncthing is the join's:
 the motherbee's while an `add_hive` or `remove_hive` is in flight, a spoke's while its finalize
 runs. The Syncthing check and the peer reconcile leave it alone until the join is done, and the
 check asks again right before it restarts Syncthing (`a_join_owns_syncthing`, FINDINGS A-194).
+A join's peer link, and `remove_hive`'s unlink, record the restart they need with their change
+(`syncthing-restart-pending`, the peer reconcile's marker): a restart that failed, or that the
+orchestrator's death cut short, is done by the link run again, or by the peer reconcile once the
+join is over. A restart clears the marker only while it holds the token read before it, so a
+change recorded meanwhile keeps its restart (FINDINGS A-196).
 
 To keep a core unit stopped, for a test or a repair, mask it for this boot and stop it:
 `systemctl mask --runtime <unit>` (the lab notes in `lab/DEPLOYMENTS.md` and
@@ -1023,7 +1028,7 @@ Environment: `JSR_LOG_LEVEL`; `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and
 | `/var/lib/fluxbee/hives/<hive>/info.yaml` | the hive registry (motherbee): role, address, status, join phase, Syncthing device |
 | `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json` | managed node config with `_system` |
 | `/var/lib/fluxbee/state/orchestrator/identity-node-ilk-map.json` | node → ILK and tenant, used on relaunch |
-| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `config-applied.json` (the config update applied last), `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, on a worker `egress-switch.json` (its last egress switch, A-219), and on the motherbee `installation-versions.json` |
+| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `config-applied.json` (the config update applied last), `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, `syncthing-restart-pending` (a Syncthing restart owed, FINDINGS A-196), on a worker `egress-switch.json` (its last egress switch, A-219), and on the motherbee `installation-versions.json` |
 | `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees, and `installation/installation.json` |
 | `/var/lib/fluxbee/tls/` | mesh CA (motherbee) and the hive's TLS leaf |
 | `/var/lib/fluxbee/ssh/motherbee.key` | the join key (motherbee) |
