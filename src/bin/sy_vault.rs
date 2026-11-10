@@ -204,6 +204,13 @@ struct VaultStore {
     cipher: Aes256Gcm,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread read the secrets table (`VaultStore::matching`): what the tests
+    /// count a listing's cost by.
+    static SECRETS_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[tokio::main]
 async fn main() -> Result<(), VaultError> {
     if cfg!(not(target_os = "linux")) {
@@ -698,81 +705,66 @@ async fn send_secret_changed_notice(
 /// N = number of secrets in vault.db — bounded by operator intent — plus
 /// one addressed to its edge for each secret an edge owns (A-78).
 ///
-/// Every secret, a page at a time (FINDINGS A-200): one listing stops at
-/// its limit, so the boot follows each page's `next_cursor`, as a
-/// VAULT_LIST caller does (A-198), until no secret follows.
+/// Every secret, in one read of the table (FINDINGS A-200), the newest
+/// write first as VAULT_LIST orders them (`VaultStore::matching`). A
+/// listing pages because its answer must fit a frame, and each page reads
+/// the whole table again; the boot sends notices, not an answer, so it
+/// needs no page, and N secrets cost one read, not about N²/200 rows,
+/// before the receive loop.
 async fn emit_bootstrap_secret_broadcasts(
     sender: &NodeSender,
     store: &VaultStore,
     hive_id: &str,
 ) -> VaultResult<()> {
+    let summaries = store.matching(&VaultFilter::default(), &Caller::default())?;
+    if summaries.is_empty() {
+        tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
+        return Ok(());
+    }
     let edges = edge_nodes(hive_id, &HiveRegistry::motherbee());
     let src_uuid = sender.uuid().to_string();
-    let mut secrets = 0usize;
+    let secrets = summaries.len();
     let mut emitted = 0usize;
     let mut skipped = 0usize;
     let mut edge_notices = 0usize;
-    let mut cursor = None;
-    loop {
-        let page = store.list_page(
-            VaultFilter {
-                limit: Some(VAULT_LIST_MAX_LIMIT),
-                ..VaultFilter::default()
-            },
-            &Caller::default(),
-            cursor.take(),
-        )?;
-        for row in page.rows {
-            let summary: VaultSecretSummary = serde_json::from_value(row)?;
-            secrets += 1;
-            let Some(payload) = build_secret_changed_payload(
-                VaultSecretOp::Put,
-                &summary.key,
-                &summary.metadata,
-                None,
-                summary.version,
-                hive_id,
-            ) else {
-                // Secret has no resource_type — Model D' rejects this on put,
-                // but legacy records could still exist. Skip and log.
-                skipped += 1;
+    for (_, summary) in summaries {
+        let Some(payload) = build_secret_changed_payload(
+            VaultSecretOp::Put,
+            &summary.key,
+            &summary.metadata,
+            None,
+            summary.version,
+            hive_id,
+        ) else {
+            // Secret has no resource_type — Model D' rejects this on put,
+            // but legacy records could still exist. Skip and log.
+            skipped += 1;
+            tracing::warn!(
+                key = %summary.key,
+                "bootstrap broadcast skipped: secret has no resource_type (legacy record?)"
+            );
+            continue;
+        };
+        // No originating msg here (this is boot, not a mutation): no src_ilk, and the notices
+        // are marked as the boot re-announcement.
+        let owner = secret_owner_ilk(&summary.metadata);
+        for notice in secret_changed_notices(&src_uuid, None, true, &payload, owner, &edges)? {
+            let to_edge = matches!(notice.routing.dst, Destination::Unicast(_));
+            if let Err(err) = sender.send(notice).await {
                 tracing::warn!(
+                    error = %err,
                     key = %summary.key,
-                    "bootstrap broadcast skipped: secret has no resource_type (legacy record?)"
+                    to_edge,
+                    "bootstrap broadcast failed for one secret; continuing with the rest"
                 );
                 continue;
-            };
-            // No originating msg here (this is boot, not a mutation): no src_ilk, and the notices
-            // are marked as the boot re-announcement.
-            let owner = secret_owner_ilk(&summary.metadata);
-            for notice in secret_changed_notices(&src_uuid, None, true, &payload, owner, &edges)? {
-                let to_edge = matches!(notice.routing.dst, Destination::Unicast(_));
-                if let Err(err) = sender.send(notice).await {
-                    tracing::warn!(
-                        error = %err,
-                        key = %summary.key,
-                        to_edge,
-                        "bootstrap broadcast failed for one secret; continuing with the rest"
-                    );
-                    continue;
-                }
-                if to_edge {
-                    edge_notices += 1;
-                } else {
-                    emitted += 1;
-                }
+            }
+            if to_edge {
+                edge_notices += 1;
+            } else {
+                emitted += 1;
             }
         }
-        // A page always moves on (`mesh_reply::list_page`): its next one starts after its last
-        // secret.
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    if secrets == 0 {
-        tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
-        return Ok(());
     }
     tracing::info!(
         secrets = secrets,
@@ -1505,12 +1497,15 @@ impl VaultStore {
         ))
     }
 
-    /// Every secret `filter` matches, each with its place in the listing's order.
+    /// Every secret `filter` matches, each with its place in the listing's order: one read of the
+    /// whole table.
     fn matching(
         &self,
         filter: &VaultFilter,
         caller: &Caller,
     ) -> VaultResult<Vec<(VaultListPlace, VaultSecretSummary)>> {
+        #[cfg(test)]
+        SECRETS_TABLE_READS.with(|reads| reads.set(reads.get() + 1));
         // Order most-recently-WRITTEN first so the consumer-resolution path (VaultClient
         // ::resolve_resource -> list_then_get_first, which takes the FIRST match) selects
         // the freshest secret when several share the same (resource_type, tenant, ilk) — the
@@ -2658,22 +2653,19 @@ mod tests {
         assert_eq!(VaultListPlace::parse(&newest.cursor()), Some(newest));
     }
 
-    /// FINDINGS A-200: the boot re-announces every secret once, past one listing's limit (200
-    /// without one, 1000 at most) and past one page's bytes, each as a VAULT_SECRET_CHANGED
-    /// broadcast marked as the boot's.
-    #[tokio::test]
-    async fn the_boot_announces_every_secret_once() {
+    /// A vault holding 250 secrets of about 1 KiB each, more than one VAULT_LIST page holds (200
+    /// without a limit, 1000 at most, and 96 KiB), with their keys in the listing's order, the
+    /// newest write first.
+    fn vault_past_one_page() -> (VaultStore, PathBuf, Vec<String>) {
         let (mut store, dir) = open_test_store([9u8; 32]);
         let admin = admin_caller();
-        let mut keys = Vec::new();
         for n in 0..250 {
             let mut meta = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
             meta.description = Some("d".repeat(1_000));
-            let key = format!("infra:k{n:03}");
-            store.put(&key, json!("v"), meta, &admin).expect("put");
-            keys.push(key);
+            store
+                .put(&format!("infra:k{n:03}"), json!("v"), meta, &admin)
+                .expect("put");
         }
-        // The pages the boot follows: more than one, by their bytes.
         let first = store
             .list_page(
                 VaultFilter {
@@ -2684,8 +2676,18 @@ mod tests {
                 None,
             )
             .expect("a page");
-        assert!(first.rows.len() < keys.len(), "{} rows", first.rows.len());
+        assert!(first.rows.len() < 250, "{} rows", first.rows.len());
+        let keys = store
+            .matching(&VaultFilter::default(), &Caller::default())
+            .expect("every secret")
+            .into_iter()
+            .map(|(_, summary)| summary.key)
+            .collect();
+        (store, dir, keys)
+    }
 
+    /// The boot's announcement of `store`, as the router gets it: each notice's key, in order.
+    async fn boot_announcements(store: &VaultStore) -> Vec<String> {
         let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
             "SY.vault@motherbee",
             build_vault_rpc_profile().expect("profile"),
@@ -2700,13 +2702,33 @@ mod tests {
             }
             announced
         };
-        let (result, mut announced) = tokio::join!(
-            emit_bootstrap_secret_broadcasts(&sender, &store, "motherbee"),
+        let (result, announced) = tokio::join!(
+            emit_bootstrap_secret_broadcasts(&sender, store, "motherbee"),
             drain
         );
         result.expect("announced");
-        announced.sort();
-        assert_eq!(announced, keys);
+        announced
+    }
+
+    /// FINDINGS A-200: the boot re-announces every secret once, past one listing's page, the
+    /// newest write first, each as a VAULT_SECRET_CHANGED broadcast marked as the boot's.
+    #[tokio::test]
+    async fn the_boot_announces_every_secret_once() {
+        let (store, dir, keys) = vault_past_one_page();
+        assert_eq!(boot_announcements(&store).await, keys);
+        cleanup(dir);
+    }
+
+    /// FINDINGS A-200: the boot reads the secrets table once, however many pages a listing of it
+    /// would take: it sends notices, not an answer, so it needs no page, and a page reads the whole
+    /// table each time.
+    #[tokio::test]
+    async fn the_boot_reads_the_secrets_table_once() {
+        let (store, dir, keys) = vault_past_one_page();
+        SECRETS_TABLE_READS.with(|reads| reads.set(0));
+        let announced = boot_announcements(&store).await;
+        assert_eq!(announced.len(), keys.len());
+        assert_eq!(SECRETS_TABLE_READS.with(|reads| reads.get()), 1);
         cleanup(dir);
     }
 

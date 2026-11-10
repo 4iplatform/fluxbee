@@ -73,10 +73,11 @@ without its secret reacts to that announcement.
 
 Details that follow from the code:
 
-- The announcement covers every secret, the most recently written first, each once: it lists
-  them a page at a time (`VaultStore::list_page`, 1000 at most and at most 96 KiB each) and
-  follows each page's `next_cursor`, as a `VAULT_LIST` caller does (FINDINGS A-200; before 0.1.127
-  it covered the 200 newest).
+- The announcement covers every secret, the most recently written first, each once, in one read
+  of the table (`VaultStore::matching`, FINDINGS A-200; before 0.1.127 it covered the 200
+  newest). It sends notices, not an answer, so it takes no page: a `VAULT_LIST` page reads the
+  whole table each time, so paging the boot would cost about N²/200 row reads before the vault
+  serves anything.
 - Consumers do not depend only on the broadcast. `VaultClient::resolve_resource_awaiting_vault`
   retries transport failures (no route, timeout) every 750 ms for up to the caller's budget;
   `VAULT_BOOT_WAIT` is 60 s.
