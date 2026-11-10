@@ -45,7 +45,9 @@ type RecoverOptions struct {
 // already run at maxReplayAttempts starts is a poison event that takes the node down, and is not run
 // again; its instance fails (causeReplayExhausted).
 //
-// Only a failing store is an error.
+// Only a failing store is an error, in 1 and 3: one in 2, the drain of an instance's internal events,
+// is logged and stops nothing (drainRecovered), the events left queued for the instance's next event
+// or the next start; one in 4 leaves the timers pending (timersPending).
 func (rt *NodeRuntime) Recover(ctx context.Context, opts RecoverOptions) error {
 	if err := rt.loadRunningInstances(ctx); err != nil {
 		return err

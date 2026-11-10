@@ -1069,7 +1069,7 @@ When a WF node restarts:
 5. Reconciles the timers with SY.timer (§11.4); when SY.timer does not answer, or the timer index cannot be read, it starts `DEGRADED` and reconciles from the receive loop.
 6. Drops the definitions no running instance uses, and enters the receive loop.
 
-When step 1 fails, or a store operation of steps 2 to 4 does, the engine does not run and the node waits for its store (§14.1): the store is closed again, and the next open runs all of these steps again from the store, as a restart, each event counting its attempt again.
+When step 1 fails (the store does not open, or the definition cannot be kept), or a store operation of step 2 or step 4 does, the engine does not run and the node waits for its store (§14.1): the store is closed again, and the next open runs all of these steps again from the store, as a restart, each event counting its attempt again. A failure while draining an instance's internal events (step 3) stops nothing: it is logged, and the events left stay queued, for after the instance's next event or the next start. A timer index that cannot be read (step 5) leaves the node `DEGRADED` (§11.4).
 
 Completed / cancelled / failed instances remain in the database for read-only introspection but are not loaded into memory.
 
