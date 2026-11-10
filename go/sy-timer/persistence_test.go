@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 func openTestTimerDB(t *testing.T) *sql.DB {
@@ -330,7 +332,8 @@ func TestEnsureTimerSchemaAddsCanceledReasonToAVersion2Table(t *testing.T) {
 }
 
 // TIMER_GET and TIMER_LIST show a timer with the SDK's fields, and canceled_reason when SY.timer
-// canceled it itself, left out otherwise (FINDINGS A-220).
+// canceled it itself, left out otherwise (FINDINGS A-220); the SDK's TimerInfo reads it back
+// (FINDINGS A-239).
 func TestTimerInfoShowsACanceledReasonOnlyWhenThereIsOne(t *testing.T) {
 	row := timerRow{
 		UUID:         "timer-1",
@@ -363,6 +366,13 @@ func TestTimerInfoShowsACanceledReasonOnlyWhenThereIsOne(t *testing.T) {
 		}
 		if got, has := fields["canceled_reason"]; has != (reason != "") || (has && got != reason) {
 			t.Fatalf("reason %q: %s", reason, encoded)
+		}
+		var decoded fluxbeesdk.TimerInfo
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("decode as the SDK does: %v", err)
+		}
+		if got := decoded.CanceledReason; (got != nil) != (reason != "") || (got != nil && *got != reason) {
+			t.Fatalf("reason %q, the SDK read %v", reason, got)
 		}
 	}
 }

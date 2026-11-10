@@ -142,8 +142,8 @@ reconciles its timers when it starts).
 
 Its owner reads `canceled_reason` with `TIMER_GET` by `timer_uuid` and with `TIMER_LIST`
 (`status_filter` `canceled` or `all`); by `client_ref` a canceled timer is `TIMER_NOT_FOUND`. The
-SDKs' `TimerInfo` does not carry the field (the Rust one keeps it in `extra`); SY.admin's routes,
-and Archi, show it.
+Go SDK's `TimerInfo` carries it as `CanceledReason` (since 0.1.130, FINDINGS A-239), and the Rust
+one keeps it in `extra`; SY.admin's routes, and Archi, show it.
 
 ## Messages
 

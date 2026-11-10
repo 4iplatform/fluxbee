@@ -757,7 +757,7 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 	}
 	// A page fits one frame (FINDINGS A-151): the timers past maxTimerListPageBytes go in the next
 	// page, after the cursor of the last one this page lists.
-	items := make([]timerInfo, 0, len(rows))
+	items := make([]fluxbeesdk.TimerInfo, 0, len(rows))
 	pageBytes := 0
 	nextCursor := ""
 	for i, row := range rows {

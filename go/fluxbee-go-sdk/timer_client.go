@@ -53,6 +53,11 @@ type TimerInfo struct {
 	LastFiredAtUTCMS *int64          `json:"last_fired_at_utc_ms,omitempty"`
 	Payload          json.RawMessage `json:"payload,omitempty"`
 	Metadata         json.RawMessage `json:"metadata,omitempty"`
+	// CanceledReason says why SY.timer canceled the timer itself (SY.timer 1.4, FINDINGS A-220): a
+	// one-shot its missed_policy dropped at a start, or a recurring timer whose next fire cannot be
+	// computed. Nil, and left out, for any other timer, one its owner canceled included. TIMER_GET
+	// and TIMER_LIST carry it; Get and List keep it since FINDINGS A-239.
+	CanceledReason *string `json:"canceled_reason,omitempty"`
 }
 
 type FiredEvent struct {

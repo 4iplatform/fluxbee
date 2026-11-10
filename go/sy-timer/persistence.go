@@ -342,17 +342,10 @@ WHERE status IN ('fired','canceled')
 	return result.RowsAffected()
 }
 
-// timerInfo is a timer as TIMER_GET and TIMER_LIST answer it: the SDK's TimerInfo, and
-// canceled_reason when SY.timer canceled it itself (FINDINGS A-220). An SDK client that decodes a
-// TimerInfo does not keep canceled_reason; a raw read (SY.admin's routes, Archi) shows it. SY.timer
-// only encodes it: decoding one goes through TimerInfo's UnmarshalJSON, promoted, which drops
-// canceled_reason.
-type timerInfo struct {
-	fluxbeesdk.TimerInfo
-	CanceledReason *string `json:"canceled_reason,omitempty"`
-}
-
-func timerRowToInfo(row timerRow) (timerInfo, error) {
+// timerRowToInfo is row as TIMER_GET and TIMER_LIST answer it: the SDK's TimerInfo, with its
+// canceled_reason when SY.timer canceled it itself (FINDINGS A-220), which the SDK's TimerInfo
+// keeps since FINDINGS A-239.
+func timerRowToInfo(row timerRow) (fluxbeesdk.TimerInfo, error) {
 	info := fluxbeesdk.TimerInfo{
 		UUID:           row.UUID,
 		OwnerL2Name:    row.OwnerL2Name,
@@ -386,22 +379,21 @@ func timerRowToInfo(row timerRow) (timerInfo, error) {
 	}
 	payload, err := jsonRaw(row.Payload)
 	if err != nil {
-		return timerInfo{}, err
+		return fluxbeesdk.TimerInfo{}, err
 	}
 	info.Payload = payload
 	if row.Metadata.Valid {
 		metadata, err := jsonRaw(row.Metadata.String)
 		if err != nil {
-			return timerInfo{}, err
+			return fluxbeesdk.TimerInfo{}, err
 		}
 		info.Metadata = metadata
 	}
-	out := timerInfo{TimerInfo: info}
 	if row.CanceledReason.Valid {
 		value := row.CanceledReason.String
-		out.CanceledReason = &value
+		info.CanceledReason = &value
 	}
-	return out, nil
+	return info, nil
 }
 
 func collectTimerRows(rows *sql.Rows) ([]timerRow, error) {

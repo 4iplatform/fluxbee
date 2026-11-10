@@ -1028,6 +1028,81 @@ func TestListFollowsSYTimersPages(t *testing.T) {
 	}
 }
 
+// A-239 — Get and List keep the canceled_reason SY.timer 1.4 gives a timer it canceled itself
+// (FINDINGS A-220), and a timer without one has none; a TimerInfo without one is encoded without the
+// field, as SY.timer answers it.
+func TestGetAndListKeepTheCanceledReason(t *testing.T) {
+	tx := make(chan []byte, 2)
+	rx := make(chan receivedMessage, 2)
+	client, err := newTestTimerClientWithChannels(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	const reason = "missed: its fire time passed while SY.timer was down, and its missed_policy is drop"
+	timer := func(uuid, canceledReason string) map[string]any {
+		out := map[string]any{
+			"uuid": uuid, "owner_l2_name": "WF.demo@motherbee", "target_l2_name": "WF.demo@motherbee",
+			"kind": "oneshot", "fire_at_utc_ms": int64(1775577600000), "missed_policy": "drop", "status": "canceled",
+			"created_at_utc_ms": int64(1775574000000), "fire_count": int64(0),
+		}
+		if canceledReason != "" {
+			out["canceled_reason"] = canceledReason
+		}
+		return out
+	}
+	answers := []map[string]any{
+		{"ok": true, "verb": "TIMER_GET", "timer": timer("timer-1", reason)},
+		{"ok": true, "verb": "TIMER_LIST", "count": 2, "timers": []map[string]any{timer("timer-1", reason), timer("timer-2", "")}},
+	}
+	go func() {
+		for _, answer := range answers {
+			var request Message
+			if err := json.Unmarshal(<-tx, &request); err != nil {
+				t.Errorf("unmarshal request: %v", err)
+				return
+			}
+			response, err := BuildSystemResponse(&request, "timer-uuid", MsgTimerResponse, answer, SystemEnvelopeOptions{})
+			if err != nil {
+				t.Errorf("build response: %v", err)
+				return
+			}
+			rx <- receivedMessage{msg: response}
+		}
+	}()
+
+	got, err := client.Get(context.Background(), TimerID("timer-1"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.CanceledReason == nil || *got.CanceledReason != reason {
+		t.Fatalf("TIMER_GET's canceled_reason: %+v", got)
+	}
+	listed, err := client.List(context.Background(), ListFilter{StatusFilter: "canceled"})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(listed) != 2 || listed[0].CanceledReason == nil || *listed[0].CanceledReason != reason || listed[1].CanceledReason != nil {
+		t.Fatalf("TIMER_LIST's canceled_reason: %+v", listed)
+	}
+	for _, info := range listed {
+		encoded, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got, has := fields["canceled_reason"]; has != (info.CanceledReason != nil) || (has && got != reason) {
+			t.Fatalf("%s encoded: %s", info.UUID, encoded)
+		}
+	}
+}
+
 func TestTimerClientNowUsesDispatcherBackend(t *testing.T) {
 	dispatcher, tx, rx := newTimerClientTestDispatcher("WF.demo@motherbee")
 	defer func() { _ = dispatcher.Close() }()
