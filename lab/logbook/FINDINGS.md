@@ -315,6 +315,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-244 🔵 SY.timer's per-timer lock map never drops an entry (low).
 - A-245 🔵 A far router's UNREACHABLE reaches only the hub's own nodes: a spoke's sender to another spoke waits out its timeout (low; the router).
 - A-246 🔵 A non-gateway router with no gateway sibling answers a broadcast twice (low; multi-router hives only, not supported).
+- A-247 🔵 A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender (low; multi-router hives only, not supported).
+- A-248 🔵 An AI node used as a tap target answers the tapped message's sender (low; the AI SDK).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1392,6 +1394,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-248 [General/AI SDK] 🔵 low (found 2026-11-10 by the router's 0.1.129 builder; read in the code, not live) — An AI node used as a tap target answers the tapped message's sender
+
+- **Why:** `build_reply_meta` (`crates/fluxbee_ai_sdk/src/message.rs:97`) copies `meta.via_tap` into
+  a reply, and `build_reply_routing` addresses `msg.routing.src`. An AI.* node that receives a tap
+  copy answers it like any message: its reply goes to the tapped message's original sender, under
+  the copy's trace_id. That sender may be an IO node, which could pass the reply on to a person.
+- **Fix, with the SDK's next release:** an AI node does not answer a tap copy (it is there to be
+  observed), and a reply never carries `via_tap`. Since 0.1.129 the router clears a `via_tap` a
+  node sets itself, so such a reply is at least tapped and copied to cognition.
+
+### A-247 [General/router] 🔵 low (found 2026-11-10 by the router's 0.1.129 builder; read in the code) — A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender
+
+- **Why:** in `handle_peer_message`'s `ResolvedRoute::ForwardRouter(peer_uuid)` arms
+  (`src/router/mod.rs` ~4883 and ~5033 on `coa/router-129`), the arm's `peer_uuid` shadows the
+  parameter that names the sibling the message came from, so a `TTL_EXCEEDED` or an `UNREACHABLE`
+  goes to the forward target's link, or nowhere. Only a hive with several routers gets there,
+  which is not supported.
+- **Fix, later (if multi-router hives come):** name the arm's binding apart.
 
 ### A-246 [General/router] 🔵 low (found 2026-11-10 by the review of the router's 0.1.129; read in the code) — A non-gateway router with no gateway sibling answers a broadcast twice
 
