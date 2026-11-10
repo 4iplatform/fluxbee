@@ -2238,12 +2238,12 @@ fn the_names_come_from_the_public_base_url_and_web() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// acme.json as 0.1.82 and 0.1.83 wrote it: one `name` per order and certificate
+// acme.json on disk: the names of each order and certificate
 // ---------------------------------------------------------------------------------------------
 
-/// A copy of the shape 0.1.83 writes, every field present: the order in flight and the issued
-/// certificate carry one `name`.
-fn acme_json_0_1_83(order_url: &str) -> String {
+/// An acme.json as a hive holds it, every field present: the order in flight and the issued
+/// certificate record their `names` (FINDINGS A-210: every hive is past 0.1.83's single `name`).
+fn acme_json_on_disk(order_url: &str) -> String {
     let account = account_url_for(DIRECTORY);
     let staging_account = account_url_for(STAGING);
     let fingerprint = "5d".repeat(32);
@@ -2266,7 +2266,7 @@ fn acme_json_0_1_83(order_url: &str) -> String {
     "directory_url": "{DIRECTORY}",
     "account_url": "{account}",
     "order_url": "{order_url}",
-    "name": "{NAME}",
+    "names": ["{NAME}"],
     "profile": null,
     "replaces": false,
     "kind": "check",
@@ -2308,7 +2308,7 @@ fn acme_json_0_1_83(order_url: &str) -> String {
       "authority_key_id": "142eb317b75856cbae500940e61faf9d8b14c2c6",
       "not_before": 1761000000,
       "not_after": 1768776000,
-      "name": "{NAME}",
+      "names": ["{NAME}"],
       "profile": "classic",
       "directory_url": "{DIRECTORY}",
       "account_url": "{account}",
@@ -2369,9 +2369,9 @@ fn acme_json_0_1_83(order_url: &str) -> String {
     )
 }
 
-/// A harness whose acme.json is the one 0.1.83 wrote, its account in the vault: a restart onto
-/// the new code.
-fn upgraded_from_0_1_83(config: AcmeConfig, order_url: &str) -> Harness {
+/// A harness whose acme.json is `acme_json_on_disk`, its account in the vault: SY.admin restarted
+/// onto it.
+fn restarted_on_acme_json(config: AcmeConfig, order_url: &str) -> Harness {
     let mut h = Harness::new(config);
     h.mesh().put(
         &account_vault_key(DIRECTORY),
@@ -2379,15 +2379,15 @@ fn upgraded_from_0_1_83(config: AcmeConfig, order_url: &str) -> Harness {
         json!({}),
     );
     fs::create_dir_all(h.state_path().parent().unwrap()).unwrap();
-    fs::write(h.state_path(), acme_json_0_1_83(order_url)).unwrap();
+    fs::write(h.state_path(), acme_json_on_disk(order_url)).unwrap();
     h.restart();
     h
 }
 
 #[tokio::test]
-async fn an_acme_json_of_0_1_83_keeps_parsing_with_one_name_per_record() {
+async fn an_acme_json_that_records_names_still_loads() {
     let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
-    let h = upgraded_from_0_1_83(AcmeConfig::On(settings()), &order_url);
+    let h = restarted_on_acme_json(AcmeConfig::On(settings()), &order_url);
     assert!(
         h.service.state_warning.is_none(),
         "{:?}",
@@ -2409,7 +2409,7 @@ async fn an_acme_json_of_0_1_83_keeps_parsing_with_one_name_per_record() {
     assert_eq!(h.ca().log.resumed, vec![order_url]);
     assert!(h.ca().log.new_orders.is_empty());
     assert_eq!(h.state().last_attempt.unwrap().result, "installed");
-    // Written back with the names list.
+    // Written back the same way, with the names list.
     let written: Value =
         serde_json::from_str(&fs::read_to_string(h.state_path()).unwrap()).unwrap();
     for record in written["issued"].as_array().unwrap() {
@@ -2421,7 +2421,7 @@ async fn an_acme_json_of_0_1_83_keeps_parsing_with_one_name_per_record() {
 #[tokio::test]
 async fn a_recorded_one_name_order_is_not_resumed_for_two_names() {
     let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
-    let h = upgraded_from_0_1_83(AcmeConfig::On(settings_with_archi()), &order_url);
+    let h = restarted_on_acme_json(AcmeConfig::On(settings_with_archi()), &order_url);
     assert!(h.service.state_warning.is_none());
     h.service.check_once().await;
     assert!(h.ca().log.resumed.is_empty());

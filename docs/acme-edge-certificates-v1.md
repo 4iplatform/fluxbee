@@ -157,7 +157,7 @@ web:
 |---|---|---|---|
 | The certificate and its private key | SY.vault, under the ingress' `edge.tls_vault_key` (PROD `edge_tls_fluxbee_ai`, new installs `edge_tls`) | `SY.edge@<ingress>` | `{cert, key}` PEM, `resource_type: tls`, root tenant. One previous version for rollback. Only the edge reads it. |
 | The ACME account | SY.vault, `acme_account:<16 hex of SHA-256(directory_url)>` | `SY.admin@motherbee` | The library's credentials JSON; the URL in the metadata description. Cloud and the admin API cannot write it. |
-| Order state | `state_dir/sy-admin/acme.json` on the motherbee | | The account URL per directory, the order in flight, the last attempt, the last 20 issued certificates (serial, dates, names, profile), the last edge status seen, the conditions. No key. An order and a certificate record their `names`; the single `name` of a file 0.1.82 or 0.1.83 wrote reads as a one-name list. |
+| Order state | `state_dir/sy-admin/acme.json` on the motherbee | | The account URL per directory, the order in flight, the last attempt, the last 20 issued certificates (serial, dates, names, profile), the last edge status seen, the conditions. No key. An order and a certificate record their `names`. |
 | The names | `admin.public_base_url` and `web:` (motherbee) | | |
 | The edge's secret name | `edge.tls_vault_key` (ingress) | | SY.admin asks the edge for it, and accepts only names that start with `edge_tls`. |
 
@@ -511,5 +511,5 @@ renewal point) until a `POST /acme/renew`.
     the unmarked authorization, the main name ordered alone after a failure on an added one (each
     condition of the served leaf) or 48 h past its point after such a failure (and not for a
     renewal that does not need it, nor a test order), adding and removing a name, and an
-    `acme.json` in the shape 0.1.83 wrote.
+    `acme.json` that records its `names`, read in place after a restart.
 - **Live gate (8.x):** §9.

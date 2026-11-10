@@ -783,30 +783,12 @@ pub(crate) struct AccountRecord {
     pub(crate) recorded_at: i64,
 }
 
-/// The names of an order or a certificate, the main one first. The files 0.1.82 and 0.1.83 wrote
-/// hold one `name`, read as a one-name list.
-fn one_or_more_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Names {
-        One(String),
-        More(Vec<String>),
-    }
-    Ok(match Names::deserialize(deserializer)? {
-        Names::One(name) => vec![name],
-        Names::More(names) => names,
-    })
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OrderRecord {
     pub(crate) directory_url: String,
     pub(crate) account_url: String,
     pub(crate) order_url: String,
-    #[serde(alias = "name", deserialize_with = "one_or_more_names")]
+    /// The names it orders, the main one first.
     pub(crate) names: Vec<String>,
     pub(crate) profile: Option<String>,
     pub(crate) replaces: bool,
@@ -896,7 +878,6 @@ pub(crate) struct IssuedRecord {
     pub(crate) not_before: i64,
     pub(crate) not_after: i64,
     /// The names it was ordered for, the main one first.
-    #[serde(alias = "name", deserialize_with = "one_or_more_names")]
     pub(crate) names: Vec<String>,
     pub(crate) profile: Option<String>,
     pub(crate) directory_url: String,
