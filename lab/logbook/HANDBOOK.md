@@ -1128,9 +1128,14 @@ Three paths:
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
 
 **Downgrading from 0.1.124 to an earlier version:** the router of 0.1.123 or earlier parses each
-hive's hive.yaml `ai` at its start, only to check it, and does not start on one it cannot use (an
-unknown provider, a default provider without its model, an empty model). 0.1.124's router reads
-neither `ai` nor `blob`. Before going back, make sure each hive's `ai` is valid or absent.
+hive's hive.yaml `ai` and `blob` at its start, only to check them, and does not start on either if
+it cannot use it:
+- an `ai` with an unknown provider, a default provider without its model, or an empty model;
+- a `blob` key of the wrong type: `enabled` and `sync.enabled` booleans; `path`, `sync.tool` and
+  `sync.data_dir` strings; `sync.api_port` a port number.
+
+0.1.124's router reads neither. Before going back, make sure each hive's `ai` is valid or absent,
+and its `blob` keys have those types.
 
 **Downgrading from 0.1.123 to 0.1.122:** 0.1.122's SY.admin has no installation update, so
 `ops deploy 0.1.122` sends the per-spoke core update. `installation-update.json` in SY.admin's

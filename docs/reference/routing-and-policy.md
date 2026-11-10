@@ -193,7 +193,7 @@ they count like this hive's.
 - A link whose writer has stopped counts as no link. A link leaves its table however it ends, a
   read error included, and a WAN session also ends after its dead interval without a frame
   (A-203, A-207, since 0.1.124). A local node whose writer has stopped is disconnected, and a
-  unicast for it is answered `NODE_NOT_FOUND`.
+  message for it but a broadcast (a unicast, a resolved message) is answered `NODE_NOT_FOUND`.
 - The message travels unchanged and the next router decides again with its own tables. A Resolve
   keeps `dst: null` (§5).
 - A gateway that receives from the WAN a message for a node of a third hive forwards it again
@@ -226,7 +226,7 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 | `WAN_UNAVAILABLE` | this router is the gateway and has no live WAN link to the next-hop hive |
 | `OPA_ERROR` | Resolve: no user policy loaded, or its evaluation failed (§5, §7) |
 | `OPA_NO_TARGET` | Resolve: the user policy gave no target |
-| `FRAME_TOO_LARGE` | the message's frame, as the router hands it to a link, is over 128 KiB: the sender's SDK let it through, and the router's additions (the sender's name, the action class, a resolve's trace entry) took it over; never queued, and a broadcast is answered once (A-202, since 0.1.124) |
+| `FRAME_TOO_LARGE` | the message's frame, as the router hands it to a link, is over 128 KiB: the sender's SDK let it through, and the router's additions (the sender's name, the action class, a resolve's trace entry) took it over; never queued. A broadcast goes everywhere or nowhere, and is answered once, by the router it entered (§4) (A-202, since 0.1.124) |
 
 A message that came from another router gets its error over the link it came in on; that router
 hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`).
@@ -252,6 +252,8 @@ hands it to the node when the node is its own (`handle_peer_message`, `handle_wa
 At the router where it enters from a node (`handle_message`):
 
 1. `trace_id` must be a UUID. A `trace_id` seen in the last 30 s is dropped (`BroadcastCache`).
+   Then its largest frame, as a local node would get it, is measured: over 128 KiB it goes
+   nowhere, and its sender is answered `FRAME_TOO_LARGE` once (`broadcast_over_limit`, A-202).
 2. Every local node except the sender gets it, when it passes the VPN check for a broadcast
    (§8.2, `vpn_allows_broadcast_between`) and, if `meta.target` is set, its name matches it
    (`pattern_match`: exact, or `*` wildcards).

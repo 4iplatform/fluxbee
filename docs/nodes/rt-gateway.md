@@ -110,6 +110,14 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - An uplink dials again 5 s after a link that got past `WAN_ACCEPT` ends. An attempt that never
   got there (no connection, a TLS or handshake error, a `WAN_REJECT`) is retried after 5 s,
   doubling up to 60 s (`UplinkRetry`).
+- **Each step of the handshake has 30 s** (`WAN_HANDSHAKE_TIMEOUT`, since 0.1.124): the TCP
+  connection, the TLS handshake, the peer's `HELLO`, on the side that dials and on the side that
+  accepts. A peer silent in one (a black hole) no longer holds the uplink, or an accepted socket
+  on the motherbee, until TCP gives up: the link ends with `wan handshake: <step> took over 30 s`
+  (in `wan connect failed`, `wan uplink error` or `wan connection error`), and an uplink retries
+  as after any failed attempt. The peer's `WAN_ACCEPT` closes the handshake and is otherwise
+  ignored; until 0.1.124 it was counted and logged as a frame from a foreign source after every
+  connection.
 - **A session's end (A-203, A-207).** A session ends on a clean close, a read error (a peer gone
   without TLS `close_notify`, as a router stopped for its update), an error handling a frame, a
   write error on its link (`wan peer session closed: its link no longer writes`), nothing heard
@@ -167,10 +175,13 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
     most once every 30 s (`frame_over_limit`). Until 0.1.124 the link's writer skipped the frame and
     the sender waited out its own timeout. SY.admin, SY.identity, SY.vault and SY.orchestrator keep
     their replies 1 KiB under the frame for these additions (A-198), so they never get it.
-  A link to a sibling router or to a hive whose writer has stopped counts as no link:
-  `PEER_UNAVAILABLE`, `GATEWAY_UNAVAILABLE` or `WAN_UNAVAILABLE` (`send_to_peer_router`,
-  `send_to_wan_peer`); a local node's, as a node that left: `NODE_NOT_FOUND`, for a unicast only
-  (`deliver_locally`; A-203).
+  - **A broadcast goes everywhere or nowhere:** its router measures its largest frame (a local
+    node's, with the action class) before it sends it anywhere, so the other routers it would
+    reach never answer it again (`broadcast_over_limit`).
+  - **A link whose writer has stopped** counts as no link: `PEER_UNAVAILABLE`,
+    `GATEWAY_UNAVAILABLE` or `WAN_UNAVAILABLE` for a sibling router or a hive
+    (`send_to_peer_router`, `send_to_wan_peer`); for a local node, as for a node that left,
+    `NODE_NOT_FOUND` to anything but a broadcast (`deliver_locally`; A-203).
 
 ### System authority
 
