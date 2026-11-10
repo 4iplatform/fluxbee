@@ -323,16 +323,16 @@ wasm and baked into the router binary with `include_bytes!` (`src/router/system_
 ### 6.2 Protected actions and who may send them
 
 The gate covers system messages (`meta.type` compared without case, `is_system_kind`) whose
-`meta.msg` is one of the 32 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
+`meta.msg` is one of the 33 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
 `src_l2_name` (§2) and the hive of the router doing the delivery.
 
 | Rule in `system.rego` | Actions | Allowed origin |
 | --- | --- | --- |
 | (1) | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `EDGE_WEB_ROUTES` | `SY.admin@motherbee` |
 | (2) | `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` | `SY.admin@motherbee` |
-| (3) mutations | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@motherbee`; `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` never on the motherbee itself |
+| (3) mutations | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`, `SYSTEM_EGRESS_ROUTE` | `SY.orchestrator@motherbee`; `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` and `SYSTEM_EGRESS_ROUTE` never on the motherbee itself |
 | (3) reads | `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `NODE_HELP` (a node's self-description, [agent-tools-v1](../agent-tools-v1.md) §3.3), `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`, `SY.orchestrator@<this hive>` |
-| (4) | every protected action outside (1) and (2): the (3) lists and `INVENTORY_REQUEST`; never `ADD_HIVE_FINALIZE` or `REMOVE_HIVE_CLEANUP` on the motherbee | `SY.admin@<this hive>` |
+| (4) | every protected action outside (1) and (2): the (3) lists and `INVENTORY_REQUEST`; never `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` or `SYSTEM_EGRESS_ROUTE` on the motherbee | `SY.admin@<this hive>` |
 | (5) | `NODE_STATUS_GET` | `SY.vault@<this hive>` |
 | (6) | `WAN_REACHABILITY_VOUCH`: not a message, the router asks it before it accepts a hub's reachability advertisement | `RT.gateway@motherbee` |
 
@@ -344,9 +344,12 @@ The gate covers system messages (`meta.type` compared without case, `is_system_k
   §3). Every orchestrator message that crosses hives goes from the motherbee to a spoke, and the
   watchdog acts locally, so a spoke's orchestrator, the DMZ ingress's included, commands no hive,
   not even its own. `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` run only on the hive being added
-  or removed: on the motherbee they would restart or stop the core, so neither rule (3) nor rule
-  (4) admits them there, from anyone, and its orchestrator refuses them too
-  (`SPOKE_ONLY_SYSTEM_ACTIONS` in `src/bin/sy_orchestrator.rs`).
+  or removed: on the motherbee they would restart or stop the core. `SYSTEM_EGRESS_ROUTE` puts a
+  worker behind the egress, or takes it back ([edge-egress-nat-spec](../edge-egress-nat-spec.md)
+  §15), and Fluxbee never rewrites the motherbee's route (PB-8). So neither rule (3) nor rule (4)
+  admits these there, from anyone, and its orchestrator refuses them too
+  (`SPOKE_ONLY_SYSTEM_ACTIONS` in `src/bin/sy_orchestrator.rs`); a spoke that is no worker refuses
+  `SYSTEM_EGRESS_ROUTE` itself (`NOT_A_WORKER`).
 - The origin is split at the first `@` after trimming. The role must match exactly, so
   `SY.orchestrator.relay@h` is not `SY.orchestrator`; an empty name, or one without `@`, matches
   nothing.

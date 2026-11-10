@@ -610,11 +610,22 @@ motherbee behind the egress, set it up at the OS/network level.
 
 ⚠️ **And the more immediate trap: today it may be that NOBODY routes through the egress.** The
 injection only reaches the workers provisioned **after** the field is declared — a worker that
-joined before keeps its original gateway.
+joined before keeps its original gateway. `GET /versions` says so: that worker's `egress.state` is
+`not_behind`.
 
-**Planned, not built yet (A-219):** an explicit action per worker, from Archi with your CONFIRM and
-through SY.admin, puts such a worker behind the egress, with guards and a way back:
-[edge-egress-nat-spec §15](../../docs/edge-egress-nat-spec.md#15-an-existing-worker-goes-behind-the-egress-a-219).
+**The way (A-219, since 0.1.125):** one explicit action per worker, `set_hive_egress`: ask Archi,
+which stages it and waits for your CONFIRM, or on the motherbee
+`ops.py admin PUT /hives/worker1/egress '{}'`. The worker gets the motherbee's `egress` section and
+its route goes to the egress, IPv6 off. Before anything moves it checks that the gateway is on its
+subnet, and that neither the mesh nor your SSH reach it through its default route (a management
+network outside its subnet needs a static route at the OS level first, through the current gateway:
+`access_from` names it for the check). After the switch it probes the internet through the egress,
+and keeps the switch only once the motherbee confirms; otherwise it puts everything back. So the
+motherbee's `egress` needs a `reachability_url` too (a hand edit and a restart of its
+`sy-orchestrator`). The way back is `clear_hive_egress` (`DELETE /hives/worker1/egress`), the way
+around an egress outage. Details:
+[edge-egress-nat-spec §15](../../docs/edge-egress-nat-spec.md#15-an-existing-worker-goes-behind-the-egress-a-219)
+and [operations](../../docs/reference/operations.md#a-worker-behind-the-egress-set_hive_egress-clear_hive_egress).
 
 **Do not take for granted that your motherbee goes out through the egress** without checking it:
 

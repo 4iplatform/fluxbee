@@ -266,7 +266,7 @@ caller and the action; a command with no stamped caller is refused too.
 | Caller | May ask for | Checked in |
 | --- | --- | --- |
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
-| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`, `update_installation`) | `authorize_llm_usage_scope` |
+| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`, `update_installation`, `set_hive_egress`, `clear_hive_egress`) | `authorize_llm_usage_scope` |
 | `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`); payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
@@ -287,11 +287,13 @@ caller and the action; a command with no stamped caller is refused too.
 - **Only Archi and the HTTP API** ask for `executor_validate_plan`, `executor_execute_plan` and
   `publish_cloud_endpoint`. The executor then runs every step of the plan as the operator.
 - **Closed to the whole mesh,** Archi included: `cognition_clear`, `reset_base_runtime`,
-  `set_installation_ai` and `update_installation` (`MeshAccess::Nobody`). The operator asks for
-  them on loopback, or Archi stages them in a plan the operator confirms and the executor runs
+  `set_installation_ai`, `update_installation`, `set_hive_egress` and `clear_hive_egress`
+  (`MeshAccess::Nobody`). The operator asks for them on loopback, or Archi stages them in a plan
+  the operator confirms and the executor runs
   ([A hive's cognition](#a-hives-cognition-the-clear),
   [The installation's ai](#the-installations-ai),
-  [The installation's update](#the-installations-update)). Their reads, `get_installation` and
+  [The installation's update](#the-installations-update),
+  [A worker behind the egress](#a-worker-behind-the-egress)). Their reads, `get_installation` and
   `get_installation_update`, are Archi's.
 - **`remove_runtime_version` keeps a base runtime's `package_version`** (`RUNTIME_PACKAGE_VERSION`):
   it is the way back with `reset_base_runtime` (FINDINGS A-122).
@@ -372,7 +374,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 
 | Actions | Sent to | How |
 | --- | --- | --- |
-| node lifecycle, node config/state/status, a node's self-description (`node_help`), hives, versions, runtimes, deployments, drift alerts, storage path, `core_rollback` (`action_routes_via_local_orchestrator`) | `SY.orchestrator@motherbee`, with `payload.target` = the hive; `node_name@hive` overrides `target` (`normalize_admin_payload`) | `msg_type: admin`, `meta.action` |
+| node lifecycle, node config/state/status, a node's self-description (`node_help`), hives, versions, runtimes, deployments, drift alerts, storage path, `core_rollback`, `set_hive_egress`, `clear_hive_egress` (`action_routes_via_local_orchestrator`) | `SY.orchestrator@motherbee`, with `payload.target` = the hive; `node_name@hive` overrides `target` (`normalize_admin_payload`) | `msg_type: admin`, `meta.action` |
 | routes, VPNs, taps | `SY.config.routes@<hive>` | `msg_type: admin` (`build_admin_request`) |
 | `inventory` | `SY.orchestrator@motherbee` | `INVENTORY_REQUEST` (`handle_inventory_http`) |
 | identity actions | `SY.identity@motherbee`, the primary, whatever hive the path names, writes and reads alike: a spoke's replica refuses SY.admin of another hive (F-07; writes A-143, reads 2026-11-07), and every replica holds the primary's identities | `ILK_*`, `TNT_*` (`handle_identity_command`, `identity_command_hive`, `handle_identity_query`) |
@@ -409,7 +411,9 @@ check and the write, plus each hive's 90 of `sync_pending`,
 ceiling (30 for the motherbee's `/versions`, then each hive's pass: 120 from the run's start for its
 answer, `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`, two reads of its `/versions`, 50 each,
 `JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`, and a core and a config update, each 90 and 60),
-`sync_hint` 45, `core_rollback` 300, `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
+`sync_hint` 45, `core_rollback` 300, `set_hive_egress` and `clear_hive_egress` 60
+(`JSR_ADMIN_EGRESS_TIMEOUT_SECS`; the motherbee forwards the switch with 30 and the confirm with
+10), `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
 `node_help` 10 (the node's hive gives the node 3 s, the motherbee gives that hive 7 s),
 `kill_node` and `remove_node_instance` 180 (a purge waits for the node's teardown: the
 orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purge 150 s),
@@ -625,6 +629,37 @@ other hives keep theirs.
   "error_code": null, "error_detail": null
 }
 ```
+
+## A worker behind the egress
+
+`PUT /hives/{hive}/egress` (`set_hive_egress`) puts a worker that joined before the motherbee
+declared its egress behind it; `DELETE /hives/{hive}/egress` (`clear_hive_egress`) takes a worker
+back ([edge-egress-nat-spec §15](../edge-egress-nat-spec.md), FINDINGS A-219). Both are the
+operator's: closed to the mesh, Archi included, so Archi stages them, one step per worker, and the
+executor runs them once the operator confirms.
+
+- **The request:** `{}`, or `{"access_from": ["<IPv4 address or network>", ...]}`: what the operator
+  manages the worker from, besides its live SSH sessions. A clear may name `gateway_ip`, the gateway
+  to go back to, only for a worker whose record keeps no route from before the egress. It names no
+  gateway otherwise: a set's is the motherbee's declaration.
+- **What SY.admin checks** before it sends anything (`handle_hive_egress_command`): the hive is a
+  worker of the registry whose join is done (`hive_egress_worker_refusal`, `409 NOT_A_WORKER` for
+  the motherbee, an ingress, an egress, a hive whose join is not done, or none of the registry's);
+  no installation update run is under way, nor a task of the update acting on that worker
+  (`409 INSTALLATION_UPDATE_RUNNING`): its core update restarts the worker's orchestrator. It holds
+  the run's mark while the action runs, as `set_installation_ai` does.
+- **Then** it sends the action to `SY.orchestrator@motherbee`, `payload.target` the worker, and
+  waits 60 s. The motherbee's checks, the worker's guards, the switch, the confirm and the commit or
+  the revert are the orchestrators' ([SY.orchestrator](sy-orchestrator.md#a-worker-behind-the-egress-a-219)).
+- **The answer:** `status` `ok` (`outcome` `switched`, `cleared` or `unchanged`) or an error with
+  `error_code`, `step` and `outcome` (`refused`, `reverted`, `not_answered`), and the worker's
+  `gateway_ip`, `previous_gateway`, `ipv6_blocked`, `internet_reachable`, `probe`,
+  `ssh_reachable_from`, `switch_id` and `timings_ms` per step. A refusal before anything changed is
+  409 (`503` for `HIVE_UNREACHABLE` and `EGRESS_GUARD_UNREADABLE`, `422` for
+  `EGRESS_DECLARATION_INVALID`); a step that failed and reverted 502; `EGRESS_CONFIRM_MISSED` and
+  `EGRESS_NOT_ANSWERED` 504. `EGRESS_NOT_ANSWERED` never means "not applied": `GET
+  /hives/{hive}/versions` says where the worker stands (`egress.state`, `egress.last_switch`).
+- The command log keeps each run under the worker's hive (`GET /hives/<worker>/commands`).
 
 ## The installation's ai
 
@@ -1501,7 +1536,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 24, 118 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 25, 120 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -1583,6 +1618,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `vault_assign` | `PUT /hives/{hive}/vault/secrets/{key}/assigned` | Replace the nodes one secret is assigned to (who uses it besides its owner), without touching its value. |
 | `vault_rollback` | `POST /hives/{hive}/vault/secrets/{key}/rollback` | Rollback one encrypted secret to its previous version. |
 | `core_rollback` | `POST /hives/{hive}/core/rollback` | Restore this hive's core binaries from a stamped backup generation (undo a core update). |
+| `set_hive_egress` | `PUT /hives/{hive}/egress` | Put a worker behind the motherbee's egress: its hive.yaml gets the motherbee's egress section (gateway_ip, reachability_url), as add_hive writes it into a new worker, and its default route goes to the egress gateway with IPv6 off. Closed to the mesh, confirmed by the operator ([A worker behind the egress](#a-worker-behind-the-egress)). |
+| `clear_hive_egress` | `DELETE /hives/{hive}/egress` | Take a worker off the egress: its default route goes back to the one it had before (its record's, or gateway_ip for a worker that joined after the declaration), its egress section leaves hive.yaml, and the IPv6 values it had come back. |
 | `list_deployments` | `GET /deployments` | List historical deployments globally. |
 | `get_deployments` | `GET /hives/{hive}/deployments` | List historical deployments targeting one hive. |
 | `list_drift_alerts` | `GET /drift-alerts` | List historical drift alerts globally. |

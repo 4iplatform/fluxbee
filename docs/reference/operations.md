@@ -215,8 +215,11 @@ also an `internet_unreachable` drift alert in its own file, which the motherbee 
 (FINDINGS A-175). There is no
 default: without the URL the probe does not run and logs `internet_reachable=not_configured`. An
 egress join takes `egress.reachability_url` from the request, else the motherbee's, and refuses
-anything but an `https://` URL; a worker join copies the motherbee's with `gateway_ip`. A hive
-joined before gets it by adding the line to its hive.yaml and restarting `sy-orchestrator`.
+anything but an `https://` URL; a worker join copies the motherbee's with `gateway_ip`. A worker
+joined before the motherbee declared its egress gets the section, the URL with it, through
+`set_hive_egress` (below); an egress joined before gets the URL by adding the line to its hive.yaml
+and restarting `sy-orchestrator`. A failed probe says why, in curl's words (no DNS, no connection,
+a timeout, an HTTP error, TLS: FINDINGS A-225).
 
 **A join over a password chooses what happens to password logins (A-165).** Since D32 the join
 revokes its own key and sudoers entry at its end, and nothing else closes password logins on the
@@ -242,14 +245,85 @@ spoke over the mesh (8 s). The spoke answers once its cleanup is scheduled as a 
 its own (`fluxbee-remove-hive-cleanup-<ms>`), which deletes its TLS material and identity key,
 stops the Fluxbee services and the managed nodes and deletes its node state, and runs to its end
 after the spoke's orchestrator has stopped; an ingress then drops its SSH table
-(`inet fluxbee_ingress`) and `fluxbee-ingress-nft.service`, an egress its NAT table and files. An
-egress or ingress the cleanup did not reach keeps them, and the answer's `warning` says what to
-remove from its console. The motherbee then unpairs Syncthing, deletes
+(`inet fluxbee_ingress`) and `fluxbee-ingress-nft.service`, an egress its NAT table and files, and a
+worker its IPv6 block (`/etc/sysctl.d/99-fluxbee-egress.conf`) and its egress switch's record
+(FINDINGS A-225): IPv6, and the default route its own network configuration gives it, come back at
+its next boot. An egress or ingress the cleanup did not reach keeps them, and the answer's
+`warning` says what to remove from its console. The motherbee then unpairs Syncthing, deletes
 `hives/<id>/` and the hive's identity key under `/var/lib/fluxbee/identity/keys/`
 (`identity_key_cleanup` in the answer). When the spoke did not answer, the motherbee restarts its
 `sy-identity` to close any session the removed hive still holds (`identity_restart`). The
 motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
 the identity key of every hive with no `hives/<id>/`.
+
+## A worker behind the egress (`set_hive_egress`, `clear_hive_egress`)
+
+A worker that joins after the motherbee declares `egress.gateway_ip` gets the motherbee's `egress`
+section, and its boot applies it: its default route goes to the gateway, IPv6 off, a probe
+(docs/edge-egress-nat-spec.md §7). A worker that joined before keeps its own route until the
+operator puts it behind the egress (FINDINGS A-219, §15 of the spec):
+
+- **`PUT /hives/{hive}/egress`** (`set_hive_egress`), body `{}` or `{"access_from": [...]}`:
+  the worker's hive.yaml gets the section the join would have written, and its route goes to the
+  gateway. A worker behind another gateway moves to the declared one the same way.
+- **`DELETE /hives/{hive}/egress`** (`clear_hive_egress`): the default routes the worker had
+  before it first went behind the egress (its record keeps them; a worker with no record names
+  `gateway_ip`), the section out of hive.yaml, and its IPv6 values back. The way around an egress
+  outage while the egress is fixed.
+
+Both are the operator's: on SY.admin's loopback API, or staged by Archi and confirmed. Nothing on the
+mesh may ask for them. The motherbee itself is refused (`NOT_A_WORKER`): Fluxbee never rewrites its
+route (PB-8).
+
+What runs:
+
+1. **SY.admin** checks that the hive is a worker of the registry whose join is done
+   (`NOT_A_WORKER`), and that no installation update run is under way, nor a task of the update
+   acting on that worker (`INSTALLATION_UPDATE_RUNNING`).
+2. **The motherbee's orchestrator** checks its own `egress`: `gateway_ip` (`NO_EGRESS_DECLARED`),
+   `reachability_url` (`NO_REACHABILITY_URL`: the switch is judged by a probe of it), a declaration
+   the join would refuse (`EGRESS_DECLARATION_INVALID`). It holds the hive's topology lock for the
+   whole action (`JOIN_IN_PROGRESS`), and sends `SYSTEM_EGRESS_ROUTE` to the worker
+   (`HIVE_UNREACHABLE` when its orchestrator is not on the mesh).
+3. **The worker** runs the guards, route lookups that only read (`ip -4 route get fibmatch`, 5 s in
+   all), and refuses before anything changes:
+   - `GATEWAY_NOT_ON_LINK`: the gateway is not on a subnet the worker is connected to.
+   - `UPLINK_ON_DEFAULT_ROUTE`: it reaches the motherbee (`wan.uplinks`, `identity.sync.upstream`)
+     through its default route, by a host name, or over IPv6.
+   - `ACCESS_ON_DEFAULT_ROUTE`: a live SSH session, or an `access_from` address or network, reaches
+     it through its default route. Keep such a network with a static route at the OS level (netplan)
+     through the current gateway, which the guard then sees as a more specific route; Fluxbee adds
+     no route of its own.
+   - `PROBE_UNAVAILABLE`: no `curl`. `EGRESS_GUARD_UNREADABLE`: a lookup could not be read.
+4. It records the way back (`/var/lib/fluxbee/orchestrator/egress-switch.json`: the default routes,
+   the four IPv6 sysctls, the sysctl file), pauses its watchdog's egress step, switches
+   (`ip route replace default via <gateway_ip>`, the IPv6 block judged by what the kernel reads
+   back), probes `reachability_url` (twice at most) and reads its route to the motherbee again, then
+   answers `pending_confirm`.
+5. The motherbee sends the confirm. The worker keeps the switch only once it arrives, within 15 s:
+   it writes hive.yaml (atomically, only `egress` changed), then its in-memory section. Otherwise,
+   or when a step failed, it puts the routes, the IPv6 values and the sysctl file back:
+   `EGRESS_PROBE_FAILED` (with curl's reason), `EGRESS_IPV6_UNMANAGED`, `UPLINK_ROUTE_CHANGED`,
+   `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`, `EGRESS_CONFIRM_MISSED`.
+
+A clear's probe is reported and decides nothing: the way back may have no internet by design. An
+orchestrator that stops mid-switch finishes it at its next start: a commit hive.yaml holds is kept,
+anything else is undone from the record (`last_switch.state: interrupted`, and a drift alert in the
+worker's own file).
+
+The answer: `status` (`ok`, or `error` with `error_code` and `step`), `outcome` (`switched`,
+`cleared`, `unchanged`, `refused`, `reverted`, `not_answered`), `gateway_ip`, `previous_gateway`,
+`ipv6_blocked`, `internet_reachable` and `probe` (`url`, `attempts`, `reason`),
+`ssh_reachable_from`, `switch_id`, `timings_ms` per step. `EGRESS_NOT_ANSWERED` (504) never means
+"not applied": an orchestrator on an older release ignores the message (bring the worker to the
+motherbee's release first, `update_installation`), and a worker whose answer was lost reverts by
+itself unless it got the confirm.
+
+`GET /versions` and `GET /hives/{hive}/versions` say where each worker stands: `egress.section`, the
+default gateway it sees, `ipv6_blocked`, `last_switch` (`state`, `step`, `error_code`, `reason`),
+and the motherbee's comparison, `egress.state`: `behind`, `not_behind`, `other_gateway` (the
+declaration changed since) or `drifted` (the section is right, the route is not). Connections open at
+the switch through the default route break once: run it while the worker's agents are idle.
 
 ## Publish runtimes
 

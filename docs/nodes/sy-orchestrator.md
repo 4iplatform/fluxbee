@@ -431,11 +431,13 @@ runs one second later (timer accuracy 100 ms) in a transient unit of its own
 sy-orchestrator does not cut it short: it deletes the spoke's TLS material and identity key first,
 then stops its core services, Syncthing and the managed nodes, and clears the node state. An
 ingress, by its own role, then drops its SSH table and `fluxbee-ingress-nft.service`
-(`ingress_teardown_script`), once its orchestrator is stopped and cannot load them again. A spoke
-takes `REMOVE_HIVE_CLEANUP` only from `SY.orchestrator@motherbee`, as its router stamps the
-sender. There is no SSH fallback: an offline spoke is cleaned up locally only, and the answer's
-`warning` says what stays on a removed egress or ingress the cleanup did not reach.
-`ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` are refused on the motherbee
+(`ingress_teardown_script`), once its orchestrator is stopped and cannot load them again, and a
+worker its IPv6 block's file and its egress switch's record (`worker_teardown_script`, FINDINGS
+A-225), so the box takes IPv6 back at its next boot. A spoke takes `REMOVE_HIVE_CLEANUP` only
+from `SY.orchestrator@motherbee`, as its router stamps the sender. There is no SSH fallback: an
+offline spoke is cleaned up locally only, and the answer's `warning` says what stays on a removed
+egress or ingress the cleanup did not reach.
+`ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` and `SYSTEM_EGRESS_ROUTE` are refused on the motherbee
 (`spoke_only_action_refusal`).
 
 The registry is the authority on which hives exist (FINDINGS A-48). With the hive's directory,
@@ -748,16 +750,72 @@ spoke until the system's log (FINDINGS A-175).
   them missing fails the boot with what is missing; after boot the watchdog logs each on every
   drift tick and records an `egress` drift alert (`lan_leg_missing`, `ipv4_forwarding_off`,
   `ipv6_not_blocked`) in its own drift-alert file, which the motherbee does not read yet
-  (FINDINGS A-175). A worker gets its default route via the egress `gateway_ip`. The motherbee
-  is only checked (`EGRESS_MOTHERBEE_BYPASS`).
+  (FINDINGS A-175). A worker gets its default route via the egress `gateway_ip`, and its IPv6
+  block judged by what the kernel reads back: an error of `sysctl --system` is only logged, so its
+  probe always runs (FINDINGS A-225). The motherbee is only checked (`EGRESS_MOTHERBEE_BYPASS`).
+  A worker that joined before the declaration gets its section through `set_hive_egress` (below).
 - **Internet probe** (`check_internet_reachable`): an HTTPS GET (curl, 5 s) of the hive's own
   `egress.reachability_url`, on the egress at boot and every drift tick, and at boot on a worker
   that routes through it and on the motherbee when they declare `gateway_ip`. A failure is a
-  warning in the journal; on the egress, since 0.1.110, also an `internet_unreachable` drift alert
-  in its own file (FINDINGS A-175). Without the URL the probe does not run and logs
-  `internet_reachable=not_configured`, as it does after warning about a URL that is not a valid
-  `https://` one: the code names no target of its own. A host without `curl` does not probe
-  either and logs `not_probed` (`run_internet_probe`), never a `false` it did not measure.
+  warning in the journal, with curl's reason (`internet_failure`: no DNS, no connection, a timeout,
+  an HTTP error, TLS; `curl_failure_reason`, FINDINGS A-225); on the egress, since 0.1.110, also
+  an `internet_unreachable` drift alert in its own file (FINDINGS A-175). Without the URL the
+  probe does not run and logs `internet_reachable=not_configured`, as it does after warning about
+  a URL that is not a valid `https://` one: the code names no target of its own. A host without
+  `curl` does not probe either and logs `not_probed` (`run_internet_probe`), never a `false` it
+  did not measure.
+
+## A worker behind the egress (A-219)
+
+`set_hive_egress` and `clear_hive_egress` ([edge-egress-nat-spec §15](../edge-egress-nat-spec.md))
+put a worker that joined before the motherbee declared its egress behind it, and take it back.
+SY.admin sends them to the motherbee's orchestrator, which answers from a task of its own
+(`spawn_hive_egress`): the worker's switch and its confirm take up to 40 s.
+
+- **The motherbee** (`hive_egress_flow`): its declaration (`NO_EGRESS_DECLARED`,
+  `NO_REACHABILITY_URL`), the section the join's renderer writes (`render_worker_egress_yaml`;
+  `EGRESS_DECLARATION_INVALID`), the request (`access_from`, a clear's `gateway_ip`;
+  `prepare_hive_egress`), the hive's topology lock for the whole action (`JOIN_IN_PROGRESS`), its
+  registry (`NOT_A_WORKER`, `hive_egress_registry_refusal`) and the worker's orchestrator in the LSA
+  (`hive_orchestrator_visibility`, `HIVE_UNREACHABLE`). Then `SYSTEM_EGRESS_ROUTE` with
+  `phase: switch` (30 s), and on `pending_confirm` the confirm, `phase: confirm` with the switch id
+  (10 s) (`hive_egress_exchange`). A forward with no answer is `EGRESS_NOT_ANSWERED`, and no confirm
+  follows a switch whose answer did not come.
+- **The worker** (`egress_route_message`): any role but worker refuses (`NOT_A_WORKER`), and one
+  switch at a time (`EGRESS_SWITCH_OPEN`). The switch runs in a task of its own
+  (`spawn_egress_switch`), so the system inbox takes the confirm meanwhile; `unchanged` when the
+  section and the default route are the declaration's already (a clear: when there is no section).
+  1. The guards (`egress_switch_guards`), route lookups that only read
+     (`ip -4 route get fibmatch`, each under `timeout`, 5 s in all): G1 the gateway on a subnet it is
+     connected to (`GATEWAY_NOT_ON_LINK`); G2 the mesh's way to the motherbee, `wan.uplinks` and
+     `identity.sync.upstream`, off the default route, an IPv4 address (`UPLINK_ON_DEFAULT_ROUTE`); G3
+     the live inbound SSH sessions (on `sshd -T`'s ports) and `access_from` off it, IPv4
+     (`ACCESS_ON_DEFAULT_ROUTE`, naming each, the current gateway, and where SSH still reaches the
+     box from); a set needs `curl` (`PROBE_UNAVAILABLE`); a lookup that cannot be read refuses too
+     (`EGRESS_GUARD_UNREADABLE`).
+  2. The record, `/var/lib/fluxbee/orchestrator/egress-switch.json`, written atomically and `open`:
+     the default routes, the four IPv6 sysctls and the sysctl file as they were, and what the worker
+     had before it first went behind an egress, carried over by later switches. The watchdog's
+     egress step skips while a switch is open.
+  3. The switch (5 s): a set `ip route replace default via <gateway_ip>` and the IPv6 block, judged
+     by the kernel's read-back (`EGRESS_IPV6_UNMANAGED`); a clear puts the recorded routes back.
+  4. The check (12 s): a GET of `reachability_url`, twice at most, 1 s apart
+     (`EGRESS_PROBE_FAILED`, with curl's reason; a clear's is reported and decides nothing), and the
+     uplinks' lookups again (`UPLINK_ROUTE_CHANGED`). Then `pending_confirm`.
+  5. The confirm within 15 s (`EGRESS_CONFIRM_MISSED`, answered also to a confirm that comes after
+     the revert), then the commit (`egress_commit`): a set writes hive.yaml (atomically,
+     `write_hive_yaml_egress`: only `egress` changed, under the lock `set_storage` takes too), then
+     its in-memory section; a clear removes the section from memory, then from hive.yaml, then puts
+     back the IPv6 values and the sysctl file the record kept. A failed step reverts from the record
+     (`egress_revert`; `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`).
+- **A start with an open record** (`resume_egress_switch_at_start`, before `reconcile_egress`): a
+  commit hive.yaml holds is marked `committed` (a clear's IPv6 values put back); otherwise the switch
+  is undone from the record, marked `interrupted`, and an `egress` drift alert
+  `egress_switch_interrupted` goes to the worker's own file.
+- **`/versions`** (`egress_versions_block`): a worker's `egress` holds its `section`, the
+  `observed_default_gateway`, `ipv6_blocked`, `switch_open` and `last_switch`; the motherbee's its
+  `declaration`. On the motherbee each worker's answer gets `egress.state`, `behind`, `not_behind`,
+  `other_gateway` or `drifted`, and `declared_gateway_ip` (`add_egress_state_to_answer`).
 
 ## Watchdog
 
@@ -766,10 +824,11 @@ role's list with `systemctl is-active`, and runs `systemctl start` on any that i
 active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
 the router, verifies runtimes, runs blob GC when enabled, checks Syncthing and its peers, re-applies
 egress and the ingress' SSH table, reports an active host firewall (`watchdog_host_rules`), and runs
-the loopback check. While a join runs, its Syncthing is the join's: the motherbee's while an
-`add_hive` or `remove_hive` is in flight, a spoke's while its finalize runs. The Syncthing check and
-the peer reconcile leave it alone until the join is done, and the check asks again right before it
-restarts Syncthing (`a_join_owns_syncthing`, FINDINGS A-194).
+the loopback check. Its egress step skips while an egress switch is open on a worker (A-219): the
+switch owns the route until it commits or reverts. While a join runs, its Syncthing is the join's:
+the motherbee's while an `add_hive` or `remove_hive` is in flight, a spoke's while its finalize
+runs. The Syncthing check and the peer reconcile leave it alone until the join is done, and the
+check asks again right before it restarts Syncthing (`a_join_owns_syncthing`, FINDINGS A-194).
 
 To keep a core unit stopped, for a test or a repair, mask it for this boot and stop it:
 `systemctl mask --runtime <unit>` (the lab notes in `lab/DEPLOYMENTS.md` and
@@ -783,12 +842,13 @@ get_storage, set_storage, list_nodes, list_tenant_nodes, list_versions, get_vers
 list_runtimes, get_runtime, run_node, start_node, restart_node, kill_node, remove_node_instance,
 get_node_config, set_node_config, get_node_state, get_node_status, node_help, list_deployments,
 get_deployments, list_drift_alerts, get_drift_alerts, record_drift_alert, list_hives, get_hive,
-add_hive, remove_hive, core_rollback. Anything else answers `NOT_IMPLEMENTED`. Every admin
-message, reads included, is accepted only from `SY.admin@<this hive>` as the router stamps the
-sender (`is_allowed_admin_source_name`, checked first in `run_admin_worker`), else `FORBIDDEN` and
-a warning in the log ([control-path hardening §3](../control-path-hardening-v1.md)). SY.admin
-addresses only its own hive's orchestrator, and a spoke runs no SY.admin, so a spoke's
-orchestrator takes no admin message at all.
+add_hive, remove_hive, core_rollback, set_hive_egress, clear_hive_egress. Anything else answers
+`NOT_IMPLEMENTED`. Every admin message, reads included, is accepted only from
+`SY.admin@<this hive>` as the router stamps the sender (`is_allowed_admin_source_name`, checked
+first in `run_admin_worker`), else `FORBIDDEN` and a warning in the log
+([control-path hardening §3](../control-path-hardening-v1.md)). SY.admin addresses only its own
+hive's orchestrator, and a spoke runs no SY.admin, so a spoke's orchestrator takes no admin message
+at all.
 
 **`record_drift_alert`** is how SY.admin's certificate conditions reach the drift store, which
 only the orchestrator writes ([ACME design §7](../acme-edge-certificates-v1.md)). Past the inbox
@@ -814,11 +874,12 @@ the last hour keeps a new one out. The answer is `{status: "ok", recorded}`, wit
 `SYSTEM_CORE_ROLLBACK`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`, `KILL_NODE`, `START_NODE`,
 `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `NODE_STATE_GET`,
 `NODE_STATUS_GET`, `NODE_HELP`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
-`INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`. `RUNTIME_UPDATE` is refused.
-The router delivers these protected actions only from allowed origins (`policy/system.rego`:
-`SY.orchestrator@motherbee` for the node and handshake actions, and also this hive's own
-orchestrator for the reads, rule (3); `SY.admin@motherbee` for
-`SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)).
+`INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`, `SYSTEM_EGRESS_ROUTE`.
+`RUNTIME_UPDATE` is refused. The router delivers these protected actions only from allowed origins
+(`policy/system.rego`: `SY.orchestrator@motherbee` for the node, handshake and egress actions, and
+also this hive's own orchestrator for the reads, rule (3); `SY.admin@motherbee` for
+`SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)). `SYSTEM_EGRESS_ROUTE`, like the join/leave
+handshake, is never admitted on the motherbee.
 
 **Pages, and answers that do not fit a frame** (FINDINGS A-198):
 
@@ -918,7 +979,7 @@ Environment: `JSR_LOG_LEVEL`; `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and
 | `/var/lib/fluxbee/hives/<hive>/info.yaml` | the hive registry (motherbee): role, address, status, join phase, Syncthing device |
 | `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json` | managed node config with `_system` |
 | `/var/lib/fluxbee/state/orchestrator/identity-node-ilk-map.json` | node → ILK and tenant, used on relaunch |
-| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `config-applied.json` (the config update applied last), `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, and on the motherbee `installation-versions.json` |
+| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `config-applied.json` (the config update applied last), `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, on a worker `egress-switch.json` (its last egress switch, A-219), and on the motherbee `installation-versions.json` |
 | `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees, and `installation/installation.json` |
 | `/var/lib/fluxbee/tls/` | mesh CA (motherbee) and the hive's TLS leaf |
 | `/var/lib/fluxbee/ssh/motherbee.key` | the join key (motherbee) |

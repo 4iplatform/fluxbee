@@ -24,9 +24,10 @@
 >
 > The egress still fails loud without `nft`, because its NAT needs it.
 >
-> **Update 2026-11-10 (design, not yet built): A-219.** §15 designs the operator's explicit action
-> that puts a worker that joined before the egress declaration behind the egress, which §7 and §11
-> left out of v1.
+> **Update 2026-11-10: A-219, built for 0.1.125.** §15 is the operator's explicit action that puts a
+> worker that joined before the egress declaration behind the egress (`set_hive_egress`), and takes
+> it back (`clear_hive_egress`), which §7 and §11 left out of v1. Its "As built" note says what
+> differs from the design.
 **Audience:** `SY.orchestrator` developer, deployment tooling, Ops/SRE
 **Supersedes:** `edge-egress-nat-spec.md` v0.1 (2026-05-27)
 **Related:** `edge-control-protocol.md`, `01-arquitectura.md`, `05-conectividad.md`, `07-operaciones.md`, `sy_orchestrator.rs`
@@ -411,7 +412,7 @@ Required behavior on the worker (applied locally by the worker's orchestrator):
    probe (§9).
 4. Report verification fields (§9).
 
-Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`; re-emitting their yaml to add the field is an explicit operator action (out of scope for v1, noted in §11; designed in §15, A-219, not built yet).
+Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`. Writing the section into such a worker, and applying it, is the operator's explicit action, `set_hive_egress` (§15, A-219, built for 0.1.125); `clear_hive_egress` takes it back.
 
 ---
 
@@ -560,7 +561,7 @@ These are legitimate production concerns deferred out of v1. The v1 design reser
 | Designated DNS resolver | Worker resolver config + DoT upstream on the egress hive | Avoids DNS leakage to public resolvers and spoofing in transit |
 | Egress HA (no SPOF) | keepalived/VRRP for a floating `edge_ip` | Egress hive is currently a SPOF for internet; HA is beta-later per project scope |
 | Process/host isolation | AppArmor/SELinux profile, network namespaces if co-located with RT.edge | Reduces blast radius of a host compromise |
-| Reconcile existing workers | Operator action to re-apply route to workers provisioned before egress declaration | v1 only injects into new workers; §15 designs the action (A-219), not built yet |
+| Reconcile existing workers | Operator action to re-apply route to workers provisioned before egress declaration | Built for 0.1.125: `set_hive_egress` and `clear_hive_egress` (§15, A-219) |
 
 The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logging insert cleanly: the allow-list narrows the LAN→WAN accept rule, and logging adds `log` statements on the same chain. No restructuring required to add them later.
 
@@ -600,7 +601,7 @@ recorded as checked live.
 - [x] `role=egress` passes `validate_system_nodes` with `SY.config.routes`-only profile (unit test; the packaged profile adds `SY.opa.rules`, §14)
 - [x] `role=egress` rejected if it lists `sy-vault` (unit test)
 - [x] Idempotent re-apply of nftables/sysctl produces no drift (the ruleset adds and flushes its own table in one transaction; the watchdog re-applies it every minute)
-- [ ] Worker reaches internet through gateway; IPv6 confirmed blocked (the egress host's NAT, IPv6 block and internet probe were checked on 8.x on 2026-07-29; a worker's route through it was not)
+- [ ] Worker reaches internet through gateway; IPv6 confirmed blocked (the egress host's NAT, IPv6 block and internet probe were checked on 8.x on 2026-07-29; a worker's route through it was not). The gate of `set_hive_egress` on 8.x (§15.6) is its first live check
 - [ ] Mode B: workers receive route from `gateway_ip` with no egress hive present (no egress hive is required by the code; not tested)
 
 ---
@@ -629,8 +630,9 @@ recorded as checked live.
 
 ## 15. An existing worker goes behind the egress (A-219)
 
-**Status:** a design for the operator's approval, 2026-11-10. Nothing in this section is built.
-Line numbers are `src/bin/sy_orchestrator.rs` at `d9ca8a6e` unless another file is named.
+**Status:** built for 0.1.125 (A-219), as the operator approved it on 2026-11-10, every open point
+of 15.7 as recommended. 15.8 says what the build does differently. Line numbers are
+`src/bin/sy_orchestrator.rs` at `d9ca8a6e`, the design's reading, unless another file is named.
 
 **The problem (FINDINGS A-219):**
 
@@ -1050,3 +1052,111 @@ confirm.
    worker runs.
 8. **The removal.** **Recommended:** `remove_hive` of a worker removes its IPv6 file and the record,
    in the same change.
+
+**The operator's call (2026-11-10):** every point as recommended, *"sobre 1, 2, 3 y 4 hacelos como
+recomendas"*, and the minor points as proposed.
+
+### 15.8 As built (0.1.125)
+
+Built as 15.1 to 15.6 say. What follows is what the build adds, or does differently.
+
+**Where it lives.**
+
+- SY.orchestrator (`src/bin/sy_orchestrator.rs`): the motherbee's part in `hive_egress_flow`
+  (its checks in `prepare_hive_egress` and `hive_egress_registry_refusal`, the forwards in
+  `hive_egress_exchange`, in a task of its own, `spawn_hive_egress`); the worker's in
+  `egress_route_message`, `egress_switch_flow` (the guards in `egress_switch_guards`, the commit in
+  `egress_commit`, the revert in `egress_revert`) and `egress_confirm_answer`; the start's reading of
+  an open record in `resume_egress_switch_at_start`; `/versions` in `egress_versions_block` and
+  `add_egress_state_to_answer`. The host is behind a trait (`EgressHost`), so the decisions are
+  tested against a fake; `LiveEgressHost` runs each command under coreutils' `timeout`.
+- SY.admin (`src/bin/sy_admin.rs`): `handle_hive_egress_command` and `hive_egress_worker_refusal`.
+- The policy: `SYSTEM_EGRESS_ROUTE` in `PROTECTED_SYSTEM_ACTIONS`, `orchestrator_mutations` and
+  `spoke_only_actions`, and in the orchestrator's `SPOKE_ONLY_SYSTEM_ACTIONS`; `policy/system.wasm`
+  and `policy/system_route.wasm` compiled again; `classify_system_message` and
+  `classify_admin_action` say `system_config`.
+
+**The message.** `SYSTEM_EGRESS_ROUTE`'s payload is `{target, operation: set | clear, phase:
+switch | confirm, section_yaml (a set's), gateway_ip (a clear's, optional), access_from,
+switch_id (a confirm's)}`. The worker makes the switch id when it takes the switch.
+
+**The route lookups** are `ip -4 route get fibmatch <address>`: the route that decides, with its
+prefix, so "through the default route" is the matched route being `default`, never a guess from a
+`via` (a more specific route may go through the same gateway). An `iproute2` without `fibmatch`
+(before 4.13) cannot be read, and the guards refuse.
+
+**The answers.**
+
+- Every answer carries `outcome`: `switched`, `cleared`, `unchanged`, `refused` (nothing changed),
+  `reverted`, or `not_answered`.
+- `unchanged` is `status: ok` with `outcome: unchanged`: SY.admin and the executor read any other
+  status but `ok` as an error.
+- `not_answered` is `status: error`, `error_code: EGRESS_NOT_ANSWERED` (HTTP 504), with the step
+  whose forward got no answer (`switch` or `confirm`).
+- Codes 15.1 to 15.3 do not name: `EGRESS_GUARD_UNREADABLE` (a lookup, sshd's ports or hive.yaml
+  could not be read within the guards' 5 s; 503), `EGRESS_SWITCH_FAILED` (the route command
+  failed), `EGRESS_RECORD_FAILED` and `EGRESS_RECORD_UNREADABLE`, `HIVE_UNREACHABLE` (503, nothing
+  sent), `PREVIOUS_GATEWAY_UNKNOWN` (a clear on a worker whose record keeps no route from before the
+  egress, and no `gateway_ip`), `EGRESS_SWITCH_NOT_FOUND` (a confirm for a switch the worker does
+  not know). A record the start finds open and undoes says `interrupted`, with
+  `EGRESS_SWITCH_INTERRUPTED`.
+- The refusals before anything changes are 409, a failed step after the switch 502, and
+  `EGRESS_CONFIRM_MISSED` 504.
+
+**The checks.**
+
+- The motherbee's orchestrator reads its registry too (`NOT_A_WORKER`), and the worker's refuses on
+  any role but worker. A body with another field than `access_from` (and a clear's `gateway_ip`) is
+  refused (`INVALID_REQUEST`).
+- SY.admin also refuses while a task of the installation's update acts on the worker (one that may
+  send it a core update; a read holds nothing back), with `INSTALLATION_UPDATE_RUNNING`. It holds
+  the explicit run's mark while the action runs, as `set_installation_ai` does, so an
+  `update_installation` started meanwhile is refused, naming it.
+- G2 refuses a worker whose hive.yaml names no `wan.uplinks` address, and an IPv6 uplink, which the
+  IPv6 block would cut.
+- G3's refusal names every session and network at once, the current gateway to route each through,
+  and where SSH still reaches the box from.
+
+**The switch and the revert.**
+
+- `ip route replace default via <gateway_ip>`, as the boot, replaces the default route of the same
+  metric. The revert replaces each recorded line again (the flags `ip route` only prints dropped),
+  then deletes the default routes through the gateway it leaves that the record does not hold; a
+  default route through another gateway (a DHCP lease's) is left alone.
+- The record keeps the sysctl file's content, not only whether it existed.
+
+**The clear.**
+
+- A worker with no egress section answers `unchanged`.
+- With a record, a `gateway_ip` other than the record's is refused: the clear puts the record's
+  routes back.
+- Without a record, the IPv6 block's file is removed and the live values stay until the box's next
+  boot; `notes` says so.
+- Its probe GETs the worker's own `reachability_url`, and decides nothing.
+
+**`/versions`.** A worker's `egress` also says `switch_open`, and `last_switch_error` when its record
+cannot be read; the motherbee adds `declared_gateway_ip` beside `state`. `state` compares the
+gateway only: a section whose `reachability_url` differs from the declaration's still reads
+`behind`.
+
+**The hive.yaml writer.** One lock in the process (`lock_hive_yaml`), taken by the commit and by
+`set_storage`. `set_storage`'s own atomic write is A-224's (0.1.125, `coa/orch-125`).
+
+**The removal (A-225).** A removed worker's cleanup removes `/etc/sysctl.d/99-fluxbee-egress.conf`
+and the record, once its services are stopped, and runs `sysctl --system`. IPv6, and the default
+route its network configuration gives it, come back at the box's next boot: the live values are not
+reset.
+
+**A-225's other two items.** The worker's boot judges its IPv6 block by what the kernel reads back,
+`sysctl --system`'s error only logged, so its probe always runs; and every probe says why it failed
+(`check_internet_reachable` answers curl's reason: no DNS, no connection, a timeout, an HTTP error,
+TLS), in the journal of the egress, the worker and the motherbee, and in the switch's answer.
+
+**Archi.** Its wait for a plan grows 70 s per `set_hive_egress` or `clear_hive_egress` step
+(`EXECUTOR_EGRESS_SWITCH_WAIT_SECS`). A step that ends `EGRESS_NOT_ANSWERED` fails the run, as any
+error does: no code of Archi's reads `/versions` by itself; its handbook (§4.4.5) tells it to read
+`GET /hives/<hive>/versions` and report `egress.state` and `last_switch`.
+
+**Docs left for later.** hive-config-update-v1 §2 and §9 (the one exception to "a worker's `egress`
+never travels") are not edited here: `coa/orch-125` rewrites those sections for A-224 in the same
+release.

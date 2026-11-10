@@ -156,7 +156,7 @@ Resolve hive in this order:
 
 If a worker hive does not exist yet, include topology/VPN creation in desired state. If it already exists, do not recreate topology.
 
-**Egress hives.** When internal hives have no internet access and need outbound HTTPS, provision a hive with `add_hive role=egress`. It runs a minimal profile (only `SY.config.routes` plus the implicit `RT.gateway`/`SY.orchestrator`) and applies OS-level NAT so internal hives can reach the internet through it. Egress provisioning requires host-specific params in the `add_hive` body under `egress` (`lan_cidr`, `wan_iface`, `lan_iface`; optional `edge_ip`/`ipv6`) — query `get_admin_action_help add_hive` for the field contract. If the deployment already has a physical router for internet, do **not** create an egress hive; instead workers receive the gateway route automatically once motherbee declares `egress.gateway_ip`.
+**Egress hives.** When internal hives have no internet access and need outbound HTTPS, provision a hive with `add_hive role=egress`. It runs a minimal profile (only `SY.config.routes` plus the implicit `RT.gateway`/`SY.orchestrator`) and applies OS-level NAT so internal hives can reach the internet through it. Egress provisioning requires host-specific params in the `add_hive` body under `egress` (`lan_cidr`, `wan_iface`, `lan_iface`; optional `edge_ip`/`ipv6`) — query `get_admin_action_help add_hive` for the field contract. If the deployment already has a physical router for internet, do **not** create an egress hive; the motherbee declares that router as `egress.gateway_ip` instead. Only a worker that joins after the declaration gets the gateway route by itself, at its join. A worker that joined before keeps its own route until the operator puts it behind the egress with `set_hive_egress` (§4.4.5); `GET /versions` shows it as `egress.state: not_behind`.
 
 **A join over a password asks the operator one thing first** (FINDINGS A-165). A join that logs in
 with `ssh_password` revokes its own access at its end, and nothing else closes password logins on
@@ -1257,6 +1257,77 @@ every hive is on it.
   `core_rollback`, a join and a removal make it look at that hive at once, and so does your read
   of `get_installation_update`. A core that did not settle stays pending until its record changes:
   run the update again, or the per-hive `update`.
+
+### 4.4.5 A worker behind the egress
+
+When the motherbee declares an egress (`egress.gateway_ip`), a worker that joins after it reaches
+the internet through it. A worker that joined before keeps its own route until the operator puts it
+behind the egress (docs/edge-egress-nat-spec.md §15). `set_hive_egress` does it, one worker at a
+time; `clear_hive_egress` takes a worker back.
+
+- **See where each worker stands** in `GET /versions` (or `GET /hives/<hive>/versions`): its
+  `egress.state`, `behind`, `not_behind` (joined before the declaration), `other_gateway` (the
+  declaration changed since), `drifted` (the section is right, the route is not), null without a
+  declaration; and `egress.last_switch`, its last switch and how it ended. When a worker is
+  `not_behind`, tell the operator. Never stage the action on your own.
+- **Before staging, tell the operator what changes:**
+  - the worker's agents reach the internet through the egress from then on, so the egress becomes
+    their dependency: an egress down cuts every agent's provider on that worker;
+  - a call an agent has in flight at the switch may fail once: run it while the agents are idle;
+  - afterwards SSH reaches the box only from its own subnets and the more specific routes it has
+    (the answer's `ssh_reachable_from`), and from the hypervisor's console. A network the operator
+    manages it from that is reached through the default route needs a static route at the OS level
+    first; name it in `access_from` so the check sees it.
+- **Stage it only when the operator asks**, with `fluxbee_plan_compiler`: one `set_hive_egress`
+  step per worker, args `hive` and, when the operator names the networks they manage it from,
+  `access_from` (IPv4 addresses or networks). The operator confirms the plan, and SY.admin's executor
+  runs it as the operator. It is closed to the mesh: never send it as an `ADMIN_COMMAND` of your own,
+  nor as SCMD.
+- **What the worker does:** it checks before anything moves, switches its default route to the
+  gateway with IPv6 off, probes the internet through the egress, and keeps the switch only once the
+  motherbee confirms it within 15 s. Otherwise it puts the route, IPv6 and its files back.
+- **The answer:** `status` `ok` with `outcome` `switched` (or `unchanged`: it was behind the declared
+  egress already), the `gateway_ip`, the `previous_gateway`, `ipv6_blocked`, `internet_reachable`
+  with the `probe` (`url`, `attempts`, `reason`), `ssh_reachable_from`, and `timings_ms` per step.
+  Report them.
+- **The way back** is `clear_hive_egress`, staged the same way (args `hive`, `access_from`, and
+  `gateway_ip` only when the worker refuses with `PREVIOUS_GATEWAY_UNKNOWN`). It puts back the route
+  the worker had before the egress, which the worker's record keeps, and its IPv6. It is the way
+  around an egress outage while the egress is fixed. Its probe is reported and decides nothing.
+- **The refusals change nothing.** Each comes with what it means and what the operator can do:
+  - `NOT_A_WORKER`: the motherbee (Fluxbee never rewrites its route), an ingress, an egress, or a
+    hive whose join is not done.
+  - `NO_EGRESS_DECLARED`: the motherbee declares no `egress.gateway_ip`. `NO_REACHABILITY_URL`: its
+    `egress` names no `reachability_url`, and the switch is judged by a probe of it. Both are a hand
+    edit of the motherbee's hive.yaml and a restart of its `sy-orchestrator`, the operator's.
+    `EGRESS_DECLARATION_INVALID`: a declaration the join would refuse.
+  - `INSTALLATION_UPDATE_RUNNING`: an installation update is under way, or acts on that worker.
+    `JOIN_IN_PROGRESS`: the worker joins or is being removed. `EGRESS_SWITCH_OPEN`: another switch
+    runs there. Stage it again once that ends.
+  - `HIVE_UNREACHABLE`: the worker's orchestrator is not on the mesh.
+  - `GATEWAY_NOT_ON_LINK`: the egress' gateway is not on a subnet the worker is connected to: the
+    egress' LAN leg must be on the worker's network, or the worker's own router must send its
+    traffic there.
+  - `UPLINK_ON_DEFAULT_ROUTE`: the worker reaches the motherbee through its default route (or by a
+    host name, or over IPv6): after the switch the mesh would go through the egress. The motherbee's
+    network needs a route of its own on the worker first.
+  - `ACCESS_ON_DEFAULT_ROUTE`: a live SSH session, or an `access_from` entry, reaches the worker
+    through its default route: the operator adds a static route at the OS level for it through the
+    current gateway, both named in the refusal. Fluxbee adds no route of its own.
+  - `PROBE_UNAVAILABLE`: the worker has no `curl`. `EGRESS_GUARD_UNREADABLE`: a check could not
+    read the worker's routes; retry once, then tell the operator.
+  - `PREVIOUS_GATEWAY_UNKNOWN` (a clear): the worker joined after the declaration, so it keeps no
+    route from before; ask the operator for the gateway, then stage the clear with `gateway_ip`.
+- **A revert** (`outcome: reverted`) means the worker tried and put everything back:
+  `EGRESS_PROBE_FAILED` (the internet does not answer through the egress; `probe.reason` says why:
+  no DNS, no connection, a timeout), `EGRESS_IPV6_UNMANAGED`, `UPLINK_ROUTE_CHANGED`,
+  `EGRESS_SWITCH_FAILED`, `EGRESS_COMMIT_FAILED`, `EGRESS_CONFIRM_MISSED`. Tell the operator which,
+  with its message; the egress is the place to look for a probe that failed.
+- **`EGRESS_NOT_ANSWERED`** never means "not applied". Read `GET /hives/<hive>/versions` and report
+  its `egress.state` and `egress.last_switch`: the worker kept the switch only if it got the confirm
+  and committed, and otherwise reverted by itself. A worker on a release before this action ignores
+  it, and nothing changed: the operator brings it to the motherbee's release first
+  (`update_installation`).
 
 ### 4.5 Secrets and vault (Model D')
 
