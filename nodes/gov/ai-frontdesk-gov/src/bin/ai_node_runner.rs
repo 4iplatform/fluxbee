@@ -6036,9 +6036,26 @@ mod tests {
         assert_eq!(registered.tenant_id.as_deref(), Some(TEST_TENANT));
     }
 
-    /// Thread state in memory, so a test can see what a handoff left for the case.
+    /// Thread state in memory, so a test can see what a handoff left for the case, and what each
+    /// read of a key found (the second field).
     #[derive(Default)]
-    struct MemoryThreadState(Mutex<HashMap<String, Value>>);
+    struct MemoryThreadState(
+        Mutex<HashMap<String, Value>>,
+        Mutex<Vec<(String, Option<Value>)>>,
+    );
+
+    impl MemoryThreadState {
+        /// What each read of the test case's state found, in order (`null` when there was none).
+        fn case_reads(&self) -> Vec<Value> {
+            self.1
+                .lock()
+                .expect("reads")
+                .iter()
+                .filter(|(key, _)| key == TEST_ILK)
+                .map(|(_, data)| data.clone().unwrap_or(Value::Null))
+                .collect()
+        }
+    }
 
     #[async_trait]
     impl ThreadStateStore for MemoryThreadState {
@@ -6046,15 +6063,17 @@ mod tests {
             &self,
             key: &str,
         ) -> fluxbee_ai_sdk::Result<Option<fluxbee_ai_sdk::ThreadStateRecord>> {
-            let state = self.0.lock().expect("thread state");
-            Ok(state
-                .get(key)
-                .map(|data| fluxbee_ai_sdk::ThreadStateRecord {
-                    thread_id: key.to_string(),
-                    data: data.clone(),
-                    updated_at: String::new(),
-                    ttl_seconds: None,
-                }))
+            let data = self.0.lock().expect("thread state").get(key).cloned();
+            self.1
+                .lock()
+                .expect("reads")
+                .push((key.to_string(), data.clone()));
+            Ok(data.map(|data| fluxbee_ai_sdk::ThreadStateRecord {
+                thread_id: key.to_string(),
+                data,
+                updated_at: String::new(),
+                ttl_seconds: None,
+            }))
         }
 
         async fn put(
@@ -7029,7 +7048,16 @@ mod tests {
         };
 
         save_case(&state, closed_case("UNREACHABLE"));
+        let reads_before = state.case_reads().len();
         let reply = structured_reply(&node, hello()).await;
+        // The turn's start reads the case as saved and reopens it there: from then on the store
+        // holds it open, which is what the model reads (thread_state_get), and what the result's
+        // read, the next one, finds before the result is built.
+        let reads = state.case_reads()[reads_before..].to_vec();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert_eq!(reads[0]["status"], "completed_error");
+        assert_eq!(reads[1]["status"], "awaiting_confirmation");
+        assert_eq!(reads[1]["register_attempted"], false);
         assert_eq!(reply["success"], false);
         assert_eq!(reply["error_code"], "missing_required_fields");
         let kept = kept_case(&state);
