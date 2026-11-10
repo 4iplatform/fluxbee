@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.129** | 2026-11-10 | `9b396e3e` | motherbee + spokes (core), the router alone: A-222 (a bounded queue per link, 1,024 frames or 8 MiB counted as heap, the senders' share 960 / 7 MiB; a message past it refused `LINK_BUSY` with an answer, the node never disconnected), A-209 (no router answers a tap copy; the router clears a `via_tap` a node sets), A-221 (an agent's turn goes to cognition only once its link took it) | ✅ live, checked on 8.x | snap `pre-router-0-1-129` (all 4 VMs) · `apt install fluxbee=0.1.128` + 0.1.128's `update_installation` (nothing one-way) |
+| **0.1.130** | 2026-11-10 | `8604debf` | motherbee + spokes (core), the Go SDK alone: A-228 (an RPC error for a router notice carries `reason`, `original_dst`, `last_hop`), A-239 (`TimerInfo.canceled_reason`; SY.timer serializes the SDK's `TimerInfo`), A-218's ECHO leftovers (`MSGEcho`/`MSGEchoReply` gone; SY.timer and wf-generic take the AI nodes' notice rule; SY.timer answers an ECHO `TIMER_UNKNOWN_VERB`) | ✅ live, checked on 8.x | snap `pre-gosdk-0-1-130` (all 4 VMs) · `apt install fluxbee=0.1.129` + 0.1.129's `update_installation` (nothing one-way; the wire is the same) |
+| **0.1.129** | 2026-11-10 | `9b396e3e` | motherbee + spokes (core), the router alone: A-222 (a bounded queue per link, 1,024 frames or 8 MiB counted as heap, the senders' share 960 / 7 MiB; a message past it refused `LINK_BUSY` with an answer, the node never disconnected), A-209 (no router answers a tap copy; the router clears a `via_tap` a node sets), A-221 (an agent's turn goes to cognition only once its link took it) | ✅ replaced by 0.1.130 | snap `pre-router-0-1-129` (deleted 2026-11-10) · `apt install fluxbee=0.1.128` + 0.1.128's `update_installation` (nothing one-way) |
 | **0.1.128** | 2026-11-10 | `89fd1fd8` | motherbee + spokes (core), the Rust SDK alone: A-218 (`TNT_APPROVE`, seven dead action names, ECHO/ECHO_REPLY/TIME_SYNC gone; SY.identity's migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`; the identity shared memory exactly as it was), A-237 (an intermediate answer marked `accepted`), A-248 (an AI node used as a tap target answers nothing, its copies counted) | ✅ replaced by 0.1.129 | snap `pre-sdk-0-1-128` (deleted 2026-11-10) · `apt install fluxbee=0.1.127` + 0.1.127's `update_installation` (SY.identity of 0.1.127 ignores migration row 5, never names the dropped column, and recreates the empty vocabulary table) |
 | **0.1.127** | 2026-11-10 | `d2b344bb` | motherbee + spokes (core), one branch per binary: SY.orchestrator (A-199's step 1: reads apart, at most 4 waiting on one hive, a command that panics answered; hive-config stage 5: the blob folders follow their dist folder, and the blob GC runs only on the motherbee (A-188); A-196's restart marker; A-232's refusals); SY.admin (A-233: no purge while a node has a page up or a publish in flight; A-231, the ledger keeps a page down 30 days; A-234, the HTTP head and body caps; A-232; A-171, the manifest's lock file); SY.vault (A-200, one pass at the boot's announcement); SY.timer (A-220, canceled with a reason, schema v3; `LINK_BUSY` retried; A-232) | ✅ replaced by 0.1.128 | snap `pre-reads-0-1-127` (deleted 2026-11-10) · `apt install fluxbee=0.1.126` + 0.1.126's `update_installation` (SY.timer of 0.1.126 reads the v3 table) |
 | **0.1.126** | 2026-11-10 | `cf005771` | motherbee + spokes (core): A-219: an existing worker goes behind the egress, and back, by an explicit action (`set_hive_egress` / `clear_hive_egress`, the operator's word or Archi's plan with CONFIRM; `SYSTEM_EGRESS_ROUTE` between the orchestrators, protected; guards, a record, a probe, the motherbee's confirm, commit or revert, the start's resume; `/versions`' egress state); with A-225 (a removed worker's IPv6 file, the boot judging IPv6 by the kernel, the probe's reason) | ✅ replaced by 0.1.127 | snap `pre-egress-0-1-126` (deleted 2026-11-10) · first `clear_hive_egress` of every worker behind the egress (a release before 0.1.126 cannot), then `apt install fluxbee=0.1.125` + 0.1.125's `update_installation` |
@@ -138,6 +139,39 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.130 — The Go SDK alone
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.129 · **Commit:** `8604debf`.
+- **Scope:** motherbee and the three spokes (the Go binaries: SY.timer, SY.wf-rules, SY.opa-rules,
+  wf-generic's build), through the installation's update.
+- **Why:** shared code ships alone ([METHOD](logbook/METHOD.md) §9); the last release of the pass of
+  the General track.
+- **What changed (`go/`):**
+  - **A-228:** the Go SDK's `RpcError` for `UNREACHABLE` or `TTL_EXCEEDED` carries the notice, the
+    `reason`, the `original_dst` and the `last_hop`, as the Rust SDK's does; the kind stays
+    `RpcErrTerminalTransport`; its text now names the reason.
+  - **A-239:** `TimerInfo` has `canceled_reason`; SY.timer answers with the SDK's `TimerInfo`
+    instead of a wrapper of its own, with the same bytes (a test pins them).
+  - **A-218's leftovers:** `MSGEcho`/`MSGEchoReply` gone (an out-of-tree Go module naming them would
+    not compile; none in the tree); SY.timer's and wf-generic's notice rules are the AI nodes' (the
+    router's messages, HELLO, ANNOUNCE, WITHDRAW, a system message without a name, and for SY.timer
+    any `*_RESPONSE`); wf-generic no longer lists TIMER_HELP as a notice (a system TIMER_HELP is
+    still dropped unanswered); SY.timer answers an ECHO or ECHO_REPLY `TIMER_UNKNOWN_VERB`.
+- **Build and review:** `coa/gosdk-130`, CI green with the Go tests; one review round: no bug, wire
+  break or loop; a byte-for-byte wire test and two texts added.
+- **The deploy:** build in about 22 min, publish in 12 s, `ops deploy 0.1.130` in 252 s, health clean;
+  snapshot `pre-gosdk-0-1-130`, `pre-router-0-1-129` dropped. The update closed in 6 s: no
+  orchestrator binary changed, so none restarted itself (A-250's counter-case).
+- **Checked on 8.x (the gate):** TIMER_LIST and TIMER_GET of two timers (one canceled, one pending
+  recurring timer with `cron_tz` and metadata made for the gate) byte for byte the same before and
+  after; ECHO and ECHO_REPLY answered `TIMER_UNKNOWN_VERB` once each, a system message without a name
+  not at all (all three unanswered on 0.1.129); a one-shot timer whose target was away retried at 5,
+  10, 20 and 40 s with `NODE_NOT_FOUND` and delivered once it came back; SY.timer, SY.wf-rules and
+  SY.opa-rules started on every hive; WF.gate0206 and AI.pruebas healthy. Not seen live: a Go node
+  reading the new error (WF.gate0206 runs its own package's build).
+- **PROD after the gate:** all four hives on 0.1.130 (`ef8488bc`); worker1 behind egress1; the gate's
+  two timers in SY.timer's history (fired, canceled); snapshot `pre-gosdk-0-1-130` on each VM.
 
 ## 0.1.129 — The router alone: a bounded queue per link
 

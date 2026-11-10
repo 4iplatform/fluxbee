@@ -183,6 +183,11 @@ no change required
     link, the newest refused `LINK_BUSY` with an answer, never a disconnect), A-209 (no router answers
     a tap copy; a node's own `via_tap` cleared), A-221 (an agent's turn reaches cognition only once its
     link took it). **Found by its gate:** A-253 [General/storage], low. A-250 seen a third time.
+21. **0.1.130, the Go SDK alone** ✅ live and checked on 8.x (2026-11-10): A-228 (the RPC error carries
+    the router's reason), A-239 (`TimerInfo` keeps `canceled_reason`; SY.timer serializes the SDK's
+    type, its bytes unchanged), A-218's ECHO leftovers (the notice rules match the AI nodes'). Its
+    update closed in 6 s with no orchestrator restarting, which confirms A-250's cause. **Found by its
+    builder:** A-254 [WF], low.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -294,10 +299,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-228 🔵 The Go SDK's RPC error for UNREACHABLE drops the router's reason (low; the Go SDK,
-  alone).
 - A-238 🔵 A canceled timer can be deleted at the next start, aged by its creation (low).
-- A-239 🔵 The Go SDK's TimerInfo drops SY.timer's canceled_reason (low; with A-228).
 - A-240 🔵 A local get_node_status writes on every read (low).
 - A-241 🔵 A spoke's blob staging is never cleaned (low, to decide).
 - A-242 🔵 remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin (low).
@@ -1449,6 +1451,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   ingress1 at 134.9 s (two waits). The spokes ran 0.1.127's reads apart this time, so the loss is
   not a queue: a read that reaches a spoke's orchestrator in its few seconds off the router, or
   just before it stops, gets no answer, and SY.admin waits its 50 s.
+- **0.1.130's deploy (2026-11-10), the counter-case:** no orchestrator binary changed, so no
+  spoke's orchestrator restarted itself, and the update closed 6 s after its call: the lag comes
+  from the self-restart window and nothing else.
 - **Before 0.1.128's deploy, the plan was to evaluate:** the spokes now run 0.1.127, whose reads run apart, so a
   read that reaches a spoke before its self-restart is answered unless it arrives in the last
   moment. If the lag stays, the options: the follow uses a short read bound while a hive is
@@ -1562,7 +1567,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reason.
 - **Fix, later:** a status read that writes nothing (the version advanced where the status changes).
 
-### A-239 [General/Go SDK] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — The Go SDK's TimerInfo drops SY.timer's canceled_reason
+### A-239 [General/Go SDK] ✅ VALIDATED ON 8.x (0.1.130, 2026-11-10; TIMER_GET and TIMER_LIST byte for byte the same before and after) (found 2026-11-10 by A-220's builder; read in the code) — The Go SDK's TimerInfo drops SY.timer's canceled_reason
 
 - **Why:** since A-220 (SY.timer 1.4) TIMER_GET and TIMER_LIST carry `canceled_reason` for a timer
   SY.timer closed itself. The Go SDK's `TimerInfo` (`go/fluxbee-go-sdk/timer_client.go:39`) has no
@@ -1676,7 +1681,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `MESSAGE_TOO_LARGE` ("nothing was sent"); other handler failures answer 500 with a fixed text; the
   405 and 413 status lines are right.
 
-### A-228 [General/Go SDK] 🔵 low (found 2026-11-10 by A-202's builder; read in the code) — The Go SDK's RPC error for UNREACHABLE drops the router's reason
+### A-228 [General/Go SDK] ✅ BUILT (0.1.130, 2026-11-10; by its tests; no Go node on 8.x read the error live) (found 2026-11-10 by A-202's builder; read in the code) — The Go SDK's RPC error for UNREACHABLE drops the router's reason
 
 - **Why:** a Go caller's request answered `UNREACHABLE` fails at once, as it should, but with
   `RpcError{Kind: RpcErrTerminalTransport}` and the message `terminal transport response
