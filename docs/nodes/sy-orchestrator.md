@@ -90,7 +90,8 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    update the start could not (a node whose binary was still on its way).
 4. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
 5. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
-   handles its messages one at a time, in arrival order.
+   runs a read in a task of its own, and every other message one at a time, in arrival order
+   ([Messages](#messages), FINDINGS A-199).
 6. Starts the managed-node reconcile loop (every 60 s) and, on the motherbee, the loop that takes
    Syncthing off public infrastructure once every spoke reports a reachable motherbee
    (`run_syncthing_options_switch_loop`).
@@ -458,10 +459,11 @@ motherbee, SY.admin's installation update sends each hive its core update and th
 update, and follows each to its settle through `/versions`
 ([SY.admin](sy-admin.md#the-installations-update)); the per-hive `update` stays the operator's tool
 for one hive. Those reads are this orchestrator's `get_versions` on the motherbee, which its admin
-worker forwards as `GET_VERSIONS`, one message at a time, within
-`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s): SY.admin keeps at most one read of a hive
-outstanding, waits 50 s for it (past that bound, so a read it gave up is not queued behind another),
-and paces them (a hive in flight every 3 s, one left as it is every 10 min).
+worker forwards as `GET_VERSIONS`, each in a task of its own since 0.1.127 (a read, see
+[Messages](#messages)), within `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s): SY.admin keeps at
+most one read of a hive outstanding, waits 50 s for it (past that bound, so a read it gave up has
+ended before it asks again), and paces them (a hive in flight every 3 s, one left as it is every
+10 min).
 
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
   applies retention.
@@ -893,6 +895,26 @@ also this hive's own orchestrator for the reads, rule (3); `SY.admin@motherbee` 
 `SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)). `SYSTEM_EGRESS_ROUTE`, like the join/leave
 handshake, is never admitted on the motherbee.
 
+**Reads run apart; everything else one at a time** (FINDINGS A-199, step 1, since 0.1.127). Each
+worker hands a message to one of two lanes once the checks above passed (`WorkerLanes`):
+
+- **A read** runs in a task of its own, at most 16 at once per worker
+  (`WORKER_CONCURRENT_READS_MAX`); one more waits for one of them to end. The reads are the ones
+  read in the code to write and change nothing (`admin_request_lane`, `system_request_lane`):
+  hive_status, get_storage, list_nodes, list_tenant_nodes, list_versions, get_versions,
+  list_runtimes, get_runtime, list_deployments, get_deployments, list_drift_alerts,
+  get_drift_alerts, get_node_config, get_node_state, list_hives, get_hive; `GET_VERSIONS`,
+  `GET_RUNTIMES`, `LIST_NODES`, `GET_RUNTIME`, `INVENTORY_REQUEST`, `NODE_CONFIG_GET`,
+  `NODE_STATE_GET`. A node's status (`get_node_status`, `NODE_STATUS_GET`) is a read when the node
+  is another hive's, which this hive only asks; for a node of its own it writes the node's status
+  version, so it keeps the order.
+- **Everything else**, every change, `node_help` and a message it does not know included, runs one
+  at a time, in arrival order, as every message did before: a change still waits for the one
+  before it, a `core_rollback` (up to 240 s) or a forward to a hive that does not answer (45 s)
+  included. A message that panics ends neither lane.
+- A read forwarded to a hive that does not answer holds its place for up to 45 s, and nothing
+  else. A read whose caller gave up still runs to its bound.
+
 **Pages, and answers that do not fit a frame** (FINDINGS A-198):
 
 - **`list_versions`** asked with `limit` or `cursor` answers a page of hives: the hives after the
@@ -925,11 +947,11 @@ handshake, is never admitted on the motherbee.
 **`node_help` and `NODE_HELP`** (`node_help_flow`): a node's self-description
 ([agent-tools-v1](../agent-tools-v1.md) §3.3), asked the way its status is.
 
-- **Its own task:** the admin and system workers take one message at a time, so the flow runs in
-  a task of its own that sends the answer itself (`spawn_node_help`): an admin answer to SY.admin,
-  `NODE_HELP_RESPONSE` to an orchestrator. Inline, the node's probe (3 s) or another hive's forward
-  (7 s) held every request behind it, and SY.admin's 5 s reads (`hive_status`, `web_status`)
-  answered 504. add_hive's join leaves the admin worker the same way (PB-7).
+- **Its own task:** the admin and system workers run what is not a read one at a time, so the
+  flow runs in a task of its own that sends the answer itself (`spawn_node_help`): an admin answer
+  to SY.admin, `NODE_HELP_RESPONSE` to an orchestrator. Inline, the node's probe (3 s) or another
+  hive's forward (7 s) held every request behind it, and SY.admin's 5 s reads (`hive_status`,
+  `web_status`) answered 504. add_hive's join leaves the admin worker the same way (PB-7).
 - **A node of another hive:** the motherbee forwards `NODE_HELP` to that hive's orchestrator and
   waits 7 s (`NODE_HELP_FORWARD_TIMEOUT_SECS`); no answer is `NODE_HELP_FAILED`.
 - **A node of this hive:** whether it is here is decided as for `get_node_status`

@@ -313,7 +313,7 @@ caller and the action; a command with no stamped caller is refused too.
   - `sync_hint` `{channel, folder_id, wait_for_idle, timeout_ms}`: only a scan of
     `fluxbee-dist-runtimes` (channel `dist`) on the motherbee, as a worker's deploy asks for one
     (`announceRuntimes`), with `timeout_ms` given and at most 5000. A longer wait would hold the
-    motherbee orchestrator's system worker, which takes one message at a time.
+    motherbee orchestrator's system worker, which takes every message but a read one at a time.
 
 Other checks:
 
@@ -747,9 +747,9 @@ What it does (`handle_set_installation_ai`):
    `502` `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE` or
    `INSTALLATION_WRITE_FAILED`.
    No answer is `TIMEOUT` (or `TRANSPORT_ERROR`), and not "nothing written": the motherbee's
-   orchestrator takes its system messages one at a time, and one ahead of the write (a node's
-   purge, up to 120 s) can hold it past the window. The answer says the write may still land
-   (`installation_write_unanswered`, payload `{write_may_still_land, expected_version}`): read
+   orchestrator takes its system messages but the reads one at a time, and one ahead of the write
+   (a node's purge, up to 120 s) can hold it past the window. The answer says the write may still
+   land (`installation_write_unanswered`, payload `{write_may_still_land, expected_version}`): read
    `get_installation`, and when its `expected_version` moved past the one sent, run `update` with
    category `config` on every hive, since this change applied it on none.
 3. **The scan.** The motherbee's Syncthing scans `fluxbee-dist-installation` (`SYSTEM_SYNC_HINT`,
@@ -955,11 +955,11 @@ time comes, in a task of its own, and sleeps until the next one is due:
 
 - **one read of a hive at a time, everywhere:** the explicit run, the follow, the re-read and the
   automatic step share each hive's read, so at most one `GET_VERSIONS` of a hive is outstanding;
-  the background task reads one hive at a time. The motherbee's orchestrator takes its admin
-  messages one at a time and forwards a spoke's read within its own bound (45 s,
-  `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`): a read waits 50 s
+  the background task reads one hive at a time. The motherbee's orchestrator forwards a spoke's
+  read within its own bound (45 s, `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), each in a task of its
+  own since 0.1.127 (FINDINGS A-199): a read waits 50 s
   (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), and one that timed out anyway keeps that hive
-  unread for another 50 s, so a second is never queued behind it. The re-read (`recheck`) takes
+  unread for another 50 s, so a second never runs beside it. The re-read (`recheck`) takes
   its turn among the background reads (`Reader::InTurn`) before it claims its hive, since 0.1.124:
   one waiting for its turn holds no hive, so an explicit run's pass waits only for the read under
   way, never for the re-reads a run's open queues behind it;

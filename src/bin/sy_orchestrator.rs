@@ -735,10 +735,10 @@ impl OrchestratorState {
         lock.lock_owned().await
     }
 
-    /// Non-blocking variant, for callers that run ON THE SERIAL ADMIN WORKER.
+    /// Non-blocking variant, for callers that run ON THE ADMIN WORKER'S ORDERED LANE.
     ///
     /// `add_hive` now holds the per-hive lock for the whole multi-minute background join, so a
-    /// caller that `.await`s it would park the single admin channel for exactly as long as the
+    /// caller that `.await`s it would park the ordered lane for exactly as long as the
     /// join takes — reintroducing the blockage PB-7 exists to remove, and making the
     /// `JOIN_IN_PROGRESS` answer unreachable because the check would never get to run.
     fn try_lock_hive_topology(&self, hive_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
@@ -1056,8 +1056,9 @@ async fn main() -> Result<(), OrchestratorError> {
     }
     tracing::info!("connected to router");
 
-    // Long-lived workers serializing admin/system command delivery. Each one
-    // owns its `RpcCommandReceiver` so we keep ordering inside a category
+    // Long-lived workers taking admin/system command delivery. Each one
+    // owns its `RpcCommandReceiver` and keeps ordering inside a category for what changes
+    // anything (reads run apart, `WorkerLanes`, FINDINGS A-199)
     // while the RouterDispatcher recv loop in `tokio::spawn` continues to dispatch
     // pending RPC responses. This is the deadlock fix from ORPC review item 1.
     let admin_rx = rpc_client
@@ -1159,11 +1160,15 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 }
 
+/// Takes SY.admin's commands. The checks below come first, as each command arrives; then the
+/// command goes to its lane (`WorkerLanes`, FINDINGS A-199): a read runs at once, apart, and
+/// anything else after the ones before it.
 async fn run_admin_worker(
     state: Arc<OrchestratorState>,
     client: Arc<RouterDispatcher>,
     mut rx: RpcCommandReceiver,
 ) {
+    let lanes = WorkerLanes::start("admin", WORKER_CONCURRENT_READS_MAX);
     while let Some(msg) = rx.recv().await {
         let sender = client.sender_snapshot();
         // docs/control-path-hardening-v1.md §3: the admin inbox takes a message, reads included,
@@ -1200,21 +1205,152 @@ async fn run_admin_worker(
             }
             continue;
         }
-        if let Err(err) = handle_admin(&sender, &msg, &state).await {
-            tracing::warn!("admin action error: {err}");
-        }
+        let lane = admin_request_lane(
+            msg.meta.action.as_deref().unwrap_or(""),
+            &msg.payload,
+            &state.hive_id,
+        );
+        let state = Arc::clone(&state);
+        lanes.run(lane, async move {
+            if let Err(err) = handle_admin(&sender, &msg, &state).await {
+                tracing::warn!("admin action error: {err}");
+            }
+        });
     }
 }
 
+/// Takes the system messages, each to its lane as `run_admin_worker` does (FINDINGS A-199).
 async fn run_system_worker(
     state: Arc<OrchestratorState>,
     client: Arc<RouterDispatcher>,
     mut rx: RpcCommandReceiver,
 ) {
+    let lanes = WorkerLanes::start("system", WORKER_CONCURRENT_READS_MAX);
     while let Some(msg) = rx.recv().await {
         let sender = client.sender_snapshot();
-        if let Err(err) = handle_system_message(&sender, &msg, &state).await {
-            tracing::warn!("system message error: {err}");
+        let lane = system_request_lane(msg.meta.msg.as_deref(), &msg.payload, &state.hive_id);
+        let state = Arc::clone(&state);
+        lanes.run(lane, async move {
+            if let Err(err) = handle_system_message(&sender, &msg, &state).await {
+                tracing::warn!("system message error: {err}");
+            }
+        });
+    }
+}
+
+/// FINDINGS A-199, step 1: the most reads one worker runs at once (`WorkerLanes`). A read
+/// forwarded to another hive holds its place up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s)
+/// when that hive does not answer; past this many at once, a read waits for one to end, and never
+/// holds a request that changes something.
+const WORKER_CONCURRENT_READS_MAX: usize = 16;
+
+/// The lane a worker runs a request in (FINDINGS A-199, step 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestLane {
+    /// Writes nothing, changes no state and leaves nothing another request depends on: it runs in
+    /// a task of its own, beside every other request.
+    Read,
+    /// Anything else, an unknown request included: one at a time, in arrival order, as every
+    /// request ran before.
+    Ordered,
+}
+
+/// The lane of one of SY.admin's commands (FINDINGS A-199). The reads are the ones read in the code
+/// to write and change nothing. `get_node_status` is a read only for a node of another hive, which
+/// this hive asks and writes nothing for: a node of this hive's own gets its status version
+/// written (`advance_node_status_version`).
+fn admin_request_lane(action: &str, payload: &serde_json::Value, local_hive: &str) -> RequestLane {
+    match action {
+        "hive_status" | "get_storage" | "list_nodes" | "list_tenant_nodes" | "list_versions"
+        | "get_versions" | "list_runtimes" | "get_runtime" | "list_deployments"
+        | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
+        | "get_node_state" | "list_hives" | "get_hive" => RequestLane::Read,
+        "get_node_status" => node_status_lane(payload, local_hive),
+        _ => RequestLane::Ordered,
+    }
+}
+
+/// The lane of a system message (FINDINGS A-199), as `admin_request_lane` decides it.
+fn system_request_lane(
+    msg: Option<&str>,
+    payload: &serde_json::Value,
+    local_hive: &str,
+) -> RequestLane {
+    match msg {
+        Some(
+            "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES" | "GET_RUNTIME" | "INVENTORY_REQUEST"
+            | "NODE_CONFIG_GET" | "NODE_STATE_GET",
+        ) => RequestLane::Read,
+        Some("NODE_STATUS_GET") => node_status_lane(payload, local_hive),
+        _ => RequestLane::Ordered,
+    }
+}
+
+/// A node's status, asked of the hive `get_node_status_flow` sends it to: a read when that is
+/// another hive, ordered when it is this one, which writes the node's status version.
+fn node_status_lane(payload: &serde_json::Value, local_hive: &str) -> RequestLane {
+    if node_request_target_hive(payload, local_hive) == local_hive {
+        RequestLane::Ordered
+    } else {
+        RequestLane::Read
+    }
+}
+
+/// A worker's two lanes (FINDINGS A-199, step 1). The worker hands each request to its lane and
+/// takes the next one at once, whatever runs:
+/// - a read runs in a task of its own once it holds one of `reads`' permits, so a slow or lost
+///   read (a forward to a hive that does not answer waits 45 s) holds no other request;
+/// - anything else goes to the ordered lane, one task that runs each request to its end before it
+///   takes the next, in the order the worker took them.
+struct WorkerLanes {
+    reads: Arc<tokio::sync::Semaphore>,
+    ordered: tokio::sync::mpsc::UnboundedSender<futures::future::BoxFuture<'static, ()>>,
+}
+
+impl WorkerLanes {
+    fn start(worker: &'static str, reads_max: usize) -> Self {
+        let (ordered, mut queue) =
+            tokio::sync::mpsc::unbounded_channel::<futures::future::BoxFuture<'static, ()>>();
+        tokio::spawn(async move {
+            while let Some(request) = queue.recv().await {
+                // A task of its own, awaited before the next: a request that panics ends neither
+                // the lane nor its order.
+                if let Err(err) = tokio::spawn(request).await {
+                    tracing::error!(
+                        worker,
+                        error = %err,
+                        "an ordered request ended without an answer"
+                    );
+                }
+            }
+        });
+        Self {
+            reads: Arc::new(tokio::sync::Semaphore::new(reads_max)),
+            ordered,
+        }
+    }
+
+    fn run(
+        &self,
+        lane: RequestLane,
+        request: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        match lane {
+            RequestLane::Read => {
+                let reads = Arc::clone(&self.reads);
+                tokio::spawn(async move {
+                    // The semaphore is never closed, so the permit always comes.
+                    let Ok(_permit) = reads.acquire_owned().await else {
+                        return;
+                    };
+                    request.await;
+                });
+            }
+            RequestLane::Ordered => {
+                if self.ordered.send(Box::pin(request)).is_err() {
+                    tracing::error!("the ordered lane is gone: a request was dropped unanswered");
+                }
+            }
         }
     }
 }
@@ -3711,8 +3847,8 @@ async fn handle_admin(
                 )
                 .await;
             }
-            // PB-7: accept and return; the join runs in the background so the serial admin
-            // channel stays free. The B-2 revoke tails moved INTO the background task.
+            // PB-7: accept and return; the join runs in the background so the admin worker's
+            // ordered lane stays free. The B-2 revoke tails moved INTO the background task.
             accept_add_hive(state_arc, &msg.payload).await
         }
         // A-219: a worker behind the egress, or back (docs/edge-egress-nat-spec.md §15).
@@ -7662,7 +7798,7 @@ fn write_installation_operator_version(
 
 /// The answer to a SYSTEM_UPDATE category config with a `write` (stage 3c): `{status: ok, version,
 /// sha256, previous_version, previous_sha256}`, or the refusal with its `error_code`. The system
-/// worker takes one message at a time; the lock keeps the write single all the same.
+/// worker's ordered lane takes one at a time; the lock keeps the write single all the same.
 fn installation_write_answer(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -14411,7 +14547,7 @@ async fn hive_egress_flow(
 }
 
 /// Runs `hive_egress_flow` in its own task, which answers SY.admin itself: the worker's switch and
-/// its confirm take up to 40 s, and this admin worker takes one message at a time.
+/// its confirm take up to 40 s, and the admin worker's ordered lane takes one at a time.
 fn spawn_hive_egress(
     state: &Arc<OrchestratorState>,
     sender: &NodeSender,
@@ -19667,9 +19803,9 @@ async fn get_versions_flow(
 
 /// The most bytes of snapshots a page of `/versions` holds once one past half a frame is in: a
 /// snapshot already asked of its hive is kept while the page stays under this, so a hive's
-/// GET_VERSIONS is not sent twice at a page's end (the motherbee's admin worker answers one
-/// message at a time, A-199). Under the frame less the router's reserve, with room for the
-/// comparison and the envelope.
+/// GET_VERSIONS is not sent twice at a page's end (a hive that does not answer holds each ask for
+/// 45 s, A-199). Under the frame less the router's reserve, with room for the comparison and the
+/// envelope.
 const VERSIONS_PAGE_HARD_MAX_BYTES: usize = 100 * 1024;
 
 /// `/versions` over every hive: the motherbee's snapshot and each connected spoke's, and the
@@ -21497,7 +21633,7 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     // F18: per-hive topology lock — serialize against a concurrent add_hive or a
     // second remove_hive on the same hive_id (closes the exists/remove TOCTOU).
     //
-    // TRY-lock: this runs on the serial admin worker, and a background join now holds this lock
+    // TRY-lock: this runs on the admin worker's ordered lane, and a background join holds this lock
     // for minutes. Awaiting it would freeze the hive's whole control plane behind a join — the
     // blockage PB-7 removed, sneaking back in through remove_hive.
     let Some(_topology_guard) = state.try_lock_hive_topology(hive_id) else {
@@ -25899,11 +26035,24 @@ fn local_node_view(
     Ok(view)
 }
 
+/// The hive a request about one node goes to: the hive its `node_name` names after `@`, else its
+/// `target` (this hive by default). `get_node_status_flow` and its lane (`node_status_lane`) read
+/// it alike, so a status the flow writes here is never taken for a read.
+fn node_request_target_hive(payload: &serde_json::Value, local_hive: &str) -> String {
+    payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .and_then(|name| name.trim().rsplit_once('@'))
+        .map(|(_, hive)| hive.trim())
+        .filter(|hive| !hive.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| target_hive_from_payload(payload, local_hive))
+}
+
 async fn get_node_status_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
     let raw_node_name = payload
         .get("node_name")
         .and_then(|v| v.as_str())
@@ -25916,11 +26065,7 @@ async fn get_node_status_flow(
             "message": "missing node_name",
         });
     }
-    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
-        if !hive.trim().is_empty() {
-            target_hive = hive.trim().to_string();
-        }
-    }
+    let target_hive = node_request_target_hive(payload, &state.hive_id);
     let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
@@ -26269,9 +26414,9 @@ enum NodeHelpAsker {
 
 /// Runs `node_help_flow` in its own task, which sends the answer itself. Asking the node takes up
 /// to NODE_HELP_PROBE_TIMEOUT_SECS, and another hive up to NODE_HELP_FORWARD_TIMEOUT_SECS, and the
-/// admin and system workers take one message at a time: run inline, it held every request behind
-/// it, and SY.admin's 5 s reads (`hive_status`, `web_status`) answered 504. add_hive's join leaves
-/// the admin worker the same way (PB-7).
+/// admin and system workers took one message at a time, as their ordered lanes still do: run
+/// inline, it held every request behind it, and SY.admin's 5 s reads (`hive_status`,
+/// `web_status`) answered 504. add_hive's join leaves the admin worker the same way (PB-7).
 fn spawn_node_help(
     state: &Arc<OrchestratorState>,
     sender: &NodeSender,
@@ -31496,7 +31641,7 @@ async fn accept_add_hive(
     // read-then-write so two concurrent accepts cannot both decide the hive is free.
     //
     // TRY-lock, never await. The background join holds this same lock for its whole ~6-minute
-    // run, so awaiting it here would park the single serial admin worker for that entire time —
+    // run, so awaiting it here would park the admin worker's ordered lane for that entire time —
     // the exact blockage this change removes — and the JOIN_IN_PROGRESS answer below would be
     // unreachable, because we would never get far enough to return it.
     let root = hives_root();
@@ -37410,7 +37555,7 @@ mod tests {
     }
 
     /// THE regression guard for the panel's worst finding. `accept_add_hive` and
-    /// `remove_hive_flow` both run ON the single serial admin worker, while a background join
+    /// `remove_hive_flow` both run ON the admin worker's ordered lane, while a background join
     /// holds the per-hive topology lock for ~6 minutes. If either of them AWAITS that lock, the
     /// hive's whole control plane freezes behind the join — the exact blockage PB-7 exists to
     /// remove — and `JOIN_IN_PROGRESS` becomes unreachable, because the check never runs.
@@ -51842,6 +51987,611 @@ blob:
         assert_eq!(reply.meta.msg.as_deref(), Some("NODE_HELP_RESPONSE"));
         assert_eq!(reply.routing.trace_id, "help-pending");
         assert_eq!(reply.payload, silent);
+    }
+
+    // --- FINDINGS A-199, step 1: the reads run apart from what changes anything ---
+
+    /// What the requests of a lane test did, in order: `<name> start` and `<name> end`.
+    type LaneLog = Arc<StdMutex<Vec<String>>>;
+
+    /// A request for `WorkerLanes` that records its start, waits until its gate opens (or is
+    /// dropped) and records its end.
+    fn gated_request(
+        log: &LaneLog,
+        name: &str,
+        gate: tokio::sync::oneshot::Receiver<()>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let log = Arc::clone(log);
+        let name = name.to_string();
+        async move {
+            log.lock().expect("lane log").push(format!("{name} start"));
+            let _ = gate.await;
+            log.lock().expect("lane log").push(format!("{name} end"));
+        }
+    }
+
+    fn lane_logged(log: &LaneLog, entry: &str) -> bool {
+        log.lock()
+            .expect("lane log")
+            .iter()
+            .any(|seen| seen == entry)
+    }
+
+    async fn wait_for_lane_entry(log: &LaneLog, entry: &str) {
+        let waited = time::timeout(Duration::from_secs(1), async {
+            while !lane_logged(log, entry) {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "{entry} within a second: {:?}",
+            log.lock().expect("lane log")
+        );
+    }
+
+    /// A read that waits holds no other read: the next one runs to its end at once.
+    #[tokio::test]
+    async fn a_slow_read_holds_no_other_read() {
+        let lanes = WorkerLanes::start("test", 4);
+        let log = LaneLog::default();
+        let (_slow_gate, slow) = tokio::sync::oneshot::channel();
+        lanes.run(RequestLane::Read, gated_request(&log, "slow", slow));
+        wait_for_lane_entry(&log, "slow start").await;
+        let (fast_gate, fast) = tokio::sync::oneshot::channel();
+        lanes.run(RequestLane::Read, gated_request(&log, "fast", fast));
+        fast_gate
+            .send(())
+            .expect("the fast read waits for its gate");
+        wait_for_lane_entry(&log, "fast end").await;
+        assert!(!lane_logged(&log, "slow end"));
+    }
+
+    /// While a request that changes something runs, reads go on.
+    #[tokio::test]
+    async fn reads_go_on_while_a_change_runs() {
+        let lanes = WorkerLanes::start("test", 4);
+        let log = LaneLog::default();
+        let (_change_gate, change) = tokio::sync::oneshot::channel();
+        lanes.run(RequestLane::Ordered, gated_request(&log, "change", change));
+        wait_for_lane_entry(&log, "change start").await;
+        let (read_gate, read) = tokio::sync::oneshot::channel();
+        lanes.run(RequestLane::Read, gated_request(&log, "read", read));
+        read_gate.send(()).expect("the read waits for its gate");
+        wait_for_lane_entry(&log, "read end").await;
+        assert!(!lane_logged(&log, "change end"));
+    }
+
+    /// The requests that change something run one at a time, in the order they came, whichever is
+    /// ready first.
+    #[tokio::test]
+    async fn changes_run_one_at_a_time_in_arrival_order() {
+        let lanes = WorkerLanes::start("test", 4);
+        let log = LaneLog::default();
+        let mut gates = Vec::new();
+        for name in ["first", "second", "third"] {
+            let (gate, opened) = tokio::sync::oneshot::channel();
+            lanes.run(RequestLane::Ordered, gated_request(&log, name, opened));
+            gates.push(gate);
+        }
+        wait_for_lane_entry(&log, "first start").await;
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*log.lock().expect("lane log"), vec!["first start"]);
+        // Opened last to first: each still waits for the one before it to end.
+        for gate in gates.into_iter().rev() {
+            gate.send(()).expect("each change waits for its gate");
+        }
+        wait_for_lane_entry(&log, "third end").await;
+        assert_eq!(
+            *log.lock().expect("lane log"),
+            vec![
+                "first start",
+                "first end",
+                "second start",
+                "second end",
+                "third start",
+                "third end"
+            ]
+        );
+    }
+
+    /// No more reads than the bound run at once; one more starts when one of them ends.
+    #[tokio::test]
+    async fn the_semaphore_bounds_the_reads() {
+        let lanes = WorkerLanes::start("test", 2);
+        let log = LaneLog::default();
+        let mut gates = HashMap::new();
+        for name in ["a", "b", "c"] {
+            let (gate, opened) = tokio::sync::oneshot::channel();
+            lanes.run(RequestLane::Read, gated_request(&log, name, opened));
+            gates.insert(name, gate);
+        }
+        let started = |log: &LaneLog| -> Vec<String> {
+            log.lock()
+                .expect("lane log")
+                .iter()
+                .filter_map(|entry| entry.strip_suffix(" start").map(str::to_string))
+                .collect()
+        };
+        let waited = time::timeout(Duration::from_secs(1), async {
+            while started(&log).len() < 2 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "two reads start: {:?}", started(&log));
+        time::sleep(Duration::from_millis(50)).await;
+        let running = started(&log);
+        assert_eq!(running.len(), 2, "{running:?}");
+        gates
+            .remove(running[0].as_str())
+            .expect("a running read's gate")
+            .send(())
+            .expect("the read waits for its gate");
+        let waited = time::timeout(Duration::from_secs(1), async {
+            while started(&log).len() < 3 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "the third starts: {:?}", started(&log));
+    }
+
+    /// A change that panics ends neither the ordered lane nor its order: the next one runs.
+    #[tokio::test]
+    async fn a_change_that_panics_leaves_the_lane_to_the_next() {
+        let lanes = WorkerLanes::start("test", 4);
+        let log = LaneLog::default();
+        lanes.run(RequestLane::Ordered, async { panic!("this change panics") });
+        let (gate, opened) = tokio::sync::oneshot::channel();
+        lanes.run(RequestLane::Ordered, gated_request(&log, "next", opened));
+        gate.send(()).expect("the next change waits for its gate");
+        wait_for_lane_entry(&log, "next end").await;
+    }
+
+    /// Which requests are reads: the ones read in the code to write and change nothing. Every other
+    /// action, an unknown one included, keeps the order, and a node's status is a read only where
+    /// it is forwarded: this hive writes the status version of a node of its own.
+    #[test]
+    fn only_the_reads_leave_the_order() {
+        let none = serde_json::json!({});
+        for action in [
+            "hive_status",
+            "get_storage",
+            "list_nodes",
+            "list_tenant_nodes",
+            "list_versions",
+            "get_versions",
+            "list_runtimes",
+            "get_runtime",
+            "list_deployments",
+            "get_deployments",
+            "list_drift_alerts",
+            "get_drift_alerts",
+            "get_node_config",
+            "get_node_state",
+            "list_hives",
+            "get_hive",
+        ] {
+            assert_eq!(
+                admin_request_lane(action, &none, "motherbee"),
+                RequestLane::Read,
+                "{action}"
+            );
+        }
+        for action in [
+            "set_storage",
+            "run_node",
+            "start_node",
+            "restart_node",
+            "kill_node",
+            "remove_node_instance",
+            "set_node_config",
+            "node_help",
+            "record_drift_alert",
+            "add_hive",
+            "remove_hive",
+            "core_rollback",
+            "set_hive_egress",
+            "clear_hive_egress",
+            "no_such_action",
+            "",
+        ] {
+            assert_eq!(
+                admin_request_lane(action, &none, "motherbee"),
+                RequestLane::Ordered,
+                "{action}"
+            );
+        }
+        for msg in [
+            "GET_VERSIONS",
+            "GET_RUNTIMES",
+            "LIST_NODES",
+            "GET_RUNTIME",
+            "INVENTORY_REQUEST",
+            "NODE_CONFIG_GET",
+            "NODE_STATE_GET",
+        ] {
+            assert_eq!(
+                system_request_lane(Some(msg), &none, "worker1"),
+                RequestLane::Read,
+                "{msg}"
+            );
+        }
+        for msg in [
+            "SYSTEM_UPDATE",
+            "SYSTEM_CORE_ROLLBACK",
+            "SYSTEM_SYNC_HINT",
+            "SPAWN_NODE",
+            "KILL_NODE",
+            "START_NODE",
+            "RESTART_NODE",
+            "REMOVE_NODE_INSTANCE",
+            "NODE_CONFIG_SET",
+            MSG_NODE_HELP,
+            "ADD_HIVE_FINALIZE",
+            "REMOVE_HIVE_CLEANUP",
+            MSG_SYSTEM_EGRESS_ROUTE,
+            "RUNTIME_UPDATE",
+            "NO_SUCH_MESSAGE",
+        ] {
+            assert_eq!(
+                system_request_lane(Some(msg), &none, "worker1"),
+                RequestLane::Ordered,
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            system_request_lane(None, &none, "worker1"),
+            RequestLane::Ordered
+        );
+        // A node's status: the hive its name names wins over `target`, as in get_node_status_flow.
+        for (payload, lane) in [
+            (
+                serde_json::json!({"node_name": "AI.demo@motherbee"}),
+                RequestLane::Ordered,
+            ),
+            (
+                serde_json::json!({"node_name": "AI.demo"}),
+                RequestLane::Ordered,
+            ),
+            (
+                serde_json::json!({"node_name": "AI.demo", "target": "motherbee"}),
+                RequestLane::Ordered,
+            ),
+            (
+                serde_json::json!({"node_name": "AI.demo@motherbee", "target": "worker1"}),
+                RequestLane::Ordered,
+            ),
+            (serde_json::json!({}), RequestLane::Ordered),
+            (
+                serde_json::json!({"node_name": "AI.demo@worker1"}),
+                RequestLane::Read,
+            ),
+            (
+                serde_json::json!({"node_name": "AI.demo", "target": "worker1"}),
+                RequestLane::Read,
+            ),
+            (
+                serde_json::json!({"node_name": "AI.demo", "hive_id": "worker1"}),
+                RequestLane::Read,
+            ),
+        ] {
+            assert_eq!(
+                admin_request_lane("get_node_status", &payload, "motherbee"),
+                lane,
+                "{payload}"
+            );
+            assert_eq!(
+                system_request_lane(Some("NODE_STATUS_GET"), &payload, "motherbee"),
+                lane,
+                "{payload}"
+            );
+        }
+    }
+
+    /// The motherbee's admin worker with its harness.
+    async fn admin_worker_for_tests() -> fluxbee_sdk::RouterDispatcherTestHarness {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        tokio::spawn(run_admin_worker(state, client, admin_rx));
+        harness
+    }
+
+    async fn next_outgoing_now(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        what: &str,
+    ) -> Message {
+        harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .unwrap_or_else(|| panic!("{what} within a second"))
+    }
+
+    fn spawn_on_workerbee(node_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "target": "workerbee",
+            "node_name": node_name,
+            "runtime": "ai.demo",
+            "runtime_version": "current"
+        })
+    }
+
+    /// FINDINGS A-199's case: a read forwarded to a hive that does not answer held the motherbee's
+    /// admin worker 45 s, every request behind it. Now, while it waits, a read answers and a change
+    /// goes ahead, and the late answer still reaches its caller.
+    #[tokio::test]
+    async fn a_lost_read_holds_neither_reads_nor_changes() {
+        let mut harness = admin_worker_for_tests().await;
+        harness
+            .inject(test_admin_command(
+                "versions-lost",
+                "get_versions",
+                serde_json::json!({ "target": "workerbee" }),
+            ))
+            .await
+            .expect("inject get_versions");
+        let lost = next_outgoing_now(&mut harness, "GET_VERSIONS forwarded").await;
+        assert_eq!(lost.meta.msg.as_deref(), Some("GET_VERSIONS"));
+        assert_unicast_destination(&lost.routing.dst, "SY.orchestrator@workerbee");
+
+        harness
+            .inject(test_admin_command(
+                "status-meanwhile",
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject hive_status");
+        let status = next_outgoing_now(&mut harness, "hive_status answered").await;
+        assert_eq!(status.meta.action.as_deref(), Some("hive_status"));
+        assert_eq!(status.routing.trace_id, "status-meanwhile");
+
+        harness
+            .inject(test_admin_command(
+                "spawn-meanwhile",
+                "run_node",
+                spawn_on_workerbee("AI.demo@workerbee"),
+            ))
+            .await
+            .expect("inject run_node");
+        let spawn = next_outgoing_now(&mut harness, "SPAWN_NODE forwarded").await;
+        assert_eq!(spawn.meta.msg.as_deref(), Some("SPAWN_NODE"));
+        harness
+            .inject(test_response_for(
+                &spawn,
+                SYSTEM_KIND,
+                "SPAWN_NODE_RESPONSE",
+                serde_json::json!({ "status": "ok", "node_name": "AI.demo@workerbee" }),
+            ))
+            .await
+            .expect("inject the spawn's answer");
+        let spawned = next_outgoing_now(&mut harness, "run_node answered").await;
+        assert_eq!(spawned.meta.action.as_deref(), Some("run_node"));
+        assert_eq!(spawned.payload["status"], "ok");
+
+        harness
+            .inject(test_response_for(
+                &lost,
+                SYSTEM_KIND,
+                "GET_VERSIONS_RESPONSE",
+                serde_json::json!({ "status": "ok", "hive": { "hive_id": "workerbee" } }),
+            ))
+            .await
+            .expect("inject the late answer");
+        let versions = next_outgoing_now(&mut harness, "get_versions answered").await;
+        assert_eq!(versions.meta.action.as_deref(), Some("get_versions"));
+        assert_eq!(versions.routing.trace_id, "versions-lost");
+        assert_eq!(versions.payload["hive"]["hive_id"], "workerbee");
+    }
+
+    /// The changes keep their order: a second change waits for the first to end, whichever node it
+    /// is for, and a read goes ahead of it meanwhile.
+    #[tokio::test]
+    async fn changes_keep_their_order_while_reads_go_on() {
+        let mut harness = admin_worker_for_tests().await;
+        harness
+            .inject(test_admin_command(
+                "spawn-first",
+                "run_node",
+                spawn_on_workerbee("AI.demo@workerbee"),
+            ))
+            .await
+            .expect("inject run_node");
+        let spawn = next_outgoing_now(&mut harness, "SPAWN_NODE forwarded").await;
+        assert_eq!(spawn.meta.msg.as_deref(), Some("SPAWN_NODE"));
+
+        harness
+            .inject(test_admin_command(
+                "kill-second",
+                "kill_node",
+                serde_json::json!({ "target": "workerbee", "node_name": "AI.other@workerbee" }),
+            ))
+            .await
+            .expect("inject kill_node");
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(100))
+                .await
+                .is_none(),
+            "the second change waits for the first"
+        );
+
+        harness
+            .inject(test_admin_command(
+                "config-meanwhile",
+                "get_node_config",
+                serde_json::json!({ "target": "workerbee", "node_name": "AI.demo@workerbee" }),
+            ))
+            .await
+            .expect("inject get_node_config");
+        let config = next_outgoing_now(&mut harness, "NODE_CONFIG_GET forwarded").await;
+        assert_eq!(config.meta.msg.as_deref(), Some("NODE_CONFIG_GET"));
+
+        harness
+            .inject(test_response_for(
+                &spawn,
+                SYSTEM_KIND,
+                "SPAWN_NODE_RESPONSE",
+                serde_json::json!({ "status": "ok", "node_name": "AI.demo@workerbee" }),
+            ))
+            .await
+            .expect("inject the spawn's answer");
+        let spawned = next_outgoing_now(&mut harness, "run_node answered").await;
+        assert_eq!(spawned.meta.action.as_deref(), Some("run_node"));
+        let kill = next_outgoing_now(&mut harness, "KILL_NODE forwarded").await;
+        assert_eq!(kill.meta.msg.as_deref(), Some("KILL_NODE"));
+        assert_eq!(kill.payload["node_name"], "AI.other@workerbee");
+
+        harness
+            .inject(test_response_for(
+                &kill,
+                SYSTEM_KIND,
+                "KILL_NODE_RESPONSE",
+                serde_json::json!({ "status": "ok", "node_name": "AI.other@workerbee" }),
+            ))
+            .await
+            .expect("inject the kill's answer");
+        let killed = next_outgoing_now(&mut harness, "kill_node answered").await;
+        assert_eq!(killed.meta.action.as_deref(), Some("kill_node"));
+        assert_eq!(killed.routing.trace_id, "kill-second");
+
+        harness
+            .inject(test_response_for(
+                &config,
+                SYSTEM_KIND,
+                "NODE_CONFIG_GET_RESPONSE",
+                serde_json::json!({ "status": "ok", "node_name": "AI.demo@workerbee" }),
+            ))
+            .await
+            .expect("inject the config's answer");
+        let read = next_outgoing_now(&mut harness, "get_node_config answered").await;
+        assert_eq!(read.meta.action.as_deref(), Some("get_node_config"));
+        assert_eq!(read.routing.trace_id, "config-meanwhile");
+    }
+
+    /// The admin worker runs at most WORKER_CONCURRENT_READS_MAX reads at once: with that many
+    /// forwards waiting, one more read waits for one of them to end, and a change still goes ahead.
+    #[tokio::test]
+    async fn the_admin_worker_bounds_its_reads() {
+        let mut harness = admin_worker_for_tests().await;
+        for read in 0..=WORKER_CONCURRENT_READS_MAX {
+            harness
+                .inject(test_admin_command(
+                    &format!("read-{read}"),
+                    "get_versions",
+                    serde_json::json!({ "target": "workerbee" }),
+                ))
+                .await
+                .expect("inject get_versions");
+        }
+        let mut forwarded = Vec::new();
+        for _ in 0..WORKER_CONCURRENT_READS_MAX {
+            let ask = next_outgoing_now(&mut harness, "GET_VERSIONS forwarded").await;
+            assert_eq!(ask.meta.msg.as_deref(), Some("GET_VERSIONS"));
+            forwarded.push(ask);
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(100))
+                .await
+                .is_none(),
+            "one read past the bound waits"
+        );
+
+        harness
+            .inject(test_admin_command(
+                "spawn-meanwhile",
+                "run_node",
+                spawn_on_workerbee("AI.demo@workerbee"),
+            ))
+            .await
+            .expect("inject run_node");
+        let spawn = next_outgoing_now(&mut harness, "SPAWN_NODE forwarded").await;
+        assert_eq!(spawn.meta.msg.as_deref(), Some("SPAWN_NODE"));
+
+        harness
+            .inject(test_response_for(
+                &forwarded[0],
+                SYSTEM_KIND,
+                "GET_VERSIONS_RESPONSE",
+                serde_json::json!({ "status": "ok", "hive": { "hive_id": "workerbee" } }),
+            ))
+            .await
+            .expect("inject one answer");
+        let mut next = [
+            next_outgoing_now(&mut harness, "an answer or the next read").await,
+            next_outgoing_now(&mut harness, "an answer or the next read").await,
+        ];
+        // The answered read's reply (admin) and the read that waited, now forwarded (system).
+        next.sort_by_key(|msg| msg.meta.msg_type.clone());
+        assert_eq!(next[0].meta.action.as_deref(), Some("get_versions"));
+        assert!(next[0].routing.trace_id.starts_with("read-"));
+        assert_eq!(next[1].meta.msg.as_deref(), Some("GET_VERSIONS"));
+        assert!(
+            forwarded
+                .iter()
+                .all(|ask| ask.routing.trace_id != next[1].routing.trace_id),
+            "a read of its own, not one asked again"
+        );
+    }
+
+    /// The system worker's reads run apart too: a NODE_CONFIG_GET forwarded to a hive that does not
+    /// answer holds neither a read nor a change.
+    #[tokio::test]
+    async fn the_system_worker_s_lost_read_holds_nothing() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+        tokio::spawn(run_system_worker(state, client, system_rx));
+        let from_orchestrator = |trace: &str, msg_name: &str, payload: serde_json::Value| {
+            let mut msg = test_system_message(trace, msg_name, payload);
+            msg.routing.src_l2_name = Some("SY.orchestrator@motherbee".to_string());
+            msg
+        };
+        harness
+            .inject(from_orchestrator(
+                "config-lost",
+                "NODE_CONFIG_GET",
+                serde_json::json!({ "target": "workerbee", "node_name": "AI.demo@workerbee" }),
+            ))
+            .await
+            .expect("inject NODE_CONFIG_GET");
+        let lost = next_outgoing_now(&mut harness, "NODE_CONFIG_GET forwarded").await;
+        assert_eq!(lost.meta.msg.as_deref(), Some("NODE_CONFIG_GET"));
+        assert_unicast_destination(&lost.routing.dst, "SY.orchestrator@workerbee");
+
+        harness
+            .inject(from_orchestrator(
+                "runtimes-meanwhile",
+                "GET_RUNTIMES",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject GET_RUNTIMES");
+        let runtimes = next_outgoing_now(&mut harness, "GET_RUNTIMES answered").await;
+        assert_eq!(runtimes.meta.msg.as_deref(), Some("GET_RUNTIMES_RESPONSE"));
+        assert_eq!(runtimes.routing.trace_id, "runtimes-meanwhile");
+
+        harness
+            .inject(test_system_message(
+                "update-meanwhile",
+                "SYSTEM_UPDATE",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject SYSTEM_UPDATE");
+        let update = next_outgoing_now(&mut harness, "SYSTEM_UPDATE answered").await;
+        assert_eq!(update.meta.msg.as_deref(), Some("SYSTEM_UPDATE_RESPONSE"));
+        assert_eq!(update.routing.trace_id, "update-meanwhile");
     }
 
     /// The files an SY node keeps under nodes/SY are its own: the inventory lists it from its unit,

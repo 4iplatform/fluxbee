@@ -334,8 +334,8 @@ The operator's change and the update with category `config`, live and checked on
   - `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE`, `INSTALLATION_WRITE_FAILED`: the
     record or the file cannot be read or written.
   - No answer in 30 s (`TIMEOUT`) is not "nothing written" (the review's F6): the motherbee's
-    orchestrator takes its system messages one at a time, and one ahead of the write (a node's
-    purge, up to 120 s) can hold it. The answer says the write may still land, to read
+    orchestrator takes its system messages but the reads one at a time, and one ahead of the write
+    (a node's purge, up to 120 s) can hold it. The answer says the write may still land, to read
     `get_installation`, and, when its `expected_version` moved, to run the update with category
     `config` on every hive (`installation_write_unanswered`).
 - **The next version** is one past the last recorded, or past the file's when a hand edit raised it,
@@ -642,10 +642,11 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   - **one read of a hive at a time, everywhere:** the explicit run, the follow, the re-read and the
     automatic step share each hive's read, so at most one `GET_VERSIONS` of a hive is outstanding,
     and the background task reads one hive at a time. **Why:** the reads go through the
-    motherbee's orchestrator, whose single admin worker forwards each within its own 45 s
-    (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), and whose queue keeps what SY.admin gave up. A read
+    motherbee's orchestrator, whose admin worker forwards each within its own 45 s
+    (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`) and runs one SY.admin gave up to that bound; until
+    0.1.127 it ran them one at a time, each queued behind the one before (FINDINGS A-199). A read
     waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), past that bound; one that timed out
-    anyway keeps the hive unread for another 50 s, so a second is never queued behind it. The
+    anyway keeps the hive unread for another 50 s, so a second never runs beside it. The
     re-read (`recheck`) takes its turn among the background reads before it claims its hive
     (since 0.1.124): one waiting for its turn holds no hive, so an explicit run's pass waits only
     for the read under way. **Why:** woken at a run's open, the task re-read every hive not read

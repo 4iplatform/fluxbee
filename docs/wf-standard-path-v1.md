@@ -70,8 +70,16 @@ to wait for its own timeout.
 worker, which runs one action at a time. A long action, such as a `core_rollback` or a forward to a
 hive that does not answer (45 s), delays the others, a WF deploy included. Today SY.wf-rules on a
 worker talked to its own orchestrator; through the admin it shares that queue like every other
-launcher. Letting the orchestrator run node actions concurrently (per-node locks already exist) is
-future work.
+launcher.
+
+- **Since 0.1.127 (FINDINGS A-199, step 1), the reads run apart:** `get_node_config`,
+  `get_node_status` of another hive's node, `list_nodes`, `get_versions` and the other reads each
+  run in a task of their own, at most 16 at once per worker
+  ([SY.orchestrator](nodes/sy-orchestrator.md#messages)). A read no longer waits behind an action,
+  and a read that waits holds nothing. The node actions and every other change still run one at a
+  time, in arrival order.
+- **Still future work:** running node actions on different nodes concurrently (step 2; per-node
+  locks already exist).
 
 ### 2.2 SY.wf-rules goes through SY.admin
 
