@@ -1479,6 +1479,13 @@ impl Bounds {
     pub(crate) fn explicit_pass(&self) -> Duration {
         self.answer + 2 * self.read + 2 * (self.apply + self.update_call)
     }
+
+    /// The longest an explicit run's pass waits for a task holding its hive: a read, then the send a
+    /// task of a closed update may still have under way (an update asked again up to the apply
+    /// bound, with its last answer), with a margin. Such a task sends nothing more after it.
+    pub(crate) fn holder_wait(&self) -> Duration {
+        self.read + self.apply + self.update_call + Duration::from_secs(5)
+    }
 }
 
 /// Who reads a hive's `/versions`: an explicit run, or the background task, one hive at a time.
@@ -2574,8 +2581,9 @@ fn core_unchanged_since_not_settled(entry: &HiveEntry, snapshot: &Value) -> bool
 /// Which holders of a hive an explicit run waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitFor {
-    /// A task that only reads it; one that acts on it keeps it (`update_installation`'s pass).
-    Readers,
+    /// A task that only reads it, or one of a closed update, which sends nothing more; one that
+    /// acts on it for this update keeps it (`update_installation`'s pass).
+    ReadersAndClosed,
     /// Any task (`set_installation_ai`'s apply: the operator's change reaches every hive in one go
     /// whenever it can).
     Anyone,
@@ -2600,7 +2608,10 @@ async fn claim_for_run<'a>(
         let Some(holder) = updates.holder(hive) else {
             continue;
         };
-        let waited_for = wait_for == WaitFor::Anyone || holder.what == READING;
+        let waited_for = match wait_for {
+            WaitFor::Anyone => true,
+            WaitFor::ReadersAndClosed => holder.what == READING || holder.update != id,
+        };
         if !waited_for || tokio::time::Instant::now() >= wait_until {
             return None;
         }
@@ -2609,8 +2620,9 @@ async fn claim_for_run<'a>(
 }
 
 /// One explicit run's pass on one hive, once no other task acts on it: [`run_claimed_hive`]. A
-/// holder that is only reading the hive is waited for, within its read's bound; one that acts on
-/// it is not, and the hive is recorded as left to it, never left unrecorded.
+/// holder that only reads the hive, or one of a closed update (superseded, done), which sends
+/// nothing more, is waited for ([`Bounds::holder_wait`]); one that acts on it for this update is
+/// not, and the hive is recorded as left to it, never left unrecorded.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_hive(
     updates: &Updates,
@@ -2623,13 +2635,13 @@ pub(crate) async fn run_hive(
     answer_deadline: tokio::time::Instant,
     bounds: &Bounds,
 ) {
-    let wait_until = tokio::time::Instant::now() + bounds.read + Duration::from_secs(5);
+    let wait_until = tokio::time::Instant::now() + bounds.holder_wait();
     let Some(_claim) = claim_for_run(
         updates,
         hive,
         "the explicit run",
         id,
-        WaitFor::Readers,
+        WaitFor::ReadersAndClosed,
         wait_until,
     )
     .await

@@ -1988,23 +1988,20 @@ async fn a_core_found_under_way_is_followed_without_the_automatic_attempt() {
     assert!(worker.automatic.is_none());
 }
 
-/// F7: an explicit run never skips a hive silently: one another task acts on is recorded as left to
-/// it, naming the task; one a task only reads is waited for.
+/// F7: an explicit run never skips a hive silently: one a task of this update acts on is recorded
+/// as left to it, naming the task. One a task only reads is waited for, and so is one a task of a
+/// closed update holds, which sends nothing more: leaving the hive to it would strand it. The run
+/// then acts on it.
 #[tokio::test]
 async fn a_hive_another_task_holds_is_recorded() {
     let updates = Updates::load(&temp_state("installation-update-held-by"));
-    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind()]);
-    let (id, _) = updates.change(|file| {
-        let opened = file.open_or_resume(&target(), "http", None, now_epoch_ms());
-        file.refresh_hives(
-            &opened.0,
-            &["motherbee".to_string(), "worker1".to_string()],
-            Vec::new(),
-        );
-        opened
-    });
+    let mut worker2 = worker_behind();
+    worker2["hive_id"] = json!("worker2");
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind(), worker2]);
+    let id = open_update(&updates, "http", &["motherbee", "worker1", "worker2"]);
+    // This update's follow, applying worker1's config: worker1 is left to it.
     let holder = updates
-        .claim("worker1", "applying its config", "upd-older")
+        .claim("worker1", "applying its config", &id)
         .expect("claimed");
     let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
     run_hive(
@@ -2025,8 +2022,7 @@ async fn a_hive_another_task_holds_is_recorded() {
         .core
         .reason
         .as_deref()
-        .is_some_and(|why| why.contains("applying its config")
-            && why.contains("superseded update upd-older")));
+        .is_some_and(|why| why.contains("applying its config") && why.contains("of this update")));
     assert!(worker
         .core
         .next
@@ -2034,29 +2030,36 @@ async fn a_hive_another_task_holds_is_recorded() {
         .is_some_and(|next| next.contains("update_installation again")));
     drop(holder);
 
-    // A task that only reads the hive is waited for.
-    let reader = updates.claim("worker1", READING, &id).expect("claimed");
-    let release = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(reader);
-    };
+    // The automatic step of a superseded update holding worker1, and a task that only reads
+    // worker2: each is waited for, and the run acts on the hive once it lets go.
     let (the_target, bounds) = (target(), quick());
-    let run = run_hive(
-        &updates,
-        dyn_mesh.as_ref(),
-        &id,
-        "worker1",
-        &the_target,
-        &[],
-        None,
-        tokio::time::Instant::now() + Duration::from_millis(100),
-        &bounds,
-    );
-    tokio::join!(release, run);
-    assert_eq!(
-        mesh.sent_to("worker1").first(),
-        Some(&json!({"category": "core", "manifest_version": 0, "manifest_hash": H_NEW}))
-    );
+    for (hive, what, update) in [
+        ("worker1", "the automatic step", "upd-older"),
+        ("worker2", READING, id.as_str()),
+    ] {
+        let holder = updates.claim(hive, what, update).expect("claimed");
+        let let_go = AtomicBool::new(false);
+        let run = run_hive(
+            &updates,
+            dyn_mesh.as_ref(),
+            &id,
+            hive,
+            &the_target,
+            &[],
+            None,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            &bounds,
+        );
+        tokio::join!(
+            let_go_after(holder, Duration::from_millis(50), &let_go),
+            run
+        );
+        assert_eq!(
+            mesh.sent_to(hive).first(),
+            Some(&json!({"category": "core", "manifest_version": 0, "manifest_hash": H_NEW})),
+            "{hive}"
+        );
+    }
 }
 
 /// F8: one explicit run at a time; a second is told which one runs, and since when.

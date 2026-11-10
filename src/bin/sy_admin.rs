@@ -21604,6 +21604,35 @@ fn installation_hive_left_json(
     })
 }
 
+/// What `set_installation_ai`'s partial answer says of the installation's update it opened, by how
+/// its hives (`hives`, the answer's lines) stand: one that did not answer gets the update finished
+/// once when it answers again (the automatic step); one left to another task, by
+/// `update_installation` once that task ends.
+fn installation_change_update_note(update_id: &str, hives: &serde_json::Value) -> String {
+    let any = |status: &str| {
+        hives
+            .as_object()
+            .into_iter()
+            .flat_map(|hives| hives.values())
+            .any(|line| line.get("status").and_then(serde_json::Value::as_str) == Some(status))
+    };
+    let mut note =
+        format!(" The installation's update {update_id} stays open (get_installation_update).");
+    if any("not_answered") {
+        note.push_str(
+            " A hive that did not answer gets it finished once when it answers again (the \
+             automatic step).",
+        );
+    }
+    if any("left_to_task") {
+        note.push_str(
+            " A hive left to another task (left_to_task) gets it from update_installation once \
+             that task ends.",
+        );
+    }
+    note
+}
+
 /// What finishes a hive that is not ok, by its error code (stage 3c's review, F5): `sync_pending`
 /// and no answer are finished by the same update run again; a refusal names what has to change
 /// first.
@@ -22101,10 +22130,7 @@ async fn handle_set_installation_ai(
     }
     payload["pending"] = serde_json::json!(pending);
     let update_note = match &update_id {
-        Ok(update_id) => format!(
-            " The installation's update {update_id} stays open: a hive that did not answer gets it \
-             finished once when it answers again (get_installation_update)."
-        ),
+        Ok(update_id) => installation_change_update_note(update_id, &payload["hives"]),
         Err(_) => String::new(),
     };
     payload["message"] = serde_json::json!(format!(
@@ -34919,6 +34945,32 @@ mod tests {
         assert!(next.contains("POST /hives/worker1/update"), "{next}");
         assert!(next.contains("\"manifest_hash\": \"bbb\""), "{next}");
         assert!(!left.to_string().contains("not applied"), "{left}");
+    }
+
+    /// The change's partial answer says what finishes each hive its update keeps open: one that did
+    /// not answer, the automatic step when it answers again; one left to another task,
+    /// update_installation once that task ends, never the automatic step.
+    #[test]
+    fn the_change_s_partial_answer_says_what_finishes_each_hive() {
+        let left = installation_change_update_note(
+            "upd-1",
+            &json!({"motherbee": {"status": "ok"}, "worker1": {"status": "left_to_task"}}),
+        );
+        assert!(left.contains("upd-1 stays open"), "{left}");
+        assert!(
+            left.contains("update_installation once that task ends"),
+            "{left}"
+        );
+        assert!(!left.contains("answers again"), "{left}");
+        let unanswered = installation_change_update_note(
+            "upd-1",
+            &json!({"egress1": {"status": "not_answered"}}),
+        );
+        assert!(
+            unanswered.contains("once when it answers again"),
+            "{unanswered}"
+        );
+        assert!(!unanswered.contains("left_to_task"), "{unanswered}");
     }
 
     /// Answers one request the change sends, by what it asks: the motherbee's /versions, the

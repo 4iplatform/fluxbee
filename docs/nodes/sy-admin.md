@@ -835,12 +835,14 @@ What it does (`handle_update_installation`, `run_explicit`):
    each check, before they send, that their update is still the open one, and the automatic step
    sends through them; a send already under way finishes, its outcome not recorded.
 6. **Each hive's pass, at once** (`run_hive`), decided by `decide` from its `/versions`:
-   - a hive another task holds: one that only reads it is waited for (its read's bound); one that
-     acts on it (the follow applying its config, the automatic step) keeps it, and the hive is
-     recorded as left to that task, naming it, the update (this one or the superseded one) and how
-     long it has been under way, with `next`. Never left unrecorded. A holder that ended meanwhile
-     is none: the hive is claimed (`claim_for_run`; `set_installation_ai`'s apply shares it, and
-     waits for a task that acts on the hive too, up to its ceiling);
+   - a hive another task holds: one that only reads it, or one of a closed update (superseded,
+     done), which sends nothing more, is waited for, up to a read and the send it may have under
+     way (`Bounds::holder_wait`, 205 s), then the pass acts; one that acts on it for this update
+     (the follow applying its config, the automatic step) keeps it, and the hive is recorded as
+     left to that task, naming it, the update and how long it has been under way, with `next`.
+     Never left unrecorded. A holder that ended meanwhile is none: the hive is claimed
+     (`claim_for_run`; `set_installation_ai`'s apply shares it, and waits for a task that acts on
+     the hive too, while it keeps its own time);
    - it waits until the hive's orchestrator answers (120 s from the run's start,
      `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`);
    - its core, when not on the target: `SYSTEM_UPDATE {category: "core", manifest_version: 0,

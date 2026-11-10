@@ -565,13 +565,16 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   refuses, `409 MOTHERBEE_ROLLED_BACK`: install a release on the motherbee first); every hive is
   read once, at once; then the update is opened or resumed, and each hive's pass runs in a task of
   its own (`run_hive`):
-  - a hive another task holds (F7): one that only reads it is waited for, within its read's bound;
-    one that acts on it (the follow applying its config, the automatic step) keeps it, and the hive
-    is recorded as left to that task, naming it and its update (this one or the superseded one),
-    with `next`: never skipped without a word. A holder that ended meanwhile is none: the hive is
-    claimed (`claim_for_run`, since 0.1.124; before, the run left the hive "to another task, which
-    has just ended"). `set_installation_ai`'s apply waits for a task that acts on the hive too, up
-    to its ceiling (below);
+  - a hive another task holds (F7): one that only reads it, or one of a closed update (superseded,
+    done), which sends nothing more, is waited for, up to a read and the send it may have under way
+    (`holder_wait`: the read bound, an update asked again up to the apply bound with its last
+    answer, and 5 s; 205 s); one that acts on it for this update (the follow applying its config,
+    the automatic step) keeps it, and the hive is recorded as left to that task, naming it, with
+    `next`: never skipped without a word. A holder that ended meanwhile is none: the hive is
+    claimed (`claim_for_run`). **Why** (since 0.1.124): a run that left a hive to a closed update's
+    task stranded it, since that task sends nothing more; and a holder ending between the run's
+    two looks had the hive left "to another task, which has just ended". `set_installation_ai`'s
+    apply waits for a task that acts on the hive too, while it keeps its own time (below);
   - it waits until the hive's orchestrator answers (120 s from the run's start,
     `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`): right after an install the motherbee's router
     may not have the spokes back (0.1.56);
