@@ -11813,14 +11813,16 @@ mod tests {
         let taken = sent - answers.len();
 
         // The node stays, with its queue at the senders' bound and no further, and another link
-        // goes on.
+        // goes on. The bound counts the frames' buffers, which serialization leaves up to about
+        // twice a frame's length: the queue is within one such buffer of it.
         assert_eq!(
             holder_name(&nodes, slow).await.as_deref(),
             Some("AI.slow@motherbee")
         );
         let (frames, bytes) = nodes.lock().await[&slow].sender.depth();
         assert!(
-            bytes <= LINK_QUEUE_SENDERS_BYTES && bytes + PAD + 1024 > LINK_QUEUE_SENDERS_BYTES,
+            bytes <= LINK_QUEUE_SENDERS_BYTES
+                && bytes + 2 * (PAD + 1024) > LINK_QUEUE_SENDERS_BYTES,
             "{frames} frames, {bytes} bytes"
         );
         write_frame(&mut sender_client, &to(other, 0, PAD))

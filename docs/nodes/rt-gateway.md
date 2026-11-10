@@ -198,7 +198,13 @@ until its writer hands it to the socket (`src/router/link.rs`, A-222, since 0.1.
   sender's message gets 960 frames or 7 MiB of it (`LINK_QUEUE_SENDERS_FRAMES`,
   `LINK_QUEUE_SENDERS_BYTES`). The rest is for the router's own frames: its answers, LSAs,
   `WAN_REACHABILITY`, handshakes, another router's answer relayed to a node. So senders that keep a
-  link at their bound never crowd them out.
+  link at their bound never crowd them out: the MiB they leave takes five LSAs at their largest.
+- **The bytes are the heap a frame holds:** its buffer's capacity, not its length. The router
+  builds frames with `serde_json::to_vec`, which can leave up to about twice the length allocated
+  (a long string takes its exact size, then the buffer doubles for what follows), so a frame
+  counts what it holds. It claims that number as it takes its place, and its writer gives the same
+  number back as it takes the frame. Counted by length, a stuck link would hold about twice its
+  8 MiB.
 - **Full:** a sender's message is refused and answered `LINK_BUSY`; one of the router's own frames
   is skipped once the whole bound is taken, and no one is answered. A frame the queue took is never
   dropped to make room, and the node or peer is never disconnected for it: as its peer reads, the
@@ -209,12 +215,13 @@ until its writer hands it to the socket (`src/router/link.rs`, A-222, since 0.1.
   kernel buffer is full. Against that, the bursts a link sees are small: an LSA per WAN peer every
   10 s (at most about 90 KiB at the LSA region's 1,024 nodes), one stream batch in flight per sink
   and stream (96 KiB), one frame per link for each broadcast. 8 MiB is 64 frames at the 128 KiB
-  limit, and a stuck link costs the router no more than that, plus the frame its writer is on.
+  limit in buffers of their size, 32 in buffers twice that, and a stuck link costs the router no
+  more than 8 MiB of heap, plus the frame its writer is on.
 - **The line:** `router did not queue frames for a link whose queue is full (LINK_BUSY): senders
   answered, its own frames skipped; the link stays up`, with `link` (`node`, `wan`, `irp`),
-  `peer` (the node's name, the hive, the sibling's UUID), `queued_frames`, `queued_bytes`, the
-  bounds, `refused` and `skipped` since the last line and `refused_total` for the process, at most
-  once per link every 30 s.
+  `peer` (the node's name, the hive, the sibling's UUID), `queued_frames`, `queued_bytes` (the
+  heap they hold), the bounds, `refused` and `skipped` since the last line and `refused_total` for
+  the process, at most once per link every 30 s.
 - **The stream** is a node of its router: a batch for a full link, SY.storage's or a WAN peer's, is
   answered `LINK_BUSY` like any node's message, and the stream retries it as after a lost ack
   (every 0.5 to 8 s), its records kept on disk meanwhile.

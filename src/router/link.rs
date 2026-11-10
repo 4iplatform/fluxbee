@@ -11,6 +11,12 @@
 //! it: room comes back as its writer drains it. Until 0.1.129 the queue had no bound, and every
 //! frame for a node that stopped reading without closing stayed in the router's memory.
 //!
+//! The bytes are the heap a frame holds, its buffer's capacity, not its length: the router builds
+//! its frames with `serde_json::to_vec`, which can leave up to about twice the length allocated,
+//! and a bound on the lengths would let a stuck link hold that much more. A frame claims its
+//! capacity as it takes its place, carries that number with it, and gives the same number back as
+//! its writer takes it.
+//!
 //! `LinkSender::reserve` takes a sender's message's place without handing it to the writer yet,
 //! for what must happen only for a frame the link took, and before its peer can have it: an
 //! agent's turn for its cognition (A-221).
@@ -24,12 +30,15 @@ use crate::shm::now_epoch_ms;
 
 /// The most frames a link's queue holds for its writer, the router's own included.
 pub(super) const LINK_QUEUE_MAX_FRAMES: usize = 1_024;
-/// The most bytes a link's queue holds for its writer, the router's own frames included: 64 frames
-/// at the socket's 128 KiB limit.
+/// The most bytes a link's queue holds for its writer, the router's own frames included, counted as
+/// the frames' buffers hold them (their capacity): 64 frames at the socket's 128 KiB limit in
+/// buffers of their size, 32 in buffers twice that.
 pub(super) const LINK_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// The frames a sender's messages may take; the other 64 are the router's own.
 pub(super) const LINK_QUEUE_SENDERS_FRAMES: usize = LINK_QUEUE_MAX_FRAMES - 64;
-/// The bytes a sender's messages may take; the other MiB is the router's own.
+/// The bytes a sender's messages may take; the other MiB is the router's own, which holds several
+/// LSAs at their largest (about 90 KiB at the LSA region's 1,024 nodes, in a buffer of up to twice
+/// that) whatever the senders hold.
 pub(super) const LINK_QUEUE_SENDERS_BYTES: usize = LINK_QUEUE_MAX_BYTES - 1024 * 1024;
 /// At most one line per link and interval about the frames its queue did not take.
 const LINK_FULL_LOG_INTERVAL_MS: u64 = 30_000;
@@ -60,16 +69,23 @@ struct LinkState {
     logged_at_ms: AtomicU64,
 }
 
+/// A frame in a link's queue, with the bytes it claimed of the bound: its buffer's capacity when it
+/// took its place, which the writer gives back as it takes the frame.
+struct Queued {
+    frame: Vec<u8>,
+    bytes: usize,
+}
+
 /// The sending side of a link's queue. Clones share the queue.
 #[derive(Clone)]
 pub(super) struct LinkSender {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Queued>,
     state: Arc<LinkState>,
 }
 
 /// The writer's side of a link's queue.
 pub(super) struct LinkReceiver {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::UnboundedReceiver<Queued>,
     state: Arc<LinkState>,
 }
 
@@ -122,12 +138,14 @@ impl LinkSender {
         if self.tx.is_closed() {
             return Err(LinkRefusal::Gone);
         }
-        if !self.claim(frame.len(), false) {
+        let bytes = frame.capacity();
+        if !self.claim(bytes, false) {
             return Err(self.full(false));
         }
         Ok(LinkSlot {
             link: self,
             frame,
+            bytes,
             queued: false,
         })
     }
@@ -142,7 +160,7 @@ impl LinkSender {
         self.tx.same_channel(&other.tx)
     }
 
-    /// The frames and bytes waiting for the link's writer.
+    /// The frames waiting for the link's writer, and the bytes their buffers hold.
     pub(super) fn depth(&self) -> (usize, usize) {
         (
             self.state.frames.load(Ordering::Relaxed),
@@ -154,17 +172,18 @@ impl LinkSender {
         if self.tx.is_closed() {
             return Err(LinkRefusal::Gone);
         }
-        if !self.claim(frame.len(), own) {
+        let bytes = frame.capacity();
+        if !self.claim(bytes, own) {
             return Err(self.full(own));
         }
-        self.tx.send(frame).map_err(|unsent| {
-            self.release(unsent.0.len());
+        self.tx.send(Queued { frame, bytes }).map_err(|_| {
+            self.release(bytes);
             LinkRefusal::Gone
         })
     }
 
-    /// Takes a frame's place and bytes within the bound, or nothing.
-    fn claim(&self, len: usize, own: bool) -> bool {
+    /// Takes a frame's place, and the `bytes` its buffer holds, within the bound, or nothing.
+    fn claim(&self, bytes: usize, own: bool) -> bool {
         let (max_frames, max_bytes) = if own {
             (LINK_QUEUE_MAX_FRAMES, LINK_QUEUE_MAX_BYTES)
         } else {
@@ -182,8 +201,8 @@ impl LinkSender {
         }
         if state
             .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
-                bytes.checked_add(len).filter(|total| *total <= max_bytes)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes).filter(|total| *total <= max_bytes)
             })
             .is_err()
         {
@@ -193,9 +212,10 @@ impl LinkSender {
         true
     }
 
-    fn release(&self, len: usize) {
+    /// Gives back a frame's place and the bytes it claimed.
+    fn release(&self, bytes: usize) {
         self.state.frames.fetch_sub(1, Ordering::Relaxed);
-        self.state.bytes.fetch_sub(len, Ordering::Relaxed);
+        self.state.bytes.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Counts a frame the full queue did not take, and says so at most once per link every
@@ -241,6 +261,8 @@ impl LinkSender {
 pub(super) struct LinkSlot<'a> {
     link: &'a LinkSender,
     frame: Vec<u8>,
+    /// What the frame claimed of the bound.
+    bytes: usize,
     queued: bool,
 }
 
@@ -250,9 +272,9 @@ impl LinkSlot<'_> {
     pub(super) fn queue(mut self) -> Result<(), LinkRefusal> {
         self.queued = true;
         let frame = std::mem::take(&mut self.frame);
-        let len = frame.len();
-        self.link.tx.send(frame).map_err(|_| {
-            self.link.release(len);
+        let bytes = self.bytes;
+        self.link.tx.send(Queued { frame, bytes }).map_err(|_| {
+            self.link.release(bytes);
             LinkRefusal::Gone
         })
     }
@@ -261,28 +283,31 @@ impl LinkSlot<'_> {
 impl Drop for LinkSlot<'_> {
     fn drop(&mut self) {
         if !self.queued {
-            self.link.release(self.frame.len());
+            self.link.release(self.bytes);
         }
     }
 }
 
 impl LinkReceiver {
-    /// The next frame for the writer; its place in the bound is free again from here. None once
-    /// every sender is gone.
+    /// The next frame for the writer; its place in the bound, and the bytes it claimed, are free
+    /// again from here. None once every sender is gone.
     pub(super) async fn recv(&mut self) -> Option<Vec<u8>> {
-        let frame = self.rx.recv().await?;
-        self.state.frames.fetch_sub(1, Ordering::Relaxed);
-        self.state.bytes.fetch_sub(frame.len(), Ordering::Relaxed);
-        Some(frame)
+        let queued = self.rx.recv().await?;
+        Some(self.taken(queued))
     }
 
     /// The next frame if one is waiting, as `recv` takes it.
     #[cfg(test)]
     pub(super) fn try_recv(&mut self) -> Result<Vec<u8>, mpsc::error::TryRecvError> {
-        let frame = self.rx.try_recv()?;
+        let queued = self.rx.try_recv()?;
+        Ok(self.taken(queued))
+    }
+
+    /// Gives back what a frame its writer took claimed of the bound.
+    fn taken(&self, queued: Queued) -> Vec<u8> {
         self.state.frames.fetch_sub(1, Ordering::Relaxed);
-        self.state.bytes.fetch_sub(frame.len(), Ordering::Relaxed);
-        Ok(frame)
+        self.state.bytes.fetch_sub(queued.bytes, Ordering::Relaxed);
+        queued.frame
     }
 
     /// The kind of link, for the writer's lines.
@@ -354,6 +379,45 @@ mod tests {
         assert!(link.depth().1 <= LINK_QUEUE_SENDERS_BYTES);
     }
 
+    /// A frame claims the heap its buffer holds, not its length, and its writer gives back what it
+    /// claimed: a buffer `serde_json::to_vec` left near twice the frame counts whole, and a link
+    /// whose writer does not read never holds more heap than its bound. Counted by length, this
+    /// link held twice its bound.
+    #[test]
+    fn a_frame_claims_the_heap_its_buffer_holds_not_its_length() {
+        // A frame as the router builds one around a long string: the buffer took the string's
+        // exact size, then doubled for the closing quote.
+        let frame = || serde_json::to_vec(&"x".repeat(64 * 1024)).expect("a frame");
+        let (len, capacity) = (frame().len(), frame().capacity());
+        assert!(capacity > len + len / 2, "{len} bytes in {capacity}");
+        let (link, mut writer) = link_queue("node");
+        let mut taken = 0;
+        while link.queue(frame()).is_ok() {
+            taken += 1;
+        }
+        assert_eq!(taken, LINK_QUEUE_SENDERS_BYTES / capacity);
+        assert_eq!(link.depth(), (taken, taken * capacity));
+        let held: usize = std::iter::from_fn(|| writer.try_recv().ok())
+            .map(|frame| frame.capacity())
+            .sum();
+        assert_eq!(held, taken * capacity);
+        assert!(held <= LINK_QUEUE_SENDERS_BYTES);
+        assert_eq!(link.depth(), (0, 0), "each frame gave back what it claimed");
+
+        // A place taken and given back, or queued and taken by the writer, counts the same.
+        let mut roomy = Vec::with_capacity(4096);
+        roomy.extend_from_slice(b"a turn");
+        let capacity = roomy.capacity();
+        let slot = link.reserve(roomy.clone()).expect("room");
+        assert_eq!(link.depth(), (1, 6), "a clone's buffer is its length");
+        drop(slot);
+        let slot = link.reserve(roomy).expect("room");
+        assert_eq!(link.depth(), (1, capacity));
+        slot.queue().expect("queued");
+        assert_eq!(writer.try_recv().expect("the frame"), b"a turn".to_vec());
+        assert_eq!(link.depth(), (0, 0));
+    }
+
     /// The router's own frames keep the rest of the bound: they still go on a queue the senders
     /// filled, and are skipped only once it is full.
     #[test]
@@ -381,6 +445,20 @@ mod tests {
         assert!(link.queue_own(vec![b'x'; 1024 * 1024 - 64 * 1024]));
         assert!(!link.queue_own(vec![b'x'; 128 * 1024]));
         assert!(link.depth().1 <= LINK_QUEUE_MAX_BYTES);
+
+        // With the senders' bytes at their bound, the rest takes an LSA at its largest, about
+        // 90 KiB at the LSA region's 1,024 nodes, in a buffer twice that: five of them.
+        let (link, _writer) = link_queue("wan");
+        fill_with(&link, 128 * 1024);
+        assert_eq!(link.depth().1, LINK_QUEUE_SENDERS_BYTES);
+        let lsa = || {
+            let mut lsa = Vec::with_capacity(2 * 90 * 1024);
+            lsa.resize(90 * 1024, b'x');
+            lsa
+        };
+        for _ in 0..5 {
+            assert!(link.queue_own(lsa()), "the rest of the bound takes an LSA");
+        }
     }
 
     /// A link whose writer has stopped takes nothing, full or not, and says it is gone; `closed`

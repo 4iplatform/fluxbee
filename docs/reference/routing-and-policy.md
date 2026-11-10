@@ -56,16 +56,18 @@ envelope in [protocol.md](protocol.md).
     writer, which hands it to the socket. The queue holds at most 1,024 frames or 8 MiB
     (`LINK_QUEUE_MAX_FRAMES`, `LINK_QUEUE_MAX_BYTES`). A sender's message is refused once it holds
     960 frames or 7 MiB (`LINK_QUEUE_SENDERS_FRAMES`, `LINK_QUEUE_SENDERS_BYTES`), and its sender
-    is answered `UNREACHABLE` `LINK_BUSY` (§3.6). The rest is kept for the router's own frames
-    (its answers, LSAs, handshakes), so senders that keep a link at their bound never crowd them
-    out; on a full queue one of them is skipped and no one is answered (§3.7). A frame the queue
-    took is never dropped to make room, and the link is never cut for being full: as its peer
-    reads, the queue drains and takes messages again. The router logs `router did not queue frames
-    for a link whose queue is full (LINK_BUSY)` with the link, its peer, its depth and how many
-    messages it refused and own frames it skipped since the last line, at most once per link every
-    30 s. Until 0.1.129 the queue had no bound: a node that stopped reading without closing (hung,
-    or stuck behind its own full queue) never made a write fail, and every frame for it stayed in
-    the router's memory.
+    is answered `UNREACHABLE` `LINK_BUSY` (§3.6). The bytes are the heap each frame holds, its
+    buffer's capacity, not its length: serialization can leave up to about twice the length
+    allocated, and a frame counts what it holds from the moment it takes its place until its
+    writer takes it. The rest is kept for the router's own frames (its answers, LSAs,
+    handshakes), so senders that keep a link at their bound never crowd them out; on a full queue
+    one of them is skipped and no one is answered (§3.7). A frame the queue took is never dropped
+    to make room, and the link is never cut for being full: as its peer reads, the queue drains
+    and takes messages again. The router logs `router did not queue frames for a link whose queue
+    is full (LINK_BUSY)` with the link, its peer, its depth and how many messages it refused and
+    own frames it skipped since the last line, at most once per link every 30 s. Until 0.1.129 the
+    queue had no bound: a node that stopped reading without closing (hung, or stuck behind its own
+    full queue) never made a write fail, and every frame for it stayed in the router's memory.
 
 ---
 
