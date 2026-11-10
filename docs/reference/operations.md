@@ -170,10 +170,11 @@ What a worker join does (`add_hive_flow`):
    a motherbee that holds none has nothing to copy, and the file arrives through Syncthing once it
    does.
 4. Writes the spoke's `hive.yaml`: uplink to the motherbee's `wan.listen`, `wan.mtls: required`,
-   `identity.sync.upstream` with `auth: required`, the motherbee's blob and dist paths, Syncthing's
-   port and home and the blob GC (`render_worker_hive_yaml`). It writes nothing the release defines
+   `identity.sync.upstream` with `auth: required`, the motherbee's blob and dist paths, and
+   Syncthing's port and home (`render_worker_hive_yaml`). It writes nothing the release defines
    (the role's SY nodes, the blob's and dist's topology): the spoke's orchestrator, of the same
-   release, has them. Nor `ai`: the installation file holds it. Pushes the TLS files to
+   release, has them. Nor `ai`: the installation file holds it. Nor, since 0.1.127, the blob GC:
+   it runs on the motherbee only (FINDINGS A-188). Pushes the TLS files to
    `/var/lib/fluxbee/tls/<hive>/`; on a worker, creates and copies the identity sync key
    (`distribute_hive_identity_key_inner`).
 5. Writes one systemd unit per core service (`core_service_unit_contents`), starts `rt-gateway`
@@ -249,7 +250,8 @@ after the spoke's orchestrator has stopped; an ingress then drops its SSH table
 worker its IPv6 block (`/etc/sysctl.d/99-fluxbee-egress.conf`) and its egress switch's record
 (FINDINGS A-225): IPv6, and the default route its own network configuration gives it, come back at
 its next boot. An egress or ingress the cleanup did not reach keeps them, and the answer's
-`warning` says what to remove from its console. The motherbee then unpairs Syncthing, deletes
+`warning` says what to remove from its console. The motherbee then unpairs Syncthing (the hive
+leaves every `fluxbee-dist*` folder and both blob folders, whatever the blob's flags), deletes
 `hives/<id>/` and the hive's identity key under `/var/lib/fluxbee/identity/keys/`
 (`identity_key_cleanup` in the answer). When the spoke did not answer, the motherbee restarts its
 `sy-identity` to close any session the removed hive still holds (`identity_restart`). The

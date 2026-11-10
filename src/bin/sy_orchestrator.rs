@@ -1005,6 +1005,13 @@ async fn main() -> Result<(), OrchestratorError> {
         identity_sync_port = state.identity_sync_port,
         "blob/dist runtime config loaded"
     );
+    if state.blob.enabled && state.blob.gc_enabled {
+        if let Some(refusal) = blob_gc_refusal(state.is_motherbee) {
+            tracing::warn!(
+                "blob.gc.enabled is on in hive.yaml and the GC does not run here: {refusal}"
+            );
+        }
+    }
     ensure_dirs(
         &config_dir,
         &state_dir,
@@ -8291,11 +8298,12 @@ fn schedule_orchestrator_self_restart() {
 }
 
 /// A worker's hive.yaml, as its join writes it: its identity and control path, the motherbee's
-/// paths, ports and blob GC, and its egress route. What the release defines for the role (its SY
-/// nodes, the blob's and dist's topology) is not written: the worker's orchestrator holds it
+/// paths and ports, and its egress route. What the release defines for the role (its SY nodes, the
+/// blob's and dist's topology) is not written: the worker's orchestrator holds it
 /// (docs/hive-config-update-v1.md §3). Nor is `ai`: the worker's readers read the installation
-/// file, which the join copies to its dist before they first start (§4). Every interpolated scalar
-/// was checked by the caller (`validate_yaml_scalar`).
+/// file, which the join copies to its dist before they first start (§4). Nor is `blob.gc`: the GC
+/// runs on the motherbee only (FINDINGS A-188; §2). Every interpolated scalar was checked by the
+/// caller (`validate_yaml_scalar`).
 fn render_worker_hive_yaml(
     hive_id: &str,
     uplink: &str,
@@ -8307,15 +8315,10 @@ fn render_worker_hive_yaml(
     egress_yaml: &str,
 ) -> String {
     format!(
-        "hive_id: {hive_id}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\ngovernment:\n  identity_frontdesk: \"{identity_frontdesk}\"\nidentity:\n  sync:\n    upstream: \"{identity_sync_upstream}\"\n    auth: required\nblob:\n  path: \"{blob_path}\"\n  sync:\n    api_port: {api_port}\n    data_dir: \"{data_dir}\"\n  gc:\n    enabled: {gc_enabled}\n    interval_secs: {gc_interval_secs}\n    apply: {gc_apply}\n    staging_ttl_hours: {gc_staging_ttl_hours}\n    active_retain_days: {gc_active_retain_days}\ndist:\n  path: \"{dist_path}\"\n{egress_yaml}",
+        "hive_id: {hive_id}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\ngovernment:\n  identity_frontdesk: \"{identity_frontdesk}\"\nidentity:\n  sync:\n    upstream: \"{identity_sync_upstream}\"\n    auth: required\nblob:\n  path: \"{blob_path}\"\n  sync:\n    api_port: {api_port}\n    data_dir: \"{data_dir}\"\ndist:\n  path: \"{dist_path}\"\n{egress_yaml}",
         blob_path = blob.path.display(),
         api_port = blob.sync_api_port,
         data_dir = blob.sync_data_dir.display(),
-        gc_enabled = blob.gc_enabled,
-        gc_interval_secs = blob.gc_interval_secs,
-        gc_apply = blob.gc_apply,
-        gc_staging_ttl_hours = blob.gc_staging_ttl_hours,
-        gc_active_retain_days = blob.gc_active_retain_days,
         dist_path = dist.path.display(),
     )
 }
@@ -17424,26 +17427,18 @@ fn remove_syncthing_top_level_device_from_config_xml(
 
 fn reconcile_syncthing_peer_removal_xml(
     config_xml: &str,
-    blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
 ) -> Result<(String, bool), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed = false;
 
-    if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    // Both blob folders, whatever the blob's flags say (docs/hive-config-update-v1.md §8, T-21): a
+    // folder the hive was linked to stays in config.xml after its flag goes off, and a removed
+    // hive must not keep receiving its blobs.
+    for folder_id in [SYNCTHING_FOLDER_BLOB_ID, SYNCTHING_FOLDER_BLOB_PUBLIC_ID] {
         let (next, folder_changed) =
-            remove_syncthing_folder_device(&updated, SYNCTHING_FOLDER_BLOB_ID, peer_device_id)?;
-        updated = next;
-        changed |= folder_changed;
-    }
-
-    if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
-        let (next, folder_changed) = remove_syncthing_folder_device(
-            &updated,
-            SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
-            peer_device_id,
-        )?;
+            remove_syncthing_folder_device(&updated, folder_id, peer_device_id)?;
         updated = next;
         changed |= folder_changed;
     }
@@ -17471,19 +17466,17 @@ fn reconcile_syncthing_peer_removal_xml(
 
 fn ensure_local_syncthing_peer_unlink(
     sync: &BlobRuntimeConfig,
-    blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     update_syncthing_config(&config_path, |current| {
-        reconcile_syncthing_peer_removal_xml(current, blob, dist, peer_device_id)
+        reconcile_syncthing_peer_removal_xml(current, dist, peer_device_id)
     })
 }
 
 async fn ensure_syncthing_peer_unlink_runtime(
     sync: &BlobRuntimeConfig,
-    blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
@@ -17494,7 +17487,7 @@ async fn ensure_syncthing_peer_unlink_runtime(
     if !(blob_sync_tool_is_syncthing(sync) || dist_sync_tool_is_syncthing(dist)) {
         return Ok(false);
     }
-    let changed = ensure_local_syncthing_peer_unlink(sync, blob, dist, peer_device_id)?;
+    let changed = ensure_local_syncthing_peer_unlink(sync, dist, peer_device_id)?;
     if !changed {
         return Ok(false);
     }
@@ -17596,6 +17589,16 @@ fn reconcile_syncthing_folders_xml(
         // follow runtimes' (FINDINGS A-72). Peer links are written only when a hive joins
         // (add_hive / finalize); without this a folder added by a later release would stay local
         // on the hives that joined before it.
+        //
+        // The blob folders follow the dist folder with their audience the same way
+        // (docs/hive-config-update-v1.md §8, FINDINGS A-181): `fluxbee-blob` the workers',
+        // runtimes', and `fluxbee-blob-public` the ingress's core folder. A hive that joined while
+        // the blob sync was off gets them, and a blob folder this hive does not declare takes no
+        // one.
+        let ingress_core = format!(
+            "{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}",
+            HiveRole::Ingress.as_str()
+        );
         for (members_of, folder_id) in [
             (
                 SYNCTHING_FOLDER_DIST_VENDOR_ID,
@@ -17609,6 +17612,8 @@ fn reconcile_syncthing_folders_xml(
                 SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
                 SYNCTHING_FOLDER_DIST_AGENT_ASSETS_ID,
             ),
+            (SYNCTHING_FOLDER_DIST_RUNTIMES_ID, SYNCTHING_FOLDER_BLOB_ID),
+            (ingress_core.as_str(), SYNCTHING_FOLDER_BLOB_PUBLIC_ID),
         ] {
             for device_id in syncthing_folder_device_ids(&updated, members_of)? {
                 if !valid_syncthing_device_id(&device_id) {
@@ -21741,7 +21746,6 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
         match ensure_syncthing_peer_unlink_runtime(
             &desired_sync,
-            &desired_blob,
             &desired_dist,
             peer_device_id,
             hive_id,
@@ -22544,11 +22548,29 @@ async fn should_run_blob_gc(
     true
 }
 
+/// FINDINGS A-188: why the blob GC does not run on this hive; None on the motherbee. The GC pins
+/// the sources of live publications from io.blob's ledger, which only the motherbee holds: a
+/// spoke's would run with no pins, and its deletions in `blob/active` would reach the motherbee's
+/// published sources through `fluxbee-blob`, a send-receive folder.
+fn blob_gc_refusal(is_motherbee: bool) -> Option<&'static str> {
+    (!is_motherbee).then_some(
+        "the blob GC runs only on the motherbee, where io.blob's publication ledger pins the \
+         sources of live publications (FINDINGS A-188)",
+    )
+}
+
 fn run_blob_gc_housekeeping(
-    _state: &OrchestratorState,
+    state: &OrchestratorState,
     blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
     if !(blob.enabled && blob.gc_enabled) {
+        return Ok(());
+    }
+    if let Some(refusal) = blob_gc_refusal(state.is_motherbee) {
+        tracing::warn!(
+            hive = %state.hive_id,
+            "blob.gc.enabled is on in hive.yaml and nothing was collected: {refusal}"
+        );
         return Ok(());
     }
     let toolkit = BlobToolkit::new(SdkBlobConfig {
@@ -45728,11 +45750,10 @@ blob:
     #[test]
     fn reconcile_syncthing_peer_removal_removes_peer_from_top_level_and_folders() {
         let config = sample_syncthing_config_with_peer();
-        let blob = sample_blob_config();
         let dist = sample_dist_config();
 
         let (updated, changed) =
-            reconcile_syncthing_peer_removal_xml(&config, &blob, &dist, PEER_DEVICE_ID)
+            reconcile_syncthing_peer_removal_xml(&config, &dist, PEER_DEVICE_ID)
                 .expect("peer removal must succeed");
 
         assert!(changed);
@@ -45752,15 +45773,11 @@ blob:
             local = LOCAL_DEVICE_ID,
             public = SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
         );
-        let mut blob = sample_blob_config();
-        blob.enabled = false;
-        blob.sync_enabled = false;
-        blob.public_sync_enabled = true;
         let mut dist = sample_dist_config();
         dist.sync_enabled = false;
 
         let (updated, changed) =
-            reconcile_syncthing_peer_removal_xml(&config, &blob, &dist, PEER_DEVICE_ID)
+            reconcile_syncthing_peer_removal_xml(&config, &dist, PEER_DEVICE_ID)
                 .expect("peer removal must succeed");
 
         assert!(changed);
@@ -45795,11 +45812,10 @@ blob:
     #[test]
     fn reconcile_syncthing_peer_removal_noop_when_peer_missing() {
         let config = sample_syncthing_config_with_peer().replace(PEER_DEVICE_ID, "");
-        let blob = sample_blob_config();
         let dist = sample_dist_config();
 
         let (updated, changed) =
-            reconcile_syncthing_peer_removal_xml(&config, &blob, &dist, PEER_DEVICE_ID)
+            reconcile_syncthing_peer_removal_xml(&config, &dist, PEER_DEVICE_ID)
                 .expect("peer removal must succeed");
 
         assert!(!changed);
@@ -46040,6 +46056,299 @@ blob:
         )));
     }
 
+    // --- Stage 5 (docs/hive-config-update-v1.md §8): the blob folders' members, and A-188 ---
+
+    /// The blob as the release has it on `role` (§3), with the sample's paths and ports.
+    fn blob_config_of_role(role: HiveRole) -> BlobRuntimeConfig {
+        let topology = role.settings().blob;
+        BlobRuntimeConfig {
+            enabled: topology.enabled,
+            sync_enabled: topology.sync_enabled,
+            public_sync_enabled: topology.public_sync_enabled,
+            sync_tool: topology.sync_tool.to_string(),
+            ..sample_blob_config()
+        }
+    }
+
+    /// One `<folder>` of a config.xml with these members.
+    fn folder_with_members(id: &str, path: &str, kind: &str, members: &[&str]) -> String {
+        let devices: String = members
+            .iter()
+            .map(|device| format!("    <device id=\"{device}\" introducedBy=\"\"/>\n"))
+            .collect();
+        let open = format!("<folder id=\"{id}\" label=\"{id}\" path=\"{path}\" type=\"{kind}\">");
+        format!("  {open}\n{devices}  </folder>\n")
+    }
+
+    /// FINDINGS A-181: a hive that joined while the blob sync was off gets both blob folders at its
+    /// next reconcile, on both ends, shared as the dist folder with their audience is:
+    /// `fluxbee-blob` with `fluxbee-dist-runtimes`' members (the workers), `fluxbee-blob-public`
+    /// with the ingress' core folder's. No device reaches a blob folder its role does not get, and
+    /// a role whose topology has no blob folder declares none.
+    #[test]
+    fn the_blob_folders_follow_the_dist_folders_with_their_audience() {
+        const WORKER: &str = "WORKER-DEVICE-ID-1234567890";
+        const INGRESS: &str = "INGRESS-DEVICE-ID-1234567890";
+        const EGRESS: &str = "EGRESS-DEVICE-ID-1234567890";
+        let dist = sample_dist_config();
+        let core = |role: HiveRole| format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}", role.as_str());
+        let local = LOCAL_DEVICE_ID;
+        // The motherbee as the joins left it with the blob sync off: the dist folders hold their
+        // spokes, and there is no blob folder at all.
+        let motherbee = [
+            "<configuration version=\"37\">\n".to_string(),
+            format!("  <device id=\"{local}\" name=\"motherbee\"></device>\n"),
+            format!("  <device id=\"{WORKER}\" name=\"worker-1\"></device>\n"),
+            format!("  <device id=\"{INGRESS}\" name=\"ingress-1\"></device>\n"),
+            format!("  <device id=\"{EGRESS}\" name=\"egress-1\"></device>\n"),
+            folder_with_members(
+                SYNCTHING_FOLDER_DIST_VENDOR_ID,
+                "/var/lib/fluxbee/dist/vendor",
+                "sendonly",
+                &[local, WORKER, INGRESS, EGRESS],
+            ),
+            folder_with_members(
+                SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
+                "/var/lib/fluxbee/dist/runtimes",
+                "sendonly",
+                &[local, WORKER],
+            ),
+            folder_with_members(
+                &core(HiveRole::Worker),
+                "/var/lib/fluxbee/dist/core/worker",
+                "sendonly",
+                &[local, WORKER],
+            ),
+            folder_with_members(
+                &core(HiveRole::Ingress),
+                "/var/lib/fluxbee/dist/core/ingress",
+                "sendonly",
+                &[local, INGRESS],
+            ),
+            folder_with_members(
+                &core(HiveRole::Egress),
+                "/var/lib/fluxbee/dist/core/egress",
+                "sendonly",
+                &[local, EGRESS],
+            ),
+            "</configuration>\n".to_string(),
+        ]
+        .concat();
+        // A spoke as its join left it: the motherbee on its dist folders, no blob folder.
+        let spoke = |role: HiveRole| {
+            let mut config = vec![
+                "<configuration version=\"37\">\n".to_string(),
+                format!("  <device id=\"{local}\" name=\"spoke\"></device>\n"),
+                format!("  <device id=\"{PEER_DEVICE_ID}\" name=\"motherbee\"></device>\n"),
+                folder_with_members(
+                    SYNCTHING_FOLDER_DIST_VENDOR_ID,
+                    "/var/lib/fluxbee/dist/vendor",
+                    "receiveonly",
+                    &[local, PEER_DEVICE_ID],
+                ),
+                folder_with_members(
+                    &core(role),
+                    "/var/lib/fluxbee/dist/core",
+                    "receiveonly",
+                    &[local, PEER_DEVICE_ID],
+                ),
+            ];
+            if role == HiveRole::Worker {
+                config.push(folder_with_members(
+                    SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
+                    "/var/lib/fluxbee/dist/runtimes",
+                    "receiveonly",
+                    &[local, PEER_DEVICE_ID],
+                ));
+            }
+            config.push("</configuration>\n".to_string());
+            config.concat()
+        };
+        let members = |config: &str, folder: &str| {
+            syncthing_folder_device_ids(config, folder).expect("the folder's members")
+        };
+        let declares =
+            |config: &str, folder: &str| config.contains(&format!("<folder id=\"{folder}\""));
+        for (is_motherbee, role, joined_before, blob_members, public_members) in [
+            (
+                true,
+                HiveRole::Motherbee,
+                motherbee.clone(),
+                Some(vec![local, WORKER]),
+                Some(vec![local, INGRESS]),
+            ),
+            (
+                false,
+                HiveRole::Worker,
+                spoke(HiveRole::Worker),
+                Some(vec![local, PEER_DEVICE_ID]),
+                None,
+            ),
+            (
+                false,
+                HiveRole::Ingress,
+                spoke(HiveRole::Ingress),
+                None,
+                Some(vec![local, PEER_DEVICE_ID]),
+            ),
+            (false, HiveRole::Egress, spoke(HiveRole::Egress), None, None),
+        ] {
+            let blob = blob_config_of_role(role);
+            let (updated, changed) =
+                reconcile_syncthing_folders_xml(&joined_before, &blob, &dist, is_motherbee, role)
+                    .expect("folder reconcile must succeed");
+            for (folder, expected) in [
+                (SYNCTHING_FOLDER_BLOB_ID, &blob_members),
+                (SYNCTHING_FOLDER_BLOB_PUBLIC_ID, &public_members),
+            ] {
+                match expected {
+                    Some(expected) => {
+                        assert!(
+                            changed.iter().any(|id| id == folder),
+                            "{} {folder}: {changed:?}",
+                            role.as_str()
+                        );
+                        assert_eq!(
+                            &members(&updated, folder),
+                            expected,
+                            "{} {folder}",
+                            role.as_str()
+                        );
+                    }
+                    None => assert!(!declares(&updated, folder), "{} {folder}", role.as_str()),
+                }
+            }
+            let (again, changed_again) =
+                reconcile_syncthing_folders_xml(&updated, &blob, &dist, is_motherbee, role)
+                    .expect("second reconcile must succeed");
+            assert!(
+                changed_again.is_empty(),
+                "{}: not idempotent: {changed_again:?}",
+                role.as_str()
+            );
+            assert_eq!(again, updated);
+        }
+        // A device taken out of a blob folder by hand is back at the next reconcile.
+        let blob = blob_config_of_role(HiveRole::Motherbee);
+        let (linked, _) =
+            reconcile_syncthing_folders_xml(&motherbee, &blob, &dist, true, HiveRole::Motherbee)
+                .expect("folder reconcile must succeed");
+        let (taken_out, _) =
+            remove_syncthing_folder_device(&linked, SYNCTHING_FOLDER_BLOB_ID, WORKER)
+                .expect("the device leaves the folder");
+        assert_eq!(members(&taken_out, SYNCTHING_FOLDER_BLOB_ID), vec![local]);
+        let (restored, changed) =
+            reconcile_syncthing_folders_xml(&taken_out, &blob, &dist, true, HiveRole::Motherbee)
+                .expect("folder reconcile must succeed");
+        assert_eq!(changed, vec![SYNCTHING_FOLDER_BLOB_ID.to_string()]);
+        assert_eq!(
+            members(&restored, SYNCTHING_FOLDER_BLOB_ID),
+            vec![local, WORKER]
+        );
+    }
+
+    /// docs/hive-config-update-v1.md §8 (T-21): a removed hive leaves both blob folders whatever
+    /// the blob's flags, as it leaves every dist folder: a folder it was linked to stays in
+    /// config.xml after a flag goes off.
+    #[test]
+    fn a_removed_hive_leaves_both_blob_folders_whatever_the_flags() {
+        let local = LOCAL_DEVICE_ID;
+        let config = [
+            "<configuration version=\"37\">\n".to_string(),
+            format!("  <device id=\"{local}\" name=\"motherbee\"></device>\n"),
+            format!("  <device id=\"{PEER_DEVICE_ID}\" name=\"spoke-1\"></device>\n"),
+            folder_with_members(
+                SYNCTHING_FOLDER_BLOB_ID,
+                "/var/lib/fluxbee/blob/active",
+                "sendreceive",
+                &[local, PEER_DEVICE_ID],
+            ),
+            folder_with_members(
+                SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+                "/var/lib/fluxbee/blob/public",
+                "sendonly",
+                &[local, PEER_DEVICE_ID],
+            ),
+            folder_with_members(
+                SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
+                "/var/lib/fluxbee/dist/runtimes",
+                "sendonly",
+                &[local, PEER_DEVICE_ID],
+            ),
+            "</configuration>\n".to_string(),
+        ]
+        .concat();
+        let (removed, changed) =
+            reconcile_syncthing_peer_removal_xml(&config, &sample_dist_config(), PEER_DEVICE_ID)
+                .expect("peer removal must succeed");
+        assert!(changed);
+        for folder in [
+            SYNCTHING_FOLDER_BLOB_ID,
+            SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+            SYNCTHING_FOLDER_DIST_RUNTIMES_ID,
+        ] {
+            assert_eq!(
+                syncthing_folder_device_ids(&removed, folder).expect("the folder's members"),
+                vec![local],
+                "{folder}"
+            );
+        }
+        assert!(!removed.contains(PEER_DEVICE_ID));
+    }
+
+    /// FINDINGS A-188: the blob GC runs only on the motherbee, where io.blob's ledger pins the
+    /// sources of live publications. A worker's `blob.gc.enabled`, turned on by hand, deletes
+    /// nothing; the same GC on the motherbee does its work. A worker's join writes no `blob.gc`.
+    #[test]
+    fn the_blob_gc_runs_only_on_the_motherbee() {
+        assert!(blob_gc_refusal(true).is_none());
+        assert!(blob_gc_refusal(false).is_some_and(|refusal| refusal.contains("A-188")));
+        let root = std::env::temp_dir().join(format!("fluxbee-a188-{}", Uuid::new_v4().simple()));
+        let prefix = root.join("staging").join("ab");
+        fs::create_dir_all(&prefix).expect("staging prefix");
+        // An unfinished put's leftover, past its TTL.
+        let leftover = prefix.join(".report_0123456789abcdef.pdf.0001.tmp");
+        fs::write(&leftover, b"unfinished put").expect("leftover");
+        fs::File::options()
+            .write(true)
+            .open(&leftover)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::now() - Duration::from_secs(48 * 3600))
+            })
+            .expect("an old mtime");
+        let mut blob = sample_blob_config();
+        blob.path = root.clone();
+        blob.gc_enabled = true;
+        blob.gc_apply = true;
+        blob.gc_staging_ttl_hours = 1;
+        let mut worker = sample_orchestrator_state_for_tests();
+        worker.hive_id = "worker1".to_string();
+        worker.is_motherbee = false;
+        worker.role = HiveRole::Worker;
+        run_blob_gc_housekeeping(&worker, &blob).expect("a refusal is no error");
+        assert!(leftover.exists(), "a worker's GC deletes nothing");
+        run_blob_gc_housekeeping(&sample_orchestrator_state_for_tests(), &blob)
+            .expect("the motherbee's GC runs");
+        assert!(!leftover.exists(), "the motherbee's GC does its work");
+        let _ = fs::remove_dir_all(&root);
+
+        let written = render_worker_hive_yaml(
+            "worker9",
+            "10.0.0.1:9000",
+            "/var/lib/fluxbee",
+            "SY.frontdesk.gov@motherbee",
+            "10.0.0.1:9100",
+            &blob,
+            &sample_dist_config(),
+            "",
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&written).expect("yaml");
+        assert!(value["blob"].get("gc").is_none(), "{written}");
+        assert!(value["blob"].get("path").is_some(), "{written}");
+        let hive: HiveFile = serde_yaml::from_str(&written).expect("the orchestrator reads it");
+        assert!(!blob_runtime_from_hive(&hive, HiveRole::Worker).gc_enabled);
+    }
+
     // --- The installation file (docs/hive-config-update-v1.md §4, stage 3b) ---
 
     /// Every role gets the installation file's folder, on `dist/installation` where the SDK places
@@ -46148,7 +46457,7 @@ blob:
 
             // remove_hive unlinks it with every other dist folder.
             let (removed, removal_changed) =
-                reconcile_syncthing_peer_removal_xml(&updated, &blob, &dist, PEER_DEVICE_ID)
+                reconcile_syncthing_peer_removal_xml(&updated, &dist, PEER_DEVICE_ID)
                     .expect("peer removal must succeed");
             assert!(removal_changed);
             assert_eq!(

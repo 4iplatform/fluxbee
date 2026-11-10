@@ -579,8 +579,8 @@ match. What happens then is each caller's (`VendorPolicy`, FINDINGS A-189):
 | `fluxbee-dist-installation` | `dist/installation`: the installation file ([The installation file](#the-installation-file)) | every spoke |
 | `fluxbee-dist-runtimes` | runtime packages | workers only |
 | `fluxbee-dist-agent-assets` | `blob/agent-assets`: SY.architect's agent assets, which ai.generic reads from disk | workers only |
-| `fluxbee-blob` | `blob/active` | workers only, when the motherbee's blob sync is on, as the release has it (`peer_shares_active_blob`) |
-| `fluxbee-blob-public` | `blob/public` | the ingress only (`peer_shares_public_blob`) |
+| `fluxbee-blob` | `blob/active` | workers only, as the release has it (`peer_shares_active_blob`), following `fluxbee-dist-runtimes`' members |
+| `fluxbee-blob-public` | `blob/public` | the ingress only (`peer_shares_public_blob`), following `fluxbee-dist-core-ingress`' members |
 
 Dist folders and `fluxbee-blob-public` are `sendonly` on the motherbee and `receiveonly` on the
 spokes (`dist_syncthing_folder_type`, `blob_public_syncthing_folder_type`), so a spoke never
@@ -589,12 +589,18 @@ writes them. `fluxbee-blob` is `sendreceive`.
 A folder added by a later release reaches the hives that joined before it at their next local
 reconcile, without a re-join (`reconcile_syncthing_folders_xml`): `fluxbee-dist-policy` and
 `fluxbee-dist-installation` are shared with every member of `fluxbee-dist-vendor`, and
-`fluxbee-dist-agent-assets` with every member of `fluxbee-dist-runtimes`. A join links a new spoke
-to each, and `remove_hive` takes it out of every `fluxbee-dist*` folder the config holds. The
-agent-assets tree is owned like a dist tree (`ensure_dirs`): root's on
-the motherbee, readable by the `fluxbee` group, and the `fluxbee` user's on a worker, where
-Syncthing writes what it receives (FINDINGS A-72). `blob/` itself is no folder, so a file written
-there and renamed into `blob/agent-assets` is never sent half-written.
+`fluxbee-dist-agent-assets` with every member of `fluxbee-dist-runtimes`. Since 0.1.127 the blob
+folders follow the same way ([hive-config-update-v1](../hive-config-update-v1.md) §8, FINDINGS
+A-181): `fluxbee-blob` every member of `fluxbee-dist-runtimes`, and `fluxbee-blob-public` every
+member of `fluxbee-dist-core-ingress`, on the hives whose role declares them. A hive that joined
+while the blob sync was off gets them, and a device taken out of one by hand is back at the next
+reconcile: each start of the orchestrator, and a watchdog repair of an unhealthy folder. A join
+links a new spoke to each, and `remove_hive` takes it out of every `fluxbee-dist*` folder the
+config holds and out of both blob folders, whatever the blob's flags. The agent-assets tree is
+owned like a dist tree (`ensure_dirs`): root's on the motherbee, readable by the `fluxbee` group,
+and the `fluxbee` user's on a worker, where Syncthing writes what it receives (FINDINGS A-72).
+`blob/` itself is no folder, so a file written there and renamed into `blob/agent-assets` is never
+sent half-written.
 
 ## The installation file
 
@@ -836,10 +842,11 @@ SY.admin sends them to the motherbee's orchestrator, which answers from a task o
 Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every SY service of its
 role's list with `systemctl is-active`, and runs `systemctl start` on any that is not
 active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
-the router, verifies runtimes, runs blob GC when enabled, checks Syncthing and its peers, re-applies
-egress and the ingress' SSH table, reports an active host firewall (`watchdog_host_rules`), and runs
-the loopback check. Its egress step skips while an egress switch is open on a worker (A-219): the
-switch owns the route until it commits or reverts. While a join runs, its Syncthing is the join's:
+the router, verifies runtimes, runs the blob GC when enabled (on the motherbee only, FINDINGS
+A-188), checks Syncthing and its peers, re-applies egress and the ingress' SSH table, reports an
+active host firewall (`watchdog_host_rules`), and runs the loopback check. Its egress step skips
+while an egress switch is open on a worker (A-219): the switch owns the route until it commits or
+reverts. While a join runs, its Syncthing is the join's:
 the motherbee's while an `add_hive` or `remove_hive` is in flight, a spoke's while its finalize
 runs. The Syncthing check and the peer reconcile leave it alone until the join is done, and the
 check asks again right before it restarts Syncthing (`a_join_owns_syncthing`, FINDINGS A-194).
@@ -969,7 +976,8 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 `/etc/fluxbee/hive.yaml` (`HiveFile`), the hive's own: `hive_id`, `role`, `wan` (`gateway_name`,
 default `RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`path`, default
 `/var/lib/fluxbee/blob`; `sync.api_port`, default 8384; `sync.data_dir`, default
-`/var/lib/fluxbee/syncthing`; `gc`), `dist.path` (default `/var/lib/fluxbee/dist`),
+`/var/lib/fluxbee/syncthing`; `gc`, read on the motherbee only: on a spoke the GC never runs, and
+its start and each GC tick say so, FINDINGS A-188), `dist.path` (default `/var/lib/fluxbee/dist`),
 `identity.sync.port` (default 9100), `government`, `egress` (with `reachability_url`, the
 internet probe's target, no default; and `ssh_from_wan`, default true), `ingress.ssh_allow_from`
 (the ingress' extra SSH sources), `ai`, read untyped: on the motherbee it is the installation

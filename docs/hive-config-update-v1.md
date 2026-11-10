@@ -25,7 +25,9 @@
   on disk, with its automatic step (§6, "As built (stage 4)"). `ops.py deploy` calls it from
   0.1.123 on. Its gates passed: the deploy through it, egress1 away across a config change and
   finished once by the automatic step, and a rolled-back egress1 held and left alone by it.
-- **Next:** stage 5 (§10).
+- **Stage 5 is built for 0.1.127** (§8, "As built (stage 5)"): the blob folders follow the dist
+  folders' members, a removed hive leaves both whatever the flags, and the blob GC runs only on the
+  motherbee. Its gate is next (§10).
 
 This is the single place for the topic.
 
@@ -801,6 +803,29 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   - Removing a hive takes it out of both folders, flags or not (T-21).
 - **A-188:** the blob GC runs only where it can pin publications, on the motherbee.
 
+### As built (stage 5)
+
+- **The members** (`reconcile_syncthing_folders_xml`, A-72's pattern): every hive's folder
+  reconcile copies each member of `fluxbee-dist-runtimes` into `fluxbee-blob`, and each member of
+  `fluxbee-dist-core-ingress` into `fluxbee-blob-public`, where the hive declares that blob folder
+  (its role's topology, §3).
+  - On the motherbee the members are the workers and the ingress; on a worker and on the ingress,
+    the motherbee. The egress declares neither folder, and a device is copied only from the
+    folder that already has the audience, so no hive reaches a blob folder its role does not get.
+  - The reconcile only adds, as A-72's does. It runs at each start of the orchestrator, and when
+    the watchdog repairs an unhealthy folder: a device taken out of a blob folder by hand comes back
+    at the next start. The peer reconcile still takes a spoke out of a folder its role must never
+    have (`folder_forbidden_for_role`).
+- **A removal** (`reconcile_syncthing_peer_removal_xml`): the hive leaves `fluxbee-blob` and
+  `fluxbee-blob-public` whenever it is in them, whatever the blob's flags, as it leaves every
+  `fluxbee-dist*` folder.
+- **The blob GC** (`run_blob_gc_housekeeping`, `blob_gc_refusal`): it runs on the motherbee only.
+  A spoke whose `hive.yaml` turns it on says so at its start, and again each time the GC would have
+  run, and deletes nothing. A worker's join no longer writes `blob.gc` (§2: it never travels);
+  worker1's `blob.gc`, written at its join, stays and is not read.
+- **Not changed:** a worker's `staging/` is not cleaned, as before (its GC was off); a cleanup of a
+  spoke's own unfinished puts, which never leave it, would be a decision of its own.
+
 ## 9. The operator's calls (2026-11-08)
 
 - **On the first draft:**
@@ -881,8 +906,14 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
 5. **A-181's blob members, and A-188.**
    - A-72's tests for both blob folders, and a removal without flags.
    - Gate: a throwaway worker. Its device is taken out of `fluxbee-blob` through Syncthing's REST;
-     the reconcile must restore it, and `remove_hive` must leave both folders. It needs A-190
-     fixed first: a fresh worker cannot join today.
+     the reconcile must restore it, and `remove_hive` must leave both folders. It needed A-190
+     fixed first, which 0.1.118 did (a throwaway worker joined end to end in 0.1.119's gate).
+   - Built for 0.1.127 (§8, "As built (stage 5)"), with its tests: both blob folders follow their
+     dist folder on each role's end, a hive joined while the blob sync was off included, and a
+     device taken out by hand comes back; a removed hive leaves both whatever the flags; the GC
+     deletes nothing off the motherbee, and the worker's join writes no `blob.gc`. The reconcile
+     that restores a device runs at the orchestrator's start, so the gate restarts the motherbee's
+     orchestrator after it takes the device out.
 
 ## 11. The DTAP panel (2026-11-08)
 

@@ -609,12 +609,14 @@ In multi-island v2.x, it is also recommended to confirm propagation before emitt
 
 ## 9. GC (Garbage Collection)
 
-The GC is implemented in `fluxbee_sdk::blob` (`BlobToolkit::run_gc`) and run by `SY.orchestrator`'s watchdog on its own hive (`run_blob_gc_housekeeping`), with two phases:
+The GC is implemented in `fluxbee_sdk::blob` (`BlobToolkit::run_gc`) and run by `SY.orchestrator`'s watchdog on the motherbee only (`run_blob_gc_housekeeping`), with two phases:
 
 - `staging/` cleanup by TTL (`staging_ttl_hours`, default `24h`), unfinished puts' temporaries included.
 - Conservative `active/` GC by retention (`active_retain_days`, default `30d`).
 
-It is set in `hive.yaml`, `blob.gc`:
+**Only on the motherbee** (FINDINGS A-188, since 0.1.127): the GC pins the sources of live publications from IO.blob's ledger, which only the motherbee holds. A worker's GC would run with no pins, and its deletions in `active/` would reach the motherbee's published sources through `fluxbee-blob`, a send-receive folder. A spoke whose `hive.yaml` turns it on says at its start that it does not run there, and each time it would have run (`blob_gc_refusal`); a worker's join no longer writes `blob.gc`.
+
+It is set in the motherbee's `hive.yaml`, `blob.gc`:
 
 - `enabled` (default `false`): the GC runs only when it is on;
 - `interval_secs` (default `3600`, at least `60`);
