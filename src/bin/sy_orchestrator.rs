@@ -400,6 +400,9 @@ struct IdentitySection {
 #[derive(Debug, Deserialize)]
 struct IdentitySyncSection {
     port: Option<u16>,
+    /// On a worker, the motherbee's identity sync (`host:port`), with its WAN uplink's host: the
+    /// egress switch's guard reads it (A-219, `egress_uplink_hosts`).
+    upstream: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,7 +663,8 @@ struct OrchestratorState {
     last_blob_gc: Mutex<Instant>,
     identity_sync_port: u16,
     system_nodes: RoleSystemNodes,
-    egress: Option<EgressSection>,
+    /// hive.yaml's `egress`, read at the start, and the egress switch open on a worker (A-219).
+    egress: EgressState,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     /// The motherbee only: why its start did not write the installation file's first version
@@ -969,7 +973,7 @@ async fn main() -> Result<(), OrchestratorError> {
         last_blob_gc: Mutex::new(Instant::now()),
         identity_sync_port,
         system_nodes,
-        egress: hive.egress.clone(),
+        egress: EgressState::new(hive.egress.clone()),
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         installation_not_written: std::sync::Mutex::new(None),
@@ -1735,6 +1739,11 @@ async fn bootstrap_local(
     report_active_host_firewalls(&state.hive_id);
     if state.role == HiveRole::Ingress {
         reconcile_ingress_ssh(state);
+    }
+    // A-219: an egress switch the last run left open is finished before the boot applies the
+    // section (docs/edge-egress-nat-spec.md §15.3).
+    if state.role == HiveRole::Worker {
+        resume_egress_switch(state);
     }
     if let Err(err) = reconcile_egress(state) {
         if state.role == HiveRole::Egress {
@@ -3118,9 +3127,16 @@ const EGRESS_RECONCILE_DRIFT_TICKS: u64 = 12;
 /// `ip route replace` (no-op when already correct) plus a periodic IPv6-sysctl
 /// re-assert.
 fn watchdog_egress_reconcile(state: &OrchestratorState) {
-    let Some(eg) = state.egress.as_ref() else {
+    // A-219: an egress switch open on this worker owns its route and its IPv6 until it commits or
+    // reverts. On a worker already behind another gateway, this step would put the old route back
+    // within 5 s of the switch.
+    if state.egress.switch_open() {
+        return;
+    }
+    let Some(eg) = state.egress.section() else {
         return;
     };
+    let eg = &eg;
     // F6: periodic idempotent drift correction on top of the cheap table-missing
     // fast path. `tick % N == 0` fires on the first tick and then every N ticks.
     let tick = EGRESS_RECONCILE_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -3173,6 +3189,7 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                         ) {
                             tracing::warn!(
                                 reachability_url = eg.reachability_url.as_deref().unwrap_or_default(),
+                                internet_failure = v.internet_failure.as_deref().unwrap_or_default(),
                                 "egress NAT healthy but internet unreachable — DEGRADED; check WAN uplink"
                             );
                             append_drift_alert(
@@ -3265,20 +3282,28 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
 /// a kill switch that any orchestrator, the DMZ ingress included, could pull: ADD_HIVE_FINALIZE
 /// restarts the whole core and links a Syncthing device the sender chooses, and
 /// REMOVE_HIVE_CLEANUP stops and disables every core service. So the motherbee refuses them
-/// (FINDINGS A-48; DTAP round 3, D3-3 and P3-3).
-const SPOKE_ONLY_SYSTEM_ACTIONS: &[&str] = &["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"];
+/// (FINDINGS A-48; DTAP round 3, D3-3 and P3-3). SYSTEM_EGRESS_ROUTE rewrites a worker's default
+/// route, and Fluxbee never rewrites the motherbee's (PB-8; docs/edge-egress-nat-spec.md §15).
+const SPOKE_ONLY_SYSTEM_ACTIONS: &[&str] = &[
+    "ADD_HIVE_FINALIZE",
+    "REMOVE_HIVE_CLEANUP",
+    "SYSTEM_EGRESS_ROUTE",
+];
 
 /// The refusal payload when `action` is spoke-only and this hive is the motherbee.
 fn spoke_only_action_refusal(action: &str, is_motherbee: bool) -> Option<serde_json::Value> {
     if !is_motherbee || !SPOKE_ONLY_SYSTEM_ACTIONS.contains(&action) {
         return None;
     }
+    let message = if action == MSG_SYSTEM_EGRESS_ROUTE {
+        format!("{action} runs only on a worker, never on the motherbee, whose route Fluxbee never rewrites (PB-8)")
+    } else {
+        format!("{action} runs only on the hive being added or removed, never on the motherbee")
+    };
     Some(serde_json::json!({
         "status": "error",
         "error_code": "FORBIDDEN",
-        "message": format!(
-            "{action} runs only on the hive being added or removed, never on the motherbee"
-        ),
+        "message": message,
     }))
 }
 
@@ -3471,7 +3496,12 @@ async fn handle_admin(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
             let payload = if let Some(path) = path {
-                match persist_storage_path_in_hive(&state.config_dir, &path) {
+                // hive.yaml's writers take one lock (A-219: an egress switch's commit is another).
+                let persisted = {
+                    let _hive_yaml = lock_hive_yaml();
+                    persist_storage_path_in_hive(&state.config_dir, &path)
+                };
+                match persisted {
                     Ok(()) => serde_json::json!({
                         "status": "ok",
                         "path": path,
@@ -3646,6 +3676,21 @@ async fn handle_admin(
             // PB-7: accept and return; the join runs in the background so the serial admin
             // channel stays free. The B-2 revoke tails moved INTO the background task.
             accept_add_hive(state_arc, &msg.payload).await
+        }
+        // A-219: a worker behind the egress, or back (docs/edge-egress-nat-spec.md §15).
+        "set_hive_egress" | "clear_hive_egress" => {
+            if !state.is_motherbee {
+                return send_admin_forbidden(
+                    sender,
+                    msg,
+                    action,
+                    "set_hive_egress/clear_hive_egress run on the motherbee",
+                )
+                .await;
+            }
+            // Its own task answers it: the worker's switch and its confirm take up to 40 s.
+            spawn_hive_egress(state_arc, sender, msg, action);
+            return Ok(());
         }
         _ => serde_json::json!({
             "status": "error",
@@ -3844,16 +3889,20 @@ async fn handle_system_message(
                     refusal
                 }
                 // docs/control-path-hardening-v1.md §6: the ingress drops the SSH table it
-                // applies, by its own role.
-                None => {
-                    remove_hive_cleanup_local_flow(egress_teardown, state.role == HiveRole::Ingress)
-                }
+                // applies, by its own role; a worker its egress files (FINDINGS A-225).
+                None => remove_hive_cleanup_local_flow(
+                    egress_teardown,
+                    state.role == HiveRole::Ingress,
+                    state.role == HiveRole::Worker,
+                ),
             };
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
             let _ =
                 send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
                     .await;
         }
+        // A-219: the motherbee's switch or confirm (docs/edge-egress-nat-spec.md §15).
+        Some(MSG_SYSTEM_EGRESS_ROUTE) => egress_route_message(state, sender, msg).await,
         _ => {}
     }
     Ok(())
@@ -10080,6 +10129,8 @@ struct EgressVerification {
     /// hive.yaml names no URL (`not_configured`), or this pass did not probe (the motherbee's
     /// watchdog tick). See `internet_reachable_label`.
     internet_reachable: Option<bool>,
+    /// Why the probe failed, in curl's words (FINDINGS A-225); None when it did not fail.
+    internet_failure: Option<String>,
     /// Motherbee only (PB-8): its observed IPv4 default route equals the declared
     /// `egress.gateway_ip`. Purely observational — on that path `route_applied` is
     /// always `false` by contract, because Fluxbee never touches the control plane's route.
@@ -10662,7 +10713,7 @@ fn verify_motherbee_egress(
     verification.gateway_matches = verdict == MotherbeeEgressVerdict::Match;
 
     if probe_internet {
-        verification.internet_reachable = run_internet_probe(probe_url);
+        verification.set_probe(run_internet_probe(probe_url));
     }
     let probed = verification.internet_reachable.is_some();
     let internet_reachable = internet_reachable_label(probe_url, verification.internet_reachable);
@@ -10673,6 +10724,7 @@ fn verify_motherbee_egress(
             gateway_matches = true,
             probed = probed,
             internet_reachable = %internet_reachable,
+            internet_failure = verification.internet_failure.as_deref().unwrap_or_default(),
             "motherbee egress path matches the declared gateway (read-only; Fluxbee does not manage this route)"
         ),
         MotherbeeEgressVerdict::Bypass { observed } => {
@@ -10697,6 +10749,7 @@ fn verify_motherbee_egress(
             observed_gateway = %observed,
             probed = probed,
             internet_reachable = %internet_reachable,
+            internet_failure = verification.internet_failure.as_deref().unwrap_or_default(),
             "EGRESS_MOTHERBEE_BYPASS: this hive's IPv4 default route is not the declared egress gateway; \
              the nodes that run here reach the internet through the observed gateway, outside the managed \
              chokepoint. Fluxbee does NOT rewrite the control plane's route — put motherbee on the egress \
@@ -10717,8 +10770,8 @@ fn verify_motherbee_egress(
 /// `egress.reachability_url` (docs/acme-edge-certificates-v1.md §8). HTTPS is the path the egress
 /// actually serves, so a network that filters ICMP but allows 443 reads as reachable. The URL is
 /// the operator's: the code names no target, and a hive without one does not probe
-/// (`EgressSection::probe_url`).
-fn check_internet_reachable(url: &str) -> bool {
+/// (`EgressSection::probe_url`). A failed GET says why, in curl's words (FINDINGS A-225).
+fn check_internet_reachable(url: &str) -> Result<(), String> {
     let mut curl = Command::new("curl");
     // `--globoff`: the operator's URL is fetched as written, never expanded as a curl glob.
     curl.arg("-fsS")
@@ -10728,12 +10781,42 @@ fn check_internet_reachable(url: &str) -> bool {
         .arg("-o")
         .arg("/dev/null")
         .arg(url);
-    run_cmd(curl, "https egress reachability").is_ok()
+    let output = curl
+        .output()
+        .map_err(|err| format!("curl could not run: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(curl_failure_reason(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
 }
 
-/// The internet probe against this hive's `probe_url`. `None` when there is no URL, or no `curl`
-/// to GET it with: never a `false` nothing measured, which would log DEGRADED on every drift tick.
-fn run_internet_probe(probe_url: Option<&str>) -> Option<bool> {
+/// What a failed probe's curl says, in words first (no DNS, no connection, a timeout, an HTTP
+/// error, TLS), then its exit code and its own line.
+fn curl_failure_reason(code: Option<i32>, stderr: &str) -> String {
+    let what = match code {
+        Some(6) => "no DNS: the host name did not resolve",
+        Some(7) => "no connection",
+        Some(28) => "a timeout",
+        Some(22) => "an HTTP error status",
+        Some(35 | 51 | 53 | 54 | 58 | 59 | 60 | 66 | 77 | 80 | 82 | 83 | 90 | 91) => "TLS failed",
+        _ => "curl failed",
+    };
+    let exit = code.map_or("a signal".to_string(), |code| format!("exit {code}"));
+    let line = stderr.trim();
+    if line.is_empty() {
+        format!("{what} (curl {exit})")
+    } else {
+        format!("{what} (curl {exit}: {})", truncate_for_error(line, 200))
+    }
+}
+
+/// The internet probe against this hive's `probe_url`: why it failed, when it did. `None` when
+/// there is no URL, or no `curl` to GET it with: never a failure nothing measured, which would log
+/// DEGRADED on every drift tick.
+fn run_internet_probe(probe_url: Option<&str>) -> Option<Result<(), String>> {
     internet_probe_result(
         probe_url,
         || command_exists("curl"),
@@ -10742,11 +10825,11 @@ fn run_internet_probe(probe_url: Option<&str>) -> Option<bool> {
 }
 
 /// `run_internet_probe` with its two effects passed in: whether `curl` exists, and the GET.
-fn internet_probe_result(
+fn internet_probe_result<T>(
     probe_url: Option<&str>,
     curl_exists: impl FnOnce() -> bool,
-    get: impl FnOnce(&str) -> bool,
-) -> Option<bool> {
+    get: impl FnOnce(&str) -> T,
+) -> Option<T> {
     let url = probe_url?;
     curl_exists().then(|| get(url))
 }
@@ -10908,6 +10991,12 @@ impl EgressVerification {
             self.ipv6_blocked,
             self.lan_leg_problem.as_deref(),
         )
+    }
+
+    /// The internet probe's result (`run_internet_probe`): whether it reached the URL, and why not.
+    fn set_probe(&mut self, probe: Option<Result<(), String>>) {
+        self.internet_reachable = probe.as_ref().map(Result::is_ok);
+        self.internet_failure = probe.and_then(Result::err);
     }
 }
 
@@ -11147,10 +11236,11 @@ fn reconcile_egress_nat(
     // Without egress.reachability_url, or without curl, there is no probe: nothing is fetched in
     // its place, and nothing is called unreachable.
     let probe_url = eg.probe_url();
-    verification.internet_reachable = run_internet_probe(probe_url.as_deref());
+    verification.set_probe(run_internet_probe(probe_url.as_deref()));
     if verification.internet_reachable == Some(false) {
         tracing::warn!(
             reachability_url = probe_url.as_deref().unwrap_or_default(),
+            internet_failure = verification.internet_failure.as_deref().unwrap_or_default(),
             "egress NAT applied but the internet probe failed; check WAN uplink"
         );
     }
@@ -11203,7 +11293,15 @@ fn reconcile_worker_egress(
     // surface it loudly rather than silently leaving a bypass.
     if ipv6_policy.trim() == "blocked" {
         write_file_if_changed(EGRESS_SYSCTL_PATH, worker_ipv6_sysctl_content())?;
-        apply_sysctl_system()?;
+        // FINDINGS A-225: `sysctl --system` loads every file and fails on a key the kernel lacks,
+        // the distribution's files as much as ours. As on the egress, its error is only reported:
+        // the block is judged by what the kernel reads back, and the probe still runs.
+        if let Err(err) = apply_sysctl_system() {
+            tracing::warn!(
+                error = %err,
+                "sysctl --system reported an error; the IPv6 block is judged by what the kernel reads back"
+            );
+        }
         // Read back from the kernel, as the egress does: a sysctl file that did not take leaves
         // IPv6 on, and a rogue RA could route around the gateway (an audit's F23).
         verification.ipv6_blocked = ipv6_disabled_now();
@@ -11219,12 +11317,13 @@ fn reconcile_worker_egress(
         );
     }
 
-    verification.internet_reachable = run_internet_probe(probe_url);
+    verification.set_probe(run_internet_probe(probe_url));
     tracing::info!(
         gateway_ip = gateway_ip,
         route_applied = verification.route_applied,
         ipv6_blocked = verification.ipv6_blocked,
         internet_reachable = %internet_reachable_label(probe_url, verification.internet_reachable),
+        internet_failure = verification.internet_failure.as_deref().unwrap_or_default(),
         "worker egress route reconciled"
     );
     Ok(verification)
@@ -11232,9 +11331,10 @@ fn reconcile_worker_egress(
 
 /// Dispatch egress reconciliation by role. Called from bootstrap.
 fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> {
-    let Some(eg) = state.egress.as_ref() else {
+    let Some(eg) = state.egress.section() else {
         return Ok(());
     };
+    let eg = &eg;
     match state.role {
         HiveRole::Egress if eg.enabled => {
             // FINDINGS A-1: an egress that cannot serve its LAN (its LAN leg, forwarding, the IPv6
@@ -11286,6 +11386,2692 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
         HiveRole::Ingress => {}
     }
     Ok(())
+}
+
+// ===========================================================================
+// A-219: an existing worker goes behind the egress, and back (docs/edge-egress-nat-spec.md §15).
+// SY.admin's `set_hive_egress` and `clear_hive_egress` reach the motherbee's orchestrator, which
+// sends SYSTEM_EGRESS_ROUTE to the worker (`hive_egress_flow`). The worker owns its routing table,
+// so it judges the guards (`egress_switch_guards`), switches, checks, answers `pending_confirm`,
+// and keeps the switch only once the motherbee's confirm comes back, a second SYSTEM_EGRESS_ROUTE
+// carrying the switch id; otherwise it reverts (`egress_switch_flow`). Its record on disk
+// (`EgressSwitchRecord`) holds the way back, and an orchestrator that stops mid-switch finishes it
+// at its next start (`resume_egress_switch_at_start`).
+// ===========================================================================
+
+const MSG_SYSTEM_EGRESS_ROUTE: &str = "SYSTEM_EGRESS_ROUTE";
+const MSG_SYSTEM_EGRESS_ROUTE_RESPONSE: &str = "SYSTEM_EGRESS_ROUTE_RESPONSE";
+/// The record of a worker's last egress switch, next to `config-applied.json`.
+const EGRESS_SWITCH_RECORD_FILE: &str = "egress-switch.json";
+/// The worker's bounds (§15.3): the guards' route lookups, the switch, the probe and the lookups
+/// again, the window for the motherbee's confirm after `pending_confirm`, and the commit or the
+/// revert. `pending_confirm` goes at most 22 s after the request.
+const EGRESS_GUARDS_BOUND: Duration = Duration::from_secs(5);
+const EGRESS_SWITCH_BOUND: Duration = Duration::from_secs(5);
+const EGRESS_CHECK_BOUND: Duration = Duration::from_secs(12);
+const EGRESS_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
+const EGRESS_COMMIT_BOUND: Duration = Duration::from_secs(5);
+/// One route lookup or listing: the guards share their 5 s, and none waits longer than this.
+const EGRESS_LOOKUP_BOUND: Duration = Duration::from_secs(2);
+/// The probe after the switch: up to two HTTPS GETs (curl's 5 s each), 1 s apart, so a cold ARP
+/// entry or DNS cache is no failure. What the check's 12 s leave is the lookups again.
+const EGRESS_PROBE_ATTEMPTS: usize = 2;
+const EGRESS_PROBE_PAUSE: Duration = Duration::from_secs(1);
+const EGRESS_PROBE_TIME: Duration = Duration::from_secs(5);
+/// The motherbee's bounds: the forward of the switch, which the worker answers 22 s after it at the
+/// latest, and the forward of the confirm, which covers the worker's commit.
+const EGRESS_SWITCH_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
+const EGRESS_CONFIRM_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// The IPv6 sysctls the worker's block sets (`worker_ipv6_sysctl_content`): the record keeps their
+/// values, and a revert or a clear puts them back.
+const EGRESS_IPV6_SYSCTLS: [&str; 4] = [
+    "net.ipv6.conf.all.disable_ipv6",
+    "net.ipv6.conf.default.disable_ipv6",
+    "net.ipv6.conf.all.accept_ra",
+    "net.ipv6.conf.default.accept_ra",
+];
+
+/// SY.admin's two actions, as SYSTEM_EGRESS_ROUTE's `operation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressOperation {
+    /// `set_hive_egress`: the motherbee's declaration into the worker's section, and its route.
+    Set,
+    /// `clear_hive_egress`: the section out, and the route the worker had before back.
+    Clear,
+}
+
+impl EgressOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Clear => "clear",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "set" => Some(Self::Set),
+            "clear" => Some(Self::Clear),
+            _ => None,
+        }
+    }
+
+    fn of_action(action: &str) -> Option<Self> {
+        match action {
+            "set_hive_egress" => Some(Self::Set),
+            "clear_hive_egress" => Some(Self::Clear),
+            _ => None,
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Set => "set_hive_egress",
+            Self::Clear => "clear_hive_egress",
+        }
+    }
+
+    /// What a switch that committed did.
+    fn outcome(self) -> &'static str {
+        match self {
+            Self::Set => "switched",
+            Self::Clear => "cleared",
+        }
+    }
+}
+
+/// hive.yaml's `egress` as this orchestrator holds it, and a worker's open egress switch (A-219).
+/// The section is read once, at the start; on a worker a switch sets it at its commit, right after
+/// the file, and a clear removes it, before the file. The watchdog's egress step reads it, and
+/// skips while a switch is open (`switch_open`).
+struct EgressState {
+    section: std::sync::RwLock<Option<EgressSection>>,
+    open: std::sync::Mutex<Option<OpenEgressSwitch>>,
+}
+
+/// The switch a worker runs now: its id, and the way the motherbee's confirm reaches it.
+struct OpenEgressSwitch {
+    switch_id: String,
+    confirm: Option<tokio::sync::oneshot::Sender<EgressConfirm>>,
+}
+
+/// The motherbee's confirm, handed to the open switch, which answers it through `answer`.
+struct EgressConfirm {
+    answer: tokio::sync::oneshot::Sender<serde_json::Value>,
+}
+
+impl EgressState {
+    fn new(section: Option<EgressSection>) -> Self {
+        Self {
+            section: std::sync::RwLock::new(section),
+            open: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn section(&self) -> Option<EgressSection> {
+        self.section
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_section(&self, section: Option<EgressSection>) {
+        *self
+            .section
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = section;
+    }
+
+    fn open_switch(&self) -> std::sync::MutexGuard<'_, Option<OpenEgressSwitch>> {
+        self.open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn switch_open(&self) -> bool {
+        self.open_switch().is_some()
+    }
+
+    /// Opens a switch: its id, and where its confirm arrives. `Err` names the switch already open.
+    fn claim(&self) -> Result<(String, tokio::sync::oneshot::Receiver<EgressConfirm>), String> {
+        let mut open = self.open_switch();
+        if let Some(open) = open.as_ref() {
+            return Err(open.switch_id.clone());
+        }
+        let switch_id = Uuid::new_v4().to_string();
+        let (confirm, confirmed) = tokio::sync::oneshot::channel();
+        *open = Some(OpenEgressSwitch {
+            switch_id: switch_id.clone(),
+            confirm: Some(confirm),
+        });
+        Ok((switch_id, confirmed))
+    }
+
+    /// The way to the open switch `switch_id`'s confirm, once: None when no such switch is open, or
+    /// its confirm was taken already.
+    fn take_confirm(&self, switch_id: &str) -> Option<tokio::sync::oneshot::Sender<EgressConfirm>> {
+        self.open_switch()
+            .as_mut()
+            .filter(|open| open.switch_id == switch_id)
+            .and_then(|open| open.confirm.take())
+    }
+
+    /// Closes the switch `switch_id`: the watchdog's egress step runs again.
+    fn release(&self, switch_id: &str) {
+        let mut open = self.open_switch();
+        if open
+            .as_ref()
+            .is_some_and(|open| open.switch_id == switch_id)
+        {
+            *open = None;
+        }
+    }
+}
+
+/// A section's `gateway_ip`, as an address.
+fn egress_section_gateway(section: &EgressSection) -> Option<std::net::Ipv4Addr> {
+    section.gateway_ip.as_deref().map(str::trim)?.parse().ok()
+}
+
+/// What `/versions` and the record show of a section.
+fn egress_section_view(section: &EgressSection) -> serde_json::Value {
+    serde_json::json!({
+        "gateway_ip": section.gateway_ip,
+        "reachability_url": section.reachability_url,
+    })
+}
+
+/// The section a set writes into the worker's hive.yaml: the motherbee's declaration as the join
+/// renders it (`render_worker_egress_yaml`), and what the worker reads of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EgressTarget {
+    gateway_ip: std::net::Ipv4Addr,
+    reachability_url: Option<String>,
+    /// The rendered section, `egress:` and its keys, as hive.yaml gets it.
+    yaml: String,
+}
+
+impl EgressTarget {
+    /// The section the worker got, parsed as its `EgressSection`: a worker's (`gateway_ip`, `ipv6:
+    /// blocked`, `reachability_url`), nothing of an egress hive's.
+    fn parse(yaml: &str) -> Result<(Self, EgressSection), String> {
+        #[derive(Deserialize)]
+        struct Holder {
+            egress: Option<EgressSection>,
+        }
+        let holder: Holder = serde_yaml::from_str(yaml)
+            .map_err(|err| format!("the egress section does not parse: {err}"))?;
+        let section = holder
+            .egress
+            .ok_or("the egress section has no `egress` key")?;
+        if section.enabled
+            || section.lan_cidr.is_some()
+            || section.edge_ip.is_some()
+            || section.wan_iface.is_some()
+            || section.lan_iface.is_some()
+        {
+            return Err("the egress section is an egress hive's, not a worker's".to_string());
+        }
+        if section.ipv6.trim() != "blocked" {
+            return Err(format!(
+                "the egress section's ipv6 is '{}': a worker behind the egress has it blocked",
+                section.ipv6
+            ));
+        }
+        let gateway_ip = egress_section_gateway(&section)
+            .ok_or("the egress section names no IPv4 gateway_ip")?;
+        let reachability_url = match section
+            .reachability_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            Some(url) => Some(
+                validate_reachability_url(url, "egress.reachability_url")
+                    .map_err(|err| err.to_string())?,
+            ),
+            None => None,
+        };
+        Ok((
+            Self {
+                gateway_ip,
+                reachability_url,
+                yaml: yaml.to_string(),
+            },
+            section,
+        ))
+    }
+
+    /// Whether the worker's `section` is this one already.
+    fn held_by(&self, section: Option<&EgressSection>) -> bool {
+        section.is_some_and(|section| {
+            egress_section_gateway(section) == Some(self.gateway_ip)
+                && section.ipv6.trim() == "blocked"
+                && section
+                    .reachability_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    == self.reachability_url.as_deref()
+        })
+    }
+
+    /// The section as hive.yaml's `egress` value.
+    fn yaml_value(&self) -> Result<serde_yaml::Value, String> {
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(&self.yaml).map_err(|err| err.to_string())?;
+        root.get("egress")
+            .cloned()
+            .ok_or_else(|| "the egress section has no `egress` key".to_string())
+    }
+}
+
+/// What the worker has of what a switch changes: its default routes as `ip -4 route show default`
+/// lists them, the IPv6 sysctls' values (none on a kernel without IPv6), and its sysctl file
+/// (`EGRESS_SYSCTL_PATH`) as it was, None when there was none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct EgressHostState {
+    default_routes: Vec<String>,
+    ipv6: BTreeMap<String, String>,
+    sysctl_file: Option<String>,
+}
+
+/// The record of a worker's last egress switch (`egress-switch.json` next to
+/// `config-applied.json`), written atomically at each step: `open` until the switch commits or
+/// reverts. An orchestrator that finds it open at its start finishes the switch
+/// (`resume_egress_switch_at_start`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EgressSwitchRecord {
+    switch_id: String,
+    /// `set` or `clear`.
+    operation: String,
+    /// `open`, `committed`, `reverted` or `interrupted`.
+    state: String,
+    started_at_ms: u64,
+    updated_at_ms: u64,
+    /// The gateway the switch routes through: the egress (set), or the one the worker goes back to
+    /// (clear; none for a default route without a gateway).
+    gateway_ip: Option<String>,
+    /// The section a set writes into hive.yaml; None for a clear, which removes it.
+    target: Option<EgressTarget>,
+    /// The default gateway when the switch began.
+    previous_gateway: Option<String>,
+    /// The switch's way back: what the worker had when it began.
+    before: EgressHostState,
+    /// What the worker had before it first went behind an egress, carried over by later switches;
+    /// None when it was never recorded (a worker that joined after the declaration).
+    original: Option<EgressHostState>,
+    /// The step that failed, its code and why, on a revert or an interruption.
+    step: Option<String>,
+    error_code: Option<String>,
+    reason: Option<String>,
+}
+
+impl EgressSwitchRecord {
+    /// What `/versions` shows of it: `last_switch`.
+    fn view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "switch_id": self.switch_id,
+            "operation": self.operation,
+            "state": self.state,
+            "started_at_ms": self.started_at_ms,
+            "updated_at_ms": self.updated_at_ms,
+            "gateway_ip": self.gateway_ip,
+            "previous_gateway": self.previous_gateway,
+            "step": self.step,
+            "error_code": self.error_code,
+            "reason": self.reason,
+        })
+    }
+}
+
+fn egress_switch_record_path() -> PathBuf {
+    orchestrator_runtime_dir().join(EGRESS_SWITCH_RECORD_FILE)
+}
+
+/// The record, None when this worker never switched.
+fn read_egress_switch_record(path: &Path) -> Result<Option<EgressSwitchRecord>, String> {
+    match fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|err| format!("{} does not parse: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("{} cannot be read: {err}", path.display())),
+    }
+}
+
+fn write_egress_switch_record(path: &Path, record: &EgressSwitchRecord) -> Result<(), String> {
+    let raw = serde_json::to_vec_pretty(record).map_err(|err| err.to_string())?;
+    write_file_atomic(path, &raw).map_err(|err| err.to_string())
+}
+
+/// The route that decides how this host reaches an IPv4 address, as `ip -4 route get fibmatch
+/// <address>` prints it: `default via 10.10.10.1 dev ens18 proto static`, `10.10.10.0/24 dev ens18
+/// proto kernel scope link src 10.10.10.20`, or `local 10.10.10.20 dev lo table local proto kernel
+/// scope host src 10.10.10.20`. A line of `ip -4 route show` reads the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteMatchLine {
+    /// The line as the kernel printed it, for a refusal to name.
+    line: String,
+    /// `default`, a network (`10.10.10.0/24`) or an address (a /32, a local route).
+    destination: String,
+    /// The route's type when it names one (`local`, `broadcast`, `unreachable`...).
+    kind: Option<String>,
+    /// Its gateway, as printed (`10.10.10.1`; `inet6 fe80::1` for an IPv6 next hop).
+    via: Option<String>,
+    dev: Option<String>,
+}
+
+/// The route types `ip route` prints before a route's destination.
+const ROUTE_TYPES: [&str; 10] = [
+    "unicast",
+    "local",
+    "broadcast",
+    "multicast",
+    "anycast",
+    "unreachable",
+    "blackhole",
+    "prohibit",
+    "throw",
+    "nat",
+];
+
+impl RouteMatchLine {
+    /// The first route of `output`; None when it holds none.
+    fn parse(output: &str) -> Option<Self> {
+        let line = output
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?;
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let (kind, rest) = match words.first() {
+            Some(first) if ROUTE_TYPES.contains(first) => (Some(first.to_string()), &words[1..]),
+            _ => (None, &words[..]),
+        };
+        let destination = rest.first()?.to_string();
+        let after = |key: &str| rest.iter().position(|word| *word == key).map(|at| at + 1);
+        let via = after("via").and_then(|at| match rest.get(at) {
+            Some(&family) if family == "inet" || family == "inet6" => rest
+                .get(at + 1)
+                .map(|gateway| format!("{family} {gateway}")),
+            Some(gateway) => Some(gateway.to_string()),
+            None => None,
+        });
+        Some(Self {
+            line: line.to_string(),
+            destination,
+            kind: kind.filter(|kind| kind != "unicast"),
+            via,
+            dev: after("dev")
+                .and_then(|at| rest.get(at))
+                .map(|dev| dev.to_string()),
+        })
+    }
+
+    fn is_default(&self) -> bool {
+        self.destination == "default" || self.destination == "0.0.0.0/0"
+    }
+
+    /// Its prefix length: 0 for the default route, 32 for an address.
+    fn prefix_len(&self) -> u8 {
+        if self.is_default() {
+            return 0;
+        }
+        self.destination
+            .split_once('/')
+            .and_then(|(_, prefix)| prefix.parse().ok())
+            .unwrap_or(32)
+    }
+
+    /// What a later lookup must find again: the same destination, gateway and device.
+    fn same_path(&self, other: &Self) -> bool {
+        self.destination == other.destination && self.via == other.via && self.dev == other.dev
+    }
+}
+
+/// G1 (§15.2): the gateway is on a subnet this worker is connected to, and none of its own
+/// addresses. The kernel itself refuses an off-link gateway; this says why before anything is
+/// touched.
+fn egress_gateway_refusal(gateway: std::net::Ipv4Addr, route: &RouteMatchLine) -> Option<String> {
+    let found = &route.line;
+    if route.kind.as_deref() == Some("local") {
+        return Some(format!(
+            "{gateway} is one of this worker's own addresses (the route found: {found})"
+        ));
+    }
+    if let Some(via) = route.via.as_deref() {
+        return Some(format!(
+            "{gateway} is not on a subnet this worker is connected to: it is reached through \
+             {via} (the route found: {found}). The egress' LAN leg must be on the worker's \
+             network, or the worker's own router must send its traffic there"
+        ));
+    }
+    if let Some(kind) = route.kind.as_deref() {
+        return Some(format!(
+            "this worker's route to {gateway} is a {kind} route (the route found: {found})"
+        ));
+    }
+    None
+}
+
+/// G3 for one of `access_from`'s networks: the route that covers all of it is not the default
+/// route. A more specific route over part of it leaves the rest on the default route.
+fn egress_network_refusal(net: &SshAllowNet, route: &RouteMatchLine) -> Option<String> {
+    if route.is_default() {
+        return Some(format!("{net} (through the default route: {})", route.line));
+    }
+    (route.prefix_len() > net.prefix).then(|| {
+        format!(
+            "{net} (only {} has a more specific route, {}; the rest goes through the default \
+             route)",
+            route.destination, route.line
+        )
+    })
+}
+
+/// The mesh's way to the motherbee as the worker's hive.yaml names it: each `wan.uplinks` address
+/// and `identity.sync.upstream`, by host. The join writes one host for both, and Syncthing dials
+/// the motherbee there too, so one lookup covers the WAN (9000), identity (9100) and Syncthing
+/// (22000).
+fn egress_uplink_hosts(hive: &HiveFile) -> Vec<String> {
+    let uplinks = hive
+        .wan
+        .as_ref()
+        .and_then(|wan| wan.uplinks.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|uplink| uplink.address.clone());
+    let identity = hive
+        .identity
+        .as_ref()
+        .and_then(|identity| identity.sync.as_ref())
+        .and_then(|sync| sync.upstream.clone());
+    let mut hosts: Vec<String> = Vec::new();
+    for address in uplinks.chain(identity) {
+        let address = address.trim();
+        if address.is_empty() {
+            continue;
+        }
+        let host = parse_host_port(address)
+            .map(|(host, _)| host)
+            .unwrap_or_else(|_| address.to_string());
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+/// The peers of the established TCP sessions this host takes on one of `ports` (`ss -H -tn`:
+/// `State Recv-Q Send-Q Local:Port Peer:Port`), each once. An IPv4-mapped peer is IPv4.
+fn inbound_session_peers(output: &str, ports: &[u16]) -> Vec<std::net::IpAddr> {
+    let endpoint = |field: &str| -> Option<(std::net::IpAddr, u16)> {
+        let (host, port) = field.rsplit_once(':')?;
+        // The scope first (`[fe80::1]%ens18`), then the brackets, as `parse_ss_tcp_listeners`.
+        let host = host.split('%').next().unwrap_or(host);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        Some((canonical_ip(host.parse().ok()?), port.parse().ok()?))
+    };
+    let mut peers = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 || fields[0] != "ESTAB" {
+            continue;
+        }
+        let (Some((_, local_port)), Some((peer, _))) = (endpoint(fields[3]), endpoint(fields[4]))
+        else {
+            continue;
+        };
+        if ports.contains(&local_port) && !peers.contains(&peer) {
+            peers.push(peer);
+        }
+    }
+    peers
+}
+
+/// Where SSH still reaches this worker from once its default route goes to the egress: its
+/// connected subnets and its more specific routes (`ip -4 route show`), and the hypervisor's
+/// console, which uses no network.
+fn egress_ssh_reachable_from(routes: &str) -> Vec<String> {
+    let mut reachable = Vec::new();
+    for line in routes.lines() {
+        let Some(route) = RouteMatchLine::parse(line) else {
+            continue;
+        };
+        if route.is_default() || route.kind.is_some() {
+            continue;
+        }
+        let entry = match (&route.via, &route.dev) {
+            (Some(via), _) => format!("{} via {via}", route.destination),
+            (None, Some(dev)) => format!("{} on {dev}", route.destination),
+            (None, None) => route.destination.clone(),
+        };
+        if !reachable.contains(&entry) {
+            reachable.push(entry);
+        }
+    }
+    reachable.push("the hypervisor's console".to_string());
+    reachable
+}
+
+/// What the egress switch reads and changes on its worker, so its decisions are tested against a
+/// fake (`LiveEgressHost` is the box). Every command runs under a bound.
+trait EgressHost: Send + Sync {
+    /// `ip -4 route get fibmatch <address>`: the route that decides how `address` is reached.
+    fn route_lookup(&self, address: std::net::Ipv4Addr, bound: Duration) -> Result<String, String>;
+    /// `ip -4 route show default`, a line per route.
+    fn default_routes(&self, bound: Duration) -> Result<Vec<String>, String>;
+    /// `ip -4 route show`.
+    fn routes(&self, bound: Duration) -> Result<String, String>;
+    /// `ss -H -tn`.
+    fn tcp_sessions(&self, bound: Duration) -> Result<String, String>;
+    /// The ports sshd listens on (`sshd_listen_ports`).
+    fn sshd_ports(&self) -> Result<Vec<u16>, String>;
+    /// `ip -4 route replace <route>`.
+    fn route_replace(&self, route: &[String], bound: Duration) -> Result<(), String>;
+    /// `ip -4 route del <route>`.
+    fn route_delete(&self, route: &[String], bound: Duration) -> Result<(), String>;
+    /// The sysctls of `EGRESS_IPV6_SYSCTLS` the kernel has, by name.
+    fn ipv6_values(&self) -> BTreeMap<String, String>;
+    fn set_ipv6_values(&self, values: &BTreeMap<String, String>) -> Result<(), String>;
+    /// `EGRESS_SYSCTL_PATH`'s content, None when there is none.
+    fn sysctl_file(&self) -> Option<String>;
+    /// Writes `EGRESS_SYSCTL_PATH`, or removes it with None.
+    fn put_sysctl_file(&self, content: Option<&str>) -> Result<(), String>;
+    /// `sysctl --system`.
+    fn sysctl_system(&self, bound: Duration) -> Result<(), String>;
+    /// Whether the kernel has IPv6 off (`ipv6_disabled_now`).
+    fn ipv6_disabled(&self) -> bool;
+    fn curl_exists(&self) -> bool;
+    /// An HTTPS GET of `url` (`check_internet_reachable`): why it failed, when it did.
+    fn probe(&self, url: &str) -> Result<(), String>;
+}
+
+/// This box, for the egress switch.
+struct LiveEgressHost;
+
+/// Runs `program` under `bound` (coreutils `timeout`, killed a second later), off the async
+/// workers: its output, or why it failed.
+fn run_bounded(program: &str, args: &[String], bound: Duration) -> Result<String, String> {
+    let secs = format!("{:.1}", bound.as_secs_f64().max(0.1));
+    let mut cmd = Command::new("timeout");
+    cmd.arg("-k").arg("1").arg(&secs).arg(program).args(args);
+    let label = format!("{program} {}", args.join(" "));
+    tokio::task::block_in_place(|| run_cmd_output(cmd, &label)).map_err(|err| {
+        let err = err.to_string();
+        if err.contains("(exit=124)") {
+            format!("{label} did not answer within {secs} s")
+        } else {
+            err
+        }
+    })
+}
+
+fn egress_args(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| item.to_string()).collect()
+}
+
+/// `/proc/sys/...` of one of `EGRESS_IPV6_SYSCTLS`; None for any other name.
+fn egress_ipv6_sysctl_path(name: &str) -> Option<PathBuf> {
+    EGRESS_IPV6_SYSCTLS
+        .contains(&name)
+        .then(|| Path::new("/proc/sys").join(name.replace('.', "/")))
+}
+
+impl EgressHost for LiveEgressHost {
+    fn route_lookup(&self, address: std::net::Ipv4Addr, bound: Duration) -> Result<String, String> {
+        let address = address.to_string();
+        run_bounded(
+            "ip",
+            &egress_args(&["-4", "route", "get", "fibmatch", address.as_str()]),
+            bound,
+        )
+    }
+
+    fn default_routes(&self, bound: Duration) -> Result<Vec<String>, String> {
+        Ok(run_bounded(
+            "ip",
+            &egress_args(&["-4", "route", "show", "default"]),
+            bound,
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+    }
+
+    fn routes(&self, bound: Duration) -> Result<String, String> {
+        run_bounded("ip", &egress_args(&["-4", "route", "show"]), bound)
+    }
+
+    fn tcp_sessions(&self, bound: Duration) -> Result<String, String> {
+        run_bounded("ss", &egress_args(&["-H", "-tn"]), bound)
+    }
+
+    fn sshd_ports(&self) -> Result<Vec<u16>, String> {
+        tokio::task::block_in_place(sshd_listen_ports)
+    }
+
+    fn route_replace(&self, route: &[String], bound: Duration) -> Result<(), String> {
+        let mut args = egress_args(&["-4", "route", "replace"]);
+        args.extend(route.iter().cloned());
+        run_bounded("ip", &args, bound).map(|_| ())
+    }
+
+    fn route_delete(&self, route: &[String], bound: Duration) -> Result<(), String> {
+        let mut args = egress_args(&["-4", "route", "del"]);
+        args.extend(route.iter().cloned());
+        run_bounded("ip", &args, bound).map(|_| ())
+    }
+
+    fn ipv6_values(&self) -> BTreeMap<String, String> {
+        EGRESS_IPV6_SYSCTLS
+            .iter()
+            .filter_map(|name| {
+                let value = fs::read_to_string(egress_ipv6_sysctl_path(name)?).ok()?;
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect()
+    }
+
+    fn set_ipv6_values(&self, values: &BTreeMap<String, String>) -> Result<(), String> {
+        let mut failed = Vec::new();
+        for (name, value) in values {
+            let Some(path) = egress_ipv6_sysctl_path(name) else {
+                failed.push(format!("{name} is not an IPv6 sysctl the switch keeps"));
+                continue;
+            };
+            if value.trim().parse::<i64>().is_err() {
+                failed.push(format!("{name}={value} is not a number"));
+                continue;
+            }
+            if let Err(err) = fs::write(&path, format!("{}\n", value.trim())) {
+                failed.push(format!("{name}={value}: {err}"));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
+    }
+
+    fn sysctl_file(&self) -> Option<String> {
+        fs::read_to_string(EGRESS_SYSCTL_PATH).ok()
+    }
+
+    fn put_sysctl_file(&self, content: Option<&str>) -> Result<(), String> {
+        match content {
+            Some(content) => write_file_if_changed(EGRESS_SYSCTL_PATH, content)
+                .map(|_| ())
+                .map_err(|err| err.to_string()),
+            None => match fs::remove_file(EGRESS_SYSCTL_PATH) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err.to_string()),
+            },
+        }
+    }
+
+    fn sysctl_system(&self, bound: Duration) -> Result<(), String> {
+        run_bounded("sysctl", &egress_args(&["--system"]), bound).map(|_| ())
+    }
+
+    fn ipv6_disabled(&self) -> bool {
+        ipv6_disabled_now()
+    }
+
+    fn curl_exists(&self) -> bool {
+        tokio::task::block_in_place(|| command_exists("curl"))
+    }
+
+    fn probe(&self, url: &str) -> Result<(), String> {
+        tokio::task::block_in_place(|| check_internet_reachable(url))
+    }
+}
+
+/// A switch that does not go on: its code, the step it came from, and why, naming the address and
+/// the route found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EgressRefusal {
+    code: &'static str,
+    step: &'static str,
+    message: String,
+}
+
+impl EgressRefusal {
+    fn new(code: &'static str, step: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            step,
+            message: message.into(),
+        }
+    }
+}
+
+/// What the guards read: the routes G2 reads again after the switch, and where SSH still reaches
+/// the worker from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EgressGuardReport {
+    uplink_routes: Vec<(std::net::Ipv4Addr, RouteMatchLine)>,
+    ssh_reachable_from: Vec<String>,
+}
+
+/// The guards (§15.2), before anything is touched, each a route lookup under the guards' 5 s:
+/// - G1: the gateway (when the switch goes through one) is on a subnet the worker is connected to.
+/// - G2: the mesh's way to the motherbee does not go through the default route.
+/// - G3: neither do the operator's SSH sessions nor `access_from`.
+///
+/// They only read. A guard that fails, or cannot read, refuses and nothing changes. A G3 refusal
+/// names every peer and network, the way to keep each, and where SSH still reaches the box from.
+fn egress_switch_guards(
+    host: &dyn EgressHost,
+    gateway: Option<std::net::Ipv4Addr>,
+    uplink_hosts: &[String],
+    access_from: &[SshAllowNet],
+    current_gateway: Option<&str>,
+) -> Result<EgressGuardReport, EgressRefusal> {
+    let deadline = Instant::now() + EGRESS_GUARDS_BOUND;
+    let unreadable =
+        |message: String| EgressRefusal::new("EGRESS_GUARD_UNREADABLE", "guards", message);
+    let left = || -> Result<Duration, EgressRefusal> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(unreadable(
+                "the guards did not finish within 5 s: nothing was changed".to_string(),
+            ));
+        }
+        Ok(left.min(EGRESS_LOOKUP_BOUND))
+    };
+    let lookup = |address: std::net::Ipv4Addr| -> Result<RouteMatchLine, EgressRefusal> {
+        let output = host.route_lookup(address, left()?).map_err(|err| {
+            unreadable(format!("the route to {address} could not be read: {err}"))
+        })?;
+        RouteMatchLine::parse(&output).ok_or_else(|| {
+            unreadable(format!(
+                "the route to {address} reads as nothing ('{}')",
+                output.trim()
+            ))
+        })
+    };
+
+    // G1.
+    if let Some(gateway) = gateway {
+        if let Some(why) = egress_gateway_refusal(gateway, &lookup(gateway)?) {
+            return Err(EgressRefusal::new("GATEWAY_NOT_ON_LINK", "guards", why));
+        }
+    }
+
+    // G2.
+    let uplink = |message: String| EgressRefusal::new("UPLINK_ON_DEFAULT_ROUTE", "guards", message);
+    if uplink_hosts.is_empty() {
+        return Err(uplink(
+            "this worker's hive.yaml names no wan.uplinks address, so the guard cannot check that \
+             the mesh stays off the default route"
+                .to_string(),
+        ));
+    }
+    let mut uplink_routes = Vec::new();
+    for name in uplink_hosts {
+        let address = match name.parse::<std::net::IpAddr>().map(canonical_ip) {
+            Ok(std::net::IpAddr::V4(address)) => address,
+            Ok(std::net::IpAddr::V6(_)) => {
+                return Err(uplink(format!(
+                    "this worker reaches the motherbee at {name}, an IPv6 address: the IPv6 block \
+                     behind the egress would cut the mesh"
+                )))
+            }
+            Err(_) => {
+                return Err(uplink(format!(
+                    "this worker names the motherbee by a host name ({name}): its DNS would go \
+                     through the default route, and a redial would then depend on the egress. \
+                     Write the motherbee's IPv4 address in wan.uplinks and identity.sync.upstream \
+                     first"
+                )))
+            }
+        };
+        let route = lookup(address)?;
+        if route.is_default() {
+            return Err(uplink(format!(
+                "this worker reaches the motherbee ({address}) through its default route (the \
+                 route found: {}): after the switch the mesh would leave through the egress' NAT, \
+                 and the worker would drop off the mesh. Give the motherbee's network a route of \
+                 its own at the OS level first",
+                route.line
+            )));
+        }
+        uplink_routes.push((address, route));
+    }
+
+    // G3.
+    let ports = host.sshd_ports().map_err(|err| {
+        unreadable(format!(
+            "sshd's ports could not be read ({err}), so the guard cannot tell the operator's \
+             sessions"
+        ))
+    })?;
+    let sessions = host
+        .tcp_sessions(left()?)
+        .map_err(|err| unreadable(format!("the TCP sessions could not be read: {err}")))?;
+    let routes = host
+        .routes(left()?)
+        .map_err(|err| unreadable(format!("the routes could not be read: {err}")))?;
+    let ssh_reachable_from = egress_ssh_reachable_from(&routes);
+    let mut cut = Vec::new();
+    for peer in inbound_session_peers(&sessions, &ports) {
+        match peer {
+            std::net::IpAddr::V4(address) => {
+                let route = lookup(address)?;
+                if route.is_default() {
+                    cut.push(format!(
+                        "the SSH session from {address} (through the default route: {})",
+                        route.line
+                    ));
+                }
+            }
+            std::net::IpAddr::V6(address) => cut.push(format!(
+                "the SSH session from {address} (IPv6, which the block behind the egress cuts)"
+            )),
+        }
+    }
+    for net in access_from {
+        let std::net::IpAddr::V4(address) = net.network else {
+            cut.push(format!(
+                "{net} (IPv6, which the block behind the egress cuts)"
+            ));
+            continue;
+        };
+        if let Some(why) = egress_network_refusal(net, &lookup(address)?) {
+            cut.push(why);
+        }
+    }
+    if !cut.is_empty() {
+        let through = current_gateway
+            .map(|gateway| format!(" through the current gateway, {gateway}"))
+            .unwrap_or_default();
+        return Err(EgressRefusal::new(
+            "ACCESS_ON_DEFAULT_ROUTE",
+            "guards",
+            format!(
+                "the operator reaches this worker from where its default route answers: {}. After \
+                 the switch its replies would leave through the egress, and SSH from there would \
+                 break. Keep each with a static route at the OS level (netplan){through}, which \
+                 this check then sees as a more specific route; Fluxbee adds no route of its own. \
+                 SSH reaches the box from: {}",
+                cut.join("; "),
+                ssh_reachable_from.join(", ")
+            ),
+        ));
+    }
+    Ok(EgressGuardReport {
+        uplink_routes,
+        ssh_reachable_from,
+    })
+}
+
+/// The words of a route as `ip -4 route show` prints it that `ip route replace` takes back: the
+/// flags it only prints dropped.
+fn route_words(line: &str) -> Vec<String> {
+    const PRINTED_ONLY: [&str; 7] = [
+        "linkdown",
+        "dead",
+        "offload",
+        "trap",
+        "rt_offload",
+        "rt_trap",
+        "rt_offload_failed",
+    ];
+    line.split_whitespace()
+        .filter(|word| !PRINTED_ONLY.contains(word))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Puts the default routes `target` back (lines of `ip -4 route show default`): each replaced in
+/// turn, then each default route through `leaving` that `target` does not hold deleted. A default
+/// route through another gateway (a DHCP lease's, say) is left as it is.
+fn restore_default_routes(
+    host: &dyn EgressHost,
+    target: &[String],
+    leaving: Option<&str>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let left = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(500))
+    };
+    let wanted: Vec<Vec<String>> = target
+        .iter()
+        .map(|line| route_words(line))
+        .filter(|words| !words.is_empty())
+        .collect();
+    for words in &wanted {
+        host.route_replace(words, left())?;
+    }
+    let Some(leaving) = leaving else {
+        return Ok(());
+    };
+    for line in host.default_routes(left())? {
+        let words = route_words(&line);
+        if !wanted.contains(&words) && parse_default_gateway(&line).as_deref() == Some(leaving) {
+            host.route_delete(&words, left())?;
+        }
+    }
+    Ok(())
+}
+
+/// The revert (§15.3, step 6): the default routes, the IPv6 values and the sysctl file as the
+/// record's `before` holds them; hive.yaml and the in-memory section were never changed. The record
+/// then says `state` (`reverted`, or `interrupted` at a start), with the step and why. The problems
+/// the revert met, each in words.
+fn egress_revert(
+    host: &dyn EgressHost,
+    record: &mut EgressSwitchRecord,
+    record_path: &Path,
+    refusal: &EgressRefusal,
+    state: &str,
+) -> Vec<String> {
+    let deadline = Instant::now() + EGRESS_COMMIT_BOUND;
+    let mut problems = Vec::new();
+    if let Err(err) = restore_default_routes(
+        host,
+        &record.before.default_routes,
+        record.gateway_ip.as_deref(),
+        deadline,
+    ) {
+        problems.push(format!("the default routes could not be put back: {err}"));
+    }
+    if let Err(err) = host.put_sysctl_file(record.before.sysctl_file.as_deref()) {
+        problems.push(format!("{EGRESS_SYSCTL_PATH} could not be put back: {err}"));
+    }
+    if let Err(err) = host.set_ipv6_values(&record.before.ipv6) {
+        problems.push(format!("the IPv6 values could not be put back: {err}"));
+    }
+    record.state = state.to_string();
+    record.step = Some(refusal.step.to_string());
+    record.error_code = Some(refusal.code.to_string());
+    record.reason = Some(if problems.is_empty() {
+        refusal.message.clone()
+    } else {
+        format!("{} The revert: {}", refusal.message, problems.join("; "))
+    });
+    record.updated_at_ms = now_epoch_ms();
+    if let Err(err) = write_egress_switch_record(record_path, record) {
+        problems.push(format!("the record could not be written: {err}"));
+    }
+    problems
+}
+
+/// After a clear: the IPv6 values and the sysctl file the worker had before it first went behind
+/// the egress. With none recorded, the sysctl file is removed and IPv6 comes back at the box's next
+/// boot. What did not go as it should, each in words.
+fn egress_ipv6_back(host: &dyn EgressHost, original: Option<&EgressHostState>) -> Vec<String> {
+    let mut notes = Vec::new();
+    match original {
+        Some(original) => {
+            if let Err(err) = host.put_sysctl_file(original.sysctl_file.as_deref()) {
+                notes.push(format!("{EGRESS_SYSCTL_PATH} could not be put back: {err}"));
+            }
+            if let Err(err) = host.set_ipv6_values(&original.ipv6) {
+                notes.push(format!("the IPv6 values could not be put back: {err}"));
+            }
+        }
+        None => {
+            if let Err(err) = host.put_sysctl_file(None) {
+                notes.push(format!("{EGRESS_SYSCTL_PATH} could not be removed: {err}"));
+            }
+            notes.push(
+                "this worker's record kept no IPv6 values from before the egress: its IPv6 block's \
+                 file is removed, and IPv6 comes back at the box's next boot"
+                    .to_string(),
+            );
+        }
+    }
+    notes
+}
+
+/// The one lock of the hive.yaml writers, `set_storage` and the egress switch's commit
+/// (docs/hive-config-update-v1.md §5).
+static HIVE_YAML_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_hive_yaml() -> std::sync::MutexGuard<'static, ()> {
+    HIVE_YAML_WRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The commit's write: hive.yaml with its `egress` set to `section`, or removed with None, every
+/// other key kept (its comments go, as with `set_storage`). Written atomically, a temp beside it
+/// and a rename (`write_file_atomic`), under `lock_hive_yaml`, and only once it loads as a
+/// hive.yaml.
+fn write_hive_yaml_egress(
+    config_dir: &Path,
+    section: Option<serde_yaml::Value>,
+) -> Result<(), OrchestratorError> {
+    let _hive_yaml = lock_hive_yaml();
+    let path = config_dir.join("hive.yaml");
+    let data = fs::read_to_string(&path)?;
+    let mut root: serde_yaml::Value = serde_yaml::from_str(&data)?;
+    let map = root
+        .as_mapping_mut()
+        .ok_or("hive.yaml root must be a map")?;
+    let key = serde_yaml::Value::String("egress".to_string());
+    match section {
+        Some(section) => {
+            map.insert(key, section);
+        }
+        None => {
+            // Its place goes, and the other keys keep their order.
+            map.shift_remove(&key);
+        }
+    }
+    let serialized = serde_yaml::to_string(&root)?;
+    serde_yaml::from_str::<HiveFile>(&serialized)?;
+    write_file_atomic(&path, serialized.as_bytes())
+}
+
+/// The commit (§15.3, step 5). A set writes the section into hive.yaml, which is the commit, then
+/// sets it in memory. A clear removes it from memory, then from hive.yaml, then puts back the IPv6
+/// values and the sysctl file the record kept. `Err`: the commit did not happen, and memory is as
+/// it was. `Ok`: what did not go as it should after the commit, each in words.
+fn egress_commit(
+    host: &dyn EgressHost,
+    env: &EgressSwitchEnv<'_>,
+    target: Option<&(EgressTarget, EgressSection)>,
+    record: &EgressSwitchRecord,
+) -> Result<Vec<String>, String> {
+    match target {
+        Some((target, section)) => {
+            let value = target.yaml_value()?;
+            write_hive_yaml_egress(env.config_dir, Some(value))
+                .map_err(|err| format!("hive.yaml could not be written: {err}"))?;
+            env.egress.set_section(Some(section.clone()));
+            Ok(Vec::new())
+        }
+        None => {
+            let previous = env.egress.section();
+            env.egress.set_section(None);
+            if let Err(err) = write_hive_yaml_egress(env.config_dir, None) {
+                env.egress.set_section(previous);
+                return Err(format!("hive.yaml could not be written: {err}"));
+            }
+            Ok(egress_ipv6_back(host, record.original.as_ref()))
+        }
+    }
+}
+
+/// What the worker's switch needs besides its host: its hive, its section and switch slot, its
+/// hive.yaml's directory and its record.
+struct EgressSwitchEnv<'a> {
+    hive_id: &'a str,
+    egress: &'a EgressState,
+    config_dir: &'a Path,
+    record_path: PathBuf,
+}
+
+/// A SYSTEM_EGRESS_ROUTE switch request, parsed.
+#[derive(Debug, Clone)]
+struct EgressSwitchRequest {
+    operation: EgressOperation,
+    /// A set's section.
+    target: Option<(EgressTarget, EgressSection)>,
+    /// A clear's gateway to go back to, for a worker whose record keeps none.
+    gateway_ip: Option<std::net::Ipv4Addr>,
+    access_from: Vec<SshAllowNet>,
+}
+
+/// `access_from` (G3): the IPv4 addresses or networks the operator manages the worker from.
+fn parse_egress_access_from(value: Option<&serde_json::Value>) -> Result<Vec<SshAllowNet>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| {
+                let raw = entry.as_str().ok_or(
+                    "access_from must be an array of IPv4 addresses or networks (strings)",
+                )?;
+                let net = SshAllowNet::parse(raw).map_err(|err| format!("access_from: {err}"))?;
+                if !net.network.is_ipv4() {
+                    return Err(format!(
+                        "access_from: '{raw}' is IPv6, which the worker blocks behind the egress: \
+                         name IPv4 addresses or networks"
+                    ));
+                }
+                Ok(net)
+            })
+            .collect(),
+        Some(_) => Err("access_from must be an array of IPv4 addresses or networks".to_string()),
+    }
+}
+
+/// A clear's optional `gateway_ip`.
+fn parse_egress_gateway_ip(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<std::net::Ipv4Addr>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => raw
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("gateway_ip '{raw}' is not an IPv4 address")),
+        Some(_) => Err("gateway_ip must be an IPv4 address (a string)".to_string()),
+    }
+}
+
+fn parse_egress_switch_request(payload: &serde_json::Value) -> Result<EgressSwitchRequest, String> {
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .and_then(EgressOperation::parse)
+        .ok_or("operation must be set or clear")?;
+    let target = match operation {
+        EgressOperation::Set => Some(EgressTarget::parse(
+            payload
+                .get("section_yaml")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("a set carries its section_yaml")?,
+        )?),
+        EgressOperation::Clear => None,
+    };
+    let gateway_ip = parse_egress_gateway_ip(payload.get("gateway_ip"))?;
+    if operation == EgressOperation::Set && gateway_ip.is_some() {
+        return Err("a set takes its gateway from its section, never from gateway_ip".to_string());
+    }
+    Ok(EgressSwitchRequest {
+        operation,
+        target,
+        gateway_ip,
+        access_from: parse_egress_access_from(payload.get("access_from"))?,
+    })
+}
+
+/// How a worker's switch ended, for its log line and the tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EgressSwitchEnd {
+    Unchanged,
+    Refused(&'static str),
+    Committed,
+    Reverted(&'static str),
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
+}
+
+/// The probe after the switch: up to `EGRESS_PROBE_ATTEMPTS` GETs of `url`, 1 s apart, within
+/// `deadline`; its result and the GETs made.
+async fn egress_probe(
+    host: &dyn EgressHost,
+    url: &str,
+    deadline: Instant,
+) -> (Result<(), String>, usize) {
+    let mut result = Err("the probe did not run".to_string());
+    let mut attempts = 0;
+    for attempt in 0..EGRESS_PROBE_ATTEMPTS {
+        if attempt > 0 {
+            // Another GET only when curl's time, the pause and a second for the lookups fit.
+            let needed = EGRESS_PROBE_TIME + EGRESS_PROBE_PAUSE + Duration::from_secs(1);
+            if deadline.saturating_duration_since(Instant::now()) < needed {
+                break;
+            }
+            tokio::time::sleep(EGRESS_PROBE_PAUSE).await;
+        }
+        attempts += 1;
+        result = host.probe(url);
+        if result.is_ok() {
+            break;
+        }
+    }
+    (result, attempts)
+}
+
+/// The worker's switch (§15.3): `unchanged`, or the guards, the record, the switch, the check,
+/// `pending_confirm` through `first_answer`, the motherbee's confirm within its window, and the
+/// commit or the revert. A refusal or a revert before `pending_confirm` answers through
+/// `first_answer`; one after it answers the confirm, or nobody when no confirm came.
+async fn egress_switch_flow(
+    host: &dyn EgressHost,
+    env: &EgressSwitchEnv<'_>,
+    request: EgressSwitchRequest,
+    switch_id: &str,
+    first_answer: tokio::sync::oneshot::Sender<serde_json::Value>,
+    confirm: tokio::sync::oneshot::Receiver<EgressConfirm>,
+) -> EgressSwitchEnd {
+    let operation = request.operation;
+    let mut timings = serde_json::Map::new();
+    let answer = |status: &str, timings: &serde_json::Map<String, serde_json::Value>| {
+        serde_json::json!({
+            "status": status,
+            "hive": env.hive_id,
+            "operation": operation.as_str(),
+            "switch_id": switch_id,
+            "timings_ms": timings,
+        })
+    };
+    let refused = |refusal: &EgressRefusal,
+                   outcome: &str,
+                   timings: &serde_json::Map<String, serde_json::Value>| {
+        let mut payload = answer("error", timings);
+        payload["error_code"] = serde_json::json!(refusal.code);
+        payload["step"] = serde_json::json!(refusal.step);
+        payload["message"] = serde_json::json!(refusal.message);
+        payload["outcome"] = serde_json::json!(outcome);
+        payload
+    };
+    let refuse = |refusal: EgressRefusal,
+                  timings: &serde_json::Map<String, serde_json::Value>,
+                  first_answer: tokio::sync::oneshot::Sender<serde_json::Value>| {
+        tracing::warn!(
+            switch_id = switch_id,
+            operation = operation.as_str(),
+            error_code = refusal.code,
+            step = refusal.step,
+            message = %refusal.message,
+            "egress switch refused: nothing changed"
+        );
+        let _ = first_answer.send(refused(&refusal, "refused", timings));
+        EgressSwitchEnd::Refused(refusal.code)
+    };
+
+    // What the worker has now, and what the switch goes to.
+    let current = env.egress.section();
+    let default_routes = match host.default_routes(EGRESS_LOOKUP_BOUND) {
+        Ok(routes) => routes,
+        Err(err) => {
+            return refuse(
+                EgressRefusal::new(
+                    "EGRESS_GUARD_UNREADABLE",
+                    "guards",
+                    format!("the default routes could not be read: {err}"),
+                ),
+                &timings,
+                first_answer,
+            )
+        }
+    };
+    let previous_gateway = parse_default_gateway(&default_routes.join("\n"));
+    let last = match read_egress_switch_record(&env.record_path) {
+        Ok(last) => last,
+        Err(err) => {
+            return refuse(
+                EgressRefusal::new("EGRESS_RECORD_UNREADABLE", "guards", err),
+                &timings,
+                first_answer,
+            )
+        }
+    };
+    let unchanged = |why: &str, first_answer: tokio::sync::oneshot::Sender<serde_json::Value>| {
+        let mut payload = answer("ok", &timings);
+        payload["outcome"] = serde_json::json!("unchanged");
+        payload["message"] = serde_json::json!(why);
+        payload["gateway_ip"] = serde_json::json!(current
+            .as_ref()
+            .and_then(egress_section_gateway)
+            .map(|gateway| gateway.to_string()));
+        payload["observed_default_gateway"] = serde_json::json!(previous_gateway);
+        tracing::info!(
+            switch_id = switch_id,
+            operation = operation.as_str(),
+            "egress switch: unchanged ({why})"
+        );
+        let _ = first_answer.send(payload);
+        EgressSwitchEnd::Unchanged
+    };
+    let (gateway, target_routes, kept_original) = match (operation, request.target.as_ref()) {
+        (EgressOperation::Set, Some((target, _))) => {
+            if target.held_by(current.as_ref())
+                && previous_gateway.as_deref() == Some(target.gateway_ip.to_string().as_str())
+            {
+                return unchanged(
+                    "this worker's section and its default route are the declaration's already",
+                    first_answer,
+                );
+            }
+            if target.reachability_url.is_none() {
+                return refuse(
+                    EgressRefusal::new(
+                        "NO_REACHABILITY_URL",
+                        "guards",
+                        "the section names no reachability_url: the switch is judged by its probe",
+                    ),
+                    &timings,
+                    first_answer,
+                );
+            }
+            (
+                Some(target.gateway_ip),
+                vec![format!("default via {}", target.gateway_ip)],
+                last.as_ref().and_then(|last| last.original.clone()),
+            )
+        }
+        (EgressOperation::Set, None) => {
+            return refuse(
+                EgressRefusal::new("INVALID_REQUEST", "guards", "a set carries its section"),
+                &timings,
+                first_answer,
+            )
+        }
+        (EgressOperation::Clear, _) => {
+            if current.is_none() {
+                return unchanged(
+                    "this worker has no egress section: it is not behind an egress",
+                    first_answer,
+                );
+            }
+            let kept = last
+                .as_ref()
+                .and_then(|last| last.original.clone())
+                .filter(|original| !original.default_routes.is_empty());
+            match (kept, request.gateway_ip) {
+                (Some(original), named) => {
+                    let gateway = parse_default_gateway(&original.default_routes.join("\n"))
+                        .and_then(|gateway| gateway.parse::<std::net::Ipv4Addr>().ok());
+                    if let Some(named) = named.filter(|named| Some(*named) != gateway) {
+                        return refuse(
+                            EgressRefusal::new(
+                                "INVALID_REQUEST",
+                                "guards",
+                                format!(
+                                    "this worker's record keeps the default route it had before \
+                                     the egress ({}), and the clear puts that back: gateway_ip \
+                                     {named} names another",
+                                    original.default_routes.join("; ")
+                                ),
+                            ),
+                            &timings,
+                            first_answer,
+                        );
+                    }
+                    (gateway, original.default_routes.clone(), Some(original))
+                }
+                (None, Some(named)) => (Some(named), vec![format!("default via {named}")], None),
+                (None, None) => {
+                    return refuse(
+                        EgressRefusal::new(
+                            "PREVIOUS_GATEWAY_UNKNOWN",
+                            "guards",
+                            "this worker's record keeps no default route from before the egress \
+                             (it joined after the declaration): name the gateway to go back to \
+                             with gateway_ip",
+                        ),
+                        &timings,
+                        first_answer,
+                    )
+                }
+            }
+        }
+    };
+
+    // 1. The guards.
+    let guards_started = Instant::now();
+    if operation == EgressOperation::Set && !host.curl_exists() {
+        return refuse(
+            EgressRefusal::new(
+                "PROBE_UNAVAILABLE",
+                "guards",
+                "this worker has no curl, so it cannot probe the internet through the egress, and \
+                 the switch is judged by that probe",
+            ),
+            &timings,
+            first_answer,
+        );
+    }
+    let uplink_hosts = match load_hive(env.config_dir) {
+        Ok(hive) => egress_uplink_hosts(&hive),
+        Err(err) => {
+            return refuse(
+                EgressRefusal::new(
+                    "EGRESS_GUARD_UNREADABLE",
+                    "guards",
+                    format!("hive.yaml could not be read: {err}"),
+                ),
+                &timings,
+                first_answer,
+            )
+        }
+    };
+    let guards = match egress_switch_guards(
+        host,
+        gateway,
+        &uplink_hosts,
+        &request.access_from,
+        previous_gateway.as_deref(),
+    ) {
+        Ok(guards) => guards,
+        Err(refusal) => {
+            timings.insert("guards".to_string(), elapsed_ms(guards_started).into());
+            return refuse(refusal, &timings, first_answer);
+        }
+    };
+    timings.insert("guards".to_string(), elapsed_ms(guards_started).into());
+
+    // 2. The record, open. The watchdog's egress step skips from the switch's claim on.
+    let before = EgressHostState {
+        default_routes: default_routes.clone(),
+        ipv6: host.ipv6_values(),
+        sysctl_file: host.sysctl_file(),
+    };
+    let original = match operation {
+        // The routes and values the worker had before it first went behind an egress are carried
+        // over by later switches.
+        EgressOperation::Set if current.is_none() => Some(before.clone()),
+        _ => kept_original,
+    };
+    let now = now_epoch_ms();
+    let mut record = EgressSwitchRecord {
+        switch_id: switch_id.to_string(),
+        operation: operation.as_str().to_string(),
+        state: "open".to_string(),
+        started_at_ms: now,
+        updated_at_ms: now,
+        gateway_ip: gateway.map(|gateway| gateway.to_string()),
+        target: request.target.as_ref().map(|(target, _)| target.clone()),
+        previous_gateway: previous_gateway.clone(),
+        before,
+        original,
+        step: Some("switch".to_string()),
+        error_code: None,
+        reason: None,
+    };
+    if let Err(err) = write_egress_switch_record(&env.record_path, &record) {
+        return refuse(
+            EgressRefusal::new(
+                "EGRESS_RECORD_FAILED",
+                "switch",
+                format!("the switch's record could not be written, so nothing was changed: {err}"),
+            ),
+            &timings,
+            first_answer,
+        );
+    }
+    tracing::info!(
+        switch_id = switch_id,
+        operation = operation.as_str(),
+        gateway_ip = ?record.gateway_ip,
+        previous_gateway = ?record.previous_gateway,
+        guards_ms = elapsed_ms(guards_started),
+        "egress switch: the guards passed and the record is open"
+    );
+
+    // How the switch goes back from here: its answer goes through `first_answer` until
+    // pending_confirm, and through the confirm after it.
+    let revert = |record: &mut EgressSwitchRecord,
+                  refusal: EgressRefusal,
+                  timings: &mut serde_json::Map<String, serde_json::Value>| {
+        let revert_started = Instant::now();
+        let problems = egress_revert(host, record, &env.record_path, &refusal, "reverted");
+        timings.insert("revert".to_string(), elapsed_ms(revert_started).into());
+        tracing::warn!(
+            switch_id = switch_id,
+            operation = operation.as_str(),
+            error_code = refusal.code,
+            step = refusal.step,
+            message = %refusal.message,
+            revert_problems = ?problems,
+            revert_ms = elapsed_ms(revert_started),
+            "egress switch reverted"
+        );
+        let mut payload = refused(&refusal, "reverted", timings);
+        payload["reverted"] = serde_json::json!(true);
+        payload["revert_problems"] = serde_json::json!(problems);
+        payload["ipv6_blocked"] = serde_json::json!(host.ipv6_disabled());
+        payload["route"] = serde_json::json!(host
+            .default_routes(EGRESS_LOOKUP_BOUND)
+            .ok()
+            .and_then(|routes| routes.into_iter().next()));
+        (payload, EgressSwitchEnd::Reverted(refusal.code))
+    };
+
+    // 3. The switch.
+    let switch_started = Instant::now();
+    let switch_deadline = switch_started + EGRESS_SWITCH_BOUND;
+    let left = |deadline: Instant| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(500))
+    };
+    let switched = match operation {
+        EgressOperation::Set => {
+            let gateway = gateway
+                .map(|gateway| gateway.to_string())
+                .unwrap_or_default();
+            host.route_replace(
+                &egress_args(&["default", "via", gateway.as_str()]),
+                left(switch_deadline),
+            )
+            .map_err(|err| {
+                EgressRefusal::new(
+                    "EGRESS_SWITCH_FAILED",
+                    "switch",
+                    format!("the default route via {gateway} could not be set: {err}"),
+                )
+            })
+            .and_then(|()| {
+                host.put_sysctl_file(Some(worker_ipv6_sysctl_content()))
+                    .map_err(|err| {
+                        EgressRefusal::new(
+                            "EGRESS_IPV6_UNMANAGED",
+                            "switch",
+                            format!("{EGRESS_SYSCTL_PATH} could not be written: {err}"),
+                        )
+                    })
+            })
+            .and_then(|()| {
+                // FINDINGS A-225: judged by what the kernel reads back, as the egress' block.
+                if let Err(err) = host.sysctl_system(left(switch_deadline)) {
+                    tracing::warn!(
+                        switch_id = switch_id,
+                        error = %err,
+                        "sysctl --system reported an error; the IPv6 block is judged by what \
+                         the kernel reads back"
+                    );
+                }
+                if host.ipv6_disabled() {
+                    Ok(())
+                } else {
+                    Err(EgressRefusal::new(
+                        "EGRESS_IPV6_UNMANAGED",
+                        "switch",
+                        "the IPv6 block was applied and the kernel still has IPv6 on: a rogue \
+                             router advertisement could route around the egress",
+                    ))
+                }
+            })
+        }
+        EgressOperation::Clear => {
+            let leaving = current
+                .as_ref()
+                .and_then(egress_section_gateway)
+                .map(|gateway| gateway.to_string());
+            restore_default_routes(host, &target_routes, leaving.as_deref(), switch_deadline)
+                .map_err(|err| {
+                    EgressRefusal::new(
+                        "EGRESS_SWITCH_FAILED",
+                        "switch",
+                        format!("the default routes could not be put back: {err}"),
+                    )
+                })
+        }
+    };
+    timings.insert("switch".to_string(), elapsed_ms(switch_started).into());
+    if let Err(refusal) = switched {
+        let (payload, end) = revert(&mut record, refusal, &mut timings);
+        let _ = first_answer.send(payload);
+        return end;
+    }
+
+    // 4. The check: the probe, then G2's lookups again.
+    let check_started = Instant::now();
+    let check_deadline = check_started + EGRESS_CHECK_BOUND;
+    let probe_url = match request.target.as_ref() {
+        Some((target, _)) => target.reachability_url.clone(),
+        None => current.as_ref().and_then(EgressSection::probe_url),
+    };
+    let probe = match probe_url.as_deref() {
+        Some(url) if host.curl_exists() => Some(egress_probe(host, url, check_deadline).await),
+        _ => None,
+    };
+    let mut uplink_changed = None;
+    for (address, guarded) in &guards.uplink_routes {
+        let again = host
+            .route_lookup(*address, left(check_deadline).min(EGRESS_LOOKUP_BOUND))
+            .map_err(|err| format!("the route to {address} could not be read again: {err}"))
+            .and_then(|output| {
+                RouteMatchLine::parse(&output)
+                    .ok_or_else(|| format!("the route to {address} reads as nothing now"))
+            });
+        match again {
+            Ok(again) if again.same_path(guarded) => {}
+            Ok(again) => {
+                uplink_changed = Some(format!(
+                    "the route to the motherbee ({address}) changed with the switch: it was '{}' \
+                     and is '{}'",
+                    guarded.line, again.line
+                ));
+                break;
+            }
+            Err(err) => {
+                uplink_changed = Some(err);
+                break;
+            }
+        }
+    }
+    timings.insert("check".to_string(), elapsed_ms(check_started).into());
+    let failed_check = if let Some(why) = uplink_changed {
+        Some(EgressRefusal::new("UPLINK_ROUTE_CHANGED", "check", why))
+    } else {
+        match (operation, probe.as_ref()) {
+            (EgressOperation::Set, Some((Err(reason), attempts))) => Some(EgressRefusal::new(
+                "EGRESS_PROBE_FAILED",
+                "check",
+                format!(
+                    "{} did not answer through the egress after {attempts} GET(s): {reason}",
+                    probe_url.as_deref().unwrap_or_default()
+                ),
+            )),
+            _ => None,
+        }
+    };
+    if let Some(refusal) = failed_check {
+        let (mut payload, end) = revert(&mut record, refusal, &mut timings);
+        if let Some((result, attempts)) = probe.as_ref() {
+            payload["internet_reachable"] = serde_json::json!(result.is_ok());
+            payload["probe"] = serde_json::json!({
+                "url": probe_url,
+                "attempts": attempts,
+                "reason": result.as_ref().err(),
+            });
+        }
+        let _ = first_answer.send(payload);
+        return end;
+    }
+
+    // 5. pending_confirm, with what the worker sees now.
+    let mut pending = answer("pending_confirm", &timings);
+    pending["gateway_ip"] = serde_json::json!(record.gateway_ip);
+    pending["previous_gateway"] = serde_json::json!(record.previous_gateway);
+    pending["ipv6_blocked"] = serde_json::json!(host.ipv6_disabled());
+    pending["internet_reachable"] =
+        serde_json::json!(probe.as_ref().map(|(result, _)| result.is_ok()));
+    let probe_reason = match probe.as_ref() {
+        Some((Err(reason), _)) => Some(reason.clone()),
+        Some((Ok(()), _)) => None,
+        None if probe_url.is_none() => Some("not_configured: no reachability_url".to_string()),
+        None => Some("not_probed: no curl on this worker".to_string()),
+    };
+    pending["probe"] = serde_json::json!({
+        "url": probe_url,
+        "attempts": probe.as_ref().map(|(_, attempts)| *attempts),
+        "reason": probe_reason,
+    });
+    pending["route"] = serde_json::json!(host
+        .default_routes(EGRESS_LOOKUP_BOUND)
+        .ok()
+        .and_then(|routes| routes.into_iter().next()));
+    pending["ssh_reachable_from"] = serde_json::json!(guards.ssh_reachable_from);
+    let uplinks: Vec<serde_json::Value> = guards
+        .uplink_routes
+        .iter()
+        .map(|(address, route)| {
+            serde_json::json!({
+                "address": address.to_string(),
+                "route": route.line,
+            })
+        })
+        .collect();
+    pending["uplinks"] = serde_json::json!(uplinks);
+    pending["confirm_window_ms"] = serde_json::json!(EGRESS_CONFIRM_WINDOW.as_millis() as u64);
+    record.step = Some("confirm".to_string());
+    record.updated_at_ms = now_epoch_ms();
+    if let Err(err) = write_egress_switch_record(&env.record_path, &record) {
+        tracing::warn!(
+            switch_id = switch_id,
+            error = %err,
+            "egress switch: the record's step could not be written"
+        );
+    }
+    tracing::info!(
+        switch_id = switch_id,
+        operation = operation.as_str(),
+        switch_ms = timings.get("switch").and_then(serde_json::Value::as_u64),
+        check_ms = timings.get("check").and_then(serde_json::Value::as_u64),
+        internet_reachable = ?pending["internet_reachable"],
+        "egress switch: pending_confirm; waiting for the motherbee's confirm"
+    );
+    let _ = first_answer.send(pending);
+
+    // 6. The confirm: its answer reaching the motherbee proves the way from the worker, the confirm
+    // reaching the worker the way back.
+    let confirm_started = Instant::now();
+    let ticket = match tokio::time::timeout(EGRESS_CONFIRM_WINDOW, confirm).await {
+        Ok(Ok(ticket)) => Some(ticket),
+        _ => None,
+    };
+    timings.insert(
+        "confirm_wait".to_string(),
+        elapsed_ms(confirm_started).into(),
+    );
+    let Some(ticket) = ticket else {
+        // Nobody waits for this answer: the record and the journal keep it.
+        let (_, end) = revert(
+            &mut record,
+            EgressRefusal::new(
+                "EGRESS_CONFIRM_MISSED",
+                "confirm",
+                format!(
+                    "no confirm from the motherbee within {} s of pending_confirm: the switch \
+                     reverted",
+                    EGRESS_CONFIRM_WINDOW.as_secs()
+                ),
+            ),
+            &mut timings,
+        );
+        return end;
+    };
+
+    // 7. The commit.
+    let commit_started = Instant::now();
+    match egress_commit(host, env, request.target.as_ref(), &record) {
+        Ok(notes) => {
+            record.state = "committed".to_string();
+            record.step = None;
+            record.updated_at_ms = now_epoch_ms();
+            if let Err(err) = write_egress_switch_record(&env.record_path, &record) {
+                tracing::warn!(
+                    switch_id = switch_id,
+                    error = %err,
+                    "egress switch: the committed record could not be written"
+                );
+            }
+            timings.insert("commit".to_string(), elapsed_ms(commit_started).into());
+            let mut payload = answer("ok", &timings);
+            payload["outcome"] = serde_json::json!(operation.outcome());
+            payload["committed"] = serde_json::json!(true);
+            payload["ipv6_blocked"] = serde_json::json!(host.ipv6_disabled());
+            payload["route"] = serde_json::json!(host
+                .default_routes(EGRESS_LOOKUP_BOUND)
+                .ok()
+                .and_then(|routes| routes.into_iter().next()));
+            payload["notes"] = serde_json::json!(notes);
+            tracing::info!(
+                switch_id = switch_id,
+                operation = operation.as_str(),
+                gateway_ip = ?record.gateway_ip,
+                confirm_wait_ms = timings.get("confirm_wait").and_then(serde_json::Value::as_u64),
+                commit_ms = elapsed_ms(commit_started),
+                notes = ?notes,
+                "egress switch committed"
+            );
+            let _ = ticket.answer.send(payload);
+            EgressSwitchEnd::Committed
+        }
+        Err(err) => {
+            timings.insert("commit".to_string(), elapsed_ms(commit_started).into());
+            let (payload, end) = revert(
+                &mut record,
+                EgressRefusal::new("EGRESS_COMMIT_FAILED", "commit", err),
+                &mut timings,
+            );
+            let _ = ticket.answer.send(payload);
+            end
+        }
+    }
+}
+
+/// The confirm's answer when no switch with its id waits for it: the record's, when it is that
+/// switch's (`ok` once it committed; `EGRESS_CONFIRM_MISSED` once it reverted or was
+/// interrupted), else `EGRESS_SWITCH_NOT_FOUND`.
+fn egress_confirm_without_switch(record_path: &Path, switch_id: &str) -> serde_json::Value {
+    let record = read_egress_switch_record(record_path)
+        .ok()
+        .flatten()
+        .filter(|record| record.switch_id == switch_id);
+    match record {
+        Some(record) if record.state == "committed" => serde_json::json!({
+            "status": "ok",
+            "switch_id": switch_id,
+            "outcome": EgressOperation::parse(&record.operation).map(EgressOperation::outcome),
+            "committed": true,
+        }),
+        Some(record) => serde_json::json!({
+            "status": "error",
+            "error_code": "EGRESS_CONFIRM_MISSED",
+            "step": "confirm",
+            "switch_id": switch_id,
+            "outcome": "reverted",
+            "message": format!(
+                "the switch is {} ({}): its confirm came after its window",
+                record.state,
+                record.reason.as_deref().unwrap_or("no reason recorded")
+            ),
+        }),
+        None => serde_json::json!({
+            "status": "error",
+            "error_code": "EGRESS_SWITCH_NOT_FOUND",
+            "step": "confirm",
+            "switch_id": switch_id,
+            "message": format!("no egress switch {switch_id} on this worker"),
+        }),
+    }
+}
+
+/// The motherbee's confirm for the open switch `switch_id`: handed to it, and its commit's answer
+/// (or its revert's) given back. One that finds no switch waiting reads the record.
+async fn egress_confirm_answer(
+    egress: &EgressState,
+    record_path: &Path,
+    switch_id: &str,
+) -> serde_json::Value {
+    let missed = || {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "EGRESS_CONFIRM_MISSED",
+            "step": "confirm",
+            "switch_id": switch_id,
+            "outcome": "reverted",
+            "message": "the confirm came as the switch's window ended: the switch reverted",
+        })
+    };
+    let Some(confirm) = egress.take_confirm(switch_id) else {
+        return egress_confirm_without_switch(record_path, switch_id);
+    };
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    if confirm.send(EgressConfirm { answer }).is_err() {
+        return missed();
+    }
+    let within = EGRESS_COMMIT_BOUND + Duration::from_secs(2);
+    match tokio::time::timeout(within, answered).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => missed(),
+        Err(_) => serde_json::json!({
+            "status": "error",
+            "error_code": "EGRESS_COMMIT_FAILED",
+            "step": "commit",
+            "switch_id": switch_id,
+            "message": format!(
+                "the commit did not answer within {} s; /versions' egress.last_switch says how it \
+                 ended",
+                within.as_secs()
+            ),
+        }),
+    }
+}
+
+/// SYSTEM_EGRESS_ROUTE on this hive (§15.1): a worker's alone. A switch runs in its own task,
+/// which answers it (`spawn_egress_switch`): it waits for the motherbee's confirm, which this inbox
+/// takes meanwhile, and a confirm is answered from a task of its own too.
+async fn egress_route_message(state: &Arc<OrchestratorState>, sender: &NodeSender, msg: &Message) {
+    let reply = |payload: serde_json::Value| async move {
+        if let Err(err) =
+            send_system_action_response(sender, msg, MSG_SYSTEM_EGRESS_ROUTE_RESPONSE, payload)
+                .await
+        {
+            tracing::warn!(error = %err, "SYSTEM_EGRESS_ROUTE answer not sent");
+        }
+    };
+    if let Some(refusal) = spoke_only_action_refusal(MSG_SYSTEM_EGRESS_ROUTE, state.is_motherbee) {
+        tracing::warn!(
+            src_l2_name = ?msg.routing.src_l2_name,
+            "SYSTEM_EGRESS_ROUTE refused: it never runs on the motherbee"
+        );
+        return reply(refusal).await;
+    }
+    if state.role != HiveRole::Worker {
+        return reply(serde_json::json!({
+            "status": "error",
+            "error_code": "NOT_A_WORKER",
+            "step": "checks",
+            "outcome": "refused",
+            "hive": state.hive_id,
+            "message": format!(
+                "{} is an {} hive: only a worker goes behind the egress",
+                state.hive_id,
+                state.role.as_str()
+            ),
+        }))
+        .await;
+    }
+    let invalid = |message: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "step": "checks",
+            "outcome": "refused",
+            "hive": state.hive_id,
+            "message": message,
+        })
+    };
+    match msg.payload.get("phase").and_then(serde_json::Value::as_str) {
+        Some("confirm") => {
+            let Some(switch_id) = msg
+                .payload
+                .get("switch_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                return reply(invalid("a confirm carries its switch_id".to_string())).await;
+            };
+            let state = Arc::clone(state);
+            let sender = sender.clone();
+            let msg = msg.clone();
+            tokio::spawn(async move {
+                let answer =
+                    egress_confirm_answer(&state.egress, &egress_switch_record_path(), &switch_id)
+                        .await;
+                tracing::info!(
+                    switch_id = %switch_id,
+                    answer = %answer,
+                    "SYSTEM_EGRESS_ROUTE confirm processed"
+                );
+                if let Err(err) = send_system_action_response(
+                    &sender,
+                    &msg,
+                    MSG_SYSTEM_EGRESS_ROUTE_RESPONSE,
+                    answer,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "SYSTEM_EGRESS_ROUTE confirm answer not sent");
+                }
+            });
+        }
+        Some("switch") => {
+            let request = match parse_egress_switch_request(&msg.payload) {
+                Ok(request) => request,
+                Err(message) => return reply(invalid(message)).await,
+            };
+            let (switch_id, confirm) = match state.egress.claim() {
+                Ok(claimed) => claimed,
+                Err(open) => {
+                    return reply(serde_json::json!({
+                        "status": "error",
+                        "error_code": "EGRESS_SWITCH_OPEN",
+                        "step": "checks",
+                        "outcome": "refused",
+                        "hive": state.hive_id,
+                        "message": format!(
+                            "egress switch {open} is open on this worker: run this once it ends"
+                        ),
+                    }))
+                    .await
+                }
+            };
+            spawn_egress_switch(state, sender, msg, request, switch_id, confirm);
+        }
+        other => {
+            reply(invalid(format!(
+                "phase must be switch or confirm (got {})",
+                other.unwrap_or("none")
+            )))
+            .await
+        }
+    }
+}
+
+/// Runs a claimed switch (`egress_switch_flow`) on this box in its own task: its first answer goes
+/// back as SYSTEM_EGRESS_ROUTE_RESPONSE as soon as it is ready, and the switch closes, the
+/// watchdog's egress step back, whatever the end.
+fn spawn_egress_switch(
+    state: &Arc<OrchestratorState>,
+    sender: &NodeSender,
+    msg: &Message,
+    request: EgressSwitchRequest,
+    switch_id: String,
+    confirm: tokio::sync::oneshot::Receiver<EgressConfirm>,
+) {
+    let state = Arc::clone(state);
+    let sender = sender.clone();
+    let msg = msg.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let (first_answer, answered) = tokio::sync::oneshot::channel::<serde_json::Value>();
+        let answering = {
+            let sender = sender.clone();
+            let msg = msg.clone();
+            tokio::spawn(async move {
+                if let Ok(answer) = answered.await {
+                    if let Err(err) = send_system_action_response(
+                        &sender,
+                        &msg,
+                        MSG_SYSTEM_EGRESS_ROUTE_RESPONSE,
+                        answer,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "SYSTEM_EGRESS_ROUTE answer not sent");
+                    }
+                }
+            })
+        };
+        let env = EgressSwitchEnv {
+            hive_id: &state.hive_id,
+            egress: &state.egress,
+            config_dir: &state.config_dir,
+            record_path: egress_switch_record_path(),
+        };
+        let operation = request.operation;
+        let end = egress_switch_flow(
+            &LiveEgressHost,
+            &env,
+            request,
+            &switch_id,
+            first_answer,
+            confirm,
+        )
+        .await;
+        state.egress.release(&switch_id);
+        let _ = answering.await;
+        tracing::info!(
+            switch_id = %switch_id,
+            operation = operation.as_str(),
+            end = ?end,
+            elapsed_ms = elapsed_ms(started),
+            "egress switch ended; the watchdog's egress step runs again"
+        );
+    });
+}
+
+/// What the start did with an open record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EgressSwitchResume {
+    /// hive.yaml holds the switch's commit: the record says `committed`.
+    Committed,
+    /// The switch never committed: undone from the record, which says `interrupted`; the problems
+    /// the undo met.
+    Interrupted(Vec<String>),
+}
+
+/// §15.3, "An orchestrator that stops mid-switch": at the start, before the boot applies the
+/// section (`reconcile_egress`), a record left `open`. When hive.yaml holds its commit (a set's
+/// section; no section after a clear) the record says `committed`, and a clear's IPv6 values are
+/// put back; otherwise the recorded routes, IPv6 values and sysctl file are restored and the record
+/// says `interrupted`. A host reboot loses the kernel's route anyway; the record still brings the
+/// IPv6 values back.
+fn resume_egress_switch_at_start(
+    host: &dyn EgressHost,
+    record_path: &Path,
+    section: Option<&EgressSection>,
+) -> Result<Option<EgressSwitchResume>, String> {
+    let Some(mut record) = read_egress_switch_record(record_path)? else {
+        return Ok(None);
+    };
+    if record.state != "open" {
+        return Ok(None);
+    }
+    let operation = EgressOperation::parse(&record.operation);
+    let committed = match operation {
+        Some(EgressOperation::Set) => record
+            .target
+            .as_ref()
+            .is_some_and(|target| target.held_by(section)),
+        Some(EgressOperation::Clear) => section.is_none(),
+        None => false,
+    };
+    if !committed {
+        let refusal = EgressRefusal::new(
+            "EGRESS_SWITCH_INTERRUPTED",
+            "start",
+            format!(
+                "the orchestrator stopped during the switch's {} step, before its commit: the \
+                 switch is undone at its start",
+                record.step.as_deref().unwrap_or("unknown")
+            ),
+        );
+        let problems = egress_revert(host, &mut record, record_path, &refusal, "interrupted");
+        return Ok(Some(EgressSwitchResume::Interrupted(problems)));
+    }
+    if operation == Some(EgressOperation::Clear) {
+        let notes = egress_ipv6_back(host, record.original.as_ref());
+        if !notes.is_empty() {
+            tracing::warn!(
+                switch_id = %record.switch_id,
+                notes = ?notes,
+                "egress clear finished at the start"
+            );
+        }
+    }
+    record.state = "committed".to_string();
+    record.step = None;
+    record.updated_at_ms = now_epoch_ms();
+    write_egress_switch_record(record_path, &record)?;
+    Ok(Some(EgressSwitchResume::Committed))
+}
+
+/// The start's reading of the record on a worker (`resume_egress_switch_at_start`), in its
+/// journal, and an interrupted switch as a drift alert in its own file, which the motherbee does
+/// not read yet (FINDINGS A-175).
+fn resume_egress_switch(state: &OrchestratorState) {
+    match resume_egress_switch_at_start(
+        &LiveEgressHost,
+        &egress_switch_record_path(),
+        state.egress.section().as_ref(),
+    ) {
+        Ok(None) => {}
+        Ok(Some(EgressSwitchResume::Committed)) => tracing::info!(
+            "egress switch: the record was open and hive.yaml holds its commit; marked committed"
+        ),
+        Ok(Some(EgressSwitchResume::Interrupted(problems))) => {
+            tracing::warn!(
+                problems = ?problems,
+                "egress switch interrupted: the orchestrator stopped before its commit, and the \
+                 switch is undone from its record"
+            );
+            append_drift_alert(
+                "egress",
+                "egress_switch_interrupted",
+                "warning",
+                &state.hive_id,
+                format!(
+                    "an egress switch was open when the orchestrator stopped, before its commit: \
+                     the default routes and the IPv6 values are back as the record kept them{}",
+                    if problems.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (problems: {})", problems.join("; "))
+                    }
+                ),
+                None,
+                None,
+                None,
+            );
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "egress switch: the record could not be read at the start")
+        }
+    }
+}
+
+/// A hive's `egress` in its `/versions` (§15.5): on a worker its section, the default gateway it
+/// sees, whether IPv6 is off and its last switch (`egress_worker_versions_block`); on the motherbee
+/// its declaration; null on an ingress or an egress.
+fn egress_versions_block(state: &OrchestratorState) -> serde_json::Value {
+    match state.role {
+        HiveRole::Worker => egress_worker_versions_block(
+            state.egress.section().as_ref(),
+            observed_default_gateway().as_deref(),
+            ipv6_disabled_now(),
+            state.egress.switch_open(),
+            &read_egress_switch_record(&egress_switch_record_path()),
+        ),
+        HiveRole::Motherbee => serde_json::json!({
+            "declaration": state.egress.section().as_ref().map(egress_section_view),
+        }),
+        HiveRole::Egress | HiveRole::Ingress => serde_json::Value::Null,
+    }
+}
+
+/// A worker's `egress` in its `/versions`: its section (`gateway_ip` and `reachability_url`, or
+/// null), the default gateway it sees, whether IPv6 is off, whether a switch is open, and its last
+/// switch from the record (`last_switch`, null when it never switched).
+fn egress_worker_versions_block(
+    section: Option<&EgressSection>,
+    observed_default_gateway: Option<&str>,
+    ipv6_blocked: bool,
+    switch_open: bool,
+    record: &Result<Option<EgressSwitchRecord>, String>,
+) -> serde_json::Value {
+    let mut block = serde_json::json!({
+        "section": section.map(egress_section_view),
+        "observed_default_gateway": observed_default_gateway,
+        "ipv6_blocked": ipv6_blocked,
+        "switch_open": switch_open,
+        "last_switch": match record {
+            Ok(Some(record)) => record.view(),
+            _ => serde_json::Value::Null,
+        },
+    });
+    if let Err(err) = record {
+        block["last_switch_error"] = serde_json::json!(err);
+    }
+    block
+}
+
+/// On the motherbee: a worker's `/versions` answer gets `egress.state` against the motherbee's
+/// declaration (§15.5), and the declared gateway beside it. An answer without `egress` (an older
+/// orchestrator), and a hive that is not a worker, are left as they are.
+fn add_egress_state_to_answer(answer: &mut serde_json::Value, declaration: Option<&EgressSection>) {
+    let Some(hive) = answer.get_mut("hive") else {
+        return;
+    };
+    if hive.get("role").and_then(serde_json::Value::as_str) != Some("worker") {
+        return;
+    }
+    let Some(egress) = hive.get_mut("egress").filter(|egress| egress.is_object()) else {
+        return;
+    };
+    let declared = declaration.and_then(egress_section_gateway);
+    let state = egress_comparison(declared, egress);
+    egress["state"] = serde_json::json!(state);
+    egress["declared_gateway_ip"] = serde_json::json!(declared.map(|gateway| gateway.to_string()));
+}
+
+/// A worker's `egress.state`: `behind` (its section names the declared gateway, and its route goes
+/// there), `not_behind` (no section: A-219's case), `other_gateway` (its section names another
+/// gateway: the declaration changed since), `drifted` (the section is right, the route is not), or
+/// None where it does not apply: the motherbee declares no gateway.
+fn egress_comparison(
+    declared: Option<std::net::Ipv4Addr>,
+    egress: &serde_json::Value,
+) -> Option<&'static str> {
+    let declared = declared?;
+    let gateway_of = |pointer: &str| {
+        egress
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|gateway| gateway.trim().parse::<std::net::Ipv4Addr>().ok())
+    };
+    let Some(section_gateway) = gateway_of("/section/gateway_ip") else {
+        return Some("not_behind");
+    };
+    if section_gateway != declared {
+        return Some("other_gateway");
+    }
+    if gateway_of("/observed_default_gateway") != Some(declared) {
+        return Some("drifted");
+    }
+    Some("behind")
+}
+
+/// What the motherbee sends a worker for `set_hive_egress` or `clear_hive_egress` once its own
+/// checks pass (§15.1): the operation, the section the join's renderer writes (a set), the gateway
+/// to go back to (a clear's, optional) and `access_from`. `Err`: the refusal, before anything is
+/// sent.
+fn prepare_hive_egress(
+    operation: EgressOperation,
+    hive: &str,
+    local_hive: &str,
+    declaration: Option<&EgressSection>,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let refuse = |code: &str, message: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": code,
+            "step": "checks",
+            "outcome": "refused",
+            "hive": hive,
+            "operation": operation.as_str(),
+            "message": message,
+        })
+    };
+    if !valid_hive_id(hive) {
+        return Err(refuse(
+            "INVALID_REQUEST",
+            format!("invalid hive id '{hive}'"),
+        ));
+    }
+    if hive == local_hive {
+        return Err(refuse(
+            "NOT_A_WORKER",
+            format!(
+                "{hive} is the motherbee: Fluxbee never rewrites its route (PB-8). Put it behind \
+                 the egress at the OS level, if at all"
+            ),
+        ));
+    }
+    let allowed: &[&str] = match operation {
+        EgressOperation::Set => &["target", "access_from"],
+        EgressOperation::Clear => &["target", "access_from", "gateway_ip"],
+    };
+    if let Some(field) = payload
+        .as_object()
+        .and_then(|fields| fields.keys().find(|key| !allowed.contains(&key.as_str())))
+    {
+        return Err(refuse(
+            "INVALID_REQUEST",
+            format!(
+                "{} takes {} (got {field})",
+                operation.action(),
+                allowed[1..].join(" and ")
+            ),
+        ));
+    }
+    let access_from = parse_egress_access_from(payload.get("access_from"))
+        .map_err(|message| refuse("INVALID_REQUEST", message))?;
+    let mut switch = serde_json::json!({
+        "target": hive,
+        "operation": operation.as_str(),
+        "phase": "switch",
+        "access_from": access_from.iter().map(SshAllowNet::to_string).collect::<Vec<_>>(),
+    });
+    match operation {
+        EgressOperation::Set => {
+            let Some(declaration) = declaration.filter(|declaration| {
+                declaration
+                    .gateway_ip
+                    .as_deref()
+                    .is_some_and(|gateway| !gateway.trim().is_empty())
+            }) else {
+                return Err(refuse(
+                    "NO_EGRESS_DECLARED",
+                    "the motherbee declares no egress.gateway_ip in its hive.yaml: there is no \
+                     egress to put the worker behind"
+                        .to_string(),
+                ));
+            };
+            if declaration
+                .reachability_url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+            {
+                return Err(refuse(
+                    "NO_REACHABILITY_URL",
+                    "the motherbee's egress names no reachability_url: the switch is judged by a \
+                     probe of it, and the code never picks a target of its own. The operator adds \
+                     egress.reachability_url to the motherbee's hive.yaml and restarts its \
+                     sy-orchestrator"
+                        .to_string(),
+                ));
+            }
+            let yaml = render_worker_egress_yaml(Some(declaration)).map_err(|err| {
+                refuse(
+                    "EGRESS_DECLARATION_INVALID",
+                    format!(
+                        "the motherbee's egress declaration is one the join would refuse: {err}"
+                    ),
+                )
+            })?;
+            switch["section_yaml"] = serde_json::json!(yaml);
+        }
+        EgressOperation::Clear => {
+            if let Some(gateway) = parse_egress_gateway_ip(payload.get("gateway_ip"))
+                .map_err(|message| refuse("INVALID_REQUEST", message))?
+            {
+                switch["gateway_ip"] = serde_json::json!(gateway.to_string());
+            }
+        }
+    }
+    Ok(switch)
+}
+
+/// The motherbee's reading of the hive (§15.1), as SY.admin's before it: a worker of its registry
+/// with its join done (`HiveRegistry::role`, the strict reading). Why not, otherwise.
+fn hive_egress_registry_refusal(
+    registry: &fluxbee_sdk::mesh::HiveRegistry,
+    hive: &str,
+) -> Option<String> {
+    use fluxbee_sdk::mesh::HiveRole as RegistryRole;
+    match registry.role(hive) {
+        Some(RegistryRole::Worker) => None,
+        Some(RegistryRole::Ingress) => Some(format!(
+            "{hive} is an ingress: only a worker goes behind the egress"
+        )),
+        Some(RegistryRole::Egress) => Some(format!(
+            "{hive} is an egress: it is the gateway, not a worker behind it"
+        )),
+        None if registry.lists(hive) => Some(format!(
+            "{hive}'s join is not done: finish it, or remove the hive, first"
+        )),
+        None => Some(format!("{hive} is no hive of the registry")),
+    }
+}
+
+/// The motherbee's part once its checks pass (§15.1, §15.3): the switch to the worker
+/// (`EGRESS_SWITCH_FORWARD_TIMEOUT`) and, on its `pending_confirm`, the confirm
+/// (`EGRESS_CONFIRM_FORWARD_TIMEOUT`). A forward without an answer is `not_answered`, which never
+/// means "not applied", and no confirm follows a switch whose answer did not come: the worker then
+/// reverts by itself when its window ends. `send` is the forward to the worker's orchestrator.
+async fn hive_egress_exchange<F, Fut>(
+    hive: &str,
+    operation: EgressOperation,
+    switch: serde_json::Value,
+    mut send: F,
+) -> serde_json::Value
+where
+    F: FnMut(serde_json::Value, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    let mut timings = serde_json::Map::new();
+    let switch_started = Instant::now();
+    let switched = send(switch, EGRESS_SWITCH_FORWARD_TIMEOUT).await;
+    timings.insert(
+        "forward_switch".to_string(),
+        elapsed_ms(switch_started).into(),
+    );
+    let not_answered =
+        |step: &str,
+         message: String,
+         base: Option<&serde_json::Value>,
+         timings: &serde_json::Map<String, serde_json::Value>| {
+            let mut answer = base.cloned().unwrap_or_else(|| serde_json::json!({}));
+            answer["status"] = serde_json::json!("error");
+            answer["error_code"] = serde_json::json!("EGRESS_NOT_ANSWERED");
+            answer["outcome"] = serde_json::json!("not_answered");
+            answer["step"] = serde_json::json!(step);
+            answer["hive"] = serde_json::json!(hive);
+            answer["operation"] = serde_json::json!(operation.as_str());
+            answer["message"] = serde_json::json!(message);
+            merge_timings(&mut answer, timings);
+            answer
+        };
+    let mut pending = match switched {
+        Ok(answer) => answer,
+        Err(err) => {
+            return not_answered(
+                "switch",
+                format!(
+                    "{hive} did not answer the switch within {} s ({err}). A worker on a release \
+                     before this action ignores it, and nothing changed there: bring it to the \
+                     motherbee's release first (update_installation). A worker whose answer was \
+                     lost gets no confirm, and reverts by itself within {} s of its answer. GET \
+                     /hives/{hive}/versions says which: egress.last_switch",
+                    EGRESS_SWITCH_FORWARD_TIMEOUT.as_secs(),
+                    EGRESS_CONFIRM_WINDOW.as_secs()
+                ),
+                None,
+                &timings,
+            )
+        }
+    };
+    if pending.get("status").and_then(serde_json::Value::as_str) != Some("pending_confirm") {
+        // `ok` with `unchanged`, or the worker's refusal or revert.
+        pending["hive"] = serde_json::json!(hive);
+        merge_timings(&mut pending, &timings);
+        return pending;
+    }
+    let switch_id = pending
+        .get("switch_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let confirm_started = Instant::now();
+    let confirmed = send(
+        serde_json::json!({
+            "target": hive,
+            "operation": operation.as_str(),
+            "phase": "confirm",
+            "switch_id": switch_id,
+        }),
+        EGRESS_CONFIRM_FORWARD_TIMEOUT,
+    )
+    .await;
+    timings.insert(
+        "forward_confirm".to_string(),
+        elapsed_ms(confirm_started).into(),
+    );
+    let confirm = match confirmed {
+        Ok(confirm) => confirm,
+        Err(err) => {
+            return not_answered(
+                "confirm",
+                format!(
+                    "{hive} did not answer the confirm within {} s ({err}). It keeps the switch \
+                     only if the confirm reached it and it committed; otherwise it reverted within \
+                     {} s of its pending_confirm. GET /hives/{hive}/versions says which: \
+                     egress.state and egress.last_switch",
+                    EGRESS_CONFIRM_FORWARD_TIMEOUT.as_secs(),
+                    EGRESS_CONFIRM_WINDOW.as_secs()
+                ),
+                Some(&pending),
+                &timings,
+            )
+        }
+    };
+    // The worker's details from pending_confirm, its outcome from the confirm's answer.
+    let mut answer = pending;
+    for key in [
+        "status",
+        "error_code",
+        "step",
+        "message",
+        "outcome",
+        "committed",
+        "reverted",
+        "revert_problems",
+        "notes",
+        "ipv6_blocked",
+        "route",
+    ] {
+        match confirm.get(key) {
+            Some(value) => answer[key] = value.clone(),
+            None => {
+                if let Some(fields) = answer.as_object_mut() {
+                    fields.remove(key);
+                }
+            }
+        }
+    }
+    if answer
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        answer["status"] = serde_json::json!("error");
+        answer["error_code"] = serde_json::json!("EGRESS_CONFIRM_UNREADABLE");
+        answer["message"] =
+            serde_json::json!(format!("the confirm's answer names no status: {confirm}"));
+    }
+    if let Some(worker) = confirm
+        .get("timings_ms")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in worker {
+            timings.insert(key.clone(), value.clone());
+        }
+    }
+    answer["hive"] = serde_json::json!(hive);
+    merge_timings(&mut answer, &timings);
+    answer
+}
+
+/// Adds `timings` to an answer's `timings_ms`.
+fn merge_timings(
+    answer: &mut serde_json::Value,
+    timings: &serde_json::Map<String, serde_json::Value>,
+) {
+    if !answer
+        .get("timings_ms")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        answer["timings_ms"] = serde_json::json!({});
+    }
+    if let Some(fields) = answer
+        .get_mut("timings_ms")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (key, value) in timings {
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// `set_hive_egress` and `clear_hive_egress` on the motherbee (§15.1): its checks (its
+/// declaration, the request, no join or removal of the hive for the whole action, a worker of its
+/// registry, its orchestrator visible), then the exchange with the worker (`hive_egress_exchange`).
+async fn hive_egress_flow(
+    state: &OrchestratorState,
+    action: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let Some(operation) = EgressOperation::of_action(action) else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": format!("{action} is no egress action"),
+        });
+    };
+    let hive = target_hive_from_payload(payload, &state.hive_id);
+    let refuse = |code: &str, message: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": code,
+            "step": "checks",
+            "outcome": "refused",
+            "hive": hive,
+            "operation": operation.as_str(),
+            "message": message,
+        })
+    };
+    let switch = match prepare_hive_egress(
+        operation,
+        &hive,
+        &state.hive_id,
+        state.egress.section().as_ref(),
+        payload,
+    ) {
+        Ok(switch) => switch,
+        Err(refusal) => return refusal,
+    };
+    // No join or removal of that hive while the action runs; never awaited on this path, which
+    // must not wait behind a join.
+    let Some(_topology) = state.try_lock_hive_topology(&hive) else {
+        return refuse(
+            "JOIN_IN_PROGRESS",
+            format!(
+                "a join, a removal or another egress action of {hive} is running; retry once it \
+                 ends"
+            ),
+        );
+    };
+    if let Some(why) =
+        hive_egress_registry_refusal(&fluxbee_sdk::mesh::HiveRegistry::new(hives_root()), &hive)
+    {
+        return refuse("NOT_A_WORKER", why);
+    }
+    if let Err(err) = hive_orchestrator_visibility(state, &hive) {
+        return refuse(
+            "HIVE_UNREACHABLE",
+            format!("{err}: nothing was sent, and nothing changed there"),
+        );
+    }
+    let destination = format!("SY.orchestrator@{hive}");
+    let mut answer = hive_egress_exchange(&hive, operation, switch, |payload, timeout| {
+        let destination = destination.clone();
+        async move {
+            orchestrator_system_action(
+                state,
+                &destination,
+                MSG_SYSTEM_EGRESS_ROUTE,
+                MSG_SYSTEM_EGRESS_ROUTE_RESPONSE,
+                payload,
+                timeout,
+            )
+            .await
+            .map_err(|err| err.to_string())
+        }
+    })
+    .await;
+    let mut total = serde_json::Map::new();
+    total.insert("total".to_string(), elapsed_ms(started).into());
+    merge_timings(&mut answer, &total);
+    tracing::info!(
+        hive = %hive,
+        operation = operation.as_str(),
+        status = ?answer.get("status"),
+        outcome = ?answer.get("outcome"),
+        error_code = ?answer.get("error_code"),
+        timings_ms = %answer.get("timings_ms").cloned().unwrap_or_default(),
+        "egress action processed"
+    );
+    answer
+}
+
+/// Runs `hive_egress_flow` in its own task, which answers SY.admin itself: the worker's switch and
+/// its confirm take up to 40 s, and this admin worker takes one message at a time.
+fn spawn_hive_egress(
+    state: &Arc<OrchestratorState>,
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+) {
+    let state = Arc::clone(state);
+    let sender = sender.clone();
+    let msg = msg.clone();
+    let action = action.to_string();
+    tokio::spawn(async move {
+        let answer = hive_egress_flow(&state, &action, &msg.payload).await;
+        if let Err(err) = send_admin_reply(&sender, &msg, &action, answer).await {
+            tracing::warn!(action = %action, "egress action answer not sent: {err}");
+        }
+    });
 }
 
 fn syncthing_unit_contents(blob: &BlobRuntimeConfig) -> String {
@@ -16039,6 +18825,8 @@ fn local_versions_snapshot(
         "config": config,
         // Host posture stage 3: the persisted Syncthing facts the motherbee waits on.
         "syncthing_posture": syncthing_posture_snapshot(state),
+        // A-219: a worker's egress section, route and last switch; the motherbee's declaration.
+        "egress": egress_versions_block(state),
     })
 }
 
@@ -16507,6 +19295,8 @@ async fn get_versions_flow(
                     &InstallationCopy::read(&state.dist.path),
                     &read_installation_versions(&installation_versions_path()),
                 );
+                // A-219: each worker against the motherbee's egress declaration.
+                add_egress_state_to_answer(&mut payload, state.egress.section().as_ref());
             }
             payload
         }
@@ -18247,11 +21037,29 @@ systemctl daemon-reload >/dev/null 2>&1 || true",
     )
 }
 
+/// FINDINGS A-225: a removed worker's egress files go with it, the IPv6 block it applied
+/// (`EGRESS_SYSCTL_PATH`) and the record of its egress switch, so the box does not keep IPv6 off
+/// through its next boots. IPv6 comes back at its next boot, with the default route its own network
+/// configuration gives it. Idempotent, and built from constants (no caller input).
+fn worker_teardown_script() -> String {
+    format!(
+        "rm -f {sysctl} /var/lib/fluxbee/orchestrator/{record} >/dev/null 2>&1 || true; \
+sysctl --system >/dev/null 2>&1 || true",
+        sysctl = EGRESS_SYSCTL_PATH,
+        record = EGRESS_SWITCH_RECORD_FILE,
+    )
+}
+
 /// Pure (testable) builder for the cleanup script: the mesh credentials first, then, when
 /// `egress_teardown` is set (the removed hive's info.yaml had `role: egress`), the NAT teardown,
 /// then the services and the node state, and last, on an ingress (`ingress_teardown`), its SSH
-/// table: once sy-orchestrator is stopped, so its watchdog cannot load the table again.
-fn remove_hive_cleanup_full_script(egress_teardown: bool, ingress_teardown: bool) -> String {
+/// table, and on a worker (`worker_teardown`), its egress files: once sy-orchestrator is stopped,
+/// so its watchdog cannot load the table or write the file again.
+fn remove_hive_cleanup_full_script(
+    egress_teardown: bool,
+    ingress_teardown: bool,
+    worker_teardown: bool,
+) -> String {
     let mut steps = vec![REMOVE_HIVE_CREDENTIALS_SCRIPT.to_string()];
     if egress_teardown {
         steps.push(egress_teardown_script());
@@ -18259,6 +21067,9 @@ fn remove_hive_cleanup_full_script(egress_teardown: bool, ingress_teardown: bool
     steps.push(remove_hive_cleanup_script().to_string());
     if ingress_teardown {
         steps.push(ingress_teardown_script());
+    }
+    if worker_teardown {
+        steps.push(worker_teardown_script());
     }
     steps.join("; ")
 }
@@ -18273,6 +21084,7 @@ fn remove_hive_cleanup_command(
     unit: &str,
     egress_teardown: bool,
     ingress_teardown: bool,
+    worker_teardown: bool,
 ) -> Command {
     let mut cmd = Command::new("systemd-run");
     cmd.args(["--on-active=1s", "--timer-property=AccuracySec=100ms"])
@@ -18281,6 +21093,7 @@ fn remove_hive_cleanup_command(
         .arg(remove_hive_cleanup_full_script(
             egress_teardown,
             ingress_teardown,
+            worker_teardown,
         ));
     cmd
 }
@@ -18290,10 +21103,11 @@ fn remove_hive_cleanup_command(
 fn remove_hive_cleanup_local_flow(
     egress_teardown: bool,
     ingress_teardown: bool,
+    worker_teardown: bool,
 ) -> serde_json::Value {
     let unit = format!("fluxbee-remove-hive-cleanup-{}", now_epoch_ms());
     match run_cmd(
-        remove_hive_cleanup_command(&unit, egress_teardown, ingress_teardown),
+        remove_hive_cleanup_command(&unit, egress_teardown, ingress_teardown, worker_teardown),
         "schedule the remove_hive cleanup",
     ) {
         Ok(()) => serde_json::json!({
@@ -21746,64 +24560,7 @@ async fn forward_system_action_to_hive_with_timeout(
     forward_timeout: Duration,
 ) -> Result<serde_json::Value, OrchestratorError> {
     if target_hive != state.hive_id {
-        if let Ok(snapshot) = load_lsa_snapshot(state) {
-            let now = now_epoch_ms();
-            let hive_visible = snapshot.hives.iter().any(|entry| {
-                remote_hive_name(entry).as_deref() == Some(target_hive)
-                    && !remote_hive_is_stale(entry, now)
-            });
-            if !hive_visible {
-                return Err(format!(
-                    "target hive '{}' not reachable in LSA (stale/missing)",
-                    target_hive
-                )
-                .into());
-            }
-
-            let expected_orchestrator = ensure_l2_name("SY.orchestrator", target_hive);
-            let mut visible_nodes = Vec::new();
-            let mut orchestrator_visible = false;
-            for node in &snapshot.nodes {
-                let hive_idx = node.hive_index as usize;
-                let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
-                    continue;
-                };
-                let Some(hive_name) = remote_hive_name(hive_entry) else {
-                    continue;
-                };
-                if hive_name != target_hive {
-                    continue;
-                }
-                if remote_hive_is_stale(hive_entry, now) {
-                    continue;
-                }
-                if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
-                    continue;
-                }
-                if node.name_len == 0 {
-                    continue;
-                }
-                let name = shm_name_to_string(&node.name, node.name_len);
-                if name == expected_orchestrator || name == "SY.orchestrator" {
-                    orchestrator_visible = true;
-                }
-                visible_nodes.push(name);
-            }
-            if !orchestrator_visible {
-                visible_nodes.sort();
-                visible_nodes.dedup();
-                let visible = if visible_nodes.is_empty() {
-                    "none".to_string()
-                } else {
-                    visible_nodes.join(", ")
-                };
-                return Err(format!(
-                    "target orchestrator '{}' not visible in LSA for hive '{}' (visible: {})",
-                    expected_orchestrator, target_hive, visible
-                )
-                .into());
-            }
-        }
+        hive_orchestrator_visibility(state, target_hive)?;
     }
 
     let destination = format!("SY.orchestrator@{target_hive}");
@@ -21816,6 +24573,73 @@ async fn forward_system_action_to_hive_with_timeout(
         forward_timeout,
     )
     .await
+}
+
+/// The check a forward to another hive makes before it sends anything: the hive is in the LSA and
+/// not stale, and its orchestrator is visible there. An LSA that cannot be read checks nothing.
+fn hive_orchestrator_visibility(
+    state: &OrchestratorState,
+    target_hive: &str,
+) -> Result<(), OrchestratorError> {
+    if let Ok(snapshot) = load_lsa_snapshot(state) {
+        let now = now_epoch_ms();
+        let hive_visible = snapshot.hives.iter().any(|entry| {
+            remote_hive_name(entry).as_deref() == Some(target_hive)
+                && !remote_hive_is_stale(entry, now)
+        });
+        if !hive_visible {
+            return Err(format!(
+                "target hive '{}' not reachable in LSA (stale/missing)",
+                target_hive
+            )
+            .into());
+        }
+
+        let expected_orchestrator = ensure_l2_name("SY.orchestrator", target_hive);
+        let mut visible_nodes = Vec::new();
+        let mut orchestrator_visible = false;
+        for node in &snapshot.nodes {
+            let hive_idx = node.hive_index as usize;
+            let Some(hive_entry) = snapshot.hives.get(hive_idx) else {
+                continue;
+            };
+            let Some(hive_name) = remote_hive_name(hive_entry) else {
+                continue;
+            };
+            if hive_name != target_hive {
+                continue;
+            }
+            if remote_hive_is_stale(hive_entry, now) {
+                continue;
+            }
+            if node.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
+                continue;
+            }
+            if node.name_len == 0 {
+                continue;
+            }
+            let name = shm_name_to_string(&node.name, node.name_len);
+            if name == expected_orchestrator || name == "SY.orchestrator" {
+                orchestrator_visible = true;
+            }
+            visible_nodes.push(name);
+        }
+        if !orchestrator_visible {
+            visible_nodes.sort();
+            visible_nodes.dedup();
+            let visible = if visible_nodes.is_empty() {
+                "none".to_string()
+            } else {
+                visible_nodes.join(", ")
+            };
+            return Err(format!(
+                "target orchestrator '{}' not visible in LSA for hive '{}' (visible: {})",
+                expected_orchestrator, target_hive, visible
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 async fn orchestrator_identity_system_call_ok(
@@ -28261,6 +31085,7 @@ async fn accept_add_hive(
             payload,
             state
                 .egress
+                .section()
                 .as_ref()
                 .and_then(|eg| eg.reachability_url.as_deref()),
         ) {
@@ -29254,7 +32079,7 @@ async fn add_hive_flow(
     let identity_sync_upstream = format_host_port(&worker_uplink_host, identity_sync_port);
     // Egress route injection (D2): if motherbee declares egress.gateway_ip, new
     // workers carry it in their yaml and reconcile the route locally each boot.
-    let worker_egress_yaml = match render_worker_egress_yaml(state.egress.as_ref()) {
+    let worker_egress_yaml = match render_worker_egress_yaml(state.egress.section().as_ref()) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -35975,6 +38800,1533 @@ mod tests {
         assert!(render_egress_hive_egress_yaml(&nat, edge_ip, Some("ftp://example.com")).is_err());
     }
 
+    // --- A-219: an existing worker goes behind the egress, and back (edge-egress-nat-spec §15) ---
+
+    /// A worker's host for the egress switch: its route lookups, default routes, sessions, IPv6
+    /// values, sysctl file and probe answers, in memory. A lookup that answers `DEFAULT` is the
+    /// current default route, as `ip route get fibmatch` names it; `lookups_via` overrides a lookup
+    /// while the default route goes through a gateway.
+    struct FakeEgressHost {
+        lookups: StdMutex<HashMap<std::net::Ipv4Addr, String>>,
+        lookups_via: HashMap<(std::net::Ipv4Addr, String), String>,
+        default_routes: StdMutex<Vec<String>>,
+        routes: String,
+        sessions: String,
+        sshd_ports: Result<Vec<u16>, String>,
+        ipv6: StdMutex<BTreeMap<String, String>>,
+        sysctl_file: StdMutex<Option<String>>,
+        /// Whether the kernel takes the IPv6 block.
+        ipv6_takes: bool,
+        curl: bool,
+        probes: StdMutex<std::collections::VecDeque<Result<(), String>>>,
+        probed: StdMutex<Vec<String>>,
+    }
+
+    fn route_metric(words: &[String]) -> u32 {
+        words
+            .iter()
+            .position(|word| word == "metric")
+            .and_then(|at| words.get(at + 1))
+            .and_then(|metric| metric.parse().ok())
+            .unwrap_or(0)
+    }
+
+    impl EgressHost for FakeEgressHost {
+        fn route_lookup(
+            &self,
+            address: std::net::Ipv4Addr,
+            _bound: Duration,
+        ) -> Result<String, String> {
+            let routes = self.default_routes.lock().unwrap().clone();
+            if let Some(gateway) = parse_default_gateway(&routes.join("\n")) {
+                if let Some(line) = self.lookups_via.get(&(address, gateway)) {
+                    return Ok(line.clone());
+                }
+            }
+            let line = self
+                .lookups
+                .lock()
+                .unwrap()
+                .get(&address)
+                .cloned()
+                .ok_or_else(|| format!("RTNETLINK answers: no route to {address}"))?;
+            if line == "DEFAULT" {
+                return routes
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "RTNETLINK answers: Network is unreachable".to_string());
+            }
+            Ok(line)
+        }
+
+        fn default_routes(&self, _bound: Duration) -> Result<Vec<String>, String> {
+            Ok(self.default_routes.lock().unwrap().clone())
+        }
+
+        fn routes(&self, _bound: Duration) -> Result<String, String> {
+            Ok(self.routes.clone())
+        }
+
+        fn tcp_sessions(&self, _bound: Duration) -> Result<String, String> {
+            Ok(self.sessions.clone())
+        }
+
+        fn sshd_ports(&self) -> Result<Vec<u16>, String> {
+            self.sshd_ports.clone()
+        }
+
+        /// A default route replaces the one with its metric, as the kernel's `replace` does.
+        fn route_replace(&self, route: &[String], _bound: Duration) -> Result<(), String> {
+            let mut routes = self.default_routes.lock().unwrap();
+            if route.first().map(String::as_str) == Some("default") {
+                let metric = route_metric(route);
+                routes.retain(|line| route_metric(&route_words(line)) != metric);
+            }
+            routes.push(route.join(" "));
+            routes.sort_by_key(|line| route_metric(&route_words(line)));
+            Ok(())
+        }
+
+        fn route_delete(&self, route: &[String], _bound: Duration) -> Result<(), String> {
+            let mut routes = self.default_routes.lock().unwrap();
+            let line = route.join(" ");
+            let before = routes.len();
+            routes.retain(|other| *other != line);
+            if routes.len() == before {
+                return Err(format!("RTNETLINK answers: No such process ({line})"));
+            }
+            Ok(())
+        }
+
+        fn ipv6_values(&self) -> BTreeMap<String, String> {
+            self.ipv6.lock().unwrap().clone()
+        }
+
+        fn set_ipv6_values(&self, values: &BTreeMap<String, String>) -> Result<(), String> {
+            let mut ipv6 = self.ipv6.lock().unwrap();
+            for (name, value) in values {
+                ipv6.insert(name.clone(), value.clone());
+            }
+            Ok(())
+        }
+
+        fn sysctl_file(&self) -> Option<String> {
+            self.sysctl_file.lock().unwrap().clone()
+        }
+
+        fn put_sysctl_file(&self, content: Option<&str>) -> Result<(), String> {
+            *self.sysctl_file.lock().unwrap() = content.map(str::to_string);
+            Ok(())
+        }
+
+        fn sysctl_system(&self, _bound: Duration) -> Result<(), String> {
+            let blocks = self
+                .sysctl_file
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|file| file.contains("disable_ipv6 = 1"));
+            if blocks && self.ipv6_takes {
+                *self.ipv6.lock().unwrap() = ipv6_values(true);
+            }
+            Ok(())
+        }
+
+        fn ipv6_disabled(&self) -> bool {
+            self.ipv6
+                .lock()
+                .unwrap()
+                .get("net.ipv6.conf.all.disable_ipv6")
+                .map(String::as_str)
+                == Some("1")
+        }
+
+        fn curl_exists(&self) -> bool {
+            self.curl
+        }
+
+        fn probe(&self, url: &str) -> Result<(), String> {
+            self.probed.lock().unwrap().push(url.to_string());
+            self.probes.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    /// The four IPv6 sysctls, on or blocked.
+    fn ipv6_values(blocked: bool) -> BTreeMap<String, String> {
+        let (disable, accept_ra) = if blocked { ("1", "0") } else { ("0", "1") };
+        EGRESS_IPV6_SYSCTLS
+            .iter()
+            .map(|name| {
+                let value = if name.ends_with("disable_ipv6") {
+                    disable
+                } else {
+                    accept_ra
+                };
+                (name.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    const WORKER1_ON_LINK: &str = "10.10.10.0/24 dev ens18 proto kernel scope link src 10.10.10.20";
+    const WORKER1_DEFAULT: &str = "default via 10.10.10.1 dev ens18 proto static";
+
+    /// worker1 of 8.x: one subnet, 10.10.10.0/24, with the motherbee (.10), egress1 (.40) and the
+    /// hypervisor's gateway (.1) on it; its default route via .1; IPv6 on; the operator's SSH from
+    /// the motherbee; the admin network (192.168.8.0/24) reached through the default route.
+    fn worker1_host() -> FakeEgressHost {
+        let lookups: HashMap<std::net::Ipv4Addr, String> = [
+            ("10.10.10.1", WORKER1_ON_LINK),
+            ("10.10.10.10", WORKER1_ON_LINK),
+            ("10.10.10.40", WORKER1_ON_LINK),
+            (
+                "10.10.10.20",
+                "local 10.10.10.20 dev lo table local proto kernel scope host src 10.10.10.20",
+            ),
+            ("192.168.8.0", "DEFAULT"),
+            ("192.168.8.5", "DEFAULT"),
+        ]
+        .into_iter()
+        .map(|(address, line)| (address.parse().unwrap(), line.to_string()))
+        .collect();
+        FakeEgressHost {
+            lookups: StdMutex::new(lookups),
+            lookups_via: HashMap::new(),
+            default_routes: StdMutex::new(vec![WORKER1_DEFAULT.to_string()]),
+            routes: format!("{WORKER1_DEFAULT}\n{WORKER1_ON_LINK}\n"),
+            sessions: "ESTAB 0 0 10.10.10.20:22 10.10.10.10:51234\n\
+                       ESTAB 0 0 10.10.10.20:41000 10.10.10.10:9000\n\
+                       LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n"
+                .to_string(),
+            sshd_ports: Ok(vec![22]),
+            ipv6: StdMutex::new(ipv6_values(false)),
+            sysctl_file: StdMutex::new(None),
+            ipv6_takes: true,
+            curl: true,
+            probes: StdMutex::new(std::collections::VecDeque::new()),
+            probed: StdMutex::new(Vec::new()),
+        }
+    }
+
+    /// worker1's hive.yaml as its join wrote it before the motherbee declared its egress.
+    const WORKER1_HIVE_YAML: &str = "hive_id: worker1\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"10.10.10.10:9000\"\nstorage:\n  path: \"/var/lib/fluxbee\"\ngovernment:\n  identity_frontdesk: \"SY.frontdesk.gov@motherbee\"\nidentity:\n  sync:\n    upstream: \"10.10.10.10:9100\"\n    auth: required\ndist:\n  path: \"/var/lib/fluxbee/dist\"\n";
+
+    /// A temp directory holding worker1's hive.yaml, with `section` after it, and room for its
+    /// record.
+    fn worker1_dir(section: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fluxbee-a219-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hive.yaml"),
+            format!("{WORKER1_HIVE_YAML}{}", section.unwrap_or_default()),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The motherbee's declaration on 8.x: egress1 as the gateway, and a probe URL.
+    fn declared_egress() -> EgressSection {
+        let mut declaration = egress_section(false);
+        declaration.lan_cidr = None;
+        declaration.wan_iface = None;
+        declaration.lan_iface = None;
+        declaration.gateway_ip = Some("10.10.10.40".to_string());
+        declaration.edge_hive = Some("egress1".to_string());
+        declaration.reachability_url = Some("https://example.com/health".to_string());
+        declaration
+    }
+
+    /// The section the join's renderer writes for the declaration.
+    fn declared_section_yaml() -> String {
+        render_worker_egress_yaml(Some(&declared_egress())).unwrap()
+    }
+
+    fn set_request(access_from: &[&str]) -> EgressSwitchRequest {
+        parse_egress_switch_request(&serde_json::json!({
+            "operation": "set",
+            "phase": "switch",
+            "section_yaml": declared_section_yaml(),
+            "access_from": access_from,
+        }))
+        .unwrap()
+    }
+
+    fn clear_request(gateway_ip: Option<&str>) -> EgressSwitchRequest {
+        parse_egress_switch_request(&serde_json::json!({
+            "operation": "clear",
+            "phase": "switch",
+            "gateway_ip": gateway_ip,
+        }))
+        .unwrap()
+    }
+
+    /// One switch on `host` as the worker runs it, the motherbee answering its pending_confirm with
+    /// the confirm when `confirm` holds (`before_confirm` runs first): how it ended, its first
+    /// answer, and the confirm's answer.
+    async fn run_egress_switch(
+        host: &FakeEgressHost,
+        dir: &Path,
+        egress: &EgressState,
+        request: EgressSwitchRequest,
+        confirm: bool,
+        before_confirm: impl FnOnce(),
+    ) -> (
+        EgressSwitchEnd,
+        serde_json::Value,
+        Option<serde_json::Value>,
+    ) {
+        let (switch_id, confirmed) = egress.claim().expect("no switch open");
+        assert!(
+            egress.switch_open(),
+            "the watchdog's egress step skips from the claim on"
+        );
+        let env = EgressSwitchEnv {
+            hive_id: "worker1",
+            egress,
+            config_dir: dir,
+            record_path: dir.join(EGRESS_SWITCH_RECORD_FILE),
+        };
+        let (first_answer, answered) = tokio::sync::oneshot::channel();
+        let flow = egress_switch_flow(host, &env, request, &switch_id, first_answer, confirmed);
+        let motherbee = async {
+            let first = answered.await.expect("the first answer");
+            let mut confirm_answer = None;
+            if confirm && first["status"] == "pending_confirm" {
+                before_confirm();
+                confirm_answer =
+                    Some(egress_confirm_answer(egress, &env.record_path, &switch_id).await);
+            }
+            (first, confirm_answer)
+        };
+        let (end, (first, confirm_answer)) = tokio::join!(flow, motherbee);
+        egress.release(&switch_id);
+        assert!(
+            !egress.switch_open(),
+            "the watchdog's egress step runs again"
+        );
+        (end, first, confirm_answer)
+    }
+
+    fn worker1_record(dir: &Path) -> EgressSwitchRecord {
+        read_egress_switch_record(&dir.join(EGRESS_SWITCH_RECORD_FILE))
+            .unwrap()
+            .expect("a record")
+    }
+
+    fn hive_yaml_value(dir: &Path) -> serde_yaml::Value {
+        serde_yaml::from_str(&fs::read_to_string(dir.join("hive.yaml")).unwrap()).unwrap()
+    }
+
+    /// The route lookup reads the route that decides, as `ip -4 route get fibmatch` prints it.
+    #[test]
+    fn the_egress_route_lookup_reads_the_route_that_decides() {
+        let on_link = RouteMatchLine::parse(&format!("{WORKER1_ON_LINK} \n")).unwrap();
+        assert_eq!(on_link.destination, "10.10.10.0/24");
+        assert_eq!(
+            (on_link.via.as_deref(), on_link.dev.as_deref()),
+            (None, Some("ens18"))
+        );
+        assert!(!on_link.is_default());
+        assert_eq!(on_link.prefix_len(), 24);
+
+        let default = RouteMatchLine::parse(WORKER1_DEFAULT).unwrap();
+        assert!(default.is_default());
+        assert_eq!(default.via.as_deref(), Some("10.10.10.1"));
+        assert_eq!(default.prefix_len(), 0);
+
+        let specific =
+            RouteMatchLine::parse("192.168.8.0/24 via 10.10.10.1 dev ens18 proto static").unwrap();
+        assert!(!specific.is_default());
+        assert_eq!(specific.via.as_deref(), Some("10.10.10.1"));
+
+        let local = RouteMatchLine::parse(
+            "local 10.10.10.20 dev lo table local proto kernel scope host src 10.10.10.20",
+        )
+        .unwrap();
+        assert_eq!(local.kind.as_deref(), Some("local"));
+        assert_eq!(local.destination, "10.10.10.20");
+        assert_eq!(local.prefix_len(), 32);
+
+        let ipv6_hop =
+            RouteMatchLine::parse("default via inet6 fe80::1 dev ens18 proto bgp").unwrap();
+        assert_eq!(ipv6_hop.via.as_deref(), Some("inet6 fe80::1"));
+        assert!(RouteMatchLine::parse("\n  \n").is_none());
+        assert!(on_link.same_path(&RouteMatchLine::parse(WORKER1_ON_LINK).unwrap()));
+        assert!(!on_link.same_path(&default));
+    }
+
+    /// G1: the gateway is on a subnet the worker is connected to, and none of its own addresses.
+    #[test]
+    fn egress_guard_g1_wants_the_gateway_on_link() {
+        let gateway: std::net::Ipv4Addr = "10.10.10.40".parse().unwrap();
+        let route = |line: &str| RouteMatchLine::parse(line).unwrap();
+        assert_eq!(
+            egress_gateway_refusal(gateway, &route(WORKER1_ON_LINK)),
+            None
+        );
+        let off_link = egress_gateway_refusal(
+            gateway,
+            &route("10.10.0.0/16 via 10.10.10.1 dev ens18 proto static"),
+        )
+        .expect("off link");
+        assert!(
+            off_link.contains("10.10.10.40") && off_link.contains("through 10.10.10.1"),
+            "{off_link}"
+        );
+        let default = egress_gateway_refusal(gateway, &route(WORKER1_DEFAULT)).expect("default");
+        assert!(
+            default.contains("10.10.10.0/24") || default.contains("default via"),
+            "{default}"
+        );
+        let own = egress_gateway_refusal(
+            "10.10.10.20".parse().unwrap(),
+            &route("local 10.10.10.20 dev lo table local proto kernel scope host"),
+        )
+        .expect("own");
+        assert!(own.contains("own addresses"), "{own}");
+        assert!(
+            egress_gateway_refusal(gateway, &route("unreachable 10.10.10.40 proto static"))
+                .is_some()
+        );
+    }
+
+    /// The guards as a table (§15.2): each refuses with its code, names the address and the route
+    /// it found, and only reads.
+    #[test]
+    fn egress_guards_as_a_table() {
+        let gateway: std::net::Ipv4Addr = "10.10.10.40".parse().unwrap();
+        let motherbee = ["10.10.10.10".to_string()];
+        let net = |raw: &str| SshAllowNet::parse(raw).unwrap();
+        let guards = |host: &FakeEgressHost, uplinks: &[String], access: &[SshAllowNet]| {
+            egress_switch_guards(host, Some(gateway), uplinks, access, Some("10.10.10.1"))
+        };
+        let code = |result: Result<EgressGuardReport, EgressRefusal>| match result {
+            Ok(_) => "ok".to_string(),
+            Err(refusal) => format!("{}: {}", refusal.code, refusal.message),
+        };
+
+        // 8.x: everything on worker1's own subnet.
+        let host = worker1_host();
+        let report = guards(&host, &motherbee, &[]).expect("8.x passes");
+        assert_eq!(report.uplink_routes.len(), 1);
+        assert_eq!(report.uplink_routes[0].1.line, WORKER1_ON_LINK);
+        assert_eq!(
+            report.ssh_reachable_from,
+            vec!["10.10.10.0/24 on ens18", "the hypervisor's console"]
+        );
+        assert_eq!(*host.default_routes.lock().unwrap(), vec![WORKER1_DEFAULT]);
+
+        // G1.
+        let off_link = egress_switch_guards(
+            &host,
+            Some("10.10.10.20".parse().unwrap()),
+            &motherbee,
+            &[],
+            None,
+        );
+        assert!(code(off_link).starts_with("GATEWAY_NOT_ON_LINK"));
+
+        // G2: the motherbee through the default route, by name, over IPv6, or not named at all.
+        let routed = worker1_host();
+        routed
+            .lookups
+            .lock()
+            .unwrap()
+            .insert("10.10.10.10".parse().unwrap(), "DEFAULT".to_string());
+        let refused = code(guards(&routed, &motherbee, &[]));
+        assert!(refused.starts_with("UPLINK_ON_DEFAULT_ROUTE"), "{refused}");
+        assert!(
+            refused.contains("10.10.10.10") && refused.contains(WORKER1_DEFAULT),
+            "{refused}"
+        );
+        let named = code(guards(&host, &["motherbee.lan".to_string()], &[]));
+        assert!(
+            named.starts_with("UPLINK_ON_DEFAULT_ROUTE") && named.contains("host name"),
+            "{named}"
+        );
+        let ipv6 = code(guards(&host, &["fd00::10".to_string()], &[]));
+        assert!(
+            ipv6.starts_with("UPLINK_ON_DEFAULT_ROUTE") && ipv6.contains("IPv6"),
+            "{ipv6}"
+        );
+        assert!(code(guards(&host, &[], &[])).starts_with("UPLINK_ON_DEFAULT_ROUTE"));
+        // A more specific route keeps the mesh off the default route.
+        let specific = worker1_host();
+        specific.lookups.lock().unwrap().insert(
+            "10.20.0.10".parse().unwrap(),
+            "10.20.0.0/16 via 10.10.10.1 dev ens18 proto static".to_string(),
+        );
+        assert_eq!(
+            code(guards(&specific, &["10.20.0.10".to_string()], &[])),
+            "ok"
+        );
+
+        // G3: a live SSH session or access_from through the default route; IPv6 cut by the block.
+        let mut office = worker1_host();
+        office.sessions = "ESTAB 0 0 10.10.10.20:22 192.168.8.5:51000\n".to_string();
+        let refused = code(guards(&office, &motherbee, &[]));
+        assert!(refused.starts_with("ACCESS_ON_DEFAULT_ROUTE"), "{refused}");
+        for named in [
+            "192.168.8.5",
+            "10.10.10.1",
+            "netplan",
+            "10.10.10.0/24 on ens18",
+            "console",
+        ] {
+            assert!(refused.contains(named), "{named}: {refused}");
+        }
+        let mut v6 = worker1_host();
+        v6.sessions = "ESTAB 0 0 [2001:db8::20]:22 [2001:db8::5]:51000\n".to_string();
+        assert!(code(guards(&v6, &motherbee, &[])).contains("IPv6"));
+        let mut mapped = worker1_host();
+        mapped.sessions =
+            "ESTAB 0 0 [::ffff:10.10.10.20]:22 [::ffff:10.10.10.10]:51000\n".to_string();
+        assert_eq!(code(guards(&mapped, &motherbee, &[])), "ok");
+        let mut other_port = worker1_host();
+        other_port.sessions = "ESTAB 0 0 10.10.10.20:2222 192.168.8.5:51000\n".to_string();
+        assert_eq!(
+            code(guards(&other_port, &motherbee, &[])),
+            "ok",
+            "not sshd's port"
+        );
+        other_port.sshd_ports = Ok(vec![22, 2222]);
+        assert!(code(guards(&other_port, &motherbee, &[])).starts_with("ACCESS_ON_DEFAULT_ROUTE"));
+
+        let admin = code(guards(&host, &motherbee, &[net("192.168.8.0/24")]));
+        assert!(
+            admin.starts_with("ACCESS_ON_DEFAULT_ROUTE") && admin.contains("192.168.8.0/24"),
+            "{admin}"
+        );
+        let part = worker1_host();
+        part.lookups.lock().unwrap().insert(
+            "192.168.8.0".parse().unwrap(),
+            "192.168.8.0/25 via 10.10.10.1 dev ens18 proto static".to_string(),
+        );
+        let partial = code(guards(&part, &motherbee, &[net("192.168.8.0/24")]));
+        assert!(partial.contains("only 192.168.8.0/25"), "{partial}");
+        let covered = worker1_host();
+        covered.lookups.lock().unwrap().insert(
+            "192.168.8.0".parse().unwrap(),
+            "192.168.0.0/16 via 10.10.10.1 dev ens18 proto static".to_string(),
+        );
+        assert_eq!(
+            code(guards(&covered, &motherbee, &[net("192.168.8.0/24")])),
+            "ok"
+        );
+        assert!(code(guards(&host, &motherbee, &[net("fd00::/64")])).contains("IPv6"));
+
+        // A guard that cannot read refuses too.
+        let mut no_sshd = worker1_host();
+        no_sshd.sshd_ports = Err("sshd: no hostkeys available".to_string());
+        assert!(code(guards(&no_sshd, &motherbee, &[])).starts_with("EGRESS_GUARD_UNREADABLE"));
+        assert!(code(guards(&host, &["10.99.0.1".to_string()], &[]))
+            .starts_with("EGRESS_GUARD_UNREADABLE"));
+    }
+
+    /// The mesh's way to the motherbee is read from hive.yaml; the inbound SSH sessions and where
+    /// SSH still reaches the box from, from the host.
+    #[test]
+    fn egress_guards_read_the_uplinks_the_sessions_and_the_routes() {
+        let hive: HiveFile = serde_yaml::from_str(WORKER1_HIVE_YAML).unwrap();
+        assert_eq!(egress_uplink_hosts(&hive), vec!["10.10.10.10"]);
+        let other: HiveFile = serde_yaml::from_str(
+            "hive_id: worker2\nrole: worker\nwan:\n  uplinks:\n    - address: \"[fd00::10]:9000\"\n    - address: \"mb.lan:9000\"\nidentity:\n  sync:\n    upstream: \"10.10.10.10:9100\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            egress_uplink_hosts(&other),
+            vec!["fd00::10", "mb.lan", "10.10.10.10"]
+        );
+
+        let sessions = "ESTAB 0 0 10.10.10.20:22 10.10.10.10:51234\n\
+                        ESTAB 0 0 10.10.10.20:22 10.10.10.10:51235\n\
+                        ESTAB 0 0 [::ffff:10.10.10.20]:22 [::ffff:192.168.8.5]:40000\n\
+                        ESTAB 0 0 [fe80::20]%ens18:22 [fe80::5]%ens18:40001\n\
+                        ESTAB 0 0 10.10.10.20:41000 10.10.10.10:9000\n\
+                        LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n";
+        let peers: Vec<String> = inbound_session_peers(sessions, &[22])
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(peers, vec!["10.10.10.10", "192.168.8.5", "fe80::5"]);
+
+        let reachable = egress_ssh_reachable_from(
+            "default via 10.10.10.1 dev ens18 proto static\n\
+             10.10.10.0/24 dev ens18 proto kernel scope link src 10.10.10.20\n\
+             192.168.8.0/24 via 10.10.10.1 dev ens18 proto static\n\
+             broadcast 10.10.10.255 dev ens18 proto kernel scope link src 10.10.10.20\n",
+        );
+        assert_eq!(
+            reachable,
+            vec![
+                "10.10.10.0/24 on ens18",
+                "192.168.8.0/24 via 10.10.10.1",
+                "the hypervisor's console"
+            ]
+        );
+    }
+
+    /// The worker takes only a worker's section, as the join's renderer writes it.
+    #[test]
+    fn the_egress_switch_takes_only_a_workers_section() {
+        let (target, section) = EgressTarget::parse(&declared_section_yaml()).unwrap();
+        assert_eq!(target.gateway_ip.to_string(), "10.10.10.40");
+        assert_eq!(
+            target.reachability_url.as_deref(),
+            Some("https://example.com/health")
+        );
+        assert!(target.held_by(Some(&section)));
+        assert!(!target.held_by(None));
+        let mut other = section.clone();
+        other.gateway_ip = Some("10.10.10.41".to_string());
+        assert!(!target.held_by(Some(&other)));
+        let mut no_url = section.clone();
+        no_url.reachability_url = None;
+        assert!(!target.held_by(Some(&no_url)));
+
+        for refused in [
+            "egress:\n  enabled: true\n  lan_cidr: \"10.10.10.0/24\"\n  gateway_ip: \"10.10.10.40\"\n",
+            "egress:\n  gateway_ip: \"10.10.10.40\"\n  ipv6: \"allowed\"\n",
+            "egress:\n  ipv6: \"blocked\"\n",
+            "egress:\n  gateway_ip: \"egress1\"\n",
+            "egress:\n  gateway_ip: \"10.10.10.40\"\n  reachability_url: \"http://example.com\"\n",
+            "storage:\n  path: /x\n",
+        ] {
+            assert!(EgressTarget::parse(refused).is_err(), "{refused}");
+        }
+        for invalid in [
+            serde_json::json!({ "operation": "move", "section_yaml": declared_section_yaml() }),
+            serde_json::json!({ "operation": "set" }),
+            serde_json::json!({
+                "operation": "set",
+                "section_yaml": declared_section_yaml(),
+                "gateway_ip": "10.10.10.1",
+            }),
+            serde_json::json!({ "operation": "clear", "gateway_ip": "worker-gw" }),
+            serde_json::json!({
+                "operation": "clear",
+                "access_from": ["192.168.8.0/24", "fd00::/64"],
+            }),
+            serde_json::json!({ "operation": "clear", "access_from": "192.168.8.0/24" }),
+        ] {
+            assert!(parse_egress_switch_request(&invalid).is_err(), "{invalid}");
+        }
+        let clear = clear_request(Some("10.10.10.1"));
+        assert_eq!(
+            clear
+                .gateway_ip
+                .map(|gateway| gateway.to_string())
+                .as_deref(),
+            Some("10.10.10.1")
+        );
+        assert!(clear.target.is_none());
+    }
+
+    /// The switch, confirmed: the egress route and the IPv6 block, the probe, pending_confirm,
+    /// then the commit, which writes only hive.yaml's `egress` and sets the section in memory; the
+    /// record keeps the route and the values the worker had before.
+    #[tokio::test]
+    async fn the_egress_switch_commits_on_the_motherbees_confirm() {
+        let host = worker1_host();
+        let dir = worker1_dir(None);
+        let egress = EgressState::new(None);
+        let before = hive_yaml_value(&dir);
+        let (end, first, confirm) =
+            run_egress_switch(&host, &dir, &egress, set_request(&[]), true, || {}).await;
+        assert_eq!(end, EgressSwitchEnd::Committed);
+        assert_eq!(first["status"], "pending_confirm", "{first}");
+        assert_eq!(first["gateway_ip"], "10.10.10.40");
+        assert_eq!(first["previous_gateway"], "10.10.10.1");
+        assert_eq!(first["ipv6_blocked"], true);
+        assert_eq!(first["internet_reachable"], true);
+        assert_eq!(first["probe"]["attempts"], 1);
+        assert_eq!(first["route"], "default via 10.10.10.40");
+        assert_eq!(first["uplinks"][0]["address"], "10.10.10.10");
+        assert!(first["ssh_reachable_from"]
+            .to_string()
+            .contains("10.10.10.0/24 on ens18"));
+        for step in ["guards", "switch", "check"] {
+            assert!(first["timings_ms"][step].is_u64(), "{step}: {first}");
+        }
+        let confirm = confirm.expect("the confirm's answer");
+        assert_eq!(confirm["status"], "ok", "{confirm}");
+        assert_eq!(confirm["outcome"], "switched");
+        assert_eq!(confirm["committed"], true);
+        assert!(confirm["timings_ms"]["commit"].is_u64());
+
+        // On the host: the route through the egress, IPv6 off with its file.
+        assert_eq!(
+            *host.default_routes.lock().unwrap(),
+            vec!["default via 10.10.10.40"]
+        );
+        assert!(host.ipv6_disabled());
+        assert_eq!(
+            host.sysctl_file().as_deref(),
+            Some(worker_ipv6_sysctl_content())
+        );
+        assert_eq!(
+            *host.probed.lock().unwrap(),
+            vec!["https://example.com/health"]
+        );
+        // hive.yaml: its `egress` added as the join's renderer writes it, every other key kept.
+        let mut after = hive_yaml_value(&dir);
+        let section = after
+            .as_mapping_mut()
+            .unwrap()
+            .shift_remove("egress")
+            .expect("the section");
+        assert_eq!(after, before);
+        let rendered: serde_yaml::Value = serde_yaml::from_str(&declared_section_yaml()).unwrap();
+        assert_eq!(section, rendered["egress"]);
+        load_hive(&dir).expect("the orchestrator starts on it");
+        // In memory: the watchdog keeps the new route from now on.
+        assert_eq!(
+            egress
+                .section()
+                .as_ref()
+                .and_then(egress_section_gateway)
+                .map(|g| g.to_string())
+                .as_deref(),
+            Some("10.10.10.40")
+        );
+        let record = worker1_record(&dir);
+        assert_eq!(
+            (record.state.as_str(), record.operation.as_str()),
+            ("committed", "set")
+        );
+        assert_eq!(record.previous_gateway.as_deref(), Some("10.10.10.1"));
+        let original = record
+            .original
+            .expect("what the worker had before the egress");
+        assert_eq!(original.default_routes, vec![WORKER1_DEFAULT]);
+        assert_eq!(original.ipv6, ipv6_values(false));
+        assert_eq!(original.sysctl_file, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The switch reverts when the probe fails twice (with curl's reason), when IPv6 stays on, and
+    /// when the route to the motherbee changed: the routes, the IPv6 values and the sysctl file go
+    /// back, hive.yaml and the section in memory never changed.
+    #[tokio::test(start_paused = true)]
+    async fn the_egress_switch_reverts_on_a_failed_check() {
+        let timeout =
+            "a timeout (curl exit 28: curl: (28) Connection timed out after 5001 milliseconds)";
+        let cases: Vec<(&str, FakeEgressHost)> = vec![
+            ("EGRESS_PROBE_FAILED", {
+                let host = worker1_host();
+                *host.probes.lock().unwrap() =
+                    vec![Err(timeout.to_string()), Err(timeout.to_string())].into();
+                host
+            }),
+            ("EGRESS_IPV6_UNMANAGED", {
+                let mut host = worker1_host();
+                host.ipv6_takes = false;
+                host
+            }),
+            ("UPLINK_ROUTE_CHANGED", {
+                let mut host = worker1_host();
+                host.lookups_via.insert(
+                    ("10.10.10.10".parse().unwrap(), "10.10.10.40".to_string()),
+                    "default via 10.10.10.40 dev ens18".to_string(),
+                );
+                host
+            }),
+        ];
+        for (code, host) in cases {
+            let dir = worker1_dir(None);
+            let egress = EgressState::new(None);
+            let before = fs::read_to_string(dir.join("hive.yaml")).unwrap();
+            let (end, first, confirm) =
+                run_egress_switch(&host, &dir, &egress, set_request(&[]), true, || {}).await;
+            assert_eq!(end, EgressSwitchEnd::Reverted(code), "{first}");
+            assert_eq!(first["status"], "error");
+            assert_eq!(first["error_code"], code, "{first}");
+            assert_eq!(first["outcome"], "reverted");
+            assert_eq!(first["revert_problems"], serde_json::json!([]), "{first}");
+            assert_eq!(first["ipv6_blocked"], false);
+            assert!(confirm.is_none(), "no confirm follows a revert");
+            assert_eq!(
+                *host.default_routes.lock().unwrap(),
+                vec![WORKER1_DEFAULT],
+                "{code}"
+            );
+            assert_eq!(host.ipv6_values(), ipv6_values(false), "{code}");
+            assert_eq!(host.sysctl_file(), None, "{code}");
+            assert_eq!(fs::read_to_string(dir.join("hive.yaml")).unwrap(), before);
+            assert!(egress.section().is_none());
+            let record = worker1_record(&dir);
+            assert_eq!(record.state, "reverted");
+            assert_eq!(record.error_code.as_deref(), Some(code));
+            if code == "EGRESS_PROBE_FAILED" {
+                assert_eq!(first["probe"]["attempts"], 2);
+                assert_eq!(first["internet_reachable"], false);
+                assert!(
+                    first["message"].as_str().unwrap().contains("a timeout"),
+                    "{first}"
+                );
+                assert_eq!(host.probed.lock().unwrap().len(), 2);
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// No confirm within the window: the worker reverts by itself, nobody waiting for its answer,
+    /// and a confirm that comes after it is answered EGRESS_CONFIRM_MISSED.
+    #[tokio::test(start_paused = true)]
+    async fn the_egress_switch_reverts_without_a_confirm() {
+        let host = worker1_host();
+        let dir = worker1_dir(None);
+        let egress = EgressState::new(None);
+        let (end, first, confirm) =
+            run_egress_switch(&host, &dir, &egress, set_request(&[]), false, || {}).await;
+        assert_eq!(first["status"], "pending_confirm");
+        assert!(confirm.is_none());
+        assert_eq!(end, EgressSwitchEnd::Reverted("EGRESS_CONFIRM_MISSED"));
+        assert_eq!(*host.default_routes.lock().unwrap(), vec![WORKER1_DEFAULT]);
+        assert!(!host.ipv6_disabled());
+        assert!(egress.section().is_none());
+        let record = worker1_record(&dir);
+        assert_eq!(
+            (record.state.as_str(), record.step.as_deref()),
+            ("reverted", Some("confirm"))
+        );
+        let late = egress_confirm_answer(
+            &egress,
+            &dir.join(EGRESS_SWITCH_RECORD_FILE),
+            &record.switch_id,
+        )
+        .await;
+        assert_eq!(late["error_code"], "EGRESS_CONFIRM_MISSED", "{late}");
+        let unknown =
+            egress_confirm_answer(&egress, &dir.join(EGRESS_SWITCH_RECORD_FILE), "another").await;
+        assert_eq!(
+            unknown["error_code"], "EGRESS_SWITCH_NOT_FOUND",
+            "{unknown}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A commit whose hive.yaml cannot be written reverts, and the confirm hears why.
+    #[tokio::test]
+    async fn the_egress_switch_reverts_when_its_commit_fails() {
+        let host = worker1_host();
+        let dir = worker1_dir(None);
+        let egress = EgressState::new(None);
+        let hive_yaml = dir.join("hive.yaml");
+        let (end, _, confirm) =
+            run_egress_switch(&host, &dir, &egress, set_request(&[]), true, || {
+                fs::write(&hive_yaml, "hive_id: [worker1\n").unwrap();
+            })
+            .await;
+        assert_eq!(end, EgressSwitchEnd::Reverted("EGRESS_COMMIT_FAILED"));
+        let confirm = confirm.expect("the confirm's answer");
+        assert_eq!(confirm["error_code"], "EGRESS_COMMIT_FAILED", "{confirm}");
+        assert_eq!(confirm["step"], "commit");
+        assert_eq!(confirm["outcome"], "reverted");
+        assert_eq!(*host.default_routes.lock().unwrap(), vec![WORKER1_DEFAULT]);
+        assert!(!host.ipv6_disabled());
+        assert!(
+            egress.section().is_none(),
+            "memory is set only after the file"
+        );
+        assert_eq!(worker1_record(&dir).state, "reverted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The action again on a worker behind the declared egress: `unchanged`, and nothing moves.
+    /// A refusal changes nothing either.
+    #[tokio::test]
+    async fn the_egress_switch_is_unchanged_or_refused_without_touching_the_host() {
+        let host = worker1_host();
+        *host.default_routes.lock().unwrap() = vec!["default via 10.10.10.40".to_string()];
+        let dir = worker1_dir(Some(&declared_section_yaml()));
+        let egress = EgressState::new(Some(load_hive(&dir).unwrap().egress.expect("a section")));
+        let (end, first, _) =
+            run_egress_switch(&host, &dir, &egress, set_request(&[]), true, || {}).await;
+        assert_eq!(end, EgressSwitchEnd::Unchanged);
+        assert_eq!(
+            (first["status"].as_str(), first["outcome"].as_str()),
+            (Some("ok"), Some("unchanged"))
+        );
+        assert!(
+            read_egress_switch_record(&dir.join(EGRESS_SWITCH_RECORD_FILE))
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.probed.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+
+        // ACCESS_ON_DEFAULT_ROUTE: the gate's first refusal on 8.x.
+        let host = worker1_host();
+        let dir = worker1_dir(None);
+        let egress = EgressState::new(None);
+        let (end, first, _) = run_egress_switch(
+            &host,
+            &dir,
+            &egress,
+            set_request(&["192.168.8.0/24"]),
+            true,
+            || {},
+        )
+        .await;
+        assert_eq!(end, EgressSwitchEnd::Refused("ACCESS_ON_DEFAULT_ROUTE"));
+        assert_eq!(
+            (first["step"].as_str(), first["outcome"].as_str()),
+            (Some("guards"), Some("refused"))
+        );
+        assert_eq!(*host.default_routes.lock().unwrap(), vec![WORKER1_DEFAULT]);
+        assert!(
+            read_egress_switch_record(&dir.join(EGRESS_SWITCH_RECORD_FILE))
+                .unwrap()
+                .is_none()
+        );
+        let mut no_curl = worker1_host();
+        no_curl.curl = false;
+        let (end, _, _) =
+            run_egress_switch(&no_curl, &dir, &egress, set_request(&[]), true, || {}).await;
+        assert_eq!(end, EgressSwitchEnd::Refused("PROBE_UNAVAILABLE"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The clear: the routes and IPv6 values the worker had before it first went behind the egress,
+    /// from its record, the section out of memory and then out of hive.yaml. The probe is reported
+    /// and decides nothing. On a worker with no record it needs gateway_ip, and one that differs
+    /// from the record's is refused.
+    #[tokio::test(start_paused = true)]
+    async fn the_egress_clear_puts_back_what_the_worker_had() {
+        let host = worker1_host();
+        let dir = worker1_dir(None);
+        let egress = EgressState::new(None);
+        let (end, _, _) =
+            run_egress_switch(&host, &dir, &egress, set_request(&[]), true, || {}).await;
+        assert_eq!(end, EgressSwitchEnd::Committed);
+
+        // A clear naming another gateway than the record's is refused.
+        let (end, _, _) = run_egress_switch(
+            &host,
+            &dir,
+            &egress,
+            clear_request(Some("10.10.10.2")),
+            true,
+            || {},
+        )
+        .await;
+        assert_eq!(end, EgressSwitchEnd::Refused("INVALID_REQUEST"));
+
+        *host.probes.lock().unwrap() = vec![Err("no connection".to_string()); 2].into();
+        let (end, first, confirm) =
+            run_egress_switch(&host, &dir, &egress, clear_request(None), true, || {}).await;
+        assert_eq!(end, EgressSwitchEnd::Committed, "{first}");
+        assert_eq!(first["gateway_ip"], "10.10.10.1");
+        assert_eq!(first["previous_gateway"], "10.10.10.40");
+        assert_eq!(first["internet_reachable"], false, "reported, not decisive");
+        let confirm = confirm.unwrap();
+        assert_eq!(
+            (confirm["status"].as_str(), confirm["outcome"].as_str()),
+            (Some("ok"), Some("cleared"))
+        );
+        assert_eq!(*host.default_routes.lock().unwrap(), vec![WORKER1_DEFAULT]);
+        assert_eq!(host.ipv6_values(), ipv6_values(false));
+        assert_eq!(host.sysctl_file(), None);
+        assert!(egress.section().is_none());
+        assert_eq!(
+            hive_yaml_value(&dir),
+            serde_yaml::from_str::<serde_yaml::Value>(WORKER1_HIVE_YAML).unwrap()
+        );
+        let record = worker1_record(&dir);
+        assert_eq!(
+            (record.operation.as_str(), record.state.as_str()),
+            ("clear", "committed")
+        );
+
+        // Not behind an egress any more: the clear is unchanged.
+        let (end, _, _) =
+            run_egress_switch(&host, &dir, &egress, clear_request(None), true, || {}).await;
+        assert_eq!(end, EgressSwitchEnd::Unchanged);
+        let _ = fs::remove_dir_all(&dir);
+
+        // A worker that joined after the declaration has no record: it names its gateway.
+        let host = worker1_host();
+        *host.default_routes.lock().unwrap() = vec!["default via 10.10.10.40".to_string()];
+        *host.ipv6.lock().unwrap() = ipv6_values(true);
+        *host.sysctl_file.lock().unwrap() = Some(worker_ipv6_sysctl_content().to_string());
+        let dir = worker1_dir(Some(&declared_section_yaml()));
+        let egress = EgressState::new(Some(declared_egress()));
+        let (end, first, _) =
+            run_egress_switch(&host, &dir, &egress, clear_request(None), true, || {}).await;
+        assert_eq!(
+            end,
+            EgressSwitchEnd::Refused("PREVIOUS_GATEWAY_UNKNOWN"),
+            "{first}"
+        );
+        let (end, _, confirm) = run_egress_switch(
+            &host,
+            &dir,
+            &egress,
+            clear_request(Some("10.10.10.1")),
+            true,
+            || {},
+        )
+        .await;
+        assert_eq!(end, EgressSwitchEnd::Committed);
+        assert_eq!(
+            *host.default_routes.lock().unwrap(),
+            vec!["default via 10.10.10.1"]
+        );
+        assert_eq!(host.sysctl_file(), None, "the block's file goes");
+        assert!(
+            host.ipv6_disabled(),
+            "the live values stay until the next boot"
+        );
+        assert!(confirm.unwrap()["notes"].to_string().contains("next boot"));
+        assert!(load_hive(&dir).unwrap().egress.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// §15.3, an orchestrator that stops mid-switch: at its start an open record whose commit
+    /// hive.yaml does not hold is undone and marked interrupted; one whose commit it holds is
+    /// marked committed, and a clear's IPv6 values come back.
+    #[test]
+    fn the_start_finishes_an_open_egress_switch() {
+        let (target, section) = EgressTarget::parse(&declared_section_yaml()).unwrap();
+        let open = |operation: &str| EgressSwitchRecord {
+            switch_id: "sw-1".to_string(),
+            operation: operation.to_string(),
+            state: "open".to_string(),
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            gateway_ip: Some("10.10.10.40".to_string()),
+            target: (operation == "set").then(|| target.clone()),
+            previous_gateway: Some("10.10.10.1".to_string()),
+            before: EgressHostState {
+                default_routes: vec![WORKER1_DEFAULT.to_string()],
+                ipv6: ipv6_values(false),
+                sysctl_file: None,
+            },
+            original: Some(EgressHostState {
+                default_routes: vec![WORKER1_DEFAULT.to_string()],
+                ipv6: ipv6_values(false),
+                sysctl_file: None,
+            }),
+            step: Some("confirm".to_string()),
+            error_code: None,
+            reason: None,
+        };
+        let switched = || {
+            let host = worker1_host();
+            *host.default_routes.lock().unwrap() = vec!["default via 10.10.10.40".to_string()];
+            *host.ipv6.lock().unwrap() = ipv6_values(true);
+            *host.sysctl_file.lock().unwrap() = Some(worker_ipv6_sysctl_content().to_string());
+            host
+        };
+        let dir = worker1_dir(None);
+        let path = dir.join(EGRESS_SWITCH_RECORD_FILE);
+
+        // Never committed: undone.
+        let host = switched();
+        write_egress_switch_record(&path, &open("set")).unwrap();
+        let resumed = resume_egress_switch_at_start(&host, &path, None).unwrap();
+        assert_eq!(resumed, Some(EgressSwitchResume::Interrupted(Vec::new())));
+        assert_eq!(*host.default_routes.lock().unwrap(), vec![WORKER1_DEFAULT]);
+        assert_eq!(host.ipv6_values(), ipv6_values(false));
+        assert_eq!(host.sysctl_file(), None);
+        let record = read_egress_switch_record(&path).unwrap().unwrap();
+        assert_eq!(record.state, "interrupted");
+        assert_eq!(
+            record.error_code.as_deref(),
+            Some("EGRESS_SWITCH_INTERRUPTED")
+        );
+        // A record that is no longer open is left as it is.
+        assert_eq!(
+            resume_egress_switch_at_start(&host, &path, None).unwrap(),
+            None
+        );
+
+        // Committed: hive.yaml holds the section; the boot applies it as it does.
+        let host = switched();
+        write_egress_switch_record(&path, &open("set")).unwrap();
+        let resumed = resume_egress_switch_at_start(&host, &path, Some(&section)).unwrap();
+        assert_eq!(resumed, Some(EgressSwitchResume::Committed));
+        assert_eq!(
+            *host.default_routes.lock().unwrap(),
+            vec!["default via 10.10.10.40"]
+        );
+        assert_eq!(
+            read_egress_switch_record(&path).unwrap().unwrap().state,
+            "committed"
+        );
+
+        // A clear whose file was written: committed, and the IPv6 values it kept come back.
+        let host = switched();
+        write_egress_switch_record(&path, &open("clear")).unwrap();
+        let resumed = resume_egress_switch_at_start(&host, &path, None).unwrap();
+        assert_eq!(resumed, Some(EgressSwitchResume::Committed));
+        assert_eq!(host.ipv6_values(), ipv6_values(false));
+        assert_eq!(host.sysctl_file(), None);
+        // A clear whose file still holds the section never committed: undone.
+        let host = switched();
+        write_egress_switch_record(&path, &open("clear")).unwrap();
+        let resumed = resume_egress_switch_at_start(&host, &path, Some(&section)).unwrap();
+        assert!(matches!(resumed, Some(EgressSwitchResume::Interrupted(_))));
+
+        // No record: nothing to do.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            resume_egress_switch_at_start(&host, &path, None).unwrap(),
+            None
+        );
+        // The boot reads it before it applies the section, on a worker.
+        let src = include_str!("sy_orchestrator.rs");
+        let boot = &src[src.find("async fn bootstrap_local(").expect("the boot")..];
+        let resume = boot
+            .find("resume_egress_switch(state)")
+            .expect("the resume");
+        assert!(resume < boot.find("reconcile_egress(state)").expect("the reconcile"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The watchdog's egress step skips while a switch is open, before it reads the section or runs
+    /// anything; one switch at a time.
+    #[test]
+    fn the_watchdog_skips_its_egress_step_while_a_switch_is_open() {
+        let egress = EgressState::new(Some(declared_egress()));
+        assert!(!egress.switch_open());
+        let (switch_id, _confirm) = egress.claim().expect("claimed");
+        assert!(egress.switch_open());
+        assert_eq!(
+            egress.claim().err(),
+            Some(switch_id.clone()),
+            "one switch at a time"
+        );
+        assert!(egress.take_confirm("another").is_none());
+        assert!(egress.take_confirm(&switch_id).is_some());
+        assert!(egress.take_confirm(&switch_id).is_none(), "once");
+        egress.release("another");
+        assert!(egress.switch_open());
+        egress.release(&switch_id);
+        assert!(!egress.switch_open());
+
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src.find("fn watchdog_egress_reconcile(").expect("the step");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        let pause = body.find("state.egress.switch_open()").expect("the pause");
+        assert!(pause < body.find("state.egress.section()").expect("the section"));
+        assert!(pause < body.find("Command::new").expect("a command"));
+    }
+
+    /// `/versions`: a worker's egress against the motherbee's declaration (§15.5).
+    #[test]
+    fn versions_compares_each_worker_with_the_egress_declaration() {
+        let declared = Some("10.10.10.40".parse().unwrap());
+        let egress = |gateway: Option<&str>, observed: &str| {
+            serde_json::json!({
+                "section": gateway.map(|gateway| serde_json::json!({ "gateway_ip": gateway })),
+                "observed_default_gateway": observed,
+            })
+        };
+        assert_eq!(
+            egress_comparison(declared, &egress(None, "10.10.10.1")),
+            Some("not_behind")
+        );
+        assert_eq!(
+            egress_comparison(declared, &egress(Some("10.10.10.41"), "10.10.10.41")),
+            Some("other_gateway")
+        );
+        assert_eq!(
+            egress_comparison(declared, &egress(Some("10.10.10.40"), "10.10.10.1")),
+            Some("drifted")
+        );
+        assert_eq!(
+            egress_comparison(declared, &egress(Some("10.10.10.40"), "10.10.10.40")),
+            Some("behind")
+        );
+        assert_eq!(egress_comparison(None, &egress(None, "10.10.10.1")), None);
+
+        let answer = |role: &str, egress: serde_json::Value| {
+            serde_json::json!({
+                "status": "ok",
+                "hive": { "hive_id": "worker1", "role": role, "egress": egress },
+            })
+        };
+        let mut worker = answer("worker", egress(None, "10.10.10.1"));
+        add_egress_state_to_answer(&mut worker, Some(&declared_egress()));
+        assert_eq!(worker["hive"]["egress"]["state"], "not_behind");
+        assert_eq!(
+            worker["hive"]["egress"]["declared_gateway_ip"],
+            "10.10.10.40"
+        );
+        let mut undeclared = answer("worker", egress(None, "10.10.10.1"));
+        add_egress_state_to_answer(&mut undeclared, None);
+        assert_eq!(
+            undeclared["hive"]["egress"]["state"],
+            serde_json::Value::Null
+        );
+        for (role, block) in [
+            ("egress", serde_json::Value::Null),
+            ("worker", serde_json::Value::Null),
+        ] {
+            let mut other = answer(role, block);
+            let before = other.clone();
+            add_egress_state_to_answer(&mut other, Some(&declared_egress()));
+            assert_eq!(
+                other, before,
+                "{role}: an egress, or an older orchestrator, is left as it is"
+            );
+        }
+
+        let record = EgressSwitchRecord {
+            switch_id: "sw-1".to_string(),
+            operation: "set".to_string(),
+            state: "reverted".to_string(),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            gateway_ip: Some("10.10.10.40".to_string()),
+            target: None,
+            previous_gateway: Some("10.10.10.1".to_string()),
+            before: EgressHostState::default(),
+            original: None,
+            step: Some("check".to_string()),
+            error_code: Some("EGRESS_PROBE_FAILED".to_string()),
+            reason: Some("a timeout".to_string()),
+        };
+        let block =
+            egress_worker_versions_block(None, Some("10.10.10.1"), false, false, &Ok(Some(record)));
+        assert_eq!(block["section"], serde_json::Value::Null);
+        assert_eq!(block["observed_default_gateway"], "10.10.10.1");
+        assert_eq!(block["last_switch"]["state"], "reverted");
+        assert_eq!(block["last_switch"]["error_code"], "EGRESS_PROBE_FAILED");
+        assert_eq!(block["last_switch"]["previous_gateway"], "10.10.10.1");
+        let unreadable = egress_worker_versions_block(
+            Some(&declared_egress()),
+            None,
+            true,
+            true,
+            &Err("x".to_string()),
+        );
+        assert_eq!(unreadable["section"]["gateway_ip"], "10.10.10.40");
+        assert_eq!(unreadable["last_switch"], serde_json::Value::Null);
+        assert_eq!(unreadable["last_switch_error"], "x");
+        assert_eq!(unreadable["switch_open"], true);
+    }
+
+    /// The motherbee's checks (§15.1), before anything is sent, each with its code.
+    #[test]
+    fn the_motherbee_checks_an_egress_action_before_it_sends_anything() {
+        let code = |result: Result<serde_json::Value, serde_json::Value>| match result {
+            Ok(_) => "ok".to_string(),
+            Err(refusal) => refusal["error_code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let set = |declaration: Option<&EgressSection>, payload: serde_json::Value| {
+            prepare_hive_egress(
+                EgressOperation::Set,
+                "worker1",
+                "motherbee",
+                declaration,
+                &payload,
+            )
+        };
+        let declared = declared_egress();
+        let switch = set(
+            Some(&declared),
+            serde_json::json!({ "target": "worker1", "access_from": ["192.168.8.7/24"] }),
+        )
+        .unwrap();
+        assert_eq!(switch["section_yaml"], declared_section_yaml());
+        assert_eq!(switch["operation"], "set");
+        assert_eq!(switch["phase"], "switch");
+        assert_eq!(switch["target"], "worker1");
+        assert_eq!(switch["access_from"], serde_json::json!(["192.168.8.0/24"]));
+        assert!(
+            parse_egress_switch_request(&switch).is_ok(),
+            "the worker takes it"
+        );
+
+        assert_eq!(code(set(None, serde_json::json!({}))), "NO_EGRESS_DECLARED");
+        let mut no_gateway = declared.clone();
+        no_gateway.gateway_ip = None;
+        assert_eq!(
+            code(set(Some(&no_gateway), serde_json::json!({}))),
+            "NO_EGRESS_DECLARED"
+        );
+        let mut no_url = declared.clone();
+        no_url.reachability_url = Some("  ".to_string());
+        assert_eq!(
+            code(set(Some(&no_url), serde_json::json!({}))),
+            "NO_REACHABILITY_URL"
+        );
+        let mut plain = declared.clone();
+        plain.reachability_url = Some("http://example.com".to_string());
+        assert_eq!(
+            code(set(Some(&plain), serde_json::json!({}))),
+            "EGRESS_DECLARATION_INVALID"
+        );
+        let mut named = declared.clone();
+        named.gateway_ip = Some("egress1".to_string());
+        assert_eq!(
+            code(set(Some(&named), serde_json::json!({}))),
+            "EGRESS_DECLARATION_INVALID"
+        );
+        assert_eq!(
+            code(set(
+                Some(&declared),
+                serde_json::json!({ "gateway_ip": "10.10.10.1" })
+            )),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            code(set(
+                Some(&declared),
+                serde_json::json!({ "access_from": ["fd00::/64"] })
+            )),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            code(set(
+                Some(&declared),
+                serde_json::json!({ "access_from": ["office"] })
+            )),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            code(prepare_hive_egress(
+                EgressOperation::Set,
+                "motherbee",
+                "motherbee",
+                Some(&declared),
+                &serde_json::json!({})
+            )),
+            "NOT_A_WORKER"
+        );
+        assert_eq!(
+            code(prepare_hive_egress(
+                EgressOperation::Set,
+                "../etc",
+                "motherbee",
+                Some(&declared),
+                &serde_json::json!({})
+            )),
+            "INVALID_REQUEST"
+        );
+
+        let clear = |payload: serde_json::Value| {
+            prepare_hive_egress(
+                EgressOperation::Clear,
+                "worker1",
+                "motherbee",
+                None,
+                &payload,
+            )
+        };
+        let switch = clear(serde_json::json!({ "gateway_ip": "10.10.10.1" })).unwrap();
+        assert_eq!(switch["gateway_ip"], "10.10.10.1");
+        assert!(switch.get("section_yaml").is_none());
+        assert_eq!(
+            code(clear(serde_json::json!({}))),
+            "ok",
+            "the clear needs no declaration"
+        );
+        assert_eq!(
+            code(clear(serde_json::json!({ "gateway_ip": "gw" }))),
+            "INVALID_REQUEST"
+        );
+    }
+
+    /// The motherbee's reading of its registry: only a worker whose join is done.
+    #[test]
+    fn the_motherbee_takes_only_a_joined_worker_behind_the_egress() {
+        let root = std::env::temp_dir().join(format!("fluxbee-a219-registry-{}", Uuid::new_v4()));
+        let done = "join:\n  phase: done\n";
+        for (dir, info) in [
+            (
+                "worker1",
+                format!("hive_id: worker1\nrole: worker\nstatus: connected\n{done}"),
+            ),
+            (
+                "ingress1",
+                format!("hive_id: ingress1\nrole: ingress\nstatus: connected\n{done}"),
+            ),
+            (
+                "egress1",
+                format!("hive_id: egress1\nrole: egress\nstatus: connected\n{done}"),
+            ),
+            (
+                "worker2",
+                "hive_id: worker2\nrole: worker\nstatus: joining\njoin:\n  phase: finalize\n"
+                    .to_string(),
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+        }
+        let registry = fluxbee_sdk::mesh::HiveRegistry::new(&root);
+        assert_eq!(hive_egress_registry_refusal(&registry, "worker1"), None);
+        for (hive, why) in [
+            ("ingress1", "an ingress"),
+            ("egress1", "the gateway"),
+            ("worker2", "join is not done"),
+            ("worker9", "no hive of the registry"),
+        ] {
+            let refusal = hive_egress_registry_refusal(&registry, hive).expect(hive);
+            assert!(refusal.contains(why), "{hive}: {refusal}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The motherbee's exchange (§15.3): the switch, and the confirm only on pending_confirm; a
+    /// switch whose answer did not come gets no confirm, and is `not_answered`.
+    #[tokio::test]
+    async fn the_motherbee_confirms_only_a_pending_switch() {
+        let exchange = |answers: Vec<Result<serde_json::Value, String>>| async move {
+            let answers = StdMutex::new(std::collections::VecDeque::from(answers));
+            let sent = StdMutex::new(Vec::new());
+            let answer = hive_egress_exchange(
+                "worker1",
+                EgressOperation::Set,
+                serde_json::json!({ "phase": "switch" }),
+                |payload, timeout| {
+                    sent.lock().unwrap().push((payload, timeout));
+                    let next = answers.lock().unwrap().pop_front().expect("an answer");
+                    async move { next }
+                },
+            )
+            .await;
+            (answer, sent.into_inner().unwrap())
+        };
+        let pending = serde_json::json!({
+            "status": "pending_confirm",
+            "switch_id": "sw-1",
+            "gateway_ip": "10.10.10.40",
+            "ipv6_blocked": true,
+            "timings_ms": { "guards": 3, "switch": 40, "check": 300 },
+        });
+
+        // A lost answer: no confirm.
+        let (answer, sent) = exchange(vec![Err("timeout after 30s".to_string())]).await;
+        assert_eq!(sent.len(), 1, "no confirm after a lost answer");
+        assert_eq!(sent[0].1, EGRESS_SWITCH_FORWARD_TIMEOUT);
+        assert_eq!(answer["error_code"], "EGRESS_NOT_ANSWERED");
+        assert_eq!(
+            (answer["outcome"].as_str(), answer["step"].as_str()),
+            (Some("not_answered"), Some("switch"))
+        );
+        assert!(answer["message"]
+            .as_str()
+            .unwrap()
+            .contains("update_installation"));
+
+        // Confirmed.
+        let committed = serde_json::json!({
+            "status": "ok", "outcome": "switched", "committed": true, "ipv6_blocked": true,
+            "route": "default via 10.10.10.40", "timings_ms": { "confirm_wait": 20, "commit": 4 },
+        });
+        let (answer, sent) = exchange(vec![Ok(pending.clone()), Ok(committed)]).await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].0["phase"], "confirm");
+        assert_eq!(sent[1].0["switch_id"], "sw-1");
+        assert_eq!(sent[1].1, EGRESS_CONFIRM_FORWARD_TIMEOUT);
+        assert_eq!(
+            (answer["status"].as_str(), answer["outcome"].as_str()),
+            (Some("ok"), Some("switched"))
+        );
+        assert_eq!(
+            answer["gateway_ip"], "10.10.10.40",
+            "pending_confirm's details stay"
+        );
+        assert_eq!(answer["hive"], "worker1");
+        for step in [
+            "guards",
+            "switch",
+            "check",
+            "confirm_wait",
+            "commit",
+            "forward_switch",
+            "forward_confirm",
+        ] {
+            assert!(answer["timings_ms"][step].is_u64(), "{step}: {answer}");
+        }
+
+        // The confirm's answer lost: not_answered at the confirm, the details kept.
+        let (answer, _) = exchange(vec![Ok(pending.clone()), Err("timeout".to_string())]).await;
+        assert_eq!(
+            (answer["error_code"].as_str(), answer["step"].as_str()),
+            (Some("EGRESS_NOT_ANSWERED"), Some("confirm"))
+        );
+        assert_eq!(answer["switch_id"], "sw-1");
+
+        // A refusal, or unchanged, passes through: no confirm.
+        for first in [
+            serde_json::json!({
+                "status": "error",
+                "error_code": "GATEWAY_NOT_ON_LINK",
+                "step": "guards",
+            }),
+            serde_json::json!({ "status": "ok", "outcome": "unchanged" }),
+        ] {
+            let (answer, sent) = exchange(vec![Ok(first.clone())]).await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(answer["status"], first["status"]);
+            assert_eq!(answer["hive"], "worker1");
+        }
+    }
+
+    /// FINDINGS A-225: a failed probe says why, in words first.
+    #[test]
+    fn a_failed_probe_says_why() {
+        assert!(
+            curl_failure_reason(Some(6), "curl: (6) Could not resolve host: example.com")
+                .starts_with("no DNS")
+        );
+        assert!(curl_failure_reason(Some(7), "").starts_with("no connection (curl exit 7)"));
+        let timeout = curl_failure_reason(
+            Some(28),
+            "curl: (28) Connection timed out after 5001 milliseconds",
+        );
+        assert!(
+            timeout.starts_with("a timeout") && timeout.contains("5001"),
+            "{timeout}"
+        );
+        assert!(curl_failure_reason(Some(60), "").starts_with("TLS failed"));
+        assert!(curl_failure_reason(None, "").contains("a signal"));
+        // The worker's boot judges its IPv6 block by the kernel's read-back, not by sysctl's exit.
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn reconcile_worker_egress(")
+            .expect("the worker's reconcile");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        assert!(!body.contains("apply_sysctl_system()?"), "{body}");
+        assert!(body.contains("ipv6_disabled_now()"));
+    }
+
+    /// FINDINGS A-225: a removed worker's egress files go with it, once its services are stopped;
+    /// another role's cleanup leaves them alone, and the worker decides by its own role.
+    #[test]
+    fn a_removed_worker_drops_its_egress_files() {
+        let worker = remove_hive_cleanup_full_script(false, false, true);
+        assert!(worker.ends_with(&worker_teardown_script()), "{worker}");
+        let teardown = worker_teardown_script();
+        assert!(teardown.contains(
+            "rm -f /etc/sysctl.d/99-fluxbee-egress.conf /var/lib/fluxbee/orchestrator/egress-switch.json"
+        ));
+        assert!(teardown.contains("sysctl --system"));
+        assert_eq!(
+            teardown.matches("|| true").count(),
+            teardown.split("; ").count()
+        );
+        assert!(
+            worker.find("sy-orchestrator").unwrap() < worker.find("99-fluxbee-egress").unwrap()
+        );
+        let ingress = remove_hive_cleanup_full_script(false, true, false);
+        assert!(!ingress.contains("egress-switch.json"));
+        let src = include_str!("sy_orchestrator.rs");
+        let arm = &src[src
+            .find("Some(\"REMOVE_HIVE_CLEANUP\") => {")
+            .expect("the arm")..];
+        let arm = &arm[..arm.find("send_system_action_response").expect("its answer")];
+        assert!(arm.contains("state.role == HiveRole::Worker"), "{arm}");
+    }
+
     /// docs/acme-edge-certificates-v1.md §8: the probe GETs only an https URL the operator named.
     /// Without one it does not run and says `not_configured`; nothing picks a target for it.
     #[test]
@@ -39708,7 +44060,11 @@ LISTEN 0      4096               *:22000       *:* users:(("syncthing",pid=20134
 
     #[test]
     fn the_motherbee_refuses_the_spoke_only_actions() {
-        for action in ["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"] {
+        for action in [
+            "ADD_HIVE_FINALIZE",
+            "REMOVE_HIVE_CLEANUP",
+            MSG_SYSTEM_EGRESS_ROUTE,
+        ] {
             let refusal =
                 spoke_only_action_refusal(action, true).expect("refused on the motherbee");
             assert_eq!(refusal["status"], "error");
@@ -39877,7 +44233,8 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     fn remove_hive_cleanup_takes_the_mesh_credentials_first() {
         for (egress_teardown, ingress_teardown) in [(false, false), (true, false), (false, true)] {
             assert!(
-                remove_hive_cleanup_full_script(egress_teardown, ingress_teardown).starts_with(
+                remove_hive_cleanup_full_script(egress_teardown, ingress_teardown, false)
+                    .starts_with(
                     "rm -rf /var/lib/fluxbee/tls /var/lib/fluxbee/identity/keys >/dev/null 2>&1 \
                      || true; "
                 )
@@ -39890,12 +44247,12 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     /// other role's cleanup leaves no trace of it.
     #[test]
     fn remove_hive_cleanup_drops_the_ingress_ssh_table_last() {
-        let worker = remove_hive_cleanup_full_script(false, false);
+        let worker = remove_hive_cleanup_full_script(false, false, false);
         assert!(!worker.contains("fluxbee_ingress"), "{worker}");
         assert!(!worker.contains("fluxbee-ingress"), "{worker}");
-        assert!(!remove_hive_cleanup_full_script(true, false).contains("fluxbee_ingress"));
+        assert!(!remove_hive_cleanup_full_script(true, false, false).contains("fluxbee_ingress"));
 
-        let ingress = remove_hive_cleanup_full_script(false, true);
+        let ingress = remove_hive_cleanup_full_script(false, true, false);
         assert!(ingress.ends_with(&ingress_teardown_script()), "{ingress}");
         let teardown = ingress_teardown_script();
         assert!(teardown.contains("nft delete table inet fluxbee_ingress"));
@@ -39930,7 +44287,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     /// orchestrator's child: the whole script runs to its end.
     #[test]
     fn remove_hive_cleanup_runs_in_its_own_transient_unit() {
-        let cmd = remove_hive_cleanup_command("fluxbee-remove-hive-cleanup-1", true, false);
+        let cmd = remove_hive_cleanup_command("fluxbee-remove-hive-cleanup-1", true, false, false);
         assert_eq!(cmd.get_program(), "systemd-run");
         let args: Vec<String> = cmd
             .get_args()
@@ -39947,7 +44304,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
                 "-c"
             ]
         );
-        assert_eq!(args[6], remove_hive_cleanup_full_script(true, false));
+        assert_eq!(args[6], remove_hive_cleanup_full_script(true, false, false));
         assert_eq!(args.len(), 7);
     }
 
@@ -40023,7 +44380,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     #[test]
     fn f11_remove_hive_cleanup_appends_egress_teardown_only_for_egress() {
         // Non-egress (worker) removal: NO NAT teardown, only the base cleanup.
-        let worker = remove_hive_cleanup_full_script(false, false);
+        let worker = remove_hive_cleanup_full_script(false, false, false);
         assert!(worker.contains("/var/lib/fluxbee/nodes/*"));
         assert!(!worker.contains("fluxbee_egress"));
         assert!(!worker.contains("99-fluxbee-egress"));
@@ -40031,7 +44388,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
 
         // Egress removal: base cleanup PLUS idempotent NAT teardown of the live
         // nft table + all four persistent /etc files + a sysctl reload.
-        let egress = remove_hive_cleanup_full_script(true, false);
+        let egress = remove_hive_cleanup_full_script(true, false, false);
         assert!(egress.contains("/var/lib/fluxbee/nodes/*")); // base preserved
         assert!(egress.contains("nft delete table inet fluxbee_egress"));
         assert!(egress.contains("/etc/nftables.d/fluxbee-egress.nft"));
@@ -45033,7 +49390,7 @@ blob:
                 nodes: vec!["SY.config.routes".to_string(), "SY.timer".to_string()],
                 wait_for: vec!["SY.config.routes".to_string(), "SY.timer".to_string()],
             },
-            egress: None,
+            egress: EgressState::new(None),
             blob: sample_blob_config(),
             dist: sample_dist_config(),
             installation_not_written: StdMutex::new(None),
