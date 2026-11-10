@@ -38,7 +38,7 @@ fails with `missing_ai_api_key`.
 ## Where it runs
 
 - Only on the motherbee. `main` reads `/etc/fluxbee/hive.yaml`: on another role it logs
-  `SY.admin solo corre en motherbee; role != motherbee` and exits 0; with `role: motherbee` the
+  `SY.admin runs only on the motherbee; role != motherbee` and exits 0; with `role: motherbee` the
   `hive_id` must be `motherbee` (`PRIMARY_HIVE_ID`), and `hive_id: motherbee` on another role is
   an error.
 - The packaged unit carries the same check as an `ExecCondition` (`unit_role_gate` in
