@@ -82,17 +82,20 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   (a `TIMER_CANCEL` or a `TIMER_RESCHEDULE` goes fire-and-forget), which is scheduled again at its
   `fire_at`. A fired timer's index row goes with it, so a restart does not fire it again. A
   restart fires the timers it missed in the order they fire, reading each row again first. If
-  SY.timer does not answer at start, the node starts `DEGRADED` and reconciles its timers when
-  SY.timer answers; a timer SY.timer never got is scheduled again then, and one scheduled after the
-  list was asked is left alone.
+  SY.timer does not answer at start, or the timer index (or a row of it) cannot be read, the node
+  starts `DEGRADED` (`timers_not_reconciled`) and reconciles its timers on a later try, every 30 s;
+  a timer SY.timer never got is scheduled again then, and one scheduled after the list was asked is
+  left alone.
 - **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
   store does not open, or fails during recovery, the node stays up and connected: `NODE_STATUS_GET`
   says `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed
   recovery), or, when the cause is the `db_path` itself (a directory, a place it cannot create or
   write), the config is `FAILED_CONFIG` (`invalid_config`, `last_error` naming the path). Meanwhile
   every event gets `NOT_TAKEN` `unavailable`, a `WF_*` request `STORE_ERROR` (`node_not_configured`
-  in `FAILED_CONFIG`), and a `TIMER_FIRED` nothing. The node opens the store again every 30 s; once
-  it opens, the engine recovers as at a start and the node is ready. A corrected `db_path` is a
+  in `FAILED_CONFIG`), and a `TIMER_FIRED` nothing: SY.timer does not send it again, and the timers'
+  reconcile at the store's open gives it, the node `DEGRADED` until that reconcile is done. The node
+  opens the store again every 30 s; once it opens, the engine recovers as at a start and the node is
+  ready. A corrected `db_path` is a
   config change, applied at a restart. Before, the node exited, and its unit restarted it every 5 s
   with the reason only in its journal.
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and

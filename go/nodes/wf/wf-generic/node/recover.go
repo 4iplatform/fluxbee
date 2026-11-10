@@ -12,7 +12,8 @@ import (
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-// timerReconcileRetryInterval is how often a node that started without SY.timer's answer asks again.
+// timerReconcileRetryInterval is how often a node whose timers are not reconciled tries again: SY.timer
+// did not answer, or the timer index could not be read.
 const timerReconcileRetryInterval = 30 * time.Second
 
 // RecoverOptions controls boot-time reconciliation behaviour.
@@ -35,8 +36,9 @@ type RecoverOptions struct {
 //     a creation that starts nothing (it has no thread, the current definition does not start from
 //     its sender, or its input_schema refuses it) is dropped and answered as live dispatch answers
 //     it, NOT_TAKEN;
-//  4. the timer index against SY.timer. When SY.timer does not answer, the node starts anyway,
-//     DEGRADED (timersPending), and the receive loop reconciles when it answers;
+//  4. the timer index against SY.timer. When SY.timer does not answer, or the index cannot be read,
+//     the node starts anyway, DEGRADED (timersPending), and the receive loop reconciles again until
+//     it can: a fire dropped while the node could not take it is given then;
 //  5. the definitions no running instance uses are dropped.
 //
 // Each event a start runs again (2 and 3) counts its attempt, in its own commit, before it runs: one
@@ -56,7 +58,7 @@ func (rt *NodeRuntime) Recover(ctx context.Context, opts RecoverOptions) error {
 	}
 	if err := rt.ReconcileTimers(ctx, opts); err != nil {
 		rt.timersPending = err
-		log.Printf("recover: timers not reconciled, the node runs DEGRADED until SY.timer answers: %v", err)
+		log.Printf("recover: timers not reconciled, the node runs DEGRADED until they are: %v", err)
 	}
 	rt.pruneDefinitions(ctx)
 	log.Printf("recover: complete, %d running instances", rt.Registry.Count())
@@ -294,8 +296,9 @@ func (rt *NodeRuntime) listTimers(ctx context.Context, opts RecoverOptions) ([]s
 	return timers, nil
 }
 
-// ReconcileTimers reconciles the timer index with what SY.timer has pending; an error says SY.timer
-// did not answer, and nothing changed.
+// ReconcileTimers reconciles the timer index with what SY.timer has pending; an error says the timers
+// are not reconciled: SY.timer did not answer, and nothing changed, or the index could not be read
+// (reconcileTimers).
 func (rt *NodeRuntime) ReconcileTimers(ctx context.Context, opts RecoverOptions) error {
 	if rt.ActCtx.Timer == nil {
 		log.Printf("recover: no timer sender configured, skipping timer reconciliation")
@@ -306,8 +309,7 @@ func (rt *NodeRuntime) ReconcileTimers(ctx context.Context, opts RecoverOptions)
 	if err != nil {
 		return err
 	}
-	rt.reconcileTimers(ctx, syTimers, opts, askedAtMS)
-	return nil
+	return rt.reconcileTimers(ctx, syTimers, opts, askedAtMS)
 }
 
 // timerListResult is SY.timer's answer to a TIMER_LIST asked off the receive loop at askedAtMS.
@@ -317,15 +319,18 @@ type timerListResult struct {
 	askedAtMS int64
 }
 
-// takeTimerList reconciles with a TIMER_LIST asked off the receive loop: on an answer the node is no
-// longer DEGRADED.
+// takeTimerList reconciles with a TIMER_LIST asked off the receive loop: once SY.timer answered and
+// the index was read, the node is no longer DEGRADED; otherwise the loop asks again on its tick.
 func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult, opts RecoverOptions) {
-	if result.err != nil {
-		rt.timersPending = result.err
-		log.Printf("wf: timers still not reconciled: %v", result.err)
+	err := result.err
+	if err == nil {
+		err = rt.reconcileTimers(ctx, result.timers, opts, result.askedAtMS)
+	}
+	if err != nil {
+		rt.timersPending = err
+		log.Printf("wf: timers still not reconciled: %v", err)
 		return
 	}
-	rt.reconcileTimers(ctx, result.timers, opts, result.askedAtMS)
 	rt.timersPending = nil
 	log.Printf("wf: timers reconciled with SY.timer; the node is no longer degraded")
 }
@@ -343,12 +348,17 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 //     answer) or lost it; it is scheduled again;
 //   - scheduled after SY.timer was asked: left alone (the list could not hold it);
 //   - in SY.timer but not in the index: an orphan, cancelled.
-func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.TimerInfo, opts RecoverOptions, askedAtMS int64) {
+//
+// An error says the timers are not reconciled, and the node stays DEGRADED until a later reconcile
+// is (timersPending), since a fire dropped while it could not take one has no other way back (SY.timer
+// sends a fire once, FINDINGS A-217): the index could not be read, and nothing changed (every timer
+// of SY.timer would have read as an orphan), or a row could not be read again, and stays as it was
+// while the others are reconciled.
+func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.TimerInfo, opts RecoverOptions, askedAtMS int64) error {
 	actx := rt.ActCtx
 	expectedTimers, err := rt.Store.ListAllExpectedTimers(ctx)
 	if err != nil {
-		log.Printf("recover: list expected timers: %v", err)
-		return
+		return fmt.Errorf("read the timer index: %w", err)
 	}
 	if len(syTimers) == sdk.MaxTimerListLimit {
 		log.Printf("recover: TIMER_LIST reached max limit=%d for owner=%s; reconciliation may be truncated", sdk.MaxTimerListLimit, opts.OwnerL2Name)
@@ -361,6 +371,7 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 	}
 
 	now := actx.Clock().UnixMilli()
+	var unread error
 	for _, listed := range expectedTimers {
 		ref := timerClientRef(listed.InstanceID, listed.TimerKey)
 		syTimer, existsInSY := syView[ref]
@@ -368,6 +379,9 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 		row, current, err := rt.Store.GetTimerForInstance(ctx, listed.InstanceID, listed.TimerKey)
 		if err != nil {
 			log.Printf("recover: reread timer %s/%s: %v", listed.InstanceID, listed.TimerKey, err)
+			if unread == nil {
+				unread = fmt.Errorf("read timer %s/%s of the index again: %w", listed.InstanceID, listed.TimerKey, err)
+			}
 			continue
 		}
 		if !current || row.FireAtMS != listed.FireAtMS {
@@ -430,7 +444,11 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 			log.Printf("recover: cancel orphan %s: %v", ref, err)
 		}
 	}
+	if unread != nil {
+		return unread
+	}
 	log.Printf("recover: timer reconciliation complete")
+	return nil
 }
 
 // scheduleAgain schedules again, at its fire_at (SY.timer's minimum ahead at least), a timer of the

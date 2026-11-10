@@ -32,8 +32,9 @@ const (
 	errCodeUnauthorized = "UNAUTHORIZED"
 	// errCodeStoreError: the instance store failed a WF_* request, or is not open (storeDown).
 	errCodeStoreError = "STORE_ERROR"
-	// errCodeTimersNotReconciled: the node runs, but its timers wait for SY.timer to answer
-	// (NODE_STATUS_GET reports it as DEGRADED).
+	// errCodeTimersNotReconciled: the node runs, but its timers are not reconciled with SY.timer yet:
+	// it did not answer, or the timer index could not be read (NODE_STATUS_GET reports it as
+	// DEGRADED).
 	errCodeTimersNotReconciled = "timers_not_reconciled"
 	// errCodeStoreUnavailable: the config is in use, but the engine waits for its store, which did
 	// not open or failed during recovery (FINDINGS A-217; NODE_STATUS_GET reports it as DEGRADED).
@@ -56,8 +57,9 @@ type NodeRuntime struct {
 	NodeName   string
 	Plane      *ControlPlane
 	VersionStr string
-	// timersPending is why the timer index is not reconciled with SY.timer yet (it did not answer
-	// at start): the node runs DEGRADED, and the receive loop tries again until it does.
+	// timersPending is why the timer index is not reconciled with SY.timer yet (it did not answer,
+	// or the index could not be read): the node runs DEGRADED, and the receive loop tries again until
+	// it is.
 	timersPending error
 	// storeDown is set while the engine waits for its store (startEngine, FINDINGS A-217): the node
 	// stays up, refuses every event, and the receive loop opens the store again until it can.
@@ -162,7 +164,7 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 // A-217): its sender gets a NOT_TAKEN unavailable that says why, as answerNotTaken says who gets
 // one. A sender the definition does not involve is dropped, as always (FINDINGS A-123), and so is a
 // TIMER_FIRED, never answered: the store's open reconciles the timers and fires the ones the node
-// missed (Recover).
+// missed (Recover), and the node stays DEGRADED until that reconcile is done (reconcileTimers).
 func (rt *NodeRuntime) refuseWhileStoreDown(msg sdk.Message) error {
 	sender := msg.SourceL2Name()
 	if rawMsgName(msg) == sdk.MsgTimerFired {
@@ -267,7 +269,7 @@ func rawMsgName(msg sdk.Message) string {
 func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	resp, err := sdk.BuildManagedNodeStatusResponse(&msg, rt.NodeUUID, rt.Plane.State)
 	if degraded := rt.degradedBy(); degraded != nil && rt.Plane.Configured() != nil {
-		// Its config in use, but its engine waits for its store, or its timers for SY.timer:
+		// Its config in use, but its engine waits for its store, or its timers for their reconcile:
 		// DEGRADED, saying why (the orchestrator's get_node_status reports both).
 		resp, err = sdk.BuildSystemMessage(rt.NodeUUID, sdk.UnicastDestination(msg.Routing.Src), 16, msg.Routing.TraceID,
 			sdk.MSGNodeStatusGetResponse, map[string]any{
@@ -283,7 +285,7 @@ func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 }
 
 // degradedBy is why a node whose config is in use is DEGRADED, nil when it is not: its engine
-// waits for its store (FINDINGS A-217), or its timers for SY.timer (A-118).
+// waits for its store (FINDINGS A-217), or its timers for their reconcile with SY.timer (A-118).
 func (rt *NodeRuntime) degradedBy() *sdk.ControlPlaneError {
 	switch {
 	case rt.storeDown != nil:

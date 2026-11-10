@@ -251,8 +251,9 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
 - **Run.** It opens the SQLite instance store, keeps its definition by hash, recovers running
   instances (each on the definition it was born with), runs again the inbound events a crash
   left unfinished, reconciles its timers with SY.timer and starts a GC loop (`startEngine`,
-  `node/node.go`; `Recover`, `node/recover.go`). When SY.timer does not answer it starts
-  `DEGRADED` and reconciles later. When the store does not open, or fails during recovery, the
+  `node/node.go`; `Recover`, `node/recover.go`). When SY.timer does not answer, or the timer index
+  cannot be read, it starts `DEGRADED` and reconciles later. When the store does not open, or fails
+  during recovery, the
   engine does not run and the node stays up (FINDINGS A-217): `DEGRADED` with `store_unavailable`,
   or `FAILED_CONFIG` `invalid_config` when the `db_path` itself cannot hold the store
   (`storeFailure`, `dbPathProblem` in `node/store.go`); it refuses every event (`NOT_TAKEN`

@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -340,6 +341,147 @@ func TestRecoverStartsDegradedWhenSYTimerDoesNotAnswer(t *testing.T) {
 	logs, _ := rt.Store.GetRecentLog(context.Background(), "wfi:degraded", 5)
 	if len(logs) == 0 || logs[0].Summary != "unhandled event TIMER_FIRED in state collecting_data" {
 		t.Fatalf("the missed fire reaches the instance once SY.timer answers: %+v", logs)
+	}
+}
+
+// A store with a running instance of raceWorkflowJSON in its working state, its timeout due a minute
+// ago, as an earlier run of the node left it, at path.
+func storeWithATimeoutDue(t *testing.T, path, instanceID string) int64 {
+	t.Helper()
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.CreateInstance(ctx, WFInstanceRow{
+		InstanceID: instanceID, ThreadID: instanceID, WorkflowType: "race", DefinitionHash: definitionHash([]byte(raceWorkflowJSON)),
+		Status: "running", CurrentState: "working", InputJSON: `{}`, StateJSON: `{}`, CreatedAtMS: 1000, UpdatedAtMS: 1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fireAt := fixedClock().Add(-time.Minute).UnixMilli()
+	if err := store.RegisterTimer(ctx, instanceID, "timeout", fixedClock().Add(-10*time.Minute).UnixMilli(), fireAt); err != nil {
+		t.Fatal(err)
+	}
+	return fireAt
+}
+
+// renameTable renames a table of the store at path: what makes the store fail, and what mends it.
+func renameTable(t *testing.T, path, from, to string) {
+	t.Helper()
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(fmt.Sprintf(`ALTER TABLE %s RENAME TO %s;`, from, to)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// FINDINGS A-217's review: a TIMER_FIRED the node drops while its engine waits for its store comes
+// back once the store opens. SY.timer sends a one-shot fire once and no longer lists the timer, so
+// the reconcile of the store's open finds the timer past and missing, and the instance takes its fire
+// then.
+func TestAFireDroppedWhileTheStoreIsDownIsGivenOnceItOpens(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dbPath := filepath.Join(t.TempDir(), "wf.db")
+	fireAt := storeWithATimeoutDue(t, dbPath, "wfi:race")
+	renameTable(t, dbPath, "wf_inbound_events", "wf_inbound_events_away")
+	document := spawnConfig(writeWorkflowPackage(t, raceWorkflowJSON))
+	document["db_path"] = dbPath
+	plane := bootstrap(t, writeNodeConfig(t, document))
+	materialized := plane.Configured()
+	disp := &mockDispatcher{l2name: testNodeName, uuid: "wf-uuid"}
+	rt := &NodeRuntime{ActCtx: ActionContext{Dispatcher: disp, Timer: &mockTimerLister{}, Clock: fixedClock}, NodeUUID: "wf-uuid", NodeName: testNodeName, Plane: plane}
+	defer func() {
+		if rt.Store != nil {
+			rt.Store.Close()
+		}
+	}()
+	if rt.startEngine(ctx, materialized) {
+		t.Fatal("a store whose recovery fails keeps the engine waiting")
+	}
+
+	// SY.timer's fire comes while the store is down: dropped, never answered.
+	if err := Dispatch(ctx, timerFiredAt(t, "wfi:race", "timeout", fireAt), rt); err != nil || len(disp.sent) != 0 {
+		t.Fatalf("the fire is dropped: %v, sent %+v", err, disp.sent)
+	}
+
+	// The store opens: SY.timer lists nothing pending, and the instance takes its fire.
+	renameTable(t, dbPath, "wf_inbound_events_away", "wf_inbound_events")
+	if !rt.startEngine(ctx, materialized) || rt.timersPending != nil {
+		t.Fatalf("the engine runs, its timers reconciled: %v", rt.timersPending)
+	}
+	if row := mustGetInstance(t, rt, "wfi:race"); row.CurrentState != "done" || row.Status != "completed" {
+		t.Fatalf("the instance takes its fire once the store opens: %+v", row)
+	}
+	if _, pending, err := rt.Store.GetTimerForInstance(ctx, "wfi:race", "timeout"); pending || err != nil {
+		t.Fatalf("the fired timer leaves the index: %v %v", pending, err)
+	}
+}
+
+// FINDINGS A-217's review: a reconcile that cannot read the timer index is no reconcile. The node
+// stays DEGRADED (timers_not_reconciled, saying why), and the loop's next try that reads the index
+// gives the instances the fires they missed. Before, the reconcile logged the error and the node
+// reported HEALTHY, and a fire SY.timer had sent while the node could not take it was lost for good.
+func TestAReconcileThatCannotReadTheTimerIndexKeepsTheNodeDegraded(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "wf.db")
+	storeWithATimeoutDue(t, dbPath, "wfi:race")
+	rt, disp := newTestRuntime(t, dbPath, raceWorkflowJSON, &mockTimerLister{})
+	rt.Plane = bootstrap(t, writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, raceWorkflowJSON))))
+	exec := func(statement string) {
+		t.Helper()
+		if _, err := rt.Store.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`ALTER TABLE wf_instance_timers RENAME TO wf_instance_timers_away;`)
+	health := func() map[string]any {
+		t.Helper()
+		statusGet := sdk.MSGNodeStatusGet
+		probe := from("SY.orchestrator@motherbee", sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "system", Msg: &statusGet}})
+		if err := Dispatch(ctx, probe, rt); err != nil {
+			t.Fatal(err)
+		}
+		return lastReply(t, disp)
+	}
+	degraded := func(when string) {
+		t.Helper()
+		reply := health()
+		lastError, _ := reply["last_error"].(map[string]any)
+		if reply["health_state"] != "DEGRADED" || lastError["code"] != errCodeTimersNotReconciled || !strings.Contains(fmt.Sprint(lastError["message"]), "timer index") {
+			t.Fatalf("%s: NODE_STATUS_GET = %v", when, reply)
+		}
+		if row := mustGetInstance(t, rt, "wfi:race"); row.CurrentState != "working" {
+			t.Fatalf("%s: nothing fires before the index reads: %+v", when, row)
+		}
+	}
+	retry := func() {
+		t.Helper()
+		timers, err := rt.listTimers(ctx, recoverOpts)
+		rt.takeTimerList(ctx, timerListResult{timers: timers, err: err, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
+	}
+
+	if err := rt.Recover(ctx, recoverOpts); err != nil {
+		t.Fatalf("an unreadable timer index does not stop the engine: %v", err)
+	}
+	degraded("at the start")
+	// The loop tries again on its tick, the index still unreadable.
+	retry()
+	degraded("on the loop's next try")
+
+	// Once the index reads, the next try reconciles: the instance takes the fire it missed.
+	exec(`ALTER TABLE wf_instance_timers_away RENAME TO wf_instance_timers;`)
+	retry()
+	if reply := health(); rt.timersPending != nil || reply["health_state"] != "HEALTHY" {
+		t.Fatalf("once the index reads, the node is HEALTHY: %v %v", rt.timersPending, reply)
+	}
+	if row := mustGetInstance(t, rt, "wfi:race"); row.CurrentState != "done" {
+		t.Fatalf("the instance takes the fire it missed: %+v", row)
 	}
 }
 

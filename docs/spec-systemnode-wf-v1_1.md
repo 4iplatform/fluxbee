@@ -895,7 +895,7 @@ When the WF node restarts, it must reconcile its view of timers with SY.timer's 
 The recovery flow is:
 
 1. The WF loads its persisted running instances, each on the definition it was born with (§13.1).
-2. It asks `SY.timer` for its pending timers (`TIMER_LIST` filtered by `owner = this WF node`, at most 1000). If SY.timer does not answer, the node starts anyway, reports itself `DEGRADED` (`timers_not_reconciled`), and asks again every 30 s; the reconciliation below runs when it answers.
+2. It asks `SY.timer` for its pending timers (`TIMER_LIST` filtered by `owner = this WF node`, at most 1000). If SY.timer does not answer, the node starts anyway, reports itself `DEGRADED` (`timers_not_reconciled`), and asks again every 30 s; the reconciliation below runs when it answers. So it does when the WF cannot read its own index of timers, or a row of it again (step 3): it stays `DEGRADED` and tries again every 30 s (FINDINGS A-217's review). A one-shot fire SY.timer sent while the WF could not take it (its store down, §14.1) has no other way back: SY.timer sends a fire to a connected node once.
 3. The WF cross-references SY.timer's timers (by `client_ref`) against its own index of the timers its instances scheduled. It goes through the index in the order the timers fire, and reads each row again before it acts on it: a fire it gives an instance may cancel or move a later timer, which then does not fire (before 0.1.90 a timer an earlier fire had cancelled fired anyway). For a running instance's timer:
    - **Pending in SY.timer, `fire_at` ahead**: nothing to do.
    - **Pending in SY.timer, `fire_at` past**: the WF gives the instance a synthetic `TIMER_FIRED` now, as SY.timer's would go (§14.4), then cancels the pending one in SY.timer so it does not fire again, unless the fire scheduled the same key again.
@@ -1066,7 +1066,7 @@ When a WF node restarts:
 2. Loads all instances with `status = 'running'`, each on the definition it was born with, on its thread, with its person and the messages it kept; fails those whose definition is not available (`definition_unavailable`) or does not have their current state (`state_not_in_definition`).
 3. Drains any pending internal events for each recovered instance, in FIFO order, until each queue is empty or the instance becomes terminal, each one counting its attempt first (§14.4).
 4. Runs again every inbound event left in `wf_inbound_events`, in the order they came: an event of an instance, or a creation under the `instance_id` it had (when the current definition still starts from its sender, and the message has a thread), each one counting its attempt first; one already run at 3 starts is not run again (§14.4). A creation that starts nothing now (it has no thread, the current definition does not start from its sender, or its `input_schema` refuses it) is dropped and answered as live dispatch answers it, `NOT_TAKEN` `no_thread`, `no_conversation` or `invalid_input` (§14.5).
-5. Reconciles the timers with SY.timer (§11.4); when SY.timer does not answer, it starts `DEGRADED` and reconciles from the receive loop.
+5. Reconciles the timers with SY.timer (§11.4); when SY.timer does not answer, or the timer index cannot be read, it starts `DEGRADED` and reconciles from the receive loop.
 6. Drops the definitions no running instance uses, and enters the receive loop.
 
 When step 1 fails, or a store operation of steps 2 to 4 does, the engine does not run and the node waits for its store (§14.1): the store is closed again, and the next open runs all of these steps again from the store, as a restart, each event counting its attempt again.
@@ -1093,7 +1093,7 @@ The WF node runs on the managed control plane of the Go SDK (`go/fluxbee-go-sdk/
    A restart applies a corrected config. A redeploy through SY.wf-rules does that: it rebinds the node and restarts it. Before 0.1.70 the node exited and systemd relaunched it every 5 s, so the reason reached only journald.
 6. With a config in use but a store it cannot use (FINDINGS A-217): `wf_instances.db` does not open, or fails during recovery (§13.4). The engine does not run, the node stays up and connected, and it says why:
    - `NODE_STATUS_GET`: `DEGRADED`, with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed recovery), or, when the cause is the `db_path` itself (a directory, a place the node cannot create or write), with `invalid_config` naming the path, the config `FAILED_CONFIG` meanwhile (`CONFIG_GET`);
-   - workflow traffic: `NOT_TAKEN`, reason `unavailable`, its detail the same cause (§14.5); a `TIMER_FIRED` is dropped, never answered, since the store's open fires the timers missed meanwhile (§11.4);
+   - workflow traffic: `NOT_TAKEN`, reason `unavailable`, its detail the same cause (§14.5); a `TIMER_FIRED` is dropped, never answered, since the store's open fires the timers missed meanwhile (§11.4), and the node stays `DEGRADED` until that reconcile is done;
    - `WF_*` requests: `STORE_ERROR`, or `node_not_configured` in `FAILED_CONFIG`.
 
    The receive loop opens the store again every 30 s. Once it opens, the engine recovers as at a start (§13.4), the config is `CONFIGURED` again and the node is ready. A corrected `db_path` is a config change: a restart applies it. Before A-217 the node exited, and systemd relaunched it every 5 s with the reason only in journald.
@@ -1112,7 +1112,7 @@ loop {
 
 Handlers:
 
-- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers wait for SY.timer.
+- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers are not reconciled: SY.timer did not answer, or the timer index could not be read (§11.4).
 - `WF_HELP` — returns the workflow HELP descriptor.
 - `WF_CANCEL_INSTANCE` — initiates soft abort.
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).
