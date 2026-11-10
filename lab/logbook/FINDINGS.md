@@ -313,6 +313,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-242 🔵 remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin (low).
 - A-243 🔵 Who can take a page down: IO/WF nodes publish but cannot unpublish; the Cloud can neither list nor unpublish (to decide).
 - A-244 🔵 SY.timer's per-timer lock map never drops an entry (low).
+- A-245 🔵 A far router's UNREACHABLE reaches only the hub's own nodes: a spoke's sender to another spoke waits out its timeout (low; the router).
+- A-246 🔵 A non-gateway router with no gateway sibling answers a broadcast twice (low; multi-router hives only, not supported).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1391,6 +1393,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-246 [General/router] 🔵 low (found 2026-11-10 by the review of the router's 0.1.129; read in the code) — A non-gateway router with no gateway sibling answers a broadcast twice
+
+- **Why:** `forward_broadcast_to_wan` answers `GATEWAY_UNAVAILABLE` itself (`src/router/mod.rs`
+  2164-2166 on `coa/router-129`), and the broadcast's sender is answered `LINK_BUSY` as well (1461)
+  when one of its links was full. Only a hive with several routers gets there, which is not
+  supported.
+- **Fix, later (if multi-router hives come):** `forward_broadcast_to_wan` returns the reason and its
+  caller answers once.
+
+### A-245 [General/router] 🔵 low (found 2026-11-10 by the review of the router's 0.1.129; read in the code; there before it) — A far router's UNREACHABLE reaches only the hub's own nodes
+
+- **Why:** the hub relays an `UNREACHABLE` that comes over the WAN only to its own nodes
+  (`src/router/mod.rs` 3674-3688 on `coa/router-129`). A message from an ingress1 node to a worker1
+  node that worker1 refuses (`NODE_NOT_FOUND`, and `LINK_BUSY` since A-222) never reaches its
+  sender, which waits out its own timeout.
+- **Also:** a sender that counts no answer as delivered (SY.timer's 30 s rule) counts such a
+  refusal as delivered, when the sender and the target are on two spokes.
+- **Fix, later (the router):** the hub relays a far `UNREACHABLE` on toward the sender's hive.
+
 ### A-244 [General/SY.timer] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — SY.timer's per-timer lock map never drops an entry
 
 - **Why:** `timerLock` (`go/sy-timer/scheduler.go` ~585) adds a small mutex per timer that ever fired,
@@ -1417,7 +1438,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   whose spawn failed without going through SY.admin; that node barely ran.
 - **Also, A-232's case in other binaries:** refusals that still repeat a cursor at
   `src/bin/sy_identity.rs:7425`, `src/bin/sy_orchestrator.rs:3493`, `:19709` (with each binary's
-  next release).
+  next release). The review of SY.admin's 0.1.127 found two more: the orchestrator's
+  `versions_limit` and SY.timer's `TIMER_LIST` cursor (`go/sy-timer/main.go:805`). The
+  orchestrator's three and SY.timer's are fixed on `coa/orch-127` and `coa/timer-127` (0.1.127);
+  SY.identity's (`list_ilks`, `list_tenants`) waits for its next release.
 - **To decide (remove_hive):** refuse it while the hive's nodes have pages up, as a purge is, or take
   them down as part of the operator's explicit removal.
 
@@ -1635,6 +1659,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   whose senders believe them delivered. A node hung for good keeps answering "busy" at once,
   instead of growing the router's memory; its restart is the orchestrator's or the operator's. For
   the router's release (with A-209, A-221).
+- **What a refusal costs a sender that expects no answer (the review of 0.1.129):** wf-generic and
+  the AI SDK's control plane ignore an `UNREACHABLE` for such a send, so a WF's or an agent's
+  reply refused `LINK_BUSY` (its IO node's link full) is lost for the user, and only the router's
+  log line shows it. SY.timer sends a refused fire again (0.1.127). This is the price option (a)
+  pays: the queue fills only behind a node that has stopped reading.
 
 ### A-221 [General/router] 🔵 low (found 2026-11-10 by A-203's builder; read in the code) — Cognition records a turn the agent never received when its delivery fails
 
