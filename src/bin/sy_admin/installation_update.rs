@@ -4294,7 +4294,9 @@ pub(crate) async fn handle_update_installation(
     run_answer(action, end, &request, started.elapsed())
 }
 
-fn registry_unreadable(action: &str, why: &str) -> (u16, String) {
+/// A hive registry that cannot be read refuses an explicit run (F1), `update_installation` or
+/// `set_installation_ai`, before it changes anything: it is no list, never the motherbee alone.
+pub(crate) fn registry_unreadable(action: &str, why: &str) -> (u16, String) {
     super::installation_refusal(
         action,
         "HIVE_REGISTRY_UNREADABLE",

@@ -536,8 +536,9 @@ first version. On the motherbee:
    `409 INSTALLATION_NOT_WRITTEN` (the motherbee holds no file: fix its hive.yaml `ai` and restart
    `sy-orchestrator`, which writes version 1), `409 PROVIDER_KEYS_MISSING` (the named readers, each
    with its tenant, would find no key of the new default provider: put it in SY.vault first, or give
-   the AI node its own provider), `422 INVALID_AI_SETTINGS`, `503 HIVES_NOT_CHECKED` and `503
-   KEYS_NOT_CHECKED` (SY.vault did not list a tenant's keys).
+   the AI node its own provider), `422 INVALID_AI_SETTINGS`, `503 HIVES_NOT_CHECKED`, `503
+   KEYS_NOT_CHECKED` (SY.vault did not list a tenant's keys) and `503 HIVE_REGISTRY_UNREADABLE`
+   (SY.admin cannot read `/var/lib/fluxbee/hives`, so it names no hive to apply on).
 7. **No answer to the write** (`504 TIMEOUT`) is not "nothing written": the write may still land.
    Read `GET /installation`: when `expected_version` moved past the one you sent, the version was
    written and applied on no hive, so update every hive as in step 4; when it did not, nothing was

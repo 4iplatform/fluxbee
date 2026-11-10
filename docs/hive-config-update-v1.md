@@ -677,10 +677,12 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   and the automatic step finishes it when it answers again: the gate "egress1 down across a config
   change, then back". A hive that joins after the change has applied no version: it gets it at the
   next explicit run, whose config update restarts its readers once (the background task only reads
-  it). When the registry cannot be read or the motherbee's own core is rolled back, no update opens
-  and the answer says why. Its answer is 3c's, with `update: {id, state}` (or `{id: null,
-  not_opened}`). Its pass is stage 3c's apply, as the update's (`apply_change_on_hive`, since
-  0.1.124):
+  it). A registry that cannot be read refuses the change before it writes anything, `503
+  HIVE_REGISTRY_UNREADABLE`, as F1 refuses `update_installation` (since 0.1.124; before, it applied
+  the version on the motherbee alone and answered ok). When the motherbee's own core is rolled
+  back, no update opens and the answer says why. Its answer is 3c's, with `update: {id, state}`
+  (or `{id: null, not_opened}`). Its pass is stage 3c's apply, as the update's
+  (`apply_change_on_hive`, since 0.1.124):
   - each hive is claimed while it applies. A task holding it, one that reads it or one that acts on
     it (the follow applying its config, the automatic step or an explicit run's pass, of the update
     the change superseded), is waited for up to the change's ceiling, and the hive is applied once

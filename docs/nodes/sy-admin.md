@@ -764,9 +764,11 @@ second while one runs is refused first, `409 INSTALLATION_UPDATE_RUNNING`, writi
 - a hive that joins after the change takes the file with its join and has applied no version: it
   gets the version at the next explicit run (`update_installation`), whose config update restarts
   its readers once; the background task only reads it;
-- when the hive registry cannot be read, or the motherbee's own core is rolled back, no update
-  opens: the version is still written and applied, and the answer says why (`update: {id: null,
-  not_opened}`).
+- a hive registry it cannot read refuses the change first, before anything is read or written,
+  `503 HIVE_REGISTRY_UNREADABLE` (F1, as `update_installation`; since 0.1.124, before which it
+  applied the version on the motherbee alone and answered ok). When the motherbee's own core is
+  rolled back, or the registry fails only when the update opens, no update opens: the version is
+  still written and applied, and the answer says why (`update: {id: null, not_opened}`).
 
 ```json
 {

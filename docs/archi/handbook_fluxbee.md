@@ -1157,8 +1157,9 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
   - A hive that joins after the change gets the version at the next `update_installation`, which
     restarts its readers once.
   - The change is refused while an update run is under way (`INSTALLATION_UPDATE_RUNNING`), and
-    when the registry cannot be read or the motherbee's own core is rolled back no update opens
-    (`update.not_opened` says why; the version is still applied).
+    when SY.admin cannot read its registry of hives (`HIVE_REGISTRY_UNREADABLE`, nothing written:
+    the operator checks it, then you stage the change again). When the motherbee's own core is
+    rolled back, no update opens (`update.not_opened` says why; the version is still applied).
 
 ### 4.4.4 The installation's update
 
