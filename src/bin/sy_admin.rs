@@ -16452,7 +16452,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "list_tenants" => vec![
             "Lists the identity tenants SY.identity knows. SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
-            "Use this when you need to discover root/default tenants, candidate sponsors, or tenant ids before spawning identity-aware software.",
+            "Use this to find the tenant the operator names, candidate sponsors, or tenant ids before spawning identity-aware software. No tenant is a default for a node: it runs in the tenant its request names, and the hive's root tenant (tnt:00000000-0000-0000-0000-000000000001) takes only the core (TENANT_ROOT_NOT_ALLOWED).",
             "This returns tenant summaries including sponsor_tenant_id, child_count, ilk_count, is_root, and is_sponsor.",
             "Use get_tenant for one specific tenant, its resolved sponsor record, and its child tenant summaries.",
             "Tenants come in the order of their ids.",
@@ -16474,7 +16474,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This mutates the tenant record itself, not ILKs that belong to that tenant.",
             "Use create_tenant to create a tenant. Use update_tenant only after the tenant already exists.",
             "Executor plans use flat args: put tenant_id, name, status, domain, settings, and sponsor_tenant_id directly under step.args; do not use args.body.",
-            "Passing sponsor_tenant_id updates the tenant hierarchy. Passing sponsor_tenant_id=null clears sponsorship and makes the tenant a root/default candidate.",
+            "Passing sponsor_tenant_id updates the tenant hierarchy. Passing sponsor_tenant_id=null clears sponsorship and makes the tenant a root, a tenant with no sponsor (is_root=true).",
             "Sponsor updates are validated against self-reference and sponsorship cycles.",
         ],
         "set_tenant_sponsor" => vec![

@@ -1545,8 +1545,8 @@ Canonical required shape:
 Notes:
 - `node_name` uses type prefix + `@hive`
 - `runtime` is lowercase and has no `@hive`
-- `tenant_id` is root-level and required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
-- an `IO.*` node other than `IO.cloud`, `IO.blob` and `IO.web` (the core IO nodes) never runs in the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: `run_node` with that tenant fails with `TENANT_ROOT_NOT_ALLOWED` (§8.2)
+- `tenant_id` is a top-level arg, required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
+- only the core runs in the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: the `SY.*` and `RT.*` nodes and the core IO nodes `IO.cloud`, `IO.blob` and `IO.web`. `run_node` of an `AI.*`, a `WF.*` or any other `IO.*` node with that tenant fails with `TENANT_ROOT_NOT_ALLOWED` (§8.2)
 - For `WF.*`, do not use `runtime: "wf.engine"` in `run_node`; first publish/apply the workflow through `wf_rules_compile_apply` and spawn the resulting concrete runtime (`wf.<workflow_name>`).
 
 ### 8.1.1 Tenant discovery before first spawn
@@ -1570,17 +1570,17 @@ Use the identity tenant read surface first:
 
 Rules:
 - executor plans use flat `step.args`; do not wrap tenant mutation fields inside `body`
-- use `list_tenants` to discover candidate root/default tenants, sponsors, or client tenants
+- use `list_tenants` to find the tenant the operator names, sponsors, or client tenants; no tenant in it is a default to pick
 - use `get_tenant` when one exact tenant id is already known or when you need the resolved sponsor record
 - use `create_tenant` to create a new admin/company tenant or a new client tenant
 - create an admin/company tenant as a root tenant with no sponsor
 - create a client tenant with `sponsor_tenant_id` pointing to the admin/company tenant
 - when the client tenant depends on a just-created admin/company tenant in the same executor plan, use a formal output reference: `"$steps.s1.payload.tenant_id"`
 - never use non-executable placeholders like `<tenant_id_from_s1>`
-- in tenant reads, treat `is_root=true` as a root/default tenant candidate and `is_sponsor=true` as a tenant that currently sponsors child tenants
+- in tenant reads, `is_root=true` means the tenant has no sponsor (an admin/company tenant, or the hive's root tenant), never that it is a default for a node; `is_sponsor=true` means it currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
 - run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node, which runs in the admin/company tenant
-- run an `IO.*` node in the tenant the operator names, or in the one you read from an existing node (as above); if there is none, block with `missing_fields:["tenant_id"]`. Never pick the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001` for it, even when it is the only `is_root=true` tenant: only the core IO nodes `IO.cloud`, `IO.blob` and `IO.web` run there
+- run an `AI.*` or `IO.*` node in the tenant the operator names, or in the one you read from an existing node (as above); if there is none, block with `missing_fields:["tenant_id"]` and ask the operator for it. Never pick a tenant yourself, and never the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`, even when it is the only `is_root=true` tenant: only the core runs there (`SY.*`, `RT.*` and the core IO nodes `IO.cloud`, `IO.blob` and `IO.web`)
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 
 ### 8.1.2 Agent cognitive definition

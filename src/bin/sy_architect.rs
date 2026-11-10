@@ -2509,12 +2509,11 @@ Use these facts only to select and validate planning intent. Do not treat them a
 
 ### Tenant and identity
 
-- First-spawn `run_node` for `AI.*` and `IO.*` managed nodes requires root-level `tenant_id`.
-- Do not invent `tenant_id`.
-- Discover tenant candidates through identity reads first: `list_tenants` for discovery and `get_tenant` for exact sponsor/default detail.
-- Only the core IO nodes `IO.cloud`, `IO.blob` and `IO.web` (runtimes `io.cloud`, `io.blob`, `io.web`) run in the root tenant `tnt:00000000-0000-0000-0000-000000000001`. Every other `IO.*` node runs in a tenant other than the root one; the orchestrator refuses it in the root tenant with `TENANT_ROOT_NOT_ALLOWED`.
-- In legacy direct-task mode, if the operator asks to create an `IO.*` node and does not name its tenant, block with `missing_fields:["tenant_id"]`; never pick the root tenant for it.
-- In legacy direct-task mode, if the operator asks to create an `AI.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
+- First-spawn `run_node` for `AI.*` and `IO.*` managed nodes requires `tenant_id` at the top level of its args.
+- Do not invent `tenant_id`: a node runs in the tenant the operator names, and no tenant is a default for it.
+- Find the tenant the operator names through identity reads: `list_tenants` to find it, `get_tenant` for its exact record and its sponsor.
+- Only the core runs in the root tenant `tnt:00000000-0000-0000-0000-000000000001`: the `SY.*` and `RT.*` nodes and the core IO nodes `IO.cloud`, `IO.blob` and `IO.web` (runtimes `io.cloud`, `io.blob`, `io.web`). Every `AI.*` and `WF.*` node, and every other `IO.*` node, runs in another tenant; the orchestrator refuses it in the root tenant with `TENANT_ROOT_NOT_ALLOWED`.
+- In legacy direct-task mode, if the operator asks to create an `AI.*` or `IO.*` node and does not name its tenant, block with `missing_fields:["tenant_id"]` so the operator names it: never pick a tenant yourself, and never the root tenant.
 - If the operator says "same tenant as node X", read node config/live config to recover the exact `tenant_id`, then validate it with `get_tenant`.
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 - If a later step needs a value produced by an earlier step, use a formal executor output reference: `$steps.<step_id>.payload.<field>`.
@@ -30195,6 +30194,32 @@ mod tests {
         assert!(prompt.contains("OPA is for policy-based target resolution"));
         assert!(prompt.contains("`IO.*` nodes are integration boundaries"));
         assert!(prompt.contains("`SY.*` nodes are system infrastructure"));
+    }
+
+    /// FINDINGS A-230: an `AI.*` or `IO.*` node runs in the tenant the operator names. With none
+    /// named the plan blocks for it, never takes a root tenant as a default (the orchestrator
+    /// refuses every node but the core in the hive's root tenant), and no text calls a tenant a
+    /// default.
+    #[test]
+    fn build_plan_compiler_prompt_asks_for_a_nodes_tenant() {
+        let prompt = build_plan_compiler_prompt(&[], &[], None);
+        assert!(prompt.contains(
+            "asks to create an `AI.*` or `IO.*` node and does not name its tenant, block with \
+             `missing_fields:[\"tenant_id\"]`"
+        ));
+        assert!(prompt.contains("never pick a tenant yourself, and never the root tenant"));
+        assert!(prompt.contains(
+            "Every `AI.*` and `WF.*` node, and every other `IO.*` node, runs in another tenant"
+        ));
+        assert!(prompt.contains("no tenant is a default for it"));
+        for gone in [
+            "root/default",
+            "sponsor/default",
+            "use that `tenant_id`",
+            "root-level `tenant_id`",
+        ] {
+            assert!(!prompt.contains(gone), "{gone}");
+        }
     }
 
     #[test]
