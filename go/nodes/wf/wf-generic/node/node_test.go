@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -377,6 +378,201 @@ func TestANodeWithoutAConfigInUseAnswersControlAndDropsWorkflowTraffic(t *testin
 	}
 	if len(disp.sent) != sent {
 		t.Fatal("workflow traffic is dropped, not answered")
+	}
+}
+
+// FINDINGS A-217: a store the node cannot use stops the engine, never the node, which used to exit
+// and restart every 5 s, its reason only in its journal. It stays up and says why: DEGRADED
+// store_unavailable when the store's own file or its recovery fails, and FAILED_CONFIG
+// invalid_config when the db_path itself cannot hold a store. Meanwhile an event gets a NOT_TAKEN
+// unavailable, which its sender sees, a WF_* request STORE_ERROR or node_not_configured, and a
+// TIMER_FIRED or a stranger's message nothing. The store's next open, once it can, runs the engine:
+// HEALTHY and CONFIGURED, with the instances it keeps, and the next event starts one.
+func TestAStoreTheNodeCannotUseLeavesItUpUntilItOpens(t *testing.T) {
+	removeAll := func(t *testing.T, paths ...string) {
+		t.Helper()
+		for _, path := range paths {
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeFile := func(t *testing.T, path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withStore := func(t *testing.T, path string, statements ...string) {
+		t.Helper()
+		store, err := OpenStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		for _, statement := range statements {
+			if _, err := store.db.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	const keptInstance = "wfi:kept"
+	cases := []struct {
+		name string
+		// spoil makes the store at dbPath unusable, and repair usable again.
+		spoil, repair func(t *testing.T, dbPath string)
+		state         sdk.ManagedLifecycleState
+		code, refusal string
+		// instances is how many running instances the engine recovers once the store opens.
+		instances int
+	}{
+		{
+			name: "a file that is no database",
+			spoil: func(t *testing.T, dbPath string) {
+				writeFile(t, dbPath, "not a database, and long enough to be read as one: 0123456789")
+			},
+			repair:  func(t *testing.T, dbPath string) { removeAll(t, dbPath, dbPath+"-wal", dbPath+"-shm") },
+			state:   sdk.ManagedConfigured,
+			code:    errCodeStoreUnavailable,
+			refusal: errCodeStoreError,
+		},
+		{
+			name: "a recovery that fails",
+			spoil: func(t *testing.T, dbPath string) {
+				withStore(t, dbPath, fmt.Sprintf(`INSERT INTO wf_instances (instance_id, thread_id, workflow_type, definition_hash, status, current_state, input_json, state_json, created_at_ms, updated_at_ms)
+VALUES (%q, %q, 'invoice', %q, 'running', 'collecting_data', '{"customer_id":"c1"}', '{}', 1000, 1000);`, keptInstance, keptInstance, definitionHash([]byte(validWorkflowJSON()))),
+					`DROP TABLE wf_inbound_events;`)
+			},
+			repair:    func(t *testing.T, dbPath string) { withStore(t, dbPath, wfSchemaStatements...) },
+			state:     sdk.ManagedConfigured,
+			code:      errCodeStoreUnavailable,
+			refusal:   errCodeStoreError,
+			instances: 1,
+		},
+		{
+			name: "a directory at db_path",
+			spoil: func(t *testing.T, dbPath string) {
+				if err := os.MkdirAll(dbPath, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			repair:  func(t *testing.T, dbPath string) { removeAll(t, dbPath) },
+			state:   sdk.ManagedFailedConfig,
+			code:    sdk.ErrCodeInvalidConfig,
+			refusal: errCodeNodeNotConfigured,
+		},
+		{
+			name:    "a file where its directory should be",
+			spoil:   func(t *testing.T, dbPath string) { writeFile(t, filepath.Dir(dbPath), "a file") },
+			repair:  func(t *testing.T, dbPath string) { removeAll(t, filepath.Dir(dbPath)) },
+			state:   sdk.ManagedFailedConfig,
+			code:    sdk.ErrCodeInvalidConfig,
+			refusal: errCodeNodeNotConfigured,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dbPath := filepath.Join(t.TempDir(), "store", "wf.db")
+			document := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+			document["db_path"] = dbPath
+			plane := bootstrap(t, writeNodeConfig(t, document))
+			materialized := plane.Configured()
+			if materialized == nil {
+				t.Fatalf("db_path is no part of the config's validation: %+v", plane.State)
+			}
+			c.spoil(t, dbPath)
+			disp := &mockDispatcher{l2name: testNodeName, uuid: "wf-uuid"}
+			rt := &NodeRuntime{ActCtx: ActionContext{Dispatcher: disp, Timer: &mockTimerLister{}, Clock: fixedClock}, NodeUUID: "wf-uuid", NodeName: testNodeName, Plane: plane}
+			defer func() {
+				if rt.Store != nil {
+					rt.Store.Close()
+				}
+			}()
+			dispatch := func(msg sdk.Message) []sdk.Message {
+				t.Helper()
+				sent := len(disp.sent)
+				if err := Dispatch(ctx, msg, rt); err != nil {
+					t.Fatal(err)
+				}
+				return disp.sent[sent:]
+			}
+			statusName := sdk.MSGNodeStatusGet
+			health := func() map[string]any {
+				t.Helper()
+				status := sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "system", Msg: &statusName}}
+				if len(dispatch(status)) != 1 {
+					t.Fatal("NODE_STATUS_GET answers once")
+				}
+				return lastReply(t, disp)
+			}
+			event := onThread("conv-a217", from("IO.api.billing@motherbee", msgWithNameAndPayload("INVOICE_REQUEST", map[string]any{"customer_id": "c1"})))
+			event.Routing.Src = "billing-uuid"
+
+			// The store cannot be used: the engine does not run, and the node stays up, saying why.
+			if rt.startEngine(ctx, materialized) || rt.Def != nil || rt.Registry != nil || rt.Store != nil || rt.storeDown == nil {
+				t.Fatalf("the engine waits for its store: def=%v store=%v down=%+v", rt.Def != nil, rt.Store != nil, rt.storeDown)
+			}
+			reply := health()
+			lastError, _ := reply["last_error"].(map[string]any)
+			message, _ := lastError["message"].(string)
+			if reply["health_state"] != "DEGRADED" || lastError["code"] != c.code || !strings.Contains(message, dbPath) {
+				t.Fatalf("NODE_STATUS_GET while the store cannot be used = %v", reply)
+			}
+			dispatch(configGet(t))
+			if reply := lastReply(t, disp); reply["state"] != string(c.state) {
+				t.Fatalf("CONFIG_GET while the store cannot be used = %v", reply)
+			}
+
+			// An event gets a NOT_TAKEN unavailable that says why, on its thread and trace; a WF_*
+			// request its refusal.
+			answers := dispatch(event)
+			if len(answers) != 1 || notTakenReason(t, answers[0]) != notTakenUnavailable || answers[0].Routing.Dst.Value() != "billing-uuid" ||
+				derefString(answers[0].Meta.ThreadID) != "conv-a217" || answers[0].Routing.TraceID != event.Routing.TraceID || !strings.Contains(string(answers[0].Payload), "wf.db") {
+				t.Fatalf("the event is refused, to its sender: %+v", answers)
+			}
+			dispatch(from(sdk.PrimaryAdminNode, msgWithName(MsgWFListInstances)))
+			if reply := lastReply(t, disp); reply["ok"] != false || reply["error"] != c.refusal || !strings.Contains(fmt.Sprint(reply["detail"]), dbPath) {
+				t.Fatalf("WF_LIST_INSTANCES while the store cannot be used = %v", reply)
+			}
+			// SY.timer's fire and a stranger's message get nothing.
+			fire := from("SY.timer@motherbee", sdk.Message{Routing: sdk.Routing{Src: "timer-uuid", TraceID: "t-fire"}, Meta: sdk.Meta{MsgType: sdk.SYSTEMKind, Msg: strPtr(sdk.MsgTimerFired)}, Payload: json.RawMessage(`{}`)})
+			stranger := onThread("conv-a217", from("AI.stranger@motherbee", msgWithName("START")))
+			stranger.Routing.Src = "stranger-uuid"
+			for _, msg := range []sdk.Message{fire, stranger} {
+				if answers := dispatch(msg); len(answers) != 0 {
+					t.Fatalf("%s from %s is answered: %+v", rawMsgName(msg), msg.SourceL2Name(), answers)
+				}
+			}
+
+			// Opened again before it can be used: nothing changes.
+			if rt.startEngine(ctx, materialized) || rt.Def != nil || plane.State.CurrentState != c.state {
+				t.Fatalf("a store still unusable keeps the engine waiting: %+v", plane.State)
+			}
+
+			// Once it can be used, the next open runs the engine.
+			c.repair(t, dbPath)
+			if !rt.startEngine(ctx, materialized) || rt.Def == nil || rt.Store == nil || rt.storeDown != nil || plane.Configured() != materialized {
+				t.Fatalf("the engine runs once its store opens: down=%+v state=%+v", rt.storeDown, plane.State)
+			}
+			if reply := health(); reply["health_state"] != "HEALTHY" || reply["last_error"] != nil {
+				t.Fatalf("NODE_STATUS_GET once the store opened = %v", reply)
+			}
+			dispatch(configGet(t))
+			if reply := lastReply(t, disp); reply["ok"] != true || reply["state"] != string(sdk.ManagedConfigured) || reply["error"] != nil {
+				t.Fatalf("CONFIG_GET once the store opened = %v", reply)
+			}
+			if rt.Registry.Count() != c.instances {
+				t.Fatalf("the engine recovers the store's running instances: %d, want %d", rt.Registry.Count(), c.instances)
+			}
+			if answers := dispatch(event); rt.Registry.Count() != c.instances+1 || len(answers) == 0 || notTakenReason(t, answers[0]) != "" {
+				t.Fatalf("the event starts an instance: %d running, sent %+v", rt.Registry.Count(), answers)
+			}
+		})
 	}
 }
 

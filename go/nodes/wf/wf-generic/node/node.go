@@ -30,11 +30,16 @@ type RunOptions struct {
 //  1. Bootstraps the control plane (config + workflow definition)
 //  2. Connects to the router, whatever the config state
 //  3. With a config in use: opens SQLite, recovers running instances, reconciles timers and starts
-//     the GC goroutine
+//     the GC goroutine (startEngine). A store it cannot use leaves the node up, waiting for it
 //  4. Enters the receive loop; without a config in use it answers control messages only, saying
-//     why, and a restart applies a corrected config. A node that started without SY.timer's answer
-//     asks it again from the loop, until it reconciles its timers. Once a GC interval the loop
-//     closes the conversations that went quiet (closeQuietInstances)
+//     why, and a restart applies a corrected config. A node that waits for its store opens it again
+//     from the loop every storeRetryInterval, until the engine runs. A node that started without
+//     SY.timer's answer asks it again from the loop, until it reconciles its timers. Once a GC
+//     interval the loop closes the conversations that went quiet (closeQuietInstances)
+//
+// It returns an error only for what the node cannot run without at all: a config file it can read,
+// a router connection, its receive channel, a timer client (and, in a dry run, a config in use). A
+// config or a store it cannot use is a state it reports, never an exit (FINDINGS A-217).
 func Run(ctx context.Context, opts RunOptions) error {
 	clock := opts.Clock
 	if clock == nil {
@@ -100,19 +105,33 @@ func Run(ctx context.Context, opts RunOptions) error {
 			rt.Store.Close()
 		}
 	}()
-	if materialized != nil {
-		if err := startEngine(ctx, rt, materialized, routerDispatcher, clock); err != nil {
-			return err
+
+	// While the engine waits for its store, the store is opened again every storeRetryInterval, on
+	// the loop: recovery runs between two messages, as at the start. While the timers wait for
+	// SY.timer, a TIMER_LIST goes out every timerReconcileRetryInterval, asked off the loop (the loop
+	// keeps serving) and taken on it.
+	var storeRetry, reconcileRetry loopTicker
+	defer storeRetry.stop()
+	defer reconcileRetry.stop()
+	// engineUp is what the loop does once the engine runs: no more opens of the store, and SY.timer
+	// asked again while the timers wait for it.
+	engineUp := func() {
+		storeRetry.stop()
+		if rt.timersPending != nil {
+			reconcileRetry.start(timerReconcileRetryInterval)
 		}
 	}
-
-	// While the timers wait for SY.timer, a TIMER_LIST goes out every timerReconcileRetryInterval,
-	// asked off the loop (the loop keeps serving) and taken on it.
-	var reconcileTick <-chan time.Time
-	if rt.timersPending != nil {
-		ticker := time.NewTicker(timerReconcileRetryInterval)
-		defer ticker.Stop()
-		reconcileTick = ticker.C
+	if materialized != nil {
+		timerSender, err := NewSDKTimerSender(routerDispatcher, materialized.Config.SYTimerL2Name)
+		if err != nil {
+			return fmt.Errorf("create timer sender: %w", err)
+		}
+		rt.ActCtx.Timer = timerSender
+		if rt.startEngine(ctx, materialized) {
+			engineUp()
+		} else {
+			storeRetry.start(storeRetryInterval)
+		}
 	}
 	timerLists := make(chan timerListResult, 1)
 	listing := false
@@ -140,7 +159,11 @@ func Run(ctx context.Context, opts RunOptions) error {
 			if err := dispatchGuarded(ctx, msg, rt); err != nil {
 				log.Printf("wf: dispatch error: %v", err)
 			}
-		case <-reconcileTick:
+		case <-storeRetry.C:
+			if rt.startEngine(ctx, materialized) {
+				engineUp()
+			}
+		case <-reconcileRetry.C:
 			if listing || rt.timersPending == nil {
 				continue
 			}
@@ -154,7 +177,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 			listing = false
 			rt.takeTimerList(ctx, result, recoverOpts)
 			if rt.timersPending == nil {
-				reconcileTick = nil
+				reconcileRetry.stop()
 			}
 		case <-idleTick:
 			rt.closeQuietInstances(ctx)
@@ -173,12 +196,45 @@ func dispatchGuarded(ctx context.Context, msg sdk.Message, rt *NodeRuntime) (err
 	return Dispatch(ctx, msg, rt)
 }
 
+// storeRetryInterval is how often a node whose engine waits for its store opens it again (FINDINGS
+// A-217).
+const storeRetryInterval = 30 * time.Second
+
 // startEngine opens the instance store, keeps the definition by its hash, recovers the running
 // instances and starts the GC: what a node with a config in use runs on top of the control plane.
-// The caller closes rt.Store.
-func startEngine(ctx context.Context, rt *NodeRuntime, materialized *Materialized, routerDispatcher *sdk.RouterDispatcher, clock ClockFunc) error {
+// It reports whether the engine runs. A store it cannot use, one that does not open or that fails
+// during recovery, stops the engine only (FINDINGS A-217): the store is closed again, and rt.storeDown
+// says why (storeFailure). The node stays up, DEGRADED, or FAILED_CONFIG when the cause is the
+// db_path itself; it refuses every event, and the receive loop calls startEngine again every
+// storeRetryInterval. A start after a failed one is a restart's: recovery runs again from the store,
+// and counts each event it runs again (Recover). The timer sender is the caller's to set, before;
+// the caller closes rt.Store.
+func (rt *NodeRuntime) startEngine(ctx context.Context, materialized *Materialized) bool {
+	if err := rt.openEngine(ctx, materialized); err != nil {
+		rt.stopEngine() // before storeFailure, which reads the path with no store open on it
+		cause, onPath := storeFailure(materialized.Config.DBPath, err)
+		rt.storeDown = &storeOutage{cause: cause, def: materialized.Definition}
+		if onPath {
+			rt.Plane.failOnDBPath(cause)
+		} else {
+			rt.Plane.inUse(materialized)
+		}
+		log.Printf("wf: the engine waits for its store and takes no event: %s; the store is opened again every %s", cause.Error(), storeRetryInterval)
+		return false
+	}
+	if rt.storeDown != nil {
+		log.Printf("wf: the instance store opened at %s: the engine runs", materialized.Config.DBPath)
+	}
+	rt.storeDown = nil
+	rt.Plane.inUse(materialized)
 	cfg := materialized.Config
-	store, err := OpenStore(cfg.DBPath)
+	StartGC(ctx, rt.Store, cfg.GCRetentionDays, time.Duration(cfg.GCIntervalSeconds)*time.Second, rt.ActCtx.Clock)
+	return true
+}
+
+// openEngine is startEngine's work. On an error, what it set is stopEngine's to undo.
+func (rt *NodeRuntime) openEngine(ctx context.Context, materialized *Materialized) error {
+	store, err := OpenStore(materialized.Config.DBPath)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -189,17 +245,12 @@ func startEngine(ctx context.Context, rt *NodeRuntime, materialized *Materialize
 		Hash:           defHash,
 		WorkflowType:   def.WorkflowType,
 		DefinitionJSON: string(materialized.DefinitionBytes),
-		LoadedAtMS:     nowMS(clock),
+		LoadedAtMS:     nowMS(rt.ActCtx.Clock),
 	}); err != nil {
 		return fmt.Errorf("keep definition: %w", err)
 	}
-	timerSender, err := NewSDKTimerSender(routerDispatcher, cfg.SYTimerL2Name)
-	if err != nil {
-		return fmt.Errorf("create timer sender: %w", err)
-	}
 
 	rt.ActCtx.Store = store
-	rt.ActCtx.Timer = timerSender
 	rt.Def = def
 	rt.DefJSON = string(materialized.DefinitionBytes)
 	rt.DefHash = defHash
@@ -207,9 +258,51 @@ func startEngine(ctx context.Context, rt *NodeRuntime, materialized *Materialize
 	if err := rt.Recover(ctx, RecoverOptions{OwnerL2Name: rt.NodeName}); err != nil {
 		return fmt.Errorf("recovery failed: %w", err)
 	}
-
-	StartGC(ctx, store, cfg.GCRetentionDays, time.Duration(cfg.GCIntervalSeconds)*time.Second, clock)
 	return nil
+}
+
+// stopEngine leaves the engine stopped, its store closed: what a failed openEngine set goes, the
+// instances it recovered with it (the next start recovers them again from the store).
+func (rt *NodeRuntime) stopEngine() {
+	if rt.Store != nil {
+		_ = rt.Store.Close()
+	}
+	rt.Store, rt.ActCtx.Store = nil, nil
+	rt.Def, rt.DefJSON, rt.DefHash = nil, "", ""
+	rt.Registry = nil
+	rt.timersPending = nil
+}
+
+// storeFailure is how the node reports err, the failure of its store at dbPath (FINDINGS A-217),
+// and whether the cause is the db_path itself (dbPathProblem): then invalid_config, the config's
+// failure, which a corrected db_path fixes; otherwise store_unavailable (a corrupt file, a full
+// disk, a failed recovery).
+func storeFailure(dbPath string, err error) (*sdk.ControlPlaneError, bool) {
+	if problem := dbPathProblem(dbPath); problem != nil {
+		return sdk.InvalidConfig("db_path %q cannot hold the instance store: %v", dbPath, problem), true
+	}
+	return &sdk.ControlPlaneError{Code: errCodeStoreUnavailable, Message: fmt.Sprintf("the instance store at %q cannot be used: %v", dbPath, err)}, false
+}
+
+// loopTicker is a ticker the receive loop selects on only while it runs: C is nil while it is
+// stopped, and a nil channel is never ready.
+type loopTicker struct {
+	ticker *time.Ticker
+	C      <-chan time.Time
+}
+
+func (t *loopTicker) start(every time.Duration) {
+	if t.ticker == nil {
+		t.ticker = time.NewTicker(every)
+		t.C = t.ticker.C
+	}
+}
+
+func (t *loopTicker) stop() {
+	if t.ticker != nil {
+		t.ticker.Stop()
+		t.ticker, t.C = nil, nil
+	}
 }
 
 // definitionHash is what a definition is kept by: the SHA-256 of its bytes, in hex.

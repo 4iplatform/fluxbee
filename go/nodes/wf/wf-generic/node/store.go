@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
@@ -161,6 +163,58 @@ func OpenStore(path string) (*Store, error) {
 // Close closes the underlying database.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// dbPathProblem says why the instance store cannot be kept at path, the configured db_path,
+// whatever a database there holds (FINDINGS A-217): path names a directory, or something else that
+// is no regular file, or its directory cannot be made, or the node cannot write the file, or next to
+// it, where SQLite keeps its journal (journal_mode WAL: <db>-wal and <db>-shm). nil when nothing
+// about the path stops it: a store that still fails fails for its database (a corrupt file) or its
+// recovery, and the system's own failures (no space left, an I/O error) are no problem of the path
+// either. Call it with no store open on path: closing a descriptor of the file drops every lock
+// this process holds on it, SQLite's included.
+func dbPathProblem(path string) error {
+	if path == ":memory:" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return pathFault(fmt.Errorf("its directory cannot be made: %w", err))
+	}
+	switch info, err := os.Stat(path); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return pathFault(err)
+	case info.IsDir():
+		return fmt.Errorf("%s is a directory", path)
+	case !info.Mode().IsRegular():
+		return fmt.Errorf("%s is no regular file", path)
+	default:
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			return pathFault(fmt.Errorf("the file cannot be written: %w", err))
+		}
+		_ = file.Close()
+	}
+	probe, err := os.CreateTemp(dir, ".wf-db-path-*")
+	if err != nil {
+		return pathFault(fmt.Errorf("its directory cannot be written: %w", err))
+	}
+	_ = probe.Close()
+	_ = os.Remove(probe.Name())
+	return nil
+}
+
+// pathFault is err when the path is at fault: a name the system will not follow, create or write
+// (permission, a read-only file system, a file where a directory should be, a name too long, a loop
+// of links); nil for the system's own failures.
+func pathFault(err error) error {
+	for _, cause := range []error{fs.ErrPermission, syscall.EROFS, syscall.ENOTDIR, syscall.EISDIR, syscall.ENAMETOOLONG, syscall.ELOOP} {
+		if errors.Is(err, cause) {
+			return err
+		}
+	}
+	return nil
 }
 
 // wfSchemaStatements create every table and index at its current shape.

@@ -918,8 +918,9 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 
 	// 3b. A supervisor asks sales something (Case 4, wf-orchestration-v1 §5.4.7): sales answers the
 	// team (answer_team), and its reply goes to the supervisors, in the question's thread (subject
-	// same), as it came: to the supervisor sales answered; the person gets nothing, and the WF waits
-	// for the decision again.
+	// same), as it came, naming no one there (FINDINGS A-215): cognition takes the supervisor who
+	// wrote last through the supervisors' node. The person gets nothing, and the WF waits for the
+	// decision again.
 	questions := c.count(supervisorsIO)
 	c.supervisor("¿Entre 20% y 15%, cuál darías vos?")
 	c.inState("sales_relaying")
@@ -928,7 +929,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	toTeam := c.sentTo(supervisorsIO)
 	if c.count(supervisorsIO) != questions+1 || string(toTeam.Payload) != `{"type":"text","content":"Daría 15%: el cliente compra seguido."}` ||
 		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.cyclePath(toTeam) != "["+supervisorsIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent ||
-		derefString(toTeam.Meta.DstIlk) != supervisorILK || derefString(toTeam.Meta.Ich) != supervisorsICH {
+		toTeam.Meta.DstIlk != nil || toTeam.Meta.Ich != nil {
 		t.Fatalf("sales' answer goes to the team, in the question's thread: %+v %s %s", toTeam.Meta, toTeam.Payload, toTeam.Meta.Context)
 	}
 
@@ -1127,12 +1128,13 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 	}
 
 	// 3. The person writes before anyone took the case: the message goes to the team, in the post's
-	// thread, as the person's, and nobody took the case yet.
+	// thread, as the person's, without the person's channel (FINDINGS A-215), and nobody took the
+	// case yet.
 	c.person("¿Hola? ¿Alguien?")
 	toTeam := c.sentTo(supervisorsIO)
 	if !strings.Contains(string(toTeam.Payload), "Alguien") || wfBlock(t, toTeam)["subject"] != "same" || derefString(toTeam.Meta.SrcIlk) != personILK ||
-		c.cyclePath(toTeam) != "["+salesIO+" "+salesWFNode+"]" {
-		t.Fatalf("the person's message goes to the team: %s %s", toTeam.Payload, toTeam.Meta.Context)
+		toTeam.Meta.DstIlk != nil || toTeam.Meta.Ich != nil || c.cyclePath(toTeam) != "["+salesIO+" "+salesWFNode+"]" {
+		t.Fatalf("the person's message goes to the team: %+v %s %s", toTeam.Meta, toTeam.Payload, toTeam.Meta.Context)
 	}
 	if _, untaken := c.pending("team_untaken"); !untaken {
 		t.Fatal("only a team message takes the case")

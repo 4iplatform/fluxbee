@@ -321,10 +321,11 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 		}
 	}
 
-	// A forward carries the subject too, and the message's meta as received: to the team's IO node its
-	// ILKs as they came; to the person's IO node the person as its dst_ilk and the person's channel as
-	// its ich, where an agent's answer to a supervisor names the supervisor, whom it answered, and the
-	// supervisors' channel, where the supervisor wrote.
+	// A forward carries the subject too, and the message's meta as received, but whom it names: to
+	// the team's IO node its src_ilk, and no dst_ilk and no ich (FINDINGS A-215); to the person's IO
+	// node the person as its dst_ilk and the person's channel as its ich, where an agent's answer to a
+	// supervisor names the supervisor, whom it answered, and the supervisors' channel, where the
+	// supervisor wrote.
 	answer := from("AI.sales@motherbee", sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-answer"},
 		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:agent"), DstIlk: strPtr("ilk:supervisor"), Ich: strPtr("ich:slack:team"), ThreadID: strPtr("conv-3")},
@@ -338,8 +339,8 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 		}
 		return disp.sent[len(disp.sent)-1]
 	}
-	const asReceived = `src_ilk="ilk:agent" dst_ilk="ilk:supervisor" ich="ich:slack:team"`
-	if sent := forward("IO.slack.team@motherbee", "same"); ilks(sent) != asReceived ||
+	const asReceived, namesNoOne = `src_ilk="ilk:agent" dst_ilk="ilk:supervisor" ich="ich:slack:team"`, `src_ilk="ilk:agent" dst_ilk="" ich=""`
+	if sent := forward("IO.slack.team@motherbee", "same"); ilks(sent) != namesNoOne ||
 		contextWithoutTrace(t, sent) != `{"wf":{"subject":"same"}}` || tracePath(sent) != "[AI.sales@motherbee WF.sales@motherbee]" {
 		t.Fatalf("a forward to the team: %s %s", ilks(sent), sent.Meta.Context)
 	}
@@ -351,12 +352,12 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	}
 
 	// An IO node of start_from the person did not write from is not the person's: when the person
-	// started the instance on another one, what goes to it names no person, and a forward keeps its own.
+	// started the instance on another one, what goes to it names no person, and a forward no one.
 	inst.PersonIO = "IO.api.shop@motherbee"
 	if sent := send(personsIO, ""); ilks(sent) != noPerson {
 		t.Fatalf("a send to an IO node of start_from the person did not write from: %s", ilks(sent))
 	}
-	if sent := forward(personsIO, ""); ilks(sent) != asReceived {
+	if sent := forward(personsIO, ""); ilks(sent) != namesNoOne {
 		t.Fatalf("a forward to an IO node of start_from the person did not write from: %s", ilks(sent))
 	}
 	inst.PersonIO = personsIO
@@ -381,6 +382,93 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 		if sent := send(target, ""); ilks(sent) != noPerson {
 			t.Fatalf("a send to %s without a person: %s", target, ilks(sent))
 		}
+	}
+}
+
+// FINDINGS A-215: a forward to an IO node other than the person's names no one there, as a send to
+// it does: the message's dst_ilk and ich go, whoever it was said to and on whatever channel, and its
+// src_ilk, who speaks, stays. Before, an agent's answer to the person forwarded to the team's channel
+// kept the person as its dst_ilk, and cognition, which takes a relay's addressee from it, filed it as
+// said to the person, via the team's node. A forward to the person's own IO node keeps A-139's
+// rewrite, the person and the person's channel, or, with no person, the message's own; a forward to
+// an agent goes as it came.
+func TestAForwardToAnotherIONodeNamesNoOne(t *testing.T) {
+	disp := &mockDispatcher{l2name: "WF.sales@motherbee", uuid: "wf-uuid-a215"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-a215", "conv-a215", "invoice", map[string]any{}, fixedClock)
+	const personsIO, team = "IO.api.billing@motherbee", "IO.slack.team@motherbee"
+	inst.PersonILK, inst.PersonICH, inst.PersonIO = "ilk:person", "ich:api:conv-a215", personsIO
+	ilks := func(msg sdk.Message) string {
+		return fmt.Sprintf("src_ilk=%q dst_ilk=%q ich=%q", derefString(msg.Meta.SrcIlk), derefString(msg.Meta.DstIlk), derefString(msg.Meta.Ich))
+	}
+	// The agent's answer to the person, on the person's channel, and the person's own message.
+	toThePerson := from("AI.sales@motherbee", sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-a215-answer"},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:agent"), DstIlk: strPtr("ilk:person"), Ich: strPtr("ich:api:conv-a215"), ThreadID: strPtr("conv-a215")},
+		Payload: json.RawMessage(`{"type":"text","content":"Your invoice is on its way."}`),
+	})
+	persons := from(personsIO, sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-a215-person"},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:person"), Ich: strPtr("ich:api:conv-a215"), ThreadID: strPtr("conv-a215")},
+		Payload: json.RawMessage(`{"type":"text","content":"Is anyone there?"}`),
+	})
+	if err := inst.keep("answer", toThePerson, actx); err != nil {
+		t.Fatal(err)
+	}
+	forward := func(target, kept string, event sdk.Message) sdk.Message {
+		t.Helper()
+		inst.takeCycleTrace(event) // as its transition takes it
+		if err := execForward(context.Background(), ActionDefinition{Type: "forward", Target: target, Message: kept}, inst, event, actx); err != nil {
+			t.Fatal(err)
+		}
+		return disp.sent[len(disp.sent)-1]
+	}
+
+	const agentToNoOne, personToNoOne = `src_ilk="ilk:agent" dst_ilk="" ich=""`, `src_ilk="ilk:person" dst_ilk="" ich=""`
+	const answerAsItCame = `src_ilk="ilk:agent" dst_ilk="ilk:person" ich="ich:api:conv-a215"`
+	for _, c := range []struct {
+		label, target, kept string
+		event               sdk.Message
+		want                string
+	}{
+		{"the agent's answer to the team", team, "", toThePerson, agentToNoOne},
+		{"the answer kept, to the team", team, "answer", persons, agentToNoOne},
+		{"the person's message to the team", team, "", persons, personToNoOne},
+		{"the agent's answer to the person's IO node", personsIO, "", toThePerson, answerAsItCame},
+		{"the agent's answer to another agent", "AI.invoice@motherbee", "", toThePerson, answerAsItCame},
+	} {
+		if sent := forward(c.target, c.kept, c.event); ilks(sent) != c.want || derefString(sent.Meta.ThreadID) != "conv-a215" {
+			t.Fatalf("%s: %s on %q, want %s", c.label, ilks(sent), derefString(sent.Meta.ThreadID), c.want)
+		}
+	}
+
+	// A supervisor's message forwarded to the person's IO node names the person, on the person's
+	// channel (A-139), and to another IO node no one.
+	supervisors := from(team, sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-a215-supervisor"},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:supervisor"), DstIlk: strPtr("ilk:agent"), Ich: strPtr("ich:slack:team"), ThreadID: strPtr("conv-a215")},
+		Payload: json.RawMessage(`{"type":"text","content":"Approved."}`),
+	})
+	if sent := forward(personsIO, "", supervisors); ilks(sent) != `src_ilk="ilk:supervisor" dst_ilk="ilk:person" ich="ich:api:conv-a215"` {
+		t.Fatalf("a supervisor's message to the person's IO node: %s", ilks(sent))
+	}
+	if sent := forward("IO.slack.audit@motherbee", "", supervisors); ilks(sent) != `src_ilk="ilk:supervisor" dst_ilk="" ich=""` {
+		t.Fatalf("a supervisor's message to another IO node: %s", ilks(sent))
+	}
+
+	// With no person (several people write on the thread): to the person's IO node the message's own
+	// dst_ilk and ich, to the team's none.
+	inst.PersonILK, inst.PersonICH = "", ""
+	if sent := forward(personsIO, "", toThePerson); ilks(sent) != answerAsItCame {
+		t.Fatalf("with no person, to the person's IO node: %s", ilks(sent))
+	}
+	if sent := forward(team, "", toThePerson); ilks(sent) != agentToNoOne {
+		t.Fatalf("with no person, to the team: %s", ilks(sent))
+	}
+
+	// What the WF forwarded is untouched: the event, and the message it keeps.
+	if ilks(toThePerson) != answerAsItCame || ilks(inst.kept["answer"].msg) != answerAsItCame || ilks(persons) != `src_ilk="ilk:person" dst_ilk="" ich="ich:api:conv-a215"` {
+		t.Fatalf("a forward changed the message it sent: %s, kept %s, %s", ilks(toThePerson), ilks(inst.kept["answer"].msg), ilks(persons))
 	}
 }
 

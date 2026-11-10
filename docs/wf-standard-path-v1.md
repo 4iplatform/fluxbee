@@ -258,7 +258,10 @@ the rest, so a new orchestrator key can never stop a node.
 - The SDK's msg_type checks become case-insensitive, as Rust's (audit #14).
 - Engine start failures (opening the store, recovery) stay fatal and are out of scope. Since 0.1.90
   SY.timer not answering at recovery is no longer one: the node starts DEGRADED and reconciles its
-  timers when SY.timer answers (`docs/wf-orchestration-v1.md` §5.1).
+  timers when SY.timer answers (`docs/wf-orchestration-v1.md` §5.1). *Since A-217 (the operator's
+  call, 2026-11-10) neither is fatal:* the node stays up, DEGRADED `store_unavailable` or, for a
+  `db_path` that cannot hold the store, FAILED_CONFIG; it refuses every event and opens the store
+  again every 30 s (`docs/spec-systemnode-wf-v1_1.md` §14.1).
 
 The orchestrator's `_system` key-pinning test (`the_system_block_keys_are_the_ones_the_wf_node_decodes`)
 and its Go twin are replaced by a Go test: a `_system` key the node does not know is ignored, and
@@ -276,7 +279,8 @@ survives a CONFIG_SET.
 - **IO family health:** IO nodes' NODE_STATUS_GET ignores the lifecycle (a FAILED_CONFIG IO node
   answers HEALTHY), and io.slack does not answer NODE_STATUS_GET. This belongs to the IO-family
   review.
-- **Fatal engine-start paths in WF:** opening the store and recovery.
+- **Fatal engine-start paths in WF:** opening the store and recovery. *Closed by A-217
+  (2026-11-10), above.*
 - **Router names:** any local process may still register any node name at HELLO (P-1).
 - **The admin's mesh surface:**
   - any node may still ask the admin for most actions (`kill_node`, `restart_node`,

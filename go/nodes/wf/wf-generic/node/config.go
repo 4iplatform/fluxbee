@@ -236,6 +236,30 @@ func (p *ControlPlane) Configured() *Materialized {
 	return materialized
 }
 
+// failOnDBPath takes the config the node booted with out of use, FAILED_CONFIG with cause, when its
+// db_path cannot hold the instance store (FINDINGS A-217). The config is not rejected for good: the
+// node keeps opening the store, and inUse puts it back once the store opens, or once the cause is
+// no longer the path. A restart applies a corrected db_path, as any config.
+func (p *ControlPlane) failOnDBPath(cause *sdk.ControlPlaneError) {
+	if p == nil {
+		return
+	}
+	p.State.CurrentState = sdk.ManagedFailedConfig
+	p.State.EffectiveConfig = nil
+	p.State.LastError = cause
+}
+
+// inUse puts materialized, the config the node booted with, in use (CONFIGURED): what failOnDBPath
+// took out of use, when the store opens or fails for a cause that is not its db_path.
+func (p *ControlPlane) inUse(materialized *Materialized) {
+	if p == nil {
+		return
+	}
+	p.State.CurrentState = sdk.ManagedConfigured
+	p.State.EffectiveConfig = materialized
+	p.State.LastError = nil
+}
+
 // latestVersion is the newest config version the node knows of: running, persisted by a CONFIG_SET,
 // or bumped on disk by the orchestrator's set_node_config, which does not tell the node.
 func (p *ControlPlane) latestVersion() uint64 {

@@ -1826,6 +1826,10 @@ Six pieces. Each one's tests come with it, and every behavior below is a contrac
   - a `send_message` to an `IO.*` node carries no `src_ilk` and no `ich`. The router's stamp names
     the WF as its sender, and the facts (`vars`) say who said what;
   - to an `AI.*` or a `WF.*` node nothing changes: a send carries the person (A-116).
+  - *Changed by A-215 (the operator's call, 2026-11-10):* a `forward` to an `IO.*` node other than
+    the person's names no one either: no `dst_ilk` and no `ich`, its `src_ilk` kept. It kept the
+    message's, so an agent's answer to the person forwarded to the team's channel reached
+    cognition as said to the person there.
 - **A-140:**
   - the example's texts (go/nodes/wf/examples/packages/wf.sales.invoice) name no duration;
   - the catalog's `handover` `summary` reads "What the team needs to take over: the person by name,

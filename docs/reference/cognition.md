@@ -293,8 +293,8 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
     (`relay_destination`), with `to` the person its `dst_ilk` names, when it names one. A relay was
     said to whoever is there, not to the agent (cognition-hands-v1 §12.9, A-161). A WF's
     `send_message` names a person only toward the IO node of whoever started it, and a `forward`
-    there sets that person; a `forward` toward any other IO node keeps the `dst_ilk` its message
-    had, none for a person's message (A-139);
+    there sets that person (A-139); toward any other IO node neither names anyone, no `dst_ilk`
+    (A-215), and the relay's counterpart is the last other person who wrote through that IO node;
   - `text`: `extract_turn_text`, cut at 2,000 characters (`COGNITION_TURN_TEXT_MAX_CHARS`), the
     last one an ellipsis when cut. Empty for a turn with files alone: it is kept, so the agent's
     answer to it keeps its question;

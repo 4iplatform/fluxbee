@@ -289,7 +289,9 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
   - `no_conversation`: no instance holds its thread, and it starts none;
   - `no_thread`: it has no thread;
   - `invalid_input`: `input_schema` refuses it;
-  - `not_expected`: the instance took nothing, neither a transition nor the catch.
+  - `not_expected`: the instance took nothing, neither a transition nor the catch;
+  - `unavailable`: the WF node cannot use its instance store, and takes no message until it can.
+    Its status says why (§4.2.7).
 
   Another sender gets it only for a named request. A sender the definition does not name gets
   nothing.
@@ -360,12 +362,16 @@ Common guards:
     person's `io` context, kept in `state` from their message, in `meta.context.io`.
 - **`forward`** sends the event's message, or the one kept under `message`, as it was received. Its
   fields are `target`, `message`, `meta.context`, `vars`, `menu` and `subject`.
-  - The payload goes byte for byte. The meta goes too, the person's ILK included, but not
-    `memory_package`.
-  - The WF changes only the destination, the thread, the `meta.context` keys it writes, and its
-    own block. To the person's own IO node it names the person too, as `dst_ilk` and `ich`,
-    whoever the message answered: an agent's answer to a supervisor reaches the person as the
-    person's.
+  - The payload goes byte for byte. The meta goes too, the `src_ilk` of whoever speaks included,
+    but not `memory_package`.
+  - The WF changes only the destination, the thread, the `meta.context` keys it writes, its own
+    block, and, toward an IO node, whom the message names:
+    - to the person's own IO node it names the person, as `dst_ilk` and `ich`, whoever the
+      message answered: an agent's answer to a supervisor reaches the person as the person's;
+    - to any other IO node, the team's say, it names no one, no `dst_ilk` and no `ich`, as a
+      send: whoever the message was said to is not there. Cognition takes such a line as said to
+      the last person who wrote through that IO node: sales' answer to a team member, sent back
+      to the team, reads as said to that team member.
   - A forward has no `meta.msg` and no `payload`. It fails when there is no message: a
     `TIMER_FIRED`, an internal event, or a name not kept yet.
 - **`keep_message`** (`name`) keeps the event's message, whole, for a later forward. A later keep
@@ -958,6 +964,13 @@ person: when its provider gave no answer, the error carries the operator's text 
 
   An instance that waits long in one state is stuck when no timer of that state can fire: read its
   log.
+- **A WF node that cannot use its instance store stays up** and says why in `get_node_status`:
+  `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed
+  recovery), or `invalid_config` naming its `db_path` when that path cannot hold the store, its
+  config `FAILED_CONFIG` meanwhile. It takes no message (`NOT_TAKEN` `unavailable`), the instance
+  verbs answer `STORE_ERROR` (`node_not_configured` for a bad `db_path`), and it opens the store
+  again every 30 s, ready as soon as it opens. A `db_path` the operator changes is a config change,
+  applied at the node's restart.
 
 ### 4.3 IO nodes
 

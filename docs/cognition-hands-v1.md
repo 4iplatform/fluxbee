@@ -1051,7 +1051,9 @@ back to the agent when A asks. The ledger's 0.1.104 has each number.
   - **Noted, not changed:** a WF's `forward` toward an IO node other than the person's keeps the
     `dst_ilk` its message had, so a relay of an agent's answer names whom the agent answered,
     wherever the copy went. Only a communication of another agent than the one that answered
-    would show it, and the docs say what a forward keeps.
+    would show it, and the docs say what a forward keeps. *Changed by A-215 (the operator's call,
+    2026-11-10):* such a forward names no one, no `dst_ilk` and no `ich`, as a send; its
+    counterpart is then the last other person who wrote through that IO node.
 
 ### 12.10 Checked on 8.x (0.1.105, 2026-11-07)
 

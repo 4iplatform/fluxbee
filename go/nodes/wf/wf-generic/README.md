@@ -18,8 +18,10 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   sends carry none. To an `IO.*` node a `send_message` names no sender, no `src_ilk` (the router's
   stamp names the WF), and a `send_message` or a `forward` to the person's IO node, the one whose
   message started the instance (not any `IO.*` node of `start_from`), names the person: its
-  `dst_ilk` is the person's `src_ilk` and its `ich` the person's (FINDINGS A-139). To another `IO.*` node a `send_message` carries no `ich` either, and without a
-  person a `forward` keeps its own. A definition names in `start_from` the nodes whose messages
+  `dst_ilk` is the person's `src_ilk` and its `ich` the person's (FINDINGS A-139); without a
+  person, a `forward` there keeps the message's own. To another `IO.*` node (the team's, say)
+  neither names anyone: no `dst_ilk` and no `ich`, a `forward` keeping only its `src_ilk`, who
+  speaks (FINDINGS A-215). A definition names in `start_from` the nodes whose messages
   start an instance, and only the nodes it names (`start_from`, `event_match.src`, the targets of
   its sends) drive one; anyone else is dropped, never answered (FINDINGS A-123).
   `start_from` names IO nodes and WFs, never an agent or a `SY.*`/`RT.*` node. `thread_id_ref` left
@@ -29,7 +31,8 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   `start_from`, and its running instances fail at the next start (`definition_unavailable`).
 - **Forwarding.** `forward` sends a message on as it was received, the event's or one `keep_message`
   kept: the payload byte for byte, every meta field but `memory_package`; the WF changes the
-  destination, the thread, the `meta.context` keys it writes, the trace and its block,
+  destination, the thread, toward an `IO.*` node the `dst_ilk` and `ich` (above), the
+  `meta.context` keys it writes, the trace and its block,
   `meta.context.wf` (the action's `vars`, its `menu`, and its `subject`, `new`, `same` or `end`, on
   a send or a forward to an `IO.*` node), on a message whose action has one of them. The trace,
   `meta.context.trace`, is the cycle's the instance is handling, and the Go SDK adds the WF's entry
@@ -82,6 +85,16 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   SY.timer does not answer at start, the node starts `DEGRADED` and reconciles its timers when
   SY.timer answers; a timer SY.timer never got is scheduled again then, and one scheduled after the
   list was asked is left alone.
+- **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
+  store does not open, or fails during recovery, the node stays up and connected: `NODE_STATUS_GET`
+  says `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed
+  recovery), or, when the cause is the `db_path` itself (a directory, a place it cannot create or
+  write), the config is `FAILED_CONFIG` (`invalid_config`, `last_error` naming the path). Meanwhile
+  every event gets `NOT_TAKEN` `unavailable`, a `WF_*` request `STORE_ERROR` (`node_not_configured`
+  in `FAILED_CONFIG`), and a `TIMER_FIRED` nothing. The node opens the store again every 30 s; once
+  it opens, the engine recovers as at a start and the node is ready. A corrected `db_path` is a
+  config change, applied at a restart. Before, the node exited, and its unit restarted it every 5 s
+  with the reason only in its journal.
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and
   `WF_CANCEL_INSTANCE` answer only SY.admin@motherbee and SY.wf-rules of the node's hive, in
   snake_case keys. A router notice and a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) are never
@@ -92,9 +105,10 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
 - **Not taken.** A message the WF takes nowhere gets `NOT_TAKEN`, a system message with
   `{"ok": false, "error": "not_taken", "reason", "detail"}`, on its thread and trace: `no_thread`
   (it has none), `no_conversation` (no instance holds its thread, and it starts none),
-  `invalid_input` (`input_schema` refuses it) or `not_expected` (its instance took nothing). An
-  `IO.*` node gets it for any message, named or not; any other sender only for a named request, and
-  only `no_thread` and `invalid_input`; a WF and an agent act on none. A start that drops a
+  `invalid_input` (`input_schema` refuses it), `not_expected` (its instance took nothing) or
+  `unavailable` (the engine waits for its store, above). An `IO.*` node gets it for any message,
+  named or not; any other sender only for a named request, and only `no_thread`, `invalid_input`
+  and `unavailable`; a WF and an agent act on none. A start that drops a
   creation a crash left, which starts nothing now, answers it the same way. The default's
   `not_expected` goes once its event is consumed. It took `INVALID_INPUT`'s place.
 - **Robustness.** A `$ref` to a missing field fails the action unless it gives a default

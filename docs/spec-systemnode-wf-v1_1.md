@@ -536,7 +536,7 @@ The instance's person is the `src_ilk` and `ich` of the message that started it,
 - **To a node that is no `IO.*` node** (an agent, a WF), a `send_message` carries the person as its `src_ilk` and `ich`: an agent files it under the person, as it does a message the WF forwards.
 - **To an `IO.*` node**, a `send_message` names no sender, no `src_ilk`: the WF wrote it, not the person, and the router's stamp names the WF. Who said what goes in the facts, `vars` (§10.9).
   - To the person's IO node, the one whose message started the instance, it names the person: its `dst_ilk` is the person's `src_ilk`, and its `ich` the person's (none when the person's message had none). A `forward` to it names the person the same way (§10.7).
-  - To any other `IO.*` node (the team's, say, even when `start_from` names it too) it names no person and no channel: no `dst_ilk` and no `ich`.
+  - To any other `IO.*` node (the team's, say, even when `start_from` names it too) it names no person and no channel: no `dst_ilk` and no `ich`. Nor does a `forward` to it (§10.7, FINDINGS A-215).
 
 **Who wrote it** (`meta.context.writer`, docs/cognition-hands-v1.md §5): every message a WF writes, a `send_message`, names the WF as its writer, its ILK (`FLUXBEE_NODE_ILK_ID`) and its node name, whatever the `src_ilk` says: the `src_ilk` says whose conversation it is, and the writer who wrote the text. A `forward` passes the text on with the writer the message came with, and a message that named none goes on naming none. A definition's `meta.context` never writes `writer`: the validator refuses it, as it refuses `wf`. Cognition analyzes a message to an agent only when a person wrote it.
 
@@ -777,7 +777,8 @@ What goes out:
 - **The payload, byte for byte**, never decoded: its text, its attachments, the order of its keys and its numbers as they came (`1.10` stays `1.10`, `<b>` stays `<b>`).
 - **The meta is the message's**: every field of it but `memory_package` (its type, `msg`, `src_ilk`, `dst_ilk`, `ich`, `scope`, `priority`, `context` and any other), and the WF sets the thread and the context. The sender's `src_ilk` travels intact: a person's message forwarded to an agent keeps the person, for the agent's memory.
 - **To the person's IO node** (the one whose message started the instance) the WF names the person too, when the instance has one (§10.1, FINDINGS A-139): `dst_ilk` is the person's `src_ilk` and `ich` the person's (none when the person's message had none). An agent answers whoever spoke, on the channel they spoke from, so its answer to a supervisor names the supervisor and the supervisors' channel; forwarded to the person, it names the person and the person's channel. Without a person both stay the message's.
-- **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; the trace, which is the cycle's the instance is handling (§10.9); the WF's block; and, to the person's IO node, `dst_ilk` and `ich`.
+- **To any other `IO.*` node** (the team's, say) the WF names no one, as a `send_message` (§10.1, FINDINGS A-215): no `dst_ilk` and no `ich`, whoever the message was said to and on whatever channel; its `src_ilk`, who speaks, stays. Before A-215 both stayed the message's, so an agent's answer to the person, forwarded to the team's channel, reached the agent's memory and cognition's episodes as said to the person there. A relay that names no one is said, for cognition, to the last other person who wrote through that IO node (`docs/reference/cognition.md`), as when an agent's answer to a supervisor goes back to the team.
+- **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; the trace, which is the cycle's the instance is handling (§10.9); the WF's block; and, to an `IO.*` node, `dst_ilk` and `ich`.
 
 A `forward` fails when there is no message to forward: the event is a `TIMER_FIRED`, an internal event or a control message (no node sent it as a workflow message), or no message is kept under `message` yet. Its `on_error` defaults to `fail`, as for `send_message`. It has no `meta.msg` and no `payload`: a definition that writes either is refused at load, and so is a `forward` without `message` where the event may be no node's message, a `TIMER_FIRED` or an internal event (§8.5, 8d).
 
@@ -1068,6 +1069,8 @@ When a WF node restarts:
 5. Reconciles the timers with SY.timer (§11.4); when SY.timer does not answer, it starts `DEGRADED` and reconciles from the receive loop.
 6. Drops the definitions no running instance uses, and enters the receive loop.
 
+When step 1 fails, or a store operation of steps 2 to 4 does, the engine does not run and the node waits for its store (§14.1): the store is closed again, and the next open runs all of these steps again from the store, as a restart, each event counting its attempt again.
+
 Completed / cancelled / failed instances remain in the database for read-only introspection but are not loaded into memory.
 
 ## 14. Runtime lifecycle
@@ -1088,8 +1091,14 @@ The WF node runs on the managed control plane of the Go SDK (`go/fluxbee-go-sdk/
    - workflow traffic: logged and dropped.
 
    A restart applies a corrected config. A redeploy through SY.wf-rules does that: it rebinds the node and restarts it. Before 0.1.70 the node exited and systemd relaunched it every 5 s, so the reason reached only journald.
+6. With a config in use but a store it cannot use (FINDINGS A-217): `wf_instances.db` does not open, or fails during recovery (§13.4). The engine does not run, the node stays up and connected, and it says why:
+   - `NODE_STATUS_GET`: `DEGRADED`, with `last_error` `store_unavailable` (a corrupt file, a full disk, a failed recovery), or, when the cause is the `db_path` itself (a directory, a place the node cannot create or write), with `invalid_config` naming the path, the config `FAILED_CONFIG` meanwhile (`CONFIG_GET`);
+   - workflow traffic: `NOT_TAKEN`, reason `unavailable`, its detail the same cause (§14.5); a `TIMER_FIRED` is dropped, never answered, since the store's open fires the timers missed meanwhile (§11.4);
+   - `WF_*` requests: `STORE_ERROR`, or `node_not_configured` in `FAILED_CONFIG`.
 
-Opening the store, and a store that fails during recovery, are still fatal at startup; SY.timer not answering is not (§11.4).
+   The receive loop opens the store again every 30 s. Once it opens, the engine recovers as at a start (§13.4), the config is `CONFIGURED` again and the node is ready. A corrected `db_path` is a config change: a restart applies it. Before A-217 the node exited, and systemd relaunched it every 5 s with the reason only in journald.
+
+SY.timer not answering does not stop the engine either (§11.4). What still stops the node is what it cannot run without at all: a `config.json` it cannot read, its router connection, its receive channel, a timer client.
 
 ### 14.2 Event processing loop
 
@@ -1103,7 +1112,7 @@ loop {
 
 Handlers:
 
-- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `timers_not_reconciled`, while its timers wait for SY.timer.
+- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers wait for SY.timer.
 - `WF_HELP` — returns the workflow HELP descriptor.
 - `WF_CANCEL_INSTANCE` — initiates soft abort.
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).
@@ -1170,7 +1179,9 @@ When an event arrives at the WF node, the runtime must decide whether it is for 
 
 6. **Otherwise**: a new instance on its thread (§14.3), as the `input_schema` allows; if the schema refuses it, `NOT_TAKEN`, reason `invalid_input`.
 
-**`NOT_TAKEN`** (since 0.1.94, `docs/wf-orchestration-v1.md` §5.4.6; it took `INVALID_INPUT`'s place) is a `system` message to the sender's uuid, with the message's `trace_id` and `thread_id`, and the payload `{"ok": false, "error": "not_taken", "reason": "<reason>", "detail": "<text>"}`. An `IO.*` node gets it for any message that is no reply and no notice, named or not, and shows it to whoever wrote. Any other sender gets it only for a named request, and only for `no_thread` and `invalid_input`: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce a `NOT_TAKEN` (FINDINGS A-119), and an agent's late answer is never answered. A WF and an agent act on none: a WF drops every `system` message but a `TIMER_FIRED` (§14.2), and ai.generic ignores a `system` message it does not know. The `not_expected` of an event no transition takes goes once the event's commit consumed it (§14.4), so a start that runs the event again sends it once.
+While the engine waits for its store (§14.1) none of this runs: a `TIMER_FIRED` is discarded, a sender the current definition does not involve is discarded as in step 2, and any other event gets `NOT_TAKEN`, reason `unavailable` (FINDINGS A-217).
+
+**`NOT_TAKEN`** (since 0.1.94, `docs/wf-orchestration-v1.md` §5.4.6; it took `INVALID_INPUT`'s place) is a `system` message to the sender's uuid, with the message's `trace_id` and `thread_id`, and the payload `{"ok": false, "error": "not_taken", "reason": "<reason>", "detail": "<text>"}`. An `IO.*` node gets it for any message that is no reply and no notice, named or not, and shows it to whoever wrote. Any other sender gets it only for a named request, and only for `no_thread`, `invalid_input` and `unavailable`: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce a `NOT_TAKEN` (FINDINGS A-119), and an agent's late answer is never answered. A WF and an agent act on none: a WF drops every `system` message but a `TIMER_FIRED` (§14.2), and ai.generic ignores a `system` message it does not know. The `not_expected` of an event no transition takes goes once the event's commit consumed it (§14.4), so a start that runs the event again sends it once.
 
 The node's log names every message by its sender, `msg` and thread, and gets the first characters of its payload only when it reaches an instance or starts one: when every message of a node comes to the WF (a Slack channel's, say), the log keeps no text of those the WF discards.
 
@@ -1391,7 +1402,7 @@ A future iteration of identity may introduce a claims model that allows per-ILK 
 
 | Code | Description |
 |---|---|
-| `NOT_TAKEN` | The WF took a message nowhere (§14.5), with its `reason`: `no_thread`, `no_conversation`, `invalid_input` (the payload does not match `input_schema`) or `not_expected`. It took `INVALID_INPUT`'s place in 0.1.94. |
+| `NOT_TAKEN` | The WF took a message nowhere (§14.5), with its `reason`: `no_thread`, `no_conversation`, `invalid_input` (the payload does not match `input_schema`), `not_expected` or `unavailable` (the engine waits for its store, §14.1). It took `INVALID_INPUT`'s place in 0.1.94. |
 | `WORKFLOW_LOAD_FAILED` | Workflow definition failed load-time validation. Includes path to offending element. |
 | `GUARD_COMPILE_FAILED` | A CEL guard expression failed to compile. |
 | `GUARD_TIMEOUT` | A guard exceeded the 10ms evaluation limit. |

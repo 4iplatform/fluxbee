@@ -252,8 +252,12 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   instances (each on the definition it was born with), runs again the inbound events a crash
   left unfinished, reconciles its timers with SY.timer and starts a GC loop (`startEngine`,
   `node/node.go`; `Recover`, `node/recover.go`). When SY.timer does not answer it starts
-  `DEGRADED` and reconciles later. Timers use `client_ref` `wf:<instance_id>::<timer_key>`
-  (`node/timer.go`).
+  `DEGRADED` and reconciles later. When the store does not open, or fails during recovery, the
+  engine does not run and the node stays up (FINDINGS A-217): `DEGRADED` with `store_unavailable`,
+  or `FAILED_CONFIG` `invalid_config` when the `db_path` itself cannot hold the store
+  (`storeFailure`, `dbPathProblem` in `node/store.go`); it refuses every event (`NOT_TAKEN`
+  `unavailable`, `refuseWhileStoreDown`) and opens the store again every 30 s. Timers use
+  `client_ref` `wf:<instance_id>::<timer_key>` (`node/timer.go`).
 - **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`,
   `CONFIG_SET`; `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE`,
   `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the node's hive
@@ -263,8 +267,9 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`, `node/correlate.go`);
   a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) never starts one, and a notice or a reply
   is never answered. A message it takes nowhere gets `NOT_TAKEN`, with its reason (`no_thread`,
-  `no_conversation`, `invalid_input` or `not_expected`): from an `IO.*` node, any message; from
-  any other node, only a named request, and only `no_thread` and `invalid_input`.
+  `no_conversation`, `invalid_input`, `not_expected` or `unavailable`): from an `IO.*` node, any
+  message; from any other node, only a named request, and only `no_thread`, `invalid_input` and
+  `unavailable`.
 
 ## Config
 

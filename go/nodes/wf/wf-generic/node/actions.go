@@ -227,11 +227,16 @@ func (inst *WFInstance) toPerson(meta *sdk.Meta) {
 // and its meta is the message's (type, msg, src_ilk, dst_ilk, ich, scope, priority and context)
 // without memory_package. What the WF changes is metadata: the destination (a target written in
 // the definition), the thread (the instance's), the context keys the action writes, the trace,
-// which is the cycle's the instance is handling (a kept message's own is of an earlier cycle), and
-// the WF's block. To the person's IO
-// node (personsIO) its dst_ilk and ich are the instance's person and the person's channel, when it
-// has a person (toPerson, FINDINGS A-139): an agent answers whoever spoke, on the channel they spoke
-// from, so its answer to a supervisor names the supervisor and the supervisors' channel.
+// which is the cycle's the instance is handling (a kept message's own is of an earlier cycle), the
+// WF's block, and toward an IO node whom it names. Its src_ilk, who speaks, travels intact:
+//   - to the person's IO node (personsIO) its dst_ilk and ich are the instance's person and the
+//     person's channel, when it has a person (toPerson, FINDINGS A-139): an agent answers whoever
+//     spoke, on the channel they spoke from, so its answer to a supervisor names the supervisor and
+//     the supervisors' channel;
+//   - to any other IO node (the team's, say) it names no one, no dst_ilk and no ich, as a send does
+//     (FINDINGS A-215): whoever the message was said to, on whatever channel, is not there, and
+//     cognition takes a relay's addressee from its dst_ilk (the last person who wrote through that
+//     node when it names none).
 func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("forward: no dispatcher configured")
@@ -263,8 +268,11 @@ func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance,
 	threadID := inst.ThreadID
 	meta.ThreadID = &threadID
 	meta.Context = contextRaw
-	if inst.personsIO(action.Target) {
+	switch {
+	case inst.personsIO(action.Target):
 		inst.toPerson(&meta)
+	case wfcel.IsIO(action.Target):
+		meta.DstIlk, meta.Ich = nil, nil
 	}
 	msg := sdk.Message{
 		Routing: sdk.Routing{

@@ -489,6 +489,9 @@ const (
 	// notTakenNotExpected: the instance on its thread took nothing, neither a transition nor the
 	// catch.
 	notTakenNotExpected = "not_expected"
+	// notTakenUnavailable: the engine waits for its store, which did not open or failed during
+	// recovery, and takes nothing meanwhile (FINDINGS A-217).
+	notTakenUnavailable = "unavailable"
 )
 
 // answerNotTaken tells the sender of msg that the WF took it nowhere (wf-orchestration-v1 §5.4.6):
@@ -496,21 +499,21 @@ const (
 // {ok: false, error: not_taken, reason, detail}. Who gets one:
 //   - an IO node (IO.*), for any message that is no reply and no notice, named or not: someone who
 //     writes is looking for a result, and the IO node shows it to them;
-//   - any other sender, only for a named request (neverAnswered), and only for no_thread and
-//     invalid_input, as INVALID_INPUT before it: the answer a named request's caller may wait for,
-//     on its trace. A WF and an agent act on none: a WF drops every system message but a
-//     TIMER_FIRED, and ai.generic ignores a system message it does not know. A NOT_TAKEN to another
+//   - any other sender, only for a named request (neverAnswered), and only for no_thread,
+//     invalid_input and unavailable, as INVALID_INPUT before it: the answer a named request's caller
+//     may wait for, on its trace. A WF and an agent act on none: a WF drops every system message but
+//     a TIMER_FIRED, and ai.generic ignores a system message it does not know. A NOT_TAKEN to another
 //     WF's NOT_TAKEN would bounce between the two forever (FINDINGS A-119), and an agent's late answer
 //     starts nothing, unanswered.
 //
-// A sender the definition does not involve never gets here (dispatchWorkflowEvent, and recovery's
-// replay of a creation, drop it first).
+// A sender the definition does not involve never gets here (dispatchWorkflowEvent, recovery's
+// replay of a creation and refuseWhileStoreDown drop it first), nor does SY.timer's TIMER_FIRED.
 func answerNotTaken(actx ActionContext, msg sdk.Message, reason, detail string) error {
 	switch name := rawMsgName(msg); {
 	case actx.Dispatcher == nil || isNotice(msg) || isReply(name):
 		return nil
 	case wfcel.IsIO(msg.SourceL2Name()):
-	case neverAnswered(msg) || (reason != notTakenNoThread && reason != notTakenInvalidInput):
+	case neverAnswered(msg) || (reason != notTakenNoThread && reason != notTakenInvalidInput && reason != notTakenUnavailable):
 		return nil
 	}
 	replyTo := msg.Routing.Src
