@@ -8,8 +8,9 @@ temporary directory:
 - every page that is up comes down by its publication_id, a page published meanwhile too, and a
   failure is retried while a pass takes one down;
 - a page that never comes down is named, and the reset goes on;
-- when SY.admin does not list the pages (down, or older than the route), the reset goes on and
-  names the pages that stay public from SY.admin's ledger, read only;
+- when SY.admin does not list the pages (an older SY.admin's 404, or SY.admin gone during the
+  run), the page step goes on and names the pages that stay public from SY.admin's ledger, read
+  only (a reset without SY.admin at its start stops before this step);
 - no link's key is ever printed, whole or in part.
 
 Usage: python3 scripts/factory_reset_pages_check.py

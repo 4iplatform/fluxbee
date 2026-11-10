@@ -17,8 +17,11 @@ REMOVED (operator decisions, 2026-09-28):
   - every published page that is up (a /public/<key> link), once no workflow or user node is left
     to publish one: SY.admin lists them (GET /artifacts, each by its publication_id, never by its
     link's key) and takes each down (unpublish_artifact): the edge stops serving it and IO.blob
-    releases its copy in blob/public/. When SY.admin cannot list them the reset goes on, and names
-    the pages that stay public from SY.admin's ledger, read only (FINDINGS A-212);
+    releases its copy in blob/public/. The reset needs SY.admin: without its answer it stops at
+    the start (list_hives). When SY.admin answers but does not list the pages (an older SY.admin
+    without the route answers 404, or its ledger cannot be read), the reset goes on, counts it as
+    a problem, and names the pages that stay public from SY.admin's ledger, read only (FINDINGS
+    A-212);
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
@@ -66,7 +69,7 @@ MANIFEST = os.environ.get("FLUXBEE_BASE_NODES", "/usr/share/fluxbee/base-nodes.j
 STORAGE_DB = "fluxbee_storage"
 LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
 # SY.admin's publication ledger: read only, and only to name the pages that stay public when
-# SY.admin cannot list them. Each row holds its link's key, which is never printed.
+# SY.admin answers but does not list them. Each row holds its link's key, which is never printed.
 PUBLICATION_LEDGER = os.path.join(STATE_DIR, "state", "sy-admin", "publications.json")
 PAGE_DOWN = ("unpublished", "expired")
 
@@ -460,8 +463,10 @@ def kill_user_nodes(nodes):
 def unpublish_pages():
     """Take every page that is up down through SY.admin: unpublish_artifact by its publication_id,
     list after list while a pass takes one down, so a page published meanwhile goes too and a
-    failure is retried. A page already down answers ok as well. When SY.admin does not list them,
-    the reset goes on: it says so and names the pages that stay public from SY.admin's ledger.
+    failure is retried. A page already down answers ok as well. When SY.admin answers but does not
+    list them (an older SY.admin answers 404, or its ledger cannot be read), the reset goes on: it
+    says so and names the pages that stay public from SY.admin's ledger. A reset that started has
+    SY.admin: without it, it stops at its start (list_hives).
     -> (pages taken down, failures [(what, why)])."""
     done, failed = 0, {}
     for _ in range(10):

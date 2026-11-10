@@ -643,7 +643,8 @@ Until step 6 ends, admin actions get `ORCHESTRATOR_BOOTING` (HTTP 500 through
 
 `sudo fluxbee-factory-reset` on the motherbee (`packaging/fluxbee-factory-reset`) is a dry run
 that lists what it would remove; `--yes` executes after you type the `hive_id` (or pass
-`--confirm-hive <id>`). It needs every hive alive and works through SY.admin:
+`--confirm-hive <id>`). It needs every hive alive and works through SY.admin: without SY.admin's
+answer it stops at its start, when it lists the hives, before it changes anything.
 
 1. deletes every workflow with `force` on motherbee and worker hives;
 2. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
@@ -653,10 +654,10 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
    by its `publication_id`, never by its link's key) and the reset takes each down
    (`POST /artifacts/unpublish`): the edge stops serving its `/public/<key>` link, and IO.blob
    releases its copy in `blob/public/`. It lists again until none is left, so a page published
-   meanwhile goes too. When SY.admin does not list them (down, or older than the route), the reset
-   goes on, counts it as a problem, and names the pages that stay public from SY.admin's ledger
-   (`state/sy-admin/publications.json`, read only); they go down when they expire, 30 days at
-   most. The dry run lists the pages;
+   meanwhile goes too. When SY.admin answers but does not list them (an older SY.admin without the
+   route answers 404, or its ledger cannot be read), the reset goes on, counts it as a problem,
+   and names the pages that stay public from SY.admin's ledger (`state/sy-admin/publications.json`,
+   read only); they go down when they expire, 30 days at most. The dry run lists the pages;
 4. marks and purges every non-system ILK, deletes every vault secret except
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
    but the root. A tenant with a page still up is not purged (`TENANT_HAS_PAGES`): step 3 takes
