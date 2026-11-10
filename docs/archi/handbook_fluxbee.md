@@ -1140,9 +1140,9 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
     `MANIFEST_INVALID` (it takes no category `config`): its core update comes first.
     `INSTALLATION_HASH_MISMATCH`: its copy holds the version with another content (edited by
     hand): the operator restores it, then `update` that hive;
-  - `left_to_task`: another task of the installation's update (§4.4.4) was acting on it, named in
-    `detail`, so the change sent it nothing. Once that task ends, `update_installation` finishes
-    it.
+  - `left_to_task`: another task of the installation's update (§4.4.4) held it for the whole
+    change, named in `detail`, so the change sent it nothing. Once that task ends,
+    `update_installation` finishes it.
 
   None of these means "not applied". Check with `GET /versions` (each hive's `config`), and finish
   a hive with `update` for that hive: `category: config`, `manifest_version` and `manifest_hash`

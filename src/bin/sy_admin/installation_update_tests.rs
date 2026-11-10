@@ -2313,16 +2313,25 @@ async fn apply_target_version(mesh: &FakeMesh, hive: &str) -> (InstallationAppli
     )
 }
 
-/// FINDINGS A-205: `set_installation_ai`'s apply holds each hive as an explicit run does. A
-/// background read neither reads nor records a hive while the change applies it; a task that only
-/// reads the hive is waited for; one that acts on it keeps it, and the change leaves the hive to it,
-/// sending nothing and saying so in the record.
+/// A task holding a hive that lets it go after `after`, saying so in `let_go` first.
+async fn let_go_after(holder: Claim<'_>, after: Duration, let_go: &AtomicBool) {
+    tokio::time::sleep(after).await;
+    let_go.store(true, Ordering::SeqCst);
+    drop(holder);
+}
+
+/// FINDINGS A-205: `set_installation_ai`'s apply holds each hive while it applies it: a background
+/// read neither reads nor records the hive meanwhile. A task holding a hive, one that reads it or
+/// one that acts on it, is waited for, and the hive applied once it lets go; only one that holds it
+/// past the change's ceiling keeps it, and the change leaves the hive to it, sending nothing and
+/// saying so in the record.
 #[tokio::test]
 async fn the_change_s_apply_holds_each_hive_it_applies() {
     let updates = Updates::load(&temp_state("installation-update-change-holds"));
     let mesh = FakeMesh::new(vec![
         motherbee_on_target(),
         config_behind("worker1"),
+        config_behind("worker2"),
         config_behind("ingress1"),
         config_behind("egress1"),
     ]);
@@ -2330,7 +2339,7 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
     let id = open_update(
         &updates,
         "set_installation_ai",
-        &["motherbee", "worker1", "ingress1", "egress1"],
+        &["motherbee", "worker1", "worker2", "ingress1", "egress1"],
     );
     let (the_target, bounds, deadline) = (
         target(),
@@ -2353,7 +2362,6 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
         &id,
         "worker1",
         &the_target,
-        &bounds,
         deadline,
         move |_within| async move {
             recheck(
@@ -2399,52 +2407,61 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
     let worker = entry_of(&updates, "worker1");
     assert!(worker.on_target(), "{worker:#?}");
 
-    // A task that only reads ingress1 is waited for: the change applies it once the read let it go.
-    let reader = updates.claim("ingress1", READING, &id).expect("claimed");
-    let released = AtomicBool::new(false);
-    let released_ref = &released;
-    let release = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        released.store(true, Ordering::SeqCst);
-        drop(reader);
-    };
-    let change = apply_change_on_hive(
-        &updates,
-        &id,
-        "ingress1",
-        &the_target,
-        &bounds,
-        deadline,
-        move |_within| async move {
-            assert!(
-                released_ref.load(Ordering::SeqCst),
-                "the read let it go first"
-            );
-            apply_target_version(mesh_ref, "ingress1").await
-        },
-    );
-    let ((), change) = tokio::join!(release, change);
-    assert!(matches!(change, ChangeApply::Applied(..)), "{change:?}");
-    assert_eq!(
-        entry_of(&updates, "ingress1").config.state,
-        Standing::OnTarget
-    );
+    // A task that reads ingress1 (a background read), and one that acts on egress1 (the automatic
+    // step of the update the change superseded): each is waited for, and the change applies the
+    // hive once it lets go.
+    for (hive, what, update) in [
+        ("ingress1", READING, id.as_str()),
+        ("egress1", "the automatic step", "upd-older"),
+    ] {
+        let holder = updates.claim(hive, what, update).expect("claimed");
+        let let_go = AtomicBool::new(false);
+        let let_go_ref = &let_go;
+        let change = apply_change_on_hive(
+            &updates,
+            &id,
+            hive,
+            &the_target,
+            deadline,
+            move |_within| async move {
+                assert!(let_go_ref.load(Ordering::SeqCst), "{hive}: it let go first");
+                apply_target_version(mesh_ref, hive).await
+            },
+        );
+        let ((), change) = tokio::join!(
+            let_go_after(holder, Duration::from_millis(50), &let_go),
+            change
+        );
+        assert!(
+            matches!(change, ChangeApply::Applied(..)),
+            "{hive}: {change:?}"
+        );
+        assert_eq!(
+            entry_of(&updates, hive).config.state,
+            Standing::OnTarget,
+            "{hive}"
+        );
+    }
 
-    // A task that acts on egress1, the automatic step of the update the change superseded, keeps
-    // it: the change leaves egress1 to it, sends it nothing, and the record says so.
+    // A task that holds worker2 past the change's ceiling keeps it: the change leaves worker2 to
+    // it, sends it nothing, and the record says so.
     let actor = updates
-        .claim("egress1", "the automatic step", "upd-older")
+        .claim("worker2", "the automatic step", "upd-older")
         .expect("claimed");
+    let ceiling = tokio::time::Instant::now() + Duration::from_millis(300);
     let change = apply_change_on_hive(
         &updates,
         &id,
-        "egress1",
+        "worker2",
         &the_target,
-        &bounds,
-        deadline,
-        move |_within| async move { unreachable!("nothing is sent to a hive another task acts on") },
+        ceiling,
+        move |_within| async move { unreachable!("nothing is sent to a hive another task holds") },
     )
     .await;
+    assert!(
+        tokio::time::Instant::now() >= ceiling,
+        "waited up to the ceiling"
+    );
     let ChangeApply::LeftToTask(why) = change else {
         panic!("left to the task: {change:?}");
     };
@@ -2452,10 +2469,10 @@ async fn the_change_s_apply_holds_each_hive_it_applies() {
         why.contains("the automatic step of the superseded update upd-older"),
         "{why}"
     );
-    assert!(mesh.sent_to("egress1").is_empty());
-    let egress = entry_of(&updates, "egress1");
-    assert_eq!(egress.config.reason.as_deref(), Some(why.as_str()));
-    assert!(egress
+    assert!(mesh.sent_to("worker2").is_empty());
+    let worker2 = entry_of(&updates, "worker2");
+    assert_eq!(worker2.config.reason.as_deref(), Some(why.as_str()));
+    assert!(worker2
         .config
         .next
         .as_deref()
@@ -2572,9 +2589,8 @@ async fn the_change_records_each_hive_s_own_time() {
         "set_installation_ai",
         &["motherbee", "worker1", "egress1"],
     );
-    let (the_target, bounds, deadline) = (
+    let (the_target, deadline) = (
         target(),
-        quick(),
         tokio::time::Instant::now() + Duration::from_secs(10),
     );
     let taking = |delay: Duration| {
@@ -2599,7 +2615,6 @@ async fn the_change_records_each_hive_s_own_time() {
             &id,
             "worker1",
             &the_target,
-            &bounds,
             deadline,
             taking(Duration::from_millis(10)),
         ),
@@ -2608,7 +2623,6 @@ async fn the_change_records_each_hive_s_own_time() {
             &id,
             "egress1",
             &the_target,
-            &bounds,
             deadline,
             taking(Duration::from_millis(300)),
         ),

@@ -564,7 +564,8 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     is recorded as left to that task, naming it and its update (this one or the superseded one),
     with `next`: never skipped without a word. A holder that ended meanwhile is none: the hive is
     claimed (`claim_for_run`, since 0.1.124; before, the run left the hive "to another task, which
-    has just ended");
+    has just ended"). `set_installation_ai`'s apply waits for a task that acts on the hive too, up
+    to its ceiling (below);
   - it waits until the hive's orchestrator answers (120 s from the run's start,
     `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`): right after an install the motherbee's router
     may not have the spokes back (0.1.56);
@@ -669,15 +670,16 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   and the answer says why. Its answer is 3c's, with `update: {id, state}` (or `{id: null,
   not_opened}`). Its pass is stage 3c's apply, as the update's (`apply_change_on_hive`, since
   0.1.124):
-  - each hive is claimed while it applies, as an explicit run claims it (F7): a task that only
-    reads it is waited for, within its read's bound; one that acts on it (the follow applying its
-    config, the automatic step or an explicit run's pass, of the update the change superseded)
-    keeps it, and the change leaves the hive to it: nothing is sent, the record says so, and the
-    answer's line is `left_to_task`, naming the task in `detail`, with `next`. **Why** (FINDINGS
-    A-205): unclaimed, the apply let the background task read a hive just before it applied the
-    version; that read's answer, back after the apply's outcome, set the hive back to `pending`, and
-    the update stayed open on a hive on the target (32 s on 8.x, up to 10 min when no one reads the
-    update);
+  - each hive is claimed while it applies. A task holding it, one that reads it or one that acts on
+    it (the follow applying its config, the automatic step or an explicit run's pass, of the update
+    the change superseded), is waited for up to the change's ceiling, and the hive is applied once
+    it lets go: the operator's change reaches every hive in one go whenever it can. Only a task
+    that holds the hive past the ceiling keeps it: the change leaves the hive to it, nothing is
+    sent, the record says so, and the answer's line is `left_to_task`, naming the task in
+    `detail`, with `next`. **Why** (FINDINGS A-205): unclaimed, the apply let the background task
+    read a hive just before it applied the version; that read's answer, back after the apply's
+    outcome, set the hive back to `pending`, and the update stayed open on a hive on the target
+    (32 s on 8.x, up to 10 min when no one reads the update);
   - each hive's outcome is recorded as its own apply ends, from its own start to its own end, so
     its `elapsed_ms` is the answer's `timings_ms.hives`. **Why** (A-204): recorded once every apply
     had ended, every hive got the slowest one's time (85.5 s each on 8.x, for applies of about 2 s);

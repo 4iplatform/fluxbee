@@ -718,14 +718,14 @@ node_check, timings_ms}`:
   a copy of the version with another hash, `RESTART_FAILED`, `CONFIG_RECORD_FAILED` (its readers
   took the version, and its record could not be written), or `MANIFEST_INVALID` from an
   orchestrator before 0.1.122, which takes no category `config`), `not_answered` (`detail`) or,
-  since 0.1.124, `left_to_task` (`detail`: another task of the installation's update was acting on
-  the hive, so the change sent it nothing; below), with `attempts` and `elapsed_ms`; a hive not ok
-  gets `next`, what finishes it by its error code (`installation_next_step`): the same update for
-  `sync_pending`, no answer, `RESTART_FAILED` and `CONFIG_RECORD_FAILED`; the core first for
-  `MANIFEST_INVALID`; the copy restored for `INSTALLATION_HASH_MISMATCH`; the later version for
-  `VERSION_MISMATCH`; `update_installation` once that task ends, or the per-hive update, for
-  `left_to_task` (`installation_hive_left_json`). Never "not applied" (P-13): a hive that did not
-  answer may hold the version already;
+  since 0.1.124, `left_to_task` (`detail`: another task of the installation's update held the hive
+  until the change's ceiling, so the change sent it nothing; below), with `attempts` and
+  `elapsed_ms`; a hive not ok gets `next`, what finishes it by its error code
+  (`installation_next_step`): the same update for `sync_pending`, no answer, `RESTART_FAILED` and
+  `CONFIG_RECORD_FAILED`; the core first for `MANIFEST_INVALID`; the copy restored for
+  `INSTALLATION_HASH_MISMATCH`; the later version for `VERSION_MISMATCH`; `update_installation`
+  once that task ends, or the per-hive update, for `left_to_task` (`installation_hive_left_json`).
+  Never "not applied" (P-13): a hive that did not answer may hold the version already;
 - `skipped`: each hive the registry holds whose join did not finish, `{hive, role, status,
   join_phase, next}` (`installation_skipped_hives`): its join may have copied the file and started
   SY.cognition; finish its join or remove it, then `update` it with category `config`. It does not
@@ -749,12 +749,14 @@ second while one runs is refused first, `409 INSTALLATION_UPDATE_RUNNING`, writi
   reference, is recorded on its core at once);
 - its apply is the update's pass (`installation_update::apply_change_on_hive`, since 0.1.124), and
   `update: {id, state}` is in the answer:
-  - each hive is claimed while it applies, as `update_installation`'s pass claims it: a task that
-    only reads it is waited for, within its read's bound; one that acts on it (the follow applying
-    its config, the automatic step or an explicit run's pass, of the update the change superseded)
-    keeps it, and the change leaves the hive to it, recorded, its line `left_to_task`. No read of
-    the background task is recorded over a hive while it applies (FINDINGS A-205: a read taken just
-    before the apply, its answer back after the apply's outcome, set the hive back to `pending`);
+  - each hive is claimed while it applies. A task holding it, one that reads it or one that acts on
+    it (the follow applying its config, the automatic step or an explicit run's pass, of the update
+    the change superseded), is waited for up to the change's ceiling, and the hive applied once it
+    lets go: the operator's change reaches every hive in one go whenever it can. Only one that
+    holds it past the ceiling keeps it, and the change leaves the hive to it, recorded, its line
+    `left_to_task`. No read of the background task is recorded over a hive while it applies
+    (FINDINGS A-205: a read taken just before the apply, its answer back after the apply's outcome,
+    set the hive back to `pending`);
   - each hive's outcome is recorded as its own apply ends, from its own start to its own end: its
     `elapsed_ms` is the answer's `timings_ms.hives` (A-204: once every apply had ended, every hive
     got the slowest one's time);
@@ -830,7 +832,8 @@ What it does (`handle_update_installation`, `run_explicit`):
      acts on it (the follow applying its config, the automatic step) keeps it, and the hive is
      recorded as left to that task, naming it, the update (this one or the superseded one) and how
      long it has been under way, with `next`. Never left unrecorded. A holder that ended meanwhile
-     is none: the hive is claimed (`claim_for_run`, which `set_installation_ai`'s apply shares);
+     is none: the hive is claimed (`claim_for_run`; `set_installation_ai`'s apply shares it, and
+     waits for a task that acts on the hive too, up to its ceiling);
    - it waits until the hive's orchestrator answers (120 s from the run's start,
      `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`);
    - its core, when not on the target: `SYSTEM_UPDATE {category: "core", manifest_version: 0,

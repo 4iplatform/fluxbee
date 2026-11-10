@@ -2550,27 +2550,40 @@ fn core_unchanged_since_not_settled(entry: &HiveEntry, snapshot: &Value) -> bool
     })
 }
 
+/// Which holders of a hive an explicit run waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitFor {
+    /// A task that only reads it; one that acts on it keeps it (`update_installation`'s pass).
+    Readers,
+    /// Any task (`set_installation_ai`'s apply: the operator's change reaches every hive in one go
+    /// whenever it can).
+    Anyone,
+}
+
 /// An explicit run's mark on a hive (`update_installation`'s pass, `set_installation_ai`'s apply),
-/// as `what`: a holder that is only reading the hive is waited for, up to `wait_until`; one that
-/// acts on it keeps it, and None. A holder that ended meanwhile is no holder: the mark is taken.
+/// as `what`: a holder it waits for (`wait_for`) is waited for, up to `wait_until`; another keeps
+/// the hive, and so does one still there then: None. A holder that ended meanwhile is no holder:
+/// the mark is taken.
 async fn claim_for_run<'a>(
     updates: &'a Updates,
     hive: &str,
     what: &str,
     id: &str,
+    wait_for: WaitFor,
     wait_until: tokio::time::Instant,
 ) -> Option<Claim<'a>> {
     loop {
         if let Some(claim) = updates.claim(hive, what, id) {
             return Some(claim);
         }
-        match updates.holder(hive) {
-            None => continue,
-            Some(holder) if holder.what == READING && tokio::time::Instant::now() < wait_until => {
-                tokio::time::sleep(Duration::from_millis(100)).await
-            }
-            Some(_) => return None,
+        let Some(holder) = updates.holder(hive) else {
+            continue;
+        };
+        let waited_for = wait_for == WaitFor::Anyone || holder.what == READING;
+        if !waited_for || tokio::time::Instant::now() >= wait_until {
+            return None;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -2590,7 +2603,15 @@ pub(crate) async fn run_hive(
     bounds: &Bounds,
 ) {
     let wait_until = tokio::time::Instant::now() + bounds.read + Duration::from_secs(5);
-    let Some(_claim) = claim_for_run(updates, hive, "the explicit run", id, wait_until).await
+    let Some(_claim) = claim_for_run(
+        updates,
+        hive,
+        "the explicit run",
+        id,
+        WaitFor::Readers,
+        wait_until,
+    )
+    .await
     else {
         left_to_holder(updates, id, hive);
         return;
@@ -3061,23 +3082,23 @@ pub(crate) fn record_config_applied(
 pub(crate) enum ChangeApply {
     /// Applied, whatever it answered, and recorded: its apply and how long it took.
     Applied(InstallationApplied, Duration),
-    /// Another task acts on the hive: the change left it to that task, as an explicit run does, and
-    /// recorded why (this text). Nothing was sent to it.
+    /// Another task held the hive until the change's ceiling: the change left it to that task, as
+    /// an explicit run leaves one, and recorded why (this text). Nothing was sent to it.
     LeftToTask(String),
 }
 
 /// One hive's apply of `set_installation_ai`'s version, the pass of the update the change opened:
-/// the hive claimed as an explicit run claims it ([`claim_for_run`]), so no background read of it
-/// is recorded while it applies (FINDINGS A-205); the version applied (`apply`, given the time
-/// left before `deadline`); and its outcome recorded as it ends, with its own start and end
-/// (A-204), before the claim is released. A hive another task acts on is left to that task, said
-/// in the record and to the caller.
+/// the hive claimed ([`claim_for_run`]), so no background read of it is recorded while it applies
+/// (FINDINGS A-205); the version applied (`apply`, given the time left before `deadline`); and its
+/// outcome recorded as it ends, with its own start and end (A-204), before the claim is released.
+/// A task holding the hive, reading it or acting on it, is waited for up to `deadline`, the
+/// change's ceiling: the operator's change reaches every hive in one go whenever it can. One still
+/// there then keeps the hive, which is left to it, said in the record and to the caller.
 pub(crate) async fn apply_change_on_hive<F, Fut>(
     updates: &Updates,
     id: &str,
     hive: &str,
     target: &Target,
-    bounds: &Bounds,
     deadline: tokio::time::Instant,
     apply: F,
 ) -> ChangeApply
@@ -3085,10 +3106,15 @@ where
     F: FnOnce(Duration) -> Fut,
     Fut: std::future::Future<Output = (InstallationApplied, Duration)>,
 {
-    let wait_until =
-        deadline.min(tokio::time::Instant::now() + bounds.read + Duration::from_secs(5));
-    let Some(_claim) =
-        claim_for_run(updates, hive, "set_installation_ai's apply", id, wait_until).await
+    let Some(_claim) = claim_for_run(
+        updates,
+        hive,
+        "set_installation_ai's apply",
+        id,
+        WaitFor::Anyone,
+        deadline,
+    )
+    .await
     else {
         return ChangeApply::LeftToTask(left_to_holder(updates, id, hive));
     };
