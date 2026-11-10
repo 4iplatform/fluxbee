@@ -143,6 +143,15 @@ no change required
     [General/admin], the installation update's record gives every `set_installation_ai` hive the
     slowest one's time (low); A-205 [General/admin], a background read taken before a hive applied
     a config change can mark it pending after it did, so the update stays open (low).
+13. **Found by the sweep's re-check (2026-11-09):** A-206 [General/SY.timer], a cron spec that
+    starts with `TZ=` and has no space crashes SY.timer (any node's own timer).
+    **Found by A-203's builder:** A-207 [General/router], a WAN peer that vanishes without
+    closing keeps its session for up to about 15 min (latent, with A-203); A-208 and A-209, low.
+14. **The sweep's calls, the operator's 2026-11-10:** A-210 to A-219 (lab/logbook/2026-11-10.md),
+    in releases by binary after the router's; A-218 alone (the SDKs); A-219 with its shape written
+    first. **Found by A-206's builder:** A-220 [General/SY.timer], low. **Found by A-207's
+    builder:** A-221 [General/router], low; A-222 [General/router], latent. **Found by A-216's
+    builder:** A-223 [IO/io.api], low.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -266,6 +275,28 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   one's time, and keeps an old outcome on a hive moved by its own update (low).
 - A-205 🟡 A background read taken before a hive applied a config change can mark it pending
   after it did: the update stays open up to 10 min when no one follows it (low).
+- A-206 🟡 A cron spec that starts with `TZ=` and has no space crashes SY.timer; with a space, a
+  `CRON_TZ=` prefix overrides `cron_tz` (any node's own timer; for 0.1.124).
+- A-207 🟡 A WAN peer that vanishes without closing keeps its session: frames to it are lost
+  without UNREACHABLE for up to about 15 min (latent; the router, with A-203, for 0.1.124).
+- A-208 🔵 With several routers on one hive (not supported), an IRP reply goes to the wrong link
+  (low).
+- A-209 🔵 A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender
+  (low).
+- The sweep's calls, decided by the operator on 2026-11-10: A-210 (one-time conversions go),
+  A-211 (wf-generic out of the core), A-212 (the reset unpublishes the pages; an action lists
+  them), A-213 (`ORCH_DEFAULT_TENANT_ID` goes), A-214 (every fixed text in English), A-215 (a WF
+  forward clears the addressee), A-216 (the frontdesk retries), A-217 (wf-generic stays up on a
+  failed database), A-218 (the dead identity surface goes, a release alone), A-219 (a worker goes
+  out through the egress, by an action). Cron descriptors wait for the talk on a WF that starts on
+  a schedule.
+- A-220 🔵 A recurring timer the replay cannot schedule stays pending and holds its client_ref
+  (low).
+- A-221 🔵 Cognition records a turn the agent never received when its delivery fails (low).
+- A-222 🟡 A node that stops reading without an error is never disconnected, and the router's
+  queue for it grows without limit (latent; a design of its own).
+- A-223 🔵 io.api waits for a frontdesk handoff no longer than the frontdesk waits for
+  SY.identity (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1343,6 +1374,231 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-223 [IO/io.api] 🔵 low (found 2026-11-10 by A-216's builder; checked in the code) — io.api waits for a frontdesk handoff no longer than the frontdesk waits for SY.identity
+
+- **Why:** io.api waits for the frontdesk's answer for its identity timeout, 10 s by default
+  (`nodes/io/io-api/src/config.rs:56-58`, used at `main.rs:1612-1621`), and the frontdesk's own
+  call to SY.identity times out at 10 s too (`nodes/gov/common/src/lib.rs:56`). When SY.identity is
+  slow, io.api gives up before the frontdesk can answer. A-216's retries fit inside the wait only
+  when SY.identity fails fast.
+- **Fix, later (io.api, with the IO standard A-149):** io.api's handoff wait is longer than the
+  frontdesk's whole attempt (its identity timeout plus A-216's retries).
+
+### A-222 [General/router] 🟡 LATENT (found 2026-11-10 by A-203's builder; read in the code) — A node that stops reading without an error is never disconnected, and the router's queue for it grows without limit
+
+- **Why:** a link's queue is unbounded, and its writer blocks while the node's socket does not
+  drain. A node that stops reading without closing (hung, or stuck behind its own full queue)
+  never makes a write fail, so A-203's "the link no longer writes" never fires, and every frame
+  for it piles up in the router's memory.
+- **Not a plain timeout:** a node busy with a long request may stop reading for a while on
+  purpose (backpressure through its SDK's queue). A write deadline would cut a healthy, busy node.
+- **Fix, later (the router, a design of its own):** a bounded queue per link with a stated
+  policy when it is full (answer the sender, drop, or disconnect), measured against the nodes'
+  real load.
+
+### A-221 [General/router] 🔵 low (found 2026-11-10 by A-203's builder; read in the code) — Cognition records a turn the agent never received when its delivery fails
+
+- **Why:** `deliver_locally` appends the agent's cognition copy before it sends the message
+  (`src/router/mod.rs` ~6994 on `coa/a-203`). When the send fails (the node's link is gone), the
+  turn is in cognition and never reached the agent. Since A-203's fix the sender is answered
+  `NODE_NOT_FOUND`, so the sender knows; cognition does not.
+- **Why it is ordered so:** a comment ties the copy's order to the package the agent reads.
+- **Fix, later (with the cognition track):** the copy follows a successful send, or cognition
+  learns of the failure.
+
+### A-220 [General/SY.timer] 🔵 low (found 2026-11-10 by A-206's builder; read in the code) — A recurring timer whose next fire cannot be computed stays pending for good and holds its client_ref; and a junk spec can get the wrong error code
+
+- **Why:** at a start, `replayPending` (`go/sy-timer/scheduler.go:134-143`) logs and skips a
+  recurring timer whose next fire fails, and leaves it `pending` with its old `fire_at`. Scheduling
+  again with the same `client_ref` and a fixed spec returns that dead timer with
+  `already_existed: true` (`main.go:627-632`), and the new spec is ignored; the timer also counts
+  toward the pending caps. The owner has to cancel it first.
+- **Also:** `timerErrorCode` (`main.go:1274`) matches error codes by substring, so a junk spec
+  that repeats "invalid timezone" in its fields comes back as `TIMER_INVALID_TIMEZONE`.
+- **Since A-206:** a stored spec with a `TZ=`/`CRON_TZ=` prefix takes this path. None is expected
+  on 8.x: the SDKs never sent one, and nothing in the repo writes one.
+- **Fix, later (SY.timer):** a recurring timer the replay cannot schedule is closed with its
+  reason, so its `client_ref` is free; error codes by type, not by text.
+
+### A-219 [General/egress] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; checked on 8.x) — A worker that joined before the egress was declared never goes out through it
+
+- **Seen on 8.x:** the motherbee declares the egress (`gateway_ip` 10.10.10.40, egress1), and
+  worker1 has no `egress` section: its default route is 10.10.10.1. Its agents' internet traffic
+  (AI.pruebas's calls to the provider) bypasses the egress, its IPv6 stays on, no probe runs, and
+  nothing reports it.
+- **Why:** the join writes a worker's `egress` section from the motherbee's
+  (`render_worker_egress_yaml`, `src/bin/sy_orchestrator.rs:8114`), and nothing writes a
+  worker's hive.yaml after its join. The worker applies it at its boot (the default route, IPv6
+  off, a probe) and its watchdog keeps the route.
+- **The operator's call:** *"si workers tienen que salir a internet, si b)"*: workers go out through
+  the egress, by an explicit action per hive.
+- **Fix (SY.orchestrator, SY.admin, Archi; a day or two):** an action per worker, from Archi with
+  the operator's CONFIRM and through SY.admin, that writes the worker's `egress` section from the
+  motherbee's and applies it, with guards: the gateway on a directly connected subnet, the mesh
+  uplink and the operator's access kept off the default route, a probe after the switch, and the
+  previous route back if the uplink drops. AI.pruebas then depends on egress1. Its shape is
+  written down before it is built.
+
+### A-218 [General/identity] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — Dead identity surface (TNT_APPROVE, the vocabulary) and ECHO/TIME_SYNC
+
+- **Why:** nothing sends `TNT_APPROVE` (SY.identity handles it: `src/bin/sy_identity.rs:154`,
+  `:3108`, `:4083`; the SDK exports it); `crates/fluxbee_sdk/src/policy.rs:126-139` classifies four
+  actions SY.admin does not have (`approve_tenant` and three of the vocabulary); nothing writes the
+  vocabulary table (`sy_identity.rs:7850`), and its region of the identity shared memory (about
+  1 MB) is always empty; nothing emits or answers ECHO, ECHO_REPLY or TIME_SYNC
+  (`crates/fluxbee_sdk/src/protocol.rs`, the Go SDK's constants; `examples/node_test.rs` only).
+- **The operator's call:** *"si borra la basura, no hay back compatibilidad"*.
+- **Fix (SY.identity and the SDKs: shared code, a release alone):** delete the code, the dead
+  action names and ECHO/TIME_SYNC with the example. The empty table and the shared memory's
+  region are open: removing the region means a new `IDENTITY_VERSION`, with the router, every SDK
+  and every published runtime moving together.
+
+### A-217 [WF] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — wf-generic exits with `log.Fatalf` when its database fails, and restarts every 5 s without ever reporting why
+
+- **Why:** any error from `node.Run` ends in `log.Fatalf` (`go/nodes/wf/wf-generic/main.go:54-68`):
+  a bad `db_path`, a corrupt database, a full disk or a failed recovery. The unit restarts it
+  every 5 s, and the reason is only in its journal. The same node already runs DEGRADED with a
+  reason while SY.timer has not answered.
+- **The operator's call:** yes.
+- **Fix (wf-generic, a new wf.engine runtime):** stay up DEGRADED, or FAILED_CONFIG when the cause
+  is the `db_path`; refuse events with an error; try the database again on a tick.
+
+### A-216 [General/frontdesk] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — The frontdesk fails a registration for good on a transient error
+
+- **Why:** the prompt's no-loop rule makes any `ilk_register` error final (`completed_error`,
+  `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:96-118`), the tool marks UNREACHABLE,
+  TIMEOUT, NOT_PRIMARY and the DB errors `retryable` but retries nothing, and the state is kept
+  per person with no expiry. A confirmation during a deploy fails for good, on every thread.
+- **The operator's calls:** retry (G8, yes); the spec's counters (G6) leave the spec: the journal
+  logs each outcome, and counts wait for the system's log.
+- **Fix (SY.frontdesk.gov):** retry a transient error for a few seconds; if it still fails, leave
+  the case awaiting confirmation so the person's next "yes" retries; final only when not
+  retryable. A case already stuck on a transient code is reopened.
+
+### A-215 [WF] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — A WF forward to an IO node other than the person's keeps the original `dst_ilk` and `ich`
+
+- **Why:** `execForward` copies the message's `src_ilk`, `dst_ilk` and `ich`, and rewrites only a
+  forward to the person's own IO node (`go/nodes/wf/wf-generic/node/actions.go:235-279`). An
+  agent's answer to a person forwarded to a team's channel reaches the agent's memory and
+  cognition's episodes as said "to the person, via IO.team". Delivery does not change.
+- **The operator's call:** yes.
+- **Fix (wf-generic):** a forward to an IO node other than the person's clears `dst_ilk` and `ich`,
+  as `send_message` does; cognition's fallback (the last person who wrote through that node)
+  covers the team's case.
+
+### A-214 [General/language] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — Fixed texts the product sends are in Spanish, and the frontdesk answers everyone in Spanish
+
+- **Why:** about 15 fixed texts: the frontdesk's `human_message` values, which io.api and io.cloud
+  pass outside; ai.generic's "Aca esta el archivo solicitado" (`ai_node_runner.rs:3071-3084`);
+  SY.architect's help notes. The frontdesk's prompt ends "Keep replies short in Spanish." A-184
+  chose English for the provider's failure text, which the frontdesk already uses (since
+  0.1.114).
+- **The operator's call:** *"solo ingles todo, en el repo, docs, y mensajes del sistema"*.
+- **Fix (SY.frontdesk.gov, ai.generic, SY.architect):** every fixed text in English; the
+  frontdesk's model answers in the person's language. The Spanish test names and strings the
+  2026-10-17 pass left go too.
+
+### A-213 [General/orchestrator] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; checked on 8.x) — The `ORCH_DEFAULT_TENANT_ID` fallback puts a node with no tenant in whatever tenant it names
+
+- **Why:** `resolve_tenant_id_for_node` falls back to the variable after the request's tenant
+  (`src/bin/sy_orchestrator.rs:21543-21565`), for the spawn, the gates and the identity
+  registration. Nothing sets it, and no hive of 8.x has it.
+- **The operator's call:** yes, drop it: the tenant is the caller's datum.
+- **Fix (SY.orchestrator):** the fallback, its error text and its docs go.
+
+### A-212 [General/admin] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — The factory reset, and a tenant's purge, leave published pages public; no action lists them
+
+- **Why:** the reset never touches publications (`packaging/fluxbee-factory-reset:39`), and a
+  page stays at its link until it expires: 24 h by default, 30 days at most. A tenant's purge
+  leaves them too. No action lists the pages, so Archi cannot either.
+- **The operator's call:** yes, option (a).
+- **Fix (SY.admin, the reset script, Archi's handbook):** a read-only SY.admin action that lists
+  the live pages; the reset unpublishes each one through SY.admin.
+
+### A-211 [General/packaging] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; checked on 8.x) — wf-generic ships as a core binary that nothing runs
+
+- **Why:** `packaging/build-deb.sh:49-50` puts wf-generic in `GO_BINS`, so the .deb installs
+  `/usr/bin/wf-generic` on the motherbee and every hive's core manifest lists it. WF nodes run the
+  `wf.engine` runtime's copy; on 8.x no WF unit runs `/usr/bin/wf-generic`.
+- **The operator's call:** yes.
+- **Fix (packaging):** out of `GO_BINS`; the runtime's seed stays.
+
+### A-210 [General/cleanup] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — One-time conversions for versions every hive has passed still run at each start
+
+- **Why:** SY.storage drops ≤0.1.82 turn columns and pre-0.1.103 cognition tables
+  (`src/bin/sy_storage.rs`), ai.generic converts `behavior.capabilities` (0.1.86), SY.edge re-keys
+  pre-0.1.84 publications, SY.cognition removes pre-0.1.103 folders, SY.admin's ACME reads 0.1.82's
+  `name`; SY.identity fills channel scopes from replicas older than 0.1.64.
+- **The operator's call:** *"OK, estamos en version solo alpha dev"*: no backward compatibility.
+- **Fix (each binary, as it is next touched):** delete them. What keeps a rollback working stays:
+  the old hive.yaml keys, the command log without `seq`, the installation update's handling of an
+  orchestrator before 0.1.121. SY.edge's re-keying after 2026-11-22, when the last pre-0.1.84 page
+  has expired.
+
+### A-209 [General/router] 🔵 low (found 2026-11-09 by A-203's builder; read in the code) — A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender, under the copy's trace_id
+
+- **Why:** a tap's copy to another hive is forwarded with a fresh trace_id; when the forward
+  fails, the router answers `WAN_UNAVAILABLE` to the original message's sender
+  (`src/router/mod.rs`, the tap forward, ~1705 on `coa/a-203`). The sender never sent that copy,
+  and no request of its waits on that trace_id.
+- **Impact:** a stray transport error at the sender, which its SDK cannot match to a request. It
+  happened already with no link at all; since A-203's fix it also happens when the link's writer
+  is gone.
+- **Fix, later:** a tap copy's failure is logged, and never answered to the sender.
+
+### A-208 [General/router] 🔵 low (found 2026-11-09 by A-203's builder; read in the code) — With several routers on one hive (not supported), an IRP reply goes to the wrong link, and a sibling can register twice
+
+- **Why:**
+  - `handle_peer_message` reuses the name `peer_uuid` for the destination router of
+    `ResolvedRoute::ForwardRouter(peer_uuid)` (`src/router/mod.rs` ~4516, ~4656 on `coa/a-203`), so
+    TTL_EXCEEDED and PEER_UNAVAILABLE go to the destination sibling's link, or nowhere, never back
+    to the link the frame came from.
+  - `handle_peer_incoming` checks for an existing entry and inserts it under two separate locks
+    (~4100-4110), so two links from one sibling at once can both register. A-203's cleanup keeps
+    that harmless.
+- **Impact:** none on 8.x: every hive runs one router. It matters only for the several-routers
+  mode, which is not supported.
+- **Fix, later:** with that mode, if it is ever supported.
+
+### A-207 [General/router] 🟡 LATENT (found 2026-11-09 by A-203's builder; read in the code) — A WAN peer that vanishes without closing its connection keeps its session, and frames to it are lost without UNREACHABLE for up to about 15 minutes
+
+- **Why:** a WAN session has no read deadline and no TCP keepalive. A peer that disappears
+  without closing (a power loss, a network split) keeps its session and its peer entry until a
+  write to it times out, about 15 minutes with Linux's defaults. Until then every frame to that
+  hive is lost silently, as in A-203. `lsa_stale_loop` marks the hive stale after the dead
+  interval (40 s, `src/router/mod.rs:2718`), but the session stays.
+- **What makes a deadline safe:** every router sends its LSA to each WAN peer every hello
+  interval (10 s, `lsa_broadcast_loop`, `:2706`), so a healthy session never goes 40 s without a
+  frame.
+- **Fix (the router, with A-203, in 0.1.124):** a WAN session with no frame for the dead interval
+  ends, and its cleanup runs: senders get `WAN_UNAVAILABLE` and the peer reconnects when it is
+  back.
+- **A limit to keep in mind:** an LSA over the frame would be skipped by the writer like any frame,
+  and a quiet link would then be cut every 40 s. Within the LSA region's 1,024 nodes (about 90 bytes
+  each) an LSA stays under the frame.
+
+### A-206 [General/SY.timer] 🟡 (found 2026-11-09 by the sweep's re-check; checked in the code and the library) — A recurring timer's cron spec that starts with `TZ=` and has no space crashes SY.timer, and a `CRON_TZ=` prefix silently overrides `cron_tz`
+
+- **Why:** SY.timer parses `cron_spec` with robfig/cron v3.0.1, at the request
+  (`go/sy-timer/main.go:1208`, `scheduleRecurringFireAt`) and at each re-schedule
+  (`scheduler.go:560`, `nextRecurringFireAt`). The library always reads a `TZ=` or `CRON_TZ=`
+  prefix (its `parser.go:95-103`) and slices the zone up to the first space: with no space the
+  index is -1, and the slice panics.
+- **The crash:** SY.timer's loop handles each message inline, with no recover (`main.go:233-246`).
+  The panic ends the process, and systemd starts it again about 5 s later. The timers persist.
+- **The override:** with a space, `CRON_TZ=America/New_York 0 9 * * *` fires on New York's time,
+  while SY.timer records and answers the request's `cron_tz` (UTC by default).
+- **Who reaches it:** any node scheduling a recurring timer for itself. Both SDKs refuse a spec
+  that is not 5 fields (`crates/fluxbee_sdk/src/timer.rs:1584`,
+  `go/fluxbee-go-sdk/timer_schedule.go:416`), but they split on any whitespace and the library
+  looks for a space only: `TZ=UTC` and four fields separated by tabs passes both checks and
+  crashes it. A raw message, or the operator's `send_node_message` (it refuses only
+  `COGNITION_CLEAR`), reaches it too. No product node schedules a recurring timer today. A node
+  that sends it in a loop keeps SY.timer restarting, and every timer waits.
+- **Fix (SY.timer, small):** refuse a spec that starts with `TZ=`, `CRON_TZ=` or `@` with
+  `TIMER_INVALID_CRON` before parsing. The zone goes in `cron_tz`, and v1 has no descriptors
+  (docs/sy-timer.md:948-951). For 0.1.124.
 
 ### A-205 [General/admin] 🟡 SEEN on 8.x, low (found 2026-11-09 by 0.1.123's gate; checked in the code) — A background read taken before a hive applied a config change can mark it pending after it did
 
