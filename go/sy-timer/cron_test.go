@@ -31,10 +31,25 @@ func TestCronSpecRefusesAZoneOrADescriptor(t *testing.T) {
 				}()
 				_, err = parseCronSpec(tc.spec)
 			}()
-			if err == nil || !strings.HasPrefix(err.Error(), "invalid cron: ") || !strings.Contains(err.Error(), tc.says) {
+			if err == nil || !strings.HasPrefix(err.Error(), "invalid cron: ") || !strings.Contains(err.Error(), tc.says) || timerErrorCode(err) != "TIMER_INVALID_CRON" {
 				t.Fatalf("%q: want an invalid cron that says %q, got %v", tc.spec, tc.says, err)
 			}
 		})
+	}
+}
+
+// A junk cron_spec is an invalid cron whatever its fields say (FINDINGS A-220): the parser quotes a
+// spec with the wrong number of fields, and one that repeated "invalid timezone" came back
+// TIMER_INVALID_TIMEZONE while the code was read from the text.
+func TestAJunkCronSpecIsAnInvalidCronWhateverItQuotes(t *testing.T) {
+	for _, spec := range []string{"invalid timezone 0 9 * * *", "minimum timer duration 0 9 * *", "maximum timer delay 0 9 * *"} {
+		_, err := parseCronSpec(spec)
+		if err == nil || !strings.Contains(err.Error(), spec) {
+			t.Fatalf("%q: want an error that quotes it, got %v", spec, err)
+		}
+		if code := timerErrorCode(err); code != "TIMER_INVALID_CRON" {
+			t.Fatalf("%q: code %s, want TIMER_INVALID_CRON", spec, code)
+		}
 	}
 }
 

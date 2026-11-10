@@ -68,6 +68,99 @@ func TestScheduleRecurringRefusesAZoneOrADescriptorInCronSpec(t *testing.T) {
 	}
 }
 
+// A refused schedule or reschedule answers the code its error carries, not one its text names
+// (FINDINGS A-220): the text quotes the spec or the zone the requester sent. Each case
+// timerErrorCode covers, through the function that refuses it.
+func TestScheduleErrorCodesAreCarriedByType(t *testing.T) {
+	day := int64(24 * time.Hour / time.Millisecond)
+	ms := func(value int64) *int64 { return &value }
+	oneShot := func(at, in *int64) error {
+		_, err := scheduleFireAt(timerScheduleRequest{FireAtUTCMS: at, FireInMS: in})
+		return err
+	}
+	reschedule := func(at, in *int64) error {
+		_, err := rescheduleFireAt(timerRescheduleRequest{NewFireAtUTCMS: at, NewFireInMS: in})
+		return err
+	}
+	recurring := func(spec, tz string) error {
+		_, _, err := scheduleRecurringFireAt(timerScheduleRecurringRequest{CronSpec: spec, CronTZ: tz})
+		return err
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{name: "neither fire_at nor fire_in", err: oneShot(nil, nil), code: "TIMER_INVALID_PAYLOAD"},
+		{name: "both new_fire_at and new_fire_in", err: reschedule(ms(1), ms(1)), code: "TIMER_INVALID_PAYLOAD"},
+		{name: "30 s ahead", err: oneShot(nil, ms(30_000)), code: "TIMER_BELOW_MINIMUM"},
+		{name: "rescheduled 30 s ahead", err: reschedule(nil, ms(30_000)), code: "TIMER_BELOW_MINIMUM"},
+		{name: "367 days ahead", err: oneShot(nil, ms(367*day)), code: "TIMER_ABOVE_MAXIMUM"},
+		{name: "no cron_spec", err: recurring("  ", ""), code: "TIMER_INVALID_PAYLOAD"},
+		{name: "a zone that is none", err: recurring("0 9 * * *", "Mars/Olympus"), code: "TIMER_INVALID_TIMEZONE"},
+		{name: "a zone that quotes the minimum", err: recurring("0 9 * * *", "minimum timer duration"), code: "TIMER_INVALID_TIMEZONE"},
+		{name: "a zone that quotes an invalid cron", err: recurring("0 9 * * *", "invalid cron"), code: "TIMER_INVALID_TIMEZONE"},
+		{name: "a spec that is no cron", err: recurring("every monday", ""), code: "TIMER_INVALID_CRON"},
+		{name: "a spec that quotes an invalid timezone", err: recurring("invalid timezone 0 9 * * *", ""), code: "TIMER_INVALID_CRON"},
+		{name: "a spec that quotes the minimum", err: recurring("minimum timer duration 0 9 * *", ""), code: "TIMER_INVALID_CRON"},
+		{name: "a spec that quotes the maximum", err: recurring("maximum timer delay 0 9 * *", ""), code: "TIMER_INVALID_CRON"},
+		{name: "a spec with no future fire", err: recurring("0 0 30 2 *", ""), code: "TIMER_INVALID_CRON"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := timerErrorCode(tc.err); got != tc.code {
+				t.Fatalf("%v: code %s, want %s", tc.err, got, tc.code)
+			}
+		})
+	}
+}
+
+// TIMER_SCHEDULE_RECURRING answers a junk cron_spec with TIMER_INVALID_CRON whatever its fields say
+// (FINDINGS A-220): one that repeated "invalid timezone" came back TIMER_INVALID_TIMEZONE.
+func TestScheduleRecurringAnswersAJunkSpecWithInvalidCron(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	msg := mustBuildSystemMessage(t, map[string]any{"cron_spec": "invalid timezone 0 9 * * *"}, "TIMER_SCHEDULE_RECURRING")
+	if err := service.handleMessage(msg); err != nil {
+		t.Fatalf("schedule recurring: %v", err)
+	}
+	if response := mustReadTimerResponse(t, tx); response.OK || response.Error == nil || response.Error.Code != "TIMER_INVALID_CRON" {
+		t.Fatalf("want TIMER_INVALID_CRON, got %+v (error %+v)", response, response.Error)
+	}
+}
+
+// A cancel or a reschedule of another owner's timer is TIMER_NOT_OWNER, a code its error carries
+// (FINDINGS A-220), not one read from its text.
+func TestCancelOrRescheduleOfAnotherOwnersTimerIsNotOwner(t *testing.T) {
+	for _, tc := range []struct {
+		verb    string
+		request map[string]any
+	}{
+		{verb: "TIMER_CANCEL", request: map[string]any{"timer_uuid": "timer-1"}},
+		{verb: "TIMER_RESCHEDULE", request: map[string]any{"timer_uuid": "timer-1", "new_fire_in_ms": time.Hour.Milliseconds()}},
+	} {
+		t.Run(tc.verb, func(t *testing.T) {
+			service, tx := newTestService(t)
+			insertOwnedTimer(t, service.db, timerRow{
+				UUID:         "timer-1",
+				OwnerL2Name:  "AI.other@motherbee",
+				TargetL2Name: "AI.other@motherbee",
+				Kind:         "oneshot",
+				FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+				MissedPolicy: "fire",
+				Payload:      `{}`,
+				Status:       "pending",
+				CreatedAtUTC: time.Now().UTC().UnixMilli(),
+			})
+			if err := service.handleMessage(mustBuildSystemMessageAs(t, tc.request, tc.verb, "WF.demo@motherbee")); err != nil {
+				t.Fatalf("%s: %v", tc.verb, err)
+			}
+			if response := mustReadTimerResponse(t, tx); response.OK || response.Error == nil || response.Error.Code != "TIMER_NOT_OWNER" {
+				t.Fatalf("want TIMER_NOT_OWNER, got %+v (error %+v)", response, response.Error)
+			}
+		})
+	}
+}
+
 func TestValidateMissedPolicyRawRejectsMissingWindow(t *testing.T) {
 	err := validateMissedPolicyRaw("fire_if_within", nil)
 	if err == nil {

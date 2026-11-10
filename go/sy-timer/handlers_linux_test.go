@@ -296,7 +296,8 @@ func TestRespondTimerCancelMarksTimerCanceled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get canceled timer: %v", err)
 	}
-	if row.Status != "canceled" {
+	// canceled_reason is SY.timer's: its owner's cancel leaves none.
+	if row.Status != "canceled" || row.CanceledReason.Valid {
 		t.Fatalf("expected canceled status, got %+v", row)
 	}
 }

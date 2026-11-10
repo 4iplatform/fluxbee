@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -269,6 +270,100 @@ INSERT INTO timers (
 	}
 	if !isPendingClientRefUniqueViolation(err) {
 		t.Fatalf("expected pending client_ref unique violation, got %v", err)
+	}
+}
+
+// Schema version 3 (FINDINGS A-220) adds canceled_reason to a version 2 table and keeps its rows. A
+// table that has it under user_version 2, which a SY.timer before version 3 writes back over it, is
+// left as it is.
+func TestEnsureTimerSchemaAddsCanceledReasonToAVersion2Table(t *testing.T) {
+	db, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v2.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	createLegacyV1TimerSchema(t, db)
+	for _, stmt := range []string{
+		`CREATE UNIQUE INDEX idx_timers_owner_clientref_pending ON timers(owner_l2_name, client_ref) WHERE client_ref IS NOT NULL AND status='pending';`,
+		`PRAGMA user_version=2;`,
+		`INSERT INTO timers (
+	uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+	missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+) VALUES ('timer-1', 'WF.demo@motherbee', 'WF.demo@motherbee', 'weekly-report', 'recurring', 1775577600000, '0 9 * * MON', 'UTC', 'fire', NULL, '{}', NULL, 'pending', 1775574000000, NULL, 0);`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("version 2 table: %v", err)
+		}
+	}
+
+	for pass := 1; pass <= 2; pass++ {
+		if err := ensureTimerSchema(db); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		var version int
+		if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersion {
+			t.Fatalf("pass %d: user_version %d (%v), want %d", pass, version, err, timerSchemaVersion)
+		}
+		row, err := getTimer(ctx, db, "timer-1")
+		if err != nil || row.Status != "pending" || row.ClientRef.String != "weekly-report" || row.CanceledReason.Valid {
+			t.Fatalf("pass %d: the version 2 row: %+v (%v)", pass, row, err)
+		}
+		// What a SY.timer before version 3 writes back.
+		if _, err := db.Exec(`PRAGMA user_version=2;`); err != nil {
+			t.Fatalf("user_version 2: %v", err)
+		}
+	}
+
+	row, err := getTimer(ctx, db, "timer-1")
+	if err != nil {
+		t.Fatalf("get timer: %v", err)
+	}
+	row.Status = "canceled"
+	row.CanceledReason = sql.NullString{String: "its next fire cannot be computed: invalid cron", Valid: true}
+	if err := updateTimer(ctx, db, *row); err != nil {
+		t.Fatalf("update timer: %v", err)
+	}
+	if saved, err := getTimer(ctx, db, "timer-1"); err != nil || saved.Status != "canceled" || saved.CanceledReason != row.CanceledReason {
+		t.Fatalf("the canceled timer read back: %+v (%v)", saved, err)
+	}
+}
+
+// TIMER_GET and TIMER_LIST show a timer with the SDK's fields, and canceled_reason when SY.timer
+// canceled it itself, left out otherwise (FINDINGS A-220).
+func TestTimerInfoShowsACanceledReasonOnlyWhenThereIsOne(t *testing.T) {
+	row := timerRow{
+		UUID:         "timer-1",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		Kind:         "recurring",
+		FireAtUTC:    1775577600000,
+		CronSpec:     sql.NullString{String: "0 9 * * MON", Valid: true},
+		MissedPolicy: "fire",
+		Payload:      `{"report":"weekly"}`,
+		Status:       "canceled",
+		CreatedAtUTC: 1775574000000,
+	}
+	for _, reason := range []string{"", "its next fire cannot be computed: invalid cron"} {
+		row.CanceledReason = sql.NullString{String: reason, Valid: reason != ""}
+		info, err := timerRowToInfo(row)
+		if err != nil {
+			t.Fatalf("timer row to info: %v", err)
+		}
+		encoded, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if fields["uuid"] != "timer-1" || fields["status"] != "canceled" || fields["cron_spec"] != "0 9 * * MON" || fields["payload"] == nil {
+			t.Fatalf("the SDK's fields: %s", encoded)
+		}
+		if got, has := fields["canceled_reason"]; has != (reason != "") || (has && got != reason) {
+			t.Fatalf("reason %q: %s", reason, encoded)
+		}
 	}
 }
 

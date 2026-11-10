@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	timerSchemaVersion      = 2
+	timerSchemaVersion      = 3
 	defaultHistoryRetention = 7 * 24 * time.Hour
 	defaultListLimit        = 100
 	maxListLimit            = 1000
@@ -37,6 +37,31 @@ type timerRow struct {
 	CreatedAtUTC   int64
 	LastFiredAtUTC sql.NullInt64
 	FireCount      int64
+	// CanceledReason says why SY.timer canceled the timer itself (FINDINGS A-220): a one-shot its
+	// missed policy dropped at a start, or a recurring timer whose next fire cannot be computed. Its
+	// owner's TIMER_CANCEL leaves none.
+	CanceledReason sql.NullString
+}
+
+// timerColumns are a timer row's columns, in the order scanTimerRow reads them.
+const timerColumns = `uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count,
+       canceled_reason`
+
+// rowScanner is a *sql.Row or a *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanTimerRow reads a row selected with timerColumns.
+func scanTimerRow(scanner rowScanner) (timerRow, error) {
+	var row timerRow
+	err := scanner.Scan(
+		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
+		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
+		&row.CanceledReason,
+	)
+	return row, err
 }
 
 func openTimerDB(path string) (*sql.DB, error) {
@@ -83,7 +108,8 @@ CREATE TABLE IF NOT EXISTS timers (
                         CHECK(status IN ('pending','fired','canceled')),
     created_at_utc      INTEGER NOT NULL,
     last_fired_at_utc   INTEGER,
-    fire_count          INTEGER NOT NULL DEFAULT 0
+    fire_count          INTEGER NOT NULL DEFAULT 0,
+    canceled_reason     TEXT
 );`); err != nil {
 		return err
 	}
@@ -104,6 +130,17 @@ ON timers(owner_l2_name, client_ref)
 WHERE client_ref IS NOT NULL AND status='pending';
 `); err != nil {
 			return fmt.Errorf("create unique pending client_ref index: %w", err)
+		}
+	}
+	// Version 3 (FINDINGS A-220): canceled_reason. Added when the table lacks it, whatever
+	// user_version says: a SY.timer before it writes user_version 2 over a table that has it.
+	var hasCanceledReason int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('timers') WHERE name='canceled_reason';`).Scan(&hasCanceledReason); err != nil {
+		return err
+	}
+	if hasCanceledReason == 0 {
+		if _, err := db.Exec(`ALTER TABLE timers ADD COLUMN canceled_reason TEXT;`); err != nil {
+			return fmt.Errorf("add canceled_reason: %w", err)
 		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d;", timerSchemaVersion)); err != nil {
@@ -133,13 +170,11 @@ func insertTimer(ctx context.Context, db *sql.DB, row timerRow) error {
 		return err
 	}
 	_, err := db.ExecContext(ctx, `
-INSERT INTO timers (
-    uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-    missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO timers (`+timerColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, row.UUID, row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
 		nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
-		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC), row.FireCount)
+		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC), row.FireCount,
+		nullableString(row.CanceledReason))
 	return err
 }
 
@@ -150,25 +185,21 @@ func updateTimer(ctx context.Context, db *sql.DB, row timerRow) error {
 	_, err := db.ExecContext(ctx, `
 UPDATE timers
 SET owner_l2_name=?, target_l2_name=?, client_ref=?, kind=?, fire_at_utc=?, cron_spec=?, cron_tz=?,
-    missed_policy=?, missed_within_ms=?, payload=?, metadata=?, status=?, created_at_utc=?, last_fired_at_utc=?, fire_count=?
+    missed_policy=?, missed_within_ms=?, payload=?, metadata=?, status=?, created_at_utc=?, last_fired_at_utc=?, fire_count=?,
+    canceled_reason=?
 WHERE uuid=?
 `, row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
 		nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
 		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC),
-		row.FireCount, row.UUID)
+		row.FireCount, nullableString(row.CanceledReason), row.UUID)
 	return err
 }
 
 func getTimer(ctx context.Context, db *sql.DB, timerUUID string) (*timerRow, error) {
-	var row timerRow
-	err := db.QueryRowContext(ctx, `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+	row, err := scanTimerRow(db.QueryRowContext(ctx, `
+SELECT `+timerColumns+`
 FROM timers WHERE uuid=?
-`, timerUUID).Scan(
-		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
-		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
-	)
+`, timerUUID))
 	if err != nil {
 		return nil, err
 	}
@@ -176,18 +207,13 @@ FROM timers WHERE uuid=?
 }
 
 func findPendingTimerByClientRef(ctx context.Context, db *sql.DB, ownerL2Name, clientRef string) (*timerRow, error) {
-	var row timerRow
-	err := db.QueryRowContext(ctx, `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+	row, err := scanTimerRow(db.QueryRowContext(ctx, `
+SELECT `+timerColumns+`
 FROM timers
 WHERE owner_l2_name=? AND client_ref=? AND status='pending'
 ORDER BY created_at_utc DESC
 LIMIT 1
-`, ownerL2Name, clientRef).Scan(
-		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
-		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
-	)
+`, ownerL2Name, clientRef))
 	if err != nil {
 		return nil, err
 	}
@@ -225,8 +251,7 @@ func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter strin
 		args = append(args, after.fireAtUTC, after.fireAtUTC, after.uuid)
 	}
 	query := `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+SELECT ` + timerColumns + `
 FROM timers`
 	if len(conditions) > 0 {
 		query += "\nWHERE " + strings.Join(conditions, " AND ")
@@ -243,8 +268,7 @@ FROM timers`
 
 func listPendingTimers(ctx context.Context, db *sql.DB) ([]timerRow, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+SELECT `+timerColumns+`
 FROM timers
 WHERE status='pending'
 ORDER BY fire_at_utc ASC
@@ -292,7 +316,17 @@ WHERE status IN ('fired','canceled')
 	return result.RowsAffected()
 }
 
-func timerRowToInfo(row timerRow) (fluxbeesdk.TimerInfo, error) {
+// timerInfo is a timer as TIMER_GET and TIMER_LIST answer it: the SDK's TimerInfo, and
+// canceled_reason when SY.timer canceled it itself (FINDINGS A-220). An SDK client that decodes a
+// TimerInfo does not keep canceled_reason; a raw read (SY.admin's routes, Archi) shows it. SY.timer
+// only encodes it: decoding one goes through TimerInfo's UnmarshalJSON, promoted, which drops
+// canceled_reason.
+type timerInfo struct {
+	fluxbeesdk.TimerInfo
+	CanceledReason *string `json:"canceled_reason,omitempty"`
+}
+
+func timerRowToInfo(row timerRow) (timerInfo, error) {
 	info := fluxbeesdk.TimerInfo{
 		UUID:           row.UUID,
 		OwnerL2Name:    row.OwnerL2Name,
@@ -326,27 +360,29 @@ func timerRowToInfo(row timerRow) (fluxbeesdk.TimerInfo, error) {
 	}
 	payload, err := jsonRaw(row.Payload)
 	if err != nil {
-		return fluxbeesdk.TimerInfo{}, err
+		return timerInfo{}, err
 	}
 	info.Payload = payload
 	if row.Metadata.Valid {
 		metadata, err := jsonRaw(row.Metadata.String)
 		if err != nil {
-			return fluxbeesdk.TimerInfo{}, err
+			return timerInfo{}, err
 		}
 		info.Metadata = metadata
 	}
-	return info, nil
+	out := timerInfo{TimerInfo: info}
+	if row.CanceledReason.Valid {
+		value := row.CanceledReason.String
+		out.CanceledReason = &value
+	}
+	return out, nil
 }
 
 func collectTimerRows(rows *sql.Rows) ([]timerRow, error) {
 	var out []timerRow
 	for rows.Next() {
-		var row timerRow
-		if err := rows.Scan(
-			&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
-			&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
-		); err != nil {
+		row, err := scanTimerRow(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, row)

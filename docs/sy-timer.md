@@ -1,9 +1,11 @@
 # SY.timer — System Node
 
-**Status:** v1.3 implemented / aligned with current runtime
+**Status:** v1.4 implemented / aligned with current runtime
 **Date:** 2026-04-13; checked against the code on 2026-10-27; v1.2 on 2026-11-04, in 0.1.99: a fire saved
 before it goes and sent again while its target is down, caps, reads by the owner, a node's own
-target (FINDINGS A-115); v1.3 for the next release: `TIMER_LIST` in pages (FINDINGS A-151)
+target (FINDINGS A-115); v1.3 for the next release: `TIMER_LIST` in pages (FINDINGS A-151); v1.4 in
+0.1.127: a recurring timer SY.timer cannot schedule is canceled, and a timer SY.timer cancels says
+why in `canceled_reason`; a refusal's code goes with its error, not in its text (FINDINGS A-220)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -134,10 +136,12 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
    - For each recurring timer:
        * Compute its next instance from now() and insert it into the heap;
          the instances missed while the node was down never fire (§10)
+       * One whose next instance cannot be computed: canceled, with its canceled_reason (§11)
    - For each one-shot:
        * If fire_at_utc > now(): insert into the in-memory heap
        * Otherwise: apply missed_policy (fire | drop | fire_if_within);
-         one that fires is queued, due at once: it goes when the tick loop starts
+         one that fires is queued, due at once: it goes when the tick loop starts;
+         one dropped is canceled, with its canceled_reason
 
 2. Tick loop (sleeps at most one hour when the heap is empty; a new timer wakes it):
    loop {
@@ -156,6 +160,8 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
                    push back to heap; continue  // rescheduled later
                if timer.is_recurring:
                    compute next fire_at from cron_spec, from now
+                   if it cannot be computed:
+                       cancel it, with its canceled_reason (§11); send nothing; continue
                    update db, push back to heap
                else:
                    update db: status = 'fired'
@@ -208,7 +214,8 @@ CREATE TABLE timers (
 
     created_at_utc      INTEGER NOT NULL,  -- unix ms, from the OS clock; kept even if rescheduled
     last_fired_at_utc   INTEGER,           -- last fire (recurring)
-    fire_count          INTEGER NOT NULL DEFAULT 0
+    fire_count          INTEGER NOT NULL DEFAULT 0,
+    canceled_reason     TEXT               -- why SY.timer canceled it itself (§7.5); schema 3
 );
 
 CREATE INDEX idx_timers_owner ON timers(owner_l2_name);
@@ -222,6 +229,7 @@ WHERE client_ref IS NOT NULL AND status='pending';
 **Notes:**
 - `created_at_utc` is kept forever, even after reschedules. It serves traceability and `fire_if_within` decisions based on the age of the original timer.
 - `cron_tz` is persisted explicitly so that the next recurring fire can be recomputed without losing the source timezone.
+- `canceled_reason` is schema version 3 (`PRAGMA user_version`, since 0.1.127, FINDINGS A-220). `ensureTimerSchema` adds it to a table that lacks it, whatever `user_version` says: a `SY.timer` before it writes `user_version` 2 back over a table that has it, and reads and writes its rows by naming the other columns, so going back to it and forward again is safe.
 - History is deleted only when `SY.timer` starts: the `fired` and `canceled` timers whose last fire (their creation, for one that never fired) is older than 7 days (`gcHistoricalTimers`, `defaultHistoryRetention`). There is no periodic GC, and the 7 days are a constant: a node that runs for weeks keeps all its history until its next start.
 
 ---
@@ -499,7 +507,9 @@ The requester's own active timer can also be queried by `client_ref`:
 }
 ```
 
-A field without a value (`client_ref`, `cron_spec`, `cron_tz`, `missed_within_ms`, `last_fired_at_utc_ms`, `metadata`) is left out.
+A field without a value (`client_ref`, `cron_spec`, `cron_tz`, `missed_within_ms`, `last_fired_at_utc_ms`, `metadata`, `canceled_reason`) is left out.
+
+`canceled_reason` (since v1.4, FINDINGS A-220) says why `SY.timer` canceled the timer itself: a one-shot its missed policy dropped at a start (§10), or a recurring timer whose next fire cannot be computed (§11), as in `"canceled_reason": "its next fire cannot be computed: invalid cron: cron_spec starts with CRON_TZ=: ..."`. A timer its owner canceled has none. Such a timer is no longer active: by `client_ref` it is `TIMER_NOT_FOUND`, and its owner reads it by `timer_uuid`, or lists its `canceled` timers (§7.6). Like any canceled timer, it is deleted at a start once its last fire, or its creation, is more than 7 days old (§5.2). The SDKs' `TimerInfo` does not carry the field (the Rust one keeps it in `extra`); a raw read, `SY.admin`'s routes and Archi show it.
 
 Read by `timer_uuid`: by the owner, and by `SY.admin@motherbee` for any timer (§12.1). Another node gets `TIMER_NOT_OWNER`.
 
@@ -540,7 +550,7 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 }
 ```
 
-`owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, then by uuid, subject to `status_filter` and `limit` (§12.1).
+`owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, then by uuid, subject to `status_filter` and `limit` (§12.1). Each timer is as `TIMER_GET` answers it, `canceled_reason` included (§7.5).
 
 **Pages** (since v1.3, FINDINGS A-151). A response fits one 128 KiB frame. A list whose timers take more than 96 KiB, encoded (`maxTimerListPageBytes`), is answered a page at a time:
 - the page lists the timers that fit, and `next_cursor` says where the next one starts (`"<fire_at_utc_ms>:<uuid>"` of the page's last timer);
@@ -781,7 +791,7 @@ Returns a complete descriptor of the node's capabilities, meant for both human a
     "verb": "TIMER_HELP",
     "node_family": "SY",
     "node_kind": "SY.timer",
-    "version": "1.3",
+    "version": "1.4",
     "description": "System node providing persistent timers and authoritative time/timezone services.",
     "operations": [
       {
@@ -811,16 +821,17 @@ When `SY.timer` starts after a downtime, it evaluates each pending one-shot agai
 | Policy | Overdue one-shot | Not yet due one-shot |
 |---|---|---|
 | `fire` | It is queued, due at once: it fires when the scheduler starts, in order of `fire_at`, and is sent again until its target takes it (§7.8). | It is rescheduled with the original `fire_at`. |
-| `drop` | It is canceled (`status = 'canceled'`), with a `timer_missed_policy_applied` event. | It is rescheduled normally. |
-| `fire_if_within` | If `now() - fire_at_utc <= missed_within_ms`, it fires. If not, it is canceled. | It is rescheduled normally. |
+| `drop` | It is canceled (`status = 'canceled'`), with a `canceled_reason` and a `timer_missed_policy_applied` event. | It is rescheduled normally. |
+| `fire_if_within` | If `now() - fire_at_utc <= missed_within_ms`, it fires. If not, it is canceled, with a `canceled_reason`. | It is rescheduled normally. |
 
-A one-shot whose policy is unknown, or `fire_if_within` without its window, is canceled.
+A one-shot whose policy is unknown, or `fire_if_within` without its window, is canceled. Each one canceled says why in its `canceled_reason` (§7.5), since v1.4: `missed: its fire time passed while SY.timer was down, and its missed_policy is drop`, `... more than its missed_within_ms (600000 ms) ago`, and so on.
 
 The same policy bounds how long a fire whose target is down is sent again (§7.8): `fire` up to an hour, `fire_if_within` within its window, `drop` not at all.
 
 For **recurring timers**, `missed_policy` is stored but never applied:
 - The **next instance** is computed from `now()` onward according to `cron_spec`.
 - Every instance that should have fired during the downtime, the one that was due when it went down included, **does not fire**, whatever the `missed_policy`. This avoids firing storms when coming back from long downtimes.
+- One whose next instance cannot be computed is canceled, with its `canceled_reason` (§11).
 
 ---
 
@@ -832,9 +843,11 @@ At node startup:
 2. Delete the history older than 7 days, once (`gcHistoricalTimers`): `DELETE FROM timers WHERE status IN ('fired','canceled') AND COALESCE(last_fired_at_utc, created_at_utc) < now - 7 days`. Nothing deletes history again until the next start.
 3. `now = time.Now().UTC()`; `SELECT * FROM timers WHERE status='pending' ORDER BY fire_at_utc ASC`.
 4. For each timer:
-   - Recurring: recompute `fire_at_utc` from `now` with `cron_spec` and `cron_tz`, update the DB, push to the heap (§10). One whose next fire cannot be computed, such as one kept before 0.1.124 whose `cron_spec` starts with a zone (§13), is skipped and stays `pending`, logged as `timer_replay_invalid_recurring` at every start.
+   - Recurring: recompute `fire_at_utc` from `now` with `cron_spec` and `cron_tz`, update the DB, push to the heap (§10). One whose next fire cannot be computed, such as one kept before 0.1.124 whose `cron_spec` starts with a zone (§13), is canceled (`cancelUnschedulable`): `status='canceled'`, with `canceled_reason` `its next fire cannot be computed: <the error>`, logged once as `timer_replay_invalid_recurring` with `outcome: canceled`. Its `client_ref` is free for a new timer, and it no longer counts toward its owner's and the hive's pending timers (§19). Since v1.4 (FINDINGS A-220); before, it stayed `pending` and out of the queue: a `TIMER_SCHEDULE_RECURRING` with its `client_ref` answered the dead timer with `already_existed: true` and kept nothing of the new spec, and the replay logged it at every start.
    - One-shot with `fire_at_utc > now`: insert it into the in-memory heap with the same `fire_at_utc`. **The `fire_at_utc` is not modified** — it is already the absolute target instant, and the heap fires it when the OS clock reaches that value.
-   - One-shot with `fire_at_utc <= now`: apply `missed_policy` (§10). If it fires: it is queued, due at once, and fires as any due timer (§4.3, §7.8). If it is dropped: save `status='canceled'` and log a `timer_missed_policy_applied` event whose `outcome` says why.
+   - One-shot with `fire_at_utc <= now`: apply `missed_policy` (§10). If it fires: it is queued, due at once, and fires as any due timer (§4.3, §7.8). If it is dropped: save `status='canceled'` with its `canceled_reason`, and log a `timer_missed_policy_applied` event whose `outcome` says why.
+
+A recurring timer whose next fire cannot be computed when it fires is canceled the same way, logged once as `timer_recurring_next_fire_failed`, and that fire is not sent; a row that cannot be saved stays `pending` and is tried again in 30 s (`timer_fire_persist_failed`). A save that fails at the replay stops the start, as any other there: systemd starts `SY.timer` again.
 5. Log `SY.timer ready: ... pending=N gc_deleted=M`, start the tick loop, and serve requests.
 
 **Guarantee:** a timer created with `fire_at_utc = T` will fire at time `T` of the OS clock, subject to the node's availability and to its `missed_policy`. There is no accumulated drift.
@@ -950,7 +963,7 @@ If this query returns no rows, the migration proceeds without friction. If it re
 - Seconds fields (6-field cron)
 - Special descriptors like `@reboot`, `@yearly`: a `cron_spec` that starts with `@` is `TIMER_INVALID_CRON`
 - Interval expressions like `every 5m` (reserved for v2 if demand shows up)
-- A zone before the fields, `TZ=<zone>` or `CRON_TZ=<zone>`, which robfig/cron reads: the zone goes in `cron_tz`, and a `cron_spec` that starts with `TZ=` or `CRON_TZ=` is `TIMER_INVALID_CRON` before it is parsed (`parseCronSpec`; FINDINGS A-206, since 0.1.124). The parser took such a zone over `cron_tz`, which the timer still recorded, and panicked, stopping `SY.timer`, when no space followed it. A recurring timer kept with one before 0.1.124 is skipped at every start, and stays `pending` (§11).
+- A zone before the fields, `TZ=<zone>` or `CRON_TZ=<zone>`, which robfig/cron reads: the zone goes in `cron_tz`, and a `cron_spec` that starts with `TZ=` or `CRON_TZ=` is `TIMER_INVALID_CRON` before it is parsed (`parseCronSpec`; FINDINGS A-206, since 0.1.124). The parser took such a zone over `cron_tz`, which the timer still recorded, and panicked, stopping `SY.timer`, when no space followed it. A recurring timer kept with one before 0.1.124 is canceled at the first start of v1.4 (0.1.127) or later, with its `canceled_reason` (§11, FINDINGS A-220); before, it was skipped at every start and stayed `pending`.
 
 ---
 
@@ -1129,6 +1142,8 @@ A node should check that a `TIMER_FIRED` comes from `SY.timer@<its hive>` (the r
 | `TIMER_INTERNAL` | A response that does not fit in one 128 KiB frame, or another internal error. A message without the router's `routing.src_l2_name` gets no answer at all (§6.1). |
 | `TIMER_UNREACHABLE` | (Go client) `SY.timer` does not answer after the retries of a time operation (§14.4). |
 
+A refusal's code goes with its error, not in its text (`timerError` in `go/sy-timer/errors.go`; FINDINGS A-220, since v1.4): the `message` quotes what the request sent, a `cron_spec` or a zone, and what it quotes never changes the code. Before, the code was read from the message: a junk `cron_spec` that repeated "invalid timezone" in its fields came back `TIMER_INVALID_TIMEZONE`, and a `cron_tz` that read "minimum timer duration", `TIMER_BELOW_MINIMUM`. They are `TIMER_INVALID_CRON` and `TIMER_INVALID_TIMEZONE` now, in that order.
+
 Format of an error response:
 
 ```json
@@ -1174,7 +1189,7 @@ The `timers.db` database should be included in the backup snapshots of the `/var
 
 ### 16.4 Logs
 
-`SY.timer` logs on stdout (captured by systemd), with no levels: plain lines, and one JSON object per event (`logEvent`). Among the events: `timer_startup` (with `pending_count` and `gc_deleted`), `timer_scheduled`, `timer_fired`, `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`, `timer_missed_policy_applied` (with its `outcome`), `timer_handler_error`; for the delivery (§7.8) `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`, `timer_fire_refused`, `timer_fire_lost` and `timer_fire_dropped`; and for recurring timers `timer_replay_invalid_recurring`, `timer_recurring_next_fire_failed` and `timer_recurring_requeued`. The router's `UNREACHABLE` for a fire sends it again (§7.8); one for no fire in flight is logged as an ignored message.
+`SY.timer` logs on stdout (captured by systemd), with no levels: plain lines, and one JSON object per event (`logEvent`). Among the events: `timer_startup` (with `pending_count` and `gc_deleted`), `timer_scheduled`, `timer_fired`, `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`, `timer_missed_policy_applied` (with its `outcome`), `timer_handler_error`; for the delivery (§7.8) `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`, `timer_fire_refused`, `timer_fire_lost` and `timer_fire_dropped`; and for recurring timers `timer_recurring_requeued`, `timer_replay_invalid_recurring` and `timer_recurring_next_fire_failed`; the last two are a timer whose next fire cannot be computed, at a start or at a fire, canceled: logged once, with `outcome: canceled`, its `owner_l2_name`, its `client_ref` and its `canceled_reason` (§11). The router's `UNREACHABLE` for a fire sends it again (§7.8); one for no fire in flight is logged as an ignored message.
 
 ### 16.5 Metrics (future)
 

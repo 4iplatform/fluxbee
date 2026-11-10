@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version             = "1.3"
+	version             = "1.4"
 	defaultNodeBaseName = "SY.timer"
 	configDir           = "/etc/fluxbee"
 	routerSockDir       = "/var/run/fluxbee/routers"
@@ -756,7 +756,7 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 	}
 	// A page fits one frame (FINDINGS A-151): the timers past maxTimerListPageBytes go in the next
 	// page, after the cursor of the last one this page lists.
-	items := make([]fluxbeesdk.TimerInfo, 0, len(rows))
+	items := make([]timerInfo, 0, len(rows))
 	pageBytes := 0
 	nextCursor := ""
 	for i, row := range rows {
@@ -1029,7 +1029,7 @@ func (s *Service) resolveSourceL2NameFromMsg(incoming fluxbeesdk.Message) (strin
 	if name := incoming.SourceL2Name(); name != "" {
 		return name, nil
 	}
-	return "", fmt.Errorf("routing.src_l2_name missing from incoming message (src=%s)", incoming.Routing.Src)
+	return "", timerErrorf("TIMER_INTERNAL", "routing.src_l2_name missing from incoming message (src=%s)", incoming.Routing.Src)
 }
 
 // mayRead reports whether the sender of incoming may read the timers of owner: a node reads its own,
@@ -1142,7 +1142,7 @@ func (s *Service) resolveOwnedTimerForMutation(ctx context.Context, incoming flu
 		return nil, ref.TimerUUID != "", err
 	}
 	if row.OwnerL2Name != ownerL2 {
-		return nil, ref.TimerUUID != "", fmt.Errorf("timer does not belong to requester")
+		return nil, ref.TimerUUID != "", timerErrorf("TIMER_NOT_OWNER", "timer does not belong to requester")
 	}
 	return row, ref.TimerUUID != "", nil
 }
@@ -1157,24 +1157,6 @@ func (s *Service) sendTimerScheduleExistingResponse(incoming fluxbeesdk.Message,
 	})
 }
 
-func timerStorageOrInternalCode(err error) string {
-	if err == nil {
-		return "TIMER_STORAGE_ERROR"
-	}
-	switch err {
-	case sql.ErrNoRows:
-		return "TIMER_NOT_FOUND"
-	default:
-		if strings.Contains(err.Error(), "routing.src_l2_name missing") {
-			return "TIMER_INTERNAL"
-		}
-		if strings.Contains(err.Error(), "does not belong to requester") {
-			return "TIMER_NOT_OWNER"
-		}
-		return "TIMER_STORAGE_ERROR"
-	}
-}
-
 func scheduleFireAt(req timerScheduleRequest) (int64, error) {
 	return oneShotFireAt(req.FireAtUTCMS, req.FireInMS, "fire_at_utc_ms", "fire_in_ms")
 }
@@ -1183,7 +1165,7 @@ func scheduleFireAt(req timerScheduleRequest) (int64, error) {
 // at least MinTimerDuration ahead, and at most maxTimerDelay.
 func oneShotFireAt(atUTCMS, inMS *int64, atField, inField string) (int64, error) {
 	if (atUTCMS != nil) == (inMS != nil) {
-		return 0, fmt.Errorf("exactly one of %s or %s must be set", atField, inField)
+		return 0, timerErrorf("TIMER_INVALID_PAYLOAD", "exactly one of %s or %s must be set", atField, inField)
 	}
 	nowUTCMS := time.Now().UTC().UnixMilli()
 	fireAt := nowUTCMS
@@ -1207,7 +1189,7 @@ func oneShotFireAt(atUTCMS, inMS *int64, atField, inField string) (int64, error)
 func scheduleRecurringFireAt(req timerScheduleRecurringRequest) (int64, string, error) {
 	cronSpec := strings.TrimSpace(req.CronSpec)
 	if cronSpec == "" {
-		return 0, "", fmt.Errorf("cron_spec must be non-empty")
+		return 0, "", timerErrorf("TIMER_INVALID_PAYLOAD", "cron_spec must be non-empty")
 	}
 	cronTZ := "UTC"
 	if strings.TrimSpace(req.CronTZ) != "" {
@@ -1215,7 +1197,7 @@ func scheduleRecurringFireAt(req timerScheduleRecurringRequest) (int64, string, 
 	}
 	loc, err := loadLocation(cronTZ)
 	if err != nil {
-		return 0, "", fmt.Errorf("invalid timezone: %w", err)
+		return 0, "", timerErrorf("TIMER_INVALID_TIMEZONE", "invalid timezone: %w", err)
 	}
 	schedule, err := parseCronSpec(cronSpec)
 	if err != nil {
@@ -1224,7 +1206,7 @@ func scheduleRecurringFireAt(req timerScheduleRecurringRequest) (int64, string, 
 	now := time.Now().UTC()
 	first := schedule.Next(now.In(loc))
 	if first.IsZero() {
-		return 0, "", fmt.Errorf("invalid cron: no future fire time")
+		return 0, "", timerErrorf("TIMER_INVALID_CRON", "invalid cron: no future fire time")
 	}
 	next := schedule.Next(first.Add(time.Second).In(loc))
 	if !next.IsZero() && next.Sub(first) < fluxbeesdk.MinTimerDuration {
@@ -1264,30 +1246,11 @@ func isCanonicalL2Name(value string) bool {
 }
 
 func errBelowMinimum() error {
-	return fmt.Errorf("minimum timer duration is %d seconds", int(fluxbeesdk.MinTimerDuration.Seconds()))
+	return timerErrorf("TIMER_BELOW_MINIMUM", "minimum timer duration is %d seconds", int(fluxbeesdk.MinTimerDuration.Seconds()))
 }
 
 func errAboveMaximum() error {
-	return fmt.Errorf("maximum timer delay is %d days", int(maxTimerDelay.Hours()/24))
-}
-
-func timerErrorCode(err error) string {
-	if err == nil {
-		return "TIMER_INTERNAL"
-	}
-	if strings.Contains(err.Error(), "minimum timer duration") {
-		return "TIMER_BELOW_MINIMUM"
-	}
-	if strings.Contains(err.Error(), "maximum timer delay") {
-		return "TIMER_ABOVE_MAXIMUM"
-	}
-	if strings.Contains(err.Error(), "invalid timezone") {
-		return "TIMER_INVALID_TIMEZONE"
-	}
-	if strings.Contains(err.Error(), "invalid cron") {
-		return "TIMER_INVALID_CRON"
-	}
-	return "TIMER_INVALID_PAYLOAD"
+	return timerErrorf("TIMER_ABOVE_MAXIMUM", "maximum timer delay is %d days", int(maxTimerDelay.Hours()/24))
 }
 
 func formatTimeMillisUTC(t time.Time) string {

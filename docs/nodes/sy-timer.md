@@ -39,7 +39,8 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    `/var/lib/fluxbee/state/nodes` (`fluxbeesdk.ConnectWithRetry`, retry every 1 s).
 4. Opens `timers.db` in its instance directory (`managedNodeInstanceDir`: `/var/lib/fluxbee/nodes/<KIND>/<node name>`),
    with `busy_timeout(5000)` and WAL on every connection (`timerDSN`), and creates the `timers`
-   table and its indexes (`ensureTimerSchema`, schema version 2).
+   table and its indexes (`ensureTimerSchema`, schema version 3: version 3 adds `canceled_reason`
+   to a table that lacks it, FINDINGS A-220).
 5. Deletes fired and canceled timers older than 7 days (`gcHistoricalTimers`,
    `defaultHistoryRetention`). This runs once per start, not periodically.
 6. Replays pending timers (`replayPending`, below), logs
@@ -53,7 +54,8 @@ A timer row (`timerRow`, table `timers`) has: `uuid`, `owner_l2_name` (who sched
 the caller's own name for it), `kind` (`oneshot` or `recurring`), `fire_at_utc` (ms),
 `cron_spec`, `cron_tz`, `missed_policy`, `missed_within_ms`, `payload` (JSON), `metadata`
 (JSON), `status` (`pending`, `fired`, `canceled`), `created_at_utc`, `last_fired_at_utc`,
-`fire_count`.
+`fire_count`, `canceled_reason` (why SY.timer canceled it itself, below; none when its owner
+canceled it).
 
 Rules enforced in `main.go`:
 
@@ -78,7 +80,8 @@ Rules enforced in `main.go`:
   descriptors. The binary embeds the timezone database (`time/tzdata` import).
 - **client_ref.** At most 255 characters. Unique per owner among pending timers (unique index
   `idx_timers_owner_clientref_pending`). Scheduling again with a pending `client_ref` returns the
-  existing timer with `already_existed: true` instead of creating a second one.
+  existing timer with `already_existed: true` instead of creating a second one. A canceled timer,
+  by its owner or by SY.timer, frees it.
 - **Missed policy.** `fire` (default), `drop`, or `fire_if_within` with `missed_within_ms > 0`
   (`validateMissedPolicyRaw`).
 
@@ -118,9 +121,19 @@ reconciles its timers when it starts).
 - a pending one-shot whose time passed while the node was down follows its missed policy
   (`handleMissedTimer`): `fire` queues it, due at once; `drop` cancels it; `fire_if_within` queues
   it only if it is late by at most `missed_within_ms`, otherwise cancels it; an unknown policy
-  cancels it. A queued one goes when the scheduler starts and, after a hive reboot, is sent again
-  until its owner is relaunched;
-- a recurring timer is moved to its next future occurrence; missed occurrences are not fired.
+  cancels it. One canceled says why in its `canceled_reason`. A queued one goes when the scheduler
+  starts and, after a hive reboot, is sent again until its owner is relaunched;
+- a recurring timer is moved to its next future occurrence; missed occurrences are not fired. One
+  whose next occurrence cannot be computed is canceled (`cancelUnschedulable`), with
+  `canceled_reason` `its next fire cannot be computed: <the error>`, and logged once
+  (`timer_replay_invalid_recurring`): its `client_ref` is free for a new timer, and it no longer
+  counts toward the pending caps (FINDINGS A-220, since 1.4). Before, it stayed `pending` for good:
+  scheduling again with its `client_ref` answered the dead timer, `already_existed: true`.
+
+Its owner reads `canceled_reason` with `TIMER_GET` by `timer_uuid` and with `TIMER_LIST`
+(`status_filter` `canceled` or `all`); by `client_ref` a canceled timer is `TIMER_NOT_FOUND`. The
+SDKs' `TimerInfo` does not carry the field (the Rust one keeps it in `extra`); SY.admin's routes,
+and Archi, show it.
 
 ## Messages
 
@@ -153,7 +166,10 @@ Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_ABOVE_MAXIMUM`, `TIMER_LIMIT_EXCEEDED
 `TIMER_INVALID_PAYLOAD`, `TIMER_INVALID_CRON`,
 `TIMER_INVALID_TIMEZONE`, `TIMER_FORBIDDEN`, `TIMER_NOT_FOUND`, `TIMER_NOT_OWNER`,
 `TIMER_ALREADY_FIRED`, `TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_STORAGE_ERROR`,
-`TIMER_UNKNOWN_VERB`, `TIMER_INTERNAL`.
+`TIMER_UNKNOWN_VERB`, `TIMER_INTERNAL`. A refusal's code goes with its error (`timerError` in
+`errors.go`: `timerErrorCode`, `timerStorageOrInternalCode`), never read from its message, which
+quotes what the request sent (FINDINGS A-220): a junk `cron_spec` that repeats "invalid timezone"
+in its fields is `TIMER_INVALID_CRON`, not `TIMER_INVALID_TIMEZONE` as it was.
 
 ### Teardown
 
@@ -195,11 +211,12 @@ secret.
   or replayed: the process exits and systemd restarts it every 5 s.
 - If the router channel closes, the run loop ends (`sy.timer incoming channel closed`).
 - A handler error is logged as a JSON event `timer_handler_error` plus `handle message error`.
-- A recurring timer whose next time cannot be computed (`timer_recurring_next_fire_failed`) does
-  not fire and is not re-queued; it stays `pending` and the next start tries again
-  (`replayPending`, which skips one it still cannot compute and logs
-  `timer_replay_invalid_recurring`). One kept before 0.1.124 whose `cron_spec` starts with a zone
-  is such a timer (FINDINGS A-206).
+- A recurring timer whose next time cannot be computed, at a start
+  (`timer_replay_invalid_recurring`) or at a fire (`timer_recurring_next_fire_failed`), is
+  canceled with its `canceled_reason` and logged once (`cancelUnschedulable`); the fire due then
+  is not sent. A row that cannot be saved stays `pending`: at a fire it is tried again in 30 s
+  (`timer_fire_persist_failed`), at a start the start fails and systemd runs it again. One kept
+  before 0.1.124 whose `cron_spec` starts with a zone is such a timer (FINDINGS A-206, A-220).
 
 ## Health
 
@@ -208,7 +225,9 @@ secret.
   `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
   `timer_missed_policy_applied`, `timer_handler_error`, and for the delivery
   `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`,
-  `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`.
+  `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`; for a recurring timer canceled
+  because its next fire cannot be computed, `timer_replay_invalid_recurring` and
+  `timer_recurring_next_fire_failed` (`outcome: canceled`, with its `canceled_reason`).
 - `curl -s 127.0.0.1:8080/hives/<hive>/timer/now` on the motherbee proves the admin → timer
   round trip; `.../timer/timers` shows the pending timers.
 
