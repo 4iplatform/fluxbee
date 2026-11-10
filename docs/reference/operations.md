@@ -392,7 +392,9 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   with the manifest untouched; before, a hand publish and an admin write that read the manifest
   at the same moment lost one of the two writes. The lock file sits in the dist root, beside the
   `runtimes` folder and never inside it, since Syncthing shares that folder with the workers; it
-  stays (removing it would let a writer lock a new one beside one still held).
+  stays (removing it would let a writer lock a new one beside one still held). The package does
+  not ship it, nor the manifest: each writer creates it where it is missing, so dpkg never owns,
+  replaces or removes it (`packaging/build-deb.sh` refuses a .deb that carries either).
 
 ### How dist reaches the other hives
 
