@@ -464,11 +464,13 @@ impl IdentityCaller for GovIdentityBridge {
         action: &str,
         payload: Value,
     ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
+        let started = tokio::time::Instant::now();
         let first = self
             .send_action_once(&identity.target, action, payload.clone(), identity.timeout)
             .await;
         // One retry on the fallback target when the target is not the identity primary or is not
         // on the router. The fallback's reply goes through the same status check as the first one.
+        // It gets what the first send left of `identity.timeout`, which bounds the whole call.
         let use_fallback = match &first {
             Ok(out) => {
                 out.payload.get("status").and_then(Value::as_str) == Some("error")
@@ -477,12 +479,15 @@ impl IdentityCaller for GovIdentityBridge {
             Err(IdentityError::Unreachable { reason, .. }) => reason == "NODE_NOT_FOUND",
             Err(_) => false,
         };
+        let left = identity.timeout.saturating_sub(started.elapsed());
         let reply = match identity.fallback_target.as_deref() {
             Some(fallback)
-                if use_fallback && !fallback.trim().is_empty() && fallback != identity.target =>
+                if use_fallback
+                    && !fallback.trim().is_empty()
+                    && fallback != identity.target
+                    && !left.is_zero() =>
             {
-                self.send_action_once(fallback, action, payload, identity.timeout)
-                    .await
+                self.send_action_once(fallback, action, payload, left).await
             }
             _ => first,
         };
@@ -702,34 +707,53 @@ struct IlkRegisterTool {
 
 /// How `ilk_register` retries an `ILK_REGISTER` that failed for a reason that may pass
 /// (`identity_error_is_transient`: SY.identity did not answer, or it is not the primary or cannot
-/// write yet, as while a deploy restarts it; FINDINGS A-216). A few seconds in all, inside what a
-/// handoff's IO node waits for the answer.
+/// write yet, as while a deploy restarts it; FINDINGS A-216), all within one deadline.
 #[derive(Debug, Clone, Copy)]
 struct RegisterRetry {
     /// The wait before each retry: one retry per wait.
     backoff: &'static [Duration],
-    /// No retry starts later than this after the first attempt, so an attempt that waited out its
-    /// own timeout (`GOV_IDENTITY_TIMEOUT_MS`, 10 s) is not sent again.
-    window: Duration,
+    /// Every attempt, the waits between them included, ends this long after the first began: an
+    /// attempt's timeout is the identity's (`GOV_IDENTITY_TIMEOUT_MS`, 10 s) or the time left,
+    /// whichever is less.
+    deadline: Duration,
+    /// No retry starts with less time than this left before the deadline.
+    min_attempt: Duration,
 }
 
-/// Three retries, after 0.5 s, 1 s and 2 s: when SY.identity answers at once, the last one starts
-/// 3.5 s after the first attempt, well inside io.api's 10 s for a handoff's answer.
+/// The deadline of a registration's attempts: under the 10 s io.api waits for a handoff's answer,
+/// so the frontdesk answers before the IO node gives up, both on a handoff and in a conversation.
+const REGISTER_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Three retries, after 0.5 s, 1 s and 2 s, while 1 s is left before `REGISTER_DEADLINE`: when
+/// SY.identity answers at once, the last starts 3.5 s after the first attempt; one that does not
+/// answer costs the deadline, never more.
 const REGISTER_RETRY: RegisterRetry = RegisterRetry {
     backoff: &[
         Duration::from_millis(500),
         Duration::from_secs(1),
         Duration::from_secs(2),
     ],
-    window: Duration::from_secs(4),
+    deadline: REGISTER_DEADLINE,
+    min_attempt: Duration::from_secs(1),
 };
 
 impl RegisterRetry {
-    /// The wait before one more attempt, after `attempts` that failed for a transient reason and
-    /// took `elapsed` since the first began; `None` when the waits ran out or the window closed.
+    /// The wait before one more attempt, after `attempts` that failed for a transient reason, the
+    /// last ending `elapsed` after the first began; `None` when the waits ran out or the attempt
+    /// would start with less than `min_attempt` left.
     fn wait_before_retry(&self, attempts: usize, elapsed: Duration) -> Option<Duration> {
         let wait = *self.backoff.get(attempts.checked_sub(1)?)?;
-        (elapsed + wait <= self.window).then_some(wait)
+        let left = self.deadline.checked_sub(elapsed + wait)?;
+        (left >= self.min_attempt).then_some(wait)
+    }
+
+    /// The timeout of an attempt that starts `elapsed` after the first: the identity's, or the
+    /// time left before the deadline, whichever is less; never zero, which the dispatcher would
+    /// take for its 5 s default.
+    fn attempt_timeout(&self, identity_timeout: Duration, elapsed: Duration) -> Duration {
+        identity_timeout
+            .min(self.deadline.saturating_sub(elapsed))
+            .max(Duration::from_millis(1))
     }
 }
 
@@ -2785,9 +2809,9 @@ impl IlkRegisterTool {
     }
 
     /// Sends the case's `ILK_REGISTER`, and sends it again while it fails for a reason that may
-    /// pass and `retry` allows (FINDINGS A-216). Registering again is safe: SY.identity replaces
-    /// the identification of an ILK registered twice. Returns the last outcome and how many
-    /// attempts it took.
+    /// pass and `retry` allows (FINDINGS A-216), all the attempts within `retry`'s one deadline.
+    /// Registering again is safe: SY.identity replaces the identification of an ILK registered
+    /// twice. Returns the last outcome and how many attempts it took.
     async fn send_register(
         &self,
         payload: Value,
@@ -2799,10 +2823,17 @@ impl IlkRegisterTool {
         let mut attempts = 0;
         loop {
             attempts += 1;
+            // This attempt's timeout: what is left of the deadline, at most the identity's.
+            let identity = GovIdentityConfig {
+                timeout: self
+                    .retry
+                    .attempt_timeout(self.identity.timeout, started.elapsed()),
+                ..self.identity.clone()
+            };
             let result = match &self.bridge {
                 Some(bridge) => {
                     bridge
-                        .call_ok(&self.identity, MSG_ILK_REGISTER, payload.clone())
+                        .call_ok(&identity, MSG_ILK_REGISTER, payload.clone())
                         .await
                 }
                 None => Err(identity_bridge_missing()),
@@ -4302,7 +4333,8 @@ mod tests {
     /// `REGISTER_RETRY`'s attempts without its waits.
     const NO_WAIT_RETRY: RegisterRetry = RegisterRetry {
         backoff: &[Duration::ZERO; REGISTER_RETRY.backoff.len()],
-        window: Duration::from_secs(60),
+        deadline: Duration::from_secs(60),
+        min_attempt: REGISTER_RETRY.min_attempt,
     };
 
     fn test_node() -> GenericAiNode {
@@ -6429,12 +6461,19 @@ mod tests {
         Rejected(&'static str),
         /// The router finds no SY.identity, as while a deploy restarts it.
         Unreachable,
+        /// SY.identity answers with this error code after this long, unless the call's timeout
+        /// comes first.
+        Late(Duration, &'static str),
+        /// SY.identity never answers: the call waits out its timeout.
+        Silent,
     }
 
     /// SY.identity as a test scripts it: one answer per `ILK_REGISTER`, the last one repeated.
+    /// It keeps the timeout each call was given.
     struct ScriptedIdentity {
         answers: Vec<IdentityAnswer>,
         calls: std::sync::atomic::AtomicUsize,
+        timeouts: Mutex<Vec<Duration>>,
     }
 
     impl ScriptedIdentity {
@@ -6442,11 +6481,26 @@ mod tests {
             Arc::new(Self {
                 answers: answers.to_vec(),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                timeouts: Mutex::new(Vec::new()),
             })
         }
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn timeouts(&self) -> Vec<Duration> {
+            self.timeouts.lock().expect("timeouts").clone()
+        }
+    }
+
+    /// What the dispatcher answers when no reply came within the call's timeout.
+    fn identity_timeout(identity: &GovIdentityConfig, action: &str) -> IdentityError {
+        IdentityError::ActionTimeout {
+            action: action.to_string(),
+            trace_id: "trace-identity-timeout".to_string(),
+            target: identity.target.clone(),
+            timeout_ms: u64::try_from(identity.timeout.as_millis()).unwrap_or(u64::MAX),
         }
     }
 
@@ -6459,6 +6513,10 @@ mod tests {
             payload: Value,
         ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, IdentityError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.timeouts
+                .lock()
+                .expect("timeouts")
+                .push(identity.timeout);
             let answer = self
                 .answers
                 .get(call)
@@ -6466,6 +6524,22 @@ mod tests {
                 .copied()
                 .expect("a scripted answer");
             match answer {
+                IdentityAnswer::Silent => {
+                    tokio::time::sleep(identity.timeout).await;
+                    Err(identity_timeout(identity, action))
+                }
+                IdentityAnswer::Late(after, _) if after >= identity.timeout => {
+                    tokio::time::sleep(identity.timeout).await;
+                    Err(identity_timeout(identity, action))
+                }
+                IdentityAnswer::Late(after, error_code) => {
+                    tokio::time::sleep(after).await;
+                    Err(IdentityError::SystemRejected {
+                        action: action.to_string(),
+                        error_code: error_code.to_string(),
+                        message: "scripted late rejection".to_string(),
+                    })
+                }
                 IdentityAnswer::Registered => Ok(fluxbee_sdk::IdentitySystemResult {
                     payload: json!({
                         "status": "ok",
@@ -6529,8 +6603,9 @@ mod tests {
             .expect("the case's state")
     }
 
-    /// The retries take a few seconds in all, and none starts after the window: an attempt that
-    /// waited out SY.identity's timeout is not sent again.
+    /// The retries take a few seconds in all, within one deadline under what io.api waits for a
+    /// handoff's answer: each attempt's timeout is the identity's or the time left, and no retry
+    /// starts with less than `min_attempt` left.
     #[test]
     fn a_transient_failure_is_retried_for_a_few_seconds() {
         let ms = Duration::from_millis;
@@ -6540,16 +6615,99 @@ mod tests {
         assert_eq!(retry.wait_before_retry(3, ms(1_530)), Some(ms(2_000)));
         // Three retries, then the waits run out.
         assert_eq!(retry.wait_before_retry(4, ms(3_540)), None);
-        // A retry that would start after the window is not sent.
-        assert_eq!(retry.wait_before_retry(3, ms(2_500)), None);
+        // A retry that would start with less than 1 s left is not sent.
+        assert_eq!(retry.wait_before_retry(1, ms(6_400)), Some(ms(500)));
+        assert_eq!(retry.wait_before_retry(1, ms(6_600)), None);
+        assert_eq!(retry.wait_before_retry(3, ms(5_500)), None);
+        // An attempt that waited out the identity's timeout ran out of time.
+        let identity_timeout = GovIdentityConfig::default().timeout;
+        assert_eq!(retry.wait_before_retry(1, identity_timeout), None);
+        // The first attempt gets the deadline, a later one what is left of it.
         assert_eq!(
-            retry.wait_before_retry(1, GovIdentityConfig::default().timeout),
-            None
+            retry.attempt_timeout(identity_timeout, ms(0)),
+            retry.deadline
         );
+        assert_eq!(
+            retry.attempt_timeout(identity_timeout, ms(3_500)),
+            ms(4_500)
+        );
+        assert_eq!(retry.attempt_timeout(ms(2_000), ms(3_500)), ms(2_000));
+        assert!(!retry
+            .attempt_timeout(identity_timeout, retry.deadline)
+            .is_zero());
         let waits: Duration = retry.backoff.iter().sum();
-        assert!(waits <= retry.window, "{waits:?}");
-        // Well inside what io.api waits for a handoff's answer.
-        assert!(retry.window < Duration::from_secs(10));
+        assert!(waits + retry.min_attempt <= retry.deadline, "{waits:?}");
+        // Under what io.api waits for a handoff's answer.
+        assert!(retry.deadline < Duration::from_secs(10));
+    }
+
+    /// Short enough for a test to wait it out.
+    const SHORT_DEADLINE_RETRY: RegisterRetry = RegisterRetry {
+        backoff: &[Duration::from_millis(20); 3],
+        deadline: Duration::from_millis(400),
+        min_attempt: Duration::from_millis(100),
+    };
+
+    /// Room for the scheduler over a deadline.
+    const SLACK: Duration = Duration::from_millis(250);
+
+    /// The attempts share one deadline: SY.identity that does not answer costs the deadline, never
+    /// a timeout per attempt; a retry gets only the time left; none starts with too little left.
+    #[tokio::test]
+    async fn the_attempts_of_a_registration_share_one_deadline() {
+        let retry = SHORT_DEADLINE_RETRY;
+        // At once unreachable, then silent: the second attempt gets what is left.
+        let identity =
+            ScriptedIdentity::new(&[IdentityAnswer::Unreachable, IdentityAnswer::Silent]);
+        let mut tool = tool_with_identity(&identity);
+        tool.retry = retry;
+        let started = std::time::Instant::now();
+        let out = tool.call(register_ana()).await.expect("tool call");
+        let took = started.elapsed();
+        assert_eq!(out["error_code"], "TIMEOUT");
+        assert_eq!(out["retryable"], true);
+        assert_eq!(identity.calls(), 2);
+        let timeouts = identity.timeouts();
+        assert!(timeouts[0] <= retry.deadline, "{timeouts:?}");
+        assert!(
+            timeouts[1] <= retry.deadline - retry.backoff[0],
+            "{timeouts:?}"
+        );
+        assert!(took < retry.deadline + SLACK, "{took:?}");
+
+        // A late answer that leaves too little for another attempt: none is sent.
+        let identity = ScriptedIdentity::new(&[
+            IdentityAnswer::Late(Duration::from_millis(320), "DB_NOT_READY"),
+            IdentityAnswer::Registered,
+        ]);
+        let mut tool = tool_with_identity(&identity);
+        tool.retry = retry;
+        let out = tool.call(register_ana()).await.expect("tool call");
+        assert_eq!(out["error_code"], "DB_NOT_READY");
+        assert_eq!(identity.calls(), 1);
+    }
+
+    /// The same deadline on both paths: a handoff and a conversation's `ilk_register` answer
+    /// within it when SY.identity does not answer, and the case stays open.
+    #[tokio::test]
+    async fn a_handoff_and_a_conversation_answer_within_the_deadline() {
+        let retry = SHORT_DEADLINE_RETRY;
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Silent]);
+        let (mut node, state) = test_node_with_identity(&identity);
+        node.register_retry = retry;
+
+        let started = std::time::Instant::now();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert!(started.elapsed() < retry.deadline + SLACK);
+        assert_eq!(reply["error_code"], "identity_unavailable");
+        assert_eq!(kept_case(&state)["status"], "awaiting_confirmation");
+
+        let started = std::time::Instant::now();
+        let out = register_in_turn(&node, &turn_ctx()).await;
+        assert!(started.elapsed() < retry.deadline + SLACK);
+        assert_eq!(out["error_code"], "TIMEOUT");
+        // One attempt each: the first used the whole deadline.
+        assert_eq!(identity.calls(), 2);
     }
 
     #[tokio::test]

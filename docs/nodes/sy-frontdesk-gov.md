@@ -243,10 +243,13 @@ is `ILK_REGISTER_RESPONSE`.
 
 A failure that may pass (`identity_error_is_transient`: `UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`,
 `IDENTITY_ERROR`, `NOT_PRIMARY`, `DB_NOT_READY`, `DB_WRITE_FAILED`) is sent again
-(`send_register`, `REGISTER_RETRY`; FINDINGS A-216): after 0.5 s, 1 s and 2 s, and no retry
-starts later than 4 s after the first attempt, so one that waited out the 10 s timeout is not sent
-again. Each retry logs `ILK_REGISTER failed for a reason that may pass; sending it again`, and the
-last failure `ILK_REGISTER failed` with its `attempts`. The tool's error answer says `retryable`.
+(`send_register`, `REGISTER_RETRY`; FINDINGS A-216): after 0.5 s, 1 s and 2 s, all the attempts
+within one 8 s deadline (`REGISTER_DEADLINE`), under the 10 s io.api waits for a handoff's answer,
+on both paths. Each attempt's timeout is the identity's or the time left, whichever is less
+(`RegisterRetry::attempt_timeout`; a fallback target gets what the first send left of it), and no
+retry starts with less than 1 s left. So SY.identity that does not answer costs 8 s, never more.
+Each retry logs `ILK_REGISTER failed for a reason that may pass; sending it again`, and the last
+failure `ILK_REGISTER failed` with its `attempts`. The tool's error answer says `retryable`.
 Registering again is safe: SY.identity replaces the identification of an ILK registered twice.
 
 The email goes in exactly one of the two keys (`person_identification`, with the tool's
@@ -315,8 +318,8 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   A later `VAULT_SECRET_CHANGED` for the key turns the conversation on.
 - **Invalid hive.yaml, installation file or `ai` section**: `FAILED_CONFIG` with the reason;
   handoffs still work. An installation file no reader can use is never a fallback to hive.yaml.
-- **SY.identity down, restarting or slow** (10 s): `ilk_register` retries for a few seconds (see
-  ILK_REGISTER); if it still fails, `IDENTITY_UNAVAILABLE`, and the case stays
+- **SY.identity down, restarting or slow**: `ilk_register` retries for a few seconds, never past
+  its 8 s deadline (see ILK_REGISTER); if it still fails, `IDENTITY_UNAVAILABLE`, and the case stays
   `awaiting_confirmation`: the handoff sent again, or the person's next confirmation, retries it.
   A case closed as `completed_error` on such a failure (by an earlier version) is reopened when
   the person writes again.

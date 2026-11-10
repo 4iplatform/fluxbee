@@ -344,10 +344,12 @@ A registration can fail for a reason that may pass: `SY.identity` did not answer
 `DB_WRITE_FAILED`, as while a deploy restarts it. Registering again is safe: a repeated
 `ILK_REGISTER` of the same ILK replaces its identification.
 
-- **The tool retries it.** `ilk_register` sends the `ILK_REGISTER` again after 0.5 s, 1 s and 2 s,
-  and starts no retry later than 4 s after the first attempt, so an attempt that waited out its
-  10 s timeout is not sent again. When `SY.identity` answers at once that is a few seconds in all,
-  inside what a handoff's IO node waits for the answer (io.api 10 s, io.cloud 20 s).
+- **The tool retries it, within one deadline.** `ilk_register` sends the `ILK_REGISTER` again
+  after 0.5 s, 1 s and 2 s, and all its attempts end within 8 s of the first, on a handoff and in
+  a conversation alike: each attempt's timeout is the identity's (10 s) or the time left,
+  whichever is less, and no retry starts with less than 1 s left. When `SY.identity` answers at
+  once that is a few seconds in all; when it does not answer, the deadline. Either way the
+  frontdesk answers before a handoff's IO node gives up (io.api waits 10 s, io.cloud 20 s).
 - **The case stays open.** If it still fails, the tool answers the error with `retryable: true`,
   and the case stays `awaiting_confirmation`, never `completed_error`, with the failure in
   `register_error`. A handoff answers `IDENTITY_UNAVAILABLE`, and sending it again retries it. In
