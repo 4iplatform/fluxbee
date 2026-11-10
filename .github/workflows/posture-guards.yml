@@ -24,6 +24,9 @@ jobs:
       - name: The .deb merges the base runtimes into the dist manifest (U-3)
         run: bash scripts/deb_seed_runtimes_e2e.sh
 
+      - name: The factory reset takes the published pages down through SY.admin (A-212)
+        run: python3 scripts/factory_reset_pages_check.py
+
       - name: Syncthing config.xml has a single writer (stage 2)
         run: bash scripts/check_syncthing_single_writer.sh
 

@@ -1013,8 +1013,17 @@ The ownership and call path are fixed:
   link stops working at once, for everyone who has it.
 - A page already down or expired answers `unpublished: false`; a link or id no publication has,
   `NOT_FOUND`.
-- No action lists the pages: the operator names one by its link, or by the `publication_id` its
-  producer reported.
+- **Which pages are up:** read `/artifacts` with `fluxbee_system_get`
+  (`list_published_artifacts`, FINDINGS A-212). Newest first, each page with its
+  `publication_id`, `status`, `filename_original`, `content_type`, `size`, `tenant_id`,
+  `publisher_l2_name`, `created_at` and `expires_at` (epoch seconds). It pages like the other long
+  lists (§10.1.1). To take one down, stage `unpublish_artifact` with its `publication_id`.
+- The list never shows a link's key, whole or in part: the key is the permission to read the page.
+  Never ask for one, and never repeat one in a summary or the chat. When the operator pastes a
+  link, its key may go in the `unpublish_artifact` step, as above (the logs keep only its
+  SHA-256).
+- A page stays up until it is taken down or expires. Taking a page down, a tenant's purge (its
+  pages come down with it) and the factory reset are the ways down before its expiry.
 
 Rules for Archi:
 
@@ -1678,8 +1687,8 @@ installation answer in pages:
 
 - **Which**: `/inventory`, `/inventory/{hive}`, `/hives/{hive}/nodes`, `/versions` (a page of hives),
   `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
-  `/hives/{hive}/vault/secrets` and `/hives/{hive}/commands` (SY.admin's command log) take
-  `?limit=&cursor=`.
+  `/hives/{hive}/vault/secrets`, `/hives/{hive}/commands` (SY.admin's command log) and
+  `/artifacts` (the public pages that are up) take `?limit=&cursor=`.
 - **How**: read without them first. Most lists then give every row, as always; two give one page
   even so: `/hives/{hive}/vault/secrets` 200 secrets and `/hives/{hive}/commands` 50 commands.
   When an answer has `next_cursor`, more rows follow: read the same path again with

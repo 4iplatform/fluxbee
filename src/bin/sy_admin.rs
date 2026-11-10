@@ -101,6 +101,9 @@ const PUBLISH_EDGE_TIMEOUT: Duration = Duration::from_secs(75);
 const PUBLISH_SYNC_HINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The Syncthing folder of `active/` blobs, on every hive that has one.
 const PUBLISH_BLOB_SYNC_FOLDER: &str = "fluxbee-blob";
+/// How long a tenant's purge spends taking its public pages down (FINDINGS A-212): a page not
+/// started by then is answered as not taken down, and stays up until it expires.
+const TENANT_PURGE_PAGES_BUDGET: Duration = Duration::from_secs(60);
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -4785,6 +4788,7 @@ fn admin_action_paging(action: &str) -> Option<AdminActionPaging> {
         "list_ilks" => paging(&["limit", "cursor"], "next_cursor", "ilks"),
         "list_tenants" => paging(&["limit", "cursor"], "next_cursor", "tenants"),
         "list_recent_commands" => paging(&["limit", "cursor"], "next_cursor", "commands"),
+        "list_published_artifacts" => paging(&["limit", "cursor"], "next_cursor", "publications"),
         "vault_list" => paging(&["filter.limit", "cursor"], "next_cursor", "secrets"),
         "list_versions" => paging(&["limit", "cursor"], "next_cursor", "hives"),
         "inventory" | "list_nodes" | "list_tenant_nodes" => {
@@ -5040,7 +5044,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "23";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "24";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -5090,6 +5094,13 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "unpublish_artifact",
         route: InternalActionRoute::Command("unpublish_artifact"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    // The public pages that are up, from the publication ledger (FINDINGS A-212).
+    InternalActionSpec {
+        action: "list_published_artifacts",
+        route: InternalActionRoute::Command("list_published_artifacts"),
         requires_target: false,
         allow_legacy_hive_id: false,
     },
@@ -5801,6 +5812,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         "externalize" | "unexternalize" | "list_externalized" => MeshAccess::OwnChannel,
         "publish_artifact" => MeshAccess::Publisher,
         "unpublish_artifact" => MeshAccess::AiPublisher,
+        // The public pages that are up (FINDINGS A-212): Archi's read. Taking one down stays the
+        // operator's, through a plan.
+        "list_published_artifacts" => MeshAccess::Archi,
         // A hive's cognition forgets every conversation: only behind the operator's word
         // (FINDINGS A-160).
         "cognition_clear" => MeshAccess::Nobody,
@@ -6777,7 +6791,7 @@ async fn handle_unpublish_artifact(
         Ok(ledger) => ledger,
         Err(err) => return Ok(internal_service_error(action, "LEDGER_FAILED", &err)),
     };
-    let Some(mut record) = find_publication(&ledger, &publication).cloned() else {
+    let Some(record) = find_publication(&ledger, &publication).cloned() else {
         let detail = match &publication {
             PublicationRef::Id(publication_id) => format!("publication {publication_id} not found"),
             // The key is a capability: the answer does not repeat it.
@@ -6798,49 +6812,274 @@ async fn handle_unpublish_artifact(
     // edge no longer serves. That last one is left to the sweep (`run_publication_expiry_sweep`),
     // which records its terminal "expired": taking it down here would record "unpublished".
     let now = Utc::now().timestamp().max(0) as u64;
-    if record.status == "unpublished" || record.status == "expired" || record.expires_at <= now {
+    let publication_id = record.publication_id.clone();
+    if publication_is_down(&record, now) {
         return Ok(InternalAdminDispatchResult {
             http_status: 200,
             envelope: serde_json::json!({
                 "status": "ok",
                 "action": action,
-                "payload": {"publication_id": record.publication_id, "unpublished": false}
+                "payload": {"publication_id": publication_id, "unpublished": false}
             }),
         });
     }
-    if let Err(err) = unpublish_edge_blob(client, &record.edge_node, &record.publication_id).await {
-        return Ok(internal_service_error(
-            action,
-            "EDGE_UNPUBLISH_FAILED",
-            &err,
-        ));
-    }
-    record.status = "edge_removed".to_string();
-    ledger
-        .publications
-        .insert(record.publication_id.clone(), record.clone());
-    if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
-        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
-    }
-    if let Err(err) = release_curated_blob(client, ctx, &record.publication_id).await {
-        return Ok(internal_service_error(action, "BLOB_RELEASE_FAILED", &err));
-    }
-    record.status = "unpublished".to_string();
-    record.released_at = Some(Utc::now().timestamp().max(0) as u64);
-    ledger
-        .publications
-        .insert(record.publication_id.clone(), record.clone());
-    if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
-        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+    if let Err((error_code, detail)) = take_down_publication(ctx, client, &mut ledger, record).await
+    {
+        return Ok(internal_service_error(action, error_code, &detail));
     }
     Ok(InternalAdminDispatchResult {
         http_status: 200,
         envelope: serde_json::json!({
             "status": "ok",
             "action": action,
-            "payload": {"publication_id": record.publication_id, "unpublished": true}
+            "payload": {"publication_id": publication_id, "unpublished": true}
         }),
     })
+}
+
+/// Whether a page is down: taken down (`unpublished`), retired by the expiry sweep (`expired`), or
+/// past its `expires_at`, which the edge no longer serves (the sweep records that one `expired`).
+fn publication_is_down(record: &AdminPublicationRecord, now: u64) -> bool {
+    record.status == "unpublished" || record.status == "expired" || record.expires_at <= now
+}
+
+/// Takes a page that is up down, for `unpublish_artifact` and for a tenant's purge: the edge
+/// removes it (the row goes to `edge_removed`), then IO.blob releases its copy (`unpublished`), the
+/// ledger written after each. The caller holds the publication lock and passes the ledger it
+/// loaded under it. The error is `(error_code, detail)`; the same call again finishes what a
+/// failed step left.
+async fn take_down_publication(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    ledger: &mut AdminPublicationLedger,
+    mut record: AdminPublicationRecord,
+) -> Result<(), (&'static str, String)> {
+    unpublish_edge_blob(client, &record.edge_node, &record.publication_id)
+        .await
+        .map_err(|err| ("EDGE_UNPUBLISH_FAILED", err))?;
+    record.status = "edge_removed".to_string();
+    ledger
+        .publications
+        .insert(record.publication_id.clone(), record.clone());
+    persist_admin_publication_ledger(&ctx.publication_ledger_path, ledger)
+        .map_err(|err| ("LEDGER_FAILED", err))?;
+    release_curated_blob(client, ctx, &record.publication_id)
+        .await
+        .map_err(|err| ("BLOB_RELEASE_FAILED", err))?;
+    record.status = "unpublished".to_string();
+    record.released_at = Some(Utc::now().timestamp().max(0) as u64);
+    ledger
+        .publications
+        .insert(record.publication_id.clone(), record);
+    persist_admin_publication_ledger(&ctx.publication_ledger_path, ledger)
+        .map_err(|err| ("LEDGER_FAILED", err))
+}
+
+/// `list_published_artifacts` (FINDINGS A-212): the public pages that are up, from the ledger,
+/// newest first (`live_publication_rows`); all of them, or asked with `limit` or `cursor`, a page
+/// (`mesh_reply::list_page`). A row names its page by its `publication_id`, which
+/// `unpublish_artifact` takes, never by its link's key (`published_artifact_row`). Read without the
+/// publication lock, which a publish holds for up to its 110 s: the ledger is replaced whole
+/// (`persist_admin_publication_ledger` renames a new file over it), so a read sees one state of it.
+fn handle_list_published_artifacts(
+    ctx: &AdminContext,
+    params: &serde_json::Value,
+) -> InternalAdminDispatchResult {
+    let action = "list_published_artifacts";
+    let ask = match PageAsk::from_payload(params) {
+        Ok(ask) => ask,
+        Err(detail) => return internal_invalid_request(action, &detail),
+    };
+    // The refusal does not repeat the cursor: a link's key pasted as one would go back with it.
+    if ask
+        .cursor
+        .as_deref()
+        .is_some_and(|cursor| publication_place(cursor).is_none())
+    {
+        return InternalAdminDispatchResult {
+            http_status: error_code_to_http_status(mesh_reply::INVALID_CURSOR),
+            envelope: serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": mesh_reply::INVALID_CURSOR,
+                "error_detail": format!("the cursor is not a next_cursor of {action}"),
+            }),
+        };
+    }
+    let ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => return internal_service_error(action, "LEDGER_FAILED", &err),
+    };
+    let now = Utc::now().timestamp().max(0) as u64;
+    let page = mesh_reply::list_page(
+        live_publication_rows(&ledger, now),
+        &ask,
+        mesh_reply::LIST_PAGE_MAX_BYTES,
+        |row, cursor| publication_place(row) > publication_place(cursor),
+    );
+    let count = page.rows.len();
+    InternalAdminDispatchResult {
+        http_status: 200,
+        envelope: serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": page.into_answer("publications", serde_json::json!({ "count": count })),
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        }),
+    }
+}
+
+/// The pages of `ledger` that are up at `now` (not `publication_is_down`), newest first and by id
+/// among the pages of one second, each keyed by its place (`publication_place`).
+fn live_publication_rows(
+    ledger: &AdminPublicationLedger,
+    now: u64,
+) -> Vec<(String, serde_json::Value)> {
+    let mut live: Vec<&AdminPublicationRecord> = ledger
+        .publications
+        .values()
+        .filter(|record| !publication_is_down(record, now))
+        .collect();
+    live.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.publication_id.cmp(&b.publication_id))
+    });
+    live.into_iter()
+        .map(|record| {
+            (
+                format!("{}|{}", record.created_at, record.publication_id),
+                published_artifact_row(record),
+            )
+        })
+        .collect()
+}
+
+/// A page's place in `list_published_artifacts`, the key it pages by: `<created_at>|<publication_id>`,
+/// newest first and by id among the pages of one second. A cursor is a place; anything else is
+/// none.
+fn publication_place(key: &str) -> Option<(std::cmp::Reverse<u64>, String)> {
+    let (created_at, publication_id) = key.trim().split_once('|')?;
+    Some((
+        std::cmp::Reverse(created_at.parse().ok()?),
+        canonical_publication_id(publication_id)?,
+    ))
+}
+
+/// What `list_published_artifacts` shows of a page, field by field: what it is, whose it is, and
+/// when it went up and goes down. Never its link's key, whole or in part: the key is the permission
+/// to read the page, and the list goes to Archi, its model and its journal.
+fn published_artifact_row(record: &AdminPublicationRecord) -> serde_json::Value {
+    serde_json::json!({
+        "publication_id": record.publication_id,
+        "status": record.status,
+        "filename_original": record.blob_ref.filename_original,
+        "content_type": record.content_type,
+        "presentation": record.presentation,
+        "size": record.size,
+        "tenant_id": record.tenant_id,
+        "publisher_l2_name": record.publisher_l2_name,
+        "edge_node": record.edge_node,
+        "created_at": record.created_at,
+        "expires_at": record.expires_at,
+    })
+}
+
+/// What a tenant's purge takes down of its public pages (FINDINGS A-212): each page the ledger
+/// holds for `tenant_id` that is up, as `unpublish_artifact` does (`take_down_publication`), one
+/// at a time under the publication lock and read again under it. The answer names the pages
+/// taken down (`unpublished`) and each one that stays up (`failed`, with its `error_code` and
+/// `error_detail`) until it expires or the operator unpublishes it. A page not started within
+/// `TENANT_PURGE_PAGES_BUDGET` is not tried (`TIMEOUT`).
+async fn take_down_tenant_publications(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    tenant_id: &str,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + TENANT_PURGE_PAGES_BUDGET;
+    let now = Utc::now().timestamp().max(0) as u64;
+    let due: Vec<String> = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+        Ok(ledger) => ledger
+            .publications
+            .values()
+            .filter(|record| record.tenant_id == tenant_id && !publication_is_down(record, now))
+            .map(|record| record.publication_id.clone())
+            .collect(),
+        Err(err) => {
+            tracing::warn!(tenant_id = %tenant_id, error = %err, "a purged tenant's public pages cannot be read: they stay up until they expire");
+            return serde_json::json!({
+                "unpublished": [],
+                "failed": [],
+                "error_code": "LEDGER_FAILED",
+                "error_detail": err,
+            });
+        }
+    };
+    let failure = |publication_id: &str, error_code: &str, detail: &str| {
+        serde_json::json!({
+            "publication_id": publication_id,
+            "error_code": error_code,
+            "error_detail": detail,
+        })
+    };
+    let out_of_time = format!(
+        "not tried: the purge's {}s for its pages ran out",
+        TENANT_PURGE_PAGES_BUDGET.as_secs()
+    );
+    let mut unpublished = Vec::new();
+    let mut failed = Vec::new();
+    for publication_id in due {
+        if tokio::time::Instant::now() >= deadline {
+            failed.push(failure(&publication_id, "TIMEOUT", &out_of_time));
+            continue;
+        }
+        let Ok(_publication_guard) =
+            tokio::time::timeout_at(deadline, ctx.publication_lock.lock()).await
+        else {
+            failed.push(failure(&publication_id, "TIMEOUT", &out_of_time));
+            continue;
+        };
+        let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                failed.push(failure(&publication_id, "LEDGER_FAILED", &err));
+                continue;
+            }
+        };
+        // An unpublish or the expiry sweep may have taken it down since the read above.
+        let now = Utc::now().timestamp().max(0) as u64;
+        let Some(record) = ledger
+            .publications
+            .get(&publication_id)
+            .filter(|record| !publication_is_down(record, now))
+            .cloned()
+        else {
+            continue;
+        };
+        match take_down_publication(ctx, client, &mut ledger, record).await {
+            Ok(()) => unpublished.push(publication_id),
+            Err((error_code, detail)) => {
+                failed.push(failure(&publication_id, error_code, &detail));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            unpublished = unpublished.len(),
+            failed = failed.len(),
+            "some of a purged tenant's public pages stay up until they expire: the purge's answer names them"
+        );
+    } else if !unpublished.is_empty() {
+        tracing::info!(
+            tenant_id = %tenant_id,
+            unpublished = unpublished.len(),
+            "a purged tenant's public pages taken down"
+        );
+    }
+    serde_json::json!({ "unpublished": unpublished, "failed": failed })
 }
 
 /// What `unpublish_artifact` names: exactly one of `publication_id` (`pub:<uuid>`, taken in its
@@ -7331,7 +7570,7 @@ async fn curate_publication_blob(
 }
 
 async fn release_curated_blob(
-    client: &Arc<RouterDispatcher>,
+    client: &RouterDispatcher,
     ctx: &AdminContext,
     publication_id: &str,
 ) -> Result<(), String> {
@@ -7360,7 +7599,7 @@ async fn release_curated_blob(
 }
 
 async fn unpublish_edge_blob(
-    client: &Arc<RouterDispatcher>,
+    client: &RouterDispatcher,
     edge_node: &str,
     publication_id: &str,
 ) -> Result<(), String> {
@@ -8277,6 +8516,11 @@ async fn dispatch_internal_admin_command(
             let result = handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
             append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
+        }
+        // A read of SY.admin's own ledger, so not in the audit log. The ledger is the motherbee's,
+        // whatever hive a caller names as the target (Archi names its own).
+        "list_published_artifacts" => {
+            return Ok(handle_list_published_artifacts(ctx, &params));
         }
         "executor_validate_plan" => {
             let plan = match parse_executor_plan(params) {
@@ -10011,6 +10255,22 @@ async fn handle_http(
                 "unpublish_artifact",
                 None,
                 payload,
+                AdminOrigin::Http,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        // The public pages that are up (FINDINGS A-212), each by its publication_id, never by its
+        // link's key. ?limit=&cursor= ask one page.
+        ("GET", "/artifacts") => {
+            let mut payload = serde_json::Map::new();
+            page_query_params(&query, &mut payload);
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "list_published_artifacts",
+                None,
+                serde_json::Value::Object(payload),
                 AdminOrigin::Http,
             )
             .await?;
@@ -13800,6 +14060,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "unpublish_artifact" => {
             "Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own."
         }
+        "list_published_artifacts" => {
+            "List the public pages that are up, newest first: each one's publication_id (what unpublish_artifact takes), status, file name, content type, size, tenant, publisher, edge, and when it went up and expires. Never a link's key."
+        }
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
         "get_hive" => "Read one hive definition.",
@@ -13846,7 +14109,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "restore_tenant" => "Undo the deleted mark of one tenant: it comes back as it was.",
         "purge_tenant" => {
-            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. Refused while people are charged to it, or it has vault secrets, node identities or sponsored tenants."
+            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it; its public pages come down with it. Refused while people are charged to it, or it has vault secrets, node identities or sponsored tenants."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -14073,6 +14336,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "publish_runtime_package" => vec!["POST /admin/runtime-packages/publish"],
         "publish_cloud_endpoint" => vec!["POST /hives/{hive}/cloud/endpoint"],
         "unpublish_artifact" => vec!["POST /artifacts/unpublish"],
+        "list_published_artifacts" => vec!["GET /artifacts"],
         "hive_status" => vec!["GET /hive/status"],
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive_id}"],
@@ -15128,7 +15392,12 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("since_ms", "u64", "Filter: only entries at/after this epoch-ms."),
             admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
         ],
-        "list_ilks" | "list_tenants" | "list_nodes" | "list_tenant_nodes" | "inventory" => vec![
+        "list_ilks"
+        | "list_tenants"
+        | "list_nodes"
+        | "list_tenant_nodes"
+        | "inventory"
+        | "list_published_artifacts" => vec![
             admin_action_body_field("limit", "u32", PAGE_LIMIT_FIELD_NOTE),
             admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
         ],
@@ -15727,6 +15996,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "unpublish_artifact" => {
             r#"curl -X POST /artifacts/unpublish -d '{"publication_id":"pub:550e8400-e29b-41d4-a716-446655440000"}'"#
         }
+        "list_published_artifacts" => "curl -X GET /artifacts",
         "hive_status" => "curl -X GET /hive/status",
         "list_hives" => "curl -X GET /hives",
         "get_hive" => "curl -X GET /hives/worker-220",
@@ -16009,9 +16279,17 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The operator takes down any page, whoever published it: POST /artifacts/unpublish on loopback, or a step of an executor plan, which Archi stages with fluxbee_plan_compiler and SY.admin runs only after the operator confirms it (A-120).",
             "Over the mesh only an AI.* node may ask (A-62), with RouterDispatcher::send_admin_rpc and target=None, and only for a page it published: the same router-stamped L2 name, else 403 UNAUTHORIZED. Archi takes a page down through the executor, never with an ADMIN_COMMAND of its own.",
             "Name the page by exactly one of publication_id (pub:<uuid>, returned by publish_artifact) or key, the last segment of its link: of https://<host>/public/<key>, only <key>. It takes no hive: the publication names its edge.",
+            "list_published_artifacts (GET /artifacts) lists the pages that are up, each with its publication_id.",
             "A publication that does not exist answers 404 NOT_FOUND.",
             "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true; a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
             "No log keeps a link's key: the command log, the executor's run log and Archi's journal keep it as its SHA-256, key_sha256.",
+        ],
+        "list_published_artifacts" => vec![
+            "Motherbee-only: SY.admin answers it from its publication ledger (state/sy-admin/publications.json), asking no one. Takes no hive.",
+            "A page is up until it is taken down (unpublish_artifact, a tenant's purge, the factory reset) or expires: the list leaves out the pages unpublished, expired, or past their expires_at, which the edge no longer serves. status is published, or curated (its publish is under way or stopped half-way, and the edge may serve it) or edge_removed (its take-down is under way or stopped half-way: the edge no longer serves it, and IO.blob still holds its copy); unpublish_artifact finishes either.",
+            "Each row: publication_id, status, filename_original, content_type, presentation, size (bytes), tenant_id and publisher_l2_name (the producer and its tenant when it published), edge_node, created_at and expires_at (epoch seconds).",
+            "A link's key is the permission to read its page, so no row carries it, whole or in part: take a page down by its publication_id. Whoever holds a link can still take its page down by the link's key.",
+            "Pages (FINDINGS A-198): newest first, with limit at most that many from cursor on, and next_cursor while pages follow; total is how many are up. Without limit, every page. A cursor the list did not give answers INVALID_CURSOR (400).",
         ],
         "publish_runtime_package" => vec![
             "Motherbee-only operation.",
@@ -16214,6 +16492,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "purge_tenant" => vec![
             "Final: removes the tenant, the ILKs marked in it and the channels other ILKs hold in its scope. Requires the tenant to be marked first (TENANT_NOT_DELETED otherwise).",
             "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
+            "Once SY.identity has purged the tenant, SY.admin takes its public pages down, each as unpublish_artifact does (FINDINGS A-212), for up to 60 s, and the answer says so in publications: unpublished, the publication_ids taken down, and failed, each page that stays up with its error_code and error_detail (TIMEOUT for one not tried in time) until it expires or is unpublished. A refused purge takes no page down.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants SY.identity knows. SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
@@ -19431,6 +19710,14 @@ async fn handle_identity_command(
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),
     };
+    let purged_tenant = (action == "purge_tenant").then(|| {
+        payload
+            .get("tenant_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    });
     let response = send_system_request(
         client,
         &target,
@@ -19440,6 +19727,26 @@ async fn handle_identity_command(
         admin_action_timeout(action),
     )
     .await;
+    // A purged tenant's public pages come down with it (FINDINGS A-212), and only once SY.identity
+    // has purged it: a refused purge leaves them up. The answer says what came down
+    // (`publications`).
+    let response = match (response, purged_tenant) {
+        (Ok(mut answer), Some(requested))
+            if answer.get("status").and_then(|status| status.as_str()) == Some("ok") =>
+        {
+            let tenant_id = answer
+                .get("tenant_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or(requested);
+            let pages = take_down_tenant_publications(ctx, client, &tenant_id).await;
+            if let Some(fields) = answer.as_object_mut() {
+                fields.insert("publications".to_string(), pages);
+            }
+            Ok(answer)
+        }
+        (response, _) => response,
+    };
     Ok(build_admin_http_response(action, response))
 }
 
@@ -33643,7 +33950,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "23");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "24");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
@@ -37006,5 +37313,355 @@ mod tests {
             assert_eq!(entry["action"], "unpublish_artifact");
             assert_eq!(entry["params"], logged, "{params}");
         }
+    }
+
+    // --- list_published_artifacts and a tenant's purge (FINDINGS A-212) --------------------
+
+    const PAGE_TENANT: &str = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
+    const OTHER_TENANT: &str = "tnt:9b2f4c1e-7a3d-4e8b-8c5f-2d6a1b0e9f37";
+
+    /// A page of `PAGE_PUBLISHER` in `tenant`, published at `created_at`, in `status`.
+    fn page_at(tenant: &str, created_at: u64, status: &str) -> AdminPublicationRecord {
+        let mut page = published_page(PAGE_PUBLISHER);
+        page.tenant_id = tenant.to_string();
+        page.created_at = created_at;
+        page.status = status.to_string();
+        page
+    }
+
+    /// No link's key of `pages`, whole or in part (its first or last 16 characters), is in `text`.
+    fn assert_no_key(text: &str, pages: &[&AdminPublicationRecord]) {
+        for page in pages {
+            for part in [
+                page.key.as_str(),
+                &page.key[..16],
+                &page.key[page.key.len() - 16..],
+            ] {
+                assert!(
+                    !text.contains(part),
+                    "a key of {} in {text}",
+                    page.publication_id
+                );
+            }
+        }
+    }
+
+    /// The pages that are up, newest first, each by its publication_id and the fields an operator
+    /// reads, through HTTP and through the mesh as Archi asks (its own hive as the target). A page
+    /// taken down, expired or past its expires_at is not listed, and no answer carries a link's
+    /// key. A read: it asks no one, and the command log keeps nothing of it.
+    #[tokio::test]
+    async fn the_list_shows_the_pages_that_are_up_and_never_a_links_key() {
+        let (ctx, mut harness) = opa_test_admin("published-list");
+        let newest = page_at(PAGE_TENANT, 30, "published");
+        let other_tenant = page_at(OTHER_TENANT, 20, "published");
+        let half_published = page_at(PAGE_TENANT, 10, "curated");
+        let half_down = page_at(PAGE_TENANT, 5, "edge_removed");
+        let unpublished = page_at(PAGE_TENANT, 40, "unpublished");
+        let expired = page_at(PAGE_TENANT, 40, "expired");
+        let mut lapsed = page_at(PAGE_TENANT, 40, "published");
+        lapsed.expires_at = Utc::now().timestamp().max(0) as u64;
+        let pages = [
+            &newest,
+            &other_tenant,
+            &half_published,
+            &half_down,
+            &unpublished,
+            &expired,
+            &lapsed,
+        ];
+        seed_publications(&ctx, &pages);
+
+        for origin in [
+            AdminOrigin::Http,
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        ] {
+            let target = matches!(origin, AdminOrigin::Mesh(_)).then_some(PRIMARY_HIVE_ID);
+            let result = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "list_published_artifacts",
+                target,
+                json!({}),
+                origin,
+            )
+            .await
+            .expect("answered");
+            assert_eq!(result.http_status, 200, "{}", result.envelope);
+            let payload = &result.envelope["payload"];
+            assert_eq!(payload["total"], json!(4));
+            assert_eq!(payload["count"], json!(4));
+            assert!(payload.get("next_cursor").is_none());
+            let listed: Vec<&str> = payload["publications"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| row["publication_id"].as_str().expect("an id"))
+                .collect();
+            assert_eq!(
+                listed,
+                [
+                    newest.publication_id.as_str(),
+                    other_tenant.publication_id.as_str(),
+                    half_published.publication_id.as_str(),
+                    half_down.publication_id.as_str(),
+                ]
+            );
+            assert_eq!(
+                payload["publications"][0],
+                json!({
+                    "publication_id": newest.publication_id,
+                    "status": "published",
+                    "filename_original": newest.blob_ref.filename_original,
+                    "content_type": "text/html; charset=utf-8",
+                    "presentation": "inline",
+                    "size": 3,
+                    "tenant_id": PAGE_TENANT,
+                    "publisher_l2_name": PAGE_PUBLISHER,
+                    "edge_node": PAGE_EDGE,
+                    "created_at": 30,
+                    "expires_at": u64::MAX,
+                })
+            );
+            assert_eq!(payload["publications"][1]["tenant_id"], json!(OTHER_TENANT));
+            assert_eq!(payload["publications"][2]["status"], json!("curated"));
+            assert_eq!(payload["publications"][3]["status"], json!("edge_removed"));
+            assert_no_key(&result.envelope.to_string(), &pages);
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        assert!(!admin_command_log_path(&ctx.state_dir).exists());
+        // A node is no reader of the list.
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "list_published_artifacts",
+            None,
+            json!({}),
+            AdminOrigin::Mesh("AI.sales@motherbee"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+    }
+
+    /// Asked with limit, the list pages newest first by its own cursor, the pages of one second by
+    /// id; a cursor it did not give, or a limit that is no number of rows, is refused. No ledger
+    /// yet is no page up.
+    #[tokio::test]
+    async fn the_list_pages_newest_first_by_its_own_cursor() {
+        let (ctx, _harness) = opa_test_admin("published-pages");
+        let list = |params: Value| handle_list_published_artifacts(&ctx, &params);
+
+        let empty = list(json!({}));
+        assert_eq!(empty.http_status, 200, "{}", empty.envelope);
+        assert_eq!(empty.envelope["payload"]["publications"], json!([]));
+        assert_eq!(empty.envelope["payload"]["total"], json!(0));
+
+        let newest = page_at(PAGE_TENANT, 30, "published");
+        let mut same_second: Vec<AdminPublicationRecord> = (0..2)
+            .map(|_| page_at(PAGE_TENANT, 20, "published"))
+            .collect();
+        same_second.sort_by(|a, b| a.publication_id.cmp(&b.publication_id));
+        seed_publications(&ctx, &[&newest, &same_second[0], &same_second[1]]);
+
+        let first = list(json!({ "limit": 2 }));
+        let payload = &first.envelope["payload"];
+        assert_eq!(payload["count"], json!(2));
+        assert_eq!(payload["total"], json!(3));
+        assert_eq!(
+            payload["publications"][0]["publication_id"],
+            json!(newest.publication_id)
+        );
+        assert_eq!(
+            payload["publications"][1]["publication_id"],
+            json!(same_second[0].publication_id)
+        );
+        let cursor = payload["next_cursor"].as_str().expect("a next page");
+        assert_eq!(cursor, format!("20|{}", same_second[0].publication_id));
+
+        // An HTTP query gives the limit as text.
+        let second = list(json!({ "limit": "2", "cursor": cursor }));
+        let payload = &second.envelope["payload"];
+        assert_eq!(payload["count"], json!(1));
+        assert_eq!(
+            payload["publications"][0]["publication_id"],
+            json!(same_second[1].publication_id)
+        );
+        assert!(payload.get("next_cursor").is_none());
+
+        // A link's key pasted as the cursor does not come back in the refusal.
+        for cursor in [
+            "20".to_string(),
+            same_second[0].publication_id.clone(),
+            format!("x|{}", same_second[0].publication_id),
+            "20|pub:not-a-uuid".to_string(),
+            newest.key.clone(),
+        ] {
+            let refused = list(json!({ "cursor": cursor }));
+            assert_eq!(refused.http_status, 400, "{cursor}");
+            assert_eq!(refused.envelope["error_code"], json!("INVALID_CURSOR"));
+            assert!(!refused.envelope.to_string().contains(&cursor), "{cursor}");
+        }
+        let refused = list(json!({ "limit": 0 }));
+        assert_eq!(refused.http_status, 400);
+        assert_eq!(refused.envelope["error_code"], json!("INVALID_REQUEST"));
+    }
+
+    /// Archi's read, with its route and its pages; not the Cloud's, and no change.
+    #[test]
+    fn list_published_artifacts_is_archis_read() {
+        let spec = resolve_internal_action_spec("list_published_artifacts").expect("registered");
+        assert!(!spec.requires_target);
+        assert!(admin_action_is_read_only("list_published_artifacts"));
+        assert!(!admin_action_requires_confirmation(
+            "list_published_artifacts"
+        ));
+        assert!(admin_action_executor_available("list_published_artifacts"));
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["path_patterns"], json!(["GET /artifacts"]));
+        assert_eq!(admin_methods_allowed_for_path("/artifacts"), vec!["GET"]);
+        assert_eq!(
+            admin_action_example_scmd("list_published_artifacts").as_deref(),
+            Some("curl -X GET /artifacts")
+        );
+        assert!(!admin_action_request_notes("list_published_artifacts").is_empty());
+        let paging = admin_action_paging("list_published_artifacts").expect("pages");
+        assert_eq!(paging.rows, "publications");
+        assert_eq!(
+            mesh_access("list_published_artifacts"),
+            Some(MeshAccess::Archi)
+        );
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"list_published_artifacts"));
+    }
+
+    /// The answers to a purge of `tenant`: SY.vault holds none of its secrets, and SY.identity
+    /// answers `purged`.
+    async fn purge_answers(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        tenant: &str,
+        purged: Value,
+    ) {
+        let wait = Duration::from_secs(5);
+        let listing = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the vault check");
+        assert_eq!(listing.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+        let none = json!({ "status": "ok", "count": 0, "total": 0, "secrets": [] });
+        harness
+            .inject(reply_to(&listing, MSG_VAULT_LIST_RESPONSE, none))
+            .await
+            .unwrap();
+        let purge = harness.next_outgoing_within(wait).await.expect("the purge");
+        assert_eq!(purge.meta.msg.as_deref(), Some("TNT_PURGE"));
+        assert_eq!(purge.payload, json!({ "tenant_id": tenant }));
+        harness
+            .inject(reply_to(&purge, "TNT_PURGE_RESPONSE", purged))
+            .await
+            .unwrap();
+    }
+
+    /// Once SY.identity has purged a tenant, its pages that are up come down, each as
+    /// unpublish_artifact takes one down, and the answer names them; one that does not come down
+    /// is named with why, and stays up. Another tenant's pages, and the tenant's pages already
+    /// down, are left as they are. A refused purge takes nothing down.
+    #[tokio::test]
+    async fn a_purged_tenants_pages_come_down_with_it() {
+        let (ctx, mut harness) = opa_test_admin("purge-pages");
+        let mut up: Vec<AdminPublicationRecord> = (0..2)
+            .map(|_| page_at(PAGE_TENANT, 10, "published"))
+            .collect();
+        up.sort_by(|a, b| a.publication_id.cmp(&b.publication_id));
+        let already_down = page_at(PAGE_TENANT, 10, "unpublished");
+        let others = page_at(OTHER_TENANT, 10, "published");
+        seed_publications(&ctx, &[&up[0], &up[1], &already_down, &others]);
+        let purge = json!({ "tenant_id": PAGE_TENANT });
+
+        // Refused: no page is touched.
+        let refused = handle_identity_command(
+            &ctx,
+            &ctx.rpc,
+            "purge_tenant",
+            purge.clone(),
+            Some(PRIMARY_HIVE_ID.to_string()),
+        );
+        let not_marked = json!({
+            "status": "error",
+            "error_code": "TENANT_NOT_DELETED",
+            "error_detail": "purge requires the tenant to be marked deleted first",
+        });
+        let (answer, ()) = tokio::join!(
+            refused,
+            purge_answers(&mut harness, PAGE_TENANT, not_marked)
+        );
+        let (status, body) = answer.expect("answered");
+        assert!(status >= 400, "{body}");
+        assert!(!body.contains("publications"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        assert_eq!(publication_status(&ctx, &up[0].publication_id), "published");
+
+        // Purged: the first page comes down, the edge refuses the second.
+        let purged = handle_identity_command(
+            &ctx,
+            &ctx.rpc,
+            "purge_tenant",
+            purge,
+            Some(PRIMARY_HIVE_ID.to_string()),
+        );
+        let drive = async {
+            let gone = json!({ "status": "ok", "tenant_id": PAGE_TENANT, "state": "purged" });
+            purge_answers(&mut harness, PAGE_TENANT, gone).await;
+            take_down(&mut harness, &up[0].publication_id).await;
+            let unpublish = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the edge's unpublish");
+            assert_eq!(
+                unpublish.payload,
+                json!({ "publication_id": up[1].publication_id })
+            );
+            harness
+                .inject(reply_to(
+                    &unpublish,
+                    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+                    json!({ "status": "error", "error": "busy" }),
+                ))
+                .await
+                .unwrap();
+        };
+        let (answer, ()) = tokio::join!(purged, drive);
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        let publications = &body["payload"]["publications"];
+        assert_eq!(publications["unpublished"], json!([up[0].publication_id]));
+        let failed = publications["failed"].as_array().expect("failed");
+        assert_eq!(failed.len(), 1, "{publications}");
+        assert_eq!(failed[0]["publication_id"], json!(up[1].publication_id));
+        assert_eq!(failed[0]["error_code"], json!("EDGE_UNPUBLISH_FAILED"));
+        assert_no_key(&body.to_string(), &[&up[0], &up[1], &already_down, &others]);
+        assert_eq!(
+            publication_status(&ctx, &up[0].publication_id),
+            "unpublished"
+        );
+        assert_eq!(publication_status(&ctx, &up[1].publication_id), "published");
+        assert_eq!(
+            publication_status(&ctx, &already_down.publication_id),
+            "unpublished"
+        );
+        assert_eq!(
+            publication_status(&ctx, &others.publication_id),
+            "published"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
     }
 }

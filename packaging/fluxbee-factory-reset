@@ -14,6 +14,11 @@ REMOVED (operator decisions, 2026-09-28):
     state and its packages, running instances included);
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
+  - every published page that is up (a /public/<key> link), once no workflow or user node is left
+    to publish one: SY.admin lists them (GET /artifacts, each by its publication_id, never by its
+    link's key) and takes each down (unpublish_artifact): the edge stops serving it and IO.blob
+    releases its copy in blob/public/. When SY.admin cannot list them the reset goes on, and names
+    the pages that stay public from SY.admin's ledger, read only (FINDINGS A-212);
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
@@ -31,12 +36,14 @@ REMOVED (operator decisions, 2026-09-28):
 KEPT: the installation (package, /etc/fluxbee, vault master key, TLS, mesh and spokes), what
 starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with their ILK, ICH and
 config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
-(admin command log, deploy history, vault audit). The spokes' host rules are part of the
+(admin command log, deploy history, vault audit, SY.admin's publication ledger, whose rows say
+how each page went down). The spokes' host rules are part of the
 installation too: the ingress' SSH table (inet fluxbee_ingress) and the egress' table live on
 those hosts, which this script never reaches, and their orchestrators apply them again on every
 reconcile; remove_hive drops them with the hive (docs/control-path-hardening-v1.md §6).
 
-NOT covered yet (never touched): blobs/publications.
+NOT covered (never touched): the blob store. The blobs nodes wrote stay (blob/active/,
+blob/staging/); only a page's copy in blob/public/ goes, with its page.
 
 Everything goes through the product's own admin API except the message log,
 which has no API: its tables are truncated with the storage consumers stopped.
@@ -58,6 +65,10 @@ HIVE_YAML = os.environ.get("FLUXBEE_HIVE_YAML", "/etc/fluxbee/hive.yaml")
 MANIFEST = os.environ.get("FLUXBEE_BASE_NODES", "/usr/share/fluxbee/base-nodes.json")
 STORAGE_DB = "fluxbee_storage"
 LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
+# SY.admin's publication ledger: read only, and only to name the pages that stay public when
+# SY.admin cannot list them. Each row holds its link's key, which is never printed.
+PUBLICATION_LEDGER = os.path.join(STATE_DIR, "state", "sy-admin", "publications.json")
+PAGE_DOWN = ("unpublished", "expired")
 
 # Vault infrastructure that survives: edge bearers and edge TLS (two of fluxbee_sdk's
 # CLOUD_RESERVED_VAULT_KEY_PREFIXES), and the postgres secret fluxbee-firstboot writes. The third
@@ -334,6 +345,62 @@ def clear_cognitions(hives):
     return failed
 
 
+def published_pages():
+    """-> (pages, None): the public pages that are up, as SY.admin lists them (GET /artifacts,
+    list_published_artifacts), each named by its publication_id, never by its link's key; or
+    (None, why) when SY.admin does not list them."""
+    status, resp = api("GET", "/artifacts")
+    if not ok(status, resp):
+        return None, "%s %s" % (status, str(resp)[:200])
+    return payload(resp).get("publications", []), None
+
+
+def ledger_pages():
+    """The pages SY.admin's ledger holds as up (neither unpublished nor expired, and not past
+    their expires_at), newest first: what stays public when SY.admin cannot take them down. None
+    when the ledger cannot be read; none at all without one."""
+    try:
+        with open(PUBLICATION_LEDGER) as f:
+            ledger = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        return None
+    rows = ledger.get("publications") if isinstance(ledger, dict) else None
+    now = time.time()
+    up = [p for p in (rows.values() if isinstance(rows, dict) else [])
+          if isinstance(p, dict) and p.get("status") not in PAGE_DOWN
+          and isinstance(p.get("expires_at"), (int, float)) and p["expires_at"] > now]
+    return sorted(up, key=lambda p: -(p.get("created_at") or 0))
+
+
+def page_line(page):
+    """One page, by the fields an operator reads (a row of the list or of the ledger), never by
+    its link's key."""
+    name = page.get("filename_original") or (page.get("blob_ref") or {}).get("filename_original")
+    try:
+        expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(page.get("expires_at"))))
+    except (TypeError, ValueError, OverflowError, OSError):
+        expires = "?"
+    return "%s  %-14s %-24s %s  %s  expires %s" % (
+        page.get("publication_id"), page.get("status") or "?", name or "?",
+        page.get("tenant_id") or "?", page.get("publisher_l2_name") or "?", expires)
+
+
+def print_ledger_pages(indent):
+    """What SY.admin's ledger holds as up, when SY.admin does not list the pages: they stay
+    public until they expire (30 days at most) or are unpublished."""
+    left = ledger_pages()
+    if left is None:
+        print("%sSY.admin's ledger (%s) cannot be read either: pages may stay public until they"
+              " expire (30 days at most)" % (indent, PUBLICATION_LEDGER))
+        return
+    print("%s%d stay public until they expire (30 days at most) or are unpublished, by SY.admin's"
+          " ledger (%s):" % (indent, len(left), PUBLICATION_LEDGER))
+    for p in left:
+        print("%s  %s" % (indent, page_line(p)))
+
+
 ROOT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
 
@@ -388,6 +455,41 @@ def kill_user_nodes(nodes):
         if not good:
             failed.append((name, status, str(resp)[:200]))
     return failed
+
+
+def unpublish_pages():
+    """Take every page that is up down through SY.admin: unpublish_artifact by its publication_id,
+    list after list while a pass takes one down, so a page published meanwhile goes too and a
+    failure is retried. A page already down answers ok as well. When SY.admin does not list them,
+    the reset goes on: it says so and names the pages that stay public from SY.admin's ledger.
+    -> (pages taken down, failures [(what, why)])."""
+    done, failed = 0, {}
+    for _ in range(10):
+        pages, why = published_pages()
+        if pages is None:
+            print("  FAIL SY.admin did not list the published pages: %s" % why)
+            print_ledger_pages("    ")
+            return done, [("published pages", why)] + list(failed.items())
+        failed = {}
+        if not pages:
+            break
+        progress = 0
+        for p in pages:
+            pid = p.get("publication_id")
+            # The publication lock a publish in flight holds (up to 110 s), then the edge and
+            # IO.blob (30 s each).
+            status, resp = api("POST", "/artifacts/unpublish", {"publication_id": pid}, timeout=180)
+            if ok(status, resp):
+                done += 1
+                progress += 1
+            else:
+                failed[pid] = "%s %s" % (status, str(resp)[:160])
+        if not progress:
+            break
+    print("  pages: %d taken down, %d failed" % (done, len(failed)))
+    for pid, why in failed.items():
+        print("    FAIL %s: %s" % (pid, why))
+    return done, list(failed.items())
 
 
 def delete_until_empty(label, lister, deleter, ident):
@@ -459,6 +561,7 @@ def main():
     user_nodes, surviving, wf_nodes = classify_nodes(hives, base, hive_id, workflows)
     # The listing counts the ILKs that go on their own (not those of the nodes removed in [0]/[1]).
     going = {name for _, name in user_nodes} | {name for _, name in wf_nodes}
+    pages_now, pages_why = published_pages()
     ilks_now = user_ilks(hive_id, surviving | going, base)
     secrets_now = user_secrets(hive_id)
     can_db = os.geteuid() == 0
@@ -477,32 +580,41 @@ def main():
     print("[1] user nodes to kill+purge (ILK, node secrets and timers go with them): %d" % len(user_nodes))
     for hive, name in user_nodes:
         print("    %s  (on %s)" % (name, hive))
-    print("[2] user ILKs to purge (mark + purge; already-marked ones too): %d  (plus the ILKs of the nodes above)" % len(ilks_now))
+    if pages_now is None:
+        print("[2] published pages: SY.admin did not list them (%s)" % pages_why)
+        print_ledger_pages("    ")
+    else:
+        print("[2] published pages to take down through SY.admin (unpublish_artifact; each one's copy"
+              " in blob/public/ goes with it): %d" % len(pages_now))
+        for p in pages_now:
+            print("    %s" % page_line(p))
+    print("[3] user ILKs to purge (mark + purge; already-marked ones too): %d  (plus the ILKs of the nodes above)" % len(ilks_now))
     for i in ilks_now:
         print("    %s  %-8s %s%s" % (i.get("ilk_id"), i.get("ilk_type"), i.get("display_name") or i.get("node_name") or "",
                                    "  [already marked]" if i.get("deleted_at_ms") else ""))
-    print("[3] vault secrets to delete (everything but infra): %d" % len(secrets_now))
+    print("[4] vault secrets to delete (everything but infra): %d" % len(secrets_now))
     for s in secrets_now:
         md = s.get("metadata") or {}
         print("    %-40s %s" % (s.get("key"), md.get("resource_type") or ""))
-    print("[4] tenants to purge (all but the root; mark + purge): %d" % len(tenants))
+    print("[5] tenants to purge (all but the root; mark + purge): %d" % len(tenants))
     for t in tenants:
         print("    %s  %s%s" % (t.get("tenant_id"), t.get("name") or "", "  [already marked]" if t.get("deleted_at_ms") else ""))
-    print("[5] user OPA policy -- opa_clear on every hive (current, staged, backup; routers unload it): %s"
+    print("[6] user OPA policy -- opa_clear on every hive (current, staged, backup; routers unload it): %s"
           % (", ".join("%s=v%s" % kv for kv in sorted(opa_versions.items())) or "status unavailable"))
     if can_db:
-        print("[6] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
+        print("[7] message log (%s), rows per table -- all truncated:" % STORAGE_DB)
         for t in tables:
             print("    %-36s %d" % (t, counts.get(t, 0)))
     else:
-        print("[6] message log (%s): run as root to see the row counts" % STORAGE_DB)
+        print("[7] message log (%s): run as root to see the row counts" % STORAGE_DB)
     print("    + SY.cognition on every hive that runs it (cognition_clear: its file, its memory and its memory region): %s"
           % (", ".join(cog_hives) or "none"))
     print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
     for d in conv:
         print("      %s" % d)
     print("    + Architect chat sessions (DELETE /api/sessions)")
-    print("\nNOT touched: routes/VPNs/taps, history, system + base nodes (%s)." % ", ".join(sorted(base)))
+    print("\nNOT touched: routes/VPNs/taps, history, the blob store (but the pages' copies in blob/public/),"
+          " system + base nodes (%s)." % ", ".join(sorted(base)))
 
     if not execute:
         print("\nDRY-RUN: nothing was changed. Execute with --yes.")
@@ -515,7 +627,7 @@ def main():
         die("confirmation does not match the hive_id -- nothing changed")
 
     t0 = time.time()
-    print("\n== [0/7] delete workflows")
+    print("\n== [0/8] delete workflows")
     wf_fail = []
     for hive, wf in workflows:
         status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
@@ -525,10 +637,15 @@ def main():
         if not good:
             wf_fail.append((wf, status, str(resp)[:200]))
             print("    %s %s" % (status, str(resp)[:200]))
-    print("== [1/7] kill+purge user nodes")
+    print("== [1/8] kill+purge user nodes")
     node_fail = kill_user_nodes(user_nodes)
 
-    print("== [2/7] purge user ILKs")
+    print("== [2/8] take down the published pages")
+    # After [0] and [1], so no workflow or user node is left to publish a page meanwhile, and
+    # while SY.admin, the edge and IO.blob run: nothing the reset stops serves the take-down.
+    pages_done, page_fail = unpublish_pages()
+
+    print("== [3/8] purge user ILKs")
     # Keep the ILK of EVERY node still alive -- a kill that failed must not lose its identity.
     surviving_now = all_node_names(list_hives())
     ilk_fail = delete_until_empty(
@@ -536,7 +653,7 @@ def main():
         lambda i: purge_identity("ilks", hive_id, i["ilk_id"]),
         lambda i: i["ilk_id"])
 
-    print("== [3/7] delete user vault secrets")
+    print("== [4/8] delete user vault secrets")
     # Each key is deleted in the tenant it belongs to: SY.vault answers KEY_NOT_FOUND for a key
     # named in another tenant, and admin fills in the root tenant when none is named.
     vault_fail = delete_until_empty(
@@ -545,7 +662,7 @@ def main():
             q(hive_id), q(s["key"]), q((s.get("metadata") or {}).get("tenant_id", "")))),
         lambda s: s["key"])
 
-    print("== [4/7] delete tenants (all but the root)")
+    print("== [5/8] delete tenants (all but the root)")
     # Passes: a sponsor can only be marked/purged once its sponsored tenants are gone, so the
     # children fall on the first pass and their sponsors on the next.
     tenant_fail = delete_until_empty(
@@ -553,7 +670,7 @@ def main():
         lambda t: purge_identity("tenants", hive_id, t["tenant_id"]),
         lambda t: t["tenant_id"])
 
-    print("== [5/7] clear the user OPA policy (every hive)")
+    print("== [6/8] clear the user OPA policy (every hive)")
     api("POST", "/opa/policy/clear", {}, timeout=120)
     # Judge by the RESULT, asked hive by hive. The motherbee clears at once; the other hives clear
     # when the published (empty) policy reaches them by Syncthing, so give them a moment.
@@ -566,9 +683,9 @@ def main():
     opa_fail = [("opa", h, v) for h, v in sorted(left_opa.items())]
     print("  %s" % ("no user policy left on any hive" if not opa_fail
                     else "FAIL user policy still loaded: %s" % left_opa))
-    print("== [6/7] message log")
+    print("== [7/8] message log")
     # Every hive's SY.cognition drops what it keeps through cognition_clear, running, this one's
-    # included (`cognition_hives`). No episode can be made meanwhile: the AI keys went at [3].
+    # included (`cognition_hives`). No episode can be made meanwhile: the AI keys went at [4].
     cog_fail = clear_cognitions(cog_hives)
     # SY.* are real systemd units, held down for the truncate (`hold_down`). The base AI nodes are
     # orchestrator-managed TRANSIENT units: a `systemctl stop` makes them vanish (a later start finds
@@ -599,7 +716,7 @@ def main():
     status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
     print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))
 
-    print("== [7/7] verify")
+    print("== [8/8] verify")
     for _ in range(40):
         hives = list_hives()
         if all(st in ("alive", "connected") for _, st in hives):
@@ -608,11 +725,11 @@ def main():
     failed_units = sh(["systemctl", "--failed", "--no-legend", "--plain"], check=False).stdout.split()
     print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
-    problems = (len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail) + len(opa_fail)
-                + len(left) + len(cog_fail))
-    summary = "%s factory-reset hive=%s workflows=%d nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
-        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), len(ilks_now), len(secrets_now),
-        len(tables), problems, time.time() - t0)
+    problems = (len(wf_fail) + len(node_fail) + len(page_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail)
+                + len(opa_fail) + len(left) + len(cog_fail))
+    summary = "%s factory-reset hive=%s workflows=%d nodes=%d pages=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), pages_done, len(ilks_now),
+        len(secrets_now), len(tables), problems, time.time() - t0)
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
         with open(LOG_PATH, "a") as f:

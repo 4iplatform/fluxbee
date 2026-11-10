@@ -262,7 +262,8 @@ Deleting is reversible; purging is physical and final (`delete_ilk`, `restore_il
 - `TNT_PURGE` needs a marked tenant and refuses while it sponsors any tenant, has node identities
   or has people charged to it (`TENANT_HAS_PEOPLE`: move them with `ILK_SET_TENANT` first). It
   removes the tenant, its ILKs and the channels in its scope. SY.admin first checks that the
-  tenant has no vault secrets (`purge_tenant_vault_block`: `TENANT_HAS_SECRETS`, HTTP 409).
+  tenant has no vault secrets (`purge_tenant_vault_block`: `TENANT_HAS_SECRETS`, HTTP 409), and
+  once the purge went through takes the tenant's public pages down (FINDINGS A-212).
 
 Every write runs on a snapshot of the store, commits in one database transaction and only then
 sends its deltas; any error rolls the store back (`run_lifecycle_op`).

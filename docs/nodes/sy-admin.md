@@ -198,6 +198,7 @@ starts, and `total` says how many rows there are in all:
 | `inventory` (`global`, `hive`) | `limit`, `cursor` | `next_cursor` | `nodes` | by hive, then name |
 | `list_versions` | `limit`, `cursor` | `next_cursor` | `hives` | the motherbee, then the others by id |
 | `list_recent_commands` | `limit`, `cursor` | `next_cursor` | `commands` | newest first, by `seq` |
+| `list_published_artifacts` | `limit`, `cursor` | `next_cursor` | `publications` | newest first, then by id |
 | `vault_list` | `filter.limit`, `cursor` | `next_cursor` | `secrets` | newest write first |
 | `get_installation`, `get_versions`, `list_versions` | `versions_limit`, `versions_before` | `versions_next_before` | `versions` | oldest first, the newest 20 |
 | `get_llm_usage` | `limit`, `after` | `next` | `records`, `groups` | SY.storage's, under 64 KiB a page |
@@ -388,6 +389,8 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
 | `publish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT`, `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` |
 | `unpublish_artifact` | the publication's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
+| `purge_tenant`, once SY.identity has purged the tenant | for each of its pages that is up, the page's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
+| `list_published_artifacts` | answered by SY.admin from its publication ledger | |
 | `acme_status`, `acme_renew`, `acme_test`, `acme_reload` | answered by SY.admin's ACME client, which asks the public edge, SY.vault, the CA and SY.orchestrator | `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `VAULT_*`, `record_drift_alert` ([The ACME client](#the-acme-client)) |
 | `web_status` | answered by SY.admin from what it holds, plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
@@ -1139,6 +1142,34 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   params that are neither an object nor null only `***REDACTED***`
   (`unpublish_artifact_log_params`). So the command log carries no live link, refused requests
   included (A-95), and neither does the executor's run log of a plan that took a page down.
+- **The pages that are up** (FINDINGS A-212). `GET /artifacts` (`list_published_artifacts`,
+  `handle_list_published_artifacts`) lists the ledger's pages that are neither `unpublished` nor
+  `expired` nor past their `expires_at`, newest first and by id within a second
+  (`live_publication_rows`). A row is built field by field (`published_artifact_row`):
+  `publication_id`, `status` (`published`; `curated`, a publish under way or stopped half-way,
+  which the edge may serve; `edge_removed`, a take-down under way or stopped half-way, which the
+  edge no longer serves and whose copy IO.blob still holds), `filename_original`,
+  `content_type`, `presentation`, `size`, `tenant_id` and `publisher_l2_name` (the producer and
+  its tenant when it published), `edge_node`, `created_at` and `expires_at` (epoch seconds).
+  **No row carries a link's key, whole or in part:** the key is the permission to read the page,
+  and the list goes to Archi, its model and its journal; a page is taken down by its
+  `publication_id`, which `unpublish_artifact` takes, and whoever holds a link can still name it
+  by its key. Pages (FINDINGS A-198): `limit` and `cursor`, `next_cursor` (`<created_at>|<id>`,
+  `publication_place`) while pages follow, `total`; a cursor the list did not give answers
+  `INVALID_CURSOR`. It reads the ledger without the publication lock, which a publish holds for up
+  to 110 s (the file is replaced whole), asks no one, and, a read, is not in the command log.
+  Archi reads it (`GET /artifacts` through `fluxbee_system_get`); the Cloud's relay does not.
+- **A tenant's purge takes its pages down** (FINDINGS A-212). Once SY.identity has purged the
+  tenant (status `ok`), `purge_tenant` takes down each page the ledger holds for that tenant that
+  is up, as `unpublish_artifact` does (`take_down_publication`), one at a time under the
+  publication lock, for up to 60 s (`TENANT_PURGE_PAGES_BUDGET`; a page not started by then is
+  `TIMEOUT`). The answer adds `publications`: `unpublished`, the ids taken down, and `failed`, each
+  page that stays up with its `error_code` and `error_detail` until it expires or the operator
+  unpublishes it (`take_down_tenant_publications`). A refused purge takes no page down. The
+  tenant is the publisher's when it published (the record's `tenant_id`).
+- **The factory reset takes every page down** through these two actions, after the workflows and
+  the user nodes are gone (`unpublish_pages` in `packaging/fluxbee-factory-reset`; see
+  [operations](../reference/operations.md#factory-reset)).
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
   hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048
@@ -1459,7 +1490,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 23, 117 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 24, 118 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -1473,6 +1504,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
 | `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
 | `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own. |
+| `list_published_artifacts` | `GET /artifacts` | List the public pages that are up, newest first: each one's publication_id (what unpublish_artifact takes), status, file name, content type, size, tenant, publisher, edge, and when it went up and expires. Never a link's key. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives, and each hive's installation file. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive, and its installation file. |
 | `get_installation` | `GET /installation` | Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), the versions recorded with their values (the newest 20 unless asked), and each hive's copy with the config update it applied last. |
@@ -1525,7 +1557,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `purge_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/purge` | Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise). |
 | `delete_tenant` | `DELETE /hives/{hive}/identity/tenants/{tenant_id}` | Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable. |
 | `restore_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | Undo the deleted mark of one tenant: it comes back as it was. |
-| `purge_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. |
+| `purge_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it; its public pages come down with it. |
 | `list_tenants` | `GET /hives/{hive}/identity/tenants` | List identity tenants in a hive. |
 | `get_tenant` | `GET /hives/{hive}/identity/tenants/{tenant_id}` | Read one identity tenant in a hive. |
 | `create_tenant` | `POST /hives/{hive}/identity/tenants` | Create an identity tenant in a hive. |

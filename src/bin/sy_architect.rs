@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets and /hives/{hive}/commands take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands and /artifacts take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -13549,6 +13549,15 @@ fn translate_scmd(
             action: "web_status".to_string(),
             target_hive: local_hive_id.to_string(),
             params: json!({}),
+        }),
+        // The public pages that are up, from SY.admin's ledger (FINDINGS A-212), each by its
+        // publication_id, never by its link's key. Taking one down, unpublish_artifact, is a plan
+        // the operator confirms.
+        ("GET", ["artifacts"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_published_artifacts".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: scmd_page_params(raw_query, json!({}), SCMD_PAGE_KEYS),
         }),
         ("GET", ["config", "storage"]) => Ok(AdminTranslation {
             admin_target,
@@ -32084,6 +32093,20 @@ mod tests {
         assert!(admin_src.contains(&format!("\"node_help\" => \"curl -X GET {path}\"")));
     }
 
+    /// The public pages that are up are a read Archi runs (FINDINGS A-212), and the admin catalog's
+    /// example for it is that read; taking one down is no read.
+    #[test]
+    fn the_published_pages_are_a_read_archi_runs() {
+        let translated = translate_scmd("motherbee", parse("curl -X GET /artifacts"))
+            .expect("the published pages");
+        assert_eq!(translated.action, "list_published_artifacts");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert!(system_get_may_run("GET", &translated.action));
+        let admin_src = include_str!("sy_admin.rs");
+        assert!(admin_src.contains("\"list_published_artifacts\" => \"curl -X GET /artifacts\""));
+        assert!(!system_get_may_run("POST", "unpublish_artifact"));
+    }
+
     #[test]
     fn a_hive_inventory_read_names_its_hive() {
         for (path, scope) in [
@@ -32486,6 +32509,13 @@ mod tests {
                 json!({ "limit": 5, "cursor": "12", "action": "run_node", "status": "error", "since_ms": 100 }),
             ),
             ("/hives/motherbee/commands", "list_recent_commands", json!({})),
+            // The public pages that are up (FINDINGS A-212).
+            (
+                "/artifacts?limit=10&cursor=1762700000%7Cpub:550e8400-e29b-41d4-a716-446655440000",
+                "list_published_artifacts",
+                json!({ "limit": 10, "cursor": "1762700000|pub:550e8400-e29b-41d4-a716-446655440000" }),
+            ),
+            ("/artifacts", "list_published_artifacts", json!({})),
         ] {
             let translated = translate(path);
             assert_eq!(translated.action, action, "{path}");

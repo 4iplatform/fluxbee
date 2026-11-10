@@ -131,14 +131,18 @@ actions in `PROGRAMMER_QUERY_ALLOWED_ACTIONS`.
 **Pages** (FINDINGS A-198): the reads of lists that grow with the installation take
 `?limit=&cursor=` (`/inventory`, `/inventory/{hive}`, `/hives/{hive}/status`,
 `/hives/{hive}/nodes`, `/versions`, `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
-`/hives/{hive}/commands`, and `cursor` beside the filter of `/hives/{hive}/vault/secrets`), and the
-installation's versions `?versions_limit=&versions_before=` (`/installation`, `/versions`,
-`/hives/{hive}/versions`); `translate_scmd` passes them to SY.admin, the numbers as numbers
-(`scmd_page_params`, `scmd_vault_list_params`). The path's description tells the model to follow
-`next_cursor`, and on `REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit`
-([SY.admin](sy-admin.md#pages)). `GET /hives/{hive}/commands` (FINDINGS A-201) reads SY.admin's
-command log (`list_recent_commands`), newest first, with `?action=&status=&since_ms=`: each
-command with its outcome, an executor plan's steps among them (origin `executor`). Archi's own
+`/hives/{hive}/commands`, `/artifacts`, and `cursor` beside the filter of
+`/hives/{hive}/vault/secrets`), and the installation's versions
+`?versions_limit=&versions_before=` (`/installation`, `/versions`, `/hives/{hive}/versions`);
+`translate_scmd` passes them to SY.admin, the numbers as numbers (`scmd_page_params`,
+`scmd_vault_list_params`). The path's description tells the model to follow `next_cursor`, and on
+`REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages)).
+`GET /hives/{hive}/commands` (FINDINGS A-201) reads SY.admin's command log
+(`list_recent_commands`), newest first, with `?action=&status=&since_ms=`: each command with its
+outcome, an executor plan's steps among them (origin `executor`). `GET /artifacts` (FINDINGS
+A-212) lists the public pages that are up (`list_published_artifacts`), newest first, each by its
+`publication_id` and never by its link's key; taking one down stays a plan the operator
+confirms. Archi's own
 reads of a list, the nodes of a hive a redeploy reads (`list_nodes_for_hive`) and the motherbee's
 nodes its status shows, go page after page with a smaller page when SY.admin says how many rows fit
 (`admin_listing_every_page`); an answer that is not ok is an error, never an empty list.

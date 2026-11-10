@@ -648,20 +648,31 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
 1. deletes every workflow with `force` on motherbee and worker hives;
 2. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
    instances of `base-nodes.json`), on every hive;
-3. marks and purges every non-system ILK, deletes every vault secret except
+3. takes down every published page that is up (FINDINGS A-212), once no workflow or user node is
+   left to publish one: SY.admin lists them (`GET /artifacts`, `list_published_artifacts`, each
+   by its `publication_id`, never by its link's key) and the reset takes each down
+   (`POST /artifacts/unpublish`): the edge stops serving its `/public/<key>` link, and IO.blob
+   releases its copy in `blob/public/`. It lists again until none is left, so a page published
+   meanwhile goes too. When SY.admin does not list them (down, or older than the route), the reset
+   goes on, counts it as a problem, and names the pages that stay public from SY.admin's ledger
+   (`state/sy-admin/publications.json`, read only); they go down when they expire, 30 days at
+   most. The dry run lists the pages;
+4. marks and purges every non-system ILK, deletes every vault secret except
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
-   but the root;
-4. clears the user OPA policy on every hive;
-5. has every hive that runs SY.cognition drop its state through SY.admin's `cognition_clear`, the
+   but the root (a purged tenant's pages would come down with it; step 3 left none);
+5. clears the user OPA policy on every hive;
+6. has every hive that runs SY.cognition drop its state through SY.admin's `cognition_clear`, the
    motherbee's included (FINDINGS A-160); truncates every table of `fluxbee_storage` with
    SY.storage and the frontdesk held down (masked for the boot, then started again); removes the
    nodes' conversation state; and clears Archi's sessions. The dry run lists the cognition hives,
    and each answer is printed.
 
 It keeps the installation, `/etc/fluxbee`, the vault master key, TLS, the spokes (with their SSH
-and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and the history.
-Re-running is safe; a summary goes to
-`/var/lib/fluxbee/state/factory-reset.log`.
+and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and the history,
+SY.admin's publication ledger included: its rows say how each page went down. It never touches
+the blob store: the blobs the nodes wrote stay in `blob/active/` and `blob/staging/`; only the
+pages' copies in `blob/public/` go with their pages (IO.blob removes a copy once no page shares
+it). Re-running is safe; a summary goes to `/var/lib/fluxbee/state/factory-reset.log`.
 
 ## Certificates (ACME)
 
