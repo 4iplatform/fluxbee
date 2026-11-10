@@ -305,6 +305,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-230 🔵 Archi's prompt tells it to use the root tenant for an AI node with no tenant (low).
 - A-231 🔵 SY.admin's publication ledger never drops a row (low).
 - A-232 🔵 A page request's refusal repeats a bad `limit` (low; shared code).
+- A-233 🔵 A purged node's pages stay public until they expire (low).
+- A-234 🔵 SY.admin's HTTP reader allocates whatever `Content-Length` a client declares (low).
+- A-235 🔴 Archi's runtime redeploy purges each node and runs it again with no tenant: the node is gone (0.1.125).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1383,6 +1386,38 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-235 [Archi] 🔴 (found 2026-11-10 by 0.1.125's review round; checked in the code) — Archi's runtime redeploy kills each node with its instance purged and runs it again with no tenant, so the node is gone for good
+
+- **Why:** `redeploy_runtime_nodes_with_current` (`src/bin/sy_architect.rs:11022`), used by a
+  software publish that promotes to current, kills each node of the runtime with
+  `purge_instance: true` and then runs it with only `node_name`, `runtime_version: current` and,
+  when the node's config is preserved, that config without `_system` (`:11130`). No top-level
+  `tenant_id` is ever sent. With the preserve box unchecked (the API's default, `#[serde(default)]`;
+  the UI's box is checked by default) the run is refused `IDENTITY_REGISTER_FAILED` (no tenant), and
+  the purged node is not recreated. A preserved config whose top-level `tenant_id` was dropped by a
+  `set_node_config replace` ends the same way. It failed the same way before A-213: the fallback
+  variable was never set on 8.x.
+- **Fix (SY.architect, 0.1.125):** read the node's tenant before the kill (its config's
+  `_system.tenant_id`, else `tenant_id`) and send it as the top-level `tenant_id`; a node whose tenant
+  cannot be read is skipped, never killed, and named in the answer.
+
+### A-234 [General/admin] 🔵 low (found 2026-11-10 by A-229's builder; read in the code) — SY.admin's HTTP reader allocates whatever `Content-Length` a client declares
+
+- **Why:** `read_http_request` (`src/bin/sy_admin.rs` ~11973 on `coa/admin-125`) allocates a buffer
+  of the declared length with no cap, so a request declaring a huge body can exhaust SY.admin's
+  memory. The API listens on loopback only, and every node on the motherbee runs as root (A-60), so
+  it is no boundary against a local process; a robustness item.
+- **Fix, later:** a cap above the largest body an action takes (the bundle upload's), refused 413.
+
+### A-233 [General/admin] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — A purged node's pages stay public until they expire
+
+- **Why:** `kill_node` with `purge_instance` (and `purge_ilk`) removes the node and its ILK, and
+  nothing reads the publication ledger there: the pages it published stay up for their TTL (24 h
+  by default, 30 days at most). Since A-212 `GET /artifacts` shows them by `publisher_l2_name`, the
+  operator can take them down, and the factory reset takes every page down.
+- **Fix, to decide (SY.admin):** the tenant's rule (2026-09-28: a purge never cascades), refusing
+  the purge while the node has pages up, or leaving them to expire.
+
 ### A-232 [General/shared] 🔵 low (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
 
 - **Why:** `PageAsk::from_payload` (`src/mesh_reply.rs:194`, `:206`) answers a bad `limit`, or a
@@ -1541,6 +1576,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   uplink and the operator's access kept off the default route, a probe after the switch, and the
   previous route back if the uplink drops. AI.pruebas then depends on egress1. Its shape is
   written down before it is built.
+- **The shape, approved by the operator (2026-11-10):** docs/edge-egress-nat-spec.md §15
+  (`coa/a-219-design`), every open point as recommended: *"sobre 1, 2, 3 y 4 hacelos como
+  recomendas"*. `set_hive_egress` and `clear_hive_egress` (`SYSTEM_EGRESS_ROUTE` between the
+  orchestrators), the reverse built now; the guards check and refuse (the operator adds an OS-level
+  route for a network they manage from); the switch stays only once the motherbee's confirm comes
+  back, else the worker reverts; the minor points as the doc proposes. Its release carries the
+  router's protected-action entry for the new message, with the rest.
 
 ### A-218 [General/identity] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — Dead identity surface (TNT_APPROVE, the vocabulary) and ECHO/TIME_SYNC
 
