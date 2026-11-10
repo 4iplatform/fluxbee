@@ -108,7 +108,8 @@ minor findings, all folded in below). PROD had nothing to migrate that day: no p
     and the upsert writes the ILK's tenant: both change.
   - A channel record without a scope (from an older peer during an upgrade) takes its ILK's tenant
     once, when it is deserialized, never on a DB load. Otherwise a reassigned person's keys would
-    follow the new tenant after a restart.
+    follow the new tenant after a restart. (Removed in 0.1.125, every hive having passed 0.1.64: a
+    record without a scope is refused; FINDINGS A-210.)
 - **Replica pushes:** a replica pushes its node ILKs, so a channel it adds must live in the node's
   own tenant, and never be a `cloud` channel or in the installation-wide scope. A channel the
   primary already holds passes as it is (the replica echoes what it was told). Both the snapshot and

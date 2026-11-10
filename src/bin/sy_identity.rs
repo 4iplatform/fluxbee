@@ -482,9 +482,8 @@ struct ChannelRecord {
     /// The namespace the address lives in, fixed when the channel is created: the tenant of the
     /// node that saw it, or the installation-wide scope for a Fluxbee Cloud account's email. Every
     /// lookup key uses it, never the ILK's current tenant, so charging an ILK to another tenant
-    /// moves no key (docs/ilk-tenant-model-v1.md §2.1). Empty only in a record from an older peer,
-    /// until `fill_channel_scopes` gives it the ILK's tenant on arrival.
-    #[serde(default)]
+    /// moves no key (docs/ilk-tenant-model-v1.md §2.1). Every record carries it: one that arrives
+    /// without it is refused.
     scope: String,
 }
 
@@ -798,7 +797,7 @@ impl IdentityStore {
                         "ich_id": channel.ich_id,
                         "channel_type": channel.channel_type,
                         "address": channel.address,
-                        "scope": channel_scope(channel, &ilk.tenant_id),
+                        "scope": channel_scope(channel),
                         "owner_l2_name": channel.owner_l2_name,
                         "enabled": channel.enabled,
                     })).collect::<Vec<_>>(),
@@ -1112,7 +1111,6 @@ impl IdentityStore {
                     && ilk.registration_status == "temporary"
                     && ilk.ilk_type.trim() == "human"
                 {
-                    fill_channel_scopes(ilk);
                     change = Some(TenantChange {
                         ilk_id: existing.clone(),
                         from_tenant_id: ilk.tenant_id.clone(),
@@ -1296,8 +1294,6 @@ impl IdentityStore {
                 if existing.tenant_id != req.tenant_id {
                     return Err("INVALID_TENANT_TRANSITION".to_string());
                 }
-                // Its channels keep the scope they were created with.
-                fill_channel_scopes(existing);
                 existing.ilk_type = req.ilk_type;
                 existing.tenant_id = req.tenant_id.clone();
                 existing.registration_status = "complete".to_string();
@@ -1421,14 +1417,10 @@ impl IdentityStore {
         let Some(source) = self.ilks.get_mut(old_ilk_id) else {
             return Err("INVALID_MERGE_SOURCE".to_string());
         };
-        fill_channel_scopes(source);
-        let source_tenant_id = source.tenant_id.clone();
         let moved = std::mem::take(&mut source.channels);
         for channel in &moved {
-            self.ich_lookup.insert(
-                channel_key(channel, &source_tenant_id),
-                canonical_ilk_id.to_string(),
-            );
+            self.ich_lookup
+                .insert(channel_key(channel), canonical_ilk_id.to_string());
         }
         if let Some(canonical) = self.ilks.get_mut(canonical_ilk_id) {
             for channel in moved {
@@ -1678,7 +1670,7 @@ impl IdentityStore {
                 && ilk
                     .channels
                     .iter()
-                    .any(|channel| channel_key(channel, &ilk.tenant_id) == *key)
+                    .any(|channel| channel_key(channel) == *key)
         });
         if reserved {
             return Err("ILK_DELETED".to_string());
@@ -1705,7 +1697,7 @@ impl IdentityStore {
                     && ilk
                         .channels
                         .iter()
-                        .any(|channel| channel_key(channel, &ilk.tenant_id) == key)
+                        .any(|channel| channel_key(channel) == key)
             })
             .map(|ilk| ilk.ilk_id.clone())
     }
@@ -1843,7 +1835,6 @@ impl IdentityStore {
             .ilks
             .get_mut(&req.ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        fill_channel_scopes(ilk);
         ilk.tenant_id = target.clone();
         Ok((
             json!({"status": "ok", "ilk_id": req.ilk_id, "tenant_id": target,
@@ -1890,7 +1881,7 @@ impl IdentityStore {
             .get(ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
         for channel in &entry.channels {
-            let mut keys = vec![channel_key(channel, &entry.tenant_id)];
+            let mut keys = vec![channel_key(channel)];
             // A person's Cloud account left in its old scope (marked before the scope migration)
             // must not come back as a second account next to the installation-wide one.
             if is_cloud_account_channel(&channel.channel_type) && entry.ilk_type.trim() == "human" {
@@ -1947,7 +1938,7 @@ impl IdentityStore {
         let record = entry.clone();
         for channel in &record.channels {
             self.ich_lookup
-                .insert(channel_key(channel, &record.tenant_id), ilk_id.to_string());
+                .insert(channel_key(channel), ilk_id.to_string());
         }
         changes
             .rescoped_ichs
@@ -1966,13 +1957,12 @@ impl IdentityStore {
         if ilk.ilk_type.trim() != "human" || ilk.registration_status != "complete" {
             return Vec::new();
         }
-        let tenant_id = ilk.tenant_id.clone();
         let candidates: Vec<ChannelRecord> = ilk
             .channels
             .iter()
             .filter(|channel| {
                 is_cloud_account_channel(&channel.channel_type)
-                    && channel_scope(channel, &tenant_id) != INSTALLATION_SCOPE
+                    && channel_scope(channel) != INSTALLATION_SCOPE
             })
             .cloned()
             .collect();
@@ -1993,7 +1983,7 @@ impl IdentityStore {
             if !free {
                 continue;
             }
-            let from = channel_key(&channel, &tenant_id);
+            let from = channel_key(&channel);
             if self.ich_lookup.get(&from).map(String::as_str) == Some(ilk_id) {
                 self.ich_lookup.remove(&from);
             }
@@ -2344,7 +2334,7 @@ impl IdentityStore {
             .filter(|ilk| {
                 ilk.channels
                     .iter()
-                    .any(|channel| channel_scope(channel, &ilk.tenant_id) == scope)
+                    .any(|channel| channel_scope(channel) == scope)
             })
             .map(|ilk| ilk.ilk_id.clone())
             .collect();
@@ -2357,10 +2347,10 @@ impl IdentityStore {
             let (gone, kept): (Vec<ChannelRecord>, Vec<ChannelRecord>) =
                 std::mem::take(&mut ilk.channels)
                     .into_iter()
-                    .partition(|channel| channel_scope(channel, &ilk.tenant_id) == scope);
+                    .partition(|channel| channel_scope(channel) == scope);
             ilk.channels = kept;
             for channel in &gone {
-                let key = channel_key(channel, &ilk.tenant_id);
+                let key = channel_key(channel);
                 if self.ich_lookup.get(&key) == Some(&ilk_id) {
                     self.ich_lookup.remove(&key);
                 }
@@ -2756,9 +2746,7 @@ impl IdentityStore {
                     .insert(tenant.tenant_id.clone(), tenant.clone());
             }
             for ilk in &chunk.ilks {
-                let mut ilk = ilk.clone();
-                fill_channel_scopes(&mut ilk);
-                store.ilks.insert(ilk.ilk_id.clone(), ilk);
+                store.ilks.insert(ilk.ilk_id.clone(), ilk.clone());
             }
             for alias in &chunk.aliases {
                 store.aliases.insert(
@@ -2778,7 +2766,7 @@ impl IdentityStore {
             for channel in &ilk.channels {
                 store
                     .ich_lookup
-                    .insert(channel_key(channel, &ilk.tenant_id), ilk_id.clone());
+                    .insert(channel_key(channel), ilk_id.clone());
             }
         }
 
@@ -2796,15 +2784,13 @@ impl IdentityStore {
             IdentityDelta::TenantDelete { tenant_id } => {
                 self.tenants.remove(&tenant_id);
             }
-            IdentityDelta::IlkUpsert { mut ilk } => {
-                fill_channel_scopes(&mut ilk);
+            IdentityDelta::IlkUpsert { ilk } => {
                 let ilk_id = ilk.ilk_id.clone();
                 self.ich_lookup
                     .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
                 if ilk.deleted_at_ms.is_none() {
                     for channel in &ilk.channels {
-                        self.ich_lookup
-                            .insert(channel_key(channel, &ilk.tenant_id), ilk_id.clone());
+                        self.ich_lookup.insert(channel_key(channel), ilk_id.clone());
                     }
                 }
                 self.ilks.insert(ilk_id, ilk);
@@ -2870,15 +2856,9 @@ impl IdentityStore {
         // Every id the replica pushed counts as present, even one refused below: a refused push
         // leaves the primary's record as it is, never removes it.
         let incoming_ids: HashSet<String> = incoming.iter().map(|ilk| ilk.ilk_id.clone()).collect();
-        // A replica on an older version sends no channel scope: fill it before comparing, or every
-        // push would look changed. Then only channels a replica may hold (see
-        // `replica_channels_acceptable`).
+        // Only channels a replica may hold (see `replica_channels_acceptable`).
         let incoming: Vec<IlkRecord> = incoming
             .into_iter()
-            .map(|mut ilk| {
-                fill_channel_scopes(&mut ilk);
-                ilk
-            })
             .filter(|ilk| {
                 let acceptable = replica_push_acceptable(ilk, self);
                 if !acceptable {
@@ -5211,7 +5191,7 @@ fn identity_shm_entries(store: &IdentityStore) -> Result<IdentityShmEntries, Ide
                 );
                 continue;
             };
-            let scope = channel_scope(channel, &ilk.tenant_id);
+            let scope = channel_scope(channel);
             let Ok(scope_uuid) = parse_prefixed_uuid(scope, "tnt") else {
                 tracing::warn!(
                     ilk_id = %ilk.ilk_id,
@@ -5515,8 +5495,7 @@ fn ich_entries_from_ilk_record(
             ilk_id: *ilk_uuid.as_bytes(),
             // The channel's scope (docs/ilk-tenant-model-v1.md §2.1); the ILK's own entry carries
             // the tenant it is charged to.
-            tenant_id: parse_prefixed_uuid(channel_scope(channel, &ilk.tenant_id), "tnt")?
-                .into_bytes(),
+            tenant_id: parse_prefixed_uuid(channel_scope(channel), "tnt")?.into_bytes(),
             channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
             address: [0u8; ICH_ADDRESS_MAX_LEN],
             flags: FLAG_ACTIVE,
@@ -7207,7 +7186,7 @@ fn report_account_scopes(store: &mut IdentityStore) {
     for ilk in store.ilks.values() {
         for channel in &ilk.channels {
             if is_cloud_account_channel(&channel.channel_type)
-                && channel_scope(channel, &ilk.tenant_id) == INSTALLATION_SCOPE
+                && channel_scope(channel) == INSTALLATION_SCOPE
             {
                 installation_holder.insert(
                     channel.address.trim().to_ascii_lowercase(),
@@ -7310,36 +7289,19 @@ const INSTALLATION_SCOPE: &str = DEFAULT_ROOT_TENANT_ID;
 /// writes it.
 const CLOUD_ACCOUNT_CHANNEL: &str = "cloud";
 
-/// The namespace a channel's address lives in: its recorded scope, or its ILK's tenant for a
-/// record that arrived without one (see `fill_channel_scopes`).
-fn channel_scope<'a>(channel: &'a ChannelRecord, ilk_tenant_id: &'a str) -> &'a str {
-    let scope = channel.scope.trim();
-    if scope.is_empty() {
-        ilk_tenant_id
-    } else {
-        scope
-    }
+/// The namespace a channel's address lives in: its recorded scope.
+fn channel_scope(channel: &ChannelRecord) -> &str {
+    channel.scope.trim()
 }
 
 /// A channel's lookup key: (type, address, scope), trimmed and lowercased. Never the ILK's
 /// current tenant, so charging an ILK to another tenant moves no key.
-fn channel_key(channel: &ChannelRecord, ilk_tenant_id: &str) -> (String, String, String) {
+fn channel_key(channel: &ChannelRecord) -> (String, String, String) {
     canonical_ich_key(
         &channel.channel_type,
         &channel.address,
-        channel_scope(channel, ilk_tenant_id),
+        channel_scope(channel),
     )
-}
-
-/// A record from an older peer carries no channel scope: each channel takes its ILK's tenant once,
-/// here, when the record arrives. Never later, so a reassigned ILK's keys never follow its new
-/// tenant.
-fn fill_channel_scopes(ilk: &mut IlkRecord) {
-    for channel in &mut ilk.channels {
-        if channel.scope.trim().is_empty() {
-            channel.scope = ilk.tenant_id.clone();
-        }
-    }
 }
 
 fn is_cloud_account_channel(channel_type: &str) -> bool {
@@ -7353,7 +7315,7 @@ fn is_cloud_account_channel(channel_type: &str) -> bool {
 fn holds_installation_account(ilk: &IlkRecord) -> bool {
     ilk.channels.iter().any(|channel| {
         is_cloud_account_channel(&channel.channel_type)
-            && channel_scope(channel, &ilk.tenant_id) == INSTALLATION_SCOPE
+            && channel_scope(channel) == INSTALLATION_SCOPE
     })
 }
 
@@ -7378,10 +7340,7 @@ fn replica_push_acceptable(incoming: &IlkRecord, store: &IdentityStore) -> bool 
         && replica_channels_acceptable(incoming, existing)
         && incoming.channels.iter().all(|channel| {
             store
-                .check_channel_free(
-                    &channel_key(channel, &incoming.tenant_id),
-                    &[incoming.ilk_id.as_str()],
-                )
+                .check_channel_free(&channel_key(channel), &[incoming.ilk_id.as_str()])
                 .is_ok()
         })
 }
@@ -7391,13 +7350,14 @@ fn replica_push_acceptable(incoming: &IlkRecord, store: &IdentityStore) -> bool 
 /// the primary already holds exactly as pushed passes as it is: the replica echoes what it was told.
 fn replica_channels_acceptable(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
     incoming.channels.iter().all(|channel| {
-        let key = channel_key(channel, &incoming.tenant_id);
+        let key = channel_key(channel);
         let known = existing.is_some_and(|existing| {
-            existing.channels.iter().any(|held| {
-                held.ich_id == channel.ich_id && channel_key(held, &existing.tenant_id) == key
-            })
+            existing
+                .channels
+                .iter()
+                .any(|held| held.ich_id == channel.ich_id && channel_key(held) == key)
         });
-        let scope = channel_scope(channel, &incoming.tenant_id);
+        let scope = channel_scope(channel);
         known
             || (scope == incoming.tenant_id
                 && scope != INSTALLATION_SCOPE
@@ -7486,13 +7446,12 @@ fn is_canonical_id(value: &str, prefix: &str) -> bool {
 }
 
 /// Every id an ILK record carries in its canonical spelling: its own, its tenant's, and each
-/// channel's id and scope (empty only in a record from an older peer).
+/// channel's id and scope.
 fn ilk_record_ids_canonical(ilk: &IlkRecord) -> bool {
     is_canonical_id(&ilk.ilk_id, "ilk")
         && is_canonical_id(&ilk.tenant_id, "tnt")
         && ilk.channels.iter().all(|channel| {
-            is_canonical_id(&channel.ich_id, "ich")
-                && (channel.scope.is_empty() || is_canonical_id(&channel.scope, "tnt"))
+            is_canonical_id(&channel.ich_id, "ich") && is_canonical_id(&channel.scope, "tnt")
         })
 }
 
@@ -8290,8 +8249,7 @@ SET
         for (index, channel) in ilk.channels.iter().enumerate() {
             let ich_uuid = parse_prefixed_uuid(&channel.ich_id, "ich")?.to_string();
             // identity_ichs.tenant_id is the channel's scope (docs/ilk-tenant-model-v1.md §2.1).
-            let scope_uuid =
-                parse_prefixed_uuid(channel_scope(channel, &ilk.tenant_id), "tnt")?.to_string();
+            let scope_uuid = parse_prefixed_uuid(channel_scope(channel), "tnt")?.to_string();
             let is_primary = index == 0;
             tx.execute(
                 r#"
@@ -8564,7 +8522,7 @@ ORDER BY added_at ASC
             if ilk.deleted_at_ms.is_none() {
                 store
                     .ich_lookup
-                    .insert(channel_key(&channel, &ilk.tenant_id), ilk_id.clone());
+                    .insert(channel_key(&channel), ilk_id.clone());
             }
         }
     }
@@ -9423,7 +9381,7 @@ mod tests {
                     address: "U123".to_string(),
                     owner_l2_name: Some("IO.slack@motherbee".to_string()),
                     enabled: true,
-                    scope: String::new(),
+                    scope: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
@@ -10105,7 +10063,7 @@ mod tests {
                     address: "U123".to_string(),
                     owner_l2_name: Some("IO.slack.support@motherbee".to_string()),
                     enabled: false,
-                    scope: String::new(),
+                    scope: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
@@ -10141,7 +10099,7 @@ mod tests {
                     address: "demo".to_string(),
                     owner_l2_name: Some("IO.cloud@motherbee".to_string()),
                     enabled: false,
-                    scope: String::new(),
+                    scope: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
@@ -10650,7 +10608,7 @@ mod tests {
                     address: "U123".to_string(),
                     owner_l2_name: Some("IO.slack.support@motherbee".to_string()),
                     enabled: false,
-                    scope: String::new(),
+                    scope: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 }],
                 deleted_at_ms: None,
                 deleted_reason: None,
@@ -13646,16 +13604,17 @@ mod tests {
         assert_eq!(lc_code(err), "ILK_KEY_CONFLICT");
     }
 
+    /// Every record carries its channels' scopes: one without them is refused, by the parser or by
+    /// the replica's push, and is never given its ILK's current tenant.
     #[test]
-    fn a_record_without_scopes_takes_its_tenant_on_arrival_and_keeps_it() {
-        let mut store = sc_store();
+    fn a_record_without_a_channel_scope_is_refused() {
         let ilk_id = "ilk:77777777-7777-4777-8777-777777777777".to_string();
-        let legacy = IlkRecord {
+        let record = IlkRecord {
             ilk_id: ilk_id.clone(),
             ilk_type: "human".to_string(),
             registration_status: "complete".to_string(),
             tenant_id: LC_TENANT.to_string(),
-            identification: json!({"display_name": "Old peer"}),
+            identification: json!({"display_name": "Ana"}),
             definition: json!({}),
             channels: vec![ChannelRecord {
                 ich_id: "ich:88888888-8888-4888-8888-888888888888".to_string(),
@@ -13663,20 +13622,19 @@ mod tests {
                 address: "U1".to_string(),
                 owner_l2_name: None,
                 enabled: false,
-                scope: String::new(),
+                scope: LC_TENANT.to_string(),
             }],
             deleted_at_ms: None,
             deleted_reason: None,
         };
-        store.apply_delta(IdentityDelta::IlkUpsert { ilk: legacy });
-        assert_eq!(store.ilks[&ilk_id].channels[0].scope, LC_TENANT);
-        let key = canonical_ich_key("slack", "U1", LC_TENANT);
-        assert_eq!(store.ich_lookup.get(&key), Some(&ilk_id));
-        // Reassigned later: the key stays where it was.
-        store
-            .set_ilk_tenant(&sc_set_tenant(&ilk_id, SC_OTHER), "x")
-            .expect("reassign");
-        assert_eq!(store.ich_lookup.get(&key), Some(&ilk_id));
+        let mut delta =
+            serde_json::to_value(IdentityDelta::IlkUpsert { ilk: record }).expect("serialize");
+        assert!(serde_json::from_value::<IdentityDelta>(delta.clone()).is_ok());
+        delta["ilk"]["channels"][0]
+            .as_object_mut()
+            .expect("a channel")
+            .remove("scope");
+        assert!(serde_json::from_value::<IdentityDelta>(delta).is_err());
     }
 
     #[test]
@@ -13695,13 +13653,17 @@ mod tests {
             enabled: true,
             scope: INSTALLATION_SCOPE.to_string(),
         }];
-        // A node channel naming another scope (the installation-wide one) is not taken.
-        assert!(store
-            .reconcile_hive_ilks("worker1", vec![node.clone()])
-            .is_empty());
-        assert!(!store.ilks.contains_key(&node.ilk_id));
-        // An older replica sends no scope: taken, with the node's tenant.
-        node.channels[0].scope = String::new();
+        // A node channel naming another scope (the installation-wide one) is not taken, nor one
+        // naming none.
+        for scope in [INSTALLATION_SCOPE, ""] {
+            node.channels[0].scope = scope.to_string();
+            assert!(store
+                .reconcile_hive_ilks("worker1", vec![node.clone()])
+                .is_empty());
+            assert!(!store.ilks.contains_key(&node.ilk_id));
+        }
+        // Its own tenant's: taken.
+        node.channels[0].scope = LC_TENANT.to_string();
         assert_eq!(
             store
                 .reconcile_hive_ilks("worker1", vec![node.clone()])

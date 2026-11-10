@@ -147,8 +147,9 @@ tenant moves no key.
 - A `cloud` channel from any other caller answers `CLOUD_CHANNEL_RESERVED`. `ILK_UPDATE` never
   takes one.
 - Any other requested scope answers `INVALID_SCOPE`.
-- A record from an older peer without a scope takes its ILK's tenant once, on arrival
-  (`fill_channel_scopes`).
+- Every record a peer sends carries each channel's scope: one without it does not parse, and a
+  replica's push of an empty scope is ignored (`ilk_record_ids_canonical`). Until 0.1.125 a record
+  from a peer older than 0.1.64 took its ILK's tenant on arrival (FINDINGS A-210).
 
 **Other rules:**
 
