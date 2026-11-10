@@ -18190,7 +18190,7 @@ const REMOVE_HIVE_CREDENTIALS_SCRIPT: &str =
 /// Stops and disables the core services, stops the managed nodes (their transient
 /// `fluxbee-node-*` units), then deletes the node state.
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov sy-edge fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -39857,6 +39857,9 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     #[test]
     fn remove_hive_cleanup_script_cleans_persisted_node_dirs() {
         let script = remove_hive_cleanup_script();
+        // A removed ingress's SY.edge must stop: its unit restarts on its own, and it would keep
+        // serving `/public/<key>` from its own registry until each page expires (FINDINGS A-236).
+        assert!(script.contains(" sy-edge "), "sy-edge is stopped and disabled");
         assert!(script.contains("/var/lib/fluxbee/nodes/*"));
         assert!(script.contains("/var/lib/fluxbee/state/nodes/*"));
         // The managed nodes stop before their directories go.
