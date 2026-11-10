@@ -902,7 +902,10 @@ time comes, in a task of its own, and sleeps until the next one is due:
   messages one at a time and forwards a spoke's read within its own bound (45 s,
   `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`): a read waits 50 s
   (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), and one that timed out anyway keeps that hive
-  unread for another 50 s, so a second is never queued behind it;
+  unread for another 50 s, so a second is never queued behind it. The re-read (`recheck`) takes
+  its turn among the background reads (`Reader::InTurn`) before it claims its hive, since 0.1.124:
+  one waiting for its turn holds no hive, so an explicit run's pass waits only for the read under
+  way, never for the re-reads a run's open queues behind it;
 - a hive in flight is read every 3 s (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`) until it settles,
   then its config goes, `by` the run that sent its core (`background` for a core it found under
   way). Before that config, and before the automatic step, the task checks that the motherbee

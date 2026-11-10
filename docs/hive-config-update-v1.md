@@ -618,7 +618,13 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     motherbee's orchestrator, whose single admin worker forwards each within its own 45 s
     (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), and whose queue keeps what SY.admin gave up. A read
     waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), past that bound; one that timed out
-    anyway keeps the hive unread for another 50 s, so a second is never queued behind it;
+    anyway keeps the hive unread for another 50 s, so a second is never queued behind it. The
+    re-read (`recheck`) takes its turn among the background reads before it claims its hive
+    (since 0.1.124): one waiting for its turn holds no hive, so an explicit run's pass waits only
+    for the read under way. **Why:** woken at a run's open, the task re-read every hive not read
+    yet, each holding its hive while queued behind one read, and a pass could be left to one;
+    the follow and the automatic step still claim first (their hives are in flight, or did not
+    answer);
   - a hive in flight is read every 3 s (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`) until it
     settles; then its config goes, `by` the run that sent its core, or `by: background` for a core
     the task found under way (F12);

@@ -1492,7 +1492,11 @@ impl Bounds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reader {
     Run,
+    /// The background task, which waits for its turn here.
     Background,
+    /// The background task with its turn already taken: [`recheck`] takes it before it claims the
+    /// hive, so a read waiting for its turn holds no hive.
+    InTurn,
 }
 
 /// A task acting on a hive: what it does, for which update, since when.
@@ -1838,7 +1842,7 @@ impl Updates {
                     .await
                     .map_err(|err| err.to_string())?,
             ),
-            Reader::Run => None,
+            Reader::Run | Reader::InTurn => None,
         };
         let hive_lock = self.read_lock(hive);
         let _one = hive_lock.lock().await;
@@ -3843,12 +3847,17 @@ pub(crate) async fn recheck(
     if look == Look::AnswerCheck && mesh.orchestrator_connected(hive) == Some(false) {
         return;
     }
+    // Its turn among the background reads first, then the hive: a read waiting for its turn holds
+    // no hive, so an explicit run's pass is never left to it, and waits only for the read under way.
+    let Ok(_turn) = updates.background_reads.acquire().await else {
+        return;
+    };
     let Some(_claim) = updates.claim(hive, READING, id) else {
         return;
     };
     let read_at = now_epoch_ms();
     let Ok(snapshot) = updates
-        .read_versions(mesh, hive, Reader::Background, bounds)
+        .read_versions(mesh, hive, Reader::InTurn, bounds)
         .await
     else {
         return;

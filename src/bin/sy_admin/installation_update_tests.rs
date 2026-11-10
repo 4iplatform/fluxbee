@@ -2997,3 +2997,132 @@ async fn a_task_of_a_closed_update_sends_nothing_more() {
         Some(OutcomeStatus::Sent)
     );
 }
+
+/// The background task's re-read takes its turn among the background reads before it claims a
+/// hive: one waiting for its turn holds no hive, so an explicit run's pass is never left to it.
+/// At a run's open every hive not read yet gets such a re-read, all queued behind one read.
+#[tokio::test]
+async fn a_pass_is_never_left_to_a_queued_read() {
+    // worker2's read answers once the test lets it, every other one at once; a config update
+    // applies its version.
+    struct SlowWorker2 {
+        snapshots: Mutex<HashMap<String, Value>>,
+        began: tokio::sync::Notify,
+        answer: tokio::sync::Notify,
+        sent: Mutex<Vec<(String, Value)>>,
+    }
+    #[async_trait]
+    impl UpdateMesh for SlowWorker2 {
+        async fn versions(&self, hive: &str, _timeout: Duration) -> Result<Value, String> {
+            if hive == "worker2" {
+                self.began.notify_one();
+                self.answer.notified().await;
+            }
+            lock(&self.snapshots)
+                .get(hive)
+                .cloned()
+                .ok_or_else(|| "no such hive".to_string())
+        }
+        async fn update(&self, hive: &str, payload: Value, _: Duration) -> Result<Value, String> {
+            lock(&self.sent).push((hive.to_string(), payload.clone()));
+            if let Some(snapshot) = lock(&self.snapshots).get_mut(hive) {
+                snapshot["config"]["applied"] = json!({
+                    "version": payload["manifest_version"],
+                    "sha256": payload["manifest_hash"],
+                });
+            }
+            Ok(json!({"status": "ok", "restarted": [], "unchanged": []}))
+        }
+        fn orchestrator_connected(&self, _: &str) -> Option<bool> {
+            Some(true)
+        }
+        fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String> {
+            Ok((
+                vec![
+                    "motherbee".to_string(),
+                    "worker1".to_string(),
+                    "worker2".to_string(),
+                ],
+                Vec::new(),
+            ))
+        }
+        fn motherbee(&self) -> &str {
+            "motherbee"
+        }
+    }
+    let mesh = SlowWorker2 {
+        snapshots: Mutex::new(
+            [
+                motherbee_on_target(),
+                config_behind("worker1"),
+                config_behind("worker2"),
+            ]
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot["hive_id"].as_str().expect("hive").to_string(),
+                    snapshot,
+                )
+            })
+            .collect(),
+        ),
+        began: tokio::sync::Notify::new(),
+        answer: tokio::sync::Notify::new(),
+        sent: Mutex::new(Vec::new()),
+    };
+    let updates = Updates::load(&temp_state("installation-update-queued-read"));
+    let id = open_update(&updates, "http", &["motherbee", "worker1", "worker2"]);
+    let (the_target, bounds) = (target(), quick());
+    // The background task's re-reads of worker2, whose read is slow, and of worker1, queued.
+    let slow = recheck(
+        &updates,
+        &mesh,
+        &id,
+        "worker2",
+        &the_target,
+        &bounds,
+        Look::AnswerCheck,
+    );
+    let queued = recheck(
+        &updates,
+        &mesh,
+        &id,
+        "worker1",
+        &the_target,
+        &bounds,
+        Look::AnswerCheck,
+    );
+    let run = async {
+        mesh.began.notified().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            updates.holder("worker1").is_none(),
+            "a read waiting for its turn holds no hive"
+        );
+        // The run's pass on worker1 goes at once.
+        let pass = run_hive(
+            &updates,
+            &mesh,
+            &id,
+            "worker1",
+            &the_target,
+            &[],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &bounds,
+        );
+        tokio::time::timeout(Duration::from_secs(2), pass)
+            .await
+            .expect("the pass is not left to the queued read, nor waits for it");
+        mesh.answer.notify_one();
+    };
+    tokio::join!(slow, queued, run);
+    assert_eq!(
+        lock(&mesh.sent).clone(),
+        vec![(
+            "worker1".to_string(),
+            json!({"category": "config", "manifest_version": 3, "manifest_hash": SHA_V3})
+        )]
+    );
+    assert!(entry_of(&updates, "worker1").on_target());
+}
