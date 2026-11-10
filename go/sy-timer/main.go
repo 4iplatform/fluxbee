@@ -816,7 +816,8 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	row, foundByUUID, err := s.resolveOwnedTimerForMutation(context.Background(), incoming, ref)
+	row, foundByUUID, unlock, err := s.lockOwnedTimerForMutation(context.Background(), incoming, ref)
+	defer unlock()
 	if err == sql.ErrNoRows && !foundByUUID {
 		return s.sendTimerResponse(incoming, map[string]any{
 			"ok":    true,
@@ -862,7 +863,8 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	row, foundByUUID, err := s.resolveOwnedTimerForMutation(context.Background(), incoming, ref)
+	row, foundByUUID, unlock, err := s.lockOwnedTimerForMutation(context.Background(), incoming, ref)
+	defer unlock()
 	if err == sql.ErrNoRows {
 		if !foundByUUID {
 			return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_NOT_FOUND", "timer not found")
@@ -1145,6 +1147,35 @@ func (s *Service) resolveOwnedTimerForMutation(ctx context.Context, incoming flu
 		return nil, ref.TimerUUID != "", timerErrorf("TIMER_NOT_OWNER", "timer does not belong to requester")
 	}
 	return row, ref.TimerUUID != "", nil
+}
+
+// lockOwnedTimerForMutation resolves the requester's timer as resolveOwnedTimerForMutation does,
+// takes its lock, and reads it again under it (FINDINGS A-220's review). A fire holds that lock from
+// its read of the row to its save: a cancel or a reschedule that lands meanwhile waits, and then
+// sees what the fire wrote, instead of being written over by it. unlock releases the lock; it is
+// never nil, and holds nothing when err is set.
+func (s *Service) lockOwnedTimerForMutation(ctx context.Context, incoming fluxbeesdk.Message, ref timerReference) (row *timerRow, foundByUUID bool, unlock func(), err error) {
+	row, foundByUUID, err = s.resolveOwnedTimerForMutation(ctx, incoming, ref)
+	if err != nil {
+		return nil, foundByUUID, func() {}, err
+	}
+	unlock = s.lockTimer(row.UUID)
+	if row, err = getTimer(ctx, s.db, row.UUID); err != nil {
+		unlock()
+		return nil, foundByUUID, func() {}, err
+	}
+	return row, foundByUUID, unlock, nil
+}
+
+// lockTimer takes a timer's lock, the one its fires take (timerScheduler.timerLock), and returns what
+// releases it. With no scheduler (some tests) no fire runs, and there is nothing to take.
+func (s *Service) lockTimer(timerUUID string) func() {
+	if s.scheduler == nil {
+		return func() {}
+	}
+	lock := s.scheduler.timerLock(timerUUID)
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (s *Service) sendTimerScheduleExistingResponse(incoming fluxbeesdk.Message, verb string, row timerRow, alreadyExisted bool) error {

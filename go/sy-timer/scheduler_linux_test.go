@@ -261,6 +261,174 @@ func TestARecurringTimerThatCannotBeScheduledAtItsFireIsCanceled(t *testing.T) {
 	}
 }
 
+// A cancel or a reschedule that lands while a fire holds its timer, between the fire's read of the
+// row and its save, waits for the fire and then sees what it wrote: the change wins, or loses
+// cleanly, never both (FINDINGS A-220's review). Before, it took no lock and the fire's save wrote
+// over it: a recurring timer its owner was told is canceled kept firing, a canceled one-shot fired
+// anyway, and a rescheduled one fired at its old time.
+func TestAChangeRacingAFireWinsOrLosesCleanly(t *testing.T) {
+	within := func(t *testing.T, done <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: not within 5 s", what)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		kind string
+		verb string
+	}{
+		{name: "a cancel racing a recurring timer's fire", kind: "recurring", verb: "TIMER_CANCEL"},
+		{name: "a cancel racing a one-shot's fire", kind: "oneshot", verb: "TIMER_CANCEL"},
+		{name: "a reschedule racing a one-shot's fire", kind: "oneshot", verb: "TIMER_RESCHEDULE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, tx := newTestService(t)
+			service.scheduler = newTimerScheduler(service)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			row := timerRow{
+				UUID:         "timer-raced",
+				OwnerL2Name:  "WF.demo@motherbee",
+				TargetL2Name: "WF.demo@motherbee",
+				Kind:         tc.kind,
+				FireAtUTC:    now.Add(-time.Second).UnixMilli(),
+				MissedPolicy: "fire",
+				Payload:      `{}`,
+				Status:       "pending",
+				CreatedAtUTC: now.Add(-time.Minute).UnixMilli(),
+			}
+			if tc.kind == "recurring" {
+				row.CronSpec = nullableStringValue("0 9 * * MON")
+				row.CronTZ = nullableStringValue("UTC")
+			}
+			insertOwnedTimer(t, service.db, row)
+			request := map[string]any{"timer_uuid": row.UUID}
+			if tc.verb == "TIMER_RESCHEDULE" {
+				request["new_fire_in_ms"] = time.Hour.Milliseconds()
+			}
+			change := mustBuildSystemMessage(t, request, tc.verb)
+
+			// The fire reads the timer and waits there, holding it, while the change lands.
+			read, proceed, fired := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			afterFireRead = func(string) {
+				close(read)
+				<-proceed
+			}
+			t.Cleanup(func() { afterFireRead = nil })
+			go func() {
+				defer close(fired)
+				service.scheduler.push(row.UUID, row.FireAtUTC)
+				service.scheduler.processDue(ctx, now)
+			}()
+			within(t, read, "the fire's read")
+			changed, answered := make(chan error, 1), make(chan struct{})
+			go func() {
+				defer close(answered)
+				changed <- service.handleMessage(change)
+			}()
+			time.Sleep(200 * time.Millisecond) // a change that does not wait for the fire is done by now
+			close(proceed)
+			within(t, fired, "the fire")
+			within(t, answered, tc.verb)
+			if err := <-changed; err != nil {
+				t.Fatalf("%s: %v", tc.verb, err)
+			}
+
+			fires := 0
+			var response *fluxbeesdk.TimerResponse
+			for len(tx) > 0 {
+				var msg fluxbeesdk.Message
+				if err := json.Unmarshal(<-tx, &msg); err != nil {
+					t.Fatalf("decode a sent message: %v", err)
+				}
+				switch stringValue(msg.Meta.Msg) {
+				case fluxbeesdk.MsgTimerFired:
+					fires++
+				case fluxbeesdk.MsgTimerResponse:
+					response = &fluxbeesdk.TimerResponse{}
+					if err := json.Unmarshal(msg.Payload, response); err != nil {
+						t.Fatalf("decode the answer: %v", err)
+					}
+				}
+			}
+			if response == nil {
+				t.Fatalf("%s got no answer", tc.verb)
+			}
+			stored, err := getTimer(ctx, service.db, row.UUID)
+			if err != nil {
+				t.Fatalf("load timer: %v", err)
+			}
+			switch {
+			case response.OK && tc.verb == "TIMER_CANCEL":
+				// The cancel won, or came after a recurring timer's fire: canceled, it fires no more;
+				// a one-shot it canceled did not fire.
+				if stored.Status != "canceled" || (tc.kind == "oneshot" && fires != 0) {
+					t.Fatalf("answered canceled, with %d fires: %+v", fires, stored)
+				}
+			case response.OK:
+				// The reschedule won: the one-shot did not fire at its old time, and waits for its new one.
+				if fires != 0 || stored.Status != "pending" || stored.FireAtUTC <= now.UnixMilli() {
+					t.Fatalf("answered rescheduled, with %d fires: %+v", fires, stored)
+				}
+			default:
+				// The fire won: a one-shot that fired is neither canceled nor rescheduled.
+				if tc.kind != "oneshot" || response.Error == nil || response.Error.Code != "TIMER_ALREADY_FIRED" || fires != 1 || stored.Status != "fired" {
+					t.Fatalf("refused %+v, with %d fires: %+v", response.Error, fires, stored)
+				}
+			}
+		})
+	}
+}
+
+// A timer purged while its fire holds it is not written back, and its fire is not sent:
+// TIMER_PURGE_OWNER takes no timer lock, and the fire saves its row only while it is still pending
+// (FINDINGS A-220's review).
+func TestTheFireOfATimerPurgedDuringItIsNotSent(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertDueTimer(t, service, "timer-purged", "fire")
+	read, proceed, fired := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	afterFireRead = func(string) {
+		close(read)
+		<-proceed
+	}
+	t.Cleanup(func() { afterFireRead = nil })
+	go func() {
+		defer close(fired)
+		service.scheduler.push("timer-purged", now.UnixMilli())
+		service.scheduler.processDue(ctx, now)
+	}()
+	select {
+	case <-read:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fire did not read the timer within 5 s")
+	}
+	purge := mustBuildSystemMessageAs(t, map[string]any{"owner_l2_name": "WF.demo@motherbee"}, "TIMER_PURGE_OWNER", "SY.orchestrator@motherbee")
+	if err := service.handleMessage(purge); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if response := mustReadTimerResponse(t, tx); !response.OK || response.DeletedCount == nil || *response.DeletedCount != 1 {
+		t.Fatalf("purge: %+v (error %+v)", response, response.Error)
+	}
+	close(proceed)
+	select {
+	case <-fired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fire did not end within 5 s")
+	}
+	if len(tx) != 0 {
+		t.Fatalf("sent the fire of a purged timer")
+	}
+	if _, err := getTimer(ctx, service.db, "timer-purged"); err != sql.ErrNoRows {
+		t.Fatalf("the purged timer is back: %v", err)
+	}
+}
+
 func nullableStringValue(value string) sql.NullString {
 	return sql.NullString{String: value, Valid: true}
 }

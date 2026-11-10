@@ -179,20 +179,46 @@ INSERT INTO timers (`+timerColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 }
 
 func updateTimer(ctx context.Context, db *sql.DB, row timerRow) error {
+	_, err := saveTimer(ctx, db, row, "")
+	return err
+}
+
+// updateTimerIfStatus saves row only while the stored row still has status, the one it was read
+// with, and reports whether it did. A row changed or deleted since (a purge, which takes no timer
+// lock) is left as it is.
+func updateTimerIfStatus(ctx context.Context, db *sql.DB, row timerRow, status string) (bool, error) {
+	return saveTimer(ctx, db, row, status)
+}
+
+// saveTimer writes every column of row; with whileStatus set, only while the stored row has it. It
+// reports whether it wrote the row.
+func saveTimer(ctx context.Context, db *sql.DB, row timerRow, whileStatus string) (bool, error) {
 	if err := validateTimerRow(row); err != nil {
-		return err
+		return false, err
 	}
-	_, err := db.ExecContext(ctx, `
+	query := `
 UPDATE timers
 SET owner_l2_name=?, target_l2_name=?, client_ref=?, kind=?, fire_at_utc=?, cron_spec=?, cron_tz=?,
     missed_policy=?, missed_within_ms=?, payload=?, metadata=?, status=?, created_at_utc=?, last_fired_at_utc=?, fire_count=?,
     canceled_reason=?
-WHERE uuid=?
-`, row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
+WHERE uuid=?`
+	args := []any{row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
 		nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
 		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC),
-		row.FireCount, nullableString(row.CanceledReason), row.UUID)
-	return err
+		row.FireCount, nullableString(row.CanceledReason), row.UUID}
+	if whileStatus != "" {
+		query += " AND status=?"
+		args = append(args, whileStatus)
+	}
+	result, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	written, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return written == 1, nil
 }
 
 func getTimer(ctx context.Context, db *sql.DB, timerUUID string) (*timerRow, error) {

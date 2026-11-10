@@ -162,10 +162,11 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
                    compute next fire_at from cron_spec, from now
                    if it cannot be computed:
                        cancel it, with its canceled_reason (§11); send nothing; continue
-                   update db, push back to heap
+                   update db while still pending, push back to heap
                else:
-                   update db: status = 'fired'
+                   update db while still pending: status = 'fired'
                if the update failed: push back in 30 s; continue  // nothing sent
+               if the row was no longer pending (purged): continue  // nothing sent
                send TIMER_FIRED to timer.target (§7.8)
    }
 ```
@@ -173,7 +174,8 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
 ### 4.4 Concurrency
 
 - One global mutex for the heap structure.
-- One mutex per timer (a map of mutexes by uuid), taken only by the fire and its retries: it serializes the fires of one timer. `TIMER_CANCEL` and `TIMER_RESCHEDULE` do not take it, so one that lands while that timer's fire is in flight can be overwritten when the fire saves the row it read.
+- One mutex per timer (a map of mutexes by uuid), taken by the fire and its retries, and by `TIMER_CANCEL` and `TIMER_RESCHEDULE` (`lockOwnedTimerForMutation`, since v1.4, FINDINGS A-220's review). A fire holds it from its read of the row to its save and its send; a cancel or a reschedule that lands meanwhile waits, reads the timer again, and sees what the fire wrote: it wins, or loses cleanly. A one-shot that fired is `TIMER_ALREADY_FIRED`; a recurring timer canceled after a fire stays canceled. Before, they took no lock, and the fire's save wrote over them: a recurring timer its owner was told is canceled kept firing, and a one-shot rescheduled during its fire fired again at its new time.
+- A fire saves its row only while it is still `pending` (`updateTimerIfStatus`): `TIMER_PURGE_OWNER`, which takes no timer lock, is not written over, and the fire of a purged timer is not sent (`timer_fire_dropped`).
 - SQLite operations serialized by the driver (SQLite in WAL mode allows multiple readers + one writer).
 
 ---

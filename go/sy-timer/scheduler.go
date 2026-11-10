@@ -84,6 +84,11 @@ const (
 // deliveryRetryDelays are the waits before each new attempt of a fire; the last one repeats.
 var deliveryRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute}
 
+// afterFireRead, set by tests only, runs in a fire between its read of the timer and its save, with
+// the timer's lock held: where a change that did not take the lock was written over (FINDINGS
+// A-220's review).
+var afterFireRead func(timerUUID string)
+
 // transientUnreachable are the router's UNREACHABLE reasons for a target that is down, restarting or
 // behind a link that is down. A fire refused for another reason (VPN_BLOCKED, OPA_*) is not sent
 // again.
@@ -171,10 +176,11 @@ func (s *timerScheduler) replayPending(ctx context.Context, now time.Time) error
 // and it no longer counts toward its owner's and the hive's pending timers. Its owner reads the
 // reason (TIMER_GET, TIMER_LIST). It is logged once, under event: a canceled timer is not replayed
 // again. The fire due when it is closed is not sent. A row that cannot be saved is not logged here:
-// the caller says so.
+// the caller says so. One that is no longer pending (purged since it was read) is left as it is.
 func (s *timerScheduler) cancelUnschedulable(ctx context.Context, row timerRow, cause error, event string) error {
 	canceledBySYTimer(&row, "its next fire cannot be computed: "+cause.Error())
-	if err := updateTimer(ctx, s.service.db, row); err != nil {
+	saved, err := updateTimerIfStatus(ctx, s.service.db, row, "pending")
+	if err != nil || !saved {
 		return err
 	}
 	fields := map[string]any{
@@ -247,6 +253,11 @@ func (s *timerScheduler) processDue(ctx context.Context, now time.Time) {
 	}
 }
 
+// fireTimerByUUID fires a due timer. It holds the timer's lock from its read of the row to its save
+// and its send; TIMER_CANCEL and TIMER_RESCHEDULE take the same lock (lockOwnedTimerForMutation), so
+// neither lands between them to be written over (FINDINGS A-220's review). The save is made only
+// while the row is still pending: a purge, which takes no lock, is not written over, and its fire
+// is not sent.
 func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, now time.Time) {
 	lock := s.timerLock(timerUUID)
 	lock.Lock()
@@ -262,6 +273,9 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 	if row.FireAtUTC > now.UTC().UnixMilli() {
 		s.push(row.UUID, row.FireAtUTC)
 		return
+	}
+	if afterFireRead != nil {
+		afterFireRead(row.UUID)
 	}
 	actual := time.Now().UTC()
 	fire := &fireAttempt{row: *row, attempt: 1, deadline: deliveryDeadline(*row, actual)}
@@ -287,13 +301,22 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 	}
 	row.FireCount++
 	row.LastFiredAtUTC = nullableNow(actual)
-	if err := updateTimer(ctx, s.service.db, *row); err != nil {
+	saved, err := updateTimerIfStatus(ctx, s.service.db, *row, "pending")
+	if err != nil {
 		logEvent("timer_fire_persist_failed", map[string]any{
 			"timer_uuid": row.UUID,
 			"error":      err.Error(),
 		})
 		log.Printf("fire of %s not sent: its row was not saved: %v", row.UUID, err)
 		s.push(row.UUID, actual.Add(storageRetryDelay).UnixMilli())
+		return
+	}
+	if !saved {
+		logEvent("timer_fire_dropped", map[string]any{
+			"timer_uuid": row.UUID,
+			"attempt":    fire.attempt,
+			"reason":     "the timer was canceled or purged while it fired",
+		})
 		return
 	}
 	if row.Kind == "recurring" {
