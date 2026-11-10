@@ -11737,19 +11737,24 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         // A-219: a worker behind the egress, and back (docs/edge-egress-nat-spec.md §15).
-        ("PUT", ["egress"]) | ("DELETE", ["egress"]) => {
-            let action = if method == "PUT" {
-                "set_hive_egress"
-            } else {
-                "clear_hive_egress"
-            };
+        ("PUT", ["egress"]) => {
             let payload: serde_json::Value = if body.is_empty() {
                 serde_json::json!({})
             } else {
                 serde_json::from_slice(body)?
             };
             let (status, resp) =
-                handle_admin_command(ctx, client, action, payload, Some(hive)).await?;
+                handle_admin_command(ctx, client, "set_hive_egress", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["egress"]) => {
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "clear_hive_egress", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["opa", "policy"]) => {
