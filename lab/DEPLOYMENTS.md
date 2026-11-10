@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.127** | 2026-11-10 | `d2b344bb` | motherbee + spokes (core), one branch per binary: SY.orchestrator (A-199's step 1: reads apart, at most 4 waiting on one hive, a command that panics answered; hive-config stage 5: the blob folders follow their dist folder, and the blob GC runs only on the motherbee (A-188); A-196's restart marker; A-232's refusals); SY.admin (A-233: no purge while a node has a page up or a publish in flight; A-231, the ledger keeps a page down 30 days; A-234, the HTTP head and body caps; A-232; A-171, the manifest's lock file); SY.vault (A-200, one pass at the boot's announcement); SY.timer (A-220, canceled with a reason, schema v3; `LINK_BUSY` retried; A-232) | ✅ live, checked on 8.x | snap `pre-reads-0-1-127` (all 4 VMs) · `apt install fluxbee=0.1.126` + 0.1.126's `update_installation` (SY.timer of 0.1.126 reads the v3 table) |
+| **0.1.128** | 2026-11-10 | `89fd1fd8` | motherbee + spokes (core), the Rust SDK alone: A-218 (`TNT_APPROVE`, seven dead action names, ECHO/ECHO_REPLY/TIME_SYNC gone; SY.identity's migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`; the identity shared memory exactly as it was), A-237 (an intermediate answer marked `accepted`), A-248 (an AI node used as a tap target answers nothing, its copies counted) | ✅ live, checked on 8.x | snap `pre-sdk-0-1-128` (all 4 VMs) · `apt install fluxbee=0.1.127` + 0.1.127's `update_installation` (SY.identity of 0.1.127 ignores migration row 5, never names the dropped column, and recreates the empty vocabulary table) |
+| **0.1.127** | 2026-11-10 | `d2b344bb` | motherbee + spokes (core), one branch per binary: SY.orchestrator (A-199's step 1: reads apart, at most 4 waiting on one hive, a command that panics answered; hive-config stage 5: the blob folders follow their dist folder, and the blob GC runs only on the motherbee (A-188); A-196's restart marker; A-232's refusals); SY.admin (A-233: no purge while a node has a page up or a publish in flight; A-231, the ledger keeps a page down 30 days; A-234, the HTTP head and body caps; A-232; A-171, the manifest's lock file); SY.vault (A-200, one pass at the boot's announcement); SY.timer (A-220, canceled with a reason, schema v3; `LINK_BUSY` retried; A-232) | ✅ replaced by 0.1.128 | snap `pre-reads-0-1-127` (deleted 2026-11-10) · `apt install fluxbee=0.1.126` + 0.1.126's `update_installation` (SY.timer of 0.1.126 reads the v3 table) |
 | **0.1.126** | 2026-11-10 | `cf005771` | motherbee + spokes (core): A-219: an existing worker goes behind the egress, and back, by an explicit action (`set_hive_egress` / `clear_hive_egress`, the operator's word or Archi's plan with CONFIRM; `SYSTEM_EGRESS_ROUTE` between the orchestrators, protected; guards, a record, a probe, the motherbee's confirm, commit or revert, the start's resume; `/versions`' egress state); with A-225 (a removed worker's IPv6 file, the boot judging IPv6 by the kernel, the probe's reason) | ✅ replaced by 0.1.127 | snap `pre-egress-0-1-126` (deleted 2026-11-10) · first `clear_hive_egress` of every worker behind the egress (a release before 0.1.126 cannot), then `apt install fluxbee=0.1.125` + 0.1.125's `update_installation` |
 | **0.1.125** | 2026-11-10 | `f39e2bb0` | motherbee + spokes (core): the sweep's calls: published pages listed (`GET /artifacts`), taken down by the factory reset, and a tenant's purge refused while one is up (A-212); no default tenant and two different tenants refused (A-213); every fixed text in English and the frontdesk answering in the person's language (A-214); a WF forward to another IO node names no one (A-215); the frontdesk retrying a transient failure (A-216); wf-generic staying up on a failed store (A-217); one-time conversions removed (A-210, mostly); hive.yaml written atomically by `set_storage` (A-224); SY.admin's HTTP answering a failed handler (A-229); Archi asking for a node's tenant (A-230); Archi's runtime redeploy keeping each node's tenant (A-235); a removed ingress's SY.edge stopped (A-236) | ✅ replaced by 0.1.126 | snap `pre-clean-0-1-125` (deleted 2026-11-10) · `apt install fluxbee=0.1.124` + 0.1.124's `update_installation` (SY.identity of 0.1.124 still reads every record 0.1.125 writes) |
 | **0.1.124** | 2026-11-10 | `bffaf4f2` | motherbee + spokes (core): the router's release: a WAN session runs its cleanup however it ends and a send into a dead link is answered (A-203, the links between sibling routers and to nodes too); a WAN peer silent for the dead interval is cut (A-207), and a WAN handshake has a deadline; a sender's message the router's additions take over the frame is answered `FRAME_TOO_LARGE`, a broadcast everywhere or nowhere (A-202); the router no longer reads hive.yaml's `ai` and blob keys; with SY.admin's installation update record (A-204, A-205, and its review round's fixes), SY.timer refusing a `TZ=`/`CRON_TZ=`/`@` cron spec (A-206), wf-generic out of the core (A-211) and A-181's leftover texts | ✅ replaced by 0.1.125 | snap `pre-router-0-1-124` (deleted 2026-11-10) · `apt install fluxbee=0.1.123` + 0.1.123's `update_installation` (the installation file v7 stays; 0.1.123's router needs hive.yaml's `ai` and blob keys valid, as they are on 8.x) |
@@ -136,6 +137,44 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.128 — The Rust SDK alone
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.127 · **Commit:** `89fd1fd8` (code
+  `976a6e00`).
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** shared code ships alone ([METHOD](logbook/METHOD.md) §9). A-218 is the operator's call
+  (*"si borra la basura, no hay back compatibilidad"*), with the operator's rule that the identity
+  shared memory stays as it is (*"no borres la SHM si no es por rediseño"*).
+- **What changed:**
+  - **SY.identity and the SDK (A-218):** `TNT_APPROVE` and its handling gone; seven dead action
+    names (`approve_tenant`, three of the vocabulary, `get_runtimes`, `update_policy_matrix`,
+    `clear_override`); ECHO, ECHO_REPLY and TIME_SYNC out of the Rust SDK and the AI nodes' notice
+    list (the Go SDK keeps them until its own release); migration v5 drops `identity_vocabulary`
+    and `identity_tenants.approved_by`. The identity shared memory, its regions and
+    `IDENTITY_VERSION` 6 are unchanged.
+  - **The SDK (A-237):** `pending_confirm` and `sync_pending` are marked `accepted` in
+    `meta.action_result`, not `failed`.
+  - **The AI SDK (A-248):** a tap copy reaches no handler and gets no answer; a reply never carries
+    `via_tap`; the ignored copies are counted (`tap_copies_ignored`).
+- **Build and review:** `coa/sdk-128`, CI green; one review round: nothing blocking, two low (stale
+  texts; a dropped copy seen nowhere), fixed. The review compared the shared memory's code between
+  the two refs and read the rollback against 0.1.127's code.
+- **The deploy:** build in about 19 min, publish in 16 s, `ops deploy 0.1.128` in 361 s, health
+  clean; snapshot `pre-sdk-0-1-128`, `pre-reads-0-1-127` dropped. The update closed `done` 116 s after
+  its call, the spokes settled by +31 s: A-250 again.
+- **Checked on 8.x (the gate):**
+  - The identity shared memory on the motherbee and worker1 (the hives that hold it): the same size,
+    magic, version 6, counts (3 tenants, 69 ILKs, 6 channels and mappings, 0 vocabulary, 0 aliases)
+    and limits before and after; only the sequence word moved.
+  - SY.identity: "migrations through v5" at each start, rows 1 to 5, the table and the column gone,
+    no view or other owner; worker1's replica applied its full sync (69 ILKs, 3 tenants); a gate
+    tenant created, updated, deleted and purged.
+  - A-248: a tap on worker1 copying a throwaway IO client's question to AI.pruebas into a throwaway
+    `AI.gate0228`: the client got one answer, from AI.pruebas; `AI.gate0228` answered nothing and
+    counted `tap_copies_ignored=1`; the tap, the node and its tenant removed.
+- **PROD after the gate:** all four hives on 0.1.128 (`015ac810`); worker1 behind egress1; no tap and no page;
+  snapshot `pre-sdk-0-1-128` on each VM.
 
 ## 0.1.127 — Reads apart, the blob folders, and no purge under a live page
 

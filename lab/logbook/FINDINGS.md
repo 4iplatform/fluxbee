@@ -173,8 +173,12 @@ no change required
     A-232, A-171), SY.vault (A-200), SY.timer (A-220, `LINK_BUSY` retried). **Found by its review
     round:** A-245 to A-249, low. **Found by its gate:** A-250 [General/admin], the update's follow
     loses a read to each spoke's self-restart; A-251 [General/admin] and A-252 [General/join], low.
-    **Next:** the Rust SDK alone (0.1.128: A-218, A-237, A-248), then the router alone (0.1.129:
-    A-222, A-209, A-221).
+    **Next:** the Rust SDK alone (0.1.128), then the router alone (0.1.129).
+19. **0.1.128, the Rust SDK alone** ✅ live and checked on 8.x (2026-11-10): A-218 (the dead identity
+    surface, SY.identity's migration v5; the identity shared memory exactly as it was), A-237 (an
+    intermediate answer marked accepted), A-248 (an AI node used as a tap target answers nothing,
+    counted). Its deploy saw A-250 again (systematic). **Next:** the router alone (0.1.129: A-222,
+    A-209 with a node's own `via_tap` cleared, A-221).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -282,7 +286,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   (low).
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
   0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
-  2026-11-22, and a few the builder found); A-218 (the dead identity surface, a release alone) open. Cron descriptors wait for the talk on a WF that starts on a schedule.
+  2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-221 🔵 Cognition records a turn the agent never received when its delivery fails (low).
 - A-222 🟡 A node that stops reading without an error is never disconnected, and the router's
   queue for it grows without limit (latent; a design of its own).
@@ -293,7 +297,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   IO node (low).
 - A-228 🔵 The Go SDK's RPC error for UNREACHABLE drops the router's reason (low; the Go SDK,
   alone).
-- A-237 🔵 A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata (low; the SDK).
 - A-238 🔵 A canceled timer can be deleted at the next start, aged by its creation (low).
 - A-239 🔵 The Go SDK's TimerInfo drops SY.timer's canceled_reason (low; with A-228).
 - A-240 🔵 A local get_node_status writes on every read (low).
@@ -304,9 +307,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-245 🔵 A far router's UNREACHABLE reaches only the hub's own nodes: a spoke's sender to another spoke waits out its timeout (low; the router).
 - A-246 🔵 A non-gateway router with no gateway sibling answers a broadcast twice (low; multi-router hives only, not supported).
 - A-247 🔵 A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender (low; multi-router hives only, not supported).
-- A-248 🔵 An AI node used as a tap target answers the tapped message's sender (low; the AI SDK).
 - A-249 🔵 A-233's guards leave two narrow cases: a kill SY.admin stops waiting for, and the reset's step [3] (low).
-- A-250 🔵 The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 85 s late (to evaluate with 0.1.128's deploy).
+- A-250 🔵 The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 90 s late (seen in 0.1.127's and 0.1.128's deploys; a design call for the operator).
 - A-251 🔵 SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500 (low).
 - A-252 🔵 A fresh worker restarts Syncthing once more about a minute after its join, for the posture options (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
@@ -1416,7 +1418,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   process exited without answering, and SY.admin waited out its 50 s read bound, then held the
   hive unread for another 50 s (worker1: two such waits). The motherbee's orchestrator, already on
   0.1.127, served every read meanwhile (A-199's step 1 worked: no read waited behind another).
-- **To evaluate with 0.1.128's deploy:** the spokes now run 0.1.127, whose reads run apart, so a
+- **Seen again in 0.1.128's deploy (t = 19:40:20):** egress1's orchestrator stopped at 35.2 s and
+  was back on its router at 40.4 s, ingress1's 39.7 to 43.9 s, worker1's 42.8 to 47.2 s; each
+  settled within a second of coming back. SY.admin marked worker1 at 83.6 s, egress1 at 85.3 s and
+  ingress1 at 134.9 s (two waits). The spokes ran 0.1.127's reads apart this time, so the loss is
+  not a queue: a read that reaches a spoke's orchestrator in its few seconds off the router, or
+  just before it stops, gets no answer, and SY.admin waits its 50 s.
+- **Before 0.1.128's deploy, the plan was to evaluate:** the spokes now run 0.1.127, whose reads run apart, so a
   read that reaches a spoke before its self-restart is answered unless it arrives in the last
   moment. If the lag stays, the options: the follow uses a short read bound while a hive is
   restarting; the spoke tells SY.admin when it settles; or a forward fails at once when its target
@@ -1437,7 +1445,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** the purge count held until the orchestrator's answer whatever SY.admin's wait;
   SY.wf-rules passing SY.admin's `error_code` on as its own.
 
-### A-248 [General/AI SDK] 🔵 low (found 2026-11-10 by the router's 0.1.129 builder; read in the code, not live) — An AI node used as a tap target answers the tapped message's sender
+### A-248 [General/AI SDK] ✅ VALIDATED ON 8.x (0.1.128, 2026-11-10; one answer from AI.pruebas, none from the tap target, `tap_copies_ignored=1`) (found 2026-11-10 by the router's 0.1.129 builder; read in the code, not live) — An AI node used as a tap target answers the tapped message's sender
 
 - **Why:** `build_reply_meta` (`crates/fluxbee_ai_sdk/src/message.rs:97`) copies `meta.via_tap` into
   a reply, and `build_reply_routing` addresses `msg.routing.src`. An AI.* node that receives a tap
@@ -1546,7 +1554,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   before A-220; documented in docs/sy-timer.md §7.5.
 - **Fix, later:** age a canceled timer by its cancellation time.
 
-### A-237 [General/SDK] 🔵 low (found 2026-11-10 by A-219's builder; read in the code) — A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata
+### A-237 [General/SDK] ✅ BUILT (0.1.128, 2026-11-10; by its test: metadata only) (found 2026-11-10 by A-219's builder; read in the code) — A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata
 
 - **Why:** `derive_action_outcome` (`crates/fluxbee_sdk/src/policy.rs`) marks any status other than
   ok, accepted or blocked as `Failed` in `meta.action_result`. A-219's `pending_confirm`, an
@@ -1809,7 +1817,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Left, by the operator's call:** worker1 behind egress1, set through Archi's plan and CONFIRM;
     AI.pruebas answers through egress1.
 
-### A-218 [General/identity] 🔴 the operator's call 2026-11-10 (from the sweep of 2026-11-07; read in the code) — Dead identity surface (TNT_APPROVE, the vocabulary) and ECHO/TIME_SYNC
+### A-218 [General/identity] ✅ VALIDATED ON 8.x (0.1.128, 2026-11-10; migration v5, the identity shared memory's header identical before and after on both hives that hold it, the replica's full sync) (from the sweep of 2026-11-07; read in the code) — Dead identity surface (TNT_APPROVE, the vocabulary) and ECHO/TIME_SYNC
 
 - **Why:** nothing sends `TNT_APPROVE` (SY.identity handles it: `src/bin/sy_identity.rs:154`,
   `:3108`, `:4083`; the SDK exports it); `crates/fluxbee_sdk/src/policy.rs:126-139` classifies four
