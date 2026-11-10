@@ -174,7 +174,7 @@ func TestTheSeedExampleIsTheBasicLoop(t *testing.T) {
 	c := newSeedConversation(t)
 
 	// 1. The person writes: sales gets the message with the menu, and its answer reaches the person.
-	c.say("Hola, ¿cuánto sale el plan Pro?")
+	c.say("Hi, how much is the Pro plan?")
 	id := c.inState("talking")
 	first, options := c.asked()
 	if options != "answer " {
@@ -182,33 +182,33 @@ func TestTheSeedExampleIsTheBasicLoop(t *testing.T) {
 	}
 	var firstPayload map[string]any
 	_ = json.Unmarshal(first.Payload, &firstPayload)
-	if firstPayload["content"] != "Hola, ¿cuánto sale el plan Pro?" {
+	if firstPayload["content"] != "Hi, how much is the Pro plan?" {
 		t.Fatalf("sales gets the person's message as it came: %v", firstPayload)
 	}
-	c.answer(first, "100 dólares por licencia por mes.")
-	c.person(0, "100 dólares por licencia por mes.")
+	c.answer(first, "100 dollars per license per month.")
+	c.person(0, "100 dollars per license per month.")
 	c.inState("talking")
 
 	// 2. The person writes twice before sales answers: both answers reach the person.
-	c.say("¿Y el Basic?")
+	c.say("And the Basic one?")
 	one, _ := c.asked()
-	c.say("¿Hay descuento por volumen?")
+	c.say("Is there a volume discount?")
 	two, options := c.asked()
 	if options != "answer " {
 		t.Fatalf("sales' menu: %q", options)
 	}
-	c.answer(two, "Desde 20 licencias, consultame.")
-	c.answer(one, "40 dólares.")
-	c.person(1, "Desde 20 licencias, consultame.", "40 dólares.")
+	c.answer(two, "From 20 licenses, ask me.")
+	c.answer(one, "40 dollars.")
+	c.person(1, "From 20 licenses, ask me.", "40 dollars.")
 
 	// 3. An empty reply reaches no one.
-	c.say("Gracias")
+	c.say("Thanks")
 	thanks, _ := c.asked()
 	c.answer(thanks, "")
 	c.person(3)
 
 	// 4. An error: the person gets the WF's apology.
-	c.say("¿Me mandás el link de pago?")
+	c.say("Can you send me the payment link?")
 	broken, _ := c.asked()
 	c.dispatch(agentAnswer(t, seedSales, broken, `{"type":"error","code":"invalid_structured_output","message":"not_json"}`, nil))
 	c.person(3, "Sorry, something went wrong on our side. Could you write that again?")
@@ -216,7 +216,7 @@ func TestTheSeedExampleIsTheBasicLoop(t *testing.T) {
 
 	// A provider failure: the error carries the operator's text for the person, which the same
 	// catch sends in place of the WF's own (FINDINGS A-184).
-	c.say("¿Sigue en pie?")
+	c.say("Is it still on?")
 	failed, _ := c.asked()
 	c.dispatch(agentAnswer(t, seedSales, failed, `{"type":"error","code":"provider_rate_limited","message":"The AI provider is rate limiting requests. Retry shortly.","retryable":true,"reply":"There is a problem with the AI provider this agent uses, so it could not answer. Please contact your administrator."}`, nil))
 	c.person(4, "There is a problem with the AI provider this agent uses, so it could not answer. Please contact your administrator.")
