@@ -748,7 +748,6 @@ async fn main() -> Result<(), CognitionError> {
     // §11.3). Without it the node does not start: the file is where its state lives.
     let store = CognitionStore::open(&runtime_paths.state_dir)
         .map_err(|err| format!("sy.cognition could not open its file: {err}"))?;
-    remove_empty_old_folders(&runtime_paths.state_dir);
     // Model D' — vault is the source of truth for the openai secret. We
     // can't know synchronously whether vault has it (probe needs an
     // ephemeral router connection). Boot starts in `Missing`; the state
@@ -903,17 +902,6 @@ async fn main() -> Result<(), CognitionError> {
                     tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process sy.cognition system message");
                 }
             }
-        }
-    }
-}
-
-/// The folders `cache` and `shm` that cognition kept in its folder before its file (0.1.103), empty
-/// since: removed once, when empty, with a line in the log. One that holds anything stays.
-fn remove_empty_old_folders(state_dir: &Path) {
-    for name in ["cache", "shm"] {
-        let folder = state_dir.join(name);
-        if folder.is_dir() && std::fs::remove_dir(&folder).is_ok() {
-            tracing::info!(folder = %folder.display(), "sy.cognition removed an empty folder it no longer uses");
         }
     }
 }
@@ -7339,18 +7327,6 @@ mod tests {
         );
         assert_eq!(app_state.runtime_state.lock().await.intake_turns_total, 2);
         unlink();
-    }
-
-    /// The folders cognition kept before its file go when empty; one with anything in it stays.
-    #[test]
-    fn the_old_empty_folders_go_and_one_with_anything_stays() {
-        let dir = TestDir::new();
-        std::fs::create_dir_all(dir.0.join("cache")).expect("cache");
-        std::fs::create_dir_all(dir.0.join("shm")).expect("shm");
-        std::fs::write(dir.0.join("shm").join("left"), b"x").expect("a file");
-        remove_empty_old_folders(&dir.0);
-        assert!(!dir.0.join("cache").exists());
-        assert!(dir.0.join("shm").join("left").exists());
     }
 
     /// A `STREAM_BATCH` as `turns_batch`, its records copied for `producer`.

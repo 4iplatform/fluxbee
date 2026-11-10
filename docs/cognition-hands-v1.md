@@ -955,7 +955,7 @@ At 10:17 sales' package carries:
   - cognition's `STATUS` no longer names the durable entity schemas of SY.storage, gone in
     0.1.103;
   - the empty `cache` and `shm` folders cognition left in its folder go at its start, once, when
-    empty.
+    empty (removed in 0.1.125, every hive having passed it; FINDINGS A-210).
 - **The review round** (one, two reviewers): no high finding. Fixed, each with its test:
   - a medium: a WF that sends a person's first message to the agent and to another person at
     once had the relay join the communication with no agent, analyzed and paid twice. The relays
