@@ -744,9 +744,8 @@ second while one runs is refused first, `409 INSTALLATION_UPDATE_RUNNING`, writi
   hive that comes back behind on its core gets its core too, once, by the automatic step, then the
   version;
 - the target differs from an open update's, so the change supersedes it, and the new update starts
-  with every hive `unknown`: the background task reads each one again, looking at each hive at
-  once when the apply ended, not when the superseded update had it due (only the motherbee, the
-  reference, is recorded on its core at once);
+  with every hive `unknown`: the background task, woken once the apply ended, reads each one again
+  (only the motherbee, the reference, is recorded on its core at once);
 - its apply is the update's pass (`installation_update::apply_change_on_hive`, since 0.1.124), and
   `update: {id, state}` is in the answer:
   - each hive is claimed while it applies. A task holding it, one that reads it or one that acts on
@@ -916,6 +915,10 @@ time comes, in a task of its own, and sleeps until the next one is due:
   target (`settled` for a core, `ok` for a config), `by: background`, `attempts` 0, the read's
   times, and a `detail` naming the outcome it replaces (A-204: a hive moved by its own per-hive
   `update` kept the last outcome a run had left, `excluded` by the automatic step on 8.x);
+- **each hive by the open update's cadence:** the task's first look at a new update (a run's, a
+  change's) forgets when the looks of the update it superseded had each hive due next (since
+  0.1.124: the due time is kept per hive, and a hive the superseded update read every 10 min, which
+  the new run recorded `not_answered`, waited out that cadence before its 30 s check);
 - **an immediate look,** which never blocks the action: a per-hive `update` or `core_rollback` on a
   hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at once; a
   read of `get_installation_update` or of `/versions` makes it look at each hive off the target it

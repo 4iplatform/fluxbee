@@ -631,6 +631,11 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
       naming the outcome it replaces. **Why** (A-204): a hive moved by its own per-hive `update`
       read on the target with the last outcome a run had left, `excluded` by the automatic step on
       8.x;
+  - **each hive by the open update's cadence:** the task's first look at a new update (a run's, a
+    change's) forgets when the looks of the update it superseded had each hive due next (since
+    0.1.124). **Why:** the due time is kept per hive, so a hive the superseded update read every
+    10 min, and which the new run recorded `not_answered`, waited out that cadence before its 30 s
+    check of shared memory and its automatic step;
   - **an immediate look,** which never blocks the action: a per-hive `update` or `core_rollback`
     on a hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at
     once; a read of `get_installation_update` or of `/versions` makes it look at each hive off the
@@ -683,10 +688,8 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   - each hive's outcome is recorded as its own apply ends, from its own start to its own end, so
     its `elapsed_ms` is the answer's `timings_ms.hives`. **Why** (A-204): recorded once every apply
     had ended, every hive got the slowest one's time (85.5 s each on 8.x, for applies of about 2 s);
-  - once the apply ended, the background task looks at each hive at once (`look_now`): not when
-    the update opens, when it would read the hives the apply is about to claim, and not when a look
-    of the superseded update had the hive due (up to 10 min later: the cadence is the hive's, not
-    the update's).
+  - the background task is woken once the apply ended, not when the update opens: it would read
+    the hives the apply is about to claim.
 - **`ops.py deploy`** calls `POST /installation/update` with `{reason: "deploy <version>"}` once the
   motherbee is on the release and the spokes answer, from 0.1.123 on, and reads the update every 3
   s until it is done or held, or until nothing moves a hive any more (900 s at most; a hive that did

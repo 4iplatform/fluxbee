@@ -22037,11 +22037,9 @@ async fn handle_set_installation_ai(
     let update = match &update_id {
         Ok(update_id) => {
             ctx.installation_update.settle_state();
-            // The apply released its hives: the background task looks at each one now, whenever
-            // a look of the superseded update had it due, and reads the cores the update has not.
-            for hive in &hives {
-                ctx.installation_update.look_now(hive);
-            }
+            // The apply released its hives: the background task looks at the new update now, each
+            // hive by its cadence (never the superseded update's), and reads the cores it has not.
+            ctx.installation_update.wake();
             serde_json::json!({
                 "id": update_id,
                 "state": ctx.installation_update.state_of(update_id),

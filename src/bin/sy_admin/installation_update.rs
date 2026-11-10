@@ -1514,6 +1514,8 @@ pub(crate) struct Updates {
     /// restart looks at once.
     due: Mutex<HashMap<String, u64>>,
     looked: Mutex<HashMap<String, u64>>,
+    /// The update the background task looked at last: its first look at another forgets `due`.
+    ticked: Mutex<Option<String>>,
     /// One read of a hive's `/versions` at a time, and until when a read SY.admin gave up may
     /// still be queued at the motherbee's orchestrator.
     reads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -1661,6 +1663,7 @@ impl Updates {
             busy: Mutex::new(HashMap::new()),
             due: Mutex::new(HashMap::new()),
             looked: Mutex::new(HashMap::new()),
+            ticked: Mutex::new(None),
             reads: Mutex::new(HashMap::new()),
             quiet_until: Mutex::new(HashMap::new()),
             background_reads: tokio::sync::Semaphore::new(1),
@@ -3230,6 +3233,15 @@ pub(crate) async fn tick(
             .as_ref()
             .map(|update| (update.id.clone(), update.target.clone()))
     })?;
+    // A hive's cadence is the open update's: the first look at a new update (a run's, a change's)
+    // forgets when the looks of the one it superseded had each hive due next, up to its 10 min.
+    {
+        let mut ticked = lock(&updates.ticked);
+        if ticked.as_deref() != Some(id.as_str()) {
+            lock(&updates.due).clear();
+            *ticked = Some(id.clone());
+        }
+    }
     // SY.admin's start: the target is checked before anything acts on the update.
     if !updates.resume_checked.swap(true, Ordering::SeqCst) {
         target_is_current(updates, mesh.as_ref(), &id, &target, bounds).await;
@@ -4379,10 +4391,9 @@ pub(crate) fn handle_get_installation_update(ctx: &AdminContext, params: &Value)
 /// `set_installation_ai`'s update (§4, step 3): the target its write made, opened (a run with
 /// another target), with the motherbee's core on it, the reference. Its explicit pass is the
 /// stage 3c apply, each hive applied and recorded by [`apply_change_on_hive`]; once that apply
-/// ended, the caller has the background task look at each hive at once, and the task reads the
-/// other hives' cores (before, it would read the hives the apply is about to claim). Its id; why
-/// none was opened, when the hive registry cannot be read or the motherbee's own core is rolled
-/// back.
+/// ended, the caller wakes the background task, which reads the other hives' cores (before, it
+/// would read the hives the apply is about to claim). Its id; why none was opened, when the hive
+/// registry cannot be read or the motherbee's own core is rolled back.
 pub(crate) fn open_for_installation_change(
     ctx: &AdminContext,
     motherbee: &Value,

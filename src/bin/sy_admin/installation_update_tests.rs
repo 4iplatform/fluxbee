@@ -2741,3 +2741,86 @@ async fn a_read_records_a_hive_it_sees_on_the_target_after_another_outcome() {
     );
     assert_eq!(updates.settle_state(), Some(UpdateState::Done));
 }
+
+/// A hive's next look follows the open update's cadence: one the superseded update read every
+/// 10 min, which the new run records not_answered, gets its 30 s check of shared memory from the
+/// new update's first look, not 10 min after the old update's last.
+#[tokio::test]
+async fn a_new_update_looks_at_each_hive_by_its_own_cadence() {
+    let bounds = Bounds {
+        retry_check: Duration::from_secs(30),
+        slow_check: Duration::from_secs(600),
+        ..quick()
+    };
+    let updates = Updates::load(&temp_state("installation-update-own-cadence"));
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind()]);
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+
+    // The old update, for the file's version 2: worker1 left in error, read every 10 min.
+    let older = Target {
+        config: Some(ConfigTarget {
+            version: 2,
+            sha256: SHA_V2.to_string(),
+        }),
+        ..target()
+    };
+    let old = updates.change(|file| {
+        let (id, _) = file.open_or_resume(&older, "http", None, now_epoch_ms());
+        file.refresh_hives(
+            &id,
+            &["motherbee".to_string(), "worker1".to_string()],
+            Vec::new(),
+        );
+        id
+    });
+    for category in [Category::Core, Category::Config] {
+        let mut error = Outcome::new(OutcomeStatus::Error, RunKind::Explicit, 1, 2);
+        error.error_code = Some("RESTART_FAILED".to_string());
+        updates.record(
+            &old,
+            "worker1",
+            category,
+            Standing::Pending,
+            None,
+            Some(error),
+            None,
+        );
+        updates.record(
+            &old,
+            "motherbee",
+            category,
+            Standing::OnTarget,
+            None,
+            None,
+            None,
+        );
+    }
+    tick(&updates, &dyn_mesh, &bounds).await;
+    let ten_minutes = now_epoch_ms() + bounds.slow_check.as_millis() as u64 - 60_000;
+    assert!(
+        updates.due_at("worker1") > ten_minutes,
+        "on the 10 min cadence"
+    );
+    // The read the look started ends before the new run.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while updates.holder("worker1").is_some() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A run for the motherbee's version 3 supersedes it, and worker1 does not answer it.
+    mesh.set_down("worker1", true);
+    let RunEnd::Update { opening, .. } = explicit_run(&updates, &mesh, &[]).await else {
+        panic!("an update opened");
+    };
+    assert_eq!(opening, Opening::Superseded(old.clone()));
+    assert!(entry_of(&updates, "worker1").awaits_automatic_step());
+
+    // The new update's first look: worker1's check comes in 30 s, not when the old cadence said.
+    tick(&updates, &dyn_mesh, &bounds).await;
+    let due = updates.due_at("worker1");
+    assert!(
+        due <= now_epoch_ms() + bounds.retry_check.as_millis() as u64,
+        "{due}"
+    );
+}
