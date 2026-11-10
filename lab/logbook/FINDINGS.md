@@ -1446,6 +1446,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, with the SDK's next release:** an AI node does not answer a tap copy (it is there to be
   observed), and a reply never carries `via_tap`. Since 0.1.129 the router clears a `via_tap` a
   node sets itself, so such a reply is at least tapped and copied to cognition.
+- **Built for 0.1.128 (`coa/sdk-128`, reviewed):** the AI runtime hands a tap copy to no handler and
+  answers nothing; a reply never carries `via_tap`; the copies it ignores are counted in its
+  metrics line. **As built, an AI node used as a tap target takes no part at all** (no memory, no
+  tools, no model): an AI observer of tapped traffic would be a feature of its own. IO and WF nodes
+  still act on a copy they receive, which is what a tap target such as an audit IO node is for.
 
 ### A-247 [General/router] 🔵 low (found 2026-11-10 by the router's 0.1.129 builder; read in the code) — A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender
 
@@ -1817,6 +1822,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   action names and ECHO/TIME_SYNC with the example. The empty table and the shared memory's
   region are open: removing the region means a new `IDENTITY_VERSION`, with the router, every SDK
   and every published runtime moving together.
+- **Built for 0.1.128 (`coa/sdk-128`, reviewed):** `TNT_APPROVE` and its handling gone; seven
+  dead action names (the four above, `get_runtimes`, `update_policy_matrix`, `clear_override`);
+  ECHO, ECHO_REPLY and TIME_SYNC out of the Rust SDK and the AI nodes' notice list; SY.identity's
+  migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`. **The identity
+  shared memory is exactly as it was** (the operator's rule): its layout, its empty vocabulary
+  region and `IDENTITY_VERSION` 6; the review compared its code between the two refs. A rollback
+  to 0.1.127 is safe (it ignores migration row 5 and never names the column).
+- **Left for the Go SDK's release (with A-228):** `MSGEcho`/`MSGEchoReply` and the notice lists
+  that name them (`go/sy-timer/main.go:318-319`, `go/nodes/wf/wf-generic/node/dispatch.go:196`, its
+  comment at :189-190, `protocol_test.go`), and the texts that say the Go nodes' rule matches the
+  AI nodes' (`docs/spec-systemnode-wf-v1_1.md:1125`, `docs/sy-timer.md:268`). Also dead, found by
+  the builder: `classify_system_message` lists `OPA_APPLY`, `OPA_COMPILE_APPLY` and `OPA_ROLLBACK`,
+  which nothing sends or handles (with the Rust SDK's next release).
 
 ### A-217 [WF] ✅ BUILT (0.1.125, 2026-11-10; by its tests) (from the sweep of 2026-11-07; read in the code) — wf-generic exits with `log.Fatalf` when its database fails, and restarts every 5 s without ever reporting why
 
