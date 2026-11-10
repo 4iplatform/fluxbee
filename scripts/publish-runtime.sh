@@ -43,6 +43,10 @@ Notes:
     which Syncthing shares, never inside it), from its read of the manifest to its write, as every
     writer of it does (SY.admin, fluxbee-publish, the .deb's seed): waits for another writer up to
     60 s, then fails with the manifest untouched.
+  - A manifest that is there but cannot be read, does not parse, or is no manifest is refused
+    before anything is written: merging over it would drop every other runtime. Only a manifest
+    that does not exist starts empty. The manifest is written whole or not at all: a temp file
+    beside it, renamed over it.
 EOF
 }
 
@@ -187,27 +191,127 @@ MANIFEST_LOCK="$DIST_ROOT/runtimes-manifest.lock"
 MANIFEST_LOCK_WAIT_SECS=60
 START_SH="$BIN_DIR/start.sh"
 
-# The version the installed package brought is the way back from a hand publish
-# (reset_base_runtime, FINDINGS A-122): only the package's seed (--package) writes over it. A hand
-# publish under the same version would replace the package's files and hide itself, current then
-# being package_version.
-if [[ "$PACKAGE" != "1" && -f "$MANIFEST_PATH" ]]; then
-  package_version="$(python3 - "$MANIFEST_PATH" "$RUNTIME" <<'PY' 2>/dev/null || true
+# The manifest's reader and merger, one program for both of its reads below (its mode first). A
+# manifest that is there but cannot be read, does not parse, or is no manifest (a JSON object whose
+# runtimes, when it has one, is an object) is refused, naming why, and nothing is written: merging
+# over it from an empty document would drop every other runtime. Only a manifest that does not
+# exist starts empty.
+#   manifest_py package-version <manifest> <runtime>: the runtime's package_version, empty without
+#     one;
+#   manifest_py merge <manifest> <runtime> <version> <set_current> <runtimes_root> <prune_missing>
+#     <package>: the merged manifest.
+manifest_py() {
+  python3 - "$@" <<'PY'
+import datetime
 import json
+import pathlib
 import sys
+import time
 
-try:
-    entry = (json.load(open(sys.argv[1], encoding="utf-8")).get("runtimes") or {}).get(sys.argv[2])
-except Exception:
+
+def load_manifest(path):
+    """The live manifest, None when it does not exist; any other failure ends the run."""
+    try:
+        raw = pathlib.Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        sys.exit("Error: cannot read the runtimes manifest %s (%s); nothing was written"
+                 % (path, err.strerror or err))
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError as err:
+        sys.exit("Error: the runtimes manifest %s does not parse (%s); nothing was written"
+                 % (path, err))
+    if not isinstance(doc, dict) or not isinstance(doc.get("runtimes", {}), dict):
+        sys.exit("Error: the runtimes manifest %s is not one (a JSON object whose runtimes is an"
+                 " object); nothing was written" % path)
+    return doc
+
+
+mode = sys.argv[1]
+if mode == "package-version":
+    doc = load_manifest(sys.argv[2]) or {}
+    entry = (doc.get("runtimes") or {}).get(sys.argv[3])
+    print((entry.get("package_version") or "") if isinstance(entry, dict) else "")
     raise SystemExit(0)
-print((entry or {}).get("package_version") or "")
+
+manifest_path, runtime, version = sys.argv[2], sys.argv[3], sys.argv[4]
+set_current = sys.argv[5] == "1"
+runtimes_root = pathlib.Path(sys.argv[6])
+prune_missing = sys.argv[7] == "1"
+package = sys.argv[8] == "1"
+
+doc = {
+    "schema_version": 1,
+    "version": 0,
+    "updated_at": None,
+    "runtimes": {},
+}
+loaded = load_manifest(manifest_path)
+if loaded is not None:
+    doc.update(loaded)
+
+schema_version = doc.get("schema_version")
+if not isinstance(schema_version, int) or schema_version < 1:
+    schema_version = 1
+doc["schema_version"] = schema_version
+doc["version"] = int(time.time() * 1000)
+doc["updated_at"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+runtimes = doc.get("runtimes")
+if not isinstance(runtimes, dict):
+    runtimes = {}
+doc["runtimes"] = runtimes
+
+entry = runtimes.get(runtime)
+if not isinstance(entry, dict):
+    entry = {}
+
+available = entry.get("available")
+if not isinstance(available, list):
+    available = []
+available = [str(v) for v in available if str(v).strip()]
+if version not in available:
+    available.append(version)
+
+# --prune-missing: retire versions of THIS runtime whose artifact directory is gone. Scoped to
+# the runtime being published, so a hot-published entry is never touched. The version being
+# published is always kept (its bin dir was just created).
+if prune_missing:
+    available = [
+        v for v in available
+        if v == version or (runtimes_root / runtime / v).is_dir()
+    ]
+
+entry["available"] = sorted(set(available))
+
+if set_current or not isinstance(entry.get("current"), str) or not entry.get("current"):
+    entry["current"] = version
+
+# --package: the version the installed package brought, which SY.admin's reset_base_runtime
+# returns `current` to (FINDINGS A-122). Any other publish keeps the one recorded.
+if package:
+    entry["package_version"] = version
+
+runtimes[runtime] = entry
+
+print(json.dumps(doc, indent=2, sort_keys=True))
 PY
-)"
-  if [[ -n "$package_version" && "$package_version" == "$VERSION" ]]; then
-    echo "Error: $RUNTIME $VERSION is the version the installed package brought; publish under" \
-      "another version (for example $VERSION-gate1)" >&2
-    exit 1
-  fi
+}
+
+# The live manifest is read before anything is written: one this script cannot merge over stops it
+# here (manifest_py). The version the installed package brought is the way back from a hand
+# publish (reset_base_runtime, FINDINGS A-122): only the package's seed (--package) writes over it.
+# A hand publish under the same version would replace the package's files and hide itself, current
+# then being package_version.
+if ! package_version="$(manifest_py package-version "$MANIFEST_PATH" "$RUNTIME")"; then
+  exit 1
+fi
+if [[ "$PACKAGE" != "1" && -n "$package_version" && "$package_version" == "$VERSION" ]]; then
+  echo "Error: $RUNTIME $VERSION is the version the installed package brought; publish under" \
+    "another version (for example $VERSION-gate1)" >&2
+  exit 1
 fi
 
 $SUDO install -d "$BIN_DIR"
@@ -246,82 +350,20 @@ if ! flock -w "$MANIFEST_LOCK_WAIT_SECS" 9; then
   exit 1
 fi
 tmp_manifest="$(mktemp)"
-python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" "$PRUNE_MISSING" "$PACKAGE" >"$tmp_manifest" <<'PY'
-import datetime
-import json
-import pathlib
-import sys
-import time
-
-manifest_path = pathlib.Path(sys.argv[1])
-runtime = sys.argv[2]
-version = sys.argv[3]
-set_current = sys.argv[4] == "1"
-
-doc = {
-    "schema_version": 1,
-    "version": 0,
-    "updated_at": None,
-    "runtimes": {},
-}
-
-if manifest_path.exists():
-    try:
-        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            doc.update(loaded)
-    except Exception:
-        pass
-
-schema_version = doc.get("schema_version")
-if not isinstance(schema_version, int) or schema_version < 1:
-    schema_version = 1
-doc["schema_version"] = schema_version
-doc["version"] = int(time.time() * 1000)
-doc["updated_at"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-runtimes = doc.get("runtimes")
-if not isinstance(runtimes, dict):
-    runtimes = {}
-doc["runtimes"] = runtimes
-
-entry = runtimes.get(runtime)
-if not isinstance(entry, dict):
-    entry = {}
-
-available = entry.get("available")
-if not isinstance(available, list):
-    available = []
-available = [str(v) for v in available if str(v).strip()]
-if version not in available:
-    available.append(version)
-
-# --prune-missing: retire versions of THIS runtime whose artifact directory is gone. Scoped to
-# the runtime being published, so a hot-published entry is never touched. The version being
-# published is always kept (its bin dir was just created).
-if len(sys.argv) > 6 and sys.argv[6] == "1":
-    runtimes_root = pathlib.Path(sys.argv[5])
-    available = [
-        v for v in available
-        if v == version or (runtimes_root / runtime / v).is_dir()
-    ]
-
-entry["available"] = sorted(set(available))
-
-if set_current or not isinstance(entry.get("current"), str) or not entry.get("current"):
-    entry["current"] = version
-
-# --package: the version the installed package brought, which SY.admin's reset_base_runtime
-# returns `current` to (FINDINGS A-122). Any other publish keeps the one recorded.
-if len(sys.argv) > 7 and sys.argv[7] == "1":
-    entry["package_version"] = version
-
-runtimes[runtime] = entry
-
-print(json.dumps(doc, indent=2, sort_keys=True))
-PY
-
-$SUDO install -m 0644 "$tmp_manifest" "$MANIFEST_PATH"
+if ! manifest_py merge "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" \
+    "$PRUNE_MISSING" "$PACKAGE" >"$tmp_manifest"; then
+  rm -f "$tmp_manifest"
+  exit 1
+fi
+# Written whole or not at all: a temp file beside the manifest, renamed over it, so a reader
+# (SY.orchestrator, Syncthing) never sees half of one.
+staged="$($SUDO mktemp "$RUNTIMES_ROOT/.manifest.json.XXXXXX")"
+if ! $SUDO install -m 0644 "$tmp_manifest" "$staged" || ! $SUDO mv -f "$staged" "$MANIFEST_PATH"; then
+  $SUDO rm -f "$staged"
+  rm -f "$tmp_manifest"
+  echo "Error: could not write $MANIFEST_PATH; it is as it was" >&2
+  exit 1
+fi
 rm -f "$tmp_manifest"
 exec 9<&-
 

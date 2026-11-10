@@ -89,14 +89,16 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     raise SystemExit(1)
-raise SystemExit(0 if isinstance(d, dict) else 1)
+raise SystemExit(0 if isinstance(d, dict) and isinstance(d.get('runtimes', {}), dict) else 1)
 " "$1" 2>/dev/null
 }
 
-# Decide on VALIDITY, not existence. The merger swallows a parse error and starts from a blank
-# document, so a corrupt-but-present manifest would silently erase every hot-published runtime —
-# and then the snapshot would be deleted on the way out, taking the only copy with it. The check
-# and the restore hold the manifest's lock, as every writer of it does.
+# Decide on VALIDITY, not existence, with the merger's own rule (publish-runtime.sh): a manifest
+# that does not parse, or is no manifest, is one the merger refuses, since merging over it from a
+# blank document would silently erase every hot-published runtime (and then the snapshot would be
+# deleted on the way out, taking the only copy with it). So the snapshot is restored over it, and
+# without a snapshot the seed refuses too. The check and the restore hold the manifest's lock, as
+# every writer of it does.
 {
   if ! flock -w "$MANIFEST_LOCK_WAIT_SECS" 9; then
     echo "fluxbee-seed-runtimes: ERROR another writer of $LIVE_MANIFEST held its lock" \

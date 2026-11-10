@@ -256,6 +256,44 @@ wait "$holder"
 check "the seed runs once the lock is free" "$rc $([ "$waited" -ge 1 ] && echo waited || echo "did not wait")" "0 waited"
 check "the hand publish stays current" "$(q "$M11" "d['runtimes']['io.api']['current']")" "9.9.11"
 
+echo "== T12: a hand publish never merges over a manifest it cannot read; it writes one whole =="
+mkdir -p "$WORK/t12-src"; printf '#!/bin/sh\ntrue\n' >"$WORK/t12-src/io-api"; chmod 0755 "$WORK/t12-src/io-api"
+# One that is there but does not parse, is no JSON object, or holds runtimes that are no object:
+# refused before anything is written, the manifest as it was and no version directory.
+n=0
+for bad in 'this is not json {{{' '["io.api"]' '{"schema_version":1,"version":1,"runtimes":[]}'; do
+  n=$((n + 1))
+  D12="$WORK/t12-$n"; mkdir -p "$D12/runtimes"
+  printf '%s' "$bad" >"$D12/runtimes/manifest.json"
+  rc=0; err="$(bash "$PUBLISH" --runtime io.api --version 9.9.12 --binary "$WORK/t12-src/io-api" \
+    --dist-root "$D12" --set-current 2>&1 >/dev/null)" || rc=$?
+  check "refused over a manifest it cannot merge over ($n)" \
+    "$([ "$rc" -ne 0 ] && echo refused || echo published) $(cat "$D12/runtimes/manifest.json")" \
+    "refused $bad"
+  check "and it says why, writing nothing ($n)" \
+    "$(printf '%s' "$err" | grep -c 'nothing was written') $([ -e "$D12/runtimes/io.api" ] && echo written || echo nothing)" \
+    "1 nothing"
+done
+# One it cannot read (as root, any file reads: not checked then).
+if [ "$(id -u)" -ne 0 ]; then
+  D12u="$WORK/t12-unreadable"; seed_artifacts "$D12u" "$VER"; run_seed "$D12u" >/dev/null
+  chmod 000 "$D12u/runtimes/manifest.json"
+  rc=0; bash "$PUBLISH" --runtime io.api --version 9.9.12 --binary "$WORK/t12-src/io-api" \
+    --dist-root "$D12u" --set-current >/dev/null 2>&1 || rc=$?
+  chmod 0644 "$D12u/runtimes/manifest.json"
+  check "refused over a manifest it cannot read" \
+    "$([ "$rc" -ne 0 ] && echo refused || echo published) $(q "$D12u/runtimes/manifest.json" "d['runtimes']['io.api']['current']")" \
+    "refused $VER"
+fi
+# No manifest at all: the first publish starts one.
+D12e="$WORK/t12-empty"; mkdir -p "$D12e"
+rc=0; bash "$PUBLISH" --runtime io.api --version 9.9.12 --binary "$WORK/t12-src/io-api" \
+  --dist-root "$D12e" --set-current >/dev/null 2>&1 || rc=$?
+check "a dist without a manifest gets one" "$rc $(q "$D12e/runtimes/manifest.json" "d['runtimes']['io.api']['current']")" "0 9.9.12"
+# Written whole: a temp file beside the manifest, renamed over it, and none left behind.
+check "no temp file is left beside the manifest" \
+  "$(ls -A "$D12e/runtimes" "$D11/runtimes" | grep -c '^\.manifest\.json\.' || true)" "0"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -355,7 +355,10 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   line `exec "$SCRIPT_DIR/<binary>" "$@"`), installs each `--file` next to `bin/`, and merges the
   manifest last. It checks every input before it writes anything, and the manifest never names a
   version that is not all there: the orchestrator moves running nodes onto it on its next pass
-  (FINDINGS A-110). The `publish-*-runtime.sh` scripts build on it with their own start script;
+  (FINDINGS A-110). A live manifest that is there but cannot be read, does not parse, or is no
+  manifest (a JSON object whose `runtimes` is an object) is refused before anything is written,
+  since merging over it would drop every other runtime; only a manifest that does not exist starts
+  empty. The manifest is written whole or not at all: a temp file beside it, renamed over it. The `publish-*-runtime.sh` scripts build on it with their own start script;
   `publish-ia-runtime.sh` also hands it ai.generic's `tools.json`, the catalog of
   `docs/reference/agent-tools.json` (or `--catalog <path>`) with the version in it.
   `fluxbee-publish <package dir> [--deploy <hive>]` (`src/bin/fluxbee-publish.rs`) publishes a
