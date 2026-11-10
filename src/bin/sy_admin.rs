@@ -10055,10 +10055,12 @@ async fn serve_http_connection(
     }
 }
 
-/// The answer to a request whose handler failed: `413 MESSAGE_TOO_LARGE` when the SDK refused a
-/// message larger than a mesh frame, anywhere in the error's chain (nothing was sent), with its
-/// size and the most it may be; `500 INTERNAL_ERROR` otherwise. The detail never repeats the
-/// error's text, which may quote the request.
+/// The answer to a request whose handler failed: `413 BODY_TOO_LARGE` when it declared a body past
+/// `HTTP_BODY_MAX_BYTES` (`HttpBodyTooLarge`, its body unread), with the size it declared and the
+/// most SY.admin reads; `413 MESSAGE_TOO_LARGE` when the SDK refused a message larger than a mesh
+/// frame, anywhere in the error's chain (nothing was sent), with its size and the most it may be;
+/// `500 INTERNAL_ERROR` otherwise. The detail never repeats the error's text, which may quote the
+/// request.
 fn http_handler_error_response(err: &(dyn std::error::Error + 'static)) -> (u16, String) {
     let answer = |status: u16, code: &str, detail: String| {
         (
@@ -10075,6 +10077,16 @@ fn http_handler_error_response(err: &(dyn std::error::Error + 'static)) -> (u16,
     };
     let mut cause = Some(err);
     while let Some(current) = cause {
+        if let Some(HttpBodyTooLarge { declared }) = current.downcast_ref::<HttpBodyTooLarge>() {
+            return answer(
+                413,
+                "BODY_TOO_LARGE",
+                format!(
+                    "the request declared a body of {declared} bytes, past the \
+                     {HTTP_BODY_MAX_BYTES} SY.admin reads: it was not read"
+                ),
+            );
+        }
         if let Some(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) =
             current.downcast_ref::<fluxbee_sdk::NodeError>()
         {
@@ -12133,6 +12145,32 @@ fn list_dirs(path: &Path) -> Result<Vec<String>, AdminError> {
     Ok(entries)
 }
 
+/// The most bytes a request's body may declare (FINDINGS A-234), above the largest body any action
+/// takes: a package is at most a bundle_upload's zip at its cap (`BUNDLE_MAX_ZIP_BYTES`), and a
+/// module's archive (`POST /modules/{name}/{version}`) or an inline package carries no more. A
+/// request that declares more is answered 413 before its body is read (`HttpBodyTooLarge`).
+const HTTP_BODY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const _: () = assert!(HTTP_BODY_MAX_BYTES > BUNDLE_MAX_ZIP_BYTES);
+
+/// A request whose `Content-Length` passes `HTTP_BODY_MAX_BYTES`: nothing is allocated for its
+/// body, nor is it read; the connection answers `413 BODY_TOO_LARGE` (`http_handler_error_response`).
+#[derive(Debug)]
+struct HttpBodyTooLarge {
+    declared: u64,
+}
+
+impl std::fmt::Display for HttpBodyTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a request declared a body of {} bytes, past the {HTTP_BODY_MAX_BYTES} SY.admin reads",
+            self.declared
+        )
+    }
+}
+
+impl std::error::Error for HttpBodyTooLarge {}
+
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<(String, String, HashMap<String, String>, Vec<u8>), AdminError> {
@@ -12168,8 +12206,14 @@ async fn read_http_request(
     }
     let content_length = headers
         .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    if content_length > HTTP_BODY_MAX_BYTES {
+        return Err(Box::new(HttpBodyTooLarge {
+            declared: content_length,
+        }));
+    }
+    let content_length = content_length as usize;
     let mut body = buf[header_end..].to_vec();
     while body.len() < content_length {
         let mut chunk = vec![0u8; content_length - body.len()];
@@ -39164,6 +39208,70 @@ mod tests {
                 "{answer}"
             );
             assert!(!answer.contains("secret-marker"), "{answer}");
+            server.await.expect("the server");
+        });
+    }
+
+    // --- a body past the most an action takes is not read (FINDINGS A-234) ------------------
+
+    /// A request that declares a body past HTTP_BODY_MAX_BYTES is answered 413 BODY_TOO_LARGE in
+    /// SY.admin's error shape, with the size it declared, before its body is read: the client here
+    /// sends none, so a reader that waited for it would never answer. That the cap stays above the
+    /// largest body an action takes, a bundle_upload's zip, is a compile-time check beside it.
+    #[test]
+    fn the_http_api_refuses_a_body_past_its_cap_unread() {
+        let declared = HTTP_BODY_MAX_BYTES + 1;
+        let (status, body) =
+            http_handler_error_response(&HttpBodyTooLarge { declared } as &dyn std::error::Error);
+        assert_eq!(status, 413, "{body}");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["error_code"], json!("BODY_TOO_LARGE"));
+        let detail = body["error_detail"].as_str().expect("why");
+        assert!(
+            detail.contains(&declared.to_string())
+                && detail.contains(&HTTP_BODY_MAX_BYTES.to_string()),
+            "{detail}"
+        );
+
+        // handle_http's frames run deep in a debug build, as in the test above.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(32 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (ctx, _harness) = opa_test_admin("http-body-cap");
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let addr = listener.local_addr().expect("its address");
+            let server_ctx = ctx.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("a connection");
+                serve_http_connection(stream, &server_ctx, &server_ctx.rpc).await;
+            });
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connected");
+            let request = format!(
+                "POST /hives/motherbee/nodes HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.expect("sent");
+            let mut answer = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+                .await
+                .expect("answered without its body")
+                .expect("an answer");
+            let answer = String::from_utf8(answer).expect("text");
+            assert!(
+                answer.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+                "{answer}"
+            );
+            assert!(
+                answer.contains("\"error_code\":\"BODY_TOO_LARGE\""),
+                "{answer}"
+            );
             server.await.expect("the server");
         });
     }

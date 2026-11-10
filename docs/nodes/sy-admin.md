@@ -112,6 +112,10 @@ fails with `missing_ai_api_key`.
   sent; `500 INTERNAL_ERROR` otherwise. The detail never repeats the request
   (`serve_http_connection`, `http_handler_error_response`). Before 0.1.125 the connection closed
   with no answer.
+- **A body past 1 GiB** (`HTTP_BODY_MAX_BYTES`, above the largest body an action takes, a
+  `bundle_upload`'s 512 MiB zip): a request whose `Content-Length` declares more answers
+  `413 BODY_TOO_LARGE` with the size it declared, before its body is read and with nothing
+  allocated for it (`read_http_request`, FINDINGS A-234).
 - **Health.** `GET /health` answers `{"status":"ok"}` without touching the mesh.
 
 ## ADMIN_COMMAND over the mesh
