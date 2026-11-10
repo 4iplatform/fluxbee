@@ -941,9 +941,11 @@ internet probe's target, no default; and `ssh_from_wan`, default true), `ingress
 (the ingress' extra SSH sources), `ai`, read untyped: on the motherbee it is the installation
 file's first version, and once a hive holds the file it is ignored
 ([The installation file](#the-installation-file)). Past a spoke's join, which writes the spoke's
-file over SSH, the orchestrator writes it in one place: `set_storage` puts `storage.path` into the
-motherbee's own file and keeps its other keys, atomically (`persist_storage_path_in_hive`: a
-temporary file beside it, then a rename; FINDINGS A-224).
+file over SSH, the orchestrator writes it in two places, each keeping the file's other keys,
+atomically (a temporary file beside it, then a rename), under one lock (`lock_hive_yaml`):
+`set_storage` puts `storage.path` into the motherbee's own file (`persist_storage_path_in_hive`;
+FINDINGS A-224), and a worker's egress switch puts its `egress` in, or takes it out, at its commit
+(`write_hive_yaml_egress`; [A worker behind the egress](#a-worker-behind-the-egress-a-219)).
 
 What the release defines for each role is in the code (`json_router::release_settings`,
 [System nodes per role](#system-nodes-per-role)): the role's SY nodes, and the blob's and dist's

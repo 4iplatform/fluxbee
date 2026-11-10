@@ -1140,7 +1140,7 @@ gateway only: a section whose `reachability_url` differs from the declaration's 
 `behind`.
 
 **The hive.yaml writer.** One lock in the process (`lock_hive_yaml`), taken by the commit and by
-`set_storage`. `set_storage`'s own atomic write is A-224's (0.1.125, `coa/orch-125`).
+`set_storage`. `set_storage`'s own atomic write is A-224's, in the same release.
 
 **The removal (A-225).** A removed worker's cleanup removes `/etc/sysctl.d/99-fluxbee-egress.conf`
 and the record, once its services are stopped, and runs `sysctl --system`. IPv6, and the default
@@ -1157,6 +1157,5 @@ TLS), in the journal of the egress, the worker and the motherbee, and in the swi
 error does: no code of Archi's reads `/versions` by itself; its handbook (§4.4.5) tells it to read
 `GET /hives/<hive>/versions` and report `egress.state` and `last_switch`.
 
-**Docs left for later.** hive-config-update-v1 §2 and §9 (the one exception to "a worker's `egress`
-never travels") are not edited here: `coa/orch-125` rewrites those sections for A-224 in the same
-release.
+**hive-config-update-v1** names the one exception to "a worker's `egress` never travels" in §1,
+§2, §5 (its writers) and §12, and §9 records the operator's call.

@@ -37,7 +37,9 @@ A spoke's `hive.yaml` is written once, at its join: `add_hive` writes it over SS
 motherbee's settings of that moment, and nothing writes it again. `set_storage`, which changes
 `storage.path` only, writes the motherbee's own file and no spoke's: SY.admin sends it to its own
 hive's orchestrator (`action_routes_via_local_orchestrator`), which never forwards it. So whatever
-the installation decides after a join never reaches that hive. Three cases bite today:
+the installation decides after a join never reaches that hive. The one exception since 0.1.125 is a
+worker's `egress`, which the operator's `set_hive_egress` and `clear_hive_egress` write on that
+worker (A-219, [edge-egress-nat-spec](edge-egress-nat-spec.md) §15). Three cases bite today:
 
 - **The AI model.** SY.cognition on worker1 reads its model from worker1's `hive.yaml`, written
   at its join. When the installation moved to Claude (0.1.72), worker1's file was edited by hand;
@@ -73,7 +75,7 @@ the installation decides after a join never reaches that hive. Three cases bite 
 | --- | --- | --- | --- |
 | `hive_id`, `role` | the hive's `hive.yaml` | the join | never travels |
 | The control path: `wan.*`, `identity.sync.*` | the hive's `hive.yaml` | the join | never travels: a wrong value cuts the mesh that would carry the fix |
-| Local: `storage.path`, `blob.path`, `blob.sync.api_port`, `blob.sync.data_dir`, `dist.path`, a worker's `egress`, the ingress's `edge` and SSH table, the motherbee's `admin`, `architect`, `acme`, `web`, `egress` | the hive's `hive.yaml` | the join; on the motherbee, `set_storage` (its own `storage.path`, §1) | never travels |
+| Local: `storage.path`, `blob.path`, `blob.sync.api_port`, `blob.sync.data_dir`, `dist.path`, a worker's `egress`, the ingress's `edge` and SSH table, the motherbee's `admin`, `architect`, `acme`, `web`, `egress` | the hive's `hive.yaml` | the join; on the motherbee, `set_storage` (its own `storage.path`, §1); on a worker, `set_hive_egress` and `clear_hive_egress` (its `egress`, A-219) | never travels with an update; a worker's `egress` goes to it alone, in `SYSTEM_EGRESS_ROUTE`, on the operator's word: the one exception ([edge-egress-nat-spec](edge-egress-nat-spec.md) §15) |
 | `system_nodes` by role, with its order and waits | the release: the code, by role | a release | with the core's binaries |
 | The blob's and dist's topology by role (`enabled`, `sync.enabled`, `public_enabled`, the tool) | the release: the code, by role | a release | with the core's binaries |
 | The frontdesk's name (`government.identity_frontdesk`) | the hive's `hive.yaml` (since 2026-11-10; first planned in the code) | the join | never travels: on a worker it is the only key that names the motherbee |
@@ -447,10 +449,14 @@ The operator's change and the update with category `config`, live and checked on
     A-224). It used to be a plain `fs::write`, which a crash or a full disk could leave truncated,
     and the orchestrator does not start on such a file. Its writes come one at a time: the
     orchestrator takes SY.admin's actions one after another (`run_admin_worker`).
-  - **A spoke's file:** its join alone writes it, whole, over SSH and under the motherbee's lock on
-    that hive (`lock_hive_topology`), with `sudo tee`: in place, not atomically.
-  - **Not built:** a lock on the file itself, so a hand edit made during a `set_storage` can be
-    lost; and an atomic write at the join.
+  - **A spoke's file:** its join writes it, whole, over SSH and under the motherbee's lock on that
+    hive (`lock_hive_topology`), with `sudo tee`: in place, not atomically.
+  - **A worker's `egress`** (A-219, since 0.1.125): its egress switch writes it at its commit, on
+    the worker, atomically as `set_storage` does (`write_hive_yaml_egress`: only `egress` changed),
+    while the motherbee holds the same `lock_hive_topology` for the whole action. Both writers take
+    one lock in the orchestrator (`lock_hive_yaml`).
+  - **Not built:** a lock against a hand edit, so one made during a `set_storage` or an egress
+    commit can be lost; and an atomic write at the join.
 - **The join writes it** without the release's keys and without `ai`.
 
 ## 6. The installation's update, SY.admin's
@@ -799,7 +805,9 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   - The keys stay as listed.
   - The blob's switch goes.
   - The worker that joined before the egress (`egress.gateway_ip`) is apart, to be talked over
-    later.
+    later. Talked over on 2026-11-10 (A-219): an explicit action per worker, `set_hive_egress`,
+    from Archi with the operator's CONFIRM, and its reverse, `clear_hive_egress`
+    ([edge-egress-nat-spec](edge-egress-nat-spec.md) §15, built for 0.1.125).
 - **The version rule:** *"no puede pasar que los archivos de config entre hives sean de distinta
   versión"*. This draft keeps it by construction: one file, one version, and SY.admin's update
   stays open until every hive has it.
@@ -936,8 +944,8 @@ They raised 70 findings, many of them the same seen from several lenses:
   - the ingress's: `:27542`.
 
   Then `ADD_HIVE_FINALIZE` runs on the spoke (`:24236`).
-- **After the join,** nothing writes a spoke's file. `set_storage` writes the motherbee's own, and
-  only `storage.path` (§1). It round-trips the YAML through serde, so the comments go; since
+- **After the join,** nothing writes a spoke's file (since 0.1.125, but a worker's `egress`:
+  A-219, §5). `set_storage` writes the motherbee's own, and only `storage.path` (§1). It round-trips the YAML through serde, so the comments go; since
   0.1.125 it writes atomically (§5).
 - **The motherbee's file at an install:** `deb-postinst` copies the example only when there is no
   `hive.yaml`.
