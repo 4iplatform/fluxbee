@@ -31,11 +31,12 @@ type RunOptions struct {
 //  2. Connects to the router, whatever the config state
 //  3. With a config in use: opens SQLite, recovers running instances, reconciles timers and starts
 //     the GC goroutine (startEngine). A store it cannot use leaves the node up, waiting for it
-//  4. Enters the receive loop; without a config in use it answers control messages only, saying
-//     why, and a restart applies a corrected config. A node that waits for its store opens it again
-//     from the loop every storeRetryInterval, until the engine runs. A node that started without
-//     SY.timer's answer asks it again from the loop, until it reconciles its timers. Once a GC
-//     interval the loop closes the conversations that went quiet (closeQuietInstances)
+//  4. Enters the receive loop (serve); without a config in use it answers control messages only,
+//     saying why, and a restart applies a corrected config. A node that waits for its store opens it
+//     again from the loop every storeRetryInterval, until the engine runs. A node whose timers are
+//     not reconciled (SY.timer did not answer, or the index could not be read) tries again from the
+//     loop, until they are. Once a GC interval the loop closes the conversations that went quiet
+//     (closeQuietInstances)
 //
 // It returns an error only for what the node cannot run without at all: a config file it can read,
 // a router connection, its receive channel, a timer client (and, in a dry run, a config in use). A
@@ -105,32 +106,47 @@ func Run(ctx context.Context, opts RunOptions) error {
 			rt.Store.Close()
 		}
 	}()
-
-	// While the engine waits for its store, the store is opened again every storeRetryInterval, on
-	// the loop: recovery runs between two messages, as at the start. While the timers wait for
-	// SY.timer, a TIMER_LIST goes out every timerReconcileRetryInterval, asked off the loop (the loop
-	// keeps serving) and taken on it.
-	var storeRetry, reconcileRetry loopTicker
-	defer storeRetry.stop()
-	defer reconcileRetry.stop()
-	// engineUp is what the loop does once the engine runs: no more opens of the store, and SY.timer
-	// asked again while the timers wait for it.
-	engineUp := func() {
-		storeRetry.stop()
-		if rt.timersPending != nil {
-			reconcileRetry.start(timerReconcileRetryInterval)
-		}
-	}
 	if materialized != nil {
 		timerSender, err := NewSDKTimerSender(routerDispatcher, materialized.Config.SYTimerL2Name)
 		if err != nil {
 			return fmt.Errorf("create timer sender: %w", err)
 		}
 		rt.ActCtx.Timer = timerSender
+	}
+	rt.serve(ctx, incoming, materialized, loopIntervals{storeRetry: storeRetryInterval, timerRetry: timerReconcileRetryInterval})
+	return nil
+}
+
+// loopIntervals are how often the receive loop opens the store again while the engine waits for it,
+// and asks SY.timer again while the timers wait for their reconcile.
+type loopIntervals struct {
+	storeRetry, timerRetry time.Duration
+}
+
+// serve is Run once the router is connected: it starts the engine, with a config in use, and runs
+// the receive loop on incoming until ctx is done or incoming closes. The caller sets the timer sender
+// before, and closes rt.Store after.
+func (rt *NodeRuntime) serve(ctx context.Context, incoming <-chan sdk.Message, materialized *Materialized, every loopIntervals) {
+	// While the engine waits for its store, the store is opened again every every.storeRetry, on the
+	// loop: recovery runs between two messages, as at the start. While the timers wait for their
+	// reconcile, a TIMER_LIST goes out every every.timerRetry, asked off the loop (the loop keeps
+	// serving) and taken on it.
+	var storeRetry, reconcileRetry loopTicker
+	defer storeRetry.stop()
+	defer reconcileRetry.stop()
+	// engineUp is what the loop does once the engine runs: no more opens of the store, and SY.timer
+	// asked again while the timers wait for their reconcile.
+	engineUp := func() {
+		storeRetry.stop()
+		if rt.timersPending != nil {
+			reconcileRetry.start(every.timerRetry)
+		}
+	}
+	if materialized != nil {
 		if rt.startEngine(ctx, materialized) {
 			engineUp()
 		} else {
-			storeRetry.start(storeRetryInterval)
+			storeRetry.start(every.storeRetry)
 		}
 	}
 	timerLists := make(chan timerListResult, 1)
@@ -146,15 +162,15 @@ func Run(ctx context.Context, opts RunOptions) error {
 		idleTick = ticker.C
 	}
 
-	log.Printf("wf: entering receive loop for %s", sender.FullName())
+	log.Printf("wf: entering receive loop for %s", rt.NodeName)
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case msg, ok := <-incoming:
 			if !ok {
 				log.Printf("wf: incoming channel closed; exiting")
-				return nil
+				return
 			}
 			if err := dispatchGuarded(ctx, msg, rt); err != nil {
 				log.Printf("wf: dispatch error: %v", err)

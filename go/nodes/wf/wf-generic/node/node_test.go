@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
@@ -658,6 +660,132 @@ func TestAStoreFailureIsTheConfigsOnlyWhenItsPathIsAtFault(t *testing.T) {
 			t.Errorf("pathFault(%v) = %v, want %v", c.err, !c.path, c.path)
 		}
 	}
+}
+
+// chanDispatcher hands each message the node sends to sent: a dispatcher for a test whose receive
+// loop runs on a goroutine of its own.
+type chanDispatcher struct{ sent chan sdk.Message }
+
+func (d *chanDispatcher) SendMsg(msg sdk.Message, note sdk.TraceNote) error {
+	sdk.WriteTraceEntry(&msg, testNodeName, note)
+	d.sent <- msg
+	return nil
+}
+func (d *chanDispatcher) NodeL2Name() string { return testNodeName }
+func (d *chanDispatcher) NodeUUID() string   { return "wf-uuid" }
+
+// switchedTimer is SY.timer as the receive loop's goroutines reach it: it answers TIMER_LIST, with no
+// timer pending, only once answering is set, and takes any other request.
+type switchedTimer struct{ answering atomic.Bool }
+
+func (s *switchedTimer) ScheduleIn(context.Context, time.Duration, sdk.ScheduleOptions) (sdk.TimerID, error) {
+	return "timer-uuid", nil
+}
+func (s *switchedTimer) Schedule(context.Context, time.Time, sdk.ScheduleOptions) (sdk.TimerID, error) {
+	return "timer-uuid", nil
+}
+func (s *switchedTimer) CancelByClientRef(context.Context, string) error                { return nil }
+func (s *switchedTimer) CancelByClientRefConfirmed(context.Context, string) error       { return nil }
+func (s *switchedTimer) RescheduleByClientRef(context.Context, string, time.Time) error { return nil }
+func (s *switchedTimer) List(context.Context, sdk.ListFilter) ([]sdk.TimerInfo, error) {
+	if !s.answering.Load() {
+		return nil, errSendFailed
+	}
+	return nil, nil
+}
+
+// FINDINGS A-217's review: the receive loop's wiring (serve, Run once the router is connected),
+// driven without a router. A store that does not open at the start is opened again on the loop's
+// tick, until it opens; the engine then runs, and its timers, which SY.timer has not answered for,
+// are reconciled on the reconcile's tick, which the late open starts, once SY.timer answers: DEGRADED
+// store_unavailable, then DEGRADED timers_not_reconciled, then HEALTHY, with nothing from outside the
+// loop but the status requests.
+func TestTheReceiveLoopOpensTheStoreAgainAndThenReconcilesItsTimers(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf.db")
+	if err := os.WriteFile(dbPath, []byte("not a database, and long enough to be read as one: 0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	document := spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))
+	document["db_path"] = dbPath
+	plane := bootstrap(t, writeNodeConfig(t, document))
+	materialized := plane.Configured()
+	disp := &chanDispatcher{sent: make(chan sdk.Message, 16)}
+	timer := &switchedTimer{}
+	rt := &NodeRuntime{ActCtx: ActionContext{Dispatcher: disp, Timer: timer, Clock: fixedClock}, NodeUUID: "wf-uuid", NodeName: testNodeName, Plane: plane}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	incoming := make(chan sdk.Message)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		rt.serve(ctx, incoming, materialized, loopIntervals{storeRetry: 10 * time.Millisecond, timerRetry: 10 * time.Millisecond})
+	}()
+	defer func() {
+		cancel()
+		<-served
+		if rt.Store != nil {
+			rt.Store.Close()
+		}
+	}()
+
+	// status asks the loop for the node's health, as the orchestrator does: its health_state and the
+	// code of its last_error.
+	statusName := sdk.MSGNodeStatusGet
+	status := func() (string, string) {
+		t.Helper()
+		select {
+		case incoming <- sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "system", Msg: &statusName}}:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the loop takes no message")
+		}
+		for {
+			select {
+			case msg := <-disp.sent:
+				if derefString(msg.Meta.Msg) != sdk.MSGNodeStatusGetResponse {
+					continue
+				}
+				var reply struct {
+					Health    string                 `json:"health_state"`
+					LastError *sdk.ControlPlaneError `json:"last_error"`
+				}
+				if err := json.Unmarshal(msg.Payload, &reply); err != nil {
+					t.Fatal(err)
+				}
+				if reply.LastError == nil {
+					return reply.Health, ""
+				}
+				return reply.Health, reply.LastError.Code
+			case <-time.After(5 * time.Second):
+				t.Fatal("no answer to NODE_STATUS_GET")
+			}
+		}
+	}
+	// until asks again until the node's health is health, with code.
+	until := func(health, code string) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+			got, gotCode := status()
+			if got == health && gotCode == code {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the loop never reached %s %q: %s %q", health, code, got, gotCode)
+			}
+		}
+	}
+
+	// The start found no store it can use: the loop serves, DEGRADED, and opens it again on its tick.
+	if got, code := status(); got != "DEGRADED" || code != errCodeStoreUnavailable {
+		t.Fatalf("at the start: %s %q", got, code)
+	}
+	// The store can be used: a tick opens it, the engine runs, and its timers wait for SY.timer.
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	until("DEGRADED", errCodeTimersNotReconciled)
+	// SY.timer answers: the reconcile's tick, started by the late open, reconciles the timers.
+	timer.answering.Store(true)
+	until("HEALTHY", "")
 }
 
 // A reply refused as over the frame limit is answered with the error its handler uses for other
