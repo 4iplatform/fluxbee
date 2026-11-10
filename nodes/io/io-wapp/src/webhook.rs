@@ -267,7 +267,7 @@ mod tests {
                                 "id": "wamid.AAA==",
                                 "timestamp": "1700000000",
                                 "type": "text",
-                                "text": { "body": "hola" }
+                                "text": { "body": "hello" }
                             }]
                         }
                     },
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(
             m.kind,
             WappMessageKind::Text {
-                body: "hola".into()
+                body: "hello".into()
             }
         );
     }
@@ -378,16 +378,16 @@ mod tests {
     fn base64_decode_roundtrips_and_rejects_garbage() {
         // Vectors matching the edge's encoder (standard alphabet + '=' padding).
         assert_eq!(
-            base64_decode("aG9sYQ==").as_deref(),
-            Some(b"hola".as_slice())
+            base64_decode("aGVscA==").as_deref(),
+            Some(b"help".as_slice())
         );
         assert_eq!(
-            base64_decode("aG9sYXM=").as_deref(),
-            Some(b"holas".as_slice())
+            base64_decode("aGVsbG8=").as_deref(),
+            Some(b"hello".as_slice())
         );
         assert_eq!(
-            base64_decode("aG9sYXMh").as_deref(),
-            Some(b"holas!".as_slice())
+            base64_decode("aGVsbG8h").as_deref(),
+            Some(b"hello!".as_slice())
         );
         assert_eq!(base64_decode("").as_deref(), Some(b"".as_slice()));
         assert_eq!(base64_decode("abc"), None); // bad length

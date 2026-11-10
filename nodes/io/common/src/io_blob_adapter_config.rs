@@ -147,7 +147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn un_curador_sin_config_es_valido_no_un_error() {
+    fn a_curator_without_config_is_valid_not_an_error() {
         let out = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({}))
             .expect("an io.blob without config is valid");
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn acepta_max_bytes_y_admin_hive_y_los_expone() {
+    fn takes_max_bytes_and_admin_hive_and_exposes_them() {
         let out = IoBlobAdapterConfigContract
             .validate_and_materialize(
                 &json!({"io": {"max_bytes": 1048576, "admin_hive": " motherbee "}}),
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn max_bytes_cero_es_un_error_no_un_silencio() {
+    fn a_zero_max_bytes_is_an_error_not_a_silence() {
         let err = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"max_bytes": 0}}))
             .expect_err("a cap of 0 would reject EVERY publish");
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_hive_en_blanco_es_un_error() {
+    fn a_blank_admin_hive_is_an_error() {
         let err = IoBlobAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"admin_hive": "   "}}))
             .expect_err("a blank admin_hive has to fail");
@@ -189,18 +189,18 @@ mod tests {
 
     /// The contract accepts NO secrets: io.blob mints and stores no tokens.
     #[test]
-    fn no_hay_campo_de_secreto_en_el_contrato() {
-        let campos: Vec<&str> = IoBlobAdapterConfigContract
+    fn the_contract_has_no_secret_field() {
+        let fields: Vec<&str> = IoBlobAdapterConfigContract
             .optional_fields()
             .iter()
             .chain(IoBlobAdapterConfigContract.required_fields())
             .copied()
             .collect();
-        for campo in &campos {
-            let bajo = campo.to_ascii_lowercase();
+        for field in &fields {
+            let lower = field.to_ascii_lowercase();
             assert!(
-                !bajo.contains("secret") && !bajo.contains("token") && !bajo.contains("api_key"),
-                "the io.blob contract must not have secret fields: {campo}"
+                !lower.contains("secret") && !lower.contains("token") && !lower.contains("api_key"),
+                "the io.blob contract must not have secret fields: {field}"
             );
         }
         let out = IoBlobAdapterConfigContract

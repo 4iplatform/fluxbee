@@ -700,12 +700,12 @@ mod tests {
         policy.enabled = false;
         let mut relay = RelayBuffer::new(policy, InMemoryRelayStore::new()).expect("relay");
 
-        let decision = relay.handle_fragment(test_fragment("k1", "f1", 10, "hola"));
+        let decision = relay.handle_fragment(test_fragment("k1", "f1", 10, "hello"));
         let RelayDecision::FlushNow(turn) = decision else {
             panic!("unexpected decision");
         };
         assert_eq!(turn.parts, 1);
-        assert_eq!(turn.payload["content"], "hola");
+        assert_eq!(turn.payload["content"], "hello");
         assert_eq!(turn.meta_context["io"]["relay"]["applied"], true);
     }
 
@@ -713,14 +713,14 @@ mod tests {
     fn holds_then_flushes_on_window() {
         let mut relay = RelayBuffer::new(test_policy(), InMemoryRelayStore::new()).expect("relay");
 
-        let d1 = relay.handle_fragment(test_fragment("k1", "f1", 10, "hola"));
+        let d1 = relay.handle_fragment(test_fragment("k1", "f1", 10, "hello"));
         assert!(matches!(d1, RelayDecision::Hold));
-        let d2 = relay.handle_fragment(test_fragment("k1", "f2", 20, "mundo"));
+        let d2 = relay.handle_fragment(test_fragment("k1", "f2", 20, "world"));
         assert!(matches!(d2, RelayDecision::Hold));
 
         let flushed = relay.flush_expired(121);
         assert_eq!(flushed.len(), 1);
-        assert_eq!(flushed[0].payload["content"], "hola\nmundo");
+        assert_eq!(flushed[0].payload["content"], "hello\nworld");
         assert_eq!(
             flushed[0].meta_context["io"]["relay"]["reason"],
             "window_elapsed"
@@ -733,17 +733,17 @@ mod tests {
         let mut relay = RelayBuffer::new(test_policy(), InMemoryRelayStore::new()).expect("relay");
 
         assert!(matches!(
-            relay.handle_fragment(test_fragment("k1", "f1", 10, "hola")),
+            relay.handle_fragment(test_fragment("k1", "f1", 10, "hello")),
             RelayDecision::Hold
         ));
         assert!(matches!(
-            relay.handle_fragment(test_fragment("k1", "f1", 20, "hola otra vez")),
+            relay.handle_fragment(test_fragment("k1", "f1", 20, "hello again")),
             RelayDecision::DropDuplicate
         ));
 
         let flushed = relay.flush_expired(111);
         assert_eq!(flushed.len(), 1);
-        assert_eq!(flushed[0].payload["content"], "hola");
+        assert_eq!(flushed[0].payload["content"], "hello");
         assert_eq!(
             flushed[0].meta_context["io"]["relay"]["dropped_duplicates"],
             1

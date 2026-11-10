@@ -4518,7 +4518,7 @@ mod tests {
     /// The literals are split with `concat!`: if they were whole, this test could find ITSELF and
     /// measure its own text.
     #[test]
-    fn el_trafico_de_control_nunca_llega_al_camino_de_salida_de_slack() {
+    fn control_traffic_never_reaches_the_path_out_to_slack() {
         let src = include_str!("main.rs");
         let guard_if = concat!("if is_control_plane_msg_type(&msg.meta.", "msg_type) {");
         let outbound = concat!("let binding = match extract_runtime_slack", "_binding(");
@@ -4559,34 +4559,34 @@ mod tests {
     /// posts, whatever the mesh answers is posted again, and that is a loop inside a customer's
     /// Slack.
     #[test]
-    fn no_relayamos_nunca_nuestros_propios_mensajes() {
+    fn the_node_never_relays_its_own_posts() {
         let me = "U0BOT";
 
-        let humano = serde_json::json!({"type":"message","user":"U0HUMANO","text":"hola"});
-        assert!(classify_slack_inbound(&humano, "message", Some(me)).is_ok());
+        let person = serde_json::json!({"type":"message","user":"U0PERSON","text":"hello"});
+        assert!(classify_slack_inbound(&person, "message", Some(me)).is_ok());
 
-        let propio = serde_json::json!({"type":"message","user":me,"text":"respuesta del bot"});
-        assert!(classify_slack_inbound(&propio, "message", Some(me)).is_err());
+        let own_post = serde_json::json!({"type":"message","user":me,"text":"the bot's answer"});
+        assert!(classify_slack_inbound(&own_post, "message", Some(me)).is_err());
 
-        let con_bot_id =
-            serde_json::json!({"type":"message","user":"U0OTRO","bot_id":"B123","text":"x"});
-        assert!(classify_slack_inbound(&con_bot_id, "message", Some(me)).is_err());
+        let with_bot_id =
+            serde_json::json!({"type":"message","user":"U0OTHER","bot_id":"B123","text":"x"});
+        assert!(classify_slack_inbound(&with_bot_id, "message", Some(me)).is_err());
 
-        let con_subtype = serde_json::json!({"type":"message","subtype":"bot_message","text":"x"});
-        assert!(classify_slack_inbound(&con_subtype, "message", Some(me)).is_err());
+        let with_subtype = serde_json::json!({"type":"message","subtype":"bot_message","text":"x"});
+        assert!(classify_slack_inbound(&with_subtype, "message", Some(me)).is_err());
 
         // FAILS CLOSED: without knowing who we are, nothing is relayed.
         assert!(
-            classify_slack_inbound(&humano, "message", None).is_err(),
+            classify_slack_inbound(&person, "message", None).is_err(),
             "without bot_user_id a self-post cannot be ruled out: nothing is relayed"
         );
 
-        let mencion =
-            serde_json::json!({"type":"app_mention","user":"U0HUMANO","text":"<@U0BOT> hola"});
-        assert!(classify_slack_inbound(&mencion, "app_mention", None).is_ok());
+        let mention_event =
+            serde_json::json!({"type":"app_mention","user":"U0PERSON","text":"<@U0BOT> hello"});
+        assert!(classify_slack_inbound(&mention_event, "app_mention", None).is_ok());
 
-        let otro = serde_json::json!({"type":"reaction_added"});
-        assert!(classify_slack_inbound(&otro, "reaction_added", Some(me)).is_err());
+        let other = serde_json::json!({"type":"reaction_added"});
+        assert!(classify_slack_inbound(&other, "reaction_added", Some(me)).is_err());
     }
 
     /// A payload's text is posted as Slack shows plain text: its `&`, `<` and `>` escaped. What a
@@ -4596,12 +4596,12 @@ mod tests {
     #[test]
     fn a_payloads_text_is_posted_escaped_and_its_blocks_as_they_are() {
         let blocks = json!([
-            {"type": "section", "text": {"type": "mrkdwn", "text": "<!here> *Aprobado*"}}
+            {"type": "section", "text": {"type": "mrkdwn", "text": "<!here> *Approved*"}}
         ]);
         let body = post_message_body(
             "C0SUPERVISORS",
-            "<!channel> <!here> <@U0BOSS> <!subteam^S0SALES|@ventas> ¿20% para 10 Pro? Entrá a \
-             <https://evil.example|https://sso.acme.com> o https://fluxbee.example/public/k3y \
+            "<!channel> <!here> <@U0BOSS> <!subteam^S0SALES|@sales> 20% for 10 Pro? Go to \
+             <https://evil.example|https://sso.acme.com> or https://fluxbee.example/public/k3y \
              (Q&A: 1 < 2 > 0)",
             Some("1793000000.000100"),
             Some(blocks.clone()),
@@ -4611,8 +4611,8 @@ mod tests {
             json!({
                 "channel": "C0SUPERVISORS",
                 "text": "&lt;!channel&gt; &lt;!here&gt; &lt;@U0BOSS&gt; \
-                         &lt;!subteam^S0SALES|@ventas&gt; ¿20% para 10 Pro? Entrá a \
-                         &lt;https://evil.example|https://sso.acme.com&gt; o \
+                         &lt;!subteam^S0SALES|@sales&gt; 20% for 10 Pro? Go to \
+                         &lt;https://evil.example|https://sso.acme.com&gt; or \
                          https://fluxbee.example/public/k3y (Q&amp;A: 1 &lt; 2 &gt; 0)",
                 "thread_ts": "1793000000.000100",
                 "blocks": blocks,
@@ -4621,8 +4621,8 @@ mod tests {
 
         // At the top level, without blocks; a text with nothing to escape goes as it is.
         assert_eq!(
-            post_message_body("C0SUPERVISORS", "Aprobado: 15%.", None, None),
-            json!({"channel": "C0SUPERVISORS", "text": "Aprobado: 15%."})
+            post_message_body("C0SUPERVISORS", "Approved: 15%.", None, None),
+            json!({"channel": "C0SUPERVISORS", "text": "Approved: 15%."})
         );
     }
 
@@ -4655,12 +4655,12 @@ mod tests {
             ("R&amp;D &amp;amp; P&amp;L", "R&D &amp; P&L"),
             ("<@U0BOSS> 1 &lt; 2", "<@U0BOSS> 1 < 2"),
             (
-                "<!here> mirá <https://acme.example/?a=1&amp;b=2|Q&amp;A> y R&amp;D",
-                "<!here> mirá <https://acme.example/?a=1&amp;b=2|Q&amp;A> y R&D",
+                "<!here> see <https://acme.example/?a=1&amp;b=2|Q&amp;A> and R&amp;D",
+                "<!here> see <https://acme.example/?a=1&amp;b=2|Q&amp;A> and R&D",
             ),
             (
-                "¿Qué tal? Nada que decodificar.",
-                "¿Qué tal? Nada que decodificar.",
+                "How are you? Nothing to decode.",
+                "How are you? Nothing to decode.",
             ),
             // A raw `<` with no `>` after it is no markup.
             ("1 < 2 &gt; 0", "1 < 2 > 0"),
@@ -4770,9 +4770,9 @@ mod tests {
     #[test]
     fn a_message_that_comes_as_two_events_is_seen_once() {
         let mut seen = DedupCache::new(Duration::from_secs(60), 2);
-        let mention = json!({"type": "app_mention", "user": "U0ANA", "text": "<@U0BOT> hola",
+        let mention = json!({"type": "app_mention", "user": "U0ANA", "text": "<@U0BOT> hello",
                              "ts": POST_TS});
-        let message = json!({"type": "message", "user": "U0ANA", "text": "<@U0BOT> hola",
+        let message = json!({"type": "message", "user": "U0ANA", "text": "<@U0BOT> hello",
                              "ts": POST_TS});
         assert!(!message_seen(&mut seen, CHANNEL, &mention));
         assert!(message_seen(&mut seen, CHANNEL, &message));
@@ -4894,12 +4894,12 @@ mod tests {
                 event_callback(
                     "Ev03",
                     in_channel(json!({"type": "app_mention", "user": "U0ANA",
-                        "text": "<@U0BOT> hola", "ts": "1793000000.000400"})),
+                        "text": "<@U0BOT> hello", "ts": "1793000000.000400"})),
                 ),
                 event_callback(
                     "Ev04",
                     in_channel(json!({"type": "message", "user": "U0ANA",
-                        "text": "<@U0BOT> hola", "ts": "1793000000.000400"})),
+                        "text": "<@U0BOT> hello", "ts": "1793000000.000400"})),
                 ),
                 event_callback(
                     "Ev05",
@@ -4961,7 +4961,7 @@ mod tests {
             br#"{"ok":true}"#
         );
 
-        assert_eq!(messages[2].payload["content"], "hola");
+        assert_eq!(messages[2].payload["content"], "hello");
         let downloads = |id: &str| api.calls().iter().filter(|(api, _)| api == id).count();
         assert_eq!(downloads("F0INVOICE"), 1);
         assert_eq!(downloads("F0OWN"), 0);

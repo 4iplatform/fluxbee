@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # E2E-10:
-# - add_hive con harden_ssh=true
-# - validar que login por password queda rechazado
-# - validar continuidad operativa via orchestrator/socket (run_node + kill_node)
+# - add_hive with harden_ssh=true
+# - check that a password login is refused
+# - check that operation goes on through the orchestrator/socket (run_node + kill_node)
 #
 # Usage:
 #   BASE="http://127.0.0.1:8080" HIVE_ID="worker-220" HIVE_ADDR="192.168.8.220" \
@@ -12,7 +12,7 @@ set -euo pipefail
 #
 # Optional:
 #   HARDEN_SSH="true|false"                # default: true
-#   RESTRICT_SSH="true|false|auto"         # default: auto (no envía campo)
+#   RESTRICT_SSH="true|false|auto"         # default: auto (sends no field)
 #   SSH_USER="administrator"               # default: administrator
 #   SSH_PASSWORD="magicAI"                 # default: magicAI
 #   REQUIRE_PASSWORD_BLOCKED="1|0"         # default: 1

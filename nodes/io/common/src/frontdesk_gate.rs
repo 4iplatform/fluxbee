@@ -276,7 +276,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn la_compuerta_viene_apagada() {
+    fn the_gate_starts_switched_off() {
         let cfg = FrontdeskGateConfig::default();
         assert!(
             !cfg.enabled,
@@ -285,14 +285,14 @@ mod tests {
         assert_eq!(cfg.target, DEFAULT_FRONTDESK_TARGET);
 
         // A config without the section => off.
-        let vacia = FrontdeskGateConfig::from_effective_config(Some(&json!({"io":{}})));
-        assert!(!vacia.enabled);
+        let empty = FrontdeskGateConfig::from_effective_config(Some(&json!({"io":{}})));
+        assert!(!empty.enabled);
         // And with no config at all, too.
         assert!(!FrontdeskGateConfig::from_effective_config(None).enabled);
     }
 
     #[test]
-    fn se_enciende_solo_por_config_explicita() {
+    fn only_an_explicit_config_switches_it_on() {
         let cfg = FrontdeskGateConfig::from_effective_config(Some(&json!({
             "io": {"frontdesk": {"enabled": true, "target": "SY.frontdesk.gov@motherbee"}}
         })));
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn un_target_vacio_no_manda_el_primer_contacto_a_la_nada() {
+    fn a_blank_target_sends_no_first_contact_into_nowhere() {
         let cfg = FrontdeskGateConfig::from_effective_config(Some(&json!({
             "io": {"frontdesk": {"enabled": true, "target": "   "}}
         })));
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn solo_pasa_por_el_frontdesk_quien_no_esta_completo() {
+    fn only_who_is_not_complete_goes_through_the_frontdesk() {
         assert!(gate_required(Some("temporary")));
         assert!(gate_required(Some("partial")));
         assert!(!gate_required(Some("complete")));
@@ -329,15 +329,15 @@ mod tests {
     }
 
     #[test]
-    fn el_handoff_presenta_al_sujeto_aunque_solo_haya_un_user_id() {
+    fn the_handoff_names_the_subject_even_with_only_a_user_id() {
         let cfg = FrontdeskGateConfig::default();
         let msg = build_handoff_message(
-            "uuid-nodo",
+            "uuid-node",
             &cfg,
             "ilk:abc",
             Some("tnt:1111"),
             "slack",
-            "IO.slack.test@motherbee:U0HUMANO",
+            "IO.slack.test@motherbee:U0HUMAN",
             "trace-1",
         );
 
@@ -366,6 +366,6 @@ mod tests {
         assert!(attrs
             .get("address")
             .and_then(Value::as_str)
-            .is_some_and(|a| a.contains("U0HUMANO")));
+            .is_some_and(|a| a.contains("U0HUMAN")));
     }
 }

@@ -359,7 +359,7 @@ mod tests {
     /// authoritative and was impossible: copying it to a real hive returns
     /// `INVALID_REQUEST: invalid key format`. This test ties the fixture to the real rule.
     #[test]
-    fn el_ejemplo_de_vault_key_tiene_que_ser_aceptable_para_el_vault() {
+    fn the_example_vault_key_is_one_the_vault_accepts() {
         let auth = valid_auth();
         let key = auth
             .get("key")

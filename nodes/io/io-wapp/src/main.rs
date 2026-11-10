@@ -1426,9 +1426,9 @@ mod tests {
     fn message_to_content_never_drops_non_text() {
         assert_eq!(
             wapp_message_to_content(&WappMessageKind::Text {
-                body: "hola".into()
+                body: "hello".into()
             }),
-            "hola"
+            "hello"
         );
         // media with caption => caption + marker; without => marker only
         assert_eq!(
@@ -1477,12 +1477,12 @@ mod tests {
             message_id: "wamid.X".into(),
             timestamp: Some("1700000000".into()),
             kind: WappMessageKind::Text {
-                body: "hola".into(),
+                body: "hello".into(),
             },
         };
         let payload = build_wapp_inbound_payload(&msg).expect("payload");
         // base text/v1 content preserved
-        assert_eq!(payload["content"], json!("hola"));
+        assert_eq!(payload["content"], json!("hello"));
         // provenance stub present with reply fields
         let wapp = &payload["raw"]["wapp"];
         assert_eq!(wapp["phone_number_id"], json!("111"));
@@ -1559,12 +1559,12 @@ mod tests {
 
     #[test]
     fn graph_text_body_matches_meta_contract() {
-        let body = build_wapp_text_message_body("573001112222", "hola mundo");
+        let body = build_wapp_text_message_body("573001112222", "hello world");
         assert_eq!(body["messaging_product"], json!("whatsapp"));
         assert_eq!(body["recipient_type"], json!("individual"));
         assert_eq!(body["to"], json!("573001112222"));
         assert_eq!(body["type"], json!("text"));
-        assert_eq!(body["text"]["body"], json!("hola mundo"));
+        assert_eq!(body["text"]["body"], json!("hello world"));
         assert_eq!(body["text"]["preview_url"], json!(false));
     }
 

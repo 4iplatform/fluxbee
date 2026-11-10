@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn un_nodo_sin_edge_es_valido_no_un_error() {
+    fn a_node_without_an_edge_is_valid_not_an_error() {
         // No public door yet: it serves the mesh and trusts nobody. Requiring the field would
         // leave it in FAILED_CONFIG on every clean start, adding nothing.
         let out = IoCloudAdapterConfigContract
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn acepta_un_edge_valido_y_lo_expone() {
+    fn takes_a_valid_edge_and_exposes_it() {
         let out = IoCloudAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"edge_node": " SY.edge@ingress1 "}}))
             .expect("valid edge");
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn un_edge_en_blanco_es_un_error_no_un_silencio() {
+    fn a_blank_edge_is_an_error_not_a_silence() {
         // This is what separates "I have no door yet" from "I mistyped it". Without this check, a
         // typo would leave the node dropping ALL inbound traffic without saying why.
         let err = IoCloudAdapterConfigContract
@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn el_edge_tiene_que_ser_un_sy_edge() {
+    fn the_edge_has_to_be_an_sy_edge() {
         let err = IoCloudAdapterConfigContract
             .validate_and_materialize(&json!({"io": {"edge_node": "IO.api@motherbee"}}))
             .expect_err("only an SY.edge can be the door");
@@ -180,18 +180,18 @@ mod tests {
     /// The contract accepts NO secrets. Accepting them would reopen the door we closed: SY.admin
     /// mints the token into the vault and nobody else chooses it.
     #[test]
-    fn no_hay_campo_de_secreto_en_el_contrato() {
-        let campos: Vec<&str> = IoCloudAdapterConfigContract
+    fn the_contract_has_no_secret_field() {
+        let fields: Vec<&str> = IoCloudAdapterConfigContract
             .optional_fields()
             .iter()
             .chain(IoCloudAdapterConfigContract.required_fields())
             .copied()
             .collect();
-        for campo in &campos {
-            let bajo = campo.to_ascii_lowercase();
+        for field in &fields {
+            let lower = field.to_ascii_lowercase();
             assert!(
-                !bajo.contains("secret") && !bajo.contains("token") && !bajo.contains("api_key"),
-                "the io.cloud contract must not have secret fields: {campo}"
+                !lower.contains("secret") && !lower.contains("token") && !lower.contains("api_key"),
+                "the io.cloud contract must not have secret fields: {field}"
             );
         }
         // And if someone sends one anyway, it is dropped on materialize (it does not propagate).

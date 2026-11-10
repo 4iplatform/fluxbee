@@ -1833,7 +1833,7 @@ mod tests {
             true,
         );
         assert!(post.facts.is_none());
-        assert_eq!(post.blocks("Hola", None), None);
+        assert_eq!(post.blocks("Hello", None), None);
     }
 
     /// Without facts or a menu, a post is as before the WF's block: its payload's blocks as they
@@ -1842,11 +1842,11 @@ mod tests {
     fn without_facts_or_a_menu_a_post_is_as_before_and_facts_alone_make_none() {
         let plain_post = WfPost::read(Some(&json!({"io": {}})), Some(CASE_THREAD), true);
         assert_eq!(plain_post.subject, Subject::New);
-        assert_eq!(plain_post.blocks("hola", None), None);
+        assert_eq!(plain_post.blocks("hello", None), None);
         let own = json!([{"type": "divider"}]);
-        assert_eq!(plain_post.blocks("hola", Some(&own)), Some(own.clone()));
+        assert_eq!(plain_post.blocks("hello", Some(&own)), Some(own.clone()));
         let no_context = WfPost::read(None, None, true);
-        assert_eq!(no_context.blocks("hola", None), None);
+        assert_eq!(no_context.blocks("hello", None), None);
 
         let facts_only = WfPost::read(
             Some(&wf_context(json!({"vars": {"how": "quiet"}}))),
@@ -2134,7 +2134,7 @@ mod tests {
     fn a_submission_reads_from_view_submission() {
         let values = json!({"note": {"note": {
             "type": "plain_text_input",
-            "value": "Emitida la NC 0001-0042 <!here> & enviada."
+            "value": "Credit note 0001-0042 issued <!here> & sent."
         }}});
         let submission =
             Submission::parse(&view_submission_fixture(values.clone())).expect("submission");
@@ -2242,7 +2242,7 @@ mod tests {
         let mut params = Map::new();
         params.insert(
             "note".to_string(),
-            json!("Emitida la NC 0001-0042.\nEnviada."),
+            json!("Credit note 0001-0042 issued.\nSent."),
         );
         let (io, payload, evaluation) = click_parts(
             WORKSPACE,
@@ -2281,7 +2281,7 @@ mod tests {
         assert_eq!(
             context["evaluation"],
             json!({"option": "handback",
-                   "params": {"note": "Emitida la NC 0001-0042.\nEnviada."}})
+                   "params": {"note": "Credit note 0001-0042 issued.\nSent."}})
         );
         let io = &context["io"];
         assert_eq!(io["channel"], "slack");
@@ -2299,7 +2299,7 @@ mod tests {
         assert_eq!(msg.payload["type"], "text");
         assert_eq!(
             msg.payload["content"],
-            "handback\nnote: Emitida la NC 0001-0042.\nEnviada."
+            "handback\nnote: Credit note 0001-0042 issued.\nSent."
         );
         assert_eq!(msg.payload["raw"]["slack"]["user"], "U0JUAN");
 
@@ -2597,7 +2597,7 @@ mod tests {
                 assert!(post.facts.is_none(), "{from:?} {block}");
                 assert!(post.menu.is_none(), "{from:?} {block}");
                 assert!(!post.only_closes(&nothing), "{from:?} {block}");
-                assert_eq!(post.blocks("Hola", None), None, "{from:?} {block}");
+                assert_eq!(post.blocks("Hello", None), None, "{from:?} {block}");
             }
         }
     }

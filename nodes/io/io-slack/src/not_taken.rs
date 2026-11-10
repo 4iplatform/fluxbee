@@ -322,7 +322,7 @@ mod tests {
             Some("ilk:person".to_string()),
             None,
             wrap_in_meta_context(&io),
-            json!({"type": "text", "content": "hola"}),
+            json!({"type": "text", "content": "hello"}),
         )
     }
 

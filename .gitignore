@@ -15,11 +15,11 @@ nodes/io/target
 # Real *.fluxbee.ai TLS cert + private key — deployed via vault/out-of-band, never committed
 sslcert/
 
-# Python bytecode cache (lab/pve.py y utilidades)
+# Python bytecode cache (lab/pve.py and its helpers)
 __pycache__/
 *.pyc
 
-# Scratchpad de sesión (throwaway: dumps, patches, borradores) — nunca va al repo
+# A session's scratchpad (throwaway: dumps, patches, drafts): never goes into the repo
 scratchpad/
 
 # Go binaries that packaging/build-deb.sh builds in place (FINDINGS A-28)

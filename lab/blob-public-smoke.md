@@ -47,9 +47,8 @@ Environment=SY_ADMIN_PUBLIC_BASE_URL=https://<ingress-ip-or-dns>:8443
 Send `AI.chat` a message that asks it to publish. The model calls `publish_html_page`
 (which validates the HTML, writes the blob, promotes it, and does `publish_artifact` to admin over the socket):
 
-> «Generá una página HTML simple autocontenida que diga "hola fluxbee" y **publicala**
->  como URL pública.» (Generate a simple, self-contained HTML page that says "hola fluxbee" and
->  **publish it** as a public URL.)
+> «Generate a simple, self-contained HTML page that says "hello fluxbee" and **publish it** as
+>  a public URL.»
 
 The tool returns `{status:"ok", url, publication_id, expires_at}` to the model; the model must
 return the URL to the user in its reply.

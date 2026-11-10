@@ -292,9 +292,9 @@ mod tests {
     use std::sync::Arc;
 
     /// A provisioner that remembers which tenant it was called with.
-    struct CapturaTenant(std::sync::Mutex<Option<Option<String>>>);
+    struct TenantCapture(std::sync::Mutex<Option<Option<String>>>);
     #[async_trait::async_trait]
-    impl IdentityProvisioner for CapturaTenant {
+    impl IdentityProvisioner for TenantCapture {
         async fn provision(
             &self,
             input: &ResolveOrCreateInput,
@@ -697,8 +697,8 @@ mod tests {
     /// with a `tenant_hint` nobody read, so the ICH seed arrived with an empty tenant, identity
     /// rejected it, and EVERY external user came in with a null src_ilk.
     #[tokio::test]
-    async fn el_usuario_externo_hereda_el_tenant_del_nodo() {
-        let captura = CapturaTenant(std::sync::Mutex::new(None));
+    async fn the_external_user_takes_the_nodes_tenant() {
+        let capture = TenantCapture(std::sync::Mutex::new(None));
         let mut proc = InboundProcessor::new(
             "uuid-test",
             InboundConfig {
@@ -718,17 +718,17 @@ mod tests {
         let _ = proc
             .process_message_parts(
                 &AlwaysMiss,
-                Some(&captura),
+                Some(&capture),
                 input,
                 None,
                 serde_json::json!({}),
-                serde_json::json!({"type":"text","content":"hola"}),
+                serde_json::json!({"type":"text","content":"hello"}),
             )
             .await;
 
-        let visto = captura.0.lock().unwrap().clone();
+        let seen = capture.0.lock().unwrap().clone();
         assert_eq!(
-            visto,
+            seen,
             Some(Some("tnt:1111".to_string())),
             "provisioning has to receive the node's tenant, not an empty one"
         );
@@ -736,8 +736,8 @@ mod tests {
 
     /// An explicit tenant in the input WINS: io.api authenticates a principal and knows better.
     #[tokio::test]
-    async fn un_tenant_explicito_le_gana_al_del_nodo() {
-        let captura = CapturaTenant(std::sync::Mutex::new(None));
+    async fn an_explicit_tenant_wins_over_the_nodes() {
+        let capture = TenantCapture(std::sync::Mutex::new(None));
         let mut proc = InboundProcessor::new(
             "uuid-test",
             InboundConfig {
@@ -757,16 +757,16 @@ mod tests {
         let _ = proc
             .process_message_parts(
                 &AlwaysMiss,
-                Some(&captura),
+                Some(&capture),
                 input,
                 None,
                 serde_json::json!({}),
-                serde_json::json!({"type":"text","content":"hola"}),
+                serde_json::json!({"type":"text","content":"hello"}),
             )
             .await;
 
         assert_eq!(
-            captura.0.lock().unwrap().clone(),
+            capture.0.lock().unwrap().clone(),
             Some(Some("tnt:9999".to_string()))
         );
     }

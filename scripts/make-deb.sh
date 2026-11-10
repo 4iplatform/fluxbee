@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # make-deb.sh — build a Fluxbee .deb from a clean GitHub checkout.
 #
-# The "any dev, sin pensar" entry point for a Fluxbee build box: it clones (or fast-forwards)
+# The "any dev, no thinking needed" entry point for a Fluxbee build box: it clones (or fast-forwards)
 # the repo and runs the packaging build. Point a dev at a build box that has the toolchain
 # (git + rust + go + protoc; see docs/packaging-and-build.md) and:
 #

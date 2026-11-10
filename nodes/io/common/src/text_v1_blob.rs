@@ -508,7 +508,7 @@ mod tests {
             },
         ];
 
-        let err = build_text_v1_inbound_payload(&toolkit, &cfg, "hola", attachments)
+        let err = build_text_v1_inbound_payload(&toolkit, &cfg, "hello", attachments)
             .expect_err("must fail by max attachments");
         assert!(matches!(
             err,
@@ -526,7 +526,7 @@ mod tests {
                 ..sample_blob_ref()
             },
         };
-        let err = build_text_v1_inbound_payload(&toolkit, &cfg, "hola", vec![attachment])
+        let err = build_text_v1_inbound_payload(&toolkit, &cfg, "hello", vec![attachment])
             .expect_err("must fail unsupported mime");
         assert!(matches!(err, IoBlobContractError::UnsupportedMime { .. }));
     }
@@ -551,7 +551,7 @@ mod tests {
                 ..sample_blob_ref()
             },
         };
-        let err = build_text_v1_inbound_payload(&toolkit, &cfg, "hola", vec![a, b])
+        let err = build_text_v1_inbound_payload(&toolkit, &cfg, "hello", vec![a, b])
             .expect_err("must fail total size");
         assert!(matches!(
             err,
@@ -583,10 +583,10 @@ mod tests {
     fn keeps_inline_content_when_it_fits() {
         let (toolkit, _root) = test_toolkit();
         let cfg = IoTextBlobConfig::default();
-        let payload = build_text_v1_inbound_payload(&toolkit, &cfg, "hola", vec![])
+        let payload = build_text_v1_inbound_payload(&toolkit, &cfg, "hello", vec![])
             .expect("payload should be built");
         let parsed = TextV1Payload::from_value(&payload).expect("parse text_v1");
-        assert_eq!(parsed.content.as_deref(), Some("hola"));
+        assert_eq!(parsed.content.as_deref(), Some("hello"));
         assert!(parsed.content_ref.is_none());
     }
 
@@ -594,14 +594,14 @@ mod tests {
     fn normalize_text_v1_keeps_inline_under_limit() {
         let (toolkit, _root) = test_toolkit();
         let cfg = IoTextBlobConfig::default();
-        let payload = TextV1Payload::new("hola", vec![])
+        let payload = TextV1Payload::new("hello", vec![])
             .to_value()
             .expect("payload value");
 
         let (normalized, decision) =
             normalize_text_v1_inbound_payload(&toolkit, &cfg, &payload).expect("normalize");
         let parsed = TextV1Payload::from_value(&normalized).expect("parse normalized");
-        assert_eq!(parsed.content.as_deref(), Some("hola"));
+        assert_eq!(parsed.content.as_deref(), Some("hello"));
         assert!(parsed.content_ref.is_none());
         assert!(!decision.processed_as_blob);
         assert!(decision.inline_payload_bytes > 0);
@@ -667,7 +667,7 @@ mod tests {
         let (toolkit, _root) = test_toolkit();
         let cfg = IoTextBlobConfig::default();
         let content_ref = toolkit
-            .put_bytes(b"contenido desde blob", "content.txt", "text/plain")
+            .put_bytes(b"content from a blob", "content.txt", "text/plain")
             .expect("put content ref");
         toolkit.promote(&content_ref).expect("promote content ref");
         let payload = TextV1Payload::with_content_ref(content_ref, vec![])
@@ -677,7 +677,7 @@ mod tests {
         let resolved = resolve_text_v1_for_outbound(&toolkit, &cfg, &payload, false)
             .await
             .expect("resolve outbound");
-        assert_eq!(resolved.text, "contenido desde blob");
+        assert_eq!(resolved.text, "content from a blob");
         assert!(resolved.attachments.is_empty());
     }
 
@@ -690,14 +690,14 @@ mod tests {
             .expect("put attachment");
         toolkit.promote(&attachment).expect("promote attachment");
 
-        let payload = TextV1Payload::new("hola", vec![attachment.clone()])
+        let payload = TextV1Payload::new("hello", vec![attachment.clone()])
             .to_value()
             .expect("payload value");
 
         let resolved = resolve_text_v1_for_outbound(&toolkit, &cfg, &payload, false)
             .await
             .expect("resolve outbound");
-        assert_eq!(resolved.text, "hola");
+        assert_eq!(resolved.text, "hello");
         assert_eq!(resolved.attachments.len(), 1);
         assert_eq!(resolved.attachments[0].blob_ref, attachment);
         assert!(toolkit.read_blob(&resolved.attachments[0].blob_ref).is_ok());
@@ -708,7 +708,7 @@ mod tests {
         let (toolkit, _root) = test_toolkit();
         let cfg = IoTextBlobConfig::default();
         let payload = TextV1Payload::new(
-            "hola",
+            "hello",
             vec![BlobRef {
                 mime: "application/zip".to_string(),
                 ..sample_blob_ref()
@@ -728,7 +728,7 @@ mod tests {
         let (toolkit, _root) = test_toolkit();
         // content + an attachment whose blob is NOT on disk: the FULL resolver hard-fails
         // (BLOB_NOT_FOUND), but the text-only resolver must still return the text + the count.
-        let payload = TextV1Payload::new("hola", vec![sample_blob_ref()])
+        let payload = TextV1Payload::new("hello", vec![sample_blob_ref()])
             .to_value()
             .expect("payload value");
         // sanity: the full resolver DOES fail on the missing attachment
@@ -744,7 +744,7 @@ mod tests {
         let resolved = resolve_text_v1_text_only_for_outbound(&toolkit, &payload, false)
             .await
             .expect("text-only must not fail on an unresolved attachment");
-        assert_eq!(resolved.text, "hola");
+        assert_eq!(resolved.text, "hello");
         assert_eq!(resolved.attachment_count, 1);
     }
 
