@@ -15,7 +15,6 @@ import (
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	"github.com/google/uuid"
-	"github.com/robfig/cron/v3"
 )
 
 type timerHeapEntry struct {
@@ -569,10 +568,12 @@ func nextRecurringFireAt(row timerRow, now time.Time) (int64, string, error) {
 	if err != nil {
 		return 0, "", fmt.Errorf("invalid timezone: %w", err)
 	}
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	schedule, err := parser.Parse(row.CronSpec.String)
+	// A spec stored before FINDINGS A-206 may start with a zone, which parsed then when a space
+	// followed it: it is refused now, and both callers log it and leave the timer pending, out of the
+	// queue.
+	schedule, err := parseCronSpec(row.CronSpec.String)
 	if err != nil {
-		return 0, "", fmt.Errorf("invalid cron: %w", err)
+		return 0, "", err
 	}
 	first := schedule.Next(now.In(loc))
 	if first.IsZero() {

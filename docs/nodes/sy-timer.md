@@ -6,7 +6,8 @@ survives restarts: it lives in a local SQLite database and fires a `TIMER_FIRED`
 target when due.
 
 Source: `go/sy-timer/` (`main.go` handlers, `scheduler.go` firing loop, `persistence.go`
-database). Client helpers and constants: `go/fluxbee-go-sdk/timer*.go`.
+database, `cron.go` the `cron_spec` parser). Client helpers and constants:
+`go/fluxbee-go-sdk/timer*.go`.
 
 | | |
 | --- | --- |
@@ -72,7 +73,9 @@ Rules enforced in `main.go`:
   hive 100,000 (`checkPendingLimits`): both `TIMER_LIMIT_EXCEEDED`.
 - **Cron.** Five fields (minute, hour, day of month, month, day of week), parsed with
   `robfig/cron`; `cron_tz` is an IANA zone and defaults to `UTC` (`scheduleRecurringFireAt`).
-  The binary embeds the timezone database (`time/tzdata` import).
+  A `cron_spec` that starts with `TZ=`, `CRON_TZ=` or `@` is `TIMER_INVALID_CRON` before the
+  parser sees it (`parseCronSpec`; FINDINGS A-206): the zone goes in `cron_tz`, and v1 has no
+  descriptors. The binary embeds the timezone database (`time/tzdata` import).
 - **client_ref.** At most 255 characters. Unique per owner among pending timers (unique index
   `idx_timers_owner_clientref_pending`). Scheduling again with a pending `client_ref` returns the
   existing timer with `already_existed: true` instead of creating a second one.
@@ -194,7 +197,9 @@ secret.
 - A handler error is logged as a JSON event `timer_handler_error` plus `handle message error`.
 - A recurring timer whose next time cannot be computed (`timer_recurring_next_fire_failed`) does
   not fire and is not re-queued; it stays `pending` and the next start tries again
-  (`replayPending`, which skips one it still cannot compute).
+  (`replayPending`, which skips one it still cannot compute and logs
+  `timer_replay_invalid_recurring`). One kept before 0.1.124 whose `cron_spec` starts with a zone
+  is such a timer (FINDINGS A-206).
 
 ## Health
 

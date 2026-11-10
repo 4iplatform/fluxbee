@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -32,6 +33,38 @@ func TestScheduleRecurringFireAtRejectsInvalidCron(t *testing.T) {
 	_, _, err := scheduleRecurringFireAt(timerScheduleRecurringRequest{CronSpec: "invalid cron"})
 	if err == nil || timerErrorCode(err) != "TIMER_INVALID_CRON" {
 		t.Fatalf("expected invalid cron error, got %v", err)
+	}
+}
+
+// TIMER_SCHEDULE_RECURRING answers a cron_spec that starts with a zone or a descriptor with
+// TIMER_INVALID_CRON, and keeps nothing (FINDINGS A-206). Both SDKs count 5 fields split by any
+// whitespace: a zone and four fields split by tabs passed them, and panicked SY.timer.
+func TestScheduleRecurringRefusesAZoneOrADescriptorInCronSpec(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec string
+	}{
+		{name: "a zone and four fields split by tabs", spec: "TZ=UTC\t0\t9\t*\t*"},
+		{name: "a zone alone", spec: "TZ=UTC"},
+		{name: "a CRON_TZ zone and five fields", spec: "CRON_TZ=America/New_York 0 9 * * *"},
+		{name: "a descriptor", spec: "@daily"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, tx := newTestService(t)
+			service.scheduler = newTimerScheduler(service)
+			msg := mustBuildSystemMessage(t, map[string]any{"cron_spec": tc.spec}, "TIMER_SCHEDULE_RECURRING")
+			if err := service.handleMessage(msg); err != nil {
+				t.Fatalf("schedule recurring: %v", err)
+			}
+			response := mustReadTimerResponse(t, tx)
+			if response.OK || response.Error == nil || response.Error.Code != "TIMER_INVALID_CRON" {
+				t.Fatalf("want TIMER_INVALID_CRON, got %+v (error %+v)", response, response.Error)
+			}
+			rows, err := listPendingTimers(context.Background(), service.db)
+			if err != nil || len(rows) != 0 {
+				t.Fatalf("kept %d timers (%v)", len(rows), err)
+			}
+		})
 	}
 }
 

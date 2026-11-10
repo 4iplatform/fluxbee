@@ -18,7 +18,6 @@ import (
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	"github.com/google/uuid"
-	"github.com/robfig/cron/v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -451,7 +450,7 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 			{Code: "TIMER_ABOVE_MAXIMUM", Description: "Requested one-shot fires more than 366 days ahead."},
 			{Code: "TIMER_LIMIT_EXCEEDED", Description: "A payload or metadata over 32 KiB, or the owner (10000) or the hive (100000) at its most pending timers."},
 			{Code: "TIMER_INVALID_PAYLOAD", Description: "Request payload is malformed or missing required fields."},
-			{Code: "TIMER_INVALID_CRON", Description: "Recurring cron expression is invalid."},
+			{Code: "TIMER_INVALID_CRON", Description: "Recurring cron expression is invalid, or starts with TZ=, CRON_TZ= or @: its zone goes in cron_tz, and v1 has no descriptors."},
 			{Code: "TIMER_INVALID_TIMEZONE", Description: "Requested timezone is not a valid IANA timezone."},
 			{Code: "TIMER_FORBIDDEN", Description: "Requester is not authorized for the requested operation: another node's target, another owner's list, or the purge."},
 			{Code: "TIMER_NOT_FOUND", Description: "Requested timer does not exist."},
@@ -1218,10 +1217,9 @@ func scheduleRecurringFireAt(req timerScheduleRecurringRequest) (int64, string, 
 	if err != nil {
 		return 0, "", fmt.Errorf("invalid timezone: %w", err)
 	}
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	schedule, err := parser.Parse(cronSpec)
+	schedule, err := parseCronSpec(cronSpec)
 	if err != nil {
-		return 0, "", fmt.Errorf("invalid cron: %w", err)
+		return 0, "", err
 	}
 	now := time.Now().UTC()
 	first := schedule.Next(now.In(loc))

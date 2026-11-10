@@ -373,11 +373,11 @@ Creates a recurring timer with standard cron syntax.
 
 | Field | Required | Description |
 |---|---|---|
-| `cron_spec` | yes | Standard cron expression (5 fields: min hr dom mon dow). |
+| `cron_spec` | yes | Standard cron expression (5 fields: min hr dom mon dow), with nothing before them: its zone goes in `cron_tz` (§13). |
 | `cron_tz` | no | IANA timezone to interpret the cron. Default: `UTC`. |
 
 **Validation:**
-- `cron_spec` must parse correctly. Error `TIMER_INVALID_CRON`.
+- `cron_spec` must parse correctly. One that starts with `TZ=` or `CRON_TZ=` (a zone, which goes in `cron_tz`) or with `@` (a descriptor) is refused before it is parsed (§13). Error `TIMER_INVALID_CRON`.
 - The interval between fires must be `>= 60s`. Error `TIMER_BELOW_MINIMUM`.
 - `cron_tz` must be a valid IANA zone. Error `TIMER_INVALID_TIMEZONE`.
 - `missed_policy` is validated and stored, but a recurring timer never applies it (§10).
@@ -832,7 +832,7 @@ At node startup:
 2. Delete the history older than 7 days, once (`gcHistoricalTimers`): `DELETE FROM timers WHERE status IN ('fired','canceled') AND COALESCE(last_fired_at_utc, created_at_utc) < now - 7 days`. Nothing deletes history again until the next start.
 3. `now = time.Now().UTC()`; `SELECT * FROM timers WHERE status='pending' ORDER BY fire_at_utc ASC`.
 4. For each timer:
-   - Recurring: recompute `fire_at_utc` from `now` with `cron_spec` and `cron_tz`, update the DB, push to the heap (§10). One whose next fire cannot be computed is skipped and stays `pending`.
+   - Recurring: recompute `fire_at_utc` from `now` with `cron_spec` and `cron_tz`, update the DB, push to the heap (§10). One whose next fire cannot be computed, such as one kept before 0.1.124 whose `cron_spec` starts with a zone (§13), is skipped and stays `pending`, logged as `timer_replay_invalid_recurring` at every start.
    - One-shot with `fire_at_utc > now`: insert it into the in-memory heap with the same `fire_at_utc`. **The `fire_at_utc` is not modified** — it is already the absolute target instant, and the heap fires it when the OS clock reaches that value.
    - One-shot with `fire_at_utc <= now`: apply `missed_policy` (§10). If it fires: it is queued, due at once, and fires as any due timer (§4.3, §7.8). If it is dropped: save `status='canceled'` and log a `timer_missed_policy_applied` event whose `outcome` says why.
 5. Log `SY.timer ready: ... pending=N gc_deleted=M`, start the tick loop, and serve requests.
@@ -948,8 +948,9 @@ If this query returns no rows, the migration proceeds without friction. If it re
 
 **Not supported in v1:**
 - Seconds fields (6-field cron)
-- Special descriptors like `@reboot`, `@yearly`
+- Special descriptors like `@reboot`, `@yearly`: a `cron_spec` that starts with `@` is `TIMER_INVALID_CRON`
 - Interval expressions like `every 5m` (reserved for v2 if demand shows up)
+- A zone before the fields, `TZ=<zone>` or `CRON_TZ=<zone>`, which robfig/cron reads: the zone goes in `cron_tz`, and a `cron_spec` that starts with `TZ=` or `CRON_TZ=` is `TIMER_INVALID_CRON` before it is parsed (`parseCronSpec`; FINDINGS A-206, since 0.1.124). The parser took such a zone over `cron_tz`, which the timer still recorded, and panicked, stopping `SY.timer`, when no space followed it. A recurring timer kept with one before 0.1.124 is skipped at every start, and stays `pending` (§11).
 
 ---
 
@@ -1115,7 +1116,7 @@ A node should check that a `TIMER_FIRED` comes from `SY.timer@<its hive>` (the r
 | `TIMER_BELOW_MINIMUM` | Requested duration lower than 60 seconds. |
 | `TIMER_ABOVE_MAXIMUM` | A one-shot more than 366 days ahead, scheduled or rescheduled. |
 | `TIMER_LIMIT_EXCEEDED` | A `payload` or `metadata` over 32 KiB; or a new timer when its owner has 10,000 pending timers, or the hive 100,000. |
-| `TIMER_INVALID_CRON` | `cron_spec` does not parse correctly. |
+| `TIMER_INVALID_CRON` | `cron_spec` does not parse correctly, or starts with `TZ=`, `CRON_TZ=` or `@`: a zone goes in `cron_tz`, and v1 has no descriptors (§13). |
 | `TIMER_INVALID_TIMEZONE` | `tz` / `cron_tz` is not a valid IANA zone. |
 | `TIMER_INVALID_PAYLOAD` | The request `payload` is not valid JSON or required fields are missing. |
 | `TIMER_NOT_FOUND` | No timer has that `timer_uuid`; or, by `client_ref` (`TIMER_GET`, `TIMER_RESCHEDULE`), the requester has no pending timer with it. |
