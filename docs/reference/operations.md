@@ -410,8 +410,9 @@ spoke's orchestrator answers, then:
   hive any more (900 s at most; a hive that did not answer still moves, for its automatic step). It
   follows only this call's update, and prints each hive's transitions in this run as they happen
   (answered, installed, settled, config applied, or once "on target" for a hive the run did not
-  move), with the seconds since the call and the record's own, and each hive left out with what
-  moves it. A held update passes with a warning naming the hives rolled back by the operator;
+  move, which includes one only the background task moved or saw on the target, `by: background`),
+  with the seconds since the call and the record's own, and each hive left out with what moves it.
+  A held update passes with a warning naming the hives rolled back by the operator;
 - below 0.1.123 (deploying an older release again, the rollback), sends the core update to every
   spoke and waits until each spoke reports the motherbee's hash and settles;
 

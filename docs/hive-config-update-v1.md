@@ -702,8 +702,11 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   not answer still moves, for its automatic step). It follows only this call's update (the one its
   answer names; before the answer, one the call opened or resumed, never one left from before) and
   prints each hive's transitions as this run's outcomes show them: answered, installed, settled,
-  config applied, or once "on target" for a hive it did not move; the times are this script's from
-  the call and SY.admin's own durations, never the two clocks compared (F11). A held update passes
+  config applied, or once "on target" for a hive it did not move. An outcome `by: background` is
+  never the run's (`this_run`, since 0.1.124): a core the background task found under way and
+  followed, or a read that saw the hive on the target, prints as "on target", never as settled or
+  config applied. The times are this script's from the call and SY.admin's own durations, never
+  the two clocks compared (F11). A held update passes
   with a warning naming the hives the operator rolled back. A release before 0.1.123 keeps the core
   update per spoke: deploying 0.1.122 again, the rollback, needs it.
 - **Archi** follows an update its plan ran past the executor's answer (F3): every 10 s, up to
