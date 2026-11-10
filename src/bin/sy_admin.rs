@@ -6820,16 +6820,22 @@ async fn handle_unpublish_artifact(
             }),
         });
     }
-    if let Err((error_code, detail)) = take_down_publication(ctx, client, &mut ledger, record).await
-    {
-        return Ok(internal_service_error(action, error_code, &detail));
+    let edge_skipped = match take_down_publication(ctx, client, &mut ledger, record).await {
+        Ok(edge_skipped) => edge_skipped,
+        Err((error_code, detail)) => {
+            return Ok(internal_service_error(action, error_code, &detail))
+        }
+    };
+    let mut payload = serde_json::json!({"publication_id": publication_id, "unpublished": true});
+    if let Some(why) = edge_skipped {
+        payload["edge_skipped"] = serde_json::json!(why);
     }
     Ok(InternalAdminDispatchResult {
         http_status: 200,
         envelope: serde_json::json!({
             "status": "ok",
             "action": action,
-            "payload": {"publication_id": publication_id, "unpublished": true}
+            "payload": payload,
         }),
     })
 }
@@ -6845,15 +6851,37 @@ fn publication_is_down(record: &AdminPublicationRecord, now: u64) -> bool {
 /// (`unpublished`), the ledger written after each. The caller holds the publication lock and
 /// passes the ledger it loaded under it. The error is `(error_code, detail)`; the same call again
 /// finishes what a failed step left.
+///
+/// An edge whose hive the hive registry no longer lists (removed, or renamed) cannot be asked:
+/// its step is skipped and only the copy is released, and the answer is why
+/// (`publication_edge_hive_gone`). Otherwise such a page, which no edge of the installation serves,
+/// would stay `published`, and block its tenant's purge, until it expires.
 async fn take_down_publication(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     ledger: &mut AdminPublicationLedger,
     mut record: AdminPublicationRecord,
-) -> Result<(), (&'static str, String)> {
-    unpublish_edge_blob(client, &record.edge_node, &record.publication_id)
-        .await
-        .map_err(|err| ("EDGE_UNPUBLISH_FAILED", err))?;
+) -> Result<Option<String>, (&'static str, String)> {
+    let edge_skipped = match publication_edge_hive_gone(ctx, &record.edge_node) {
+        Some(hive) => {
+            tracing::warn!(
+                publication_id = %record.publication_id,
+                edge = %record.edge_node,
+                "the page's edge is on a hive the registry no longer lists: only its copy is released"
+            );
+            Some(format!(
+                "its edge {} is on hive {hive}, which the hive registry no longer lists (removed or \
+                 renamed): the edge was not asked, and only the page's copy was released",
+                record.edge_node
+            ))
+        }
+        None => {
+            unpublish_edge_blob(client, &record.edge_node, &record.publication_id)
+                .await
+                .map_err(|err| ("EDGE_UNPUBLISH_FAILED", err))?;
+            None
+        }
+    };
     record.status = "edge_removed".to_string();
     ledger
         .publications
@@ -6869,7 +6897,21 @@ async fn take_down_publication(
         .publications
         .insert(record.publication_id.clone(), record);
     persist_admin_publication_ledger(&ctx.publication_ledger_path, ledger)
-        .map_err(|err| ("LEDGER_FAILED", err))
+        .map_err(|err| ("LEDGER_FAILED", err))?;
+    Ok(edge_skipped)
+}
+
+/// The hive of a publication's edge when the hive registry no longer lists it (`HiveRegistry::
+/// lists`: its directory, which the orchestrator deletes when the hive is removed). Never this
+/// admin's own hive, which is no entry of its registry, and never when the registry's own
+/// directory is missing or the edge names no valid hive: then the edge is asked, as always.
+fn publication_edge_hive_gone(ctx: &AdminContext, edge_node: &str) -> Option<String> {
+    let hive = edge_node.rsplit_once('@').map(|(_, hive)| hive.trim())?;
+    if hive == ctx.hive_id || !is_valid_hive_id(hive) {
+        return None;
+    }
+    let registry = hive_registry(ctx);
+    (registry.root().is_dir() && !registry.lists(hive)).then(|| hive.to_string())
 }
 
 /// `list_published_artifacts` (FINDINGS A-212): the public pages that are up, from the ledger,
@@ -16238,6 +16280,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "list_published_artifacts (GET /artifacts) lists the pages that are up, each with its publication_id.",
             "A publication that does not exist answers 404 NOT_FOUND.",
             "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true; a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
+            "A page whose edge is on a hive the hive registry no longer lists (removed, or renamed) gets no edge step, since that edge cannot be asked: IO.blob releases its copy, and the answer says why in edge_skipped.",
             "No log keeps a link's key: the command log, the executor's run log and Archi's journal keep it as its SHA-256, key_sha256.",
         ],
         "list_published_artifacts" => vec![
@@ -37655,6 +37698,81 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    /// A page whose edge is on a hive the registry no longer lists (removed, or renamed) comes down
+    /// without its edge, which cannot be asked: IO.blob releases its copy, the answer says why, and
+    /// the tenant's purge is no longer refused for it. While the hive is listed, its edge is asked,
+    /// as when the registry cannot be read (the other unpublish tests have none).
+    #[tokio::test]
+    async fn a_page_whose_edge_hive_is_gone_comes_down_without_its_edge() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-edge-gone");
+        let gone = page_at(PAGE_TENANT, 10, "published");
+        let listed = page_at(PAGE_TENANT, 10, "published");
+        seed_publications(&ctx, &[&gone, &listed]);
+        // The registry lists another hive: the page's edge, SY.edge@ingress1, was removed.
+        let registry = hive_registry(&ctx);
+        fs::create_dir_all(registry.root().join("worker1")).expect("the registry");
+
+        let unpublish = handle_unpublish_artifact(
+            &ctx,
+            &ctx.rpc,
+            json!({ "publication_id": gone.publication_id }),
+            None,
+        );
+        let release = async {
+            let release = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("IO.blob's release, and no edge before it");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            assert_eq!(
+                release.payload,
+                json!({ "publication_id": gone.publication_id })
+            );
+            harness
+                .inject(reply_to(
+                    &release,
+                    MSG_BLOB_RELEASE_RESPONSE,
+                    json!({ "status": "ok", "released": true }),
+                ))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(unpublish, release);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        let payload = &result.envelope["payload"];
+        assert_eq!(payload["unpublished"], json!(true));
+        let why = payload["edge_skipped"]
+            .as_str()
+            .expect("why its edge was not asked");
+        assert!(why.contains(PAGE_EDGE) && why.contains("ingress1"), "{why}");
+        assert_eq!(
+            publication_status(&ctx, &gone.publication_id),
+            "unpublished"
+        );
+
+        // A hive the registry lists has its edge asked, as always.
+        fs::create_dir_all(registry.root().join("ingress1")).expect("ingress1 listed");
+        let unpublish = handle_unpublish_artifact(
+            &ctx,
+            &ctx.rpc,
+            json!({ "publication_id": listed.publication_id }),
+            None,
+        );
+        let (result, ()) = tokio::join!(unpublish, take_down(&mut harness, &listed.publication_id));
+        let result = result.expect("dispatch");
+        assert_eq!(
+            result.envelope["payload"],
+            json!({ "publication_id": listed.publication_id, "unpublished": true })
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        // Neither page is up any more: the tenant's purge is no longer refused for them.
+        assert!(purge_tenant_pages_block(&ctx, &json!({ "tenant_id": PAGE_TENANT })).is_none());
     }
 
     // --- a failed HTTP handler still answers (FINDINGS A-229) -------------------------------

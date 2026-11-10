@@ -1139,7 +1139,12 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   - otherwise `EDGE_UNPUBLISH_BLOB` to the publication's edge (the row goes to `edge_removed`),
     then `BLOB_RELEASE` to `IO.blob@motherbee` (the row goes to `unpublished`), each with 30 s,
     and the answer is `unpublished: true`. A failed step answers `EDGE_UNPUBLISH_FAILED` or
-    `BLOB_RELEASE_FAILED`; the same request again finishes it.
+    `BLOB_RELEASE_FAILED`; the same request again finishes it;
+  - an edge on a hive the hive registry no longer lists (removed, or renamed: its directory is
+    gone) cannot be asked, so its step is skipped: only the `BLOB_RELEASE`, and the answer says
+    why in `edge_skipped` (`publication_edge_hive_gone`). Otherwise such a page would stay
+    `published`, and block its tenant's purge, until it expires. This admin's own hive, and a
+    registry whose directory is missing, always have the edge asked.
 
   The answer carries the `publication_id` either way. A request can carry a live link in any
   field, so the command log keeps only a `publication_id` that is one, in its canonical form, and
