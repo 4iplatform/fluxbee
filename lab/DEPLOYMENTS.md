@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.128** | 2026-11-10 | `89fd1fd8` | motherbee + spokes (core), the Rust SDK alone: A-218 (`TNT_APPROVE`, seven dead action names, ECHO/ECHO_REPLY/TIME_SYNC gone; SY.identity's migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`; the identity shared memory exactly as it was), A-237 (an intermediate answer marked `accepted`), A-248 (an AI node used as a tap target answers nothing, its copies counted) | ✅ live, checked on 8.x | snap `pre-sdk-0-1-128` (all 4 VMs) · `apt install fluxbee=0.1.127` + 0.1.127's `update_installation` (SY.identity of 0.1.127 ignores migration row 5, never names the dropped column, and recreates the empty vocabulary table) |
+| **0.1.129** | 2026-11-10 | `9b396e3e` | motherbee + spokes (core), the router alone: A-222 (a bounded queue per link, 1,024 frames or 8 MiB counted as heap, the senders' share 960 / 7 MiB; a message past it refused `LINK_BUSY` with an answer, the node never disconnected), A-209 (no router answers a tap copy; the router clears a `via_tap` a node sets), A-221 (an agent's turn goes to cognition only once its link took it) | ✅ live, checked on 8.x | snap `pre-router-0-1-129` (all 4 VMs) · `apt install fluxbee=0.1.128` + 0.1.128's `update_installation` (nothing one-way) |
+| **0.1.128** | 2026-11-10 | `89fd1fd8` | motherbee + spokes (core), the Rust SDK alone: A-218 (`TNT_APPROVE`, seven dead action names, ECHO/ECHO_REPLY/TIME_SYNC gone; SY.identity's migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`; the identity shared memory exactly as it was), A-237 (an intermediate answer marked `accepted`), A-248 (an AI node used as a tap target answers nothing, its copies counted) | ✅ replaced by 0.1.129 | snap `pre-sdk-0-1-128` (deleted 2026-11-10) · `apt install fluxbee=0.1.127` + 0.1.127's `update_installation` (SY.identity of 0.1.127 ignores migration row 5, never names the dropped column, and recreates the empty vocabulary table) |
 | **0.1.127** | 2026-11-10 | `d2b344bb` | motherbee + spokes (core), one branch per binary: SY.orchestrator (A-199's step 1: reads apart, at most 4 waiting on one hive, a command that panics answered; hive-config stage 5: the blob folders follow their dist folder, and the blob GC runs only on the motherbee (A-188); A-196's restart marker; A-232's refusals); SY.admin (A-233: no purge while a node has a page up or a publish in flight; A-231, the ledger keeps a page down 30 days; A-234, the HTTP head and body caps; A-232; A-171, the manifest's lock file); SY.vault (A-200, one pass at the boot's announcement); SY.timer (A-220, canceled with a reason, schema v3; `LINK_BUSY` retried; A-232) | ✅ replaced by 0.1.128 | snap `pre-reads-0-1-127` (deleted 2026-11-10) · `apt install fluxbee=0.1.126` + 0.1.126's `update_installation` (SY.timer of 0.1.126 reads the v3 table) |
 | **0.1.126** | 2026-11-10 | `cf005771` | motherbee + spokes (core): A-219: an existing worker goes behind the egress, and back, by an explicit action (`set_hive_egress` / `clear_hive_egress`, the operator's word or Archi's plan with CONFIRM; `SYSTEM_EGRESS_ROUTE` between the orchestrators, protected; guards, a record, a probe, the motherbee's confirm, commit or revert, the start's resume; `/versions`' egress state); with A-225 (a removed worker's IPv6 file, the boot judging IPv6 by the kernel, the probe's reason) | ✅ replaced by 0.1.127 | snap `pre-egress-0-1-126` (deleted 2026-11-10) · first `clear_hive_egress` of every worker behind the egress (a release before 0.1.126 cannot), then `apt install fluxbee=0.1.125` + 0.1.125's `update_installation` |
 | **0.1.125** | 2026-11-10 | `f39e2bb0` | motherbee + spokes (core): the sweep's calls: published pages listed (`GET /artifacts`), taken down by the factory reset, and a tenant's purge refused while one is up (A-212); no default tenant and two different tenants refused (A-213); every fixed text in English and the frontdesk answering in the person's language (A-214); a WF forward to another IO node names no one (A-215); the frontdesk retrying a transient failure (A-216); wf-generic staying up on a failed store (A-217); one-time conversions removed (A-210, mostly); hive.yaml written atomically by `set_storage` (A-224); SY.admin's HTTP answering a failed handler (A-229); Archi asking for a node's tenant (A-230); Archi's runtime redeploy keeping each node's tenant (A-235); a removed ingress's SY.edge stopped (A-236) | ✅ replaced by 0.1.126 | snap `pre-clean-0-1-125` (deleted 2026-11-10) · `apt install fluxbee=0.1.124` + 0.1.124's `update_installation` (SY.identity of 0.1.124 still reads every record 0.1.125 writes) |
@@ -137,6 +138,44 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.129 — The router alone: a bounded queue per link
+
+- **Date:** 2026-11-10 (ART) · **Previous version:** 0.1.128 · **Commit:** `9b396e3e`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the router ships alone ([METHOD](logbook/METHOD.md) §9). A-222 is the operator's call
+  of 2026-11-10, option (a): a bounded queue per link, the newest refused with an answer, never a
+  disconnect, not a circular buffer.
+- **What changed (`src/router/`):**
+  - **A-222:** each link's queue holds at most 1,024 frames or 8 MiB, counted as the heap each frame
+    holds; senders' messages stop at 960 frames or 7 MiB, so the router's own frames always have
+    room; a message past it is answered `UNREACHABLE` `LINK_BUSY` and logged at most once every 30 s
+    per link; the node stays connected and room comes back as it reads.
+  - **A-209:** no router answers a tap copy, the entry router or one it reaches; the router clears a
+    `meta.via_tap` a node sets on its own message (only the router marks a copy).
+  - **A-221:** an agent's turn goes to its cognition only once the agent's link took the frame.
+- **Build and review:** `coa/router-129`, CI green; one review round: nothing high or medium; A-209 on
+  the far router, the bound counted as heap, three tests, fixed; and a node's own `via_tap` cleared,
+  found by its builder. Rebased on 0.1.128 with three documentation conflicts merged by hand.
+- **The deploy:** build of `9b396e3e` in 16.7 min, publish in 12 s, `ops deploy 0.1.129` in 362 s,
+  health clean; snapshot `pre-router-0-1-129`, `pre-sdk-0-1-128` dropped. The update closed `done`
+  about 128 s after its call (A-250 again).
+- **Checked on 8.x (the gate):**
+  - No "link whose queue is full" line on any router during the deploy and its update.
+  - A throwaway client on worker1 that read nothing for 60 s: of 80 messages of 100 KB sent to it
+    from worker1, 39 were taken and 41 refused `LINK_BUSY` at once (the first 0.2 s in); from the
+    motherbee, the same, the refusals relayed by worker1; each time it then got all 39, in order;
+    worker1's router grew 4 to 10 MB and came back; one line naming the link.
+  - A-209: a tap whose target was absent dropped at the entry router; a tap target on worker1 whose
+    link was full (by frame count) dropped there without an answer (`unanswered_total=1`); the
+    tapped message's sender heard nothing and its receiver got it. A client's own message marked
+    `via_tap` was answered `NODE_NOT_FOUND`, with the router's "cleared" line.
+  - SY.storage stopped 20 s: nothing lost. egress1's router stopped 60 s: the motherbee closed its
+    session at 38 s (A-207), reads failed fast after, and egress1 came back on its own.
+  - The routers' stream dropped the copies of the gate's own 100 KB messages as oversize, as 0.1.128
+    did: A-253.
+- **PROD after the gate:** all four hives on 0.1.129 (`018529f6`); worker1 behind egress1; no tap and
+  no page; snapshot `pre-router-0-1-129` on each VM.
 
 ## 0.1.128 — The Rust SDK alone
 

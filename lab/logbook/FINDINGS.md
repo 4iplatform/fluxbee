@@ -179,6 +179,10 @@ no change required
     intermediate answer marked accepted), A-248 (an AI node used as a tap target answers nothing,
     counted). Its deploy saw A-250 again (systematic). **Next:** the router alone (0.1.129: A-222,
     A-209 with a node's own `via_tap` cleared, A-221).
+20. **0.1.129, the router alone** ✅ live and checked on 8.x (2026-11-10): A-222 (a bounded queue per
+    link, the newest refused `LINK_BUSY` with an answer, never a disconnect), A-209 (no router answers
+    a tap copy; a node's own `via_tap` cleared), A-221 (an agent's turn reaches cognition only once its
+    link took it). **Found by its gate:** A-253 [General/storage], low. A-250 seen a third time.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -282,14 +286,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
 - A-208 🔵 With several routers on one hive (not supported), an IRP reply goes to the wrong link
   (low).
-- A-209 🔵 A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender
-  (low).
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
   0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
-- A-221 🔵 Cognition records a turn the agent never received when its delivery fails (low).
-- A-222 🟡 A node that stops reading without an error is never disconnected, and the router's
-  queue for it grows without limit (latent; a design of its own).
 - A-223 🔵 io.api waits for a frontdesk handoff no longer than the frontdesk waits for
   SY.identity (low).
 - A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
@@ -311,6 +310,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-250 🔵 The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 90 s late (seen in 0.1.127's and 0.1.128's deploys; a design call for the operator).
 - A-251 🔵 SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500 (low).
 - A-252 🔵 A fresh worker restarts Syncthing once more about a minute after its join, for the posture options (low).
+- A-253 🔵 A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1389,6 +1389,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-253 [General/storage] 🔵 low (found 2026-11-10 by 0.1.129's gate; seen on 8.x, the same on 0.1.128) — A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns
+
+- **Seen:** the gate's test messages of 100 KB were delivered, and each router logged *"router
+  stream lost records in the last 30 s: oversize: 80"* for their copies to SY.storage.
+- **Why:** the router stream drops a record over its batch's 96 KiB (`STREAM_BATCH_MAX_BYTES`,
+  `src/router/stream.rs:42`), by design (docs/router-stream-v1.md, "the alarm"), while a frame may
+  be up to 128 KiB: a person's message in between is not in `turns`, so the conversation's record
+  and cognition miss it.
+- **To decide, later:** keep it (such messages are rare; attachments go through the blob), store
+  the turn truncated with a mark, or raise the batch's bound to the frame's.
+
 ### A-252 [General/join] 🔵 low (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — A fresh worker restarts Syncthing once more about a minute after its join, for the posture options
 
 - **Seen:** the throwaway worker `gate0227` joined at 18:23:56 and was done at 18:26:18; at
@@ -1717,7 +1728,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (io.api, with the IO standard A-149):** io.api's handoff wait is longer than the
   frontdesk's whole attempt (its identity timeout plus A-216's retries).
 
-### A-222 [General/router] 🟡 LATENT (found 2026-11-10 by A-203's builder; read in the code) — A node that stops reading without an error is never disconnected, and the router's queue for it grows without limit
+### A-222 [General/router] ✅ VALIDATED ON 8.x (0.1.129, 2026-11-10; a client that stopped reading took 39 frames of 100 KB, the other 41 refused `LINK_BUSY` at once, locally and across the WAN; all 39 delivered in order after) (found 2026-11-10 by A-203's builder; read in the code) — A node that stops reading without an error is never disconnected, and the router's queue for it grows without limit
 
 - **Why:** a link's queue is unbounded, and its writer blocks while the node's socket does not
   drain. A node that stops reading without closing (hung, or stuck behind its own full queue)
@@ -1741,7 +1752,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   log line shows it. SY.timer sends a refused fire again (0.1.127). This is the price option (a)
   pays: the queue fills only behind a node that has stopped reading.
 
-### A-221 [General/router] 🔵 low (found 2026-11-10 by A-203's builder; read in the code) — Cognition records a turn the agent never received when its delivery fails
+### A-221 [General/router] ✅ BUILT (0.1.129, 2026-11-10; by its tests) (found 2026-11-10 by A-203's builder; read in the code) — Cognition records a turn the agent never received when its delivery fails
 
 - **Why:** `deliver_locally` appends the agent's cognition copy before it sends the message
   (`src/router/mod.rs` ~6994 on `coa/a-203`). When the send fails (the node's link is gone), the
@@ -1961,7 +1972,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   SY.identity's migrations v3/v4 and `move_account_to_installation_scope`, ai.generic's
   `runtime.immediate_memory` hint, a stale runbook section ("Rolling back to 0.1.86").
 
-### A-209 [General/router] 🔵 low (found 2026-11-09 by A-203's builder; read in the code) — A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender, under the copy's trace_id
+### A-209 [General/router] ✅ VALIDATED ON 8.x (0.1.129, 2026-11-10; an absent tap target dropped at the entry router, a full one dropped without an answer at the far router, the sender hearing nothing; a node's own `via_tap` cleared and answered) (found 2026-11-09 by A-203's builder; read in the code) — A tap copy that cannot reach its hive answers WAN_UNAVAILABLE to the original sender, under the copy's trace_id
 
 - **Why:** a tap's copy to another hive is forwarded with a fresh trace_id; when the forward
   fails, the router answers `WAN_UNAVAILABLE` to the original message's sender
