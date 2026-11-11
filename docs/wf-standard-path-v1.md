@@ -159,7 +159,10 @@ Known gaps:
   - `get_node_config`, `set_node_config`, `get_node_status`: 10 s;
   - `run_node`, `restart_node`: 15 s, inside the 45 s budget for the package to reach a worker;
   - `kill_node` with purge: 25 s, as for IO.cloud;
-  - the admin calls for publish and remove: 5 s.
+  - the admin's publish: 5 s;
+  - each `remove_runtime_version`: up to 35 s, since SY.admin reads every hive's use of the
+    version first (0.1.133, FINDINGS A-281; 5 s before), and in an apply or a rollback the whole
+    purge within 15 s; a delete's purge takes what is left of the 60 s.
 - **SY.admin** waits 75 s for SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`).
 - **Archi** waits 90 s for the admin on `wf_rules_*` (`JSR_ARCHITECT_WF_RULES_TIMEOUT_SECS`).
 

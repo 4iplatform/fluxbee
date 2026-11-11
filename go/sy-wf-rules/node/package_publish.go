@@ -160,7 +160,8 @@ type PackageLeft struct {
 	// Retryable says that remove_runtime_version asked again for the version, nothing else changed
 	// first, may remove it (removalFailure): true for a refusal SY.admin says may pass, a TIMEOUT, a
 	// TRANSPORT_ERROR and a PURGE_STOPPED; false for one that needs a change first (RUNTIME_IN_USE:
-	// stop or move the node) and for DIST_UNREADABLE (this hive's dist first).
+	// stop or move the node; a RUNTIME_USAGE_UNKNOWN SY.admin says is not, with each PURGE_STOPPED
+	// after it: purgeStoppedAt) and for DIST_UNREADABLE (this hive's dist first).
 	Retryable bool `json:"retryable"`
 	// UnansweredHives are the hives whose nodes SY.admin could not read, as its refusal names them
 	// (its payload.unanswered_hives, each {hive, reason, detail}), when it names any.
@@ -298,10 +299,14 @@ func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versio
 // purgeStoppedAt is what a purge that stopped at version leaves: that version, with why its
 // removal failed (removalFailure), and each version it had still to remove, PURGE_STOPPED (a
 // version refused as current earlier in the pass, waiting to be asked again, among them), which
-// was not asked, so asking may remove it.
+// was not asked, so asking may remove it; but not after a RUNTIME_USAGE_UNKNOWN SY.admin says
+// cannot pass before something changes (a hive not read is a join that ended, or the motherbee
+// could not read its own nodes): what it could not read holds for every version, whose removal
+// reads the same (FINDINGS A-281, the integration's review).
 func purgeStoppedAt(runtimeName, version string, err error, notRemoved []string) []PackageLeft {
 	stopped := removalFailure(err)
 	stopped.Runtime, stopped.Version = runtimeName, version
+	retryable := stopped.Retryable || stopped.ErrorCode != "RUNTIME_USAGE_UNKNOWN"
 	left := []PackageLeft{stopped}
 	for _, next := range notRemoved {
 		left = append(left, PackageLeft{
@@ -309,7 +314,7 @@ func purgeStoppedAt(runtimeName, version string, err error, notRemoved []string)
 			Version:   next,
 			ErrorCode: "PURGE_STOPPED",
 			Detail:    fmt.Sprintf("the purge stopped at %s %s (%s) before removing it", runtimeName, version, stopped.ErrorCode),
-			Retryable: true,
+			Retryable: retryable,
 		})
 	}
 	return left

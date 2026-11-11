@@ -443,6 +443,21 @@ func TestEachVersionLeftSaysWhetherAskingAgainMayRemoveIt(t *testing.T) {
 	if len(left) != 2 || left[0].Retryable || !left[1].Retryable || left[1].ErrorCode != "PURGE_STOPPED" {
 		t.Fatalf("purge stopped at a version in use: %+v", left)
 	}
+	// But not after a use SY.admin could not read and says no retry passes before something changes
+	// (a join that ended not read, the motherbee's own nodes unread): its removal reads the same
+	// hives (FINDINGS A-281, the integration's review), where each said asking may remove it.
+	for _, retryable := range []bool{true, false} {
+		stopped := refusal("RUNTIME_USAGE_UNKNOWN", map[string]any{"unanswered_hives": []any{worker1}, "retryable": retryable})
+		left := purgeStoppedAt("wf.invoice", "0.0.1", stopped, []string{"0.0.2", "0.0.3"})
+		if len(left) != 3 || left[1].ErrorCode != "PURGE_STOPPED" || left[2].ErrorCode != "PURGE_STOPPED" {
+			t.Fatalf("purge stopped at a use not read: %+v", left)
+		}
+		for _, version := range left {
+			if version.Retryable != retryable {
+				t.Fatalf("purge stopped at a use not read, retryable %v: %+v", retryable, left)
+			}
+		}
+	}
 }
 
 // An apply's purge runs between its publish and the node's step, within deployPurgeBudget (15 s):

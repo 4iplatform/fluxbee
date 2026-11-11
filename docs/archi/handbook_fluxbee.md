@@ -973,15 +973,27 @@ person: when its provider gave no answer, the error carries the operator's text 
     `RUNTIME_IN_USE`; `TIMEOUT`, no answer in time, 35 s at most, which SY.admin may still
     finish), and each after it `PURGE_STOPPED`; or one entry with no version, `DIST_UNREADABLE`,
     when the hive's dist could not be listed and none was removed. `retryable` says whether asking
-    again, nothing changed first, may remove it (not for `RUNTIME_IN_USE`: its node is stopped or
-    moved first). `payload.warning` says the workflow is deleted and what removes them. Say the
-    workflow is deleted, and which versions stayed and why; never that the removal failed, and
-    never run it again (it answers `WORKFLOW_NOT_FOUND`).
+    again, nothing changed first, may remove it: not for `RUNTIME_IN_USE` (its node is stopped or
+    moved first), nor for a `RUNTIME_USAGE_UNKNOWN` SY.admin says is not retryable (a hive not
+    read is a join that ended, whose `next` says what ends it, or the motherbee could not read its
+    own nodes) and each `PURGE_STOPPED` after it. `payload.warning` says the workflow is deleted
+    and what removes them. Say the workflow is deleted, and which versions stayed and why; never
+    that the removal failed, and never run it again (it answers `WORKFLOW_NOT_FOUND`).
+  - In a plan's answer cut to fit the frame, the step keeps `packages_left` short: each version's
+    `runtime`, `version`, `error_code` and `retryable`, the first one's `detail` cut, and each hive
+    not read with its `reason` and `next`. When that is cut too (`truncated_items`), read `GET
+    /hives/motherbee/runtimes/wf.<workflow_name>` for the versions that stayed.
   - Those versions block nothing: a workflow created again under that name numbers its versions
     above them, and its deploy's purge removes them. To remove them sooner, offer one
     `remove_runtime_version` step each (hive `motherbee`) once every hive answers, in
     `packages_left`'s order, the runtime's current last (a step refused `RUNTIME_CURRENT_CONFLICT`
     goes after the others), in a plan the operator confirms.
+  - `DIST_UNREADABLE` is the exception: it names no version, and until the hive's
+    `dist/runtimes/wf.<workflow_name>` can be listed again, a compile of the name that names no
+    version is refused (`WFRULES_ERROR`, nothing staged), so the workflow cannot be deployed again.
+    Tell the operator to fix that folder first (the entry's `detail` says why); the versions to
+    remove then come from `GET /hives/motherbee/runtimes/wf.<workflow_name>`, not from
+    `packages_left`.
 - **Operating instances** (the node is `WF.<workflow_name>`):
   - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and its
     last change (`updated_at_ms`), which is not when it entered its state: that is its last
@@ -1719,8 +1731,14 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
     (`USAGE_UNREADABLE`: the detail says why, such as a node whose config cannot be read while it
     runs; tell the operator to stop that node or fix its config); a hive whose join is not done,
     with its `status` and `join_phase` (finish the join with `add_hive`, or remove the hive with
-    `remove_hive`); or the motherbee alone, when the read failed there and no hive was counted
-    (`TIMEOUT`: its own orchestrator gave no answer within 30 s; ask again). It is never "not in
+    `remove_hive`; one whose join ended, failed or interrupted, is read only then); or the
+    motherbee alone, when the read failed there and no hive was counted: `TIMEOUT`, its own
+    orchestrator gave no answer within 30 s (ask again); `USAGE_READ_FAILED`, it could not read
+    its own nodes or its hive registry, and every read fails so until that is fixed: the detail
+    names what, such as a node whose config cannot be read while it runs, so tell the operator to
+    stop that node (`kill_node`) or fix its config, or to fix what else it names, before asking
+    again. `payload.retryable` says whether asking again, nothing changed first, may pass: false
+    for that `USAGE_READ_FAILED` and while a join that ended is not read. It is never "not in
     use": ask again once the hive answers. A hive gone for good is removed with `remove_hive`
     first. An ingress or an egress receives no runtime, so it never refuses a removal.
 
@@ -1919,7 +1937,8 @@ installation answer in pages:
   cut: such an event says `output_truncated`, with `output_bytes`, its size before, and keeps its
   status and small fields whole. A larger answer drops every step's output, keeping each step's
   status, its ids and what you read of it (a deploy's `wf_node`, a change's `version` and
-  `pending`, an installation update's `id`), and then keeps only each step's last event.
+  `pending`, an installation update's `id`, a workflow delete's `packages_left` in short), and
+  then keeps only each step's last event.
   `payload.outputs_bounded` says how it was cut. Read what a step changed back with the read that
   shows it.
 - **A plan whose answer is still too large** comes back as `REPLY_TOO_LARGE` with

@@ -230,10 +230,13 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
     (`version: ""`) and `DIST_UNREADABLE`: nothing was removed.
 
   `retryable` says that `remove_runtime_version` asked again for that version, nothing changed
-  first, may remove it: SY.admin's own word when its refusal gives one (`payload.retryable`,
-  true for `RUNTIME_USAGE_UNKNOWN`); without it, true for `RUNTIME_USAGE_UNKNOWN` and
-  `INVENTORY_UNAVAILABLE`; true for `TIMEOUT`, `TRANSPORT_ERROR` and `PURGE_STOPPED`; false for
-  any other refusal (`RUNTIME_IN_USE`: stop or move the node first) and for `DIST_UNREADABLE`.
+  first, may remove it: SY.admin's own word when its refusal gives one (`payload.retryable` of
+  `RUNTIME_USAGE_UNKNOWN`: false while a hive not read is a join that ended and when the
+  motherbee could not read its own nodes or its registry, true otherwise); without it, true for
+  `RUNTIME_USAGE_UNKNOWN` and `INVENTORY_UNAVAILABLE`; true for `TIMEOUT`, `TRANSPORT_ERROR` and
+  `PURGE_STOPPED`, but a `PURGE_STOPPED` after a `RUNTIME_USAGE_UNKNOWN` that is not retryable is
+  not either, since its removal reads the same hives (`purgeStoppedAt`); false for any other
+  refusal (`RUNTIME_IN_USE`: stop or move the node first) and for `DIST_UNREADABLE`.
   `unanswered_hives` is SY.admin's list of the hives whose nodes it could not read, each
   `{hive, reason, detail}`, when its refusal names any (`RUNTIME_USAGE_UNKNOWN`, and
   `RUNTIME_IN_USE` with a hive not read besides).
@@ -257,7 +260,10 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   again, the name published its `0.0.1` over the one left there and was refused (see
   [The workflow store](#the-workflow-store)).
   SY.admin's `wf_rules_delete` passes the answer on whole as its `payload` (adding
-  `pages_left_up`), over HTTP, over the mesh and as an Archi plan step's `result_preview`.
+  `pages_left_up`), over HTTP, over the mesh and as an Archi plan step's `result_preview`; a
+  plan's answer cut to fit the frame keeps `packages_left` in short (each version's `runtime`,
+  `version`, `error_code` and `retryable`, the first one's `detail` cut, the hives not read with
+  their `reason` and `next`, in 1 KiB: SY.admin's `packages_left_essentials`).
 
 ### Queries
 

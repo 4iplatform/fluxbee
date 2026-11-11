@@ -457,15 +457,19 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   lifecycle; `409 RUNTIME_USAGE_UNKNOWN` while the use is unknown (an error, or a hive in
   `skipped_hives`), naming each hive not read and why in `payload.unanswered_hives` (a join not
   done with its `status` and `join_phase`; the motherbee alone when the read failed there, so no
-  hive was counted), with `payload.retryable: true`. Ask again once each hive answers: bring a
-  worker back, finish or remove a join left behind, and remove a hive gone for good with
-  `remove_hive` first. A workflow's delete whose purge meets the refusal is done all the same,
-  and names that version and those after it in `payload.packages_left` (below). Before 0.1.133
-  a hive not counted read as one with no node: a version a node of a restarting worker ran on
-  was removed, and the worker's mirror deleted it when it came back. And every ingress and egress
-  was in `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`, and the hives were
-  asked one after another, 45 s each, so one that did not answer held the read past SY.admin's
-  30 s ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
+  hive was counted), with `payload.retryable`, whether asking again, nothing changed first, may
+  pass: false while a join that ended (failed or interrupted) is not read, and when the motherbee
+  could not read its own nodes or its registry (`USAGE_READ_FAILED`: stop the node whose
+  `config.json` it names, or fix that config, or make the folder or the registry readable,
+  first). Ask again once each hive answers: bring a worker back, finish or remove a join left
+  behind, and remove a hive gone for good with `remove_hive` first. A workflow's delete whose
+  purge meets the refusal is done all the same, and names that version and those after it in
+  `payload.packages_left` (below). Before 0.1.133 a hive not counted read as one with no node: a
+  version a node of a restarting worker ran on was removed, and the worker's mirror deleted it
+  when it came back. And every ingress and egress was in `skipped_hives` on every read, for its
+  `RUNTIME_MANIFEST_MISSING`, and the hives were asked one after another, 45 s each, so one that
+  did not answer held the read past SY.admin's 30 s
+  ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
 - **A workflow's delete can leave its versions in dist (FINDINGS A-281).** SY.wf-rules removes them
   last, after the workflow, its node and its state, through `remove_runtime_version`, each waited
   for up to 35 s within what is left of the request's 60 s, and stops at the first one refused or
@@ -474,9 +478,11 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   A workflow created again under that name numbers its versions above every version the dist
   holds, and its deploy's purge removes those left; to remove them sooner,
   `remove_runtime_version` each (`GET /hives/motherbee/runtimes/wf.<name>` lists them) once every
-  hive answers, the runtime's current last. `fluxbee-factory-reset` prints them under each deleted
-  workflow and counts them in its log line (`packages_left=`); its next run no longer lists the
-  workflow.
+  hive answers, the runtime's current last. One entry with no version, `DIST_UNREADABLE`, says the
+  hive's `dist/runtimes/wf.<name>` could not be listed: until it can, a compile of the name that
+  names no version is refused, so fix it first. `fluxbee-factory-reset` prints them under each
+  deleted workflow and counts them in its log line (`packages_left=`); its next run no longer
+  lists the workflow.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on
   `dist/runtimes-manifest.lock` from its read of the manifest to its write: SY.admin's
   `publish_runtime_package`, `remove_runtime_version` (across its read of the version's use, up to

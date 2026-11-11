@@ -609,14 +609,19 @@ not read. Otherwise, with nothing removed:
   gone, so stop it (`kill_node`) or move it first.
 - **`409 RUNTIME_USAGE_UNKNOWN`** when the use could not be read on every hive (FINDINGS A-281,
   since 0.1.133). `payload.unanswered_hives` names each hive not read, `{hive, reason, detail}`,
-  the detail names them with their reasons, and `payload.retryable` is true:
+  the detail names them with their reasons, and `payload.retryable` says whether asking again,
+  nothing changed first, may pass: false for a `USAGE_READ_FAILED` and while a join that ended is
+  not read (both below), true otherwise:
   - the motherbee alone, when the read failed there, and the detail says that no hive's nodes were
     counted: its orchestrator did not answer the read (`TIMEOUT`: no answer within SY.admin's
     30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a
     runtime's use, which it runs 4 at a time; `TRANSPORT_ERROR`), refused it (its code), could not
     make it (`USAGE_READ_FAILED`: its usage says `status: error`, its own nodes or its registry
-    unread, a node's `config.json` that cannot be read while the node may run among them) or gave
-    no usage of every hive (`NO_USAGE`: none, or one without `running_nodes` or `skipped_hives`);
+    unread, a node's `config.json` that cannot be read while the node may run among them; every
+    read fails so, for every runtime, until that is fixed, and the detail says what to fix: stop
+    that node with `kill_node` or fix its config, or make the folder or the registry readable) or
+    gave no usage of every hive (`NO_USAGE`: none, or one without `running_nodes` or
+    `skipped_hives`);
   - a worker of its `skipped_hives`, or a hive whose role its registry entry does not record, each
     asked at once for its nodes alone (`GET_RUNTIME` with `usage_only`): one that gave no answer
     within 10 s (`TIMEOUT`: its orchestrator stuck or restarting while the LSA shows it); one the
@@ -627,7 +632,10 @@ not read. Otherwise, with nothing removed:
     not read its own nodes (`USAGE_UNREADABLE`: its nodes' folder, or the `config.json` of a node
     whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its
     config). A hive whose join the registry does not record as done also gets its `status`, its
-    `join_phase` and `next`: finish its join (`add_hive` again) or remove it (`remove_hive`).
+    `join_phase` and `next`: finish its join (`add_hive` again) or remove it (`remove_hive`). One
+    whose join ended (its status `failed` or `interrupted`, or its record's phase `done`, as a
+    failed join and the boot sweep of a cut one stamp it: `UnfinishedJoin::ended`) is read only
+    then, so the refusal is not retryable while it is not read; a join under way ends by itself.
 
   Ask again once each hive answers. A hive gone for good is removed with `remove_hive` first: the
   orchestrator asks only the hives of the registry. Before 0.1.133 a hive not counted read as one
@@ -654,13 +662,16 @@ node and its state are gone, within what is left of its request's 60 s, and stop
 removal that fails; since 0.1.133 it answers ok all the same: `payload.packages_left` names each
 version left, `{runtime, version, error_code, detail, retryable, unanswered_hives}` (the one it
 stopped at with its failure, each after it `PURGE_STOPPED`; `[]` when every version it knew of
-went), and `payload.warning` says what removes them. A workflow created again under that name
-numbers its versions above every version the dist holds, so it never publishes over one left
-there, and its deploy's purge removes them; or remove each with `remove_runtime_version` once every
-hive answers, in `packages_left`'s order, the runtime's current last (`RUNTIME_CURRENT_CONFLICT`
-otherwise). `fluxbee-factory-reset` prints each version left under its workflow and counts them in
-its log line (`packages_left=`); a second run does not remove them, since the workflow is no
-longer listed.
+went; one entry with no version, `DIST_UNREADABLE`, when its hive's dist could not be listed),
+and `payload.warning` says what removes them. A workflow created again under that name numbers its
+versions above every version the dist holds, so it never publishes over one left there, and its
+deploy's purge removes them; or remove each with `remove_runtime_version` once every hive answers,
+in `packages_left`'s order, the runtime's current last (`RUNTIME_CURRENT_CONFLICT` otherwise).
+After `DIST_UNREADABLE` neither holds until that hive's `dist/runtimes/wf.<workflow>` can be listed
+again: a compile of the name that names no version is refused meanwhile (`WFRULES_ERROR`), and the
+versions to remove are those `GET /hives/motherbee/runtimes/wf.<workflow>` lists.
+`fluxbee-factory-reset` prints each version left under its workflow and counts them in its log line
+(`packages_left=`); a second run does not remove them, since the workflow is no longer listed.
 
 ## Workflows: the check and the instances
 
@@ -1268,11 +1279,13 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   3. **The outputs dropped.** Every output and args goes; each event keeps its step, status, tool,
      error code and error text (cut to 256 bytes), and of its output its status, its error code,
      its ids and the fields Archi reads (`wf_node`, `warning`, `pending`, `version`, `held`,
-     `nothing_to_do`, a removal's `pages_left_up` cut to 1 KiB, and of an installation update its
-     `id`, `state`, `held`, `stale_target` and `superseded_by`, never its hives: Archi reads an
-     update whose answer was cut again; `executor_result_essentials`). Its run id, time and
-     summary line go. If the answer still does not fit, each step keeps only its last event
-     (`collapse_executor_events`).
+     `nothing_to_do`, a removal's `pages_left_up` cut to 1 KiB, a workflow delete's
+     `packages_left` in 1 KiB, each version's `runtime`, `version`, `error_code` and `retryable`,
+     the first one's `detail` cut to 256 bytes and each hive not read with its `reason` and `next`
+     (`packages_left_essentials`), and of an installation update its `id`, `state`, `held`,
+     `stale_target` and `superseded_by`, never its hives: Archi reads an update whose answer was
+     cut again; `executor_result_essentials`). Its run id, time and summary line go. If the
+     answer still does not fit, each step keeps only its last event (`collapse_executor_events`).
   4. **REPLY_TOO_LARGE.** An answer past all of it goes as `REPLY_TOO_LARGE`, with `action_ran`
      and an `outcome` that keeps the run's `execution_id`, `plan_status`, `completed_steps`,
      `total_steps`, `failed_step_id` and `log_path`.
