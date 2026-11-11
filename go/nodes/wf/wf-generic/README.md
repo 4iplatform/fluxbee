@@ -96,7 +96,8 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   (`ok: false`), that gets no answer in 30 s, or that does not go (the send queue full) marks its
   timer in the index, saying why, and the node's log names it. A marked timer goes again, a
   `TIMER_SCHEDULE` at its `fire_at`, after 5, 10, 20 and 40 s, then each minute, until SY.timer
-  takes it; one whose time comes first is fired by the node itself. Meanwhile `NODE_STATUS_GET` says
+  takes it; one less than 60 s from its time, SY.timer's floor, is not sent again (SY.timer would
+  fire it up to 60 s late), and the node fires it itself at its time. Meanwhile `NODE_STATUS_GET` says
   `DEGRADED` (`timers_not_reconciled`), naming the next timer and why. What goes again is the index
   row: a timer the instance cancelled since does not go, one it moved goes at its new time, and a
   later request about the same timer supersedes an earlier one. Before, a schedule refused while

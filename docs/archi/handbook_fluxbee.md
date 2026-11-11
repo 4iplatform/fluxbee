@@ -393,9 +393,9 @@ Common guards:
     asks more is refused, naming the path (`must be at most 366d`). A time may be a `$ref`; the
     bounds are then checked when the timer is set.
   - A timer SY.timer does not take (it restarts, its store fails, it does not answer in 30 s) goes
-    again after 5, 10, 20 and 40 s, then each minute, until SY.timer takes it; one whose time comes
-    first is fired by the WF itself. Meanwhile the WF node is `DEGRADED`, `timers_not_reconciled`,
-    and its `last_error` names the timer and why.
+    again after 5, 10, 20 and 40 s, then each minute, until SY.timer takes it; one less than 60 s
+    from its time is fired by the WF itself, on time. Meanwhile the WF node is `DEGRADED`,
+    `timers_not_reconciled`, and its `last_error` names the timer and why.
   - A definition schedules at most 10 timer keys: the WF keeps one timer per conversation and key,
     so its keys are the most timers a conversation holds at once. A logic that needs more is two
     WFs.

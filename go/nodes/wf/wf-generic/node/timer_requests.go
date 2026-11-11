@@ -26,9 +26,11 @@ import (
 // A refusal marks the timer in the index (refuseTimer), and the node's log says which timer, which
 // request and why. A refused timer is sent again, a TIMER_SCHEDULE at its fire_at, after 5, 10, 20
 // and 40 s, then each minute, as SY.timer sends again a fire it could not deliver, until SY.timer
-// takes it, the instance cancels it or ends, or its time comes: then the node fires it itself, as the
-// reconcile fires a timer lost while the node was down (sendRefusedTimersAgain). While a timer is
-// refused the node is DEGRADED, timers_not_reconciled, naming it (refusedTimersDegraded).
+// takes it, or the instance cancels it or ends. One less than 60 s from its time, SY.timer's floor,
+// is not sent again, since SY.timer would take it for 60 s from then and fire it late: the node fires
+// it itself at its time, as the reconcile fires a timer lost while the node was down
+// (sendRefusedTimersAgain). While a timer is refused the node is DEGRADED, timers_not_reconciled,
+// naming it (refusedTimersDegraded).
 //
 // The order with the instance's later requests about the same timer holds. What goes again is the
 // index row, so a timer the instance cancelled since is not sent (the cancel dropped its row), and one
@@ -70,10 +72,12 @@ func timerResendDelay(resends int) time.Duration {
 }
 
 // resendTime is when a refused timer that went again resends times goes again, at nowMS: after
-// timerResendDelay, never after its fireAtMS, when the node fires it itself, and never before nowMS.
+// timerResendDelay, while SY.timer could still take it at its fireAtMS, 60 s ahead at least (its
+// floor). Past that the timer is not sent again: the node fires it itself at its time, never before
+// nowMS (FINDINGS A-254's review).
 func resendTime(nowMS int64, resends int, fireAtMS int64) int64 {
 	at := nowMS + timerResendDelay(resends).Milliseconds()
-	if at > fireAtMS {
+	if at > fireAtMS-minTimerDuration.Milliseconds() {
 		at = max(fireAtMS, nowMS)
 	}
 	return at
@@ -214,6 +218,10 @@ func refuseTimer(ctx context.Context, actx ActionContext, ref timerRef, why stri
 	if actx.Requests != nil {
 		actx.Requests.refused = true
 	}
+	if resendAt >= row.FireAtMS {
+		log.Printf("wf: timer %s not taken by SY.timer: %s; too near its time for SY.timer, the node fires it itself at %s", ref, why, msTime(row.FireAtMS))
+		return nil
+	}
 	log.Printf("wf: timer %s not taken by SY.timer: %s; it goes again at %s", ref, why, msTime(resendAt))
 	return nil
 }
@@ -338,8 +346,9 @@ func (rt *NodeRuntime) tickTimerRequests(ctx context.Context) {
 
 // sendRefusedTimersAgain sends again the refused timers due at nowMS, the earliest first: a timer
 // whose time has come is fired by the node itself, as the reconcile fires one lost while the node was
-// down (SY.timer, which never took it, has no fire to give); a timer of an instance that no longer
-// runs leaves the index.
+// down (SY.timer, which never took it, has no fire to give); one less than 60 s from its time waits
+// for it, since SY.timer would fire it late (FINDINGS A-254's review); a timer of an instance that no
+// longer runs leaves the index.
 func (rt *NodeRuntime) sendRefusedTimersAgain(ctx context.Context, nowMS int64) {
 	due, err := rt.Store.RefusedTimersDue(ctx, nowMS, maxTimerRequestsPerTick)
 	if err != nil {
@@ -360,16 +369,25 @@ func (rt *NodeRuntime) sendRefusedTimersAgain(ctx context.Context, nowMS int64) 
 			}
 			log.Printf("wf: timer %s, which SY.timer has not taken (%s), is due: the instance takes its fire now", ref, row.Refusal)
 			rt.fireMissedTimer(ctx, inst, row, "")
+		case row.FireAtMS-nowMS < minTimerDuration.Milliseconds():
+			// SY.timer would take it for 60 s from now, its floor, and fire it late: the node fires it
+			// itself at its time, as it would once that came (FINDINGS A-254's review).
+			if err := rt.Store.RefuseTimer(ctx, row.InstanceID, row.TimerKey, row.Refusal, row.FireAtMS); err != nil {
+				log.Printf("wf: timer %s: %v", ref, err)
+				continue
+			}
+			log.Printf("wf: timer %s, which SY.timer has not taken (%s), is less than %s from its time: the node fires it itself at %s",
+				ref, row.Refusal, minTimerDuration, msTime(row.FireAtMS))
 		default:
 			rt.sendTimerAgain(ctx, row, nowMS)
 		}
 	}
 }
 
-// sendTimerAgain sends a refused timer again: a TIMER_SCHEDULE at its fire_at (SY.timer's minimum
-// ahead at least), under its client_ref, with SY.timer's default missed_policy, fire, as scheduleAgain
-// does. SY.timer keeps one pending timer per client_ref, so a timer it holds already is not doubled.
-// Its refusal stays until SY.timer takes it.
+// sendTimerAgain sends a refused timer again, 60 s from its time at least (sendRefusedTimersAgain): a
+// TIMER_SCHEDULE at its fire_at, under its client_ref, with SY.timer's default missed_policy, fire,
+// as scheduleAgain does. SY.timer keeps one pending timer per client_ref, so a timer it holds already
+// is not doubled. Its refusal stays until SY.timer takes it.
 func (rt *NodeRuntime) sendTimerAgain(ctx context.Context, row TimerRow, nowMS int64) {
 	ref := timerRef{row.InstanceID, row.TimerKey}
 	resends := row.Resends + 1
@@ -377,7 +395,7 @@ func (rt *NodeRuntime) sendTimerAgain(ctx context.Context, row TimerRow, nowMS i
 		log.Printf("wf: timer %s not sent again: %v", ref, err)
 		return
 	}
-	in := max(time.Duration(row.FireAtMS-nowMS)*time.Millisecond, minTimerDuration)
+	in := time.Duration(row.FireAtMS-nowMS) * time.Millisecond
 	traceID, err := rt.ActCtx.Timer.ScheduleIn(ctx, in, timerScheduleOptions(rt.ActCtx.Dispatcher.NodeL2Name(), row.InstanceID, row.TimerKey))
 	if err == nil {
 		log.Printf("wf: timer %s sent again to SY.timer (resend %d, trace_id=%s) after %s", ref, resends, traceID, row.Refusal)

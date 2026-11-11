@@ -53,9 +53,15 @@ type refusalTest struct {
 
 func newRefusalTest(t *testing.T) *refusalTest {
 	t.Helper()
+	return newRefusalTestOn(t, deadlineWorkflowJSON)
+}
+
+// newRefusalTestOn is a refusalTest on definition.
+func newRefusalTestOn(t *testing.T, definition string) *refusalTest {
+	t.Helper()
 	timer := &mockTimerSender{}
-	rt, disp := newTestRuntime(t, "", deadlineWorkflowJSON, timer)
-	rt.Plane = bootstrap(t, writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, deadlineWorkflowJSON))))
+	rt, disp := newTestRuntime(t, "", definition, timer)
+	rt.Plane = bootstrap(t, writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, definition))))
 	rt.ActCtx.Requests = newTimerRequests()
 	tc := &refusalTest{t: t, rt: rt, disp: disp, timer: timer, now: fixedClock()}
 	rt.ActCtx.Clock = func() time.Time { return tc.now }
@@ -92,7 +98,13 @@ func (tc *refusalTest) tick() { tc.rt.tickTimerRequests(context.Background()) }
 // deadline is the instance's deadline as the index keeps it.
 func (tc *refusalTest) deadline(instanceID string) (TimerRow, bool) {
 	tc.t.Helper()
-	row, ok, err := tc.rt.Store.GetTimerForInstance(context.Background(), instanceID, "deadline")
+	return tc.timerRow(instanceID, "deadline")
+}
+
+// timerRow is the instance's timer timerKey as the index keeps it.
+func (tc *refusalTest) timerRow(instanceID, timerKey string) (TimerRow, bool) {
+	tc.t.Helper()
+	row, ok, err := tc.rt.Store.GetTimerForInstance(context.Background(), instanceID, timerKey)
 	if err != nil {
 		tc.t.Fatal(err)
 	}
@@ -414,6 +426,62 @@ func TestARefusedTimerWhoseTimeComesIsFiredByTheNode(t *testing.T) {
 	}
 	if health, code, message := tc.health(); health != "HEALTHY" {
 		t.Fatalf("nothing is refused: %s %s %q", health, code, message)
+	}
+}
+
+// FINDINGS A-254's review: a refused timer less than 60 s from its time, SY.timer's floor, is not
+// sent again. SY.timer would have taken it for 60 s from then, and once it had, the node no longer
+// fired it: the timer fired up to 60 s late. The node fires it itself at its time: a move to a minute
+// from now that SY.timer never answers is refused at 30 s, and one SY.timer refuses at once is not
+// sent again 5 s later; a timer marked to go now (as the reconcile marks one) 30 s from its time
+// waits for it too.
+func TestARefusedTimerTooNearItsTimeIsFiredByTheNodeOnTime(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		refuse func(tc *refusalTest, instanceID, traceID string)
+	}{
+		{"no answer in 30 s", func(tc *refusalTest, _, _ string) {
+			tc.later(30 * time.Second)
+			tc.tick()
+		}},
+		{"refused at once", func(tc *refusalTest, _, traceID string) {
+			tc.dispatch(unreachable(traceID, "NODE_NOT_FOUND"))
+		}},
+		{"marked to go now, 30 s from its time", func(tc *refusalTest, instanceID, traceID string) {
+			tc.dispatch(timerTook(traceID))
+			tc.later(30 * time.Second)
+			if err := tc.rt.Store.RefuseTimer(context.Background(), instanceID, "reminder", "TIMER_LIST: SY.timer@motherbee does not have it", nowMS(tc.rt.ActCtx.Clock)); err != nil {
+				tc.t.Fatal(err)
+			}
+			tc.tick()
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tc := newRefusalTestOn(t, reminderWorkflowJSON)
+			instanceID, _ := tc.start()
+			tc.tell(instanceID, "SOON")
+			fireAt := tc.now.Add(time.Minute)
+			scheduled, rescheduled := len(tc.timer.scheduled), len(tc.timer.rescheduled)
+			c.refuse(tc, instanceID, tc.timer.lastTrace(t))
+			if row, _ := tc.timerRow(instanceID, "reminder"); row.Refusal == "" || row.ResendAtMS != fireAt.UnixMilli() {
+				t.Fatalf("the timer waits for its time: %+v", row)
+			}
+			for tc.now.Before(fireAt.Add(-time.Second)) {
+				tc.later(time.Second)
+				tc.tick()
+			}
+			if len(tc.timer.scheduled) != scheduled || len(tc.timer.rescheduled) != rescheduled {
+				t.Fatalf("a timer too near its time is not sent again: %v %v", tc.timer.scheduled[scheduled:], tc.timer.rescheduled[rescheduled:])
+			}
+			if row := mustGetInstance(t, tc.rt, instanceID); row.Status != "running" {
+				t.Fatalf("the timer does not fire before its time: %+v", row)
+			}
+			tc.later(time.Second)
+			tc.tick()
+			if row := mustGetInstance(t, tc.rt, instanceID); row.CurrentState != "done" || row.Status != "completed" {
+				t.Fatalf("the node fires it at its time: %+v", row)
+			}
+		})
 	}
 }
 
