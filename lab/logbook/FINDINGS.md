@@ -325,6 +325,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-263 🔵 The installation update's follow reads one hive at a time (low; with A-250's gate).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
 - A-265 🔵 The hub does not rebuild its FIB when it applies a spoke's LSA (low; the router).
+- A-266 🔵 `TIMER_LIST` says nothing of the timers its `limit` left out (low; SY.timer).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1401,6 +1402,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-266 [General/SY.timer] 🔵 low (found 2026-11-11 by 0.1.131's gate; seen on 8.x, read in the code) — `TIMER_LIST` says nothing of the timers its `limit` left out
+
+- **Seen:** `GET /hives/motherbee/timer/timers?status_filter=all&limit=1` listed one of the
+  motherbee's three timers and gave no `next_cursor`.
+- **Why:** `listTimers` (`go/sy-timer/persistence.go` ~279) reads at most `limit` rows, and
+  `respondTimerList` (`go/sy-timer/main.go` ~740-805) sets `next_cursor` only when a page passes its
+  96 KiB (A-151). When the limit cuts the list, the answer reads as the whole list.
+- **Effect:** Archi or the operator listing a hive's timers with a `limit` (100 by default) sees the
+  first ones and no sign of the rest when they are small (worker1 holds 350 canceled ones); the Go
+  SDK's `List`, the WF's reconcile included, stops at its own limit the same way.
+- **Fix:** read one row more than the limit and, when it is there, answer the cursor of the last
+  row listed.
 
 ### A-265 [General/router] 🔵 low (found 2026-11-11 by the review fixes of the router's A-195; read in the code) — The hub does not rebuild its FIB when it applies a spoke's LSA
 
