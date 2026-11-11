@@ -331,6 +331,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; to decide).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-277 🔵 A removed hive whose identity key could not be deleted keeps reading the identity store (low; to decide).
+- A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
+- A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1407,6 +1409,35 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-279 [Archi] 🔵 low (found 2026-11-11 by A-266's review; read in the code; there before it) — Archi's timer list passes its query undecoded, so a cursor or an owner it encoded is refused
+
+- **Why:** SY.architect's SCMD translation of `GET /hives/{hive}/timer/timers`
+  (`src/bin/sy_architect.rs` ~14104-14130) copies `cursor`, `owner_l2_name` and `status_filter`
+  as they come; Archi's other paged reads decode through `scmd_page_params` (~12914), and SY.admin's
+  own route decodes too (`parse_query`). SY.timer's cursor is `<fire_at>:<uuid>`: one Archi
+  writes as `%3A`, or an owner with `%40`, reaches SY.timer encoded and is refused
+  `TIMER_INVALID_PAYLOAD` or matches nothing.
+- **Effect:** since A-266 (0.1.133) a timer list cut by its limit (100 by default) answers
+  `next_cursor`, so Archi pages it far more often. Archi's `fluxbee_get` tool text names the paged
+  lists without the timer list (~1039), and SY.admin's catalog text for `timer_list`'s `cursor`
+  names only the frame's cut.
+- **Fix:** the translation decodes as `scmd_page_params` does; the tool text names the timer list.
+
+### A-278 [WF/Go SDK] 🔵 medium (found 2026-11-11 by A-266's builder and review; read in the code; there before it) — A WF with more than 1000 pending timers cannot reconcile them
+
+- **Why:** the WF's reconcile (`go/nodes/wf/wf-generic/node/recover.go` ~286-299) lists its pending
+  timers with `Limit: sdk.MaxTimerListLimit` (1000); the Go SDK's `List` (and the Rust SDK's) stops
+  at its limit and drops SY.timer's `next_cursor`, so even after A-266 the WF cannot tell exactly
+  1000 timers from more. It only logs *"reconciliation may be truncated"* at exactly 1000.
+- **Effect:** every index timer past the first 1000 by fire time looks missing in SY.timer: it is
+  marked refused (*"TIMER_LIST: SY.timer@<hive> does not have it"*) and sent again at 32 a tick;
+  SY.timer answers each `already_existed`, and the node stays `DEGRADED` meanwhile (about 1 min for
+  3,000 timers, about 5 min for 10,000, at every reconcile). An owner may hold 10,000 pending
+  timers. None on 8.x holds more than a handful today.
+- **Fix, its own release (the SDKs, then the WF):** `List` says whether more follow (or returns the
+  cursor) and the WF pages through all its pending timers; a cheaper stopgap is that the WF takes
+  index timers past the last one listed as unknown, not missing.
 
 ### A-277 [General/identity] 🔵 low (found 2026-11-11 by the review fixes of identity's 0.1.133 branch; read in the code) — A removed hive whose identity key could not be deleted keeps reading the identity store
 
