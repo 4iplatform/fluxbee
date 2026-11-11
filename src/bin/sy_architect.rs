@@ -8943,33 +8943,36 @@ fn query_bool_param(query: &str, key: &str) -> Option<bool> {
     })
 }
 
-/// A query value or a path segment, percent-decoded: `%` and two hex digits are the byte they name,
-/// and `+` is a space. A `%` without two hex digits after it stays as it came, and what follows it
-/// is read by the same rules (`%+A` is `% A`, `%%41` is `%A`); bytes that are no UTF-8 read as
-/// U+FFFD. Read byte by byte (FINDINGS A-279): a `%` before a character of more than one byte
-/// panicked, and `%+A` was a newline.
+/// A query value or a path segment of Archi's own HTTP API (`query_param`, a message's key),
+/// percent-decoded as `percent_decode` does, with `+` a space, as a form encodes one (`%+A` is
+/// `% A`). An SCMD keeps its `+` (`percent_decode`, FINDINGS A-286).
 fn percent_decode_simple(raw: &str) -> String {
+    percent_decode(&raw.replace('+', " "))
+}
+
+/// A value percent-decoded once: `%` and two hex digits are the byte they name, and every other
+/// byte, a `+` among them, is itself. A `%` without two hex digits after it stays as it came, and
+/// what follows it is read by the same rules (`%%41` is `%A`); bytes that are no UTF-8 read as
+/// U+FFFD. Read byte by byte (FINDINGS A-279): a `%` before a character of more than one byte
+/// panicked, and `%+A` was a newline. An SCMD's query values and path segments are read with it,
+/// as SY.admin's routes read a query (`parse_query`): there a raw `+`, an RFC 3339 offset's, is
+/// commoner than a form's space (A-286).
+fn percent_decode(raw: &str) -> String {
     let hex = |byte: u8| char::from(byte).to_digit(16);
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
                 // Two hex digits: one byte, at most 0xff.
                 out.push((high << 4 | low) as u8);
                 i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
+                continue;
             }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
         }
+        out.push(bytes[i]);
+        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -12591,9 +12594,10 @@ fn env_timeout_secs(name: &str) -> Option<u64> {
 
 /// The query of an SCMD read, each value percent-decoded here, once, for every read (FINDINGS
 /// A-279): a value written encoded, a cursor's `%3A` or an owner's `%40`, reaches SY.admin as the
-/// same value written raw, as on SY.admin's own HTTP routes (`parse_query`, which keeps a `+` that
-/// `percent_decode_simple` reads as a space). A pair without `=`, or with an empty key or value, is
-/// left out; a key is taken as it came.
+/// same value written raw, as on SY.admin's own HTTP routes (`parse_query`). A `+` stays a `+`, as
+/// there (A-286): `from=2026-11-01T00:00:00+01:00` is that time, where it reached SY.storage as
+/// `00:00:00 01:00`, no RFC 3339 time. A pair without `=`, or with an empty key or value, is left
+/// out; a key is taken as it came.
 fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> {
     let mut params = serde_json::Map::new();
     let Some(query) = raw_query else {
@@ -12607,7 +12611,7 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
         if key.is_empty() || value.is_empty() {
             continue;
         }
-        params.insert(key.to_string(), Value::String(percent_decode_simple(value)));
+        params.insert(key.to_string(), Value::String(percent_decode(value)));
     }
     params
 }
@@ -13269,10 +13273,18 @@ fn translate_scmd(
         Some((path, query)) => (path, Some(query)),
         None => (parsed.path.as_str(), None),
     };
-    let segments: Vec<&str> = path_only
+    // Each segment decoded once, after the path is split, as SY.admin's HTTP routes decode theirs
+    // (FINDINGS A-287), where only the vault key's was: `AI.sales%40worker1` is AI.sales@worker1,
+    // a `%2F` stays inside its segment, and a `%` that is no escape goes as it came, a name
+    // SY.admin refuses or finds nothing by, as in the query (A-279). A `+` stays a `+`, as in the
+    // query (A-286); SY.admin's routes read one in a path as a space, and a node's, a runtime's, a
+    // hive's or a vault key's name holds neither.
+    let decoded: Vec<String> = path_only
         .split('/')
         .filter(|segment| !segment.is_empty())
+        .map(percent_decode)
         .collect();
+    let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
     let admin_target = format!("SY.admin@{local_hive_id}");
 
     match (parsed.method.as_str(), segments.as_slice()) {
@@ -13491,7 +13503,7 @@ fn translate_scmd(
             admin_target,
             action: "vault_get_metadata".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({ "key": percent_decode_simple(key) }),
+            params: json!({ "key": key }),
         }),
         ("PUT", ["hives", hive_id, "identity", "tenants", tenant_id]) => {
             let mut params = parsed.body.unwrap_or_else(|| json!({}));
@@ -32946,31 +32958,177 @@ mod tests {
     /// FINDINGS A-279: a `%` without two hex digits after it stays as it came, whatever follows it:
     /// before a character of more than one byte it panicked (a byte index inside the character),
     /// and before a sign it was a byte (`%+A` a newline). What follows it is read by the same
-    /// rules. Two hex digits are the byte they name, `+` is a space, and bytes that are no UTF-8
-    /// read as U+FFFD.
+    /// rules. Two hex digits are the byte they name, and bytes that are no UTF-8 read as U+FFFD.
+    /// A `+` is a space in Archi's own HTTP API (`percent_decode_simple`) and stays a `+` in an
+    /// SCMD (`percent_decode`, A-286); an escaped `+` is a `+` in both.
     #[test]
     fn percent_decoding_keeps_an_escape_that_is_none() {
-        for (raw, decoded) in [
-            ("1775577600000%3A9d8c", "1775577600000:9d8c"),
-            ("WF.onboarding%40worker1", "WF.onboarding@worker1"),
-            ("%3a", ":"),
-            ("caf%C3%A9", "café"),
-            ("a+b", "a b"),
-            ("%ZZ", "%ZZ"),
-            ("%4", "%4"),
-            ("100%", "100%"),
-            // A sign is no hex digit: the `%` stays, and the `+` is a space.
-            ("%+A", "% A"),
+        for (raw, own_http, scmd) in [
+            (
+                "1775577600000%3A9d8c",
+                "1775577600000:9d8c",
+                "1775577600000:9d8c",
+            ),
+            (
+                "WF.onboarding%40worker1",
+                "WF.onboarding@worker1",
+                "WF.onboarding@worker1",
+            ),
+            ("%3a", ":", ":"),
+            ("caf%C3%A9", "café", "café"),
+            ("a+b", "a b", "a+b"),
+            ("00:00:00+01:00", "00:00:00 01:00", "00:00:00+01:00"),
+            ("00:00:00%2B01:00", "00:00:00+01:00", "00:00:00+01:00"),
+            ("%ZZ", "%ZZ", "%ZZ"),
+            ("%4", "%4", "%4"),
+            ("100%", "100%", "100%"),
+            // A sign is no hex digit: the `%` stays, and so does the `+`, a space or itself.
+            ("%+A", "% A", "%+A"),
             // The `%` stays, and the escape after it is one.
-            ("%%41", "%A"),
-            ("%aé", "%aé"),
-            ("%3é", "%3é"),
-            ("%€", "%€"),
-            ("%FF", "\u{FFFD}"),
-            ("", ""),
+            ("%%41", "%A", "%A"),
+            ("%aé", "%aé", "%aé"),
+            ("%3é", "%3é", "%3é"),
+            ("%€", "%€", "%€"),
+            ("%FF", "\u{FFFD}", "\u{FFFD}"),
+            ("", "", ""),
         ] {
-            assert_eq!(percent_decode_simple(raw), decoded, "{raw}");
+            assert_eq!(percent_decode_simple(raw), own_http, "{raw}");
+            assert_eq!(percent_decode(raw), scmd, "{raw}");
         }
+    }
+
+    /// FINDINGS A-286: an SCMD read keeps a `+` in its query, as SY.admin's routes do
+    /// (`parse_query`): an RFC 3339 offset written raw reaches SY.admin as written, where it read as
+    /// a space and SY.storage refused `from` as no RFC 3339 time. Written `%2B`, it is the same `+`.
+    /// Archi's own HTTP API keeps its reading, a `+` a space (`query_param`).
+    #[test]
+    fn an_scmd_query_keeps_its_plus() {
+        let read = translate_scmd(
+            "motherbee",
+            parse("curl -X GET '/hives/motherbee/usage?from=2026-11-01T00:00:00+01:00&to=2026-11-02T00:00:00%2B01:00&group_by=day'"),
+        )
+        .expect("translation should succeed");
+        assert_eq!(read.action, "get_llm_usage");
+        assert_eq!(
+            read.params,
+            json!({
+                "from": "2026-11-01T00:00:00+01:00",
+                "to": "2026-11-02T00:00:00+01:00",
+                "group_by": "day",
+                "all_tenants": true
+            })
+        );
+        assert_eq!(
+            query_param("q=a+b%2Bc", "q").as_deref(),
+            Some("a b+c"),
+            "Archi's own HTTP API reads a + as a space"
+        );
+    }
+
+    /// FINDINGS A-287: `translate_scmd` decodes each path segment once, after the path is split, as
+    /// SY.admin's routes do, where it copied each as it came (only the vault key's was decoded): a
+    /// node name written `%40` finds the node, a `%2F` stays inside its segment, and the vault key
+    /// is decoded once, never twice. A `%` that is no escape goes as it came, as in the query
+    /// (A-279) and on SY.admin's routes: no node name holds a `%`, so the node's hive refuses it
+    /// (`invalid node_name`).
+    #[test]
+    fn an_scmd_path_is_decoded_once_segment_by_segment() {
+        let translate = |method: &str, path: &str| {
+            translate_scmd("motherbee", parse(&format!("curl -X {method} {path}")))
+                .expect("translation should succeed")
+        };
+        let status = translate("GET", "/hives/worker1/nodes/AI.sales%40worker1/status");
+        assert_eq!(status.action, "get_node_status");
+        assert_eq!(status.target_hive, "worker1");
+        assert_eq!(status.params, json!({ "node_name": "AI.sales@worker1" }));
+        for (method, path, action, params) in [
+            (
+                "POST",
+                "/hives/worker1/nodes/AI.sales%40worker1/restart",
+                "restart_node",
+                json!({ "node_name": "AI.sales@worker1" }),
+            ),
+            (
+                "DELETE",
+                "/hives/worker1/nodes/AI.sales%40worker1",
+                "kill_node",
+                json!({ "node_name": "AI.sales@worker1", "force": false }),
+            ),
+            (
+                "GET",
+                "/hives/motherbee/identity/ilks/ilk%3A550e8400-e29b-41d4-a716-446655440000",
+                "get_ilk",
+                json!({ "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000" }),
+            ),
+            (
+                "GET",
+                "/hives/worker1/nodes/WF.sales%40worker1/wf/instances/run%2D1",
+                "wf_get_instance",
+                json!({ "hive": "worker1", "node_name": "WF.sales@worker1", "instance_id": "run-1" }),
+            ),
+            (
+                "GET",
+                "/admin/actions/get%5Fnode%5Fstatus",
+                "get_admin_action_help",
+                json!({ "action_name": "get_node_status" }),
+            ),
+            // A `%2F` stays inside its segment: one route prefix, not two segments.
+            (
+                "DELETE",
+                "/hives/motherbee/routes/AI.a%2FAI.b",
+                "delete_route",
+                json!({ "prefix": "AI.a/AI.b" }),
+            ),
+            (
+                "GET",
+                "/hives/worker1/nodes/AI.x%2Fy/config",
+                "get_node_config",
+                json!({ "node_name": "AI.x/y" }),
+            ),
+            // A `%` that is no escape goes as it came, beside one that is.
+            (
+                "GET",
+                "/hives/worker1/nodes/AI.sales%4worker1/status",
+                "get_node_status",
+                json!({ "node_name": "AI.sales%4worker1" }),
+            ),
+            (
+                "GET",
+                "/hives/worker1/nodes/AI.%ZZ%40worker1/status",
+                "get_node_status",
+                json!({ "node_name": "AI.%ZZ@worker1" }),
+            ),
+            // A `+` stays a `+`.
+            (
+                "GET",
+                "/hives/worker1/nodes/AI.a+b/status",
+                "get_node_status",
+                json!({ "node_name": "AI.a+b" }),
+            ),
+            // The vault key, decoded once: an escaped `%` is a `%`.
+            (
+                "GET",
+                "/hives/motherbee/vault/secrets/infra%3Aopenai/metadata",
+                "vault_get_metadata",
+                json!({ "key": "infra:openai" }),
+            ),
+            (
+                "GET",
+                "/hives/motherbee/vault/secrets/infra%253Aopenai/metadata",
+                "vault_get_metadata",
+                json!({ "key": "infra%3Aopenai" }),
+            ),
+        ] {
+            let translated = translate(method, path);
+            assert_eq!(translated.action, action, "{path}");
+            assert_eq!(translated.params, params, "{path}");
+        }
+        // Split before it is decoded: an encoded `/` never makes a path another route's.
+        assert!(translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/worker1/nodes%2FAI.sales%40worker1/status")
+        )
+        .is_err());
     }
 
     /// FINDINGS A-279: Archi's read tool names the timer list among the lists that answer in pages,

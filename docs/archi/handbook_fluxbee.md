@@ -1972,6 +1972,19 @@ installation answer in pages:
   (`/hives/motherbee/commands?limit=`, the steps with origin `executor`); the run's full log is on
   the motherbee at `outcome.log_path`. Never run the plan again to see its answer.
 
+### 10.1.2 Encoded names and values in a path
+
+A path you read (or an operator's SCMD) may carry values encoded as a URL encodes them:
+
+- Each path segment and each query value is decoded once:
+  `/hives/worker1/nodes/AI.sales%40worker1/status` reads `AI.sales@worker1`, and a cursor written
+  with `%3A` is that cursor. Never encode a value twice: `%2540` is `%40`, never `@`.
+- A `+` stays a `+`, in the path and in the query: write an RFC 3339 offset as it is
+  (`/hives/motherbee/usage?from=2026-11-01T00:00:00+01:00&to=2026-11-08T00:00:00+01:00`).
+- A `%2F` stays inside its segment: it never splits the path.
+- A `%` without two hex digits after it goes as it came: the name it is in is refused or matches
+  nothing.
+
 ### 10.2 Prefer existing platform primitives
 
 Prefer:

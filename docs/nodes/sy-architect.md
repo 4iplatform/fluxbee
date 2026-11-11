@@ -117,6 +117,17 @@ the method and path to one admin action, sent as `ADMIN_COMMAND` to `SY.admin@<h
 `GET /architect/control/config-get` and `POST /architect/control/config-set`
 (`handle_local_architect_scmd`). `SCMD: help` lists the forms.
 
+Each segment of the path is percent-decoded once, after the path is split, as SY.admin's HTTP
+routes decode theirs (`translate_scmd`, FINDINGS A-287): in
+`/hives/worker1/nodes/AI.sales%40worker1/status` the node is `AI.sales@worker1`, a `%2F` stays
+inside its segment (one route prefix, never two segments), and the vault key of
+`/hives/{hive}/vault/secrets/{key}/metadata` is decoded once, never twice. A `%` without two hex
+digits after it goes as it came, as in the query: no node name holds a `%`, so the node's hive
+refuses it (`invalid node_name`). A `+` stays a `+`, as in the query, where SY.admin's routes read
+one in a path segment as a space; no node, runtime, hive or vault key name holds either. Before
+0.1.136 each segment went as it came, but the vault key's: a node name written `%40` matched no
+node through Archi, and worked over SY.admin's route.
+
 An SCMD typed by the operator runs immediately; a mutating action is recorded in the
 `operations` table (`handle_scmd`, `execute_tracked_admin_translation`).
 `DELETE /hives/{hive}/taps` names its tap (`match_src`, `match_dst`, `target`) in the body or, as
@@ -145,10 +156,13 @@ installation's versions `?versions_limit=&versions_before=` (`/installation`, `/
 (`scmd_page_params`, `scmd_vault_list_params`, and `scmd_timer_list_params`, whose `limit` goes
 only when it is a number, as on SY.admin's route). Every query value of an SCMD read is
 percent-decoded once, where the query is read (`scmd_query_params`, FINDINGS A-279), as SY.admin's
-own HTTP routes decode theirs: a cursor written with `%3A`, or an owner with `%40`, reaches SY.admin
-as it does written raw; an escape that is none goes as it came, and `+` reads as a space, where
-SY.admin's routes keep it. The path's description tells the model to follow `next_cursor`, and on
-`REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages));
+own HTTP routes decode theirs (`parse_query`): a cursor written with `%3A`, or an owner with `%40`,
+reaches SY.admin as it does written raw; an escape that is none goes as it came, and a `+` stays a
+`+` (`percent_decode`, FINDINGS A-286), so `?from=2026-11-01T00:00:00+01:00` is that time. Before
+0.1.136 a `+` read as a space, and SY.storage refused that `from` as no RFC 3339 time. Archi's own
+HTTP API (`/api/...`) reads a `+` in its query as a space (`query_param`). The path's description
+tells the model to follow `next_cursor`, and on `REPLY_TOO_LARGE` to ask again with
+`error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages));
 of the timer list, SY.timer's own page, it says that it gives 100 timers without a `limit` (`limit`
 up to 1000), `next_cursor` while timers follow and no `total`, and that a cursor that is not one
 (`<fire_at_utc_ms>:<uuid>`) is refused with `TIMER_INVALID_PAYLOAD` (HTTP 400 on SY.admin's route;
