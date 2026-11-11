@@ -4277,17 +4277,20 @@ async fn handle_wan_message(
 /// `FRAME_TOO_LARGE`, `VPN_BLOCKED`, no TTL left) and waited out its own timeout, and one that
 /// counts no answer as delivered (SY.timer) counted it delivered.
 ///
-/// The answer goes on, one hop of its TTL taken off, only:
+/// The answer goes on, one hop of its TTL taken off, only (`far_answer_link`):
 /// - when the router of `peer_hive` made it, its `src` being that router's UUID: a node's notice,
 ///   or an answer another router made, never travels on, so no answer is relayed twice;
 /// - with a hop of TTL left;
 /// - to the hive whose own LSA lists its destination (`find_remote_node`, which resolves a UUID two
 ///   hives list, a stale hive's node or this hive's own to none), and never back to `peer_hive`.
 ///
-/// Anything else is dropped without a word, as before. It is one of the router's own frames: on a
-/// full link it is skipped, and no one is answered. A spoke hands nothing on: its only peer is the
-/// hub, whose answers are for its own nodes, and an answer the hub relays was made by another
-/// router. No router answers a tap copy (A-209), so no answer to one comes this way either.
+/// Anything else is dropped, counted and logged with its reason at most once every 30 s
+/// (`far_answer_dropped`, A-245's review), so a sender that waits out its timeout leaves a trace
+/// on the hub; until 0.1.131 it was dropped without a word. An answer handed on gets a debug line.
+/// It is one of the router's own frames: on a full link it is skipped, counted in the link's
+/// `LINK_BUSY` line, and no one is answered. A spoke hands nothing on: its only peer is the hub,
+/// whose answers are for its own nodes, and an answer the hub relays was made by another router.
+/// No router answers a tap copy (A-209), so no answer to one comes this way either.
 async fn relay_far_answer(
     ctx: &WanContext,
     msg: &Message,
@@ -4295,27 +4298,115 @@ async fn relay_far_answer(
     peer_hive: &str,
     peer_router_uuid: Uuid,
 ) -> Result<(), RouterError> {
-    if Uuid::parse_str(&msg.routing.src).ok() != Some(peer_router_uuid) || msg.routing.ttl <= 1 {
-        return Ok(());
+    let (sender_hive, link) =
+        match far_answer_link(ctx, msg, dst_uuid, peer_hive, peer_router_uuid).await {
+            Ok(found) => found,
+            Err(reason) => {
+                far_answer_dropped(msg, dst_uuid, peer_hive, reason);
+                return Ok(());
+            }
+        };
+    let mut relayed = msg.clone();
+    relayed.routing.ttl -= 1;
+    if link.queue_own(serde_json::to_vec(&relayed)?) {
+        tracing::debug!(
+            answer = msg.meta.msg.as_deref().unwrap_or("-"),
+            from_hive = %peer_hive,
+            to_hive = %sender_hive,
+            sender = %dst_uuid,
+            trace_id = %msg.routing.trace_id,
+            "router handed another router's answer on toward its sender's hive"
+        );
+    }
+    Ok(())
+}
+
+// Why the hub does not hand an `UNREACHABLE` or `TTL_EXCEEDED` from the WAN on (`far_answer_link`),
+// in the line that says so (`far_answer_dropped`).
+/// Its `src` is not the router of the link it came in on: a node's notice, or an answer a hub has
+/// already handed on (on a spoke, every answer for a node that is not its own).
+const FAR_ANSWER_NOT_THE_PEER_ROUTERS: &str = "not_made_by_the_peer_router";
+/// It has no hop of TTL left (`ttl <= 1`).
+const FAR_ANSWER_NO_TTL_LEFT: &str = "no_ttl_left";
+/// No hive's LSA lists its destination, or a stale hive's does, or two hives do, or this hive does
+/// (`find_remote_node`).
+const FAR_ANSWER_SENDER_NOT_LISTED: &str = "sender_not_listed";
+/// The hive that answered lists its destination: the answer would go back where it came from.
+const FAR_ANSWER_SENDER_ON_THE_ANSWERING_HIVE: &str = "sender_on_the_answering_hive";
+/// There is no WAN link to the hive whose LSA lists its destination.
+const FAR_ANSWER_NO_LINK: &str = "no_link_to_the_senders_hive";
+
+/// The hive `relay_far_answer` hands `msg` on to, with that hive's link, or why it does not
+/// (`FAR_ANSWER_*`).
+async fn far_answer_link(
+    ctx: &WanContext,
+    msg: &Message,
+    dst_uuid: Uuid,
+    peer_hive: &str,
+    peer_router_uuid: Uuid,
+) -> Result<(String, LinkSender), &'static str> {
+    if Uuid::parse_str(&msg.routing.src).ok() != Some(peer_router_uuid) {
+        return Err(FAR_ANSWER_NOT_THE_PEER_ROUTERS);
+    }
+    if msg.routing.ttl <= 1 {
+        return Err(FAR_ANSWER_NO_TTL_LEFT);
     }
     let sender_hive = {
         let snapshot = ctx.lsa_snapshot.lock().await;
         find_remote_node(&snapshot, dst_uuid).map(|node| node.next_hop_hive)
-    };
-    let Some(sender_hive) = sender_hive.filter(|hive| hive != peer_hive) else {
-        return Ok(());
-    };
+    }
+    .ok_or(FAR_ANSWER_SENDER_NOT_LISTED)?;
+    if sender_hive == peer_hive {
+        return Err(FAR_ANSWER_SENDER_ON_THE_ANSWERING_HIVE);
+    }
     let link = {
         let wan_peers = ctx.wan_peers.lock().await;
         wan_peers.get(&sender_hive).map(|peer| peer.sender.clone())
-    };
-    let Some(link) = link else {
-        return Ok(());
-    };
-    let mut relayed = msg.clone();
-    relayed.routing.ttl -= 1;
-    link.queue_own(serde_json::to_vec(&relayed)?);
-    Ok(())
+    }
+    .ok_or(FAR_ANSWER_NO_LINK)?;
+    Ok((sender_hive, link))
+}
+
+/// Answers from the WAN, for none of this router's nodes, that it did not hand on, process-wide
+/// (`relay_far_answer`). Each line about them carries the total; at most one line per interval.
+static FAR_ANSWERS_DROPPED: AtomicU64 = AtomicU64::new(0);
+static FAR_ANSWERS_DROPPED_LOGGED_AT_MS: AtomicU64 = AtomicU64::new(0);
+const FAR_ANSWERS_DROPPED_LOG_INTERVAL_MS: u64 = 30_000;
+
+/// Counts an `UNREACHABLE` or `TTL_EXCEEDED` from `from_hive` for `sender`, a node that is not this
+/// router's, which `relay_far_answer` does not hand on, and says so with `reason`, at most once
+/// every 30 s with the count since the start. The line names the answer, what it refused and why,
+/// and its trace_id.
+fn far_answer_dropped(msg: &Message, sender: Uuid, from_hive: &str, reason: &'static str) {
+    let dropped_total = FAR_ANSWERS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_epoch_ms();
+    let last = FAR_ANSWERS_DROPPED_LOGGED_AT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= FAR_ANSWERS_DROPPED_LOG_INTERVAL_MS
+        && FAR_ANSWERS_DROPPED_LOGGED_AT_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let payload_field = |field: &str| {
+            msg.payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+                .to_string()
+        };
+        tracing::warn!(
+            answer = msg.meta.msg.as_deref().unwrap_or("-"),
+            answer_reason = %payload_field("reason"),
+            original_dst = %payload_field("original_dst"),
+            from_hive,
+            answered_by = %msg.routing.src,
+            sender = %sender,
+            trace_id = %msg.routing.trace_id,
+            reason,
+            dropped_total,
+            "router dropped another router's answer from the WAN: it is for none of its nodes, and \
+             it does not hand it on"
+        );
+    }
 }
 
 /// What a router a message reached over IRP or the WAN answers its sender, of what its local
@@ -15832,8 +15923,9 @@ mod tests {
     /// A-245: what the hub does not hand on goes nowhere, as before, back to worker1 least of all:
     /// an answer worker1's router did not make (a node's, another router's); one for a node of
     /// worker1 itself, for a node no hive lists, a stale hive's, one whose UUID two hives list, or
-    /// a node of a hive the hub has no link to; one with no hop of TTL left. On a full link the
-    /// answer is skipped, and no one is answered for it.
+    /// a node of a hive the hub has no link to; one with no hop of TTL left. Each is counted, under
+    /// its reason, for the line that says so (A-245's review). On a full link the answer is
+    /// skipped, and no one is answered for it.
     #[tokio::test]
     async fn a_far_answer_the_hub_cannot_hand_on_goes_nowhere() {
         let sender = Uuid::new_v4();
@@ -15862,36 +15954,85 @@ mod tests {
             answer.routing.ttl = ttl;
             answer
         };
-        for (case, msg) in [
+        for (case, src, dst, ttl, reason) in [
             (
                 "made by a node of worker1",
-                answer(worker1_node, sender, 16),
+                worker1_node,
+                sender,
+                16,
+                FAR_ANSWER_NOT_THE_PEER_ROUTERS,
             ),
-            ("made by another router", answer(Uuid::new_v4(), sender, 16)),
+            (
+                "made by another router",
+                Uuid::new_v4(),
+                sender,
+                16,
+                FAR_ANSWER_NOT_THE_PEER_ROUTERS,
+            ),
             (
                 "for a node of worker1 itself",
-                answer(worker1_router, worker1_node, 16),
+                worker1_router,
+                worker1_node,
+                16,
+                FAR_ANSWER_SENDER_ON_THE_ANSWERING_HIVE,
             ),
             (
                 "for a node no hive lists",
-                answer(worker1_router, Uuid::new_v4(), 16),
+                worker1_router,
+                Uuid::new_v4(),
+                16,
+                FAR_ANSWER_SENDER_NOT_LISTED,
             ),
             (
                 "for a node of a stale hive",
-                answer(worker1_router, stale, 16),
+                worker1_router,
+                stale,
+                16,
+                FAR_ANSWER_SENDER_NOT_LISTED,
             ),
             (
                 "for a UUID two hives list",
-                answer(worker1_router, contested, 16),
+                worker1_router,
+                contested,
+                16,
+                FAR_ANSWER_SENDER_NOT_LISTED,
             ),
             (
                 "for a node of a hive with no link",
-                answer(worker1_router, unlinked, 16),
+                worker1_router,
+                unlinked,
+                16,
+                FAR_ANSWER_NO_LINK,
             ),
-            ("with one hop of TTL", answer(worker1_router, sender, 1)),
-            ("with no TTL", answer(worker1_router, sender, 0)),
+            (
+                "with one hop of TTL",
+                worker1_router,
+                sender,
+                1,
+                FAR_ANSWER_NO_TTL_LEFT,
+            ),
+            (
+                "with no TTL",
+                worker1_router,
+                sender,
+                0,
+                FAR_ANSWER_NO_TTL_LEFT,
+            ),
         ] {
+            let msg = answer(src, dst, ttl);
+            assert_eq!(
+                far_answer_link(&hub.ctx, &msg, dst, "worker1", worker1_router)
+                    .await
+                    .err(),
+                Some(reason),
+                "{case}"
+            );
+            let dropped_before = FAR_ANSWERS_DROPPED.load(Ordering::Relaxed);
             hub.hears_from_worker1(&msg).await;
+            assert!(
+                FAR_ANSWERS_DROPPED.load(Ordering::Relaxed) > dropped_before,
+                "{case}: counted"
+            );
             for (hive, link) in [
                 ("ingress1", &mut hub.to_ingress1),
                 ("worker1", &mut hub.to_worker1),
@@ -15937,17 +16078,24 @@ mod tests {
                 router_uuid: hub_router,
             },
         );
-        for (case, src, dst) in [
-            ("the hub's, for a node of the hub", hub_router, hub_node),
+        for (case, src, dst, reason) in [
+            (
+                "the hub's, for a node of the hub",
+                hub_router,
+                hub_node,
+                FAR_ANSWER_SENDER_ON_THE_ANSWERING_HIVE,
+            ),
             (
                 "the hub's, for a node no one lists",
                 hub_router,
                 Uuid::new_v4(),
+                FAR_ANSWER_SENDER_NOT_LISTED,
             ),
             (
                 "another spoke's router's, relayed",
                 Uuid::new_v4(),
                 Uuid::new_v4(),
+                FAR_ANSWER_NOT_THE_PEER_ROUTERS,
             ),
         ] {
             let answer = build_unreachable(
@@ -15956,6 +16104,13 @@ mod tests {
                 &Uuid::new_v4().to_string(),
                 "IO.y@worker1",
                 "NODE_NOT_FOUND",
+            );
+            assert_eq!(
+                far_answer_link(&spoke, &answer, dst, "motherbee", hub_router)
+                    .await
+                    .err(),
+                Some(reason),
+                "{case}"
             );
             handle_wan_message(
                 &answer,

@@ -58,7 +58,8 @@ Separate three things that are conflated today: **data** (which node lives on wh
 - Since 0.1.131 (FINDINGS A-245) the hub also hands a far spoke's `UNREACHABLE` or `TTL_EXCEEDED`
   on toward the spoke of the sender it is for (`relay_far_answer`), so a sender on one spoke hears
   a refusal from another, as between any other two hives. Only an answer the adjacent router made
-  itself goes on, and never back where it came from.
+  itself goes on, and never back where it came from; one it does not hand on is counted and
+  logged with the reason.
 - Each spoke ingests into a **new `reachability` table** (`Arc<Mutex<HashMap<Uuid,
   ReachabilityEntry>>>`), kept SEPARATE from `lsa_state`/the LSA SHM snapshot so the
   identity-bearing snapshot is never polluted. Each `ReachabilityEntry` carries `{ name,

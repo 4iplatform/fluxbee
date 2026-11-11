@@ -291,7 +291,9 @@ its own timeout. A tap copy gets none, on any router (§8.3).
   hub does not hand on (§3.6): its `src` is not the router of the link it came in on; it has no
   hop of TTL left (`ttl <= 1`); no hive's LSA lists its destination, or a stale hive's does, or two
   hives do, or the hive that answered does; or the hub has no link to that hive. On a spoke every
-  such error is dropped: its one link is the hub's;
+  such error is dropped: its one link is the hub's. Each is counted and logged, at most every 30 s,
+  as `router dropped another router's answer from the WAN: it is for none of its nodes, and it
+  does not hand it on`, with its trace_id and the reason (`far_answer_dropped`, A-245's review);
 - a tap copy that cannot be delivered (§8.3);
 - `STREAM_APPEND`, `OPA_RELOAD` and `WITHDRAW`, which the router consumes; `WITHDRAW` also closes the
   node's connection.

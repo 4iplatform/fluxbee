@@ -160,7 +160,12 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
     less, when the far router made it itself; never back where it came from, and never twice
     (`relay_far_answer`). Until 0.1.131 the hub gave it only to its own nodes, and a sender on
     another spoke waited out its own timeout, or, as SY.timer does when no answer comes in 30 s,
-    counted the message delivered.
+    counted the message delivered. An answer the router does not hand on is counted and logged, at
+    most every 30 s, as `router dropped another router's answer from the WAN: it is for none of its
+    nodes, and it does not hand it on`, with its trace_id and the reason:
+    `not_made_by_the_peer_router`, `no_ttl_left`, `sender_not_listed`,
+    `sender_on_the_answering_hive` or `no_link_to_the_senders_hive`. One handed on gets a debug
+    line.
 
 ## Routing
 
