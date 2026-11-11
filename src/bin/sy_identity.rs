@@ -7317,15 +7317,11 @@ fn normalize_tenant_domain(value: Option<&str>) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
-/// `<prefix>:<uuid>` in its one canonical spelling: lowercase and hyphenated, with nothing around
-/// it. The store keys every id by its string and the database by its uuid, so another spelling
-/// (uppercase, no hyphens, braces, spaces) would name a second record in memory and an existing
-/// row in the database, which the upsert would then overwrite. Any other spelling answers
-/// INVALID_REQUEST.
 /// The page an `ILK_LIST` or `TNT_LIST` asks for (FINDINGS A-198): its `limit` and `cursor`, the
 /// cursor an id of the listing's own kind (`prefix`, `ilk` or `tnt`), since each page goes on from
 /// the id the page before ended at. Another listing's cursor answers INVALID_CURSOR, never an empty
-/// page.
+/// page. A refusal names the field and what it takes, never the value (FINDINGS A-232): a link's
+/// key pasted there by mistake would go back with it, into the caller's logs and Archi's provider.
 fn list_page_ask(payload: &Value, prefix: &str) -> Result<PageAsk, Value> {
     let page = PageAsk::from_payload(payload)
         .map_err(|detail| error_payload("INVALID_REQUEST", &detail))?;
@@ -7333,13 +7329,18 @@ fn list_page_ask(payload: &Value, prefix: &str) -> Result<PageAsk, Value> {
         if parse_prefixed_uuid(cursor, prefix).is_err() {
             return Err(error_payload(
                 mesh_reply::INVALID_CURSOR,
-                &format!("cursor {cursor} is not a next_cursor of this listing, a {prefix}:<uuid>"),
+                &format!("cursor is not a next_cursor of this listing, a {prefix}:<uuid>"),
             ));
         }
     }
     Ok(page)
 }
 
+/// `<prefix>:<uuid>` in its one canonical spelling: lowercase and hyphenated, with nothing around
+/// it. The store keys every id by its string and the database by its uuid, so another spelling
+/// (uppercase, no hyphens, braces, spaces) would name a second record in memory and an existing
+/// row in the database, which the upsert would then overwrite. Any other spelling answers
+/// INVALID_REQUEST.
 fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
     let uuid = value
         .strip_prefix(prefix)
@@ -14102,5 +14103,28 @@ mod tests {
         ));
         assert!(store.reconcile_hive_ilks("worker1", vec![moved]).is_empty());
         assert_eq!(store.ilks[&node.ilk_id].tenant_id, LC_TENANT);
+    }
+
+    /// FINDINGS A-232: a listing's refusal of a cursor names the field and what it takes, never
+    /// the value: a link's key pasted there by mistake does not go back.
+    #[test]
+    fn a_listing_s_cursor_refusal_never_repeats_the_cursor() {
+        let key = "3f1c0e9a8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e";
+        for (prefix, cursor) in [
+            ("ilk", key.to_string()),
+            ("ilk", format!("tnt:{}", Uuid::new_v4())),
+            ("tnt", format!("ilk:{}", Uuid::new_v4())),
+            ("ilk", format!("ilk:{}", Uuid::new_v4()).to_uppercase()),
+        ] {
+            let refusal =
+                list_page_ask(&json!({ "limit": 5, "cursor": cursor }), prefix).expect_err(&cursor);
+            assert_eq!(refusal["error_code"], json!(mesh_reply::INVALID_CURSOR));
+            let text = refusal.to_string();
+            assert!(!text.contains(&cursor), "{text}");
+            assert!(text.contains(&format!("{prefix}:<uuid>")), "{text}");
+        }
+        let own = format!("ilk:{}", Uuid::new_v4());
+        let page = list_page_ask(&json!({ "limit": 5, "cursor": own }), "ilk").expect("its own");
+        assert_eq!(page.cursor.as_deref(), Some(own.as_str()));
     }
 }

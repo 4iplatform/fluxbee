@@ -226,6 +226,7 @@ request gets `UNAUTHORIZED_REGISTRAR`.
   limit that is not a whole number from 1, or a cursor that is not a string, answers
   `INVALID_REQUEST`; a cursor that is not the listing's own, `ilk:<uuid>` for `ILK_LIST` and
   `tnt:<uuid>` for `TNT_LIST`, answers `INVALID_CURSOR`, never an empty page (`list_page_ask`).
+  Each refusal names the field and what it takes, never the value sent (FINDINGS A-232).
   Each page rebuilds the listing from the registry and sorts it before it cuts the page, a cost
   that grows with the registry and is paid once a page. SY.admin always asks in pages and
   assembles them ([SY.admin](sy-admin.md#pages)).
