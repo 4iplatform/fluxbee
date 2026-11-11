@@ -66,7 +66,8 @@ use fluxbee_sdk::{
     RpcRequestLabels, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::frontdesk_contract::{
-    FRONTDESK_HANDOFF_MSG, FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1,
+    FrontdeskHandoffPayload, FRONTDESK_HANDOFF_MSG, FRONTDESK_HANDOFF_PAYLOAD_TYPE,
+    FRONTDESK_SCHEMA_VERSION_V1,
 };
 use io_common::frontdesk_gate::{
     frontdesk_response_contract, DEFAULT_FRONTDESK_TARGET, FRONTDESK_OPERATION_REGISTER,
@@ -2173,9 +2174,9 @@ struct RegisterHumanRequest {
 }
 
 /// Validate a `register_human` Cloud request and extract what io.cloud needs. io.cloud owns NO
-/// format decision: it only checks the payload will reach the deterministic frontdesk path
-/// (`type == frontdesk_handoff`) and carries the tenant + email required to provision. On failure it
-/// returns the JSON error to relay straight back to Cloud (the flow dies there).
+/// format decision: it only checks the payload will reach the deterministic frontdesk path (it
+/// parses as the frontdesk's handoff) and carries the tenant + email required to provision. On
+/// failure it returns the JSON error to relay straight back to Cloud (the flow dies there).
 fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest, Value> {
     let Some(mut handoff) = payload.get("params").filter(|v| v.is_object()).cloned() else {
         return Err(cloud_error_code(
@@ -2249,6 +2250,23 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
     // inside. This is the same "root tenant → injected downstream" pattern the relay ops use.
     if let Some(obj) = handoff.as_object_mut() {
         obj.insert("tenant_id".to_string(), Value::String(tenant_id.clone()));
+    }
+    // What goes on must parse as the frontdesk's handoff, read here with that contract's own type
+    // once the tenant_id is in (FINDINGS A-293). The checks above name the usual faults; past them
+    // only a subject field of another type fails (`subject.phone` a number, `subject.attributes`
+    // a list). Such a message would take the frontdesk's conversational path, not its
+    // registration: an LLM turn on the JSON or, while the frontdesk has no model,
+    // `node_not_configured`, retryable, which would read to Cloud as FRONTDESK_UNAVAILABLE on
+    // every attempt.
+    if let Err(err) = serde_json::from_value::<FrontdeskHandoffPayload>(handoff.clone()) {
+        return Err(cloud_error_code(
+            "INVALID_REQUEST",
+            &format!(
+                "params is not a frontdesk_handoff the frontdesk can read (params.subject's \
+                 display_name, email, phone and company_name are strings, its attributes an \
+                 object): {err}"
+            ),
+        ));
     }
     Ok(RegisterHumanRequest {
         handoff,
@@ -2779,6 +2797,50 @@ mod tests {
         assert_eq!(
             ok.handoff.get("operation").and_then(Value::as_str),
             Some("complete_registration")
+        );
+    }
+
+    /// FINDINGS A-293: a handoff the frontdesk cannot parse is refused before anything is created,
+    /// where it went on to the frontdesk's conversational path, whose retryable answers would read
+    /// to Cloud as FRONTDESK_UNAVAILABLE for a request no attempt can register.
+    #[test]
+    fn register_human_refuses_a_handoff_the_frontdesk_cannot_read() {
+        let request = |subject: Value| {
+            json!({
+                "op": "register_human", "tenant_id": TEST_TENANT,
+                "params": {
+                    "type": "frontdesk_handoff", "schema_version": 1,
+                    "operation": "complete_registration", "subject": subject
+                }
+            })
+        };
+        for subject in [
+            json!({"display_name": "Juan Perez", "email": "juan@acme.com", "phone": 5491100000000_u64}),
+            json!({"display_name": ["Juan", "Perez"], "email": "juan@acme.com"}),
+            json!({"display_name": "Juan Perez", "email": "juan@acme.com",
+                   "company_name": {"name": "ACME"}}),
+            json!({"display_name": "Juan Perez", "email": "juan@acme.com", "attributes": ["vip"]}),
+        ] {
+            let Err(err) = parse_register_human_request(&request(subject.clone())) else {
+                panic!("{subject} would reach the frontdesk");
+            };
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{subject}");
+            assert!(
+                err["error_detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("frontdesk_handoff")),
+                "{err}"
+            );
+        }
+        // Every field the frontdesk reads, null where it takes none, and one it does not read.
+        let ok = parse_register_human_request(&request(json!({
+            "display_name": "Juan Perez", "email": "juan@acme.com", "phone": "+54 9 11 0000-0000",
+            "company_name": null, "attributes": {"crm_customer_id": "crm-123"}, "nickname": 7
+        })))
+        .expect("a handoff the frontdesk reads");
+        // What io.cloud forwards is a handoff the frontdesk parses.
+        assert!(
+            io_common::frontdesk_contract::parse_frontdesk_handoff_payload(&ok.handoff).is_some()
         );
     }
 

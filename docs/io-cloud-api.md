@@ -367,9 +367,11 @@ handed out (§5.3, §5.4). The pages its nodes published stay up until they expi
 | `params.type` | required | `"frontdesk_handoff"` |
 | `params.schema_version` | required | `1` (a number) |
 | `params.operation` | required | `"complete_registration"` |
-| `params.subject.display_name` | required | |
+| `params.subject.display_name` | required | a string |
 | `params.subject.email` | required | a real address; the person's key in the tenant |
-| `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity |
+| `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity; strings, `.attributes` an object |
+
+A field of another type is refused with `INVALID_REQUEST` before anything is created.
 
 **One email is one account, in the whole hive.** The person is charged to the tenant at the root;
 their email (the account's `cloud` channel) belongs to no tenant.
@@ -1080,6 +1082,10 @@ post '{"op":"list_cloud_actions"}'
   does: send the request again. It answered `FRONTDESK_REJECTED`, which stays for an error that does
   not say so. Both, and `INVALID_FRONTDESK_RESPONSE`, are listed with what to do (§5.2), and
   `error_detail` starts with the frontdesk's own code.
+- **`register_human` refuses a `subject` field of another type** with `INVALID_REQUEST`, before
+  anything is created: `display_name`, `phone` and `company_name` are strings, `attributes` an
+  object (§5.2). Such a request went on to the frontdesk, which took it for a conversation, not a
+  registration.
 
 ### 0.1.136
 
