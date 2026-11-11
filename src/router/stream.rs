@@ -57,8 +57,8 @@ pub const STREAM_USAGE_QUEUE_RESERVE: usize = 128;
 pub const STREAM_ALARM_INTERVAL_SECS: u64 = 30;
 /// At most this many records too big for a batch are named in the router's journal, each in a
 /// line of its own, every alarm interval; the others are only counted, and the alarm gives their
-/// number a line of its own (A-253). A burst of them costs at most this many lines, and that one,
-/// every interval.
+/// number a line of its own (A-253). A burst of them costs at most this many lines, each of a
+/// bounded size, and that one, every interval.
 pub const STREAM_OVERSIZE_NAMED_PER_INTERVAL: u64 = 10;
 /// How often the disk thread trims what every sink took and saves the cursors.
 const STREAM_HOUSEKEEPING_INTERVAL_MS: u64 = 1_000;
@@ -474,8 +474,7 @@ struct Shared {
 /// others are only counted (A-253). Each such record is counted as `oversize` as well, once.
 #[derive(Debug, Default)]
 struct OversizeNames {
-    /// When the current interval started, and how many were named in it.
-    interval_started_ms: u64,
+    /// How many were named in the current interval, which the alarm opens (`next_interval`).
     named: u64,
     /// Those not named since the start, which the alarm reports by interval.
     unnamed: u64,
@@ -484,11 +483,7 @@ struct OversizeNames {
 impl OversizeNames {
     /// Of `records`, just passed for being too big for a batch, the ones to name: as many as the
     /// interval has room for, in order. The rest are counted as not named.
-    fn take(&mut self, mut records: Vec<Record>, now: u64) -> Vec<Record> {
-        if now.saturating_sub(self.interval_started_ms) >= STREAM_ALARM_INTERVAL_SECS * 1000 {
-            self.interval_started_ms = now;
-            self.named = 0;
-        }
+    fn take(&mut self, mut records: Vec<Record>) -> Vec<Record> {
         let room = usize::try_from(STREAM_OVERSIZE_NAMED_PER_INTERVAL.saturating_sub(self.named))
             .unwrap_or(usize::MAX);
         if records.len() > room {
@@ -497,6 +492,14 @@ impl OversizeNames {
         }
         self.named += records.len() as u64;
         records
+    }
+
+    /// Opens the next interval. The alarm calls it as it reads the count of those not named,
+    /// under the same lock (`AlarmSnapshot::take`), so the interval is the alarm's own: at most
+    /// `STREAM_OVERSIZE_NAMED_PER_INTERVAL` are named between two of its lines, and a step of the
+    /// wall clock changes nothing.
+    fn next_interval(&mut self) {
+        self.named = 0;
     }
 }
 
@@ -645,7 +648,7 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> (BatchPlan, Vec<Reco
     }
     shared.usage_lost += usage_lost;
     let oversize_count = oversize.len() as u64;
-    let to_name = shared.oversize_names.take(oversize, now);
+    let to_name = shared.oversize_names.take(oversize);
     let state = shared.sinks.entry(sink.to_string()).or_default();
     state.expired += expired;
     state.oversize += oversize_count;
@@ -700,21 +703,45 @@ fn record_ids(payload: &[u8]) -> (Option<String>, Option<String>) {
     )
 }
 
+/// The most of a producer, a trace_id or a thread_id that the line naming a record holds. Nothing
+/// bounds a message's `meta.thread_id`, a unicast's `routing.trace_id` or a node's name, so without
+/// the cut each line could hold most of its record, about 95 KiB, and the lines of one interval
+/// about a megabyte (A-253's review).
+const NAMED_FIELD_MAX_BYTES: usize = 128;
+
+/// `text` as the line naming a record shows it: quoted and escaped as `Debug` does, so a newline or
+/// a quote in it can end neither the line, to start a forged one, nor the field. One longer than
+/// `NAMED_FIELD_MAX_BYTES` is cut at the last char boundary within them, its full length after the
+/// quotes.
+fn shown_field(text: &str) -> String {
+    if text.len() <= NAMED_FIELD_MAX_BYTES {
+        return format!("{text:?}");
+    }
+    let mut end = NAMED_FIELD_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}... ({} bytes)", &text[..end], text.len())
+}
+
 /// Names in the router's journal a record its stream dropped for being too big for a batch, which
 /// its sink never gets (A-253): the sink, the subject, the producer, the trace_id and thread_id
 /// when it has them, its size and the most it could have had. Its sender calls it, outside the
 /// lock, for the ones `plan_batch` gave it, at most `STREAM_OVERSIZE_NAMED_PER_INTERVAL` every
-/// alarm interval. Until 0.1.132 such a record was only counted, in the alarm line, and nobody
-/// could tell which conversation's turn was missing from `turns` and cognition.
+/// alarm interval, and the line is bounded: the producer and the ids come quoted and escaped, each
+/// cut at `NAMED_FIELD_MAX_BYTES` (`shown_field`). Until 0.1.132 such a record was only counted, in
+/// the alarm line, and nobody could tell which conversation's turn was missing from `turns` and
+/// cognition.
 fn name_oversize_record(stream: &str, sink: &str, record: &Record) {
     let (trace_id, thread_id) = record_ids(&record.payload);
+    let shown_id = |id: Option<String>| id.as_deref().map_or_else(|| "-".to_string(), shown_field);
     tracing::warn!(
         stream = %stream,
         sink = %sink,
         subject = %record.subject,
-        producer = %record.producer,
-        trace_id = %trace_id.as_deref().unwrap_or("-"),
-        thread_id = %thread_id.as_deref().unwrap_or("-"),
+        producer = %shown_field(&record.producer),
+        trace_id = %shown_id(trace_id),
+        thread_id = %shown_id(thread_id),
         seq = record.seq,
         bytes = record.payload.len(),
         max_bytes = largest_payload(record),
@@ -1288,10 +1315,14 @@ struct AlarmSnapshot {
 }
 
 impl AlarmSnapshot {
+    /// The counters now. Under the lock it reads how many records too big for a batch were not
+    /// named with, it opens the next interval for naming them (`OversizeNames::next_interval`,
+    /// A-253's review).
     fn take(counters: &Counters, shared: &Arc<StdMutex<Shared>>) -> Self {
         let (expired, oversize, sink_usage_lost, oversize_unnamed) = shared
             .lock()
-            .map(|shared| {
+            .map(|mut shared| {
+                shared.oversize_names.next_interval();
                 let (expired, oversize) = shared.sinks.values().fold((0, 0), |(e, o), state| {
                     (e + state.expired, o + state.oversize)
                 });
@@ -2067,7 +2098,9 @@ mod tests {
     /// A-253: the records too big for a batch are handed to their sender to name, at most
     /// `STREAM_OVERSIZE_NAMED_PER_INTERVAL` every alarm interval and in order; the others are
     /// counted as not named. Each is counted as oversize once, and named at most once: a plan
-    /// that passes nothing new names nothing. The next interval names again.
+    /// that passes nothing new names nothing. The interval is the alarm's (A-253's review): the
+    /// wall clock, however far it goes, opens no other, and the alarm's next line, which reports
+    /// those not named, does: it names again.
     #[test]
     fn records_too_big_for_a_batch_are_named_at_most_so_often() {
         let now = 1_000_000_000;
@@ -2099,22 +2132,33 @@ mod tests {
         assert_eq!(shared.sinks[sink].oversize, limit + 3);
         assert_eq!(shared.oversize_names.unnamed, 3);
 
-        // The next interval names again.
-        let later = now + STREAM_ALARM_INTERVAL_SECS * 1000;
+        // Two alarm intervals later on the wall clock, with no alarm line between: not named.
+        let later = now + 2 * STREAM_ALARM_INTERVAL_SECS * 1000;
         shared
             .records
             .push_back(record(limit + 4, later, SUBJECT_STORAGE_TURNS, &big));
         let (_, named) = plan_batch(&mut shared, sink, later);
+        assert!(named.is_empty(), "the wall clock opens no interval");
+
+        // The alarm's line reports the four not named and opens the next interval: named again.
+        let shared = Arc::new(StdMutex::new(shared));
+        let alarm = AlarmSnapshot::take(&Counters::default(), &shared);
+        assert_eq!((alarm.oversize, alarm.oversize_unnamed), (limit + 4, 4));
+        let mut shared = shared.lock().expect("the log");
+        shared
+            .records
+            .push_back(record(limit + 5, later, SUBJECT_STORAGE_TURNS, &big));
+        let (_, named) = plan_batch(&mut shared, sink, later);
         assert_eq!(
             named.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            vec![limit + 4]
+            vec![limit + 5]
         );
     }
 
     /// A-253: the line that names a record too big for a batch gives its sink, subject and
     /// producer, the trace_id and thread_id it carries (a turn's copy those of its message, a usage
-    /// record its own), and its size against the most it could have had; `-` for an id it lacks.
-    /// It is not the alarm line `ops.py health` sums.
+    /// record its own), and its size against the most it could have had; the producer and the ids
+    /// quoted, `-` for an id it lacks. It is not the alarm line `ops.py health` sums.
     #[test]
     fn a_record_too_big_for_a_batch_is_named_with_its_trace_and_thread() {
         let turn = json!({
@@ -2147,9 +2191,9 @@ mod tests {
                 "router stream dropped a record too big for a batch".to_string(),
                 "sink=SY.storage@motherbee".to_string(),
                 format!("subject={}", record.subject),
-                "producer=AI.sales@worker1".to_string(),
-                format!("trace_id={trace_id}"),
-                format!("thread_id={thread_id}"),
+                "producer=\"AI.sales@worker1\"".to_string(),
+                format!("trace_id=\"{trace_id}\""),
+                format!("thread_id=\"{thread_id}\""),
                 format!("bytes={}", record.payload.len()),
                 format!("max_bytes={}", largest_payload(&record)),
             ] {
@@ -2168,6 +2212,57 @@ mod tests {
             line.contains("trace_id=-") && line.contains("thread_id=-"),
             "{line}"
         );
+    }
+
+    /// A-253's review: the line naming a record is bounded, and forges no other. The record's
+    /// thread_id holds most of its bytes and starts with a newline and the alarm line `ops.py
+    /// health` sums; its trace_id is long too, with a 2-byte char across the cut; its producer, a
+    /// node's name, as long. The line stays one line, under 1 KiB: each of the three is cut at
+    /// `NAMED_FIELD_MAX_BYTES`, at a char boundary, its full length after the quotes, and the
+    /// newline is escaped inside them.
+    #[test]
+    fn the_line_naming_a_record_is_bounded_and_forges_no_other() {
+        let forged = format!(
+            "\nrouter stream lost records in the last 30 s: oversize: 99999{}",
+            "x".repeat(STREAM_BATCH_MAX_BYTES / 2)
+        );
+        let trace_id = format!("a{}", "ñ".repeat(STREAM_BATCH_MAX_BYTES / 8));
+        let producer = format!("AI.{}@worker1", "p".repeat(STREAM_BATCH_MAX_BYTES / 8));
+        let turn = json!({
+            "routing": {"src": "a", "dst": "b", "ttl": 16, "trace_id": trace_id},
+            "meta": {"type": "user", "thread_id": forged},
+            "payload": {"type": "text", "content": "x"},
+        });
+        let record = Record {
+            producer: Arc::from(producer.as_str()),
+            ..record(7, 0, SUBJECT_STORAGE_TURNS, &turn.to_string())
+        };
+        let line = journal_of(|| {
+            name_oversize_record("RT.gateway.stream@worker1", "SY.storage@motherbee", &record)
+        });
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.len() < 1_024, "{} bytes: {line}", line.len());
+        assert!(
+            line.contains(r#"thread_id="\nrouter stream lost records in the last 30 s: "#),
+            "{line}"
+        );
+        // "a" and then 2-byte chars: the cut at 128 bytes falls inside one and goes back to 127.
+        let kept = format!("a{}", "ñ".repeat((NAMED_FIELD_MAX_BYTES - 1) / 2));
+        for part in [
+            format!(
+                "thread_id={:?}... ({} bytes)",
+                &forged[..NAMED_FIELD_MAX_BYTES],
+                forged.len()
+            ),
+            format!("trace_id={kept:?}... ({} bytes)", trace_id.len()),
+            format!(
+                "producer={:?}... ({} bytes)",
+                &producer[..NAMED_FIELD_MAX_BYTES],
+                producer.len()
+            ),
+        ] {
+            assert!(line.contains(&part), "{part} in {line}");
+        }
     }
 
     /// A-253: the most a record may have, as its line gives it, is what a batch takes: a payload
