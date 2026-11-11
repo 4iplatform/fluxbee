@@ -1332,7 +1332,7 @@ design chat; the build design is §5.4.10, the review round §5.4.11, and the ga
 - **"Not taken" is the engine's answer `NOT_TAKEN`,** a system message to the sender, with a reason:
   `no_conversation`, `not_expected`, `invalid_input` or `no_thread`. It takes `INVALID_INPUT`'s
   place.
-  - *Changed by A-217 (0.1.123):* a fifth reason, `unavailable`: the WF node cannot use its
+  - *Changed by A-217 (0.1.125):* a fifth reason, `unavailable`: the WF node cannot use its
     instance store, and takes no message until it can. Any other sender gets it for a named
     request, as `no_thread` and `invalid_input`.
 - **The IO node shows it to whoever wrote, as an error.** io.slack posts a message that only that
@@ -1434,7 +1434,7 @@ Read in the code on 2026-11-02, at `3d9325b4`. Five pieces; the contracts betwee
       instance's log keeps today's `unhandled event` entry.
   - **To any other sender,** only a named request gets it (`neverAnswered`), for `no_thread` and
     `invalid_input`, as `INVALID_INPUT` today.
-  - *Changed by A-217 (0.1.123):* and `unavailable`, to both, while the WF node cannot use its
+  - *Changed by A-217 (0.1.125):* and `unavailable`, to both, while the WF node cannot use its
     instance store (§5.4.6).
   - `isReply` takes `NOT_TAKEN` instead of `INVALID_INPUT`, so it never starts an instance and is
     never answered.
