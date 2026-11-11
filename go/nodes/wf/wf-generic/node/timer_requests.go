@@ -209,8 +209,9 @@ func (actx ActionContext) timerRequestSent(ctx context.Context, req timerRequest
 }
 
 // refuseTimer marks timer ref of the index refused, saying why, to go again after timerResendDelay
-// of the times it went again already, or at its fire_at when that comes first. A timer no longer in
-// the index (the instance cancelled it, took its fire, or ended) is left alone.
+// of the times it went again already, or, once SY.timer could no longer take it at its time, to be
+// fired by the node itself at its fire_at (resendTime). A timer no longer in the index (the instance
+// cancelled it, took its fire, or ended) is left alone.
 func refuseTimer(ctx context.Context, actx ActionContext, ref timerRef, why string) error {
 	row, ok, err := actx.Store.GetTimerForInstance(ctx, ref.instanceID, ref.timerKey)
 	if err != nil {

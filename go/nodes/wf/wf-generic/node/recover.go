@@ -412,8 +412,11 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 		case existsInSY && syTimer.FireAtUTCMS > now && row.FireAtMS > now:
 			// Pending, fire_at ahead: SY.timer has it. A refusal of it is settled (FINDINGS A-254),
 			// unless SY.timer holds it later than its time, a move it did not take: it goes to its
-			// time (timerHeld, A-254's review).
-			rt.timerHeld(ctx, timerRef{row.InstanceID, row.TimerKey}, syTimer.FireAtUTCMS)
+			// time (timerHeld, A-254's review). The timer of an instance that no longer runs is left
+			// alone: its fire is dropped as an orphan's, and a mark of it goes on the loop's tick.
+			if running {
+				rt.timerHeld(ctx, timerRef{row.InstanceID, row.TimerKey}, syTimer.FireAtUTCMS)
+			}
 
 		case existsInSY:
 			// Pending, and its time has come: SY.timer's, or the index's when SY.timer holds it later
