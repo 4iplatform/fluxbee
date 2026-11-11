@@ -156,7 +156,7 @@ Every AI agent loads the same base tools: beyond answering, an agent can do only
 2. Show the operator the checked definition.
 3. Deploy it with `fluxbee_plan_compiler` (`wf_rules_compile_apply`, with `auto_spawn=true` and the `tenant_id` its node runs in: the node is spawned when it does not exist, and an update is that one step, which restarts the node). The operator confirms the plan.
 
-A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs, a stopped WF node's too: tell the operator how many run before you stage `wf_rules_delete`. Without `force: true` it is refused while instances run (INSTANCES_ACTIVE) and while the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: start the node or wait for it, or remove it with force). ORCHESTRATOR_ERROR, with force too, changed nothing: ask again.
+A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs, a stopped WF node's too: tell the operator how many run before you stage `wf_rules_delete`. Without `force: true` it is refused while instances run (INSTANCES_ACTIVE) and while the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why): start the node or wait for it, or remove it with force once the operator accepts ending the conversations it keeps, their number unknown. With force too, an ORCHESTRATOR_ERROR from the node's config read (it says nothing was changed) changed nothing: ask again. Any other ORCHESTRATOR_ERROR may come from the node's kill, which may have stopped or removed the node: read the workflow's status (`GET /hives/{hive}/wf-rules/status?workflow_name=`), then ask again.
 
 ## Pipeline confirmation rules
 
@@ -195,6 +195,7 @@ Do not ask multiple clarifying questions. If the task is reasonably clear, choos
 
 - Be direct and operational. Prefer short concrete answers.
 - Do not claim actions ran unless they actually did.
+- A node's `lifecycle_state` `UNKNOWN` is a unit its hive's systemd gave no full answer for, which may run, or a managed node with neither config nor state, which reads `UNKNOWN` every time: never report it as stopped. A step refused with `SERVICE_FAILED` and `retryable: true` did nothing: say so and offer to ask again.
 - When unsure of field names or schemas while answering, inspect `/admin/actions/{action}` — never guess payloads."#.to_string();
 
     if let Some(handbook_text) = handbook.filter(|t| !t.trim().is_empty()) {
@@ -2482,7 +2483,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - Use `restart_node` only when the managed instance already exists and should be restarted.
 - Use `kill_node` to stop a node process. It does not necessarily delete the persisted instance.
 - Use `remove_node_instance` only to delete the persisted managed instance.
-- A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd did not answer. Read it again before you choose; never take it for stopped. `SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or `remove_node_instance` has that cause: nothing was done, and the same step can be asked again.
+- A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd gave no full answer for its unit. Read it again before you choose; never take it for stopped. A managed node with neither config nor state reads `UNKNOWN` every time too, so a read again changes nothing. `SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or `remove_node_instance` is a systemd check with no answer: nothing was done, and the same step can be asked again.
 - Use `publish_runtime_package` to publish a runtime package. It does not spawn nodes.
 
 ### Workflow runtime selection
@@ -2491,7 +2492,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - A `WF.<workflow_name>@<hive>` node must run a published workflow package runtime such as `wf.<workflow_name>`, whose manifest type is `workflow` and whose `runtime_base` is `wf.engine`.
 - To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: with `auto_spawn=true` and `tenant_id` it spawns the node when it does not exist, and without them no node is created; on an existing node it restarts it, so never add a `restart_node` after it. A deploy whose node does not run the definition is refused (`WF_NODE_NOT_DEPLOYED`, its `wf_node` says why): the definition is current, and the deploy is not done.
 - The definition was checked before it reached you (`wf_rules_check`, a read that stages nothing): `wf_rules_check` is never an executor step.
-- `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE), or whose WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: a node that is not RUNNING keeps its instances); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them. A config read of the WF node with no answer refuses it with `force` too (ORCHESTRATOR_ERROR), and nothing changes.
+- `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE), or whose WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: a node that is not RUNNING keeps its instances); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them. A config read of the WF node with no answer refuses it with `force` too (ORCHESTRATOR_ERROR, saying nothing was changed), and nothing changes; an ORCHESTRATOR_ERROR from the node's kill may have stopped or removed the node: read the workflow's status (`wf_rules_get_status`) before you stage the delete again.
 - `wf_cancel_instance` cancels one instance of a WF node (hive, node_name `WF.<workflow_name>`, instance_id, reason): its cancel transition runs.
 - Only use `run_node` for `WF.*` when the concrete `wf.<workflow_name>` workflow package runtime already exists in the runtime manifest.
 
@@ -30407,32 +30408,72 @@ mod tests {
     /// INSTANCES_UNKNOWN, and a config read of the node with no answer is ORCHESTRATOR_ERROR, with
     /// force too. The chat's prompt and the plan compiler's facts say so, where they named running
     /// instances only; and the facts say what a node's UNKNOWN state and a retryable SERVICE_FAILED
-    /// are (A-271): its hive's systemd gave no answer.
+    /// are (A-271): its hive's systemd gave no answer. The review: an ORCHESTRATOR_ERROR is
+    /// "nothing changed" only from the config read, which says so; one from the node's kill (its
+    /// error, SY.wf-rules' wait for kill_node over) may have stopped or removed the node, so the
+    /// workflow's status is read before the delete is asked again. Force ends the conversations a
+    /// node that is not RUNNING keeps, their number unknown, only once the operator accepts it. A
+    /// node's UNKNOWN is also a managed node with neither config nor state, which reads UNKNOWN
+    /// every time; and the chat, which reads the statuses and the plan's answers, says what an
+    /// UNKNOWN and a retryable SERVICE_FAILED are.
     #[test]
     fn archis_texts_say_what_a_workflow_delete_refuses() {
         let chat = build_archi_prompt(None);
         for text in [
             "Removing a workflow ends the conversations it still runs, a stopped WF node's too",
             "Without `force: true` it is refused while instances run (INSTANCES_ACTIVE) and while \
-             the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: start \
-             the node or wait for it, or remove it with force)",
-            "ORCHESTRATOR_ERROR, with force too, changed nothing: ask again",
+             the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why): start \
+             the node or wait for it, or remove it with force once the operator accepts ending the \
+             conversations it keeps, their number unknown.",
+            "With force too, an ORCHESTRATOR_ERROR from the node's config read (it says nothing was \
+             changed) changed nothing: ask again.",
+            "Any other ORCHESTRATOR_ERROR may come from the node's kill, which may have stopped or \
+             removed the node: read the workflow's status \
+             (`GET /hives/{hive}/wf-rules/status?workflow_name=`), then ask again.",
+            "A node's `lifecycle_state` `UNKNOWN` is a unit its hive's systemd gave no full answer \
+             for, which may run, or a managed node with neither config nor state, which reads \
+             `UNKNOWN` every time: never report it as stopped.",
+            "A step refused with `SERVICE_FAILED` and `retryable: true` did nothing: say so and \
+             offer to ask again.",
         ] {
             assert!(chat.contains(text), "{text}");
         }
-        assert!(!chat.contains("with running instances only with `force: true`"));
+        for gone in [
+            "with running instances only with `force: true`",
+            "ORCHESTRATOR_ERROR, with force too, changed nothing",
+            "or remove it with force)",
+        ] {
+            assert!(!chat.contains(gone), "{gone}");
+        }
         let facts = build_plan_compiler_prompt(&[], &[], None);
         for text in [
             "or whose WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: a \
              node that is not RUNNING keeps its instances)",
             "A config read of the WF node with no answer refuses it with `force` too \
-             (ORCHESTRATOR_ERROR), and nothing changes",
-            "A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd did not answer",
+             (ORCHESTRATOR_ERROR, saying nothing was changed), and nothing changes; an \
+             ORCHESTRATOR_ERROR from the node's kill may have stopped or removed the node: read the \
+             workflow's status (`wf_rules_get_status`) before you stage the delete again.",
+            "A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd gave no full \
+             answer for its unit. Read it again before you choose; never take it for stopped.",
+            "A managed node with neither config nor state reads `UNKNOWN` every time too, so a read \
+             again changes nothing.",
             "`SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or \
-             `remove_node_instance` has that cause: nothing was done",
+             `remove_node_instance` is a systemd check with no answer: nothing was done",
         ] {
             assert!(facts.contains(text), "{text}");
         }
+        assert!(
+            PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_get_status"),
+            "the status the facts send the plan compiler to is one it can read"
+        );
+        let status = translate_scmd(
+            "motherbee",
+            parse("curl -X GET '/hives/worker1/wf-rules/status?workflow_name=invoice'"),
+        )
+        .expect("the status the chat reads");
+        assert_eq!(status.action, "wf_rules_get_status");
+        assert_eq!(status.target_hive, "worker1");
+        assert_eq!(status.params, json!({ "workflow_name": "invoice" }));
     }
 
     /// docs/hive-config-update-v1.md §4: Archi's provider and the hive's model are the installation

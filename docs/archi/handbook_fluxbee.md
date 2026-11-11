@@ -956,8 +956,9 @@ person: when its provider gave no answer, the error carries the operator's text 
     one.
   - `wf_rules_rollback` goes back to the version before.
 - **A removal** ends the conversations still running. The pipeline's plan says how many there are,
-  and the operator's confirmation removes the workflow with `force`. To let them finish, wait; to
-  end them one by one, cancel them.
+  or that they could not be counted: a WF node that is not `RUNNING` keeps them, and the removal
+  ends them. The operator's confirmation removes the workflow with `force`. To let them finish,
+  wait; to end them one by one, cancel them.
 - **Operating instances** (the node is `WF.<workflow_name>`):
   - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and its
     last change (`updated_at_ms`), which is not when it entered its state: that is its last

@@ -214,11 +214,17 @@ pasted in the chat run without that confirmation, unless one is already pending 
 **A workflow's removal and a node's unanswered state** (FINDINGS A-285, 0.1.133): the chat's
 prompt and the plan compiler's facts say that `wf_rules_delete` without `force` is refused while
 instances run (`INSTANCES_ACTIVE`) and while the WF node is not `RUNNING` or cannot count them
-(`INSTANCES_UNKNOWN`, naming why; a node that is not `RUNNING` keeps its instances), and that a
-config read of the node with no answer refuses it with `force` too (`ORCHESTRATOR_ERROR`: nothing
-changed, ask again) ([SY.wf-rules](sy-wf-rules.md#delete)). The plan compiler's facts also say
-that a node whose `lifecycle_state` is `UNKNOWN` may run, its hive's systemd gave no answer, so it
-is read again and never taken for stopped, and that `SERVICE_FAILED` with `retryable: true` from
+(`INSTANCES_UNKNOWN`, naming why; a node that is not `RUNNING` keeps its instances, their number
+unknown, and `force` ends them only once the operator accepts it), and that a config read of the
+node with no answer refuses it with `force` too (`ORCHESTRATOR_ERROR`, saying nothing was
+changed: ask again). An `ORCHESTRATOR_ERROR` from the node's kill is another matter: SY.wf-rules
+waits for `kill_node` a bounded time while the orchestrator goes on, so the node may have been
+stopped or removed, and the workflow's status (`GET /hives/{hive}/wf-rules/status?workflow_name=`,
+`wf_rules_get_status`) is read before the delete is asked again, as for any `ORCHESTRATOR_ERROR`
+that does not say nothing was changed ([SY.wf-rules](sy-wf-rules.md#delete)). Both texts say that
+a node whose `lifecycle_state` is `UNKNOWN` may run, its hive's systemd gave no full answer for
+its unit, so it is read again and never taken for stopped, while a managed node with neither
+config nor state reads `UNKNOWN` every time, and that `SERVICE_FAILED` with `retryable: true` from
 `run_node`, `start_node`, `kill_node` or `remove_node_instance` did nothing and can be asked again
 ([SY.orchestrator](sy-orchestrator.md)).
 
