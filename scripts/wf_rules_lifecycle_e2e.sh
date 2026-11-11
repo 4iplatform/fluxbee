@@ -13,14 +13,16 @@ set -euo pipefail
 #     bash scripts/wf_rules_lifecycle_e2e.sh
 #
 # Optional:
-#   WF_NAME="test-wf-rules"   workflow name used for the test (auto-deleted on exit)
+#   WF_NAME="testwfrules"     workflow name used for the test (auto-deleted on exit); it
+#                             matches ^[a-z][a-z0-9]*(\.[a-z0-9]+)*$, no hyphen (0.1.98:
+#                             INVALID_WORKFLOW_NAME otherwise)
 #   AUTO_SPAWN="true"         spawn WF node on first apply (default: true)
 #   WF_NODE_WAIT_SECS="10"   seconds to wait for WF node to appear after apply
 #   SKIP_ROLLBACK="0"         set to 1 to skip rollback step (e.g. debugging apply)
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-motherbee}"
-WF_NAME="${WF_NAME:-test-wf-rules}"
+WF_NAME="${WF_NAME:-testwfrules}"
 AUTO_SPAWN="${AUTO_SPAWN:-true}"
 WF_NODE_WAIT_SECS="${WF_NODE_WAIT_SECS:-10}"
 SKIP_ROLLBACK="${SKIP_ROLLBACK:-0}"
@@ -510,9 +512,13 @@ echo "  response: $resp"
 
 delete_status="$(json_get "$resp" "payload.status")"
 deleted="$(json_get "$resp" "payload.deleted")"
+# Every version of wf.$WF_NAME went: with every hive answering, SY.admin refuses no removal
+# (FINDINGS A-281). A version left is named here with why (0.1.133).
+packages_left="$(json_get "$resp" "payload.packages_left")"
 
 assert_eq "status"  "$delete_status" "ok"
 assert_eq "deleted" "$deleted"       "true"
+assert_eq "packages_left" "$packages_left" "[]"
 DELETED_IN_MAIN_FLOW=1
 
 # verify it's gone
