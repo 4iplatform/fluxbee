@@ -345,7 +345,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
 - A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
 - A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; the small fix, SY.admin in 0.1.136).
-- A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin; with A-271's class in 0.1.133).
+- A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin, the orchestrator and SY.wf-rules' delete; with A-271's class in 0.1.133).
 - A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator).
 - A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart; the orchestrator in 0.1.136).
 - A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
@@ -363,6 +363,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-296 🔵 A deployments read filtered by category also answers the local snapshot rows of every category (low; the orchestrator).
 - A-297 🔵 SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee (low; SY.admin).
 - A-298 🔵 Archi's runtime publish that makes a version current recreates the motherbee's nodes of that runtime: new ILK, owned secrets purged, `launched_by: "archi"` (medium; to decide; SY.architect).
+- A-299 🔵 A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it (low; the orchestrator).
+- A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1440,6 +1442,33 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-300 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's SY.admin review; read in the code; there before it) — A node pinned to a version is not counted as its use between crash-loop restarts, and the version can be removed under it
+
+- **Why:** the global usage lists a node whose unit runs or gives no answer. A unit between
+  restarts after a crash, or failed, reads inactive (`systemctl`'s exit 3 also means "on its way
+  up or down"), yet `relaunch_on_boot` makes the 60 s reconcile relaunch it
+  (`src/bin/sy_orchestrator.rs` ~20580 on `coa/admin-usage-133`'s base).
+- **Effect:** AI.x@worker1, pinned to ai.generic 0.3.1, crashes; during its backoff the operator
+  removes 0.3.1 and gets 200; a minute later the reconcile relaunches AI.x, which fails with
+  *"unable to resolve runtime version"*. SY.admin's note says a node pinned to the version may run
+  on it, which this case contradicts.
+- **Fix, later:** list a pinned node whose config has `relaunch_on_boot` and whose unit does not
+  run (for example as lifecycle `RELAUNCH_DUE`), so it must be stopped before its version goes; or
+  narrow the note to units that run or give no answer.
+
+### A-299 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review fixes; read in the code; there before it) — A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it
+
+- **Why:** `add_hive_flow` writes `syncthing_device_id` into the registry entry only on success, on
+  both of its paths. A join that fails after the link (`DIST_SYNC_TIMEOUT`, `SSH_HARDEN_FAILED`,
+  `SSH_KEY_FAILED`, or `IO_ERROR` on its final write) leaves the device a member of the
+  motherbee's folders, `fluxbee-dist-runtimes` included, and `remove_hive` skips the unlink
+  (`skipped_no_peer_device_id`). Only the peer reconcile's orphan pass removes those memberships,
+  and it waits until every hive is connected with a recorded device.
+- **Effect:** a box whose join failed keeps the motherbee's folders until every hive is connected;
+  `remove_hive`'s cleanup still stops its managed nodes when it reaches the box.
+- **Fix, later:** record the device id as soon as the link is made, or unlink by the device id the
+  failure path reads, so `remove_hive` unlinks a failed join too.
+
 ### A-298 [Archi] 🔵 to decide, medium (found 2026-11-11 by the io-cloud-api docs verification; read in the code; there before it) — Archi's runtime publish that makes a version current recreates every motherbee node of that runtime: new ILK, owned secrets purged, `launched_by: "archi"`
 
 - **Why:** `redeploy_runtime_nodes_with_current` (`src/bin/sy_architect.rs` ~11046-11210; A-235
@@ -1688,6 +1717,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   skipped hive would refuse every removal for good, so A-281 has an orchestrator part too
   (`coa/orch-usage-133`): a hive whose role runs no managed nodes is never reported as skipped; a
   worker or the motherbee with no manifest still is.
+- **The two halves (0.1.133):** `coa/admin-usage-133`, SY.admin's refusal (`RUNTIME_USAGE_UNKNOWN`
+  naming the hives not read, retryable; `RUNTIME_IN_USE` naming each node's hive and state); and
+  `coa/orch-usage-133`, the motherbee asks no ingress or egress, by the role its registry records,
+  and lists them in `hives_without_runtimes`; an ok answer whose own usage failed is skipped as
+  `USAGE_UNREADABLE`; a registry that cannot be listed makes the whole usage an error; `in_use` is
+  null while a hive is skipped; a registry entry keeps its role until `remove_hive` (`add_hive`
+  with another role answers `HIVE_EXISTS`).
+- **Found by SY.admin's review (high), fixed with it in 0.1.133:** with the refusal, a workflow's
+  delete answers 422 `PACKAGE_PUBLISH_FAILED` after the workflow, its node and its state are gone
+  whenever a hive cannot be read (worker1's copy lagging a `wf.<x>` deployed seconds before
+  included), and the versions left behind block a new workflow of the same name: its versions
+  start again at 0.0.1, and the publish answers `VERSION_CONFLICT`. In flight: SY.wf-rules' delete
+  answers ok and names the versions left (`packages_left`), and a re-created name numbers its
+  versions above them (`coa/wfrules-usage-133`); the orchestrator counts a worker whose copy lags
+  and asks the spokes at the same time, each with a bound, within SY.admin's 30 s
+  (`coa/orch-usage-133`).
+- **By design:** a failed join's registry entry is a hive that may run nodes and is not read, so it
+  refuses every removal until the join is finished or the hive removed; the 409 names it.
 
 ### A-280 [General/admin] 🔵 low (found 2026-11-11 by A-274's review; read in the code; there before it) — A publish holds the publication lock across its curate and the edge's publish, and on its failure paths across a clean-up its budget does not bound
 
