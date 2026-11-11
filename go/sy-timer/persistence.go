@@ -275,8 +275,10 @@ type timerListCursor struct {
 }
 
 // listTimers lists up to limit timers, an owner's or every owner's, in a status or all, by fire time
-// and then uuid, after a cursor when there is one.
-func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter string, limit int, after *timerListCursor) ([]timerRow, error) {
+// and then uuid, after a cursor when there is one, and says whether more follow the last one listed.
+// It reads one timer past the limit to know, and never lists that one. Before 1.6 it read the limit
+// only, and a list its limit cut read as the whole list (FINDINGS A-266).
+func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter string, limit int, after *timerListCursor) (listed []timerRow, more bool, err error) {
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
@@ -304,13 +306,20 @@ FROM timers`
 		query += "\nWHERE " + strings.Join(conditions, " AND ")
 	}
 	query += "\nORDER BY fire_at_utc ASC, uuid ASC\nLIMIT ?"
-	args = append(args, limit)
+	args = append(args, limit+1)
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	return collectTimerRows(rows)
+	listed, err = collectTimerRows(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(listed) > limit {
+		return listed[:limit], true, nil
+	}
+	return listed, false, nil
 }
 
 func listPendingTimers(ctx context.Context, db *sql.DB) ([]timerRow, error) {

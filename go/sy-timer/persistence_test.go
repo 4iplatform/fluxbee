@@ -80,12 +80,77 @@ func TestInsertGetAndListTimer(t *testing.T) {
 		t.Fatalf("unexpected timer row: %+v", got)
 	}
 
-	items, err := listTimers(ctx, db, "WF.demo@motherbee", "pending", 10, nil)
+	items, more, err := listTimers(ctx, db, "WF.demo@motherbee", "pending", 10, nil)
 	if err != nil {
 		t.Fatalf("list timers: %v", err)
 	}
-	if len(items) != 1 || items[0].UUID != "timer-1" {
-		t.Fatalf("unexpected listed timers: %+v", items)
+	if len(items) != 1 || items[0].UUID != "timer-1" || more {
+		t.Fatalf("unexpected listed timers: %+v (more %v)", items, more)
+	}
+}
+
+// insertPendingTimers inserts count pending one-shots of owner with payload, in one statement: timer
+// i is named fmt.Sprintf(format, i) and fires at base + i/together, so together timers share each
+// fire time and their uuids order them. Hundreds of inserts of their own take seconds under the race
+// detector.
+func insertPendingTimers(t *testing.T, db *sql.DB, owner, format string, count int, base int64, together int, payload string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?)
+INSERT INTO timers (uuid, owner_l2_name, target_l2_name, kind, fire_at_utc, missed_policy, payload, status, created_at_utc)
+SELECT printf(?, i), ?, ?, 'oneshot', ? + i / ?, 'fire', ?, 'pending', ? FROM n`,
+		count, format, owner, owner, base, together, payload, base); err != nil {
+		t.Fatalf("insert %d timers: %v", count, err)
+	}
+}
+
+// listTimers says whether more timers follow the last one it lists (FINDINGS A-266): it reads one
+// past the limit it keeps (100 without one, at most 1000) and never lists that one. A list that
+// ends at the limit, or before it, has none after it.
+func TestListTimersSaysWhetherMoreFollow(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	const owner = "WF.demo@motherbee"
+	const total = maxListLimit + 1
+	base := int64(1775577600000)
+	name := func(i int) string { return fmt.Sprintf("timer-%04d", i) }
+	fireAt := func(i int) int64 { return base + int64(i/3) } // three by three at one time: the uuid orders them
+	insertPendingTimers(t, db, owner, "timer-%04d", total, base, 3, `{}`)
+
+	for _, tc := range []struct {
+		name   string
+		limit  int
+		after  int // the timer the list starts after, -1 for the start
+		listed int
+		more   bool
+	}{
+		{name: "a limit that cuts the list", limit: 10, after: -1, listed: 10, more: true},
+		{name: "no limit, the default's", limit: 0, after: -1, listed: defaultListLimit, more: true},
+		{name: "the maximum, with one timer past it", limit: maxListLimit, after: -1, listed: maxListLimit, more: true},
+		{name: "a limit over the maximum, cut to it", limit: 5 * maxListLimit, after: -1, listed: maxListLimit, more: true},
+		{name: "after a cursor, a limit that cuts the rest", limit: 9, after: total - 11, listed: 9, more: true},
+		{name: "after a cursor, a limit of exactly the rest", limit: 10, after: total - 11, listed: 10, more: false},
+		{name: "after a cursor, a limit past the rest", limit: 11, after: total - 11, listed: 10, more: false},
+		{name: "after the last timer", limit: 10, after: total - 1, listed: 0, more: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var after *timerListCursor
+			if tc.after >= 0 {
+				after = &timerListCursor{fireAtUTC: fireAt(tc.after), uuid: name(tc.after)}
+			}
+			rows, more, err := listTimers(ctx, db, owner, "pending", tc.limit, after)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(rows) != tc.listed || more != tc.more {
+				t.Fatalf("listed %d timers, more %v; want %d, more %v", len(rows), more, tc.listed, tc.more)
+			}
+			for i, row := range rows {
+				if want := name(tc.after + 1 + i); row.UUID != want {
+					t.Fatalf("timer %d is %s, want %s: the list starts right after its cursor, in order", i, row.UUID, want)
+				}
+			}
+		})
 	}
 }
 
@@ -590,7 +655,7 @@ func TestGCHistoricalTimersAgesACanceledTimerByItsCancellation(t *testing.T) {
 	kept := func(when string, want ...string) {
 		t.Helper()
 		var uuids []string
-		rows, err := listTimers(ctx, db, "", "all", maxListLimit, nil)
+		rows, _, err := listTimers(ctx, db, "", "all", maxListLimit, nil)
 		if err != nil {
 			t.Fatalf("%s: list: %v", when, err)
 		}

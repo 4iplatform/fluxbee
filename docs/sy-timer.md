@@ -13,7 +13,8 @@ purged timer's entry leaving it at once, a fire whose read of its timer fails is
 30 s, and a start whose count of pending timers fails says so (FINDINGS A-259); a refused request
 gets a line in SY.timer's own log, with its verb, its code and its sender (and the database's error
 for a `TIMER_STORAGE_ERROR`), at most 10 a minute per sender, and so does a message that is no
-request (FINDINGS A-258)
+request (FINDINGS A-258); a `TIMER_LIST` page its `limit` cuts answers `next_cursor`, as one the
+frame cuts does (FINDINGS A-266)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -577,12 +578,14 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 
 `owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, then by uuid, subject to `status_filter` and `limit` (§12.1). Each timer is as `TIMER_GET` answers it, `canceled_reason` included (§7.5).
 
-**Pages** (since v1.3, FINDINGS A-151). A response fits one 128 KiB frame. A list whose timers take more than 96 KiB, encoded (`maxTimerListPageBytes`), is answered a page at a time:
-- the page lists the timers that fit, and `next_cursor` says where the next one starts (`"<fire_at_utc_ms>:<uuid>"` of the page's last timer);
-- the same request with `cursor` set to it, and `limit` lowered by what came, lists the next;
-- the last page has no `next_cursor`.
+**Pages** (since v1.3, FINDINGS A-151; the limit's since v1.6, FINDINGS A-266). A page ends at the request's `limit` or where the frame does, whichever comes first: a response fits one 128 KiB frame, so a page holds at most 96 KiB of timers, encoded (`maxTimerListPageBytes`).
+- While timers follow the page's last one, `next_cursor` says where the next page starts (`"<fire_at_utc_ms>:<uuid>"` of the page's last timer), whichever cut ended the page. `SY.timer` reads one timer past the `limit` to know, and never lists it.
+- The same request with `cursor` set to it lists the next page: the timers right after that one, in the same order, under the same filters. A caller that wants `limit` timers in all lowers `limit` by what came.
+- The page that lists the rest of the list has no `next_cursor`, even when it holds exactly `limit` timers.
 
-Both SDKs' `List` follow the pages up to the limit (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk), so a WF reconciles all its timers at start (`Recover`). `SY.admin`'s `timer_list` answers one page, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
+Before v1.6 only the frame's cut gave `next_cursor`: a page its `limit` cut, 100 timers without one, read as the whole list. A list in pages is no snapshot: a timer whose fire time moves between two pages (a recurring timer's fire, a `TIMER_RESCHEDULE`) takes its new place in the order, so it can come again on a later page, or not at all.
+
+Both SDKs' `List` follow the pages up to their own limit, lowering it by what came, and stop there: what they return carries no cursor (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk). So a WF reconciles its pending timers at start up to 1000, the first by fire time (`Recover`; [spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md) §11.4). `SY.admin`'s `timer_list` answers one page, its `next_cursor` included, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
 
 ### 7.7 `TIMER_PURGE_OWNER` (exclusive use of `SY.orchestrator`)
 
@@ -1327,7 +1330,7 @@ responseToUser := fmt.Sprintf("The event is on %s", formatted.Formatted)
 | Minimum duration | 60 s | Enforced (`TIMER_BELOW_MINIMUM`); a cron may not fire twice within 60 s. Constant, not configurable |
 | Maximum delay | 366 days | One-shots (`TIMER_ABOVE_MAXIMUM`); a recurring timer has none |
 | Pending timers | 10,000 per owner, 100,000 per hive | A new timer past either is `TIMER_LIMIT_EXCEEDED`. About 10,000 per hive is the load it was designed for |
-| `TIMER_LIST` maximum | 1000 results | Per request; default 100, and a larger `limit` is cut to 1000. A page holds what fits in one 128 KiB frame, 96 KiB of timers, and `next_cursor` lists the next (§7.6, FINDINGS A-151) |
+| `TIMER_LIST` maximum | 1000 results | Per request; default 100, and a larger `limit` is cut to 1000. A page ends at the `limit` or at what fits in one 128 KiB frame, 96 KiB of timers, and either way `next_cursor` lists the next while timers follow (§7.6, FINDINGS A-151, A-266) |
 | Retention of fired/canceled timers | 7 days | From a fired timer's last fire, and a canceled one's cancellation (since v1.5, FINDINGS A-238). Deleted when `SY.timer` starts, never in between (§5.2). A constant |
 | Firing precision | ±5 s | Best-effort, subject to load |
 | `payload` and `metadata` size | 32 KiB each | `TIMER_LIMIT_EXCEEDED`; with both, a `TIMER_FIRED` fits in the router's 128 KiB frame |

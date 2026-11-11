@@ -225,12 +225,15 @@ starts, and `total` says how many rows there are in all:
 | `timer_list` | `limit`, `cursor` | `next_cursor` | `timers` | by fire time |
 
 - **No caller's default changed.** Without a `limit` a listing answers every row, as before, but
-  for the two that never did: `vault_list` answers its filter's limit (200 without one, at most
-  1000) and `list_recent_commands` its `limit` (50 without one, at most 500). Over HTTP the query
-  parameters are the same names (`?limit=&cursor=`, `?versions_limit=&versions_before=`), and an
-  empty `?cursor=` is none. A caller whose answer outgrows the frame gets `REPLY_TOO_LARGE` with
-  the params to page and `suggested_limit`: it asks again with that limit and follows the next page
-  until the answer names none.
+  for the three that never did: `vault_list` answers its filter's limit (200 without one, at most
+  1000), `list_recent_commands` its `limit` (50 without one, at most 500), and `timer_list` the
+  one page SY.timer answers: `limit` timers (100 without one, at most 1000), or fewer when the
+  frame cuts the page first, with `next_cursor` while timers follow (since 0.1.133, FINDINGS
+  A-266; before, only a page the frame cut gave one). Over HTTP the query parameters are the same
+  names (`?limit=&cursor=`, `?versions_limit=&versions_before=`), and an empty `?cursor=` is none.
+  A caller whose answer outgrows the frame gets `REPLY_TOO_LARGE` with the params to page and
+  `suggested_limit`: it asks again with that limit and follows the next page until the answer
+  names none.
 - **The one exception is the installation's version history.** The motherbee's `config.versions`
   in `/versions` and `get_installation`'s `versions` list the newest 20 versions recorded, oldest
   first, with `versions_total`, `versions_latest` (the newest version recorded, whichever page is

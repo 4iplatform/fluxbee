@@ -475,7 +475,7 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 			{Verb: "TIMER_SCHEDULE", Description: "Create a one-shot timer, 60 seconds to 366 days ahead. Its fire goes to the requester; only a SY node may name another target_l2_name. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"fire_at_utc_ms OR fire_in_ms"}, OptionalFields: []string{"target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
 			{Verb: "TIMER_SCHEDULE_RECURRING", Description: "Create a recurring timer from a 5-field cron expression. Its fires go to the requester; only a SY node may name another target_l2_name. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"cron_spec"}, OptionalFields: []string{"cron_tz", "target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
 			{Verb: "TIMER_GET", Description: "Read one of the caller's timers by uuid, or its active timer by client_ref. SY.admin reads any timer by uuid. A timer's canceled_reason is present only when SY.timer canceled it itself, and says why: a one-shot its missed_policy dropped at a start, or a recurring timer whose next fire cannot be computed.", RequiredFields: []string{"timer_uuid OR client_ref"}},
-			{Verb: "TIMER_LIST", Description: "List the caller's timers, by fire time, a page at a time: an answer with next_cursor has more, which the same request with cursor set to it lists. SY.admin lists every owner's, or one owner's with owner_l2_name. Each timer as TIMER_GET reads it: its canceled_reason is present only when SY.timer canceled it itself, and says why (a one-shot its missed_policy dropped, a recurring timer whose next fire cannot be computed).", OptionalFields: []string{"owner_l2_name", "status_filter", "limit", "cursor"}},
+			{Verb: "TIMER_LIST", Description: "List the caller's timers, by fire time, a page at a time: a page ends at limit (100 by default, at most 1000) or at what fits one frame, and an answer with next_cursor has more, which the same request with cursor set to it lists. SY.admin lists every owner's, or one owner's with owner_l2_name. Each timer as TIMER_GET reads it: its canceled_reason is present only when SY.timer canceled it itself, and says why (a one-shot its missed_policy dropped, a recurring timer whose next fire cannot be computed).", OptionalFields: []string{"owner_l2_name", "status_filter", "limit", "cursor"}},
 			{Verb: "TIMER_CANCEL", Description: "Cancel a pending owned timer by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref"}},
 			{Verb: "TIMER_RESCHEDULE", Description: "Reschedule a pending one-shot timer owned by the requester, by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref", "new_fire_at_utc_ms OR new_fire_in_ms"}},
 			{Verb: "TIMER_PURGE_OWNER", Description: "Delete every timer owned by a node. Reserved to SY.orchestrator.", RequiredFields: []string{"owner_l2_name"}},
@@ -791,15 +791,16 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	rows, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit, after)
+	rows, more, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit, after)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_STORAGE_ERROR", err.Error())
 	}
-	// A page fits one frame (FINDINGS A-151): the timers past maxTimerListPageBytes go in the next
-	// page, after the cursor of the last one this page lists.
+	// A page ends at the request's limit (FINDINGS A-266) or where the frame does (FINDINGS A-151):
+	// the timers past maxTimerListPageBytes go in the next page. Either way, while timers follow,
+	// next_cursor is the cursor of the last timer this page lists, where the next page starts; the
+	// page that lists the rest of the list has none.
 	items := make([]fluxbeesdk.TimerInfo, 0, len(rows))
 	pageBytes := 0
-	nextCursor := ""
 	for i, row := range rows {
 		info, err := timerRowToInfo(row)
 		if err != nil {
@@ -810,7 +811,7 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INTERNAL", err.Error())
 		}
 		if i > 0 && pageBytes+len(encoded)+1 > maxTimerListPageBytes {
-			nextCursor = formatTimerListCursor(rows[i-1])
+			more = true
 			break
 		}
 		pageBytes += len(encoded) + 1
@@ -823,8 +824,9 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 		"count":         len(items),
 		"timers":        items,
 	}
-	if nextCursor != "" {
-		response["next_cursor"] = nextCursor
+	if more {
+		// A page lists its first timer whatever its size, so a page with more after it lists one.
+		response["next_cursor"] = formatTimerListCursor(rows[len(items)-1])
 	}
 	return s.sendTimerResponse(incoming, response)
 }

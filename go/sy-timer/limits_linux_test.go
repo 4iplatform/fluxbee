@@ -5,6 +5,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -226,6 +228,235 @@ func TestTimerListAnswersInPagesThatFitAFrame(t *testing.T) {
 	if answer, _ := list("nonsense"); answer.OK || answer.Error == nil || answer.Error.Code != "TIMER_INVALID_PAYLOAD" {
 		t.Fatalf("a cursor that is not one: %+v", answer)
 	}
+}
+
+// timerListPage is a TIMER_LIST answer; NextCursor is nil when it has none.
+type timerListPage struct {
+	OK     bool `json:"ok"`
+	Count  int  `json:"count"`
+	Timers []struct {
+		UUID        string `json:"uuid"`
+		FireAtUTCMS int64  `json:"fire_at_utc_ms"`
+	} `json:"timers"`
+	NextCursor *string `json:"next_cursor"`
+	Error      *struct {
+		Code string `json:"code"`
+	} `json:"error"`
+}
+
+// askTimerList sends request as requester's TIMER_LIST, and reads the page it answers.
+func askTimerList(t *testing.T, service *Service, tx chan []byte, requester string, request map[string]any) timerListPage {
+	t.Helper()
+	if err := service.respondTimerList(mustBuildSystemMessageAs(t, request, "TIMER_LIST", requester)); err != nil {
+		t.Fatalf("list timers: %v", err)
+	}
+	var page timerListPage
+	if err := json.Unmarshal(mustReadResponsePayload(t, tx), &page); err != nil {
+		t.Fatalf("decode a page: %v", err)
+	}
+	if !page.OK || page.Count != len(page.Timers) {
+		t.Fatalf("a page: ok=%v count=%d of %d timers, error %+v", page.OK, page.Count, len(page.Timers), page.Error)
+	}
+	return page
+}
+
+// uuids are the uuids of the page's timers, in its order, joined by commas.
+func (p timerListPage) uuids() string {
+	uuids := make([]string, 0, len(p.Timers))
+	for _, timer := range p.Timers {
+		uuids = append(uuids, timer.UUID)
+	}
+	return strings.Join(uuids, ",")
+}
+
+// A TIMER_LIST page its limit cuts says so (FINDINGS A-266): it answers next_cursor, the place of its
+// last timer, as a page the frame cuts does, and the same request with that cursor lists the timers
+// right after that one. The page that lists the rest of the list answers none, a limit of exactly the
+// rest included. For every status_filter, as a node listing its own, as SY.admin listing one owner's
+// and the whole hive's, with timers of both owners and of every status at one fire time, which the
+// uuid orders.
+func TestATimerListPageItsLimitCutsSaysWhereTheNextOneStarts(t *testing.T) {
+	service, tx := newTestService(t)
+	const owner, other = "WF.demo@motherbee", "WF.other@motherbee"
+	base := time.Now().UTC().Add(time.Hour).UnixMilli()
+	type stored struct {
+		uuid, owner, status string
+		fireAt              int64
+	}
+	timers := []stored{
+		{"t-k", owner, "pending", 0}, {"t-c", other, "pending", 0}, {"t-h", owner, "fired", 0},
+		{"t-a", owner, "canceled", 1}, {"t-m", owner, "pending", 1},
+		{"t-e", other, "fired", 2}, {"t-b", owner, "fired", 2}, {"t-l", owner, "canceled", 2},
+		{"t-g", other, "canceled", 3}, {"t-d", owner, "pending", 3},
+		{"t-j", owner, "fired", 4}, {"t-f", owner, "canceled", 4},
+		{"t-i", other, "pending", 5}, {"t-n", owner, "pending", 5},
+	}
+	for i := range timers {
+		timers[i].fireAt += base
+		insertOwnedTimer(t, service.db, timerRow{
+			UUID:         timers[i].uuid,
+			OwnerL2Name:  timers[i].owner,
+			TargetL2Name: timers[i].owner,
+			Kind:         "oneshot",
+			FireAtUTC:    timers[i].fireAt,
+			MissedPolicy: "fire",
+			Payload:      `{}`,
+			Status:       timers[i].status,
+			CreatedAtUTC: base,
+		})
+	}
+	// listOf is what a list of ownerFilter's timers (the hive's for none) in status holds, by fire
+	// time and then uuid.
+	listOf := func(ownerFilter, status string) []string {
+		var rows []stored
+		for _, timer := range timers {
+			if (ownerFilter == "" || timer.owner == ownerFilter) && (status == "all" || timer.status == status) {
+				rows = append(rows, timer)
+			}
+		}
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].fireAt != rows[j].fireAt {
+				return rows[i].fireAt < rows[j].fireAt
+			}
+			return rows[i].uuid < rows[j].uuid
+		})
+		uuids := make([]string, 0, len(rows))
+		for _, row := range rows {
+			uuids = append(uuids, row.uuid)
+		}
+		return uuids
+	}
+
+	for _, scope := range []struct {
+		name      string
+		requester string
+		asks      string // the owner_l2_name it sends
+		lists     string // whose timers it lists, the hive's for none
+	}{
+		{name: "a node's own", requester: owner, lists: owner},
+		{name: "SY.admin, one owner's", requester: fluxbeesdk.PrimaryAdminNode, asks: other, lists: other},
+		{name: "SY.admin, the hive's", requester: fluxbeesdk.PrimaryAdminNode},
+	} {
+		for _, status := range []string{"", "pending", "fired", "canceled", "all"} {
+			filter := status
+			if filter == "" {
+				filter = "pending"
+			}
+			all := listOf(scope.lists, filter)
+			var limits []int
+			for _, limit := range []int{1, 2, 3, len(all) - 1, len(all), len(all) + 1} {
+				if limit >= 1 && !slices.Contains(limits, limit) {
+					limits = append(limits, limit)
+				}
+			}
+			for _, limit := range limits {
+				t.Run(fmt.Sprintf("%s, status_filter %q, limit %d", scope.name, status, limit), func(t *testing.T) {
+					cursor := ""
+					for listed, pages := 0, 1; ; pages++ {
+						request := map[string]any{"limit": limit}
+						if status != "" {
+							request["status_filter"] = status
+						}
+						if scope.asks != "" {
+							request["owner_l2_name"] = scope.asks
+						}
+						if cursor != "" {
+							request["cursor"] = cursor
+						}
+						page := askTimerList(t, service, tx, scope.requester, request)
+						next := min(listed+limit, len(all))
+						if got, want := page.uuids(), strings.Join(all[listed:next], ","); got != want {
+							t.Fatalf("page %d lists %q, want %q: the timers right after the last one listed, in order", pages, got, want)
+						}
+						listed = next
+						if listed == len(all) {
+							if page.NextCursor != nil {
+								t.Fatalf("page %d lists the rest of the list and answers next_cursor %q", pages, *page.NextCursor)
+							}
+							return
+						}
+						if page.NextCursor == nil {
+							t.Fatalf("page %d, cut by its limit with %d timers after it, answers no next_cursor", pages, len(all)-listed)
+						}
+						last := page.Timers[len(page.Timers)-1]
+						if want := fmt.Sprintf("%d:%s", last.FireAtUTCMS, last.UUID); *page.NextCursor != want {
+							t.Fatalf("page %d answers next_cursor %q, want its last timer's place %q", pages, *page.NextCursor, want)
+						}
+						cursor = *page.NextCursor
+					}
+				})
+			}
+		}
+	}
+}
+
+// The frame's cut still answers its cursor, and the two cuts give one (FINDINGS A-151, A-266): a page
+// ends at its limit or at what fits a frame, whichever comes first, and either way next_cursor is the
+// place of its last timer, where the next page starts. The SDKs' way, the limit lowered by what came,
+// ends on a page the limit cuts after one the frame cut, and that page says more follow.
+func TestTheFramesCutAndTheLimitsGiveOneCursor(t *testing.T) {
+	service, tx := newTestService(t)
+	const owner = "WF.demo@motherbee"
+	const total = 200
+	payload := `{"note":"` + strings.Repeat("x", 900) + `"}`
+	base := time.Now().UTC().Add(time.Hour).UnixMilli()
+	name := func(i int) string { return fmt.Sprintf("timer-%03d", i) }
+	fireAt := func(i int) int64 { return base + int64(i/2) } // two by two at one time: the uuid orders them
+	insertPendingTimers(t, service.db, owner, "timer-%03d", total, base, 2, payload)
+	placeOf := func(i int) string { return fmt.Sprintf("%d:%s", fireAt(i), name(i)) }
+	list := func(limit int, cursor string) timerListPage {
+		t.Helper()
+		request := map[string]any{"limit": limit}
+		if cursor != "" {
+			request["cursor"] = cursor
+		}
+		return askTimerList(t, service, tx, owner, request)
+	}
+	// expect checks that page lists count timers from the first, and answers the place of the timer
+	// next names as its next_cursor, or none for -1.
+	expect := func(what string, page timerListPage, first, count, next int) {
+		t.Helper()
+		want := make([]string, 0, count)
+		for i := first; i < first+count; i++ {
+			want = append(want, name(i))
+		}
+		if got := page.uuids(); got != strings.Join(want, ",") {
+			t.Fatalf("%s: lists %d timers (%.40s...), want %d from %s", what, len(page.Timers), got, count, name(first))
+		}
+		switch {
+		case next < 0 && page.NextCursor != nil:
+			t.Fatalf("%s: next_cursor %q, want none", what, *page.NextCursor)
+		case next >= 0 && page.NextCursor == nil:
+			t.Fatalf("%s: no next_cursor, want %q", what, placeOf(next))
+		case next >= 0 && *page.NextCursor != placeOf(next):
+			t.Fatalf("%s: next_cursor %q, want %q", what, *page.NextCursor, placeOf(next))
+		}
+	}
+
+	// A limit past what fits: the frame cuts the page.
+	first := list(maxListLimit, "")
+	fit := len(first.Timers)
+	if fit < 3 || 2*fit >= total {
+		t.Fatalf("%d timers of about 1 KiB fit a page: the test wants 3 or more, and less than half of %d", fit, total)
+	}
+	expect("the frame's cut", first, 0, fit, fit-1)
+	// A limit that cuts the page where the frame does, or before it: the cursor of its last timer.
+	expect("a limit of what fits", list(fit, ""), 0, fit, fit-1)
+	expect("a limit one past what fits", list(fit+1, ""), 0, fit, fit-1)
+	expect("a limit one short of what fits", list(fit-1, ""), 0, fit-1, fit-2)
+	// The next page starts right after it, whichever cut gave it.
+	expect("the page after the frame's cut", list(fit, placeOf(fit-1)), fit, fit, 2*fit-1)
+	expect("the page after the limit's cut", list(1, placeOf(fit-2)), fit-1, 1, fit-1)
+
+	// The SDKs' way: fit + fit/2 timers asked, then the limit lowered by what came. The frame cuts the
+	// first page, the limit the second, and the second says more follow.
+	asked := fit + fit/2
+	expect("the first of the SDKs' pages", list(asked, ""), 0, fit, fit-1)
+	second := list(asked-fit, placeOf(fit-1))
+	expect("the second of the SDKs' pages", second, fit, asked-fit, asked-1)
+	expect("the page after the SDKs' last", list(1, *second.NextCursor), asked, 1, asked)
+	// The page that lists the rest answers none.
+	expect("the rest", list(maxListLimit, placeOf(total-3)), total-2, 2, -1)
 }
 
 // A cursor TIMER_LIST cannot read is refused naming the field, never the value it was sent
