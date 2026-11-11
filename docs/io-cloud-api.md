@@ -719,9 +719,10 @@ operator's work, through Archi.
   credentials it owned, with the runtime's default config unless the operator keeps its own, and
   with `launched_by: "archi"`, so `start_node`, `stop_node` and `delete_node` answer
   `NODE_NOT_FOUND`. If it happens to a node of yours, give the operator its name. The operator
-  decided that it goes: from 0.1.137 (planned, built, not deployed yet) such a publish moves a
-  running node on `current` in place, as the point above says, with its identity, config and
-  `launched_by`, and leaves a pinned or stopped node as it is.
+  decided that it goes: from 0.1.137 (planned, built, not deployed yet) such a publish leaves your
+  nodes as they are: the hive moves a running node on `current` in place, as the point above says,
+  with its identity, its credentials, its config and its `launched_by`, and leaves a pinned or
+  stopped node as it is.
 
 #### `list_nodes`
 

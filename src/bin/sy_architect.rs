@@ -488,8 +488,6 @@ struct PackagePublishRequest {
     #[serde(default)]
     set_current: Option<bool>,
     #[serde(default)]
-    preserve_node_config: bool,
-    #[serde(default)]
     sync_to: Vec<String>,
     #[serde(default)]
     update_to: Vec<String>,
@@ -509,8 +507,6 @@ struct SoftwarePublishRequest {
     filename: Option<String>,
     #[serde(default)]
     set_current: Option<bool>,
-    #[serde(default)]
-    preserve_node_config: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9732,7 +9728,6 @@ async fn handle_software_publish_request(
             PackagePublishRequest {
                 blob_name: req.blob_name,
                 set_current: req.set_current,
-                preserve_node_config: req.preserve_node_config,
                 sync_to: Vec::new(),
                 update_to: Vec::new(),
             },
@@ -9743,7 +9738,6 @@ async fn handle_software_publish_request(
             "action": "software_publish",
             "resolution": resolved.resolution,
             "publish": package_out,
-            "redeploy": Value::Null,
         });
     }
 
@@ -9836,7 +9830,6 @@ async fn handle_software_publish_request(
                 PackagePublishRequest {
                     blob_name,
                     set_current: req.set_current,
-                    preserve_node_config: req.preserve_node_config,
                     sync_to: Vec::new(),
                     update_to: Vec::new(),
                 },
@@ -9848,7 +9841,6 @@ async fn handle_software_publish_request(
                 "action": "software_publish",
                 "resolution": resolved.resolution,
                 "publish": publish,
-                "redeploy": Value::Null,
             })
         }
         Err(err) => {
@@ -9858,7 +9850,6 @@ async fn handle_software_publish_request(
                 "action": "software_publish",
                 "resolution": resolved.resolution,
                 "error": err.to_string(),
-                "redeploy": Value::Null,
             })
         }
     }
@@ -10789,6 +10780,29 @@ async fn handle_executor_plan_request(
     }
 }
 
+/// What follows a publish that made its version current (FINDINGS A-298): Archi recreates no node.
+/// Each hive's orchestrator moves the running nodes of the runtime that follow `current` onto it
+/// within a minute of the version reaching that hive (its reconcile, FINDINGS A-109), in place;
+/// a pinned or stopped node stays as it is, and a stopped one that follows `current` runs it when
+/// it is started. A node's config is its own, written at its launch from the template of the
+/// version it was launched on: a config change of its own changes it, never a publish.
+const PUBLISH_NEXT_CURRENT: &str = "The version is current. No node is recreated: each hive \
+    moves its running nodes of this runtime that follow current onto it within a minute of the \
+    version reaching that hive, in place, each with its ILK, its secrets, its config and who \
+    launched it. A node pinned to a version and a stopped node stay as they are; a stopped node \
+    that follows current runs this version when it is started. A node's config stays its own: \
+    the package's template config reaches only the nodes launched after it; to change an \
+    existing node's config, set it (node_control_config_set).";
+/// What follows a publish that did not make its version current.
+const PUBLISH_NEXT_NOT_CURRENT: &str = "The version is published, not current: no node moves to \
+    it. A node launched with this runtime_version runs it.";
+
+/// Archi's publish of an uploaded package (the Publish Software panel, `POST /api/package/publish`):
+/// SY.admin's `publish_runtime_package`, `set_current` true unless the request says false. Its
+/// answer is SY.admin's, with what follows it (`next`) when the publish went through. Up to
+/// 0.1.135 a publish that made its version current then killed every motherbee node of that
+/// runtime with its instance purged and ran it again on `current`: a new ILK, its owned secrets
+/// gone, `launched_by: "archi"` (FINDINGS A-298).
 async fn handle_package_publish_request(
     state: &ArchitectState,
     req: PackagePublishRequest,
@@ -10807,7 +10821,6 @@ async fn handle_package_publish_request(
         }
     };
     let set_current = req.set_current.unwrap_or(true);
-    let preserve_node_config = req.preserve_node_config;
     let translation = AdminTranslation {
         admin_target: format!("SY.admin@{}", state.hive_id),
         action: "publish_runtime_package".to_string(),
@@ -10829,39 +10842,17 @@ async fn handle_package_publish_request(
                 .and_then(|value| value.as_str())
                 .unwrap_or("ok")
                 .to_string();
-            let payload = output.get("payload").cloned().unwrap_or(Value::Null);
-            let runtime_name = payload
-                .get("runtime_name")
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-            let redeploy = if set_current && output_status_is_success(Some(status.as_str())) {
-                match runtime_name {
-                    Some(runtime_name) => match redeploy_runtime_nodes_with_current(
-                        state,
-                        &state.hive_id,
-                        &runtime_name,
-                        preserve_node_config,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => json!({
-                            "status": "error",
-                            "hive": state.hive_id,
-                            "runtime": runtime_name,
-                            "errors": [err.to_string()],
-                        }),
-                    },
-                    None => Value::Null,
-                }
-            } else {
-                Value::Null
+            // Archi recreates no node (FINDINGS A-298): the answer says what follows instead.
+            let next = match (output_status_is_success(Some(status.as_str())), set_current) {
+                (false, _) => None,
+                (true, true) => Some(PUBLISH_NEXT_CURRENT),
+                (true, false) => Some(PUBLISH_NEXT_NOT_CURRENT),
             };
             json!({
                 "status": status,
                 "action": "publish_runtime_package",
-                "payload": payload,
-                "redeploy": redeploy,
+                "payload": output.get("payload").cloned().unwrap_or(Value::Null),
+                "next": next,
                 "error": output.get("error_detail").or_else(|| output.get("error")).cloned()
             })
         }
@@ -10875,33 +10866,6 @@ async fn handle_package_publish_request(
 
 fn output_status_is_success(status: Option<&str>) -> bool {
     matches!(status, Some("ok") | Some("sync_pending"))
-}
-
-/// Every node of `hive_id` (`list_nodes`), page after page (`admin_listing_every_page`): one answer
-/// of every node can outgrow the mesh frame (FINDINGS A-198), and an answer that is not ok is an
-/// error, never a hive without nodes.
-async fn list_nodes_for_hive(
-    state: &ArchitectState,
-    hive_id: &str,
-) -> Result<Vec<Value>, ArchitectError> {
-    let context = admin_tool_context(state, None);
-    let admin_target = format!("SY.admin@{}", state.hive_id);
-    let listing = admin_listing_every_page("list_nodes", json!({}), "nodes", |params| {
-        execute_admin_action_with_context(
-            &context,
-            &admin_target,
-            "list_nodes",
-            Some(hive_id),
-            params,
-            "scmd",
-        )
-    })
-    .await?;
-    Ok(listing
-        .get("nodes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default())
 }
 
 /// The rows a paged admin listing holds (FINDINGS A-198), page after page: `ADMIN_LISTING_PAGE_ROWS`
@@ -10983,233 +10947,6 @@ where
 const ADMIN_LISTING_PAGE_ROWS: u64 = 200;
 /// The most pages Archi reads of one listing.
 const ADMIN_LISTING_MAX_PAGES: usize = 1_000;
-
-async fn get_node_config_for_hive(
-    state: &ArchitectState,
-    hive_id: &str,
-    node_name: &str,
-) -> Result<Value, ArchitectError> {
-    let translation = AdminTranslation {
-        admin_target: format!("SY.admin@{}", state.hive_id),
-        action: "get_node_config".to_string(),
-        target_hive: hive_id.to_string(),
-        params: json!({ "node_name": node_name }),
-    };
-    execute_admin_translation(state, translation).await
-}
-
-fn sanitized_redeploy_config(config: &Value) -> Value {
-    let Some(obj) = config.as_object() else {
-        return json!({});
-    };
-    let mut sanitized = obj.clone();
-    sanitized.remove("_system");
-    Value::Object(sanitized)
-}
-
-fn runtime_name_from_node_config_output(output: &Value) -> Option<&str> {
-    output
-        .get("payload")
-        .and_then(|value| value.get("config"))
-        .and_then(|value| value.get("_system"))
-        .and_then(|value| value.get("runtime"))
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn node_config_from_output(output: &Value) -> Option<Value> {
-    output
-        .get("payload")
-        .and_then(|value| value.get("config"))
-        .cloned()
-        .filter(Value::is_object)
-}
-
-/// The tenant a node's stored config records, as the orchestrator reads it (its
-/// `config_tenant_id`): `_system.tenant_id`, else a top-level `tenant_id`.
-fn node_tenant_from_config(config: &Value) -> Option<String> {
-    [
-        config
-            .get("_system")
-            .and_then(|system| system.get("tenant_id")),
-        config.get("tenant_id"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(Value::as_str)
-    .map(str::trim)
-    .find(|tenant| !tenant.is_empty())
-    .map(str::to_string)
-}
-
-async fn redeploy_runtime_nodes_with_current(
-    state: &ArchitectState,
-    hive_id: &str,
-    runtime_name: &str,
-    preserve_node_config: bool,
-) -> Result<Value, ArchitectError> {
-    let nodes = list_nodes_for_hive(state, hive_id).await?;
-
-    let mut recreated = Vec::new();
-    let mut errors = Vec::new();
-
-    for node in nodes {
-        let node_name = match node.get("node_name").and_then(|value| value.as_str()) {
-            Some(value) if !value.trim().is_empty() => value.to_string(),
-            _ => continue,
-        };
-        let mut config_output: Option<Value> = None;
-        let resolved_runtime_name = match node
-            .get("runtime")
-            .and_then(|value| value.get("name"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(value) => Some(value.to_string()),
-            None => match get_node_config_for_hive(state, hive_id, &node_name).await {
-                Ok(output) => {
-                    let runtime = runtime_name_from_node_config_output(&output).map(str::to_string);
-                    if runtime.is_some() {
-                        config_output = Some(output);
-                    }
-                    runtime
-                }
-                Err(_) => None,
-            },
-        };
-        if resolved_runtime_name.as_deref() != Some(runtime_name) {
-            continue;
-        }
-        // The node's tenant, read before anything is killed (FINDINGS A-235): the kill purges the
-        // node, and run_node takes its tenant as a top-level tenant_id, which the preserved config
-        // does not carry (its `_system` is dropped). A node whose tenant cannot be read is left as
-        // it is. The same read gives the config a preserved redeploy keeps.
-        let output = match config_output.take() {
-            Some(output) => Ok(output),
-            None => get_node_config_for_hive(state, hive_id, &node_name).await,
-        };
-        let stored_config = match output {
-            Ok(output) => node_config_from_output(&output),
-            Err(err) => {
-                errors.push(json!({
-                    "node_name": node_name,
-                    "action": "get_node_config",
-                    "status": "error",
-                    "error": format!("{err}; the node was left as it is"),
-                }));
-                continue;
-            }
-        };
-        let Some((stored_config, tenant_id)) = stored_config.and_then(|config| {
-            let tenant_id = node_tenant_from_config(&config)?;
-            Some((config, tenant_id))
-        }) else {
-            errors.push(json!({
-                "node_name": node_name,
-                "action": "get_node_config",
-                "status": "error",
-                "error": "its stored config is missing, or names no tenant (_system.tenant_id or tenant_id): the node was left as it is",
-            }));
-            continue;
-        };
-        let config = preserve_node_config.then(|| sanitized_redeploy_config(&stored_config));
-
-        let kill_translation = AdminTranslation {
-            admin_target: format!("SY.admin@{}", state.hive_id),
-            action: "kill_node".to_string(),
-            target_hive: hive_id.to_string(),
-            params: json!({
-                "node_name": node_name,
-                "force": true,
-                "purge_instance": true,
-            }),
-        };
-        let kill_output = match execute_admin_translation(state, kill_translation).await {
-            Ok(output) => output,
-            Err(err) => {
-                errors.push(json!({
-                    "node_name": node_name,
-                    "action": "kill_node",
-                    "status": "error",
-                    "error": err.to_string(),
-                }));
-                continue;
-            }
-        };
-        let kill_status = kill_output
-            .get("status")
-            .and_then(|value| value.as_str())
-            .unwrap_or("error");
-        if !output_status_is_success(Some(kill_status)) {
-            errors.push(json!({
-                "node_name": node_name,
-                "action": "kill_node",
-                "status": kill_status,
-                "error": kill_output.get("error_detail").or_else(|| kill_output.get("error")).cloned().unwrap_or(Value::Null),
-            }));
-            continue;
-        }
-
-        let mut run_params = json!({
-            "node_name": node_name,
-            "runtime_version": "current",
-            "tenant_id": tenant_id,
-        });
-        if let Some(config) = config {
-            if let Some(obj) = run_params.as_object_mut() {
-                obj.insert("config".to_string(), config);
-            }
-        }
-        let run_translation = AdminTranslation {
-            admin_target: format!("SY.admin@{}", state.hive_id),
-            action: "run_node".to_string(),
-            target_hive: hive_id.to_string(),
-            params: run_params,
-        };
-        match execute_admin_translation(state, run_translation).await {
-            Ok(output) => {
-                let step_status = output
-                    .get("status")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("error");
-                if output_status_is_success(Some(step_status)) {
-                    recreated.push(json!({
-                        "node_name": node_name,
-                        "status": step_status,
-                        "config_mode": if preserve_node_config { "preserved" } else { "template_default" },
-                    }));
-                } else {
-                    errors.push(json!({
-                        "node_name": node_name,
-                        "action": "run_node",
-                        "status": step_status,
-                        "error": output.get("error_detail").or_else(|| output.get("error")).cloned().unwrap_or(Value::Null),
-                    }));
-                }
-            }
-            Err(err) => {
-                errors.push(json!({
-                    "node_name": node_name,
-                    "action": "run_node",
-                    "status": "error",
-                    "error": err.to_string(),
-                }));
-            }
-        }
-    }
-
-    Ok(json!({
-        "hive": hive_id,
-        "runtime": runtime_name,
-        "matched_nodes": recreated.len() + errors.len(),
-        "preserve_node_config": preserve_node_config,
-        "recreated": recreated,
-        "errors": errors,
-        "status": if errors.is_empty() { "ok" } else { "error" },
-    }))
-}
 
 async fn handle_ai_chat(
     state: &ArchitectState,
@@ -18746,11 +18483,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             <div id="publish-filename" class="publish-filename"></div>
             <label class="publish-label">
               <input type="checkbox" id="publish-promote-current" />
-              Promote To Current and recreate matching node(s) on this hive
-            </label>
-            <label id="publish-preserve-config-wrap" class="publish-label" style="display:none">
-              <input type="checkbox" id="publish-preserve-node-config" checked />
-              Preserve existing node config during recreate
+              Promote To Current: running nodes on current move to it in place, keeping their config
             </label>
             <button id="publish-btn" class="publish-btn" type="button">Publish</button>
           </div>
@@ -18934,8 +18667,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const publishOptions = document.getElementById("publish-options");
     const publishFilename = document.getElementById("publish-filename");
     const publishPromoteCurrent = document.getElementById("publish-promote-current");
-    const publishPreserveConfigWrap = document.getElementById("publish-preserve-config-wrap");
-    const publishPreserveNodeConfig = document.getElementById("publish-preserve-node-config");
     const publishBtn = document.getElementById("publish-btn");
     const publishResult = document.getElementById("publish-result");
     const confirmModal = document.getElementById("confirm-modal");
@@ -20969,15 +20700,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       publishProgressLines.push(line);
       renderPublishProgress();
     }}
-    function updatePublishOptionsState() {{
-      const promote = !!(publishPromoteCurrent && publishPromoteCurrent.checked);
-      if (publishPreserveConfigWrap) {{
-        publishPreserveConfigWrap.style.display = promote ? "" : "none";
-      }}
-      if (publishPreserveNodeConfig) {{
-        publishPreserveNodeConfig.disabled = !promote;
-      }}
-    }}
     function publishSetFile(file) {{
       if (!file) {{
         publishResult.className = "publish-result err";
@@ -20989,8 +20711,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const label = isZip ? "ZIP package" : "Executable upload pilot";
       publishFilename.textContent = file.name + " \u00B7 " + label;
       if (publishPromoteCurrent) publishPromoteCurrent.checked = false;
-      if (publishPreserveNodeConfig) publishPreserveNodeConfig.checked = true;
-      updatePublishOptionsState();
       publishOptions.style.display = "";
       resetPublishProgress();
       publishResult.className = "publish-result";
@@ -21010,17 +20730,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       publishFileInput.value = "";
       if (file) publishSetFile(file);
     }});
-    if (publishPromoteCurrent) {{
-      publishPromoteCurrent.addEventListener("change", () => {{
-        updatePublishOptionsState();
-      }});
-    }}
     publishBtn.addEventListener("click", async () => {{
       if (!publishSelectedFile) return;
       publishBtn.disabled = true;
       resetPublishProgress();
       const promoteToCurrent = !!(publishPromoteCurrent && publishPromoteCurrent.checked);
-      const preserveNodeConfig = promoteToCurrent && !!(publishPreserveNodeConfig && publishPreserveNodeConfig.checked);
       pushPublishProgress("1. Uploading file...");
       try {{
         const formData = new FormData();
@@ -21034,17 +20748,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (!blobName) throw new Error("No blob_name in upload response");
         pushPublishProgress("2. Upload complete.");
         if (uploadData.upload_kind === "bundle_upload") {{
-          pushPublishProgress("3. Publishing ZIP package...");
-          if (promoteToCurrent) {{
-            pushPublishProgress("4. Promoting to current and recreating matching node(s)...");
-          }}
+          pushPublishProgress("3. Publishing ZIP package" + (promoteToCurrent ? " as current..." : "..."));
         }} else {{
           pushPublishProgress("3. Resolving runtime from executable name...");
           pushPublishProgress("4. Building package from executable...");
-          pushPublishProgress("5. Publishing generated package...");
-          if (promoteToCurrent) {{
-            pushPublishProgress("6. Promoting to current and recreating matching node(s)...");
-          }}
+          pushPublishProgress("5. Publishing generated package" + (promoteToCurrent ? " as current..." : "..."));
         }}
         let pubRes;
         if (uploadData.upload_kind === "bundle_upload") {{
@@ -21054,7 +20762,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
             body: JSON.stringify({{
               blob_name: blobName,
               set_current: promoteToCurrent,
-              preserve_node_config: preserveNodeConfig,
               sync_to: [],
               update_to: []
             }})
@@ -21066,8 +20773,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             body: JSON.stringify({{
               blob_name: blobName,
               filename: uploadData.attachment.filename,
-              set_current: promoteToCurrent,
-              preserve_node_config: preserveNodeConfig
+              set_current: promoteToCurrent
             }})
           }});
         }}
@@ -21076,14 +20782,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (effectiveStatus === "ok" || effectiveStatus === "sync_pending") {{
           const publishPayload = pubData.payload || (pubData.publish && pubData.publish.payload) || {{}};
           const resolution = pubData.resolution || null;
-          const redeploy = pubData.redeploy || (pubData.publish && pubData.publish.redeploy) || null;
+          // What follows the publish: no node is recreated (FINDINGS A-298).
+          const next = pubData.next || (pubData.publish && pubData.publish.next) || "";
           const name = publishPayload.runtime_name || (resolution && resolution.runtime_name) || "";
           const ver = publishPayload.runtime_version || (resolution && resolution.next_version) || "";
           const summary = resolution && resolution.summary ? " \u00B7 " + resolution.summary : "";
-          const redeploySummary = redeploy && redeploy !== null && redeploy.status
-            ? " \u00B7 redeploy " + redeploy.status
-                + (typeof redeploy.matched_nodes === "number" ? " (" + redeploy.matched_nodes + " node(s))" : "")
-            : "";
           publishResult.className = "publish-result ok";
           publishResult.textContent =
             publishProgressLines.join("\n")
@@ -21091,8 +20794,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
             + "Published"
             + (name ? ": " + name + (ver ? " v" + ver : "") : "")
             + summary
-            + redeploySummary
-            + " ✓";
+            + " ✓"
+            + (next ? "\n" + next : "");
           publishOptions.style.display = "none";
           publishSelectedFile = null;
           resetPublishProgress();
@@ -28141,23 +27844,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_name_from_node_config_output_extracts_nested_system_runtime() {
-        let output = json!({
-            "payload": {
-                "config": {
-                    "_system": {
-                        "runtime": "io.api"
-                    }
-                }
-            }
-        });
-        assert_eq!(
-            runtime_name_from_node_config_output(&output),
-            Some("io.api")
-        );
-    }
-
-    #[test]
     fn validate_manifest_v2_rejects_unknown_desired_state_sections() {
         let manifest: SolutionManifestV2 = serde_json::from_value(json!({
             "manifest_version": "1.0",
@@ -30746,98 +30432,88 @@ mod tests {
         sent
     }
 
-    /// FINDINGS A-235: a redeploy onto the runtime's current kills each node with its instance
-    /// purged and runs it again, so it reads each node's tenant first and runs it again in it, a
-    /// top-level tenant_id, whether its config is kept or not. A node whose tenant cannot be read
-    /// is never killed, and the answer names it.
+    /// FINDINGS A-298: Archi's publish recreates no node. With `set_current`, its default, it sends
+    /// SY.admin's `publish_runtime_package` and nothing after it: no `list_nodes`, no `kill_node`,
+    /// no `run_node`, where up to 0.1.135 every motherbee node of the runtime was killed with its
+    /// instance purged (its ILK and the secrets it owned gone) and run again on `current`. Its
+    /// answer says what follows instead: the hive moves the running nodes that follow `current`
+    /// within a minute, in place, and leaves pinned and stopped ones; without `set_current`, that
+    /// no node moves. A publish that failed says nothing of what follows.
     #[tokio::test]
-    async fn a_redeploy_runs_each_node_again_in_its_tenant() {
-        let tenant = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
-        for preserve in [false, true] {
-            let (state, mut router) = harness_state();
-            let redeploy = tokio::spawn({
-                let state = Arc::clone(&state);
-                async move {
-                    redeploy_runtime_nodes_with_current(&state, "motherbee", "ai.generic", preserve)
-                        .await
-                }
-            });
-            let nodes = json!({ "status": "ok", "action": "list_nodes", "payload": { "nodes": [
-                { "node_name": "AI.sales@motherbee", "runtime": { "name": "ai.generic" } },
-                { "node_name": "AI.lost@motherbee", "runtime": { "name": "ai.generic" } },
-                { "node_name": "IO.api.x@motherbee", "runtime": { "name": "io.api" } }
-            ] } });
-            answer_admin_command(&mut router, "list_nodes", nodes).await;
-            let stored = json!({
-                "_system": { "runtime": "ai.generic", "tenant_id": tenant },
-                "behavior": { "kind": "openai_chat" }
-            });
-            let sales = answer_admin_command(
-                &mut router,
-                "get_node_config",
-                json!({ "status": "ok", "action": "get_node_config",
-                        "payload": { "node_name": "AI.sales@motherbee", "config": stored } }),
-            )
-            .await;
-            assert_eq!(sales.payload["params"]["node_name"], "AI.sales@motherbee");
-            let kill = answer_admin_command(
-                &mut router,
-                "kill_node",
-                json!({ "status": "ok", "action": "kill_node", "payload": {} }),
-            )
-            .await;
-            assert_eq!(kill.payload["params"]["node_name"], "AI.sales@motherbee");
-            assert_eq!(kill.payload["params"]["purge_instance"], true);
-            let run = answer_admin_command(
-                &mut router,
-                "run_node",
-                json!({ "status": "ok", "action": "run_node", "payload": {} }),
-            )
-            .await;
-            let mut expected = json!({
-                "node_name": "AI.sales@motherbee",
-                "runtime_version": "current",
-                "tenant_id": tenant,
-            });
-            if preserve {
-                expected["config"] = json!({ "behavior": { "kind": "openai_chat" } });
-            }
-            assert_eq!(run.payload["params"], expected);
-
-            // A stored config that names no tenant: the node is not killed.
-            answer_admin_command(
-                &mut router,
-                "get_node_config",
-                json!({ "status": "ok", "action": "get_node_config",
-                        "payload": { "node_name": "AI.lost@motherbee",
-                                     "config": { "_system": { "runtime": "ai.generic" } } } }),
-            )
-            .await;
-            let answer = redeploy.await.expect("the redeploy").expect("answered");
-            assert!(router
-                .next_outgoing_within(Duration::from_millis(200))
+    async fn a_publish_recreates_no_node_and_says_what_follows() {
+        let publish = |state: &Arc<ArchitectState>, set_current: Option<bool>| {
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                handle_package_publish_request(
+                    &state,
+                    PackagePublishRequest {
+                        blob_name: "ai-sales-1-2-0_0123456789abcdef.zip".to_string(),
+                        set_current,
+                        sync_to: Vec::new(),
+                        update_to: Vec::new(),
+                    },
+                )
                 .await
-                .is_none());
+            })
+        };
+        let published = json!({ "status": "ok", "action": "publish_runtime_package",
+                                "payload": { "runtime_name": "ai.sales", "runtime_version": "1.2.0" } });
+        for (set_current, next) in [
+            (None, PUBLISH_NEXT_CURRENT),
+            (Some(true), PUBLISH_NEXT_CURRENT),
+            (Some(false), PUBLISH_NEXT_NOT_CURRENT),
+        ] {
+            let (state, mut router) = harness_state();
+            let answer = publish(&state, set_current);
+            let sent =
+                answer_admin_command(&mut router, "publish_runtime_package", published.clone())
+                    .await;
             assert_eq!(
-                answer["recreated"],
-                json!([{
-                    "node_name": "AI.sales@motherbee",
-                    "status": "ok",
-                    "config_mode": if preserve { "preserved" } else { "template_default" },
-                }])
+                sent.payload["params"]["set_current"],
+                set_current.unwrap_or(true)
             );
-            let errors = answer["errors"].as_array().expect("errors");
-            assert_eq!(errors.len(), 1, "{answer}");
-            assert_eq!(errors[0]["node_name"], "AI.lost@motherbee");
-            assert_eq!(errors[0]["action"], "get_node_config");
+            let answer = answer.await.expect("the publish");
             assert!(
-                errors[0]["error"]
-                    .as_str()
-                    .is_some_and(|why| why.contains("names no tenant")),
-                "{answer}"
+                router
+                    .next_outgoing_within(Duration::from_millis(200))
+                    .await
+                    .is_none(),
+                "nothing is sent after the publish ({set_current:?})"
             );
-            assert_eq!(answer["status"], "error");
+            assert_eq!(answer["status"], "ok", "{answer}");
+            assert_eq!(answer["payload"], published["payload"], "{answer}");
+            assert_eq!(answer["next"], next, "{answer}");
+            assert!(answer.get("redeploy").is_none(), "{answer}");
         }
+        for text in [
+            "No node is recreated",
+            "within a minute of the version reaching that hive, in place",
+            "each with its ILK, its secrets, its config and who launched it",
+            "A node pinned to a version and a stopped node stay as they are",
+            "the package's template config reaches only the nodes launched after it",
+            "(node_control_config_set)",
+        ] {
+            assert!(PUBLISH_NEXT_CURRENT.contains(text), "{text}");
+        }
+        assert!(PUBLISH_NEXT_NOT_CURRENT.contains("not current: no node moves to it"));
+
+        let (state, mut router) = harness_state();
+        let answer = publish(&state, None);
+        answer_admin_command(
+            &mut router,
+            "publish_runtime_package",
+            json!({ "status": "error", "action": "publish_runtime_package", "payload": null,
+                    "error_code": "VERSION_CONFLICT", "error_detail": "install conflict: 1.2.0" }),
+        )
+        .await;
+        let answer = answer.await.expect("the publish");
+        assert!(router
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        assert_eq!(answer["status"], "error", "{answer}");
+        assert_eq!(answer["next"], Value::Null, "{answer}");
+        assert_eq!(answer["error"], "install conflict: 1.2.0", "{answer}");
     }
 
     /// Every tool Archi offers a model, whichever agent gets it (the chat, the designer, the
@@ -30907,23 +30583,6 @@ mod tests {
         assert!(recovery.can_resume);
         assert!(recovery.can_discard);
         assert_eq!(recovery.interrupted_at_ms, Some(3));
-    }
-
-    #[test]
-    fn node_config_from_output_returns_only_object_payloads() {
-        let output = json!({
-            "payload": {
-                "config": {
-                    "_system": {
-                        "runtime": "io.api",
-                        "runtime_version": "1.0.0"
-                    },
-                    "mode": "support"
-                }
-            }
-        });
-        let config = node_config_from_output(&output).expect("object config");
-        assert_eq!(config.get("mode").and_then(Value::as_str), Some("support"));
     }
 
     #[test]

@@ -1666,6 +1666,24 @@ Then:
 1. `publish_runtime_package`
 2. `run_node`
 
+**What a publish does to the nodes already there.** `set_current` (true unless the step says
+false) makes the new version the runtime's `current`. No node is recreated, whether the publish is
+a plan step or the operator's `Publish Software` panel (its `Promote To Current` box is
+`set_current`):
+
+- Each hive moves its running nodes of that runtime that follow `current` onto the new version
+  within a minute of the version reaching that hive, in place: each keeps its ILK, its secrets,
+  its config and who launched it (`launched_by`).
+- A node pinned to a version and a stopped node stay as they are. A stopped node that follows
+  `current` runs the new version when it is started.
+- A node's config is its own, written at its launch from its version's template. A package's new
+  template config reaches only the nodes launched after it. When the operator wants an existing
+  node on the new template, that is a config change of its own (§7.3, `node_control_config_set`),
+  which keeps its ILK and its secrets. Never recreate the node for it (`kill_node` with
+  `purge_instance`, then `run_node`): that removes its ILK and the secrets it owns.
+- Up to 0.1.135 the `Publish Software` panel recreated every motherbee node of the runtime on
+  such a publish: a new ILK, its owned secrets gone, `launched_by: "archi"`. It no longer does.
+
 ### 7.3 Update node config
 
 Use:

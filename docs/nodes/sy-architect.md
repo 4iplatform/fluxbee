@@ -171,10 +171,9 @@ a key is read as it came, where SY.admin's routes decode it. The read tool's key
 chat's line for deployments and drift name the query: newest first, 50 without a `limit` and at
 most 500 (the orchestrator's), so the model puts what the operator asks for, a severity or a
 kind, in the query, where it read the newest 50 of every kind and missed an older match.
-Archi's own reads of a list, the nodes of a hive a redeploy reads (`list_nodes_for_hive`) and the
-motherbee's nodes its status shows, go page after page with a smaller page when SY.admin says how
-many rows fit (`admin_listing_every_page`); an answer that is not ok is an error, never an empty
-list.
+Archi's own read of a list, the motherbee's nodes its status shows, goes page after page with a
+smaller page when SY.admin says how many rows fit (`admin_listing_every_page`); an answer that is
+not ok is an error, never an empty list.
 
 **A plan whose answer was too large** (FINDINGS A-198): SY.admin cuts an executor run's answer as
 far as the frame needs, and past that answers `REPLY_TOO_LARGE` with `action_ran` and the run's
@@ -381,14 +380,37 @@ skills, handbooks and a personality.
 
 - `POST /api/package/publish` sends `publish_runtime_package` to SY.admin with
   `{source: {kind: "bundle_upload", blob_path}, set_current, sync_to, update_to}`
-  (`handle_package_publish_request`). With `set_current` (default true) it then redeploys the
-  nodes of that runtime on Archi's own hive with the new current version
-  (`redeploy_runtime_nodes_with_current`): each node is killed with its instance purged and run
-  again, with its stored config when `preserve_node_config` asks for it. Before the kill it reads
-  the node's tenant from its stored config (`_system.tenant_id`, else `tenant_id`) and runs it
-  again in it, a top-level `tenant_id`; a node whose tenant cannot be read is not touched and
-  is named in the answer's `errors` (FINDINGS A-235).
-- `POST /api/software/publish` publishes an uploaded `.zip`, or packages a single binary first.
+  (`handle_package_publish_request`); `set_current` is true unless the request says false. That
+  is all it sends: Archi recreates no node (FINDINGS A-298). Its answer is SY.admin's
+  (`status`, `payload`, `error`) with `next`, what follows a publish that went through, for the
+  operator to read:
+  - **With `set_current`:** each hive's orchestrator moves its running nodes of that runtime that
+    follow `current` onto the new version within a minute of the version reaching that hive (its
+    reconcile, FINDINGS A-109), in place: each keeps its ILK, its secrets, its config and its
+    `launched_by`. A node pinned to a version and a stopped node stay as they are; a stopped node
+    that follows `current` runs the new version when it is started (`start_node` resolves
+    `current` again).
+  - **Without it:** no node moves; a node launched with that `runtime_version` runs it.
+  - **A node's config is its own,** written at its launch from the template of the version it was
+    launched on (`config/default-config.json`, or the package's `config_template`). A package's new
+    template reaches only the nodes launched after it: an `ai.generic` node reads its own
+    `config.json` alone, so a config-only package's new template config never reaches a node
+    launched before it. To give an existing node another config, change it with a config change of
+    its own (`node_control_config_set`, the node's `CONFIG_SET`), which keeps its ILK and its
+    secrets; Archi stages it as a plan the operator confirms.
+  - **Up to 0.1.135** a publish with `set_current` then took every node of that runtime on the
+    motherbee, by runtime name, running or stopped, pinned or not, and ran `kill_node` with `force`
+    and `purge_instance` and then `run_node` on `current` (`redeploy_runtime_nodes_with_current`):
+    each came back with a new ILK, without the secrets it owned, running even if it had been
+    stopped, with the template config unless `preserve_node_config`, and with
+    `launched_by: "archi"`, so a node the Cloud launched answered `NODE_NOT_FOUND` to the Cloud's
+    start, stop and delete. The request's `preserve_node_config` and the answer's `redeploy` are
+    gone with it.
+- `POST /api/software/publish` publishes an uploaded `.zip`, or packages a single binary first,
+  through the same publish (`handle_software_publish_request`): its answer carries that publish's
+  answer, `next` with it, under `publish`. The **Publish Software** panel of the chat sidebar
+  calls either; its **Promote To Current** box, unchecked when a file is chosen, is `set_current`,
+  and the panel shows `next` under the published version.
 - Pipeline artifacts are published inside the executor plan (`inline_package` or
   `bundle_upload`).
 - SY.admin opens a `bundle_upload`'s zip under the blob root without following a symlink at any
