@@ -51,7 +51,7 @@ Defined in `packaging/base-nodes.json`:
 | Node | Class | At boot |
 |------|-------|---------|
 | IO.blob | runtime (boot=true) | running, CONFIGURED on its defaults (HEALTHY) |
-| IO.cloud | runtime (boot=true, role: motherbee) | running, UNCONFIGURED and DEGRADED (`missing_edge_node`) until it trusts the ingress' edge: publishing a Fluxbee Cloud's door records it, and IO.cloud reads it when it restarts (the Cloud is another repo) |
+| IO.cloud | runtime (boot=true, role: motherbee) | running, UNCONFIGURED and DEGRADED (`missing_edge_node`) until it trusts the ingress' edge, which publishing a Fluxbee Cloud's door records and applies to it at once (the Cloud is another repo) |
 | io.api | runtime | baked in, NOT at boot: each API (`IO.api.<label>`) is launched by the tenant that needs it, with its tenant |
 | io.slack | runtime | baked in, NOT at boot: each Slack binding is launched by the tenant that needs it, with its tenant |
 | io.wapp | runtime | baked in, NOT at boot: each WhatsApp number (`IO.wapp.<label>`) is launched by its tenant |
@@ -65,8 +65,8 @@ Only IO.cloud and IO.blob start with the install, in the root tenant
 They start **running** (FINDINGS A-91). IO.blob's defaults cover everything it does, so it boots
 CONFIGURED on them, HEALTHY. IO.cloud drops every Cloud request while it trusts no edge, so it is
 UNCONFIGURED, its status DEGRADED and its CONFIG_GET naming `missing_edge_node`, until it trusts an
-`SY.edge`: `publish_cloud_endpoint` records the edge in its `config.json`, which IO.cloud reads only
-when it starts, so a restart of IO.cloud follows the publish ([io-cloud-api](io-cloud-api.md) §7).
+`SY.edge`: `publish_cloud_endpoint` records the edge in its config and applies it to the running
+IO.cloud at once (FINDINGS A-255, [io-cloud-api](io-cloud-api.md) §7).
 IO.web, the third IO node of the root tenant, starts only when the operator launches it there with
 `run_node` ([io-web-v2](io-web-v2.md) §11.2). The other IO runtimes
 stay baked in and spawnable: a tenant launches them (or an operator, for that tenant) with `run_node`.

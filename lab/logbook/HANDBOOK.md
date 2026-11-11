@@ -493,11 +493,11 @@ The base nodes start as their defaults allow (FINDINGS A-91):
 
 - `IO.blob` is `CONFIGURED` on its defaults and `HEALTHY`: they cover everything it does.
 - `IO.cloud` is `UNCONFIGURED`, its status `DEGRADED` and its `CONFIG_GET` naming
-  `missing_edge_node`, until it trusts the ingress' `SY.edge`. `publish_cloud_endpoint` records
-  that edge in its `config.json`, which IO.cloud reads only when it starts, so restart IO.cloud
-  after the publish (`POST /hives/motherbee/nodes/IO.cloud@motherbee/restart`). **That is
-  correct**, not a failure: with no edge it drops every Cloud request, and only a hive that
-  connects a Fluxbee Cloud publishes its door.
+  `missing_edge_node`, until it trusts the ingress' `SY.edge`, which `publish_cloud_endpoint`
+  records in its config and applies to it at once (FINDINGS A-255; an answer with
+  `edge_applied: false` carries a `warning` that says why not). **That is correct**, not a
+  failure: with no edge it drops every Cloud request, and only a hive that connects a Fluxbee
+  Cloud publishes its door.
 
 > **The hive registry decides who may connect over the WAN.** The motherbee admits a hive only
 > while `/var/lib/fluxbee/hives/<hive_id>/` exists: `add_hive` creates it when it accepts the

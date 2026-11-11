@@ -25,11 +25,11 @@
 //! config as part of publishing; `CONFIG_SET` is the manual override. There is deliberately NO
 //! secret field: the endpoint token is minted by `SY.admin` into the vault.
 //!
-//! The record and the override do not reach the node the same way. `publish_cloud_endpoint`
-//! records the edge with `set_node_config`, which only writes the node's `config.json`, and io.cloud
-//! reads that file only when it starts: a running io.cloud trusts an edge recorded that way after
-//! its next start (`restart_node`). A `CONFIG_SET` of `io.edge_node` reaches the live control plane,
-//! and the next request is judged by it (FINDINGS A-91's review).
+//! Both reach the running node. `publish_cloud_endpoint` records the edge with `set_node_config`,
+//! which writes the node's `config.json` (read when io.cloud starts), and then applies it with a
+//! `CONFIG_SET` of the live config with that edge, at its `config_version` + 1, unless io.cloud
+//! trusts that edge already (FINDINGS A-255). A `CONFIG_SET` of `io.edge_node` reaches the live
+//! control plane, and the next request is judged by it.
 //!
 //! Its defaults do not cover its work: with no edge to trust it drops every Cloud request. So it
 //! is CONFIGURED only while its config names an edge (`require_trusted_edge`, FINDINGS A-91); the
@@ -322,9 +322,9 @@ const MISSING_EDGE_NODE: &str = "missing_edge_node";
 /// `missing_edge_node` as its reason. A config the contract refused stays FAILED_CONFIG, with the
 /// contract's.
 ///
-/// The reason says how the edge gets there, as it is (FINDINGS A-91's review):
-/// `publish_cloud_endpoint` writes it to `config.json`, which io.cloud reads only when it starts, so
-/// a restart follows the publish; a CONFIG_SET of `io.edge_node` applies it at once.
+/// The reason says how the edge gets there: `publish_cloud_endpoint` records the edge it publishes
+/// on and applies it to the running io.cloud at once (FINDINGS A-255), and so does a CONFIG_SET of
+/// `io.edge_node`.
 fn require_trusted_edge(state: &mut IoControlPlaneState) {
     if state.current_state == IoNodeLifecycleState::FailedConfig {
         return;
@@ -337,10 +337,9 @@ fn require_trusted_edge(state: &mut IoControlPlaneState) {
         state.last_error = Some(IoControlPlaneErrorInfo {
             code: MISSING_EDGE_NODE.to_string(),
             message: "IO.cloud trusts no SY.edge (config io.edge_node), so it drops every Cloud \
-                      request. publish_cloud_endpoint records the edge it publishes on in \
-                      IO.cloud's config.json, which IO.cloud reads only when it starts: after a \
-                      publish, restart IO.cloud (restart_node); or set the edge at once with \
-                      CONFIG_SET io.edge_node (node_control_config_set)"
+                      request. publish_cloud_endpoint publishes its channel on an edge and applies \
+                      that edge here at once; or set the edge with CONFIG_SET io.edge_node \
+                      (node_control_config_set)"
                 .to_string(),
         });
     }
@@ -425,8 +424,9 @@ async fn run_loop(
         }
 
         // Trusted edge is read LIVE from the control plane on EVERY request (hot-apply): a
-        // CONFIG_SET that changes `io.edge_node` takes effect on the very next message, no restart.
-        // An edge `publish_cloud_endpoint` records reaches only config.json, read at the next start.
+        // CONFIG_SET that changes `io.edge_node` takes effect on the very next message, no restart,
+        // and so does the edge `publish_cloud_endpoint` publishes on, which SY.admin applies with
+        // one (FINDINGS A-255).
         let effective = state.control_plane.read().await.effective_config.clone();
         let cloud_edge_node = trusted_edge_node(effective.as_ref());
         let cloud_edge_node = cloud_edge_node.as_deref();
@@ -437,15 +437,14 @@ async fn run_loop(
             if msg.meta.ich.as_deref() == Some(state.own_ich.as_str()) {
                 // A request for its own channel from an edge it does not trust, or while it
                 // trusts none (FINDINGS A-91): Cloud gets nothing and waits out the edge's 30 s,
-                // so the drop is said where the operator looks, with what fixes it when the door
-                // was published, or moved, since the start (its status is HEALTHY on a moved one).
+                // so the drop is said where the operator looks (its status is HEALTHY while it
+                // trusts another edge).
                 tracing::warn!(
                     trace_id = %msg.routing.trace_id,
                     src_l2_name = ?msg.routing.src_l2_name,
                     trusted_edge = ?cloud_edge_node,
                     "IO.cloud dropped a request for its channel: its live config io.edge_node does \
-                     not name the SY.edge it came through; an edge publish_cloud_endpoint recorded \
-                     since IO.cloud started is trusted after its restart"
+                     not name the SY.edge it came through"
                 );
             } else {
                 tracing::debug!(
@@ -3376,8 +3375,8 @@ mod tests {
 
     /// FINDINGS A-91: io.cloud's defaults do not cover its work, so the orchestrator's seed alone,
     /// and no config.json at all, boot UNCONFIGURED, naming what it misses, `io.edge_node`; never
-    /// a silent UNCONFIGURED. The reason says how the edge gets there as it is (the review): the
-    /// publish records it in config.json, which a running io.cloud reads at its next start.
+    /// a silent UNCONFIGURED. The reason says how the edge gets there: the publish applies it to
+    /// the running io.cloud at once (FINDINGS A-255), as a CONFIG_SET does, so it names no restart.
     #[test]
     fn the_seed_alone_boots_unconfigured_naming_the_missing_edge() {
         let root = nodes_root("seed");
@@ -3405,11 +3404,13 @@ mod tests {
         for what in [
             "io.edge_node",
             "publish_cloud_endpoint",
-            "config.json, which IO.cloud reads only when it starts",
-            "restart IO.cloud (restart_node)",
+            "applies that edge here at once",
             "CONFIG_SET io.edge_node (node_control_config_set)",
         ] {
             assert!(error.message.contains(what), "{what}: {}", error.message);
+        }
+        for gone in ["restart", "only when it starts"] {
+            assert!(!error.message.contains(gone), "{gone}: {}", error.message);
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3684,6 +3685,24 @@ mod tests {
             !src[receive..status].contains("\n        if "),
             "nothing is decided between the receive and the status branch"
         );
+    }
+
+    /// FINDINGS A-255: the edge `publish_cloud_endpoint` publishes on reaches the running io.cloud
+    /// (SY.admin applies it with a CONFIG_SET), so no text of io.cloud tells the operator to restart
+    /// it after a publish any more, as `missing_edge_node`'s reason and the line logged for a
+    /// dropped request did in 0.1.131. Read from the source, the literals split so this test cannot
+    /// find itself.
+    #[test]
+    fn no_text_of_io_cloud_asks_for_a_restart_after_a_publish() {
+        let src = include_str!("main.rs");
+        for gone in [
+            concat!("restart IO", ".cloud"),
+            concat!("trusted after its ", "restart"),
+            concat!("reads only when it ", "starts"),
+            concat!("(restart", "_node)"),
+        ] {
+            assert!(!src.contains(gone), "{gone}");
+        }
     }
 
     #[test]

@@ -872,28 +872,25 @@ It publishes IO.cloud's channel on that edge, mints the token, stores it in the 
 edge in IO.cloud's config and answers with `url` (`/e/<ich>`) and `token`. **The token is shown
 only here.** Give Cloud `https://<public host><url>` and the token.
 
-**Then restart IO.cloud,** the first time and whenever the door moves to another edge. The record is
-written to IO.cloud's `config.json`, which IO.cloud reads only when it starts; until then it drops
-every Cloud request the new edge forwards (a 504 for Cloud):
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/hives/motherbee/nodes/IO.cloud@motherbee/restart
-```
-
-The restart (`restart_node`) changes nothing else: the door, the token and the channel stay. A
-`CONFIG_SET` of `io.edge_node` (`node_control_config_set`, with `config_version` one above its
-`node_control_config_get`) applies the edge at once instead.
+IO.cloud trusts that edge at once, the first time and whenever the door moves to another edge
+(FINDINGS A-255): after the record, SY.admin applies the edge to the running IO.cloud, a
+`CONFIG_SET` of its live config with that edge at its `config_version` + 1. The answer says so with
+`edge_applied: true`. With `edge_applied: false` it carries a `warning`: the edge is recorded but
+not applied yet, and why (IO.cloud did not answer, or refused the `CONFIG_SET`). Until IO.cloud
+takes it, it drops every Cloud request through that edge (a 504 for Cloud); it reads the record
+when it starts, or takes it at once from a `CONFIG_SET` of `io.edge_node` (`node_control_config_set`,
+its `node_control_config_get` config with the edge, `config_version` one above).
 
 - **Rotate:** run it again on the same edge. A new token is minted; the previous one works 10 more
-  minutes. IO.cloud already trusts that edge: no restart.
+  minutes. IO.cloud already trusts that edge: nothing in it changes.
 - **Check:** `curl 'http://127.0.0.1:8080/channels/externalized?edge_node=SY.edge@ingress1'` lists a
   row owned by `IO.cloud@motherbee`.
 - **IO.cloud's own state** (FINDINGS A-91): while it trusts no edge, it drops every Cloud request,
   so `GET /hives/motherbee/nodes/IO.cloud@motherbee/status` says `health_state: DEGRADED` with
   `last_error.code: missing_edge_node`, and its `CONFIG_GET` (`node_control_config_get`) is not
   `ok`, with the same reason, `state: UNCONFIGURED`. A `CONFIG_SET` that names no edge is applied,
-  and its answer gives the same reason (`node_error` in SY.admin's 200). A publish alone does not
-  change that; the restart after it does. Trusting the edge, it is `HEALTHY` and `CONFIGURED`.
+  and its answer gives the same reason (`node_error` in SY.admin's 200). A publish that answers
+  `edge_applied: true` changes that at once. Trusting the edge, it is `HEALTHY` and `CONFIGURED`.
 - **Smoke test** (no token needed for the first three):
 
 ```bash
@@ -908,7 +905,7 @@ post '{"op":"list_cloud_actions"}'
 |---|---|
 | **404** | the endpoint was never published, or the hive was reinstalled: publish again |
 | **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log) |
-| **504** | IO.cloud is down or busy (§6), or it does not trust this edge yet: restart IO.cloud after a publish (it reads the recorded edge only when it starts). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
+| **504** | IO.cloud is down or busy (§6), or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
 ---
 

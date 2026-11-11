@@ -16,9 +16,8 @@
     "  per-tenant on demand via run_node. When 'boot': true, fluxbee-firstboot auto-spawns",
     "  one default instance ('instance') at the root tenant so it is RUNNING at boot: io.blob",
     "  CONFIGURED on its defaults; io.cloud UNCONFIGURED, its status DEGRADED with",
-    "  missing_edge_node, until it trusts an SY.edge: publish_cloud_endpoint records one in its",
-    "  config.json, which io.cloud reads only when it starts, so a restart follows the publish",
-    "  (FINDINGS A-91).",
+    "  missing_edge_node, until it trusts an SY.edge, which publish_cloud_endpoint records in its",
+    "  config and applies to it at once (FINDINGS A-91, A-255).",
     "  Only the system IO nodes boot (io.cloud, io.blob). They and io.web, which runs only where",
     "  the operator starts it, are the only IO nodes in the root tenant (operator, 2026-10-02;",
     "  FINDINGS A-43; the orchestrator's CORE_IO_RUNTIMES): every other runtime is 'boot': false,",
@@ -49,7 +48,7 @@
       "instance": "IO.blob@motherbee"
     },
     {
-      "_note": "io.cloud is the in-mesh Fluxbee Cloud provisioning relay. Promoted from a systemd singleton to a first-class MANAGED runtime: it takes its single config field io.edge_node via CONFIG_SET/GET, NO env, and publish_cloud_endpoint records the edge into this node's config.json as part of publishing, which io.cloud reads only when it starts (a CONFIG_SET of io.edge_node applies at once). With no edge to trust it drops every Cloud request, so until it trusts one (a restart after the first publish) it is UNCONFIGURED and DEGRADED, its status and CONFIG_GET naming missing_edge_node (FINDINGS A-91). Motherbee-only via a fail-closed self-check; externalize is admin-driven (io.cloud does NOT self-externalize at boot). Bare instance name (true singleton).",
+      "_note": "io.cloud is the in-mesh Fluxbee Cloud provisioning relay. Promoted from a systemd singleton to a first-class MANAGED runtime: it takes its single config field io.edge_node via CONFIG_SET/GET, NO env, and publish_cloud_endpoint records the edge into this node's config as part of publishing and applies it to the running node at once, a CONFIG_SET of its live config with that edge (FINDINGS A-255). With no edge to trust it drops every Cloud request, so until it trusts one (the first publish) it is UNCONFIGURED and DEGRADED, its status and CONFIG_GET naming missing_edge_node (FINDINGS A-91). Motherbee-only via a fail-closed self-check; externalize is admin-driven (io.cloud does NOT self-externalize at boot). Bare instance name (true singleton).",
       "runtime": "io.cloud",
       "crate": "io-cloud",
       "bin": "io-cloud",
