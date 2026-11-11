@@ -412,8 +412,22 @@ anyone. Send only emails Cloud has verified.
   - `ACCOUNT_IN_ROOT_TENANT`: the account is charged to the root tenant (registered before 0.1.54);
     the operator reassigns it.
   - `TENANT_ROOT_NOT_REGISTRABLE`, `INVALID_REQUEST` (the handoff shape), `ILK_DELETED` (that
-    account is marked deleted: restore it), `IDENTITY_UNAVAILABLE`, `FRONTDESK_UNAVAILABLE`.
+    account is marked deleted: restore it), `IDENTITY_UNAVAILABLE`.
   - On a frontdesk refusal, `success:false` with its code, and the identity stays temporary.
+- **When the frontdesk gives no verdict**, the answer is one of these codes. When the frontdesk
+  sent an error, the answer also names the person (`ilk_id`), and `error_detail` starts with the
+  frontdesk's own code (`"ai_runtime_busy: …"`).
+
+  | `error_code` | what happened | what Cloud does |
+  |---|---|---|
+  | `FRONTDESK_UNAVAILABLE` | the frontdesk did not answer within 20 s (§6), or answered with an error that says sending the request again may pass (it was busy) | send the same request again after a few seconds; it is safe (below) |
+  | `FRONTDESK_REJECTED` | the frontdesk answered with an error that does not say so: it failed on this registration, and may have done part of it | do not resend it in a loop: read the person (`get_ilk` by email: its `registration_status`) and give the operator the `request_id` |
+  | `INVALID_FRONTDESK_RESPONSE` | the frontdesk answered something that is neither its verdict nor an error: a fault on the hive's side | as `FRONTDESK_REJECTED` |
+
+  **Sending `register_human` again is safe.** One email is one account, so the retry takes over
+  the temporary identity an earlier attempt left, or answers `existing: true` when that attempt
+  completed after all. A 504 from the edge on `register_human` is answered the same way: send it
+  again.
 
 #### `set_ilk_tenant`
 
@@ -936,6 +950,7 @@ to, for example. No op of this list reads them or takes them down.
 ```text
 you / the edge wait   30 s
 IO.cloud waits        20 s for the hive (25 s for provision_node, stop_node, delete_node and get_usage)
+register_human        10 s for the identity registry, then 20 s for the frontdesk (§5.2)
 ```
 
 A request that takes between 20 (25) and 30 s answers `ADMIN_UNAVAILABLE` **while it may still be
@@ -951,6 +966,7 @@ completing inside**. Treat it as **unknown**, not failed:
 - `delete_node`: a retry answers `NODE_NOT_FOUND` once the timed-out attempt finished, as it does
   while the node's hive cannot be reached (`unreachable_hives` then names it): in both cases, read
   `list_nodes` to know.
+- `register_human`: safe to send again, on `FRONTDESK_UNAVAILABLE` or a 504 (§5.2).
 
 **IO.cloud serves one request at a time.** Concurrent calls queue, and a queued one can spend the
 edge's 30 s and get a 504. Serialize your calls.
@@ -1056,6 +1072,14 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.137
+
+- **`register_human`: a frontdesk error that says sending the request again may pass** (the
+  frontdesk was busy) answers `FRONTDESK_UNAVAILABLE`, as a frontdesk that does not answer in time
+  does: send the request again. It answered `FRONTDESK_REJECTED`, which stays for an error that does
+  not say so. Both, and `INVALID_FRONTDESK_RESPONSE`, are listed with what to do (§5.2), and
+  `error_detail` starts with the frontdesk's own code.
 
 ### 0.1.136
 

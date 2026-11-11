@@ -211,13 +211,7 @@ async fn main() -> Result<(), DynError> {
         "IO.cloud starting (managed in-mesh Fluxbee Cloud adapter)"
     );
 
-    // Broad catch-all: unsolicited traffic (edge-forwarded requests under any family, plus system
-    // messages incl. CONFIG_GET/SET) lands on `incoming`. Admin responses to our own outbound RPCs
-    // are correlated by trace_id in the pending map first, so they never leak here.
-    let profile = OperationalRouteProfile::builder()
-        .command_channel(RPC_CH_INCOMING)
-        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_INCOMING))
-        .build()?;
+    let profile = io_cloud_route_profile()?;
     let dispatcher = RouterDispatcher::connect_with_retry(
         NodeConfig {
             name: config.node_name.clone(),
@@ -285,6 +279,16 @@ async fn main() -> Result<(), DynError> {
         .take_command_receiver(RPC_CH_INCOMING)
         .await?;
     run_loop(&sender, &full_name, &state, &mut incoming).await
+}
+
+/// The dispatcher's routes. Broad catch-all: unsolicited traffic (edge-forwarded requests under any
+/// family, plus system messages incl. CONFIG_GET/SET) lands on `incoming`. Admin responses to our
+/// own outbound RPCs are correlated by trace_id in the pending map first, so they never leak here.
+fn io_cloud_route_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_INCOMING)
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_INCOMING))
+        .build()
 }
 
 /// The control plane at boot, from the node's `config.json`: the SDK validates operator content
@@ -2385,20 +2389,22 @@ async fn handle_register_human(
     };
 
     // (3) Parse the frontdesk's structured verdict and relay it to Cloud, stamped with the ilk_id
-    // io.cloud minted (the frontdesk's minimal contract omits it, but io.cloud knows it).
+    // io.cloud minted (the frontdesk's minimal contract omits it, but io.cloud knows it). An error
+    // the frontdesk sends in its place reaches Cloud by its `retryable` (FINDINGS A-293).
     if reply.payload.get("type").and_then(Value::as_str) == Some("error") {
-        let detail = reply
-            .payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("frontdesk rejected the request");
-        return json!({
-            "status": "error",
-            "op": "register_human",
-            "ilk_id": temp_ilk,
-            "error_code": "FRONTDESK_REJECTED",
-            "error_detail": detail,
-        });
+        let answer = frontdesk_error_reply(&temp_ilk, &reply.payload);
+        // The frontdesk's journal has this handoff under its own trace_id, not the Cloud
+        // request's: this line joins the two.
+        tracing::warn!(
+            trace_id = %msg.routing.trace_id,
+            handoff_trace_id = %reply.routing.trace_id,
+            ilk_id = %temp_ilk,
+            frontdesk_code = ?reply.payload.get("code").and_then(|v| v.as_str()),
+            retryable = ?reply.payload.get("retryable").and_then(|v| v.as_bool()),
+            error_code = ?answer.get("error_code").and_then(|v| v.as_str()),
+            "IO.cloud got an error from the frontdesk in place of its verdict"
+        );
+        return answer;
     }
     let structured =
         match parse_structured_response_payload(&reply.payload, &frontdesk_response_contract()) {
@@ -2411,6 +2417,44 @@ async fn handle_register_human(
             }
         };
     register_human_reply(&temp_ilk, &structured)
+}
+
+/// Cloud's answer when the frontdesk sends an error in place of its verdict (FINDINGS A-293), in
+/// the shape of every AI runtime error: `type`, `code`, `message`, `retryable`. The frontdesk's
+/// `retryable` picks the code, never its text:
+/// - `retryable: true`: nothing was done that sending the request again would repeat, and the
+///   cause may pass (the frontdesk was busy). That is `FRONTDESK_UNAVAILABLE`, the code of a
+///   frontdesk that does not answer within IO.cloud's 20 s, on which Cloud sends the request
+///   again: one code for one action.
+/// - anything else, `retryable` false or missing: `FRONTDESK_REJECTED`. The frontdesk failed on
+///   this registration and does not say the same request would pass; a handler that failed may
+///   have acted before it stopped.
+///
+/// Either way the answer names the person's ilk_id, and its detail the frontdesk's code.
+fn frontdesk_error_reply(temp_ilk: &str, error: &Value) -> Value {
+    let retryable = error.get("retryable").and_then(Value::as_bool) == Some(true);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("the frontdesk answered with an error");
+    let detail = match error
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        Some(code) => format!("{code}: {message}"),
+        None => message.to_string(),
+    };
+    json!({
+        "status": "error",
+        "op": "register_human",
+        "ilk_id": temp_ilk,
+        "error_code": if retryable { "FRONTDESK_UNAVAILABLE" } else { "FRONTDESK_REJECTED" },
+        "error_detail": detail,
+    })
 }
 
 /// Cloud's answer from the frontdesk's structured verdict. `ilk_id` is where the person ended up:
@@ -3822,5 +3866,216 @@ mod tests {
             ilk_shm_subset(&person("ilk:account", "complete"), &pending)["pending_signup"],
             false
         );
+    }
+
+    const TEST_TENANT: &str = "tnt:11111111-1111-4111-8111-111111111111";
+    /// The temporary ILK SY.identity gives the person in the tests through the handler.
+    const TEST_TEMP_ILK: &str = "ilk:33333333-3333-4333-8333-333333333333";
+
+    /// An io.cloud whose router is the test: the SDK's in-process harness, with the receive loop's
+    /// routes. The test plays SY.identity and the frontdesk.
+    fn io_cloud_on_a_test_router() -> (Arc<RuntimeState>, fluxbee_sdk::RouterDispatcherTestHarness)
+    {
+        let (dispatcher, router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "IO.cloud@motherbee",
+            io_cloud_route_profile().expect("the routes"),
+        );
+        let control_plane = IoControlPlaneState::default();
+        let state = Arc::new(RuntimeState {
+            config: Config {
+                node_name: "IO.cloud@motherbee".to_string(),
+                hive_id: MOTHERBEE_HIVE.to_string(),
+                node_version: "test".to_string(),
+                router_socket: PathBuf::new(),
+                uuid_persistence_dir: PathBuf::new(),
+                config_dir: PathBuf::new(),
+                spawn_config_path: PathBuf::new(),
+                identity_target: "SY.identity@motherbee".to_string(),
+                admin_target: "SY.admin@motherbee".to_string(),
+                orchestrator_target: "SY.orchestrator@motherbee".to_string(),
+            },
+            own_ich: "ich:14b66389-d425-531c-a140-a591d25e8f39".to_string(),
+            control_metrics: Arc::new(IoControlPlaneMetrics::with_initial_state(
+                control_plane.current_state.as_str(),
+                control_plane.config_version,
+            )),
+            control_plane: Arc::new(RwLock::new(control_plane)),
+            adapter_contract: Arc::new(IoCloudAdapterConfigContract),
+            dispatcher,
+        });
+        (state, router)
+    }
+
+    /// A peer's answer to one of io.cloud's requests: the same trace, back to io.cloud.
+    fn answer_to(request: &Message, msg_type: &str, msg: Option<&str>, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "uuid-of-the-peer".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(request.routing.src.clone()),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                msg: msg.map(ToString::to_string),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    /// One `register_human` through the handler: the test answers SY.identity's ILK_PROVISION with
+    /// a new temporary person, then the handoff with `frontdesk_answer`, and gives Cloud's answer.
+    async fn register_human_answered_by(frontdesk_answer: Value) -> Value {
+        let (state, mut router) = io_cloud_on_a_test_router();
+        let sender = state.dispatcher.sender_snapshot();
+        let request = Message {
+            routing: Routing {
+                src: "uuid-of-the-edge".to_string(),
+                src_l2_name: Some("SY.edge@ingress1".to_string()),
+                dst: Destination::Unicast("IO.cloud@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-of-the-cloud-request".to_string(),
+            },
+            meta: Meta {
+                msg_type: CLOUD_INBOUND_FAMILY.to_string(),
+                ..Meta::default()
+            },
+            payload: json!({
+                "op": "register_human", "tenant_id": TEST_TENANT, "request_id": "req-a293",
+                "params": {
+                    "type": "frontdesk_handoff", "schema_version": 1,
+                    "operation": "complete_registration",
+                    "subject": {"display_name": "Juan Perez", "email": "juan@acme.com"}
+                }
+            }),
+        };
+        let peers = async {
+            let provision = router
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("io.cloud provisions the person first");
+            assert_eq!(
+                provision.meta.msg.as_deref(),
+                Some(fluxbee_sdk::MSG_ILK_PROVISION)
+            );
+            router
+                .inject(answer_to(
+                    &provision,
+                    SYSTEM_KIND,
+                    Some(fluxbee_sdk::MSG_ILK_PROVISION_RESPONSE),
+                    json!({"status": "ok", "ilk_id": TEST_TEMP_ILK, "created": true,
+                           "registration_status": "temporary", "tenant_id": TEST_TENANT}),
+                ))
+                .await
+                .expect("SY.identity answers");
+            let handoff = router
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("then io.cloud hands the person to the frontdesk");
+            assert_eq!(handoff.meta.msg.as_deref(), Some(FRONTDESK_HANDOFF_MSG));
+            assert!(matches!(
+                &handoff.routing.dst,
+                Destination::Unicast(target) if target == DEFAULT_FRONTDESK_TARGET
+            ));
+            router
+                .inject(answer_to(&handoff, USER_KIND, None, frontdesk_answer))
+                .await
+                .expect("the frontdesk answers");
+        };
+        let (answer, ()) = tokio::join!(handle_register_human(&sender, &state, &request), peers);
+        answer
+    }
+
+    /// FINDINGS A-293, through the handler: an error the frontdesk sends in place of its verdict
+    /// reaches Cloud by its `retryable`. A frontdesk too busy to run the handoff (the AI runtime's
+    /// `ai_runtime_busy`: retryable, nothing run) is FRONTDESK_UNAVAILABLE, the code Cloud sends the
+    /// request again on, where it was FRONTDESK_REJECTED, a final refusal; a handler that failed
+    /// (`ai_runtime_error`, not retryable) stays FRONTDESK_REJECTED. Both keep the person's ILK and
+    /// name the frontdesk's code, and the frontdesk's verdict is relayed as before.
+    #[tokio::test]
+    async fn a_frontdesk_error_reaches_cloud_by_its_retryable() {
+        let busy = register_human_answered_by(json!({
+            "type": "error",
+            "code": "ai_runtime_busy",
+            "message": "The AI runtime is busy: its 4 model workers are all taken and 128 more \
+                        messages wait for them. This message was not run; send it again later.",
+            "retryable": true
+        }))
+        .await;
+        assert_eq!(busy["status"], "error");
+        assert_eq!(busy["op"], "register_human");
+        assert_eq!(busy["error_code"], "FRONTDESK_UNAVAILABLE");
+        assert_eq!(busy["ilk_id"], TEST_TEMP_ILK);
+        assert!(
+            busy["error_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.starts_with("ai_runtime_busy: The AI runtime is busy")),
+            "{busy}"
+        );
+
+        let failed = register_human_answered_by(json!({
+            "type": "error",
+            "code": "ai_runtime_error",
+            "message": "The AI runtime failed while processing this message.",
+            "retryable": false
+        }))
+        .await;
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["error_code"], "FRONTDESK_REJECTED");
+        assert_eq!(failed["ilk_id"], TEST_TEMP_ILK);
+        assert_eq!(
+            failed["error_detail"],
+            "ai_runtime_error: The AI runtime failed while processing this message."
+        );
+
+        let registered = register_human_answered_by(json!({
+            "type": "text",
+            "content": json!({
+                "success": true,
+                "human_message": "Registration completed successfully.",
+                "ilk_id": TEST_TEMP_ILK,
+                "merged": false
+            })
+            .to_string()
+        }))
+        .await;
+        assert_eq!(registered["status"], "ok");
+        assert_eq!(registered["registration_status"], "complete");
+        assert_eq!(registered["ilk_id"], TEST_TEMP_ILK);
+    }
+
+    /// FINDINGS A-293: only the frontdesk's own `retryable: true` makes an error one to send again;
+    /// an error that does not say so is final, as every error was before.
+    #[test]
+    fn only_an_error_the_frontdesk_marks_retryable_is_unavailable() {
+        // The frontdesk's error with this `retryable`, or none when it is absent.
+        let code = |retryable: Option<Value>| {
+            let mut error =
+                json!({"type": "error", "code": "provider_unreachable", "message": "m"});
+            if let Some(retryable) = retryable {
+                error["retryable"] = retryable;
+            }
+            frontdesk_error_reply(TEST_TEMP_ILK, &error)["error_code"].clone()
+        };
+        assert_eq!(code(Some(json!(true))), "FRONTDESK_UNAVAILABLE");
+        for not_retryable in [
+            Some(json!(false)),
+            None,
+            Some(json!("true")),
+            Some(Value::Null),
+        ] {
+            assert_eq!(
+                code(not_retryable.clone()),
+                "FRONTDESK_REJECTED",
+                "{not_retryable:?}"
+            );
+        }
+        // With neither a code nor a message, the detail still says what happened.
+        let bare = json!({"type": "error", "retryable": true});
+        let bare = frontdesk_error_reply(TEST_TEMP_ILK, &bare);
+        assert_eq!(bare["error_detail"], "the frontdesk answered with an error");
+        assert_eq!(bare["ilk_id"], TEST_TEMP_ILK);
     }
 }
