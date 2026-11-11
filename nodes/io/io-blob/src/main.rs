@@ -9,8 +9,11 @@
 //!
 //! Configuration model: io.blob is a FIRST-CLASS MANAGED IO NODE like io.api/io.slack. Its tunables
 //! (`max_bytes`, `admin_hive`) come from the managed CONFIG_SET/GET control plane, NOT from ENV. The
-//! blob roots and ledger path are FIXED design paths (node defaults, dirs created at install). A
-//! curator with no operator config is VALID and runs on defaults (it is not `FAILED_CONFIG`).
+//! blob roots and ledger path are FIXED design paths (node defaults, dirs created at install). Its
+//! defaults cover everything it does (the default cap, the local hive's SY.admin), so the
+//! orchestrator's seed alone boots CONFIGURED on them, as io.web does (`boot_control_plane`,
+//! FINDINGS A-91), and NODE_STATUS_GET answers from the config state: HEALTHY while CONFIGURED,
+//! DEGRADED with the contract's reason while a config it refused is on disk.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -23,14 +26,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fluxbee_sdk::blob::{
     safe_fs, BlobConfig, BlobError, BlobRef, BlobToolkit, BLOB_DEFAULT_MAX_BYTES,
 };
+use fluxbee_sdk::managed_control_plane::{
+    build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
+    DEFAULT_MANAGED_NODES_ROOT,
+};
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
     MSG_BLOB_RELEASE, MSG_BLOB_RELEASE_RESPONSE, MSG_BLOB_STATUS_GET, MSG_BLOB_STATUS_GET_RESPONSE,
-    MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_NODE_STATUS_GET, SYSTEM_KIND,
+    MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, FLUXBEE_NODE_NAME_ENV,
+    managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
@@ -44,7 +51,7 @@ use io_common::io_control_plane::{
     ensure_config_version_advances, parse_and_validate_io_control_plane_request, IoConfigSource,
     IoControlPlaneErrorInfo, IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
 };
-use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
+use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state_with_root;
 use io_common::io_control_plane_logging::{
     log_config_get_served, log_config_set_applied, log_config_set_persist_error,
     log_config_set_stale_rejected, log_control_plane_request_rejected,
@@ -252,22 +259,13 @@ async fn main() -> Result<(), DynError> {
 
     // Control plane: boot reads ONLY the `config.json` in the node's dir, validated by the
     // adapter's contract through the SDK (single-config, no dynamic file shadowing a respawn:
-    // BUG-4).
+    // BUG-4); the seed alone is CONFIGURED on the defaults (`boot_control_plane`).
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoBlobAdapterConfigContract);
-    let mut boot_state =
-        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
-            .unwrap_or_else(|err| IoControlPlaneState {
-                current_state: IoNodeLifecycleState::FailedConfig,
-                config_source: IoConfigSource::None,
-                schema_version: 1,
-                config_version: 0,
-                effective_config: None,
-                last_error: Some(IoControlPlaneErrorInfo {
-                    code: "config_bootstrap_failed".to_string(),
-                    message: err.to_string(),
-                }),
-            });
-    validate_boot_effective_config(&mut boot_state, adapter_contract.as_ref());
+    let boot_state = boot_control_plane(
+        &config.node_name,
+        adapter_contract.as_ref(),
+        Path::new(DEFAULT_MANAGED_NODES_ROOT),
+    );
 
     let profile = OperationalRouteProfile::builder()
         .command_channel(RPC_CH_CONTROL)
@@ -337,6 +335,7 @@ async fn main() -> Result<(), DynError> {
         hive = %local_hive,
         lifecycle = %boot_state.current_state.as_str(),
         config_version = boot_state.config_version,
+        last_error = ?boot_state.last_error,
         max_bytes = initial_max_bytes,
         public_root = %curator.public_root.display(),
         ledger_path = %curator.ledger_path.display(),
@@ -357,7 +356,16 @@ async fn main() -> Result<(), DynError> {
     let mut incoming = dispatcher.take_command_receiver(RPC_CH_CONTROL).await?;
 
     while let Some(message) = incoming.recv().await {
-        if try_handle_default_node_status(&sender, &message).await? {
+        if is_node_status_request(&message) {
+            let payload = node_status_payload(&*state.control_plane.read().await);
+            sender
+                .send(build_reply(
+                    &sender,
+                    &message,
+                    MSG_NODE_STATUS_GET_RESPONSE,
+                    payload,
+                ))
+                .await?;
             continue;
         }
 
@@ -411,7 +419,41 @@ async fn main() -> Result<(), DynError> {
     Ok(())
 }
 
-// --- Plano de control (espejo de io.api) --------------------------------------------------------
+// --- Control plane (a mirror of io.web's) -------------------------------------------------------
+
+/// The control plane at boot, from the node's `config.json` through the contract, as io.web's
+/// (FINDINGS A-91). io.blob's defaults cover everything it does, so what the SDK reads as
+/// UNCONFIGURED (a config.json without operator content, or none) boots CONFIGURED on the
+/// contract's defaults: the default cap, and the local hive's SY.admin. Operator content the
+/// contract refuses is FAILED_CONFIG, with the contract's error; the curator then runs on its
+/// defaults, and its status says why its config is not in use.
+fn boot_control_plane(
+    node_name: &str,
+    contract: &dyn IoAdapterConfigContract,
+    nodes_root: &Path,
+) -> IoControlPlaneState {
+    let mut state = bootstrap_io_control_plane_state_with_root(node_name, contract, nodes_root)
+        .unwrap_or_else(|err| IoControlPlaneState {
+            current_state: IoNodeLifecycleState::FailedConfig,
+            config_source: IoConfigSource::None,
+            schema_version: 1,
+            config_version: 0,
+            effective_config: None,
+            last_error: Some(IoControlPlaneErrorInfo {
+                code: "config_bootstrap_failed".to_string(),
+                message: err.to_string(),
+            }),
+        });
+    if state.current_state == IoNodeLifecycleState::Unconfigured {
+        // No operator content: the defaults are the contract applied to nothing. The config is the
+        // seed config.json the orchestrator wrote, the one source there is.
+        state.effective_config = Some(json!({}));
+        state.config_source = IoConfigSource::OrchestratorFallback;
+        state.schema_version = state.schema_version.max(1);
+    }
+    validate_boot_effective_config(&mut state, contract);
+    state
+}
 
 fn validate_boot_effective_config(
     state: &mut IoControlPlaneState,
@@ -427,6 +469,7 @@ fn validate_boot_effective_config(
             state.last_error = None;
         }
         Err(err) => {
+            state.effective_config = None;
             state.current_state = IoNodeLifecycleState::FailedConfig;
             state.last_error = Some(IoControlPlaneErrorInfo {
                 code: err.code().to_string(),
@@ -434,6 +477,31 @@ fn validate_boot_effective_config(
             });
         }
     }
+}
+
+fn is_node_status_request(message: &Message) -> bool {
+    is_system_kind(&message.meta.msg_type)
+        && message.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
+}
+
+/// NODE_STATUS_GET: the SDK's managed answer for the config (FINDINGS A-91), as io.web's without
+/// its port: HEALTHY while CONFIGURED, which io.blob is on its defaults; otherwise DEGRADED, never
+/// ERROR, as across the managed family, with the reason in `last_error` (a config the contract
+/// refused). The orchestrator's `get_node_status` reports `health_state` and `last_error`.
+fn node_status_payload(control: &IoControlPlaneState) -> Value {
+    let lifecycle = match control.current_state {
+        IoNodeLifecycleState::Unconfigured => ManagedNodeLifecycleState::Unconfigured,
+        IoNodeLifecycleState::Configured => ManagedNodeLifecycleState::Configured,
+        IoNodeLifecycleState::FailedConfig => ManagedNodeLifecycleState::FailedConfig,
+    };
+    let last_error = control
+        .last_error
+        .as_ref()
+        .map(|error| ControlPlaneErrorInfo {
+            code: error.code.clone(),
+            message: error.message.clone(),
+        });
+    build_node_status_response_payload(lifecycle, last_error.as_ref())
 }
 
 fn is_config_command(message: &Message) -> bool {
@@ -1310,6 +1378,9 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
 
+    const NODE: &str = "IO.blob@motherbee";
+    const ROOT_TENANT: &str = "tnt:00000000-0000-0000-0000-000000000001";
+
     fn temp_root(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "io-blob-{label}-{}-{}",
@@ -1318,6 +1389,144 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp root");
         path
+    }
+
+    /// Writes the node's `config.json` under a managed-nodes root of the test's own.
+    fn write_config(root: &Path, raw: &str) {
+        let path = fluxbee_sdk::managed_node_config_path_with_root(NODE, root).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, raw).unwrap();
+    }
+
+    fn boot(root: &Path) -> IoControlPlaneState {
+        boot_control_plane(NODE, &IoBlobAdapterConfigContract, root)
+    }
+
+    /// FINDINGS A-91: the orchestrator's seed alone, and no config.json at all, boot CONFIGURED on
+    /// the defaults, which cover everything io.blob does: the default cap, and the local hive's
+    /// SY.admin. What a CONFIG_SET persists boots with its values.
+    #[test]
+    fn the_seed_alone_boots_configured_on_the_defaults() {
+        let root = temp_root("seed");
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(state.effective_config, Some(json!({"io": {}})));
+        assert_eq!(state.config_version, 0);
+
+        let seed = json!({
+            "tenant_id": ROOT_TENANT,
+            "_system": {"config_version": 3, "ilk_id": "ilk:11111111-2222-3333-4444-555555555555"},
+        });
+        write_config(&root, &seed.to_string());
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(state.config_source, IoConfigSource::OrchestratorFallback);
+        assert_eq!(state.effective_config, Some(json!({"io": {}})));
+        assert_eq!(
+            state.config_version, 3,
+            "kept, so CONFIG_SET stays monotonic"
+        );
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.last_error, None);
+        assert_eq!(
+            configured_max_bytes(state.effective_config.as_ref()),
+            None,
+            "the default cap"
+        );
+        assert_eq!(
+            configured_admin_hive(state.effective_config.as_ref()),
+            None,
+            "the local hive's SY.admin"
+        );
+
+        // What a CONFIG_SET persists boots with its values.
+        let set = json!({"io": {"max_bytes": 1024}, "_system": {"config_version": 4}});
+        write_config(&root, &set.to_string());
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(state.config_version, 4);
+        assert_eq!(
+            configured_max_bytes(state.effective_config.as_ref()),
+            Some(1024)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Operator content the contract refuses is FAILED_CONFIG with the contract's reason and no
+    /// config in use, and so is a config.json that is not JSON.
+    #[test]
+    fn a_config_the_contract_refuses_boots_failed_config() {
+        let root = temp_root("refused");
+        let refused = json!({
+            "io": {"max_bytes": 0},
+            "tenant_id": ROOT_TENANT,
+            "_system": {"config_version": 2},
+        });
+        write_config(&root, &refused.to_string());
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::FailedConfig);
+        assert_eq!(state.effective_config, None);
+        assert_eq!(state.config_version, 2);
+        let error = state.last_error.expect("why");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("io.max_bytes"), "{}", error.message);
+
+        write_config(&root, "not json");
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::FailedConfig);
+        assert_eq!(state.effective_config, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// FINDINGS A-91: HEALTHY only while the config is in use; DEGRADED with the reason while a
+    /// config the contract refused is on disk, where the SDK's default handler said HEALTHY always.
+    #[test]
+    fn the_status_is_healthy_only_while_configured() {
+        let configured = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            config_source: IoConfigSource::OrchestratorFallback,
+            schema_version: 1,
+            config_version: 3,
+            effective_config: Some(json!({"io": {}})),
+            last_error: None,
+        };
+        let healthy = node_status_payload(&configured);
+        assert_eq!(healthy["status"], "ok");
+        assert_eq!(healthy["health_state"], "HEALTHY");
+        assert_eq!(healthy["lifecycle_state"], "CONFIGURED");
+        assert!(healthy.get("last_error").is_none());
+
+        let failed = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::FailedConfig,
+            effective_config: None,
+            last_error: Some(IoControlPlaneErrorInfo {
+                code: "invalid_config".to_string(),
+                message: "io.max_bytes must be > 0".to_string(),
+            }),
+            ..configured
+        };
+        let refused = node_status_payload(&failed);
+        assert_eq!(refused["health_state"], "DEGRADED");
+        assert_eq!(refused["lifecycle_state"], "FAILED_CONFIG");
+        assert_eq!(refused["last_error"]["code"], "invalid_config");
+
+        let status_get = |msg: &str| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast(NODE.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        assert!(is_node_status_request(&status_get(MSG_NODE_STATUS_GET)));
+        assert!(!is_node_status_request(&status_get(MSG_CONFIG_GET)));
     }
 
     fn test_curator(root: &Path) -> BlobCurator {

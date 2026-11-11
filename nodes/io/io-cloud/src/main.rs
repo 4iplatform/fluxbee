@@ -25,6 +25,11 @@
 //! config as part of publishing; `CONFIG_SET` is the manual override. There is deliberately NO
 //! secret field: the endpoint token is minted by `SY.admin` into the vault.
 //!
+//! Its defaults do not cover its work: with no edge to trust it drops every Cloud request. So it
+//! is CONFIGURED only while its config names an edge (`require_trusted_edge`, FINDINGS A-91); the
+//! orchestrator's seed alone, or a config without `io.edge_node`, is UNCONFIGURED with
+//! `missing_edge_node` as its reason, which NODE_STATUS_GET (DEGRADED) and CONFIG_GET both give.
+//!
 //! Two decisions that separate io.cloud from io.api:
 //! - **Motherbee-only, fail-closed in the binary.** io.cloud used to be a packaged systemd
 //!   unit gated by an `ExecCondition`; as a managed runtime that gate is gone, so the binary
@@ -32,20 +37,25 @@
 //! - **Externalize is admin-driven.** io.cloud registers its own ICH at boot but does NOT
 //!   self-externalize — `publish_cloud_endpoint` owns opening the public door on `SY.edge`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fluxbee_sdk::cloud::{cloud_action_catalog, is_cloud_local_op};
+use fluxbee_sdk::managed_control_plane::{
+    build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
+    DEFAULT_MANAGED_NODES_ROOT,
+};
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_NODE_STATUS_GET,
+    MSG_NODE_STATUS_GET_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::vault::is_cloud_reserved_vault_key;
 use fluxbee_sdk::{
-    managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
-    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
-    RpcCommandReceiver, RpcRequestLabels, FLUXBEE_NODE_NAME_ENV,
+    managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    RpcRequestLabels, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::frontdesk_contract::{
     FRONTDESK_HANDOFF_MSG, FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1,
@@ -65,7 +75,7 @@ use io_common::io_control_plane::{
     ensure_config_version_advances, parse_and_validate_io_control_plane_request, IoConfigSource,
     IoControlPlaneErrorInfo, IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
 };
-use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
+use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state_with_root;
 use io_common::io_control_plane_logging::{
     log_config_get_served, log_config_set_applied, log_config_set_persist_error,
     log_config_set_stale_rejected, log_control_plane_request_rejected,
@@ -168,23 +178,15 @@ async fn main() -> Result<(), DynError> {
     }
 
     // Single-config model: boot reads ONLY the node-dir config.json and validates it through the
-    // adapter contract via the SDK (mirrors io.api). An io.cloud with no edge is a VALID node —
-    // it serves the mesh and trusts no edge yet — so an empty config is CONFIGURED, not FAILED.
+    // adapter contract via the SDK (mirrors io.api). An io.cloud with no edge is a valid node that
+    // cannot do its work yet: it is UNCONFIGURED, and says it misses `io.edge_node`
+    // (`boot_control_plane`, FINDINGS A-91).
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoCloudAdapterConfigContract);
-    let mut boot_state =
-        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
-            .unwrap_or_else(|err| IoControlPlaneState {
-                current_state: IoNodeLifecycleState::FailedConfig,
-                config_source: IoConfigSource::None,
-                schema_version: 1,
-                config_version: 0,
-                effective_config: None,
-                last_error: Some(IoControlPlaneErrorInfo {
-                    code: "config_bootstrap_failed".to_string(),
-                    message: err.to_string(),
-                }),
-            });
-    validate_boot_effective_config(&mut boot_state, adapter_contract.as_ref());
+    let boot_state = boot_control_plane(
+        &config.node_name,
+        adapter_contract.as_ref(),
+        Path::new(DEFAULT_MANAGED_NODES_ROOT),
+    );
 
     tracing::info!(
         node_name = %config.node_name,
@@ -197,6 +199,7 @@ async fn main() -> Result<(), DynError> {
         orchestrator_target = %config.orchestrator_target,
         lifecycle_state = %boot_state.current_state.as_str(),
         trusted_edge = ?trusted_edge_node(boot_state.effective_config.as_ref()),
+        last_error = ?boot_state.last_error,
         "IO.cloud starting (managed in-mesh Fluxbee Cloud adapter)"
     );
 
@@ -276,28 +279,106 @@ async fn main() -> Result<(), DynError> {
     run_loop(&sender, &full_name, &state, &mut incoming).await
 }
 
-/// Validate the boot effective config through the adapter contract (mirrors io.api). A candidate
-/// that the contract rejects lands the node in FAILED_CONFIG with the contract's error.
-fn validate_boot_effective_config(
-    state: &mut IoControlPlaneState,
+/// The control plane at boot, from the node's `config.json`: the SDK validates operator content
+/// through the contract (FAILED_CONFIG, with no config in use, when it refuses it), then
+/// `require_trusted_edge` decides whether io.cloud can do its work.
+fn boot_control_plane(
+    node_name: &str,
     contract: &dyn IoAdapterConfigContract,
-) {
-    let Some(candidate) = state.effective_config.as_ref() else {
-        return;
-    };
-    match contract.validate_and_materialize(candidate) {
-        Ok(effective) => {
-            state.effective_config = Some(effective);
-            state.current_state = IoNodeLifecycleState::Configured;
-            state.last_error = None;
-        }
-        Err(err) => {
-            state.current_state = IoNodeLifecycleState::FailedConfig;
-            state.last_error = Some(IoControlPlaneErrorInfo {
-                code: err.code().to_string(),
+    nodes_root: &Path,
+) -> IoControlPlaneState {
+    let mut state = bootstrap_io_control_plane_state_with_root(node_name, contract, nodes_root)
+        .unwrap_or_else(|err| IoControlPlaneState {
+            current_state: IoNodeLifecycleState::FailedConfig,
+            config_source: IoConfigSource::None,
+            schema_version: 1,
+            config_version: 0,
+            effective_config: None,
+            last_error: Some(IoControlPlaneErrorInfo {
+                code: "config_bootstrap_failed".to_string(),
                 message: err.to_string(),
-            });
-        }
+            }),
+        });
+    require_trusted_edge(&mut state);
+    state
+}
+
+/// The reason io.cloud gives while it trusts no edge (FINDINGS A-91).
+const MISSING_EDGE_NODE: &str = "missing_edge_node";
+
+/// io.cloud's rule on top of its contract (FINDINGS A-91, the operator's call: a node that does not
+/// work on its defaults says what it misses). The one thing it cannot do without its config is its
+/// work, relaying Cloud's requests, which it drops while no edge is trusted. So it is CONFIGURED
+/// only while its config names the edge to trust (`io.edge_node`); with none, the orchestrator's
+/// seed alone or a config the contract accepts without it, it is UNCONFIGURED, with
+/// `missing_edge_node` as its reason. A config the contract refused stays FAILED_CONFIG, with the
+/// contract's.
+fn require_trusted_edge(state: &mut IoControlPlaneState) {
+    if state.current_state == IoNodeLifecycleState::FailedConfig {
+        return;
+    }
+    if trusted_edge_node(state.effective_config.as_ref()).is_some() {
+        state.current_state = IoNodeLifecycleState::Configured;
+        state.last_error = None;
+    } else {
+        state.current_state = IoNodeLifecycleState::Unconfigured;
+        state.last_error = Some(IoControlPlaneErrorInfo {
+            code: MISSING_EDGE_NODE.to_string(),
+            message: "IO.cloud trusts no SY.edge (config io.edge_node), so it drops every Cloud \
+                      request; publish_cloud_endpoint publishes its channel on an edge and records \
+                      that edge (or CONFIG_SET io.edge_node)"
+                .to_string(),
+        });
+    }
+}
+
+fn is_node_status_request(message: &Message) -> bool {
+    is_system_kind(&message.meta.msg_type)
+        && message.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
+}
+
+/// NODE_STATUS_GET: the SDK's managed answer for the config (FINDINGS A-91), as io.web's and
+/// io.blob's: HEALTHY only while CONFIGURED, which io.cloud is while it trusts an edge; otherwise
+/// DEGRADED, never ERROR, with the reason in `last_error` (`missing_edge_node`, or the contract's
+/// for a refused config). The orchestrator's `get_node_status` reports `health_state` and
+/// `last_error`.
+fn node_status_payload(control: &IoControlPlaneState) -> Value {
+    let lifecycle = match control.current_state {
+        IoNodeLifecycleState::Unconfigured => ManagedNodeLifecycleState::Unconfigured,
+        IoNodeLifecycleState::Configured => ManagedNodeLifecycleState::Configured,
+        IoNodeLifecycleState::FailedConfig => ManagedNodeLifecycleState::FailedConfig,
+    };
+    let last_error = control
+        .last_error
+        .as_ref()
+        .map(|error| ControlPlaneErrorInfo {
+            code: error.code.clone(),
+            message: error.message.clone(),
+        });
+    build_node_status_response_payload(lifecycle, last_error.as_ref())
+}
+
+fn build_reply(
+    sender: &NodeSender,
+    request: &Message,
+    response_msg: &str,
+    payload: Value,
+) -> Message {
+    Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(request.routing.src.clone()),
+            ttl: request.routing.ttl.max(1),
+            trace_id: request.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(response_msg.to_string()),
+            action: Some(response_msg.to_string()),
+            ..Meta::default()
+        },
+        payload,
     }
 }
 
@@ -314,7 +395,16 @@ async fn run_loop(
             Err(_) => continue,
         };
 
-        if try_handle_default_node_status(sender, &msg).await? {
+        if is_node_status_request(&msg) {
+            let payload = node_status_payload(&*state.control_plane.read().await);
+            sender
+                .send(build_reply(
+                    sender,
+                    &msg,
+                    MSG_NODE_STATUS_GET_RESPONSE,
+                    payload,
+                ))
+                .await?;
             continue;
         }
 
@@ -337,11 +427,24 @@ async fn run_loop(
         // RouteMatch::Any also receives unsolicited mesh notifications (for example VAULT changes).
         // They are not Cloud requests and must not get a reply from IO.cloud.
         if !message_from_configured_edge(&msg, cloud_edge_node) {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                src_l2_name = ?msg.routing.src_l2_name,
-                "IO.cloud ignored a non-edge mesh message"
-            );
+            if msg.meta.ich.as_deref() == Some(state.own_ich.as_str()) {
+                // A request for its own channel from an edge it does not trust, or while it
+                // trusts none (FINDINGS A-91): Cloud gets nothing and waits out the edge's 30 s,
+                // so the drop is said where the operator looks.
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    trusted_edge = ?cloud_edge_node,
+                    "IO.cloud dropped a request for its channel: its config io.edge_node does not \
+                     name the SY.edge it came through"
+                );
+            } else {
+                tracing::debug!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    "IO.cloud ignored a non-edge mesh message"
+                );
+            }
             continue;
         }
 
@@ -541,15 +644,35 @@ async fn build_config_get_payload(state: &RuntimeState, message: &Message) -> Va
         &state.config.node_name,
         &snapshot,
     );
-    let mut payload = build_io_config_get_response_payload(
+    let mut payload = config_get_answer(
         &state.config.node_name,
         &snapshot,
-        build_io_adapter_contract_payload(
-            state.adapter_contract.as_ref(),
-            snapshot.effective_config.as_ref(),
-        ),
+        state.adapter_contract.as_ref(),
     );
     inject_runtime_status(&mut payload, state).await;
+    payload
+}
+
+/// The CONFIG_GET answer: the IO family's, `ok` only while io.cloud can do its work (CONFIGURED),
+/// and otherwise with the reason its status gives as `error`, `missing_edge_node` or the contract's
+/// for a refused config, in place of the family's bare `node_not_configured` (FINDINGS A-91).
+/// SY.admin turns a CONFIG_GET that is not `ok` into its error (`error_code`, `error_detail`).
+fn config_get_answer(
+    node_name: &str,
+    snapshot: &IoControlPlaneState,
+    contract: &dyn IoAdapterConfigContract,
+) -> Value {
+    let mut payload = build_io_config_get_response_payload(
+        node_name,
+        snapshot,
+        build_io_adapter_contract_payload(contract, snapshot.effective_config.as_ref()),
+    );
+    if snapshot.current_state != IoNodeLifecycleState::Configured {
+        payload["ok"] = json!(false);
+        if let Some(error) = snapshot.last_error.as_ref() {
+            payload["error"] = json!(error);
+        }
+    }
     payload
 }
 
@@ -594,7 +717,7 @@ async fn apply_config_set(
                 );
             }
         };
-    let next = IoControlPlaneState {
+    let mut next = IoControlPlaneState {
         current_state: IoNodeLifecycleState::Configured,
         config_source: IoConfigSource::Dynamic,
         schema_version: payload.schema_version,
@@ -602,6 +725,8 @@ async fn apply_config_set(
         effective_config: Some(effective.clone()),
         last_error: None,
     };
+    // Applied whatever it names, and CONFIGURED only with an edge to trust (FINDINGS A-91).
+    require_trusted_edge(&mut next);
     if let Err(err) = persist_io_control_plane_state(&state.config.node_name, &next) {
         log_config_set_persist_error(
             &state.config.node_name,
@@ -3192,6 +3317,194 @@ mod tests {
         assert!(authorize_cloud_message(&msg, "ich:own", Some("SY.edge@ingress1")).is_err());
         assert!(!message_from_configured_edge(&msg, None));
         assert!(authorize_cloud_message(&msg, "ich:other", None).is_err());
+    }
+
+    const NODE: &str = "IO.cloud@motherbee";
+    const ROOT_TENANT: &str = "tnt:00000000-0000-0000-0000-000000000001";
+
+    /// A fresh managed-nodes root of the test's own under the system's temp dir.
+    fn nodes_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "io-cloud-nodes-{label}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create nodes root");
+        dir
+    }
+
+    fn write_config(root: &Path, config: &Value) {
+        let path = fluxbee_sdk::managed_node_config_path_with_root(NODE, root).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, config.to_string()).unwrap();
+    }
+
+    fn boot(root: &Path) -> IoControlPlaneState {
+        boot_control_plane(NODE, &IoCloudAdapterConfigContract, root)
+    }
+
+    /// FINDINGS A-91: io.cloud's defaults do not cover its work, so the orchestrator's seed alone,
+    /// and no config.json at all, boot UNCONFIGURED, naming what it misses, `io.edge_node`; never
+    /// a silent UNCONFIGURED.
+    #[test]
+    fn the_seed_alone_boots_unconfigured_naming_the_missing_edge() {
+        let root = nodes_root("seed");
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Unconfigured);
+        assert_eq!(state.effective_config, None);
+        assert_eq!(
+            state.last_error.as_ref().map(|error| error.code.as_str()),
+            Some(MISSING_EDGE_NODE)
+        );
+
+        let seed = json!({
+            "tenant_id": ROOT_TENANT,
+            "_system": {"config_version": 3, "ilk_id": "ilk:11111111-2222-3333-4444-555555555555"},
+        });
+        write_config(&root, &seed);
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Unconfigured);
+        assert_eq!(
+            state.config_version, 3,
+            "kept, so CONFIG_SET stays monotonic"
+        );
+        let error = state.last_error.expect("what it misses");
+        assert_eq!(error.code, MISSING_EDGE_NODE);
+        assert!(error.message.contains("io.edge_node"), "{}", error.message);
+        assert!(
+            error.message.contains("publish_cloud_endpoint"),
+            "{}",
+            error.message
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// What `publish_cloud_endpoint` records (`set_node_config` of `io.edge_node`) boots CONFIGURED
+    /// on that edge. A config the contract accepts without an edge is still UNCONFIGURED, missing
+    /// it, and so is a CONFIG_SET without one; a config the contract refuses is FAILED_CONFIG with
+    /// the contract's reason.
+    #[test]
+    fn only_a_config_that_names_an_edge_is_configured() {
+        let root = nodes_root("edge");
+        write_config(
+            &root,
+            &json!({
+                "io": {"edge_node": "SY.edge@ingress1"},
+                "tenant_id": ROOT_TENANT,
+                "_system": {"config_version": 4},
+            }),
+        );
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(
+            trusted_edge_node(state.effective_config.as_ref()).as_deref(),
+            Some("SY.edge@ingress1")
+        );
+        assert_eq!(state.last_error, None);
+
+        write_config(&root, &json!({"io": {}, "_system": {"config_version": 5}}));
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::Unconfigured);
+        assert_eq!(state.effective_config, Some(json!({"io": {}})));
+        assert_eq!(
+            state.last_error.as_ref().map(|error| error.code.as_str()),
+            Some(MISSING_EDGE_NODE)
+        );
+
+        write_config(
+            &root,
+            &json!({"io": {"edge_node": "AI.x@motherbee"}, "_system": {"config_version": 6}}),
+        );
+        let state = boot(&root);
+        assert_eq!(state.current_state, IoNodeLifecycleState::FailedConfig);
+        assert_eq!(state.effective_config, None);
+        let error = state.last_error.expect("why");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("SY.edge"), "{}", error.message);
+        let _ = std::fs::remove_dir_all(root);
+
+        let mut set = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            config_source: IoConfigSource::Dynamic,
+            schema_version: 1,
+            config_version: 7,
+            effective_config: Some(json!({"io": {}})),
+            last_error: None,
+        };
+        require_trusted_edge(&mut set);
+        assert_eq!(set.current_state, IoNodeLifecycleState::Unconfigured);
+        assert_eq!(set.effective_config, Some(json!({"io": {}})), "applied");
+        set.effective_config = Some(json!({"io": {"edge_node": "SY.edge@ingress1"}}));
+        require_trusted_edge(&mut set);
+        assert_eq!(set.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(set.last_error, None);
+    }
+
+    /// FINDINGS A-91: the status is HEALTHY only while io.cloud trusts an edge, where the SDK's
+    /// default handler said HEALTHY always, and CONFIG_GET is `ok` only then; otherwise both give
+    /// the same reason: `missing_edge_node`, or the contract's for a refused config.
+    #[test]
+    fn the_status_and_the_config_answer_name_what_is_missing() {
+        let root = nodes_root("answers");
+        let missing = boot(&root);
+        let _ = std::fs::remove_dir_all(root);
+
+        let status = node_status_payload(&missing);
+        assert_eq!(status["status"], "ok");
+        assert_eq!(status["health_state"], "DEGRADED");
+        assert_eq!(status["lifecycle_state"], "UNCONFIGURED");
+        assert_eq!(status["last_error"]["code"], MISSING_EDGE_NODE);
+        let answer = config_get_answer(NODE, &missing, &IoCloudAdapterConfigContract);
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "UNCONFIGURED");
+        assert_eq!(answer["error"]["code"], MISSING_EDGE_NODE);
+        assert_eq!(answer["error"], status["last_error"]);
+
+        let no_edge = IoControlPlaneState {
+            effective_config: Some(json!({"io": {}})),
+            config_source: IoConfigSource::Dynamic,
+            ..missing.clone()
+        };
+        let answer = config_get_answer(NODE, &no_edge, &IoCloudAdapterConfigContract);
+        assert_eq!(answer["ok"], false, "a config in use, and still no edge");
+        assert_eq!(answer["error"]["code"], MISSING_EDGE_NODE);
+
+        let refused = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::FailedConfig,
+            last_error: Some(IoControlPlaneErrorInfo {
+                code: "invalid_config".to_string(),
+                message: "io.edge_node must be an SY.edge L2 name (got 'AI.x@motherbee')"
+                    .to_string(),
+            }),
+            ..missing.clone()
+        };
+        let status = node_status_payload(&refused);
+        assert_eq!(status["health_state"], "DEGRADED");
+        assert_eq!(status["lifecycle_state"], "FAILED_CONFIG");
+        assert_eq!(status["last_error"]["code"], "invalid_config");
+        let answer = config_get_answer(NODE, &refused, &IoCloudAdapterConfigContract);
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["error"]["code"], "invalid_config");
+
+        let configured = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            config_source: IoConfigSource::OrchestratorFallback,
+            effective_config: Some(json!({"io": {"edge_node": "SY.edge@ingress1"}})),
+            last_error: None,
+            ..missing
+        };
+        let status = node_status_payload(&configured);
+        assert_eq!(status["health_state"], "HEALTHY");
+        assert_eq!(status["lifecycle_state"], "CONFIGURED");
+        assert!(status.get("last_error").is_none());
+        let answer = config_get_answer(NODE, &configured, &IoCloudAdapterConfigContract);
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["state"], "CONFIGURED");
+        assert_eq!(answer["error"], Value::Null);
+        assert_eq!(
+            answer["effective_config"]["io"]["edge_node"],
+            "SY.edge@ingress1"
+        );
     }
 
     #[test]

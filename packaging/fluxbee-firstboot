@@ -111,15 +111,16 @@ if [ "$HIVE_READY" != "1" ]; then
   exit 1
 fi
 # IO.blob and IO.cloud are no longer systemd singletons: they are boot=true managed runtimes,
-# spawned below by the boot_runtimes loop (they come up degraded until configured via
-# CONFIG_SET). Nothing to start here anymore.
+# spawned below by the boot_runtimes loop. Nothing to start here anymore.
 
-echo "== [6/6] spawn base node instances (running, degraded until configured) =="
+echo "== [6/6] spawn base node instances (IO.blob on its defaults; IO.cloud waits for its edge) =="
 # Auto-spawn one default instance of each boot=true runtime at the root tenant: the system IO
 # nodes (IO.cloud, IO.blob). The only other IO node that runs there is IO.web, which the
-# operator starts (boot=false; FINDINGS A-43). They come up RUNNING but degraded/unconfigured
-# until the operator configures them. Every other runtime (io.api, io.wapp, io.slack,
-# ai.generic, ...) is baked but not started: a tenant launches it.
+# operator starts (boot=false; FINDINGS A-43). IO.blob comes up CONFIGURED on its defaults, which
+# cover everything it does. IO.cloud comes up UNCONFIGURED, its status DEGRADED with
+# missing_edge_node, until it trusts the ingress' SY.edge, which publish_cloud_endpoint records in
+# its config (FINDINGS A-91). Every other runtime (io.api, io.wapp, io.slack, ai.generic, ...) is
+# baked but not started: a tenant launches it.
 while IFS=$'\t' read -r rt inst; do
   [ -n "$rt" ] && [ -n "$inst" ] || continue
   body="{\"node_name\":\"$inst\",\"runtime\":\"$rt\",\"runtime_version\":\"current\",\"tenant_id\":\"$ROOT_TENANT\"}"
@@ -134,7 +135,7 @@ cat <<EOF
 
 ============================================================
  Fluxbee backend is UP. Core (SY.*) + base nodes are RUNNING.
- Some nodes are DEGRADED until you load their secret into SY.vault:
+ Some nodes are DEGRADED until they get what they miss:
 
   - The core's AI (architect / admin / cognition / frontdesk) needs a provider key.
     Load an OpenAI (or "anthropic") key in the root tenant (a tenant's ai.generic nodes use
@@ -164,6 +165,10 @@ cat <<EOF
     hive.yaml declares a web host (web:), start it once, in the root tenant:
       curl -sS -X POST $ADMIN/hives/$HIVE_ID/nodes -H 'content-type: application/json' \\
         -d '{"node_name":"IO.web@$HIVE_ID","runtime":"io.web","runtime_version":"current","tenant_id":"$ROOT_TENANT"}'
+
+  - IO.cloud, Fluxbee Cloud's way in, stays DEGRADED (missing_edge_node) until it trusts the
+    ingress' SY.edge, which publishing its door for a Fluxbee Cloud records in its config
+    (publish_cloud_endpoint, docs/io-cloud-api.md section 7). IO.blob needs nothing.
 
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 

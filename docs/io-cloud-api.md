@@ -875,6 +875,11 @@ is shown only here.** Give Cloud `https://<public host><url>` and the token.
 - **Rotate:** run it again. A new token is minted; the previous one works 10 more minutes.
 - **Check:** `curl 'http://127.0.0.1:8080/channels/externalized?edge_node=SY.edge@ingress1'` lists a
   row owned by `IO.cloud@motherbee`.
+- **IO.cloud's own state** (FINDINGS A-91): while it trusts no edge, it drops every Cloud request,
+  so `GET /hives/motherbee/nodes/IO.cloud@motherbee/status` says `health_state: DEGRADED` with
+  `last_error.code: missing_edge_node`, and its `CONFIG_GET` (`node_control_config_get`) is not
+  `ok`, with the same reason, `state: UNCONFIGURED`. Trusting the edge, it is `HEALTHY` and
+  `CONFIGURED`.
 - **Smoke test** (no token needed for the first three):
 
 ```bash
@@ -889,7 +894,7 @@ post '{"op":"list_cloud_actions"}'
 |---|---|
 | **404** | the endpoint was never published, or the hive was reinstalled: publish again |
 | **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log) |
-| **504** | IO.cloud is down or busy (§6), or its config does not name this edge: publish again |
+| **504** | IO.cloud is down or busy (§6), or its config does not name this edge: publish again. IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
 ---
 

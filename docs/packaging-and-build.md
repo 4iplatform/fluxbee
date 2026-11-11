@@ -50,8 +50,8 @@ Defined in `packaging/base-nodes.json`:
 
 | Node | Class | At boot |
 |------|-------|---------|
-| IO.blob | runtime (boot=true) | running |
-| IO.cloud | runtime (boot=true, role: motherbee) | running (degraded if there is no Fluxbee Cloud — the Cloud is another repo) |
+| IO.blob | runtime (boot=true) | running, CONFIGURED on its defaults (HEALTHY) |
+| IO.cloud | runtime (boot=true, role: motherbee) | running, UNCONFIGURED and DEGRADED (`missing_edge_node`) until it trusts the ingress' edge, which publishing a Fluxbee Cloud's door records (the Cloud is another repo) |
 | io.api | runtime | baked in, NOT at boot: each API (`IO.api.<label>`) is launched by the tenant that needs it, with its tenant |
 | io.slack | runtime | baked in, NOT at boot: each Slack binding is launched by the tenant that needs it, with its tenant |
 | io.wapp | runtime | baked in, NOT at boot: each WhatsApp number (`IO.wapp.<label>`) is launched by its tenant |
@@ -62,9 +62,12 @@ Defined in `packaging/base-nodes.json`:
 
 Only IO.cloud and IO.blob start with the install, in the root tenant
 `tnt:00000000-0000-0000-0000-000000000001` (operator decision 2026-10-02, A-43).
-They start **running but degraded** until the operator configures them. IO.web, the third IO node
-of the root tenant, starts only when the operator launches it there with `run_node`
-([io-web-v2](io-web-v2.md) §11.2). The other IO runtimes
+They start **running** (FINDINGS A-91). IO.blob's defaults cover everything it does, so it boots
+CONFIGURED on them, HEALTHY. IO.cloud drops every Cloud request while it trusts no edge, so it is
+UNCONFIGURED, its status DEGRADED and its CONFIG_GET naming `missing_edge_node`, until
+`publish_cloud_endpoint` records the `SY.edge` it trusts ([io-cloud-api](io-cloud-api.md) §7).
+IO.web, the third IO node of the root tenant, starts only when the operator launches it there with
+`run_node` ([io-web-v2](io-web-v2.md) §11.2). The other IO runtimes
 stay baked in and spawnable: a tenant launches them (or an operator, for that tenant) with `run_node`.
 In the root tenant (the genesis one) only the core is born: the SY.\*, the RT.\* and the core IO nodes (io.cloud,
 io.blob, io.web). The orchestrator defines this and rejects any other node there (IO, AI or WF) with
@@ -216,8 +219,10 @@ does the `vault_put` of the postgres secret (the **DB connection is resolved on 
 vault**), reconnects the consumers and auto-spawns in the root tenant the boot managed runtimes
 (IO.blob/IO.cloud). When it finishes it prints the **next steps**.
 
-After the firstboot these are left **running**: the `SY.*` core + IO.blob + IO.cloud, **degraded**
-until they are configured. (io.api, io.wapp, io.slack, io.linkedhelper, io.web, `ai.generic` and
+After the firstboot these are left **running**: the `SY.*` core + IO.blob + IO.cloud. IO.blob is
+CONFIGURED on its defaults; IO.cloud is **degraded** (`missing_edge_node`) until it trusts the
+ingress' edge, and the core's AI until its provider key is in the vault. (io.api, io.wapp,
+io.slack, io.linkedhelper, io.web, `ai.generic` and
 `wf.engine` stay **baked in but NOT at boot** — `boot:false` in `base-nodes.json`; their instances
 are created on demand: the IO channel ones from their tenant, IO.web by the operator in the root
 tenant.)

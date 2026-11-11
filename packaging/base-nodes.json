@@ -14,8 +14,9 @@
     "  fail-closed self-check in the binary (no systemd ExecCondition anymore).",
     "runtimes: instanced nodes baked into dist/runtimes/<runtime>/<version>, spawnable",
     "  per-tenant on demand via run_node. When 'boot': true, fluxbee-firstboot auto-spawns",
-    "  one default instance ('instance') at the root tenant so it is RUNNING at boot",
-    "  (degraded/unconfigured until the operator loads its secret/config into SY.vault).",
+    "  one default instance ('instance') at the root tenant so it is RUNNING at boot: io.blob",
+    "  CONFIGURED on its defaults; io.cloud UNCONFIGURED, its status DEGRADED with",
+    "  missing_edge_node, until publish_cloud_endpoint records the SY.edge it trusts (FINDINGS A-91).",
     "  Only the system IO nodes boot (io.cloud, io.blob). They and io.web, which runs only where",
     "  the operator starts it, are the only IO nodes in the root tenant (operator, 2026-10-02;",
     "  FINDINGS A-43; the orchestrator's CORE_IO_RUNTIMES): every other runtime is 'boot': false,",
@@ -37,7 +38,7 @@
       "boot": false
     },
     {
-      "_note": "io.blob is the motherbee-local public-artifact curator. Promoted from a systemd singleton to a first-class MANAGED runtime: it boots DEGRADED (a curator with default paths + default max_bytes is a valid unconfigured node) and takes config (io.max_bytes / io.admin_hive) via CONFIG_SET/GET, NO env. Motherbee-only is enforced by a fail-closed self-check in the binary. Bare instance name (not .default) because it is a true singleton, not a fanout family.",
+      "_note": "io.blob is the motherbee-local public-artifact curator. Promoted from a systemd singleton to a first-class MANAGED runtime: its defaults (the fixed paths, the default max_bytes, the local hive's SY.admin) cover everything it does, so it boots CONFIGURED on them and HEALTHY (FINDINGS A-91), and takes config (io.max_bytes / io.admin_hive) via CONFIG_SET/GET, NO env. Motherbee-only is enforced by a fail-closed self-check in the binary. Bare instance name (not .default) because it is a true singleton, not a fanout family.",
       "runtime": "io.blob",
       "crate": "io-blob",
       "bin": "io-blob",
@@ -46,7 +47,7 @@
       "instance": "IO.blob@motherbee"
     },
     {
-      "_note": "io.cloud is the in-mesh Fluxbee Cloud provisioning relay. Promoted from a systemd singleton to a first-class MANAGED runtime: it boots DEGRADED (an io.cloud with no trusted edge is valid — it serves the mesh and trusts no edge yet) and takes its single config field io.edge_node via CONFIG_SET/GET, NO env. publish_cloud_endpoint records the edge into this node's config as part of publishing. Motherbee-only via a fail-closed self-check; externalize is admin-driven (io.cloud does NOT self-externalize at boot). Bare instance name (true singleton).",
+      "_note": "io.cloud is the in-mesh Fluxbee Cloud provisioning relay. Promoted from a systemd singleton to a first-class MANAGED runtime: it takes its single config field io.edge_node via CONFIG_SET/GET, NO env, and publish_cloud_endpoint records the edge into this node's config as part of publishing. With no edge to trust it drops every Cloud request, so until one is recorded it is UNCONFIGURED and DEGRADED, its status and CONFIG_GET naming missing_edge_node (FINDINGS A-91). Motherbee-only via a fail-closed self-check; externalize is admin-driven (io.cloud does NOT self-externalize at boot). Bare instance name (true singleton).",
       "runtime": "io.cloud",
       "crate": "io-cloud",
       "bin": "io-cloud",

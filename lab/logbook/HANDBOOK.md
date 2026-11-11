@@ -477,7 +477,7 @@ Its log tells exactly what it does:
 [3/5] wait admin + vault_put postgres secret
 [4/5] reconnect DB consumers
 [5/6] wait hive ready + start motherbee singleton nodes
-[6/6] spawn base node instances   (they start degraded, unconfigured)
+[6/6] spawn base node instances   (IO.blob on its defaults; IO.cloud waits for its edge)
 ```
 
 **Acceptance:**
@@ -489,8 +489,13 @@ systemctl --failed                                        # empty
 curl -s http://127.0.0.1:8080/hives/motherbee/commands   # the audit log is already recording
 ```
 
-The base nodes (`IO.cloud`, `IO.blob`) start in `UNCONFIGURED`.
-**That is correct**, not a failure: the degraded start is by design.
+The base nodes start as their defaults allow (FINDINGS A-91):
+
+- `IO.blob` is `CONFIGURED` on its defaults and `HEALTHY`: they cover everything it does.
+- `IO.cloud` is `UNCONFIGURED`, its status `DEGRADED` and its `CONFIG_GET` naming
+  `missing_edge_node`, until it trusts the ingress' `SY.edge`, which `publish_cloud_endpoint`
+  records in its config. **That is correct**, not a failure: with no edge it drops every Cloud
+  request, and only a hive that connects a Fluxbee Cloud publishes its door.
 
 > **The hive registry decides who may connect over the WAN.** The motherbee admits a hive only
 > while `/var/lib/fluxbee/hives/<hive_id>/` exists: `add_hive` creates it when it accepts the

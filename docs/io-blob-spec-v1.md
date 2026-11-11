@@ -227,18 +227,24 @@ Arbitrary HTML+JS is still allowed inside the sandbox; it gets no Fluxbee APIs.
 
 ## 7. IO.blob worker
 
-`IO.blob` is a motherbee-only managed runtime and does not externalize ICH. Config:
+`IO.blob` is a motherbee-only managed runtime and does not externalize ICH. Its paths are fixed
+(`/var/lib/fluxbee/blob`, its `public/`, and the ledger
+`/var/lib/fluxbee/state/io-blob/publications.json`), and its config (`CONFIG_SET`/`CONFIG_GET`
+through SY.admin, `IoBlobAdapterConfigContract`, never an env) has two optional fields:
 
-- `IO_BLOB_NODE_NAME` default `IO.blob`;
-- `IO_BLOB_ADMIN_HIVE` default local hive;
-- `IO_BLOB_BLOB_ROOT` default `/var/lib/fluxbee/blob`;
-- `IO_BLOB_PUBLIC_ROOT` default `<blob_root>/public`;
-- `IO_BLOB_LEDGER_PATH` default `/var/lib/fluxbee/state/io-blob/publications.json`;
-- `IO_BLOB_MAX_BYTES` default to the canonical Blob SDK limit.
+- `io.max_bytes`, the largest blob it publishes, by default the Blob SDK's limit
+  (`BLOB_DEFAULT_MAX_BYTES`); 0 is refused;
+- `io.admin_hive`, the hive whose `SY.admin` it obeys, by default its own.
 
-It is part of `system_nodes.motherbee` as a packaged lifecycle node: the Orchestrator starts,
-waits for and supervises `io-blob.service` together with the base topology. This inclusion does not change its
-identity boundary: it is still an `IO.*` worker, visible in the inventory of managed nodes,
+Those defaults cover everything it does, so the orchestrator's seed alone boots it `CONFIGURED`
+on them, and its status is `HEALTHY` (FINDINGS A-91). A config the contract refuses leaves it
+`FAILED_CONFIG`: it curates on its defaults, and its status is `DEGRADED` with the refusal in
+`last_error`.
+
+It runs in the root tenant as `IO.blob@motherbee`, a `boot: true` runtime of
+`packaging/base-nodes.json` that `fluxbee-firstboot` launches, and the orchestrator relaunches it as
+any managed node. That does not change its identity boundary: it is still an `IO.*` worker,
+visible in the inventory of managed nodes,
 and `SY.identity` does not create a deterministic ILK of type `system` for it. `SY.vault` also excludes
 non-`SY.*` entries when it builds its local allowlist of known authorities, so being in
 this lifecycle does not grant access to the secret pool of the root tenant.
