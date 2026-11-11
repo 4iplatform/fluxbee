@@ -64,6 +64,9 @@ type Service struct {
 	scheduler   *timerScheduler
 	// refusals logs the requests SY.timer refuses, bounded per sender (refusalLog, FINDINGS A-258).
 	refusals refusalLog
+	// ignored logs the messages that are no request, bounded per sender in windows of their own
+	// (ignoredLog, the review of A-258).
+	ignored ignoredLog
 }
 
 type timerNowInRequest struct {
@@ -229,7 +232,7 @@ func main() {
 	logEvent("timer_startup", startup)
 	log.Printf("SY.timer ready: node=%s db=%s %s %s", service.nodeName, service.dbPath, pending, gc)
 	service.scheduler.start()
-	go service.refusals.sweepEvery(refusalLogSweepInterval)
+	go service.sweepLogsEvery(senderLogSweepInterval)
 	service.run()
 }
 
@@ -264,11 +267,14 @@ func startupGC(fields map[string]any, deleted, stamped int64, err error) string 
 func (s *Service) run() {
 	for msg := range s.incoming {
 		if err := s.handleMessage(msg); err != nil {
+			// Who asked, as a refusal's line says (the review of A-258): an answer over the frame is
+			// answered TIMER_INTERNAL here, not by sendTimerError.
 			logEvent("timer_handler_error", map[string]any{
-				"error":    err.Error(),
-				"msg_type": msg.Meta.MsgType,
-				"verb":     stringValue(msg.Meta.Msg),
-				"trace_id": msg.Routing.TraceID,
+				"error":       err.Error(),
+				"msg_type":    msg.Meta.MsgType,
+				"verb":        stringValue(msg.Meta.Msg),
+				"src_l2_name": msg.SourceL2Name(),
+				"trace_id":    msg.Routing.TraceID,
 			})
 			log.Printf("handle message error: %v", err)
 		}
@@ -291,7 +297,9 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 		}
 	}
 	if isInfrastructureMessage(msg) {
-		log.Printf("ignoring %s from %q (trace_id=%s): not a request", stringValue(msg.Meta.Msg), msg.SourceL2Name(), msg.Routing.TraceID)
+		// One line, bounded per sender as refusals are (ignoredLog): before, a plain line each, and a
+		// node that looped notices or replies at SY.timer wrote one per message (the review of A-258).
+		s.ignored.note(time.Now(), msg.SourceL2Name(), stringValue(msg.Meta.Msg), msg.Routing.TraceID)
 		return nil
 	}
 	switch stringValue(msg.Meta.Msg) {
@@ -1019,10 +1027,10 @@ func (s *Service) sendTimerResponseOnce(incoming fluxbeesdk.Message, payload any
 }
 
 // sendTimerError answers incoming with a refusal, and logs it first, bounded per sender (refusalLog,
-// FINDINGS A-258): its verb, its code and its sender, not its message. Before, only the sender heard
-// of it.
+// FINDINGS A-258): its verb, its code and its sender, not its message, but for a TIMER_STORAGE_ERROR,
+// whose message is the database's. Before, only the sender heard of it.
 func (s *Service) sendTimerError(incoming fluxbeesdk.Message, verb, code, message string) error {
-	s.refusals.note(time.Now(), incoming.SourceL2Name(), verb, code, incoming.Routing.TraceID)
+	s.refusals.note(time.Now(), incoming.SourceL2Name(), verb, code, incoming.Routing.TraceID, message)
 	return s.sendTimerResponse(incoming, timerErrorPayload(verb, code, message))
 }
 

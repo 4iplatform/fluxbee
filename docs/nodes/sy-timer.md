@@ -6,7 +6,8 @@ survives restarts: it lives in a local SQLite database and fires a `TIMER_FIRED`
 target when due.
 
 Source: `go/sy-timer/` (`main.go` handlers, `scheduler.go` firing loop, `persistence.go`
-database, `cron.go` the `cron_spec` parser, `refusals.go` the refusal log). Client helpers and constants:
+database, `cron.go` the `cron_spec` parser, `refusals.go` the refusal log and the log of ignored
+messages). Client helpers and constants:
 `go/fluxbee-go-sdk/timer*.go`.
 
 | | |
@@ -72,7 +73,8 @@ Rules enforced in `main.go`:
 
 - **Owner.** The owner is the router-stamped `routing.src_l2_name` of the request
   (`resolveSourceL2NameFromMsg`). A message without it is one the router made itself
-  (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line (`isInfrastructureMessage`).
+  (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line, bounded
+  (`isInfrastructureMessage`; `timer_message_ignored`, Messages below).
   Nor does a notice or a reply from a node: `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a
   name, or any `*_RESPONSE`; the AI nodes' rule and wf-generic's, name by name (FINDINGS A-218).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
@@ -179,11 +181,15 @@ All requests are `SYSTEM` messages to `SY.timer@<hive>`. Every answer is `TIMER_
 
 Every refusal is logged too (`sendTimerError`, `refusalLog` in `refusals.go`; since 1.6, FINDINGS
 A-258): one `timer_request_refused` line with the `verb`, the `error_code`, the sender
-(`src_l2_name`) and the `trace_id`, never the `message`, which can quote what the request sent
-(FINDINGS A-232). At most 10 lines a minute per sender, from its first refusal: the tenth carries
+(`src_l2_name`) and the `trace_id`, not the `message`, which can quote what the request sent
+(FINDINGS A-232), except a `TIMER_STORAGE_ERROR`'s, which is the database's: the line gives it as
+`error`. At most 10 lines a minute per sender, from its first refusal: the tenth carries
 `not_logged_until_utc_ms`, the rest of that minute is counted, and one
 `timer_request_refusals_not_logged` line gives the `count` when the minute ends (a sweep every 10 s,
-or the sender's next refusal). Before, only the sender heard of a refusal.
+or the sender's next refusal). Before, only the sender heard of a refusal. A message that is no
+request (below) gets one `timer_message_ignored` line (`msg`, `src_l2_name`, empty for one the
+router made, `trace_id`; `ignoredLog`), bounded the same way in windows of its own, with
+`timer_messages_ignored_not_logged` for the count; before 1.6, a plain line each, with no bound.
 
 | Verb | Payload | Who may send |
 | --- | --- | --- |
@@ -261,7 +267,9 @@ secret.
 - No identity SHM entry within 30 s, no router connection, or a database that cannot be opened
   or replayed: the process exits and systemd restarts it every 5 s.
 - If the router channel closes, the run loop ends (`sy.timer incoming channel closed`).
-- A handler error is logged as a JSON event `timer_handler_error` plus `handle message error`.
+- A handler error is logged as a JSON event `timer_handler_error` (the request's `verb`, its sender
+  `src_l2_name`, since 1.6, and its `trace_id`) plus `handle message error`: an answer over the
+  frame, answered `TIMER_INTERNAL`, is one.
 - A recurring timer whose next time cannot be computed, at a start
   (`timer_replay_invalid_recurring`) or at a fire (`timer_recurring_next_fire_failed`), is
   canceled with its `canceled_reason` and logged once (`cancelUnschedulable`); the fire due then
@@ -277,11 +285,13 @@ secret.
   JSON object per event (`logEvent` in `logging.go`): `timer_startup`, `timer_scheduled`,
   `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
   `timer_missed_policy_applied`, `timer_handler_error`, for a refused request
-  `timer_request_refused` and `timer_request_refusals_not_logged` (Messages, above), and for the delivery
-  `timer_fire_read_failed`, `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`,
-  `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`; for a recurring timer canceled
-  because its next fire cannot be computed, `timer_replay_invalid_recurring` and
-  `timer_recurring_next_fire_failed` (`outcome: canceled`, with its `canceled_reason`).
+  `timer_request_refused` and `timer_request_refusals_not_logged`, for a message that is no request
+  `timer_message_ignored` and `timer_messages_ignored_not_logged` (Messages, above), and for the
+  delivery `timer_fire_read_failed`, `timer_fire_persist_failed`, `timer_fire_emit_failed`,
+  `timer_fire_undelivered`, `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`; for a
+  recurring timer canceled because its next fire cannot be computed,
+  `timer_replay_invalid_recurring` and `timer_recurring_next_fire_failed` (`outcome: canceled`,
+  with its `canceled_reason`).
 - `curl -s 127.0.0.1:8080/hives/<hive>/timer/now` on the motherbee proves the admin → timer
   round trip; `.../timer/timers` shows the pending timers.
 
