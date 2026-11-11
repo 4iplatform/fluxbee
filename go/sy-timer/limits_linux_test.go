@@ -459,6 +459,87 @@ func TestTheFramesCutAndTheLimitsGiveOneCursor(t *testing.T) {
 	expect("the rest", list(maxListLimit, placeOf(total-3)), total-2, 2, -1)
 }
 
+// A TIMER_LIST without a limit answers SY.timer's default, 100 timers, and while more follow the
+// place of its last one (FINDINGS A-266): before, the first 100 of a longer list came as the whole
+// list. The next page, again without a limit, lists the rest and answers none.
+func TestATimerListWithoutALimitAnswersAHundredAndWhereTheNextPageStarts(t *testing.T) {
+	service, tx := newTestService(t)
+	const owner = "WF.demo@motherbee"
+	const total = defaultListLimit + 30
+	base := time.Now().UTC().Add(time.Hour).UnixMilli()
+	insertPendingTimers(t, service.db, owner, "timer-%03d", total, base, 1, `{}`)
+	name := func(i int) string { return fmt.Sprintf("timer-%03d", i) }
+	names := func(from, to int) string {
+		listed := make([]string, 0, to-from)
+		for i := from; i < to; i++ {
+			listed = append(listed, name(i))
+		}
+		return strings.Join(listed, ",")
+	}
+
+	first := askTimerList(t, service, tx, owner, map[string]any{})
+	if got := first.uuids(); got != names(0, defaultListLimit) {
+		t.Fatalf("a list without a limit lists %d timers, want the first %d of %d", len(first.Timers), defaultListLimit, total)
+	}
+	last := fmt.Sprintf("%d:%s", base+defaultListLimit-1, name(defaultListLimit-1))
+	if first.NextCursor == nil || *first.NextCursor != last {
+		t.Fatalf("the first page answers next_cursor %v, want its last timer's place %q", first.NextCursor, last)
+	}
+	rest := askTimerList(t, service, tx, owner, map[string]any{"cursor": *first.NextCursor})
+	if got := rest.uuids(); got != names(defaultListLimit, total) {
+		t.Fatalf("the next page lists %d timers, want the other %d", len(rest.Timers), total-defaultListLimit)
+	}
+	if rest.NextCursor != nil {
+		t.Fatalf("the page that lists the rest answers next_cursor %q", *rest.NextCursor)
+	}
+}
+
+// A cursor is a place in the order, never a timer SY.timer looks up (FINDINGS A-151, A-266): the
+// timer a page ended on canceled before the next page is asked, and the one after it too, the next
+// page of pending timers lists the timer after them; the timer a page ended on deleted (the
+// history's GC, an owner's purge), the next page still starts right after its place.
+func TestATimerListCursorIsAPlaceNotATimer(t *testing.T) {
+	service, tx := newTestService(t)
+	const owner = "WF.demo@motherbee"
+	base := time.Now().UTC().Add(time.Hour).UnixMilli()
+	insertPendingTimers(t, service.db, owner, "timer-%d", 6, base, 2, `{}`)
+	placeOf := func(i int) string { return fmt.Sprintf("%d:timer-%d", base+int64(i/2), i) }
+	// page asks for one timer in status after cursor, checks that it lists timer want and answers
+	// that timer's place, and returns the place.
+	page := func(what, status, cursor string, want int) string {
+		t.Helper()
+		request := map[string]any{"limit": 1, "status_filter": status}
+		if cursor != "" {
+			request["cursor"] = cursor
+		}
+		listed := askTimerList(t, service, tx, owner, request)
+		if got := listed.uuids(); got != fmt.Sprintf("timer-%d", want) {
+			t.Fatalf("%s: lists %q, want timer-%d", what, got, want)
+		}
+		if listed.NextCursor == nil || *listed.NextCursor != placeOf(want) {
+			t.Fatalf("%s: next_cursor %v, want %q", what, listed.NextCursor, placeOf(want))
+		}
+		return *listed.NextCursor
+	}
+
+	cursor := page("the first pending page", "pending", "", 0)
+	for _, timerUUID := range []string{"timer-0", "timer-1"} {
+		if err := service.respondTimerCancel(mustBuildSystemMessageAs(t, map[string]any{"timer_uuid": timerUUID}, "TIMER_CANCEL", owner)); err != nil {
+			t.Fatalf("cancel %s: %v", timerUUID, err)
+		}
+		if response := mustReadTimerResponse(t, tx); !response.OK {
+			t.Fatalf("cancel %s: %+v", timerUUID, response.Error)
+		}
+	}
+	page("the pending page after a canceled timer's place", "pending", cursor, 2)
+	// Every status: the canceled timer after the place is still there, and comes next.
+	cursor = page("every status after the same place", "all", cursor, 1)
+	if _, err := service.db.Exec(`DELETE FROM timers WHERE uuid=?`, "timer-1"); err != nil {
+		t.Fatalf("delete timer-1: %v", err)
+	}
+	page("every status after a deleted timer's place", "all", cursor, 2)
+}
+
 // A cursor TIMER_LIST cannot read is refused naming the field, never the value it was sent
 // (FINDINGS A-232).
 func TestATimerListCursorRefusalNamesNoValue(t *testing.T) {

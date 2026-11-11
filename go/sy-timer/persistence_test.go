@@ -91,15 +91,15 @@ func TestInsertGetAndListTimer(t *testing.T) {
 
 // insertPendingTimers inserts count pending one-shots of owner with payload, in one statement: timer
 // i is named fmt.Sprintf(format, i) and fires at base + i/together, so together timers share each
-// fire time and their uuids order them. Hundreds of inserts of their own take seconds under the race
-// detector.
+// fire time and their uuids order them. A count of 0 inserts none. Hundreds of inserts of their own
+// take seconds under the race detector.
 func insertPendingTimers(t *testing.T, db *sql.DB, owner, format string, count int, base int64, together int, payload string) {
 	t.Helper()
 	if _, err := db.ExecContext(context.Background(), `
-WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?)
+WITH RECURSIVE n(i) AS (SELECT 0 WHERE ? > 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?)
 INSERT INTO timers (uuid, owner_l2_name, target_l2_name, kind, fire_at_utc, missed_policy, payload, status, created_at_utc)
 SELECT printf(?, i), ?, ?, 'oneshot', ? + i / ?, 'fire', ?, 'pending', ? FROM n`,
-		count, format, owner, owner, base, together, payload, base); err != nil {
+		count, count, format, owner, owner, base, together, payload, base); err != nil {
 		t.Fatalf("insert %d timers: %v", count, err)
 	}
 }
