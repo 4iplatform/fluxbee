@@ -2283,7 +2283,7 @@ async fn bootstrap_local(
         .cloned()
         .collect();
     // FINDINGS A-282: a listed service `systemctl show` gives no answer for, asked again, is
-    // restarted too.
+    // restarted too when the boot found a service on a replaced binary, and only started otherwise.
     let binaries = check_core_binaries_at_boot(&core_services, &unlisted_core).await;
     core_services.extend(unlisted_core.iter().cloned());
     let mut upgrade_restart = BootUpgradeRestart::begin(&core_services, &binaries);
@@ -2431,8 +2431,9 @@ const REPLACED_BINARY_CHECK_LIMIT: Duration = Duration::from_secs(1);
 
 /// What the boot found of the core services' binaries (FINDINGS A-45, A-282): the services running
 /// a binary replaced on disk since they started, and those of the role's list `systemctl show` gave
-/// no answer for, asked again. The boot restarts both: a restart also starts a stopped service,
-/// where a start leaves a running one on its old binary.
+/// no answer for, asked again. The boot restarts the replaced ones, and the others only beside them
+/// (`restarts_unanswered`): a restart also starts a stopped service, where a start leaves a running
+/// one on its old binary.
 #[derive(Debug, Default)]
 struct BootBinaryChecks {
     replaced: HashSet<String>,
@@ -2454,7 +2455,8 @@ impl BootBinaryChecks {
                 tracing::warn!(
                     service,
                     "systemctl did not answer whether the service runs a binary a package upgrade \
-                     replaced, asked again; the boot restarts it all the same"
+                     replaced, asked again; the boot restarts it only if it finds a service on a \
+                     replaced binary"
                 );
                 self.unanswered.insert(service.to_string());
             }
@@ -2467,9 +2469,20 @@ impl BootBinaryChecks {
         }
     }
 
+    /// Whether the boot restarts `service`, one of the role's list whose check gave no answer
+    /// (FINDINGS A-282, the operator's call of 2026-11-11): only when this boot found a service on
+    /// a replaced binary, the boot's own sign of a package upgrade. Any other start of this
+    /// orchestrator, `systemctl restart sy-orchestrator` or a spoke's after its core update among
+    /// them, must never blip the running hive: a restart of rt-gateway drops every node's
+    /// connection. Given up: a package upgrade whose every replaced service's check gave no
+    /// answer keeps its old binaries, as before A-282.
+    fn restarts_unanswered(&self, service: &str) -> bool {
+        !self.replaced.is_empty() && self.unanswered.contains(service)
+    }
+
     /// Whether the boot restarts `service` instead of starting it.
     fn restarts(&self, service: &str) -> bool {
-        self.replaced.contains(service) || self.unanswered.contains(service)
+        self.replaced.contains(service) || self.restarts_unanswered(service)
     }
 }
 
@@ -2565,13 +2578,23 @@ fn start_core_service_with(
     restart: impl FnOnce(&str) -> Result<(), OrchestratorError>,
 ) -> Result<(), OrchestratorError> {
     if !binaries.restarts(service) {
+        if binaries.unanswered.contains(service) {
+            tracing::warn!(
+                service,
+                "starting, not restarting: systemctl gave no answer whether the service runs a \
+                 binary a package upgrade replaced, and this boot found no service on a replaced \
+                 binary, which is what tells a package upgrade's boot; a running service stays on \
+                 the binary it runs (after a package upgrade, restart it by hand)"
+            );
+        }
         return start(service);
     }
-    if binaries.unanswered.contains(service) {
+    if binaries.restarts_unanswered(service) {
         tracing::info!(
             service,
-            "restarting: systemctl gave no answer whether it runs a replaced binary, and a restart \
-             also starts a stopped one"
+            "restarting: systemctl gave no answer whether it runs a replaced binary, and this boot \
+             found services on one, which is what tells a package upgrade's boot; a restart also \
+             starts a stopped one"
         );
     } else {
         tracing::info!(
@@ -2587,10 +2610,12 @@ fn start_core_service_with(
 /// The restarts a boot does after a package upgrade, recorded like a core update (`/versions`:
 /// `core.last_update`, `via: package`): `updated`, the services that ran a replaced binary, and
 /// apart from them `unanswered`, those of the role's list `systemctl show` gave no answer for,
-/// restarted all the same (FINDINGS A-282). Only a service on a replaced binary makes a record:
-/// that is what tells a package upgrade's boot. A boot whose checks only gave no answer could be
-/// any start of this orchestrator, a spoke's after its core update among them, whose record
-/// SY.admin follows and this one would replace: its restarts are logged, not recorded.
+/// restarted beside them (FINDINGS A-282). Only a service on a replaced binary makes a record:
+/// that is what tells a package upgrade's boot, and the boot restarts a service with no answer
+/// only beside one (`BootBinaryChecks::restarts_unanswered`), so every restart it does is
+/// recorded. A boot that found none restarts nothing: it could be any start of this orchestrator,
+/// a spoke's after its core update among them, whose record SY.admin follows and this one would
+/// replace.
 struct BootUpgradeRestart {
     started_at_ms: Option<String>,
     updated: Vec<String>,
@@ -2626,7 +2651,11 @@ impl BootUpgradeRestart {
         Self {
             started_at_ms: (!updated.is_empty()).then(|| now_ms.to_string()),
             updated,
-            unanswered: upgrade_restart_order(order, &binaries.unanswered),
+            unanswered: order
+                .iter()
+                .filter(|service| binaries.restarts_unanswered(service))
+                .cloned()
+                .collect(),
             restarted: Vec::new(),
             errors: Vec::new(),
         }
@@ -2641,15 +2670,6 @@ impl BootUpgradeRestart {
 
     fn finish(&self) {
         let Some(started_at_ms) = &self.started_at_ms else {
-            if !self.unanswered.is_empty() {
-                tracing::warn!(
-                    unanswered = ?self.unanswered,
-                    restarted = ?self.restarted,
-                    errors = ?self.errors,
-                    "restarted the core services systemctl gave no answer for; no other service \
-                     was found on a replaced binary, so no package upgrade's restart is recorded"
-                );
-            }
             return;
         };
         write_core_update_last_record(&boot_upgrade_restart_record(
@@ -52499,38 +52519,25 @@ blob:
         );
     }
 
-    /// FINDINGS A-282: at boot, a service of the role's list that `systemctl show` gives no answer
-    /// for, asked again, is restarted (a restart also starts a stopped one), as one on a replaced
-    /// binary is, and recorded apart (`unanswered`, not `updated`). A core component the list
-    /// leaves out is restarted only on a replaced binary: a restart would start a service the role
-    /// does not run. Before, no answer read as "not replaced", and `start` left a running service
-    /// on its old binary while the package said new.
-    #[test]
-    fn the_boot_restarts_a_service_whose_binary_check_gives_no_answer() {
-        use CheckAnswer::{No, NoAnswer, Yes};
+    /// The boot's starts of the core services, as `bootstrap_local` makes them, from each one's
+    /// check of its binary (`checks`: the service, its answer, and whether the role's list names
+    /// it): each service of the list in order, then each core component the list leaves out that
+    /// runs a replaced binary. Answers the calls made and the boot's restarts, planned and done.
+    fn boot_with_checks(checks: &[(&str, CheckAnswer, bool)]) -> (Vec<String>, BootUpgradeRestart) {
         let mut binaries = BootBinaryChecks::default();
-        for (service, answer, listed) in [
-            ("rt-gateway", Yes, true),
-            ("sy-identity", NoAnswer, true),
-            ("sy-admin", No, true),
-            ("sy-edge", NoAnswer, false),
-            ("sy-extra", Yes, false),
-        ] {
-            binaries.take(service, answer, listed);
+        for (service, answer, listed) in checks {
+            binaries.take(service, *answer, *listed);
         }
-        assert!(!binaries.restarts("sy-edge"));
-        let order: Vec<String> = [
-            "rt-gateway",
-            "sy-identity",
-            "sy-admin",
-            "sy-edge",
-            "sy-extra",
-        ]
-        .map(str::to_string)
-        .to_vec();
+        let order: Vec<String> = checks
+            .iter()
+            .map(|(service, _, _)| service.to_string())
+            .collect();
         let mut upgrade = BootUpgradeRestart::planned(&order, &binaries, 1_000);
         let calls = std::cell::RefCell::new(Vec::new());
-        for service in ["rt-gateway", "sy-identity", "sy-admin", "sy-extra"] {
+        for (service, _, listed) in checks {
+            if !listed && !binaries.replaced.contains(*service) {
+                continue;
+            }
             start_core_service_with(
                 service,
                 &binaries,
@@ -52546,8 +52553,55 @@ blob:
             )
             .expect("started");
         }
+        (calls.into_inner(), upgrade)
+    }
+
+    /// FINDINGS A-282, the operator's call of 2026-11-11: a boot that found no service on a
+    /// replaced binary restarts none, whatever `systemctl show` gave no answer for: it starts each
+    /// service of the role's list, which leaves a running one as it is, and records nothing. Any
+    /// start of this orchestrator is such a boot, `systemctl restart sy-orchestrator` or a spoke's
+    /// after its core update among them, and a restart of rt-gateway there drops every node's
+    /// connection. Before, a check with no answer restarted its service at every start.
+    #[test]
+    fn a_boot_with_only_unanswered_checks_starts_and_restarts_nothing() {
+        use CheckAnswer::{No, NoAnswer};
+        let (calls, upgrade) = boot_with_checks(&[
+            ("rt-gateway", NoAnswer, true),
+            ("sy-identity", NoAnswer, true),
+            ("sy-admin", No, true),
+            ("sy-edge", NoAnswer, false),
+        ]);
         assert_eq!(
-            calls.into_inner(),
+            calls,
+            ["start rt-gateway", "start sy-identity", "start sy-admin"]
+        );
+        assert!(upgrade.started_at_ms.is_none(), "no record");
+        assert!(upgrade.updated.is_empty() && upgrade.unanswered.is_empty());
+        assert!(upgrade.restarted.is_empty() && upgrade.errors.is_empty());
+    }
+
+    /// FINDINGS A-282: a boot that found a service on a replaced binary, the sign of a package
+    /// upgrade, restarts it and, beside it, each service of the role's list `systemctl show` gave
+    /// no answer for, asked again (a restart also starts a stopped one). Every restart a boot does
+    /// is recorded (the operator's call of 2026-11-11): the replaced services in `updated`, the
+    /// others apart, in `unanswered`; a boot with no record restarts nothing. A core component the
+    /// list leaves out is restarted only on a replaced binary: a restart would start a service the
+    /// role does not run. Before A-282, no answer read as "not replaced", and `start` left a
+    /// running service on its old binary while the package said new; before the operator's call,
+    /// a boot that found no replaced binary restarted on no answer all the same, and recorded none
+    /// of it.
+    #[test]
+    fn a_boot_with_a_replaced_binary_restarts_the_unanswered_ones_too_and_records_every_restart() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let (calls, upgrade) = boot_with_checks(&[
+            ("rt-gateway", Yes, true),
+            ("sy-identity", NoAnswer, true),
+            ("sy-admin", No, true),
+            ("sy-edge", NoAnswer, false),
+            ("sy-extra", Yes, false),
+        ]);
+        assert_eq!(
+            calls,
             [
                 "restart rt-gateway",
                 "restart sy-identity",
@@ -52575,17 +52629,48 @@ blob:
             record["restarted"],
             serde_json::json!(["rt-gateway", "sy-identity", "sy-extra"])
         );
+        // A component the list leaves out, on a replaced binary, is that sign too.
+        let (calls, upgrade) = boot_with_checks(&[
+            ("rt-gateway", NoAnswer, true),
+            ("sy-admin", No, true),
+            ("sy-extra", Yes, false),
+        ]);
+        assert_eq!(
+            calls,
+            ["restart rt-gateway", "start sy-admin", "restart sy-extra"]
+        );
+        assert_eq!(upgrade.unanswered, ["rt-gateway"]);
 
-        // A boot whose checks only gave no answer restarts those services all the same, and
-        // records no package upgrade: it could be any start of this orchestrator, and its record
-        // would take the place of a spoke's last core update, which SY.admin follows.
-        let mut unanswered_only = BootBinaryChecks::default();
-        unanswered_only.take("rt-gateway", NoAnswer, true);
-        unanswered_only.take("sy-admin", No, true);
-        assert!(unanswered_only.restarts("rt-gateway"));
-        let quiet = BootUpgradeRestart::planned(&order, &unanswered_only, 1_000);
-        assert!(quiet.started_at_ms.is_none());
-        assert_eq!(quiet.unanswered, ["rt-gateway"]);
+        // Every restart a boot does is in its record, and a boot with no record restarts nothing.
+        for checks in [
+            vec![("rt-gateway", NoAnswer, true), ("sy-admin", NoAnswer, true)],
+            vec![("rt-gateway", Yes, true), ("sy-admin", NoAnswer, true)],
+            vec![
+                ("rt-gateway", No, true),
+                ("sy-admin", NoAnswer, true),
+                ("sy-edge", Yes, false),
+            ],
+            vec![("rt-gateway", No, true), ("sy-edge", NoAnswer, false)],
+        ] {
+            let (calls, upgrade) = boot_with_checks(&checks);
+            let restarted: HashSet<String> = calls
+                .iter()
+                .filter_map(|call| call.strip_prefix("restart "))
+                .map(str::to_string)
+                .collect();
+            let recorded: HashSet<String> = upgrade
+                .updated
+                .iter()
+                .chain(&upgrade.unanswered)
+                .cloned()
+                .collect();
+            assert_eq!(restarted, recorded, "{checks:?}");
+            assert_eq!(
+                upgrade.started_at_ms.is_some(),
+                !restarted.is_empty(),
+                "{checks:?}"
+            );
+        }
 
         // The boot asks each check again while it gives none, as a node action does.
         let src = include_str!("sy_orchestrator.rs");

@@ -80,19 +80,26 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
       removed, a node the list added is installed;
    9. starts each SY node of its role in list order (`start_core_service`), using
       `restart` instead of `start` for a service whose binary a package upgrade replaced (its
-      `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45), and
-      for one whose `systemctl show -p MainPID` gives no answer, or whose `/proc/<pid>/exe` link
-      cannot be read for another reason than a process gone, asked again up to 3 times 250 ms
-      apart: a restart also starts a stopped service (`BootBinaryChecks`, FINDINGS A-282, since
-      0.1.136). Before, such a check read as "not replaced", and a service the upgrade replaced
-      kept its old binary while the package and `/versions` said new. rt-gateway, in step 4, is
-      started the same way; a core component the role's list leaves out is restarted only on a
-      replaced binary, since a restart would start a service the role does not run. The restarts
-      are recorded as the last core update (`via: package`): `updated` names the services on a
-      replaced binary, and `unanswered`, apart, those restarted on no answer. Only a boot that
-      found a replaced binary records them: one whose checks only gave no answer could be any
-      start, a spoke's after its core update among them, whose record SY.admin follows, so it
-      only logs them. A failure only warns;
+      `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45). A
+      check with no answer, a `systemctl show -p MainPID` that gives none or a `/proc/<pid>/exe`
+      link that cannot be read for another reason than a process gone, is asked again up to 3
+      times 250 ms apart (`BootBinaryChecks`, FINDINGS A-282, since 0.1.136). One that still
+      gives none restarts its service only when the same boot found a service on a replaced
+      binary, the boot's own sign of a package upgrade (a restart also starts a stopped
+      service); otherwise the service is only started, which leaves a running one as it is,
+      with a warning that says why (`restarts_unanswered`, the operator's call of 2026-11-11):
+      any other start of the orchestrator, `systemctl restart sy-orchestrator` or a spoke's
+      after its core update among them, must not restart rt-gateway, which drops every node's
+      connection. Given up: a package upgrade whose every replaced service's check gave no
+      answer leaves those services on their old binaries while the package and `/versions` say
+      new, as every such check did before A-282, when no answer read as "not replaced".
+      rt-gateway, in step 4, is started the same way; a core component the role's list leaves
+      out is restarted only on a replaced binary, since a restart would start a service the
+      role does not run. Every restart is recorded as the last core update (`via: package`):
+      `updated` names the services on a replaced binary, and `unanswered`, apart, those
+      restarted beside them on no answer. A boot that found no replaced binary restarts nothing
+      and records nothing: it could be any start, a spoke's after its core update among them,
+      whose record SY.admin follows. A failure only warns;
    10. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
        timeout only warns.
 
