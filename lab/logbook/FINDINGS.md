@@ -1562,7 +1562,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   most, no renewal; SY.admin's sweep takes the edge's row down and deletes the public copy, the edge
   refuses an expired row on its own), and the operator's path takes any page down whoever published
   it. Proposed: no refusal for pages on `remove_hive`, a node's purge (A-233) or a tenant's purge
-  (A-212); the answer names the pages left up and when each expires. Waiting for the operator's yes.
+  (A-212); the answer names the pages left up and when each expires.
+- **The operator's call (2026-11-10):** *"si, nada se traba con las paginas.. porque quedan en el edge,
+  solas mueren despues.. 24hrs asi que no veo problema"*. No removal (a hive, a node, a tenant) is
+  refused for published pages; A-233's and A-212's refusals go. For SY.admin's next release.
 
 ### A-241 [General/blob] 🔵 low (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
 
