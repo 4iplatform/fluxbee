@@ -101,7 +101,9 @@ wrote it, never as the sender wrote it.
     Anything else, a node of another hive sent by its UUID included, is dropped, counted as
     `foreign_source` and logged, at most every 30 s, as `router dropped a WAN frame: its sender is
     neither a node of the peer that sent it nor one that peer relays as the hub`. Until 0.1.83 the
-    UUID was looked up in every bucket, so a spoke could send as another spoke's node.
+    UUID was looked up in every bucket, so a spoke could send as another spoke's node. Until 0.1.134
+    most of these drops were echoes: every router sent a broadcast that came over the WAN back to
+    the peer it came from (§4, A-272).
   - So a frame must not arrive before what names its sender (A-195, since 0.1.132). A router's
     first frames on a new link, after the handshake, are its LSA and, on the hub, its reachability
     advertisement, queued before the link takes anything else; and the hub advertises a hive's
@@ -320,12 +322,25 @@ At the router where it enters from a node (`handle_message`):
 4. `ttl >= 3`: toward the WAN. The gateway sends it to every WAN peer; another router sends it to
    the gateway sibling (`forward_broadcast_to_wan`).
 
-A sibling delivers it to its own nodes and, with `ttl >= 3`, sends it toward the WAN as in step 4.
-Every router checks a copy that comes over IRP against the same cache, so one it has seen in the
-last 30 s, from one of its own nodes, from another sibling or from the WAN, goes no further there
-(`handle_peer_message`, since 0.1.132, A-208). A gateway that receives it from the WAN checks the
-same cache, delivers it to its nodes, and passes it to its siblings (`ttl >= 2`) and to its WAN
-peers (`ttl >= 3`). `meta.target` is matched by every router against its own nodes.
+A sibling delivers it to its own nodes and, with `ttl >= 3`, sends it toward the WAN as in step 4,
+unless the gateway sibling handed it over: the gateway sent it toward the WAN itself, so it goes
+back to no router. Every router checks a copy that comes over IRP against the same cache, so one it
+has seen in the last 30 s, from one of its own nodes, from another sibling or from the WAN, goes no
+further there (`handle_peer_message`, since 0.1.132, A-208). A gateway that receives it from the
+WAN checks the same cache, delivers it to its nodes, and passes it to its siblings (`ttl >= 2`) and
+to every WAN peer but the one it came from (`ttl >= 3`). `meta.target` is matched by every router
+against its own nodes.
+
+**Over the WAN, never back where it came from** (split horizon, A-272, since 0.1.134). The peer a
+broadcast came from has it already, so the hub hands a spoke's broadcast to every other spoke, and
+a spoke, whose one WAN peer is the hub, hands a broadcast from the hub to no hive
+(`broadcast_to_wan`). A spoke's node's broadcast thus crosses its spoke's link once, then each other
+spoke's link once; the hub's node's crosses each spoke's link once. Until 0.1.134 every router sent
+it to every WAN peer: each spoke sent each broadcast of the hub back to it, and the hub sent a
+spoke's back to that spoke, where the source check dropped it as `foreign_source` (§2): a frame
+wasted per spoke and per broadcast. Most of what that counter and its line showed on 8.x were these
+echoes, which hid a real drop. Over IRP, likewise, a router that is not the gateway no longer hands
+a copy the gateway handed it back to the gateway (§10).
 
 A link whose queue is at the senders' bound (§1) skips the broadcast, and every other link gets it.
 The router it entered answers its sender `LINK_BUSY` once when any link it handed it to was full, a
@@ -778,7 +793,8 @@ Fixed in 0.1.132:
   against the broadcast cache, as one from a node or from the WAN is (§4). Until then a router
   delivered every copy that reached it, and the gateway, which gets a broadcast from the router it
   entered and again from each sibling that sends it on toward the WAN, delivered it and sent it to
-  the WAN once per copy. Those copies still travel to the gateway, which drops them.
+  the WAN once per copy. Those copies still travel to the gateway, which drops them; since 0.1.134
+  a sibling no longer sends one the gateway handed it back to the gateway (A-272, §4).
 - **Two links from one sibling at once register it once** (A-208): the check and the entry take
   one guard, as on the side that dials.
 

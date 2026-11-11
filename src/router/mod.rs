@@ -1404,8 +1404,15 @@ async fn handle_message(
                 broadcast_link_full |= broadcast_to_peers(peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                match forward_broadcast_to_wan(&msg, is_gateway, peer_routers, peers, wan_peers)
-                    .await?
+                match forward_broadcast_to_wan(
+                    &msg,
+                    is_gateway,
+                    None,
+                    peer_routers,
+                    peers,
+                    wan_peers,
+                )
+                .await?
                 {
                     Some(UNREACHABLE_LINK_BUSY) => broadcast_link_full = true,
                     reason => broadcast_not_toward_wan = reason,
@@ -2162,15 +2169,27 @@ async fn broadcast_to_peers(
     Ok(full)
 }
 
-/// Hands a broadcast to every WAN peer's link. Its handler checked it first
+/// Hands a broadcast to every WAN peer's link but that of `came_from`, the hive it came from when
+/// it came over the WAN, which has it already (split horizon, A-272): the hub hands a spoke's
+/// broadcast to every other spoke, and a spoke, whose one peer is the hub, hands one from the hub
+/// to no hive. Until 0.1.134 it went back too: each spoke sent every broadcast of the hub back to
+/// it, and the hub sent a spoke's back to that spoke, where the source check dropped it as a
+/// `foreign_source` frame (routing-and-policy.md §2): a frame wasted per spoke and per broadcast,
+/// and a counter and a line filled with echoes that hid a real drop. Its handler checked it first
 /// (`broadcast_over_limit`): a frame over the limit here goes to none, and is only logged. A link
 /// whose queue is full is skipped; whether one was, as `broadcast_to_peers`.
 async fn broadcast_to_wan(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     msg: &Message,
+    came_from: Option<&str>,
 ) -> Result<bool, RouterError> {
     let peers_guard = wan_peers.lock().await;
-    if peers_guard.is_empty() {
+    let links: Vec<&LinkSender> = peers_guard
+        .iter()
+        .filter(|(hive, _)| Some(hive.as_str()) != came_from)
+        .map(|(_, peer)| &peer.sender)
+        .collect();
+    if links.is_empty() {
         return Ok(false);
     }
     let mut forward = msg.clone();
@@ -2182,8 +2201,8 @@ async fn broadcast_to_wan(
         return Ok(false);
     }
     let mut full = false;
-    for peer in peers_guard.values() {
-        full |= peer.sender.queue(data.clone()) == Err(LinkRefusal::Full);
+    for link in links {
+        full |= link.queue(data.clone()) == Err(LinkRefusal::Full);
     }
     Ok(full)
 }
@@ -2245,17 +2264,20 @@ async fn hand_to_hive(
 }
 
 /// Hands a broadcast toward the WAN: the gateway to every WAN peer, another router to the gateway
-/// sibling. The reason its sender would be answered `UNREACHABLE` with, if any: `LINK_BUSY` when a
-/// link it was handed to was full (A-222); `GATEWAY_UNAVAILABLE` when it could not leave for the WAN
-/// at all, with no gateway sibling or no link to it. A `FRAME_TOO_LARGE` from that link would be
-/// answered the same way, but cannot come: the caller measured the broadcast first
-/// (`broadcast_over_limit`). It answers no one: the router the broadcast entered answers, once
-/// (`handle_message`). Until 0.1.132 it answered `GATEWAY_UNAVAILABLE` itself, so a sender whose
-/// broadcast also met a full link heard twice, every sibling a broadcast reached answered it too,
-/// and one whose gateway sibling had no link went unanswered (A-246).
+/// sibling, unless the copy came from that sibling over IRP (`came_from`, `None` for a node's
+/// broadcast): the gateway sent it toward the WAN itself, so it goes back no more (split horizon,
+/// A-272, since 0.1.134). The reason its sender would be answered `UNREACHABLE` with, if any:
+/// `LINK_BUSY` when a link it was handed to was full (A-222); `GATEWAY_UNAVAILABLE` when it could
+/// not leave for the WAN at all, with no gateway sibling or no link to it. A `FRAME_TOO_LARGE` from
+/// that link would be answered the same way, but cannot come: the caller measured the broadcast
+/// first (`broadcast_over_limit`). It answers no one: the router the broadcast entered answers,
+/// once (`handle_message`). Until 0.1.132 it answered `GATEWAY_UNAVAILABLE` itself, so a sender
+/// whose broadcast also met a full link heard twice, every sibling a broadcast reached answered it
+/// too, and one whose gateway sibling had no link went unanswered (A-246).
 async fn forward_broadcast_to_wan(
     msg: &Message,
     is_gateway: bool,
+    came_from: Option<Uuid>,
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
@@ -2264,7 +2286,7 @@ async fn forward_broadcast_to_wan(
         return Ok(None);
     }
     if is_gateway {
-        return Ok(broadcast_to_wan(wan_peers, msg)
+        return Ok(broadcast_to_wan(wan_peers, msg, None)
             .await?
             .then_some(UNREACHABLE_LINK_BUSY));
     }
@@ -2278,6 +2300,9 @@ async fn forward_broadcast_to_wan(
     let Some(gateway_uuid) = gateway_uuid else {
         return Ok(Some("GATEWAY_UNAVAILABLE"));
     };
+    if came_from == Some(gateway_uuid) {
+        return Ok(None);
+    }
     Ok(send_to_peer_router(peers, gateway_uuid, msg)
         .await?
         .unreachable("GATEWAY_UNAVAILABLE"))
@@ -4222,12 +4247,13 @@ async fn handle_wan_message(
                 senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             // A full link skips the broadcast without an answer here: its sender is answered once,
-            // by the router it entered (A-222).
+            // by the router it entered (A-222). Over the WAN it goes on to every peer but the one
+            // it came from, and from a spoke, whose one peer is the hub, to none (A-272).
             if msg.routing.ttl >= 2 {
                 let _full = broadcast_to_peers(&ctx.peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                let _full = broadcast_to_wan(&ctx.wan_peers, &msg).await?;
+                let _full = broadcast_to_wan(&ctx.wan_peers, &msg, Some(peer_hive)).await?;
             }
         }
         Destination::Resolve => {
@@ -5355,10 +5381,16 @@ async fn handle_peer_message(
             if msg.routing.ttl >= 3 {
                 // Whatever stops it toward the WAN, a full link or no gateway sibling, is not
                 // answered here: the router the broadcast entered answers its sender, once (A-222,
-                // A-246).
-                let _not_answered_here =
-                    forward_broadcast_to_wan(&msg, is_gateway, peer_routers, peers, wan_peers)
-                        .await?;
+                // A-246). A copy the gateway sibling handed over does not go back to it (A-272).
+                let _not_answered_here = forward_broadcast_to_wan(
+                    &msg,
+                    is_gateway,
+                    Some(*peer_uuid),
+                    peer_routers,
+                    peers,
+                    wan_peers,
+                )
+                .await?;
             }
         }
         Destination::Resolve => {
@@ -14821,6 +14853,30 @@ mod tests {
         }
     }
 
+    /// A-272 over IRP: a router that is not the gateway hands a broadcast the gateway sibling
+    /// handed it, here SY.admin@motherbee's from the WAN, back to no router: the gateway sent it
+    /// toward the WAN itself. Its node gets it. One a sibling that is not the gateway hands it
+    /// still goes on to the gateway
+    /// (`a_router_that_is_not_the_gateway_hands_a_siblings_frame_on_and_goes_on`). Until 0.1.134
+    /// the gateway's copy went back to it, which dropped it.
+    #[tokio::test]
+    async fn a_router_that_is_not_the_gateway_hands_the_gateways_broadcast_back_to_no_router() {
+        let mut scene = Siblings::new(false).await;
+        let broadcast = broadcast_from(scene.admin, "SY.admin@motherbee", 14);
+        scene.hand_over(scene.gateway, &broadcast).await;
+        assert!(
+            has(messages_on(&mut scene.local), &broadcast),
+            "its node got it"
+        );
+        for (router, link) in [
+            ("the gateway", &mut scene.gateway_link),
+            ("RT.switch1", &mut scene.switch1_link),
+            ("RT.switch3", &mut scene.switch3_link),
+        ] {
+            assert!(messages_on(link).is_empty(), "nothing to {router}");
+        }
+    }
+
     /// A-247: a frame a sibling hands over for a node of a third sibling is answered over the link
     /// it came in on, never over the third sibling's. RT.switch1's node sends to
     /// SY.frontdesk.gov@worker1, a node of RT.switch3, by name and resolved: with no TTL left it
@@ -17519,6 +17575,260 @@ mod tests {
             vec![(stale.routing.trace_id.clone(), "NODE_NOT_FOUND".to_string())]
         );
         unlink_test_shm(&lsa_name);
+    }
+
+    /// `name`'s link on `ctx`'s router, and what it reads: a node of `uuid`.
+    async fn node_on(ctx: &WanContext, uuid: Uuid, name: &str) -> LinkReceiver {
+        let (tx, rx) = link_queue("node");
+        ctx.nodes.lock().await.insert(
+            uuid,
+            NodeHandle {
+                name: name.to_string(),
+                vpn_id: 0,
+                sender: tx,
+                connected_at: 0,
+            },
+        );
+        rx
+    }
+
+    /// `ctx`'s link to `hive`'s router, and what it reads.
+    async fn wan_link_to(ctx: &WanContext, hive: &str) -> (LinkSender, LinkReceiver) {
+        let (tx, rx) = link_queue("wan");
+        ctx.wan_peers.lock().await.insert(
+            hive.to_string(),
+            WanPeer {
+                sender: tx.clone(),
+                router_uuid: Uuid::new_v4(),
+            },
+        );
+        (tx, rx)
+    }
+
+    /// `src`'s broadcast as its router hands it on: stamped with its name, with `ttl` left.
+    fn broadcast_from(src: Uuid, name: &str, ttl: u8) -> Message {
+        let mut broadcast = padded_message(src, Destination::Broadcast, 0);
+        broadcast.routing.src_l2_name = Some(name.to_string());
+        broadcast.routing.ttl = ttl;
+        broadcast
+    }
+
+    /// A-272's hub: the motherbee, whose LSA lists ingress1's `IO.x@ingress1` (`io_x`) and
+    /// worker1's `AI.y@worker1` (`ai_y`).
+    async fn broadcast_hub(io_x: Uuid, ai_y: Uuid) -> Arc<WanContext> {
+        let hub = test_wan_context(None);
+        *hub.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive("motherbee", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("ingress1", FLAG_ACTIVE),
+                lsa_hive("worker1", FLAG_ACTIVE),
+            ],
+            vec![
+                lsa_node_entry(io_x, "IO.x@ingress1", 1),
+                lsa_node_entry(ai_y, "AI.y@worker1", 2),
+            ],
+        ));
+        hub
+    }
+
+    /// A spoke, `hive`: its LSA lists the hub's `SY.admin@motherbee` (`admin`), and the hub vouches
+    /// for the other spoke's `relayed`, named `relayed_name`.
+    async fn broadcast_spoke(
+        hive: &str,
+        admin: Uuid,
+        relayed: Uuid,
+        relayed_name: &str,
+    ) -> Arc<WanContext> {
+        let spoke = wan_context_of(hive, None);
+        *spoke.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive(hive, FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("motherbee", FLAG_ACTIVE),
+            ],
+            vec![lsa_node_entry(admin, "SY.admin@motherbee", 1)],
+        ));
+        spoke.reachability.lock().await.insert(
+            relayed,
+            ReachabilityEntry {
+                name: relayed_name.to_string(),
+                origin_hive: extract_hive(relayed_name).expect("a hive").to_string(),
+                next_hop_hive: "motherbee".to_string(),
+                vpn_id: 0,
+                last_updated: now_epoch_ms(),
+            },
+        );
+        spoke
+    }
+
+    /// A-272 on the hub, linked to two spokes: a broadcast of ingress1's node goes on to worker1,
+    /// one hop of TTL less, and never back to ingress1, which has it; the hub's node gets it. With
+    /// 3 hops left it still reaches worker1, with 2 or 1 only the hub's node. Until 0.1.134 it went
+    /// back to ingress1 too, where the source check dropped it as `foreign_source`.
+    #[tokio::test]
+    async fn the_hub_hands_a_spokes_broadcast_to_the_other_spoke_and_never_back() {
+        let (io_x, ai_y) = (Uuid::new_v4(), Uuid::new_v4());
+        let hub = broadcast_hub(io_x, ai_y).await;
+        let mut admin = node_on(&hub, Uuid::new_v4(), "SY.admin@motherbee").await;
+        let (hub_to_ingress1, mut ingress1_reads) = wan_link_to(&hub, "ingress1").await;
+        let (_hub_to_worker1, mut worker1_reads) = wan_link_to(&hub, "worker1").await;
+        for (ttl, on_to_worker1) in [(15, true), (3, true), (2, false), (1, false)] {
+            let broadcast = broadcast_from(io_x, "IO.x@ingress1", ttl);
+            wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &broadcast).await;
+            assert!(
+                has(messages_on(&mut admin), &broadcast),
+                "ttl {ttl}: the hub's node got it"
+            );
+            let relayed = messages_on(&mut worker1_reads);
+            if on_to_worker1 {
+                assert_eq!(relayed.len(), 1, "ttl {ttl}: on to worker1, once");
+                assert_eq!(relayed[0].routing.trace_id, broadcast.routing.trace_id);
+                assert_eq!(relayed[0].routing.ttl, ttl - 1, "ttl {ttl}: one hop less");
+            } else {
+                assert!(relayed.is_empty(), "ttl {ttl}: no hop left for worker1");
+            }
+            assert!(
+                messages_on(&mut ingress1_reads).is_empty(),
+                "ttl {ttl}: nothing back to ingress1"
+            );
+        }
+        assert_eq!(
+            hub.lsa_reject_counters
+                .lock()
+                .await
+                .get(LSA_REJECT_FOREIGN_SOURCE),
+            None
+        );
+    }
+
+    /// A-272 on a spoke, whose one WAN peer is the hub: a broadcast from the hub, of the hub's node
+    /// or of another spoke's node the hub relays, goes over no WAN link, back to the hub least of
+    /// all; the spoke's node gets it, and a sibling router too, one hop less, as before. Until
+    /// 0.1.134, with 3 hops left or more, it went back to the hub, where the source check dropped
+    /// it.
+    #[tokio::test]
+    async fn a_spoke_hands_a_broadcast_from_the_hub_back_to_no_hive() {
+        let (admin, io_x) = (Uuid::new_v4(), Uuid::new_v4());
+        let spoke = broadcast_spoke("worker1", admin, io_x, "IO.x@ingress1").await;
+        let mut ai_y = node_on(&spoke, Uuid::new_v4(), "AI.y@worker1").await;
+        let (sibling_tx, mut sibling) = link_queue("irp");
+        spoke
+            .peers
+            .lock()
+            .await
+            .insert(Uuid::new_v4(), PeerHandle { sender: sibling_tx });
+        let (spoke_to_hub, mut hub_reads) = wan_link_to(&spoke, "motherbee").await;
+        for (case, src, name) in [
+            ("the hub's node", admin, "SY.admin@motherbee"),
+            ("another spoke's node, relayed", io_x, "IO.x@ingress1"),
+        ] {
+            for ttl in [15, 3] {
+                let broadcast = broadcast_from(src, name, ttl);
+                wan_frame_from(&spoke, "motherbee", &spoke_to_hub, &broadcast).await;
+                assert!(
+                    has(messages_on(&mut ai_y), &broadcast),
+                    "{case}, ttl {ttl}: the spoke's node got it"
+                );
+                let handed = messages_on(&mut sibling);
+                assert_eq!(handed.len(), 1, "{case}, ttl {ttl}: to the sibling");
+                assert_eq!(handed[0].routing.ttl, ttl - 1, "{case}, ttl {ttl}");
+                assert!(
+                    messages_on(&mut hub_reads).is_empty(),
+                    "{case}, ttl {ttl}: nothing back to the hub"
+                );
+            }
+        }
+    }
+
+    /// A-272 end to end, a router per hive as on 8.x: the hub linked to ingress1 and worker1, each
+    /// spoke linked only to it. A broadcast of the hub's node reaches both spokes' nodes, and one
+    /// of ingress1's node reaches the hub's and worker1's: each crosses each link once, away from
+    /// its sender, and no router drops a frame as a foreign source's. Until 0.1.134 each spoke sent
+    /// the hub's broadcast back to it, and the hub sent ingress1's back to ingress1; each was
+    /// dropped there as `foreign_source`, which counted mostly these echoes on 8.x.
+    #[tokio::test]
+    async fn a_broadcast_crosses_each_wan_link_once_and_no_router_drops_an_echo() {
+        let (admin, io_x, ai_y) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let hub = broadcast_hub(io_x, ai_y).await;
+        let ingress1 = broadcast_spoke("ingress1", admin, ai_y, "AI.y@worker1").await;
+        let worker1 = broadcast_spoke("worker1", admin, io_x, "IO.x@ingress1").await;
+        let mut admin_reads = node_on(&hub, admin, "SY.admin@motherbee").await;
+        let mut io_x_reads = node_on(&ingress1, io_x, "IO.x@ingress1").await;
+        let mut ai_y_reads = node_on(&worker1, ai_y, "AI.y@worker1").await;
+        // Each link, by the end that sends on it and the end that reads it.
+        let (hub_to_ingress1, mut ingress1_reads) = wan_link_to(&hub, "ingress1").await;
+        let (hub_to_worker1, mut worker1_reads) = wan_link_to(&hub, "worker1").await;
+        let (ingress1_to_hub, mut hub_reads_ingress1) = wan_link_to(&ingress1, "motherbee").await;
+        let (worker1_to_hub, mut hub_reads_worker1) = wan_link_to(&worker1, "motherbee").await;
+
+        // The hub's node broadcasts: once to each spoke, and each spoke's node gets it.
+        let from_admin = padded_message(admin, Destination::Broadcast, 0);
+        route_from_a_node_on_the_gateway(&from_admin, &hub.nodes, &hub.peers, &hub.wan_peers, None)
+            .await;
+        for (spoke, reads, to_hub, node) in [
+            (
+                &ingress1,
+                &mut ingress1_reads,
+                &ingress1_to_hub,
+                &mut io_x_reads,
+            ),
+            (
+                &worker1,
+                &mut worker1_reads,
+                &worker1_to_hub,
+                &mut ai_y_reads,
+            ),
+        ] {
+            let handed = messages_on(reads);
+            assert_eq!(handed.len(), 1, "{}: once", spoke.hive_id);
+            wan_frame_from(spoke, "motherbee", to_hub, &handed[0]).await;
+            assert!(has(messages_on(node), &from_admin), "{}", spoke.hive_id);
+        }
+
+        // ingress1's node broadcasts: on from the hub to worker1 alone, and both nodes get it.
+        let from_io_x = broadcast_from(io_x, "IO.x@ingress1", 15);
+        wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &from_io_x).await;
+        assert!(has(messages_on(&mut admin_reads), &from_io_x));
+        let relayed = messages_on(&mut worker1_reads);
+        assert_eq!(relayed.len(), 1, "on to worker1, once");
+        wan_frame_from(&worker1, "motherbee", &worker1_to_hub, &relayed[0]).await;
+        assert!(has(messages_on(&mut ai_y_reads), &from_io_x));
+
+        // Whatever went back over a link is handed to the router at its end, as the link would:
+        // nothing did, and no router drops a frame as a foreign source's.
+        let back = [
+            (
+                "to the hub from ingress1",
+                messages_on(&mut hub_reads_ingress1),
+            ),
+            (
+                "to the hub from worker1",
+                messages_on(&mut hub_reads_worker1),
+            ),
+            ("to ingress1", messages_on(&mut ingress1_reads)),
+        ];
+        for frame in &back[0].1 {
+            wan_frame_from(&hub, "ingress1", &hub_to_ingress1, frame).await;
+        }
+        for frame in &back[1].1 {
+            wan_frame_from(&hub, "worker1", &hub_to_worker1, frame).await;
+        }
+        for frame in &back[2].1 {
+            wan_frame_from(&ingress1, "motherbee", &ingress1_to_hub, frame).await;
+        }
+        for ctx in [&hub, &ingress1, &worker1] {
+            assert_eq!(
+                ctx.lsa_reject_counters
+                    .lock()
+                    .await
+                    .get(LSA_REJECT_FOREIGN_SOURCE),
+                None,
+                "{}: no frame dropped as a foreign source's",
+                ctx.hive_id
+            );
+        }
+        for (case, frames) in back {
+            assert!(frames.is_empty(), "nothing went back {case}");
+        }
     }
 
     /// A-195 at a link-up: a spoke that comes up on the hub reads its HELLO, WAN_ACCEPT and LSA,

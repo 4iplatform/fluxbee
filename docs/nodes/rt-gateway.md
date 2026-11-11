@@ -169,6 +169,12 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
     message of one of its own nodes or within 5 s. It rebuilds it, too, as it marks a hive stale:
     a frame by name to a node of that hive is answered `NODE_NOT_FOUND` at once, where until
     0.1.132 it went on toward that hive until the next rebuild.
+  - **Broadcasts across the hub** (A-272, since 0.1.134): a gateway hands a broadcast that came
+    over the WAN on to every WAN peer but the one it came from (split horizon): the hub to every
+    other spoke, a spoke, whose one peer is the hub, to none. Until 0.1.134 it went back too: each
+    spoke sent every broadcast of the hub back to it, and the hub sent a spoke's back to that spoke,
+    where the source check dropped it (`router dropped a WAN frame`, counted as `foreign_source`).
+    Most of that counter's drops on 8.x were these echoes.
   - **Errors across the hub** (A-245, since 0.1.132): a message between two spokes passes the
     hub both ways, and the far spoke's router answers it over the hub's link. The hub hands that
     `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke whose LSA lists the sender, one hop of TTL
@@ -192,8 +198,9 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   nodes, sibling routers, the static routes of SY.config.routes, the LSA and the reachability
   table (`rebuild_fib`). `name@*` tries the sender's hive first.
 - **Broadcast** reaches the nodes connected at that moment (minus the sender), filtered by VPN
-  and by `meta.target`; TTL 2 also reaches sibling routers and TTL 3 also crosses the WAN.
-  Duplicates are dropped by `trace_id` for 30 s.
+  and by `meta.target`; TTL 2 also reaches sibling routers and TTL 3 also crosses the WAN, never
+  back to the peer it came from (Multi-hop, above; A-272). Duplicates are dropped by `trace_id`
+  for 30 s.
 - **Resolve** (no destination): first the system policy's frontdesk rule sends a message with no
   ILK, or with a `temporary` one, to `government.identity_frontdesk`; otherwise the user policy
   of SY.opa.rules picks the target (`resolve_target_with_identity`).

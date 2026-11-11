@@ -63,6 +63,11 @@ Separate three things that are conflated today: **data** (which node lives on wh
   a refusal from another, as between any other two hives. Only an answer the adjacent router made
   itself goes on, and never back where it came from; one it does not hand on is counted and
   logged with the reason.
+- Since 0.1.134 (FINDINGS A-272) a broadcast takes the same **split horizon**: a gateway hands one
+  that came over the WAN on to every WAN peer but the one it came from (`broadcast_to_wan`), so the
+  hub hands a spoke's broadcast to every other spoke, and a spoke sends one from the hub back to no
+  hive. Until then each went back too, and the router it went back to dropped it as a
+  `foreign_source` frame.
 - Each spoke ingests into a **new `reachability` table** (`Arc<Mutex<HashMap<Uuid,
   ReachabilityEntry>>>`), kept SEPARATE from `lsa_state`/the LSA SHM snapshot so the
   identity-bearing snapshot is never polluted. Each `ReachabilityEntry` carries `{ name,

@@ -435,9 +435,11 @@ it knows (`broadcast_reachability`): with its LSA every `hello_interval`, to a s
 comes up, and to every spoke as soon as an LSA adds to a hive's nodes (FINDINGS A-195). A spoke
 accepts it only from the motherbee's gateway (`wan_reachability_voucher_allowed`, rule 6 in §7.3)
 and routes those nodes through the motherbee, which relays the frames, and a far spoke's
-`UNREACHABLE` or `TTL_EXCEEDED` back to their sender (`relay_far_answer`, FINDINGS A-245). A node
-learned this way gets data only: the router drops its protected system actions
-(`prepare_local_delivery`, `src_via_hub`).
+`UNREACHABLE` or `TTL_EXCEEDED` back to their sender (`relay_far_answer`, FINDINGS A-245). A
+broadcast goes on from each gateway to every WAN peer but the one it came from: the motherbee hands
+a spoke's to every other spoke, and a spoke hands one from the motherbee to no hive (split horizon,
+FINDINGS A-272). A node learned this way gets data only: the router drops its protected system
+actions (`prepare_local_delivery`, `src_via_hub`).
 
 ### 5.3 Identity sync: 9100/tcp with a per-hive HMAC
 
