@@ -2,10 +2,12 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.79** (2026-10-17). Read from the code, operation by operation; §10
+> Contract as of **fluxbee 0.1.133** (2026-11-11). Read from the code, operation by operation; §10
 > lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in each
-> release. The model behind it: `docs/ilk-tenant-model-v1.md` (an identity is the actor and is
-> never duplicated; a tenant is a cost center, a workspace of the system, never a company).
+> release. PROD runs **0.1.132** until 0.1.133 is deployed: what 0.1.133 changes for Cloud arrives
+> with it, and the text marks it "(0.1.133)". The model behind it: `docs/ilk-tenant-model-v1.md`
+> (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
+> system, never a company).
 >
 > **Tenant, not company.** Fluxbee sees tenants only. Cloud associates each of its companies with
 > a tenant (today one to one); companies, members and billing are Cloud's.
@@ -34,10 +36,12 @@ hive's admin checks every request again (§3), in case IO.cloud itself were comp
         │  Content-Type: application/json
         ▼
   SY.edge (the only piece on the internet)
+    0. is Host the hive's name?     no → 404 (two Host headers → 400)
     1. is <ich> published?          no → 404
     2. is the method POST?          no → 405
     3. does the bearer match?       no → 401
     4. does the body fit in 64 KiB? no → 413
+    5. is it whole within 30 s?     no → 408
     → removes Authorization: it never travels inside
         ▼  (the hive's internal network)
   IO.cloud   translates {op, tenant_id, params} into one hive action
@@ -45,7 +49,9 @@ hive's admin checks every request again (§3), in case IO.cloud itself were comp
   SY.admin   checks the request again and runs it
 ```
 
-**The URL** is `https://<hive public host>/e/<ich>`. The operator gives it to you (§7).
+**The URL** is `https://<hive public host>/e/<ich>`. The operator gives it to you (§7). The door
+answers that host only: another name for the same server (an alias, a domain that points to it)
+answers 404.
 
 **The ICH is not a secret.** It is derived deterministically, and with IO.cloud's fixed channel it
 is the same on every installation: `ich:14b66389-d425-531c-a140-a591d25e8f39`. **The only
@@ -59,7 +65,11 @@ tenant:
 - minted by the hive's admin when the operator publishes the endpoint, stored in the hive's vault,
   and shown **once**. Nobody can read it back afterwards: if it is lost, it is rotated (§7);
 - after a rotation the **previous token keeps working for 10 minutes**, so a request in flight is
-  not refused at the switch. It is a safety net, not a migration window.
+  not refused at the switch. It is a safety net, not a migration window. The grace lives only in
+  the edge's memory: an edge restart within those 10 minutes ends it.
+
+**The certificate** on PROD comes from Let's Encrypt, and the hive renews it before it expires.
+Validate it against the system's CAs; never pin it.
 
 PROD:
 
@@ -133,7 +143,7 @@ any tenant. Choosing the right tenant for the person in the session is Cloud's j
 
 ```js
 const r = await fetch(url, { method: 'POST', headers, body });
-if (r.status !== 200) {                       // the edge: 401 404 405 413 500 502 503 504
+if (r.status !== 200) {               // the edge: 400 401 404 405 408 413 500 502 503 504
   const e = await r.json().catch(() => ({}));
   throw new EdgeError(r.status, e.error_code, e.message);
 }
@@ -178,10 +188,12 @@ object:
 |---|---|
 | `message`, `action` | what was too large |
 | `size`, `max` | the answer's bytes and the most an answer may take |
-| `paging` | for a list: the params to page (`params`) and the field naming the next page (`next`) |
+| `paging` | for a list: the params to page (`params`), the field naming the next page (`next`) and the one holding the rows (`rows`), in the hive's own names: for `list_tokens` it says `filter.limit`, which you send as `params.limit` |
 | `suggested_limit` | for a list: about how many rows fit half a frame |
+| `read_only` | `true` when the action only reads, so asking again changes nothing |
 | `outcome` | the action's own `status`, `error_code` and ids |
 | `action_ran` | `true` for an action that changed something: **it ran**; read its effect back, never send it again to see its answer |
+| `source` | the hive service's own text, when its answer did not fit its hop to the admin |
 
 It never names one of the hive's own HTTP routes: Cloud reaches the hive only through IO.cloud.
 For `list_tenants`, `list_tokens` and `list_nodes`, send the op again with `params.limit` set to
@@ -334,7 +346,7 @@ tenant. Restore brings the tenant back as it was. Only the operator purges, and 
 is charged to it.
 
 While it is deleted, like while it is suspended, its nodes do not start and its credentials are not
-handed out (§5.3, §5.4).
+handed out (§5.3, §5.4). The pages its nodes published stay up until they expire (§5.7).
 
 - delete: `{"status":"ok","tenant_id":…,"state":"deleted","already_deleted":false,"people_charged":3}`;
   idempotent (`already_deleted:true`). `people_charged` counts the people still charged to it.
@@ -343,6 +355,7 @@ handed out (§5.3, §5.4).
   - `TENANT_HAS_NODES`: node identities live in it (kill its nodes first).
   - `TENANT_HAS_CHILDREN`: it sponsors other tenants.
   - `TENANT_NOT_DELETED` (restore), `TENANT_NOT_FOUND`.
+  - `TENANT_DELETED` (restore): its sponsor is marked deleted; restore the sponsor first.
 
 ### 5.2 People (identities, "ilk")
 
@@ -361,6 +374,11 @@ handed out (§5.3, §5.4).
 
 **One email is one account, in the whole hive.** The person is charged to the tenant at the root;
 their email (the account's `cloud` channel) belongs to no tenant.
+
+**The email is vouched.** The hive takes the email Cloud sends as the person's own
+(`identification.email`). An email someone only typed in a conversation is kept as
+`identification.claimed_email` (`get_ilk_details` shows it), and it never identifies or joins
+anyone. Send only emails Cloud has verified.
 
 - **A new email:** IO.cloud creates the person, hands them to the hive's frontdesk, and answers
   **flat** (no `result`):
@@ -381,9 +399,16 @@ their email (the account's `cloud` channel) belongs to no tenant.
   To charge it to your tenant, call `set_ilk_tenant`.
 - **A signup that was never completed** (from any tenant) is picked up by the next
   `register_human` of that email, charged to the new tenant.
+- **An email a person charged to your tenant already holds** as their vouched email, with no
+  account yet (registered through another door, such as `IO.api`): the new identity merges into
+  that person. The answer has `merged: true`, `ilk_id` the person's, and `merged_from_ilk_id` the
+  identity IO.cloud created for the request.
 - Errors:
   - `ACCOUNT_AMBIGUOUS`: that email is held twice from before 0.1.65 (by several people, or by a
     person and another identity); the operator resolves it.
+  - `TENANT_DELETED`: your tenant is marked deleted.
+  - `INVALID_SCOPE`: the hive refused the account's scope, a fault on its side: give the operator
+    the `request_id`.
   - `CLOUD_CHANNEL_RESERVED`: the email is the address of a node's own channel, not a person's.
   - `ACCOUNT_IN_ROOT_TENANT`: the account is charged to the root tenant (registered before 0.1.54);
     the operator reassigns it.
@@ -437,6 +462,9 @@ takes it over.
 {"result":{"exists":false,"ilk":null,"matches":[]}}           // first time: register_human
 ```
 
+By email, an envelope `tenant_id` is optional. With one, IO.cloud looks for the account in the
+whole hive, then in that tenant, and answers `{exists, ilk}` without `matches`.
+
 #### `list_ilks` (local, fast)
 
 `tenant_id` at the root: the identities charged to it.
@@ -473,7 +501,8 @@ operator purges). Idempotent.
 - A person also comes back while the tenant they are charged to is deleted, still charged to it;
   `set_ilk_tenant` then moves them.
 - Errors: `ILK_NOT_FOUND`, `ILK_TYPE_MISMATCH` (not a person), `ILK_NOT_DELETED` (restore),
-  `ILK_KEY_CONFLICT` (restoring it would bring back a second account for its email).
+  `ILK_KEY_CONFLICT` (restore: a channel of theirs, their account's email above all, is now another
+  identity's, or another person charged to the same tenant has their email).
 - A person deleted before 0.1.65 comes back with their account where `register_human` finds it,
   unless another identity holds that email.
 
@@ -623,7 +652,7 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `tenant_id` (root) | required | the node's tenant |
 | `params.node_name` | required | **must start with `IO.`**; a `@hive` suffix picks the server (omit it if unsure) |
 | `params.runtime` | send it | what to run (e.g. `io.api`). Omitted, it is derived from the name's first two segments, which rarely exists |
-| `params.runtime_version` | optional | default `"current"` |
+| `params.runtime_version` | optional | default `"current"`: the node follows it, and when the operator makes another version current the hive restarts the node on it within a minute. A version named here pins it |
 | `params.config` | optional | object; IO.cloud overwrites `config.tenant_id` with the envelope's `tenant_id` |
 | `params.add_channels` | optional | `[{"ich_id":"ich:…","type":…,"address":…}]` |
 | `params.identity_change_reason` | optional | text |
@@ -641,8 +670,12 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `NODE_ALREADY_EXISTS` | a node with that name exists |
 | `TENANT_NOT_ACTIVE` | the tenant is pending or suspended: it starts no node |
 | `RUNTIME_NOT_AVAILABLE` | the runtime or version cannot be resolved |
+| `RUNTIME_NOT_PRESENT` | that version has not reached the node's hive yet: retry later |
+| `CORE_IO_NAME_MISMATCH` / `TENANT_ROOT_REQUIRED` | the runtime is one of the hive's core IO runtimes (`io.cloud`, `io.blob`, `io.web`), or the name is one of their nodes (`IO.cloud@motherbee`…): each runs only as its one node, in the root tenant |
 | `INVALID_REQUEST` | not `IO.*`, runtime not derivable, bad version |
-| `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SERVICE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted tenant, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |
+| `IDENTITY_UPDATE_FAILED` | `add_channels` or `identity_change_reason` could not be applied (a channel another identity holds, for example); the launch is undone |
+| `SERVICE_FAILED` | the hive's systemd did not answer whether the node runs: nothing was launched. Since 0.1.133 nothing of the node stays either: send it again (in 0.1.132 a retry answers `NODE_ALREADY_EXISTS`: ask the operator) |
+| `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted tenant, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |
 
 The hive records that you launched it (`launched_by: "cloud"`): only those nodes can you start, stop
 or delete. Nodes launched before 0.1.68 carry no `launched_by`: `list_nodes` shows them
@@ -678,14 +711,15 @@ You see a node's state, not how the hive runs it: no process, unit or host paths
 
 - `lifecycle_state`: `RUNNING`, `STARTING`, `STOPPED` or `FAILED`, from the hive itself, for every
   node; `UNKNOWN` while the hive cannot tell (its systemd did not answer for the node), never a
-  `STOPPED` it did not see. Read it again.
+  `STOPPED` it did not see (0.1.133). Read it again.
 - `health_state`: what the node reports about itself. IO nodes are not all at the same stage, and
   an older one may answer `UNKNOWN`.
 - `identity.ilk_id` is what `list_tokens` shows in `assigned_ilks`.
 - `relaunch_on_boot: false` means it was stopped and stays stopped until `start_node`.
 - A hive whose nodes are missing from `nodes` is listed in `unreachable_hives`, never left out in
-  silence: it did not answer in time, it is not connected (`HIVE_NOT_CONNECTED`), or its core
-  predates 0.1.68 (`HIVE_OUTDATED`, the operator updates it).
+  silence. Each entry is `{hive_id, error_code, message}`: `HIVE_NOT_CONNECTED` (it is not
+  connected), `NODE_LIST_FAILED` (it did not answer within 10 s), `HIVE_OUTDATED` (its core predates
+  0.1.68: the operator updates it), or the hive's own code.
 - A node appears once it really exists, so after `provision_node` read it here, not from your own
   records.
 
@@ -703,7 +737,9 @@ where the health came from (`health_source`) and the node's last error when it r
  "config_version":1, …}}}
 ```
 
-A node of another tenant, or one that does not exist, answers `NODE_NOT_FOUND`.
+A node of another tenant, or one that does not exist, answers `NODE_NOT_FOUND`, and so does a node
+whose hive cannot be reached (`list_nodes` names that hive in `unreachable_hives`). When the node's
+hive does not answer the status read, the answer is `NODE_STATUS_GET_FAILED`: read it again.
 
 #### `start_node` / `stop_node` / `delete_node`
 
@@ -718,11 +754,33 @@ other node answers `NODE_NOT_FOUND`, exactly as one that does not exist.
 
 ```json
 {"status":"ok","op":"stop_node","result":{"status":"ok","state":"stopped",
- "node_name":"IO.slack.acme@motherbee","unit_was_active":true,"relaunch_on_boot":false}}
+ "node_name":"IO.slack.acme@motherbee","hive":"motherbee","unit_was_active":true,
+ "relaunch_on_boot":false}}
 ```
 
 The answer says what happened (`state`: `started`, `already_running`, `stopped`, `deleted`), never
 how: no unit, signal or host path.
+
+`delete_node` answers `{status, state: "deleted", node_name, hive, unit_was_active,
+instance_purged}`. An ok does not prove that the node's identity and the credentials it owned went:
+the hive logs a teardown that left them behind and still answers ok. `list_tokens` shows a
+credential that stayed.
+
+A node may have published public pages (§5.7). `delete_node` is not refused for them, and each
+stays up until its fixed expiry: 24 h after it was published by default, 30 days at most, never
+renewed. The answer does not name them.
+
+| `error_code` | when |
+|---|---|
+| `NODE_NOT_FOUND` | not an IO node you launched in this tenant, or no such node, or the node's hive cannot be reached (`list_nodes` then names that hive in `unreachable_hives`) |
+| `TENANT_NOT_ACTIVE` | `start_node` while the tenant is pending or suspended |
+| `RUNTIME_NOT_AVAILABLE` / `RUNTIME_NOT_PRESENT` | `start_node`: the node's runtime version cannot be resolved / has not reached its hive yet (retry later) |
+| `SERVICE_FAILED` | the hive's systemd did not answer whether the node runs: nothing was started, stopped or removed. Send it again (`start_node` answers it since 0.1.133) |
+| `START_FAILED` / `KILL_FAILED` | the start or the stop failed on the node's hive, or that hive did not answer in time: read `list_nodes`. A start that failed on the hive stays wanted: the hive tries it again every minute until `stop_node` |
+| `TIMER_PURGE_FAILED` | `delete_node` stopped the node (it stays stopped), but its timers could not be removed, and nothing else was: send `delete_node` again |
+| `NODE_INSTANCE_PURGE_FAILED`, `ILK_MAPPING_REMOVE_FAILED` | `delete_node` stopped the node, but its removal stopped partway on its hive: give the operator the `request_id` |
+
+IO.cloud passes the hive's text as `error_detail`, with no retry flag: match on the code.
 
 To cut a node's access without stopping it, take its credential away (`assign_token`) or delete
 the credential (`delete_token`); to cut a whole tenant, suspend it (`update_tenant`).
@@ -731,9 +789,10 @@ the credential (`delete_token`); to cut a whole tenant, suspend it (`update_tena
 
 The hive records **every call its nodes make to a model**: one record per call, charged to a
 tenant. Your tenant's records are the calls of its nodes and the calls the hive makes for them: its
-memory of a conversation is charged to the tenant of the agent in it, its frontdesk to the case's
-tenant. **The hive's own spending (Archi, the admin) is charged to the root tenant, which no op
-reads.** Pricing is yours, record by record.
+memory of a conversation is charged to the tenant of the agent in it (with no agent, to the tenant
+of the person who wrote each turn), its frontdesk to the case's tenant. **The hive's own spending
+(Archi, the admin) is charged to the root tenant, which no op reads.** Pricing is yours, record by
+record.
 
 #### `get_usage`
 
@@ -785,10 +844,10 @@ Record by record (a period without `group_by`, or `since`):
 | `stored_at` | when the hive stored the record. `since` goes by it |
 | `hive`, `node_name`, `node_ilk` | the node that made the call |
 | `tenant_id` | the tenant charged |
-| `tenant_source` | why: `node` (your node), `agent` (the hive's memory, for your agent's conversation), `case` (the frontdesk, for your case) |
+| `tenant_source` | why: `node` (your node), `agent` (the hive's memory, for your agent's conversation), `writer` (the hive's memory of a conversation with no agent, such as people talking through a workflow: the tenant of the person who wrote the turn), `case` (the frontdesk, for your case) |
 | `claimed_tenant_id` | the tenant the node's record named. It differs from `tenant_id` when the hive charged the node's own tenant instead |
 | `verified` | `false` when the hive could not check the tenant against its identity registry and kept the one the record named |
-| `counterpart_ilk` | who the call was for: the person your agent answered, or your agent for the hive's memory |
+| `counterpart_ilk` | who the call was for: the person your agent answered; your agent, for the hive's memory; the person who wrote the turn, for `writer` |
 | `provider`, `model`, `served_model`, `service_tier` | the provider, the model asked for, the model that answered, and OpenAI's service tier |
 | `kind` | `generate` (one answer) or `function_turn` (one turn of a tool loop) |
 | `outcome` | `ok`; `truncated` (cut at the output limit); `refused` (the model refused); `unreadable` (an answer paid for whose counts could not be read); `abandoned` (the node stopped waiting: maybe paid for) |
@@ -832,7 +891,28 @@ stream's 2 minutes while the motherbee is down. The hive counts what it loses; t
 ### 5.6 `list_cloud_actions` (local)
 
 No tenant, no params. `result: {"actions":[{"op":…,"category":"relay"|"local","summary":…}, …]}`:
-every op of §5 with a one-line summary, from the hive itself.
+every op of §5 with a one-line summary, from the hive itself. Where a summary says less than §5,
+§5 governs.
+
+### 5.7 Published pages
+
+A tenant's nodes can publish pages on the edge: a report an AI agent wrote for the person it talks
+to, for example. No op of this list reads them or takes them down.
+
+- **Who publishes:** the hive lets `AI.*`, `IO.*` and `WF.*` nodes publish a page, and charges it to
+  the tenant the node is charged to when it publishes. Today only the AI agents do, so a tenant's
+  pages come from the agents the operator runs in it; no IO runtime publishes one yet.
+- **The link** is `https://<hive public host>/public/<key>`, on the host of `/e/`. Whoever has the
+  link opens the page: the key is its only protection.
+- **Its life is fixed when it is published:** 24 h by default, which is what an agent's page gets,
+  and 30 days at most, never renewed. At its expiry the link answers 404 at once.
+- **No removal waits for a page** (0.1.131). After `delete_node`, `delete_tenant` or a suspension,
+  the pages stay up until they expire, and no answer Cloud gets names them. Sooner, only the agent
+  that published a page, or the operator, can take it down.
+- **Cloud can neither list them nor take them down.** Listing and taking down your tenant's pages
+  through IO.cloud is planned with the Cloud track, not scheduled yet.
+- **Planned for 0.1.136, not built yet:** an `IO.*` or `WF.*` node can take down the pages it
+  published itself, as an agent can now. Cloud gets no op for pages with it.
 
 ---
 
@@ -848,14 +928,24 @@ completing inside**. Treat it as **unknown**, not failed:
 
 - `create_tenant`, `update_tenant`, `put_token` (same value), `delete_*`, `restore_*`: safe to retry.
 - `get_usage`: a read, safe to retry.
+- `start_node`, `stop_node`: safe to retry: a start that did complete answers `already_running`, a
+  stop `stopped` again.
 - `delete_token`: a retry of a delete that did complete answers `KEY_NOT_FOUND`.
 - `provision_node`: a retry answers `NODE_ALREADY_EXISTS`, which may mean the timed-out attempt
   worked. There is no idempotency key (`request_id` is for traces only); ask the operator.
-- `delete_node`: a retry answers `NODE_NOT_FOUND` once the timed-out attempt finished; read
+- `delete_node`: a retry answers `NODE_NOT_FOUND` once the timed-out attempt finished, as it does
+  while the node's hive cannot be reached (`unreachable_hives` then names it): in both cases, read
   `list_nodes` to know.
 
 **IO.cloud serves one request at a time.** Concurrent calls queue, and a queued one can spend the
 edge's 30 s and get a 504. Serialize your calls.
+
+**A `SERVICE_FAILED` from a node op is not unknown** (0.1.133): on `provision_node`, `start_node`,
+`stop_node` or `delete_node` it says nothing was done (§5.4). Send it again.
+
+**From the edge, a 502 `HANDLER_UNREACHABLE` is not unknown either:** the request never reached
+IO.cloud (§7). Send it again after a pause, whatever the op. A 504 is unknown, as
+`ADMIN_UNAVAILABLE` is.
 
 ---
 
@@ -874,12 +964,12 @@ edge in IO.cloud's config and answers with `url` (`/e/<ich>`) and `token`. **The
 only here.** Give Cloud `https://<public host><url>` and the token.
 
 IO.cloud trusts that edge at once, the first time and whenever the door moves to another edge
-(FINDINGS A-255): after the record, SY.admin applies the edge to the running IO.cloud, a
-`CONFIG_SET` of its live config with that edge at its `config_version` + 1. A `CONFIG_SET` refused
-as stale (another config reached IO.cloud between the read and the write) or not answered is tried
-once more on the config read again, within 30 s in all. The answer says so with
-`edge_applied: true`. With `edge_applied: false` it carries a `warning` that says why, and which
-case it is:
+(0.1.133, FINDINGS A-255; in 0.1.132 only once IO.cloud restarts, or by the `CONFIG_SET` below):
+after the record, SY.admin applies the edge to the running IO.cloud, a `CONFIG_SET` of its live
+config with that edge at its `config_version` + 1. A `CONFIG_SET` refused as stale (another config
+reached IO.cloud between the read and the write) or not answered is tried once more on the config
+read again, within 30 s in all. The answer says so with `edge_applied: true`. With
+`edge_applied: false` it carries a `warning` that says why, and which case it is:
 
 - the edge is recorded but not applied yet: IO.cloud refused the read or the `CONFIG_SET`, and it
   reads the record when it starts;
@@ -894,7 +984,11 @@ Until IO.cloud takes the edge, it drops every Cloud request through it (a 504 fo
 `node_control_config_get` config with the edge, `config_version` one above).
 
 - **Rotate:** run it again on the same edge. A new token is minted; the previous one works 10 more
-  minutes. IO.cloud already trusts that edge: nothing in it changes.
+  minutes, or until the edge restarts within them (§2). IO.cloud already trusts that edge: nothing
+  in it changes.
+- **A publish that answers `CONFIG_RECORD_FAILED`** opened the door and minted a new token it does
+  not hand over: the previous token works 10 more minutes (none after a first publish). Run the
+  publish again, and give Cloud the token it answers.
 - **Check:** `curl 'http://127.0.0.1:8080/channels/externalized?edge_node=SY.edge@ingress1'` lists a
   row owned by `IO.cloud@motherbee`.
 - **IO.cloud's own state** (FINDINGS A-91): while it trusts no edge, it drops every Cloud request,
@@ -915,9 +1009,10 @@ post '{"op":"list_cloud_actions"}'
 
 | Cloud sees | likely cause on the hive |
 |---|---|
-| **404** | the endpoint was never published, or the hive was reinstalled: publish again |
+| **404** | the endpoint was never published, or the hive was reinstalled: publish again. Or the request named a host other than the hive's (§2) |
 | **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log) |
-| **504** | IO.cloud is down or busy (§6), or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
+| **502** `HANDLER_UNREACHABLE` | IO.cloud is not running (restarting, for example), or the edge's hive cannot reach the motherbee: the request never reached IO.cloud |
+| **504** | IO.cloud is busy (§6) or does not answer, or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
 ---
 
@@ -938,10 +1033,59 @@ post '{"op":"list_cloud_actions"}'
    charged to now; which companies a person belongs to, and which one they act for, is Cloud's
    (`docs/ilk-tenant-model-v1.md`). Model spending is recorded per call and read with `get_usage`
    (§5.5); pricing it is Cloud's.
+9. **Public pages** (§5.7). Cloud can neither list nor take down its tenant's pages. Each stays up
+   until its fixed expiry (24 h by default, 30 days at most), also after its node or its tenant is
+   deleted or suspended; the operator can take one down sooner.
 
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.133 (not deployed yet: PROD runs 0.1.132)
+
+- **The door works as soon as the operator publishes it or moves it to another edge** (§7). Before,
+  a first publish or a move left Cloud with 504s until IO.cloud restarted; a rotation on the same
+  edge never did.
+- **`lifecycle_state` can be `UNKNOWN`** in `list_nodes` and `get_node_status`: the hive's systemd
+  did not answer for the node. The hive no longer reports a `STOPPED` it did not see. Read it again.
+- **`SERVICE_FAILED` on `provision_node`, `start_node`, `stop_node` and `delete_node`** means the
+  hive's systemd did not answer whether the node runs, asked again for a second: nothing was done,
+  and a provision leaves nothing of the node behind (in 0.1.132 its config and identity stayed, and
+  a retry answered `NODE_ALREADY_EXISTS`). Send it again. The answer has no retry flag: match on the
+  code.
+- **`get_node_status` of a node on the motherbee no longer waits behind a change** the hive runs (a
+  node on another hive stopped waiting in 0.1.127).
+
+### 0.1.131
+
+- **`delete_node` is never refused for public pages** (§5.7). A page the node published stays up
+  until its fixed expiry, and the answer does not name it. From 0.1.127 to 0.1.130 such a delete
+  answered `NODE_HAS_PAGES`, and one whose page list could not be read `PAGES_CHECK_FAILED`.
+
+### 0.1.127
+
+- **`list_nodes`, and `get_node_status` of a node on another hive, no longer wait behind a change**
+  the hive runs (a provision, a delete, the operator's work), where they could reach IO.cloud's 20 s
+  and answer `ADMIN_UNAVAILABLE`.
+- **A request that fails inside the hive's node launcher answers `INTERNAL_ERROR`** at once, where
+  it went unanswered until IO.cloud's wait ran out. Do not retry it in a loop: give the operator the
+  `request_id`.
+- **`delete_node` of a node with a public page up, or a publish in flight, answers
+  `NODE_HAS_PAGES`** (until 0.1.131).
+
+### 0.1.125
+
+- **`register_human`'s `human_message` is in English** (it was Spanish). It is the frontdesk's text
+  for the person: never match on it.
+- **The frontdesk tries a passing failure of the identity registry again**, for up to 8 s, before it
+  answers: `register_human` can take that much longer.
+
+### 0.1.124
+
+- **While the edge cannot reach IO.cloud's hive, the door answers 502 `HANDLER_UNREACHABLE`** within
+  seconds, where it could wait 30 s for a 504 for as long as the outage lasted. A link that falls
+  silent is cut after 40 s, and since 0.1.129 a link too busy to take the request answers the same
+  way. Such a request never reached IO.cloud: send it again (§6).
 
 ### 0.1.123
 
@@ -951,6 +1095,51 @@ post '{"op":"list_cloud_actions"}'
   (`params.cursor`, §5.3) and `list_nodes` (`params.limit`, `params.cursor`, §5.4): `next_cursor`
   while more follow, and `total`. Without them every answer is what it was. A cursor the op did
   not give is refused with the new code `INVALID_CURSOR`.
+
+### 0.1.106
+
+- **`restore_ilk`:** an email blocks a restore only when another person charged to the same tenant
+  holds it; another tenant holding it answered `ILK_KEY_CONFLICT`.
+
+### 0.1.104
+
+- **`get_usage`: new `tenant_source` `writer`** (§5.5): the hive's memory of a conversation with no
+  agent (people talking through a workflow), charged to the tenant of the person who wrote each
+  turn; `counterpart_ilk` is that person.
+
+### 0.1.88
+
+- **A launch checks the whole runtime first:** `provision_node` and `start_node` answer
+  `RUNTIME_NOT_PRESENT`, before anything starts, while any part of that version has not reached the
+  node's hive (retry later).
+- **A failed start stays wanted:** after `START_FAILED` the hive tries the node again every minute
+  until `stop_node`.
+- **A node on `current` follows it:** when the operator makes another version current, the hive
+  restarts the node on it within a minute; a version named in `runtime_version` pins it.
+
+### 0.1.85
+
+- **`provision_node` refuses the hive's core IO runtimes** (`io.cloud`, `io.blob`, `io.web`) and
+  their node names: `CORE_IO_NAME_MISMATCH`, or `TENANT_ROOT_REQUIRED` for the exact core node.
+
+### 0.1.84
+
+- **The door answers the hive's own name only:** another `Host` answers 404, two `Host` headers 400
+  (`BAD_HOST`). A body not whole within 30 s answers 408 (`BODY_TIMEOUT`). The edge's `message` is
+  a fixed text per code: match on `error_code`.
+
+### 0.1.83
+
+- **`register_human`'s email is vouched** (§5.2): it is the person's `identification.email`. An
+  email someone only typed in a conversation is kept as `claimed_email`, which never identifies or
+  joins anyone.
+
+### 0.1.82
+
+- **`acme_account*` joined the reserved keys** (`put_token`, `assign_token` and `delete_token`
+  answer `INVALID_REQUEST`).
+- **PROD's certificate comes from Let's Encrypt, and the hive renews it:** validate it against the
+  system's CAs; never pin it.
 
 ### 0.1.79
 
@@ -1032,6 +1221,17 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.82 to 0.1.90:** on PROD, through the public door (`lab/DEPLOYMENTS.md`; 0.1.90 in
+`lab/logbook/2026-10-29.md`):
+
+- 0.1.90, 2026-10-29, right after the token was rotated: `list_cloud_actions` with the new token
+  answered its 25 ops; without a token, 401;
+- 0.1.85: a relay with Cloud's token;
+- 0.1.84: `list_tenants` with Cloud's token; another host answered 404, and two `Host` headers 400;
+- 0.1.83: `list_tenants`, `create_tenant`, and `register_human`, which completed with the email in
+  `identification.email`;
+- 0.1.82: the Let's Encrypt certificate, verified from outside against the system's CAs.
 
 **0.1.79:** on PROD, 2026-10-17, through the public door with Cloud's token, with a test tenant
 whose agent, memory and frontdesk made model calls (`lab/DEPLOYMENTS.md`, 0.1.79):
