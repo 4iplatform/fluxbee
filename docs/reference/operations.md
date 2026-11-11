@@ -406,6 +406,22 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   publish, except on a base that packages are built on (`RUNTIME_HAS_DEPENDENTS`: it stays,
   unused). It never deletes `package_version` itself (`RUNTIME_PACKAGE_VERSION`), and
   `publish-runtime.sh` refuses a hand publish under that version.
+- **A version is removed only once every hive's nodes were read (FINDINGS A-281, since
+  0.1.133).** `remove_runtime_version` reads the version's use from the motherbee's orchestrator,
+  which asks every hive of the registry. A node pinned to the version whose unit may run refuses
+  it, `409 RUNTIME_IN_USE`, whose detail names each node with its hive and lifecycle (`RUNNING`,
+  `STARTING` or `UNKNOWN`: systemd did not answer for its unit). A worker whose nodes were not
+  read refuses it too, `409 RUNTIME_USAGE_UNKNOWN`, naming each in `payload.unanswered_hives` with
+  its reason: `UNREACHABLE` (down, its orchestrator restarting, stale in the LSA), the error it
+  answered (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet), or, for the
+  motherbee, a read its orchestrator did not answer or could not make. An ingress or an egress
+  receives no runtime (it answers `RUNTIME_MANIFEST_MISSING` to every such read) and refuses
+  nothing. Nothing is removed: ask
+  again once each hive answers, and remove a hive gone for good with `remove_hive` first. Before,
+  such a hive counted as one with no node: a version a node of a restarting worker ran on was
+  removed, and the worker's mirror deleted it when it came back. A workflow's delete whose purge
+  meets the refusal answers `PACKAGE_PUBLISH_FAILED` after the workflow and its node are gone, and
+  that version stays in dist.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on
   `dist/runtimes-manifest.lock` from its read of the manifest to its write: SY.admin's
   `publish_runtime_package`, `remove_runtime_version` (across its read of the version's use, up to

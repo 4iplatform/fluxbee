@@ -959,6 +959,10 @@ person: when its provider gave no answer, the error carries the operator's text 
   or that they could not be counted: a WF node that is not `RUNNING` keeps them, and the removal
   ends them. The operator's confirmation removes the workflow with `force`. To let them finish,
   wait; to end them one by one, cancel them.
+  - `PACKAGE_PUBLISH_FAILED` after a removal: the workflow, its node and its state are gone, and
+    only some of its old versions stayed (their `remove_runtime_version` was refused or not
+    answered, the reason in the detail). Say so; never that the removal failed, and never run it
+    again.
 - **Operating instances** (the node is `WF.<workflow_name>`):
   - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and its
     last change (`updated_at_ms`), which is not when it entered its state: that is its last
@@ -1676,10 +1680,20 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
 - Each hive's orchestrator moves the running nodes within its next reconcile pass (60 s); a node
   pinned to a version stays.
 - The hand-published version stays available. If the operator wants it gone,
-  `remove_runtime_version` deletes it once no node runs it. A base that packages are built on
-  (`wf.engine` with deployed workflows, `ai.generic` with config-only packages) refuses that with
-  `RUNTIME_HAS_DEPENDENTS`: the version then stays, unused, and costs only its disk.
+  `remove_runtime_version` deletes it once every hive's nodes were read and none runs on it. A
+  base that packages are built on (`wf.engine` with deployed workflows, `ai.generic` with
+  config-only packages) refuses that with `RUNTIME_HAS_DEPENDENTS`: the version then stays,
+  unused, and costs only its disk.
 - The package's own version is never removed (`RUNTIME_PACKAGE_VERSION`): it is the way back.
+- `remove_runtime_version` also refuses, removing nothing:
+  - `RUNTIME_IN_USE` while a node runs on the version. Its detail names each node with its hive
+    and state: `RUNNING`, `STARTING` (its unit runs and the router does not see it yet) or
+    `UNKNOWN` (its hive's systemd did not answer; it stays listed until systemd answers). Tell the
+    operator which nodes, and that each must be stopped or moved to another version first.
+  - `RUNTIME_USAGE_UNKNOWN` when some worker's nodes could not be read: `payload.unanswered_hives`
+    names each hive and why (`UNREACHABLE`: down, restarting, or stale). It is never "not in use":
+    ask again once the hive answers. A hive gone for good is removed with `remove_hive` first. An
+    ingress or an egress receives no runtime, so it never refuses a removal.
 
 ---
 

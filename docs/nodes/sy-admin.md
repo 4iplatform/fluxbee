@@ -576,6 +576,56 @@ Archi, and over the mesh only Archi may ask for it (`mesh_access`).
 
 SY.timer describes itself with `timer_help` (`TIMER_HELP`) and may answer `NODE_HELP` later.
 
+## A runtime version's removal
+
+`remove_runtime_version` (`DELETE /hives/motherbee/runtimes/{runtime}/versions/{version}`,
+`handle_remove_runtime_version`) removes a version from the motherbee's dist and runtimes manifest;
+each hive's receive-only mirror deletes it when it syncs. Before it writes, it reads the version's
+use on every hive from the motherbee's orchestrator (`get_runtime` with the version, its
+`usage_global_visible`; `read_runtime_version_use`): `running_nodes`, the nodes of every hive
+pinned to the version whose unit may run, each with its `hive` and `lifecycle`, and
+`skipped_hives`, the hives whose nodes the orchestrator did not count. Only a read that counted
+every hive that may run a node on a runtime, and lists no node, lets the version go
+(`runtime_version_removable`). An ingress or an egress (the registry's role, `hive_runs_no_runtime`)
+receives no runtime: the orchestrator shares `dist/runtimes` with the workers alone, so each answers
+every such read `RUNTIME_MANIFEST_MISSING` (FINDINGS A-24) and is in `skipped_hives` on every
+read, and a read that skipped it missed no node. Otherwise, with nothing removed:
+
+- **`409 RUNTIME_IN_USE`** while a node is listed. The detail names each node, the first 20 of
+  them, with its hive and lifecycle: `RUNNING`, `STARTING` (its unit runs and the router does not
+  see it yet) or `UNKNOWN` (systemd did not answer whether its unit runs; it is listed until
+  systemd answers that it does not: [SY.orchestrator](sy-orchestrator.md), FINDINGS A-271). Before
+  0.1.133 it said "still running" of each. `payload.usage_global_visible.running_nodes` lists them
+  all, and `payload.unanswered_hives` the hives not counted besides. Stop each node that runs on
+  the version, or move it to another, then ask again.
+- **`409 RUNTIME_USAGE_UNKNOWN`** when the use could not be read on every hive (FINDINGS A-281,
+  since 0.1.133). `payload.unanswered_hives` names each hive not read, `{hive, reason, detail}`,
+  the detail names them with their reasons, and `payload.retryable` is true:
+  - the motherbee, when its orchestrator did not answer the read (`TIMEOUT`, `TRANSPORT_ERROR`),
+    refused it (its code), failed the read of its own nodes (`USAGE_READ_FAILED`: its usage has
+    `status: error` and no list) or gave no usage, or one without `running_nodes` or
+    `skipped_hives` (`NO_USAGE`);
+  - a worker of its `skipped_hives`, or a hive whose role the registry does not give (a join under
+    way): one that did not answer its `GET_RUNTIME` (`UNREACHABLE`: down, its orchestrator
+    restarting, or stale in the LSA), or that answered it with an error (its code:
+    `RUNTIME_NOT_FOUND` while its copy of the manifest does not list the runtime yet).
+
+  Ask again once each hive answers. A hive gone for good is removed with `remove_hive` first: the
+  orchestrator asks only the hives of the registry. Before 0.1.133 a hive not counted read as one
+  with no node, and a usage missing from the answer as one not in use (`in_use: false`): with
+  worker1's orchestrator restarting, a version a node of worker1 ran on was removed, its mirror
+  deleted it when it came back, and the node failed at its next start. A read the motherbee's
+  orchestrator did not answer was `RUNTIME_REMOVE_FAILED`.
+
+The other refusals: `409 RUNTIME_CURRENT_CONFLICT` for the runtime's current version while other
+versions remain, `409 RUNTIME_PACKAGE_VERSION` for the version the installed package brought
+(FINDINGS A-122), `404 RUNTIME_NOT_FOUND` or `RUNTIME_VERSION_NOT_FOUND`, and after the read of the
+use `409 RUNTIME_HAS_DEPENDENTS` while packages are built on the runtime. SY.wf-rules removes its
+workflows' old versions through this action ([SY.wf-rules](sy-wf-rules.md)): a deploy or a
+rollback whose removal is refused goes on, and the next one tries that version again; a
+workflow's delete answers `PACKAGE_PUBLISH_FAILED` with the refusal, after the workflow, its node
+and its state are gone, and that version stays in dist.
+
 ## Workflows: the check and the instances
 
 What Archi needs to write and operate a WF ([wf-orchestration-v1](../wf-orchestration-v1.md)

@@ -13159,6 +13159,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "INSTANCES_UNKNOWN"
         | "STALE_CONFIG_VERSION"
         | "RUNTIME_IN_USE"
+        // remove_runtime_version: some hive's nodes were not read, so the version's use is unknown
+        // (FINDINGS A-281); nothing was removed, ask again.
+        | "RUNTIME_USAGE_UNKNOWN"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
         // A name another tenant holds: a vault key (one namespace for the hive), a tenant name or
@@ -17211,6 +17214,10 @@ const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDIN
 /// Which pages a node's purge names, and the publish it does not wait for.
 const NODE_PAGES_LEFT_UP_NOTE: &str = "A node's purge names the pages the node published (publisher_l2_name); a stop names none. A publish of the node in flight at its purge is not waited for: its page may still go up within 110 s, unnamed, and stays up until it expires like the rest.";
 
+/// What `remove_runtime_version` refuses, nothing removed.
+const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: the detail names each node (the first 20) with its hive and lifecycle, RUNNING, STARTING (its unit runs and the router does not see it yet) or UNKNOWN (its hive's systemd did not answer whether its unit runs: it is listed until systemd answers that it does not), and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again.";
+const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): the motherbee's orchestrator did not answer the read, refused it or failed its own nodes' read, or a worker, or a hive whose join is under way, did not answer it (UNREACHABLE: down, restarting, or stale in the LSA) or answered it with an error (RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet). An ingress or an egress receives no runtime, and is never one of them. payload.unanswered_hives names each, {hive, reason, detail}, payload.retryable is true, and nothing was removed. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
+
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
 const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
@@ -17688,6 +17695,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "workflow_name is required.",
             "Delete is a direct command to SY.wf-rules, not a node CONFIG_SET operation.",
             "SY.wf-rules purges the workflow's WF node (kill_node with purge_instance) and answers {deleted, wf_node: {node_name, action}}.",
+            "Then SY.wf-rules removes every published version of wf.<workflow_name> (remove_runtime_version). A removal SY.admin refuses (RUNTIME_IN_USE, or RUNTIME_USAGE_UNKNOWN while a hive's nodes cannot be read: FINDINGS A-281) makes it answer PACKAGE_PUBLISH_FAILED with that refusal, though the workflow, its node and its state are gone: those versions stay in dist.",
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of its WF node, wf_node.node_name.",
         ],
@@ -17716,12 +17724,19 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The answer is the engine's WF_CANCEL_INSTANCE_RESPONSE as it is: payload {ok: true, instance_id, status: \"cancelled\"}. An instance already ended answers 409 INSTANCE_ALREADY_TERMINATED; one the node does not have, 404 INSTANCE_NOT_FOUND.",
             WF_INSTANCE_ERRORS_NOTE,
         ],
+        "remove_runtime_version" => vec![
+            "Motherbee-only (409 NOT_PRIMARY elsewhere): it removes the version from the motherbee's dist and runtimes manifest, and each hive's mirror deletes it when it syncs. In HTTP runtime and runtime_version come from the path; the executor step's args are hive, runtime and runtime_version.",
+            "Refused, with nothing removed: 409 RUNTIME_CURRENT_CONFLICT for the runtime's current version while other versions remain; 409 RUNTIME_PACKAGE_VERSION for the version the installed package brought (the way back with reset_base_runtime); 404 RUNTIME_NOT_FOUND or RUNTIME_VERSION_NOT_FOUND; 409 RUNTIME_HAS_DEPENDENTS while packages are built on the runtime; 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_REMOVE_FAILED (the manifest's lock not taken within 60 s, or a step of the removal failed: what it changed is put back).",
+            RUNTIME_REMOVAL_IN_USE_NOTE,
+            RUNTIME_REMOVAL_UNKNOWN_NOTE,
+            "SY.wf-rules removes its workflows' old versions with it: a deploy or a rollback whose removal is refused goes on, and the next one tries that version again; a workflow's delete answers PACKAGE_PUBLISH_FAILED with the refusal, and that version stays in dist.",
+        ],
         "reset_base_runtime" => vec![
             "Confirm with the operator first: every node that follows the runtime's current moves onto the package's version, the WF and config-only packages built on it with them.",
             "A base runtime is one the installed Fluxbee package brought. The package's seed records its version as package_version at every install, and list_runtimes and get_runtime show it. A current that differs is a hand publish, which the seed keeps through every upgrade while its directory is on disk (FINDINGS A-122).",
             "Motherbee-only (409 NOT_PRIMARY elsewhere): it writes the runtimes manifest, which the other hives receive through the dist folder. Takes no body: the runtime comes from the path in HTTP, and the executor step's args are hive and runtime.",
             "The answer: payload {runtime, previous_current, current, package_version, changed, manifest_version, manifest_hash}. changed is false, and nothing is written, when current already is the package's version.",
-            "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove_runtime_version deletes it once no node runs it, except on a base that packages are built on (wf.engine with deployed workflows, ai.generic with config-only packages), which refuses it with RUNTIME_HAS_DEPENDENTS; it then stays unused, and costs only its disk. The package's own version is never removed (RUNTIME_PACKAGE_VERSION).",
+            "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove_runtime_version deletes it once every hive's nodes were read and none runs on it (RUNTIME_IN_USE, RUNTIME_USAGE_UNKNOWN otherwise), except on a base that packages are built on (wf.engine with deployed workflows, ai.generic with config-only packages), which refuses it with RUNTIME_HAS_DEPENDENTS; it then stays unused, and costs only its disk. The package's own version is never removed (RUNTIME_PACKAGE_VERSION).",
             "400 INVALID_REQUEST for a missing or invalid runtime; 404 RUNTIME_NOT_FOUND for a runtime the manifest does not have, or names in two cases; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not on disk or cannot run (reinstall the package), or is on disk but not published (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_RESET_FAILED; 502 SERVICE_FAILED when the written manifest cannot be read back.",
         ],
         "set_hive_egress" => vec![
@@ -18817,12 +18832,104 @@ fn finalize_quarantined_runtime_version_dir_local(
     Ok(false)
 }
 
-async fn query_runtime_usage_global_visible(
+/// How many nodes `RUNTIME_IN_USE`'s detail names; its payload's
+/// `usage_global_visible.running_nodes` lists them all.
+const RUNTIME_IN_USE_NODES_NAMED: usize = 20;
+
+/// How much of each hive's reason a refusal of `remove_runtime_version` quotes in its text: the
+/// reason for a hive whose orchestrator the LSA does not show lists every node the LSA shows of
+/// it. The payload keeps each reason whole.
+const RUNTIME_USE_REASON_MAX_CHARS: usize = 200;
+
+/// A hive whose nodes the read of a runtime version's use did not count (FINDINGS A-281): the
+/// motherbee, when its orchestrator did not answer that read, refused it, failed the read of its
+/// own nodes or gave no usage; or a hive that orchestrator lists in `skipped_hives`, one that did
+/// not answer its `GET_RUNTIME` (`UNREACHABLE`) or answered it with an error (that error's code,
+/// `RUNTIME_NOT_FOUND` while its copy of the manifest does not list the runtime yet), but an
+/// ingress or an egress (`hive_runs_no_runtime`).
+#[derive(Debug)]
+struct UnreadHive {
+    hive: String,
+    reason: String,
+    detail: Option<String>,
+}
+
+impl UnreadHive {
+    /// A hive of the orchestrator's `skipped_hives`, `{hive_id, reason, message}`.
+    fn skipped(entry: &serde_json::Value) -> Self {
+        let text = |key: &str| {
+            entry
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            hive: text("hive_id").unwrap_or_else(|| "?".to_string()),
+            reason: text("reason").unwrap_or_else(|| "RUNTIME_QUERY_FAILED".to_string()),
+            detail: text("message"),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "hive": self.hive,
+            "reason": self.reason,
+            "detail": self.detail,
+        })
+    }
+
+    /// `<hive> (<reason>: <detail>)`, the detail cut to `RUNTIME_USE_REASON_MAX_CHARS`.
+    fn describe(&self) -> String {
+        match &self.detail {
+            Some(detail) if detail.chars().count() > RUNTIME_USE_REASON_MAX_CHARS => format!(
+                "{} ({}: {}...)",
+                self.hive,
+                self.reason,
+                detail
+                    .chars()
+                    .take(RUNTIME_USE_REASON_MAX_CHARS)
+                    .collect::<String>()
+            ),
+            Some(detail) => format!("{} ({}: {detail})", self.hive, self.reason),
+            None => format!("{} ({})", self.hive, self.reason),
+        }
+    }
+}
+
+/// What `remove_runtime_version` knows of a version's use, from the motherbee's orchestrator:
+/// `get_runtime` with the version, whose `usage_global_visible`
+/// (`global_visible_runtime_usage_summary` in src/bin/sy_orchestrator.rs) lists in `running_nodes`
+/// the nodes of every hive pinned to the version whose unit may run, each with its `hive` and
+/// `lifecycle` (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN,
+/// systemd did not answer for its unit: FINDINGS A-271), and in `skipped_hives` the hives whose
+/// nodes it did not count. Only a read that counted every hive that may run a node on a runtime,
+/// and lists no node, lets the version go.
+#[derive(Debug)]
+enum RuntimeVersionUse {
+    /// Every hive that may run a node on a runtime was counted, and no node is listed.
+    Unused(serde_json::Value),
+    /// Nodes are listed; `unread` names the hives that were not counted besides.
+    InUse {
+        usage: serde_json::Value,
+        nodes: Vec<serde_json::Value>,
+        unread: Vec<UnreadHive>,
+    },
+    /// No node is listed, and some hive was not counted.
+    Unknown {
+        usage: Option<serde_json::Value>,
+        unread: Vec<UnreadHive>,
+    },
+}
+
+/// The use of a runtime version on every hive, read from the motherbee's orchestrator.
+async fn read_runtime_version_use(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     runtime: &str,
     runtime_version: &str,
-) -> Result<serde_json::Value, String> {
+) -> RuntimeVersionUse {
     let request = build_admin_request(
         ctx,
         "get_runtime",
@@ -18832,30 +18939,264 @@ async fn query_runtime_usage_global_visible(
         }),
         Some(ctx.hive_id.clone()),
     );
-    let payload = send_admin_request(
+    let answer = send_admin_request(
         client,
         request,
         admin_action_timeout("get_runtime"),
         &admin_node_name(&ctx.hive_id),
     )
     .await
-    .map_err(|err| err.to_string())?;
-    if !payload_is_ok(&payload) {
-        return Err(payload_error_detail(&payload)
-            .unwrap_or_else(|| "failed to query runtime usage".to_string()));
-    }
-    Ok(payload
+    .map_err(|err| err.to_string());
+    let registry = hive_registry(ctx);
+    runtime_version_use(&ctx.hive_id, answer, |hive| {
+        hive_runs_no_runtime(&registry, hive)
+    })
+}
+
+/// Whether `hive` runs no node on a runtime: an ingress or an egress, by the registry's strict
+/// reading (`HiveRegistry::role`), receives no runtime (the orchestrator shares `dist/runtimes`
+/// with the workers alone, and A-11 reads the same hives: `installation_node_check_hives`), so its
+/// orchestrator answers every read of a runtime's use `RUNTIME_MANIFEST_MISSING` (FINDINGS A-24),
+/// and a read that skipped it missed no node. Any other hive may run one: a worker, and a hive
+/// whose role the registry does not give (a join under way, an entry it cannot read).
+fn hive_runs_no_runtime(registry: &HiveRegistry, hive: &str) -> bool {
+    matches!(
+        registry.role(hive),
+        Some(HiveRole::Ingress | HiveRole::Egress)
+    )
+}
+
+/// The orchestrator's answer to the read of a version's use, or why none came, as
+/// `remove_runtime_version` takes it (FINDINGS A-281). No answer, a refusal, an answer without a
+/// usage, a usage whose own read failed (`status: error`, with no list) and a hive not counted are
+/// each no "not in use", but a hive not counted that runs no runtime (`runs_no_runtime`: an
+/// ingress or an egress). Before 0.1.133 a usage missing from the answer read as `in_use: false`
+/// and every hive not counted as one with no node: a version a node of a restarting worker ran on
+/// was removed, and the worker's mirror deleted it when it came back.
+fn runtime_version_use(
+    admin_hive: &str,
+    answer: Result<serde_json::Value, String>,
+    runs_no_runtime: impl Fn(&str) -> bool,
+) -> RuntimeVersionUse {
+    let not_read = |reason: &str, detail: String, usage: Option<serde_json::Value>| {
+        RuntimeVersionUse::Unknown {
+            usage,
+            unread: vec![UnreadHive {
+                hive: admin_hive.to_string(),
+                reason: reason.to_string(),
+                detail: Some(detail),
+            }],
+        }
+    };
+    let answer = match answer {
+        Ok(answer) if payload_is_ok(&answer) => answer,
+        Ok(refused) => {
+            let code =
+                payload_error_code(&refused).unwrap_or_else(|| "RUNTIME_QUERY_FAILED".to_string());
+            let detail = payload_error_detail(&refused).unwrap_or_else(|| refused.to_string());
+            return not_read(
+                &code,
+                format!("its orchestrator refused the read: {detail}"),
+                None,
+            );
+        }
+        Err(err) => {
+            return not_read(
+                infer_transport_error_code(&err),
+                format!("its orchestrator did not answer the read: {err}"),
+                None,
+            );
+        }
+    };
+    let Some(usage) = answer
         .get("usage_global_visible")
+        .filter(|usage| usage.is_object())
         .cloned()
-        .unwrap_or_else(|| {
+    else {
+        return not_read(
+            "NO_USAGE",
+            "its orchestrator's answer gives no usage_global_visible".to_string(),
+            None,
+        );
+    };
+    let failed = usage
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("error"));
+    if failed {
+        let detail = usage
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason given");
+        return not_read(
+            "USAGE_READ_FAILED",
+            format!("its orchestrator could not read its own nodes: {detail}"),
+            Some(usage),
+        );
+    }
+    let nodes = usage
+        .get("running_nodes")
+        .and_then(serde_json::Value::as_array)
+        .cloned();
+    let unread = usage
+        .get("skipped_hives")
+        .and_then(serde_json::Value::as_array)
+        .map(|skipped| {
+            skipped
+                .iter()
+                .map(UnreadHive::skipped)
+                .filter(|hive| !runs_no_runtime(&hive.hive))
+                .collect::<Vec<_>>()
+        });
+    let (Some(nodes), Some(unread)) = (nodes, unread) else {
+        return not_read(
+            "NO_USAGE",
+            "its orchestrator's usage lists no running_nodes or no skipped_hives".to_string(),
+            Some(usage),
+        );
+    };
+    if !nodes.is_empty() {
+        return RuntimeVersionUse::InUse {
+            usage,
+            nodes,
+            unread,
+        };
+    }
+    if !unread.is_empty() {
+        return RuntimeVersionUse::Unknown {
+            usage: Some(usage),
+            unread,
+        };
+    }
+    RuntimeVersionUse::Unused(usage)
+}
+
+/// `remove_runtime_version`'s decision on a version's use: the usage when the version can go,
+/// otherwise its refusal, 409 with nothing removed. `RUNTIME_IN_USE` names each node listed with
+/// its hive and lifecycle (`runtime_in_use_detail`); `RUNTIME_USAGE_UNKNOWN` (FINDINGS A-281) each
+/// hive whose nodes were not counted, with why, and what to do. Both payloads keep the usage
+/// (`usage_global_visible`) and name the hives not counted (`unanswered_hives`).
+fn runtime_version_removable(
+    runtime: &str,
+    runtime_version: &str,
+    version_use: RuntimeVersionUse,
+) -> Result<serde_json::Value, (u16, String)> {
+    let refusal = |code: &str, detail: String, payload: serde_json::Value| {
+        (
+            409,
             serde_json::json!({
-                "scope": "global_visible",
-                "status": "ok",
-                "in_use": false,
-                "running_count": 0,
-                "running_nodes": [],
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": payload,
+                "error_code": code,
+                "error_detail": detail,
             })
-        }))
+            .to_string(),
+        )
+    };
+    let named = |unread: &[UnreadHive]| unread.iter().map(UnreadHive::to_json).collect::<Vec<_>>();
+    match version_use {
+        RuntimeVersionUse::Unused(usage) => Ok(usage),
+        RuntimeVersionUse::InUse {
+            usage,
+            nodes,
+            unread,
+        } => Err(refusal(
+            "RUNTIME_IN_USE",
+            runtime_in_use_detail(runtime, runtime_version, &nodes, &unread),
+            serde_json::json!({
+                "usage_global_visible": usage,
+                "unanswered_hives": named(&unread),
+            }),
+        )),
+        RuntimeVersionUse::Unknown { usage, unread } => Err(refusal(
+            "RUNTIME_USAGE_UNKNOWN",
+            format!(
+                "cannot tell whether runtime '{runtime}' version '{runtime_version}' is in use: the \
+                 nodes of {} were not read, and nothing was removed. Ask again once each hive \
+                 answers; a hive gone for good is removed with remove_hive first",
+                unread
+                    .iter()
+                    .map(UnreadHive::describe)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            serde_json::json!({
+                "usage_global_visible": usage,
+                "unanswered_hives": named(&unread),
+                "retryable": true,
+            }),
+        )),
+    }
+}
+
+/// `RUNTIME_IN_USE`'s detail: each node listed (the first `RUNTIME_IN_USE_NODES_NAMED`) with its
+/// hive and lifecycle, what STARTING and UNKNOWN mean when one is listed, what to do, and the hives
+/// whose nodes were not counted. Before 0.1.133 it said only "still running" (FINDINGS A-285).
+fn runtime_in_use_detail(
+    runtime: &str,
+    runtime_version: &str,
+    nodes: &[serde_json::Value],
+    unread: &[UnreadHive],
+) -> String {
+    let lifecycle = |node: &serde_json::Value| {
+        node.get("lifecycle")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no lifecycle given")
+            .to_string()
+    };
+    let named = nodes
+        .iter()
+        .take(RUNTIME_IN_USE_NODES_NAMED)
+        .map(|node| {
+            let name = node
+                .get("node_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let hive = node
+                .get("hive")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| name.rsplit_once('@').map(|(_, hive)| hive))
+                .unwrap_or("?");
+            format!("{name} ({hive}, {})", lifecycle(node))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = nodes.len().saturating_sub(RUNTIME_IN_USE_NODES_NAMED);
+    let mut detail = format!(
+        "runtime '{runtime}' version '{runtime_version}' is in use by {} node{}: {named}{}.",
+        nodes.len(),
+        if nodes.len() == 1 { "" } else { "s" },
+        if more > 0 {
+            format!(", and {more} more (payload.usage_global_visible.running_nodes)")
+        } else {
+            String::new()
+        }
+    );
+    let listed = |state: &str| nodes.iter().any(|node| lifecycle(node) == state);
+    if listed("STARTING") {
+        detail.push_str(" STARTING: its unit runs and the router does not see it yet.");
+    }
+    if listed("UNKNOWN") {
+        detail.push_str(
+            " UNKNOWN: its hive's systemd did not answer whether its unit runs, so it is listed \
+             until systemd answers that it does not.",
+        );
+    }
+    detail.push_str(
+        " Stop each node that runs on this version, or move it to another, then ask again.",
+    );
+    if !unread.is_empty() {
+        detail.push_str(&format!(
+            " The nodes of {} were not read, so they are not listed.",
+            unread
+                .iter()
+                .map(UnreadHive::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    detail
 }
 
 fn parse_admin_envelope(body: &str, action: &str) -> Result<serde_json::Value, String> {
@@ -19419,52 +19760,15 @@ async fn handle_remove_runtime_version(
         ));
     }
 
-    let usage_global = match query_runtime_usage_global_visible(
-        ctx,
-        client,
-        &runtime_key,
+    // Removed only once every hive's nodes were read and none runs on the version (FINDINGS A-281).
+    let usage_global = match runtime_version_removable(
+        runtime,
         runtime_version,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            return Ok((
-                409,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "RUNTIME_REMOVE_FAILED",
-                    "error_detail": format!("failed to resolve visible runtime usage before delete: {}", err),
-                })
-                .to_string(),
-            ));
-        }
+        read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,
+    ) {
+        Ok(usage) => usage,
+        Err(refusal) => return Ok(refusal),
     };
-    let running_nodes = usage_global
-        .get("running_nodes")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if !running_nodes.is_empty() {
-        return Ok((
-            409,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": {
-                    "usage_global_visible": usage_global,
-                },
-                "error_code": "RUNTIME_IN_USE",
-                "error_detail": format!(
-                    "runtime '{}' version '{}' is still running in visible inventory",
-                    runtime, runtime_version
-                ),
-            })
-            .to_string(),
-        ));
-    }
 
     let dependents = match runtime_dependents_summary_local(&manifest, &runtime_key) {
         Ok(value) => value,
@@ -36138,6 +36442,402 @@ mod tests {
                 "{name} is named again in {handler}: dropped or moved before the write"
             );
         }
+    }
+
+    // --- remove_runtime_version: a version's use, read on every hive (FINDINGS A-281) ----------
+
+    /// What a removal of ai.generic 0.3.1 decides, as its handler does: the read of the version's
+    /// use (`read_runtime_version_use`), answered by the motherbee's orchestrator with `answer`,
+    /// then the decision on it (`runtime_version_removable`): the usage, or the refusal's status
+    /// and body. The registry holds two workers, an ingress, an egress and a worker whose join is
+    /// under way.
+    async fn removal_decided_on(answer: Value) -> Result<Value, (u16, Value)> {
+        let (ctx, mut harness) = opa_test_admin("runtime-use");
+        let registry = hive_registry(&ctx);
+        for (hive, role, status) in [
+            ("worker1", "worker", "connected"),
+            ("worker2", "worker", "connected"),
+            ("ingress1", "ingress", "connected"),
+            ("egress1", "egress", "connected"),
+            ("joining3", "worker", "joining"),
+        ] {
+            write_registry_entry(
+                registry.root(),
+                hive,
+                &format!("hive_id: {hive}\nrole: {role}\nstatus: {status}\n"),
+            );
+        }
+        let decide = async {
+            runtime_version_removable(
+                "ai.generic",
+                "0.3.1",
+                read_runtime_version_use(&ctx, &ctx.rpc, "ai.generic", "0.3.1").await,
+            )
+        };
+        let orchestrator = async {
+            let sent = answer_admin_relay(&mut harness, "get_runtime", answer).await;
+            assert_eq!(sent.payload["runtime"], json!("ai.generic"));
+            assert_eq!(sent.payload["runtime_version"], json!("0.3.1"));
+        };
+        let (decided, ()) = tokio::join!(decide, orchestrator);
+        decided.map_err(|(status, body)| (status, serde_json::from_str(&body).expect("a body")))
+    }
+
+    /// The orchestrator's answer to `get_runtime` with `usage` as its `usage_global_visible`.
+    fn runtime_read_with_usage(usage: Value) -> Value {
+        json!({
+            "status": "ok",
+            "hive_id": PRIMARY_HIVE_ID,
+            "runtime": { "name": "ai.generic", "current": "0.3.2" },
+            "usage_global_visible": usage,
+        })
+    }
+
+    /// The motherbee's global usage (`global_visible_runtime_usage_summary`): `running_nodes` and
+    /// the hives it did not count.
+    fn global_usage(running_nodes: Value, skipped_hives: Value) -> Value {
+        let running_count = running_nodes.as_array().map_or(0, Vec::len);
+        json!({
+            "scope": "group_visible_control_plane",
+            "in_use": running_count > 0,
+            "running_count": running_count,
+            "running_nodes": running_nodes,
+            "skipped_hives": skipped_hives,
+        })
+    }
+
+    /// A node the usage lists, as the orchestrator writes it.
+    fn running_node(node_name: &str, lifecycle: &str) -> Value {
+        json!({
+            "node_name": node_name,
+            "hive": node_name.rsplit_once('@').map(|(_, hive)| hive).unwrap_or_default(),
+            "runtime": "ai.generic",
+            "runtime_version": "0.3.1",
+            "lifecycle": lifecycle,
+        })
+    }
+
+    /// The refusal of a version whose use was not read on every hive: 409 RUNTIME_USAGE_UNKNOWN,
+    /// nothing removed, `payload.unanswered_hives` naming each hive not read with its reason, the
+    /// usage kept, and the detail saying what to do.
+    fn assert_usage_unknown(refusal: &(u16, Value), unread: &[(&str, &str)]) {
+        let (status, body) = refusal;
+        assert_eq!(*status, 409, "{body}");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["action"], json!("remove_runtime_version"));
+        assert_eq!(body["error_code"], json!("RUNTIME_USAGE_UNKNOWN"), "{body}");
+        assert_eq!(body["payload"]["retryable"], json!(true));
+        let named: Vec<(&str, &str)> = body["payload"]["unanswered_hives"]
+            .as_array()
+            .expect("unanswered_hives")
+            .iter()
+            .map(|hive| {
+                (
+                    hive["hive"].as_str().unwrap_or_default(),
+                    hive["reason"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(named, unread, "{body}");
+        let detail = body["error_detail"].as_str().expect("error_detail");
+        assert!(
+            detail.starts_with(
+                "cannot tell whether runtime 'ai.generic' version '0.3.1' is in use: the nodes of "
+            ),
+            "{detail}"
+        );
+        for (hive, reason) in unread {
+            assert!(detail.contains(&format!("{hive} ({reason}")), "{detail}");
+        }
+        assert!(detail.contains("nothing was removed"), "{detail}");
+        assert!(
+            detail.ends_with(
+                "Ask again once each hive answers; a hive gone for good is removed with \
+                 remove_hive first"
+            ),
+            "{detail}"
+        );
+    }
+
+    /// FINDINGS A-281: a version is removed only once every hive's nodes were read and none runs
+    /// on it. A usage whose own read failed (`status: error`, no list), a usage that names a hive
+    /// it did not count (a worker that did not answer, or answered an error, or a hive whose join
+    /// is under way), and an answer with no usage are no "not in use": each is refused
+    /// RUNTIME_USAGE_UNKNOWN, naming the hives and why. Before, the first and the last read as no
+    /// node, and the usage's `skipped_hives` was never looked at: worker1 restarting its
+    /// orchestrator, a version AI.x@worker1 ran on was removed.
+    #[tokio::test]
+    async fn a_version_whose_use_was_not_read_on_every_hive_is_not_removed() {
+        // The motherbee's orchestrator could not read its own nodes.
+        let failed = json!({
+            "scope": "group_visible_control_plane",
+            "status": "error",
+            "message": "Permission denied (os error 13)",
+        });
+        let refusal = removal_decided_on(runtime_read_with_usage(failed.clone()))
+            .await
+            .expect_err("refused");
+        assert_usage_unknown(&refusal, &[("motherbee", "USAGE_READ_FAILED")]);
+        let (_, body) = &refusal;
+        assert_eq!(body["payload"]["usage_global_visible"], failed);
+        assert!(body["payload"]["unanswered_hives"][0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Permission denied (os error 13)")));
+
+        // worker1 did not answer, and worker2's copy of the manifest does not list the runtime yet.
+        // The ingress and the egress, which receive no runtime, are not named.
+        let skipped = global_usage(
+            json!([]),
+            json!([
+                { "hive_id": "egress1", "reason": "RUNTIME_MANIFEST_MISSING" },
+                { "hive_id": "ingress1", "reason": "RUNTIME_MANIFEST_MISSING" },
+                {
+                    "hive_id": "worker1",
+                    "reason": "UNREACHABLE",
+                    "message": "target hive 'worker1' not reachable in LSA (stale/missing)",
+                },
+                { "hive_id": "worker2", "reason": "RUNTIME_NOT_FOUND" },
+            ]),
+        );
+        let refusal = removal_decided_on(runtime_read_with_usage(skipped.clone()))
+            .await
+            .expect_err("refused");
+        assert_usage_unknown(
+            &refusal,
+            &[("worker1", "UNREACHABLE"), ("worker2", "RUNTIME_NOT_FOUND")],
+        );
+        let (_, body) = &refusal;
+        assert_eq!(body["payload"]["usage_global_visible"], skipped);
+        let detail = body["error_detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(
+                "the nodes of worker1 (UNREACHABLE: target hive 'worker1' not reachable in LSA \
+                 (stale/missing)), worker2 (RUNTIME_NOT_FOUND) were not read"
+            ),
+            "{detail}"
+        );
+
+        // A hive whose join is under way, whose role the registry does not give yet, may run one.
+        let joining = global_usage(
+            json!([]),
+            json!([{ "hive_id": "joining3", "reason": "UNREACHABLE" }]),
+        );
+        let refusal = removal_decided_on(runtime_read_with_usage(joining))
+            .await
+            .expect_err("refused");
+        assert_usage_unknown(&refusal, &[("joining3", "UNREACHABLE")]);
+
+        // An answer with no usage, and a usage that does not say which hives it did not count.
+        for answer in [
+            json!({ "status": "ok", "hive_id": PRIMARY_HIVE_ID }),
+            runtime_read_with_usage(json!({
+                "scope": "group_visible_control_plane",
+                "in_use": false,
+                "running_count": 0,
+                "running_nodes": [],
+            })),
+        ] {
+            let refusal = removal_decided_on(answer).await.expect_err("refused");
+            assert_usage_unknown(&refusal, &[("motherbee", "NO_USAGE")]);
+        }
+
+        // The orchestrator refused the read: its code is the reason.
+        let refused = json!({
+            "status": "error",
+            "error_code": "MANIFEST_INVALID",
+            "message": "runtime manifest is being written",
+        });
+        let refusal = removal_decided_on(refused).await.expect_err("refused");
+        assert_usage_unknown(&refusal, &[("motherbee", "MANIFEST_INVALID")]);
+
+        // Every hive answered, and no node runs on the version: it goes.
+        let counted = global_usage(json!([]), json!([]));
+        let usage = removal_decided_on(runtime_read_with_usage(counted.clone()))
+            .await
+            .expect("removable");
+        assert_eq!(usage, counted);
+    }
+
+    /// An ingress and an egress receive no runtime, so their orchestrators answer every read of a
+    /// runtime's use RUNTIME_MANIFEST_MISSING, and the motherbee's lists them in `skipped_hives`
+    /// on every read (FINDINGS A-24): a read that skipped them, whatever the reason, missed no
+    /// node, and the version goes once every worker was counted. Taken for hives not read, they
+    /// refused every removal, SY.wf-rules' purges included.
+    #[tokio::test]
+    async fn an_ingress_or_an_egress_not_counted_refuses_no_removal() {
+        let usage = global_usage(
+            json!([]),
+            json!([
+                { "hive_id": "egress1", "reason": "UNREACHABLE", "message": "stale in the LSA" },
+                { "hive_id": "ingress1", "reason": "RUNTIME_MANIFEST_MISSING" },
+            ]),
+        );
+        let removable = removal_decided_on(runtime_read_with_usage(usage.clone()))
+            .await
+            .expect("removable");
+        assert_eq!(removable, usage);
+
+        let registry = HiveRegistry::new(test_temp_dir("runtime-use-roles"));
+        let done = "join:\n  phase: done\n";
+        for (hive, role, status) in [
+            ("worker1", "worker", "connected"),
+            ("ingress1", "ingress", "connected"),
+            ("egress1", "egress", "connected"),
+            ("ingress2", "ingress", "joining"),
+        ] {
+            write_registry_entry(
+                registry.root(),
+                hive,
+                &format!("hive_id: {hive}\nrole: {role}\nstatus: {status}\n{done}"),
+            );
+        }
+        assert!(hive_runs_no_runtime(&registry, "ingress1"));
+        assert!(hive_runs_no_runtime(&registry, "egress1"));
+        for hive in ["worker1", "ingress2", "gone1", PRIMARY_HIVE_ID] {
+            assert!(!hive_runs_no_runtime(&registry, hive), "{hive}");
+        }
+    }
+
+    /// No answer from the motherbee's orchestrator is no "not in use" either: refused, naming the
+    /// motherbee and how the read failed. Before, RUNTIME_REMOVE_FAILED, which reads as a removal
+    /// that failed under way.
+    #[test]
+    fn a_read_of_a_versions_use_with_no_answer_refuses_the_removal() {
+        for (err, reason) in [
+            ("timed out waiting for the reply", "TIMEOUT"),
+            ("router connection closed", "TRANSPORT_ERROR"),
+        ] {
+            let version_use = runtime_version_use(PRIMARY_HIVE_ID, Err(err.to_string()), |_| false);
+            let (status, body) =
+                runtime_version_removable("ai.generic", "0.3.1", version_use).expect_err("refused");
+            let body: Value = serde_json::from_str(&body).expect("a body");
+            assert_usage_unknown(&(status, body.clone()), &[("motherbee", reason)]);
+            assert!(body["payload"]["unanswered_hives"][0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(err)));
+            assert_eq!(body["payload"]["usage_global_visible"], Value::Null);
+        }
+        assert_eq!(error_code_to_http_status("RUNTIME_USAGE_UNKNOWN"), 409);
+    }
+
+    /// FINDINGS A-285: RUNTIME_IN_USE names each node listed with its hive and its lifecycle, and
+    /// says what STARTING and UNKNOWN mean (since A-271 the usage lists a node whose unit runs
+    /// and the router does not see yet, and one whose unit systemd gave no answer for), where it
+    /// said "still running" of all of them. A hive not counted is named too; a long list names
+    /// the first 20 and counts the rest.
+    #[tokio::test]
+    async fn runtime_in_use_names_each_node_with_its_hive_and_state() {
+        let nodes = json!([
+            running_node("AI.sales@motherbee", "RUNNING"),
+            running_node("AI.support@worker1", "STARTING"),
+            running_node("WF.billing@worker1", "UNKNOWN"),
+        ]);
+        let usage = global_usage(
+            nodes,
+            json!([
+                { "hive_id": "ingress1", "reason": "RUNTIME_MANIFEST_MISSING" },
+                { "hive_id": "worker2", "reason": "UNREACHABLE" },
+            ]),
+        );
+        let (status, body) = removal_decided_on(runtime_read_with_usage(usage.clone()))
+            .await
+            .expect_err("refused");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("RUNTIME_IN_USE"));
+        assert_eq!(body["payload"]["usage_global_visible"], usage);
+        assert_eq!(
+            body["payload"]["unanswered_hives"],
+            json!([{ "hive": "worker2", "reason": "UNREACHABLE", "detail": null }])
+        );
+        let detail = body["error_detail"].as_str().expect("error_detail");
+        assert_eq!(
+            detail,
+            "runtime 'ai.generic' version '0.3.1' is in use by 3 nodes: AI.sales@motherbee \
+             (motherbee, RUNNING), AI.support@worker1 (worker1, STARTING), WF.billing@worker1 \
+             (worker1, UNKNOWN). STARTING: its unit runs and the router does not see it yet. \
+             UNKNOWN: its hive's systemd did not answer whether its unit runs, so it is listed \
+             until systemd answers that it does not. Stop each node that runs on this version, or \
+             move it to another, then ask again. The nodes of worker2 (UNREACHABLE) were not \
+             read, so they are not listed."
+        );
+        assert!(!detail.contains("still running"));
+
+        // One RUNNING node: no word on the states it does not have.
+        let usage = global_usage(
+            json!([running_node("AI.sales@worker1", "RUNNING")]),
+            json!([]),
+        );
+        let (_, body) = removal_decided_on(runtime_read_with_usage(usage))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            body["error_detail"],
+            json!(
+                "runtime 'ai.generic' version '0.3.1' is in use by 1 node: AI.sales@worker1 \
+                 (worker1, RUNNING). Stop each node that runs on this version, or move it to \
+                 another, then ask again."
+            )
+        );
+
+        // 23 nodes: the first 20 named, the rest counted.
+        let many: Vec<Value> = (0..23)
+            .map(|n| running_node(&format!("AI.n{n:02}@worker1"), "RUNNING"))
+            .collect();
+        let version_use = runtime_version_use(
+            PRIMARY_HIVE_ID,
+            Ok(runtime_read_with_usage(global_usage(
+                json!(many),
+                json!([]),
+            ))),
+            |_| false,
+        );
+        let (_, body) =
+            runtime_version_removable("ai.generic", "0.3.1", version_use).expect_err("refused");
+        let body: Value = serde_json::from_str(&body).expect("a body");
+        let detail = body["error_detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("in use by 23 nodes: AI.n00@worker1 (worker1, RUNNING)"));
+        assert!(detail.contains(
+            "AI.n19@worker1 (worker1, RUNNING), and 3 more (payload.usage_global_visible.running_nodes)."
+        ));
+        assert!(!detail.contains("AI.n20@worker1"), "{detail}");
+    }
+
+    /// The handler decides on that read and that decision alone (FINDINGS A-281): no usage of its
+    /// own, no default that reads as unused.
+    #[test]
+    fn the_removal_decides_on_the_use_read_on_every_hive() {
+        let source = include_str!("sy_admin.rs");
+        let handler = "async fn handle_remove_runtime_version(";
+        let start = source.find(handler).expect("the handler");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("its end")];
+        assert!(body.contains(
+            "runtime_version_removable(\n        runtime,\n        runtime_version,\n        \
+             read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,"
+        ));
+        assert!(!body.contains("in_use"), "{handler}");
+        assert!(!body.contains("running_nodes"), "{handler}");
+    }
+
+    /// The help says what a runtime version's removal answers (FINDINGS A-281): RUNTIME_IN_USE
+    /// with each node's state, and RUNTIME_USAGE_UNKNOWN with the hives not read and what to do,
+    /// where a workflow's delete meets them too; reset_base_runtime's way to remove a hand publish
+    /// no longer reads as "once no node runs it".
+    #[test]
+    fn the_help_says_what_a_runtime_versions_removal_answers() {
+        let notes = admin_action_request_notes("remove_runtime_version");
+        assert!(notes.contains(&RUNTIME_REMOVAL_IN_USE_NOTE));
+        assert!(notes.contains(&RUNTIME_REMOVAL_UNKNOWN_NOTE));
+        assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE
+            .contains("a hive gone for good is removed with remove_hive first"));
+        assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE
+            .contains("An ingress or an egress receives no runtime, and is never one of them."));
+        assert!(!admin_action_request_notes("reset_base_runtime")
+            .join(" ")
+            .contains("once no node runs it"));
+        assert!(admin_action_request_notes("wf_rules_delete")
+            .iter()
+            .any(|note| note.contains("RUNTIME_USAGE_UNKNOWN")
+                && note.contains("PACKAGE_PUBLISH_FAILED")));
     }
 
     /// The executor runs it as the operator, and no mesh caller reaches it, Archi included.
