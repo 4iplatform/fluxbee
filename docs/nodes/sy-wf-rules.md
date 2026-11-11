@@ -211,9 +211,9 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   hive's dist is a Syncthing copy of the motherbee's, which lists a version published there
   10-60 s later; before 0.1.133 a delete within that window removed nothing and answered
   `packages_left: []`. A version the motherbee does not hold (a staged one never applied) SY.admin
-  answers `RUNTIME_VERSION_NOT_FOUND` at once, which counts as removed. A failure up to the
-  directory's deletion (the config read, the kill, the deletion itself) fails the delete as
-  before, with its code.
+  answers `RUNTIME_VERSION_NOT_FOUND` before its read of the version's use, which counts as
+  removed. A failure up to the directory's deletion (the config read, the kill, the deletion
+  itself) fails the delete as before, with its code.
 - The answer: `{status: ok, deleted: true, wf_node: {node_name, action, status, reason},
   packages_left: [...], warning}`. Once the node and the directory are gone the workflow is
   deleted (asked again, the delete answers `WORKFLOW_NOT_FOUND`), so since 0.1.133 a purge that
@@ -251,11 +251,11 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   `packages_left`'s order, which puts the runtime's current last as far as this hive's copy of
   the manifest tells: SY.admin refuses the current one (`RUNTIME_CURRENT_CONFLICT`) while another
   version remains, so one refused so goes after the others. Nothing removes them in the
-  background. Before
-  0.1.133 such a delete answered `PACKAGE_PUBLISH_FAILED` though the workflow, its node and its
-  state were gone: the factory reset counted it as failed, and running it again never removed the
-  versions left, since the workflow was no longer listed; deployed again, the name published its
-  `0.0.1` over the one left there and was refused (see [The workflow store](#the-workflow-store)).
+  background. Before 0.1.133 such a delete answered `PACKAGE_PUBLISH_FAILED` though the
+  workflow, its node and its state were gone: the factory reset counted it as failed, and running
+  it again never removed the versions left, since the workflow was no longer listed; deployed
+  again, the name published its `0.0.1` over the one left there and was refused (see
+  [The workflow store](#the-workflow-store)).
   SY.admin's `wf_rules_delete` passes the answer on whole as its `payload` (adding
   `pages_left_up`), over HTTP, over the mesh and as an Archi plan step's `result_preview`.
 
