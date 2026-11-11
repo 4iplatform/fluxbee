@@ -273,11 +273,15 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   `SERVICE_FAILED`; `start_node` of a node the router does not see starts and writes nothing,
   `SERVICE_FAILED`; `kill_node` and `remove_node_instance` stop and remove nothing,
   `SERVICE_FAILED` (`remove_instance_refusal`); `restart_node` takes the command for a running
-  unit, which also starts a stopped one (`restart_takes_running_command`). A runtime's `usage`
-  lists a node the router sees whose unit systemctl gives no answer for, with `lifecycle:
-  UNKNOWN`, so SY.admin's `remove_runtime_version` refuses that version (`RUNTIME_IN_USE`) until
-  systemctl answers (`runtime_usage_lifecycle`). Before, each of them read no answer as "not
-  running": a remove stopped and purged a node that might run.
+  unit, which also starts a stopped one (`restart_takes_running_command`). Each of those
+  `SERVICE_FAILED` answers carries `retryable: true`: nothing was done, and the same action asked
+  again is answered once systemctl answers. A runtime's `usage` lists every node pinned to it whose
+  unit may run: one whose unit systemctl gives no answer for, `lifecycle: UNKNOWN`, whatever the
+  router sees, and one whose unit runs, `RUNNING` once the router sees it and `STARTING` before
+  (`runtime_usage_lifecycle`). So SY.admin's `remove_runtime_version` refuses that version
+  (`RUNTIME_IN_USE`) until systemctl answers that the unit does not run. Before, each of them read
+  no answer as "not running": a remove stopped and purged a node that might run, and the usage
+  left out a node on its way up and any node systemctl gave no answer for.
 
 ### A running node and a new runtime version
 
@@ -542,10 +546,15 @@ another hive's read or a local one.
     its binary there matches the manifest, and recorded as created by the update
     (`created_without_backup`);
   - a node whose stop fails is taken for stopped only when systemctl answers that it does not
-    run; one it gives no answer for keeps its unit and binary, an error, as a node does whose
-    removal finds systemctl giving no answer for it (`stop_core_node`, `remove_core_nodes`;
-    FINDINGS A-271, since 0.1.133). A rollback's removal of a node its update created reads it
-    the same way;
+    run, asked again up to 3 times 250 ms apart; one it still gives no answer for keeps its unit
+    and binary, an error (`stop_core_node`; FINDINGS A-271, since 0.1.133). The removal asks the
+    same way before a binary goes: one systemctl still gives no answer for keeps only its binary,
+    an error, since its unit is already gone (`remove_core_nodes`). The settle's next pass finds
+    that node by the generation's `dropped_units` (one this list does not name whose binary is
+    still in `/usr/bin`) and removes the binary again (`dropped_binaries_left_behind`); the
+    outcome that settles the generation names it among `dropped`. Before, that pass found nothing
+    to drop and settled the generation with the binary left. A rollback's removal of a node its
+    update created reads it the same way;
   - a node still pending (its binary not yet in dist, or left out while this list names it), or
     an error, keeps the generation open. The dist recheck tries again when
     `core.awaiting_update` closes, for that update only (`open_core_settle`: one installed since,
@@ -765,23 +774,29 @@ spoke until the system's log (FINDINGS A-175).
   `wan.uplinks` (a hostname is resolved, IPv4 and IPv6) plus `ingress.ssh_allow_from`,
   deduplicated and without an entry another one covers (`ssh_allow_set`). It is reconciled at
   boot and about every 60 s (at once when nft answers that a loaded table is gone: `nft list
-  table` exits 1 with the kernel's "No such file or directory"; a check nft gives no answer for
-  waits for the next reconcile, FINDINGS A-271), like the egress table: add +
+  table` exits 1 with the kernel's "No such file or directory"), like the egress table: add +
   flush + define in one `nft -f`, saved in `/etc/nftables.d/fluxbee-ingress.nft` once nft has
   loaded it, and loaded at boot by `fluxbee-ingress-nft.service` (`apply_nft_table`,
   `ensure_nft_boot_unit`). The sources are inline, never a named set: `flush table` keeps a named
   set's elements. Only a complete input set renders a new table (`ingress_ssh_action`), and an
-  unchanged one is neither loaded again nor logged while its table is there. When `sshd -T` fails
+  unchanged one is neither loaded again nor logged while nft answers that its table is there. A
+  table check nft gives no answer for (FINDINGS A-271, since 0.1.133) reconciles nothing at once;
+  the boot's and the 60 s reconcile load the saved ruleset again on it, which changes nothing on a
+  table that is there and brings back one that went missing. A load whose `nft -f` exits 0 stands
+  even when the check after it gives no answer: a warning, and its boot unit is still written
+  (`nft_load_checked`; before, a failed load). Without `nft` on the orchestrator's PATH
+  (`nft_installed`, a look at the filesystem) the table counts as gone: no rule can be in force,
+  and the alert says so. When `sshd -T` fails
   only because `/run/sshd` is missing (at boot before ssh.service is up, or on a socket-activated
   host before its first connection), the orchestrator creates it as ssh.service would (root, 0755)
   and asks once more (`sshd_listen_ports_with`). An input that fails (hive.yaml, `sshd -T`, an
   uplink that does not resolve), an invalid `ssh_allow_from` entry or an empty allow set never
   narrows or loosens the table: the rules in
-  force stay, the saved ruleset is loaded again if nft answers that the table is gone, and a
+  force stay, the saved ruleset is loaded again as above, and a
   `posture` alert is recorded (`ingress_ssh_input_failed`, a warning; `ingress_ssh_rules_failed`;
   `ingress_ssh_allow_set_empty`); a failed load records `ingress_ssh_rules_failed`. An alert says
   whether rules stay in force as nft answers it, and that nft did not answer when it did not,
-  never "no SSH rule is in force" for that. Recovery: the
+  never "no SSH rule is in force" for that (`ingress_ssh_consequence`). Recovery: the
   hypervisor console, or `ingress.ssh_allow_from` in the ingress' hive.yaml and an orchestrator
   restart.
 - **SSH on the egress' WAN**: with `egress.ssh_from_wan: false` (default true, D31) the
@@ -908,11 +923,16 @@ directory"), the ingress reconciles its SSH table at once on the same answer, a 
 its default route only when `ip route` answers that it goes elsewhere or nowhere, and the
 Syncthing check restarts Syncthing for a folder only when Syncthing answers that the folder is
 not healthy (curl's exit 0 with a status that says so, or exit 22, an error status). A check with
-no answer (a kill, a command that could not run, curl reaching nothing in time) acts on nothing;
-the periodic re-apply still runs, and 12 in a row, a minute at least, are warned of once with the
-check named ("a check has given no answer for a minute", `note_check_answer`). Before, each read
-as a "no": the tick in flight when systemd stops the orchestrator applied a healthy NAT table
-again, or restarted Syncthing.
+no answer (a kill, a command that could not run, curl reaching nothing in time) acts on nothing at
+once, and 12 in a row, a minute at least, are warned of once with the check named ("a check has
+given no answer for a minute", `note_check_answer`). Two of them have a periodic repair that runs
+all the same, about once a minute: the egress re-applies its NAT whatever its check says, and the
+ingress' reconcile loads its saved SSH ruleset again when its own check gives no answer (the
+same rules on a table that is there). The others wait for an answer: a worker's default route
+is replaced only once `ip route` answers that it drifted (its periodic step re-asserts only the
+IPv6 sysctl), and Syncthing is restarted for a folder only once Syncthing answers for it. Before,
+each read as a "no": the tick in flight when systemd stops the orchestrator applied a healthy NAT
+table again, or restarted Syncthing.
 
 The same tick logs managed nodes that left the router, verifies runtimes, runs the blob GC (on the
 motherbee when its `blob.gc` turns it on, FINDINGS A-188; on a worker, every hour whatever its

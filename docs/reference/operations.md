@@ -706,6 +706,10 @@ tenant (`TENANT_ROOT_REQUIRED`; both `core_io_refusal`); a tenant that is not ac
 whose runtime is not a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`). Start, restart and the
 boot relaunch refuse the same root-tenant cases.
 
+Each `SERVICE_FAILED` above that says systemd did not answer (asked again for up to a second)
+carries `retryable: true` in the orchestrator's payload: nothing was done, and the same action
+asked again is answered once systemd answers (FINDINGS A-271, since 0.1.133).
+
 **Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first). It is
 never refused for the node's public pages (FINDINGS A-242): they stay up until they expire (24 h
 after their publish by default, 30 days at most, never renewed), and SY.admin's ok answer names

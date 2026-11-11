@@ -2124,7 +2124,7 @@ async fn bootstrap_local(
     // to; the ingress applies its SSH table (never fatal: the edge serves without it).
     report_active_host_firewalls(&state.hive_id);
     if state.role == HiveRole::Ingress {
-        reconcile_ingress_ssh(state);
+        reconcile_ingress_ssh(state, true);
     }
     // A-219: an egress switch the last run left open is finished before the boot applies the
     // section (docs/edge-egress-nat-spec.md §15.3).
@@ -5302,14 +5302,15 @@ fn set_exec_0755(path: &Path) -> Result<(), OrchestratorError> {
 
 /// What a core update and its rollback act on: the installed core binaries (`/usr/bin`), the core
 /// units this orchestrator writes on a spoke (`/etc/systemd/system`, `core_service_unit_contents`),
-/// and systemd: its commands, and what `systemctl is-active` answers for a node (`activity`).
-/// `CoreHost::live()` is this host; the tests point both directories at temporary roots and record
-/// systemd's calls instead of making them.
+/// and systemd: its commands, and what `systemctl is-active` answers for a node (`activity`), asked
+/// again `ask_again_after` apart while it gives none. `CoreHost::live()` is this host; the tests
+/// point both directories at temporary roots and record systemd's calls instead of making them.
 struct CoreHost {
     bin_dir: PathBuf,
     unit_dir: PathBuf,
     systemctl: Box<dyn Fn(&[&str]) -> Result<(), OrchestratorError> + Send + Sync>,
     activity: Box<dyn Fn(&str) -> ServiceActivity + Send + Sync>,
+    ask_again_after: Duration,
 }
 
 impl CoreHost {
@@ -5323,6 +5324,7 @@ impl CoreHost {
                 run_cmd(cmd, &format!("systemctl {}", args.join(" ")))
             }),
             activity: Box::new(systemd_activity),
+            ask_again_after: Duration::from_millis(SERVICE_CHECK_ASK_AGAIN_MS),
         }
     }
 
@@ -5330,9 +5332,20 @@ impl CoreHost {
         (self.systemctl)(args)
     }
 
-    /// What `systemctl is-active` answers for `name` (FINDINGS A-267, A-271).
+    /// What `systemctl is-active` answers for `name` (FINDINGS A-267, A-271), asked again while it
+    /// gives none, SERVICE_CHECK_ASKS_AGAIN times at most, `ask_again_after` apart, as a node
+    /// action asks: one systemctl hiccup neither fails a stop nor keeps a binary. Unknown when it
+    /// still gave none.
     fn activity(&self, name: &str) -> ServiceActivity {
-        (self.activity)(name)
+        let mut activity = (self.activity)(name);
+        for _ in 0..SERVICE_CHECK_ASKS_AGAIN {
+            if activity != ServiceActivity::Unknown {
+                break;
+            }
+            std::thread::sleep(self.ask_again_after);
+            activity = (self.activity)(name);
+        }
+        activity
     }
 
     fn bin_path(&self, name: &str) -> PathBuf {
@@ -5378,8 +5391,8 @@ impl CoreHost {
 
     /// Stops a core node and disables it. A unit systemctl answers does not run counts as stopped;
     /// a node still running after a failed stop is an error, and nothing of it may be removed. So is
-    /// one systemctl gives no answer for (FINDINGS A-271): before, that read as stopped, and its
-    /// unit and binary went while it might still run.
+    /// one systemctl gives no answer for, asked again (FINDINGS A-271): before, that read as
+    /// stopped, and its unit and binary went while it might still run.
     fn stop_core_node(&self, name: &str) -> Result<(), OrchestratorError> {
         if let Err(err) = self.systemctl(&["stop", name]) {
             match self.activity(name) {
@@ -5402,8 +5415,10 @@ impl CoreHost {
     /// Takes stopped core nodes off this host: each unit this orchestrator wrote, then systemd's
     /// view of them, then each binary. A node started again between its stop and the removal of
     /// its unit (by a watchdog that still lists it) is stopped once more before its binary goes.
-    /// One systemctl gives no answer for keeps its binary, an error (FINDINGS A-271): before, that
-    /// read as stopped, and the binary of a node that might run went. The errors, by node.
+    /// One systemctl gives no answer for, asked again, keeps its binary, an error (FINDINGS A-271):
+    /// before, that read as stopped, and the binary of a node that might run went. Its unit is gone
+    /// by then, so the settle's next pass finds it by its generation (`settle_core_generation`).
+    /// The errors, by node.
     fn remove_core_nodes(&self, names: &[String]) -> Vec<String> {
         let mut errors = Vec::new();
         let mut units_removed = false;
@@ -6296,6 +6311,25 @@ fn generation_that_installed(
     found.pop()
 }
 
+/// The nodes `generation` keeps as dropped whose binary is still on `host`, but those this pass
+/// `kept` and those `components`, this release's list, names (FINDINGS A-271): an earlier pass
+/// stopped and kept each, and its removal left the binary, its unit already gone.
+fn dropped_binaries_left_behind(
+    host: &CoreHost,
+    generation: &CoreBackupGeneration,
+    components: &[String],
+    kept: &[String],
+) -> Vec<String> {
+    generation
+        .dropped_units
+        .iter()
+        .map(|unit| unit.name.clone())
+        .filter(|name| {
+            !components.contains(name) && !kept.contains(name) && host.bin_path(name).exists()
+        })
+        .collect()
+}
+
 /// Copies a dropped node's binary and unit into its generation, and records them there.
 fn keep_dropped_node(
     host: &CoreHost,
@@ -6334,7 +6368,8 @@ fn keep_dropped_node(
 /// what dist no longer held (`core_update_sets`). At the start of the orchestrator it installed:
 /// - each SY core unit this orchestrator wrote whose node the list no longer names, one the release
 ///   dropped, is stopped and disabled; its unit and binary go into the update's generation, and
-///   then off the host;
+///   then off the host. A binary an earlier pass's removal left, its unit gone, goes again
+///   (`dropped_binaries_left_behind`);
 /// - each node of the list `/usr/bin` lacks, one the release added, is installed from dist once
 ///   its binary there is the manifest's, and recorded as created by the update.
 ///
@@ -6386,6 +6421,11 @@ fn settle_core_generation(
                 .push(format!("{name} not dropped, its backup failed: {err}")),
         }
     }
+    // A dropped node an earlier pass kept whose removal left its binary here (systemctl gave no
+    // answer whether it ran again, or it ran again and did not stop): its unit went, so
+    // `sy_core_units` no longer finds it, and the generation does (FINDINGS A-271). Before, the
+    // next pass settled the generation with that binary in /usr/bin, for good.
+    let left_behind = dropped_binaries_left_behind(host, &generation, components, &kept);
 
     // The nodes the release added, whose binary dist holds as the manifest says.
     let mut to_install = Vec::new();
@@ -6408,9 +6448,11 @@ fn settle_core_generation(
     if !kept.is_empty() || !to_install.is_empty() {
         write_core_backup_generation(&dir, &generation)?;
     }
-    if !kept.is_empty() {
-        outcome.errors.extend(host.remove_core_nodes(&kept));
-        outcome.dropped = kept;
+    let mut to_remove = kept;
+    to_remove.extend(left_behind);
+    if !to_remove.is_empty() {
+        outcome.errors.extend(host.remove_core_nodes(&to_remove));
+        outcome.dropped = to_remove;
     }
     for name in to_install {
         match host.install_binary(&name, &dist_bin.join(&name)) {
@@ -10259,8 +10301,9 @@ fn ingress_ssh_rules(
 enum IngressSshAction {
     /// Write and load the rendered ruleset: it differs from the saved one.
     Apply,
-    /// Load the saved ruleset again: the table is gone, and either the rendered ruleset is the
-    /// saved one or nothing could be rendered.
+    /// Load the saved ruleset again: nft answers that the table is gone, or gives no answer on a
+    /// periodic reconcile; and either the rendered ruleset is the saved one or nothing could be
+    /// rendered.
     LoadSaved,
     /// Nothing to run: the loaded table is the rendered one, or, with nothing rendered, the rules
     /// in force stay as they are (or there were none).
@@ -10268,18 +10311,29 @@ enum IngressSshAction {
 }
 
 /// The reconcile's decision, from the ruleset it rendered (`None` when an input failed or the
-/// configuration refused), the saved ruleset, and whether nft answers that the table is loaded.
-/// Only a rendered ruleset ever replaces the saved one, and an unchanged one is not loaded again
-/// while its table is there. The saved one is loaded again only when nft answers that its table is
-/// gone: a check with no answer loads nothing, and the next reconcile asks again (FINDINGS A-271).
+/// configuration refused), the saved ruleset, whether nft answers that the table is loaded, and
+/// whether this is the periodic reconcile (the boot's or the watchdog's minute). Only a rendered
+/// ruleset ever replaces the saved one, and an unchanged one is not loaded again while nft answers
+/// that its table is there. The saved one is loaded again when nft answers that its table is gone,
+/// and on a periodic reconcile when nft gives no answer (FINDINGS A-271): the load adds, flushes
+/// and defines the table in one transaction, so on a table that is there it changes nothing, and a
+/// check that keeps giving no answer leaves a table that went missing a minute at most, as the
+/// egress' periodic re-apply does. The watchdog's reconcile at once, on nft's answer that an
+/// applied table is gone, loads nothing on a check with no answer.
 fn ingress_ssh_action(
     rendered: Option<&str>,
     saved: Option<&str>,
     table: CheckAnswer,
+    periodic: bool,
 ) -> IngressSshAction {
+    let reload = match table {
+        CheckAnswer::Yes => false,
+        CheckAnswer::No => true,
+        CheckAnswer::NoAnswer => periodic,
+    };
     match rendered {
         Some(rendered) if saved != Some(rendered) => IngressSshAction::Apply,
-        _ if table == CheckAnswer::No && saved.is_some() => IngressSshAction::LoadSaved,
+        _ if reload && saved.is_some() => IngressSshAction::LoadSaved,
         _ => IngressSshAction::Nothing,
     }
 }
@@ -10307,20 +10361,32 @@ fn ingress_ssh_rules_on_host(
 /// was (FINDINGS A-271).
 static INGRESS_SSH_RULES_APPLIED: AtomicBool = AtomicBool::new(false);
 
-/// The ingress' SSH table, at boot and on every reconcile (`ingress_ssh_action`). A new ruleset is
-/// written and loaded only when it renders from a complete input set and differs from the saved
-/// one; an unchanged one is left alone while its table is loaded, and loaded again from the saved
-/// file when nft answers that it is gone. What keeps it from rendering, and a failed load, are
+/// The ingress' SSH table, at boot and on every reconcile (`ingress_ssh_action`; `periodic` at
+/// boot and on the watchdog's minute). A new ruleset is written and loaded only when it renders
+/// from a complete input set and differs from the saved one; an unchanged one is left alone while
+/// its table is loaded, and loaded again from the saved file when nft answers that it is gone, or,
+/// on a periodic reconcile, gives no answer. What keeps it from rendering, and a failed load, are
 /// posture alerts, and the rules applied before stay in force. Never fatal: the edge serves without
 /// it.
-fn reconcile_ingress_ssh(state: &OrchestratorState) {
+fn reconcile_ingress_ssh(state: &OrchestratorState, periodic: bool) {
     let rendered = ingress_ssh_rules_on_host(state);
     let saved = fs::read_to_string(INGRESS_NFT_PATH).ok();
-    let table = nft_table_loaded(INGRESS_NFT_TABLE);
+    // FINDINGS A-271: with no nft, no table can be loaded, by this reconcile or at boot: no rule is
+    // in force. A table check nft gives no answer for says nothing of it.
+    let nft_installed = nft_installed();
+    let ingress_table = || {
+        if nft_installed {
+            nft_table_loaded(INGRESS_NFT_TABLE)
+        } else {
+            CheckAnswer::No
+        }
+    };
+    let table = ingress_table();
     let action = ingress_ssh_action(
         rendered.as_ref().ok().map(|rules| rules.ruleset.as_str()),
         saved.as_deref(),
         table,
+        periodic,
     );
     let load = match (&action, &rendered, &saved) {
         (IngressSshAction::Apply, Ok(rules), _) => Some(rules.ruleset.as_str()),
@@ -10337,7 +10403,7 @@ fn reconcile_ingress_ssh(state: &OrchestratorState) {
             table
         }
         Some(ruleset) => {
-            let applied = if command_exists("nft") {
+            let applied = if nft_installed {
                 apply_nft_table(&INGRESS_NFT, ruleset).map_err(|err| err.to_string())
             } else {
                 Err("'nft' is not installed".to_string())
@@ -10349,16 +10415,24 @@ fn reconcile_ingress_ssh(state: &OrchestratorState) {
                     tracing::info!(allow = %allow.join(", "), "ingress SSH rules applied");
                     CheckAnswer::Yes
                 }
-                (Ok(()), _) => {
+                (Ok(()), _) if table == CheckAnswer::No => {
                     tracing::warn!(
                         path = INGRESS_NFT_PATH,
                         "ingress SSH table was gone; loaded its saved ruleset again"
                     );
                     CheckAnswer::Yes
                 }
+                (Ok(()), _) => {
+                    tracing::info!(
+                        path = INGRESS_NFT_PATH,
+                        "nft gave no answer whether the ingress SSH table is loaded; loaded its \
+                         saved ruleset again, as the periodic reconcile does"
+                    );
+                    CheckAnswer::Yes
+                }
                 (Err(err), _) => {
                     tracing::error!(error = %err, "ingress SSH rules could not be loaded");
-                    let in_force = nft_table_loaded(INGRESS_NFT_TABLE);
+                    let in_force = ingress_table();
                     report_ingress_ssh_problem(
                         state,
                         "ingress_ssh_rules_failed",
@@ -10383,8 +10457,8 @@ fn reconcile_ingress_ssh(state: &OrchestratorState) {
     }
 }
 
-/// A posture alert for the ingress' SSH rules, saying whether rules stay in force as nft answers it:
-/// never "no rule is in force" for a check nft did not answer (FINDINGS A-271).
+/// A posture alert for the ingress' SSH rules, saying whether rules stay in force
+/// (`ingress_ssh_consequence`).
 fn report_ingress_ssh_problem(
     state: &OrchestratorState,
     kind: &str,
@@ -10392,19 +10466,7 @@ fn report_ingress_ssh_problem(
     why: &str,
     rules_in_force: CheckAnswer,
 ) {
-    let consequence = match rules_in_force {
-        CheckAnswer::Yes => format!(
-            "The SSH rules this ingress applied before stay in force ({INGRESS_NFT_PATH}); \
-             nothing was narrowed or loosened."
-        ),
-        CheckAnswer::No => {
-            "No SSH rule is in force: SSH on this ingress is not filtered.".to_string()
-        }
-        CheckAnswer::NoAnswer => format!(
-            "nft did not answer whether the SSH rules this ingress applied before are in force \
-             ({INGRESS_NFT_PATH}); nothing was loaded on that, and the next reconcile asks again."
-        ),
-    };
+    let consequence = ingress_ssh_consequence(rules_in_force);
     append_drift_alert(
         "posture",
         kind,
@@ -10418,6 +10480,25 @@ fn report_ingress_ssh_problem(
         None,
         None,
     );
+}
+
+/// What an ingress SSH alert says of the rules in force, as nft answers it (FINDINGS A-271): never
+/// "no rule is in force" for a check nft did not answer. Without nft to run, the reconcile takes
+/// the table for gone (no rule can be in force), and the alert says so, as before.
+fn ingress_ssh_consequence(rules_in_force: CheckAnswer) -> String {
+    match rules_in_force {
+        CheckAnswer::Yes => format!(
+            "The SSH rules this ingress applied before stay in force ({INGRESS_NFT_PATH}); \
+             nothing was narrowed or loosened."
+        ),
+        CheckAnswer::No => {
+            "No SSH rule is in force: SSH on this ingress is not filtered.".to_string()
+        }
+        CheckAnswer::NoAnswer => format!(
+            "nft did not answer whether the SSH rules this ingress applied before are in force \
+             ({INGRESS_NFT_PATH}); the next reconcile asks again."
+        ),
+    }
 }
 
 /// ufw or firewalld, when active: either may close 9000, 9100, 9200, 22000 or 443 without anyone
@@ -10485,7 +10566,8 @@ fn watchdog_host_rules(state: &OrchestratorState) {
         .is_multiple_of(EGRESS_RECONCILE_DRIFT_TICKS);
     if state.role == HiveRole::Ingress {
         // FINDINGS A-271: only nft's answer that the applied table is gone reconciles at once; a
-        // check with no answer waits for the periodic reconcile, and a run of them is reported.
+        // check with no answer waits for the periodic reconcile, which loads the saved ruleset
+        // again on its own check's no answer, and a run of them is reported.
         let table = nft_table_loaded(INGRESS_NFT_TABLE);
         state.note_check_answer(
             &format!("nft list table {INGRESS_NFT_TABLE}"),
@@ -10498,7 +10580,7 @@ fn watchdog_host_rules(state: &OrchestratorState) {
             tracing::warn!("ingress SSH table missing on watchdog; re-applying");
         }
         if periodic || vanished {
-            reconcile_ingress_ssh(state);
+            reconcile_ingress_ssh(state, periodic);
         }
     }
     if periodic {
@@ -11215,6 +11297,18 @@ fn conntrack_max_live() -> Option<u32> {
     None
 }
 
+/// Whether this process has an `nft` to run: a file `nft` in a directory of its PATH, where
+/// `Command::new("nft")` looks for one (FINDINGS A-271). A look at the filesystem answers either
+/// way, where a `command -v nft` that was killed would read as "not installed".
+fn nft_installed() -> bool {
+    program_on_path(std::env::var_os("PATH").as_deref(), "nft")
+}
+
+/// Whether `name` is a file in a directory of `path`, a PATH value.
+fn program_on_path(path: Option<&std::ffi::OsStr>, name: &str) -> bool {
+    path.is_some_and(|path| std::env::split_paths(path).any(|dir| dir.join(name).is_file()))
+}
+
 /// Whether `table` (`<family> <name>`, e.g. `inet fluxbee_egress`) is loaded, as `nft list table`
 /// answers (FINDINGS A-271).
 fn nft_table_loaded(table: &str) -> CheckAnswer {
@@ -11248,10 +11342,10 @@ fn nft_table_answer(output: std::io::Result<std::process::Output>) -> CheckAnswe
 }
 
 /// Loads a dedicated table's ruleset in one `nft -f` (the ruleset adds, flushes and defines its
-/// table in one transaction, SO-08), checks that the table is there, and makes sure its boot unit
-/// loads it at the next boot (F17). A new ruleset is saved only once nft has loaded it: nft
-/// refuses a whole ruleset or takes it, so a refused one leaves the loaded table and the saved
-/// file (what the boot unit loads) as they were.
+/// table in one transaction, SO-08), checks that the table is there (`nft_load_checked`), and
+/// makes sure its boot unit loads it at the next boot (F17). A new ruleset is saved only once nft
+/// has loaded it: nft refuses a whole ruleset or takes it, so a refused one leaves the loaded table
+/// and the saved file (what the boot unit loads) as they were.
 fn apply_nft_table(files: &NftTableFiles, ruleset: &str) -> Result<(), OrchestratorError> {
     let load = |path: &str| -> Result<(), OrchestratorError> {
         let mut apply = Command::new("nft");
@@ -11272,26 +11366,31 @@ fn apply_nft_table(files: &NftTableFiles, ruleset: &str) -> Result<(), Orchestra
         }
         fs::rename(&pending, files.path)?;
     }
-    match nft_table_loaded(files.table) {
-        CheckAnswer::Yes => {}
+    nft_load_checked(files.table, nft_table_loaded(files.table))?;
+    ensure_nft_boot_unit(files)
+}
+
+/// What the check after a load says of it (FINDINGS A-271). `nft -f`'s exit 0 is nft's answer
+/// that the transaction committed, so a check after it that gives no answer (killed, say, by
+/// systemd's stop of this orchestrator) leaves the load standing, with a warning: its boot unit is
+/// still made sure of, and the caller takes the table for loaded. Only nft's answer that the
+/// table is not there fails the load. Before, that check's no answer failed it: a false
+/// `ingress_ssh_rules_failed`, and on an egress' boot a fatal error.
+fn nft_load_checked(table: &str, after: CheckAnswer) -> Result<(), OrchestratorError> {
+    match after {
+        CheckAnswer::Yes => Ok(()),
         CheckAnswer::No => {
-            return Err(format!(
-                "nft applied but table {} is not present afterwards",
-                files.table
-            )
-            .into());
+            Err(format!("nft applied but table {table} is not present afterwards").into())
         }
-        // FINDINGS A-271: never "not present" for a check that said nothing.
         CheckAnswer::NoAnswer => {
-            return Err(format!(
-                "nft applied the ruleset, but gave no answer whether table {} is loaded \
-                 afterwards",
-                files.table
-            )
-            .into());
+            tracing::warn!(
+                table,
+                "nft loaded the ruleset, and its check of the table after the load gave no \
+                 answer; the load stands on nft's exit 0"
+            );
+            Ok(())
         }
     }
-    ensure_nft_boot_unit(files)
 }
 
 /// Absolute path of an executable on `PATH`, for baking into a systemd unit's
@@ -11388,9 +11487,6 @@ fn ensure_nft_boot_unit(files: &NftTableFiles) -> Result<(), OrchestratorError> 
     Ok(())
 }
 
-/// Whether the current IPv4 default route already points at `gateway_ip`.
-/// Used by the watchdog to skip a no-op `ip route replace`. On any error
-/// reading the route table, returns false so the caller re-applies (safe).
 /// The gateway of the first IPv4 default route, i.e. the token after `via`.
 ///
 /// Pure, so the parsing is testable without a host. Mirrors how the validating
@@ -11905,8 +12001,8 @@ fn reconcile_egress_nat(
     )?;
 
     // nftables is the only supported backend; fail loud if absent (no silent
-    // fallback to iptables/ufw).
-    if !command_exists("nft") {
+    // fallback to iptables/ufw). A look at PATH, which no kill turns into "absent" (FINDINGS A-271).
+    if !nft_installed() {
         return Err("egress requires nftables: 'nft' not found on PATH (no fallback)".into());
     }
 
@@ -20474,21 +20570,23 @@ async fn local_runtime_snapshot(
     }
 }
 
-/// Whether a node uses its runtime, for the runtime's `usage` (`running_nodes`), and as what: a node
-/// the router sees whose unit runs (RUNNING), or whose unit systemctl gives no answer for
-/// (UNKNOWN, FINDINGS A-271). SY.admin's `remove_runtime_version` refuses a version while a node
-/// is listed, so a check with no answer never reads as "not in use"; asked again, it answers. The
-/// router is asked only for a unit that may run.
+/// Whether a node uses its runtime, for the runtime's `usage` (`running_nodes`), and as what, by
+/// systemctl's answer for its unit (FINDINGS A-271): a unit that runs is RUNNING when the router
+/// sees the node and STARTING before it does (one starting, crash-looping or reconnecting, or any
+/// while this hive's LSA entry is stale); a unit systemctl gives no answer for is UNKNOWN, whatever
+/// the router sees. SY.admin's `remove_runtime_version` refuses a version while a node is listed,
+/// so neither a node the router does not see yet nor a check with no answer reads as "not in use";
+/// asked again, systemctl answers. Only a unit that runs asks the router.
 fn runtime_usage_lifecycle(
     unit: ServiceActivity,
     visible_in_router: impl FnOnce() -> bool,
 ) -> Option<&'static str> {
-    let lifecycle = match unit {
-        ServiceActivity::Active => "RUNNING",
-        ServiceActivity::Unknown => "UNKNOWN",
-        ServiceActivity::Inactive => return None,
-    };
-    visible_in_router().then_some(lifecycle)
+    match unit {
+        ServiceActivity::Active if visible_in_router() => Some("RUNNING"),
+        ServiceActivity::Active => Some("STARTING"),
+        ServiceActivity::Unknown => Some("UNKNOWN"),
+        ServiceActivity::Inactive => None,
+    }
 }
 
 fn local_runtime_usage_summary(
@@ -20496,7 +20594,16 @@ fn local_runtime_usage_summary(
     runtime: &str,
     version_filter: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
-    let root = node_files_root();
+    local_runtime_usage_summary_with_root(state, &node_files_root(), runtime, version_filter)
+}
+
+/// `local_runtime_usage_summary` over the managed nodes' files under `root`.
+fn local_runtime_usage_summary_with_root(
+    state: &OrchestratorState,
+    root: &Path,
+    runtime: &str,
+    version_filter: Option<&str>,
+) -> Result<serde_json::Value, OrchestratorError> {
     if !root.exists() {
         return Ok(serde_json::json!({
             "scope": "hive_local_visible",
@@ -20507,7 +20614,7 @@ fn local_runtime_usage_summary(
     }
 
     let mut running_nodes = Vec::new();
-    for kind_entry in fs::read_dir(&root)? {
+    for kind_entry in fs::read_dir(root)? {
         let kind_entry = kind_entry?;
         if !kind_entry.file_type()?.is_dir() {
             continue;
@@ -28355,6 +28462,7 @@ async fn run_node_flow(
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
+                "retryable": true,
                 "message": format!(
                     "{UNIT_UNANSWERED}; the node was not launched, and its config and identity \
                      were undone"
@@ -28884,6 +28992,7 @@ async fn start_or_restart_node_flow(
                 return serde_json::json!({
                     "status": "error",
                     "error_code": "SERVICE_FAILED",
+                    "retryable": true,
                     "message": format!("{UNIT_UNANSWERED}; nothing was started or written"),
                     "target": target_hive,
                     "node_name": plan.node.node_name,
@@ -29152,6 +29261,7 @@ async fn kill_node_flow(
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
+                "retryable": true,
                 "message": format!("{UNIT_UNANSWERED}; nothing was stopped or removed"),
                 "target": target_hive,
                 "node_name": validated_node_name,
@@ -29498,12 +29608,13 @@ async fn remove_node_instance_flow(
         .await;
     let inventory_visible = local_inventory_has_node(state, &node_name);
     if let Some(error_code) = remove_instance_refusal(unit_activity, inventory_visible) {
-        let message = if error_code == "SERVICE_FAILED" {
+        let unanswered = error_code == "SERVICE_FAILED";
+        let message = if unanswered {
             format!("{UNIT_UNANSWERED}; nothing was stopped or removed")
         } else {
             "node instance is still running/visible; stop it before removing".to_string()
         };
-        return serde_json::json!({
+        let mut refusal = serde_json::json!({
             "status": "error",
             "error_code": error_code,
             "message": message,
@@ -29512,6 +29623,10 @@ async fn remove_node_instance_flow(
             "unit": unit,
             "visible_in_router": inventory_visible,
         });
+        if unanswered {
+            refusal["retryable"] = serde_json::json!(true);
+        }
+        return refusal;
     }
 
     let cleanup_cmd =
@@ -37787,13 +37902,15 @@ mod tests {
     /// A host of temporary roots for a core update: `bin/` stands for `/usr/bin`, `units/` for
     /// `/etc/systemd/system`. systemd's calls are recorded, each with whether the node's binary
     /// was still there when it was made; `is-active` answers for the nodes `active` names, and no
-    /// answer for those `unanswered` names, and a stop fails for those `stop_fails` names.
+    /// answer for those `unanswered` names, or for the next asks `hiccups` counts, and a stop fails
+    /// for those `stop_fails` names. It asks again at once.
     struct TestCoreHost {
         root: PathBuf,
         host: CoreHost,
         calls: Arc<StdMutex<Vec<String>>>,
         active: Arc<StdMutex<HashSet<String>>>,
         unanswered: Arc<StdMutex<HashSet<String>>>,
+        hiccups: Arc<StdMutex<HashMap<String, u32>>>,
         stop_fails: Arc<StdMutex<HashSet<String>>>,
     }
 
@@ -37811,6 +37928,7 @@ mod tests {
             let calls = Arc::new(StdMutex::new(Vec::new()));
             let active = Arc::new(StdMutex::new(HashSet::new()));
             let unanswered = Arc::new(StdMutex::new(HashSet::new()));
+            let hiccups = Arc::new(StdMutex::new(HashMap::new()));
             let stop_fails = Arc::new(StdMutex::new(HashSet::new()));
             let record = {
                 let calls = Arc::clone(&calls);
@@ -37854,9 +37972,17 @@ mod tests {
                 activity: {
                     let active = Arc::clone(&active);
                     let unanswered = Arc::clone(&unanswered);
+                    let hiccups = Arc::clone(&hiccups);
                     Box::new(move |node: &str| {
                         record(&["is-active", "--quiet", node]);
-                        if unanswered.lock().expect("unanswered").contains(node) {
+                        let hiccup = match hiccups.lock().expect("hiccups").get_mut(node) {
+                            Some(left) if *left > 0 => {
+                                *left -= 1;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if hiccup || unanswered.lock().expect("unanswered").contains(node) {
                             ServiceActivity::Unknown
                         } else if active.lock().expect("active").contains(node) {
                             ServiceActivity::Active
@@ -37865,6 +37991,7 @@ mod tests {
                         }
                     })
                 },
+                ask_again_after: Duration::ZERO,
             };
             TestCoreHost {
                 root,
@@ -37872,6 +37999,7 @@ mod tests {
                 calls,
                 active,
                 unanswered,
+                hiccups,
                 stop_fails,
             }
         }
@@ -39792,36 +39920,43 @@ mod tests {
     /// docs/control-path-hardening-v1.md §6: only a ruleset rendered from a complete input set
     /// replaces the saved one; an unchanged one is not loaded again while its table is there; with
     /// nothing rendered (an input failed, the configuration refused) the rules in force stay, and
-    /// the saved ones are loaded again only when nft answers that the table is gone, never on a
-    /// check it did not answer (FINDINGS A-271).
+    /// the saved ones are loaded again when nft answers that the table is gone. A check nft did not
+    /// answer loads them again only on the periodic reconcile, whose load changes nothing on a
+    /// table that is there, never on the watchdog's at once (FINDINGS A-271).
     #[test]
     fn the_ingress_reconcile_never_narrows_a_working_table() {
         use CheckAnswer::{No, NoAnswer, Yes};
         use IngressSshAction::{Apply, LoadSaved, Nothing};
         let (new, saved) = ("new ruleset", "saved ruleset");
-        for (rendered, saved_file, table, expected) in [
+        for (rendered, saved_file, table, expected, periodic_expected) in [
             // A new or changed ruleset is applied, whether or not a table is loaded.
-            (Some(new), Some(saved), Yes, Apply),
-            (Some(new), Some(saved), No, Apply),
-            (Some(new), Some(saved), NoAnswer, Apply),
-            (Some(new), None, No, Apply),
-            (Some(new), None, Yes, Apply),
+            (Some(new), Some(saved), Yes, Apply, Apply),
+            (Some(new), Some(saved), No, Apply, Apply),
+            (Some(new), Some(saved), NoAnswer, Apply, Apply),
+            (Some(new), None, No, Apply, Apply),
+            (Some(new), None, Yes, Apply, Apply),
+            (Some(new), None, NoAnswer, Apply, Apply),
             // The rendered ruleset is the saved one: nothing while it is loaded, else load it.
-            (Some(saved), Some(saved), Yes, Nothing),
-            (Some(saved), Some(saved), No, LoadSaved),
-            (Some(saved), Some(saved), NoAnswer, Nothing),
+            (Some(saved), Some(saved), Yes, Nothing, Nothing),
+            (Some(saved), Some(saved), No, LoadSaved, LoadSaved),
+            (Some(saved), Some(saved), NoAnswer, Nothing, LoadSaved),
             // Nothing rendered: keep what is loaded, load the saved one when the table is gone.
-            (None, Some(saved), Yes, Nothing),
-            (None, Some(saved), No, LoadSaved),
-            (None, Some(saved), NoAnswer, Nothing),
-            (None, None, No, Nothing),
-            (None, None, Yes, Nothing),
-            (None, None, NoAnswer, Nothing),
+            (None, Some(saved), Yes, Nothing, Nothing),
+            (None, Some(saved), No, LoadSaved, LoadSaved),
+            (None, Some(saved), NoAnswer, Nothing, LoadSaved),
+            (None, None, No, Nothing, Nothing),
+            (None, None, Yes, Nothing, Nothing),
+            (None, None, NoAnswer, Nothing, Nothing),
         ] {
             assert_eq!(
-                ingress_ssh_action(rendered, saved_file, table),
+                ingress_ssh_action(rendered, saved_file, table, false),
                 expected,
-                "rendered {rendered:?}, saved {saved_file:?}, table {table:?}"
+                "rendered {rendered:?}, saved {saved_file:?}, table {table:?}, at once"
+            );
+            assert_eq!(
+                ingress_ssh_action(rendered, saved_file, table, true),
+                periodic_expected,
+                "rendered {rendered:?}, saved {saved_file:?}, table {table:?}, periodic"
             );
         }
         // An input that fails is a warning: the rules in force stay; the configuration's own
@@ -53757,6 +53892,63 @@ blob:
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// FINDINGS A-271: a runtime's usage, which SY.admin's `remove_runtime_version` refuses on,
+    /// lists a node pinned to the version whose unit systemctl gives no answer for (UNKNOWN), and
+    /// one whose unit runs that the router does not see yet (STARTING): neither reads as "not in
+    /// use". Only a unit systemctl answers does not run leaves it out.
+    #[test]
+    fn a_runtimes_usage_lists_a_node_whose_unit_may_run() {
+        let mut state = sample_orchestrator_state_for_tests();
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-runtime-usage-{}", Uuid::new_v4().simple()));
+        let node_dir = root.join("AI").join("AI.usage.test@motherbee");
+        std::fs::create_dir_all(&node_dir).expect("create node dir");
+        std::fs::write(
+            node_dir.join("config.json"),
+            serde_json::json!({
+                "_system": {
+                    "runtime": "ai.usage.test",
+                    "runtime_version": "0.3.1",
+                    "tenant_id": "tnt:test",
+                    "relaunch_on_boot": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write config");
+        let usage = |state: &OrchestratorState| {
+            local_runtime_usage_summary_with_root(state, &root, "ai.usage.test", Some("0.3.1"))
+                .expect("usage")
+        };
+
+        // Answered not running: not in use.
+        let not_running = usage(&state);
+        assert_eq!(not_running["in_use"], false, "{not_running}");
+
+        state.unit_checks = UnitChecks {
+            activity: |_| ServiceActivity::Unknown,
+            failed: |_| CheckAnswer::NoAnswer,
+        };
+        let unanswered = usage(&state);
+        assert_eq!(unanswered["in_use"], true, "{unanswered}");
+        assert_eq!(
+            unanswered["running_nodes"][0]["node_name"],
+            "AI.usage.test@motherbee"
+        );
+        assert_eq!(unanswered["running_nodes"][0]["lifecycle"], "UNKNOWN");
+
+        // The test's router sees no node: a unit that runs is one on its way up.
+        state.unit_checks = UnitChecks {
+            activity: |_| ServiceActivity::Active,
+            failed: |_| CheckAnswer::No,
+        };
+        let starting = usage(&state);
+        assert_eq!(starting["in_use"], true, "{starting}");
+        assert_eq!(starting["running_nodes"][0]["lifecycle"], "STARTING");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// An SY node runs as its packaged unit and the router as `rt-gateway`, never as a
     /// `fluxbee-node-*` unit; a core node this hive's role does not run is not here.
     #[test]
@@ -58657,8 +58849,9 @@ blob:
 
     /// FINDINGS A-271: the egress re-applies its NAT at once only when nft answers that its table
     /// is gone, and the ingress reconciles its SSH table at once on the same answer; a check with
-    /// no answer waits for the periodic pass. Before, a killed `nft list table` re-applied a
-    /// healthy table.
+    /// no answer waits for the periodic pass, which re-applies the egress' NAT and loads the
+    /// ingress' saved ruleset again. Before, a killed `nft list table` re-applied a healthy table.
+    /// A load whose check after it gives no answer stands on nft's exit 0.
     #[test]
     fn the_nft_watchdogs_act_at_once_only_when_nft_says_the_table_is_gone() {
         use CheckAnswer::{No, NoAnswer, Yes};
@@ -58688,13 +58881,83 @@ blob:
         assert!(ingress.contains(
             "INGRESS_SSH_RULES_APPLIED.load(Ordering::Relaxed) && table == CheckAnswer::No"
         ));
-        // After a load, a check with no answer is its own error, never "not present".
+        // The reconcile at once is no periodic one; the boot's is.
+        assert!(ingress.contains("reconcile_ingress_ssh(state, periodic);"));
+        let boot = body("async fn bootstrap_local(");
+        assert!(boot.contains("reconcile_ingress_ssh(state, true);"));
+
+        // After a load, nft's answer that the table is not there fails it; a check with no answer
+        // leaves it standing, its boot unit still made sure of.
+        assert!(nft_load_checked("inet fluxbee_ingress", Yes).is_ok());
+        assert!(nft_load_checked("inet fluxbee_ingress", NoAnswer).is_ok());
+        let err = nft_load_checked("inet fluxbee_ingress", No).expect_err("not there");
+        assert!(
+            err.to_string().contains("is not present afterwards"),
+            "{err}"
+        );
         let apply = body("fn apply_nft_table(");
-        assert!(apply.contains("CheckAnswer::NoAnswer => {"));
-        assert_eq!(apply.matches("is not present afterwards").count(), 1);
+        let checked = apply
+            .find("nft_load_checked(files.table, nft_table_loaded(files.table))?;")
+            .expect("the check after the load");
+        let boot_unit = apply
+            .find("ensure_nft_boot_unit(files)")
+            .expect("the boot unit");
+        assert!(checked < boot_unit);
         // The reconcile leaves the watchdog's view as it was on a check with no answer.
         let reconcile = body("fn reconcile_ingress_ssh(");
         assert!(reconcile.contains("CheckAnswer::NoAnswer => {}"));
+    }
+
+    /// FINDINGS A-271: with no nft to run, no ingress SSH rule can be in force, and the posture
+    /// alert says so, as before; a table check nft gave no answer for says that it did not answer,
+    /// never that no rule is in force. Whether nft is installed is a look at PATH, never a command
+    /// a kill could turn into "not installed".
+    #[test]
+    fn the_ingress_alert_says_no_rule_is_in_force_only_on_an_answer() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        assert!(ingress_ssh_consequence(Yes).contains("stay in force"));
+        assert!(ingress_ssh_consequence(No).contains("No SSH rule is in force"));
+        let unanswered = ingress_ssh_consequence(NoAnswer);
+        assert!(unanswered.contains("nft did not answer"), "{unanswered}");
+        assert!(!unanswered.contains("No SSH rule"), "{unanswered}");
+
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        let reconcile = body("fn reconcile_ingress_ssh(");
+        assert!(reconcile.contains("let nft_installed = nft_installed();"));
+        assert!(!reconcile.contains("command_exists("));
+        // Without nft, the table reads as gone: the load says why, and the alert that no rule is
+        // in force.
+        let table = reconcile
+            .find("let ingress_table = || {")
+            .expect("the table");
+        let table = &reconcile[table..];
+        let table = &table[..table.find("};").expect("its end")];
+        assert!(table.contains("nft_table_loaded(INGRESS_NFT_TABLE)"));
+        assert!(table.contains("CheckAnswer::No"));
+        assert!(reconcile.contains("let in_force = ingress_table();"));
+        assert!(!body("fn reconcile_egress_nat(").contains("command_exists("));
+
+        // The look at PATH: a file of that name in one of its directories, nothing else.
+        let root = std::env::temp_dir().join(format!("fbnft-{}", Uuid::new_v4().simple()));
+        let (empty, bin) = (root.join("empty"), root.join("bin"));
+        fs::create_dir_all(&empty).expect("empty dir");
+        fs::create_dir_all(bin.join("nft-dir")).expect("bin dir");
+        fs::write(bin.join("nft"), "").expect("nft");
+        let path = std::env::join_paths([&empty, &bin]).expect("a PATH");
+        assert!(program_on_path(Some(path.as_os_str()), "nft"));
+        assert!(
+            !program_on_path(Some(path.as_os_str()), "nft-dir"),
+            "a directory is no program"
+        );
+        assert!(!program_on_path(Some(path.as_os_str()), "curl"));
+        let only_empty = std::env::join_paths([&empty]).expect("a PATH");
+        assert!(!program_on_path(Some(only_empty.as_os_str()), "nft"));
+        assert!(!program_on_path(None, "nft"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// FINDINGS A-271: the worker's watchdog replaces its default route only when ip answers that it
@@ -58761,10 +59024,14 @@ blob:
         );
         assert_eq!(remove_instance_refusal(Inactive, false), None);
 
+        // A runtime's usage lists every node whose unit may run: one the router does not see yet
+        // too, and one systemctl gives no answer for whatever the router sees.
         assert_eq!(runtime_usage_lifecycle(Active, || true), Some("RUNNING"));
-        assert_eq!(runtime_usage_lifecycle(Unknown, || true), Some("UNKNOWN"));
-        assert_eq!(runtime_usage_lifecycle(Unknown, || false), None);
-        assert_eq!(runtime_usage_lifecycle(Active, || false), None);
+        assert_eq!(runtime_usage_lifecycle(Active, || false), Some("STARTING"));
+        assert_eq!(
+            runtime_usage_lifecycle(Unknown, || panic!("the router is not asked")),
+            Some("UNKNOWN")
+        );
         assert_eq!(
             runtime_usage_lifecycle(Inactive, || panic!("not asked for a unit that is down")),
             None
@@ -58814,11 +59081,19 @@ blob:
         let unknown = &unknown[..unknown.find("    }\n\n").expect("its end")];
         assert!(unknown.contains("\"SERVICE_FAILED\"") && !unknown.contains("execute_on_hive("));
         assert!(unknown.contains("rollback_node_identity_after_failed_spawn("));
+        // Each answer that nothing was done says to ask again.
+        assert!(unknown.contains("\"retryable\": true,"));
         let start = body("async fn start_or_restart_node_flow(");
         before(
             start,
             "match start_node_finds_running(unit_activity, visible_in_router) {",
             "record_planned_launch(",
+        );
+        let unanswered = &start[start.find("None => {").expect("start's no answer")..];
+        let unanswered = &unanswered[..unanswered.find("});").expect("its answer")];
+        assert!(
+            unanswered.contains("\"SERVICE_FAILED\"")
+                && unanswered.contains("\"retryable\": true,")
         );
         let kill = body("async fn kill_node_flow(");
         let unknown = &kill[kill
@@ -58832,15 +59107,16 @@ blob:
             "remove_instance_refusal(unit_activity, inventory_visible)",
             "let cleanup_cmd =",
         );
+        assert!(remove.contains("refusal[\"retryable\"] = serde_json::json!(true);"));
         assert!(!src.contains(&format!("fn systemd_unit_is_{}(", "active")));
         assert!(!src.contains(&format!("fn systemd_unit_is_{}(", "failed")));
     }
 
     /// FINDINGS A-271, through the flows: on a hive where systemctl gives no answer for a node's
     /// unit, a core node's status reads UNKNOWN, a managed node with nothing on disk is not
-    /// NODE_NOT_FOUND, and a stop, asked again, stops nothing. Where systemctl answers that the
-    /// unit is not there, the same reads are STOPPED and NODE_NOT_FOUND, and the stop finds
-    /// nothing to stop.
+    /// NODE_NOT_FOUND, and a stop, asked again, stops nothing and says to ask again (`retryable`).
+    /// Where systemctl answers that the unit is not there, the same reads are STOPPED and
+    /// NODE_NOT_FOUND, and the stop finds nothing to stop.
     #[tokio::test(start_paused = true)]
     async fn a_hive_whose_systemctl_does_not_answer_reads_unknown_and_stops_nothing() {
         let answered = sample_orchestrator_state_for_tests();
@@ -58877,6 +59153,7 @@ blob:
         assert_eq!(kill["status"], "not_found", "{kill}");
         let kill = kill_node_flow(&unanswered, &ghost).await;
         assert_eq!(kill["error_code"], "SERVICE_FAILED", "{kill}");
+        assert_eq!(kill["retryable"], true, "{kill}");
         assert!(
             kill["message"]
                 .as_str()
@@ -58954,16 +59231,148 @@ blob:
             .lock()
             .expect("unanswered")
             .insert("sy-timer".to_string());
+        let asked_before = test.calls().len();
         let errors = test.host.remove_core_nodes(&["sy-timer".to_string()]);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("did not answer"), "{errors:?}");
         assert!(test.host.bin_path("sy-timer").exists());
+        // Asked again before it gave up, as a node action asks.
+        let asks = test.calls()[asked_before..]
+            .iter()
+            .filter(|call| call.starts_with("is-active --quiet sy-timer"))
+            .count();
+        assert_eq!(asks, 1 + SERVICE_CHECK_ASKS_AGAIN as usize);
         test.unanswered.lock().expect("unanswered").clear();
         assert!(test
             .host
             .remove_core_nodes(&["sy-timer".to_string()])
             .is_empty());
         assert!(!test.host.bin_path("sy-timer").exists());
+
+        // One hiccup, a check that answers when asked again, neither keeps a binary nor fails a
+        // stop.
+        test.install("sy-timer", "old");
+        test.active.lock().expect("active").clear();
+        test.hiccups
+            .lock()
+            .expect("hiccups")
+            .insert("sy-timer".to_string(), 2);
+        assert!(test.host.stop_core_node("sy-timer").is_ok());
+        test.hiccups
+            .lock()
+            .expect("hiccups")
+            .insert("sy-timer".to_string(), 1);
+        assert!(test
+            .host
+            .remove_core_nodes(&["sy-timer".to_string()])
+            .is_empty());
+        assert!(!test.host.bin_path("sy-timer").exists());
+    }
+
+    /// FINDINGS A-271: a dropped node whose removal got no answer keeps its binary and the update
+    /// open; its unit is gone, so the settle's next pass finds it by its generation and removes
+    /// the binary, and the outcome that settles the generation names it. Before, that pass found
+    /// nothing to drop and settled it with the binary in /usr/bin, for good.
+    #[test]
+    fn the_settles_next_pass_removes_a_dropped_binary_a_no_answer_left() {
+        let test = TestCoreHost::new("leftbin");
+        let dist = test.root.join("dist");
+        fs::create_dir_all(&dist).expect("dist");
+        for name in [
+            "rt-gateway",
+            "sy-orchestrator",
+            "sy-config-routes",
+            "sy-timer",
+        ] {
+            test.install(name, "old");
+        }
+        let release = [
+            ("rt-gateway", "new"),
+            ("sy-orchestrator", "new"),
+            ("sy-config-routes", "new"),
+        ];
+        let manifest = manifest_for(&release);
+        for (name, body) in release {
+            fs::write(dist.join(name), body).expect("dist binary");
+            fs::write(test.host.bin_path(name), body).expect("installed");
+        }
+        let dir = stamp_update(
+            &test,
+            &["rt-gateway", "sy-orchestrator", "sy-config-routes"],
+            &["sy-timer"],
+            "newhash",
+        );
+        let list: Vec<String> = ["rt-gateway", "sy-config-routes", "sy-orchestrator"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let settle = |now: u64| {
+            settle_core_generation(
+                &test.host,
+                &test.root.join("generations"),
+                "newhash",
+                &manifest,
+                &dist,
+                &list,
+                now,
+            )
+            .expect("settle")
+        };
+
+        // The stop works; the removal's check then gives no answer, asked again.
+        test.unanswered
+            .lock()
+            .expect("unanswered")
+            .insert("sy-timer".to_string());
+        let outcome = settle(1).expect("open");
+        assert_eq!(outcome.dropped, vec!["sy-timer".to_string()]);
+        assert!(!outcome.settled, "{outcome:?}");
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|err| err.contains("did not answer")),
+            "{outcome:?}"
+        );
+        assert!(test.host.bin_path("sy-timer").exists());
+        assert!(!test.host.unit_path("sy-timer").exists());
+        assert!(!test.host.sy_core_units().contains(&"sy-timer".to_string()));
+
+        // Still no answer: the next pass asks again, and keeps the binary and the update open.
+        let outcome = settle(2).expect("still open");
+        assert_eq!(outcome.dropped, vec!["sy-timer".to_string()]);
+        assert!(!outcome.settled, "{outcome:?}");
+        assert!(test.host.bin_path("sy-timer").exists());
+
+        // Answered: the pass after removes the binary and settles the generation.
+        test.unanswered.lock().expect("unanswered").clear();
+        let outcome = settle(3).expect("settles");
+        assert_eq!(outcome.dropped, vec!["sy-timer".to_string()]);
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(outcome.settled, "{outcome:?}");
+        assert!(!test.host.bin_path("sy-timer").exists());
+        let generation = read_core_backup_generation(&dir).expect("stamp");
+        assert_eq!(generation.settled_at_ms, Some(3));
+        assert!(generation.components.iter().any(|c| c.name == "sy-timer"));
+        assert_eq!(generation.dropped_units.len(), 1);
+
+        // A dropped node this release's list names again is not taken for one left behind.
+        let named = vec![
+            "rt-gateway".to_string(),
+            "sy-config-routes".to_string(),
+            "sy-orchestrator".to_string(),
+            "sy-timer".to_string(),
+        ];
+        fs::write(test.host.bin_path("sy-timer"), "new").expect("installed again");
+        assert!(dropped_binaries_left_behind(&test.host, &generation, &named, &[]).is_empty());
+        assert_eq!(
+            dropped_binaries_left_behind(&test.host, &generation, &list, &[]),
+            vec!["sy-timer".to_string()]
+        );
+        assert!(
+            dropped_binaries_left_behind(&test.host, &generation, &list, &["sy-timer".into()])
+                .is_empty()
+        );
     }
 
     /// FINDINGS A-271: the other checks' runs of no answers are counted as the watchdog's are, by
