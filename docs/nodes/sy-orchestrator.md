@@ -242,7 +242,8 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   unit is not active and that the router does not see is launched once what its runtime names is
   ready on this hive; until then it waits, logged once ("node is down, and what its runtime names
   is not ready on this hive; it is launched once it is"). A running node may be moved, below.
-  Only systemctl's answer that the unit does not run (exit 3) counts as not active: a node whose
+  Only systemctl's answer that the unit does not run (exit 3, or 4 for a unit systemd does not
+  have, as a new node's: FINDINGS A-314, since 0.1.134) counts as not active: a node whose
   unit it gives no answer for is neither launched nor moved, the next pass asks again, and the
   second pass in a row with no answer for it is warned of once (`reconcile_unit_active`,
   `note_check_answer`; FINDINGS A-271, since 0.1.133). Before, such a node that the router did not
@@ -995,7 +996,8 @@ SY.admin sends them to the motherbee's orchestrator, which answers from a task o
 
 Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every SY service of its
 role's list with `systemctl is-active`, and runs `systemctl start` on any that systemctl answers
-is not running (exit 3). A stopped core unit comes back within seconds. A check with no answer
+is not running (exit 3, or 4 for a unit systemd does not have: FINDINGS A-314, since 0.1.134).
+A stopped core unit comes back within seconds. A check with no answer
 (another exit, or a check that could not run or was killed, as systemd's stop of the orchestrator
 kills the one in flight) starts nothing, and the next tick asks again (`ServiceActivity`,
 FINDINGS A-267, since 0.1.133); before, the last tick of each self-restart took the services it

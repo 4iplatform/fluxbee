@@ -8681,10 +8681,10 @@ async fn apply_config_update_local(
     let mut restarted = Vec::new();
     let mut errors = Vec::new();
     for service in restart {
-        // One check and its three answers (FINDINGS A-267). `systemctl is-active` answers 3, not
-        // running, for a unit systemd does not have, so no unit check comes first: that one took a
-        // failed `systemctl show` for "no such unit", and so a reader with no answer for a stopped
-        // one.
+        // One check and its three answers (FINDINGS A-267). For a unit systemd does not have,
+        // `systemctl is-active` answers 4 on the hives' systemd 255, which reads as not running
+        // (A-314), so no unit check comes first: that one took a failed `systemctl show` for "no
+        // such unit", and so a reader with no answer for a stopped one.
         match systemd_activity(&service) {
             ServiceActivity::Active => {}
             ServiceActivity::Inactive => {
@@ -36702,7 +36702,10 @@ fn run_cmd_output(mut cmd: Command, label: &str) -> Result<String, OrchestratorE
 enum ServiceActivity {
     /// Exit 0: active (or reloading).
     Active,
-    /// Exit 3, LSB's "not running": inactive, failed, or on its way up or down.
+    /// Exit 3, LSB's "not running": inactive, failed, or on its way up or down; or exit 4, a unit
+    /// systemd does not have (FINDINGS A-314: the hives' systemd 255 answers 4 for a unit whose
+    /// LoadState is not-found, as a node's is before its first launch and once its stopped
+    /// transient unit is gone).
     Inactive,
     /// No answer: systemctl could not run, failed otherwise, or was killed, as systemd's stop of
     /// this orchestrator kills the check in flight. It says nothing of the service: no caller
@@ -36721,13 +36724,17 @@ fn systemd_activity(service: &str) -> ServiceActivity {
 }
 
 /// `systemctl is-active`'s answer from how it ended: active only on exit 0, not running only on
-/// exit 3. Before, any other end read as not running, and the watchdog tick in flight when systemd
-/// stopped the orchestrator (its own restart) took the healthy services it checked for down and
-/// started them.
+/// exit 3 or 4. Before 0.1.133, any other end read as not running, and the watchdog tick in flight
+/// when systemd stopped the orchestrator (its own restart) took the healthy services it checked
+/// for down and started them (FINDINGS A-267). Exit 4 is systemd's answer for a unit it does not
+/// have (FINDINGS A-314): 0.1.133 read it as no answer, so on 8.x every run_node of a new node,
+/// every start of a node whose unit was gone and every purge of such a node was refused
+/// SERVICE_FAILED, and the reconcile never launched one. A systemctl that cannot reach systemd
+/// exits 1, and one that is killed has no exit code: both stay no answer.
 fn service_activity(status: std::io::Result<std::process::ExitStatus>) -> ServiceActivity {
     match status.map(|status| status.code()) {
         Ok(Some(0)) => ServiceActivity::Active,
-        Ok(Some(3)) => ServiceActivity::Inactive,
+        Ok(Some(3)) | Ok(Some(4)) => ServiceActivity::Inactive,
         _ => ServiceActivity::Unknown,
     }
 }
@@ -60078,18 +60085,19 @@ blob:
         assert!(!syncthing_runs_stale(Unknown, false, false, false));
     }
 
-    /// FINDINGS A-267: `systemctl is-active` says active only by exit 0 and not running only by
-    /// exit 3; a check that fails otherwise, cannot run, or is killed, as systemd's stop of this
-    /// orchestrator kills the watchdog's check in flight, answers nothing. Real children, each
-    /// ending one of those ways.
+    /// FINDINGS A-267, A-314: `systemctl is-active` says active only by exit 0 and not running
+    /// only by exit 3, or 4 for a unit systemd does not have (systemd 255); a check that fails
+    /// otherwise, cannot run, or is killed, as systemd's stop of this orchestrator kills the
+    /// watchdog's check in flight, answers nothing. Real children, each ending one of those ways.
     #[test]
-    fn a_service_check_answers_only_by_exit_0_or_3() {
+    fn a_service_check_answers_only_by_exit_0_3_or_4() {
         let ends =
             |script: &str| service_activity(Command::new("sh").arg("-c").arg(script).status());
         assert_eq!(ends("exit 0"), ServiceActivity::Active);
         assert_eq!(ends("exit 3"), ServiceActivity::Inactive);
+        assert_eq!(ends("exit 4"), ServiceActivity::Inactive);
         assert_eq!(ends("exit 1"), ServiceActivity::Unknown);
-        assert_eq!(ends("exit 4"), ServiceActivity::Unknown);
+        assert_eq!(ends("exit 5"), ServiceActivity::Unknown);
         assert_eq!(ends("kill -TERM $$"), ServiceActivity::Unknown);
         assert_eq!(ends("kill -KILL $$"), ServiceActivity::Unknown);
         assert_eq!(
