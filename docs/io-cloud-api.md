@@ -677,7 +677,8 @@ With `limit`, `result.next_cursor` is there while more nodes follow: send the sa
 You see a node's state, not how the hive runs it: no process, unit or host paths.
 
 - `lifecycle_state`: `RUNNING`, `STARTING`, `STOPPED` or `FAILED`, from the hive itself, for every
-  node.
+  node; `UNKNOWN` while the hive cannot tell (its systemd did not answer for the node), never a
+  `STOPPED` it did not see. Read it again.
 - `health_state`: what the node reports about itself. IO nodes are not all at the same stage, and
   an older one may answer `UNKNOWN`.
 - `identity.ilk_id` is what `list_tokens` shows in `assigned_ilks`.

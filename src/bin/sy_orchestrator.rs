@@ -713,10 +713,29 @@ struct OrchestratorState {
     /// update only: a later one, installed while this orchestrator still runs, is never settled
     /// with this orchestrator's list.
     open_core_settle: std::sync::Mutex<Option<String>>,
-    /// FINDINGS A-267: the watchdog's checks in a row that systemctl gave no answer for, by service
-    /// (`note_service_answer`).
-    watchdog_unanswered: std::sync::Mutex<HashMap<String, u32>>,
+    /// FINDINGS A-267, A-271: the checks in a row that gave no answer, by check (`count_unanswered`):
+    /// the watchdog's of each core service, by its name (`note_service_answer`), and the other
+    /// checks that decide an action, by what they run (`note_check_answer`).
+    unanswered_checks: std::sync::Mutex<HashMap<String, u32>>,
+    /// How this hive asks systemd about a node's unit (FINDINGS A-271): systemctl itself
+    /// (`UnitChecks::SYSTEMCTL`); a test's state answers as a host without the unit does.
+    unit_checks: UnitChecks,
     rpc: OnceLock<Arc<RouterDispatcher>>,
+}
+
+/// What systemctl answers for a node's unit, its managed unit or its core one (FINDINGS A-271):
+/// whether it runs, and whether it failed.
+#[derive(Clone, Copy)]
+struct UnitChecks {
+    activity: fn(&str) -> ServiceActivity,
+    failed: fn(&str) -> CheckAnswer,
+}
+
+impl UnitChecks {
+    const SYSTEMCTL: UnitChecks = UnitChecks {
+        activity: systemd_activity,
+        failed: systemd_unit_failed,
+    };
 }
 
 impl OrchestratorState {
@@ -730,10 +749,41 @@ impl OrchestratorState {
     /// FINDINGS A-267: counts one of the watchdog's checks of `service` (`note_service_answer`).
     fn note_watchdog_check(&self, service: &str, activity: ServiceActivity) {
         let mut unanswered = self
-            .watchdog_unanswered
+            .unanswered_checks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         note_service_answer(&mut unanswered, service, activity);
+    }
+
+    /// What systemctl answers for a node's unit, asked again while it gives none, within `limit`
+    /// (`ask_again_while_unanswered`, FINDINGS A-271): a node action's one answer.
+    async fn unit_activity_asked_again(&self, unit: &str, limit: Duration) -> ServiceActivity {
+        let activity = self.unit_checks.activity;
+        ask_again_while_unanswered(|| activity(unit), limit).await
+    }
+
+    /// FINDINGS A-271: counts one answer, or no answer, of `check`, a check that decides an action
+    /// (an nft table, the default route, a Syncthing folder, a node's unit in the reconcile), named
+    /// by what it runs. `report_at` checks in a row are a minute at least: the run of no answers
+    /// that reaches it is warned of once, since what the check decides waits meanwhile, and the
+    /// answer that ends a run so reported says so.
+    fn note_check_answer(&self, check: &str, answered: bool, report_at: u32) {
+        let mut unanswered = self
+            .unanswered_checks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match count_unanswered(&mut unanswered, check, answered, report_at) {
+            UnansweredChecks::Quiet => {}
+            UnansweredChecks::Reported => tracing::warn!(
+                check,
+                checks = report_at,
+                "a check has given no answer for a minute; what it decides waits until it answers"
+            ),
+            UnansweredChecks::Ended => tracing::info!(
+                check,
+                "a check that gave no answer for a minute answers again"
+            ),
+        }
     }
 
     /// F18: acquire the per-hive_id topology lock, held across the whole
@@ -1004,7 +1054,8 @@ async fn main() -> Result<(), OrchestratorError> {
         core_awaiting_update: std::sync::Mutex::new(None),
         vendor_awaiting_update: std::sync::Mutex::new(None),
         open_core_settle: std::sync::Mutex::new(None),
-        watchdog_unanswered: std::sync::Mutex::new(HashMap::new()),
+        unanswered_checks: std::sync::Mutex::new(HashMap::new()),
+        unit_checks: UnitChecks::SYSTEMCTL,
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -2782,6 +2833,19 @@ fn start_script_entry(start_script: &Path) -> Result<StartScriptEntry, String> {
     ))
 }
 
+/// Whether the reconcile takes a node's unit for running, by systemctl's answer (FINDINGS A-271):
+/// `None` when it gave none, and the node is neither launched nor moved on this pass. Before, that
+/// read as "not running": a node the router did not see (one still starting, say) had its unit
+/// stopped and was launched again, as when systemd's stop of this orchestrator killed the check in
+/// flight.
+fn reconcile_unit_active(unit: ServiceActivity) -> Option<bool> {
+    match unit {
+        ServiceActivity::Active => Some(true),
+        ServiceActivity::Inactive => Some(false),
+        ServiceActivity::Unknown => None,
+    }
+}
+
 /// One reconcile pass over the persisted nodes. Its callers hold `reconcile_pass` for it.
 async fn reconcile_persisted_custom_nodes(
     state: &OrchestratorState,
@@ -2839,7 +2903,24 @@ async fn reconcile_persisted_custom_nodes(
             skipped = skipped.saturating_add(1);
             continue;
         };
-        let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+        // FINDINGS A-271: a unit systemctl gives no answer for is neither launched nor moved; the
+        // next pass asks again, and a run of them is reported.
+        let unit_activity = (state.unit_checks.activity)(&unit);
+        state.note_check_answer(
+            &format!("systemctl is-active {unit}"),
+            unit_activity != ServiceActivity::Unknown,
+            RECONCILE_UNANSWERED_REPORT_PASSES,
+        );
+        let Some(unit_active) = reconcile_unit_active(unit_activity) else {
+            skipped = skipped.saturating_add(1);
+            tracing::debug!(
+                node_name = node.node_name,
+                unit = unit,
+                "systemctl did not answer whether the node's unit runs; nothing launched or moved, \
+                 the next pass asks again"
+            );
+            continue;
+        };
         let live = if unit_active {
             live_unit(&unit)
         } else {
@@ -3369,51 +3450,79 @@ fn keep_core_service_running(
 /// minute at least.
 const WATCHDOG_UNANSWERED_REPORT_CHECKS: u32 = 12;
 
-/// What the watchdog said of systemctl's answers for a service after one check (FINDINGS A-267).
+/// How many passes in a row of the managed-node reconcile, a minute apart, may get no answer from
+/// systemctl for a node's unit before it says that it cannot keep the node running (FINDINGS A-271):
+/// a minute at least, as the watchdog's 12 checks.
+const RECONCILE_UNANSWERED_REPORT_PASSES: u32 = 2;
+
+/// What is said of a check's answers after one more check (FINDINGS A-267, A-271).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnansweredChecks {
-    /// Nothing: systemctl answered, or its checks with no answer are too few yet.
+    /// Nothing: the check answered, or its checks with no answer are too few yet.
     Quiet,
-    /// That it gave no answer at WATCHDOG_UNANSWERED_REPORT_CHECKS checks in a row: said once.
+    /// That it gave no answer at its report count of checks in a row: said once.
     Reported,
     /// That it answers again, after a run of checks with no answer that was reported.
     Ended,
 }
 
+/// Counts a check's checks in a row that gave no answer (FINDINGS A-267, A-271). A check with no
+/// answer decides nothing, so one that kept failing (systemctl with a D-Bus problem, say) would
+/// leave what it decides undone without a word: the run's `report_at`th check is reported, once,
+/// and so is the answer that ends a run so reported. Any answer ends the run.
+fn count_unanswered(
+    unanswered: &mut HashMap<String, u32>,
+    check: &str,
+    answered: bool,
+    report_at: u32,
+) -> UnansweredChecks {
+    if answered {
+        let reported = unanswered
+            .remove(check)
+            .is_some_and(|checks| checks >= report_at);
+        return if reported {
+            UnansweredChecks::Ended
+        } else {
+            UnansweredChecks::Quiet
+        };
+    }
+    let checks = unanswered.entry(check.to_string()).or_insert(0);
+    *checks = checks.saturating_add(1);
+    if *checks == report_at {
+        UnansweredChecks::Reported
+    } else {
+        UnansweredChecks::Quiet
+    }
+}
+
 /// Counts the watchdog's checks in a row that systemctl gave no answer for, by service (FINDINGS
-/// A-267). A check with no answer starts nothing, so a systemctl that kept failing (a D-Bus
-/// problem, say) would leave the watchdog keeping nothing running without a word: the run's 12th
-/// check warns, once, and the answer that ends a run so reported says so. Any answer ends the run.
+/// A-267, `count_unanswered`): the run's 12th check warns that the watchdog cannot keep the
+/// service running, and the answer that ends a run so reported says that it can again.
 fn note_service_answer(
     unanswered: &mut HashMap<String, u32>,
     service: &str,
     activity: ServiceActivity,
 ) -> UnansweredChecks {
-    if activity != ServiceActivity::Unknown {
-        let reported = unanswered
-            .remove(service)
-            .is_some_and(|checks| checks >= WATCHDOG_UNANSWERED_REPORT_CHECKS);
-        if !reported {
-            return UnansweredChecks::Quiet;
-        }
-        tracing::info!(
+    let said = count_unanswered(
+        unanswered,
+        service,
+        activity != ServiceActivity::Unknown,
+        WATCHDOG_UNANSWERED_REPORT_CHECKS,
+    );
+    match said {
+        UnansweredChecks::Quiet => {}
+        UnansweredChecks::Reported => tracing::warn!(
+            service,
+            checks = WATCHDOG_UNANSWERED_REPORT_CHECKS,
+            "systemctl has not answered whether the service runs for a minute; the watchdog cannot \
+             keep it running until it does"
+        ),
+        UnansweredChecks::Ended => tracing::info!(
             service,
             "systemctl answers for the service again; the watchdog keeps it running again"
-        );
-        return UnansweredChecks::Ended;
+        ),
     }
-    let checks = unanswered.entry(service.to_string()).or_insert(0);
-    *checks = checks.saturating_add(1);
-    if *checks != WATCHDOG_UNANSWERED_REPORT_CHECKS {
-        return UnansweredChecks::Quiet;
-    }
-    tracing::warn!(
-        service,
-        checks = *checks,
-        "systemctl has not answered whether the service runs for a minute; the watchdog cannot \
-         keep it running until it does"
-    );
-    UnansweredChecks::Reported
+    said
 }
 
 async fn watchdog_tick(state: &OrchestratorState) {
@@ -3519,6 +3628,14 @@ static EGRESS_RECONCILE_TICKS: AtomicU64 = AtomicU64::new(0);
 /// self-healing partial drift promptly.
 const EGRESS_RECONCILE_DRIFT_TICKS: u64 = 12;
 
+/// Whether the egress watchdog re-applies its NAT on this tick: when nft answers that its table is
+/// gone, at once, and on the periodic tick. A check with no answer re-applies nothing at once
+/// (FINDINGS A-271): before, it read as "gone", and the tick in flight when systemd stopped the
+/// orchestrator applied a healthy table again.
+fn egress_nat_reapplies(table: CheckAnswer, periodic: bool) -> bool {
+    table == CheckAnswer::No || periodic
+}
+
 /// Re-establish egress drift on the watchdog tick (spec §6.5: "on startup and
 /// on reconcile"). Two paths: the cheap table-missing fast path re-applies the
 /// NAT the instant the `fluxbee_egress` table vanishes; the periodic path
@@ -3544,15 +3661,22 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
     let periodic = tick.is_multiple_of(EGRESS_RECONCILE_DRIFT_TICKS);
     match state.role {
         HiveRole::Egress if eg.enabled => {
-            let table_missing = !nft_table_loaded(EGRESS_NFT_TABLE);
-            if table_missing {
+            // FINDINGS A-271: only nft's answer that the table is gone re-applies at once; a check
+            // with no answer waits for the periodic re-apply, and a run of them is reported.
+            let table = nft_table_loaded(EGRESS_NFT_TABLE);
+            state.note_check_answer(
+                &format!("nft list table {EGRESS_NFT_TABLE}"),
+                table != CheckAnswer::NoAnswer,
+                WATCHDOG_UNANSWERED_REPORT_CHECKS,
+            );
+            if table == CheckAnswer::No {
                 tracing::warn!("egress nft table missing on watchdog; re-applying NAT");
             }
             // Re-apply when the table vanished (fast path) or on the periodic
             // tick (catches partial drift the presence check misses: a flushed
             // chain, an edited rule, sysctl/conntrack drift). reconcile is
             // idempotent (write_file_if_changed + nft delete+apply + sysctl).
-            if table_missing || periodic {
+            if egress_nat_reapplies(table, periodic) {
                 match reconcile_egress_nat(eg, &state.hive_id) {
                     Ok(v) => {
                         // FINDINGS A-1: an egress can stop serving its LAN after boot (an
@@ -3619,8 +3743,16 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                 .filter(|g| !g.is_empty())
             {
                 // Only re-apply on drift: skip the subprocess when the default
-                // route already points at the gateway (the common case).
-                if !default_route_via(gateway_ip) {
+                // route already points at the gateway (the common case). FINDINGS A-271: only
+                // ip's answer that it points elsewhere, or nowhere, is drift; a check with no
+                // answer replaces nothing, the next tick asks again, and a run of them is reported.
+                let route = default_route_via(gateway_ip);
+                state.note_check_answer(
+                    "ip -4 route show default",
+                    route != CheckAnswer::NoAnswer,
+                    WATCHDOG_UNANSWERED_REPORT_CHECKS,
+                );
+                if route == CheckAnswer::No {
                     tracing::warn!(
                         gateway_ip = gateway_ip,
                         "worker default route drifted; re-applying"
@@ -4819,7 +4951,7 @@ async fn syncthing_folder_status_across_restart(
                     || now >= restart_window
                     || syncthing_api_healthy(sync.sync_api_port).await
                 {
-                    return Err(err);
+                    return Err(err.into());
                 }
                 tracing::debug!(folder = %folder_id, error = %err, "syncthing API restarting; asking again");
                 time::sleep(Duration::from_millis(SYSTEM_SYNC_HINT_POLL_INTERVAL_MS)).await;
@@ -5061,24 +5193,7 @@ async fn restart_local_core_services_with_health_gate(
     left_out: &[String],
 ) -> Result<Vec<String>, OrchestratorError> {
     let mut restarted = Vec::new();
-    let mut services = vec!["rt-gateway".to_string()];
-    services.extend(
-        system_nodes_for_role(role)
-            .nodes
-            .iter()
-            .map(|name| name_to_service(name)),
-    );
-    for service in services {
-        if service == "sy-orchestrator" {
-            // Avoid self-restart while processing the request; operator can restart orchestrator separately.
-            continue;
-        }
-        if left_out.contains(&service) {
-            continue;
-        }
-        if !systemd_unit_exists(&service) {
-            continue;
-        }
+    for service in core_services_to_restart(role, left_out, systemd_unit_exists) {
         // MUST be restart, not start: this runs AFTER the binaries were swapped in place
         // while the services stayed up, so `start` would be a silent no-op and the unit
         // would keep running the old inode. The rollback path calls this same function
@@ -5088,6 +5203,45 @@ async fn restart_local_core_services_with_health_gate(
         restarted.push(service);
     }
     Ok(restarted)
+}
+
+/// What the core's restart restarts, in start order: rt-gateway and the SY services of this
+/// release's list for `role`, but sy-orchestrator, those of `left_out`, and those systemctl answers
+/// systemd has no unit for (`unit_exists`). One it gives no answer for is restarted all the same
+/// (FINDINGS A-271): its binary was swapped, and left out it would keep running the old one while
+/// the update answers ok; a restart of a unit that is not there fails the health gate instead.
+fn core_services_to_restart(
+    role: HiveRole,
+    left_out: &[String],
+    unit_exists: impl Fn(&str) -> CheckAnswer,
+) -> Vec<String> {
+    let mut services = vec!["rt-gateway".to_string()];
+    services.extend(
+        system_nodes_for_role(role)
+            .nodes
+            .iter()
+            .map(|name| name_to_service(name)),
+    );
+    services.retain(|service| {
+        // Avoid self-restart while processing the request; operator can restart orchestrator
+        // separately.
+        if service == "sy-orchestrator" || left_out.contains(service) {
+            return false;
+        }
+        match unit_exists(service) {
+            CheckAnswer::Yes => true,
+            CheckAnswer::No => false,
+            CheckAnswer::NoAnswer => {
+                tracing::warn!(
+                    service = service.as_str(),
+                    "systemctl did not answer whether the service has a unit; restarting it all \
+                     the same, onto its new binary"
+                );
+                true
+            }
+        }
+    });
+    services
 }
 
 /// Restarts one core service and waits until systemd has it active again, up to
@@ -5148,12 +5302,14 @@ fn set_exec_0755(path: &Path) -> Result<(), OrchestratorError> {
 
 /// What a core update and its rollback act on: the installed core binaries (`/usr/bin`), the core
 /// units this orchestrator writes on a spoke (`/etc/systemd/system`, `core_service_unit_contents`),
-/// and systemd. `CoreHost::live()` is this host; the tests point both directories at temporary
-/// roots and record systemd's calls instead of making them.
+/// and systemd: its commands, and what `systemctl is-active` answers for a node (`activity`).
+/// `CoreHost::live()` is this host; the tests point both directories at temporary roots and record
+/// systemd's calls instead of making them.
 struct CoreHost {
     bin_dir: PathBuf,
     unit_dir: PathBuf,
     systemctl: Box<dyn Fn(&[&str]) -> Result<(), OrchestratorError> + Send + Sync>,
+    activity: Box<dyn Fn(&str) -> ServiceActivity + Send + Sync>,
 }
 
 impl CoreHost {
@@ -5166,11 +5322,17 @@ impl CoreHost {
                 cmd.args(args);
                 run_cmd(cmd, &format!("systemctl {}", args.join(" ")))
             }),
+            activity: Box::new(systemd_activity),
         }
     }
 
     fn systemctl(&self, args: &[&str]) -> Result<(), OrchestratorError> {
         (self.systemctl)(args)
+    }
+
+    /// What `systemctl is-active` answers for `name` (FINDINGS A-267, A-271).
+    fn activity(&self, name: &str) -> ServiceActivity {
+        (self.activity)(name)
     }
 
     fn bin_path(&self, name: &str) -> PathBuf {
@@ -5214,12 +5376,21 @@ impl CoreHost {
         names
     }
 
-    /// Stops a core node and disables it. A unit systemd does not run counts as stopped; a node
-    /// still running after a failed stop is an error, and nothing of it may be removed.
+    /// Stops a core node and disables it. A unit systemctl answers does not run counts as stopped;
+    /// a node still running after a failed stop is an error, and nothing of it may be removed. So is
+    /// one systemctl gives no answer for (FINDINGS A-271): before, that read as stopped, and its
+    /// unit and binary went while it might still run.
     fn stop_core_node(&self, name: &str) -> Result<(), OrchestratorError> {
         if let Err(err) = self.systemctl(&["stop", name]) {
-            if self.systemctl(&["is-active", "--quiet", name]).is_ok() {
-                return Err(format!("stop {name}: {err}").into());
+            match self.activity(name) {
+                ServiceActivity::Inactive => {}
+                ServiceActivity::Active => return Err(format!("stop {name}: {err}").into()),
+                ServiceActivity::Unknown => {
+                    return Err(format!(
+                        "stop {name}: {err}; systemctl did not answer whether it still runs"
+                    )
+                    .into())
+                }
             }
         }
         if let Err(err) = self.systemctl(&["disable", name]) {
@@ -5231,7 +5402,8 @@ impl CoreHost {
     /// Takes stopped core nodes off this host: each unit this orchestrator wrote, then systemd's
     /// view of them, then each binary. A node started again between its stop and the removal of
     /// its unit (by a watchdog that still lists it) is stopped once more before its binary goes.
-    /// The errors, by node.
+    /// One systemctl gives no answer for keeps its binary, an error (FINDINGS A-271): before, that
+    /// read as stopped, and the binary of a node that might run went. The errors, by node.
     fn remove_core_nodes(&self, names: &[String]) -> Vec<String> {
         let mut errors = Vec::new();
         let mut units_removed = false;
@@ -5249,9 +5421,19 @@ impl CoreHost {
             }
         }
         for name in names {
-            if self.systemctl(&["is-active", "--quiet", name]).is_ok() {
-                if let Err(err) = self.systemctl(&["stop", name]) {
-                    errors.push(format!("{name} runs again and does not stop: {err}"));
+            match self.activity(name) {
+                ServiceActivity::Inactive => {}
+                ServiceActivity::Active => {
+                    if let Err(err) = self.systemctl(&["stop", name]) {
+                        errors.push(format!("{name} runs again and does not stop: {err}"));
+                        continue;
+                    }
+                }
+                ServiceActivity::Unknown => {
+                    errors.push(format!(
+                        "{name}: systemctl did not answer whether it runs again, so its binary \
+                         stays"
+                    ));
                     continue;
                 }
             }
@@ -10086,18 +10268,18 @@ enum IngressSshAction {
 }
 
 /// The reconcile's decision, from the ruleset it rendered (`None` when an input failed or the
-/// configuration refused), the saved ruleset, and whether the table is loaded. Only a rendered
-/// ruleset ever replaces the saved one, and an unchanged one is not loaded again while its table is
-/// there.
+/// configuration refused), the saved ruleset, and whether nft answers that the table is loaded.
+/// Only a rendered ruleset ever replaces the saved one, and an unchanged one is not loaded again
+/// while its table is there. The saved one is loaded again only when nft answers that its table is
+/// gone: a check with no answer loads nothing, and the next reconcile asks again (FINDINGS A-271).
 fn ingress_ssh_action(
     rendered: Option<&str>,
     saved: Option<&str>,
-    table_loaded: bool,
+    table: CheckAnswer,
 ) -> IngressSshAction {
     match rendered {
         Some(rendered) if saved != Some(rendered) => IngressSshAction::Apply,
-        _ if table_loaded => IngressSshAction::Nothing,
-        _ if saved.is_some() => IngressSshAction::LoadSaved,
+        _ if table == CheckAnswer::No && saved.is_some() => IngressSshAction::LoadSaved,
         _ => IngressSshAction::Nothing,
     }
 }
@@ -10121,22 +10303,24 @@ fn ingress_ssh_rules_on_host(
 }
 
 /// Whether this ingress' SSH table is loaded after its last reconcile: the watchdog reconciles at
-/// once when a loaded table vanishes.
+/// once when a loaded table vanishes. A reconcile whose check nft did not answer leaves it as it
+/// was (FINDINGS A-271).
 static INGRESS_SSH_RULES_APPLIED: AtomicBool = AtomicBool::new(false);
 
 /// The ingress' SSH table, at boot and on every reconcile (`ingress_ssh_action`). A new ruleset is
 /// written and loaded only when it renders from a complete input set and differs from the saved
 /// one; an unchanged one is left alone while its table is loaded, and loaded again from the saved
-/// file when it is gone. What keeps it from rendering, and a failed load, are posture alerts, and
-/// the rules applied before stay in force. Never fatal: the edge serves without it.
+/// file when nft answers that it is gone. What keeps it from rendering, and a failed load, are
+/// posture alerts, and the rules applied before stay in force. Never fatal: the edge serves without
+/// it.
 fn reconcile_ingress_ssh(state: &OrchestratorState) {
     let rendered = ingress_ssh_rules_on_host(state);
     let saved = fs::read_to_string(INGRESS_NFT_PATH).ok();
-    let table_loaded = nft_table_loaded(INGRESS_NFT_TABLE);
+    let table = nft_table_loaded(INGRESS_NFT_TABLE);
     let action = ingress_ssh_action(
         rendered.as_ref().ok().map(|rules| rules.ruleset.as_str()),
         saved.as_deref(),
-        table_loaded,
+        table,
     );
     let load = match (&action, &rendered, &saved) {
         (IngressSshAction::Apply, Ok(rules), _) => Some(rules.ruleset.as_str()),
@@ -10145,12 +10329,12 @@ fn reconcile_ingress_ssh(state: &OrchestratorState) {
     };
     let loaded = match load {
         None => {
-            if table_loaded && saved.is_some() {
+            if table == CheckAnswer::Yes && saved.is_some() {
                 if let Err(err) = ensure_nft_boot_unit(&INGRESS_NFT) {
                     tracing::warn!(error = %err, "ingress SSH: could not write its boot unit");
                 }
             }
-            table_loaded
+            table
         }
         Some(ruleset) => {
             let applied = if command_exists("nft") {
@@ -10163,14 +10347,14 @@ fn reconcile_ingress_ssh(state: &OrchestratorState) {
                     let allow: Vec<String> =
                         rules.allow.iter().map(SshAllowNet::to_string).collect();
                     tracing::info!(allow = %allow.join(", "), "ingress SSH rules applied");
-                    true
+                    CheckAnswer::Yes
                 }
                 (Ok(()), _) => {
                     tracing::warn!(
                         path = INGRESS_NFT_PATH,
                         "ingress SSH table was gone; loaded its saved ruleset again"
                     );
-                    true
+                    CheckAnswer::Yes
                 }
                 (Err(err), _) => {
                     tracing::error!(error = %err, "ingress SSH rules could not be loaded");
@@ -10192,24 +10376,34 @@ fn reconcile_ingress_ssh(state: &OrchestratorState) {
         tracing::warn!(kind = kind, reason = %why, "ingress SSH: no new rules rendered");
         report_ingress_ssh_problem(state, kind, severity, why, loaded);
     }
-    INGRESS_SSH_RULES_APPLIED.store(loaded, Ordering::Relaxed);
+    match loaded {
+        CheckAnswer::Yes => INGRESS_SSH_RULES_APPLIED.store(true, Ordering::Relaxed),
+        CheckAnswer::No => INGRESS_SSH_RULES_APPLIED.store(false, Ordering::Relaxed),
+        CheckAnswer::NoAnswer => {}
+    }
 }
 
-/// A posture alert for the ingress' SSH rules, saying whether rules stay in force.
+/// A posture alert for the ingress' SSH rules, saying whether rules stay in force as nft answers it:
+/// never "no rule is in force" for a check nft did not answer (FINDINGS A-271).
 fn report_ingress_ssh_problem(
     state: &OrchestratorState,
     kind: &str,
     severity: &str,
     why: &str,
-    rules_in_force: bool,
+    rules_in_force: CheckAnswer,
 ) {
-    let consequence = if rules_in_force {
-        format!(
+    let consequence = match rules_in_force {
+        CheckAnswer::Yes => format!(
             "The SSH rules this ingress applied before stay in force ({INGRESS_NFT_PATH}); \
              nothing was narrowed or loosened."
-        )
-    } else {
-        "No SSH rule is in force: SSH on this ingress is not filtered.".to_string()
+        ),
+        CheckAnswer::No => {
+            "No SSH rule is in force: SSH on this ingress is not filtered.".to_string()
+        }
+        CheckAnswer::NoAnswer => format!(
+            "nft did not answer whether the SSH rules this ingress applied before are in force \
+             ({INGRESS_NFT_PATH}); nothing was loaded on that, and the next reconcile asks again."
+        ),
     };
     append_drift_alert(
         "posture",
@@ -10290,8 +10484,16 @@ fn watchdog_host_rules(state: &OrchestratorState) {
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(EGRESS_RECONCILE_DRIFT_TICKS);
     if state.role == HiveRole::Ingress {
-        let vanished = INGRESS_SSH_RULES_APPLIED.load(Ordering::Relaxed)
-            && !nft_table_loaded(INGRESS_NFT_TABLE);
+        // FINDINGS A-271: only nft's answer that the applied table is gone reconciles at once; a
+        // check with no answer waits for the periodic reconcile, and a run of them is reported.
+        let table = nft_table_loaded(INGRESS_NFT_TABLE);
+        state.note_check_answer(
+            &format!("nft list table {INGRESS_NFT_TABLE}"),
+            table != CheckAnswer::NoAnswer,
+            WATCHDOG_UNANSWERED_REPORT_CHECKS,
+        );
+        let vanished =
+            INGRESS_SSH_RULES_APPLIED.load(Ordering::Relaxed) && table == CheckAnswer::No;
         if vanished {
             tracing::warn!("ingress SSH table missing on watchdog; re-applying");
         }
@@ -11013,11 +11215,36 @@ fn conntrack_max_live() -> Option<u32> {
     None
 }
 
-/// Whether `table` (`<family> <name>`, e.g. `inet fluxbee_egress`) is loaded.
-fn nft_table_loaded(table: &str) -> bool {
+/// Whether `table` (`<family> <name>`, e.g. `inet fluxbee_egress`) is loaded, as `nft list table`
+/// answers (FINDINGS A-271).
+fn nft_table_loaded(table: &str) -> CheckAnswer {
     let mut cmd = Command::new("nft");
-    cmd.arg("list").arg("table").args(table.split_whitespace());
-    run_cmd_output(cmd, "nft list table").is_ok()
+    cmd.arg("list")
+        .arg("table")
+        .args(table.split_whitespace())
+        .env("LC_ALL", "C");
+    nft_table_answer(cmd.output())
+}
+
+/// What nft prints when the kernel has no such table (ENOENT), in the C locale.
+const NFT_NO_SUCH_TABLE: &str = "No such file or directory";
+
+/// `nft list table`'s answer from how it ended: loaded on exit 0, not loaded only on exit 1 with the
+/// kernel's "no such table" in nft's error (NFT_NO_SUCH_TABLE). Any other end, an nft that was
+/// killed, could not run or failed otherwise (no permission, say), is no answer. Before, all of
+/// them read as "not loaded", and the egress watchdog applied a healthy NAT table again: the tick
+/// in flight when systemd stops the orchestrator has its check killed.
+fn nft_table_answer(output: std::io::Result<std::process::Output>) -> CheckAnswer {
+    let Ok(output) = output else {
+        return CheckAnswer::NoAnswer;
+    };
+    match output.status.code() {
+        Some(0) => CheckAnswer::Yes,
+        Some(1) if String::from_utf8_lossy(&output.stderr).contains(NFT_NO_SUCH_TABLE) => {
+            CheckAnswer::No
+        }
+        _ => CheckAnswer::NoAnswer,
+    }
 }
 
 /// Loads a dedicated table's ruleset in one `nft -f` (the ruleset adds, flushes and defines its
@@ -11045,12 +11272,24 @@ fn apply_nft_table(files: &NftTableFiles, ruleset: &str) -> Result<(), Orchestra
         }
         fs::rename(&pending, files.path)?;
     }
-    if !nft_table_loaded(files.table) {
-        return Err(format!(
-            "nft applied but table {} is not present afterwards",
-            files.table
-        )
-        .into());
+    match nft_table_loaded(files.table) {
+        CheckAnswer::Yes => {}
+        CheckAnswer::No => {
+            return Err(format!(
+                "nft applied but table {} is not present afterwards",
+                files.table
+            )
+            .into());
+        }
+        // FINDINGS A-271: never "not present" for a check that said nothing.
+        CheckAnswer::NoAnswer => {
+            return Err(format!(
+                "nft applied the ruleset, but gave no answer whether table {} is loaded \
+                 afterwards",
+                files.table
+            )
+            .into());
+        }
     }
     ensure_nft_boot_unit(files)
 }
@@ -11168,16 +11407,31 @@ fn parse_default_gateway(route_output: &str) -> Option<String> {
     })
 }
 
-fn observed_default_gateway() -> Option<String> {
+/// What `ip -4 route show default` prints, when it answered (exit 0); None when it gave no answer:
+/// it could not run, failed, or was killed (FINDINGS A-271).
+fn default_route_output() -> Option<String> {
     let mut cmd = Command::new("ip");
     cmd.arg("-4").arg("route").arg("show").arg("default");
-    run_cmd_output(cmd, "ip route show default")
-        .ok()
-        .and_then(|out| parse_default_gateway(&out))
+    run_cmd_output(cmd, "ip route show default").ok()
 }
 
-fn default_route_via(gateway_ip: &str) -> bool {
-    observed_default_gateway().is_some_and(|observed| observed == gateway_ip)
+fn observed_default_gateway() -> Option<String> {
+    default_route_output().and_then(|out| parse_default_gateway(&out))
+}
+
+/// Whether the default route goes via `gateway_ip`, as `ip route` answers (FINDINGS A-271): no when
+/// it names another gateway or none, no answer when ip gave none. Before, that read as a drifted
+/// route, and the worker's watchdog warned and replaced a route that may have been right.
+fn default_route_via(gateway_ip: &str) -> CheckAnswer {
+    default_route_answer(default_route_output().as_deref(), gateway_ip)
+}
+
+fn default_route_answer(route_output: Option<&str>, gateway_ip: &str) -> CheckAnswer {
+    match route_output.map(parse_default_gateway) {
+        Some(Some(observed)) if observed == gateway_ip => CheckAnswer::Yes,
+        Some(_) => CheckAnswer::No,
+        None => CheckAnswer::NoAnswer,
+    }
 }
 
 /// Is motherbee's own egress path the one the operator declared?
@@ -15106,11 +15360,58 @@ fn json_u64(payload: &serde_json::Value, camel_key: &str, snake_key: &str) -> u6
         .unwrap_or(0)
 }
 
+/// Why a folder's status was not read (FINDINGS A-271).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FolderStatusError {
+    /// Syncthing answered, and what it answered is no status: an error status (a folder it does
+    /// not have, a key it refuses), a payload that is not one; or no API key to ask with. It says
+    /// the folder is not healthy, as before.
+    Broken(String),
+    /// Syncthing gave no answer: curl could not run, was killed, or got no HTTP answer (no
+    /// connection, a timeout, a reset). It says nothing of the folder.
+    NoAnswer(String),
+}
+
+impl std::fmt::Display for FolderStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FolderStatusError::Broken(err) | FolderStatusError::NoAnswer(err) => f.write_str(err),
+        }
+    }
+}
+
+impl std::error::Error for FolderStatusError {}
+
+/// How a curl call to Syncthing's REST API ended (FINDINGS A-271): Syncthing's body on exit 0,
+/// Syncthing's error status on exit 22 (curl's `-f`), and no answer on any other end: curl could
+/// not run, was killed, or got no HTTP answer at all (no connection, a timeout, a reset). Only the
+/// first two are Syncthing's word.
+fn syncthing_rest_reply(
+    output: std::io::Result<std::process::Output>,
+    label: &str,
+) -> Result<String, FolderStatusError> {
+    let output = output
+        .map_err(|err| FolderStatusError::NoAnswer(format!("{label}: curl did not run: {err}")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&output.stdout).to_string()),
+        Some(22) => Err(FolderStatusError::Broken(format!(
+            "{label}: {}",
+            curl_failure_reason(Some(22), &stderr)
+        ))),
+        code => Err(FolderStatusError::NoAnswer(format!(
+            "{label}: no answer, {}",
+            curl_failure_reason(code, &stderr)
+        ))),
+    }
+}
+
 fn syncthing_folder_status(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
-) -> Result<SyncthingFolderStatus, OrchestratorError> {
-    let api_key = syncthing_api_key(sync)?;
+) -> Result<SyncthingFolderStatus, FolderStatusError> {
+    let api_key =
+        syncthing_api_key(sync).map_err(|err| FolderStatusError::Broken(err.to_string()))?;
     let endpoint = format!(
         "http://127.0.0.1:{}/rest/db/status?folder={}",
         sync.sync_api_port, folder_id
@@ -15122,9 +15423,25 @@ fn syncthing_folder_status(
         .arg("-H")
         .arg(format!("X-API-Key: {}", api_key))
         .arg(&endpoint);
-    let out = run_cmd_output(cmd, &format!("syncthing db status folder={folder_id}"))?;
-    let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
-        format!("invalid syncthing db/status payload for folder '{folder_id}': {err}")
+    folder_status_from_reply(
+        syncthing_rest_reply(
+            cmd.output(),
+            &format!("syncthing db status folder={folder_id}"),
+        ),
+        folder_id,
+    )
+}
+
+/// A folder's status from Syncthing's reply (`syncthing_rest_reply`): a body that is no status is
+/// Syncthing's answer too, a broken one.
+fn folder_status_from_reply(
+    reply: Result<String, FolderStatusError>,
+    folder_id: &str,
+) -> Result<SyncthingFolderStatus, FolderStatusError> {
+    let payload: serde_json::Value = serde_json::from_str(&reply?).map_err(|err| {
+        FolderStatusError::Broken(format!(
+            "invalid syncthing db/status payload for folder '{folder_id}': {err}"
+        ))
     })?;
     Ok(syncthing_folder_status_from_payload(&payload))
 }
@@ -15171,10 +15488,13 @@ fn syncthing_folder_status_from_payload(payload: &serde_json::Value) -> Syncthin
 /// row. A join's bootstrap fills a new spoke's dist folders before its peer is linked, and before
 /// the source's index arrives a revert deletes them; with the index in, the copies that match it
 /// stop counting as local changes, and only a real divergence is left to revert.
+///
+/// A status Syncthing gave no answer for is `FolderStatusError::NoAnswer` (FINDINGS A-271): the
+/// watchdog restarts nothing on it.
 fn check_syncthing_folder(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
-) -> Result<bool, OrchestratorError> {
+) -> Result<bool, FolderStatusError> {
     let status = syncthing_folder_status(sync, folder_id)?;
     if status.receive_only_total_items == 0 {
         receive_only_holds().forget(folder_id);
@@ -18723,7 +19043,9 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
         );
         systemd_stop(SYNCTHING_SERVICE_NAME)?;
     }
-    if systemd_unit_exists(SYNCTHING_SERVICE_NAME) {
+    // FINDINGS A-271: only systemctl's "no such unit" skips the disable. One with no answer
+    // disables it too: a disable that finds no unit fails, and that is only a warning.
+    if systemd_unit_exists(SYNCTHING_SERVICE_NAME) != CheckAnswer::No {
         if let Err(err) = systemd_disable(SYNCTHING_SERVICE_NAME) {
             tracing::warn!(
                 service = SYNCTHING_SERVICE_NAME,
@@ -18742,6 +19064,50 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
         run_cmd(daemon_reload, "systemctl daemon-reload")?;
     }
     Ok(())
+}
+
+/// The Syncthing check's answer for one folder, logged (FINDINGS A-271): healthy, not healthy by
+/// Syncthing's answer (a status that says so, or one it could not give), or no answer, which says
+/// nothing of the folder. Before, a curl that was killed or failed read as a folder that was not
+/// healthy, and the watchdog restarted Syncthing.
+fn syncthing_folder_answer(folder: &str, check: Result<bool, FolderStatusError>) -> CheckAnswer {
+    match check {
+        Ok(true) => CheckAnswer::Yes,
+        Ok(false) => {
+            tracing::warn!(
+                folder,
+                "syncthing folder unhealthy; scheduling runtime reconcile"
+            );
+            CheckAnswer::No
+        }
+        Err(FolderStatusError::Broken(err)) => {
+            tracing::warn!(
+                folder,
+                error = %err,
+                "failed to verify syncthing folder health; scheduling runtime reconcile"
+            );
+            CheckAnswer::No
+        }
+        Err(FolderStatusError::NoAnswer(err)) => {
+            tracing::debug!(
+                folder,
+                error = %err,
+                "Syncthing gave no answer for the folder's status; nothing restarted"
+            );
+            CheckAnswer::NoAnswer
+        }
+    }
+}
+
+/// Whether the Syncthing check restarts Syncthing: when it does not run, when its API refuses
+/// connections, or when Syncthing answers that a folder is not healthy. A folder it gives no answer
+/// for restarts nothing (FINDINGS A-271): the next tick asks again.
+fn syncthing_watchdog_restarts(
+    service_active: bool,
+    api_healthy: bool,
+    folders: CheckAnswer,
+) -> bool {
+    !(service_active && api_healthy) || folders == CheckAnswer::No
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
@@ -18807,83 +19173,47 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     }
     let service_active = activity == ServiceActivity::Active;
     let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
-    let mut folders_healthy = true;
+    // FINDINGS A-271: what Syncthing answers for each folder; one it gives no answer for says
+    // nothing of the folder, and a run of them is reported.
+    let mut folders = CheckAnswer::Yes;
     if service_active && api_healthy {
+        let mut folder_ids = Vec::new();
         if desired_blob.enabled
             && desired_blob.sync_enabled
             && blob_sync_tool_is_syncthing(&desired_blob)
         {
-            match check_syncthing_folder(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
-                Ok(true) => {}
-                Ok(false) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_BLOB_ID,
-                        "syncthing folder unhealthy; scheduling runtime reconcile"
-                    );
-                }
-                Err(err) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_BLOB_ID,
-                        error = %err,
-                        "failed to verify syncthing folder health; scheduling runtime reconcile"
-                    );
-                }
-            }
+            folder_ids.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
         }
         if desired_blob.public_sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
-            match check_syncthing_folder(&desired_sync, SYNCTHING_FOLDER_BLOB_PUBLIC_ID) {
-                Ok(true) => {}
-                Ok(false) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
-                        "syncthing public blob folder unhealthy; scheduling runtime reconcile"
-                    );
-                }
-                Err(err) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
-                        error = %err,
-                        "failed to verify public blob folder health; scheduling runtime reconcile"
-                    );
-                }
-            }
+            folder_ids.push(SYNCTHING_FOLDER_BLOB_PUBLIC_ID.to_string());
         }
         if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
-            for folder in dist_sync_folders_for_hive(
-                &desired_dist,
-                &desired_blob.path,
-                state.role,
-                state.is_motherbee,
-            ) {
-                match check_syncthing_folder(&desired_sync, &folder.id) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        folders_healthy = false;
-                        tracing::warn!(
-                            folder = %folder.id,
-                            "syncthing folder unhealthy; scheduling runtime reconcile"
-                        );
-                    }
-                    Err(err) => {
-                        folders_healthy = false;
-                        tracing::warn!(
-                            folder = %folder.id,
-                            error = %err,
-                            "failed to verify syncthing folder health; scheduling runtime reconcile"
-                        );
-                    }
-                }
-            }
+            folder_ids.extend(
+                dist_sync_folders_for_hive(
+                    &desired_dist,
+                    &desired_blob.path,
+                    state.role,
+                    state.is_motherbee,
+                )
+                .into_iter()
+                .map(|folder| folder.id),
+            );
+        }
+        for folder in &folder_ids {
+            let answer =
+                syncthing_folder_answer(folder, check_syncthing_folder(&desired_sync, folder));
+            state.note_check_answer(
+                &format!("syncthing db status folder={folder}"),
+                answer != CheckAnswer::NoAnswer,
+                WATCHDOG_UNANSWERED_REPORT_CHECKS,
+            );
+            folders = folders.and(answer);
         }
     }
     if service_active && api_healthy {
         report_blob_folder_errors(&state.hive_id, &desired_sync, &desired_blob);
     }
-    if service_active && api_healthy && folders_healthy {
+    if !syncthing_watchdog_restarts(service_active, api_healthy, folders) {
         return Ok(());
     }
     // A join that started during this tick's checks owns Syncthing by now (FINDINGS A-194).
@@ -18895,7 +19225,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         service = SYNCTHING_SERVICE_NAME,
         service_active = service_active,
         api_healthy = api_healthy,
-        folders_healthy = folders_healthy,
+        folders_healthy = folders != CheckAnswer::No,
         "syncthing unhealthy; restarting"
     );
     // FINDINGS A-189: on the installed binary while the vendor still syncs.
@@ -18980,8 +19310,9 @@ fn managed_node_inventory_with_root(
             let state_path = node_entry.path().join("state.json");
             let config_exists = managed && config_path.is_file();
             let state_exists = managed && state_path.is_file();
-            let unit_active = systemd_unit_is_active(node_unit.unit()).unwrap_or(false);
-            let unit_failed = systemd_unit_is_failed(node_unit.unit()).unwrap_or(false);
+            // FINDINGS A-271: a unit systemctl gives no answer for is listed UNKNOWN.
+            let unit_activity = (state.unit_checks.activity)(node_unit.unit());
+            let unit_failed = (state.unit_checks.failed)(node_unit.unit());
             let inventory_visible = node_seen_by_router(state, &node_name);
 
             let mut config_valid = false;
@@ -19031,7 +19362,7 @@ fn managed_node_inventory_with_root(
 
             let lifecycle_state = node_lifecycle_state(
                 &node_unit,
-                unit_active,
+                unit_activity,
                 unit_failed,
                 inventory_visible,
                 config_exists || state_exists,
@@ -20143,6 +20474,23 @@ async fn local_runtime_snapshot(
     }
 }
 
+/// Whether a node uses its runtime, for the runtime's `usage` (`running_nodes`), and as what: a node
+/// the router sees whose unit runs (RUNNING), or whose unit systemctl gives no answer for
+/// (UNKNOWN, FINDINGS A-271). SY.admin's `remove_runtime_version` refuses a version while a node
+/// is listed, so a check with no answer never reads as "not in use"; asked again, it answers. The
+/// router is asked only for a unit that may run.
+fn runtime_usage_lifecycle(
+    unit: ServiceActivity,
+    visible_in_router: impl FnOnce() -> bool,
+) -> Option<&'static str> {
+    let lifecycle = match unit {
+        ServiceActivity::Active => "RUNNING",
+        ServiceActivity::Unknown => "UNKNOWN",
+        ServiceActivity::Inactive => return None,
+    };
+    visible_in_router().then_some(lifecycle)
+}
+
 fn local_runtime_usage_summary(
     state: &OrchestratorState,
     runtime: &str,
@@ -20207,21 +20555,13 @@ fn local_runtime_usage_summary(
             }
 
             let unit = unit_from_node_name(&node_name);
-            let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
-            let lifecycle = if unit_active {
-                if local_inventory_has_node(state, &node_name) {
-                    "RUNNING"
-                } else {
-                    "STARTING"
-                }
-            } else if systemd_unit_is_failed(&unit).unwrap_or(false) {
-                "FAILED"
-            } else {
-                "STOPPED"
-            };
-            if lifecycle != "RUNNING" {
+            let Some(lifecycle) =
+                runtime_usage_lifecycle((state.unit_checks.activity)(&unit), || {
+                    local_inventory_has_node(state, &node_name)
+                })
+            else {
                 continue;
-            }
+            };
 
             let hive = node_name
                 .rsplit_once('@')
@@ -24147,36 +24487,30 @@ fn local_node_unit(state: &OrchestratorState, node_name: &str) -> Option<NodeUni
 
 /// A node's lifecycle from its unit and the router's LSA. A core unit of this hive's role that is
 /// not running is STOPPED; a managed node that is not running is STOPPED only while it has a
-/// config or a state, else UNKNOWN.
+/// config or a state, else UNKNOWN. A unit systemctl gives no answer for, whether it runs or, not
+/// running, whether it failed, is UNKNOWN too (FINDINGS A-271): never STOPPED for a check that
+/// said nothing.
 fn node_lifecycle_state(
     node_unit: &NodeUnit,
-    unit_active: bool,
-    unit_failed: bool,
+    unit: ServiceActivity,
+    unit_failed: CheckAnswer,
     visible_in_router: bool,
     managed_files_exist: bool,
 ) -> &'static str {
-    if unit_active {
-        if visible_in_router {
-            "RUNNING"
-        } else {
-            "STARTING"
+    match (unit, unit_failed) {
+        (ServiceActivity::Active, _) if visible_in_router => "RUNNING",
+        (ServiceActivity::Active, _) => "STARTING",
+        (ServiceActivity::Unknown, _) | (ServiceActivity::Inactive, CheckAnswer::NoAnswer) => {
+            "UNKNOWN"
         }
-    } else if unit_failed {
-        "FAILED"
-    } else if !node_unit.is_managed() || managed_files_exist {
-        "STOPPED"
-    } else {
-        "UNKNOWN"
+        (ServiceActivity::Inactive, CheckAnswer::Yes) => "FAILED",
+        (ServiceActivity::Inactive, CheckAnswer::No)
+            if !node_unit.is_managed() || managed_files_exist =>
+        {
+            "STOPPED"
+        }
+        (ServiceActivity::Inactive, CheckAnswer::No) => "UNKNOWN",
     }
-}
-
-fn systemd_unit_is_active(unit: &str) -> Result<bool, OrchestratorError> {
-    let status = Command::new("systemctl")
-        .arg("is-active")
-        .arg("--quiet")
-        .arg(unit)
-        .status()?;
-    Ok(status.success())
 }
 
 fn resolve_runtime_version(
@@ -26530,15 +26864,6 @@ fn local_inventory_has_node(state: &OrchestratorState, expected_node_name: &str)
     })
 }
 
-fn systemd_unit_is_failed(unit: &str) -> Result<bool, OrchestratorError> {
-    let status = Command::new("systemctl")
-        .arg("is-failed")
-        .arg("--quiet")
-        .arg(unit)
-        .status()?;
-    Ok(status.success())
-}
-
 fn epoch_ms_to_iso_utc(epoch_ms: u64) -> Option<String> {
     let secs = (epoch_ms / 1000) as i64;
     let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
@@ -26621,8 +26946,8 @@ struct LocalNodeView {
     state_path: PathBuf,
     config_exists: bool,
     state_exists: bool,
-    unit_active: bool,
-    unit_failed: bool,
+    unit_activity: ServiceActivity,
+    unit_failed: CheckAnswer,
     inventory_visible: bool,
 }
 
@@ -26630,19 +26955,32 @@ impl LocalNodeView {
     fn lifecycle_state(&self) -> &'static str {
         node_lifecycle_state(
             &self.unit,
-            self.unit_active,
+            self.unit_activity,
             self.unit_failed,
             self.inventory_visible,
             self.config_exists || self.state_exists,
         )
+    }
+
+    /// Nothing of a managed node is here: no config or state, systemctl answers that its unit
+    /// neither runs nor failed, and the router does not see it. A check with no answer is never
+    /// "nothing" (FINDINGS A-271): such a node reads UNKNOWN, not NODE_NOT_FOUND.
+    fn managed_node_gone(&self) -> bool {
+        self.unit.is_managed()
+            && !self.config_exists
+            && !self.state_exists
+            && self.unit_activity == ServiceActivity::Inactive
+            && self.unit_failed == CheckAnswer::No
+            && !self.inventory_visible
     }
 }
 
 /// `node_name`, a node of this hive, as this hive knows it. `get_node_status_flow` and
 /// `node_help_flow` decide alike whether a node is here: a core node of this hive's role even
 /// stopped, a managed one only while something of it is (its config or state, its unit running or
-/// failed, the router seeing it). Otherwise the `Err` is the answer: NODE_NOT_FOUND, or
-/// INVALID_REQUEST for a name without paths.
+/// failed, the router seeing it), or while systemctl does not answer for its unit
+/// (`managed_node_gone`). Otherwise the `Err` is the answer: NODE_NOT_FOUND, or INVALID_REQUEST for
+/// a name without paths.
 fn local_node_view(
     state: &OrchestratorState,
     node_name: &str,
@@ -26667,20 +27005,14 @@ fn local_node_view(
     let view = LocalNodeView {
         config_exists: managed && config_path.exists(),
         state_exists: managed && state_path.exists(),
-        unit_active: systemd_unit_is_active(unit.unit()).unwrap_or(false),
-        unit_failed: systemd_unit_is_failed(unit.unit()).unwrap_or(false),
+        unit_activity: (state.unit_checks.activity)(unit.unit()),
+        unit_failed: (state.unit_checks.failed)(unit.unit()),
         inventory_visible: node_seen_by_router(state, node_name),
         unit,
         config_path,
         state_path,
     };
-    if managed
-        && !view.config_exists
-        && !view.state_exists
-        && !view.unit_active
-        && !view.unit_failed
-        && !view.inventory_visible
-    {
+    if view.managed_node_gone() {
         return Err(not_found());
     }
     Ok(view)
@@ -26768,7 +27100,7 @@ async fn get_node_status_flow(
         state_path,
         config_exists,
         state_exists,
-        unit_active,
+        unit_activity,
         unit_failed,
         inventory_visible,
     } = match local_node_view(state, &node_name, &target_hive) {
@@ -26872,7 +27204,7 @@ async fn get_node_status_flow(
 
     let lifecycle_state = node_lifecycle_state(
         &node_unit,
-        unit_active,
+        unit_activity,
         unit_failed,
         inventory_visible,
         config_exists || state_exists,
@@ -27986,8 +28318,14 @@ async fn run_node_flow(
         }
     };
 
-    match systemd_unit_is_active(&unit) {
-        Ok(true) => {
+    // FINDINGS A-271: asked again while systemctl gives no answer. A unit it still gives none for
+    // is not launched over, and the spawn is undone as a failed launch is (SO-03): nothing of the
+    // node stays, so a retry starts clean.
+    match state
+        .unit_activity_asked_again(&unit, NODE_ACTION_CHECK_LIMIT)
+        .await
+    {
+        ServiceActivity::Active => {
             return serde_json::json!({
                 "status": "ok",
                 "state": "already_running",
@@ -28002,17 +28340,31 @@ async fn run_node_flow(
                 "config": node_config,
             });
         }
-        Ok(false) => {}
-        Err(err) => {
+        ServiceActivity::Inactive => {}
+        ServiceActivity::Unknown => {
+            let _ = std::fs::remove_file(&config_path);
+            let identity_rollback = rollback_node_identity_after_failed_spawn(
+                state,
+                payload,
+                &identity_primary_hive_id,
+                &node_name,
+                preexisting_ilk_id.as_deref(),
+                &identity_register,
+            )
+            .await;
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("unable to check unit activity: {err}"),
+                "message": format!(
+                    "{UNIT_UNANSWERED}; the node was not launched, and its config and identity \
+                     were undone"
+                ),
                 "target": target_hive,
                 "node_name": node_name,
                 "unit": unit,
                 "identity": identity,
                 "config": node_config,
+                "identity_rollback": identity_rollback,
             });
         }
     }
@@ -28396,6 +28748,28 @@ fn record_planned_launch(
     })
 }
 
+/// Whether start_node finds the node running, by systemctl's answer for its unit, asked again, and
+/// the router's view (FINDINGS A-271): `Some(true)` when its unit runs or the router sees it,
+/// `Some(false)` when systemctl answers that it does not run and the router does not see it. `None`
+/// when systemctl gave no answer and the router does not see it: nothing is started or written.
+fn start_node_finds_running(unit: ServiceActivity, visible_in_router: bool) -> Option<bool> {
+    match unit {
+        _ if visible_in_router => Some(true),
+        ServiceActivity::Active => Some(true),
+        ServiceActivity::Inactive => Some(false),
+        ServiceActivity::Unknown => None,
+    }
+}
+
+/// Whether restart_node takes the command for a running unit (`managed_node_restart_command`): but
+/// when systemctl answers that the unit does not run. A unit it gives no answer for takes it too
+/// (FINDINGS A-271): that command also starts a stopped unit, where the start command fails on a
+/// running one (`systemd-run` refuses a loaded unit's name), so the restart does what was asked
+/// either way.
+fn restart_takes_running_command(unit: ServiceActivity) -> bool {
+    unit != ServiceActivity::Inactive
+}
+
 async fn start_or_restart_node_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -28481,24 +28855,43 @@ async fn start_or_restart_node_flow(
         Ok(value) => value,
         Err(payload) => return payload,
     };
-    let unit_active = systemd_unit_is_active(&plan.unit).unwrap_or(false);
+    // FINDINGS A-271: asked again while systemctl gives no answer.
+    let unit_activity = state
+        .unit_activity_asked_again(&plan.unit, NODE_ACTION_CHECK_LIMIT)
+        .await;
     let visible_in_router = local_inventory_has_node(state, &plan.node.node_name);
 
-    if !restart && (unit_active || visible_in_router) {
-        // Asked to run: the relaunches keep it running from now on.
-        set_node_relaunch_on_boot(state, &plan.node.node_name, true);
-        return serde_json::json!({
-            "status": "ok",
-            "state": "already_running",
-            "target": target_hive,
-            "hive": target_hive,
-            "node_name": plan.node.node_name,
-            "runtime": plan.runtime_key,
-            "version": plan.resolved_version,
-            "requested_version": plan.requested_version.clone(),
-            "unit": plan.unit,
-            "visible_in_router": visible_in_router,
-        });
+    if !restart {
+        match start_node_finds_running(unit_activity, visible_in_router) {
+            Some(true) => {
+                // Asked to run: the relaunches keep it running from now on.
+                set_node_relaunch_on_boot(state, &plan.node.node_name, true);
+                return serde_json::json!({
+                    "status": "ok",
+                    "state": "already_running",
+                    "target": target_hive,
+                    "hive": target_hive,
+                    "node_name": plan.node.node_name,
+                    "runtime": plan.runtime_key,
+                    "version": plan.resolved_version,
+                    "requested_version": plan.requested_version.clone(),
+                    "unit": plan.unit,
+                    "visible_in_router": visible_in_router,
+                });
+            }
+            Some(false) => {}
+            None => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SERVICE_FAILED",
+                    "message": format!("{UNIT_UNANSWERED}; nothing was started or written"),
+                    "target": target_hive,
+                    "node_name": plan.node.node_name,
+                    "unit": plan.unit,
+                    "visible_in_router": visible_in_router,
+                });
+            }
+        }
     }
     // Before anything is stopped or started: a restart refused here leaves the node running.
     if let Some(refusal) = tenant_gate_refusal(
@@ -28513,7 +28906,7 @@ async fn start_or_restart_node_flow(
     }
 
     let cmd = if restart {
-        managed_node_restart_command(state, &plan, unit_active)
+        managed_node_restart_command(state, &plan, restart_takes_running_command(unit_activity))
     } else {
         managed_node_start_command(state, &plan)
     };
@@ -28703,8 +29096,13 @@ async fn kill_node_flow(
     if let Some(refusal) = node_requirements_refusal(state, node_name_ref, payload) {
         return refusal;
     }
-    let unit_was_active = match systemd_unit_is_active(&unit) {
-        Ok(false) => {
+    // FINDINGS A-271: asked again while systemctl gives no answer. A unit it still gives none for is
+    // neither stopped nor purged, nor answered "not found".
+    let unit_was_active = match state
+        .unit_activity_asked_again(&unit, NODE_ACTION_CHECK_LIMIT)
+        .await
+    {
+        ServiceActivity::Inactive => {
             // A stop of a node that is down right now still lasts. "Down" includes a node waiting
             // for systemd's next automatic restart (a crash loop): the stop cancels that too.
             if !purge_instance
@@ -28749,12 +29147,12 @@ async fn kill_node_flow(
             }
             false
         }
-        Ok(true) => true,
-        Err(err) => {
+        ServiceActivity::Active => true,
+        ServiceActivity::Unknown => {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
-                "message": format!("unable to check unit activity: {err}"),
+                "message": format!("{UNIT_UNANSWERED}; nothing was stopped or removed"),
                 "target": target_hive,
                 "node_name": validated_node_name,
                 "unit": unit,
@@ -28984,6 +29382,20 @@ fn purge_node_uuid_file(node_name: &str) -> serde_json::Value {
     }
 }
 
+/// Why remove_node_instance refuses a node, by systemctl's answer for its unit, asked again, and
+/// the router's view: NODE_INSTANCE_RUNNING while its unit runs or the router sees it, and
+/// SERVICE_FAILED when systemctl gave no answer (FINDINGS A-271). Before, that read as "not
+/// running", and the removal stopped and purged a node that might run. `None` only when systemctl
+/// answers that the unit does not run and the router does not see it.
+fn remove_instance_refusal(unit: ServiceActivity, visible_in_router: bool) -> Option<&'static str> {
+    match unit {
+        _ if visible_in_router => Some("NODE_INSTANCE_RUNNING"),
+        ServiceActivity::Active => Some("NODE_INSTANCE_RUNNING"),
+        ServiceActivity::Unknown => Some("SERVICE_FAILED"),
+        ServiceActivity::Inactive => None,
+    }
+}
+
 async fn remove_node_instance_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -29080,13 +29492,21 @@ async fn remove_node_instance_flow(
     }
 
     let unit = unit_from_node_name(&node_name);
-    let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+    // FINDINGS A-271: asked again while systemctl gives no answer.
+    let unit_activity = state
+        .unit_activity_asked_again(&unit, NODE_ACTION_CHECK_LIMIT)
+        .await;
     let inventory_visible = local_inventory_has_node(state, &node_name);
-    if unit_active || inventory_visible {
+    if let Some(error_code) = remove_instance_refusal(unit_activity, inventory_visible) {
+        let message = if error_code == "SERVICE_FAILED" {
+            format!("{UNIT_UNANSWERED}; nothing was stopped or removed")
+        } else {
+            "node instance is still running/visible; stop it before removing".to_string()
+        };
         return serde_json::json!({
             "status": "error",
-            "error_code": "NODE_INSTANCE_RUNNING",
-            "message": "node instance is still running/visible; stop it before removing",
+            "error_code": error_code,
+            "message": message,
             "target": target_hive,
             "node_name": node_name,
             "unit": unit,
@@ -35834,22 +36254,89 @@ async fn ask_again_while_unanswered(
     activity
 }
 
-fn systemd_unit_exists(service: &str) -> bool {
-    Command::new("systemctl")
-        .arg("show")
-        .arg(format!("{service}.service"))
-        .arg("--property=LoadState")
-        .arg("--value")
-        .output()
+/// How long a node action (run, start, restart, kill, remove) asks systemctl again for its unit
+/// when a check gives no answer (FINDINGS A-271): SERVICE_CHECK_ASKS_AGAIN asks fit in it.
+const NODE_ACTION_CHECK_LIMIT: Duration = Duration::from_secs(1);
+
+/// What a node action answers, `SERVICE_FAILED`, when systemctl gave no answer for the node's unit,
+/// asked again (FINDINGS A-271): the action did nothing on it.
+const UNIT_UNANSWERED: &str = "systemctl did not answer whether the node's unit runs, asked again";
+
+/// A check's answer: yes, no, or none (FINDINGS A-271). A check gives none when its command could
+/// not run, failed otherwise, or was killed, as systemd's stop of this orchestrator kills the one
+/// in flight: that says nothing either way, and no caller acts on it as a no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckAnswer {
+    Yes,
+    No,
+    NoAnswer,
+}
+
+impl CheckAnswer {
+    /// Both answers at once (Kleene's and): a no is the answer, else no answer, else yes.
+    fn and(self, other: CheckAnswer) -> CheckAnswer {
+        match (self, other) {
+            (CheckAnswer::No, _) | (_, CheckAnswer::No) => CheckAnswer::No,
+            (CheckAnswer::NoAnswer, _) | (_, CheckAnswer::NoAnswer) => CheckAnswer::NoAnswer,
+            (CheckAnswer::Yes, CheckAnswer::Yes) => CheckAnswer::Yes,
+        }
+    }
+}
+
+/// What a `systemctl show --value` printed, when it answered: exit 0 and a value (FINDINGS A-271).
+/// `systemctl show` answers 0 for a unit systemd does not have too (LoadState `not-found`,
+/// ActiveState `inactive`), so any other end, or no value, is no answer.
+fn systemctl_show_value(output: std::io::Result<std::process::Output>) -> Option<String> {
+    let output = output
         .ok()
-        .map(|output| {
-            if !output.status.success() {
-                return false;
-            }
-            let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            !state.is_empty() && state != "not-found"
-        })
-        .unwrap_or(false)
+        .filter(|output| output.status.code() == Some(0))?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether systemd has `unit` failed, its `ActiveState` (FINDINGS A-271). Before, `systemctl
+/// is-failed`'s other ends all read as "not failed", and that check exits 1 both for a unit that
+/// is not failed and for a check that failed.
+fn systemd_unit_failed(unit: &str) -> CheckAnswer {
+    unit_failed_answer(systemctl_show_value(
+        Command::new("systemctl")
+            .arg("show")
+            .arg(unit)
+            .arg("--property=ActiveState")
+            .arg("--value")
+            .output(),
+    ))
+}
+
+fn unit_failed_answer(active_state: Option<String>) -> CheckAnswer {
+    match active_state.as_deref() {
+        Some("failed") => CheckAnswer::Yes,
+        Some(_) => CheckAnswer::No,
+        None => CheckAnswer::NoAnswer,
+    }
+}
+
+/// Whether systemd has a unit for `service`, its `LoadState` (FINDINGS A-271): no only when
+/// systemctl answers `not-found`. Before, a `systemctl show` that failed or was killed read as "no
+/// such unit", and the core update skipped that service's restart, leaving it on its old binary
+/// while the update answered ok.
+fn systemd_unit_exists(service: &str) -> CheckAnswer {
+    unit_exists_answer(systemctl_show_value(
+        Command::new("systemctl")
+            .arg("show")
+            .arg(format!("{service}.service"))
+            .arg("--property=LoadState")
+            .arg("--value")
+            .output(),
+    ))
+}
+
+fn unit_exists_answer(load_state: Option<String>) -> CheckAnswer {
+    match load_state.as_deref() {
+        Some("not-found") => CheckAnswer::No,
+        Some(_) => CheckAnswer::Yes,
+        None => CheckAnswer::NoAnswer,
+    }
 }
 
 fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
@@ -35869,7 +36356,10 @@ fn clear_stale_transient_unit(unit: &str) {
     // `<unit>.service.service`, which is always "not-found", so the guard returns early and the
     // cleanup silently never runs.
     let unit = unit.strip_suffix(".service").unwrap_or(unit);
-    if !systemd_unit_exists(unit) {
+    // FINDINGS A-271: only systemctl's "no such unit" skips the cleanup. A check with no answer
+    // cleans up all the same: each step is best-effort, and one on a unit that is not there changes
+    // nothing.
+    if systemd_unit_exists(unit) == CheckAnswer::No {
         return;
     }
     for (verb, label) in [
@@ -37296,12 +37786,15 @@ mod tests {
 
     /// A host of temporary roots for a core update: `bin/` stands for `/usr/bin`, `units/` for
     /// `/etc/systemd/system`. systemd's calls are recorded, each with whether the node's binary
-    /// was still there when it was made, and `is-active` answers for the nodes `active` names.
+    /// was still there when it was made; `is-active` answers for the nodes `active` names, and no
+    /// answer for those `unanswered` names, and a stop fails for those `stop_fails` names.
     struct TestCoreHost {
         root: PathBuf,
         host: CoreHost,
         calls: Arc<StdMutex<Vec<String>>>,
         active: Arc<StdMutex<HashSet<String>>>,
+        unanswered: Arc<StdMutex<HashSet<String>>>,
+        stop_fails: Arc<StdMutex<HashSet<String>>>,
     }
 
     impl TestCoreHost {
@@ -37317,32 +37810,58 @@ mod tests {
             fs::create_dir_all(&unit_dir).expect("unit dir");
             let calls = Arc::new(StdMutex::new(Vec::new()));
             let active = Arc::new(StdMutex::new(HashSet::new()));
+            let unanswered = Arc::new(StdMutex::new(HashSet::new()));
+            let stop_fails = Arc::new(StdMutex::new(HashSet::new()));
+            let record = {
+                let calls = Arc::clone(&calls);
+                let bin_dir = bin_dir.clone();
+                move |args: &[&str]| {
+                    let node = args.last().copied().unwrap_or_default();
+                    let binary = if bin_dir.join(node).exists() {
+                        "binary"
+                    } else {
+                        "no binary"
+                    };
+                    calls
+                        .lock()
+                        .expect("calls")
+                        .push(format!("{} ({binary})", args.join(" ")));
+                }
+            };
             let host = CoreHost {
                 bin_dir: bin_dir.clone(),
                 unit_dir,
                 systemctl: {
-                    let calls = Arc::clone(&calls);
+                    let record = record.clone();
                     let active = Arc::clone(&active);
+                    let stop_fails = Arc::clone(&stop_fails);
                     Box::new(move |args: &[&str]| {
+                        record(args);
                         let node = args.last().copied().unwrap_or_default();
-                        let binary = if bin_dir.join(node).exists() {
-                            "binary"
-                        } else {
-                            "no binary"
-                        };
-                        calls
-                            .lock()
-                            .expect("calls")
-                            .push(format!("{} ({binary})", args.join(" ")));
                         let mut active = active.lock().expect("active");
                         match args.first().copied() {
+                            Some("stop") if stop_fails.lock().expect("fails").contains(node) => {
+                                Err("stop failed".into())
+                            }
                             Some("stop") => {
                                 active.remove(node);
                                 Ok(())
                             }
-                            Some("is-active") if active.contains(node) => Ok(()),
-                            Some("is-active") => Err("inactive".into()),
                             _ => Ok(()),
+                        }
+                    })
+                },
+                activity: {
+                    let active = Arc::clone(&active);
+                    let unanswered = Arc::clone(&unanswered);
+                    Box::new(move |node: &str| {
+                        record(&["is-active", "--quiet", node]);
+                        if unanswered.lock().expect("unanswered").contains(node) {
+                            ServiceActivity::Unknown
+                        } else if active.lock().expect("active").contains(node) {
+                            ServiceActivity::Active
+                        } else {
+                            ServiceActivity::Inactive
                         }
                     })
                 },
@@ -37352,6 +37871,8 @@ mod tests {
                 host,
                 calls,
                 active,
+                unanswered,
+                stop_fails,
             }
         }
 
@@ -39271,30 +39792,36 @@ mod tests {
     /// docs/control-path-hardening-v1.md §6: only a ruleset rendered from a complete input set
     /// replaces the saved one; an unchanged one is not loaded again while its table is there; with
     /// nothing rendered (an input failed, the configuration refused) the rules in force stay, and
-    /// the saved ones are loaded again only when the table is gone.
+    /// the saved ones are loaded again only when nft answers that the table is gone, never on a
+    /// check it did not answer (FINDINGS A-271).
     #[test]
     fn the_ingress_reconcile_never_narrows_a_working_table() {
+        use CheckAnswer::{No, NoAnswer, Yes};
         use IngressSshAction::{Apply, LoadSaved, Nothing};
         let (new, saved) = ("new ruleset", "saved ruleset");
-        for (rendered, saved_file, loaded, expected) in [
+        for (rendered, saved_file, table, expected) in [
             // A new or changed ruleset is applied, whether or not a table is loaded.
-            (Some(new), Some(saved), true, Apply),
-            (Some(new), Some(saved), false, Apply),
-            (Some(new), None, false, Apply),
-            (Some(new), None, true, Apply),
+            (Some(new), Some(saved), Yes, Apply),
+            (Some(new), Some(saved), No, Apply),
+            (Some(new), Some(saved), NoAnswer, Apply),
+            (Some(new), None, No, Apply),
+            (Some(new), None, Yes, Apply),
             // The rendered ruleset is the saved one: nothing while it is loaded, else load it.
-            (Some(saved), Some(saved), true, Nothing),
-            (Some(saved), Some(saved), false, LoadSaved),
+            (Some(saved), Some(saved), Yes, Nothing),
+            (Some(saved), Some(saved), No, LoadSaved),
+            (Some(saved), Some(saved), NoAnswer, Nothing),
             // Nothing rendered: keep what is loaded, load the saved one when the table is gone.
-            (None, Some(saved), true, Nothing),
-            (None, Some(saved), false, LoadSaved),
-            (None, None, false, Nothing),
-            (None, None, true, Nothing),
+            (None, Some(saved), Yes, Nothing),
+            (None, Some(saved), No, LoadSaved),
+            (None, Some(saved), NoAnswer, Nothing),
+            (None, None, No, Nothing),
+            (None, None, Yes, Nothing),
+            (None, None, NoAnswer, Nothing),
         ] {
             assert_eq!(
-                ingress_ssh_action(rendered, saved_file, loaded),
+                ingress_ssh_action(rendered, saved_file, table),
                 expected,
-                "rendered {rendered:?}, saved {saved_file:?}, loaded {loaded}"
+                "rendered {rendered:?}, saved {saved_file:?}, table {table:?}"
             );
         }
         // An input that fails is a warning: the rules in force stay; the configuration's own
@@ -50181,7 +50708,7 @@ blob:
             "async fn kill_node_flow(",
             &[
                 "node_requirements_refusal(",
-                "systemd_unit_is_active(",
+                "unit_activity_asked_again(",
                 "execute_on_hive(",
             ],
         );
@@ -52472,7 +52999,13 @@ blob:
             core_awaiting_update: StdMutex::new(None),
             vendor_awaiting_update: StdMutex::new(None),
             open_core_settle: StdMutex::new(None),
-            watchdog_unanswered: StdMutex::new(HashMap::new()),
+            unanswered_checks: StdMutex::new(HashMap::new()),
+            // As systemctl answers on a host without the unit: not running, not failed. Asking
+            // the test's own host would answer nothing where systemd does not run.
+            unit_checks: UnitChecks {
+                activity: |_| ServiceActivity::Inactive,
+                failed: |_| CheckAnswer::No,
+            },
             rpc: OnceLock::new(),
         }
     }
@@ -53211,6 +53744,16 @@ blob:
         assert_eq!(inventory[0]["launched_by"], "cloud");
         assert_eq!(inventory[0]["relaunch_on_boot"], false);
 
+        // FINDINGS A-271: a unit systemctl gives no answer for is listed UNKNOWN, never STOPPED.
+        let mut unanswered = state;
+        unanswered.unit_checks = UnitChecks {
+            activity: |_| ServiceActivity::Unknown,
+            failed: |_| CheckAnswer::NoAnswer,
+        };
+        let inventory = managed_node_inventory_with_root(&unanswered, &root)
+            .expect("managed inventory must load");
+        assert_eq!(inventory[0]["lifecycle_state"], "UNKNOWN");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -53260,29 +53803,54 @@ blob:
 
         let core = NodeUnit::Core("sy-storage".to_string());
         let managed = NodeUnit::Managed("fluxbee-node-AI.sales-motherbee".to_string());
+        use CheckAnswer::{No, NoAnswer, Yes};
+        use ServiceActivity::{Active, Inactive, Unknown};
         assert_eq!(
-            node_lifecycle_state(&core, true, false, true, false),
+            node_lifecycle_state(&core, Active, No, true, false),
             "RUNNING"
         );
         assert_eq!(
-            node_lifecycle_state(&core, true, false, false, false),
+            node_lifecycle_state(&core, Active, No, false, false),
             "STARTING"
         );
         assert_eq!(
-            node_lifecycle_state(&core, false, true, false, false),
+            node_lifecycle_state(&core, Inactive, Yes, false, false),
             "FAILED"
         );
         assert_eq!(
-            node_lifecycle_state(&core, false, false, false, false),
+            node_lifecycle_state(&core, Inactive, No, false, false),
             "STOPPED"
         );
         assert_eq!(
-            node_lifecycle_state(&managed, false, false, false, true),
+            node_lifecycle_state(&managed, Inactive, No, false, true),
             "STOPPED"
         );
         assert_eq!(
-            node_lifecycle_state(&managed, false, false, false, false),
+            node_lifecycle_state(&managed, Inactive, No, false, false),
             "UNKNOWN"
+        );
+        // FINDINGS A-271: a check systemctl did not answer is never STOPPED (nor FAILED): whether
+        // the unit runs, or, not running, whether it failed.
+        for node in [&core, &managed] {
+            for visible in [true, false] {
+                assert_eq!(
+                    node_lifecycle_state(node, Unknown, No, visible, true),
+                    "UNKNOWN"
+                );
+                assert_eq!(
+                    node_lifecycle_state(node, Unknown, Yes, visible, true),
+                    "UNKNOWN"
+                );
+                assert_eq!(
+                    node_lifecycle_state(node, Inactive, NoAnswer, visible, true),
+                    "UNKNOWN"
+                );
+            }
+        }
+        // A running unit's lifecycle does not wait on its failed check.
+        assert_eq!(
+            node_lifecycle_state(&core, Active, NoAnswer, true, false),
+            "RUNNING"
         );
     }
 
@@ -57905,6 +58473,536 @@ blob:
             note_service_answer(&mut unanswered, "sy-timer", Unknown),
             UnansweredChecks::Quiet,
             "and the count starts again"
+        );
+    }
+
+    /// A real child ending as `script` says, through `sh -c`.
+    fn child_ending_as(script: &str) -> std::io::Result<std::process::Output> {
+        Command::new("sh").arg("-c").arg(script).output()
+    }
+
+    /// FINDINGS A-271: `systemctl show --value` answers only by exit 0 with a value; the failed
+    /// check and the unit check read its value, and any other end (another exit, a kill, a show
+    /// that could not run) is no answer, never "not failed" or "no such unit". Real children.
+    #[test]
+    fn a_unit_check_answers_only_by_exit_0_with_a_value() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let failed =
+            |script: &str| unit_failed_answer(systemctl_show_value(child_ending_as(script)));
+        assert_eq!(failed("echo failed"), Yes);
+        assert_eq!(failed("echo active"), No);
+        assert_eq!(failed("echo inactive"), No);
+        assert_eq!(failed("echo activating"), No);
+        assert_eq!(failed("echo failed; exit 1"), NoAnswer);
+        assert_eq!(failed("exit 1"), NoAnswer);
+        assert_eq!(failed("exit 0"), NoAnswer, "an answer with no value");
+        assert_eq!(failed("kill -TERM $$"), NoAnswer);
+        assert_eq!(failed("kill -KILL $$"), NoAnswer);
+        assert_eq!(
+            unit_failed_answer(systemctl_show_value(
+                Command::new("/nonexistent/systemctl").output()
+            )),
+            NoAnswer
+        );
+
+        let exists =
+            |script: &str| unit_exists_answer(systemctl_show_value(child_ending_as(script)));
+        assert_eq!(exists("echo loaded"), Yes);
+        assert_eq!(exists("echo masked"), Yes);
+        assert_eq!(exists("echo not-found"), No);
+        assert_eq!(exists("echo not-found; exit 1"), NoAnswer);
+        assert_eq!(exists("exit 4"), NoAnswer);
+        assert_eq!(exists("kill -TERM $$"), NoAnswer);
+        assert_eq!(exists("kill -KILL $$"), NoAnswer);
+        assert_eq!(
+            unit_exists_answer(systemctl_show_value(
+                Command::new("/nonexistent/systemctl").output()
+            )),
+            NoAnswer
+        );
+    }
+
+    /// FINDINGS A-271: `nft list table` says loaded only by exit 0 and gone only by exit 1 with the
+    /// kernel's "no such table"; another error, another exit, a kill or an nft that could not run
+    /// is no answer. Real children.
+    #[test]
+    fn an_nft_table_check_answers_only_by_exit_0_or_no_such_table() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let table = |script: &str| nft_table_answer(child_ending_as(script));
+        assert_eq!(table("exit 0"), Yes);
+        assert_eq!(
+            table("echo 'Error: No such file or directory' >&2; exit 1"),
+            No
+        );
+        assert_eq!(
+            table(
+                "echo 'Error: No such file or directory; did you mean table fluxbee_egress in \
+                 family inet?' >&2; exit 1"
+            ),
+            No
+        );
+        assert_eq!(
+            table("echo 'Error: Could not process rule: Operation not permitted' >&2; exit 1"),
+            NoAnswer
+        );
+        assert_eq!(table("exit 1"), NoAnswer);
+        assert_eq!(
+            table("echo 'Error: No such file or directory' >&2; exit 2"),
+            NoAnswer
+        );
+        assert_eq!(table("kill -TERM $$"), NoAnswer);
+        assert_eq!(table("kill -KILL $$"), NoAnswer);
+        assert_eq!(
+            nft_table_answer(Command::new("/nonexistent/nft").output()),
+            NoAnswer
+        );
+    }
+
+    /// FINDINGS A-271: a folder's status is Syncthing's word only when curl got an HTTP answer: its
+    /// body (exit 0), or its error status (exit 22). A body that is no status is a broken answer;
+    /// any other end (no connection, a timeout, a kill, a curl that could not run) is no answer.
+    /// Real children.
+    #[test]
+    fn a_folder_status_is_syncthings_word_only_on_an_http_answer() {
+        let status = |script: &str| {
+            folder_status_from_reply(
+                syncthing_rest_reply(child_ending_as(script), "syncthing db status"),
+                "fluxbee-blob",
+            )
+        };
+        let healthy = status(r#"printf '{"state":"idle","needTotalItems":0}'"#).expect("a status");
+        assert!(healthy.is_healthy() && healthy.is_converged());
+        let unhealthy = status(r#"printf '{"state":"error","error":"folder path missing"}'"#)
+            .expect("a status");
+        assert!(!unhealthy.is_healthy());
+        for broken in [
+            "printf 'not json'",
+            "echo 'curl: (22) The requested URL returned error: 404' >&2; exit 22",
+        ] {
+            assert!(
+                matches!(status(broken), Err(FolderStatusError::Broken(_))),
+                "{broken}"
+            );
+        }
+        for unanswered in [
+            "echo 'curl: (7) Failed to connect' >&2; exit 7",
+            "echo 'curl: (28) Operation timed out' >&2; exit 28",
+            "exit 52",
+            "kill -TERM $$",
+            "kill -KILL $$",
+        ] {
+            assert!(
+                matches!(status(unanswered), Err(FolderStatusError::NoAnswer(_))),
+                "{unanswered}"
+            );
+        }
+        assert!(matches!(
+            folder_status_from_reply(
+                syncthing_rest_reply(Command::new("/nonexistent/curl").output(), "status"),
+                "fluxbee-blob"
+            ),
+            Err(FolderStatusError::NoAnswer(_))
+        ));
+    }
+
+    /// FINDINGS A-271: the Syncthing check restarts Syncthing on Syncthing's answers only: a folder
+    /// it gives no answer for restarts nothing, unless another folder's answer, or the service or
+    /// its API, says it must. Before, a killed or failed curl read as an unhealthy folder.
+    #[test]
+    fn the_syncthing_check_restarts_nothing_on_a_folder_with_no_answer() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let broken = || Err(FolderStatusError::Broken("404".into()));
+        let unanswered = || Err(FolderStatusError::NoAnswer("killed".into()));
+        assert_eq!(syncthing_folder_answer("f", Ok(true)), Yes);
+        assert_eq!(syncthing_folder_answer("f", Ok(false)), No);
+        assert_eq!(syncthing_folder_answer("f", broken()), No);
+        assert_eq!(syncthing_folder_answer("f", unanswered()), NoAnswer);
+        for (a, b, both) in [
+            (Yes, Yes, Yes),
+            (Yes, NoAnswer, NoAnswer),
+            (NoAnswer, Yes, NoAnswer),
+            (NoAnswer, No, No),
+            (No, NoAnswer, No),
+            (Yes, No, No),
+        ] {
+            assert_eq!(a.and(b), both, "{a:?} and {b:?}");
+        }
+        assert!(!syncthing_watchdog_restarts(true, true, Yes));
+        assert!(!syncthing_watchdog_restarts(true, true, NoAnswer));
+        assert!(syncthing_watchdog_restarts(true, true, No));
+        assert!(syncthing_watchdog_restarts(false, true, Yes));
+        assert!(syncthing_watchdog_restarts(true, false, NoAnswer));
+
+        // The watchdog decides by that before it restarts, and every folder goes through its
+        // answer; the sync probe still reads no answer as an error of the probe.
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        let watchdog = body("async fn watchdog_blob_sync(");
+        let decides = watchdog
+            .find("if !syncthing_watchdog_restarts(service_active, api_healthy, folders) {")
+            .expect("the decision");
+        assert!(
+            decides
+                < watchdog
+                    .rfind("ensure_blob_sync_runtime(")
+                    .expect("the restart")
+        );
+        assert_eq!(watchdog.matches("check_syncthing_folder(").count(), 1);
+        assert!(watchdog.contains("syncthing_folder_answer(folder, check_syncthing_folder("));
+        assert!(!watchdog.contains("folders_healthy = false"));
+    }
+
+    /// FINDINGS A-271: the egress re-applies its NAT at once only when nft answers that its table
+    /// is gone, and the ingress reconciles its SSH table at once on the same answer; a check with
+    /// no answer waits for the periodic pass. Before, a killed `nft list table` re-applied a
+    /// healthy table.
+    #[test]
+    fn the_nft_watchdogs_act_at_once_only_when_nft_says_the_table_is_gone() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        assert!(egress_nat_reapplies(No, false));
+        assert!(!egress_nat_reapplies(Yes, false));
+        assert!(!egress_nat_reapplies(NoAnswer, false));
+        assert!(
+            egress_nat_reapplies(NoAnswer, true),
+            "the periodic re-apply still runs"
+        );
+
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        let egress = body("fn watchdog_egress_reconcile(");
+        assert!(egress.contains("if egress_nat_reapplies(table, periodic) {"));
+        let warns = egress
+            .find("\"egress nft table missing on watchdog; re-applying NAT\"")
+            .expect("the warning");
+        let guard = egress
+            .find("if table == CheckAnswer::No {")
+            .expect("the guard");
+        assert!(guard < warns && !egress[guard..warns].contains('}'));
+        let ingress = body("fn watchdog_host_rules(");
+        assert!(ingress.contains(
+            "INGRESS_SSH_RULES_APPLIED.load(Ordering::Relaxed) && table == CheckAnswer::No"
+        ));
+        // After a load, a check with no answer is its own error, never "not present".
+        let apply = body("fn apply_nft_table(");
+        assert!(apply.contains("CheckAnswer::NoAnswer => {"));
+        assert_eq!(apply.matches("is not present afterwards").count(), 1);
+        // The reconcile leaves the watchdog's view as it was on a check with no answer.
+        let reconcile = body("fn reconcile_ingress_ssh(");
+        assert!(reconcile.contains("CheckAnswer::NoAnswer => {}"));
+    }
+
+    /// FINDINGS A-271: the worker's watchdog replaces its default route only when ip answers that it
+    /// goes elsewhere, or nowhere; an ip that gave no answer replaces nothing. Real children.
+    #[test]
+    fn the_worker_replaces_its_route_only_when_ip_says_it_drifted() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let route = |script: &str| {
+            let mut ip = Command::new("sh");
+            ip.arg("-c").arg(script);
+            default_route_answer(run_cmd_output(ip, "ip route").ok().as_deref(), "10.10.10.1")
+        };
+        assert_eq!(
+            route("echo 'default via 10.10.10.1 dev ens18 proto static'"),
+            Yes
+        );
+        assert_eq!(route("echo 'default via 192.168.8.1 dev ens18'"), No);
+        assert_eq!(route("true"), No, "no default route at all");
+        assert_eq!(route("exit 1"), NoAnswer);
+        assert_eq!(route("kill -TERM $$"), NoAnswer);
+        assert_eq!(route("kill -KILL $$"), NoAnswer);
+
+        let src = include_str!("sy_orchestrator.rs");
+        let egress = &src[src.find("fn watchdog_egress_reconcile(").expect("watchdog")..];
+        let worker = &egress[egress.find("HiveRole::Worker => {").expect("the worker")..];
+        let drifted = worker
+            .find("\"worker default route drifted; re-applying\"")
+            .expect("the re-apply");
+        assert!(worker[..drifted].contains("if route == CheckAnswer::No {"));
+    }
+
+    /// FINDINGS A-271: what each node action and the reconcile do when systemctl gives no answer
+    /// for a node's unit, asked again: the reconcile neither launches nor moves it, start starts
+    /// nothing, remove and kill refuse, run undoes its spawn, and restart takes the command that is
+    /// right whether the unit runs or not. A runtime with such a node is not "not in use".
+    #[test]
+    fn no_answer_for_a_nodes_unit_starts_stops_or_removes_nothing() {
+        use ServiceActivity::{Active, Inactive, Unknown};
+        assert_eq!(reconcile_unit_active(Unknown), None);
+        assert_eq!(reconcile_unit_active(Active), Some(true));
+        assert_eq!(reconcile_unit_active(Inactive), Some(false));
+
+        assert_eq!(start_node_finds_running(Unknown, false), None);
+        assert_eq!(start_node_finds_running(Unknown, true), Some(true));
+        assert_eq!(start_node_finds_running(Active, false), Some(true));
+        assert_eq!(start_node_finds_running(Inactive, false), Some(false));
+        assert_eq!(start_node_finds_running(Inactive, true), Some(true));
+
+        assert!(restart_takes_running_command(Unknown));
+        assert!(restart_takes_running_command(Active));
+        assert!(!restart_takes_running_command(Inactive));
+
+        assert_eq!(
+            remove_instance_refusal(Unknown, false),
+            Some("SERVICE_FAILED")
+        );
+        assert_eq!(
+            remove_instance_refusal(Unknown, true),
+            Some("NODE_INSTANCE_RUNNING")
+        );
+        assert_eq!(
+            remove_instance_refusal(Active, false),
+            Some("NODE_INSTANCE_RUNNING")
+        );
+        assert_eq!(remove_instance_refusal(Inactive, false), None);
+
+        assert_eq!(runtime_usage_lifecycle(Active, || true), Some("RUNNING"));
+        assert_eq!(runtime_usage_lifecycle(Unknown, || true), Some("UNKNOWN"));
+        assert_eq!(runtime_usage_lifecycle(Unknown, || false), None);
+        assert_eq!(runtime_usage_lifecycle(Active, || false), None);
+        assert_eq!(
+            runtime_usage_lifecycle(Inactive, || panic!("not asked for a unit that is down")),
+            None
+        );
+
+        // A managed node with nothing on disk and nothing seen is gone only when systemctl answers
+        // for its unit.
+        let view = |unit_activity, unit_failed| LocalNodeView {
+            unit: NodeUnit::Managed("fluxbee-node-AI.x-motherbee".to_string()),
+            config_path: PathBuf::from("/nonexistent/config.json"),
+            state_path: PathBuf::from("/nonexistent/state.json"),
+            config_exists: false,
+            state_exists: false,
+            unit_activity,
+            unit_failed,
+            inventory_visible: false,
+        };
+        assert!(view(Inactive, CheckAnswer::No).managed_node_gone());
+        assert!(!view(Unknown, CheckAnswer::No).managed_node_gone());
+        assert!(!view(Inactive, CheckAnswer::NoAnswer).managed_node_gone());
+        assert_eq!(
+            view(Inactive, CheckAnswer::NoAnswer).lifecycle_state(),
+            "UNKNOWN"
+        );
+
+        // Each flow takes that answer before it acts.
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        let before = |body: &str, first: &str, then: &str| {
+            let first_at = body.find(first).unwrap_or_else(|| panic!("{first}"));
+            let then_at = body.find(then).unwrap_or_else(|| panic!("{then}"));
+            assert!(first_at < then_at, "{first} before {then}");
+        };
+        let reconcile = body("async fn reconcile_persisted_custom_nodes(");
+        before(
+            reconcile,
+            "let Some(unit_active) = reconcile_unit_active(unit_activity) else {",
+            "clear_stale_transient_unit(&unit);",
+        );
+        let run = body("async fn run_node_flow(");
+        let unknown = &run[run
+            .find("ServiceActivity::Unknown => {")
+            .expect("run's unknown")..];
+        let unknown = &unknown[..unknown.find("    }\n\n").expect("its end")];
+        assert!(unknown.contains("\"SERVICE_FAILED\"") && !unknown.contains("execute_on_hive("));
+        assert!(unknown.contains("rollback_node_identity_after_failed_spawn("));
+        let start = body("async fn start_or_restart_node_flow(");
+        before(
+            start,
+            "match start_node_finds_running(unit_activity, visible_in_router) {",
+            "record_planned_launch(",
+        );
+        let kill = body("async fn kill_node_flow(");
+        let unknown = &kill[kill
+            .find("ServiceActivity::Unknown => {")
+            .expect("kill's unknown")..];
+        before(unknown, "\"SERVICE_FAILED\"", "execute_on_hive(");
+        before(unknown, "return serde_json::json!(", "execute_on_hive(");
+        let remove = body("async fn remove_node_instance_flow(");
+        before(
+            remove,
+            "remove_instance_refusal(unit_activity, inventory_visible)",
+            "let cleanup_cmd =",
+        );
+        assert!(!src.contains(&format!("fn systemd_unit_is_{}(", "active")));
+        assert!(!src.contains(&format!("fn systemd_unit_is_{}(", "failed")));
+    }
+
+    /// FINDINGS A-271, through the flows: on a hive where systemctl gives no answer for a node's
+    /// unit, a core node's status reads UNKNOWN, a managed node with nothing on disk is not
+    /// NODE_NOT_FOUND, and a stop, asked again, stops nothing. Where systemctl answers that the
+    /// unit is not there, the same reads are STOPPED and NODE_NOT_FOUND, and the stop finds
+    /// nothing to stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_hive_whose_systemctl_does_not_answer_reads_unknown_and_stops_nothing() {
+        let answered = sample_orchestrator_state_for_tests();
+        let mut unanswered = sample_orchestrator_state_for_tests();
+        unanswered.unit_checks = UnitChecks {
+            activity: |_| ServiceActivity::Unknown,
+            failed: |_| CheckAnswer::NoAnswer,
+        };
+        let core = serde_json::json!({ "node_name": "SY.timer@motherbee" });
+        let ghost = serde_json::json!({ "node_name": "AI.ghost@motherbee" });
+
+        let status = get_node_status_flow(&answered, &core).await;
+        assert_eq!(
+            status["node_status"]["lifecycle_state"], "STOPPED",
+            "{status}"
+        );
+        let status = get_node_status_flow(&unanswered, &core).await;
+        assert_eq!(status["status"], "ok", "{status}");
+        assert_eq!(
+            status["node_status"]["lifecycle_state"], "UNKNOWN",
+            "{status}"
+        );
+
+        let status = get_node_status_flow(&answered, &ghost).await;
+        assert_eq!(status["error_code"], "NODE_NOT_FOUND", "{status}");
+        let status = get_node_status_flow(&unanswered, &ghost).await;
+        assert_eq!(status["status"], "ok", "{status}");
+        assert_eq!(
+            status["node_status"]["lifecycle_state"], "UNKNOWN",
+            "{status}"
+        );
+
+        let kill = kill_node_flow(&answered, &ghost).await;
+        assert_eq!(kill["status"], "not_found", "{kill}");
+        let kill = kill_node_flow(&unanswered, &ghost).await;
+        assert_eq!(kill["error_code"], "SERVICE_FAILED", "{kill}");
+        assert!(
+            kill["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with(UNIT_UNANSWERED)),
+            "{kill}"
+        );
+    }
+
+    /// FINDINGS A-271: the core's restart leaves a service out only when systemctl answers that
+    /// systemd has no unit for it; one it gives no answer for is restarted onto its new binary.
+    /// The Syncthing disable and the transient unit's cleanup skip only on that answer too.
+    #[test]
+    fn only_no_such_unit_skips_a_core_restart_or_a_cleanup() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let services =
+            core_services_to_restart(HiveRole::Motherbee, &[], |service| match service {
+                "sy-admin" => NoAnswer,
+                "sy-frontdesk-gov" => No,
+                _ => Yes,
+            });
+        assert_eq!(services.first().map(String::as_str), Some("rt-gateway"));
+        assert!(services.iter().any(|service| service == "sy-admin"));
+        assert!(!services.iter().any(|service| service == "sy-frontdesk-gov"));
+        assert!(!services.iter().any(|service| service == "sy-orchestrator"));
+        let left_out = vec!["sy-admin".to_string()];
+        assert!(
+            !core_services_to_restart(HiveRole::Motherbee, &left_out, |_| NoAnswer)
+                .iter()
+                .any(|service| service == "sy-admin")
+        );
+
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        assert!(body("fn disable_blob_sync_runtime_local(")
+            .contains("if systemd_unit_exists(SYNCTHING_SERVICE_NAME) != CheckAnswer::No {"));
+        assert!(body("fn clear_stale_transient_unit(")
+            .contains("if systemd_unit_exists(unit) == CheckAnswer::No {"));
+        assert!(
+            body("async fn restart_local_core_services_with_health_gate(")
+                .contains("core_services_to_restart(role, left_out, systemd_unit_exists)")
+        );
+    }
+
+    /// FINDINGS A-271: a core node whose stop failed is taken for stopped only when systemctl
+    /// answers that it does not run, and one it gives no answer for keeps its unit and binary; the
+    /// removal of a dropped node keeps the binary of one systemctl gives no answer for.
+    #[test]
+    fn a_core_node_systemctl_does_not_answer_for_keeps_its_binary() {
+        let test = TestCoreHost::new("unanswered");
+        test.install("sy-timer", "old");
+        test.stop_fails
+            .lock()
+            .expect("fails")
+            .insert("sy-timer".to_string());
+        test.unanswered
+            .lock()
+            .expect("unanswered")
+            .insert("sy-timer".to_string());
+        let err = test
+            .host
+            .stop_core_node("sy-timer")
+            .expect_err("no answer is not stopped");
+        assert!(err.to_string().contains("did not answer"), "{err}");
+        // Running after a failed stop: an error too; answered not running: stopped.
+        test.unanswered.lock().expect("unanswered").clear();
+        assert!(test.host.stop_core_node("sy-timer").is_err());
+        test.active.lock().expect("active").clear();
+        assert!(test.host.stop_core_node("sy-timer").is_ok());
+
+        // The removal: no answer keeps the binary, an error; an answer removes it.
+        test.unanswered
+            .lock()
+            .expect("unanswered")
+            .insert("sy-timer".to_string());
+        let errors = test.host.remove_core_nodes(&["sy-timer".to_string()]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("did not answer"), "{errors:?}");
+        assert!(test.host.bin_path("sy-timer").exists());
+        test.unanswered.lock().expect("unanswered").clear();
+        assert!(test
+            .host
+            .remove_core_nodes(&["sy-timer".to_string()])
+            .is_empty());
+        assert!(!test.host.bin_path("sy-timer").exists());
+    }
+
+    /// FINDINGS A-271: the other checks' runs of no answers are counted as the watchdog's are, by
+    /// check, against their own report count: the reconcile's, a minute apart, at its second pass.
+    #[test]
+    fn a_checks_run_of_no_answers_is_reported_at_its_own_count() {
+        let mut unanswered = HashMap::new();
+        let check = "systemctl is-active fluxbee-node-AI.x-motherbee";
+        let report_at = RECONCILE_UNANSWERED_REPORT_PASSES;
+        assert_eq!(
+            count_unanswered(&mut unanswered, check, false, report_at),
+            UnansweredChecks::Quiet
+        );
+        assert_eq!(
+            count_unanswered(&mut unanswered, check, false, report_at),
+            UnansweredChecks::Reported
+        );
+        assert_eq!(
+            count_unanswered(&mut unanswered, check, false, report_at),
+            UnansweredChecks::Quiet,
+            "said once"
+        );
+        assert_eq!(
+            count_unanswered(
+                &mut unanswered,
+                "nft list table inet fluxbee_egress",
+                false,
+                12
+            ),
+            UnansweredChecks::Quiet,
+            "by check"
+        );
+        assert_eq!(
+            count_unanswered(&mut unanswered, check, true, report_at),
+            UnansweredChecks::Ended
+        );
+        assert_eq!(
+            count_unanswered(&mut unanswered, check, true, report_at),
+            UnansweredChecks::Quiet
         );
     }
 
