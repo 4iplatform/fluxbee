@@ -25,3 +25,6 @@ uuid = { version = "1", features = ["v4"] }
 serde_yaml = "0.9"
 # Paused time for the runtime's lanes, and a router socket of the tests' own (FINDINGS A-257).
 tokio = { version = "1.37", features = ["rt", "macros", "time", "sync", "net", "test-util"] }
+# The frontdesk's handoff contract, which the runtime's own copy of it is held to
+# (tests/frontdesk_handoff_contract.rs, FINDINGS A-257).
+gov-common = { path = "../../nodes/gov/common" }

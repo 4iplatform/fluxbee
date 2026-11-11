@@ -518,9 +518,11 @@ registered case ends saved as `completed` and is never deleted by the model.
   a notice or a reply: one the router made, without `src_l2_name` (`UNREACHABLE`,
   `TTL_EXCEEDED`), or one named as a notice or a reply (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any
   `*_RESPONSE`). `note_infrastructure_message(node_name, &msg)` logs it, a router notice as a WARN
-  with its reason. An answer to the router's notice would go to the router's own UUID, and the two
-  would bounce it forever (FINDINGS A-112). SY.timer and the WF engine leave the same ones
-  unanswered (FINDINGS A-218).
+  with its reason: the first of each notice and reason at once, then at most one every 10 s, with
+  how many came since (`notices`; the ones between are debug lines), since a node that answers at
+  the rate messages come (`ai_runtime_busy`, below) may get as many back. An answer to the
+  router's notice would go to the router's own UUID, and the two would bounce it forever (FINDINGS
+  A-112). SY.timer and the WF engine leave the same ones unanswered (FINDINGS A-218).
 - **A tap copy never reaches it:** the runtime takes no message with `meta.via_tap` to
   `on_message` and answers none (`ignored_tap_copy`, FINDINGS A-248), whatever its kind; nor does
   a copy take a worker or a place in the queue (below). Each copy is a debug line and counts in
@@ -531,35 +533,62 @@ registered case ends saved as `completed` and is never deleted by the model.
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:
     `.command_channel(AI_RUNTIME_CHANNEL).post_pending_rule(RouteMatch::Any, RouteTarget::Command(AI_RUNTIME_CHANNEL))`.
-  - `RuntimeConfig::default()` gives 4 workers, a queue of 128, 64 places for what runs without
-    the model (`DEFAULT_DIRECT_CAPACITY`) and `DEFAULT_HANDLER_TIMEOUT` (47 min) per message: a
-    whole tool loop, `DEFAULT_MAX_TURNS` (8) model turns plus one plain call, each bounded by
-    `MODEL_CALL_TIMEOUT`, and 2 min for its tools.
+  - `RuntimeConfig::default()` gives 4 workers, a queue of 128 and `DEFAULT_HANDLER_TIMEOUT`
+    (47 min) per LLM turn: a whole tool loop, `DEFAULT_MAX_TURNS` (8) model turns plus one plain
+    call, each bounded by `MODEL_CALL_TIMEOUT`, and 2 min for its tools. Beside them, 64 places
+    for what runs without the model (`DEFAULT_DIRECT_CAPACITY`), 8 of them at most for its `user`
+    messages (`DEFAULT_DIRECT_USER_CAPACITY`), and 30 s for each (`DEFAULT_DIRECT_HANDLER_TIMEOUT`).
   - **Two lanes** (FINDINGS A-257). The runtime reads each message as it comes, however busy its
     workers are, and places it:
-    - **What runs without the model** (`runs_without_model`) starts at once, beside the workers:
-      any `system` or `admin` message, which ai.generic and the frontdesk take to their control
-      plane, never to the model (`NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`,
-      `VAULT_SECRET_CHANGED`, a notice or a reply); and the frontdesk's handoff, a `user` message
-      an IO node marks `frontdesk_handoff` (its `meta.msg` and its payload's `type`), which the
-      frontdesk runs in code while the IO node waits for the answer (io.api 10 s, IO.cloud 20 s).
-      Up to `direct_capacity` run at once. One more is dropped, neither run nor answered, as a
-      `system` request whose handler fails: its caller's own timeout reports it.
+    - **What runs without the model** (`runs_without_model`) starts at once on the direct lane,
+      beside the workers:
+      - any `system` or `admin` message, which ai.generic and the frontdesk take to their control
+        plane, never to the model (`NODE_STATUS_GET`, `NODE_HELP`, `CONFIG_GET`, `CONFIG_SET`,
+        `VAULT_SECRET_CHANGED`, a notice or a reply);
+      - the frontdesk's handoff, a `user` message from an IO node, marked `frontdesk_handoff` (its
+        `meta.msg` and its payload's `type`) and whose payload parses as gov-common's
+        `FrontdeskHandoffPayload`, which the frontdesk runs in code while the IO node waits for
+        the answer (io.api 10 s, IO.cloud 20 s). A marked payload that does not parse (a field of
+        the wrong type) is a conversation's turn at the frontdesk, which calls the model, so it is
+        an LLM turn here (`tests/frontdesk_handoff_contract.rs` holds the runtime's copy to
+        gov-common's).
+    - Up to `direct_capacity` run at once, each within `direct_handler_timeout` (30 s: no sender
+      waits longer; SY.admin waits 30 s for a `CONFIG_SET`). A `system` or `admin` message may
+      take any of those places; the `user` ones, the handoffs and the `ai_runtime_busy` answers,
+      at most `direct_user_capacity`, so a burst of handoffs held by a slow SY.identity never takes
+      the places of the status and config requests, and SY.identity gets the registrations of at
+      most 8 handoffs at once (4 before, when they ran on the workers).
+    - A message that finds every place it may take taken is dropped, neither run nor answered, as
+      a `system` request whose handler fails: its caller's own timeout reports it. A handoff is
+      dropped too rather than answered with an error: io.api reports `frontdesk_unavailable`
+      either way, and IO.cloud takes any error answer for the frontdesk's refusal
+      (`FRONTDESK_REJECTED`), its timeout for `FRONTDESK_UNAVAILABLE`.
     - **Everything else is an LLM turn:** a conversation's turn, a WF's message. It takes one of
       the `worker_pool_size` workers, in the order turns came, as before; up to `queue_capacity`
-      wait for one. One more is answered at once with `ai_runtime_busy` (`retryable: true`: it
-      never ran), sent from the other lane, and never run.
+      wait for one. One more is refused and never run: it is answered at once with
+      `ai_runtime_busy` (`retryable: true`: it never ran), sent from the direct lane in one of its
+      `user` places, and its entry in the message's trace names the refusal (`busy`). When those
+      places are all taken, the answer is not sent either.
     - So a status request or a handoff never waits behind an LLM turn, nothing waits without a
       bound, and with a free worker each message runs as it comes, as before. A `user` message the
       node answers in code that the runtime cannot tell apart (the frontdesk's case of the root
-      tenant, a turn to an agent that is not configured) is a turn.
+      tenant, a turn to an agent that is not configured, a handoff from a node that is no IO node)
+      is a turn.
+    - A config change runs on the direct lane, so it applies to the turns still waiting for a
+      worker; a turn that has started keeps the config it read.
     - Each one turned away counts in the `ai runtime metrics` line (`turns_refused`,
-      `direct_dropped`, beside `turns_queued` and `turns_waiting`), and a WARN line says so at once,
-      then at most once every 10 s with how many since.
-  - A handler runs once. When it returns an error or runs out of time it may already have called a
-    model (billed) or a tool that acts, so the runtime never runs it again: a conversational message
-    gets an error reply (`ai_runtime_error` or `ai_runtime_timeout`, `retryable: false`); a `system`
-    or `admin` request gets none, and its caller's own timeout reports it.
+      `direct_dropped`, `busy_answers_dropped`, beside `turns_queued` and `turns_waiting`). A WARN
+      line names it at once (`ai runtime refused an LLM turn without running it`, `ai runtime
+      dropped a message, neither run nor answered`, `ai runtime sent no ai_runtime_busy answer to a
+      refused LLM turn`), then at most one every 10 s with how many since (`refused`, `dropped`);
+      the metrics loop names the end of a burst that no later one would.
+  - A handler runs once. When it returns an error or runs out of time (its lane's) it may already
+    have called a model (billed) or a tool that acts, so the runtime never runs it again: a
+    conversational message or a handoff gets an error reply (`ai_runtime_error` or
+    `ai_runtime_timeout`, `retryable: false`); a `system` or `admin` request gets none, and its
+    caller's own timeout reports it.
+  - A task that ends with an error the runtime does not go on after (a reply too large to send, a
+    handler that panicked) stops it, and no waiting turn starts then.
   - Only the write of a reply is retried (`RuntimeConfig::write_retry`): a send that timed out or
     was refused never queued it, so a reply cannot go out twice.
 - **A reply goes from the agent to whoever spoke:**

@@ -1,13 +1,18 @@
 //! The control plane of an AI node (ai.generic, SY.frontdesk.gov): which `system` requests it runs,
 //! and from whom, and which messages it never answers.
 
+use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
+
 use fluxbee_sdk::protocol::{
     is_system_kind, MSG_ANNOUNCE, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_HELLO, MSG_NODE_HELP,
     MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, PRIMARY_HIVE_ID,
 };
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::message::Message;
+use crate::refusal_log::RefusalLog;
 
 /// A liveness probe: the node's name and state.
 pub const MSG_PING: &str = "PING";
@@ -123,7 +128,11 @@ pub fn is_infrastructure_message(msg: &Message) -> bool {
 
 /// The journal's line for `msg`, a notice or a reply that reached the control plane of the AI node
 /// `node_name` (`is_infrastructure_message`), which gets no answer. The router's notice that a
-/// message of the node's was not delivered is a warning, with its reason.
+/// message of the node's was not delivered is a warning, with its reason: the first of its name
+/// and reason at once, then at most one every 10 s, which names how many came since its last
+/// (`notices`); the ones between are debug lines. An agent answers at the rate messages come (an
+/// `ai_runtime_busy` answer to each turn past its queue, FINDINGS A-257), and as many answers may
+/// come back undelivered.
 pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
     let name = msg.meta.msg.as_deref().unwrap_or_default();
     if matches!(name, MSG_UNREACHABLE | MSG_TTL_EXCEEDED) {
@@ -134,13 +143,34 @@ pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
                 .unwrap_or_default()
                 .to_string()
         };
+        let reason = field("reason");
+        let due = notice_line_due(
+            &mut NOTICE_LOGS.lock().unwrap_or_else(PoisonError::into_inner),
+            name,
+            &reason,
+            Instant::now(),
+        );
+        let Some(notices) = due else {
+            tracing::debug!(
+                node_name = %node_name,
+                trace_id = %msg.routing.trace_id,
+                notice = %name,
+                original_dst = %field("original_dst"),
+                reason = %reason,
+                last_hop = %field("last_hop"),
+                "router notice: a message this node sent was not delivered; not answered (counted \
+                 in the next warning of its reason)"
+            );
+            return;
+        };
         tracing::warn!(
             node_name = %node_name,
             trace_id = %msg.routing.trace_id,
             notice = %name,
             original_dst = %field("original_dst"),
-            reason = %field("reason"),
+            reason = %reason,
             last_hop = %field("last_hop"),
+            notices,
             "router notice: a message this node sent was not delivered; not answered"
         );
         return;
@@ -153,6 +183,30 @@ pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
         src_l2_name = ?msg.routing.src_l2_name,
         "a notice or a reply, not a request; not answered"
     );
+}
+
+/// How many kinds of router notice, a name and a reason, keep a count of their own. The router has
+/// a few reasons; a notice of any other past these counts with its name's other reasons
+/// (`OTHER_REASONS`), so the counts stay bounded whatever comes.
+const NOTICE_LOG_KINDS: usize = 32;
+const OTHER_REASONS: &str = "*";
+
+/// The router notices' counts, one `RefusalLog` for each name and reason (`notice_line_due`).
+static NOTICE_LOGS: Mutex<BTreeMap<(String, String), RefusalLog>> = Mutex::new(BTreeMap::new());
+
+/// When the warning for a router notice named `notice` with `reason` is due, how many notices of
+/// that name and reason to name in it, this one and those since its last.
+fn notice_line_due(
+    logs: &mut BTreeMap<(String, String), RefusalLog>,
+    notice: &str,
+    reason: &str,
+    now: Instant,
+) -> Option<u64> {
+    let mut key = (notice.to_string(), reason.to_string());
+    if logs.len() >= NOTICE_LOG_KINDS && !logs.contains_key(&key) {
+        key.1 = OTHER_REASONS.to_string();
+    }
+    logs.entry(key).or_default().note(now)
 }
 
 #[cfg(test)]
@@ -334,5 +388,44 @@ mod tests {
                 "{msg} from {sender}"
             );
         }
+    }
+
+    /// The review of A-257: a burst of undelivered answers (a client that sent 200 turns and left)
+    /// is one warning for each notice and reason, then one every 10 s with how many came since.
+    #[test]
+    fn the_router_notices_are_named_at_once_then_once_an_interval_for_each_reason() {
+        let mut logs = BTreeMap::new();
+        let start = Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        assert_eq!(
+            notice_line_due(&mut logs, MSG_UNREACHABLE, "NODE_NOT_FOUND", start),
+            Some(1)
+        );
+        for _ in 0..67 {
+            assert_eq!(
+                notice_line_due(&mut logs, MSG_UNREACHABLE, "NODE_NOT_FOUND", at(1)),
+                None
+            );
+        }
+        // Another reason, or another notice, has its own line.
+        assert_eq!(
+            notice_line_due(&mut logs, MSG_UNREACHABLE, "LINK_BUSY", at(1)),
+            Some(1)
+        );
+        assert_eq!(
+            notice_line_due(&mut logs, MSG_TTL_EXCEEDED, "NODE_NOT_FOUND", at(1)),
+            Some(1)
+        );
+        assert_eq!(
+            notice_line_due(&mut logs, MSG_UNREACHABLE, "NODE_NOT_FOUND", at(10)),
+            Some(68)
+        );
+
+        // Reasons past the kinds kept count together, so the counts stay bounded.
+        for n in 0..100 {
+            notice_line_due(&mut logs, MSG_UNREACHABLE, &format!("reason-{n}"), at(20));
+        }
+        assert!(logs.len() <= NOTICE_LOG_KINDS + 1, "{}", logs.len());
+        assert!(logs.contains_key(&(MSG_UNREACHABLE.to_string(), OTHER_REASONS.to_string())));
     }
 }

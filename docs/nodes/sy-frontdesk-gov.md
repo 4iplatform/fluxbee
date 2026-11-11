@@ -333,25 +333,38 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
 - **Identity SHM unreadable**: the case tenant is unknown, so registration answers that the tenant
   is unresolved and usage goes to `fallback_root`; the conversation itself continues.
 - **Handler errors**: each message runs once under the AI runtime
-  (`crates/fluxbee_ai_sdk/src/runtime.rs`): up to 47 min per message, each model call bounded at
-  5 min. When the handler fails or runs out of time, a conversation or handoff gets an
-  `ai_runtime_error` or `ai_runtime_timeout` error and the message is not run again (it may already
-  have called the model or `ILK_REGISTER`); a `system` request gets no answer. The node keeps
-  running.
+  (`crates/fluxbee_ai_sdk/src/runtime.rs`): up to 47 min per conversation turn, each model call
+  bounded at 5 min, and 30 s per handoff or `system` request. When the handler fails or runs out
+  of time, a conversation or handoff gets an `ai_runtime_error` or `ai_runtime_timeout` error and
+  the message is not run again (it may already have called the model or `ILK_REGISTER`); a
+  `system` request gets no answer. The node keeps running.
 - **Conversations that keep every worker busy**: the AI runtime runs 4 conversation turns at once
-  and lets up to 128 more wait, in the order they came; the next is answered `ai_runtime_busy`
-  (`retryable: true`) without running. A handoff runs as it comes beside them, never behind a
-  turn, and so does every `system` or `admin` request (`NODE_STATUS_GET`, `CONFIG_GET`,
+  and lets up to 128 more wait, in the order they came; the next is refused without running and
+  answered `ai_runtime_busy` (`retryable: true`). A handoff runs as it comes beside them, never
+  behind a turn, and so does every `system` or `admin` request (`NODE_STATUS_GET`, `CONFIG_GET`,
   `CONFIG_SET`, `VAULT_SECRET_CHANGED`): io.api has its answer within the registration's 8 s
   (FINDINGS A-257; `runs_without_model`,
-  [the AI SDK](../../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)). Up to 64 of those run
-  at once; one more is dropped unanswered, and its sender's own timeout reports it.
+  [the AI SDK](../../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)).
+  - Only a handoff the node parses runs that way: a message marked `frontdesk_handoff` whose
+    payload does not parse (a field of the wrong type) is a conversation's turn, as below, and
+    waits for a worker like one.
+  - Up to 64 run at once, each within 30 s; handoffs (and the `ai_runtime_busy` answers) take at
+    most 8 of those places, so SY.identity gets the registrations of at most 8 handoffs at once
+    and a burst of them never stops a status or config request. Past its places a message is
+    dropped unanswered, and its sender's own timeout reports it: io.api's
+    `frontdesk_unavailable` after 10 s, IO.cloud's `FRONTDESK_UNAVAILABLE` after 20 s.
 
 ## Health
 
 - `systemctl status sy-frontdesk-gov`; `journalctl -u sy-frontdesk-gov`. Lines to look for:
   `frontdesk-gov connected to router`, `AI token resolved from vault → Configured`,
   `frontdesk handoff REGISTERED (ILK_REGISTER complete)`.
+- Under load (FINDINGS A-257), WARN lines, each at once and then at most one every 10 s with how
+  many since: `ai runtime refused an LLM turn without running it` (every worker busy and the queue
+  full; its sender gets `ai_runtime_busy`), `ai runtime dropped a message, neither run nor
+  answered` (a handoff or a request past its places), and `ai runtime sent no ai_runtime_busy
+  answer to a refused LLM turn`. The `ai runtime metrics` line, every 30 s, counts them
+  (`turns_refused`, `direct_dropped`, `busy_answers_dropped`) beside `turns_waiting`.
 - `NODE_STATUS_GET` says whether the conversation runs: `HEALTHY`, or `DEGRADED` with
   `missing_secret` or `invalid_ai_config` in `last_error`. Handoffs work in every state. `CONFIG_GET`
   (through SY.admin's `node_control_config_get`) shows the same state and reason.

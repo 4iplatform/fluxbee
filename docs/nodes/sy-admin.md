@@ -570,7 +570,9 @@ Archi, and over the mesh only Archi may ask for it (`mesh_access`).
     runtime_version, tools: [card, ...]}`, and `reason` is null;
   - or `help` is null, and `reason` says why: what runs the node does not answer `NODE_HELP`
     (today only `ai.generic` does), the node is not connected (its lifecycle is named), it did not
-    answer within 3 s (a busy AI node may not), or it answered with an error.
+    answer within 3 s, or it answered with an error. An AI node answers at once however busy its
+    conversations keep it (FINDINGS A-257): one that does not answer in 3 s is stuck or
+    restarting, or its 64 places for control requests were all taken (its journal says which).
 - **A card:** `{name, summary, when_to_use, limits: [...], present_when, input: <JSON schema>,
   output: <JSON schema>, errors: [{code, meaning}]}`. `present_when` says when the tool is there.
   The same cards make the generated catalog, `docs/reference/agent-tools.md`.

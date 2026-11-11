@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -9,7 +9,8 @@ use fluxbee_sdk::message_writer::{self, Writer};
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{is_solution_kind, is_system_kind};
 use fluxbee_sdk::{NodeSender, RouterDispatcher, RpcCommandReceiver, RpcError};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::sleep;
@@ -20,8 +21,9 @@ use crate::errors::AiSdkError;
 use crate::errors::Result;
 use crate::function_calling::DEFAULT_MAX_TURNS;
 use crate::llm::MODEL_CALL_TIMEOUT;
-use crate::message::{build_reply_message_runtime_src, take_reply_act, Message};
+use crate::message::{build_reply_message_runtime_src, set_reply_act, take_reply_act, Message};
 use crate::node_trait::AiNode;
+use crate::refusal_log::RefusalLog;
 
 /// Command channel the AI runtime drains. Binary callers must declare a
 /// matching `command_channel` + `post_pending_rule` in the dispatcher
@@ -41,18 +43,30 @@ pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(
     MODEL_CALL_TIMEOUT.as_secs() * (DEFAULT_MAX_TURNS as u64 + 1) + TOOL_TIME_ALLOWANCE.as_secs(),
 );
 
-/// How many messages that run without the model (`runs_without_model`) run at once by default,
-/// beside the workers: a status or config request takes milliseconds, a frontdesk handoff at most
-/// its registration's 8 s.
+/// How many tasks the direct lane runs at once by default, beside the workers: the messages that
+/// run without the model (`runs_without_model`) and the answers `ai_runtime_busy`. A status or
+/// config request takes milliseconds, a frontdesk handoff at most its registration's 8 s.
 pub const DEFAULT_DIRECT_CAPACITY: usize = 64;
+
+/// How many of the direct lane's places its `user` messages may take at once by default: the
+/// frontdesk's handoffs and the answers `ai_runtime_busy`. The other places stay for the `system`
+/// and `admin` messages, so a burst of handoffs never stops a status or config request. It is
+/// twice the 4 workers the handoffs ran on before (FINDINGS A-257), so SY.identity gets the
+/// registrations of at most twice as many handoffs at once as it did then.
+pub const DEFAULT_DIRECT_USER_CAPACITY: usize = 8;
+
+// By default the direct lane keeps places its `user` messages never take.
+const _: () = assert!(DEFAULT_DIRECT_USER_CAPACITY < DEFAULT_DIRECT_CAPACITY);
+
+/// How long a message that runs without the model may run by default, in place of the 47 min of an
+/// LLM turn (`DEFAULT_HANDLER_TIMEOUT`): no sender of one waits longer (SY.admin waits 30 s for a
+/// `CONFIG_SET`, IO.cloud 20 s and io.api 10 s for a handoff, which registers within 8 s), so none
+/// holds its place longer than its sender waits for it.
+pub const DEFAULT_DIRECT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The channel that hands what the reader takes to the dispatch loop. The loop never waits for a
 /// worker (FINDINGS A-257), so it only holds what arrives between two of the loop's turns.
 const DISPATCH_CHANNEL_CAPACITY: usize = 64;
-
-/// A lane that turns messages away says so at once, then at most once in this time, with how many
-/// it turned away since its last line, as the router does for a full link (FINDINGS A-222).
-const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What an IO node marks a frontdesk handoff with: its `meta.msg` and its payload's `type`
 /// (`FRONTDESK_HANDOFF_MSG` and `FRONTDESK_HANDOFF_PAYLOAD_TYPE` of gov-common and io-common).
@@ -61,9 +75,12 @@ const FRONTDESK_HANDOFF: &str = "frontdesk_handoff";
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub read_timeout: Duration,
-    /// How long one message's handler may run. The handler runs once: when it fails or runs out of
+    /// How long one LLM turn's handler may run. The handler runs once: when it fails or runs out of
     /// time, the sender gets an error and the message is never run again.
     pub handler_timeout: Duration,
+    /// How long the handler of a message that runs without the model (`runs_without_model`) may
+    /// run, on the same terms as `handler_timeout`.
+    pub direct_handler_timeout: Duration,
     pub write_timeout: Duration,
     /// How many LLM turns may wait for a worker, in the order they came (FINDINGS A-257). A turn
     /// that finds every worker busy and this queue full is answered `ai_runtime_busy` and never
@@ -71,10 +88,16 @@ pub struct RuntimeConfig {
     pub queue_capacity: usize,
     /// The model workers: how many LLM turns, the messages that may need the model, run at once.
     pub worker_pool_size: usize,
-    /// How many messages that run without the model (`runs_without_model`), and answers
-    /// `ai_runtime_busy`, run at once beside the workers. One that finds them all taken is dropped:
-    /// nothing runs or answers it.
+    /// How many tasks the direct lane runs at once beside the workers: the messages that run
+    /// without the model (`runs_without_model`) and the answers `ai_runtime_busy`. A `system` or
+    /// `admin` message may take any place; one that finds them all taken is dropped: nothing runs
+    /// or answers it.
     pub direct_capacity: usize,
+    /// How many of the `direct_capacity` places the direct lane's `user` messages may take at
+    /// once: the frontdesk's handoffs and the answers `ai_runtime_busy`. The rest stay for the
+    /// `system` and `admin` messages. A handoff that finds these places taken is dropped like
+    /// them, and a busy answer is not sent.
+    pub direct_user_capacity: usize,
     /// Retries of the write of a reply, the only step the runtime retries.
     pub write_retry: RetryPolicy,
     pub metrics_log_interval: Duration,
@@ -95,14 +118,37 @@ impl Default for RuntimeConfig {
         Self {
             read_timeout: Duration::from_secs(30),
             handler_timeout: DEFAULT_HANDLER_TIMEOUT,
+            direct_handler_timeout: DEFAULT_DIRECT_HANDLER_TIMEOUT,
             write_timeout: Duration::from_secs(10),
             queue_capacity: 128,
             worker_pool_size: 4,
             direct_capacity: DEFAULT_DIRECT_CAPACITY,
+            direct_user_capacity: DEFAULT_DIRECT_USER_CAPACITY,
             write_retry: RetryPolicy::default(),
             metrics_log_interval: Duration::from_secs(30),
             self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// The bounds the runtime runs on: a worker, a place on the direct lane, and one of its places
+    /// for `user` messages, never more of those than the lane has.
+    fn check(&self) -> Result<()> {
+        let refuse = |reason: &str| Err(AiSdkError::Protocol(reason.to_string()));
+        if self.worker_pool_size == 0 {
+            return refuse("worker_pool_size must be >= 1");
+        }
+        if self.direct_capacity == 0 {
+            return refuse("direct_capacity must be >= 1");
+        }
+        if self.direct_user_capacity == 0 || self.direct_user_capacity > self.direct_capacity {
+            return refuse("direct_user_capacity must be >= 1 and <= direct_capacity");
+        }
+        if self.metrics_log_interval.is_zero() {
+            return refuse("metrics_log_interval must be > 0");
+        }
+        Ok(())
     }
 }
 
@@ -143,10 +189,47 @@ struct RuntimeMetrics {
     turns_queued: AtomicU64,
     /// LLM turns waiting for a worker now.
     turns_waiting: AtomicU64,
-    /// LLM turns answered `ai_runtime_busy` and never run: every worker busy and the queue full.
+    /// LLM turns refused and never run: every worker busy and the queue full. Each is answered
+    /// `ai_runtime_busy`, unless its answer counts in `busy_answers_dropped`.
     turns_refused: AtomicU64,
-    /// Messages nothing ran or answered: every place of the direct lane was taken.
+    /// Messages nothing ran or answered: every place of the direct lane they may take was taken.
     direct_dropped: AtomicU64,
+    /// Refused turns whose answer `ai_runtime_busy` was not sent: every place of the direct lane
+    /// for its `user` messages was taken.
+    busy_answers_dropped: AtomicU64,
+    /// When the journal names what the lanes turned away (`RefusalLogs`).
+    refusal_logs: Mutex<RefusalLogs>,
+}
+
+/// What the lanes turn away, by kind (FINDINGS A-257).
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    /// An LLM turn refused (`turns_refused`).
+    Turn,
+    /// A message of the direct lane dropped (`direct_dropped`).
+    Dropped,
+    /// A refused turn's answer `ai_runtime_busy` not sent (`busy_answers_dropped`).
+    BusyAnswer,
+}
+
+/// One `RefusalLog` for each kind of refusal: the dispatch loop names a refusal as it turns it
+/// away, when its line is due, and the metrics loop names the end of a burst, which no later
+/// refusal would name.
+#[derive(Debug, Default)]
+struct RefusalLogs {
+    turns: RefusalLog,
+    dropped: RefusalLog,
+    busy_answers: RefusalLog,
+}
+
+impl RefusalLogs {
+    fn of(&mut self, kind: Refusal) -> &mut RefusalLog {
+        match kind {
+            Refusal::Turn => &mut self.turns,
+            Refusal::Dropped => &mut self.dropped,
+            Refusal::BusyAnswer => &mut self.busy_answers,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,9 +251,58 @@ struct RuntimeMetricsSnapshot {
     turns_waiting: u64,
     turns_refused: u64,
     direct_dropped: u64,
+    busy_answers_dropped: u64,
 }
 
 impl RuntimeMetrics {
+    /// Counts one refusal of `kind` in its log: when its line is due, how many to name in it.
+    fn note_refusal(&self, kind: Refusal) -> Option<u64> {
+        self.refusal_logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .of(kind)
+            .note(Instant::now())
+    }
+
+    /// Names, for each kind, what the lanes turned away after its last line, once that line is
+    /// due: the end of a burst.
+    fn log_refusals_since_last_line(&self) {
+        let now = Instant::now();
+        let flushed = {
+            let mut logs = self
+                .refusal_logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            [Refusal::Turn, Refusal::Dropped, Refusal::BusyAnswer]
+                .map(|kind| (kind, logs.of(kind).flush(now)))
+        };
+        for (kind, count) in flushed {
+            let Some(count) = count else {
+                continue;
+            };
+            match kind {
+                Refusal::Turn => tracing::warn!(
+                    refused = count,
+                    turns_refused = self.turns_refused.load(Ordering::Relaxed),
+                    "ai runtime refused more LLM turns since its last line, without running them: \
+                     every model worker was busy and the queue for them full"
+                ),
+                Refusal::Dropped => tracing::warn!(
+                    dropped = count,
+                    direct_dropped = self.direct_dropped.load(Ordering::Relaxed),
+                    "ai runtime dropped more messages since its last line, neither run nor \
+                     answered: every place of the direct lane they may take was taken"
+                ),
+                Refusal::BusyAnswer => tracing::warn!(
+                    dropped = count,
+                    busy_answers_dropped = self.busy_answers_dropped.load(Ordering::Relaxed),
+                    "ai runtime sent no ai_runtime_busy answer to more refused LLM turns since its \
+                     last line: every place of the direct lane for user messages was taken"
+                ),
+            }
+        }
+    }
+
     fn snapshot(&self) -> RuntimeMetricsSnapshot {
         RuntimeMetricsSnapshot {
             read_messages: self.read_messages.load(Ordering::Relaxed),
@@ -190,6 +322,7 @@ impl RuntimeMetrics {
             turns_waiting: self.turns_waiting.load(Ordering::Relaxed),
             turns_refused: self.turns_refused.load(Ordering::Relaxed),
             direct_dropped: self.direct_dropped.load(Ordering::Relaxed),
+            busy_answers_dropped: self.busy_answers_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -204,28 +337,16 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
     }
 
     pub async fn run_with_config(self, config: RuntimeConfig) -> Result<()> {
-        if config.worker_pool_size == 0 {
-            return Err(AiSdkError::Protocol(
-                "worker_pool_size must be >= 1".to_string(),
-            ));
-        }
-        if config.direct_capacity == 0 {
-            return Err(AiSdkError::Protocol(
-                "direct_capacity must be >= 1".to_string(),
-            ));
-        }
-        if config.metrics_log_interval.is_zero() {
-            return Err(AiSdkError::Protocol(
-                "metrics_log_interval must be > 0".to_string(),
-            ));
-        }
+        config.check()?;
 
         tracing::info!(
             worker_pool_size = config.worker_pool_size,
             queue_capacity = config.queue_capacity,
             direct_capacity = config.direct_capacity,
+            direct_user_capacity = config.direct_user_capacity,
             read_timeout_ms = config.read_timeout.as_millis() as u64,
             handler_timeout_ms = config.handler_timeout.as_millis() as u64,
+            direct_handler_timeout_ms = config.direct_handler_timeout.as_millis() as u64,
             write_timeout_ms = config.write_timeout.as_millis() as u64,
             write_retry_max_attempts = config.write_retry.max_attempts,
             write_retry_initial_backoff_ms = config.write_retry.initial_backoff.as_millis() as u64,
@@ -284,6 +405,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             turns_waiting = final_metrics.turns_waiting,
             turns_refused = final_metrics.turns_refused,
             direct_dropped = final_metrics.direct_dropped,
+            busy_answers_dropped = final_metrics.busy_answers_dropped,
             "ai runtime stopped"
         );
 
@@ -295,27 +417,39 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
 /// an LLM turn that waits for one (FINDINGS A-257). It is a message the AI nodes on this runtime
 /// (ai.generic, SY.frontdesk.gov) answer without their model:
 ///
-/// - **Control traffic:** any `system` or `admin` message, in any case. Both nodes take it to
-///   their control plane, never to the model (`is_control_plane` in each): the verbs it runs
-///   (`NODE_STATUS_GET`, `NODE_HELP`, `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`) or refuses,
-///   `VAULT_SECRET_CHANGED`, and the notices and replies it leaves unanswered
+/// - **Control traffic** (`is_control_traffic`): any `system` or `admin` message, in any case.
+///   Both nodes take it to their control plane, never to the model (`is_control_plane` in each):
+///   the verbs it runs (`NODE_STATUS_GET`, `NODE_HELP`, `CONFIG_GET`, `CONFIG_SET`, `PING`,
+///   `STATUS`) or refuses, `VAULT_SECRET_CHANGED`, and the notices and replies it leaves unanswered
 ///   (`is_infrastructure_message`).
-/// - **The frontdesk's handoff:** a `user` message an IO node sends marked as one, `meta.msg` and
-///   the payload's `type` both `frontdesk_handoff`. SY.frontdesk.gov runs it in code
+/// - **The frontdesk's handoff** (`is_frontdesk_handoff`): a `user` message an IO node sends marked
+///   as one, whose payload parses as one. SY.frontdesk.gov runs it in code
 ///   (`handle_frontdesk_handoff`: an `ILK_REGISTER` to SY.identity, every attempt within 8 s) while
-///   the IO node waits for the answer, 10 s for io.api and 20 s for IO.cloud. Only an IO node hands
-///   a person over, and only to the frontdesk (`frontdesk_handoff_sender_allowed`), so a handoff
-///   from any other sender is an LLM turn here.
+///   the IO node waits for the answer, 10 s for io.api and 20 s for IO.cloud.
 ///
 /// Anything else may need the model and waits for a worker: a conversation's turn, a WF's message,
 /// and the few `user` messages a node answers in code that the runtime cannot tell apart (the
-/// frontdesk's case of the root tenant, a turn to an agent that is not configured).
+/// frontdesk's case of the root tenant, a turn to an agent that is not configured, a handoff the
+/// frontdesk refuses because no IO node sent it).
 pub fn runs_without_model(msg: &Message) -> bool {
+    is_control_traffic(msg) || is_frontdesk_handoff(msg)
+}
+
+/// A `system` or `admin` message, in any case: the AI nodes take it to their control plane.
+fn is_control_traffic(msg: &Message) -> bool {
     let kind = msg.meta.msg_type.as_str();
-    if is_system_kind(kind) || kind.eq_ignore_ascii_case("admin") {
-        return true;
-    }
-    kind.eq_ignore_ascii_case("user")
+    is_system_kind(kind) || kind.eq_ignore_ascii_case("admin")
+}
+
+/// A handoff SY.frontdesk.gov runs in code: a `user` message from an IO node, which alone hands a
+/// person over (`frontdesk_handoff_sender_allowed` of gov-common), marked as one (`meta.msg` and the
+/// payload's `type` both `frontdesk_handoff`), whose payload has the handoff's shape
+/// (`parse_frontdesk_handoff` of gov-common). A marked message whose payload does not parse is a
+/// conversation's turn there, which calls the model once the frontdesk is configured, so it is an
+/// LLM turn here too: an IO node relays a payload someone else wrote (IO.cloud, Cloud's
+/// `register_human`), and a field of the wrong type must not run the model on the direct lane.
+fn is_frontdesk_handoff(msg: &Message) -> bool {
+    msg.meta.msg_type.eq_ignore_ascii_case("user")
         && msg.meta.msg.as_deref() == Some(FRONTDESK_HANDOFF)
         && msg.payload.get("type").and_then(Value::as_str) == Some(FRONTDESK_HANDOFF)
         && msg
@@ -324,6 +458,41 @@ pub fn runs_without_model(msg: &Message) -> bool {
             .as_deref()
             .map(str::trim)
             .is_some_and(|sender| sender.starts_with("IO."))
+        && FrontdeskHandoffShape::deserialize(&msg.payload).is_ok()
+}
+
+/// A frontdesk handoff's payload as SY.frontdesk.gov parses it: gov-common's
+/// `FrontdeskHandoffPayload`, field for field, with the same types and defaults. The runtime reads
+/// none of it, only whether it parses; tests/frontdesk_handoff_contract.rs holds it to gov-common's.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct FrontdeskHandoffShape {
+    #[serde(rename = "type")]
+    payload_type: String,
+    schema_version: u32,
+    operation: String,
+    #[serde(default)]
+    subject: FrontdeskHandoffSubjectShape,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    context: Option<Value>,
+}
+
+/// gov-common's `FrontdeskHandoffSubject`, for `FrontdeskHandoffShape`.
+#[derive(Default, Deserialize)]
+#[allow(dead_code)]
+struct FrontdeskHandoffSubjectShape {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    phone: Option<String>,
+    #[serde(default)]
+    company_name: Option<String>,
+    #[serde(default)]
+    attributes: Option<Map<String, Value>>,
 }
 
 /// Where the runtime sends the answers: the node's connection to its router, or a test's.
@@ -364,8 +533,27 @@ type TaskEnd = std::result::Result<Result<()>, JoinError>;
 enum Lane {
     /// The model workers, which run the LLM turns.
     Worker,
-    /// What runs without the model, as it is read.
+    /// What runs without the model, as it is read, and the answers `ai_runtime_busy`.
     Direct,
+}
+
+impl Lane {
+    fn name(self) -> &'static str {
+        match self {
+            Lane::Worker => "model worker",
+            Lane::Direct => "direct lane",
+        }
+    }
+}
+
+/// Which places of the direct lane a task may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPlace {
+    /// A `system` or `admin` message: any free place.
+    Control,
+    /// A `user` message, a frontdesk handoff or an answer `ai_runtime_busy`: one of the
+    /// `direct_user_capacity` places.
+    User,
 }
 
 /// Takes each message the reader hands on into `lanes` as it comes, while their tasks run, and
@@ -403,11 +591,16 @@ async fn dispatch<N: AiNode + 'static, W: ReplyWriter>(
 /// The runtime's two lanes (FINDINGS A-257).
 ///
 /// - **Direct:** a message that runs without the model (`runs_without_model`) starts as it is
-///   read, up to `direct_capacity` at once. One that finds every place taken is dropped: no handler
-///   runs and nothing answers it, as for a handler that fails on a `system` request.
+///   read, under `direct_handler_timeout`, up to `direct_capacity` at once. A `system` or `admin`
+///   message may take any of those places; the lane's `user` messages, a frontdesk handoff and an
+///   answer `ai_runtime_busy`, at most `direct_user_capacity` of them, so they never take the
+///   places a status or config request needs. A message that finds every place it may take taken
+///   is dropped: no handler runs and nothing answers it, as for a handler that fails on a `system`
+///   request; a busy answer that finds them taken is not sent.
 /// - **Workers:** every other message is an LLM turn. It takes a free worker, of
 ///   `worker_pool_size`, or waits for one in the order turns came, up to `queue_capacity`; the next
-///   one is answered `ai_runtime_busy` at once (retryable: it never ran), on the direct lane.
+///   one is refused and never run, and answered `ai_runtime_busy` (retryable: it never ran) from
+///   the direct lane.
 ///
 /// So turns start in the order they came, at most `worker_pool_size` at once, as before; nothing
 /// waits without a bound; and a node with a free worker runs each message as it comes, as before.
@@ -420,10 +613,11 @@ struct Lanes<N, W> {
     workers: JoinSet<Result<()>>,
     /// The LLM turns that wait for a worker, in the order they came.
     waiting: VecDeque<Message>,
-    /// What runs without the model, and the answers `ai_runtime_busy`.
-    direct: JoinSet<Result<()>>,
-    turns_refused_log: RefusalLog,
-    direct_dropped_log: RefusalLog,
+    /// The direct lane's `system` and `admin` messages.
+    direct_control: JoinSet<Result<()>>,
+    /// The direct lane's `user` messages: the frontdesk's handoffs and the answers
+    /// `ai_runtime_busy`.
+    direct_user: JoinSet<Result<()>>,
 }
 
 impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
@@ -435,14 +629,13 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             metrics,
             workers: JoinSet::new(),
             waiting: VecDeque::new(),
-            direct: JoinSet::new(),
-            turns_refused_log: RefusalLog::default(),
-            direct_dropped_log: RefusalLog::default(),
+            direct_control: JoinSet::new(),
+            direct_user: JoinSet::new(),
         }
     }
 
     fn is_running(&self) -> bool {
-        !self.workers.is_empty() || !self.direct.is_empty()
+        !self.workers.is_empty() || !self.direct_control.is_empty() || !self.direct_user.is_empty()
     }
 
     /// Places a message the reader handed on: a tap copy nowhere, a message that runs without the
@@ -454,15 +647,10 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
         if ignored_tap_copy(&msg, &self.metrics) {
             return Ok(());
         }
-        if runs_without_model(&msg) {
-            let task = process_one(
-                self.node.clone(),
-                self.writer.clone(),
-                msg.clone(),
-                self.config.clone(),
-                self.metrics.clone(),
-            );
-            self.run_direct(&msg, task);
+        if is_control_traffic(&msg) {
+            self.run_direct_message(DirectPlace::Control, msg);
+        } else if is_frontdesk_handoff(&msg) {
+            self.run_direct_message(DirectPlace::User, msg);
         } else if self.waiting.is_empty() && self.workers.len() < self.config.worker_pool_size {
             self.start_turn(msg);
         } else if self.waiting.len() < self.config.queue_capacity {
@@ -486,7 +674,8 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
     async fn join_next(&mut self) -> Option<(Lane, TaskEnd)> {
         tokio::select! {
             Some(ended) = self.workers.join_next() => Some((Lane::Worker, ended)),
-            Some(ended) = self.direct.join_next() => Some((Lane::Direct, ended)),
+            Some(ended) = self.direct_control.join_next() => Some((Lane::Direct, ended)),
+            Some(ended) = self.direct_user.join_next() => Some((Lane::Direct, ended)),
             else => None,
         }
     }
@@ -496,32 +685,40 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
         while let Some(ended) = self.workers.try_join_next() {
             self.settle((Lane::Worker, ended))?;
         }
-        while let Some(ended) = self.direct.try_join_next() {
+        while let Some(ended) = self.direct_control.try_join_next() {
+            self.settle((Lane::Direct, ended))?;
+        }
+        while let Some(ended) = self.direct_user.try_join_next() {
             self.settle((Lane::Direct, ended))?;
         }
         Ok(())
     }
 
-    /// A worker a task gives back takes the next waiting turn. A task's error is the runtime's, as
-    /// it was: a write that failed after its retries counts in `recoverable_exhausted` and the
-    /// runtime goes on; any other error, or a task that panicked, stops it.
+    /// A task's error is the runtime's, as it was: a write that failed after its retries counts in
+    /// `recoverable_exhausted` and the runtime goes on, and the worker a turn gives back takes the
+    /// next waiting turn; any other error, or a task that panicked, stops the runtime, and no
+    /// waiting turn starts, since it would be cut off as the runtime stops, after it may have
+    /// called its model.
     fn settle(&mut self, (lane, ended): (Lane, TaskEnd)) -> Result<()> {
-        if lane == Lane::Worker {
-            self.start_waiting_turns();
-        }
         match ended {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {}
             Ok(Err(AiSdkError::RecoverableExhausted(_))) => {
                 self.metrics
                     .recoverable_exhausted
                     .fetch_add(1, Ordering::Relaxed);
-                Ok(())
             }
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(AiSdkError::Protocol(format!(
-                "worker task join error: {err}"
-            ))),
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                return Err(AiSdkError::Protocol(format!(
+                    "{} task join error: {err}",
+                    lane.name()
+                )))
+            }
         }
+        if lane == Lane::Worker {
+            self.start_waiting_turns();
+        }
+        Ok(())
     }
 
     fn start_turn(&mut self, msg: Message) {
@@ -529,6 +726,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             self.node.clone(),
             self.writer.clone(),
             msg,
+            self.config.handler_timeout,
             self.config.clone(),
             self.metrics.clone(),
         ));
@@ -550,36 +748,68 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             .store(self.waiting.len() as u64, Ordering::Relaxed);
     }
 
-    /// Runs `task`, for `msg`, on the direct lane, or drops it when every place is taken.
-    fn run_direct<F>(&mut self, msg: &Message, task: F)
+    /// Whether the direct lane has a place a task of `place` may take: any free one for a `system`
+    /// or `admin` message, and for a `user` one only while fewer than `direct_user_capacity` run.
+    fn has_direct_place(&self, place: DirectPlace) -> bool {
+        let running = self.direct_control.len() + self.direct_user.len();
+        running < self.config.direct_capacity
+            && (place == DirectPlace::Control
+                || self.direct_user.len() < self.config.direct_user_capacity)
+    }
+
+    fn spawn_direct<F>(&mut self, place: DirectPlace, task: F)
     where
         F: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        if self.direct.len() < self.config.direct_capacity {
-            self.direct.spawn(task);
+        match place {
+            DirectPlace::Control => self.direct_control.spawn(task),
+            DirectPlace::User => self.direct_user.spawn(task),
+        };
+    }
+
+    /// Runs `msg`, which runs without the model, on the direct lane under its own deadline
+    /// (`direct_handler_timeout`), or drops it when every place it may take is taken: nothing runs
+    /// or answers it, and its sender's own timeout reports it. A handoff is dropped too rather than
+    /// answered: IO.cloud takes any error answer to it for the frontdesk's refusal
+    /// (`FRONTDESK_REJECTED`), and its timeout for the frontdesk being unavailable.
+    fn run_direct_message(&mut self, place: DirectPlace, msg: Message) {
+        if self.has_direct_place(place) {
+            let task = process_one(
+                self.node.clone(),
+                self.writer.clone(),
+                msg,
+                self.config.direct_handler_timeout,
+                self.config.clone(),
+                self.metrics.clone(),
+            );
+            self.spawn_direct(place, task);
             return;
         }
         let dropped_total = self.metrics.direct_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(dropped) = self.direct_dropped_log.note(Instant::now()) {
+        if let Some(dropped) = self.metrics.note_refusal(Refusal::Dropped) {
             tracing::warn!(
                 trace_id = %msg.routing.trace_id,
                 msg_type = %msg.meta.msg_type,
                 msg = ?msg.meta.msg,
                 src_l2_name = ?msg.routing.src_l2_name,
                 direct_capacity = self.config.direct_capacity,
+                direct_user_capacity = self.config.direct_user_capacity,
+                direct_running = self.direct_control.len() + self.direct_user.len(),
+                direct_user_running = self.direct_user.len(),
                 dropped,
                 direct_dropped = dropped_total,
-                "ai runtime dropped a message, neither run nor answered: every place of its lane for \
-                 what runs without the model is taken"
+                "ai runtime dropped a message, neither run nor answered: every place of the direct \
+                 lane it may take is taken"
             );
         }
     }
 
-    /// An LLM turn that finds every worker busy and the queue full is never run: its sender gets
-    /// `ai_runtime_busy` at once, from the direct lane.
+    /// An LLM turn that finds every worker busy and the queue full is refused and never run. Its
+    /// sender gets `ai_runtime_busy` at once, from the direct lane, while a place for its `user`
+    /// messages is free; when none is, the answer is not sent.
     fn refuse_turn(&mut self, msg: Message) {
         let refused_total = self.metrics.turns_refused.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(refused) = self.turns_refused_log.note(Instant::now()) {
+        if let Some(refused) = self.metrics.note_refusal(Refusal::Turn) {
             tracing::warn!(
                 trace_id = %msg.routing.trace_id,
                 msg_type = %msg.meta.msg_type,
@@ -589,13 +819,33 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
                 queue_capacity = self.config.queue_capacity,
                 refused,
                 turns_refused = refused_total,
-                "ai runtime answered an LLM turn ai_runtime_busy without running it: every model \
-                 worker is busy and the queue for them is full"
+                "ai runtime refused an LLM turn without running it: every model worker is busy and \
+                 the queue for them is full"
             );
         }
         let Some(reply) = busy_reply(&msg, &self.config) else {
             return;
         };
+        if !self.has_direct_place(DirectPlace::User) {
+            let dropped_total = self
+                .metrics
+                .busy_answers_dropped
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if let Some(dropped) = self.metrics.note_refusal(Refusal::BusyAnswer) {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    thread_id = ?msg.meta.thread_id,
+                    direct_user_capacity = self.config.direct_user_capacity,
+                    dropped,
+                    busy_answers_dropped = dropped_total,
+                    "ai runtime sent no ai_runtime_busy answer to a refused LLM turn: every place \
+                     of the direct lane for user messages is taken"
+                );
+            }
+            return;
+        }
         let task = send_reply(
             self.writer.clone(),
             msg.routing.src_l2_name.clone(),
@@ -603,7 +853,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             self.config.clone(),
             self.metrics.clone(),
         );
-        self.run_direct(&msg, task);
+        self.spawn_direct(DirectPlace::User, task);
     }
 
     /// The runtime stops: the turns still waiting are dropped, as the messages not handed on yet
@@ -621,29 +871,6 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             self.settle(ended)?;
         }
         Ok(())
-    }
-}
-
-/// When a lane says it turned messages away: the first time, then at most once every
-/// `REFUSAL_LOG_INTERVAL`.
-#[derive(Debug, Default)]
-struct RefusalLog {
-    logged_at: Option<Instant>,
-    unlogged: u64,
-}
-
-impl RefusalLog {
-    /// Counts one; when its line is due, how many to name in it (this one and those since the last).
-    fn note(&mut self, now: Instant) -> Option<u64> {
-        self.unlogged += 1;
-        if self
-            .logged_at
-            .is_some_and(|at| now.duration_since(at) < REFUSAL_LOG_INTERVAL)
-        {
-            return None;
-        }
-        self.logged_at = Some(now);
-        Some(std::mem::take(&mut self.unlogged))
     }
 }
 
@@ -747,17 +974,19 @@ fn with_jitter(base: Duration) -> Duration {
     Duration::from_millis(total as u64)
 }
 
+/// Runs `msg`'s handler once, within `handler_timeout` (its lane's), and sends its answer.
 async fn process_one<N: AiNode, W: ReplyWriter>(
     node: Arc<N>,
     writer: W,
     msg: Message,
+    handler_timeout: Duration,
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
     // The reply goes to the requester's UUID: its entry in the cycle's trace names the requester by
     // the name the router stamped on the request.
     let requester = msg.routing.src_l2_name.clone();
-    let maybe_response = run_handler(node.as_ref(), msg, config.handler_timeout, &metrics).await;
+    let maybe_response = run_handler(node.as_ref(), msg, handler_timeout, &metrics).await;
 
     if let Some(response) = maybe_response {
         send_reply(writer, requester, response, config, metrics.clone()).await?;
@@ -915,9 +1144,11 @@ async fn run_handler<N: AiNode>(
 }
 
 /// The answer to an LLM turn the runtime turned away without running it (FINDINGS A-257): every
-/// worker busy and the queue for them full. It is `retryable`: nothing was done.
+/// worker busy and the queue for them full. It is `retryable`: nothing was done. The agent's entry
+/// in the message's trace says it refused the turn (`busy`, docs/message-trace-v1.md §5), so the
+/// trace alone tells a refusal from an answer.
 fn busy_reply(msg: &Message, config: &RuntimeConfig) -> Option<Message> {
-    error_reply(
+    let mut reply = error_reply(
         msg,
         "ai_runtime_busy",
         format!(
@@ -926,7 +1157,9 @@ fn busy_reply(msg: &Message, config: &RuntimeConfig) -> Option<Message> {
             config.worker_pool_size, config.queue_capacity
         ),
         true,
-    )
+    )?;
+    set_reply_act(&mut reply, ["busy"]);
+    Some(reply)
 }
 
 /// An AI runtime error the sender gets in place of the handler's answer, in the shape of every one
@@ -1001,10 +1234,13 @@ where
     ))
 }
 
+/// The periodic `ai runtime metrics` line, after the lines that name what the lanes turned away
+/// since their last one (`log_refusals_since_last_line`).
 async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
+        metrics.log_refusals_since_last_line();
         let snapshot = metrics.snapshot();
         tracing::info!(
             read_messages = snapshot.read_messages,
@@ -1024,6 +1260,7 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
             turns_waiting = snapshot.turns_waiting,
             turns_refused = snapshot.turns_refused,
             direct_dropped = snapshot.direct_dropped,
+            busy_answers_dropped = snapshot.busy_answers_dropped,
             "ai runtime metrics"
         );
     }
@@ -1297,10 +1534,12 @@ mod tests {
 
     // FINDINGS A-257: the lanes.
 
-    /// The answers the runtime sends, handed to the test.
+    /// The answers the runtime sends, handed to the test. The answer to the message named in
+    /// `too_large` is refused as a frame too large, an error that stops the runtime.
     #[derive(Clone)]
     struct TestWriter {
         sent: mpsc::UnboundedSender<Message>,
+        too_large: Option<&'static str>,
     }
 
     #[async_trait]
@@ -1318,19 +1557,25 @@ mod tests {
             msg: Message,
             _note: TraceNote,
         ) -> std::result::Result<(), NodeError> {
+            if self.too_large == Some(msg.routing.trace_id.as_str()) {
+                return Err(NodeError::MessageTooLarge {
+                    size: 200_000,
+                    max: 131_072,
+                });
+            }
             let _ = self.sent.send(msg);
             Ok(())
         }
     }
 
     /// A node as the frontdesk is to its runtime: an LLM turn holds its worker until the test lets
-    /// one go (the earliest first), and a status request or a handoff is answered at once. A
-    /// `system` message named `SLOW` holds its place until the test lets it go. It notes the order
-    /// its handler starts each message in, by trace id.
+    /// one go (the earliest first), and a status request or a handoff is answered at once, unless
+    /// its trace id starts with `held`: that one holds its place until the test lets it go
+    /// (`let_held_go`). It notes the order its handler starts each message in, by trace id.
     struct GatedNode {
         started: std::sync::Mutex<Vec<String>>,
         turns: tokio::sync::Semaphore,
-        slow_control: tokio::sync::Semaphore,
+        held: tokio::sync::Semaphore,
     }
 
     impl GatedNode {
@@ -1338,7 +1583,7 @@ mod tests {
             Self {
                 started: std::sync::Mutex::new(Vec::new()),
                 turns: tokio::sync::Semaphore::new(0),
-                slow_control: tokio::sync::Semaphore::new(0),
+                held: tokio::sync::Semaphore::new(0),
             }
         }
 
@@ -1354,15 +1599,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(msg.routing.trace_id.clone());
+            let held = msg.routing.trace_id.starts_with("held");
             if is_system_kind(&msg.meta.msg_type) {
-                if msg.meta.msg.as_deref() == Some("SLOW") {
-                    self.slow_control.acquire().await.unwrap().forget();
+                if held {
+                    self.held.acquire().await.unwrap().forget();
                 }
                 let mut answer = build_reply_message_runtime_src(&msg, json!({"status": "ok"}));
                 answer.meta.msg = Some("NODE_STATUS_GET_RESPONSE".to_string());
                 return Ok(Some(answer));
             }
             if msg.meta.msg.as_deref() == Some(FRONTDESK_HANDOFF) {
+                if held {
+                    self.held.acquire().await.unwrap().forget();
+                }
                 return Ok(Some(build_reply_message_runtime_src(
                     &msg,
                     json!({"type": "frontdesk_result", "status": "ok"}),
@@ -1390,7 +1639,11 @@ mod tests {
             let metrics = Arc::new(RuntimeMetrics::default());
             let (sent, answers) = mpsc::unbounded_channel();
             let (to_runtime, mut rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
-            let mut lanes = Lanes::new(node.clone(), TestWriter { sent }, config, metrics.clone());
+            let writer = TestWriter {
+                sent,
+                too_large: None,
+            };
+            let mut lanes = Lanes::new(node.clone(), writer, config, metrics.clone());
             tokio::spawn(async move {
                 let mut reader = tokio::spawn(std::future::pending::<Result<()>>());
                 dispatch(&mut lanes, &mut rx, &mut reader).await
@@ -1435,6 +1688,10 @@ mod tests {
 
         fn let_turns_go(&self, count: usize) {
             self.node.turns.add_permits(count);
+        }
+
+        fn let_held_go(&self, count: usize) {
+            self.node.held.add_permits(count);
         }
     }
 
@@ -1619,23 +1876,202 @@ mod tests {
     async fn past_the_direct_lane_a_message_is_dropped_unanswered() {
         let mut runtime = Harness::start(RuntimeConfig {
             direct_capacity: 1,
+            direct_user_capacity: 1,
             ..RuntimeConfig::default()
         });
-        let mut slow = status_request("slow");
-        slow.meta.msg = Some("SLOW".to_string());
-        runtime.send(slow).await;
-        assert_eq!(runtime.started(1).await, ["slow"]);
+        runtime.send(status_request("held")).await;
+        assert_eq!(runtime.started(1).await, ["held"]);
 
         runtime.send(status_request("dropped")).await;
+        runtime.send(handoff("dropped-handoff")).await;
         runtime.no_answer().await;
-        assert_eq!(runtime.node.started(), ["slow"]);
-        assert_eq!(runtime.metrics.direct_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.node.started(), ["held"]);
+        assert_eq!(runtime.metrics.direct_dropped.load(Ordering::Relaxed), 2);
 
-        runtime.node.slow_control.add_permits(1);
-        assert_eq!(runtime.answer().await.routing.trace_id, "slow");
+        runtime.let_held_go(1);
+        assert_eq!(runtime.answer().await.routing.trace_id, "held");
         runtime.send(status_request("status")).await;
         assert_eq!(runtime.answer().await.routing.trace_id, "status");
-        assert_eq!(runtime.node.started(), ["slow", "status"]);
+        assert_eq!(runtime.node.started(), ["held", "status"]);
+    }
+
+    /// The review of A-257: a burst of handoffs as large as the whole direct lane, held by a slow
+    /// SY.identity, takes only the places of its `user` messages: the first `direct_user_capacity`
+    /// run, the rest are dropped unanswered, and so is the busy answer of a turn refused meanwhile.
+    /// Status requests are still answered at once, and the place a handoff gives back answers the
+    /// next refused turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_handoffs_leaves_the_places_of_the_control_traffic() {
+        let mut runtime = Harness::start(RuntimeConfig {
+            worker_pool_size: 1,
+            queue_capacity: 0,
+            ..RuntimeConfig::default()
+        });
+        runtime.send(turn("turn-1")).await;
+        for n in 1..=DEFAULT_DIRECT_CAPACITY {
+            runtime.send(handoff(&format!("held-handoff-{n}"))).await;
+        }
+        runtime.send(turn("turn-2")).await;
+        runtime.no_answer().await;
+        let started = runtime.node.started();
+        assert_eq!(
+            started.len(),
+            1 + DEFAULT_DIRECT_USER_CAPACITY,
+            "{started:?}"
+        );
+        assert_eq!(
+            started.last().map(String::as_str),
+            Some(format!("held-handoff-{DEFAULT_DIRECT_USER_CAPACITY}").as_str())
+        );
+        assert_eq!(
+            runtime.metrics.direct_dropped.load(Ordering::Relaxed),
+            (DEFAULT_DIRECT_CAPACITY - DEFAULT_DIRECT_USER_CAPACITY) as u64
+        );
+        assert_eq!(runtime.metrics.turns_refused.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runtime.metrics.busy_answers_dropped.load(Ordering::Relaxed),
+            1
+        );
+
+        // The control traffic keeps its places.
+        for id in ["status-1", "status-2"] {
+            runtime.send(status_request(id)).await;
+            assert_eq!(runtime.answer().await.routing.trace_id, id);
+        }
+        assert!(!runtime.node.started().iter().any(|id| id == "turn-2"));
+
+        // A handoff that ends gives its place back: the next refused turn is answered busy.
+        runtime.let_held_go(1);
+        assert_eq!(
+            runtime.answer().await.payload["type"],
+            json!("frontdesk_result")
+        );
+        runtime.send(turn("turn-3")).await;
+        let busy = runtime.answer().await;
+        assert_eq!(busy.routing.trace_id, "turn-3");
+        assert_eq!(busy.payload["code"], json!("ai_runtime_busy"));
+    }
+
+    /// The review of A-257: what runs without the model has its own deadline,
+    /// `direct_handler_timeout`, not an LLM turn's 47 min. A handoff that runs out of it is
+    /// answered `ai_runtime_timeout`, a status request gets nothing, and both give their places
+    /// back.
+    #[tokio::test(start_paused = true)]
+    async fn the_direct_lane_cuts_a_message_at_its_own_deadline() {
+        let mut runtime = Harness::start(RuntimeConfig {
+            direct_capacity: 2,
+            direct_user_capacity: 1,
+            ..RuntimeConfig::default()
+        });
+        runtime.send(handoff("held-handoff")).await;
+        runtime.send(status_request("held-status")).await;
+        assert_eq!(runtime.started(2).await.len(), 2);
+        runtime.send(status_request("dropped")).await;
+        runtime.no_answer().await;
+        assert_eq!(runtime.metrics.direct_dropped.load(Ordering::Relaxed), 1);
+
+        sleep(DEFAULT_DIRECT_HANDLER_TIMEOUT).await;
+        let cut = runtime.answer().await;
+        assert_eq!(cut.routing.trace_id, "held-handoff");
+        assert_eq!(cut.payload["code"], json!("ai_runtime_timeout"));
+        assert_eq!(cut.payload["retryable"], json!(false));
+        runtime.no_answer().await;
+        assert_eq!(runtime.metrics.handler_timeouts.load(Ordering::Relaxed), 2);
+
+        runtime.send(handoff("handoff")).await;
+        runtime.send(status_request("status")).await;
+        let answers = [runtime.answer().await, runtime.answer().await];
+        let mut answered = ids(&answers);
+        answered.sort_unstable();
+        assert_eq!(answered, ["handoff", "status"]);
+    }
+
+    /// The review of A-257: a task that ends with an error that stops the runtime starts no
+    /// waiting turn, which the stop would cut off after it may have called its model.
+    #[tokio::test]
+    async fn a_task_that_stops_the_runtime_starts_no_waiting_turn() {
+        let node = Arc::new(GatedNode::new());
+        let (sent, _answers) = mpsc::unbounded_channel();
+        let writer = TestWriter {
+            sent,
+            too_large: Some("turn-1"),
+        };
+        let config = RuntimeConfig {
+            worker_pool_size: 1,
+            ..RuntimeConfig::default()
+        };
+        let mut lanes = Lanes::new(node.clone(), writer, config, Arc::default());
+        lanes.take(turn("turn-1")).unwrap();
+        lanes.take(turn("turn-2")).unwrap();
+        assert_eq!(lanes.waiting.len(), 1);
+
+        // turn-1's answer is too large to send.
+        node.turns.add_permits(1);
+        let ended = timeout(Duration::from_secs(5), lanes.join_next())
+            .await
+            .expect("turn-1 ends")
+            .expect("a task ended");
+        assert!(matches!(
+            lanes.settle(ended),
+            Err(AiSdkError::Node(NodeError::MessageTooLarge { .. }))
+        ));
+        assert!(lanes.workers.is_empty(), "turn-2 never started");
+        assert_eq!(lanes.waiting.len(), 1);
+        assert_eq!(node.started(), ["turn-1"]);
+
+        // A task that did not end on its own (it panicked, or it was cut off) names its lane.
+        let task = tokio::spawn(std::future::pending::<Result<()>>());
+        task.abort();
+        let cut_off = task.await.unwrap_err();
+        let Err(AiSdkError::Protocol(reason)) = lanes.settle((Lane::Direct, Err(cut_off))) else {
+            panic!("a task that did not end on its own stops the runtime");
+        };
+        assert!(
+            reason.starts_with("direct lane task join error"),
+            "{reason}"
+        );
+    }
+
+    /// The review of A-257: the busy answer's entry in the trace says the agent refused the turn.
+    #[test]
+    fn a_busy_answer_names_the_refusal_in_the_trace() {
+        let mut busy =
+            busy_reply(&turn("turn"), &RuntimeConfig::default()).expect("a turn is answered");
+        assert_eq!(busy.payload["code"], json!("ai_runtime_busy"));
+        let note = reply_trace_note(Some("IO.slack.main@motherbee"), &mut busy);
+        assert_eq!(note.act, ["busy"]);
+    }
+
+    #[test]
+    fn the_runtime_runs_on_bounds_that_hold() {
+        assert!(RuntimeConfig::default().check().is_ok());
+        for config in [
+            RuntimeConfig {
+                worker_pool_size: 0,
+                ..RuntimeConfig::default()
+            },
+            RuntimeConfig {
+                direct_capacity: 0,
+                ..RuntimeConfig::default()
+            },
+            RuntimeConfig {
+                direct_user_capacity: 0,
+                ..RuntimeConfig::default()
+            },
+            RuntimeConfig {
+                direct_user_capacity: DEFAULT_DIRECT_CAPACITY + 1,
+                ..RuntimeConfig::default()
+            },
+            RuntimeConfig {
+                metrics_log_interval: Duration::ZERO,
+                ..RuntimeConfig::default()
+            },
+        ] {
+            assert!(config.check().is_err(), "{config:?}");
+        }
+        // Above every sender's wait (SY.admin's 30 s for a CONFIG_SET, IO.cloud's 20 s for a
+        // handoff), far below an LLM turn's.
+        assert_eq!(DEFAULT_DIRECT_HANDLER_TIMEOUT, Duration::from_secs(30));
     }
 
     /// A tap copy takes no worker and no place in the queue, and is answered by nothing, not even
@@ -1724,17 +2160,75 @@ mod tests {
         assert!(!runs_without_model(&event));
     }
 
+    /// The review of A-257: a marked handoff runs without the model only when its payload has the
+    /// shape the frontdesk parses; any other is a conversation's turn there, which calls the model,
+    /// and waits for a worker here. IO.cloud relays Cloud's `register_human` params as they come.
     #[test]
-    fn a_lane_says_it_turned_messages_away_at_once_then_once_an_interval() {
-        let mut log = RefusalLog::default();
-        let start = Instant::now();
-        assert_eq!(log.note(start), Some(1));
-        assert_eq!(log.note(start + Duration::from_secs(1)), None);
-        assert_eq!(log.note(start + Duration::from_secs(9)), None);
-        assert_eq!(log.note(start + REFUSAL_LOG_INTERVAL), Some(3));
-        assert_eq!(
-            log.note(start + REFUSAL_LOG_INTERVAL + Duration::from_secs(1)),
-            None
-        );
+    fn a_marked_handoff_runs_without_the_model_only_in_the_shape_the_frontdesk_parses() {
+        let with_payload = |payload: Value| {
+            let mut msg = handoff("handoff");
+            msg.routing.src_l2_name = Some("IO.cloud@motherbee".to_string());
+            msg.payload = payload;
+            msg
+        };
+        for payload in [
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": "complete_registration"}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": "x", "subject": {}}),
+            json!({
+                "type": "frontdesk_handoff", "schema_version": 1, "operation": "complete_registration",
+                "subject": {
+                    "display_name": null, "email": "ana@example.com", "phone": "+54 9 11 5555 0000",
+                    "company_name": "ACME", "attributes": {"plan": 3}
+                },
+                "tenant_id": "tnt:acme", "context": [1, "two"], "extra": {"ignored": true}
+            }),
+        ] {
+            assert!(
+                runs_without_model(&with_payload(payload.clone())),
+                "{payload}"
+            );
+        }
+        for payload in [
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": "x", "subject": {"email": "ana@example.com", "phone": 5491155550000_u64}}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": "x", "subject": null}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": "x", "subject": {"attributes": ["plan"]}}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": "x", "tenant_id": 7}),
+            json!({"type": "frontdesk_handoff", "schema_version": "1", "operation": "x"}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1.0, "operation": "x"}),
+            json!({"type": "frontdesk_handoff", "schema_version": -1, "operation": "x"}),
+            json!({"type": "frontdesk_handoff", "schema_version": 4_294_967_296_u64, "operation": "x"}),
+            json!({"type": "frontdesk_handoff", "operation": "x"}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1}),
+            json!({"type": "frontdesk_handoff", "schema_version": 1, "operation": null}),
+            json!("frontdesk_handoff"),
+        ] {
+            assert!(
+                !runs_without_model(&with_payload(payload.clone())),
+                "{payload}"
+            );
+        }
+    }
+
+    /// The review of A-257: a marked handoff the frontdesk cannot parse waits for a worker as an
+    /// LLM turn, where it used to start at once on the direct lane, outside the workers' bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_marked_handoff_the_frontdesk_cannot_parse_waits_as_a_turn() {
+        let mut runtime = Harness::start(RuntimeConfig {
+            worker_pool_size: 1,
+            ..RuntimeConfig::default()
+        });
+        runtime.send(turn("turn-1")).await;
+        assert_eq!(runtime.started(1).await, ["turn-1"]);
+        let mut malformed = handoff("malformed");
+        malformed.payload["subject"]["phone"] = json!(5491155550000_u64);
+        runtime.send(malformed).await;
+        runtime.no_answer().await;
+        assert_eq!(runtime.node.started(), ["turn-1"]);
+        assert_eq!(runtime.metrics.turns_queued.load(Ordering::Relaxed), 1);
+
+        runtime.let_turns_go(1);
+        assert_eq!(runtime.answer().await.routing.trace_id, "turn-1");
+        assert_eq!(runtime.answer().await.routing.trace_id, "malformed");
+        assert_eq!(runtime.node.started(), ["turn-1", "malformed"]);
     }
 }
