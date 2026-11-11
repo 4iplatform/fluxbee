@@ -124,11 +124,18 @@ func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 			s.sendCommandResponse(msg, action, commandErrorPayload(err))
 			return
 		}
-		s.sendCommandResponse(msg, action, map[string]any{
-			"status":  "ok",
-			"deleted": result.Deleted,
-			"wf_node": result.WFNode,
-		})
+		// packages_left is always there, [] when the purge removed every version: an answer
+		// without it is from an SY.wf-rules before 0.1.133.
+		payload := map[string]any{
+			"status":        "ok",
+			"deleted":       result.Deleted,
+			"wf_node":       result.WFNode,
+			"packages_left": result.PackagesLeft,
+		}
+		if result.Warning != "" {
+			payload["warning"] = result.Warning
+		}
+		s.sendCommandResponse(msg, action, payload)
 	}
 }
 

@@ -8,6 +8,12 @@ import (
 type DeleteWorkflowResult struct {
 	Deleted bool
 	WFNode  WFNodeActionResult
+	// PackagesLeft are the versions of wf.<workflow> the delete's purge did not remove from the
+	// motherbee's dist, each with why; empty when it removed them all.
+	PackagesLeft []PackageLeft
+	// Warning says, when PackagesLeft names any, that the workflow is deleted all the same, and what
+	// removes them.
+	Warning string
 }
 
 func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResult, error) {
@@ -50,6 +56,7 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 			Action:   "none",
 			Reason:   "node not managed",
 		},
+		PackagesLeft: []PackageLeft{},
 	}
 	if snapshot.ConfigExists {
 		if s.nodes == nil {
@@ -68,10 +75,38 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 	if err := s.store.DeleteWorkflowState(workflowName); err != nil {
 		return nil, err
 	}
-	if err := s.purgeWorkflowPackages(ctx, workflowName, false); err != nil {
-		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
+	// The workflow is deleted now: its node and its state are gone, and a delete asked again answers
+	// WORKFLOW_NOT_FOUND. So a purge that cannot finish does not fail it: the answer names what
+	// stayed. Before 0.1.133 the delete answered PACKAGE_PUBLISH_FAILED, the factory reset counted it
+	// as failed, and nothing named the versions left in the motherbee's dist. With A-281, SY.admin
+	// refuses any removal while a hive that may run the version cannot be read (a worker down or
+	// restarting, a join under way), RUNTIME_USAGE_UNKNOWN.
+	left, err := s.purgeWorkflowPackages(ctx, workflowName, false)
+	if err != nil {
+		left = []PackageLeft{{Runtime: workflowRuntimeName(workflowName), ErrorCode: "DIST_UNREADABLE", Detail: err.Error()}}
 	}
+	result.PackagesLeft = append(result.PackagesLeft, left...)
+	result.Warning = packagesLeftWarning(workflowName, left)
 	return result, nil
+}
+
+// packagesLeftWarning is a delete's warning when its purge left versions of the workflow's package
+// in the motherbee's dist: the workflow is deleted, how many versions stayed and why the purge
+// stopped (packages_left names each), and what removes them. "" when it left none.
+func packagesLeftWarning(workflowName string, left []PackageLeft) string {
+	if len(left) == 0 {
+		return ""
+	}
+	runtimeName := workflowRuntimeName(workflowName)
+	stopped := left[0]
+	what := fmt.Sprintf("its purge did not remove %d versions of %s from the motherbee's dist (packages_left): it stopped at %s, %s", len(left), runtimeName, stopped.Version, stopped.ErrorCode)
+	switch {
+	case stopped.Version == "":
+		what = fmt.Sprintf("its purge could not list the versions of %s to remove from the motherbee's dist (packages_left: %s)", runtimeName, stopped.ErrorCode)
+	case len(left) == 1:
+		what = fmt.Sprintf("its purge did not remove %s %s from the motherbee's dist (packages_left: %s)", runtimeName, stopped.Version, stopped.ErrorCode)
+	}
+	return fmt.Sprintf("workflow %s is deleted, but %s. remove_runtime_version removes each version once every hive answers and no node runs it, and a later deploy of %s purges them too.", workflowName, what, workflowName)
 }
 
 // instancesUnconfirmed is why a delete without force cannot tell that the WF node runs no

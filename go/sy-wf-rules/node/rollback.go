@@ -55,7 +55,7 @@ func (s *Service) rollbackWorkflow(ctx context.Context, req RollbackRequest) (*R
 	if err != nil {
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
-	_ = s.purgeWorkflowPackages(ctx, workflowName, true)
+	s.purgeAfterPublish(ctx, workflowName)
 	return &RollbackResult{
 		Current: *currentMeta,
 		Package: *publish,

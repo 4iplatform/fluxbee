@@ -12,7 +12,7 @@ import (
 )
 
 // CompileWorkflow validates a definition (loadWorkflow) and stages it as written, under the version
-// the request gives or else the next one.
+// the request gives or else the next one (nextWorkflowVersion).
 func (s *Service) CompileWorkflow(req CompileRequest) (*WfRulesMetadata, error) {
 	loaded, err := s.loadWorkflow(req)
 	if err != nil {
@@ -20,7 +20,9 @@ func (s *Service) CompileWorkflow(req CompileRequest) (*WfRulesMetadata, error) 
 	}
 	version := req.Version
 	if version == 0 {
-		version = s.store.NextVersion(loaded.name)
+		if version, err = s.nextWorkflowVersion(loaded.name); err != nil {
+			return nil, fmt.Errorf("%w; nothing was staged", err)
+		}
 	}
 	meta := WfRulesMetadata{
 		Version:         version,
@@ -37,6 +39,22 @@ func (s *Service) CompileWorkflow(req CompileRequest) (*WfRulesMetadata, error) 
 		return nil, err
 	}
 	return &meta, nil
+}
+
+// nextWorkflowVersion is the version a compile stages when the request names none: one above the
+// highest of the workflow's slots (Store.NextVersion) and of the versions of wf.<workflow> this
+// hive's dist holds (highestPublishedVersion). A delete whose purge could not remove the workflow's
+// packages leaves them in the motherbee's dist (packages_left) and drops its state, so its slots
+// start again at 1: the next deploy of the name published 0.0.1 over the 0.0.1 left there, SY.admin
+// refused it (VERSION_CONFLICT, the definition differing), and the name stayed blocked until the
+// leftover was removed by hand. Above them, that deploy's purge removes them, since no slot keeps
+// them.
+func (s *Service) nextWorkflowVersion(workflowName string) (uint64, error) {
+	highest, err := s.highestPublishedVersion(workflowName)
+	if err != nil {
+		return 0, err
+	}
+	return max(s.store.NextVersion(workflowName), highest+1), nil
 }
 
 // WorkflowCheck is what a check answers of a definition that loads: its workflow, and the counts a

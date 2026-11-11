@@ -2,12 +2,15 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
@@ -326,6 +329,204 @@ func TestDeleteWorkflowWithoutForceRemovesARunningWFNodeWithNoInstances(t *testi
 	}
 	if removed := svc.admin.(*fakeAdminClient).removedVersions; len(removed) != 1 || removed[0] != "wf.invoice@0.0.1" {
 		t.Fatalf("want the workflow's package removed through the admin, got %v", removed)
+	}
+	if result.PackagesLeft == nil || len(result.PackagesLeft) != 0 || result.Warning != "" {
+		t.Fatalf("a purge that removed every version leaves none and warns of none: %#v", result)
+	}
+}
+
+// deleteWorkflowCommand is SY.admin's delete_workflow for workflow.
+func deleteWorkflowCommand(t *testing.T, workflow string, force bool) fluxbeesdk.Message {
+	t.Helper()
+	action, admin := "delete_workflow", fluxbeesdk.PrimaryAdminNode
+	payload, err := json.Marshal(map[string]any{"workflow_name": workflow, "force": force})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fluxbeesdk.Message{
+		Routing: fluxbeesdk.Routing{Src: "admin-uuid", SrcL2Name: &admin, TraceID: "t-delete"},
+		Meta:    fluxbeesdk.Meta{MsgType: "command", Action: &action},
+		Payload: payload,
+	}
+}
+
+// deleteAnswer is SY.wf-rules' answer to a delete_workflow, as SY.admin reads it.
+type deleteAnswer struct {
+	Status       string             `json:"status"`
+	Deleted      bool               `json:"deleted"`
+	WFNode       WFNodeActionResult `json:"wf_node"`
+	PackagesLeft []PackageLeft      `json:"packages_left"`
+	Warning      string             `json:"warning"`
+	ErrorCode    string             `json:"error_code"`
+	ErrorDetail  string             `json:"error_detail"`
+}
+
+// SY.admin removes a version only once every hive that may run it was read (FINDINGS A-281): with a
+// worker that does not answer, it refuses the delete's purge, RUNTIME_USAGE_UNKNOWN. The WF node and
+// the state are gone by then, so the delete is done and answers ok: packages_left names every
+// version the purge did not remove, the one SY.admin refused with its refusal and each it had still
+// to remove as PURGE_STOPPED, since what refused one refuses the next, and the warning says the
+// workflow is deleted and what removes them. Before 0.1.133 the delete answered
+// PACKAGE_PUBLISH_FAILED, though nothing could be asked again (WORKFLOW_NOT_FOUND).
+func TestADeleteWhosePurgeIsRefusedIsDoneAndNamesThePackagesLeft(t *testing.T) {
+	svc := newTestService(t)
+	for range 2 {
+		applyWorkflowForDelete(t, svc)
+	}
+	admin := svc.admin.(*fakeAdminClient)
+	admin.removedVersions = nil
+	const refusal = "cannot tell whether runtime 'wf.invoice' version '0.0.1' is in use: the nodes of worker1 (UNREACHABLE: hive 'worker1' is stale in the LSA) were not read, and nothing was removed. Ask again once each hive answers; a hive gone for good is removed with remove_hive first"
+	admin.removeErr = map[string]error{
+		"0.0.1": &adminActionError{Status: "error", Code: "RUNTIME_USAGE_UNKNOWN", Message: refusal},
+	}
+	killed := false
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: deployedWFNodeConfig, killNodeFunc: purgingKill(t, &killed)}
+	svc.wfNodes = &fakeWFNodeClient{countRunningInstancesFunc: func(string) (int, error) { return 0, nil }}
+	sender := &recordingSender{}
+	svc.sender = sender
+
+	svc.handleMessage(deleteWorkflowCommand(t, "invoice", false))
+
+	if len(sender.sent) != 1 {
+		t.Fatalf("want one answer, got %d", len(sender.sent))
+	}
+	var answer deleteAnswer
+	if err := json.Unmarshal(sender.sent[0].Payload, &answer); err != nil {
+		t.Fatal(err)
+	}
+	if answer.Status != "ok" || !answer.Deleted || answer.WFNode.Action != "deleted" || answer.ErrorCode != "" || !killed {
+		t.Fatalf("the delete is done: answer %+v, killed %v", answer, killed)
+	}
+	if svc.store.WorkflowExists("invoice") {
+		t.Fatal("the workflow's state goes")
+	}
+	want := []PackageLeft{
+		{Runtime: "wf.invoice", Version: "0.0.1", ErrorCode: "RUNTIME_USAGE_UNKNOWN", Detail: refusal},
+		{Runtime: "wf.invoice", Version: "0.0.2", ErrorCode: "PURGE_STOPPED", Detail: "the purge stopped at wf.invoice 0.0.1 (RUNTIME_USAGE_UNKNOWN) before removing it"},
+	}
+	if !reflect.DeepEqual(answer.PackagesLeft, want) {
+		t.Fatalf("packages_left:\n got %+v\nwant %+v", answer.PackagesLeft, want)
+	}
+	if got := strings.Join(admin.removedVersions, ","); got != "wf.invoice@0.0.1" {
+		t.Fatalf("the purge stops at the first refusal: asked %s", got)
+	}
+	const warning = "workflow invoice is deleted, but its purge did not remove 2 versions of wf.invoice from the motherbee's dist (packages_left): it stopped at 0.0.1, RUNTIME_USAGE_UNKNOWN. remove_runtime_version removes each version once every hive answers and no node runs it, and a later deploy of invoice purges them too."
+	if answer.Warning != warning {
+		t.Fatalf("warning:\n got %q\nwant %q", answer.Warning, warning)
+	}
+
+	// The delete happened: asked again, the workflow is not found.
+	svc.handleMessage(deleteWorkflowCommand(t, "invoice", false))
+	if err := json.Unmarshal(sender.sent[1].Payload, &answer); err != nil || answer.ErrorCode != "WORKFLOW_NOT_FOUND" {
+		t.Fatalf("asked again: %+v, %v", answer, err)
+	}
+}
+
+// A removal SY.admin does not answer in time is no failure of the delete either: packages_left names
+// it TIMEOUT (SY.admin may still remove it) and each version after it, PURGE_STOPPED. The delete's
+// removal waits up to runtimeRemovalTimeout (35 s), long enough for SY.admin's read of every hive's
+// use (30 s at most), where it waited 5 s before 0.1.133.
+func TestADeleteWhosePurgeTimesOutIsDoneAndNamesThePackagesLeft(t *testing.T) {
+	svc := newTestService(t)
+	for range 2 {
+		applyWorkflowForDelete(t, svc)
+	}
+	admin := svc.admin.(*fakeAdminClient)
+	admin.removedVersions, admin.removeWaits = nil, nil
+	admin.removeErr = map[string]error{
+		"0.0.1": &fluxbeesdk.RpcError{Kind: fluxbeesdk.RpcErrTimeout, TraceID: "t-remove", Target: fluxbeesdk.PrimaryAdminNode, Verb: "ADMIN_COMMAND"},
+	}
+	killed := false
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: deployedWFNodeConfig, killNodeFunc: purgingKill(t, &killed)}
+
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice", Force: true})
+	if err != nil || !result.Deleted || result.WFNode.Action != "deleted" || !killed || svc.store.WorkflowExists("invoice") {
+		t.Fatalf("the delete is done: result %#v, err %v, killed %v", result, err, killed)
+	}
+	if len(result.PackagesLeft) != 2 {
+		t.Fatalf("packages_left = %+v", result.PackagesLeft)
+	}
+	timedOut := result.PackagesLeft[0]
+	if timedOut.Runtime != "wf.invoice" || timedOut.Version != "0.0.1" || timedOut.ErrorCode != "TIMEOUT" ||
+		!strings.Contains(timedOut.Detail, "no answer in time (remove wf.invoice 0.0.1 on SY.admin@motherbee: rpc timeout") ||
+		!strings.Contains(timedOut.Detail, "SY.admin may still remove it") {
+		t.Fatalf("the version that timed out: %+v", timedOut)
+	}
+	notRemoved := PackageLeft{Runtime: "wf.invoice", Version: "0.0.2", ErrorCode: "PURGE_STOPPED", Detail: "the purge stopped at wf.invoice 0.0.1 (TIMEOUT) before removing it"}
+	if result.PackagesLeft[1] != notRemoved || !strings.Contains(result.Warning, "it stopped at 0.0.1, TIMEOUT") {
+		t.Fatalf("after it: %+v, warning %q", result.PackagesLeft[1], result.Warning)
+	}
+	if len(admin.removeWaits) != 1 || admin.removeWaits[0] <= 30*time.Second || admin.removeWaits[0] > runtimeRemovalTimeout {
+		t.Fatalf("the removal waits up to %s for SY.admin, could wait %v", runtimeRemovalTimeout, admin.removeWaits)
+	}
+}
+
+// A purge that cannot list the workflow's versions removes none and says so: the delete is done,
+// and packages_left names the runtime with no version, DIST_UNREADABLE, and why.
+func TestADeleteThatCannotListItsPackagesSaysSo(t *testing.T) {
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	// wf.invoice is no directory, so it cannot be listed.
+	if err := os.MkdirAll(svc.cfg.DistRuntimeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+	if err != nil || !result.Deleted || svc.store.WorkflowExists("invoice") {
+		t.Fatalf("the delete is done: result %#v, err %v", result, err)
+	}
+	left := result.PackagesLeft
+	if len(left) != 1 || left[0].Runtime != "wf.invoice" || left[0].Version != "" || left[0].ErrorCode != "DIST_UNREADABLE" ||
+		!strings.Contains(left[0].Detail, "cannot list the versions of wf.invoice in this hive's dist") {
+		t.Fatalf("packages_left = %+v", left)
+	}
+	const warning = "workflow invoice is deleted, but its purge could not list the versions of wf.invoice to remove from the motherbee's dist (packages_left: DIST_UNREADABLE). remove_runtime_version removes each version once every hive answers and no node runs it, and a later deploy of invoice purges them too."
+	if result.Warning != warning {
+		t.Fatalf("warning:\n got %q\nwant %q", result.Warning, warning)
+	}
+	if removed := svc.admin.(*fakeAdminClient).removedVersions; len(removed) != 0 {
+		t.Fatalf("nothing is removed, asked %v", removed)
+	}
+}
+
+// A workflow deleted while SY.admin refused its purge leaves wf.<workflow> 0.0.1 and 0.0.2 in the
+// motherbee's dist, and its state goes. Deployed again under the same name, it stages 3, above them:
+// before 0.1.133 it staged 1 again, published 0.0.1 over the one left there, and SY.admin refused it
+// (VERSION_CONFLICT, so PACKAGE_PUBLISH_FAILED) until the leftover was removed by hand. Its apply's
+// purge then removes the leftovers, which no slot keeps.
+func TestAWorkflowDeployedAgainPublishesAboveWhatItsDeleteLeftAndPurgesIt(t *testing.T) {
+	svc := newTestService(t)
+	for range 2 {
+		applyWorkflowForDelete(t, svc)
+	}
+	admin := svc.admin.(*fakeAdminClient)
+	admin.removeErr = map[string]error{
+		"0.0.1": &adminActionError{Status: "error", Code: "RUNTIME_USAGE_UNKNOWN", Message: "the nodes of worker1 were not read"},
+	}
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice", Force: true})
+	if err != nil || len(result.PackagesLeft) != 2 {
+		t.Fatalf("the delete leaves both versions: result %#v, err %v", result, err)
+	}
+
+	// Every hive answers again, and the workflow comes back with another definition.
+	admin.removeErr, admin.removedVersions = nil, nil
+	definition := validWorkflowDefinition()
+	definition["description"] = "issues invoices, deployed again"
+	staged, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: definition})
+	if err != nil || staged.Version != 3 {
+		t.Fatalf("want version 3 staged, above the versions left, got %#v, %v", staged, err)
+	}
+	applied, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"})
+	if err != nil || applied.Package.Version != "0.0.3" {
+		t.Fatalf("want 0.0.3 published, got %#v, %v", applied, err)
+	}
+	if got := strings.Join(admin.removedVersions, ","); got != "wf.invoice@0.0.1,wf.invoice@0.0.2" {
+		t.Fatalf("the apply's purge removes the versions left, asked %s", got)
 	}
 }
 

@@ -586,7 +586,7 @@ The node's `_system.launched_by` says who asked for the deploy, as for any node.
 On each successful apply, `SY.wf-rules` generates and installs a new package version:
 
 - runtime name: `wf.<workflow_name>`
-- version: the same monotonic logical version managed in `metadata.json`
+- version: the same monotonic logical version managed in `metadata.json`, as `0.0.<n>`; a compile that names none takes one above the workflow's slots and above every version of `wf.<workflow_name>` the hive's dist holds (its directories and its manifest's entry), so a workflow deployed again after a delete that left versions in `dist` never publishes over them (since 0.1.133, FINDINGS A-281)
 - type: `workflow`
 - runtime_base: `wf.engine`
 
@@ -612,8 +612,8 @@ The `delete_workflow` command removes a workflow entirely:
 3. If `force: true`, the node has no config, or it counted no running instances:
    - When the node has a config, call SY.admin's `kill_node` for `WF.<workflow_name>@<hive>` with `purge_instance: true`: the node stops and its instance, timers, owned secrets and identity go (the standard teardown).
    - Remove the state directories for that workflow: `/var/lib/fluxbee/wf-rules/<workflow_name>/`.
-   - Remove package versions in `dist` for that workflow that are no longer referenced by any node instance.
-   - Respond with `"status": "ok", "deleted": true`.
+   - Remove the package versions in `dist` for that workflow, through SY.admin's `remove_runtime_version`, one at a time, stopping at the first one SY.admin refuses or does not answer in time (35 s each, `runtimeRemovalTimeout`). Since 0.1.133 SY.admin removes a version only once it read its use on every hive that may run it, and refuses it otherwise (`RUNTIME_USAGE_UNKNOWN`, FINDINGS A-281).
+   - Respond with `"status": "ok", "deleted": true`, `wf_node`, and `packages_left`: each version the purge did not remove, `{runtime, version, error_code, detail}` (SY.admin's refusal, `TIMEOUT`, `TRANSPORT_ERROR`, `PURGE_STOPPED` for those after the one it stopped at, or `DIST_UNREADABLE` with no version when they could not be listed), `[]` when it removed them all; with any, a `warning` says the workflow is deleted and that `remove_runtime_version` removes them once every hive answers, or a later deploy of the same name. A purge that cannot finish does not fail the delete, whose node and state are gone by then: before 0.1.133 it answered `PACKAGE_PUBLISH_FAILED`, and a retry `WORKFLOW_NOT_FOUND`.
 
 This is a destructive operation. Active instances are lost if `force: true`. There is no undo.
 

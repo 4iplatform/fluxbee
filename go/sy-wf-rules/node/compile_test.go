@@ -75,6 +75,76 @@ func TestCompileWorkflowAutoIncrementsVersion(t *testing.T) {
 	}
 }
 
+// A compile that names no version stages one above every version of wf.<workflow> this hive's dist
+// holds, not only above the workflow's slots: a delete whose purge SY.admin refused leaves its
+// versions there and drops the state, whose slots start again at 1, and the next deploy published
+// 0.0.1 over the 0.0.1 left there, which SY.admin refused (VERSION_CONFLICT) until it was removed by
+// hand (FINDINGS A-281). The version directories count, and the versions the runtimes manifest lists
+// (a worker's mirror may list one whose directory has not arrived yet); another runtime's do not,
+// nor a version SY.wf-rules never writes (no 0.0.<n>).
+func TestACompileStagesAboveTheVersionsTheDistHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dirs     []string
+		manifest map[string]runtimeManifestEntry
+		want     uint64
+	}{
+		{name: "none", want: 1},
+		{name: "directories left by a delete", dirs: []string{"0.0.1", "0.0.2"}, want: 3},
+		{name: "a version only the manifest lists", dirs: []string{"0.0.1"}, manifest: map[string]runtimeManifestEntry{
+			"wf.invoice": {Available: []string{"0.0.1", "0.0.4"}, Current: "0.0.4"},
+		}, want: 5},
+		{name: "the manifest's current", manifest: map[string]runtimeManifestEntry{"wf.invoice": {Current: "0.0.6"}}, want: 7},
+		{name: "no version of this workflow's", dirs: []string{"1.0.0", "0.1.9"}, manifest: map[string]runtimeManifestEntry{
+			"wf.invoice": {Available: []string{"2.0.0"}},
+			"wf.billing": {Available: []string{"0.0.9"}, Current: "0.0.9"},
+		}, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService(t)
+			for _, dir := range tc.dirs {
+				if err := os.MkdirAll(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.manifest != nil {
+				manifest := &runtimeManifest{SchemaVersion: 2, Version: 1, Runtimes: tc.manifest}
+				if err := writeRuntimeManifest(filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json"), manifest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			meta, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()})
+			if err != nil || meta.Version != tc.want {
+				t.Fatalf("want version %d staged, got %#v, %v", tc.want, meta, err)
+			}
+			if staged, err := svc.store.ReadStagedMetadata("invoice"); err != nil || staged.Version != tc.want {
+				t.Fatalf("staged = %#v, %v", staged, err)
+			}
+		})
+	}
+}
+
+// A dist whose versions cannot be read leaves the next version unknown, and one over a version left
+// there would be refused at the apply: the compile is refused, naming what it could not read, and
+// stages nothing.
+func TestACompileThatCannotReadTheDistStagesNothing(t *testing.T) {
+	svc := newTestService(t)
+	if err := os.MkdirAll(svc.cfg.DistRuntimeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()})
+	if err == nil || !strings.Contains(err.Error(), "cannot read the versions of wf.invoice in this hive's runtimes manifest") ||
+		!strings.HasSuffix(err.Error(), "; nothing was staged") {
+		t.Fatalf("want the compile refused, naming the manifest, got %v", err)
+	}
+	if svc.store.WorkflowExists("invoice") {
+		t.Fatal("a refused compile stages nothing")
+	}
+}
+
 // A workflow name follows the runtime naming policy, since its runtime is wf.<workflow_name>: a
 // hyphen, which the package's publish refused after the slots rotated (WF Case 5's gate), is refused
 // at compile and at check, with the rule in the detail.

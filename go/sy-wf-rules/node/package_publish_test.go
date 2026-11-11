@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 func TestPublishWorkflowPackageWritesDefaultConfigTemplate(t *testing.T) {
@@ -126,8 +129,8 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 		},
 	}
 
-	if err := svc.PurgeWorkflowPackages("invoice", true); err != nil {
-		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	if left, err := svc.PurgeWorkflowPackages("invoice", true); err != nil || len(left) != 0 {
+		t.Fatalf("PurgeWorkflowPackages: left %v, err %v", left, err)
 	}
 
 	// Current (4), backup (3) and the version the node is bound to (1) stay; 2 goes, through
@@ -165,9 +168,9 @@ func TestPurgeWorkflowPackagesRemovesNothingWhileTheBoundVersionIsUnknown(t *tes
 		return nil, context.DeadlineExceeded
 	}}
 
-	err := svc.PurgeWorkflowPackages("invoice", true)
-	if err == nil || !strings.Contains(err.Error(), "cannot tell the version WF.invoice@motherbee is bound to: its config read (get_node_config) timed out") {
-		t.Fatalf("want the purge refused, naming the read, got %v", err)
+	left, err := svc.PurgeWorkflowPackages("invoice", true)
+	if err == nil || !strings.Contains(err.Error(), "cannot tell the version WF.invoice@motherbee is bound to: its config read (get_node_config) timed out") || left != nil {
+		t.Fatalf("want the purge refused, naming the read, got left %v, err %v", left, err)
 	}
 	if len(admin.removedVersions) != 0 {
 		t.Fatalf("a purge that cannot tell the bound version removes none, removed %v", admin.removedVersions)
@@ -177,8 +180,8 @@ func TestPurgeWorkflowPackagesRemovesNothingWhileTheBoundVersionIsUnknown(t *tes
 	svc.nodes = &fakeNodeClient{getNodeConfigFunc: func(context.Context, string) (map[string]any, error) {
 		return map[string]any{"status": "ok", "config": map[string]any{"_system": map[string]any{"runtime_version": "0.0.3"}}}, nil
 	}}
-	if err := svc.PurgeWorkflowPackages("invoice", true); err != nil {
-		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	if left, err := svc.PurgeWorkflowPackages("invoice", true); err != nil || len(left) != 0 {
+		t.Fatalf("PurgeWorkflowPackages: left %v, err %v", left, err)
 	}
 	if strings.Join(admin.removedVersions, ",") != "wf.invoice@0.0.1" {
 		t.Fatalf("want 0.0.1 removed once the bound version is known, got %v", admin.removedVersions)
@@ -235,8 +238,8 @@ func TestPurgeWorkflowPackagesOnAMirrorHiveGoesThroughTheAdmin(t *testing.T) {
 		"0.0.2": &adminActionError{Status: "error", Code: "RUNTIME_VERSION_NOT_FOUND", Message: "gone"},
 	}
 
-	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
-		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	if left, err := svc.PurgeWorkflowPackages("invoice", false); err != nil || len(left) != 0 {
+		t.Fatalf("PurgeWorkflowPackages: left %v, err %v", left, err)
 	}
 
 	want := []string{"wf.invoice@0.0.2", "wf.invoice@0.0.3", "wf.invoice@0.0.1"}
@@ -264,6 +267,9 @@ type fakeAdminClient struct {
 	currentOnPrimary  string
 	versionsOnPrimary int
 	syncHints         []string
+	// removeWaits is how long each removal could wait for SY.admin's answer: the time left to its
+	// context's deadline when it was asked.
+	removeWaits []time.Duration
 }
 
 func (f *fakeAdminClient) SyncRuntimes(_ context.Context, hive string, waitMs int) error {
@@ -271,8 +277,11 @@ func (f *fakeAdminClient) SyncRuntimes(_ context.Context, hive string, waitMs in
 	return nil
 }
 
-func (f *fakeAdminClient) RemoveRuntimeVersion(_ context.Context, runtimeName, version string) error {
+func (f *fakeAdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error {
 	f.removedVersions = append(f.removedVersions, runtimeName+"@"+version)
+	if deadline, ok := ctx.Deadline(); ok {
+		f.removeWaits = append(f.removeWaits, time.Until(deadline))
+	}
 	if version == f.currentOnPrimary && f.versionsOnPrimary > 1 {
 		return &adminActionError{Status: "error", Code: "RUNTIME_CURRENT_CONFLICT", Message: "cannot delete current version"}
 	}
@@ -310,6 +319,15 @@ func installWorkflowPackageViaFakeAdmin(svc *Service, packageFiles map[string]st
 		return nil, fmt.Errorf("package metadata missing name/version")
 	}
 	packageDir := filepath.Join(svc.cfg.DistRuntimeRoot, packageMeta.Name, packageMeta.Version)
+	// As SY.admin's install does (src/runtime_package.rs): a version already there is published
+	// again only with the same contents, and refused otherwise.
+	for relPath, contents := range packageFiles {
+		existing, err := os.ReadFile(filepath.Join(packageDir, filepath.FromSlash(relPath)))
+		if err == nil && string(existing) != contents {
+			return nil, &adminActionError{Status: "error", Code: "VERSION_CONFLICT", Message: fmt.Sprintf(
+				"install conflict: target runtime version already exists with different contents '%s'", packageDir)}
+		}
+	}
 	for relPath, contents := range packageFiles {
 		targetPath := filepath.Join(packageDir, filepath.FromSlash(relPath))
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
@@ -327,6 +345,74 @@ func installWorkflowPackageViaFakeAdmin(svc *Service, packageFiles map[string]st
 		Version:     packageMeta.Version,
 		PackagePath: packageDir,
 	}, nil
+}
+
+// SY.admin answers a removal only after its read of the version's use on every hive, which it waits
+// 30 s for (FINDINGS A-281): the removal waits runtimeRemovalTimeout, 35 s, for that answer, where it
+// waited 5 s and a read that took longer was a timeout. A refusal keeps SY.admin's code and detail,
+// which packages_left names. The publish still waits adminRPCTimeout.
+func TestARemovalWaitsForSYAdminsReadOfEveryHive(t *testing.T) {
+	const refusal = "cannot tell whether runtime 'wf.invoice' version '0.0.1' is in use: the nodes of worker1 (UNREACHABLE) were not read, and nothing was removed"
+	admin := &recordingAdmin{reply: map[string]any{
+		"status":       "error",
+		"action":       "remove_runtime_version",
+		"error_code":   "RUNTIME_USAGE_UNKNOWN",
+		"error_detail": refusal,
+		"payload": map[string]any{
+			"unanswered_hives": []any{map[string]any{"hive": "worker1", "reason": "UNREACHABLE", "detail": "stale in the LSA"}},
+			"retryable":        true,
+		},
+	}}
+	client := &l2AdminClient{send: admin.send, targetNode: fluxbeesdk.PrimaryAdminNode}
+
+	err := client.RemoveRuntimeVersion(context.Background(), "wf.invoice", "0.0.1")
+	request, params := admin.last(t)
+	if runtimeRemovalTimeout != 35*time.Second || request.Timeout != runtimeRemovalTimeout {
+		t.Fatalf("the removal waits %v for SY.admin, want 35s", request.Timeout)
+	}
+	if request.AdminTarget != fluxbeesdk.PrimaryAdminNode || request.Action != "remove_runtime_version" || request.Target != fluxbeesdk.PrimaryHiveID ||
+		params["runtime"] != "wf.invoice" || params["runtime_version"] != "0.0.1" {
+		t.Fatalf("request = %+v", request)
+	}
+	var refused *adminActionError
+	if !errors.As(err, &refused) || refused.Code != "RUNTIME_USAGE_UNKNOWN" || refused.Message != refusal {
+		t.Fatalf("want SY.admin's refusal, got %v", err)
+	}
+	if code, detail := removalFailure(err); code != "RUNTIME_USAGE_UNKNOWN" || detail != refusal {
+		t.Fatalf("packages_left would name %s: %s", code, detail)
+	}
+
+	admin.reply = map[string]any{"status": "ok", "payload": map[string]any{"runtime_name": "wf.invoice", "runtime_version": "0.0.2"}}
+	if _, err := client.PublishRuntimePackage(context.Background(), map[string]string{"package.json": "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if request, _ := admin.last(t); request.Action != "publish_runtime_package" || request.Timeout != adminRPCTimeout {
+		t.Fatalf("the publish: %+v", request)
+	}
+}
+
+// An apply's purge runs between its publish and the node's step, within deployPurgeBudget (15 s):
+// a removal may wait 35 s for SY.admin now, and one that waited out a hive that does not answer
+// would take 30 s of the request's 60, the time a worker's node step needs to wait for its package.
+// What it cuts, the next deploy's purge removes.
+func TestAnApplysPurgeLeavesTheNodeStepItsTime(t *testing.T) {
+	svc := newTestService(t)
+	admin := svc.admin.(*fakeAdminClient)
+	for range 3 {
+		if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+			t.Fatalf("CompileWorkflow: %v", err)
+		}
+		if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+			t.Fatalf("ApplyWorkflow: %v", err)
+		}
+	}
+	// The third apply keeps 0.0.3 (current) and 0.0.2 (backup), and removes 0.0.1.
+	if got := strings.Join(admin.removedVersions, ","); got != "wf.invoice@0.0.1" || len(admin.removeWaits) != 1 {
+		t.Fatalf("removals = %s, waits = %v", got, admin.removeWaits)
+	}
+	if wait := admin.removeWaits[0]; wait > deployPurgeBudget || wait < deployPurgeBudget-time.Second {
+		t.Fatalf("an apply's removal may wait %v, want the purge's %v", wait, deployPurgeBudget)
+	}
 }
 
 // A worker's copy of the manifest can lag behind the motherbee's: after a rollback the motherbee's
@@ -350,8 +436,8 @@ func TestPurgeRemovesTheCurrentVersionLastEvenWithALaggingManifest(t *testing.T)
 	admin.currentOnPrimary = "0.0.1"
 	admin.versionsOnPrimary = 2
 
-	if err := svc.PurgeWorkflowPackages("invoice", false); err != nil {
-		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	if left, err := svc.PurgeWorkflowPackages("invoice", false); err != nil || len(left) != 0 {
+		t.Fatalf("PurgeWorkflowPackages: left %v, err %v", left, err)
 	}
 	want := "wf.invoice@0.0.1,wf.invoice@0.0.2,wf.invoice@0.0.1"
 	if got := strings.Join(admin.removedVersions, ","); got != want {

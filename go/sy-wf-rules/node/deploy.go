@@ -11,10 +11,22 @@ import (
 )
 
 // wfRulesRequestBudget bounds one request to SY.wf-rules end to end (publish, purge, the node's
-// rebind and restart, or its launch), so it answers before SY.admin stops waiting for it (75 s),
-// and Archi waits longer still (90 s). A deploy that outlived its callers would change state after
-// they had reported a timeout (A-68).
+// rebind and restart, or its launch; a delete's reads of the node, its kill and its purge), so it
+// answers before SY.admin stops waiting for it (75 s), and Archi waits longer still (90 s). A deploy
+// that outlived its callers would change state after they had reported a timeout (A-68).
 const wfRulesRequestBudget = 60 * time.Second
+
+// deployPurgeBudget bounds an apply's or a rollback's purge of old versions (purgeAfterPublish),
+// which runs between the publish and the node's step: the read of the version the WF node is bound
+// to (get_node_config, up to 10 s), then each removal (up to runtimeRemovalTimeout, 35 s, since
+// SY.admin reads every hive's use of the version first: A-281). Unbounded, a removal waiting out a
+// hive that does not answer would take 30 s of the request's 60, and a worker's node step, which
+// waits for its package to arrive by Syncthing (~11 s, over 20 s while its folder retries a pull),
+// would run out. 15 s is what such a purge could take before 0.1.133 (the read, then one 5 s
+// removal), so the node step keeps the 40 s it had (60 s, less the publish's 5 s and these 15).
+// What it cuts, the next deploy's purge removes. A delete's purge, its last step, has no such
+// bound: it takes what the request has left.
+const deployPurgeBudget = 15 * time.Second
 
 // runtimeSyncBudget bounds how long a deploy waits for the package it just published to reach this
 // hive, whole (manifest, package.json, flow/definition.json). Publishing happens on the motherbee,

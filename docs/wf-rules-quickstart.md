@@ -556,6 +556,12 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
 Either one is refused with `ORCHESTRATOR_ERROR`, and nothing changes, when SY.admin does not answer
 the node's config read in time: SY.wf-rules cannot tell whether the node exists. Try again.
 
+A delete that removed the node and the workflow is done even when some versions of the
+`wf.<workflow>` package could not be removed (SY.admin cannot read a worker's nodes, say): it
+answers ok, `payload.packages_left` names each version left in the motherbee's dist with why, and
+`payload.warning` says so. `remove_runtime_version` removes them once every hive answers, and a
+later deploy of the same name purges them too ([SY.wf-rules](nodes/sy-wf-rules.md#delete)).
+
 ---
 
 ## 3. Writing the definition

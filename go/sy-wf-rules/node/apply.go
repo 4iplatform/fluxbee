@@ -63,7 +63,7 @@ func (s *Service) applyWorkflow(ctx context.Context, req ApplyRequest) (*ApplyRe
 	if err != nil {
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
-	_ = s.purgeWorkflowPackages(ctx, workflowName, true)
+	s.purgeAfterPublish(ctx, workflowName)
 	return &ApplyResult{
 		Current: *currentMeta,
 		Package: *publish,

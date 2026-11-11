@@ -12,7 +12,15 @@ import (
 )
 
 const (
-	adminRPCTimeout             = 5 * time.Second
+	adminRPCTimeout = 5 * time.Second
+	// runtimeRemovalTimeout is how long SY.wf-rules waits for SY.admin's answer to one
+	// remove_runtime_version. Before it removes anything, SY.admin reads the version's use on every
+	// hive that may run it (get_runtime to the motherbee's orchestrator, which it waits 30 s for) and
+	// removes the version only once each of them answered (FINDINGS A-281): 30 s for that read and
+	// adminRPCTimeout for the rest (the manifest's lock and write, the mesh both ways), 35 s in all,
+	// so SY.admin's own answer, a refusal naming the hives it could not read included, comes before
+	// this wait ends. With 5 s, a read that took longer was answered as a timeout.
+	runtimeRemovalTimeout       = 30*time.Second + adminRPCTimeout
 	adminCommandMsg             = "ADMIN_COMMAND"
 	adminCommandResponseMsg     = "ADMIN_COMMAND_RESPONSE"
 	publishRuntimePackageAction = "publish_runtime_package"
@@ -55,7 +63,9 @@ func (e *adminActionError) Error() string {
 }
 
 type l2AdminClient struct {
-	dispatcher *fluxbeesdk.RouterDispatcher
+	// send delivers one ADMIN_COMMAND and waits for its answer (the router dispatcher's
+	// SendAdminRPC), as adminNodeClient's does.
+	send       func(ctx context.Context, request fluxbeesdk.AdminRpcRequest) (fluxbeesdk.Message, error)
 	targetNode string
 	distRoot   string
 }
@@ -65,7 +75,7 @@ func newAdminClient(cfg NodeConfig, dispatcher *fluxbeesdk.RouterDispatcher) adm
 		return nil
 	}
 	return &l2AdminClient{
-		dispatcher: dispatcher,
+		send: dispatcher.SendAdminRPC,
 		// SY.admin runs only on the motherbee; a worker's SY.wf-rules publishes there too.
 		targetNode: fluxbeesdk.PrimaryAdminNode,
 		distRoot:   cfg.DistRuntimeRoot,
@@ -73,7 +83,7 @@ func newAdminClient(cfg NodeConfig, dispatcher *fluxbeesdk.RouterDispatcher) adm
 }
 
 func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {
-	if c == nil || c.dispatcher == nil {
+	if c == nil || c.send == nil {
 		return nil, fmt.Errorf("admin client unavailable")
 	}
 	params := map[string]any{
@@ -108,14 +118,14 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 }
 
 func (c *l2AdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, version string) error {
-	if c == nil || c.dispatcher == nil {
+	if c == nil || c.send == nil {
 		return fmt.Errorf("admin client unavailable")
 	}
 	// The admin runs this on a hive's orchestrator: the dist being purged is the motherbee's.
-	_, err := c.request(ctx, removeRuntimeVersionAction, fluxbeesdk.PrimaryHiveID, map[string]any{
+	_, err := c.requestWithTimeout(ctx, removeRuntimeVersionAction, fluxbeesdk.PrimaryHiveID, map[string]any{
 		"runtime":         runtimeName,
 		"runtime_version": version,
-	})
+	}, runtimeRemovalTimeout)
 	return err
 }
 
@@ -124,7 +134,7 @@ func (c *l2AdminClient) RemoveRuntimeVersion(ctx context.Context, runtimeName, v
 const runtimesFolderID = "fluxbee-dist-runtimes"
 
 func (c *l2AdminClient) SyncRuntimes(ctx context.Context, hive string, waitMs int) error {
-	if c == nil || c.dispatcher == nil {
+	if c == nil || c.send == nil {
 		return fmt.Errorf("admin client unavailable")
 	}
 	params := map[string]any{
@@ -144,7 +154,7 @@ func (c *l2AdminClient) request(ctx context.Context, action, target string, para
 }
 
 func (c *l2AdminClient) requestWithTimeout(ctx context.Context, action, target string, params map[string]any, timeout time.Duration) (map[string]any, error) {
-	msg, err := c.dispatcher.SendAdminRPC(ctx, fluxbeesdk.AdminRpcRequest{
+	msg, err := c.send(ctx, fluxbeesdk.AdminRpcRequest{
 		AdminTarget: c.targetNode,
 		Action:      action,
 		Target:      target,

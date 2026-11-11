@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -25,6 +27,49 @@ const workflowRuntimeBase = "wf.engine"
 // node's runtime_version all agree byte-for-byte.
 func workflowRuntimeVersion(v uint64) string {
 	return fmt.Sprintf("0.0.%d", v)
+}
+
+// workflowVersionOf is the counter a version string encodes (workflowRuntimeVersion: 0.0.<n>), and
+// whether it is one: any other version of wf.<workflow> is none SY.wf-rules publishes.
+func workflowVersionOf(version string) (uint64, bool) {
+	counter, ok := strings.CutPrefix(strings.TrimSpace(version), "0.0.")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(counter, 10, 64)
+	return n, err == nil
+}
+
+// highestPublishedVersion is the highest counter among the versions of wf.<workflow> this hive's
+// dist holds, 0 for none: its version directories (DistRuntimeRoot/wf.<workflow>/0.0.<n>) and the
+// versions its runtimes manifest lists for it (available, current). On the motherbee they are the
+// motherbee's own; on a worker, its receive-only Syncthing mirror of them. A directory or a
+// manifest that cannot be read is an error: the versions it holds are unknown.
+func (s *Service) highestPublishedVersion(workflowName string) (uint64, error) {
+	runtimeName := workflowRuntimeName(workflowName)
+	entries, err := os.ReadDir(filepath.Join(s.cfg.DistRuntimeRoot, runtimeName))
+	if err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("cannot list the versions of %s in this hive's dist: %w", runtimeName, err)
+	}
+	var versions []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			versions = append(versions, entry.Name())
+		}
+	}
+	manifest, err := loadRuntimeManifest(filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json"))
+	if err != nil {
+		return 0, fmt.Errorf("cannot read the versions of %s in this hive's runtimes manifest: %w", runtimeName, err)
+	}
+	entry := manifest.Runtimes[runtimeName]
+	versions = append(append(versions, entry.Available...), entry.Current)
+	highest := uint64(0)
+	for _, version := range versions {
+		if n, ok := workflowVersionOf(version); ok && n > highest {
+			highest = n
+		}
+	}
+	return highest, nil
 }
 
 type PackagePublishResult struct {
@@ -100,21 +145,39 @@ func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata
 	}, nil
 }
 
-func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersion bool) error {
+// PackageLeft is a version of a workflow's package that a purge did not remove from the motherbee's
+// dist, and why: SY.admin refused its removal (ErrorCode is SY.admin's: RUNTIME_USAGE_UNKNOWN while
+// a hive that may run the version cannot be read, RUNTIME_IN_USE while a node runs it), did not
+// answer in time (TIMEOUT: it may still remove it) or could not be reached (TRANSPORT_ERROR); the
+// purge stopped at an earlier version and did not ask (PURGE_STOPPED); or the versions could not be
+// listed (DIST_UNREADABLE, with no Version).
+type PackageLeft struct {
+	Runtime   string `json:"runtime"`
+	Version   string `json:"version"`
+	ErrorCode string `json:"error_code"`
+	Detail    string `json:"detail"`
+}
+
+func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersion bool) ([]PackageLeft, error) {
 	ctx, cancel := newRequestContext()
 	defer cancel()
 	return s.purgeWorkflowPackages(ctx, workflowName, preserveBoundVersion)
 }
 
-func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string, preserveBoundVersion bool) error {
+// purgeWorkflowPackages removes from the motherbee's dist each version of wf.<workflow> that this
+// hive's dist holds and no slot keeps (current, backup and, with preserveBoundVersion, the version
+// the WF node's config names). It answers the versions it did not remove, none when it removed them
+// all (purgeOnPrimary), and an error, with nothing removed, when it cannot tell which to remove:
+// the runtime's directory cannot be listed, or the version the WF node is bound to cannot be read.
+func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string, preserveBoundVersion bool) ([]PackageLeft, error) {
 	runtimeName := workflowRuntimeName(workflowName)
 	runtimeDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName)
 	entries, err := os.ReadDir(runtimeDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, fmt.Errorf("cannot list the versions of %s in this hive's dist: %w", runtimeName, err)
 	}
 
 	keep := map[string]struct{}{}
@@ -127,7 +190,7 @@ func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string
 	if preserveBoundVersion {
 		boundVersion, err := s.boundRuntimeVersionForWorkflow(ctx, workflowName)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if strings.TrimSpace(boundVersion) != "" {
 			keep[strings.TrimSpace(boundVersion)] = struct{}{}
@@ -150,15 +213,38 @@ func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string
 		}
 		obsolete = append(obsolete, version)
 	}
-	return s.purgeOnPrimary(ctx, runtimeName, obsolete)
+	return s.purgeOnPrimary(ctx, runtimeName, obsolete), nil
 }
 
-// purgeOnPrimary removes versions from the motherbee's dist. The admin refuses to remove a
-// runtime's current version while other versions remain (RUNTIME_CURRENT_CONFLICT), so the current
-// one goes last: first by this hive's copy of the manifest, and a version refused as current is
-// tried again once the others are gone, since a worker's copy can lag behind the motherbee's (a
-// rollback moves the current version back; 0.1.70 gate, A-68).
-func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versions []string) error {
+// purgeAfterPublish is an apply's or a rollback's purge (purgeWorkflowPackages, keeping the version
+// the WF node is bound to), within deployPurgeBudget so the node's step after it keeps its time.
+// The deploy goes on whatever it leaves, and the next one tries that again: what it left is
+// logged, not answered.
+func (s *Service) purgeAfterPublish(ctx context.Context, workflowName string) {
+	purgeCtx, cancel := context.WithTimeout(ctx, deployPurgeBudget)
+	defer cancel()
+	left, err := s.purgeWorkflowPackages(purgeCtx, workflowName, true)
+	if err != nil {
+		log.Printf("purge of %s skipped: %v", workflowRuntimeName(workflowName), err)
+	}
+	for _, pkg := range left {
+		log.Printf("purge left %s %s: %s: %s", pkg.Runtime, pkg.Version, pkg.ErrorCode, pkg.Detail)
+	}
+}
+
+// purgeOnPrimary removes versions from the motherbee's dist, one at a time, and answers those it
+// did not remove. It stops at the first removal that fails, SY.admin's refusal or no answer in
+// time: each removal reads the version's use on every hive first (FINDINGS A-281), and what refused
+// one (a hive that cannot be read) holds for the next, which would wait as long to be refused too.
+// The version it stopped at is answered with why, and each one it had still to remove as
+// PURGE_STOPPED.
+//
+// The admin refuses to remove a runtime's current version while other versions remain
+// (RUNTIME_CURRENT_CONFLICT), so the current one goes last: first by this hive's copy of the
+// manifest, and a version refused as current is tried again once the others are gone, since a
+// worker's copy can lag behind the motherbee's (a rollback moves the current version back; 0.1.70
+// gate, A-68).
+func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versions []string) []PackageLeft {
 	current := ""
 	if manifest, err := loadRuntimeManifest(filepath.Join(s.cfg.DistRuntimeRoot, "manifest.json")); err == nil {
 		current = manifest.Runtimes[runtimeName].Current
@@ -167,7 +253,7 @@ func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versio
 		return versions[i] != current && versions[j] == current
 	})
 	var refusedAsCurrent []string
-	for _, version := range versions {
+	for i, version := range versions {
 		err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version)
 		var actionErr *adminActionError
 		if errors.As(err, &actionErr) && actionErr.Code == "RUNTIME_CURRENT_CONFLICT" {
@@ -175,22 +261,65 @@ func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versio
 			continue
 		}
 		if err != nil {
-			return err
+			notRemoved := append(append([]string{}, versions[i+1:]...), refusedAsCurrent...)
+			return purgeStoppedAt(runtimeName, version, err, notRemoved)
 		}
 	}
-	for _, version := range refusedAsCurrent {
+	for i, version := range refusedAsCurrent {
 		if err := s.removeRuntimeVersionOnPrimary(ctx, runtimeName, version); err != nil {
-			return err
+			return purgeStoppedAt(runtimeName, version, err, refusedAsCurrent[i+1:])
 		}
 	}
 	return nil
 }
 
+// purgeStoppedAt is what a purge that stopped at version leaves: that version, with why its
+// removal failed (removalFailure), and each version it had still to remove, PURGE_STOPPED (a
+// version refused as current earlier in the pass, waiting to be asked again, among them).
+func purgeStoppedAt(runtimeName, version string, err error, notRemoved []string) []PackageLeft {
+	stopped := PackageLeft{Runtime: runtimeName, Version: version}
+	stopped.ErrorCode, stopped.Detail = removalFailure(err)
+	left := []PackageLeft{stopped}
+	for _, next := range notRemoved {
+		left = append(left, PackageLeft{
+			Runtime:   runtimeName,
+			Version:   next,
+			ErrorCode: "PURGE_STOPPED",
+			Detail:    fmt.Sprintf("the purge stopped at %s %s (%s) before removing it", runtimeName, version, stopped.ErrorCode),
+		})
+	}
+	return left
+}
+
+// removalFailure is why a removal of a runtime version failed, as packages_left names it: SY.admin's
+// refusal, with its code and detail; TIMEOUT when no answer came in time, which does not mean the
+// version stayed: SY.admin may still remove it; TRANSPORT_ERROR when SY.admin was not reached.
+func removalFailure(err error) (code, detail string) {
+	var actionErr *adminActionError
+	switch {
+	case errors.As(err, &actionErr):
+		code, detail = actionErr.Code, actionErr.Message
+		if code == "" {
+			code = "SERVICE_FAILED"
+		}
+		if detail == "" {
+			detail = err.Error()
+		}
+		return code, detail
+	case isRPCTimeout(nil, err):
+		return "TIMEOUT", fmt.Sprintf("no answer in time (%v); SY.admin may still remove it, and remove_runtime_version answers RUNTIME_VERSION_NOT_FOUND once it is gone", err)
+	default:
+		return "TRANSPORT_ERROR", err.Error()
+	}
+}
+
+// removeRuntimeVersionOnPrimary asks SY.admin to remove one version from the motherbee's dist, and
+// waits runtimeRemovalTimeout at most for its answer, within the request's deadline.
 func (s *Service) removeRuntimeVersionOnPrimary(ctx context.Context, runtimeName, version string) error {
 	if s.admin == nil {
 		return fmt.Errorf("admin client unavailable")
 	}
-	callCtx, cancel := context.WithTimeout(ctx, adminRPCTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, runtimeRemovalTimeout)
 	defer cancel()
 	if err := s.admin.RemoveRuntimeVersion(callCtx, runtimeName, version); err != nil {
 		var actionErr *adminActionError
