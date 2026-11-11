@@ -23095,6 +23095,16 @@ fn run_blob_gc_housekeeping(
     state: &OrchestratorState,
     blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
+    run_blob_gc_housekeeping_as(state, blob, BLOB_STAGING_OWNER_UID)
+}
+
+/// `run_blob_gc_housekeeping`, with the user a spoke's staging pass wants to own its blob root and
+/// staging (`clean_own_blob_staging`): root, but in the tests, which cannot chown to root.
+fn run_blob_gc_housekeeping_as(
+    state: &OrchestratorState,
+    blob: &BlobRuntimeConfig,
+    staging_owner: u32,
+) -> Result<(), OrchestratorError> {
     // A spoke first, whatever its blob.gc says (FINDINGS A-241): its own staging pass, never the
     // active one (A-188).
     if let Some(refusal) = blob_gc_refusal(state.is_motherbee) {
@@ -23107,7 +23117,7 @@ fn run_blob_gc_housekeeping(
                 "blob.gc.enabled is on in hive.yaml and is not read here: {refusal}"
             );
         }
-        clean_own_blob_staging(&state.hive_id, blob, BLOB_STAGING_OWNER_UID)?;
+        clean_own_blob_staging(&state.hive_id, blob, staging_owner)?;
         return Ok(());
     }
     if !(blob.enabled && blob.gc_enabled) {
@@ -23212,13 +23222,18 @@ fn clean_own_blob_staging(
         name_max_chars: BLOB_NAME_MAX_CHARS,
         max_blob_bytes: None,
     })?;
+    // The pass holds the watchdog's tick while it walks: its line says for how long.
+    let started = Instant::now();
     let report = toolkit.cleanup_staging_orphans(DEFAULT_BLOB_GC_STAGING_TTL_HOURS, true)?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     if report.deleted_files > 0 {
         tracing::info!(
             hive = %hive_id,
             ttl_hours = DEFAULT_BLOB_GC_STAGING_TTL_HOURS,
+            scanned = report.scanned_files,
             deleted = report.deleted_files,
             deleted_bytes = report.deleted_bytes,
+            elapsed_ms,
             "blob staging cleaned: unfinished puts past their TTL deleted (FINDINGS A-241)"
         );
     }
@@ -23227,6 +23242,8 @@ fn clean_own_blob_staging(
             hive = %hive_id,
             errors = report.errors.len(),
             first_error = report.errors.first().cloned().unwrap_or_default(),
+            scanned = report.scanned_files,
+            elapsed_ms,
             "blob staging cleanup finished with errors"
         );
     }
@@ -47502,6 +47519,15 @@ blob:
         root
     }
 
+    /// worker1's orchestrator state.
+    fn a241_worker_state() -> OrchestratorState {
+        let mut worker = sample_orchestrator_state_for_tests();
+        worker.hive_id = "worker1".to_string();
+        worker.is_motherbee = false;
+        worker.role = HiveRole::Worker;
+        worker
+    }
+
     /// FINDINGS A-188 and A-241: the blob GC's `active/` pass runs only on the motherbee, where
     /// io.blob's ledger pins the sources of live publications. A worker, its `blob.gc` turned on by
     /// hand included, cleans only its own staging and leaves `active/` alone; the motherbee's GC
@@ -47525,18 +47551,12 @@ blob:
         blob.gc_apply = true;
         blob.gc_staging_ttl_hours = 1;
         blob.gc_active_retain_days = 1;
-        let mut worker = sample_orchestrator_state_for_tests();
-        worker.hive_id = "worker1".to_string();
-        worker.is_motherbee = false;
-        worker.role = HiveRole::Worker;
-        run_blob_gc_housekeeping(&worker, &blob).expect("a worker's pass");
-        assert!(promoted.exists(), "a worker never runs the active pass");
-        // The worker's staging pass, run here with this user's id, since a test cannot chown to
-        // root.
+        // The worker's pass, its staging pass wanting this user for the owner of the blob root and
+        // staging, since a test cannot chown to root.
         let me = fs::metadata(&root).expect("the root").uid();
-        clean_own_blob_staging(&worker.hive_id, &blob, me).expect("the worker's staging pass");
+        run_blob_gc_housekeeping_as(&a241_worker_state(), &blob, me).expect("a worker's pass");
         assert!(!leftover.exists(), "a worker cleans its own staging");
-        assert!(promoted.exists(), "and leaves active/ alone");
+        assert!(promoted.exists(), "and never runs the active pass");
         a241_file(&leftover, b"unfinished put", old);
         run_blob_gc_housekeeping(&sample_orchestrator_state_for_tests(), &blob)
             .expect("the motherbee's GC runs");
@@ -47559,6 +47579,38 @@ blob:
         assert!(value["blob"].get("path").is_some(), "{written}");
         let hive: HiveFile = serde_yaml::from_str(&written).expect("the orchestrator reads it");
         assert!(!blob_runtime_from_hive(&hive, HiveRole::Worker).gc_enabled);
+    }
+
+    /// FINDINGS A-241: a worker's staging pass comes before the motherbee's `blob.gc.enabled`
+    /// check, so it runs whatever its `blob.gc` says: a worker with no `blob.gc`, as every join now
+    /// writes it, cleans its staging; the motherbee, its GC off, deletes nothing. Run here with this
+    /// user's id, since a test cannot chown to root.
+    #[test]
+    fn a_worker_cleans_its_staging_with_its_blob_gc_off() {
+        use std::os::unix::fs::MetadataExt;
+        let root = a241_blob_root("gc-off");
+        let leftover = root.join("staging/ab/report_0123456789abcdef.pdf");
+        a241_file(
+            &leftover,
+            b"an unfinished put",
+            Duration::from_secs(48 * 3600),
+        );
+        let mut blob = sample_blob_config();
+        blob.path = root.clone();
+        assert!(
+            blob.enabled && !blob.gc_enabled,
+            "a worker's blob, no blob.gc"
+        );
+        let me = fs::metadata(&root).expect("the root").uid();
+        run_blob_gc_housekeeping_as(&sample_orchestrator_state_for_tests(), &blob, me)
+            .expect("the motherbee's pass");
+        assert!(leftover.exists(), "the motherbee's GC is off");
+        run_blob_gc_housekeeping_as(&a241_worker_state(), &blob, me).expect("the worker's pass");
+        assert!(
+            !leftover.exists(),
+            "a worker cleans its staging all the same"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// FINDINGS A-241: a spoke cleans its own staging: a staged file past the SDK's 24 h TTL and an
@@ -47598,9 +47650,11 @@ blob:
     }
 
     /// FINDINGS A-241: the staging pass walks by path, so it walks nothing where another user could
-    /// turn its walk elsewhere: a staging another user owns, one its group or others may write, a
-    /// staging that is a link (whatever it points at keeps its files), or a blob root that is one.
-    /// A spoke with no staging yet has nothing to clean.
+    /// turn its walk elsewhere: a blob root another user owns, a staging its group or others may
+    /// write, a staging that is a link (whatever it points at keeps its files), or a blob root that
+    /// is one. A spoke with no staging yet has nothing to clean. A staging another user owns, under
+    /// a blob root of this user's, takes a chown only root may run: the owner check is run here on
+    /// the blob root, and the same check runs on staging.
     #[test]
     fn a_spoke_walks_its_staging_only_while_it_is_root_s_alone() {
         use std::os::unix::fs::MetadataExt;
@@ -47618,7 +47672,8 @@ blob:
                 .is_some()
         };
 
-        assert!(!walked(&blob, me + 1), "another user's staging");
+        // The blob root's owner check refuses first: this user owns staging too.
+        assert!(!walked(&blob, me + 1), "another user's blob root");
         for mode in [0o770, 0o757] {
             fs::set_permissions(&staging, fs::Permissions::from_mode(mode)).expect("mode");
             assert!(!walked(&blob, me), "a staging of mode {mode:o}");
