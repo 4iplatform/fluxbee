@@ -157,3 +157,30 @@ func TestProcessDueRecurringFiresAndRequeues(t *testing.T) {
 		t.Fatalf("expected recurring timer to be requeued: %+v", row)
 	}
 }
+
+// A start gives its history GC's counts in its timer_startup event and its ready line (§11). A GC
+// that failed returns counts of 0, as one that found nothing to delete or to date: the start says
+// gc=failed instead, with the error in the event, and gives no counts (FINDINGS A-238's review).
+func TestAStartWhoseHistoryGCFailedSaysSo(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertOwnedTimer(t, db, timerRow{UUID: "timer-canceled-before-1.5", OwnerL2Name: "WF.demo@motherbee", TargetL2Name: "WF.demo@motherbee",
+		Kind: "oneshot", FireAtUTC: now.Add(time.Hour).UnixMilli(), MissedPolicy: "fire", Payload: `{}`, Status: "canceled",
+		CreatedAtUTC: now.Add(-time.Hour).UnixMilli()})
+
+	deleted, stamped, err := gcHistoricalTimers(ctx, db, now, defaultHistoryRetention)
+	fields := map[string]any{}
+	if line := startupGC(fields, deleted, stamped, err); err != nil || line != "gc_deleted=0 gc_stamped=1" ||
+		len(fields) != 2 || fields["gc_deleted"] != int64(0) || fields["gc_stamped"] != int64(1) {
+		t.Fatalf("a GC that dated a timer: %q, %v (%v)", line, fields, err)
+	}
+
+	_ = db.Close()
+	deleted, stamped, err = gcHistoricalTimers(ctx, db, now, defaultHistoryRetention)
+	fields = map[string]any{}
+	if line := startupGC(fields, deleted, stamped, err); err == nil || deleted != 0 || stamped != 0 || line != "gc=failed" ||
+		len(fields) != 1 || fields["gc_error"] != err.Error() {
+		t.Fatalf("a GC that failed: deleted %d, dated %d, %q, %v (%v)", deleted, stamped, line, fields, err)
+	}
+}

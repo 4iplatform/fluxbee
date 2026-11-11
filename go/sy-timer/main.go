@@ -207,11 +207,9 @@ func main() {
 		db:          db,
 	}
 	service.scheduler = newTimerScheduler(service)
-	// gc_stamped: the canceled timers this start dated, canceled before 1.5 or by a SY.timer before it
-	// (FINDINGS A-238); they are kept 7 days from now.
-	deleted, stamped, err := gcHistoricalTimers(context.Background(), db, time.Now().UTC(), defaultHistoryRetention)
-	if err != nil {
-		log.Printf("historical timer gc failed: %v", err)
+	deleted, stamped, gcErr := gcHistoricalTimers(context.Background(), db, time.Now().UTC(), defaultHistoryRetention)
+	if gcErr != nil {
+		log.Printf("historical timer gc failed: %v", gcErr)
 	}
 	if err := service.scheduler.replayPending(context.Background(), time.Now().UTC()); err != nil {
 		log.Fatalf("failed to replay pending timers: %v", err)
@@ -220,16 +218,31 @@ func main() {
 	if err != nil {
 		log.Printf("failed to count pending timers: %v", err)
 	}
-	logEvent("timer_startup", map[string]any{
+	startup := map[string]any{
 		"node_name":     service.nodeName,
 		"db_path":       service.dbPath,
 		"pending_count": pendingCount,
-		"gc_deleted":    deleted,
-		"gc_stamped":    stamped,
-	})
-	log.Printf("SY.timer ready: node=%s db=%s pending=%d gc_deleted=%d gc_stamped=%d", service.nodeName, service.dbPath, pendingCount, deleted, stamped)
+	}
+	gc := startupGC(startup, deleted, stamped, gcErr)
+	logEvent("timer_startup", startup)
+	log.Printf("SY.timer ready: node=%s db=%s pending=%d %s", service.nodeName, service.dbPath, pendingCount, gc)
 	service.scheduler.start()
 	service.run()
+}
+
+// startupGC puts the start's history GC (gcHistoricalTimers) in the timer_startup event's fields, and
+// returns it for the ready line: gc_deleted, and gc_stamped, the canceled timers it dated, canceled
+// before 1.5 or by a SY.timer before it, which are kept 7 days from now (FINDINGS A-238). A GC that
+// failed changed nothing, and its counts are 0, as for one that found nothing to delete or to date:
+// it is gc=failed instead, with gc_error in the event.
+func startupGC(fields map[string]any, deleted, stamped int64, err error) string {
+	if err != nil {
+		fields["gc_error"] = err.Error()
+		return "gc=failed"
+	}
+	fields["gc_deleted"] = deleted
+	fields["gc_stamped"] = stamped
+	return fmt.Sprintf("gc_deleted=%d gc_stamped=%d", deleted, stamped)
 }
 
 func (s *Service) run() {

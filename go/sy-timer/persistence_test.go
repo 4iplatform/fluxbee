@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -622,11 +623,19 @@ func TestGCHistoricalTimersAgesACanceledTimerByItsCancellation(t *testing.T) {
 	kept("a start 8 days later", "pending")
 }
 
-// timerTableOfSYTimer14 creates the timers table as SY.timer 1.4 (schema 3, FINDINGS A-220) did, on
-// a database it never opened.
-func timerTableOfSYTimer14(t *testing.T, db *sql.DB) {
-	t.Helper()
-	for _, stmt := range []string{`
+// timerSchemaVersionOfSYTimer14 is the user_version SY.timer 1.4 writes: schema 3 (FINDINGS A-220).
+const timerSchemaVersionOfSYTimer14 = 3
+
+// ensureTimerSchemaOfSYTimer14 is SY.timer 1.4's schema step, the first thing its start does, copied
+// from its code (6c6b084f, go/sy-timer/persistence.go) with only its timerSchemaVersion renamed. On a
+// database it never opened it creates its table; on a newer table every statement is IF NOT EXISTS
+// or skipped, and it writes its user_version back.
+func ensureTimerSchemaOfSYTimer14(db *sql.DB) error {
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&userVersion); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS timers (
     uuid                TEXT PRIMARY KEY,
     owner_l2_name       TEXT NOT NULL,
@@ -647,17 +656,73 @@ CREATE TABLE IF NOT EXISTS timers (
     last_fired_at_utc   INTEGER,
     fire_count          INTEGER NOT NULL DEFAULT 0,
     canceled_reason     TEXT
-);`,
+);`); err != nil {
+		return err
+	}
+	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_timers_owner ON timers(owner_l2_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at_utc) WHERE status='pending';`,
 		`CREATE INDEX IF NOT EXISTS idx_timers_status ON timers(status);`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_timers_owner_clientref_pending ON timers(owner_l2_name, client_ref) WHERE client_ref IS NOT NULL AND status='pending';`,
-		`PRAGMA user_version=3;`,
-	} {
+	}
+	for _, stmt := range indexes {
 		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("the table of SY.timer 1.4: %v", err)
+			return err
 		}
 	}
+	if userVersion < 2 {
+		if _, err := db.Exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS idx_timers_owner_clientref_pending
+ON timers(owner_l2_name, client_ref)
+WHERE client_ref IS NOT NULL AND status='pending';
+`); err != nil {
+			return fmt.Errorf("create unique pending client_ref index: %w", err)
+		}
+	}
+	// Version 3 (FINDINGS A-220): canceled_reason. Added when the table lacks it, whatever
+	// user_version says: a SY.timer before it writes user_version 2 over a table that has it.
+	var hasCanceledReason int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('timers') WHERE name='canceled_reason';`).Scan(&hasCanceledReason); err != nil {
+		return err
+	}
+	if hasCanceledReason == 0 {
+		if _, err := db.Exec(`ALTER TABLE timers ADD COLUMN canceled_reason TEXT;`); err != nil {
+			return fmt.Errorf("add canceled_reason: %w", err)
+		}
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d;", timerSchemaVersionOfSYTimer14)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startAsSYTimer14 runs SY.timer 1.4's schema step on db, as its start does.
+func startAsSYTimer14(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := ensureTimerSchemaOfSYTimer14(db); err != nil {
+		t.Fatalf("SY.timer 1.4's schema step: %v", err)
+	}
+}
+
+// timersSchema is the timers table and its indexes as SQLite keeps them, one per line.
+func timersSchema(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	rows, err := db.Query(`SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE tbl_name='timers' ORDER BY type, name`)
+	if err != nil {
+		t.Fatalf("read the schema: %v", err)
+	}
+	defer rows.Close()
+	var schema []string
+	for rows.Next() {
+		var kind, name, definition string
+		if err := rows.Scan(&kind, &name, &definition); err != nil {
+			t.Fatalf("read the schema: %v", err)
+		}
+		schema = append(schema, kind+" "+name+": "+definition)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the schema: %v", err)
+	}
+	return strings.Join(schema, "\n")
 }
 
 // What SY.timer 1.4 sends its database, copied from its code (6c6b084f, go/sy-timer/persistence.go):
@@ -714,7 +779,7 @@ func readAsSYTimer14(t *testing.T, db *sql.DB, timerUUID string) timerRow {
 
 // Schema version 4 (FINDINGS A-238) adds canceled_at_utc to SY.timer 1.4's table, and keeps its rows:
 // their cancellation has no date, until the next start's GC dates it. A table that has it under
-// user_version 3, which SY.timer 1.4 writes back over it, is left as it is.
+// user_version 3, which SY.timer 1.4's start writes back over it, is left as it is.
 func TestEnsureTimerSchemaAddsCanceledAtToAVersion3Table(t *testing.T) {
 	db, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
 	if err != nil {
@@ -722,7 +787,8 @@ func TestEnsureTimerSchemaAddsCanceledAtToAVersion3Table(t *testing.T) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	timerTableOfSYTimer14(t, db)
+	// SY.timer 1.4 starts on a database it never opened: its table, schema 3.
+	startAsSYTimer14(t, db)
 	created := time.Now().UTC().Add(-time.Hour).UnixMilli()
 	reason := sql.NullString{String: "missed: its fire time passed while SY.timer was down, and its missed_policy is drop", Valid: true}
 	for _, row := range []timerRow{
@@ -751,18 +817,17 @@ func TestEnsureTimerSchemaAddsCanceledAtToAVersion3Table(t *testing.T) {
 		if row, err := getTimer(ctx, db, "timer-dropped"); err != nil || row.Status != "canceled" || row.CanceledReason != reason || row.CanceledAtUTC.Valid {
 			t.Fatalf("pass %d: the canceled row: %+v (%v)", pass, row, err)
 		}
-		// What SY.timer 1.4 writes back.
-		if _, err := db.Exec(`PRAGMA user_version=3;`); err != nil {
-			t.Fatalf("user_version 3: %v", err)
-		}
+		// SY.timer 1.4 starts on it: it writes user_version 3 back.
+		startAsSYTimer14(t, db)
 	}
 }
 
 // Back to SY.timer 1.4 after 1.5 (FINDINGS A-238's rollback): 1.4 starts on the version 4 table, and
-// reads, writes and deletes its timers as before. Its start writes user_version 3 back and changes
-// nothing else: every other statement of its ensureTimerSchema is IF NOT EXISTS, or skipped. Its GC
-// ages a canceled timer by its creation again. The date 1.5 gave a cancellation survives 1.4's
-// writes, and 1.4's own cancellation has none; 1.5, started again, keeps the table and dates that one.
+// reads, writes and deletes its timers as before. Its start, its own schema step run as it is, writes
+// user_version 3 back and changes nothing else: every other statement of its ensureTimerSchema is IF
+// NOT EXISTS, or skipped. Its GC ages a canceled timer by its creation again. The date 1.5 gave a
+// cancellation survives 1.4's writes, and 1.4's own cancellation has none; 1.5, started again, keeps
+// the table and dates that one.
 func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 	db := openTestTimerDB(t)
 	ctx := context.Background()
@@ -780,10 +845,16 @@ func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 		}
 	}
 
-	// SY.timer 1.4 starts: its schema step, then its history GC, which takes the timer canceled an
-	// hour ago but scheduled a month ago.
-	if _, err := db.Exec(`PRAGMA user_version=3;`); err != nil {
-		t.Fatalf("user_version 3: %v", err)
+	// SY.timer 1.4 starts: its schema step, which leaves the table as it is, then its history GC,
+	// which takes the timer canceled an hour ago but scheduled a month ago.
+	schemaOf15 := timersSchema(t, db)
+	startAsSYTimer14(t, db)
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersionOfSYTimer14 {
+		t.Fatalf("SY.timer 1.4's start: user_version %d (%v), want %d", version, err, timerSchemaVersionOfSYTimer14)
+	}
+	if schema := timersSchema(t, db); schema != schemaOf15 {
+		t.Fatalf("SY.timer 1.4's start changed the table:\n%s\nwas:\n%s", schema, schemaOf15)
 	}
 	result, err := db.Exec(gcOfSYTimer14, now.Add(-defaultHistoryRetention).UnixMilli())
 	if err != nil {
@@ -828,9 +899,11 @@ func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 	if err := ensureTimerSchema(db); err != nil {
 		t.Fatalf("ensure schema: %v", err)
 	}
-	var version int
 	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersion {
 		t.Fatalf("user_version %d (%v), want %d", version, err, timerSchemaVersion)
+	}
+	if schema := timersSchema(t, db); schema != schemaOf15 {
+		t.Fatalf("SY.timer 1.5's start changed the table:\n%s\nwas:\n%s", schema, schemaOf15)
 	}
 	restart := now.Add(time.Minute)
 	deleted, stamped, err := gcHistoricalTimers(ctx, db, restart, defaultHistoryRetention)

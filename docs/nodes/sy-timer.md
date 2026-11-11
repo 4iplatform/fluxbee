@@ -50,7 +50,9 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    A-238). This runs once per start, not periodically; a GC that fails is logged and changes nothing.
 6. Replays pending timers (`replayPending`, below), logs
    `SY.timer ready: node=... db=... pending=N gc_deleted=M gc_stamped=S` (S: the canceled timers
-   step 5 dated), starts the scheduler and serves messages.
+   step 5 dated), starts the scheduler and serves messages. When step 5 failed, the line says
+   `gc=failed` in place of both counts, and `timer_startup` gives `gc_error` (`startupGC`): the
+   failed GC's counts are 0, which would read as nothing to delete or to date.
 
 ## Timers
 
