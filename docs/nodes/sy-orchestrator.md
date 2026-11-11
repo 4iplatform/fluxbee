@@ -284,8 +284,9 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   left out a node on its way up and any node systemctl gave no answer for.
 - **A runtime's use across the hives** (FINDINGS A-281, since 0.1.133). A `get_runtime`
   (`GET_RUNTIME`) answers, beside its hive's `usage`, `usage_global_visible`: on a spoke its own
-  usage again; on the motherbee its nodes and those of the other hives of its registry, asked for
-  their `GET_RUNTIME` one at a time (`global_visible_runtime_usage_summary`,
+  usage again; on the motherbee its nodes and those of the other hives of its registry, all asked
+  at once for their nodes alone (`GET_RUNTIME` with `usage_only`, `runtime_usage_request`), each
+  given 10 s to answer (`RUNTIME_USAGE_HIVE_TIMEOUT`; `global_visible_runtime_usage_summary`,
   `group_runtime_usage`). The answer tells a hive where no managed node can run, which is not
   asked, from one whose use is unknown:
   - **`hives_without_runtimes`**: each hive whose role, as its registry entry records it whatever
@@ -299,24 +300,49 @@ one SY.identity answers, the identity map (an older map's other forms are read c
     never reads as an ingress or an egress.
   - **`skipped_hives`**: each other hive, a worker or one whose role cannot be read (no `info.yaml`
     that parses, an entry that names another hive, no spoke role), that did not answer with its
-    nodes, with the reason and the `message` that came with it: `UNREACHABLE` (no answer); the
-    answer's error code (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest,
-    `RUNTIME_NOT_FOUND` for one whose manifest lacks the runtime, `RUNTIME_QUERY_FAILED` when it
-    names none); or `USAGE_UNREADABLE` (an `ok` whose own usage failed). Its use is unknown, never
-    none.
+    nodes, with the reason and the `message` that came with it: `TIMEOUT` (asked, and no answer
+    within its 10 s: its orchestrator stopped, restarting or stuck while the LSA still shows it);
+    `UNREACHABLE` (the request never reached it: the LSA does not show the hive or its
+    orchestrator, or a router answered it unreachable); `USAGE_UNREADABLE` (its read of its own
+    nodes failed, answered with that code or, by a spoke before 0.1.133, as an `ok` whose usage
+    failed); or the code of another error it answered (`RUNTIME_QUERY_FAILED` when it names none),
+    above all `RUNTIME_NOT_FOUND` or `RUNTIME_MANIFEST_MISSING` from a spoke before 0.1.133 whose
+    manifest does not list the runtime. Its use is unknown, never none.
   - **`running_nodes`** (and `running_count`): the motherbee's nodes and the answered hives', by
     hive, then name.
   - **`in_use`**: true while a node is listed, false only once every hive asked was counted, and
     `null` (unknown) while none is listed and a hive is in `skipped_hives`.
+
+  **A hive's own nodes alone.** A `get_runtime` with `usage_only: true` answers
+  `{status: "ok", hive_id, usage}`: the hive's nodes on the runtime, read from their configs
+  whatever its runtime manifest lists (`local_runtime_usage_answer`), and `USAGE_UNREADABLE` when
+  that read fails. A forward carries the field to the target hive; the motherbee, asked so, answers
+  its own nodes and asks no other hive. A node's use is its config, so a worker whose copy of
+  `dist/runtimes` lags the motherbee's (10-60 s after a workflow's first deploy) is counted by its
+  nodes. Without the field a read answers as before: `RUNTIME_NOT_FOUND` while the hive's manifest
+  does not list the runtime, as an operator's `GET /hives/worker1/runtimes/<runtime>` shows. A
+  spoke before 0.1.133 reads no `usage_only` and answers the whole read: counted while its manifest
+  lists the runtime, skipped otherwise, so a removal is refused until its copy lists the runtime or
+  its core is updated.
+
+  **Its time.** Every hive is asked at once, so a hive the LSA shows whose orchestrator does not
+  answer costs the read 10 s, well within SY.admin's 30 s for `get_runtime`: SY.admin's refusal
+  names that hive (`TIMEOUT`), and the motherbee stops waiting before SY.admin does. A forward that
+  has not ended a second later, its send held by a router link that takes nothing, is no longer
+  waited for (`RUNTIME_USAGE_ASK_GRACE`). The motherbee's `get_runtime` of its own hive waits on
+  every hive ([Messages](#messages): `read_target`, as `list_versions`), so the reads asked again
+  while a hive does not answer hold the fan-outs' places, never a local read's.
 
   A registry that cannot be listed makes the whole `usage_global_visible` an error
   (`{status: "error", message}`), as a failed read of the motherbee's own nodes does
   (`global_visible_runtime_usage_summary_with_roots`). SY.admin's `remove_runtime_version` refuses
   the version while a node is listed, and while the use is unknown: an error, or a hive in
   `skipped_hives`. On 0.1.132 every ingress and egress was in `skipped_hives` on every read, for
-  its `RUNTIME_MANIFEST_MISSING`, an `ok` whose usage failed counted as a hive with no node, an
-  error answer's `message` was dropped, and `in_use` read false with a hive skipped. The motherbee
-  decides by its registry rather than by what a spoke answers: an ingress's
+  its `RUNTIME_MANIFEST_MISSING`, and a worker whose copy lagged, for its `RUNTIME_NOT_FOUND`; an
+  `ok` whose usage failed counted as a hive with no node, an error answer's `message` was dropped,
+  `in_use` read false with a hive skipped, and the hives were asked one after another, 45 s each
+  (`system_forward_timeout`): one that did not answer held the read past SY.admin's 30 s for it.
+  The motherbee decides by its registry rather than by what a spoke answers: an ingress's
   `RUNTIME_MANIFEST_MISSING` is true and stays its answer, and the motherbee's core, which brings
   SY.admin's refusal, comes before the spokes' cores, so a spoke that answered "none" instead would
   leave every removal refused, SY.wf-rules' package purges included, until each ingress and egress
@@ -1060,7 +1086,9 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 
 - **A read** runs in a task of its own. A read of this hive alone takes one of 16 places per
   worker (`WORKER_CONCURRENT_READS_MAX`); a read that waits on another hive (that hive, or every
-  hive for list_versions and list_tenant_nodes) takes one of its target's 4 places
+  hive for list_versions, list_tenant_nodes and, since 0.1.133, the motherbee's get_runtime of its
+  own hive, which asks every hive for its nodes on the runtime: [A runtime's use across the
+  hives](#managed-nodes), FINDINGS A-281) takes one of its target's 4 places
   (`WORKER_READS_PER_TARGET_MAX`), then one of 16 others. A hive that does not answer, asked again
   and again, then holds 4 forwarding places and no local read's (the review of step 1). One more
   read of a kind waits for one of its kind to end. Each read's target is the hive its flow

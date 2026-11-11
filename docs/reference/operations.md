@@ -417,16 +417,20 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   (`DELETE /hives/motherbee/runtimes/<runtime>/versions/<version>`) first reads the version's use
   across the hives, the motherbee's `usage_global_visible`, which
   `GET /hives/motherbee/runtimes/<runtime>` shows for all of a runtime's versions. The motherbee's
-  orchestrator asks each hive of its registry for its nodes, but an ingress or an egress:
+  orchestrator asks each hive of its registry for its nodes, but an ingress or an egress, all at
+  once, each with 10 s to answer. A worker reads its nodes from their configs whatever its mirror
+  of `dist/runtimes` lists, so one whose mirror does not list the runtime yet (10-60 s after a
+  workflow's first deploy) is counted by its nodes:
   - `running_nodes`: each node pinned to the version whose unit may run, on the motherbee and on
     each hive that answered, with its `hive` and `lifecycle` (`RUNNING`; `STARTING`, its unit runs
     and the router does not see it yet; `UNKNOWN`, systemd did not answer for its unit);
   - `skipped_hives`: each hive whose use is unknown, with its `reason` and the `message` that came
-    with it: `UNREACHABLE` (no answer: down, its orchestrator restarting, stale in the LSA), the
-    error it answered (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest,
-    `RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet), or `USAGE_UNREADABLE`
-    (its own read failed). A worker, and a hive whose registry entry gives no role (a join being
-    accepted, an entry that does not parse), are asked;
+    with it: `TIMEOUT` (no answer within 10 s: its orchestrator stopped or restarting while the
+    LSA still shows it), `UNREACHABLE` (the request never reached it: down, or stale in the LSA),
+    `USAGE_UNREADABLE` (its own read of its nodes failed), or the error a worker before 0.1.133
+    answered, which reads its mirror first (`RUNTIME_NOT_FOUND` while its mirror does not list the
+    runtime yet, `RUNTIME_MANIFEST_MISSING` without one). A worker, and a hive whose registry entry
+    gives no role (a join being accepted, an entry that does not parse), are asked;
   - `hives_without_runtimes`: each ingress and egress, by the role the hive registry records,
     whatever the state of its join; an entry keeps its role until the hive is removed
     ([add_hive](#join-a-hive-add_hive)). The runtimes never reach them (`fluxbee-dist-runtimes`
@@ -435,18 +439,21 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   - `in_use`: true while a node is listed, false only once every hive asked was counted, and
     `null` (unknown) while none is listed and a hive is in `skipped_hives`.
 
-  A registry the motherbee cannot list makes the whole use an error (`status: error`). SY.admin
-  refuses the removal, with nothing removed: `409 RUNTIME_IN_USE` while a node is listed, its
-  detail naming each node with its hive and lifecycle; `409 RUNTIME_USAGE_UNKNOWN` while the use is
-  unknown (an error, or a hive in `skipped_hives`), naming each hive not read and why in
-  `payload.unanswered_hives`, with `payload.retryable: true`. Ask again once each hive answers:
-  bring a worker back, finish or remove a join left behind, and remove a hive gone for good with
-  `remove_hive` first. A workflow's delete whose purge meets the refusal answers
-  `PACKAGE_PUBLISH_FAILED` after the workflow and its node are gone, and that version stays in
-  dist. Before 0.1.133 a hive not counted read as one with no node: a version a node of a
-  restarting worker ran on was removed, and the worker's mirror deleted it when it came back. And
-  every ingress and egress was in `skipped_hives` on every read, for its
-  `RUNTIME_MANIFEST_MISSING` ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
+  A registry the motherbee cannot list makes the whole use an error (`status: error`). With a
+  worker that does not answer, the read ends in about 10 s, well within SY.admin's 30 s for it,
+  so the refusal names that worker. SY.admin refuses the removal, with nothing removed:
+  `409 RUNTIME_IN_USE` while a node is listed, its detail naming each node with its hive and
+  lifecycle; `409 RUNTIME_USAGE_UNKNOWN` while the use is unknown (an error, or a hive in
+  `skipped_hives`), naming each hive not read and why in `payload.unanswered_hives`, with
+  `payload.retryable: true`. Ask again once each hive answers: bring a worker back, finish or
+  remove a join left behind, and remove a hive gone for good with `remove_hive` first. A
+  workflow's delete whose purge meets the refusal answers `PACKAGE_PUBLISH_FAILED` after the
+  workflow and its node are gone, and that version stays in dist. Before 0.1.133 a hive not
+  counted read as one with no node: a version a node of a restarting worker ran on was removed,
+  and the worker's mirror deleted it when it came back. And every ingress and egress was in
+  `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`, and the hives were asked one
+  after another, 45 s each, so one that did not answer held the read past SY.admin's 30 s
+  ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
 - **A workflow's delete can leave its versions in dist (FINDINGS A-281).** SY.wf-rules removes them
   last, after the workflow, its node and its state, through `remove_runtime_version`, and stops at
   the first one refused or not answered within its 5 s: the delete answers
