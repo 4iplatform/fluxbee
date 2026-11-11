@@ -342,6 +342,13 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-286 🔵 Archi's SCMD reads take `+` for a space where SY.admin keeps it (low; SY.architect).
 - A-287 🔵 Archi's SCMD paths go to SY.admin undecoded: `AI.sales%40worker1` matches no node (low; SY.architect).
 - A-288 🔵 Archi's SCMD reads of deployments and drift alerts drop their query (low; SY.architect; with A-279 in 0.1.133).
+- A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
+- A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners).
+- A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
+- A-292 🔵 A turn the AI runtime refuses stays in cognition, unanswered (low; cognition).
+- A-293 🔵 io.cloud answers `FRONTDESK_REJECTED` to a retryable frontdesk error (low; io.cloud).
+- A-294 🔵 One answer over the frame limit stops the whole AI runtime (low; the AI SDK).
+- A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1419,6 +1426,83 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-295 [General/Rust SDK] 🔵 low (found 2026-11-11 by A-257's builder; read in the code; there before it) — The Rust SDK's command channels are unbounded
+
+- **Why:** `RouterDispatcher`'s command channels are `mpsc::unbounded_channel`
+  (`crates/fluxbee_sdk/src/rpc.rs` ~593), with only a WARN at a depth of 1,000 (~76, ~614). The AI
+  runtime's old *queue of 128* was no real bound: what waited behind it piled up there. Since A-257
+  (0.1.135) the AI runtime drains it continuously; any other node that stops draining a command
+  channel grows without limit.
+- **Fix, later (the Rust SDK alone):** a bounded channel with a named refusal past its bound.
+
+### A-294 [General/AI SDK] 🔵 low (found 2026-11-11 by A-257's builder and review; read in the code; there before it) — One answer over the frame limit stops the whole AI runtime
+
+- **Why:** `NodeError::MessageTooLarge` (over 128 KiB, refused before sending in `send_traced`) is
+  not recoverable (`crates/fluxbee_ai_sdk/src/errors.rs` ~185): `run_with_config` returns it, both
+  runners propagate it with `?`, and the node process exits, cutting every other turn in flight.
+  ai.generic offloads long text to `content_ref`, so the likely source is a large request context
+  copied into a reply, or a large control answer.
+- **Since 0.1.135 (A-257's review):** no waiting turn starts after such an end.
+- **Fix, later (the AI SDK alone):** a write refused as too large fails that message alone, counted
+  and logged, as an exhausted recoverable write does.
+
+### A-293 [IO/io.cloud] 🔵 low (found 2026-11-11 by A-257's review fixes; read in the code) — io.cloud answers `FRONTDESK_REJECTED` to a retryable frontdesk error
+
+- **Why:** `handle_register_human` (`nodes/io/io-cloud/src/main.rs` ~2390-2400) maps any error reply
+  from the frontdesk to `FRONTDESK_REJECTED`, whatever its `retryable`; `docs/io-cloud-api.md` does
+  not list that code.
+- **Effect:** a retryable error (the frontdesk busy) reads to Cloud as a final refusal; this is why
+  A-257 drops a handoff past the frontdesk's places instead of answering it busy (a drop gives the
+  documented `FRONTDESK_UNAVAILABLE` after IO.cloud's 20 s).
+- **Fix, with IO.cloud's release:** a retryable error maps to `FRONTDESK_UNAVAILABLE` (or a code of
+  its own), and `FRONTDESK_REJECTED` is documented.
+
+### A-292 [General/cognition] 🔵 low (found 2026-11-11 by A-257's review; read in the code) — A turn the AI runtime refuses stays in cognition, unanswered
+
+- **Why:** the router copies a user message to cognition when the agent's link takes the frame
+  (`src/router/mod.rs` ~7774-7777), before the runtime refuses it; the `ai_runtime_busy` answer is
+  not text/v1, so cognition keeps no Out turn (`src/bin/sy_cognition.rs` ~1157-1167).
+- **Effect:** the person's message stays unanswered in the communication, and appears twice in the
+  next package if the person sends it again. Since A-257 (0.1.135) a busy node refuses at once, so
+  this becomes the usual case under load (the old runtime ran such a turn, late).
+- **Fix, later (cognition):** an In turn whose `trace_id` the agent answered `ai_runtime_busy` is
+  dropped or marked unanswered; the busy answer's trace entry says `busy` since 0.1.135.
+
+### A-291 [IO/io.slack] 🔵 low (found 2026-11-11 by A-257's review; read in the code; there before it) — io.slack posts an agent's error answer as *invalid_text_payload*
+
+- **Why:** io.slack posts any agent answer that is not text/v1 (`nodes/io/io-slack/src/main.rs`
+  ~3099-3112; `TextV1Payload::from_value`, `nodes/io/common/src/text_v1_blob.rs` ~383) as *"Error
+  (invalid_text_payload) while processing the content or attachments."*, error payloads included
+  (`ai_runtime_busy`, `ai_runtime_error`, `ai_runtime_timeout`).
+- **Effect:** the person reads that their content was invalid; since A-257 (0.1.135) a busy node
+  answers `ai_runtime_busy` at once, so under load this is the usual answer.
+- **Fix, with io.slack's revamp:** post the payload's `message`, with a send-again hint when
+  `retryable` is true.
+
+### A-290 [General/AI runners] 🔵 low (found 2026-11-11 by A-257's reviews; read in the code) — An AI node answers `HEALTHY` while its runtime refuses every turn
+
+- **Why:** `build_node_status_response_payload` (`crates/fluxbee_sdk/src/managed_control_plane.rs`
+  ~342-367) looks only at the config state; since A-257 (0.1.135) `NODE_STATUS_GET` is always
+  answered at once, while the lanes' load (`turns_waiting`, `turns_refused`, `direct_dropped`,
+  `busy_answers_dropped`) shows only in the journal's *"ai runtime metrics"* line.
+- **Effect:** neither `get_node_status` nor Archi, the operator's interface, sees a saturated node;
+  before, its status timed out, which at least showed something was wrong.
+- **Fix, later:** the AI runtime gives the node a read-only load handle (the AI SDK, alone); both
+  runners put it in `NODE_STATUS_GET`'s `extensions`, which the orchestrator passes on, and report
+  `DEGRADED` while turns were refused in the last interval.
+
+### A-289 [General/router] 🔵 low (found 2026-11-11 by the router's 0.1.134 builder and review; read in the code; there before it; several routers a hive, not supported) — A broadcast from a router that is not the gateway needs ttl 4 to cross the WAN
+
+- **Why:** the IRP hand-over takes a hop, and the gateway's `handle_peer_message` sends a copy toward
+  the WAN only at ttl >= 3: a broadcast that enters a router that is not the gateway with ttl 3
+  stops at the gateway, unanswered (a gateway sibling exists, so no `GATEWAY_UNAVAILABLE`). The
+  entering router also hands the gateway two copies, and each other sibling one more.
+- **Impact:** none on 8.x (one router a hive; the SDKs send ttl 16). Documented in
+  `docs/reference/routing-and-policy.md` §4 and §10 with 0.1.134. A known limit (the operator,
+  2026-11-10: the several-routers mode's defects past A-208, A-246 and A-247 are not scheduled).
+- **Fix, if the mode is ever supported:** a router that is not the gateway hands no IRP copy toward
+  the WAN.
+
 ### A-288 [Archi] 🔵 low (found 2026-11-11 by A-279's review; read in the code; there before it) — Archi's SCMD reads of deployments and drift alerts drop their query
 
 - **Why:** the SCMD arms of `GET /deployments`, `/drift-alerts`, `/hives/{hive}/deployments` and
@@ -1842,6 +1926,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `CONFIG_*` to the frontdesk wait in the same queue.
 - **Fix, later:** control traffic and the handoff not behind the LLM workers (the AI SDK: shared
   code, alone).
+- **Correction (A-257's builder, 2026-11-11):** the frontdesk's runner is
+  `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (its `RuntimeConfig` at ~3121), not
+  ai.generic's.
+- **Built for 0.1.135 (`coa/aisdk-135`, the AI SDK alone):** two lanes; a handoff runs beside the
+  workers only in the shape the frontdesk parses, within 30 s and on at most 8 of the direct lane's
+  64 places. **For the frontdesk's own release:** an `AiNode` method by which the node says what it
+  answers without its model (default system and admin only; the frontdesk's override is
+  `parse_frontdesk_handoff` and its sender rule); then the SDK's copy of the handoff's shape, its
+  gov-common dev-dependency and `tests/frontdesk_handoff_contract.rs` go.
 
 ### A-256 [IO/io.cloud] 🔵 low (found 2026-11-10 by A-91's builder; read in the code) — io.cloud accepts `io.inbound_family` and ignores it
 
