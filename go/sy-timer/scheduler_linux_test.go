@@ -153,7 +153,8 @@ func TestAStoredCronSpecThatCannotBeScheduledIsCanceledAtTheReplay(t *testing.T)
 	if err != nil {
 		t.Fatalf("load timer: %v", err)
 	}
-	if stored.Status != "canceled" || stored.FireAtUTC != row.FireAtUTC || stored.FireCount != 0 {
+	// Dated at the first replay, which canceled it: kept 7 days from it (FINDINGS A-238).
+	if stored.Status != "canceled" || stored.FireAtUTC != row.FireAtUTC || stored.FireCount != 0 || stored.CanceledAtUTC != nullableNow(now) {
 		t.Fatalf("unexpected row: %+v", stored)
 	}
 	for _, says := range []string{"its next fire cannot be computed", "the time zone goes in cron_tz"} {
@@ -229,7 +230,7 @@ func TestARecurringTimerThatCannotBeScheduledAtItsFireIsCanceled(t *testing.T) {
 	}
 	service.scheduler.push(row.UUID, row.FireAtUTC)
 	service.scheduler.processDue(context.Background(), now)
-	if stored, err := getTimer(context.Background(), service.db, row.UUID); err != nil || stored.Status != "pending" || stored.CanceledReason.Valid {
+	if stored, err := getTimer(context.Background(), service.db, row.UUID); err != nil || stored.Status != "pending" || stored.CanceledReason.Valid || stored.CanceledAtUTC.Valid {
 		t.Fatalf("a row that was not saved: %+v (%v)", stored, err)
 	}
 	if _, retryAt := mustPeekScheduledTimer(t, service.scheduler); retryAt < now.Add(storageRetryDelay).UnixMilli() {
@@ -242,7 +243,9 @@ func TestARecurringTimerThatCannotBeScheduledAtItsFireIsCanceled(t *testing.T) {
 	if _, err := service.db.Exec(`DROP TRIGGER refuse_updates;`); err != nil {
 		t.Fatalf("drop trigger: %v", err)
 	}
+	before := time.Now().UTC().UnixMilli()
 	service.scheduler.processDue(context.Background(), time.Now().UTC().Add(storageRetryDelay+time.Second))
+	after := time.Now().UTC().UnixMilli()
 	if len(tx) != 0 {
 		t.Fatalf("sent a fire for it")
 	}
@@ -255,6 +258,10 @@ func TestARecurringTimerThatCannotBeScheduledAtItsFireIsCanceled(t *testing.T) {
 	}
 	if stored.Status != "canceled" || !strings.Contains(stored.CanceledReason.String, "its next fire cannot be computed") || stored.FireCount != 0 || stored.LastFiredAtUTC.Valid {
 		t.Fatalf("unexpected row: %+v", stored)
+	}
+	// Dated at the fire that canceled it: kept 7 days from it (FINDINGS A-238).
+	if at := stored.CanceledAtUTC; !at.Valid || at.Int64 < before || at.Int64 > after {
+		t.Fatalf("canceled at %+v, want the fire's time, between %d and %d", at, before, after)
 	}
 	if n := strings.Count(logged.String(), `"event":"timer_recurring_next_fire_failed"`); n != 1 {
 		t.Fatalf("logged %d times, want once: %s", n, logged.String())

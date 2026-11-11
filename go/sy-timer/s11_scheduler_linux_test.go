@@ -40,6 +40,10 @@ func TestReplayPendingDropCancelsMissedOneShot(t *testing.T) {
 	if row.Status != "canceled" || !strings.Contains(row.CanceledReason.String, "its missed_policy is drop") {
 		t.Fatalf("expected dropped timer to be canceled, saying why: %+v", row)
 	}
+	// Dated at the replay: kept 7 days from it (FINDINGS A-238).
+	if row.CanceledAtUTC != nullableNow(now) {
+		t.Fatalf("canceled at %+v, want the replay's %d", row.CanceledAtUTC, now.UnixMilli())
+	}
 }
 
 func TestReplayPendingFireIfWithinCancelsOutsideWindow(t *testing.T) {
@@ -72,6 +76,9 @@ func TestReplayPendingFireIfWithinCancelsOutsideWindow(t *testing.T) {
 	}
 	if row.Status != "canceled" || !strings.Contains(row.CanceledReason.String, "more than its missed_within_ms (60000 ms) ago") {
 		t.Fatalf("expected timer to be canceled outside window, saying why: %+v", row)
+	}
+	if row.CanceledAtUTC != nullableNow(now) {
+		t.Fatalf("canceled at %+v, want the replay's %d", row.CanceledAtUTC, now.UnixMilli())
 	}
 }
 

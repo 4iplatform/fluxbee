@@ -141,7 +141,7 @@ func (s *timerScheduler) replayPending(ctx context.Context, now time.Time) error
 		if row.Kind == "recurring" {
 			nextFireAt, _, nextErr := nextRecurringFireAt(row, now)
 			if nextErr != nil {
-				if err := s.cancelUnschedulable(ctx, row, nextErr, "timer_replay_invalid_recurring"); err != nil {
+				if err := s.cancelUnschedulable(ctx, row, nextErr, "timer_replay_invalid_recurring", now); err != nil {
 					return err
 				}
 				continue
@@ -179,9 +179,10 @@ func (s *timerScheduler) replayPending(ctx context.Context, now time.Time) error
 // and it no longer counts toward its owner's and the hive's pending timers. Its owner reads the
 // reason (TIMER_GET, TIMER_LIST). It is logged once, under event: a canceled timer is not replayed
 // again. The fire due when it is closed is not sent. A row that cannot be saved is not logged here:
-// the caller says so. One that is no longer pending (purged since it was read) is left as it is.
-func (s *timerScheduler) cancelUnschedulable(ctx context.Context, row timerRow, cause error, event string) error {
-	canceledBySYTimer(&row, "its next fire cannot be computed: "+cause.Error())
+// the caller says so. One that is no longer pending (purged since it was read) is left as it is. at
+// is when it is canceled: the replay's now, or the fire's.
+func (s *timerScheduler) cancelUnschedulable(ctx context.Context, row timerRow, cause error, event string, at time.Time) error {
+	canceledBySYTimer(&row, "its next fire cannot be computed: "+cause.Error(), at)
 	saved, err := updateTimerIfStatus(ctx, s.service.db, row, "pending")
 	if err != nil || !saved {
 		return err
@@ -200,10 +201,12 @@ func (s *timerScheduler) cancelUnschedulable(ctx context.Context, row timerRow, 
 	return nil
 }
 
-// canceledBySYTimer marks row canceled by SY.timer itself, and says why (canceled_reason).
-func canceledBySYTimer(row *timerRow, reason string) {
+// canceledBySYTimer marks row canceled by SY.timer itself at at, and says why (canceled_reason). Its
+// history is kept 7 days from at (canceled_at_utc, gcHistoricalTimers; FINDINGS A-238).
+func canceledBySYTimer(row *timerRow, reason string, at time.Time) {
 	row.Status = "canceled"
 	row.CanceledReason = sql.NullString{String: reason, Valid: true}
+	row.CanceledAtUTC = nullableNow(at)
 }
 
 func (s *timerScheduler) run() {
@@ -285,7 +288,7 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 	if row.Kind == "recurring" {
 		nextFireAt, _, nextErr := nextRecurringFireAt(*row, actual)
 		if nextErr != nil {
-			if err := s.cancelUnschedulable(ctx, *row, nextErr, "timer_recurring_next_fire_failed"); err != nil {
+			if err := s.cancelUnschedulable(ctx, *row, nextErr, "timer_recurring_next_fire_failed", actual); err != nil {
 				logEvent("timer_fire_persist_failed", map[string]any{
 					"timer_uuid": row.UUID,
 					"error":      err.Error(),
@@ -479,7 +482,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 		})
 		s.push(row.UUID, row.FireAtUTC)
 	case "drop":
-		canceledBySYTimer(&row, missed+", and its missed_policy is drop")
+		canceledBySYTimer(&row, missed+", and its missed_policy is drop", now)
 		logEvent("timer_missed_policy_applied", map[string]any{
 			"timer_uuid":     row.UUID,
 			"policy":         row.MissedPolicy,
@@ -490,7 +493,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 		return updateTimer(ctx, s.service.db, row)
 	case "fire_if_within":
 		if !row.MissedWithinMS.Valid {
-			canceledBySYTimer(&row, missed+", and its missed_policy fire_if_within has no missed_within_ms")
+			canceledBySYTimer(&row, missed+", and its missed_policy fire_if_within has no missed_within_ms", now)
 			logEvent("timer_missed_policy_applied", map[string]any{
 				"timer_uuid":     row.UUID,
 				"policy":         row.MissedPolicy,
@@ -512,7 +515,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 			s.push(row.UUID, row.FireAtUTC)
 			return nil
 		}
-		canceledBySYTimer(&row, fmt.Sprintf("%s, more than its missed_within_ms (%d ms) ago", missed, row.MissedWithinMS.Int64))
+		canceledBySYTimer(&row, fmt.Sprintf("%s, more than its missed_within_ms (%d ms) ago", missed, row.MissedWithinMS.Int64), now)
 		logEvent("timer_missed_policy_applied", map[string]any{
 			"timer_uuid":       row.UUID,
 			"policy":           row.MissedPolicy,
@@ -523,7 +526,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 		})
 		return updateTimer(ctx, s.service.db, row)
 	default:
-		canceledBySYTimer(&row, fmt.Sprintf("%s, and its missed_policy %q is unknown", missed, row.MissedPolicy))
+		canceledBySYTimer(&row, fmt.Sprintf("%s, and its missed_policy %q is unknown", missed, row.MissedPolicy), now)
 		logEvent("timer_missed_policy_applied", map[string]any{
 			"timer_uuid":     row.UUID,
 			"policy":         row.MissedPolicy,
@@ -643,8 +646,4 @@ func nextRecurringFireAt(row timerRow, now time.Time) (int64, string, error) {
 		return 0, "", errBelowMinimum()
 	}
 	return first.UTC().UnixMilli(), cronTZ, nil
-}
-
-func nullableNow(now time.Time) sql.NullInt64 {
-	return sql.NullInt64{Int64: now.UTC().UnixMilli(), Valid: true}
 }

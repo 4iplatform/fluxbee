@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	timerSchemaVersion      = 3
+	timerSchemaVersion      = 4
 	defaultHistoryRetention = 7 * 24 * time.Hour
 	defaultListLimit        = 100
 	maxListLimit            = 1000
@@ -41,12 +41,16 @@ type timerRow struct {
 	// missed policy dropped at a start, or a recurring timer whose next fire cannot be computed. Its
 	// owner's TIMER_CANCEL leaves none.
 	CanceledReason sql.NullString
+	// CanceledAtUTC is when the timer was canceled, by its owner or by SY.timer (FINDINGS A-238): a
+	// canceled timer is kept defaultHistoryRetention from it (gcHistoricalTimers). One canceled before
+	// schema 4, or by a SY.timer before it, has none until the next start dates it.
+	CanceledAtUTC sql.NullInt64
 }
 
 // timerColumns are a timer row's columns, in the order scanTimerRow reads them.
 const timerColumns = `uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
        missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count,
-       canceled_reason`
+       canceled_reason, canceled_at_utc`
 
 // rowScanner is a *sql.Row or a *sql.Rows.
 type rowScanner interface {
@@ -59,7 +63,7 @@ func scanTimerRow(scanner rowScanner) (timerRow, error) {
 	err := scanner.Scan(
 		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
 		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
-		&row.CanceledReason,
+		&row.CanceledReason, &row.CanceledAtUTC,
 	)
 	return row, err
 }
@@ -109,7 +113,8 @@ CREATE TABLE IF NOT EXISTS timers (
     created_at_utc      INTEGER NOT NULL,
     last_fired_at_utc   INTEGER,
     fire_count          INTEGER NOT NULL DEFAULT 0,
-    canceled_reason     TEXT
+    canceled_reason     TEXT,
+    canceled_at_utc     INTEGER
 );`); err != nil {
 		return err
 	}
@@ -132,19 +137,35 @@ WHERE client_ref IS NOT NULL AND status='pending';
 			return fmt.Errorf("create unique pending client_ref index: %w", err)
 		}
 	}
-	// Version 3 (FINDINGS A-220): canceled_reason. Added when the table lacks it, whatever
-	// user_version says: a SY.timer before it writes user_version 2 over a table that has it.
-	var hasCanceledReason int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('timers') WHERE name='canceled_reason';`).Scan(&hasCanceledReason); err != nil {
-		return err
-	}
-	if hasCanceledReason == 0 {
-		if _, err := db.Exec(`ALTER TABLE timers ADD COLUMN canceled_reason TEXT;`); err != nil {
-			return fmt.Errorf("add canceled_reason: %w", err)
+	// Version 3 (FINDINGS A-220) adds canceled_reason, version 4 (FINDINGS A-238) canceled_at_utc.
+	for _, column := range []struct{ name, definition string }{
+		{name: "canceled_reason", definition: "TEXT"},
+		{name: "canceled_at_utc", definition: "INTEGER"},
+	} {
+		if err := addTimerColumn(db, column.name, column.definition); err != nil {
+			return err
 		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d;", timerSchemaVersion)); err != nil {
 		return err
+	}
+	return nil
+}
+
+// addTimerColumn adds a nullable column to a timers table that lacks it, whatever user_version says:
+// a SY.timer before the column writes its own user_version back over a table that has it. That
+// SY.timer names every column it reads and writes, so it keeps working on the newer table, and its
+// rows get no value in the column.
+func addTimerColumn(db *sql.DB, name, definition string) error {
+	var has int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('timers') WHERE name=?;`, name).Scan(&has); err != nil {
+		return err
+	}
+	if has > 0 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE timers ADD COLUMN ` + name + ` ` + definition + `;`); err != nil {
+		return fmt.Errorf("add %s: %w", name, err)
 	}
 	return nil
 }
@@ -170,11 +191,11 @@ func insertTimer(ctx context.Context, db *sql.DB, row timerRow) error {
 		return err
 	}
 	_, err := db.ExecContext(ctx, `
-INSERT INTO timers (`+timerColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO timers (`+timerColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, row.UUID, row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
 		nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
 		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC), row.FireCount,
-		nullableString(row.CanceledReason))
+		nullableString(row.CanceledReason), nullableInt64(row.CanceledAtUTC))
 	return err
 }
 
@@ -200,12 +221,12 @@ func saveTimer(ctx context.Context, db *sql.DB, row timerRow, whileStatus string
 UPDATE timers
 SET owner_l2_name=?, target_l2_name=?, client_ref=?, kind=?, fire_at_utc=?, cron_spec=?, cron_tz=?,
     missed_policy=?, missed_within_ms=?, payload=?, metadata=?, status=?, created_at_utc=?, last_fired_at_utc=?, fire_count=?,
-    canceled_reason=?
+    canceled_reason=?, canceled_at_utc=?
 WHERE uuid=?`
 	args := []any{row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
 		nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
 		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC),
-		row.FireCount, nullableString(row.CanceledReason), row.UUID}
+		row.FireCount, nullableString(row.CanceledReason), nullableInt64(row.CanceledAtUTC), row.UUID}
 	if whileStatus != "" {
 		query += " AND status=?"
 		args = append(args, whileStatus)
@@ -326,20 +347,47 @@ func countPendingTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name stri
 	return count, err
 }
 
-func gcHistoricalTimers(ctx context.Context, db *sql.DB, now time.Time, retention time.Duration) (int64, error) {
+// gcHistoricalTimers deletes the history older than retention, at a start (main): a fired timer by
+// its last fire (its creation, for one that never fired), a canceled one by its cancellation
+// (FINDINGS A-238). A canceled timer with no cancellation time, canceled before schema 4 or by a
+// SY.timer before it, is dated now first, and kept retention from this start: stamped counts them.
+// Before, a canceled timer went by its last fire or its creation, so one canceled yesterday whose
+// creation was a week old was deleted, with its canceled_reason.
+func gcHistoricalTimers(ctx context.Context, db *sql.DB, now time.Time, retention time.Duration) (deleted, stamped int64, err error) {
 	if retention <= 0 {
 		retention = defaultHistoryRetention
 	}
 	cutoff := now.UTC().Add(-retention).UnixMilli()
-	result, err := db.ExecContext(ctx, `
-DELETE FROM timers
-WHERE status IN ('fired','canceled')
-  AND COALESCE(last_fired_at_utc, created_at_utc) < ?
-`, cutoff)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return result.RowsAffected()
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
+UPDATE timers SET canceled_at_utc=?
+WHERE status='canceled' AND canceled_at_utc IS NULL
+`, now.UTC().UnixMilli())
+	if err != nil {
+		return 0, 0, err
+	}
+	if stamped, err = result.RowsAffected(); err != nil {
+		return 0, 0, err
+	}
+	result, err = tx.ExecContext(ctx, `
+DELETE FROM timers
+WHERE (status='fired' AND COALESCE(last_fired_at_utc, created_at_utc) < ?)
+   OR (status='canceled' AND canceled_at_utc < ?)
+`, cutoff, cutoff)
+	if err != nil {
+		return 0, 0, err
+	}
+	if deleted, err = result.RowsAffected(); err != nil {
+		return 0, 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return deleted, stamped, nil
 }
 
 // timerRowToInfo is row as TIMER_GET and TIMER_LIST answer it: the SDK's TimerInfo, with its
@@ -446,6 +494,11 @@ func nullableInt64(value sql.NullInt64) any {
 		return value.Int64
 	}
 	return nil
+}
+
+// nullableNow is the instant now as a timer row keeps it: unix ms, UTC.
+func nullableNow(now time.Time) sql.NullInt64 {
+	return sql.NullInt64{Int64: now.UTC().UnixMilli(), Valid: true}
 }
 
 func isPendingClientRefUniqueViolation(err error) bool {

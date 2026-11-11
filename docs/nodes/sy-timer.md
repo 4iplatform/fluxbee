@@ -39,13 +39,18 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    `/var/lib/fluxbee/state/nodes` (`fluxbeesdk.ConnectWithRetry`, retry every 1 s).
 4. Opens `timers.db` in its instance directory (`managedNodeInstanceDir`: `/var/lib/fluxbee/nodes/<KIND>/<node name>`),
    with `busy_timeout(5000)` and WAL on every connection (`timerDSN`), and creates the `timers`
-   table and its indexes (`ensureTimerSchema`, schema version 3: version 3 adds `canceled_reason`
-   to a table that lacks it, FINDINGS A-220).
-5. Deletes fired and canceled timers older than 7 days (`gcHistoricalTimers`,
-   `defaultHistoryRetention`). This runs once per start, not periodically.
+   table and its indexes (`ensureTimerSchema`, schema version 4: version 3 adds `canceled_reason`,
+   FINDINGS A-220, and version 4 `canceled_at_utc`, FINDINGS A-238, to a table that lacks them,
+   whatever `user_version` says; `addTimerColumn`).
+5. Deletes the fired timers whose last fire, and the canceled timers whose cancellation, is more
+   than 7 days old (`gcHistoricalTimers`, `defaultHistoryRetention`). A canceled timer with no
+   cancellation time, canceled before 1.5 or by a SY.timer before it, is dated first and kept 7 days
+   from this start. Before 1.5 a canceled timer went by its last fire or its creation: one canceled
+   yesterday whose creation was a week old was deleted, its `canceled_reason` with it (FINDINGS
+   A-238). This runs once per start, not periodically; a GC that fails is logged and changes nothing.
 6. Replays pending timers (`replayPending`, below), logs
-   `SY.timer ready: node=... db=... pending=N gc_deleted=M`, starts the scheduler and serves
-   messages.
+   `SY.timer ready: node=... db=... pending=N gc_deleted=M gc_stamped=S` (S: the canceled timers
+   step 5 dated), starts the scheduler and serves messages.
 
 ## Timers
 
@@ -55,7 +60,9 @@ the caller's own name for it), `kind` (`oneshot` or `recurring`), `fire_at_utc` 
 `cron_spec`, `cron_tz`, `missed_policy`, `missed_within_ms`, `payload` (JSON), `metadata`
 (JSON), `status` (`pending`, `fired`, `canceled`), `created_at_utc`, `last_fired_at_utc`,
 `fire_count`, `canceled_reason` (why SY.timer canceled it itself, below; none when its owner
-canceled it).
+canceled it), `canceled_at_utc` (when it was canceled, by its owner's first `TIMER_CANCEL` or by
+SY.timer: the 7 days of a canceled timer count from it; kept, not shown by `TIMER_GET` or
+`TIMER_LIST`).
 
 Rules enforced in `main.go`:
 

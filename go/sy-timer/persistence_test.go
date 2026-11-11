@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -519,12 +521,12 @@ func TestGCHistoricalTimersDeletesOldHistoricalRows(t *testing.T) {
 		t.Fatalf("insert pending timer: %v", err)
 	}
 
-	deleted, err := gcHistoricalTimers(ctx, db, now, defaultHistoryRetention)
+	deleted, stamped, err := gcHistoricalTimers(ctx, db, now, defaultHistoryRetention)
 	if err != nil {
 		t.Fatalf("gc historical timers: %v", err)
 	}
-	if deleted != 1 {
-		t.Fatalf("expected 1 deleted row, got %d", deleted)
+	if deleted != 1 || stamped != 0 {
+		t.Fatalf("expected 1 deleted row and none dated, got %d and %d", deleted, stamped)
 	}
 
 	if _, err := getTimer(ctx, db, "timer-old"); err == nil {
@@ -532,6 +534,311 @@ func TestGCHistoricalTimersDeletesOldHistoricalRows(t *testing.T) {
 	}
 	if _, err := getTimer(ctx, db, "timer-pending"); err != nil {
 		t.Fatalf("expected pending timer to remain: %v", err)
+	}
+}
+
+// A canceled timer is kept 7 days from its cancellation, not from its creation or its last fire
+// (FINDINGS A-238): one canceled yesterday whose creation, or last fire, is weeks old stays, with its
+// canceled_reason. A fired one goes 7 days after its last fire, as before, and a pending one never.
+// One canceled with no date (before schema 4, or by a SY.timer before it) is dated at the start, and
+// goes 7 days after it. Before, the GC aged every one by its last fire or its creation.
+func TestGCHistoricalTimersAgesACanceledTimerByItsCancellation(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	now := time.UnixMilli(1776000000000).UTC()
+	day := 24 * time.Hour
+	ago := func(days int) int64 { return now.Add(-time.Duration(days) * day).UnixMilli() }
+	at := func(days int) sql.NullInt64 { return sql.NullInt64{Int64: ago(days), Valid: true} }
+	timer := func(timerUUID, kind, status string, createdDaysAgo int) timerRow {
+		row := timerRow{
+			UUID:         timerUUID,
+			OwnerL2Name:  "WF.demo@motherbee",
+			TargetL2Name: "WF.demo@motherbee",
+			Kind:         kind,
+			FireAtUTC:    ago(createdDaysAgo - 10),
+			MissedPolicy: "fire",
+			Payload:      `{}`,
+			Status:       status,
+			CreatedAtUTC: ago(createdDaysAgo),
+		}
+		if kind == "recurring" {
+			row.CronSpec = sql.NullString{String: "0 9 * * MON", Valid: true}
+		}
+		return row
+	}
+	canceledYesterday := timer("canceled-yesterday", "oneshot", "canceled", 30)
+	canceledYesterday.CanceledAtUTC = at(1)
+	canceledLastWeek := timer("canceled-8-days-ago", "oneshot", "canceled", 30)
+	canceledLastWeek.CanceledAtUTC = at(8)
+	firedLastWeek := timer("fired-8-days-ago", "oneshot", "fired", 30)
+	firedLastWeek.LastFiredAtUTC, firedLastWeek.FireCount = at(8), 1
+	firedYesterday := timer("fired-yesterday", "oneshot", "fired", 30)
+	firedYesterday.LastFiredAtUTC, firedYesterday.FireCount = at(1), 1
+	recurringCanceledYesterday := timer("recurring-canceled-yesterday", "recurring", "canceled", 60)
+	recurringCanceledYesterday.LastFiredAtUTC, recurringCanceledYesterday.FireCount = at(20), 6
+	recurringCanceledYesterday.CanceledReason = sql.NullString{String: "its next fire cannot be computed: invalid cron", Valid: true}
+	recurringCanceledYesterday.CanceledAtUTC = at(1)
+	canceledUndated := timer("canceled-before-schema-4", "oneshot", "canceled", 30)
+	pending := timer("pending", "oneshot", "pending", 30)
+	pending.FireAtUTC = now.Add(day).UnixMilli()
+	for _, row := range []timerRow{canceledYesterday, canceledLastWeek, firedLastWeek, firedYesterday, recurringCanceledYesterday, canceledUndated, pending} {
+		if err := insertTimer(ctx, db, row); err != nil {
+			t.Fatalf("insert %s: %v", row.UUID, err)
+		}
+	}
+	kept := func(when string, want ...string) {
+		t.Helper()
+		var uuids []string
+		rows, err := listTimers(ctx, db, "", "all", maxListLimit, nil)
+		if err != nil {
+			t.Fatalf("%s: list: %v", when, err)
+		}
+		for _, row := range rows {
+			uuids = append(uuids, row.UUID)
+		}
+		sort.Strings(uuids)
+		sort.Strings(want)
+		if strings.Join(uuids, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: kept %v, want %v", when, uuids, want)
+		}
+	}
+
+	deleted, stamped, err := gcHistoricalTimers(ctx, db, now, defaultHistoryRetention)
+	if err != nil || deleted != 2 || stamped != 1 {
+		t.Fatalf("the first start: deleted %d, dated %d (%v), want 2 and 1", deleted, stamped, err)
+	}
+	kept("the first start", "canceled-yesterday", "fired-yesterday", "recurring-canceled-yesterday", "canceled-before-schema-4", "pending")
+	if row, err := getTimer(ctx, db, "canceled-before-schema-4"); err != nil || row.CanceledAtUTC != nullableNow(now) {
+		t.Fatalf("the undated canceled timer: %+v (%v), want it dated %d", row, err, now.UnixMilli())
+	}
+	if row, err := getTimer(ctx, db, "recurring-canceled-yesterday"); err != nil || row.CanceledReason != recurringCanceledYesterday.CanceledReason || row.CanceledAtUTC != at(1) {
+		t.Fatalf("the recurring timer SY.timer canceled: %+v (%v)", row, err)
+	}
+
+	deleted, stamped, err = gcHistoricalTimers(ctx, db, now.Add(8*day), defaultHistoryRetention)
+	if err != nil || deleted != 4 || stamped != 0 {
+		t.Fatalf("a start 8 days later: deleted %d, dated %d (%v), want 4 and 0", deleted, stamped, err)
+	}
+	kept("a start 8 days later", "pending")
+}
+
+// timerTableOfSYTimer14 creates the timers table as SY.timer 1.4 (schema 3, FINDINGS A-220) did, on
+// a database it never opened.
+func timerTableOfSYTimer14(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, stmt := range []string{`
+CREATE TABLE IF NOT EXISTS timers (
+    uuid                TEXT PRIMARY KEY,
+    owner_l2_name       TEXT NOT NULL,
+    target_l2_name      TEXT NOT NULL,
+    client_ref          TEXT,
+    kind                TEXT NOT NULL CHECK(kind IN ('oneshot','recurring')),
+    fire_at_utc         INTEGER NOT NULL,
+    cron_spec           TEXT,
+    cron_tz             TEXT,
+    missed_policy       TEXT NOT NULL DEFAULT 'fire'
+                        CHECK(missed_policy IN ('fire','drop','fire_if_within')),
+    missed_within_ms    INTEGER,
+    payload             TEXT NOT NULL,
+    metadata            TEXT,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','fired','canceled')),
+    created_at_utc      INTEGER NOT NULL,
+    last_fired_at_utc   INTEGER,
+    fire_count          INTEGER NOT NULL DEFAULT 0,
+    canceled_reason     TEXT
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_timers_owner ON timers(owner_l2_name);`,
+		`CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at_utc) WHERE status='pending';`,
+		`CREATE INDEX IF NOT EXISTS idx_timers_status ON timers(status);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_timers_owner_clientref_pending ON timers(owner_l2_name, client_ref) WHERE client_ref IS NOT NULL AND status='pending';`,
+		`PRAGMA user_version=3;`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("the table of SY.timer 1.4: %v", err)
+		}
+	}
+}
+
+// What SY.timer 1.4 sends its database, copied from its code (6c6b084f, go/sy-timer/persistence.go):
+// it names every column it writes and reads, and none is canceled_at_utc.
+const (
+	insertOfSYTimer14 = `
+INSERT INTO timers (uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count,
+       canceled_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+	updateWhileStatusOfSYTimer14 = `
+UPDATE timers
+SET owner_l2_name=?, target_l2_name=?, client_ref=?, kind=?, fire_at_utc=?, cron_spec=?, cron_tz=?,
+    missed_policy=?, missed_within_ms=?, payload=?, metadata=?, status=?, created_at_utc=?, last_fired_at_utc=?, fire_count=?,
+    canceled_reason=?
+WHERE uuid=? AND status=?`
+	selectOfSYTimer14 = `
+SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count,
+       canceled_reason
+FROM timers WHERE uuid=?
+`
+	gcOfSYTimer14 = `
+DELETE FROM timers
+WHERE status IN ('fired','canceled')
+  AND COALESCE(last_fired_at_utc, created_at_utc) < ?
+`
+)
+
+// writeAsSYTimer14 inserts row as SY.timer 1.4 does.
+func writeAsSYTimer14(t *testing.T, db *sql.DB, row timerRow) {
+	t.Helper()
+	if _, err := db.Exec(insertOfSYTimer14, row.UUID, row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
+		nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
+		row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC), row.FireCount,
+		nullableString(row.CanceledReason)); err != nil {
+		t.Fatalf("SY.timer 1.4's insert of %s: %v", row.UUID, err)
+	}
+}
+
+// readAsSYTimer14 reads a timer as SY.timer 1.4 does.
+func readAsSYTimer14(t *testing.T, db *sql.DB, timerUUID string) timerRow {
+	t.Helper()
+	var row timerRow
+	if err := db.QueryRow(selectOfSYTimer14, timerUUID).Scan(
+		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
+		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
+		&row.CanceledReason,
+	); err != nil {
+		t.Fatalf("SY.timer 1.4's read of %s: %v", timerUUID, err)
+	}
+	return row
+}
+
+// Schema version 4 (FINDINGS A-238) adds canceled_at_utc to SY.timer 1.4's table, and keeps its rows:
+// their cancellation has no date, until the next start's GC dates it. A table that has it under
+// user_version 3, which SY.timer 1.4 writes back over it, is left as it is.
+func TestEnsureTimerSchemaAddsCanceledAtToAVersion3Table(t *testing.T) {
+	db, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	timerTableOfSYTimer14(t, db)
+	created := time.Now().UTC().Add(-time.Hour).UnixMilli()
+	reason := sql.NullString{String: "missed: its fire time passed while SY.timer was down, and its missed_policy is drop", Valid: true}
+	for _, row := range []timerRow{
+		{UUID: "timer-pending", OwnerL2Name: "WF.demo@motherbee", TargetL2Name: "WF.demo@motherbee", ClientRef: sql.NullString{String: "weekly-report", Valid: true},
+			Kind: "oneshot", FireAtUTC: created + time.Hour.Milliseconds()*2, MissedPolicy: "fire", Payload: `{}`, Status: "pending", CreatedAtUTC: created},
+		{UUID: "timer-dropped", OwnerL2Name: "WF.demo@motherbee", TargetL2Name: "WF.demo@motherbee",
+			Kind: "oneshot", FireAtUTC: created + time.Minute.Milliseconds(), MissedPolicy: "drop", Payload: `{}`, Status: "canceled", CreatedAtUTC: created, CanceledReason: reason},
+	} {
+		writeAsSYTimer14(t, db, row)
+	}
+
+	for pass := 1; pass <= 2; pass++ {
+		if err := ensureTimerSchema(db); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		var version, hasColumn int
+		if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersion {
+			t.Fatalf("pass %d: user_version %d (%v), want %d", pass, version, err, timerSchemaVersion)
+		}
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('timers') WHERE name='canceled_at_utc';`).Scan(&hasColumn); err != nil || hasColumn != 1 {
+			t.Fatalf("pass %d: canceled_at_utc %d times (%v)", pass, hasColumn, err)
+		}
+		if row, err := getTimer(ctx, db, "timer-pending"); err != nil || row.Status != "pending" || row.ClientRef.String != "weekly-report" || row.CanceledAtUTC.Valid {
+			t.Fatalf("pass %d: the pending row: %+v (%v)", pass, row, err)
+		}
+		if row, err := getTimer(ctx, db, "timer-dropped"); err != nil || row.Status != "canceled" || row.CanceledReason != reason || row.CanceledAtUTC.Valid {
+			t.Fatalf("pass %d: the canceled row: %+v (%v)", pass, row, err)
+		}
+		// What SY.timer 1.4 writes back.
+		if _, err := db.Exec(`PRAGMA user_version=3;`); err != nil {
+			t.Fatalf("user_version 3: %v", err)
+		}
+	}
+}
+
+// Back to SY.timer 1.4 after 1.5 (FINDINGS A-238's rollback): 1.4 starts on the version 4 table, and
+// reads, writes and deletes its timers as before. Its start writes user_version 3 back and changes
+// nothing else: every other statement of its ensureTimerSchema is IF NOT EXISTS, or skipped. Its GC
+// ages a canceled timer by its creation again. The date 1.5 gave a cancellation survives 1.4's
+// writes, and 1.4's own cancellation has none; 1.5, started again, keeps the table and dates that one.
+func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	canceledBy15 := func(timerUUID string, created time.Time) timerRow {
+		return timerRow{UUID: timerUUID, OwnerL2Name: "WF.demo@motherbee", TargetL2Name: "WF.demo@motherbee",
+			Kind: "oneshot", FireAtUTC: now.Add(time.Hour).UnixMilli(), MissedPolicy: "fire", Payload: `{}`, Status: "canceled",
+			CreatedAtUTC: created.UnixMilli(), CanceledAtUTC: nullableNow(now.Add(-time.Hour))}
+	}
+	scheduledLastMonth := canceledBy15("timer-of-last-month", now.Add(-30*24*time.Hour))
+	scheduledToday := canceledBy15("timer-of-today", now.Add(-2*time.Hour))
+	for _, row := range []timerRow{scheduledLastMonth, scheduledToday} {
+		if err := insertTimer(ctx, db, row); err != nil {
+			t.Fatalf("insert %s: %v", row.UUID, err)
+		}
+	}
+
+	// SY.timer 1.4 starts: its schema step, then its history GC, which takes the timer canceled an
+	// hour ago but scheduled a month ago.
+	if _, err := db.Exec(`PRAGMA user_version=3;`); err != nil {
+		t.Fatalf("user_version 3: %v", err)
+	}
+	result, err := db.Exec(gcOfSYTimer14, now.Add(-defaultHistoryRetention).UnixMilli())
+	if err != nil {
+		t.Fatalf("SY.timer 1.4's gc: %v", err)
+	}
+	if deleted, _ := result.RowsAffected(); deleted != 1 {
+		t.Fatalf("SY.timer 1.4's gc deleted %d timers, want 1", deleted)
+	}
+	if _, err := getTimer(ctx, db, scheduledLastMonth.UUID); err != sql.ErrNoRows {
+		t.Fatalf("the timer scheduled a month ago: %v", err)
+	}
+	// It schedules a timer, reads it, and cancels it; it cancels 1.5's again.
+	scheduledBy14 := timerRow{UUID: "timer-of-1.4", OwnerL2Name: "WF.demo@motherbee", TargetL2Name: "WF.demo@motherbee",
+		Kind: "oneshot", FireAtUTC: now.Add(time.Hour).UnixMilli(), MissedPolicy: "fire", Payload: `{}`, Status: "pending", CreatedAtUTC: now.UnixMilli()}
+	writeAsSYTimer14(t, db, scheduledBy14)
+	for _, timerUUID := range []string{scheduledBy14.UUID, scheduledToday.UUID} {
+		row := readAsSYTimer14(t, db, timerUUID)
+		status := row.Status
+		row.Status = "canceled"
+		result, err := db.Exec(updateWhileStatusOfSYTimer14, row.OwnerL2Name, row.TargetL2Name, nullableString(row.ClientRef), row.Kind, row.FireAtUTC,
+			nullableString(row.CronSpec), nullableString(row.CronTZ), row.MissedPolicy, nullableInt64(row.MissedWithinMS),
+			row.Payload, nullableString(row.Metadata), row.Status, row.CreatedAtUTC, nullableInt64(row.LastFiredAtUTC),
+			row.FireCount, nullableString(row.CanceledReason), row.UUID, status)
+		if err != nil {
+			t.Fatalf("SY.timer 1.4's update of %s: %v", timerUUID, err)
+		}
+		if written, _ := result.RowsAffected(); written != 1 {
+			t.Fatalf("SY.timer 1.4's update of %s wrote %d rows", timerUUID, written)
+		}
+		if read := readAsSYTimer14(t, db, timerUUID); read.Status != "canceled" {
+			t.Fatalf("SY.timer 1.4 read back %+v", read)
+		}
+	}
+	if row, err := getTimer(ctx, db, scheduledToday.UUID); err != nil || row.CanceledAtUTC != scheduledToday.CanceledAtUTC {
+		t.Fatalf("the date 1.5 gave: %+v (%v)", row, err)
+	}
+	if row, err := getTimer(ctx, db, scheduledBy14.UUID); err != nil || row.Status != "canceled" || row.CanceledAtUTC.Valid {
+		t.Fatalf("1.4's own cancellation: %+v (%v)", row, err)
+	}
+
+	// SY.timer 1.5 starts again.
+	if err := ensureTimerSchema(db); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersion {
+		t.Fatalf("user_version %d (%v), want %d", version, err, timerSchemaVersion)
+	}
+	restart := now.Add(time.Minute)
+	deleted, stamped, err := gcHistoricalTimers(ctx, db, restart, defaultHistoryRetention)
+	if err != nil || deleted != 0 || stamped != 1 {
+		t.Fatalf("the start: deleted %d, dated %d (%v), want 0 and 1", deleted, stamped, err)
+	}
+	if row, err := getTimer(ctx, db, scheduledBy14.UUID); err != nil || row.CanceledAtUTC != nullableNow(restart) {
+		t.Fatalf("1.4's cancellation, dated at the start: %+v (%v)", row, err)
 	}
 }
 

@@ -308,6 +308,74 @@ func TestRespondTimerCancelMarksTimerCanceled(t *testing.T) {
 	}
 }
 
+// An owner's TIMER_CANCEL dates the cancellation (canceled_at_utc), and the timer is kept 7 days from
+// it (FINDINGS A-238): one scheduled 8 days ago, for 2 days later, and canceled now is still read
+// after the next start. Before, that start deleted it, aged by its creation, and TIMER_GET answered
+// TIMER_NOT_FOUND. A cancel again keeps the first date, so it does not lengthen the timer's stay.
+func TestAnOwnersCanceledTimerIsKeptSevenDaysFromItsCancel(t *testing.T) {
+	service, tx := newTestService(t)
+	ctx := context.Background()
+	scheduled := time.Now().UTC().Add(-8 * 24 * time.Hour)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-1",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    scheduled.Add(10 * 24 * time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: scheduled.UnixMilli(),
+	})
+	cancel := func() timerRow {
+		t.Helper()
+		if err := service.handleMessage(mustBuildSystemMessage(t, map[string]any{"timer_uuid": "timer-1"}, "TIMER_CANCEL")); err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		if response := mustReadTimerResponse(t, tx); !response.OK {
+			t.Fatalf("cancel: %+v", response.Error)
+		}
+		row, err := getTimer(ctx, service.db, "timer-1")
+		if err != nil {
+			t.Fatalf("load timer: %v", err)
+		}
+		return *row
+	}
+
+	before := time.Now().UTC().UnixMilli()
+	canceled := cancel()
+	if at := canceled.CanceledAtUTC; canceled.Status != "canceled" || !at.Valid || at.Int64 < before || at.Int64 > time.Now().UTC().UnixMilli() {
+		t.Fatalf("the cancel's date: %+v, want it between %d and now", canceled, before)
+	}
+	time.Sleep(5 * time.Millisecond) // a cancel again that dated the timer would date it later
+	if again := cancel(); again.CanceledAtUTC != canceled.CanceledAtUTC {
+		t.Fatalf("a cancel again dated it %d, want %d still", again.CanceledAtUTC.Int64, canceled.CanceledAtUTC.Int64)
+	}
+
+	// The next start's GC keeps it.
+	if deleted, _, err := gcHistoricalTimers(ctx, service.db, time.Now().UTC(), defaultHistoryRetention); err != nil || deleted != 0 {
+		t.Fatalf("the next start deleted %d timers (%v), want none", deleted, err)
+	}
+	var got struct {
+		OK    bool                  `json:"ok"`
+		Timer *fluxbeesdk.TimerInfo `json:"timer"`
+	}
+	if err := service.handleMessage(mustBuildSystemMessage(t, map[string]any{"timer_uuid": "timer-1"}, "TIMER_GET")); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if err := json.Unmarshal(mustReadResponsePayload(t, tx), &got); err != nil {
+		t.Fatalf("decode get: %v", err)
+	}
+	if !got.OK || got.Timer == nil || got.Timer.UUID != "timer-1" || got.Timer.Status != "canceled" {
+		t.Fatalf("TIMER_GET after the start: %+v", got)
+	}
+	// A start more than 7 days after the cancel deletes it.
+	later := time.UnixMilli(canceled.CanceledAtUTC.Int64).Add(defaultHistoryRetention + time.Minute)
+	if deleted, _, err := gcHistoricalTimers(ctx, service.db, later, defaultHistoryRetention); err != nil || deleted != 1 {
+		t.Fatalf("a start 7 days after the cancel deleted %d timers (%v), want it", deleted, err)
+	}
+}
+
 func TestRespondTimerCancelByClientRefMarksTimerCanceled(t *testing.T) {
 	service, tx := newTestService(t)
 	insertOwnedTimer(t, service.db, timerRow{

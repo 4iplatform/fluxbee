@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version             = "1.4"
+	version             = "1.5"
 	defaultNodeBaseName = "SY.timer"
 	configDir           = "/etc/fluxbee"
 	routerSockDir       = "/var/run/fluxbee/routers"
@@ -207,7 +207,9 @@ func main() {
 		db:          db,
 	}
 	service.scheduler = newTimerScheduler(service)
-	deleted, err := gcHistoricalTimers(context.Background(), db, time.Now().UTC(), defaultHistoryRetention)
+	// gc_stamped: the canceled timers this start dated, canceled before 1.5 or by a SY.timer before it
+	// (FINDINGS A-238); they are kept 7 days from now.
+	deleted, stamped, err := gcHistoricalTimers(context.Background(), db, time.Now().UTC(), defaultHistoryRetention)
 	if err != nil {
 		log.Printf("historical timer gc failed: %v", err)
 	}
@@ -223,8 +225,9 @@ func main() {
 		"db_path":       service.dbPath,
 		"pending_count": pendingCount,
 		"gc_deleted":    deleted,
+		"gc_stamped":    stamped,
 	})
-	log.Printf("SY.timer ready: node=%s db=%s pending=%d gc_deleted=%d", service.nodeName, service.dbPath, pendingCount, deleted)
+	log.Printf("SY.timer ready: node=%s db=%s pending=%d gc_deleted=%d gc_stamped=%d", service.nodeName, service.dbPath, pendingCount, deleted, stamped)
 	service.scheduler.start()
 	service.run()
 }
@@ -835,6 +838,11 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 	}
 	if row.Status == "fired" {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_ALREADY_FIRED", "timer already fired")
+	}
+	if row.Status == "pending" {
+		// Its history is kept 7 days from now (canceled_at_utc, FINDINGS A-238). A timer canceled
+		// already keeps its time: a cancel again does not lengthen it.
+		row.CanceledAtUTC = nullableNow(time.Now())
 	}
 	row.Status = "canceled"
 	if err := updateTimer(context.Background(), s.db, *row); err != nil {
