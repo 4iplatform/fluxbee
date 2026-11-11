@@ -1377,12 +1377,15 @@ async fn main() -> Result<(), OrchestratorError> {
             _ = sigterm.recv() => {
                 // The orchestrator is a SUPERVISOR, not the owner of the hive's service processes:
                 // rt-gateway and the SY.* nodes are independent systemd units (only sy-orchestrator
-                // is `enabled`). Its own restart/upgrade must be TRANSPARENT to them — a package
-                // upgrade or `systemctl restart sy-orchestrator` must never blip the running hive —
-                // so we exit PROMPTLY and do NOT tear services down here. The next orchestrator boot
-                // idempotently re-adopts whatever is already running. Deliberate machine shutdown is
-                // handled by systemd stopping every active unit; a deliberate hive teardown, if ever
-                // needed, is an explicit operation, not this process's exit path. (Fixes the
+                // is `enabled`). Its exit never stops them, so we exit PROMPTLY and do NOT tear
+                // services down here, and the next orchestrator boot takes over whatever is running.
+                // That boot restarts services only when it finds one on a binary a package upgrade
+                // replaced (FINDINGS A-45): those, and beside them the role's services whose check
+                // gave no answer (`BootBinaryChecks::restarts_unanswered`, FINDINGS A-282). Any
+                // other start, `systemctl restart sy-orchestrator` included, restarts none: a
+                // restart of rt-gateway drops every node's connection. Deliberate machine shutdown
+                // is handled by systemd stopping every active unit; a deliberate hive teardown, if
+                // ever needed, is an explicit operation, not this process's exit path. (Fixes the
                 // io-api-audit residual: apt upgrade previously hung 90s here then SIGKILLed.)
                 tracing::info!("SIGTERM received; orchestrator exiting (managed services keep running)");
                 return Ok(());
