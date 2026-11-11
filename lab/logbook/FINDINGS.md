@@ -362,6 +362,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - A-296 🔵 A deployments read filtered by category also answers the local snapshot rows of every category (low; the orchestrator).
 - A-297 🔵 SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee (low; SY.admin).
+- A-298 🔵 Archi's runtime publish that makes a version current recreates the motherbee's nodes of that runtime: new ILK, owned secrets purged, `launched_by: "archi"` (medium; to decide; SY.architect).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1439,6 +1440,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-298 [Archi] 🔵 to decide, medium (found 2026-11-11 by the io-cloud-api docs verification; read in the code; there before it) — Archi's runtime publish that makes a version current recreates every motherbee node of that runtime: new ILK, owned secrets purged, `launched_by: "archi"`
+
+- **Why:** `redeploy_runtime_nodes_with_current` (`src/bin/sy_architect.rs` ~11046-11210; A-235
+  fixed its tenant) runs after Archi's software and package publish when `set_current` is true:
+  the API's default (`unwrap_or(true)`, ~10809); the UI's promote box starts unchecked. It takes
+  every node of that runtime on Archi's own hive (the motherbee), by runtime name only, running or
+  stopped, pinned or on `current`. For each it runs `kill_node` with `force` and `purge_instance`
+  (its timers, the secrets it owns and its ILK go), then `run_node` on `current` in the node's
+  tenant.
+- **What the node comes back as:** a new ILK (a credential assigned to the old one no longer
+  reaches it), running even if it was stopped, with the runtime's template config unless
+  `preserve_node_config` (the API's default is false; the UI's box starts checked), and with
+  `launched_by: "archi"` (`launched_by_for_caller`, `src/bin/sy_admin.rs` ~9887). A node the Cloud
+  launched then answers `NODE_NOT_FOUND` to the Cloud's start, stop and delete, which need
+  `launched_by: "cloud"`.
+- **Against the operator's rule of 2026-11-11** (A-275; the deletion chapter, A-159): nothing
+  deletes ILKs or secrets on its own, and an ILK with history is never deleted.
+- **What it adds over the reconcile:** since 0.1.88 (A-109) the orchestrator moves a running node on
+  `current` to a new current version within a minute, in place, and leaves a pinned node as it is.
+  The redeploy adds only the template config and the move of pinned and stopped nodes.
+- **Proposed:** drop the redeploy and leave the move to the reconcile (a config reset, when wanted,
+  is a config change of its own); or, at least, relaunch in place without the purge and skip
+  pinned, stopped and Cloud-launched nodes.
+- **Docs:** `docs/io-cloud-api.md` §5.4 and §9 0.1.88, and the Cloud team's page, tell the Cloud
+  of it as today's behavior, pending this decision.
+
 ### A-297 [General/admin] 🔵 low (found 2026-11-11 by A-288's review; read in the code) — SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee
 
 - **Why:** `GET /deployments?hive=` and `GET /drift-alerts?hive=` take the value untrimmed, so an
@@ -2238,6 +2265,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-11):** each publisher takes its own pages down: IO and WF nodes
   as AI nodes do (only their own). The Cloud's list and take-down of its tenant's pages wait for
   the Cloud track. In 0.1.136 (SY.admin).
+- **Told to the Cloud team (2026-11-11):** `docs/io-cloud-api.md` §5.7 (on daily; on main with
+  0.1.133's close) and the Cloud team's page give today's behavior (who publishes, the fixed
+  expiry, no removal waits for a page, no op for the Cloud), the call as planned for 0.1.136 and
+  not built, and the Cloud's list and take-down with its track. Both say so again when 0.1.136
+  ships.
 
 ### A-242 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a node's and a tenant's purge with two pages up, each naming them; the spawn's rollback stays by design) (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
 
