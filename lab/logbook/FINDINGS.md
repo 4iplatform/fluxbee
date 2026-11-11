@@ -206,7 +206,7 @@ no change required
     A-240, A-241, A-255 checked live, A-258, A-259, A-260, A-266, A-267, A-270, A-271, A-274, A-279
     with A-288, A-281, A-285's texts); 0.1.134, the router alone (A-272, A-268); 0.1.135, the AI SDK
     alone (A-257); 0.1.136, one branch per binary (A-243, A-263, A-273, A-280 in SY.admin; A-282,
-    A-283 in the orchestrator; A-277 in SY.identity; A-284 in the WF; A-286, A-287 in SY.architect;
+    A-283 in the orchestrator; A-277 in SY.identity; A-284 in the WF; A-286, A-287, A-298 in SY.architect;
     A-292 in SY.cognition; A-293 in IO.cloud); then A-278 alone (the SDKs and the WF). **From
     0.1.136 a new finding enters only if it breaks operation; the rest is recorded for later.** The
     SDKs' lows (A-264, A-290, A-294, A-295, A-285's catalog text) and the router's A-269 go with each
@@ -346,8 +346,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
 - A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; the small fix, SY.admin in 0.1.136).
 - A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin, the orchestrator and SY.wf-rules' delete; with A-271's class in 0.1.133).
-- A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator; built for 0.1.136; the boot's restart on no answer to decide).
-- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart; built for 0.1.136; a refused API port to decide).
+- A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator; built for 0.1.136; decided 2026-11-11: restart on no answer only with a replaced binary).
+- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart, a refused API port included; the orchestrator in 0.1.136).
 - A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
 - A-285 🔵 The texts Archi and Cloud read do not describe 0.1.133's new answers (low; SY.admin and SY.architect in 0.1.133; the SDK's catalog later).
 - A-286 🔵 Archi's SCMD reads take `+` for a space where SY.admin keeps it (low; SY.architect).
@@ -362,7 +362,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - A-296 🔵 A deployments read filtered by category also answers the local snapshot rows of every category (low; the orchestrator).
 - A-297 🔵 SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee (low; SY.admin).
-- A-298 🔵 Archi's runtime publish that makes a version current recreates the motherbee's nodes of that runtime: new ILK, owned secrets purged, `launched_by: "archi"` (medium; to decide; SY.architect).
+- A-298 🔵 Archi's runtime publish that makes a version current recreates the motherbee's nodes of that runtime: new ILK, owned secrets purged, `launched_by: "archi"` (medium; decided 2026-11-11: the redeploy goes; SY.architect in 0.1.136).
 - A-299 🔵 A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it (low; the orchestrator).
 - A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator).
 - A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator).
@@ -1544,6 +1544,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   pinned, stopped and Cloud-launched nodes.
 - **Docs:** `docs/io-cloud-api.md` §5.4 and §9 0.1.88, and the Cloud team's page, tell the Cloud
   of it as today's behavior, pending this decision.
+- **The operator's call (2026-11-11):** the redeploy goes. The orchestrator's reconcile moves the
+  nodes on `current` in place, and a config reset is a config change of its own. In 0.1.136
+  (SY.architect, with A-286 and A-287).
 
 ### A-297 [General/admin] 🔵 low (found 2026-11-11 by A-288's review; read in the code) — SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee
 
@@ -1757,6 +1760,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   start that does nothing and waits 30 s for health, a stopped core service waits about 35 s, and
   nothing repairs Syncthing. Proposed: count those ticks too (reason *API port refused*), so the
   same 5 min, once-an-hour restart repairs it.
+- **The operator's call (2026-11-11):** yes: a tick whose API port refuses the connection or times
+  out its connect counts toward the same bounded restart. With 0.1.136's orchestrator.
 
 ### A-282 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — A replaced binary is taken for current when `systemctl show` gives no answer
 
@@ -1777,6 +1782,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   binary (the boot's own sign of an upgrade), each such restart recorded in `core.last_update`;
   one line in `BootBinaryChecks::restarts`. Lost: a package upgrade where every replaced service's
   check gives no answer keeps its old binary, as before A-282.
+- **The operator's call (2026-11-11):** yes: at boot, a check with no answer restarts only when the
+  same boot found a replaced binary, each such restart recorded in `core.last_update`. With
+  0.1.136's orchestrator.
 
 ### A-281 [General/admin] 🟡 medium (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — `remove_runtime_version` removes a version whose usage it could not read
 
