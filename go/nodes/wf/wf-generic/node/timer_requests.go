@@ -37,7 +37,10 @@ import (
 // it moved goes at its new time (MoveTimer keeps the refusal). A later request about the same timer
 // supersedes an earlier one, whose answer then decides nothing (timerRequests.sent): a schedule
 // refused while SY.timer restarted and then moved is settled by the reschedule's own answer, a
-// TIMER_NOT_FOUND from SY.timer, which never got the timer.
+// TIMER_NOT_FOUND from SY.timer, which never got the timer. A move SY.timer did not take of a timer
+// it holds is settled by the time SY.timer says it holds: the TIMER_SCHEDULE that goes again is
+// answered already_existed at the old time, and a time later than the index's is moved there, a
+// TIMER_RESCHEDULE (timerHeld), as is one the reconcile's TIMER_LIST lists.
 
 const (
 	verbTimerSchedule   = "TIMER_SCHEDULE"
@@ -239,25 +242,76 @@ func (rt *NodeRuntime) timerRequestRefused(ctx context.Context, req timerRequest
 	}
 }
 
-// timerTaken clears the refusal of timer ref, if it has one: SY.timer took a request about it, or
-// lists it pending.
+// timerTaken clears the refusal of timer ref, if it has one: SY.timer took a request about it.
 func (rt *NodeRuntime) timerTaken(ctx context.Context, ref timerRef) {
+	if row, ok := rt.timerRow(ctx, ref, "taken by SY.timer"); ok {
+		rt.clearRefusal(ctx, row)
+	}
+}
+
+// timerRow reads timer ref of the index, false when the index no longer has it, or when it cannot be
+// read: the log says so, with what SY.timer did (what).
+func (rt *NodeRuntime) timerRow(ctx context.Context, ref timerRef, what string) (TimerRow, bool) {
 	if rt.Store == nil {
-		return
+		return TimerRow{}, false
 	}
 	row, ok, err := rt.Store.GetTimerForInstance(ctx, ref.instanceID, ref.timerKey)
 	if err != nil {
-		log.Printf("wf: timer %s taken by SY.timer, and its row could not be read: %v", ref, err)
+		log.Printf("wf: timer %s %s, and its row could not be read: %v", ref, what, err)
+		return TimerRow{}, false
+	}
+	return row, ok
+}
+
+// clearRefusal clears the refusal of row, if it has one: SY.timer has its timer.
+func (rt *NodeRuntime) clearRefusal(ctx context.Context, row TimerRow) {
+	if row.Refusal == "" {
 		return
 	}
-	if !ok || row.Refusal == "" {
-		return
-	}
-	if err := rt.Store.TimerTaken(ctx, ref.instanceID, ref.timerKey); err != nil {
+	ref := timerRef{row.InstanceID, row.TimerKey}
+	if err := rt.Store.TimerTaken(ctx, row.InstanceID, row.TimerKey); err != nil {
 		log.Printf("wf: timer %s taken by SY.timer, and its refusal could not be cleared: %v", ref, err)
 		return
 	}
 	log.Printf("wf: timer %s taken by SY.timer, sent again %d time(s) after %s", ref, row.Resends, row.Refusal)
+}
+
+// timerHeld settles timer ref, which SY.timer holds pending at heldAtMS: it answered a schedule
+// already_existed with that time (it keeps one pending timer per client_ref), or the reconcile's
+// TIMER_LIST lists it. The timer is taken, its refusal cleared, unless SY.timer holds it later than
+// the index's time, past a fire's tolerance: a move SY.timer did not take (its TIMER_RESCHEDULE
+// refused or lost, and the TIMER_SCHEDULE that went again answered already_existed at the old time),
+// or a schedule of a key it held already. SY.timer would fire it late, and the stale-fire rule
+// (takeTimerFired) rescues only a timer it holds earlier. The timer is moved to its time, a
+// TIMER_RESCHEDULE followed as any request, its refusal, if it has one, kept until SY.timer takes
+// it; one less than 60 s from its time, SY.timer's floor, is marked, and the node fires it itself at
+// its time (FINDINGS A-254's review).
+func (rt *NodeRuntime) timerHeld(ctx context.Context, ref timerRef, heldAtMS int64) {
+	row, ok := rt.timerRow(ctx, ref, "held by SY.timer")
+	if !ok {
+		return
+	}
+	if heldAtMS <= row.FireAtMS+timerFireTolerance.Milliseconds() || rt.ActCtx.Timer == nil {
+		rt.clearRefusal(ctx, row)
+		return
+	}
+	why := fmt.Sprintf("%s holds it at %s, later than its time, %s", timerAuthority(rt.NodeName), msTime(heldAtMS), msTime(row.FireAtMS))
+	now := nowMS(rt.ActCtx.Clock)
+	if row.FireAtMS-now < minTimerDuration.Milliseconds() {
+		if err := refuseTimer(ctx, rt.ActCtx, ref, why); err != nil {
+			log.Printf("wf: timer %s: %v", ref, err)
+		}
+		return
+	}
+	in := time.Duration(row.FireAtMS-now) * time.Millisecond
+	traceID, err := rt.ActCtx.Timer.RescheduleInByClientRef(ctx, timerClientRef(row.InstanceID, row.TimerKey), in)
+	if err == nil {
+		log.Printf("wf: timer %s: %s; moved to its time (trace_id=%s)", ref, why, traceID)
+	}
+	req := timerRequest{timer: ref, verb: verbTimerReschedule, traceID: traceID, sentAtMS: now}
+	if err := rt.ActCtx.timerRequestSent(ctx, req, err); err != nil {
+		log.Printf("wf: timer %s: %v", ref, err)
+	}
 }
 
 // takeTimerRequestNotice takes the router's UNREACHABLE or TTL_EXCEEDED of a timer request the node
@@ -302,6 +356,8 @@ func routerNotice(name string, payload json.RawMessage) string {
 // takeTimerAnswer takes SY.timer's TIMER_RESPONSE to a request the node sent without waiting, never
 // answered: taken only from SY.timer of the node's hive, the one its timers are on. An answer the node
 // waits for settles its timer: one SY.timer took is no longer refused, and one it refused goes again.
+// A schedule SY.timer answers already_existed, holding a timer under the client_ref already, is
+// taken at the time SY.timer holds it (timerHeld): one later than the index's is moved to its time.
 // Any other answer (to a cancel, or to a request a later one about the same timer superseded) decides
 // nothing; a refusal among them is logged.
 func (rt *NodeRuntime) takeTimerAnswer(ctx context.Context, msg sdk.Message) {
@@ -322,6 +378,8 @@ func (rt *NodeRuntime) takeTimerAnswer(ctx context.Context, msg sdk.Message) {
 		if refusal != nil {
 			log.Printf("wf: %s refused %s (trace_id=%s): %v", authority, answer.Verb, msg.Routing.TraceID, refusal)
 		}
+	case refusal == nil && answer.AlreadyExisted != nil && *answer.AlreadyExisted && answer.FireAtUTCMS != nil:
+		rt.timerHeld(ctx, req.timer, *answer.FireAtUTCMS)
 	case refusal == nil:
 		rt.timerTaken(ctx, req.timer)
 	default:

@@ -100,7 +100,10 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   fire it up to 60 s late), and the node fires it itself at its time. Meanwhile `NODE_STATUS_GET` says
   `DEGRADED` (`timers_not_reconciled`), naming the next timer and why. What goes again is the index
   row: a timer the instance cancelled since does not go, one it moved goes at its new time, and a
-  later request about the same timer supersedes an earlier one. Before, a schedule refused while
+  later request about the same timer supersedes an earlier one. A schedule SY.timer answers
+  `already_existed` at a time later than the index's (a move it did not take of a timer it holds)
+  is moved to its time, a `TIMER_RESCHEDULE` followed the same way, as is one the reconcile finds
+  so (`timerHeld`). Before, a schedule refused while
   SY.timer restarted was lost until the node's next start, and the SDK dropped SY.timer's refusals.
 - **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
   store does not open, or fails during recovery, the node stays up and connected: `NODE_STATUS_GET`

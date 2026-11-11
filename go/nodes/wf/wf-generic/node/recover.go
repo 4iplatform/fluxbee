@@ -342,9 +342,12 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 // each row again before it acts: a fire it gives an instance may cancel or move a later timer.
 //
 //   - pending, fire_at ahead: nothing to do, but a refusal the index keeps of it is cleared: SY.timer
-//     has it (FINDINGS A-254);
-//   - pending, fire_at past: the instance takes a fire now (as SY.timer's would, through the journal),
-//     and the pending one is cancelled unless the fire scheduled the key again;
+//     has it (FINDINGS A-254). SY.timer holding it later than the index's time (a move it did not
+//     take) would fire it late: it is moved to its time, or, less than 60 s from it, fired by the
+//     node itself then (timerHeld, A-254's review);
+//   - pending, fire_at past, SY.timer's or the index's (SY.timer holding it later): the instance takes
+//     a fire now (as SY.timer's would, through the journal), in the order of the index, and the
+//     pending one is cancelled unless the fire scheduled the key again;
 //   - not in SY.timer, fire_at past: it fired while the WF was down and the fire was lost; the
 //     instance takes a fire now;
 //   - not in SY.timer, fire_at ahead: SY.timer never got it (it was scheduled while SY.timer did not
@@ -397,14 +400,15 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 		inst, running := rt.Registry.Get(row.InstanceID)
 
 		switch {
-		case existsInSY && syTimer.FireAtUTCMS > now:
-			// Pending, fire_at ahead: nothing to do. A refusal of it is settled: SY.timer has it
-			// (FINDINGS A-254).
-			if row.Refusal != "" {
-				rt.timerTaken(ctx, timerRef{row.InstanceID, row.TimerKey})
-			}
+		case existsInSY && syTimer.FireAtUTCMS > now && row.FireAtMS > now:
+			// Pending, fire_at ahead: SY.timer has it. A refusal of it is settled (FINDINGS A-254),
+			// unless SY.timer holds it later than its time, a move it did not take: it goes to its
+			// time (timerHeld, A-254's review).
+			rt.timerHeld(ctx, timerRef{row.InstanceID, row.TimerKey}, syTimer.FireAtUTCMS)
 
 		case existsInSY:
+			// Pending, and its time has come: SY.timer's, or the index's when SY.timer holds it later
+			// (a move to an earlier time it did not take), whose fire would come late.
 			if running {
 				log.Printf("recover: timer %s/%s past fire_at, injecting synthetic TIMER_FIRED", row.InstanceID, row.TimerKey)
 				rt.fireMissedTimer(ctx, inst, row, syTimer.UUID)

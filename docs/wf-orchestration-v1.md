@@ -209,7 +209,9 @@ This is the single place for the track. The cases are worked here one at a time.
     one (the router's `UNREACHABLE`, SY.timer's own refusal, no answer in 30 s) marks its timer in
     the index, which goes again after 5, 10, 20 and 40 s, then each minute, until SY.timer takes
     it; the node is `DEGRADED` meanwhile.
-  - Re-scheduling a pending key keeps SY.timer's old time.
+  - Re-scheduling a pending key keeps SY.timer's old time. Since FINDINGS A-254's review SY.timer's
+    `already_existed` answer names that time, and a later one is moved to the new time
+    (`TIMER_RESCHEDULE`); an earlier one fires stale, and the timer goes again then.
   - A reschedule after a fire fails silently.
 - **Recovery runs only at start.** Since 0.1.99 SY.timer sends a fire again while the WF is not
   connected, for up to an hour ([sy-timer](sy-timer.md) §7.8, A-115); a fire lost past that waits
