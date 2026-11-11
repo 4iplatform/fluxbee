@@ -23773,9 +23773,9 @@ fn local_hive_entry(state: &OrchestratorState) -> serde_json::Value {
 
 /// `get_hive`: one hive's entry of the registry under `root` (`hives_root()`), its `info.yaml` as
 /// JSON. A hive id that is not one (`valid_hive_id`, as `add_hive` and `remove_hive` check it)
-/// answers INVALID_HIVE_ID, as `remove_hive` does, and nothing is read: joined into the path,
-/// `/srv/x` named a file outside the registry and `..` climbed out of it (FINDINGS A-311). A hive
-/// the registry does not have answers NOT_FOUND.
+/// answers INVALID_HIVE_ID as they do (`invalid_hive_id_answer`), and nothing is read: joined into
+/// the path, `/srv/x` named a file outside the registry and `..` climbed out of it (FINDINGS
+/// A-311). A hive the registry does not have answers NOT_FOUND.
 fn get_hive_flow(root: &Path, payload: &serde_json::Value) -> serde_json::Value {
     let Some(hive_id) = payload.get("hive_id").and_then(|value| value.as_str()) else {
         return serde_json::json!({
@@ -23800,12 +23800,15 @@ fn get_hive_flow(root: &Path, payload: &serde_json::Value) -> serde_json::Value 
     }
 }
 
-/// The answer to a hive id that is not one (`valid_hive_id`), `remove_hive`'s and `get_hive`'s.
+/// The answer to a hive id that is not one (`valid_hive_id`): `add_hive`'s, each join flow's,
+/// `remove_hive`'s and `get_hive`'s. Its message names the rule, in the words SY.admin's and
+/// SY.identity's refusals of a hive id use, so the operator and Archi can follow it; it named a
+/// stricter rule (lowercase only) or none before (FINDINGS A-311).
 fn invalid_hive_id_answer() -> serde_json::Value {
     serde_json::json!({
         "status": "error",
         "error_code": "INVALID_HIVE_ID",
-        "message": "invalid hive_id",
+        "message": "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'",
     })
 }
 
@@ -24238,9 +24241,12 @@ fn socket_cleanup_timeout(forward_result: &Result<serde_json::Value, Orchestrato
 }
 
 /// A hive's entry of the registry under `root`, its `info.yaml`, for a hive id that is one
-/// (`valid_hive_id`). Any other id names no entry and is refused before a path is built, so no
-/// reader or writer of the registry reaches a file outside it, whoever gave the id (FINDINGS
-/// A-311: `get_hive` joined `/srv/x` or `..` into the path).
+/// (`valid_hive_id`). Any other id names no entry and is refused before a path is built, so
+/// `read_hive_info`, `write_hive_info` and `registry_has_hive`, which build their path here, reach
+/// no file outside the registry, whoever gave the id (FINDINGS A-311: `get_hive` joined `/srv/x`
+/// or `..` into the path). The registry's other paths built from a hive id (`remove_hive_flow`,
+/// `accept_add_hive`, the add flows, `hive_partial_exists`, `update_join_state_in`) come after a
+/// `valid_hive_id` check, their own or their callers'.
 fn hive_info_path(root: &Path, hive_id: &str) -> Result<PathBuf, OrchestratorError> {
     if !valid_hive_id(hive_id) {
         return Err(format!("invalid hive id {hive_id:?}: no entry of the hive registry").into());
@@ -34111,11 +34117,7 @@ async fn accept_add_hive(
     }
 
     if !valid_hive_id(&hive_id) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_HIVE_ID",
-            "message": "hive_id must be 1-64 chars of [a-z0-9-_] (no '/', '.', '..')",
-        });
+        return invalid_hive_id_answer();
     }
     // These used to be checked only INSIDE the flow — i.e. after acceptance had already created
     // hives/<id>/ and published `joining`. A typo'd address therefore left a permanent phantom
@@ -34415,11 +34417,7 @@ async fn add_hive_flow(
     // hive_partial_exists / remove_dir_all. valid_hive_id forbids '/' '.' '..',
     // so `hives_root().join(hive_id)` below cannot traverse out of the tree.
     if !valid_hive_id(hive_id) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_HIVE_ID",
-            "message": "invalid hive_id",
-        });
+        return invalid_hive_id_answer();
     }
     if !valid_address(address) {
         return serde_json::json!({
@@ -35624,7 +35622,7 @@ async fn add_egress_hive_flow(
     // hive_id/address BEFORE any path join / hive_exists / remove_dir_all so a
     // traversal hive_id can never reach a destructive fs op.
     if !valid_hive_id(hive_id) {
-        return err_payload("INVALID_HIVE_ID", "invalid hive_id".to_string());
+        return invalid_hive_id_answer();
     }
     if !valid_address(address) {
         return err_payload("INVALID_ADDRESS", "invalid address".to_string());
@@ -36378,7 +36376,7 @@ async fn add_ingress_hive_flow(
     let err_payload = |code: &str, msg: String| serde_json::json!({ "status": "error", "error_code": code, "message": msg });
 
     if !valid_hive_id(hive_id) {
-        return err_payload("INVALID_HIVE_ID", "invalid hive_id".to_string());
+        return invalid_hive_id_answer();
     }
     if !valid_address(address) {
         return err_payload("INVALID_ADDRESS", "invalid address".to_string());
@@ -37135,7 +37133,14 @@ fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
     registry_has_hive(&hives_root(), hive_id)
 }
 
+/// Whether the registry holds a directory for `hive_id` with no `info.yaml` in it, the stale state
+/// an add flow cleans up before its bootstrap. A hive id that is not one has no directory of the
+/// registry, answered with no path touched (as `registry_has_hive`, FINDINGS A-311), so the
+/// clean-up's `remove_dir_all` never follows such an id.
 fn hive_partial_exists(hive_id: &str) -> bool {
+    if !valid_hive_id(hive_id) {
+        return false;
+    }
     let dir = hives_root().join(hive_id);
     dir.exists() && !dir.join("info.yaml").exists()
 }
@@ -40767,7 +40772,7 @@ mod tests {
         let refused = serde_json::json!({
             "status": "error",
             "error_code": "INVALID_HIVE_ID",
-            "message": "invalid hive_id",
+            "message": "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'",
         });
         let state = sample_orchestrator_state_for_tests();
         for hive_id in [
@@ -40884,10 +40889,11 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// FINDINGS A-311: the inventory's and the deployments' probes of the registry answer a name
-    /// that is not a hive id as a hive the registry does not have, touching no path. Joined into
-    /// the path, an absolute name replaced the registry's root, so they told whether an
-    /// `info.yaml` was there.
+    /// FINDINGS A-311: the inventory's, the deployments' and the add flows' probes of the registry
+    /// answer a name that is not a hive id as a hive the registry does not have, touching no path.
+    /// Joined into the path, an absolute name replaced the registry's root, so they told whether
+    /// an `info.yaml` was there, and the add flows' probe of a stale directory, the one their
+    /// clean-up removes, found one with none.
     #[test]
     fn the_registry_probes_answer_a_name_that_is_not_a_hive_id_as_unknown() {
         let state = sample_orchestrator_state_for_tests();
@@ -40906,10 +40912,102 @@ mod tests {
             );
             assert!(!hive_exists(&state.state_dir, hive_id), "{hive_id:?}");
         }
+        let stale = dir.join("stale");
+        fs::create_dir_all(&stale).expect("a directory with no info.yaml");
+        let stale = stale.to_string_lossy().to_string();
+        for hive_id in [stale.as_str(), "..", ".", "a/b"] {
+            assert!(!hive_partial_exists(hive_id), "{hive_id:?}");
+        }
         // This hive is known without the registry, as before.
         assert!(hive_is_registered_for_inventory(&state, &state.hive_id));
         assert!(hive_present_for_deployments(&state, &state.hive_id));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-311, the review: every refusal of a hive id that is not one is one answer, and
+    /// its message names the rule `valid_hive_id` checks, in the words SY.admin's and SY.identity's
+    /// refusals of a hive id use. `add_hive`'s accept said lowercase only, which the rule is not,
+    /// and the join flows, `remove_hive` and `get_hive` named no rule.
+    #[tokio::test]
+    async fn every_refusal_of_a_hive_id_is_one_answer_that_names_the_rule() {
+        let refused = serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'",
+        });
+        // The rule the message names: letters of either case, digits, '_' and '-'.
+        assert!(valid_hive_id("Worker_2-B"));
+
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let creds = BootstrapCreds {
+            user: "admin".to_string(),
+            password: None,
+            ssh_key: None,
+        };
+        let ingress = IngressSection {
+            listen: Some("0.0.0.0:8443".to_string()),
+            tls_vault_key: None,
+            vault_hive: None,
+            ssh_allow_from: Vec::new(),
+        };
+        // Never created: no refusal reads it.
+        let root = std::env::temp_dir().join(format!("fluxbee-a311-answer-{}", Uuid::new_v4()));
+        // Every answer that differs, so one run names each refusal that strays.
+        let mut strays = Vec::new();
+        for hive_id in ["../x", "/srv/x", "a.b", "worker 9", ""] {
+            let accept = serde_json::json!({
+                "hive_id": hive_id,
+                "address": "10.0.0.9",
+                "ssh_user": "admin",
+            });
+            let answers = [
+                ("add_hive's accept", accept_add_hive(&state, &accept).await),
+                (
+                    "the worker join",
+                    add_hive_flow(&state, hive_id, "10.0.0.9", false, false, false, 45, &creds)
+                        .await,
+                ),
+                (
+                    "the egress join",
+                    add_egress_hive_flow(
+                        &state,
+                        hive_id,
+                        "10.0.0.9",
+                        false,
+                        false,
+                        egress_section(true),
+                        &creds,
+                    )
+                    .await,
+                ),
+                (
+                    "the ingress join",
+                    add_ingress_hive_flow(
+                        &state,
+                        hive_id,
+                        "10.0.0.9",
+                        false,
+                        false,
+                        ingress.clone(),
+                        &creds,
+                    )
+                    .await,
+                ),
+                ("remove_hive", remove_hive_flow(&state, hive_id).await),
+                (
+                    "get_hive",
+                    get_hive_flow(&root, &serde_json::json!({ "hive_id": hive_id })),
+                ),
+            ];
+            for (refusal, answer) in answers {
+                if answer != refused {
+                    strays.push(format!("{refusal} of {hive_id:?}: {answer}"));
+                }
+            }
+        }
+        assert!(strays.is_empty(), "{strays:#?}");
+        assert!(!state.any_hive_topology_busy());
+        assert!(!root.exists());
     }
 
     // F20: a corrupt/torn SHM writer can report name_len past the buffer (it is a

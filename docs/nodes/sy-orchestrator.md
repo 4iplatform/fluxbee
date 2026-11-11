@@ -600,12 +600,16 @@ deletes the key of any hive with no directory under `hives/`, when both listings
 **Reading the registry.** `get_hive` (`get_hive_flow`) answers one hive's `info.yaml` as `hive`,
 and `NOT_FOUND` for a hive the registry does not have. A hive id that is not one, 1 to 64
 characters `[A-Za-z0-9_-]` (`valid_hive_id`, the check `add_hive` and `remove_hive` make), answers
-`INVALID_HIVE_ID` as `remove_hive` does, and nothing is read (FINDINGS A-311, since 0.1.136):
-joined into the path, `/srv/x` read `/srv/x/info.yaml` and `..` climbed out of the registry. Every
-read and write of an entry refuses such an id as well (`hive_info_path`), so `list_hives` lists a
-directory whose name is not a hive id by its name alone, as it lists one without an `info.yaml`.
-The inventory leaves out a hive of the LSA with such a name, and a deployment's or a drift alert's
-`present` and `hive_present` are false for one (`registry_has_hive`), with no path touched.
+`INVALID_HIVE_ID` and nothing is read (FINDINGS A-311, since 0.1.136): joined into the path,
+`/srv/x` read `/srv/x/info.yaml` and `..` climbed out of the registry. `add_hive`, at its accept and
+in each role's join flow, `remove_hive` and `get_hive` refuse such an id with one answer
+(`invalid_hive_id_answer`), whose message names the rule in the words SY.admin's and SY.identity's
+refusals of a hive id use: `hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'`.
+`read_hive_info` and `write_hive_info` refuse such an id as well (`hive_info_path`), so
+`list_hives` lists a directory whose name is not a hive id by its name alone, as it lists one
+without an `info.yaml`. The inventory leaves out a hive of the LSA with such a name, and a
+deployment's or a drift alert's `present` and `hive_present` are false for one
+(`registry_has_hive`), with no path touched.
 
 ## Updates
 
