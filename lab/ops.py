@@ -226,6 +226,11 @@ def cmd_opa_status(a):
 # `usagerej` sums them. A journal that cannot be read is reported, never counted as zero. Each of the
 # router's patterns must open the line's message (after its time, level and target): a node name, a
 # trace_id or a thread_id that another line quotes is never counted (the review of A-253).
+# `wandrops` counts the router's foreign_source lines (WAN frames whose sender the peer does not
+# vouch for; at most one line every 30 s a router, each with its cumulative count). Until every hive
+# runs 0.1.134 most of them are a WAN broadcast echoed back to its peer (A-272), so the field is
+# printed and kept out of the check; it joins `HEALTH_OK` once 0.1.134 runs everywhere.
+HEALTH_OK = "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0"
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then
   echo "journal unreadable: $(printf '%%s' "$log" | head -1)"; exit 1
@@ -245,7 +250,8 @@ echo "failed=$(systemctl --failed --no-legend --plain | wc -l)" \
      "usagerej=$(printf '%%s\n' "$storage" \
                  | grep 'usage records refused, mismatched or unverified' \
                  | grep -oE '(refused|mismatched|unverified)=[0-9]+' | cut -d= -f2 \
-                 | awk '{s+=$1} END {print s+0}')"
+                 | awk '{s+=$1} END {print s+0}')" \
+     "wandrops=$(printf '%%s\n' "$log" | grep -cE '^[^ ]+ +WARN [^ ]+: router dropped a WAN frame')"
 """
 
 
@@ -265,8 +271,8 @@ def health(since):
     ok = True
     for hive in hives():
         print("%-10s %s" % (hive, rows.get(hive, "no answer")))
-        ok = ok and rows.get(hive, "") == (
-            "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0")
+        checked = " ".join(f for f in rows.get(hive, "").split() if not f.startswith("wandrops="))
+        ok = ok and checked == HEALTH_OK
     certificate_ok = certificate_health()
     web_health()
     return certificate_ok and ok
