@@ -55,8 +55,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Ubuntu's protobuf-compiler first; protoc's own GitHub release (the same 21.12, Ubuntu's
+      # 3.21.12) when Ubuntu's archive cannot be reached: on 2026-11-11 *.ubuntu.com did not
+      # resolve on the runners for hours and every run failed here.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          if ! (timeout 240 sudo apt-get update && timeout 240 sudo apt-get install -y protobuf-compiler); then
+            echo "::warning::apt could not install protobuf-compiler; protoc 21.12 from its GitHub release"
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/protoc.zip" \
+              https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+            sudo unzip -o -q "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+          fi
+          protoc --version
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.92.0
