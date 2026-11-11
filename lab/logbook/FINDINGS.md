@@ -294,8 +294,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
   0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
-- A-223 🔵 io.api waits for a frontdesk handoff no longer than the frontdesk waits for
-  SY.identity (low).
 - A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
@@ -1404,6 +1402,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   cancel and reschedule work this way; `LINK_BUSY` makes a lost schedule likelier under load.
 - **Fix, later (WF):** the schedule waits for SY.timer's answer (an RPC), or a refusal of a schedule
   the WF sent marks that timer in its index and retries it.
+- **The operator's call (2026-11-10, the sweep):** *"si"*, option (b): the WF records a refused schedule and tries again, without blocking, plus the 366-day bound; a Go release (wf.engine, SY.wf-rules).
 
 ### A-253 [General/storage] 🔵 low (found 2026-11-10 by 0.1.129's gate; seen on 8.x, the same on 0.1.128) — A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns
 
@@ -1415,6 +1414,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   and cognition miss it.
 - **To decide, later:** keep it (such messages are rare; attachments go through the blob), store
   the turn truncated with a mark, or raise the batch's bound to the frame's.
+- **The operator's call (2026-11-10, the sweep):** keep the drop, but *"hay que logear eso en algun lado.. imagino el log del propio nodo, para todo tenemos que tener logs"*: the router's own line names the dropped record (its trace, thread and size), with the router's release. Logs for everything are a topic of their own, later.
 
 ### A-252 [General/join] 🔵 low (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — A fresh worker restarts Syncthing once more about a minute after its join, for the posture options
 
@@ -1503,6 +1503,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   goes to the forward target's link, or nowhere. Only a hive with several routers gets there,
   which is not supported.
 - **Fix, later (if multi-router hives come):** name the arm's binding apart.
+- **The operator's call (2026-11-10, the sweep):** *"si"*: with the router's next release (A-208's change touches the same lines).
 
 ### A-246 [General/router] 🔵 low (found 2026-11-10 by the review of the router's 0.1.129; read in the code) — A non-gateway router with no gateway sibling answers a broadcast twice
 
@@ -1512,6 +1513,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   supported.
 - **Fix, later (if multi-router hives come):** `forward_broadcast_to_wan` returns the reason and its
   caller answers once.
+- **The operator's call (2026-11-10, the sweep):** *"si"*: fixed with the router's next release, with A-247 and A-208.
 
 ### A-245 [General/router] 🔵 low (found 2026-11-10 by the review of the router's 0.1.129; read in the code; there before it) — A far router's UNREACHABLE reaches only the hub's own nodes
 
@@ -1573,6 +1575,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   never cleaned before either, because its GC was off. A staging-only pass on spokes, which needs
   no publication pins, would clean them.
 - **Fix, to decide:** whether spokes get a staging-only GC pass.
+- **The operator's call (2026-11-10, the sweep):** *"si"*: each worker cleans its own blob staging (always on, files older than 24 h, hourly, one log line).
 
 ### A-240 [General/orchestrator] 🔵 low (found 2026-11-10 by A-199's builder; read in the code) — A local get_node_status writes on every read
 
@@ -1582,6 +1585,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`crates/fluxbee_sdk/src/policy.rs:86`). A-199's step 1 keeps it in the ordered lane for that
   reason.
 - **Fix, later:** a status read that writes nothing (the version advanced where the status changes).
+- **The operator's call (2026-11-10, the sweep):** *"si, sacalo"*: `status_version` goes; a node's status becomes a plain read.
 
 ### A-239 [General/Go SDK] ✅ VALIDATED ON 8.x (0.1.130, 2026-11-10; TIMER_GET and TIMER_LIST byte for byte the same before and after) (found 2026-11-10 by A-220's builder; read in the code) — The Go SDK's TimerInfo drops SY.timer's canceled_reason
 
@@ -1716,6 +1720,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   person.
 - **Fix, later (the cognition track):** the relay carries whom the forwarded answer was for, as a
   fact of the message, apart from its addressee.
+- **The operator (2026-11-10):** *"si, tema cognition no termino"*: with the cognition track, not the sweep.
 
 ### A-226 [IO/io.slack] 🔵 low (found 2026-11-10 by A-217's builder; read in the code) — io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable`
 
@@ -1723,6 +1728,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   io.slack has a text per reason, and shows an unknown one as "Not taken." with a warning
   (`nodes/io/io-slack/src/not_taken.rs:199-207`, `:235-241`).
 - **Fix, later (io.slack's revamp, A-148):** a text for `unavailable`.
+- **The operator's call (2026-11-10, the sweep):** *"ok"*: the text now, with a test.
 
 ### A-225 [General/egress] ✅ BUILT (0.1.126, 2026-11-10; the probe's reason seen on 8.x) (found 2026-11-10 by A-219's design; checked in the code) — A worker's egress path: a removed worker keeps IPv6 off, its boot gives up on a sysctl error before the probe, and a failed probe never says why
 
@@ -1753,7 +1759,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   that fails midway is redone anyway. hive-config-update-v1 §5 lists it as not built.
 - **Being fixed:** `coa/orch-125` (0.1.125).
 
-### A-223 [IO/io.api] 🔵 low (found 2026-11-10 by A-216's builder; checked in the code) — io.api waits for a frontdesk handoff no longer than the frontdesk waits for SY.identity
+### A-223 [IO/io.api] ✅ CLOSED (2026-11-10; fixed by 0.1.125, read in the code by the sweep's triage) (found 2026-11-10 by A-216's builder; checked in the code) — io.api waits for a frontdesk handoff no longer than the frontdesk waits for SY.identity
 
 - **Why:** io.api waits for the frontdesk's answer for its identity timeout, 10 s by default
   (`nodes/io/io-api/src/config.rs:56-58`, used at `main.rs:1612-1621`), and the frontdesk's own
@@ -1762,6 +1768,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   when SY.identity fails fast.
 - **Fix, later (io.api, with the IO standard A-149):** io.api's handoff wait is longer than the
   frontdesk's whole attempt (its identity timeout plus A-216's retries).
+- **Closed (2026-11-10, the sweep's triage):** already fixed by 0.1.125 (A-216's review round bounds every ILK_REGISTER attempt of a registration by one 8 s deadline, under io.api's 10 s wait); io.api's doc to correct with the IO release.
 
 ### A-222 [General/router] ✅ VALIDATED ON 8.x (0.1.129, 2026-11-10; a client that stopped reading took 39 frames of 100 KB, the other 41 refused `LINK_BUSY` at once, locally and across the WAN; all 39 delivered in order after) (found 2026-11-10 by A-203's builder; read in the code) — A node that stops reading without an error is never disconnected, and the router's queue for it grows without limit
 
@@ -2038,6 +2045,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Impact:** none on 8.x: every hive runs one router. It matters only for the several-routers
   mode, which is not supported.
 - **Fix, later:** with that mode, if it is ever supported.
+- **The operator's call (2026-11-10, the sweep):** *"si"*: with the router's next release, with A-246 and A-247.
 
 ### A-207 [General/router] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10; a silent egress1 cut after the dead interval) (found 2026-11-09 by A-203's builder; read in the code) — A WAN peer that vanishes without closing its connection keeps its session, and frames to it are lost without UNREACHABLE for up to about 15 minutes
 
@@ -2379,6 +2387,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   on 0.1.123), then dpkg 82 s (unpack 64 s, configure 15 s), with the motherbee's orchestrator down
   80 s inside it. The installation's update took 46.6 s. The build took 26.5 min (12-15 min
   before).
+- **The operator (2026-11-10):** *"ese es todo un tema, identificando porque tarda despues hablamos de los problemas"*: first find why each step takes its time, then talk; nothing built in the sweep.
 
 ### A-192 [General/vault] 🟢 LAB NOTE, no change (found 2026-11-08, 0.1.117's deploy on 8.x; read in its journals) — A running IO node's secret read is refused for a moment at a motherbee restart
 
@@ -2403,6 +2412,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Impact:** none seen. They are deterministic, so a hive joined again under the same name
   reuses them. Data hygiene, next to A-159 (deleting an ILK that other data names); a release
   that drops a node from a role leaves its ILK too (A-181, stage 2).
+- **The operator's call (2026-11-10, the sweep):** old ILKs that made no history are deleted (*"si son ilk viejos, borralos cuando puedas"*); an ILK that made history is disabled, never deleted (*"los ilk son historia... podemos hacer disable pero no borrarlos sino rompe"*). So: `remove_hive` disables (marks, reversibly) the removed hive's system ILKs and never purges them; the throwaway gate workers' and worker2's are purged once; SY.policy's, which ran in PROD for months, are only disabled.
 
 ### A-190 [General/join] ✅ VALIDATED ON 8.x (0.1.118, 2026-11-08; found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
 
@@ -5374,6 +5384,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   hive's single provider (agent-tools-v1 T8). How their tokens are measured per message is still
   open.
 - **The operator (2026-10-26):** *"después vemos cómo se miden los tokens por mensaje"*.
+- **The operator (2026-11-10):** a large topic, like io.web, to talk over: a node that meters, or the datum in the messages, or system messages streamed from every node to a log node over its socket, with the stream code in the SDK so it is not in a thousand places; tokens come from the AI nodes and the SY nodes, so the SDK could record them wherever it calls an AI, transparent to its user (every node uses the same SDK). Not in the sweep.
 
 ### A-95 ✅ VALIDATED ON 8.x (0.1.86, 2026-10-27) — ai.generic logs the full public link of a page it publishes
 
@@ -5471,6 +5482,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   - io.web (0.1.85) applies its contract to `{}` at boot and runs CONFIGURED.
 - **To decide** with the IO family's review: whether the siblings should materialize their
   defaults the same way, so that a node's state says whether it works.
+- **The operator's call (2026-11-10, the sweep):** *"si funcionan 100% sin configurar si, sino algo tenemos que decir que falta"*: boot CONFIGURED when the defaults cover everything they do; otherwise say what is missing.
 
 ### A-90 [io.web] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; the share per client and the stalled body by tests; found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
 
