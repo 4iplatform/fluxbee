@@ -14379,7 +14379,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "restore_tenant" => "Undo the deleted mark of one tenant: it comes back as it was.",
         "purge_tenant" => {
-            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. Refused while people are charged to it, or it has vault secrets, public pages that are up, node identities or sponsored tenants."
+            "Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. Refused while people are charged to it, or it has vault secrets, node identities or sponsored tenants. Its public pages stay up until they expire, and its answer names them (pages_left_up)."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -39814,22 +39814,39 @@ mod tests {
         }
     }
 
-    /// No action's notes name A-233's refusals any more, and each removal says what it leaves up
-    /// (FINDINGS A-242).
+    /// No action's notes or summary name A-233's refusals any more, no summary puts a page among
+    /// the refusals it lists, and each removal says what it leaves up (FINDINGS A-242). The summary
+    /// is each action's description in the catalog (`list_admin_actions`, compact over the mesh,
+    /// as Archi reads it; `GET /admin/actions`) and in its help: purge_tenant's still said a page
+    /// that is up refused it.
     #[test]
     fn the_removals_notes_name_the_pages_left_up() {
         for spec in INTERNAL_ACTION_REGISTRY {
-            for note in admin_action_request_notes(spec.action) {
+            let summary = admin_action_summary(spec.action);
+            for text in admin_action_request_notes(spec.action)
+                .into_iter()
+                .chain([summary])
+            {
                 for gone in [
                     "NODE_HAS_PAGES",
                     "TENANT_HAS_PAGES",
                     "NODE_BEING_PURGED",
                     "PAGES_CHECK_FAILED",
                 ] {
-                    assert!(!note.contains(gone), "{}: {note}", spec.action);
+                    assert!(!text.contains(gone), "{}: {text}", spec.action);
                 }
             }
+            // A refusal, to the end of its sentence or clause, names no page ("package" is no
+            // page: the words are compared).
+            for clause in summary.split(". ").flat_map(|sentence| sentence.split(';')) {
+                let refusal = clause.to_ascii_lowercase().contains("refus");
+                let names_a_page = clause
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|word| word.to_ascii_lowercase().starts_with("page"));
+                assert!(!(refusal && names_a_page), "{}: {clause}", spec.action);
+            }
         }
+        assert!(admin_action_summary("purge_tenant").contains("pages_left_up"));
         for action in [
             "kill_node",
             "remove_node_instance",

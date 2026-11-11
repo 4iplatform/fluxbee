@@ -706,7 +706,7 @@ on the motherbee, so `{hive}` is `motherbee` in practice.
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor` | `set_tenant_sponsor` → `TNT_SET_SPONSOR` |
 | `DELETE /hives/{hive}/identity/tenants/{tenant_id}` | `delete_tenant` → `TNT_DELETE` |
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | `restore_tenant` → `TNT_RESTORE` |
-| `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | `purge_tenant` → `TNT_PURGE`, after the pages and vault checks |
+| `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | `purge_tenant` → `TNT_PURGE`, after the vault check; its ok answer names the pages left up (`pages_left_up`) |
 | `GET /hives/{hive}/identity/tenants/{tenant_id}/nodes` | `list_tenant_nodes` |
 
 - `pending_signup` keeps only the temporary people who hold a Cloud account key, wherever they

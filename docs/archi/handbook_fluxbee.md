@@ -1034,9 +1034,16 @@ The ownership and call path are fixed:
   in `payload.pages_left_up`: `count`, `pages` (each with its `publication_id`, `expires_at` in
   epoch seconds, `status`, `filename_original`, `publisher_l2_name`, `tenant_id` and
   `edge_node`), and `more`, the pages it did not name. The step's `result_preview` carries it.
-  When the answer was cut (`output_truncated`, or `pages_left_up` cut short) or `count` is null,
-  read `/artifacts` and pick the rows whose `publisher_l2_name` is the removed node (a hive's:
-  its nodes, or an `edge_node` on it).
+  It names the pages that expire soonest first, so the ones it leaves out stay public longest.
+  When `more` is more than 0, the answer was cut (`output_truncated`, or `pages_left_up` cut
+  short) or `count` is null, read `/artifacts` and pick the rows whose `publisher_l2_name` is the
+  removed node (a hive's: its nodes, or an `edge_node` on it): name every page that stays up,
+  each with its date.
+- **After a removal that failed or timed out,** the answer names no page, yet the node may be
+  gone already: the orchestrator may finish a purge whose answer timed out, and a workflow's
+  delete can fail after its WF node was purged (a retry then answers `WORKFLOW_NOT_FOUND`). Read
+  `/artifacts` for the node's pages before you report to the operator, and say which stay public
+  as below.
 - When `count` is more than 0, tell the operator which pages stay public and until when: each
   `expires_at` as a date. Offer to take them down now, one `unpublish_artifact` step each, in a
   plan the operator confirms; never stage it without their yes.
