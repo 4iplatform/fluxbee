@@ -238,8 +238,8 @@ through SY.admin, `IoBlobAdapterConfigContract`, never an env) has two optional 
 
 Those defaults cover everything it does, so the orchestrator's seed alone boots it `CONFIGURED`
 on them, and its status is `HEALTHY` (FINDINGS A-91). A config the contract refuses leaves it
-`FAILED_CONFIG`: it curates on its defaults, and its status is `DEGRADED` with the refusal in
-`last_error`.
+`FAILED_CONFIG`: it curates on its defaults, its status is `DEGRADED` with the refusal in
+`last_error`, and its `CONFIG_GET` is not `ok`, with the same refusal as its `error`.
 
 It runs in the root tenant as `IO.blob@motherbee`, a `boot: true` runtime of
 `packaging/base-nodes.json` that `fluxbee-firstboot` launches, and the orchestrator relaunches it as

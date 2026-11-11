@@ -13,7 +13,8 @@
 //! defaults cover everything it does (the default cap, the local hive's SY.admin), so the
 //! orchestrator's seed alone boots CONFIGURED on them, as io.web does (`boot_control_plane`,
 //! FINDINGS A-91), and NODE_STATUS_GET answers from the config state: HEALTHY while CONFIGURED,
-//! DEGRADED with the contract's reason while a config it refused is on disk.
+//! DEGRADED with the contract's reason while a config it refused is on disk, which CONFIG_GET then
+//! gives too, as its `error`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -36,8 +37,8 @@ use fluxbee_sdk::protocol::{
     MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, FLUXBEE_NODE_NAME_ENV,
+    managed_node_config_path, NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch,
+    RouteTarget, RouterDispatcher, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
@@ -357,15 +358,9 @@ async fn main() -> Result<(), DynError> {
 
     while let Some(message) = incoming.recv().await {
         if is_node_status_request(&message) {
-            let payload = node_status_payload(&*state.control_plane.read().await);
-            sender
-                .send(build_reply(
-                    &sender,
-                    &message,
-                    MSG_NODE_STATUS_GET_RESPONSE,
-                    payload,
-                ))
-                .await?;
+            let reply =
+                node_status_reply(sender.uuid(), &message, &*state.control_plane.read().await);
+            sender.send(reply).await?;
             continue;
         }
 
@@ -412,7 +407,7 @@ async fn main() -> Result<(), DynError> {
             }
         };
         sender
-            .send(build_reply(&sender, &message, response_msg, payload))
+            .send(build_reply(sender.uuid(), &message, response_msg, payload))
             .await?;
     }
 
@@ -504,6 +499,19 @@ fn node_status_payload(control: &IoControlPlaneState) -> Value {
     build_node_status_response_payload(lifecycle, last_error.as_ref())
 }
 
+/// The answer to NODE_STATUS_GET (FINDINGS A-91): `node_status_payload` of the live control plane,
+/// to whoever asked, on its trace. The receive loop gives it before anything else, never through
+/// the SDK's default handler, which says HEALTHY whatever the state
+/// (`the_receive_loop_answers_node_status_from_the_config_state`).
+fn node_status_reply(own_uuid: &str, request: &Message, control: &IoControlPlaneState) -> Message {
+    build_reply(
+        own_uuid,
+        request,
+        MSG_NODE_STATUS_GET_RESPONSE,
+        node_status_payload(control),
+    )
+}
+
 fn is_config_command(message: &Message) -> bool {
     message.meta.msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
         && matches!(
@@ -581,15 +589,36 @@ async fn build_config_get_payload(state: &RuntimeState, message: &Message) -> Va
         &state.config.node_name,
         &snapshot,
     );
-    let mut payload = build_io_config_get_response_payload(
+    let mut payload = config_get_answer(
         &state.config.node_name,
         &snapshot,
-        build_io_adapter_contract_payload(
-            state.adapter_contract.as_ref(),
-            snapshot.effective_config.as_ref(),
-        ),
+        state.adapter_contract.as_ref(),
     );
     inject_runtime_status(&mut payload, state).await;
+    payload
+}
+
+/// The CONFIG_GET answer: the IO family's, and, while a config the contract refused is on disk
+/// (FAILED_CONFIG, io.blob curating on its defaults), not `ok`, with the reason its status gives as
+/// `error` in place of the family's bare `node_not_configured`, as io.cloud's answer (FINDINGS A-91's
+/// review). SY.admin turns a CONFIG_GET that is not `ok` into its error (`error_code`,
+/// `error_detail`).
+fn config_get_answer(
+    node_name: &str,
+    snapshot: &IoControlPlaneState,
+    contract: &dyn IoAdapterConfigContract,
+) -> Value {
+    let mut payload = build_io_config_get_response_payload(
+        node_name,
+        snapshot,
+        build_io_adapter_contract_payload(contract, snapshot.effective_config.as_ref()),
+    );
+    if snapshot.current_state != IoNodeLifecycleState::Configured {
+        payload["ok"] = json!(false);
+        if let Some(error) = snapshot.last_error.as_ref() {
+            payload["error"] = json!(error);
+        }
+    }
     payload
 }
 
@@ -1234,15 +1263,10 @@ fn response_message_for(request: Option<&str>) -> &'static str {
     }
 }
 
-fn build_reply(
-    sender: &NodeSender,
-    request: &Message,
-    response_msg: &str,
-    payload: Value,
-) -> Message {
+fn build_reply(own_uuid: &str, request: &Message, response_msg: &str, payload: Value) -> Message {
     Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: own_uuid.to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: request.routing.ttl.max(1),
@@ -1527,6 +1551,123 @@ mod tests {
         };
         assert!(is_node_status_request(&status_get(MSG_NODE_STATUS_GET)));
         assert!(!is_node_status_request(&status_get(MSG_CONFIG_GET)));
+    }
+
+    /// FINDINGS A-91's review: CONFIG_GET says what the status says. While a config the contract
+    /// refused is on disk, it is not `ok`, with the refusal as `error` in place of the family's bare
+    /// `node_not_configured`, though io.blob curates on its defaults; on its config it is `ok`, with
+    /// no error.
+    #[test]
+    fn the_config_answer_names_the_refusal_the_status_gives() {
+        let root = temp_root("config-answer");
+        let configured = boot(&root);
+        let answer = config_get_answer(NODE, &configured, &IoBlobAdapterConfigContract);
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["state"], "CONFIGURED");
+        assert_eq!(answer["error"], Value::Null);
+        assert_eq!(answer["effective_config"], json!({"io": {}}));
+
+        write_config(
+            &root,
+            &json!({"io": {"max_bytes": 0}, "_system": {"config_version": 2}}).to_string(),
+        );
+        let refused = boot(&root);
+        let _ = fs::remove_dir_all(root);
+        let status = node_status_payload(&refused);
+        let answer = config_get_answer(NODE, &refused, &IoBlobAdapterConfigContract);
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "FAILED_CONFIG");
+        assert_eq!(answer["config_version"], 2);
+        assert_eq!(answer["error"]["code"], "invalid_config");
+        let message = answer["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("io.max_bytes"), "{message}");
+        assert_eq!(answer["error"], status["last_error"]);
+    }
+
+    /// FINDINGS A-91's review: NODE_STATUS_GET is answered to whoever asked, on its trace, as
+    /// NODE_STATUS_GET_RESPONSE, with the status of the live control plane it is given.
+    #[test]
+    fn node_status_is_answered_to_the_asker_from_the_live_state() {
+        let request = Message {
+            routing: Routing {
+                src: "uuid-of-the-orchestrator".to_string(),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast(NODE.to_string()),
+                ttl: 16,
+                trace_id: "trace-status-1".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_NODE_STATUS_GET.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        let root = temp_root("status-reply");
+        let configured = boot(&root);
+        write_config(&root, &json!({"io": {"max_bytes": 0}}).to_string());
+        let refused = boot(&root);
+        let _ = fs::remove_dir_all(root);
+
+        let reply = node_status_reply("uuid-of-io-blob", &request, &configured);
+        assert_eq!(reply.routing.src, "uuid-of-io-blob");
+        let Destination::Unicast(dst) = &reply.routing.dst else {
+            panic!("a reply goes to whoever asked: {:?}", reply.routing.dst);
+        };
+        assert_eq!(dst, "uuid-of-the-orchestrator");
+        assert_eq!(reply.routing.trace_id, "trace-status-1");
+        assert_eq!(reply.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(
+            reply.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+        assert_eq!(reply.payload, node_status_payload(&configured));
+        assert_eq!(reply.payload["health_state"], "HEALTHY");
+
+        let reply = node_status_reply("uuid-of-io-blob", &request, &refused);
+        assert_eq!(reply.payload["health_state"], "DEGRADED");
+        assert_eq!(reply.payload["last_error"]["code"], "invalid_config");
+    }
+
+    /// FINDINGS A-91's review: the receive loop answers NODE_STATUS_GET from the config state, as
+    /// its first branch, ahead of the config commands and the curator's admin gate, and the SDK's
+    /// default handler, which says HEALTHY whatever the state, is called nowhere.
+    ///
+    /// It is pinned by reading the source because the property is one of ORDER, as io.slack's
+    /// `control_traffic_never_reaches_the_path_out_to_slack`: a test on `node_status_reply` alone
+    /// passes just as happily with the default handler put back ahead of it. The literals are
+    /// split with `concat!` so this test cannot find ITSELF.
+    #[test]
+    fn the_receive_loop_answers_node_status_from_the_config_state() {
+        let src = include_str!("main.rs");
+        assert!(
+            !src.contains(concat!("try_handle_default_", "node_status(")),
+            "the SDK's default handler says HEALTHY whatever the config state"
+        );
+        let receive = src
+            .find(concat!(
+                "while let Some(message) = incoming.",
+                "recv().await {"
+            ))
+            .expect("the receive loop");
+        let in_loop = |what: &str| {
+            receive
+                + src[receive..]
+                    .find(what)
+                    .unwrap_or_else(|| panic!("the receive loop has {what}"))
+        };
+        let status = in_loop(concat!("if is_node_status_", "request(&message) {"));
+        let reply = in_loop(concat!("node_status_", "reply(sender.uuid(), &message, "));
+        let config = in_loop(concat!("if is_config_", "command(&message) {"));
+        let admin_gate = in_loop(concat!("match authorize_admin_", "message(&message, "));
+        assert!(
+            status < reply && reply < config && config < admin_gate,
+            "broken order: status={status} reply={reply} config={config} admin_gate={admin_gate}"
+        );
+        assert!(
+            !src[receive..status].contains("\n        if "),
+            "nothing is decided between the receive and the status branch"
+        );
     }
 
     fn test_curator(root: &Path) -> BlobCurator {
