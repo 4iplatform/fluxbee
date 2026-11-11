@@ -553,6 +553,9 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
   -d '{"workflow_name": "invoice", "force": true}' | jq .
 ```
 
+Either one is refused with `ORCHESTRATOR_ERROR`, and nothing changes, when SY.admin does not answer
+the node's config read in time: SY.wf-rules cannot tell whether the node exists. Try again.
+
 ---
 
 ## 3. Writing the definition

@@ -25,6 +25,14 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 	if err != nil {
 		return nil, err
 	}
+	// No answer is not no node: with its config read unanswered, the delete cannot tell whether the
+	// WF node exists. A forced delete took it for none: it dropped the workflow and its packages
+	// and left the node running with its instances, where no delete reaches it any more (the review
+	// of A-270). It is refused, with force or without, as a config read the orchestrator refuses
+	// is, and nothing changes.
+	if snapshot.Timeout && !snapshot.ConfigExists {
+		return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: fmt.Sprintf("cannot tell whether %s exists: its %s; nothing was changed, try again", snapshot.NodeName, snapshot.ReadFailure)}
+	}
 
 	if !req.Force {
 		if reason := instancesUnconfirmed(snapshot); reason != "" {
@@ -68,18 +76,16 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 
 // instancesUnconfirmed is why a delete without force cannot tell that the WF node runs no
 // instances, or "" when it can: the node has no config (never deployed, or already purged), or it
-// counted them. Only a RUNNING node is asked to count. One that crashed, was stopped or is
-// restarting keeps its instances in its store, and the kill's purge removes the store with the
-// node: before 0.1.133, a delete a second after a restart_node read STARTING, took the node for
-// one with none, and purged them (A-270).
+// counted them. A read of the node that failed is named, with how. Only a RUNNING node is asked to
+// count. One that crashed, was stopped or is restarting keeps its instances in its store, and the
+// kill's purge removes the store with the node: before 0.1.133, a delete a second after a
+// restart_node read STARTING, took the node for one with none, and purged them (A-270).
 func instancesUnconfirmed(snapshot wfNodeSnapshot) string {
 	switch {
-	case snapshot.Timeout:
-		return "the wf node status timed out"
+	case snapshot.ReadFailure != "":
+		return fmt.Sprintf("the wf node's %s", snapshot.ReadFailure)
 	case !snapshot.ConfigExists:
 		return ""
-	case snapshot.StatusError != "":
-		return fmt.Sprintf("the wf node's status read failed: %s", snapshot.StatusError)
 	case !snapshot.Running && snapshot.LifecycleState == "":
 		return "the wf node's status names no lifecycle_state"
 	case !snapshot.Running:

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 func TestDeleteWorkflowRejectsUnknownInstancesWhenWFDoesNotRespond(t *testing.T) {
@@ -206,16 +208,16 @@ func TestDeleteWorkflowWithoutForceRefusesAWFNodeThatIsNotRunning(t *testing.T) 
 }
 
 // A status read that failed says nothing of the node's instances either: a delete without force
-// refuses, naming the failure (A-270), as it refused one that timed out.
+// refuses, naming the read and how it failed (A-270), as it refused one that timed out.
 func TestDeleteWorkflowWithoutForceRefusesWhenTheWFNodeStatusCannotBeRead(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 		says string
 	}{
-		{"refused", &nodeActionError{Status: "error", Code: "NODE_STATUS_GET_FAILED", Message: "worker1 did not answer"}, "the wf node's status read failed: NODE_STATUS_GET_FAILED: worker1 did not answer"},
-		{"malformed", fmt.Errorf("get_node_status answered without node_status"), "the wf node's status read failed: get_node_status answered without node_status"},
-		{"timed out", context.DeadlineExceeded, "the wf node status timed out"},
+		{"refused", &nodeActionError{Status: "error", Code: "NODE_STATUS_GET_FAILED", Message: "worker1 did not answer"}, "the wf node's status read (get_node_status) failed: NODE_STATUS_GET_FAILED: worker1 did not answer"},
+		{"malformed", fmt.Errorf("get_node_status answered without node_status"), "the wf node's status read (get_node_status) failed: get_node_status answered without node_status"},
+		{"timed out", context.DeadlineExceeded, "the wf node's status read (get_node_status) timed out"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newTestService(t)
@@ -230,6 +232,65 @@ func TestDeleteWorkflowWithoutForceRefusesWhenTheWFNodeStatusCannotBeRead(t *tes
 
 			_, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
 			refusedDelete(t, svc, err, killed, "INSTANCES_UNKNOWN", tc.says, "delete with force to remove it anyway")
+		})
+	}
+}
+
+// A count of a RUNNING node that got no answer, or one that is no count, is named as such: the
+// refusal said "the wf node status timed out" for both, though the status had answered RUNNING
+// (the review of A-270). get_status still shows either as wf_node_timeout.
+func TestDeleteWorkflowWithoutForceNamesTheInstanceCountThatFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		says string
+	}{
+		{"timed out", context.DeadlineExceeded, "the wf node's instance count (WF_LIST_INSTANCES) got no answer within 2s"},
+		{"unreachable", &fluxbeesdk.RpcError{Kind: fluxbeesdk.RpcErrTerminalTransport, Message: "UNREACHABLE (NODE_NOT_FOUND)"}, "the wf node's instance count (WF_LIST_INSTANCES) failed: rpc terminal transport error: UNREACHABLE (NODE_NOT_FOUND)"},
+		{"no count", fmt.Errorf("wf node response missing count"), "the wf node's instance count (WF_LIST_INSTANCES) failed: wf node response missing count"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService(t)
+			applyWorkflowForDelete(t, svc)
+			killed := false
+			svc.nodes = &fakeNodeClient{getNodeConfigFunc: deployedWFNodeConfig, killNodeFunc: purgingKill(t, &killed)}
+			svc.wfNodes = &fakeWFNodeClient{countRunningInstancesFunc: func(string) (int, error) { return 0, tc.err }}
+
+			_, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+			refusedDelete(t, svc, err, killed, "INSTANCES_UNKNOWN", tc.says, "delete with force to remove it anyway")
+
+			status, err := svc.GetWorkflowStatus(GetStatusRequest{WorkflowName: "invoice"})
+			if err != nil || !status.WFNode.Timeout || !status.WFNode.Running || status.WFNode.ActiveInstances != nil || status.WFNode.InstancesError != "" {
+				t.Fatalf("get_status: snapshot=%#v, err=%v", status, err)
+			}
+		})
+	}
+}
+
+// A config read that got no answer cannot tell whether the WF node exists: the delete is refused
+// with force too, and changes nothing. A forced delete took the node for one with no config, left
+// it running with its instances, and dropped the workflow and its packages (the review of A-270).
+func TestDeleteWorkflowRefusesWhenTheWFNodeConfigReadTimesOut(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force %v", force), func(t *testing.T) {
+			svc := newTestService(t)
+			applyWorkflowForDelete(t, svc)
+			killed := false
+			svc.nodes = &fakeNodeClient{
+				getNodeConfigFunc: func(context.Context, string) (map[string]any, error) { return nil, context.DeadlineExceeded },
+				getNodeStatusFunc: func(context.Context, string) (map[string]any, error) {
+					t.Fatal("a node whose config read timed out is not asked for its status")
+					return nil, nil
+				},
+				killNodeFunc: purgingKill(t, &killed),
+			}
+
+			_, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice", Force: force})
+			refusedDelete(t, svc, err, killed, "ORCHESTRATOR_ERROR",
+				"cannot tell whether WF.invoice@motherbee exists: its config read (get_node_config) timed out; nothing was changed, try again")
+			if strings.Contains(err.Error(), "force") {
+				t.Fatalf("force would not remove it either: %v", err)
+			}
 		})
 	}
 }

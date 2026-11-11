@@ -121,7 +121,10 @@ compile and its apply leaves the staged and the current definitions as they were
    version, the backup version and the version the WF node is bound to
    (`purgeWorkflowPackages`). Removal goes through SY.admin's `remove_runtime_version` on the
    motherbee (`purgeOnPrimary`), because on a worker `dist/runtimes` is a receive-only
-   Syncthing mirror.
+   Syncthing mirror. When the node's config read (`get_node_config`) does not answer, the version
+   it is bound to is unknown and nothing is removed (`boundRuntimeVersionForWorkflow`): SY.admin
+   refuses to remove only a version a node runs, so a stopped node would lose its own. The next
+   apply or rollback removes what this one left.
 4. Deploys `WF.<workflow>@<hive>` (`deployPublishedWorkflow`), always through SY.admin's node
    actions for this hive (`node/node_lifecycle.go`):
    - node config exists: `set_node_config` with only the new runtime binding (`runtime`,
@@ -152,16 +155,22 @@ waits 75 s for the answer (`wf_rules_request_timeout`, overridable with
 `DeleteWorkflow` (`node/delete.go`):
 
 - `WORKFLOW_NOT_FOUND` if no slot exists.
+- With `force` or without, a config read of the node (`get_node_config`) that SY.admin or the
+  orchestrator refuses, or that does not answer in time, refuses the delete with
+  `ORCHESTRATOR_ERROR`, and nothing changes: whether the node exists is unknown. Before 0.1.133 a
+  config read that did not answer was taken for no node: a forced delete left the node running
+  with its instances, where no delete reached it any more, and dropped its workflow and packages.
 - Without `force`, it refuses while the WF node has running instances (`INSTANCES_ACTIVE`) or
   when it cannot tell (`INSTANCES_UNKNOWN`, saying why and "delete with force to remove it
   anyway"): the node is not `RUNNING` (its state named: `STARTING`, `STOPPED`, `FAILED` or
-  `UNKNOWN`), its status read failed (the failure named) or timed out, or its instance query
-  failed. It counts instances by asking a `RUNNING` WF node `WF_LIST_INSTANCES` with
-  `status: running` directly (2 s timeout, `node/wf_client.go`), and a node with a config is
-  deleted only once it counted none (`instancesUnconfirmed`). A node that crashed, was stopped or
-  is restarting keeps its instances in its store, which the kill's purge removes: before 0.1.133
-  (A-270) such a node was taken for one with none, and a delete a second after a `restart_node`
-  read `STARTING` and purged them.
+  `UNKNOWN`), its status read (`get_node_status`) or its instance count failed or got no answer
+  (the read and how named), or the node refused the count (its refusal named). It counts
+  instances by asking a `RUNNING` WF node `WF_LIST_INSTANCES` with `status: running` directly
+  (2 s timeout, `node/wf_client.go`), and a node with a config is deleted only once it counted
+  none (`instancesUnconfirmed`). A node that crashed, was stopped or is restarting keeps its
+  instances in its store, which the kill's purge removes: before 0.1.133 (A-270) such a node was
+  taken for one with none, and a delete a second after a `restart_node` read `STARTING` and
+  purged them.
 - A workflow whose WF node has no config (never deployed, or already purged) has none to lose,
   and is deleted without a node step.
 - If the node exists it is removed with `kill_node` (`force: true`, `purge_instance: true`)
@@ -304,8 +313,9 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
   502), with `wf_node.action` `restart_failed` (or `none`), the `warning` and what is current;
   re-run apply once the cause is fixed.
 - `ORCHESTRATOR_ERROR` when SY.admin or the orchestrator refuses a node's config read
-  (`get_node_config`) or a delete's `kill_node`. A status read it refuses makes a delete without
-  `force` `INSTANCES_UNKNOWN`, naming the refusal.
+  (`get_node_config`) or a delete's `kill_node`, and when a delete's config read does not answer
+  in time (whether the node exists is unknown; nothing changes, with `force` or without). A
+  status read it refuses makes a delete without `force` `INSTANCES_UNKNOWN`, naming the refusal.
 
 ## Health
 

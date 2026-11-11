@@ -18,14 +18,21 @@ type wfNodeSnapshot struct {
 	StatusReachable bool
 	HealthState     string
 	ActiveInstances *int
-	Timeout         bool
+	// Timeout is what get_status and list_workflows show as wf_node_timeout: a read of the node did
+	// not answer in time, or its instance count failed other than by the node's refusal.
+	// ReadFailure names which read, and how.
+	Timeout bool
 	// LifecycleState is the lifecycle_state get_node_status answered (RUNNING, STARTING, STOPPED,
-	// FAILED, UNKNOWN), and StatusError why that read failed, other than by a timeout (a timeout is
-	// Timeout). Only a RUNNING node is asked for its running instances.
+	// FAILED, UNKNOWN). Only a RUNNING node is asked for its running instances.
 	LifecycleState string
-	StatusError    string
+	// ReadFailure names the read of the node that failed, and how, for a refusal to say: "config
+	// read (get_node_config) timed out", "status read (get_node_status) failed: <error>",
+	// "instance count (WF_LIST_INSTANCES) got no answer within 2s". A config read the orchestrator
+	// refuses is an ORCHESTRATOR_ERROR instead, and the node's own refusal of the count is
+	// InstancesError.
+	ReadFailure string
 	// InstancesError is why a WF node that answered could not count its running instances (e.g.
-	// node_not_configured while its config is not in use); a timeout is Timeout instead.
+	// node_not_configured while its config is not in use).
 	InstancesError string
 }
 
@@ -130,6 +137,7 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 		}
 		if isRPCTimeout(rpcCtx, err) {
 			snapshot.Timeout = true
+			snapshot.ReadFailure = "config read (get_node_config) timed out"
 			return snapshot, nil
 		}
 		return snapshot, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: err.Error()}
@@ -143,8 +151,9 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 	if err != nil {
 		if isRPCTimeout(rpcCtx, err) {
 			snapshot.Timeout = true
+			snapshot.ReadFailure = "status read (get_node_status) timed out"
 		} else {
-			snapshot.StatusError = err.Error()
+			snapshot.ReadFailure = fmt.Sprintf("status read (get_node_status) failed: %v", err)
 		}
 		return snapshot, nil
 	}
@@ -165,7 +174,14 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 			snapshot.InstancesError = refusal.Error()
 			return snapshot, nil
 		}
+		// No answer, or one that is not a count (the node not reachable by name, a reply without
+		// count): wf_node_timeout, as before, and the delete names which.
 		snapshot.Timeout = true
+		if isRPCTimeout(rpcCtx, err) {
+			snapshot.ReadFailure = fmt.Sprintf("instance count (WF_LIST_INSTANCES) got no answer within %s", wfNodeRPCTimeout)
+		} else {
+			snapshot.ReadFailure = fmt.Sprintf("instance count (WF_LIST_INSTANCES) failed: %v", err)
+		}
 		return snapshot, nil
 	}
 	snapshot.ActiveInstances = intPtr(count)
@@ -189,10 +205,18 @@ func isRPCTimeout(rpcCtx context.Context, err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded")
 }
 
+// boundRuntimeVersionForWorkflow is the version the workflow's WF node is bound to, the one its
+// config names, or "" when it has no config. A config read that did not answer is an error, not
+// "no node": the purge that asks would otherwise remove the version a stopped node is bound to,
+// since SY.admin refuses only a version a node runs (the review of A-270). The apply and the
+// rollback then purge nothing, and their next purge removes what this one left.
 func (s *Service) boundRuntimeVersionForWorkflow(ctx context.Context, workflowName string) (string, error) {
 	snapshot, err := s.inspectWFNode(ctx, workflowName, false)
 	if err != nil {
 		return "", err
+	}
+	if snapshot.Timeout {
+		return "", fmt.Errorf("cannot tell the version %s is bound to: its %s", snapshot.NodeName, snapshot.ReadFailure)
 	}
 	return snapshot.RuntimeVersion, nil
 }

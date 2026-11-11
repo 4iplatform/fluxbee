@@ -144,6 +144,47 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 	}
 }
 
+// A node config read that got no answer leaves the bound version unknown, and any version the
+// purge would remove may be it: the purge removes nothing and says why. Before, it took the
+// timeout for no node, and since SY.admin refuses to remove only a version a node runs, a stopped
+// node could lose the version its config names (the review of A-270). The apply and the rollback
+// go on without the purge.
+func TestPurgeWorkflowPackagesRemovesNothingWhileTheBoundVersionIsUnknown(t *testing.T) {
+	svc := newTestService(t)
+	for range 3 {
+		if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+			t.Fatalf("CompileWorkflow: %v", err)
+		}
+		if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+			t.Fatalf("ApplyWorkflow: %v", err)
+		}
+	}
+	admin := svc.admin.(*fakeAdminClient)
+	admin.removedVersions = nil
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: func(context.Context, string) (map[string]any, error) {
+		return nil, context.DeadlineExceeded
+	}}
+
+	err := svc.PurgeWorkflowPackages("invoice", true)
+	if err == nil || !strings.Contains(err.Error(), "cannot tell the version WF.invoice@motherbee is bound to: its config read (get_node_config) timed out") {
+		t.Fatalf("want the purge refused, naming the read, got %v", err)
+	}
+	if len(admin.removedVersions) != 0 {
+		t.Fatalf("a purge that cannot tell the bound version removes none, removed %v", admin.removedVersions)
+	}
+
+	// The next purge that reads the bound version removes what this one left.
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: func(context.Context, string) (map[string]any, error) {
+		return map[string]any{"status": "ok", "config": map[string]any{"_system": map[string]any{"runtime_version": "0.0.3"}}}, nil
+	}}
+	if err := svc.PurgeWorkflowPackages("invoice", true); err != nil {
+		t.Fatalf("PurgeWorkflowPackages: %v", err)
+	}
+	if strings.Join(admin.removedVersions, ",") != "wf.invoice@0.0.1" {
+		t.Fatalf("want 0.0.1 removed once the bound version is known, got %v", admin.removedVersions)
+	}
+}
+
 // On a worker the dist tree is a receive-only mirror of the motherbee's: purging must ask SY.admin
 // to remove the obsolete versions there and leave the local copy alone (lab 2026-09-30: a local
 // delete on worker1 was never restored, and the next deploy of that version found no files).
