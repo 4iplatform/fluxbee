@@ -334,6 +334,11 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
 - A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
 - A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; SY.admin).
+- A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin; with A-271's class in 0.1.133).
+- A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator).
+- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; the orchestrator; to decide).
+- A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
+- A-285 🔵 The texts Archi and Cloud read do not describe 0.1.133's new answers (low; SY.admin and SY.architect in 0.1.133; the SDK's catalog later).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1410,6 +1415,81 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-285 [Archi] 🔵 low (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
+
+- **`delete_workflow` (A-270):** a WF node that is not RUNNING, or whose instances cannot be
+  counted, now needs `force` or a start first, and a config read with no answer is
+  `ORCHESTRATOR_ERROR` with `force` too. SY.admin's `force` field (`src/bin/sy_admin.rs` ~16544,
+  *"Force delete even if active instances exist."*), Archi's catalog line for `wf_rules_delete`
+  (`src/bin/sy_architect.rs` ~2493) and the reconciler's comment on a null count
+  (`src/bin/sy_architect/reconciler.rs` ~580) say only *running instances*.
+- **`run_node`, `start_node`, `kill_node`, `remove_node_instance` (A-271):** `SERVICE_FAILED` with
+  `retryable: true` means systemctl did not answer and nothing was done (ask again), and a node's
+  `lifecycle_state` can be `UNKNOWN`; SY.admin's per-action HELP names neither, and the Cloud
+  catalog (`crates/fluxbee_sdk/src/cloud.rs` ~143, `list_nodes`) lists four states.
+- **`RUNTIME_IN_USE`'s detail** says *"still running"* for the `STARTING` and `UNKNOWN` entries the
+  orchestrator lists since A-271.
+- **Fix:** SY.admin's and SY.architect's texts in 0.1.133 with A-281; `cloud.rs` with the SDK's
+  next release.
+
+### A-284 [WF/wf-generic] 🔵 low (found 2026-11-11 by A-270's review; read in the code) — The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame
+
+- **Why:** SY.wf-rules counts a WF node's running instances with `WF_LIST_INSTANCES {status:
+  running, limit: 0}` (`go/sy-wf-rules/node/wf_client.go` ~63-69); wf-generic
+  (`handleWFListInstances`, `go/nodes/wf/wf-generic/node/dispatch.go` ~399) takes limit 0 as no
+  limit, answers every instance's summary (about 366 B each) and counts the rows. Past about 350
+  running instances (spec §21 allows 1000 a node) the answer passes the SDK's 128 KiB frame and the
+  node answers `INTERNAL_ERROR` (*"WF_LIST_INSTANCES_RESPONSE not sent: too large"*).
+- **Effect:** `get_status` and `list_workflows` show `active_instances` null with
+  `instances_error`; Archi's removal plan says *unknown* instead of the count the operator decided
+  it shows (2026-11-03); a delete without force answers `INSTANCES_UNKNOWN` instead of
+  `INSTANCES_ACTIVE` (safe: nothing is purged). The count fails exactly for busy workflows.
+- **Fix, later (the WF alone):** a count-only `WF_LIST_INSTANCES` (`count_only: true`: a `COUNT(*)`
+  with the same filters, no rows) that SY.wf-rules asks for.
+
+### A-283 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's review; read in the code; there before it; to decide) — The Syncthing watchdog waits on an API that never answers, and never repairs it
+
+- **Why:** `watchdog_blob_sync` (`src/bin/sy_orchestrator.rs` ~18627) asks each folder with a 10 s
+  timeout: about 120 s a tick on the motherbee (10 folders and 2 folder-error reads), about 80 s on
+  worker1. Its *"syncthing unhealthy; restarting"* path runs `ensure_blob_sync_runtime`, which on a
+  running Syncthing only calls `systemd_start` (a no-op) unless its binary or unit is stale.
+- **Effect:** while Syncthing's REST accepts connections and never answers, a crashed rt-gateway or
+  SY service waits up to about 2 min for the watchdog instead of 5 s, and nothing repairs
+  Syncthing. Since A-271 (0.1.133) the only trace is one journal line a folder after 12 such ticks
+  (about 24 min), with no drift alert.
+- **Fix (the review's proposal):** stop asking after the first no answer in a tick, skip
+  `report_blob_folder_errors` that tick, and add a `syncthing` drift alert when the count is
+  reached. **To decide (the operator):** whether that run also restarts Syncthing.
+
+### A-282 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — A replaced binary is taken for current when `systemctl show` gives no answer
+
+- **Why:** `service_runs_replaced_binary` (`src/bin/sy_orchestrator.rs` ~2212) reads a failed or
+  killed `systemctl show -p MainPID` as *not replaced* (`systemd_unit_show` returns an empty map).
+  Its callers: the boot after a package upgrade (~2207), where `start_core_service` then starts (a
+  no-op) instead of restarting, so the service keeps the old inode while the package and
+  `/versions` say new (U-1's shape); and Syncthing's staleness check in `ensure_blob_sync_runtime`
+  (~18315), A-57's catch-up for a restart an earlier call never reached.
+- **Fix, later (the orchestrator):** ask again; at boot, a check with no answer restarts (a restart
+  also starts a stopped service), recorded in `BootUpgradeRestart` apart from a real replacement;
+  Syncthing's caller never restarts on every ensure while `systemctl show` fails.
+
+### A-281 [General/admin] 🟡 medium (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — `remove_runtime_version` removes a version whose usage it could not read
+
+- **Why:** `handle_remove_runtime_version` (`src/bin/sy_admin.rs` ~19422-19470) refuses only when
+  `usage_global_visible.running_nodes` is not empty, and `query_runtime_usage_global_visible`
+  (~18820) fills a missing `usage_global_visible` with `in_use: false`. The orchestrator's global
+  usage (`global_visible_runtime_usage_summary`, `src/bin/sy_orchestrator.rs` ~20128) answers
+  `{status: error}` with no list when the motherbee's own read fails, and counts only the hives that
+  answered: a spoke that is down, or whose read fails, appears only in `skipped_hives`.
+- **Effect:** worker1's orchestrator is restarting, so its `GET_RUNTIME` times out, while AI.x@worker1
+  runs pinned to ai.generic 0.3.1; the operator removes 0.3.1; SY.admin sees no running node and
+  deletes it from dist; worker1's receive-only mirror deletes it when it reconnects; AI.x runs on
+  an unlinked binary until its next restart, where the reconcile fails it (*"unable to resolve
+  runtime version"*). SY.wf-rules' package purge goes through the same removal.
+- **Fix (0.1.133, SY.admin):** a usage that is missing, has `status: error` or a non-empty
+  `skipped_hives` refuses the removal (409, naming the hives that did not answer), the
+  `in_use: false` default goes, and `RUNTIME_IN_USE`'s detail names each node's state (A-285).
 
 ### A-280 [General/admin] 🔵 low (found 2026-11-11 by A-274's review; read in the code; there before it) — A publish holds the publication lock across its curate and the edge's publish, and on its failure paths across a clean-up its budget does not bound
 
