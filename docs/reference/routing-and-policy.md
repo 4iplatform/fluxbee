@@ -165,6 +165,13 @@ hive's LSA, and as it marks a hive stale (since 0.1.132, A-265): until then a fr
 to a node an LSA had just added got `NODE_NOT_FOUND` from the hub until its next rebuild, up to
 5 s later, and one to a node of a hive just marked stale went on toward that hive.
 
+Builds run at once (a message of one of the router's nodes, the 5 s loops, an LSA applied, the
+stale check). Each takes a generation before it reads the tables, and stores its FIB only if no
+build with a newer generation stored one first (`build_fib`, `store_fib`; A-268, since 0.1.134):
+so once the rebuild that follows a change returns, the FIB has seen that change. Until 0.1.134 the
+last build to store won, and one that read the tables before a change could undo the change's
+rebuild until the next build, up to 5 s: the rebuilds above among them.
+
 | Source (`FibSource`) | Comes from | Match | Next hop | Admin distance |
 | --- | --- | --- | --- | --- |
 | `LocalNode` | nodes connected to this router | EXACT name | this router | 0 |

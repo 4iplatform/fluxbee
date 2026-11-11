@@ -81,7 +81,7 @@ pub struct Router {
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
     tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -162,7 +162,7 @@ impl Router {
             static_routes: Arc::new(Mutex::new(Vec::new())),
             vpn_rules: Arc::new(Mutex::new(Vec::new())),
             tap_rules: Arc::new(Mutex::new(Vec::new())),
-            fib: Arc::new(Mutex::new(Vec::new())),
+            fib: Arc::new(Mutex::new(Fib::default())),
             config_version: Arc::new(Mutex::new(0)),
             opa,
             opa_reader: Arc::new(Mutex::new(None)),
@@ -614,7 +614,7 @@ async fn handle_node(
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
     tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
@@ -1106,7 +1106,7 @@ impl NodeViaTap {
 async fn handle_message(
     msg: &Message,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
@@ -1591,7 +1591,7 @@ async fn fanout_taps_for_unicast(
     snap: &ConfigSnapshot,
     src_handle: &NodeHandle,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
@@ -3192,7 +3192,7 @@ async fn lsa_refresh_loop(
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -4535,7 +4535,7 @@ async fn peer_discovery_loop(
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) {
@@ -4752,7 +4752,7 @@ async fn connect_to_peer(
     identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     log_stream: stream::StreamHandle,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
@@ -4842,7 +4842,7 @@ async fn handle_peer_incoming(
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
@@ -5068,7 +5068,7 @@ async fn handle_peer_message(
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
@@ -5903,7 +5903,7 @@ struct WanContext {
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
     tap_rules: Arc<Mutex<Vec<TapEntry>>>,
-    fib: Arc<Mutex<Vec<FibEntry>>>,
+    fib: Arc<Mutex<Fib>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
     /// Held while a reachability advertisement is built and queued (`broadcast_reachability`,
@@ -5980,6 +5980,24 @@ struct FibEntry {
     action: u8,
 }
 
+/// The router's FIB: its entries, most specific first, and the generations that order its builds
+/// (`rebuild_fib`, A-268).
+#[derive(Default)]
+struct Fib {
+    entries: Vec<FibEntry>,
+    /// The generation the last build took: each build takes the next, under the FIB's lock, before
+    /// it reads anything the FIB is built from.
+    taken: u64,
+    /// The generation of the build whose entries these are.
+    stored: u64,
+}
+
+/// A FIB a build made, with the generation it took before it read anything (A-268).
+struct FibBuild {
+    generation: u64,
+    entries: Vec<FibEntry>,
+}
+
 enum ResolvedRoute {
     Drop,
     Unreachable(&'static str),
@@ -6029,7 +6047,7 @@ async fn refresh_config(
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     force: bool,
@@ -6789,7 +6807,7 @@ async fn refresh_lsa(
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) -> Option<LsaSnapshot> {
     let snapshot = {
@@ -6924,14 +6942,70 @@ async fn reassign_vpns(
     }
 }
 
+/// Builds the FIB from the router's nodes, its siblings' nodes, the static routes, the LSA and the
+/// reachability table, and stores it unless a newer build stored one first (`build_fib`,
+/// `store_fib`, A-268).
 async fn rebuild_fib(
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) {
+    let build = build_fib(
+        fib,
+        nodes,
+        peer_nodes,
+        static_routes,
+        lsa_snapshot,
+        reachability,
+    )
+    .await;
+    store_fib(fib, build).await;
+}
+
+/// Stores `build` as the router's FIB unless a build with a newer generation stored one first.
+/// Builds run at once (a message of one of the router's nodes, the 5 s loops, an LSA applied, the
+/// stale check), and one that read the tables before a change must not replace the FIB of one that
+/// saw it. Each build takes its generation before it reads anything (`build_fib`), and the change's
+/// own rebuild takes one after the change: so a build with a newer generation than that rebuild's
+/// read the change too, and one with an older generation is dropped. Once the rebuild that follows
+/// a change returns, the FIB has seen the change. Until 0.1.134 the last build to store won, and
+/// one that read before a change could undo the change's rebuild until the next build, 5 s at
+/// most: a node an LSA had just added missing from the hub's FIB (A-265), or a stale hive's names
+/// left in it (A-268).
+async fn store_fib(fib: &Arc<Mutex<Fib>>, build: FibBuild) {
+    let mut fib_guard = fib.lock().await;
+    if build.generation <= fib_guard.stored {
+        tracing::debug!(
+            generation = build.generation,
+            stored = fib_guard.stored,
+            "fib build dropped: a newer build stored its fib first"
+        );
+        return;
+    }
+    fib_guard.stored = build.generation;
+    fib_guard.entries = build.entries;
+    tracing::debug!(fib_entries = fib_guard.entries.len(), "fib rebuilt");
+}
+
+/// Builds the FIB from the router's tables. It takes its generation first, under the FIB's lock,
+/// and lets the lock go before it reads anything: the FIB's lock is never held while another is
+/// taken, so the builds add no lock order (A-268).
+async fn build_fib(
+    fib: &Arc<Mutex<Fib>>,
+    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
+    static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
+    lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
+) -> FibBuild {
+    let generation = {
+        let mut fib_guard = fib.lock().await;
+        fib_guard.taken += 1;
+        fib_guard.taken
+    };
     let nodes_snapshot: Vec<(Uuid, NodeHandle)> = {
         let nodes_guard = nodes.lock().await;
         nodes_guard
@@ -7117,10 +7191,10 @@ async fn rebuild_fib(
             .then_with(|| a.metric.cmp(&b.metric))
             .then_with(|| a.installed_at.cmp(&b.installed_at))
     });
-
-    let mut fib_guard = fib.lock().await;
-    *fib_guard = entries;
-    tracing::debug!(fib_entries = fib_guard.len(), "fib rebuilt");
+    FibBuild {
+        generation,
+        entries,
+    }
 }
 
 fn bytes_to_string(buf: &[u8], len: usize) -> &str {
@@ -7366,7 +7440,7 @@ async fn resolve_by_name(
     target: &str,
     src: &NodeHandle,
     nodes: &std::collections::HashMap<Uuid, NodeHandle>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     meta: &Meta,
 ) -> Result<ResolvedRoute, RouterError> {
     if let Some(base) = target.strip_suffix("@*") {
@@ -7386,11 +7460,11 @@ async fn resolve_by_name_inner(
     target: &str,
     src: &NodeHandle,
     nodes: &std::collections::HashMap<Uuid, NodeHandle>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     meta: &Meta,
 ) -> Result<ResolvedRoute, RouterError> {
     let fib_guard = fib.lock().await;
-    for entry in fib_guard.iter() {
+    for entry in fib_guard.entries.iter() {
         if !pattern_match_kind(entry.match_kind, &entry.pattern, target) {
             continue;
         }
@@ -7467,13 +7541,13 @@ async fn resolve_by_name_any_hive(
     base: &str,
     src: &NodeHandle,
     nodes: &std::collections::HashMap<Uuid, NodeHandle>,
-    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    fib: &Arc<Mutex<Fib>>,
     meta: &Meta,
 ) -> Result<ResolvedRoute, RouterError> {
     let fib_guard = fib.lock().await;
     // Routes see the destination as written, `name@*`.
     let target = format!("{}@*", base);
-    for entry in fib_guard.iter() {
+    for entry in fib_guard.entries.iter() {
         let matched = match entry.source {
             FibSource::LocalNode
             | FibSource::PeerNode
@@ -8432,7 +8506,7 @@ mod tests {
             metric: 0,
             installed_at: 0,
         }]));
-        let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+        let fib = Arc::new(Mutex::new(Fib::default()));
         rebuild_fib(
             &fib,
             &Arc::new(Mutex::new(HashMap::<Uuid, NodeHandle>::new())),
@@ -8645,7 +8719,7 @@ mod tests {
             lsa.nodes
                 .push(lsa_node_entry(Uuid::new_v4(), "IO.audit@worker1", 1));
             let lsa_snapshot = Arc::new(Mutex::new(Some(lsa)));
-            let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+            let fib = Arc::new(Mutex::new(Fib::default()));
             rebuild_fib(
                 &fib,
                 &nodes,
@@ -8764,7 +8838,7 @@ mod tests {
         lsa.nodes
             .push(lsa_node_entry(Uuid::new_v4(), "IO.audit@worker1", 1));
         let lsa_snapshot = Arc::new(Mutex::new(Some(lsa)));
-        let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+        let fib = Arc::new(Mutex::new(Fib::default()));
         rebuild_fib(
             &fib,
             &nodes,
@@ -9110,7 +9184,7 @@ mod tests {
             Uuid::new_v4(),
             "IO.audit@worker1",
         ))));
-        let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+        let fib = Arc::new(Mutex::new(Fib::default()));
         let static_routes = Arc::new(Mutex::new(Vec::<StaticRoute>::new()));
         let reachability = Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new()));
         rebuild_fib(
@@ -9457,7 +9531,7 @@ mod tests {
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             Uuid::new_v4(),
             false,
             &Arc::new(Mutex::new(None)),
@@ -11064,7 +11138,7 @@ mod tests {
         handle_message(
             &msg,
             &nodes,
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
@@ -11162,7 +11236,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Fib::default())),
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(OpaResolver::new())),
             Arc::new(Mutex::new(None)),
@@ -11331,7 +11405,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Fib::default())),
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(OpaResolver::new())),
             Arc::new(Mutex::new(None)),
@@ -12127,7 +12201,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Fib::default())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(Vec::new())),
             Arc::clone(&shm.writer),
@@ -12203,7 +12277,7 @@ mod tests {
                     "SY.frontdesk.gov@motherbee",
                     Arc::new(Mutex::new(None)),
                     Arc::new(Mutex::new(HashMap::new())),
-                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(Mutex::new(Fib::default())),
                     stream::StreamHandle::detached(),
                     false,
                 )
@@ -12329,7 +12403,7 @@ mod tests {
         handle_message(
             msg,
             nodes,
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
@@ -12588,7 +12662,7 @@ mod tests {
         handle_message(
             msg,
             nodes,
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             peers,
@@ -13563,7 +13637,7 @@ mod tests {
             handle_message(
                 &notice,
                 &nodes,
-                &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+                &Arc::new(Mutex::new(Fib::default())),
                 &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
                 &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
                 &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
@@ -13639,7 +13713,10 @@ mod tests {
         handle_message(
             &message,
             &nodes,
-            &Arc::new(Mutex::new(fib)),
+            &Arc::new(Mutex::new(Fib {
+                entries: fib,
+                ..Fib::default()
+            })),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
@@ -13750,7 +13827,7 @@ mod tests {
             handle_message(
                 &message,
                 &nodes,
-                &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+                &Arc::new(Mutex::new(Fib::default())),
                 &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
                 &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
                 &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
@@ -13842,7 +13919,7 @@ mod tests {
         handle_message(
             &msg,
             &nodes,
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
@@ -13981,7 +14058,7 @@ mod tests {
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             router_uuid,
             false,
             &Arc::new(Mutex::new(None)),
@@ -14345,7 +14422,7 @@ mod tests {
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
             "worker1",
             "SY.frontdesk.gov@worker1",
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             router_uuid,
             false,
             &lsa_snapshot,
@@ -14400,7 +14477,7 @@ mod tests {
         peer_routers: Arc<Mutex<HashMap<Uuid, PeerRouter>>>,
         peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>>,
         wan_peers: Arc<Mutex<HashMap<String, WanPeer>>>,
-        fib: Arc<Mutex<Vec<FibEntry>>>,
+        fib: Arc<Mutex<Fib>>,
         static_routes: Arc<Mutex<Vec<StaticRoute>>>,
         lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
         reachability: Arc<Mutex<HashMap<Uuid, ReachabilityEntry>>>,
@@ -14501,7 +14578,7 @@ mod tests {
                 peer_routers: Arc::new(Mutex::new(routers)),
                 peers: Arc::new(Mutex::new(links)),
                 wan_peers: Arc::new(Mutex::new(wan_peers)),
-                fib: Arc::new(Mutex::new(Vec::new())),
+                fib: Arc::new(Mutex::new(Fib::default())),
                 static_routes: Arc::new(Mutex::new(Vec::new())),
                 lsa_snapshot,
                 reachability: Arc::new(Mutex::new(HashMap::new())),
@@ -14669,7 +14746,7 @@ mod tests {
         handle_message(
             msg,
             nodes,
-            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(Fib::default())),
             &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
             peer_routers,
             peers,
@@ -14955,7 +15032,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
-                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Fib::default())),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(Vec::new())),
                 Arc::clone(&shm.writer),
@@ -15383,7 +15460,7 @@ mod tests {
             static_routes: Arc::new(Mutex::new(Vec::new())),
             vpn_rules: Arc::new(Mutex::new(Vec::new())),
             tap_rules: Arc::new(Mutex::new(Vec::new())),
-            fib: Arc::new(Mutex::new(Vec::new())),
+            fib: Arc::new(Mutex::new(Fib::default())),
             broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
             reachability_adverts: Mutex::new(()),
@@ -17577,6 +17654,91 @@ mod tests {
         unlink_test_shm(&lsa_name);
     }
 
+    /// A-268 on the hub: two builds of its FIB at once are stored in the order of the generations
+    /// they took before they read anything, whichever stores last. A build reads the hub's tables;
+    /// worker1's LSA then names a new node, and the arm that applies it rebuilds the FIB (A-265);
+    /// the first build stores last and is dropped, so a frame ingress1's node sends by name to the
+    /// new node goes on to worker1. A build taken after both stores. Until 0.1.134 the last build
+    /// to store won: the older one undid A-265's rebuild, and the hub answered such a frame
+    /// NODE_NOT_FOUND until its next build, up to 5 s later.
+    #[tokio::test]
+    async fn a_fib_build_that_read_before_an_lsa_never_undoes_the_lsas_own() {
+        let hub = test_wan_context(None);
+        let lsa_name = format!("/lsa-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        unlink_test_shm(&lsa_name);
+        *hub.lsa_writer.lock().await = Some(
+            LsaRegionWriter::open_or_create(&lsa_name, hub.router_uuid, "motherbee")
+                .expect("lsa region"),
+        );
+        let (hub_to_ingress1, mut ingress1_reads) = wan_link_to(&hub, "ingress1").await;
+        let (hub_to_worker1, mut worker1_reads) = wan_link_to(&hub, "worker1").await;
+        let sender = Uuid::new_v4();
+        lsa_from(
+            &hub,
+            "ingress1",
+            &hub_to_ingress1,
+            1,
+            &[(sender, "IO.x@ingress1")],
+        )
+        .await;
+        let build = || {
+            build_fib(
+                &hub.fib,
+                &hub.nodes,
+                &hub.peer_nodes,
+                &hub.static_routes,
+                &hub.lsa_snapshot,
+                &hub.reachability,
+            )
+        };
+        let older = build().await;
+        lsa_from(
+            &hub,
+            "worker1",
+            &hub_to_worker1,
+            1,
+            &[(Uuid::new_v4(), "AI.new@worker1")],
+        )
+        .await;
+        store_fib(&hub.fib, older).await;
+        messages_on(&mut ingress1_reads);
+        messages_on(&mut worker1_reads);
+        let by_name = || Message {
+            routing: Routing {
+                src: sender.to_string(),
+                src_l2_name: Some("IO.x@ingress1".to_string()),
+                dst: Destination::Unicast("AI.new@worker1".to_string()),
+                ttl: 15,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let first = by_name();
+        wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &first).await;
+        assert!(
+            has(messages_on(&mut worker1_reads), &first),
+            "on to worker1"
+        );
+        assert!(
+            messages_on(&mut ingress1_reads).is_empty(),
+            "and no NODE_NOT_FOUND back"
+        );
+
+        // A build taken after both reads the same tables and stores: the node stays.
+        let newer = build().await;
+        let generation = newer.generation;
+        store_fib(&hub.fib, newer).await;
+        assert_eq!(hub.fib.lock().await.stored, generation, "stored");
+        let again = by_name();
+        wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &again).await;
+        assert!(has(messages_on(&mut worker1_reads), &again));
+        unlink_test_shm(&lsa_name);
+    }
+
     /// `name`'s link on `ctx`'s router, and what it reads: a node of `uuid`.
     async fn node_on(ctx: &WanContext, uuid: Uuid, name: &str) -> LinkReceiver {
         let (tx, rx) = link_queue("node");
@@ -18240,7 +18402,7 @@ mod tests {
                     &Arc::new(Mutex::new(HashMap::new())),
                     &Arc::new(Mutex::new(HashMap::new())),
                     &Arc::new(Mutex::new(Vec::new())),
-                    &Arc::new(Mutex::new(Vec::new())),
+                    &Arc::new(Mutex::new(Fib::default())),
                     &Arc::new(Mutex::new(HashMap::new())),
                 )
                 .await
