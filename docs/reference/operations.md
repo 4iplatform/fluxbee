@@ -423,7 +423,10 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   workflow's first deploy) is counted by its nodes:
   - `running_nodes`: each node pinned to the version whose unit may run, on the motherbee and on
     each hive that answered, with its `hive` and `lifecycle` (`RUNNING`; `STARTING`, its unit runs
-    and the router does not see it yet; `UNKNOWN`, systemd did not answer for its unit);
+    and the router does not see it yet; `UNKNOWN`, systemd did not answer for its unit). A node
+    whose unit does not run (stopped, failed, between two restarts of a crash loop) is not
+    listed: one relaunched later fails to start once its version is gone, so stop it
+    (`kill_node`) or move it first;
   - `skipped_hives`: each hive whose use is unknown, with its `reason` and the `message` that came
     with it: `TIMEOUT` (no answer within 10 s: its orchestrator stopped or restarting while the
     LSA still shows it), `UNREACHABLE` (the request never reached it: down, or stale in the LSA),
@@ -452,26 +455,28 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   node lists hold none of those 4. SY.admin refuses the removal, with nothing removed:
   `409 RUNTIME_IN_USE` while a node is listed, its detail naming each node with its hive and
   lifecycle; `409 RUNTIME_USAGE_UNKNOWN` while the use is unknown (an error, or a hive in
-  `skipped_hives`), naming each hive not read and why in `payload.unanswered_hives`, with
-  `payload.retryable: true`. Ask again once each hive answers: bring a worker back, finish or
-  remove a join left behind, and remove a hive gone for good with `remove_hive` first. A
-  workflow's delete whose purge meets the refusal answers `PACKAGE_PUBLISH_FAILED` after the
-  workflow and its node are gone, and that version stays in dist. Before 0.1.133 a hive not
-  counted read as one with no node: a version a node of a restarting worker ran on was removed,
-  and the worker's mirror deleted it when it came back. And every ingress and egress was in
-  `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`, and the hives were asked one
-  after another, 45 s each, so one that did not answer held the read past SY.admin's 30 s
-  ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
+  `skipped_hives`), naming each hive not read and why in `payload.unanswered_hives` (a join not
+  done with its `status` and `join_phase`; the motherbee alone when the read failed there, so no
+  hive was counted), with `payload.retryable: true`. Ask again once each hive answers: bring a
+  worker back, finish or remove a join left behind, and remove a hive gone for good with
+  `remove_hive` first. A workflow's delete whose purge meets the refusal is done all the same,
+  and names that version and those after it in `payload.packages_left` (below). Before 0.1.133
+  a hive not counted read as one with no node: a version a node of a restarting worker ran on
+  was removed, and the worker's mirror deleted it when it came back. And every ingress and egress
+  was in `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`, and the hives were
+  asked one after another, 45 s each, so one that did not answer held the read past SY.admin's
+  30 s ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
 - **A workflow's delete can leave its versions in dist (FINDINGS A-281).** SY.wf-rules removes them
-  last, after the workflow, its node and its state, through `remove_runtime_version`, and stops at
-  the first one refused or not answered within its 5 s: the delete answers
-  `PACKAGE_PUBLISH_FAILED`, and the versions not removed stay, all of them possibly. A workflow
-  created again under that name numbers its versions from 0.0.1 again, so its deploy is refused
-  (`VERSION_CONFLICT`, answered `PACKAGE_PUBLISH_FAILED`) while a version that stayed has other
-  contents: remove each version of `wf.<name>` that stayed
-  (`GET /hives/motherbee/runtimes/wf.<name>` lists them) with `remove_runtime_version` once every
-  hive answers, then deploy. `fluxbee-factory-reset` counts such a delete as failed, and its next
-  run no longer lists the workflow.
+  last, after the workflow, its node and its state, through `remove_runtime_version`, each waited
+  for up to 35 s within what is left of the request's 60 s, and stops at the first one refused or
+  not answered. Since 0.1.133 the delete answers ok all the same: `payload.packages_left` names
+  each version left, with why, `retryable` and the hives not read, and `payload.warning` says so.
+  A workflow created again under that name numbers its versions above every version the dist
+  holds, and its deploy's purge removes those left; to remove them sooner,
+  `remove_runtime_version` each (`GET /hives/motherbee/runtimes/wf.<name>` lists them) once every
+  hive answers, the runtime's current last. `fluxbee-factory-reset` prints them under each deleted
+  workflow and counts them in its log line (`packages_left=`); its next run no longer lists the
+  workflow.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on
   `dist/runtimes-manifest.lock` from its read of the manifest to its write: SY.admin's
   `publish_runtime_package`, `remove_runtime_version` (across its read of the version's use, up to
@@ -868,7 +873,9 @@ answer it stops at its start, when it lists the hives, before it changes anythin
    goes on, counts it as a problem, and names the pages that stay public from SY.admin's ledger
    (`state/sy-admin/publications.json`, read only); they go down when they expire, 30 days at
    most. The dry run lists the pages;
-2. deletes every workflow with `force` on motherbee and worker hives;
+2. deletes every workflow with `force` on motherbee and worker hives; a delete whose purge left
+   versions of its package in the motherbee's dist is done, and the reset names each (`left in
+   the motherbee's dist: ...`), which a re-run does not remove;
 3. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
    instances of `base-nodes.json`), on every hive, each once;
 4. marks and purges every non-system ILK, deletes every vault secret except
@@ -892,8 +899,8 @@ and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and
 SY.admin's publication ledger included: its rows say how each page went down, for 30 days after
 it did (FINDINGS A-231). It never touches the blob store: the blobs the nodes wrote stay in
 `blob/active/` and `blob/staging/`; only the pages' copies in `blob/public/` go with their pages
-(IO.blob removes a copy once no page shares it). Re-running is safe; a summary goes to
-`/var/lib/fluxbee/state/factory-reset.log`.
+(IO.blob removes a copy once no page shares it). Re-running is safe; a summary line goes to
+`/var/lib/fluxbee/state/factory-reset.log`, with `packages_left=<n>` beside `problems=<n>`.
 
 ## Certificates (ACME)
 

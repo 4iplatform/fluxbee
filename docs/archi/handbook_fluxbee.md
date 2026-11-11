@@ -965,15 +965,23 @@ person: when its provider gave no answer, the error carries the operator's text 
     was changed): ask again. Any other `ORCHESTRATOR_ERROR` may come from the node's kill, which
     may have stopped or removed it: read the workflow's status (`wf_rules_get_status`) before
     asking again.
-  - `PACKAGE_PUBLISH_FAILED` after a removal: the workflow, its node and its state are gone, and
-    its versions not removed yet stayed in dist, all of them possibly. The first
-    `remove_runtime_version` refused, or not answered within 5 s, stopped the rest (the reason in
-    the detail). Say so; never that the removal failed, and never run it again.
-  - While such a version stays, a workflow created again under that name can be refused at its
-    deploy: its versions start again at `0.0.1`, and one that stayed with other contents (another
-    definition, or another hive) answers `PACKAGE_PUBLISH_FAILED` with `VERSION_CONFLICT`. Remove
-    each version of `wf.<workflow_name>` that stayed (`remove_runtime_version`, once every hive
-    answers), then deploy.
+  - A removal that answers ok has removed the workflow, its node and its state, also when
+    `payload.packages_left` names versions of `wf.<workflow_name>` that stayed in the motherbee's
+    dist: since 0.1.133 the purge of its versions never fails the delete. Each is `{runtime,
+    version, error_code, detail, retryable, unanswered_hives}`: the version where the purge
+    stopped and why (`RUNTIME_USAGE_UNKNOWN`, its `unanswered_hives` naming the hives not read;
+    `RUNTIME_IN_USE`; `TIMEOUT`, no answer in time, 35 s at most, which SY.admin may still
+    finish), and each after it `PURGE_STOPPED`; or one entry with no version, `DIST_UNREADABLE`,
+    when the hive's dist could not be listed and none was removed. `retryable` says whether asking
+    again, nothing changed first, may remove it (not for `RUNTIME_IN_USE`: its node is stopped or
+    moved first). `payload.warning` says the workflow is deleted and what removes them. Say the
+    workflow is deleted, and which versions stayed and why; never that the removal failed, and
+    never run it again (it answers `WORKFLOW_NOT_FOUND`).
+  - Those versions block nothing: a workflow created again under that name numbers its versions
+    above them, and its deploy's purge removes them. To remove them sooner, offer one
+    `remove_runtime_version` step each (hive `motherbee`) once every hive answers, in
+    `packages_left`'s order, the runtime's current last (a step refused `RUNTIME_CURRENT_CONFLICT`
+    goes after the others), in a plan the operator confirms.
 - **Operating instances** (the node is `WF.<workflow_name>`):
   - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and its
     last change (`updated_at_ms`), which is not when it entered its state: that is its last
@@ -1063,9 +1071,11 @@ The ownership and call path are fixed:
   each with its date.
 - **After a removal that failed or timed out,** the answer names no page, yet the node may be
   gone already: the orchestrator may finish a purge whose answer timed out, and a workflow's
-  delete can fail after its WF node was purged (a retry then answers `WORKFLOW_NOT_FOUND`). Read
+  delete that fails at its WF node's kill or after it (an `ORCHESTRATOR_ERROR` other than the
+  config read's: the kill refused or not answered in time) may have purged its WF node. Read
   `/artifacts` for the node's pages before you report to the operator, and say which stay public
-  as below.
+  as below. A workflow's delete that answers ok names its WF node's pages also when
+  `packages_left` names versions that stayed.
 - When `count` is more than 0, tell the operator which pages stay public and until when: each
   `expires_at` as a date. Offer to take them down now, one `unpublish_artifact` step each, in a
   plan the operator confirms; never stage it without their yes.
@@ -1704,12 +1714,15 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
     whose unit does not run (stopped, failed, between two restarts) is not listed: relaunched
     later, it fails to start once its version is gone.
   - `RUNTIME_USAGE_UNKNOWN` when some hive's nodes could not be read: `payload.unanswered_hives`
-    names each hive and why. A worker down, restarting or stale (`UNREACHABLE`), or one that could
-    not read its nodes; a hive whose join is not done, with its `status` and `join_phase` (finish
-    the join with `add_hive`, or remove the hive with `remove_hive`); or the motherbee alone, when
-    the read failed there and no hive was counted. It is never "not in use": ask again once the
-    hive answers. A hive gone for good is removed with `remove_hive` first. An ingress or an egress
-    receives no runtime, so it never refuses a removal.
+    names each hive and why. A worker that gave no answer within 10 s (`TIMEOUT`: its orchestrator
+    stuck or restarting), one down or stale (`UNREACHABLE`), or one that could not read its nodes
+    (`USAGE_UNREADABLE`: the detail says why, such as a node whose config cannot be read while it
+    runs; tell the operator to stop that node or fix its config); a hive whose join is not done,
+    with its `status` and `join_phase` (finish the join with `add_hive`, or remove the hive with
+    `remove_hive`); or the motherbee alone, when the read failed there and no hive was counted
+    (`TIMEOUT`: its own orchestrator gave no answer within 30 s; ask again). It is never "not in
+    use": ask again once the hive answers. A hive gone for good is removed with `remove_hive`
+    first. An ingress or an egress receives no runtime, so it never refuses a removal.
 
 ---
 

@@ -17251,17 +17251,18 @@ const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and
 
 /// What `remove_runtime_version` refuses, nothing removed.
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. A node whose unit does not run is not listed (stopped, failed, or between two restarts of a crash loop): one relaunched later (relaunch_on_boot) fails to start once its version is gone, so stop it (kill_node) or move it first.";
-const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable is true. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT, TRANSPORT_ERROR; a worker whose orchestrator does not answer delays it, since the motherbee asks the workers one at a time), refused it (its code), could not make it (USAGE_READ_FAILED) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive): it did not answer (UNREACHABLE: down, restarting, or stale in the LSA), answered an error (RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet) or gave no list of its nodes (USAGE_UNREADABLE). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
+const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable is true. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
 /// A workflow delete's ORCHESTRATOR_ERROR that does not come from the WF node's config read: the
 /// node's kill (`DeleteWorkflow` in go/sy-wf-rules/node/delete.go), which SY.wf-rules waits for
 /// 25 s (`nodeDeleteTimeout`) while SY.admin gives kill_node 180 s.
 const WF_DELETE_KILL_ERROR_NOTE: &str = "Any other ORCHESTRATOR_ERROR may come from the node's kill, refused or not answered within SY.wf-rules' 25 s while the orchestrator went on, which may have stopped or removed the node: read the workflow's status (wf_rules_get_status) before asking again.";
 
-/// What a workflow's delete leaves when SY.wf-rules' purge of its versions meets a removal that
-/// fails (`purgeOnPrimary` in go/sy-wf-rules/node/package_publish.go), and what a workflow created
-/// again under the name meets: its versions start again at 0.0.1 (`Store.NextVersion`).
-const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes every published version of wf.<workflow_name> last, with one remove_runtime_version each that SY.wf-rules gives 5 s, and stops at the first that fails: a refusal (RUNTIME_IN_USE, or RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281) or no answer in time. It then answers PACKAGE_PUBLISH_FAILED with that failure, though the workflow, its node and its state are gone, and every version not removed stays in dist, all of them possibly. A workflow created again under that name publishes from 0.0.1 again, and a version that stayed with other contents refuses its deploy (VERSION_CONFLICT, answered PACKAGE_PUBLISH_FAILED): remove each version of wf.<workflow_name> that stayed (get_runtime lists them) with remove_runtime_version once every hive answers, then deploy.";
+/// What a workflow's delete answers when SY.wf-rules' purge of its versions meets a removal that
+/// fails (`purgeOnPrimary` in go/sy-wf-rules/node/package_publish.go), and how a workflow created
+/// again under the name numbers its versions (`nextWorkflowVersion` in
+/// go/sy-wf-rules/node/compile.go).
+const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the versions of wf.<workflow_name> last, once its WF node and its state are gone: each version its hive's dist lists and each its slots named, one remove_runtime_version at a time, the current last, each waited for up to 35 s (SY.admin reads every hive's use first) within what is left of the request's 60 s, and stops at the first that fails: a refusal (RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281; RUNTIME_IN_USE while a node runs it) or no answer in time (TIMEOUT: SY.admin may still remove it). Since 0.1.133 the delete answers ok all the same: payload.packages_left names each version not removed, {runtime, version, error_code, detail, retryable, unanswered_hives}, the one it stopped at with its failure and each after it PURGE_STOPPED ([] when every version it knew of went; one entry with no version, DIST_UNREADABLE, when its hive's dist could not be listed and none was removed); retryable says whether asking again, nothing changed first, may remove it (false for RUNTIME_IN_USE: stop or move the node first), and unanswered_hives, when SY.admin named any, the hives it did not read. payload.warning says the workflow is deleted and what removes them. Say so; never that the delete failed, and never ask it again: it answers WORKFLOW_NOT_FOUND. The versions left block nothing: a workflow created again under that name numbers its versions above every version the dist holds, and its deploy's purge removes them. To remove them sooner, remove_runtime_version each once every hive answers, in packages_left's order, the runtime's current last: one refused RUNTIME_CURRENT_CONFLICT goes after the others.";
 
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
@@ -17753,7 +17754,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "wf_rules_delete" => vec![
             "workflow_name is required.",
             "Delete is a direct command to SY.wf-rules, not a node CONFIG_SET operation.",
-            "SY.wf-rules purges the workflow's WF node (kill_node with purge_instance) and answers {deleted, wf_node: {node_name, action}}.",
+            "SY.wf-rules purges the workflow's WF node (kill_node with purge_instance) and answers {deleted, wf_node: {node_name, action}, packages_left, warning}: packages_left and warning as below.",
             "Without force it is refused, with nothing changed, while the WF node runs instances (INSTANCES_ACTIVE, with the count) and when they cannot be counted (INSTANCES_UNKNOWN, saying why): the node is not RUNNING (its state named), or its status read or its count failed or got no answer (FINDINGS A-270, since 0.1.133). A node that is not RUNNING keeps its instances in its store, and force removes them with it.",
             "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR (502), whose detail says nothing was changed: whether the node exists is unknown. Ask again.",
             WF_DELETE_KILL_ERROR_NOTE,
@@ -17792,7 +17793,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             RUNTIME_REMOVAL_IN_USE_NOTE,
             RUNTIME_REMOVAL_UNKNOWN_NOTE,
             "502 SERVICE_FAILED when the manifest it wrote cannot be read back: the version was removed, and get_runtime shows the runtime as it is now.",
-            "SY.wf-rules removes its workflows' old versions with it, each removal given 5 s: a deploy or a rollback whose removal is refused, or not answered in time, goes on, and the next one tries that version again.",
+            "SY.wf-rules removes its workflows' old versions with it, each removal waited for up to 35 s (SY.admin reads every hive's use first) and a deploy's or a rollback's whole purge within 15 s: a deploy or a rollback whose removal is refused, or not answered in time, goes on, logs what it left (purge left wf.<workflow> <version>: <code>: <detail>), and the next one tries those versions again.",
             WF_DELETE_VERSIONS_LEFT_NOTE,
         ],
         "reset_base_runtime" => vec![
@@ -18911,11 +18912,16 @@ const UNFINISHED_JOIN_NEXT: &str = "finish its join (add_hive again) or remove i
 
 /// A hive whose nodes the read of a runtime version's use did not count (FINDINGS A-281). Either
 /// a hive the motherbee's orchestrator lists in `skipped_hives`, a worker or a hive whose role its
-/// registry entry does not record, that did not answer its `GET_RUNTIME` (`UNREACHABLE`), answered
-/// it with an error (that error's code: `RUNTIME_NOT_FOUND` while its copy of the manifest does not
-/// list the runtime yet) or gave no list of its nodes (`USAGE_UNREADABLE`); never an ingress or an
-/// egress (`RegisteredHive::WithoutRuntimes`). Or the motherbee, whose read failed, so that no
-/// hive was counted (`RuntimeVersionUse::NotRead`).
+/// registry entry does not record, each asked at once for its nodes (`GET_RUNTIME` with
+/// `usage_only`): asked, and no answer within 10 s (`TIMEOUT`: its orchestrator stuck or
+/// restarting while the LSA shows it); the request never delivered (`UNREACHABLE`: down, or stale
+/// in the LSA); an error it answered (that error's code: `RUNTIME_NOT_FOUND` while its copy of the
+/// manifest does not list the runtime yet, `RUNTIME_MANIFEST_MISSING` without one, only from a
+/// worker before 0.1.133, which reads its copy first); or no list of its nodes
+/// (`USAGE_UNREADABLE`: its nodes' folder, or the `config.json` of a node whose unit runs or gives
+/// systemd no answer, cannot be read); never an ingress or an egress
+/// (`RegisteredHive::WithoutRuntimes`). Or the motherbee, whose read failed, so that no hive was
+/// counted (`RuntimeVersionUse::NotRead`).
 #[derive(Debug)]
 struct UnreadHive {
     hive: String,
@@ -19285,7 +19291,10 @@ fn runtime_version_removable(
             }),
         )),
         // The read did not end on the motherbee: no hive was counted, the motherbee's own nodes
-        // included, so naming the motherbee alone would read as a hive whose nodes are unknown.
+        // included, so naming the motherbee alone would read as a hive whose nodes are unknown. A
+        // timeout is the motherbee's orchestrator's own: it asks every worker at once and names
+        // one that does not answer as TIMEOUT within 10 s (`RUNTIME_USAGE_HIVE_TIMEOUT` in
+        // src/bin/sy_orchestrator.rs), well within SY.admin's wait for the read.
         RuntimeVersionUse::NotRead { usage, failure } => Err(refusal(
             "RUNTIME_USAGE_UNKNOWN",
             format!(
@@ -19294,10 +19303,15 @@ fn runtime_version_removable(
                  removed.{} Ask again",
                 failure.describe(),
                 if failure.reason == "TIMEOUT" {
-                    " A worker whose orchestrator does not answer delays that read: the motherbee \
-                     asks the workers one at a time."
+                    format!(
+                        " The motherbee's orchestrator itself gave no answer within {} s: it was \
+                         stuck or restarting, or its read waited behind other reads of a \
+                         runtime's use, which it runs 4 at a time. A worker that does not answer \
+                         is named in skipped_hives as TIMEOUT within 10 s.",
+                        admin_action_timeout("get_runtime").as_secs()
+                    )
                 } else {
-                    ""
+                    String::new()
                 }
             ),
             serde_json::json!({
@@ -37157,10 +37171,12 @@ mod tests {
 
     /// No answer from the motherbee's orchestrator is no "not in use" either: refused, naming the
     /// motherbee and how the read failed, and saying no hive was counted, where it read "the nodes
-    /// of motherbee were not read" of a healthy motherbee. A timeout says that a worker whose
-    /// orchestrator does not answer delays the read: the motherbee asks the workers one at a time,
-    /// each for longer than SY.admin waits. Before, RUNTIME_REMOVE_FAILED, which reads as a removal
-    /// that failed under way.
+    /// of motherbee were not read" of a healthy motherbee. A timeout says that the motherbee's
+    /// orchestrator itself gave no answer within SY.admin's wait (30 s by default): stuck or
+    /// restarting, or its read behind other reads of a runtime's use, 4 at a time. A worker that
+    /// does not answer is named as TIMEOUT within 10 s instead, since the motherbee asks every
+    /// worker at once, where it asked them one at a time, each for longer than SY.admin waits.
+    /// Before, RUNTIME_REMOVE_FAILED, which reads as a removal that failed under way.
     #[test]
     fn a_read_of_a_versions_use_with_no_answer_refuses_the_removal() {
         for (err, reason) in [
@@ -37182,12 +37198,15 @@ mod tests {
             let detail = body["error_detail"].as_str().unwrap_or_default();
             assert_eq!(
                 detail.contains(
-                    " A worker whose orchestrator does not answer delays that read: the motherbee \
-                     asks the workers one at a time. Ask again"
+                    " The motherbee's orchestrator itself gave no answer within 30 s: it was stuck \
+                     or restarting, or its read waited behind other reads of a runtime's use, \
+                     which it runs 4 at a time. A worker that does not answer is named in \
+                     skipped_hives as TIMEOUT within 10 s. Ask again"
                 ),
                 reason == "TIMEOUT",
                 "{detail}"
             );
+            assert!(!detail.contains("one at a time"), "{detail}");
         }
         assert_eq!(error_code_to_http_status("RUNTIME_USAGE_UNKNOWN"), 409);
     }
@@ -37314,9 +37333,12 @@ mod tests {
 
     /// The help says what a runtime version's removal answers (FINDINGS A-281): RUNTIME_IN_USE
     /// with each node's state, and RUNTIME_USAGE_UNKNOWN with the hives not read and what to do,
-    /// where a workflow's delete meets them too, with what it leaves and what a workflow created
-    /// again under the name then meets; reset_base_runtime's way to remove a hand publish no
-    /// longer reads as "once no node runs it".
+    /// every worker asked at once, never one at a time; a workflow's delete meets them too, answers
+    /// ok all the same with the versions it left (packages_left), never PACKAGE_PUBLISH_FAILED, and
+    /// a workflow created again under the name numbers its versions above them, never 0.0.1 again;
+    /// SY.wf-rules waits up to 35 s for each removal, 15 s for a deploy's whole purge, where it
+    /// gave each 5 s; reset_base_runtime's way to remove a hand publish no longer reads as "once no
+    /// node runs it".
     #[test]
     fn the_help_says_what_a_runtime_versions_removal_answers() {
         let notes = admin_action_request_notes("remove_runtime_version");
@@ -37340,13 +37362,16 @@ mod tests {
             "An ingress or an egress, by the role its registry entry records in any state of its \
              join, receives no runtime and is never one of them.",
             "gave no usage of every hive (NO_USAGE)",
-            "gave no list of its nodes (USAGE_UNREADABLE)",
+            "could not read its own nodes (USAGE_UNREADABLE",
             "no hive's nodes were counted",
-            "a worker whose orchestrator does not answer delays it",
+            "which asks every worker at once",
+            "gave no answer within 10 s (TIMEOUT",
+            "only a worker before 0.1.133 does",
             "finish its join with add_hive again, or remove it with remove_hive",
         ] {
             assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE.contains(words), "{words}");
         }
+        assert!(!RUNTIME_REMOVAL_UNKNOWN_NOTE.contains("one at a time"));
         assert!(
             RUNTIME_REMOVAL_IN_USE_NOTE.contains("A node whose unit does not run is not listed")
         );
@@ -37359,14 +37384,28 @@ mod tests {
         for words in [
             "stops at the first that fails",
             "RUNTIME_USAGE_UNKNOWN",
-            "PACKAGE_PUBLISH_FAILED",
-            "every version not removed stays in dist, all of them possibly",
-            "publishes from 0.0.1 again",
-            "VERSION_CONFLICT",
-            "with remove_runtime_version once every hive answers",
+            "answers ok all the same",
+            "packages_left",
+            "35 s",
+            "numbers its versions above every version the dist holds",
+            "the runtime's current last",
+            "RUNTIME_CURRENT_CONFLICT",
+            "once every hive answers",
         ] {
             assert!(WF_DELETE_VERSIONS_LEFT_NOTE.contains(words), "{words}");
         }
+        for gone in [
+            "PACKAGE_PUBLISH_FAILED",
+            "0.0.1 again",
+            "VERSION_CONFLICT",
+            "all of them possibly",
+        ] {
+            assert!(!WF_DELETE_VERSIONS_LEFT_NOTE.contains(gone), "{gone}");
+        }
+        assert!(!all.contains("each removal given 5 s") && all.contains("15 s"));
+        assert!(admin_action_request_notes("wf_rules_delete")
+            .join(" ")
+            .contains("packages_left"));
     }
 
     /// FINDINGS A-285: the help Archi and the operator read says what 0.1.133 answers. A node

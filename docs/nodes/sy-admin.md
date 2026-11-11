@@ -611,18 +611,23 @@ not read. Otherwise, with nothing removed:
   since 0.1.133). `payload.unanswered_hives` names each hive not read, `{hive, reason, detail}`,
   the detail names them with their reasons, and `payload.retryable` is true:
   - the motherbee alone, when the read failed there, and the detail says that no hive's nodes were
-    counted: its orchestrator did not answer the read (`TIMEOUT`, `TRANSPORT_ERROR`; a worker
-    whose orchestrator does not answer delays it past SY.admin's 30 s, since the motherbee asks
-    the workers one at a time), refused it (its code), could not make it (`USAGE_READ_FAILED`: its
-    usage says `status: error`, its own nodes or its registry unread) or gave no usage of every
-    hive (`NO_USAGE`: none, or one without `running_nodes` or `skipped_hives`);
-  - a worker of its `skipped_hives`, or a hive whose role its registry entry does not record: one
-    that did not answer its `GET_RUNTIME` (`UNREACHABLE`: down, its orchestrator restarting, or
-    stale in the LSA), answered it with an error (its code: `RUNTIME_NOT_FOUND` while its copy of
-    the manifest does not list the runtime yet, `RUNTIME_MANIFEST_MISSING` for a worker without
-    one) or gave no list of its nodes (`USAGE_UNREADABLE`). A hive whose join the registry does not
-    record as done also gets its `status`, its `join_phase` and `next`: finish its join (`add_hive`
-    again) or remove it (`remove_hive`).
+    counted: its orchestrator did not answer the read (`TIMEOUT`: no answer within SY.admin's
+    30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a
+    runtime's use, which it runs 4 at a time; `TRANSPORT_ERROR`), refused it (its code), could not
+    make it (`USAGE_READ_FAILED`: its usage says `status: error`, its own nodes or its registry
+    unread, a node's `config.json` that cannot be read while the node may run among them) or gave
+    no usage of every hive (`NO_USAGE`: none, or one without `running_nodes` or `skipped_hives`);
+  - a worker of its `skipped_hives`, or a hive whose role its registry entry does not record, each
+    asked at once for its nodes alone (`GET_RUNTIME` with `usage_only`): one that gave no answer
+    within 10 s (`TIMEOUT`: its orchestrator stuck or restarting while the LSA shows it); one the
+    request never reached (`UNREACHABLE`: down, or stale in the LSA); one that answered an error
+    (its code; only a worker before 0.1.133 does, which reads its copy of the manifest first:
+    `RUNTIME_NOT_FOUND` while that copy does not list the runtime yet, `RUNTIME_MANIFEST_MISSING`
+    without one; a 0.1.133 worker answers its nodes whatever its copy lists); or one that could
+    not read its own nodes (`USAGE_UNREADABLE`: its nodes' folder, or the `config.json` of a node
+    whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its
+    config). A hive whose join the registry does not record as done also gets its `status`, its
+    `join_phase` and `next`: finish its join (`add_hive` again) or remove it (`remove_hive`).
 
   Ask again once each hive answers. A hive gone for good is removed with `remove_hive` first: the
   orchestrator asks only the hives of the registry. Before 0.1.133 a hive not counted read as one
@@ -641,16 +646,21 @@ use since 0.1.133: a removal that could never pass no longer waits for every hiv
 cannot be read back: the version was removed.
 
 SY.wf-rules removes its workflows' old versions through this action
-([SY.wf-rules](sy-wf-rules.md)), giving each removal 5 s: a deploy or a rollback whose removal is
-refused, or not answered in time, goes on, and the next one tries that version again. A workflow's
-delete removes every version last, after the workflow, its node and its state are gone, and stops
-at the first removal that fails: it answers `PACKAGE_PUBLISH_FAILED` with that failure, and every
-version not removed stays in dist, all of them possibly. Its state gone, a workflow created again
-under that name numbers its versions from 0.0.1 again, and its publish of a version that stayed
-with other contents is refused `VERSION_CONFLICT`, which SY.wf-rules answers
-`PACKAGE_PUBLISH_FAILED`: remove each version of `wf.<name>` that stayed (`get_runtime` lists them)
-with `remove_runtime_version` once every hive answers, then deploy. `fluxbee-factory-reset` counts
-such a delete as failed, and a second run no longer lists the workflow, so its versions stay too.
+([SY.wf-rules](sy-wf-rules.md)), waiting up to 35 s for each removal (this read of every hive's use
+comes first) and, in a deploy or a rollback, up to 15 s for the whole purge: a deploy or a rollback
+whose removal is refused, or not answered in time, goes on, logs what it left, and the next one
+tries those versions again. A workflow's delete removes its versions last, after the workflow, its
+node and its state are gone, within what is left of its request's 60 s, and stops at the first
+removal that fails; since 0.1.133 it answers ok all the same: `payload.packages_left` names each
+version left, `{runtime, version, error_code, detail, retryable, unanswered_hives}` (the one it
+stopped at with its failure, each after it `PURGE_STOPPED`; `[]` when every version it knew of
+went), and `payload.warning` says what removes them. A workflow created again under that name
+numbers its versions above every version the dist holds, so it never publishes over one left
+there, and its deploy's purge removes them; or remove each with `remove_runtime_version` once every
+hive answers, in `packages_left`'s order, the runtime's current last (`RUNTIME_CURRENT_CONFLICT`
+otherwise). `fluxbee-factory-reset` prints each version left under its workflow and counts them in
+its log line (`packages_left=`); a second run does not remove them, since the workflow is no
+longer listed.
 
 ## Workflows: the check and the instances
 
