@@ -100,6 +100,9 @@ func Run(ctx context.Context, opts RunOptions) error {
 		NodeName:   sender.FullName(),
 		Plane:      plane,
 		VersionStr: "1.0",
+		timerAnswerDrops: func() uint64 {
+			return routerDispatcher.CommandChannelDrops()["broadcast:"+timerAnswersChannel]
+		},
 	}
 	defer func() {
 		if rt.Store != nil {

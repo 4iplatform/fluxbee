@@ -734,7 +734,9 @@ func TestOnlyTheRouterAndSYTimerOfTheHiveRefuseARequest(t *testing.T) {
 }
 
 // The reconcile with SY.timer settles the refused timers: one SY.timer lists pending is no longer
-// refused, and one it does not have is scheduled again, a new request, its refusal gone.
+// refused, and one it does not have goes again from the loop's tick, at once, a request like any
+// other (FINDINGS A-254's review). The node is DEGRADED until SY.timer takes it, and the reconcile's
+// log says no longer degraded only once no timer waits for SY.timer.
 func TestTheReconcileSettlesTheRefusedTimers(t *testing.T) {
 	tc := newRefusalTest(t)
 	listed, listedTrace := tc.start()
@@ -744,19 +746,91 @@ func TestTheReconcileSettlesTheRefusedTimers(t *testing.T) {
 	tc.later(time.Second)
 	scheduled := len(tc.timer.scheduled)
 	pending := timerInfo(timerClientRef(listed, "deadline"), fixedClock().Add(2*time.Hour).UnixMilli())
-	tc.rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{pending}, askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+	logged := nodeLog(t, func() {
+		tc.rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{pending}, askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+	})
 	if row, _ := tc.deadline(listed); row.Refusal != "" {
 		t.Fatalf("SY.timer has the listed timer: %+v", row)
 	}
-	if row, _ := tc.deadline(missing); row.Refusal != "" || len(tc.timer.scheduled) != scheduled+1 || tc.timer.scheduled[scheduled] != timerClientRef(missing, "deadline") {
-		t.Fatalf("the missing timer is scheduled again: %+v %v", row, tc.timer.scheduled[scheduled:])
+	if row, _ := tc.deadline(missing); row.Refusal != "TIMER_LIST: SY.timer@motherbee does not have it" || row.ResendAtMS != tc.now.UnixMilli() ||
+		len(tc.timer.scheduled) != scheduled {
+		t.Fatalf("the missing timer goes from the loop's tick, at once: %+v %v", row, tc.timer.scheduled[scheduled:])
 	}
-	if health, code, message := tc.health(); health != "HEALTHY" {
-		t.Fatalf("nothing is refused: %s %s %q", health, code, message)
+	if !strings.Contains(logged, "timers reconciled with SY.timer; 1 timer(s) wait for it to take them") || strings.Contains(logged, "no longer degraded") {
+		t.Fatalf("the log says a timer waits for SY.timer: %s", logged)
+	}
+	if health, code, _ := tc.health(); health != "DEGRADED" || code != errCodeTimersNotReconciled {
+		t.Fatalf("a timer waits for SY.timer: %s %s", health, code)
+	}
+
+	tc.tick()
+	if len(tc.timer.scheduled) != scheduled+1 || tc.timer.scheduled[scheduled] != timerClientRef(missing, "deadline") {
+		t.Fatalf("the missing timer is scheduled again: %v", tc.timer.scheduled[scheduled:])
 	}
 	tc.dispatch(unreachable(tc.timer.lastTrace(t), "NODE_NOT_FOUND"))
-	if row, _ := tc.deadline(missing); row.Refusal == "" {
+	if row, _ := tc.deadline(missing); !strings.Contains(row.Refusal, "UNREACHABLE reason=NODE_NOT_FOUND") {
 		t.Fatalf("the reconcile's schedule is a request like any other: %+v", row)
+	}
+	tc.later(10 * time.Second)
+	tc.tick()
+	tc.dispatch(timerTook(tc.timer.lastTrace(t)))
+	if health, code, message := tc.health(); health != "HEALTHY" {
+		t.Fatalf("SY.timer took it: %s %s %q", health, code, message)
+	}
+	both := []sdk.TimerInfo{pending, timerInfo(timerClientRef(missing, "deadline"), fixedClock().Add(2*time.Hour).UnixMilli())}
+	logged = nodeLog(t, func() {
+		tc.rt.takeTimerList(context.Background(), timerListResult{timers: both, askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+	})
+	if !strings.Contains(logged, "timers reconciled with SY.timer; the node is no longer degraded") {
+		t.Fatalf("nothing waits for SY.timer: %s", logged)
+	}
+}
+
+// FINDINGS A-254's review: the timers the reconcile finds SY.timer lost go paced, 32 a tick at most,
+// where the reconcile sent every one at once, past SY.timer's 64 messages and the node's 64 answers
+// after a long outage: the answers the SDK dropped read as refusals 30 s later.
+func TestTheTimersSYTimerLostGoAgainPaced(t *testing.T) {
+	tc := newRefusalTest(t)
+	for range 40 {
+		_, traceID := tc.start()
+		tc.dispatch(timerTook(traceID))
+	}
+	tc.later(time.Second)
+	scheduled := len(tc.timer.scheduled)
+	tc.rt.takeTimerList(context.Background(), timerListResult{askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+	if len(tc.timer.scheduled) != scheduled {
+		t.Fatalf("the reconcile sends none at once: %d", len(tc.timer.scheduled)-scheduled)
+	}
+	for tick, want := range []int{32, 40} {
+		tc.tick()
+		if len(tc.timer.scheduled)-scheduled != want {
+			t.Fatalf("tick %d: %d timers went again, want %d", tick+1, len(tc.timer.scheduled)-scheduled, want)
+		}
+		tc.later(time.Second)
+	}
+}
+
+// FINDINGS A-254's review: the answers of SY.timer the SDK dropped, the node's channel for them
+// full, are named in the node's log on the loop's tick, once each, so the gate tells the refusals
+// their requests read as 30 s later from SY.timer's own.
+func TestTheAnswersTheSDKDroppedAreLogged(t *testing.T) {
+	tc := newRefusalTest(t)
+	tc.start()
+	var dropped uint64
+	tc.rt.timerAnswerDrops = func() uint64 { return dropped }
+	if logged := nodeLog(t, tc.tick); strings.Contains(logged, "dropped") {
+		t.Fatalf("nothing dropped: %s", logged)
+	}
+	dropped = 3
+	if logged := nodeLog(t, tc.tick); !strings.Contains(logged, "the SDK dropped 3 answer(s) of SY.timer@motherbee, the node's channel for them full") {
+		t.Fatalf("the drops are logged: %s", logged)
+	}
+	if logged := nodeLog(t, tc.tick); strings.Contains(logged, "dropped") {
+		t.Fatalf("once: %s", logged)
+	}
+	dropped = 5
+	if logged := nodeLog(t, tc.tick); !strings.Contains(logged, "the SDK dropped 2 answer(s)") {
+		t.Fatalf("the new drops are logged: %s", logged)
 	}
 }
 

@@ -173,6 +173,13 @@ func (r *timerRequests) unanswered(cutoffMS int64, limit int) []timerRequest {
 	return late
 }
 
+// noteRefused says a timer of the index may be refused: the loop's tick looks at it.
+func (r *timerRequests) noteRefused() {
+	if r != nil {
+		r.refused = true
+	}
+}
+
 // waiting reports whether the node waits for anything from SY.timer: an answer, or a refused timer
 // to go again.
 func (r *timerRequests) waiting() bool {
@@ -218,9 +225,7 @@ func refuseTimer(ctx context.Context, actx ActionContext, ref timerRef, why stri
 	if err := actx.Store.RefuseTimer(ctx, ref.instanceID, ref.timerKey, why, resendAt); err != nil {
 		return fmt.Errorf("mark timer %s refused: %w", ref, err)
 	}
-	if actx.Requests != nil {
-		actx.Requests.refused = true
-	}
+	actx.Requests.noteRefused()
 	if resendAt >= row.FireAtMS {
 		log.Printf("wf: timer %s not taken by SY.timer: %s; too near its time for SY.timer, the node fires it itself at %s", ref, why, msTime(row.FireAtMS))
 		return nil
@@ -394,12 +399,28 @@ func (rt *NodeRuntime) tickTimerRequests(ctx context.Context) {
 	if rt.Store == nil || rt.Registry == nil || rt.ActCtx.Timer == nil {
 		return
 	}
+	rt.noteDroppedTimerAnswers()
 	now := nowMS(rt.ActCtx.Clock)
 	for _, req := range rt.ActCtx.Requests.unanswered(now-timerAnswerTimeout.Milliseconds(), maxTimerRequestsPerTick) {
 		rt.timerRequestRefused(ctx, req, fmt.Sprintf("no answer from %s in %s", timerAuthority(rt.NodeName), timerAnswerTimeout))
 	}
 	rt.sendRefusedTimersAgain(ctx, now)
 	rt.countRefusedTimers(ctx)
+}
+
+// noteDroppedTimerAnswers logs the answers of SY.timer the SDK dropped since the tick before, the
+// node's channel for them full (64 at once): the requests they answered are taken as refused once
+// timerAnswerTimeout passes, and their timers go again, so the log tells those from SY.timer's own
+// refusals (FINDINGS A-254's review).
+func (rt *NodeRuntime) noteDroppedTimerAnswers() {
+	if rt.timerAnswerDrops == nil {
+		return
+	}
+	if dropped := rt.timerAnswerDrops(); dropped > rt.timerAnswersDropped {
+		log.Printf("wf: the SDK dropped %d answer(s) of %s, the node's channel for them full: the requests they answered are taken as refused %s after they went, and their timers go again",
+			dropped-rt.timerAnswersDropped, timerAuthority(rt.NodeName), timerAnswerTimeout)
+		rt.timerAnswersDropped = dropped
+	}
 }
 
 // sendRefusedTimersAgain sends again the refused timers due at nowMS, the earliest first: a timer

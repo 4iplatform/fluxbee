@@ -85,9 +85,9 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   restart fires the timers it missed in the order they fire, reading each row again first. If
   SY.timer does not answer at start, or the timer index (or a row of it) cannot be read, the node
   starts `DEGRADED` (`timers_not_reconciled`) and reconciles its timers on a later try, every 30 s;
-  a timer SY.timer never got is scheduled again then, and one scheduled after the list was asked is
-  left alone. A timer fires from 60 s to 366 days ahead, SY.timer's floor and ceiling (a definition
-  that asks more does not load).
+  a timer SY.timer never got is scheduled again then, from the loop, 32 a second at most, and one
+  scheduled after the list was asked is left alone. A timer fires from 60 s to 366 days ahead,
+  SY.timer's floor and ceiling (a definition that asks more does not load).
 - **A timer SY.timer does not take goes again** (FINDINGS A-254). A `schedule_timer` or a
   `reschedule_timer` records the timer in the index first (a `cancel_timer` drops it first, whatever
   becomes of its cancel, a fire of it then dropped as stale), then sends its request without waiting,
@@ -104,8 +104,9 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   later request about the same timer supersedes an earlier one. A schedule SY.timer answers
   `already_existed` at a time later than the index's (a move it did not take of a timer it holds)
   is moved to its time, a `TIMER_RESCHEDULE` followed the same way, as is one the reconcile finds
-  so (`timerHeld`). Before, a schedule refused while
-  SY.timer restarted was lost until the node's next start, and the SDK dropped SY.timer's refusals.
+  so (`timerHeld`). The answers the SDK drops, the node's channel for them full, are named in the
+  log on the loop's tick. Before, a schedule refused while SY.timer restarted was lost until the
+  node's next start, and the SDK dropped SY.timer's refusals.
 - **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
   store does not open, or fails during recovery, the node stays up and connected: `NODE_STATUS_GET`
   says `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a file system

@@ -523,7 +523,8 @@ func TestRecoverDrainsPendingInternalEvents(t *testing.T) {
 // A timer an instance schedules while the node is DEGRADED goes to SY.timer fire-and-forget, and
 // SY.timer, not answering, may never get it. When SY.timer answers again without it, the timer is
 // scheduled again, under the same client_ref (SY.timer keeps one pending timer per client_ref),
-// instead of leaving the index, which left its instance waiting forever.
+// instead of leaving the index, which left its instance waiting forever. It goes from the receive
+// loop's tick, paced, as a timer SY.timer has not taken (FINDINGS A-254's review).
 func TestATimerScheduledWhileDegradedIsScheduledAgain(t *testing.T) {
 	timer := &mockTimerLister{listErr: errSendFailed}
 	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, timer)
@@ -542,6 +543,10 @@ func TestATimerScheduledWhileDegradedIsScheduledAgain(t *testing.T) {
 	if rt.timersPending != nil {
 		t.Fatalf("still DEGRADED: %v", rt.timersPending)
 	}
+	if row, _, _ := rt.Store.GetTimerForInstance(context.Background(), instanceID, "ask_timeout"); row.Refusal == "" || len(timer.scheduled) != scheduled {
+		t.Fatalf("the timer goes from the loop's tick: %+v %v", row, timer.scheduled[scheduled:])
+	}
+	rt.tickTimerRequests(context.Background())
 	if ref := timerClientRef(instanceID, "ask_timeout"); len(timer.scheduled) != scheduled+1 || timer.scheduled[scheduled] != ref {
 		t.Fatalf("the timer is scheduled again as %s: %v", ref, timer.scheduled[scheduled:])
 	}

@@ -64,6 +64,11 @@ type NodeRuntime struct {
 	// storeDown is set while the engine waits for its store (startEngine, FINDINGS A-217): the node
 	// stays up, refuses every event, and the receive loop opens the store again until it can.
 	storeDown *storeOutage
+	// timerAnswerDrops counts the answers of SY.timer the SDK dropped, the node's channel for them
+	// full (nil counts none), and timerAnswersDropped is the count the loop's tick logged last
+	// (noteDroppedTimerAnswers, FINDINGS A-254's review).
+	timerAnswerDrops    func() uint64
+	timerAnswersDropped uint64
 }
 
 // storeOutage is why the engine waits for its store, and the definition it runs once the store
