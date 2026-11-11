@@ -202,6 +202,15 @@ no change required
     0.33 s, 5.98 s before), A-246, A-253 (each dropped record named), A-208 (A-247 closed into it).
     **Found by its review:** A-268, A-269; **by its gate:** A-272, low. **Next:** 0.1.133 (A-191,
     A-240, A-241, A-255, A-258, A-259, A-260, A-266, A-267, A-270, A-271).
+24. **The sweep's end (the operator, 2026-11-11):** 0.1.133, one branch per binary (A-191 with A-232,
+    A-240, A-241, A-255 checked live, A-258, A-259, A-260, A-266, A-267, A-270, A-271, A-274, A-279
+    with A-288, A-281, A-285's texts); 0.1.134, the router alone (A-272, A-268); 0.1.135, the AI SDK
+    alone (A-257); 0.1.136, one branch per binary (A-243, A-263, A-273, A-280 in SY.admin; A-282,
+    A-283 in the orchestrator; A-277 in SY.identity; A-284 in the WF; A-286, A-287 in SY.architect;
+    A-292 in SY.cognition; A-293 in IO.cloud); then A-278 alone (the SDKs and the WF). **From
+    0.1.136 a new finding enters only if it breaks operation; the rest is recorded for later.** The
+    SDKs' lows (A-264, A-290, A-294, A-295, A-285's catalog text) and the router's A-269 go with each
+    one's next change.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -312,7 +321,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   IO node (low).
 - A-240 🔵 A local get_node_status writes on every read (low).
 - A-241 🔵 A spoke's blob staging is never cleaned (low, to decide).
-- A-243 🔵 Who can take a page down: IO/WF nodes publish but cannot unpublish; the Cloud can neither list nor unpublish (to decide).
+- A-243 🔵 Who can take a page down: each publisher its own (the operator, 2026-11-11; SY.admin in 0.1.136; the Cloud with its track).
 - A-257 🔵 The frontdesk's handoff waits behind its LLM turns (low; the AI SDK).
 - A-258 🔵 SY.timer's refusals leave no line in its own log (low).
 - A-259 🔵 SY.timer's scheduler keeps a canceled or moved timer's entry until its old fire time (low).
@@ -326,17 +335,17 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-270 🔵 `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances (low; SY.wf-rules; with A-240 in 0.1.133).
 - A-271 🔵 A check that decides an action takes "no answer" for "no": A-267's class, left in the orchestrator (low).
 - A-272 🔵 Every router sends a WAN broadcast back to the peer it came from (low; the router).
-- A-273 🔵 `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door open and its new token lost (low; to decide).
+- A-273 🔵 `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door open and its new token lost (low; decided 2026-11-11; SY.admin in 0.1.136).
 - A-274 🔵 A take-down holds the publication lock across its edge and IO.blob calls (low; SY.admin).
-- A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; to decide).
+- A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
-- A-277 🔵 A removed hive whose identity key could not be deleted keeps reading the identity store (low; to decide).
+- A-277 🔵 A removed hive whose identity key could not be deleted keeps reading the identity store (low; decided 2026-11-11; SY.identity in 0.1.136).
 - A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
 - A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
-- A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; SY.admin).
+- A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; the small fix, SY.admin in 0.1.136).
 - A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin; with A-271's class in 0.1.133).
 - A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator).
-- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; the orchestrator; to decide).
+- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart; the orchestrator in 0.1.136).
 - A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
 - A-285 🔵 The texts Archi and Cloud read do not describe 0.1.133's new answers (low; SY.admin and SY.architect in 0.1.133; the SDK's catalog later).
 - A-286 🔵 Archi's SCMD reads take `+` for a space where SY.admin keeps it (low; SY.architect).
@@ -1434,6 +1443,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (0.1.135) the AI runtime drains it continuously; any other node that stops draining a command
   channel grows without limit.
 - **Fix, later (the Rust SDK alone):** a bounded channel with a named refusal past its bound.
+- **The operator (2026-11-11):** after the sweep (the Rust SDK alone, with the next change there).
 
 ### A-294 [General/AI SDK] 🔵 low (found 2026-11-11 by A-257's builder and review; read in the code; there before it) — One answer over the frame limit stops the whole AI runtime
 
@@ -1445,6 +1455,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Since 0.1.135 (A-257's review):** no waiting turn starts after such an end.
 - **Fix, later (the AI SDK alone):** a write refused as too large fails that message alone, counted
   and logged, as an exhausted recoverable write does.
+- **The operator (2026-11-11):** after the sweep (the AI SDK alone, with the next change there).
 
 ### A-293 [IO/io.cloud] 🔵 low (found 2026-11-11 by A-257's review fixes; read in the code) — io.cloud answers `FRONTDESK_REJECTED` to a retryable frontdesk error
 
@@ -1490,6 +1501,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** the AI runtime gives the node a read-only load handle (the AI SDK, alone); both
   runners put it in `NODE_STATUS_GET`'s `extensions`, which the orchestrator passes on, and report
   `DEGRADED` while turns were refused in the last interval.
+- **The operator (2026-11-11):** after the sweep (the AI SDK, then the runners alone, with the next change there).
 
 ### A-289 [General/router] 🔵 low (found 2026-11-11 by the router's 0.1.134 builder and review; read in the code; there before it; several routers a hive, not supported) — A broadcast from a router that is not the gateway needs ttl 4 to cross the WAN
 
@@ -1581,6 +1593,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (the review's proposal):** stop asking after the first no answer in a tick, skip
   `report_blob_folder_errors` that tick, and add a `syncthing` drift alert when the count is
   reached. **To decide (the operator):** whether that run also restarts Syncthing.
+- **The operator's call (2026-11-11):** the safe part, and a bounded restart: after 5 min with no
+  answer, `systemctl restart` of Syncthing, at most once an hour, with a drift alert and a log
+  line. In 0.1.136 (the orchestrator).
 
 ### A-282 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — A replaced binary is taken for current when `systemctl show` gives no answer
 
@@ -1629,6 +1644,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   a publish still under way, which `handle_unpublish_artifact` today rules out by the lock (comment
   at ~6833-6836). The smaller fix keeps the failure path's clean-up inside the budget, or outside
   the lock.
+- **The operator's call (2026-11-11):** the small fix: the failure path's clean-up inside the
+  budget or outside the lock; a publish that succeeds is unchanged. In 0.1.136 (SY.admin).
 
 ### A-279 [Archi] 🔵 low (found 2026-11-11 by A-266's review; read in the code; there before it) — Archi's timer list passes its query undecoded, so a cursor or an owner it encoded is refused
 
@@ -1661,6 +1678,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, its own release (the SDKs, then the WF):** `List` says whether more follow (or returns the
   cursor) and the WF pages through all its pending timers; a cheaper stopgap is that the WF takes
   index timers past the last one listed as unknown, not missing.
+- **The operator's call (2026-11-11):** built in the sweep, its own release (the SDKs and the WF),
+  after 0.1.136.
 
 ### A-277 [General/identity] 🔵 low (found 2026-11-11 by the review fixes of identity's 0.1.133 branch; read in the code) — A removed hive whose identity key could not be deleted keeps reading the identity store
 
@@ -1674,6 +1693,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, to decide (the auth path):** the handshake answers a hive the registry no longer lists
   with the same uniform rejection, after checking that a join's first handshake comes after its
   registry entry.
+- **The operator's call (2026-11-11):** SY.identity refuses a hive the hive registry no longer
+  lists. In 0.1.136 (SY.identity).
 
 ### A-276 [General/identity] 🔵 low (found 2026-11-11 by A-191's builder; read in the code) — A replica cut off during a purge can bring back a purged node ILK
 
@@ -1694,6 +1715,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **To decide:** the operator's rule for ILKs (2026-11-10: one with history is disabled, never
   deleted) suggests `remove_hive` marks them retired as it does the system ones; whether their
   secrets are deleted with them, or kept until the operator says.
+- **The operator's rule (2026-11-11):** only Fluxbee Cloud, through IO.cloud, deletes one thing
+  at a time (its own secrets, and what it can today); an ILK with data is a reference and is never
+  deleted; ILKs, secrets and history go together only when the Cloud deletes a whole tenant, with a
+  warning. So `remove_hive` leaves its nodes' ILKs and secrets as they are, and the chapter on
+  deleting (A-159) takes it. **A conflict to settle there:** a node's purge (`kill_node` with
+  `purge_instance`, then `teardown_node`) deletes the node's secrets and purges its ILK today.
 
 ### A-274 [General/admin] 🔵 low (found 2026-11-11 by A-260's builder; read in the code; there before it) — A take-down holds the publication lock across its edge and IO.blob calls
 
@@ -1713,6 +1740,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the error answer carries no token and says to publish again, which rotates the token once more.
 - **To decide:** whether the failed record is retried before answering, the door closed again, or
   the token handed over with the error (A-124: a token through Archi reaches the AI provider).
+- **The operator's call (2026-11-11):** the record is tried once more before the error; when it
+  still fails, the error says the previous token no longer works and running again hands a new one.
+  The token goes out once, only with a success. In 0.1.136 (SY.admin).
 
 ### A-272 [General/router] 🔵 low (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
 
@@ -1851,6 +1881,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `meta.context` land in the window with a small text too.
 - **Fix, later:** the Go SDK gets the Rust SDK's `text/v1` offload (the blob layout and its promote;
   check the WF nodes' access to the blob root). A Go SDK release, alone.
+- **The operator (2026-11-11):** after the sweep (the Go SDK alone, with the next change there).
 
 ### A-263 [General/admin] 🔵 low (found 2026-11-10 by A-250's builder; read in the code) — The installation update's follow reads one hive at a time
 
@@ -1960,6 +1991,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   restart IO.cloud after a publish.
 - **Fix:** SY.admin applies the recorded edge live (a `CONFIG_SET` to IO.cloud at its live
   `config_version` + 1, or its restart), and the restart steps written in 0.1.131 come out.
+- **The operator's call (2026-11-11):** checked live in 0.1.133's gate: the new token goes to a
+  0600 file whose path the operator gets, and the operator passes it to the Cloud team.
 
 ### A-254 [WF] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a timer refused while SY.timer was down went again 6 s later and fired on time; fire_in 400d a COMPILE_ERROR) (found 2026-11-10 by the Go SDK's 0.1.130 builder; read in the code, not run) — A WF can lose a timer schedule without knowing it
 
@@ -2166,6 +2199,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **0.1.131 (A-242):** the Cloud's `delete_node` (a kill with purge) is no longer refused for a page
   up, and IO.cloud's view of its answer keeps no `pages_left_up`: the Cloud is not told which pages
   stay public. The operator's answer is pending.
+- **The operator's call (2026-11-11):** each publisher takes its own pages down: IO and WF nodes
+  as AI nodes do (only their own). The Cloud's list and take-down of its tenant's pages wait for
+  the Cloud track. In 0.1.136 (SY.admin).
 
 ### A-242 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a node's and a tenant's purge with two pages up, each naming them; the spawn's rollback stays by design) (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
 
