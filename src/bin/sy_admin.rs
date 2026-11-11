@@ -8233,33 +8233,53 @@ impl CloudEdgeTry {
 /// `config.json` and nothing more; IO.cloud reads that file when it starts. Alone, it left a running
 /// IO.cloud dropping every Cloud request through a new edge (a 504 for Cloud) until its restart: on
 /// a fresh install's first publish, and whenever the door moved to another edge. So the record is
-/// applied at once (`apply_cloud_edge`). A record that fails is the error answer, as before, and
-/// nothing is applied.
+/// applied at once (`apply_cloud_edge`).
+///
+/// A record that fails is tried once more at once (FINDINGS A-273): the externalize before it has
+/// minted a new token and the edge holds it, and that token goes out only in an ok answer. A record
+/// that fails again is the error answer, which carries no token (`cloud_edge_record_failed_detail`
+/// says what is left), and nothing is applied.
 async fn record_and_apply_cloud_edge(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     cloud_node: &str,
     edge_node: &str,
 ) -> Result<CloudEdgeApply, InternalAdminDispatchResult> {
-    let record = handle_admin_command(
-        ctx,
-        client,
-        "set_node_config",
-        serde_json::json!({
-            "node_name": cloud_node,
-            "config": { "io": { "edge_node": edge_node } },
-        }),
-        Some(ctx.hive_id.clone()),
-    )
-    .await;
-    if let Some(failure) = cloud_edge_record_failure(&record) {
+    let record = || {
+        handle_admin_command(
+            ctx,
+            client,
+            "set_node_config",
+            serde_json::json!({
+                "node_name": cloud_node,
+                "config": { "io": { "edge_node": edge_node } },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+    };
+    let mut failure = cloud_edge_record_failure(&record().await);
+    if let Some(first) = &failure {
+        tracing::warn!(
+            cloud_node = %cloud_node,
+            edge_node = %edge_node,
+            reason = %first,
+            "publish_cloud_endpoint: recording edge_node in IO.cloud's config failed: tried once \
+             more"
+        );
+        failure = cloud_edge_record_failure(&record().await);
+    }
+    if let Some(failure) = failure {
+        tracing::warn!(
+            cloud_node = %cloud_node,
+            edge_node = %edge_node,
+            reason = %failure,
+            "publish_cloud_endpoint: recording edge_node in IO.cloud's config failed twice: the \
+             token this call minted is not handed out"
+        );
         return Err(internal_service_error(
             "publish_cloud_endpoint",
             "CONFIG_RECORD_FAILED",
-            &format!(
-                "endpoint published but recording edge_node into {cloud_node} config \
-                 failed{failure}. Re-run publish_cloud_endpoint to re-record."
-            ),
+            &cloud_edge_record_failed_detail(cloud_node, edge_node, &failure),
         ));
     }
     tracing::info!(
@@ -8304,7 +8324,7 @@ async fn record_and_apply_cloud_edge(
     Ok(applied)
 }
 
-/// Why the record failed, as `CONFIG_RECORD_FAILED`'s detail says it right after "config failed";
+/// Why the record failed, as `CONFIG_RECORD_FAILED`'s detail says it right after "the last time";
 /// none when the orchestrator took it.
 fn cloud_edge_record_failure(record: &Result<(u16, String), AdminError>) -> Option<String> {
     match record {
@@ -8312,6 +8332,31 @@ fn cloud_edge_record_failure(record: &Result<(u16, String), AdminError>) -> Opti
         Ok((status, body)) => Some(format!(" (HTTP {status}): {body}")),
         Err(err) => Some(format!(": {err}")),
     }
+}
+
+/// `CONFIG_RECORD_FAILED`'s detail once the record failed twice (FINDINGS A-273), `failure` the
+/// second time's (`cloud_edge_record_failure`). What is left, as the code leaves it:
+/// - the door is open on `edge_node` with the token the externalize minted: the vault holds it for
+///   the edge (`edge_channel_secret:<ich>`, dedicated to SY.edge's ILK, which SY.admin cannot read
+///   back), and the edge took it; nothing closes the door;
+/// - that token is in no answer (A-124: a token through Archi reaches the AI provider), and in no
+///   log line;
+/// - a token the edge held for that channel before is the edge's grace secret, accepted for 10
+///   minutes from the open (SY.edge's `SHARED_SECRET_GRACE_MS`), in its memory only: a restart of
+///   the edge ends it sooner;
+/// - nothing is applied to the running IO.cloud: it trusts what it trusted before (no edge, on a
+///   first publish).
+///
+/// Running the action again records the edge and hands a new token, once.
+fn cloud_edge_record_failed_detail(cloud_node: &str, edge_node: &str, failure: &str) -> String {
+    format!(
+        "the door is open on {edge_node} with the token this call minted, but recording \
+         edge_node into {cloud_node} config failed twice, the last time{failure}. That token is \
+         not handed out, and it cannot be read back: the vault keeps it for the edge alone. A \
+         previous token on {edge_node} keeps working only for the 10 minutes this rotation \
+         leaves it (sooner if the edge restarts). Run publish_cloud_endpoint again: it records \
+         the edge and hands a new token."
+    )
 }
 
 /// Applies `edge_node` to the running `cloud_node` (FINDINGS A-255): a `CONFIG_GET` gives its live
@@ -17364,6 +17409,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again, it mints a new token; the previous one works 10 more minutes.",
             "IO.cloud trusts that edge at once (FINDINGS A-255): SY.admin records it in IO.cloud's config (set_node_config of io.edge_node), then applies it to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
+            "A record that fails is tried once more at once (FINDINGS A-273, since 0.1.136). One that fails again answers 502 CONFIG_RECORD_FAILED, with no token: the door is open on the edge with the token this call minted, which is handed to no one and cannot be read back; a previous token on that edge keeps working only for the 10 minutes the rotation leaves it (sooner if the edge restarts); nothing is applied to IO.cloud. Run publish_cloud_endpoint again: it records the edge and hands a new token. A token goes out once, only in an ok answer, never in an error or a log line.",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
@@ -41685,27 +41731,33 @@ mod tests {
         }
     }
 
-    /// A record the orchestrator refuses is the error answer, as before (FINDINGS A-255): nothing
-    /// is applied, and IO.cloud is not asked.
+    /// The orchestrator's refusal of the record: IO.cloud has no config.json yet.
+    fn cloud_edge_record_refused() -> Value {
+        json!({
+            "status": "error",
+            "error_code": "NODE_CONFIG_NOT_FOUND",
+            "message": "config.json not found for node",
+        })
+    }
+
+    /// A record the orchestrator refuses twice is the error answer (FINDINGS A-255): it is tried
+    /// once more at once (A-273), nothing is applied, and IO.cloud is not asked.
     #[tokio::test]
     async fn an_edge_whose_record_fails_is_not_applied() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-record-fails");
         let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
-        let drive = answer_cloud_edge_record(
-            &mut harness,
-            json!({
-                "status": "error",
-                "error_code": "NODE_CONFIG_NOT_FOUND",
-                "message": "config.json not found for node",
-            }),
-        );
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
+            answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
+        };
         let (failed, ()) = tokio::join!(apply, drive);
         let failed = failed.expect_err("the record failed");
         assert_eq!(failed.http_status, 502);
         assert_eq!(failed.envelope["error_code"], json!("CONFIG_RECORD_FAILED"));
         let detail = failed.envelope["error_detail"].as_str().unwrap_or_default();
         assert!(
-            detail.contains("config failed (HTTP ") && detail.contains("NODE_CONFIG_NOT_FOUND"),
+            detail.contains("config failed twice, the last time (HTTP ")
+                && detail.contains("NODE_CONFIG_NOT_FOUND"),
             "{detail}"
         );
         assert!(
@@ -41717,10 +41769,11 @@ mod tests {
         );
     }
 
-    /// CONFIG_RECORD_FAILED's detail reads "config failed: <why>" for an error and "config failed
-    /// (HTTP <status>): <body>" for a refusal (FINDINGS A-255's review).
+    /// CONFIG_RECORD_FAILED's detail names the second failure right after "the last time":
+    /// ": <why>" for an error and " (HTTP <status>): <body>" for a refusal (FINDINGS A-255's
+    /// review, A-273).
     #[test]
-    fn the_record_s_failure_reads_right_after_config_failed() {
+    fn the_record_s_failure_reads_right_after_the_last_time() {
         let failure =
             |record: Result<(u16, String), AdminError>| cloud_edge_record_failure(&record);
         assert_eq!(failure(Ok((200, "{}".to_string()))), None);
@@ -41731,6 +41784,14 @@ mod tests {
         assert_eq!(
             failure(Err("timeout".into())),
             Some(": timeout".to_string())
+        );
+        let detail = cloud_edge_record_failed_detail(CLOUD_NODE, CLOUD_EDGE, ": timeout");
+        assert!(
+            detail.contains(&format!(
+                "recording edge_node into {CLOUD_NODE} config failed twice, the last time: \
+                 timeout. "
+            )),
+            "{detail}"
         );
     }
 
@@ -41812,14 +41873,19 @@ mod tests {
         };
         let (answer, token) = tokio::join!(publish, drive);
         let answer = answer.expect("dispatch");
-        assert_eq!(answer.http_status, 200, "{}", answer.envelope);
+        // No assertion prints the token (FINDINGS A-273).
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
         assert_eq!(answer.envelope["status"], json!("ok"));
         let payload = &answer.envelope["payload"];
-        assert_eq!(payload["token"], json!(token));
+        assert!(
+            payload["token"] == json!(token),
+            "the answer carries the token the vault got: {shown}"
+        );
         assert_eq!(payload["url"], json!(format!("/e/{CLOUD_ICH}")));
         assert_eq!(payload["edge_node"], json!(CLOUD_EDGE));
         assert_eq!(payload["edge_applied"], json!(true));
-        assert!(payload.get("warning").is_none(), "{payload}");
+        assert!(payload.get("warning").is_none(), "{shown}");
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
@@ -41870,6 +41936,205 @@ mod tests {
             "nothing opened, recorded or applied"
         );
         assert!(is_io_cloud_node(CLOUD_NODE));
+    }
+
+    /// The vault's and the edge's answers while publish_cloud_endpoint opens IO.cloud's door: the
+    /// token minted into the vault for the edge, then the edge's open. The token the vault got.
+    async fn open_cloud_door(harness: &mut fluxbee_sdk::RouterDispatcherTestHarness) -> String {
+        let wait = Duration::from_secs(5);
+        let secret_ref = format!("edge_channel_secret:{CLOUD_ICH}");
+        let put = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the token into the vault");
+        assert_eq!(put.meta.msg.as_deref(), Some(MSG_VAULT_PUT));
+        let token = put.payload["value"]["secret"]
+            .as_str()
+            .expect("the minted token")
+            .to_string();
+        harness
+            .inject(reply_to(
+                &put,
+                MSG_VAULT_PUT_RESPONSE,
+                json!({ "status": "ok", "key": secret_ref }),
+            ))
+            .await
+            .unwrap();
+        let open = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the edge's open");
+        assert_eq!(open.meta.msg.as_deref(), Some(MSG_EDGE_OPEN_URL));
+        assert_eq!(dst_of(&open), json!(CLOUD_EDGE));
+        harness
+            .inject(reply_to(
+                &open,
+                MSG_EDGE_OPEN_URL_RESPONSE,
+                json!({ "status": "ok" }),
+            ))
+            .await
+            .unwrap();
+        token
+    }
+
+    /// `text` with `token` masked, so that no assertion prints a token.
+    fn without_token(text: &str, token: &str) -> String {
+        text.replace(token, "<the minted token>")
+    }
+
+    /// A record that fails is tried once more at once (FINDINGS A-273): the orchestrator refuses
+    /// the first and takes the second, and the publish goes on to IO.cloud and answers ok with the
+    /// token this call minted, once. Before, the first refusal was the error answer, and that
+    /// token went to no one.
+    #[tokio::test]
+    async fn a_record_that_fails_once_is_tried_again() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-record-again");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let publish =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let drive = async {
+            let token = open_cloud_door(&mut harness).await;
+            answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(3, Value::Null),
+            )
+            .await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_SET",
+                "CONFIG_RESPONSE",
+                cloud_config_taken(4, json!({ "io": { "edge_node": CLOUD_EDGE } })),
+            )
+            .await;
+            token
+        };
+        let (answer, token) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        assert_eq!(answer.envelope["status"], json!("ok"), "{shown}");
+        assert!(
+            answer.envelope["payload"]["token"] == json!(token),
+            "the answer carries the token the vault got: {shown}"
+        );
+        assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// A record that fails twice is the error answer (FINDINGS A-273): 502 CONFIG_RECORD_FAILED
+    /// with no token in it, the token this call minted handed to no one, and its detail says what
+    /// is left: the door open on the edge with that token, a previous token on that edge working
+    /// only for the rotation's 10 minutes, and publish_cloud_endpoint again for a new one. IO.cloud
+    /// is not asked. Neither a log line, at any level, nor the command log carries the token.
+    #[tokio::test]
+    async fn a_record_that_fails_twice_hands_no_token_and_says_what_is_left() {
+        #[derive(Clone)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Every line this thread logs, at every level. A second dispatcher stays registered
+        // meanwhile, so that tracing asks each event's own thread whether it wants the event: with
+        // one alone, a callsite another test's thread reaches first is cached as unwanted for
+        // every thread (tracing-core's `has_just_one`), and this thread's lines would be lost.
+        let _other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let captured = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        tracing::callsite::rebuild_interest_cache();
+
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-record-fails-twice");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let publish = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "publish_cloud_endpoint",
+            None,
+            json!({ "edge_node": CLOUD_EDGE }),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        );
+        let drive = async {
+            let token = open_cloud_door(&mut harness).await;
+            answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
+            answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
+            token
+        };
+        let (answer, token) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        let text = answer.envelope.to_string();
+        assert!(!text.contains(&token), "the error carries the minted token");
+        assert_eq!(answer.http_status, 502, "{text}");
+        assert_eq!(answer.envelope["error_code"], json!("CONFIG_RECORD_FAILED"));
+        let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+        for what in [
+            format!("the door is open on {CLOUD_EDGE} with the token this call minted"),
+            format!("recording edge_node into {CLOUD_NODE} config failed twice"),
+            "the last time (HTTP ".to_string(),
+            "NODE_CONFIG_NOT_FOUND".to_string(),
+            "That token is not handed out".to_string(),
+            format!("A previous token on {CLOUD_EDGE} keeps working only for the 10 minutes"),
+            "Run publish_cloud_endpoint again: it records the edge and hands a new token"
+                .to_string(),
+        ] {
+            assert!(detail.contains(&what), "{what}: {detail}");
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "IO.cloud is not asked"
+        );
+
+        let logs = String::from_utf8_lossy(
+            &captured
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+        .to_string();
+        assert!(
+            !logs.contains(&token),
+            "a log line carries the minted token"
+        );
+        for line in [
+            "recording edge_node in IO.cloud's config failed: tried once more",
+            "recording edge_node in IO.cloud's config failed twice",
+        ] {
+            assert!(logs.contains(line), "{line}");
+        }
+        let command_log =
+            fs::read_to_string(admin_command_log_path(&ctx.state_dir)).expect("the command log");
+        assert!(
+            !command_log.contains(&token),
+            "the command log carries the minted token"
+        );
+        let entry: Value =
+            serde_json::from_str(command_log.lines().last().expect("an entry")).expect("JSON");
+        assert_eq!(entry["action"], "publish_cloud_endpoint");
+        assert_eq!(entry["error_code"], "CONFIG_RECORD_FAILED");
     }
 
     // --- unpublish_artifact: by its id or its link's key, by its publisher only -------------
