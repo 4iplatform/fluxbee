@@ -56,8 +56,8 @@ jobs:
         uses: actions/checkout@v6
 
       # Ubuntu's protobuf-compiler first; protoc's own GitHub release (the same 21.12, Ubuntu's
-      # 3.21.12) when Ubuntu's archive cannot be reached: on 2026-11-11 *.ubuntu.com did not
-      # resolve on the runners for hours and every run failed here.
+      # 3.21.12) when Ubuntu's archive cannot be reached: on 2026-11-11, from 14:10 UTC, *.ubuntu.com
+      # did not resolve on the runners and every run failed here.
       - name: Install protoc
         run: |
           if ! (timeout 240 sudo apt-get update && timeout 240 sudo apt-get install -y protobuf-compiler); then
