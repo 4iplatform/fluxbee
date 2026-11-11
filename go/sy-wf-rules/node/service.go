@@ -94,10 +94,7 @@ func Run(runtimeCfg RuntimeConfig) error {
 	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
 	_ = selfIlkID // cached for future outgoing meta.src_ilk use
 
-	profile, err := fluxbeesdk.NewOperationalRouteProfile().
-		CommandChannel("incoming").
-		PostPendingRule(fluxbeesdk.RouteAny{}, fluxbeesdk.RouteCommand{Channel: "incoming"}).
-		Build()
+	profile, err := routeProfile()
 	if err != nil {
 		return fmt.Errorf("sy-wf-rules rpc profile invalid: %w", err)
 	}
@@ -130,6 +127,16 @@ func Run(runtimeCfg RuntimeConfig) error {
 	}
 	_ = sender
 	return NewService(cfg, dispatcher, incoming, nil).RunWithContext(ctx)
+}
+
+// routeProfile is how SY.wf-rules' dispatcher routes what reaches it: an answer to one of its RPCs
+// (SY.admin's, a WF node's count) goes to the RPC that waits for it, and anything else to
+// "incoming", the operations SY.admin sends.
+func routeProfile() (fluxbeesdk.OperationalRouteProfile, error) {
+	return fluxbeesdk.NewOperationalRouteProfile().
+		CommandChannel("incoming").
+		PostPendingRule(fluxbeesdk.RouteAny{}, fluxbeesdk.RouteCommand{Channel: "incoming"}).
+		Build()
 }
 
 func (s *Service) Run() error {

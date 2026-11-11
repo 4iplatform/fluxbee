@@ -194,12 +194,18 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   anyway"): the node is not `RUNNING` (its state named: `STARTING`, `STOPPED`, `FAILED` or
   `UNKNOWN`), its status read (`get_node_status`) or its instance count failed or got no answer
   (the read and how named), or the node refused the count (its refusal named). It counts
-  instances by asking a `RUNNING` WF node `WF_LIST_INSTANCES` with `status: running` directly
-  (2 s timeout, `node/wf_client.go`), and a node with a config is deleted only once it counted
-  none (`instancesUnconfirmed`). A node that crashed, was stopped or is restarting keeps its
-  instances in its store, which the kill's purge removes: before 0.1.133 (A-270) such a node was
-  taken for one with none, and a delete a second after a `restart_node` read `STARTING` and
-  purged them.
+  instances by asking a `RUNNING` WF node `WF_LIST_INSTANCES` with `status: running`, `limit: 0`
+  and `count_only: true` directly (2 s timeout, `node/wf_client.go`), which the node answers
+  with a `COUNT(*)` and no rows; a count that is not a whole number from 0 is a count that
+  failed (`instanceCount`). A node with a config is deleted only once it counted none
+  (`instancesUnconfirmed`). Before 0.1.136 it asked for the whole list, which passed the frame
+  past about 350 running instances: the node answered `INTERNAL_ERROR`, and a busy workflow's
+  delete `INSTANCES_UNKNOWN` (FINDINGS A-284). `limit` stays 0 for an engine before 0.1.136,
+  which ignores `count_only` and lists every running instance, so its count is still the whole
+  count during a deploy (the spec's §5.7). A node that crashed, was stopped or is restarting
+  keeps its instances in its store, which the kill's purge removes: before 0.1.133 (A-270) such a
+  node was taken for one with none, and a delete a second after a `restart_node` read `STARTING`
+  and purged them.
 - A workflow whose WF node has no config (never deployed, or already purged) has none to lose,
   and is deleted without a node step.
 - If the node exists it is removed with `kill_node` (`force: true`, `purge_instance: true`)
@@ -381,19 +387,20 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   less than 60 s from its time is fired by the node itself, and one SY.timer holds at a later time
   (a move it did not take) is moved to its time (`node/timer_requests.go`, FINDINGS A-254 and its
   review).
-- **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`,
-  `CONFIG_SET`; `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE`,
-  `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the node's hive
-  (`UNAUTHORIZED` otherwise); `TIMER_FIRED`, taken only from SY.timer of the node's hive, and its
-  `TIMER_RESPONSE` to the node's own timer requests, on a channel of its own (`wfRouteProfile`). Any
-  other message is taken only from a node the definition names (`start_from`, an
-  `event_match.src`, a target of its sends), and reaches the running instance on its thread or,
-  from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`, `node/correlate.go`);
-  a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) never starts one, and a notice or a reply
-  is never answered. A message it takes nowhere gets `NOT_TAKEN`, with its reason (`no_thread`,
-  `no_conversation`, `invalid_input`, `not_expected` or `unavailable`): from an `IO.*` node, any
-  message; from any other node, only a named request, and only `no_thread`, `invalid_input` and
-  `unavailable`.
+- **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`;
+  `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES` (with `count_only`, only how many, a
+  `COUNT(*)`; a payload it cannot read, or a status no instance has, `INVALID_REQUEST`),
+  `WF_GET_CODE`, `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the
+  node's hive (`UNAUTHORIZED` otherwise); `TIMER_FIRED`, taken only from SY.timer of the node's
+  hive, and its `TIMER_RESPONSE` to the node's own timer requests, on a channel of its own
+  (`wfRouteProfile`). Any other message is taken only from a node the definition names
+  (`start_from`, an `event_match.src`, a target of its sends), and reaches the running instance
+  on its thread or, from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`,
+  `node/correlate.go`); a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) never starts one, and
+  a notice or a reply is never answered. A message it takes nowhere gets `NOT_TAKEN`, with its
+  reason (`no_thread`, `no_conversation`, `invalid_input`, `not_expected` or `unavailable`): from
+  an `IO.*` node, any message; from any other node, only a named request, and only `no_thread`,
+  `invalid_input` and `unavailable`.
 
 ## Config
 

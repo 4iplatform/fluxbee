@@ -742,21 +742,28 @@ ORDER BY created_at_ms, instance_id;`)
 	return scanInstances(rows)
 }
 
-// ListInstances returns instances with optional filtering.
-func (s *Store) ListInstances(ctx context.Context, statusFilter string, limit int, createdAfterMS int64) ([]WFInstanceRow, error) {
-	query := `
-SELECT ` + instanceColumns + `
-FROM wf_instances WHERE 1=1`
+// instanceFilter is the WHERE clause of WF_LIST_INSTANCES' filters, with its arguments: a status
+// ("" for any) and a creation time the instances come after (0 for any).
+func instanceFilter(statusFilter string, createdAfterMS int64) (string, []any) {
+	where := ` WHERE 1=1`
 	args := []any{}
 	if statusFilter != "" {
-		query += ` AND status = ?`
+		where += ` AND status = ?`
 		args = append(args, statusFilter)
 	}
 	if createdAfterMS > 0 {
-		query += ` AND created_at_ms > ?`
+		where += ` AND created_at_ms > ?`
 		args = append(args, createdAfterMS)
 	}
-	query += ` ORDER BY created_at_ms DESC`
+	return where, args
+}
+
+// ListInstances returns instances with optional filtering.
+func (s *Store) ListInstances(ctx context.Context, statusFilter string, limit int, createdAfterMS int64) ([]WFInstanceRow, error) {
+	where, args := instanceFilter(statusFilter, createdAfterMS)
+	query := `
+SELECT ` + instanceColumns + `
+FROM wf_instances` + where + ` ORDER BY created_at_ms DESC`
 	if limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, limit)
@@ -767,6 +774,17 @@ FROM wf_instances WHERE 1=1`
 	}
 	defer rows.Close()
 	return scanInstances(rows)
+}
+
+// CountInstances is how many instances ListInstances' filters match, with no limit: a COUNT(*),
+// which hands back no row (FINDINGS A-284).
+func (s *Store) CountInstances(ctx context.Context, statusFilter string, createdAfterMS int64) (int, error) {
+	where, args := instanceFilter(statusFilter, createdAfterMS)
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wf_instances`+where+`;`, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {

@@ -1,9 +1,11 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -52,20 +54,31 @@ func (c *l2WFNodeClient) wfSystemRPC(
 	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
 		return nil, fmt.Errorf("unexpected wf node response %q", stringValue(msg.Meta.Msg))
 	}
+	// Numbers as the node wrote them (json.Number): a count is read as a whole number, never
+	// through a float64 (instanceCount).
+	decoder := json.NewDecoder(bytes.NewReader(msg.Payload))
+	decoder.UseNumber()
 	var decoded map[string]any
-	if err := json.Unmarshal(msg.Payload, &decoded); err != nil {
+	if err := decoder.Decode(&decoded); err != nil {
 		return nil, err
 	}
 	return decoded, nil
 }
 
+// CountRunningInstances asks the WF node how many instances it runs: WF_LIST_INSTANCES with
+// count_only, which the node answers with a COUNT(*) and no rows. Before 0.1.136 it counted the rows
+// of the whole list, which passed the frame past about 350 running instances: the node answered
+// INTERNAL_ERROR, and the count was unknown exactly for a busy workflow (FINDINGS A-284). limit
+// stays 0 for an engine before 0.1.136, which does not know count_only, ignores it as any field it
+// does not know, and lists every running instance: its count is then the whole count, as before, or
+// past the frame its INTERNAL_ERROR, a refusal. A limit would cut the count it answers.
 func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName string) (int, error) {
 	decoded, err := c.wfSystemRPC(
 		ctx,
 		nodeName,
 		"WF_LIST_INSTANCES",
 		"WF_LIST_INSTANCES_RESPONSE",
-		map[string]any{"status": "running", "limit": 0},
+		map[string]any{"status": "running", "limit": 0, "count_only": true},
 	)
 	if err != nil {
 		return 0, err
@@ -82,16 +95,23 @@ func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName str
 	if !ok {
 		return 0, fmt.Errorf("wf node response missing count")
 	}
-	switch value := countValue.(type) {
-	case float64:
-		return int(value), nil
-	case int:
-		return value, nil
-	case int64:
-		return int(value), nil
-	default:
-		return 0, fmt.Errorf("wf node returned invalid count type %T", countValue)
+	return instanceCount(countValue)
+}
+
+// instanceCount reads the count of a WF_LIST_INSTANCES answer, a whole number from 0. Anything else
+// is no count, and fails the read: a delete without force goes on only on a count of 0, and a
+// negative count, or one an int cannot hold, read as one would have let it purge the node's
+// instances.
+func instanceCount(value any) (int, error) {
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("wf node returned invalid count type %T", value)
 	}
+	count, err := strconv.Atoi(number.String())
+	if err != nil || count < 0 {
+		return 0, fmt.Errorf("wf node returned invalid count %s", number)
+	}
+	return count, nil
 }
 
 // wfControlError reads a WF node's refusal of a WF_* request: `{ok:false, error:<code>,

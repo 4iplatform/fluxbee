@@ -1,11 +1,13 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -396,13 +398,37 @@ func handleWFGetInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 	return sendReply(ctx, msg, MsgWFGetInstanceResponse, payload, rt)
 }
 
+// instanceStatuses are the statuses an instance has (wf_instances' CHECK): a WF_LIST_INSTANCES
+// filter names one of them, or none for every instance.
+var instanceStatuses = []string{"running", "completed", "cancelled", "failed"}
+
+// wfListInstancesRequest is a WF_LIST_INSTANCES request (spec §16.1): its filters, a status and a
+// time the instances were created after; the most instances to list, newest first (0 or absent,
+// every one); and count_only, which answers how many instances the filters match, and none of them.
+type wfListInstancesRequest struct {
+	Status         string `json:"status"`
+	Limit          int    `json:"limit"`
+	CreatedAfterMS int64  `json:"created_after_ms"`
+	CountOnly      bool   `json:"count_only"`
+}
+
 func handleWFListInstances(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
-	var req struct {
-		Status         string `json:"status"`
-		Limit          int    `json:"limit"`
-		CreatedAfterMS int64  `json:"created_after_ms"`
+	req, err := parseListInstances(msg.Payload)
+	if err != nil {
+		return sendErrorReply(ctx, msg, MsgWFListInstancesResponse, "INVALID_REQUEST", err.Error(), rt)
 	}
-	_ = json.Unmarshal(msg.Payload, &req)
+	if req.CountOnly {
+		// SY.wf-rules' count of a workflow's running instances, which a delete without force decides
+		// on: {ok, count}, no rows, whatever the limit. Before 0.1.136 SY.wf-rules counted the rows of
+		// the whole list, about 360 B each, which passed the frame past about 350 running instances:
+		// the node answered INTERNAL_ERROR, and the count was unknown exactly for a busy workflow
+		// (FINDINGS A-284).
+		count, err := rt.Store.CountInstances(ctx, req.Status, req.CreatedAfterMS)
+		if err != nil {
+			return sendErrorReply(ctx, msg, MsgWFListInstancesResponse, errCodeStoreError, err.Error(), rt)
+		}
+		return sendReply(ctx, msg, MsgWFListInstancesResponse, map[string]any{"ok": true, "count": count}, rt)
+	}
 	if req.Limit < 0 {
 		req.Limit = 50
 	}
@@ -420,6 +446,22 @@ func handleWFListInstances(ctx context.Context, msg sdk.Message, rt *NodeRuntime
 		"instances": instances,
 	}
 	return sendReply(ctx, msg, MsgWFListInstancesResponse, payload, rt)
+}
+
+// parseListInstances reads a WF_LIST_INSTANCES request; one with no payload lists every instance. A
+// payload it cannot read, or a status no instance has, is refused, never answered on what it could
+// read: a count of a misspelled status is 0, which reads as no instance.
+func parseListInstances(payload json.RawMessage) (wfListInstancesRequest, error) {
+	var req wfListInstancesRequest
+	if len(bytes.TrimSpace(payload)) > 0 {
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return req, fmt.Errorf("invalid WF_LIST_INSTANCES payload: %v", err)
+		}
+	}
+	if req.Status != "" && !slices.Contains(instanceStatuses, req.Status) {
+		return req, fmt.Errorf("status must be one of %s, not %q", strings.Join(instanceStatuses, ", "), req.Status)
+	}
+	return req, nil
 }
 
 // instanceSummary is an instance as WF_LIST_INSTANCES lists it.

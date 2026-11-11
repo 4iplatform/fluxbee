@@ -1119,7 +1119,7 @@ Handlers:
 - `WF_HELP` — returns the workflow HELP descriptor.
 - `WF_CANCEL_INSTANCE` — initiates soft abort.
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).
-- `WF_LIST_INSTANCES` — returns instances matching filter.
+- `WF_LIST_INSTANCES` — returns the instances matching a filter, or only how many (`count_only`, §16.1).
 - `WF_GET_CODE` — returns the current workflow definition.
 - `TIMER_FIRED` — from SY.timer of its own hive only, for a timer this node scheduled: routes to the instance its `client_ref` names (§11.2).
 - `TIMER_RESPONSE` — from SY.timer of its own hive only, the answer to a timer request the node sent without waiting: it settles the request's timer, which a refusal marks to go again (§10.2); never answered. The SDK hands it to the loop on a channel of its own.
@@ -1254,7 +1254,7 @@ A bare `WF.<workflow>` is a node of the path's hive. `WF_HELP` and `WF_GET_CODE`
 
 ### 16.1 Instance listing and retrieval
 
-`WF_LIST_INSTANCES` takes optional filters: `status` (`running`, `completed`, `cancelled` or `failed`; absent, all), `limit` (newest first; `0` or absent, all) and `created_after_ms`:
+`WF_LIST_INSTANCES` takes optional filters: `status` (`running`, `completed`, `cancelled` or `failed`; absent, all), `limit` (newest first; `0` or absent, all), `created_after_ms` and `count_only` (below):
 
 ```json
 {
@@ -1291,7 +1291,20 @@ Returns compact rows:
 }
 ```
 
-SY.wf-rules reads `ok` and `count` of it (`{"status": "running", "limit": 0}`) for a workflow's active instances.
+A list that passes the router's 128 KiB frame (about 360 B an instance) is refused, `INTERNAL_ERROR`, never cut to fit.
+
+With `count_only: true` the node answers how many instances the filters match, a `COUNT(*)`, and no rows, whatever the `limit`:
+
+```json
+{
+  "payload": {
+    "ok": true,
+    "count": 1000
+  }
+}
+```
+
+SY.wf-rules counts a workflow's active instances so, `{"status": "running", "limit": 0, "count_only": true}` (`docs/sy-wf-rules-spec.md` §5.7). Before 0.1.136 it counted the rows of the whole list, which passed the frame past about 350 running instances (§21 allows 1000): the node answered `INTERNAL_ERROR`, and the count was unknown exactly for a busy workflow (FINDINGS A-284). An engine before 0.1.136 does not know `count_only`, ignores it as any field it does not know, and lists: SY.wf-rules keeps `limit` at 0, so the count of that list is still every running instance. A payload the node cannot read, or a `status` that is none of the four, is refused `INVALID_REQUEST`, never answered on what it could read: a count of a misspelled status would be 0 (since 0.1.136; before, the list took the fields it could read, and a status none of the four listed no instance).
 
 `WF_GET_INSTANCE` takes `instance_id` (and `log_limit`, 20 by default) and returns the same fields, the instance's input and variables as the store keeps them, and its most recent log entries, newest first:
 
