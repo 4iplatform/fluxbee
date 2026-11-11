@@ -322,6 +322,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-267 🔵 The watchdog's last tick during the orchestrator's own stop reads a healthy service as down (low).
 - A-268 🔵 Two FIB builds at once can store the older one last (low; the router).
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
+- A-270 🔵 `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances (low; SY.wf-rules; with A-240 in 0.1.133).
+- A-271 🔵 A check that decides an action takes "no answer" for "no": A-267's class, left in the orchestrator (low).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1398,6 +1400,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-271 [General/orchestrator] 🔵 low (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — A check that decides an action takes "no answer" for "no"
+
+- **Why:** A-267 fixed this in `systemd_is_active` only (a killed or failed `systemctl is-active`
+  read as "not running"). The same two-state reading is in other checks of
+  `src/bin/sy_orchestrator.rs` (lines on daily at 36135e52):
+  - `systemd_unit_is_active` (~23944) and `systemd_unit_is_failed` (~26373) return
+    `status.success()`: a killed check reads as not active or not failed. They feed the 60 s
+    `reconcile_persisted_custom_nodes`'s relaunch, `remove_node_instance_flow`'s
+    `NODE_INSTANCE_RUNNING` guard and the run, start and kill flows.
+  - `systemd_unit_exists` (~35648): a failed or killed `systemctl show` reads as "no such unit", so
+    `restart_local_core_services_with_health_gate` (~4966) skips that service and, after a core
+    binary swap, it keeps running the old binary while the update reports ok (U-1's shape).
+  - `nft_table_loaded` (~10902): a killed `nft list table` reads as "table missing", and the egress
+    watchdog deletes and applies a healthy NAT table, for example during the orchestrator's own stop.
+  - `check_syncthing_folder` and `syncthing_folder_status` (~15059, ~14994, curl): a killed or
+    failed curl reads as an unhealthy folder, and the blob sync watchdog logs *"syncthing unhealthy;
+    restarting"* and runs an ensure.
+- **When:** a check in flight when systemd stops the orchestrator (its own self-restart, every
+  deploy), or a systemctl, nft or curl that fails for another reason.
+- **Fix:** a tri-state per check (yes, no, no answer), where only "no" acts, as A-267 did; each
+  caller says what "no answer" means to it.
+
+### A-270 [WF/SY.wf-rules] 🔵 low (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances
+
+- **Why:** `inspectWFNode` (`go/sy-wf-rules/node/status.go` ~137-146) returns no instance count
+  when `get_node_status` answers any `lifecycle_state` but `RUNNING`, or fails with anything but a
+  timeout; `DeleteWorkflow` (`go/sy-wf-rules/node/delete.go` ~29-53) then skips the
+  `INSTANCES_ACTIVE` refusal and kills the node with its purge, which removes its
+  `wf_instances.db`.
+- **Effect:** a WF node that crashed, was stopped, or is restarting loses its live instances to a
+  delete that did not say force. Since A-240 (0.1.133) a status read no longer waits behind a
+  `restart_node` or `run_node` of that node, which widens the window: the operator restarts
+  `WF.billing@motherbee`, and a delete a second later sees `STARTING` and purges its instances.
+- **Fix:** without force, a WF node whose config exists and that is not `RUNNING`, or whose status
+  read failed, is answered `INSTANCES_UNKNOWN` (its state named, and "delete with force to remove it
+  anyway").
 
 ### A-269 [General/router] 🔵 low (found 2026-11-11 by the review fixes of the router's A-253; read in the code) — The router takes any node name and logs it unescaped: a local node can write a line of its own into the router's journal
 
