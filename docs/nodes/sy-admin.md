@@ -1351,13 +1351,13 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   writer recorded meanwhile stays (`retire_expired_publication`, `advance_publication`, FINDINGS
   A-260): the sweep's own calls, even to an edge that is listed but down or to a slow IO.blob,
   hold up no publish or take-down. A publish still holds the lock across its curate and the
-  edge's publish (up to 110 s, and a release on its failure path can add 30 s), and each of the
-  sweep's reads and writes waits for it. A take-down holds the lock as the sweep does (FINDINGS
-  A-274, below), so the two may run on one page at once, and neither writes over the other's
-  state. The ledger keeps a page's row for 30 days once the page is down, `expired` or
-  `unpublished` (since its `released_at`, or its `expires_at` for a row without one); each sweep
-  first drops the rows down for longer, and keeps every other row (`drop_old_down_publications`,
-  `PUBLICATION_LEDGER_KEEP_DOWN_SECS`, FINDINGS A-231).
+  edge's publish (up to 110 s; a failed one lets it go before its clean-up, FINDINGS A-280,
+  below), and each of the sweep's reads and writes waits for it. A take-down holds the lock as
+  the sweep does (FINDINGS A-274, below), so the two may run on one page at once, and neither
+  writes over the other's state. The ledger keeps a page's row for 30 days once the page is down,
+  `expired` or `unpublished` (since its `released_at`, or its `expires_at` for a row without one);
+  each sweep first drops the rows down for longer, and keeps every other row
+  (`drop_old_down_publications`, `PUBLICATION_LEDGER_KEEP_DOWN_SECS`, FINDINGS A-231).
 - **A producer on a worker** (FINDINGS A-81) promotes its blob there, and Syncthing brings it to
   the motherbee about 10 s later. Before the publication lock, unless the blob is in the
   motherbee's `active/` already, SY.admin asks the producer's hive to scan its blob folder
@@ -1365,11 +1365,19 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   most, in a task of its own) while it looks for the blob every half second for up to 30 s
   (`await_producer_blob`). A producer on the motherbee gets the looks only. Either way the curate
   answers for the blob. Any curate error, a lost answer included, releases what `IO.blob` may
-  have curated (`curate_publication_blob`).
+  have curated, after the answer (`fail_publish`, below).
 - **One budget of 110 s** covers a whole `publish_artifact`, under the 120 s ai.generic waits for
   its answer: the wait for the blob, the publication lock, the curate (30 s at most) and the
   edge's publish (75 s at most) each get what is left. A step with nothing left answers
-  `TIMEOUT`; at the edge's step, after releasing what was curated.
+  `TIMEOUT`. A publish that fails once it asked for the curate answers at once and lets the
+  publication lock go (`fail_publish`, FINDINGS A-280, since 0.1.136); its clean-up runs after
+  the answer, in a task of its own: IO.blob's release of what it may have curated (`BLOB_RELEASE`),
+  after the edge's unpublish (`EDGE_UNPUBLISH_BLOB`) when the edge took the page and the last
+  ledger write failed, each within its own 30 s, a failed step logged. Before, the clean-up ran
+  under the lock and before the answer: up to 60 s more against every take-down and sweep, and
+  an answer past ai.generic's 120 s. The failed publish removes the row it wrote before it lets
+  the lock go; a row it could not remove, or whose last write failed, stays `curated`, which a
+  take-down or the expiry sweep finishes. A publish that succeeds is unchanged.
 - **A page outlives its publisher** (FINDINGS A-242). A purge of the node while its publish is
   under way neither waits for the publish nor stops it, and the page, once up, stays up until it
   expires or is taken down, as every page the node published before.
@@ -1383,11 +1391,11 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   exact router-stamped name, and the record's tenant the one identity's shared memory charges
   that name to now (`resolve_artifact_publisher`, the read publish makes), else
   `403 UNAUTHORIZED`. A page outlives its publisher (FINDINGS A-242), so a node launched later
-  under the same name in another tenant does not take it down. The operator takes down any publication by either
-  field (FINDINGS A-120): `POST /artifacts/unpublish`, or a step of an executor plan, which
-  Archi's plan compiler stages and which runs only once the operator confirms it. The action is
-  `confirmation_required`, and takes no hive: the publication names its edge. It reads the
-  page's row under the publication lock:
+  under the same name in another tenant does not take it down. The operator takes down any
+  publication by either field (FINDINGS A-120): `POST /artifacts/unpublish`, or a step of an
+  executor plan, which Archi's plan compiler stages and which runs only once the operator
+  confirms it. The action is `confirmation_required`, and takes no hive: the publication names
+  its edge. It reads the page's row under the publication lock:
   - a publication the ledger does not hold answers `404 NOT_FOUND`;
   - one already down answers ok, `unpublished: false`, and asks no one: `unpublished`, `expired`,
     or past its `expires_at`, which the edge no longer serves. That last one keeps its row for the
@@ -1411,15 +1419,15 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   never across the edge's or IO.blob's call, as the expiry sweep (FINDINGS A-274): its own calls,
   even to an edge that is listed but down or to a slow IO.blob, hold up no publish, no other
   take-down and no sweep, and neither do the factory reset's take-downs. A publish still holds the
-  lock across its curate and the edge's publish (up to 110 s, and a release on its failure path
-  can add 30 s): each of the take-down's holds, its read and each of its writes, waits for the
-  publish under way and for those queued before it. Each state is written on the ledger loaded
-  again, and only while the row is still at the one the take-down read (`take_down_publication`,
-  `advance_publication`), so a page published meanwhile keeps its row and a state another writer
-  recorded meanwhile stays. When another take-down, or the sweep, got past the edge meanwhile
-  (`edge_removed`), this one goes on to the release; when one of them recorded the page down
-  meanwhile (`unpublished`, `expired`), this one asks no one more, writes nothing, and answers ok
-  with `unpublished: false`, as it would have after that one.
+  lock across its curate and the edge's publish (up to 110 s; a failed one lets it go before its
+  clean-up, FINDINGS A-280): each of the take-down's holds, its read and each of its writes,
+  waits for the publish under way and for those queued before it. Each state is written on the
+  ledger loaded again, and only while the row is still at the one the take-down read
+  (`take_down_publication`, `advance_publication`), so a page published meanwhile keeps its row
+  and a state another writer recorded meanwhile stays. When another take-down, or the sweep, got
+  past the edge meanwhile (`edge_removed`), this one goes on to the release; when one of them
+  recorded the page down meanwhile (`unpublished`, `expired`), this one asks no one more, writes
+  nothing, and answers ok with `unpublished: false`, as it would have after that one.
 
   The answer carries the `publication_id` either way. A request can carry a live link in any
   field, so the command log keeps only a `publication_id` that is one, in its canonical form, and

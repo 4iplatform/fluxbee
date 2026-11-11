@@ -6751,13 +6751,25 @@ async fn handle_publish_artifact(
     let expires_at = now.saturating_add(expires_in_secs);
     let publication_id = format!("pub:{}", Uuid::new_v4());
     let key = mint_public_capability();
-    let Ok(_publication_guard) =
+    let Ok(publication_guard) =
         tokio::time::timeout_at(deadline, ctx.publication_lock.lock()).await
     else {
         return Ok(out_of_time("the publication lock was free"));
     };
     let Some(curate_limit) = time_left(deadline, PUBLISH_CURATE_TIMEOUT) else {
         return Ok(out_of_time("the curate"));
+    };
+    // From the curate on, a failure answers through `fail_publish`: the lock let go, the answer at
+    // once, and the clean-up after it (FINDINGS A-280).
+    let fail = |publication_guard, edge_node: Option<&str>, answer| {
+        fail_publish(
+            publication_guard,
+            ctx,
+            client,
+            &publication_id,
+            edge_node,
+            answer,
+        )
     };
     let curate = match curate_publication_blob(
         ctx,
@@ -6772,7 +6784,11 @@ async fn handle_publish_artifact(
     {
         Ok(curate) => curate,
         Err((error_code, detail)) => {
-            return Ok(internal_service_error(action, &error_code, &detail))
+            return fail(
+                publication_guard,
+                None,
+                internal_service_error(action, &error_code, &detail),
+            )
         }
     };
     let public_name = curate
@@ -6790,19 +6806,25 @@ async fn handle_publish_artifact(
         .and_then(|value| value.as_u64())
         .unwrap_or(u64::MAX);
     if !is_lower_hex_64(&public_name) || public_name != sha256 || size != request.blob_ref.size {
-        let _ = release_curated_blob(client, ctx, &publication_id).await;
-        return Ok(internal_service_error(
-            action,
-            "BLOB_CURATE_INVALID_RESPONSE",
-            "IO.blob returned inconsistent public_name, sha256 or size",
-        ));
+        return fail(
+            publication_guard,
+            None,
+            internal_service_error(
+                action,
+                "BLOB_CURATE_INVALID_RESPONSE",
+                "IO.blob returned inconsistent public_name, sha256 or size",
+            ),
+        );
     }
 
     let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
         Ok(ledger) => ledger,
         Err(err) => {
-            let _ = release_curated_blob(client, ctx, &publication_id).await;
-            return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+            return fail(
+                publication_guard,
+                None,
+                internal_service_error(action, "LEDGER_FAILED", &err),
+            );
         }
     };
     let mut record = AdminPublicationRecord {
@@ -6827,15 +6849,17 @@ async fn handle_publish_artifact(
         .publications
         .insert(publication_id.clone(), record.clone());
     if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
-        let _ = release_curated_blob(client, ctx, &publication_id).await;
-        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+        return fail(
+            publication_guard,
+            None,
+            internal_service_error(action, "LEDGER_FAILED", &err),
+        );
     }
 
     let Some(edge_limit) = time_left(deadline, PUBLISH_EDGE_TIMEOUT) else {
-        let _ = release_curated_blob(client, ctx, &publication_id).await;
         ledger.publications.remove(&publication_id);
         let _ = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger);
-        return Ok(out_of_time("the edge's publish"));
+        return fail(publication_guard, None, out_of_time("the edge's publish"));
     };
     let edge_result = send_system_request_with_meta(
         client,
@@ -6865,18 +6889,17 @@ async fn handle_publish_artifact(
     match edge_result {
         Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {}
         result => {
-            let _ = release_curated_blob(client, ctx, &publication_id).await;
             ledger.publications.remove(&publication_id);
             let _ = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger);
             let detail = match result {
                 Ok(payload) => format!("edge rejected publication: {payload}"),
                 Err(err) => format!("edge unavailable while publishing: {err}"),
             };
-            return Ok(internal_service_error(
-                action,
-                "EDGE_PUBLISH_FAILED",
-                &detail,
-            ));
+            return fail(
+                publication_guard,
+                None,
+                internal_service_error(action, "EDGE_PUBLISH_FAILED", &detail),
+            );
         }
     }
 
@@ -6885,9 +6908,11 @@ async fn handle_publish_artifact(
         .publications
         .insert(publication_id.clone(), record.clone());
     if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
-        let _ = unpublish_edge_blob(client, &edge_node, &publication_id).await;
-        let _ = release_curated_blob(client, ctx, &publication_id).await;
-        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+        return fail(
+            publication_guard,
+            Some(&edge_node),
+            internal_service_error(action, "LEDGER_FAILED", &err),
+        );
     }
     let path = format!("/public/{key}");
     let public_url = ctx
@@ -6951,7 +6976,9 @@ async fn handle_unpublish_artifact(
     // The publication lock only to read the page's row (FINDINGS A-274): the take-down takes it
     // again to write each state, never across the edge's or IO.blob's call
     // (`take_down_publication`). Read under it, the row is never one of a publish under way, which
-    // holds the lock from its row's `curated` to its `published`.
+    // holds the lock from its row's `curated` to its `published`, or to its failure: a failed
+    // publish lets the lock go with its row removed, or none written, or `curated` when a write
+    // failed, for a take-down to finish (FINDINGS A-280).
     let ledger = {
         let _publication_guard = ctx.publication_lock.lock().await;
         load_admin_publication_ledger(&ctx.publication_ledger_path)
@@ -7737,9 +7764,9 @@ async fn scan_producer_blob_folder(client: &RouterDispatcher, hive: &str, limit:
     }
 }
 
-/// BLOB_CURATE of one publication's blob, within `limit`. Any error releases what IO.blob may
-/// have curated: an answer lost on the way can follow a curate that went through (FINDINGS A-81).
-/// The error is `(error_code, detail)`.
+/// BLOB_CURATE of one publication's blob, within `limit`. The error is `(error_code, detail)`, on
+/// which the publish releases what IO.blob may have curated, after its answer (`fail_publish`): an
+/// answer lost on the way can follow a curate that went through (FINDINGS A-81).
 async fn curate_publication_blob(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -7770,31 +7797,81 @@ async fn curate_publication_blob(
         limit,
     )
     .await;
-    let refusal = match curate {
+    match curate {
         Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {
-            return Ok(payload)
+            Ok(payload)
         }
-        Ok(payload) => (
+        Ok(payload) => Err((
             payload
                 .get("error_code")
                 .and_then(|value| value.as_str())
                 .unwrap_or("BLOB_CURATE_FAILED")
                 .to_string(),
             format!("IO.blob rejected publication: {payload}"),
-        ),
-        Err(err) => (
+        )),
+        Err(err) => Err((
             "BLOB_CURATE_FAILED".to_string(),
             format!("IO.blob unavailable: {err}"),
-        ),
-    };
+        )),
+    }
+}
+
+/// A publish that failed once it asked IO.blob to curate (FINDINGS A-280): the publication lock is
+/// let go (`publication_guard`), `answer` goes at once, and the clean-up runs after it, in a task
+/// of its own (`clean_up_failed_publish`): the edge's unpublish first when `edge_node` took the
+/// page (the last ledger write failed after the edge's publish), then IO.blob's release of what it
+/// may have curated (an answer lost on the way can follow a curate that went through, FINDINGS
+/// A-81). Each call keeps its own 30 s.
+///
+/// Awaited under the lock, the clean-up held it up to 60 s past the publish's own steps, against
+/// every take-down's and every sweep step's read and write, and gave the answer past the publish's
+/// 110 s, after ai.generic stopped waiting at 120 s. The publish removes the row it wrote before
+/// it lets the lock go; a row it could not remove, or whose last write failed, stays `curated`,
+/// which a take-down or the expiry sweep finishes as any page stopped half-way. A publish that
+/// succeeds is unchanged.
+fn fail_publish(
+    publication_guard: tokio::sync::MutexGuard<'_, ()>,
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    publication_id: &str,
+    edge_node: Option<&str>,
+    answer: InternalAdminDispatchResult,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    drop(publication_guard);
+    let (ctx, client) = (ctx.clone(), Arc::clone(client));
+    let publication_id = publication_id.to_string();
+    let edge_node = edge_node.map(str::to_string);
+    tokio::spawn(async move {
+        clean_up_failed_publish(&ctx, &client, &publication_id, edge_node.as_deref()).await;
+    });
+    Ok(answer)
+}
+
+/// The clean-up of a failed publish (`fail_publish`): the edge's unpublish when `edge_node` took
+/// the page, then IO.blob's release; a step that fails is one warning line, and the next goes on.
+async fn clean_up_failed_publish(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    publication_id: &str,
+    edge_node: Option<&str>,
+) {
+    if let Some(edge_node) = edge_node {
+        if let Err(err) = unpublish_edge_blob(client, edge_node, publication_id).await {
+            tracing::warn!(
+                publication_id = %publication_id,
+                edge = %edge_node,
+                error = %err,
+                "a failed publish's clean-up: the edge did not unpublish the page"
+            );
+        }
+    }
     if let Err(err) = release_curated_blob(client, ctx, publication_id).await {
         tracing::warn!(
             publication_id = %publication_id,
             error = %err,
-            "the release after a failed curate did not go through"
+            "a failed publish's clean-up: IO.blob did not release what it may have curated"
         );
     }
-    Err(refusal)
 }
 
 async fn release_curated_blob(
@@ -40865,11 +40942,15 @@ mod tests {
             .is_none());
     }
 
-    /// A lost answer can follow a curate that went through: every error releases.
+    /// A lost answer can follow a curate that went through: every curate error releases (FINDINGS
+    /// A-81), once the publish has answered it and let the publication lock go (A-280).
     #[tokio::test]
     async fn any_curate_error_releases_what_was_curated() {
-        let (ctx, mut harness) = opa_test_admin("a81-curate");
+        let (mut ctx, mut harness) = opa_test_admin("a81-curate");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
+        ctx.public_edge_node = Some(PAGE_EDGE.to_string());
         let blob_ref = page_blob_ref();
+        land_blob(&ctx, &blob_ref);
         let publication_id = format!("pub:{}", Uuid::new_v4());
         let tenant = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
         let wait = Duration::from_secs(5);
@@ -40885,14 +40966,15 @@ mod tests {
                 "BLOB_NOT_FOUND",
             ),
         ] {
-            let curate = curate_publication_blob(
-                &ctx,
-                &ctx.rpc,
-                &publication_id,
-                tenant,
-                "AI.sales@worker1",
-                &blob_ref,
-                PUBLISH_CURATE_TIMEOUT,
+            // Answered before IO.blob answers the release (30 s at most).
+            let publish = tokio::time::timeout(
+                wait,
+                handle_publish_artifact(
+                    &ctx,
+                    &ctx.rpc,
+                    json!({ "blob_ref": blob_ref }),
+                    Some(PAGE_PUBLISHER),
+                ),
             );
             let drive = async {
                 let sent = harness
@@ -40905,22 +40987,29 @@ mod tests {
                     .inject(reply_to(&sent, answer_msg, answer.clone()))
                     .await
                     .unwrap();
-                let release = harness
-                    .next_outgoing_within(wait)
-                    .await
-                    .expect("the release");
-                assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
-                assert_eq!(release.payload, json!({ "publication_id": publication_id }));
-                let released = reply_to(
-                    &release,
-                    MSG_BLOB_RELEASE_RESPONSE,
-                    json!({ "status": "ok", "released": false }),
-                );
-                harness.inject(released).await.unwrap();
+                sent.payload["publication_id"].clone()
             };
-            let (result, ()) = tokio::join!(curate, drive);
-            let (error_code, _) = result.expect_err("a failed curate");
-            assert_eq!(error_code, expected);
+            let (result, curated) = tokio::join!(publish, drive);
+            let result = result
+                .expect("answered before IO.blob answers the release")
+                .expect("dispatch");
+            assert_eq!(result.envelope["error_code"], json!(expected));
+            let release = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the release");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            assert_eq!(release.payload, json!({ "publication_id": curated }));
+            assert!(
+                ctx.publication_lock.try_lock().is_ok(),
+                "the release goes with the publication lock free"
+            );
+            let released = reply_to(
+                &release,
+                MSG_BLOB_RELEASE_RESPONSE,
+                json!({ "status": "ok", "released": false }),
+            );
+            harness.inject(released).await.unwrap();
         }
         // A curate that goes through releases nothing.
         let curate = curate_publication_blob(
@@ -40950,6 +41039,188 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    /// IO.blob's answer to a publish's curate, the page's 3 bytes curated.
+    fn page_curated() -> Value {
+        json!({
+            "status": "ok",
+            "public_name": "ab".repeat(32),
+            "sha256": "ab".repeat(32),
+            "size": 3,
+        })
+    }
+
+    /// A failed publish answers within its 110 s budget and cleans up after its answer, with the
+    /// publication lock let go (FINDINGS A-280). Here IO.blob takes 25 s to curate, the edge never
+    /// answers its publish (75 s at most), and IO.blob never answers the release (30 s at most).
+    /// The answer, EDGE_PUBLISH_FAILED, comes 100 s after the publish began, and its row is gone;
+    /// the release goes after it, the lock free. Under the lock the release came first, and the
+    /// answer at 130 s, after ai.generic stopped waiting at 120 s, while every take-down and sweep
+    /// waited for the lock.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_answers_within_its_budget_and_cleans_up_after() {
+        let (mut ctx, mut harness) = opa_test_admin("a280-edge-silent");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
+        ctx.public_edge_node = Some(PAGE_EDGE.to_string());
+        land_blob(&ctx, &page_blob_ref());
+        let started = tokio::time::Instant::now();
+        let publish = async {
+            let answer = handle_publish_artifact(
+                &ctx,
+                &ctx.rpc,
+                json!({ "blob_ref": page_blob_ref() }),
+                Some(PAGE_PUBLISHER),
+            )
+            .await;
+            (answer, started.elapsed())
+        };
+        let drive = async {
+            let wait = Duration::from_secs(200);
+            let curate = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the curate");
+            assert_eq!(curate.meta.msg.as_deref(), Some(MSG_BLOB_CURATE));
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            harness
+                .inject(reply_to(&curate, MSG_BLOB_CURATE_RESPONSE, page_curated()))
+                .await
+                .unwrap();
+            let edge = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the edge's publish");
+            assert_eq!(edge.meta.msg.as_deref(), Some(MSG_EDGE_PUBLISH_BLOB));
+            // The edge never answers; IO.blob gets the release, and never answers it.
+            let release = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the release");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            assert_eq!(
+                release.payload,
+                json!({ "publication_id": curate.payload["publication_id"] })
+            );
+            assert!(
+                ctx.publication_lock.try_lock().is_ok(),
+                "the release goes with the publication lock free"
+            );
+            curate.payload["publication_id"]
+                .as_str()
+                .expect("its id")
+                .to_string()
+        };
+        let ((answer, answered_after), publication_id) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        assert_eq!(answer.http_status, 502, "{}", answer.envelope);
+        assert_eq!(answer.envelope["error_code"], json!("EDGE_PUBLISH_FAILED"));
+        assert!(
+            answered_after <= PUBLISH_ARTIFACT_BUDGET,
+            "answered {answered_after:?} after the publish began"
+        );
+        assert!(
+            (Duration::from_secs(100)..Duration::from_secs(101)).contains(&answered_after),
+            "answered {answered_after:?} after the publish began: the edge's limit, not later"
+        );
+        assert!(!load_admin_publication_ledger(&ctx.publication_ledger_path)
+            .expect("the ledger")
+            .publications
+            .contains_key(&publication_id));
+    }
+
+    /// A publish whose last ledger write fails after the edge took its page answers LEDGER_FAILED
+    /// within its 110 s budget, the publication lock let go, and only then asks the edge to
+    /// unpublish the page and IO.blob to release its copy, each within its own 30 s (FINDINGS
+    /// A-280). Here IO.blob takes 25 s to curate, the edge answers at 95 s, and neither answers the
+    /// clean-up: the answer comes at 95 s, where both calls under the lock pushed it to 155 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_publish_whose_last_write_fails_unpublishes_after_its_answer() {
+        let (mut ctx, mut harness) = opa_test_admin("a280-last-write");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
+        ctx.public_edge_node = Some(PAGE_EDGE.to_string());
+        land_blob(&ctx, &page_blob_ref());
+        let started = tokio::time::Instant::now();
+        let publish = async {
+            let answer = handle_publish_artifact(
+                &ctx,
+                &ctx.rpc,
+                json!({ "blob_ref": page_blob_ref() }),
+                Some(PAGE_PUBLISHER),
+            )
+            .await;
+            (answer, started.elapsed())
+        };
+        let ledger_path = ctx.publication_ledger_path.clone();
+        let drive = async {
+            let wait = Duration::from_secs(200);
+            let curate = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the curate");
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            harness
+                .inject(reply_to(&curate, MSG_BLOB_CURATE_RESPONSE, page_curated()))
+                .await
+                .unwrap();
+            let edge = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the edge's publish");
+            assert_eq!(edge.meta.msg.as_deref(), Some(MSG_EDGE_PUBLISH_BLOB));
+            let publication_id = curate.payload["publication_id"]
+                .as_str()
+                .expect("its id")
+                .to_string();
+            let curated = load_admin_publication_ledger(&ledger_path).expect("the ledger");
+            assert_eq!(curated.publications[&publication_id].status, "curated");
+            // The ledger can no longer be replaced: a directory, not empty, where its file was.
+            fs::remove_file(&ledger_path).expect("the ledger file");
+            fs::create_dir_all(ledger_path.join("in-the-way")).expect("a directory in its place");
+            tokio::time::sleep(Duration::from_secs(70)).await;
+            harness
+                .inject(reply_to(
+                    &edge,
+                    MSG_EDGE_PUBLISH_BLOB_RESPONSE,
+                    json!({ "status": "ok" }),
+                ))
+                .await
+                .unwrap();
+            // Neither the edge nor IO.blob answers the clean-up, which goes with the lock free.
+            let unpublish = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the edge's unpublish");
+            assert_eq!(unpublish.meta.msg.as_deref(), Some(MSG_EDGE_UNPUBLISH_BLOB));
+            assert_eq!(dst_of(&unpublish), json!(PAGE_EDGE));
+            assert_eq!(
+                unpublish.payload,
+                json!({ "publication_id": publication_id })
+            );
+            assert!(
+                ctx.publication_lock.try_lock().is_ok(),
+                "the clean-up goes with the publication lock free"
+            );
+            let release = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the release, once the edge's 30 s are out");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            assert_eq!(release.payload, json!({ "publication_id": publication_id }));
+        };
+        let ((answer, answered_after), ()) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        assert_eq!(answer.http_status, 502, "{}", answer.envelope);
+        assert_eq!(answer.envelope["error_code"], json!("LEDGER_FAILED"));
+        assert!(
+            answered_after <= PUBLISH_ARTIFACT_BUDGET,
+            "answered {answered_after:?} after the publish began"
+        );
+        assert!(
+            (Duration::from_secs(95)..Duration::from_secs(96)).contains(&answered_after),
+            "answered {answered_after:?} after the publish began: the edge's answer, not later"
+        );
+        fs::remove_dir_all(&ledger_path).expect("the directory in the ledger's place");
     }
 
     // --- publish_cloud_endpoint: the edge applied to the running IO.cloud (FINDINGS A-255) -----
