@@ -800,11 +800,12 @@ impl OrchestratorState {
     }
 
     /// FINDINGS A-283: counts one tick of the Syncthing check that asked Syncthing's REST API
-    /// (`SyncthingApiWatch::tick`), by its folders' answers (`checks`). A tick at which the API
-    /// answered for no folder is the API's: its run's report is a warning and a `syncthing`
-    /// condition that opens, once a run, and the tick the API answers at closes it, with a line
-    /// that says so. At another tick, a folder whose status gave no answer counts as its own check
-    /// (`note_check_answer`), and so does each folder Syncthing answered for.
+    /// (`SyncthingApiWatch::tick`), by its folders' answers (`checks`). A tick at which the API's
+    /// port took no connection, or the API answered for no folder, is the API's: its run's report
+    /// is a warning and a `syncthing` condition that opens, once a run, and the tick the API
+    /// answers at closes it, with a line that says so. At another tick, a folder whose status gave
+    /// no answer counts as its own check (`note_check_answer`), and so does each folder Syncthing
+    /// answered for.
     fn note_syncthing_api_tick(
         &self,
         checks: &SyncthingFolderChecks,
@@ -15704,15 +15705,39 @@ fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<bool, OrchestratorE
 }
 
 async fn syncthing_api_healthy(api_port: u16) -> bool {
+    syncthing_api_port(api_port).await.is_ok()
+}
+
+/// Whether Syncthing's API port takes a TCP connection within SYNCTHING_HEALTH_TIMEOUT_SECS, and
+/// why not when it takes none (`syncthing_api_port_answer`).
+async fn syncthing_api_port(api_port: u16) -> Result<(), String> {
     let endpoint = format!("127.0.0.1:{api_port}");
-    matches!(
-        time::timeout(
-            Duration::from_secs(SYNCTHING_HEALTH_TIMEOUT_SECS),
-            tokio::net::TcpStream::connect(endpoint)
-        )
-        .await,
-        Ok(Ok(_))
+    let connect = time::timeout(
+        Duration::from_secs(SYNCTHING_HEALTH_TIMEOUT_SECS),
+        tokio::net::TcpStream::connect(&endpoint),
     )
+    .await
+    .ok()
+    .map(|connected| connected.map(drop));
+    syncthing_api_port_answer(&endpoint, connect)
+}
+
+/// The API port's answer from its connect (`None`: none within SYNCTHING_HEALTH_TIMEOUT_SECS). A
+/// port that takes no connection, refused or not in time, is Syncthing's REST API giving no
+/// answer, and its reason says so, "API port refused" (FINDINGS A-283, the operator's call of
+/// 2026-11-11).
+fn syncthing_api_port_answer(
+    endpoint: &str,
+    connect: Option<std::io::Result<()>>,
+) -> Result<(), String> {
+    match connect {
+        Some(Ok(())) => Ok(()),
+        Some(Err(err)) => Err(format!("API port refused: {endpoint}: {err}")),
+        None => Err(format!(
+            "API port refused: {endpoint} took no connection within \
+             {SYNCTHING_HEALTH_TIMEOUT_SECS} s"
+        )),
+    }
 }
 
 fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
@@ -19577,16 +19602,18 @@ fn syncthing_folder_answer(folder: &str, check: Result<bool, FolderStatusError>)
     }
 }
 
-/// Whether the Syncthing check restarts Syncthing: when it does not run, when its API refuses
-/// connections, or when Syncthing answers that a folder is not healthy. A folder it gives no answer
-/// for restarts nothing (FINDINGS A-271): the next tick asks again. A run of such ticks that lasts
-/// restarts it the watchdog's own way (`SyncthingApiWatch`, FINDINGS A-283).
-fn syncthing_watchdog_restarts(
-    service_active: bool,
-    api_healthy: bool,
-    folders: CheckAnswer,
-) -> bool {
-    !(service_active && api_healthy) || folders == CheckAnswer::No
+/// Whether the Syncthing check takes the unhealthy path (`ensure_blob_sync_runtime`, which starts
+/// Syncthing, restarts it when it is stale, and waits up to 30 s for its API port): when it does
+/// not run, or when Syncthing answers that a folder is not healthy. A folder it gives no answer
+/// for restarts nothing (FINDINGS A-271): the next tick asks again. Neither does an API port that
+/// takes no connection while the unit is active (FINDINGS A-283, the operator's call of
+/// 2026-11-11): the path's start of a running unit does nothing, and its wait, which the whole
+/// watchdog's tick waits for, a stopped core service's start included, can only end as the next
+/// tick would see it, once the port listens, or with no port. A run of ticks at which the REST API
+/// gives no answer, at its port or for every folder, restarts Syncthing the watchdog's own way
+/// once it lasts (`SyncthingApiWatch`).
+fn syncthing_watchdog_restarts(service_active: bool, folders: CheckAnswer) -> bool {
+    !service_active || folders == CheckAnswer::No
 }
 
 /// What one tick of the Syncthing check got for its folders (FINDINGS A-271, A-283).
@@ -19599,15 +19626,34 @@ struct SyncthingFolderChecks {
     /// The folder Syncthing gave no answer for, and why, when it gave none: the tick asked no
     /// folder after it.
     unanswered: Option<(String, String)>,
+    /// Why the API port took no connection, when it took none (`syncthing_api_port`): the tick
+    /// asked no folder (`port_refused`).
+    port_refused: Option<String>,
 }
 
 impl SyncthingFolderChecks {
-    /// Why Syncthing's REST API gave no answer at this tick, when it gave none: it answered for no
-    /// folder the tick asked (FINDINGS A-283, the review). A folder it gives no answer for after
-    /// it answered for another is that folder's alone, its status slow under a long scan, say:
-    /// the tick counts as answered, and the folder is asked last from then on
-    /// (`SyncthingApiWatch::ask_last`), so it never keeps the others from being asked.
+    /// A tick at which Syncthing's API port took no connection, refused or not within its time,
+    /// while its unit is active (FINDINGS A-283, the operator's call of 2026-11-11): the REST API
+    /// gave no answer, and no folder was asked, so nothing is known of any.
+    fn port_refused(why: String) -> Self {
+        Self {
+            folders: CheckAnswer::NoAnswer,
+            answered: Vec::new(),
+            unanswered: None,
+            port_refused: Some(why),
+        }
+    }
+
+    /// Why Syncthing's REST API gave no answer at this tick, when it gave none: its port took no
+    /// connection, or it answered for no folder the tick asked (FINDINGS A-283, the review). A
+    /// folder it gives no answer for after it answered for another is that folder's alone, its
+    /// status slow under a long scan, say: the tick counts as answered, and the folder is asked
+    /// last from then on (`SyncthingApiWatch::ask_last`), so it never keeps the others from being
+    /// asked.
     fn api_unanswered(&self) -> Option<&str> {
+        if let Some(why) = &self.port_refused {
+            return Some(why);
+        }
         match &self.unanswered {
             Some((_, why)) if self.answered.is_empty() => Some(why),
             _ => None,
@@ -19636,6 +19682,7 @@ fn check_syncthing_folders(
         folders: CheckAnswer::Yes,
         answered: Vec::new(),
         unanswered: None,
+        port_refused: None,
     };
     let first = folder_ids
         .iter()
@@ -19668,7 +19715,10 @@ fn syncthing_folder_check_name(folder: &str) -> String {
 
 /// How long Syncthing's REST API may give no answer, from the first tick of the Syncthing check it
 /// gave none in, before the watchdog restarts Syncthing (FINDINGS A-283, the operator's call of
-/// 2026-11-11).
+/// 2026-11-11). It covers a start: a Syncthing that starts keeps its API port closed for a few
+/// seconds, which count as ticks with no answer (`SyncthingFolderChecks::port_refused`), and the
+/// first answer ends the run. A start that keeps it closed longer than this, a database
+/// migration, say, is restarted once; the next restart waits SYNCTHING_API_RESTART_EVERY.
 const SYNCTHING_API_RESTART_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// The least time between two of those restarts: one an hour at most. It counts from the last
@@ -19847,7 +19897,8 @@ fn syncthing_api_restart_message(unanswered_for: Duration, last: &str) -> String
 /// Restarts Syncthing once its REST API has given no answer for SYNCTHING_API_RESTART_AFTER
 /// (FINDINGS A-283, the operator's call of 2026-11-11): `systemctl restart`, at most once an hour,
 /// with a `syncthing` drift alert and a log line that say why. Before, nothing repaired a Syncthing
-/// whose API took connections and never answered: the unhealthy path only starts a running one.
+/// whose API took connections and never answered, or whose API port refused them while its unit
+/// was active: the unhealthy path only starts a running one.
 /// The restart is every pending one's (`restart_syncthing_for_pending`): it applies what
 /// config.xml holds, so it clears the pending restart it read before it (FINDINGS A-196).
 async fn restart_syncthing_for_unanswered_api(
@@ -19952,12 +20003,12 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         return Ok(());
     }
     let service_active = activity == ServiceActivity::Active;
-    let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
     // FINDINGS A-271: what Syncthing answers for each folder; one it gives no answer for says
     // nothing of the folder. FINDINGS A-283: it ends the tick's asks, and a run of ticks at which
-    // Syncthing answers for no folder is reported and, once it has lasted, repaired by a restart.
+    // Syncthing answers for no folder, or its API port takes no connection, is reported and, once
+    // it has lasted, repaired by a restart.
     let mut folders = CheckAnswer::Yes;
-    if service_active && api_healthy {
+    if service_active {
         let mut folder_ids = Vec::new();
         if desired_blob.enabled
             && desired_blob.sync_enabled
@@ -19980,12 +20031,19 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
                 .map(|folder| folder.id),
             );
         }
-        let ask_last = state.syncthing_folders_asked_last();
-        let checks = check_syncthing_folders(&folder_ids, &ask_last, |folder| {
-            check_syncthing_folder(&desired_sync, folder)
-        });
+        // FINDINGS A-283, the operator's call of 2026-11-11: a port that refuses the connection, or
+        // takes none within 2 s, is the API's no answer too, and no folder is asked.
+        let checks = match syncthing_api_port(desired_sync.sync_api_port).await {
+            Ok(()) => {
+                let ask_last = state.syncthing_folders_asked_last();
+                check_syncthing_folders(&folder_ids, &ask_last, |folder| {
+                    check_syncthing_folder(&desired_sync, folder)
+                })
+            }
+            Err(refused) => SyncthingFolderChecks::port_refused(refused),
+        };
         folders = checks.folders;
-        if !folder_ids.is_empty() {
+        if checks.port_refused.is_some() || !folder_ids.is_empty() {
             let tick = state.note_syncthing_api_tick(&checks, Instant::now());
             if tick.restart {
                 // A join that started during this tick's checks owns Syncthing by now (FINDINGS
@@ -20014,7 +20072,9 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             );
         }
     }
-    if !syncthing_watchdog_restarts(service_active, api_healthy, folders) {
+    // An active Syncthing whose API port takes no connection is the run's, above, not this path's
+    // (FINDINGS A-283, `syncthing_watchdog_restarts`).
+    if !syncthing_watchdog_restarts(service_active, folders) {
         return Ok(());
     }
     // A join that started during this tick's checks owns Syncthing by now (FINDINGS A-194).
@@ -20025,10 +20085,14 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     tracing::warn!(
         service = SYNCTHING_SERVICE_NAME,
         service_active = service_active,
-        api_healthy = api_healthy,
         folders_healthy = folders != CheckAnswer::No,
         "syncthing unhealthy; restarting"
     );
+    // FINDINGS A-283: this path starts a Syncthing that does not run, whose API port takes a few
+    // seconds to listen. Those seconds count in a run of their own, never in one from before the
+    // start, which could have lasted 5 min already: the run starts again. (A tick at which
+    // Syncthing answered for a folder ended its run already.)
+    state.forget_syncthing_api_run();
     // FINDINGS A-189: on the installed binary while the vendor still syncs.
     ensure_blob_sync_runtime(
         state,
@@ -61463,8 +61527,10 @@ blob:
     }
 
     /// FINDINGS A-271: the Syncthing check restarts Syncthing on Syncthing's answers only: a folder
-    /// it gives no answer for restarts nothing, unless another folder's answer, or the service or
-    /// its API, says it must. Before, a killed or failed curl read as an unhealthy folder.
+    /// it gives no answer for restarts nothing, unless another folder's answer, or the service,
+    /// says it must. Before, a killed or failed curl read as an unhealthy folder. FINDINGS A-283:
+    /// an API port that takes no connection while the unit is active takes no unhealthy path
+    /// either (its tick is the API's no answer, `SyncthingFolderChecks::port_refused`).
     #[test]
     fn the_syncthing_check_restarts_nothing_on_a_folder_with_no_answer() {
         use CheckAnswer::{No, NoAnswer, Yes};
@@ -61484,11 +61550,13 @@ blob:
         ] {
             assert_eq!(a.and(b), both, "{a:?} and {b:?}");
         }
-        assert!(!syncthing_watchdog_restarts(true, true, Yes));
-        assert!(!syncthing_watchdog_restarts(true, true, NoAnswer));
-        assert!(syncthing_watchdog_restarts(true, true, No));
-        assert!(syncthing_watchdog_restarts(false, true, Yes));
-        assert!(syncthing_watchdog_restarts(true, false, NoAnswer));
+        assert!(!syncthing_watchdog_restarts(true, Yes));
+        assert!(!syncthing_watchdog_restarts(true, NoAnswer));
+        assert!(syncthing_watchdog_restarts(true, No));
+        assert!(syncthing_watchdog_restarts(false, Yes));
+        assert!(syncthing_watchdog_restarts(false, NoAnswer));
+        let refused = SyncthingFolderChecks::port_refused("API port refused".into());
+        assert!(!syncthing_watchdog_restarts(true, refused.folders));
 
         // The watchdog decides by that before it restarts, and every folder goes through its
         // answer; the sync probe still reads no answer as an error of the probe.
@@ -61499,7 +61567,7 @@ blob:
         };
         let watchdog = body("async fn watchdog_blob_sync(");
         let decides = watchdog
-            .find("if !syncthing_watchdog_restarts(service_active, api_healthy, folders) {")
+            .find("if !syncthing_watchdog_restarts(service_active, folders) {")
             .expect("the decision");
         assert!(
             decides
@@ -61509,7 +61577,7 @@ blob:
         );
         assert_eq!(watchdog.matches("check_syncthing_folder(").count(), 1);
         assert!(watchdog.contains(
-            "check_syncthing_folders(&folder_ids, &ask_last, |folder| {\n            check_syncthing_folder(&desired_sync, folder)\n        });"
+            "check_syncthing_folders(&folder_ids, &ask_last, |folder| {\n                    check_syncthing_folder(&desired_sync, folder)\n                })"
         ));
         assert!(body("fn check_syncthing_folders(")
             .contains("checks.folders.and(syncthing_folder_answer(folder, result))"));
@@ -61568,7 +61636,8 @@ blob:
             SyncthingFolderChecks {
                 folders: No,
                 answered: folders.clone(),
-                unanswered: None
+                unanswered: None,
+                port_refused: None
             }
         );
         let (checks, _) = ask(vec![Ok(true), Ok(true), Ok(true)]);
@@ -61577,7 +61646,8 @@ blob:
             SyncthingFolderChecks {
                 folders: Yes,
                 answered: folders.clone(),
-                unanswered: None
+                unanswered: None,
+                port_refused: None
             }
         );
     }
@@ -61694,6 +61764,7 @@ blob:
             folders: CheckAnswer::Yes,
             answered: answered.iter().map(|folder| folder.to_string()).collect(),
             unanswered: unanswered.map(|folder| (folder.to_string(), "a timeout".to_string())),
+            port_refused: None,
         };
         let counted = |folder: &str| {
             state
@@ -62043,7 +62114,7 @@ blob:
             watchdog
                 .matches("state.forget_syncthing_api_run();")
                 .count(),
-            3
+            4
         );
         // One count a tick that asked, by its folders' answers, which ask the folders that gave
         // none last.
@@ -62054,7 +62125,7 @@ blob:
                 < at("check_syncthing_folders(&folder_ids, &ask_last, |folder| {")
         );
         assert!(!watchdog.contains("note_check_answer("));
-        let counted = at("if !folder_ids.is_empty() {");
+        let counted = at("if checks.port_refused.is_some() || !folder_ids.is_empty() {");
         assert!(counted < at("note_syncthing_api_tick("));
         // The restart: on the run's word, after the join's hold asked again.
         let decides = at("if tick.restart {");
@@ -62123,6 +62194,190 @@ blob:
         ] {
             assert!(restarted.contains(said), "{said}: {restarted}");
         }
+    }
+
+    /// FINDINGS A-283, the operator's call of 2026-11-11: an API port that refuses the connection,
+    /// or takes none within 2 s, says why, "API port refused", and is the REST API's no answer:
+    /// no folder is asked, none counts and none moves in the order they are asked in, and the
+    /// tick counts in the API's run, which reaches the restart once it has lasted 5 min, at most
+    /// once an hour, the reason in what it says. Before, such a tick counted nowhere: it took the
+    /// unhealthy path, whose start of an active unit does nothing, and nothing repaired Syncthing.
+    #[tokio::test]
+    async fn a_refused_api_port_counts_toward_the_restart_with_its_reason() {
+        let endpoint = "127.0.0.1:8384";
+        assert_eq!(syncthing_api_port_answer(endpoint, Some(Ok(()))), Ok(()));
+        let refused = syncthing_api_port_answer(
+            endpoint,
+            Some(Err(std::io::ErrorKind::ConnectionRefused.into())),
+        )
+        .expect_err("refused");
+        assert!(
+            refused.starts_with("API port refused: 127.0.0.1:8384: "),
+            "{refused}"
+        );
+        let timed_out = syncthing_api_port_answer(endpoint, None).expect_err("timed out");
+        assert_eq!(
+            timed_out,
+            "API port refused: 127.0.0.1:8384 took no connection within 2 s"
+        );
+        // A real port: one that listens takes the connection; once closed, it refuses it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("its address").port();
+        assert_eq!(syncthing_api_port(port).await, Ok(()));
+        assert!(syncthing_api_healthy(port).await);
+        drop(listener);
+        let closed = syncthing_api_port(port).await.expect_err("closed");
+        assert!(
+            closed.starts_with(&format!("API port refused: 127.0.0.1:{port}")),
+            "{closed}"
+        );
+        assert!(!syncthing_api_healthy(port).await);
+
+        // The tick: the API's no answer, by its port, with nothing of any folder.
+        let checks = SyncthingFolderChecks::port_refused(timed_out.clone());
+        assert_eq!(checks.api_unanswered(), Some(timed_out.as_str()));
+        assert_eq!(checks.unanswered_folder(), None);
+        assert_eq!(checks.folders, CheckAnswer::NoAnswer);
+        assert!(checks.answered.is_empty());
+
+        let state = sample_orchestrator_state_for_tests();
+        let counted = || {
+            state
+                .unanswered_checks
+                .lock()
+                .expect("the counts")
+                .keys()
+                .filter(|check| check.starts_with("syncthing db status"))
+                .count()
+        };
+        let t0 = Instant::now();
+        // A folder that gave no answer while another answered, asked last since.
+        state.note_syncthing_api_tick(
+            &SyncthingFolderChecks {
+                folders: CheckAnswer::NoAnswer,
+                answered: vec!["fluxbee-dist-vendor".to_string()],
+                unanswered: Some(("fluxbee-blob".to_string(), "a timeout".to_string())),
+                port_refused: None,
+            },
+            t0,
+        );
+        assert_eq!(counted(), 1);
+        assert!(!state.syncthing_api_run_open());
+        // The port refuses: the API's run opens; no folder's count or order moves.
+        let tick = state.note_syncthing_api_tick(&checks, t0 + Duration::from_secs(5));
+        assert_eq!(tick, SyncthingApiTick::default());
+        assert!(state.syncthing_api_run_open());
+        assert_eq!(counted(), 1);
+        assert_eq!(state.syncthing_folders_asked_last(), ["fluxbee-blob"]);
+        // 5 min of it, from its first tick: the restart, with its reason.
+        let tick = state.note_syncthing_api_tick(&checks, t0 + Duration::from_secs(304));
+        assert!(!tick.restart, "4:59 of the run");
+        let tick = state.note_syncthing_api_tick(&checks, t0 + Duration::from_secs(305));
+        assert!(tick.restart);
+        assert_eq!(tick.unanswered_for, SYNCTHING_API_RESTART_AFTER);
+        let last = checks.api_unanswered().unwrap_or_default();
+        assert!(syncthing_api_restart_message(tick.unanswered_for, last).contains(&timed_out));
+        assert!(syncthing_api_unanswered_message(tick.unanswered_for, last).contains(&timed_out));
+        // At most once an hour: the port still refuses after the restart, and nothing restarts.
+        state.note_syncthing_api_restart(now_epoch_ms());
+        for secs in [310, 600, 3600] {
+            let tick = state.note_syncthing_api_tick(&checks, t0 + Duration::from_secs(secs));
+            assert!(!tick.restart, "{secs}");
+        }
+        // An hour after it, a run that still lasts restarts again (the hour by the epoch).
+        let mut watch = SyncthingApiWatch::default();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let ms = |secs: u64| 1_790_000_000_000 + secs * 1000;
+        let port_answered = checks.api_unanswered().is_none();
+        assert!(!watch.tick(port_answered, at(0), ms(0)).restart);
+        assert!(watch.tick(port_answered, at(300), ms(300)).restart);
+        watch.restarted(ms(300));
+        assert!(!watch.tick(port_answered, at(3899), ms(3899)).restart);
+        assert!(watch.tick(port_answered, at(3900), ms(3900)).restart);
+
+        // The watchdog asks the port at a tick its unit is active, and asks the folders only once
+        // the port took the connection; a refused port counts, whatever the folders.
+        let src = include_str!("sy_orchestrator.rs");
+        let watchdog = &src[src
+            .find("async fn watchdog_blob_sync(")
+            .expect("the watchdog")..];
+        let watchdog = &watchdog[..watchdog.find("\n}\n").expect("its end")];
+        let at = |needle: &str| watchdog.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(watchdog.contains("    if service_active {\n"));
+        assert!(!watchdog.contains("api_healthy"));
+        let port = at("let checks = match syncthing_api_port(desired_sync.sync_api_port).await {");
+        assert!(port < at("check_syncthing_folders(&folder_ids, &ask_last, |folder| {"));
+        assert!(watchdog[port..].starts_with(
+            "let checks = match syncthing_api_port(desired_sync.sync_api_port).await {\n            Ok(()) => {"
+        ));
+        assert!(watchdog.contains("Err(refused) => SyncthingFolderChecks::port_refused(refused),"));
+        assert!(
+            at("Err(refused) => SyncthingFolderChecks::port_refused(refused),")
+                < at("if checks.port_refused.is_some() || !folder_ids.is_empty() {")
+        );
+    }
+
+    /// FINDINGS A-283, the operator's call of 2026-11-11: a Syncthing that is starting keeps its
+    /// API port closed for a few seconds, and is never restarted for them. Those ticks count, and
+    /// the first answer ends the run, so the next run counts its 5 min from its own first tick. A
+    /// start by the watchdog's own unhealthy path starts the run again too: one from before it,
+    /// already 5 min long, would restart Syncthing within its first seconds. And an active
+    /// Syncthing whose port takes no connection takes no unhealthy path: its start of a running
+    /// unit does nothing, and its 30 s wait for the port held the whole watchdog's tick, a stopped
+    /// core service's start included.
+    #[test]
+    fn a_starting_syncthing_is_never_restarted_for_its_closed_port() {
+        let state = sample_orchestrator_state_for_tests();
+        let refused = SyncthingFolderChecks::port_refused(
+            "API port refused: 127.0.0.1:8384: Connection refused (os error 111)".to_string(),
+        );
+        let answered = SyncthingFolderChecks {
+            folders: CheckAnswer::Yes,
+            answered: vec!["fluxbee-blob".to_string()],
+            unanswered: None,
+            port_refused: None,
+        };
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // A start: the port refuses at three ticks, then answers. Nothing restarts, and the run,
+        // too short to report, ends without a word.
+        for secs in [0, 5, 10] {
+            let tick = state.note_syncthing_api_tick(&refused, at(secs));
+            assert!(!tick.restart && !tick.reported, "{secs}");
+            assert_eq!(tick.unanswered_for, Duration::from_secs(secs));
+        }
+        assert!(state.syncthing_api_run_open());
+        assert_eq!(
+            state.note_syncthing_api_tick(&answered, at(15)),
+            SyncthingApiTick::default()
+        );
+        assert!(!state.syncthing_api_run_open());
+        // The answer reset the count: a later run counts 5 min from its own first tick.
+        state.note_syncthing_api_tick(&refused, at(100));
+        assert!(!state.note_syncthing_api_tick(&refused, at(399)).restart);
+        assert!(state.note_syncthing_api_tick(&refused, at(400)).restart);
+        // A start ends the run: the watchdog's own start below, as a join's hold does.
+        state.forget_syncthing_api_run();
+        assert!(!state.syncthing_api_run_open());
+        assert!(!state.note_syncthing_api_tick(&refused, at(401)).restart);
+
+        // The unhealthy path ends the run before its start, after it decided to take it.
+        let src = include_str!("sy_orchestrator.rs");
+        let watchdog = &src[src
+            .find("async fn watchdog_blob_sync(")
+            .expect("the watchdog")..];
+        let watchdog = &watchdog[..watchdog.find("\n}\n").expect("its end")];
+        let unhealthy = watchdog
+            .find("\"syncthing unhealthy; restarting\"")
+            .expect("the unhealthy path");
+        let start = watchdog
+            .rfind("ensure_blob_sync_runtime(")
+            .expect("its start");
+        assert!(unhealthy < start);
+        assert!(watchdog[unhealthy..start].contains("state.forget_syncthing_api_run();"));
+        // An active unit whose port refused takes no such path.
+        assert!(!syncthing_watchdog_restarts(true, refused.folders));
+        assert!(syncthing_watchdog_restarts(false, refused.folders));
     }
 
     /// FINDINGS A-271: the egress re-applies its NAT at once only when nft answers that its table
