@@ -206,7 +206,7 @@ no change required
     A-240, A-241, A-255 checked live, A-258, A-259, A-260, A-266, A-267, A-270, A-271, A-274, A-279
     with A-288, A-281, A-285's texts); 0.1.134, the router alone (A-272, A-268); 0.1.135, the AI SDK
     alone (A-257); 0.1.136, one branch per binary (A-243, A-263, A-273, A-280 in SY.admin; A-282,
-    A-283 in the orchestrator; A-277 in SY.identity; A-284 in the WF; A-286, A-287, A-298 in SY.architect;
+    A-283, A-311 in the orchestrator; A-277 in SY.identity; A-284 in the WF; A-286, A-287, A-298 in SY.architect;
     A-292 in SY.cognition; A-293 in IO.cloud); then A-278 alone (the SDKs and the WF). **From
     0.1.136 a new finding enters only if it breaks operation; the rest is recorded for later.** The
     SDKs' lows (A-264, A-290, A-294, A-295, A-285's catalog text) and the router's A-269 go with each
@@ -375,6 +375,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-308 🔵 Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer (low; the orchestrator).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-310 🔵 Runtime retention skips a node config it cannot read, and can delete a version only that node pins (low; the orchestrator).
+- A-311 🔵 `get_hive` reads any file named `info.yaml` its hive id leads to (low; widened by 0.1.136's A-287, so the orchestrator's fix ships with 0.1.136).
+- A-312 🔵 A version with build metadata (`1.2.0+b1`) breaks every node built on it and cannot be removed (low; the runtimes).
+- A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1452,6 +1455,44 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-313 [General/orchestrator] 🔵 low (found 2026-11-11 by A-283's second review; read in the code; there before it; to decide) — A Syncthing that cannot come up holds the whole watchdog about 35 s a tick
+
+- **Why:** while Syncthing crash-loops (a corrupt database, a full disk: `Restart=always` with
+  `RestartSec=5` never reaches the start limit), every tick that sees it inactive takes the
+  unhealthy path: `systemctl start` succeeds (`Type=simple`), then `wait_for_syncthing_health`
+  waits its full 30 s, and the tick is the whole watchdog's.
+- **Effect:** a stopped core service waits up to about 35 s for the watchdog instead of 5 s, for as
+  long as Syncthing cannot come up.
+- **Fix, later (to decide):** the Syncthing watch and the peer reconcile run in a task or loop of
+  their own, as `run_syncthing_options_switch_loop` already does; a structural change to the
+  watchdog.
+
+### A-312 [General/runtimes] 🔵 low (found 2026-11-11 by A-287's review; read in the code; there before it) — A version with build metadata (`1.2.0+b1`) is published, then breaks every node built on it and cannot be removed
+
+- **Why:** `validate_semver` (`src/runtime_package.rs` ~98) accepts build metadata, while SY.admin's
+  `valid_runtime_token` (`src/bin/sy_admin.rs` ~18358, `remove_runtime_version`) and the
+  orchestrator's `valid_token` (`src/bin/sy_orchestrator.rs` ~23923: `resolve_runtime_spawn_entrypoint`,
+  `stamped_runtime_version`, `get_runtime_flow`) refuse `+`.
+- **Effect:** once `ai.generic 0.2.0+b1` is current, every launch or restart of a config-only or
+  workflow node on it fails `BASE_RUNTIME_NOT_AVAILABLE`, and `remove_runtime_version` answers
+  `INVALID_REQUEST`. A version segment is also the one place where Archi (keeps `+`) and SY.admin's
+  route (reads `+` as a space) disagree; both readings are refused today.
+- **Fix, later:** refuse build metadata in `validate_semver`, or take `+` in both tokens.
+
+### A-311 [General/orchestrator] 🔵 low (found 2026-11-11 by A-287's review; read in the code; there before it, widened by 0.1.136) — `get_hive` reads any file named `info.yaml` its hive id leads to
+
+- **Why:** `get_hive` (`src/bin/sy_orchestrator.rs` ~4142, ~22522, `read_hive_info` ~22959) joins the
+  hive id into `hives_root()/<hive_id>/info.yaml` with no `valid_hive_id` check; `remove_hive`
+  checks it. SY.admin passes the id on as it comes (`handle_hive_paths`, the action's payload).
+- **Effect:** `get_hive {hive_id: "/srv/x"}` answers `/srv/x/info.yaml` as JSON, and `..` climbs out
+  of the hive registry; `hive_is_registered_for_inventory` and `hive_present_for_deployments`
+  tell whether such a path exists. Only files named `info.yaml`. A mesh caller allowed `get_hive`
+  could send any id before; an HTTP path segment cannot hold `/`. A-287's decoding (0.1.136) lets
+  Archi's read tool name one: `GET /hives/%2Fsrv%2Fx`.
+- **Fix (0.1.136, the orchestrator):** `get_hive` refuses a hive id that fails `valid_hive_id`
+  (`INVALID_HIVE_ID`), as `remove_hive` does, and so do `read_hive_info` and the existence probes,
+  as a defense. 0.1.136's own change widens it, so it ships with it.
+
 ### A-310 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it) — Runtime retention skips a node config it cannot read, and can delete a version only that node pins
 
 - **Why:** `persisted_runtime_keep_versions_with_root` (`src/bin/sy_orchestrator.rs` ~23523) logs
@@ -1640,6 +1681,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-11):** the redeploy goes. The orchestrator's reconcile moves the
   nodes on `current` in place, and a config reset is a config change of its own. In 0.1.136
   (SY.architect, with A-286 and A-287).
+- **Built on `coa/architect-136` (0.1.136), with its review's fixes:** the redeploy and
+  `preserve_node_config` are gone. A publish answers `next`, which says what follows: the running
+  nodes on the runtime's `current`, and the running nodes of the packages built on it
+  (`config_only`, `workflow`), pinned to their package's version or not, move to it in place,
+  keeping their ILK, config and `launched_by`; a node of the runtime pinned to a version, and a
+  stopped node, stay; a package's new template is its `.zip`'s `config/default-config.json`, and
+  no read shows a published version's template. `next` comes whenever the version is installed,
+  a failed follow-up included; without `set_current` it says that nothing moves. Archi's handbook
+  (§7.2), the panel's Promote To Current label and `sy-architect.md` say the same.
 
 ### A-297 [General/admin] 🔵 low (found 2026-11-11 by A-288's review; read in the code) — SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee
 
@@ -1776,6 +1826,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Effect:** a path the model writes encoded (`/hives/worker1/nodes/AI.sales%40worker1/status`)
   works over SY.admin's HTTP route and finds nothing through Archi.
 - **Fix, later (SY.architect):** `translate_scmd` decodes each segment once, as SY.admin's routes do.
+- **Built on `coa/architect-136` (0.1.136):** each segment is decoded once after the path is split
+  and the query set apart; its review's fix: Archi's own two paths (`/architect/control/...`) are
+  read the same way. Found by the review: A-311 (with the decoding, Archi's read tool can name a
+  `/` in `GET /hives/{hive_id}`) and A-312.
 
 ### A-286 [Archi] 🔵 low (found 2026-11-11 by A-279's builder; read in the code; there before it) — Archi's SCMD reads take `+` for a space where SY.admin keeps it
 
@@ -1788,6 +1842,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   offsets are not affected.
 - **Fix, later (SY.architect):** the SCMD reads decode with `+` kept, as SY.admin does; Archi's own
   HTTP `query_param` keeps its reading.
+- **Built on `coa/architect-136` (0.1.136):** the SCMD reads keep `+`, as SY.admin does.
 
 ### A-285 [Archi] 🔵 low (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
 
@@ -1855,6 +1910,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   same 5 min, once-an-hour restart repairs it.
 - **The operator's call (2026-11-11):** yes: a tick whose API port refuses the connection or times
   out its connect counts toward the same bounded restart. With 0.1.136's orchestrator.
+- **Built on `coa/orch-136` (`754b81c6`), with its second review's fixes:** a refused or timed-out
+  connect counts (*API port refused*); any other connect error is the host's own (file
+  descriptors run out, `EPERM`) and counts nothing, a check with no answer warned after a minute;
+  a setup the boot or a config change could not finish is owed, and runs at the first tick whose
+  port takes the connection; a setup that restarts Syncthing, or starts one that did not run,
+  starts the run of no answers again; every tick counts, a hive with no folder included; an
+  egress no longer reads its own start's config as a change. Left, and documented: a restart no
+  tick sees (systemd's own `Restart=always`, or a manual `systemctl restart fluxbee-syncthing`)
+  can count the new process's first seconds in the old run, at most one restart more within the
+  hour's bound; an owed setup that keeps failing for a lasting reason runs every 5 s with a
+  warning, as the unhealthy path does. Found on the way: A-313, and an unreachable branch in
+  `bootstrap_local`'s Syncthing step (cleanup only).
 
 ### A-282 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — A replaced binary is taken for current when `systemctl show` gives no answer
 
@@ -1878,6 +1945,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-11):** yes: at boot, a check with no answer restarts only when the
   same boot found a replaced binary, each such restart recorded in `core.last_update`. With
   0.1.136's orchestrator.
+- **Built on `coa/orch-136` (`754b81c6`);** its second review changed only the SIGTERM comment: the
+  orchestrator's exit never stops a service, and its boot restarts only the services a package
+  upgrade replaced and, beside them, the listed ones with no answer; any other start, `systemctl
+  restart sy-orchestrator` included, restarts none.
 
 ### A-281 [General/admin] 🟡 medium (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — `remove_runtime_version` removes a version whose usage it could not read
 
