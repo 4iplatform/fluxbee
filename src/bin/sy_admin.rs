@@ -19200,14 +19200,7 @@ async fn handle_admin_command_with_origin(
     let logged_params = admin_command_log_params(&payload);
     // The hive a rollback, a removal or a join acts on: the installation's update looks at it at
     // once (stage 4), never blocking the command.
-    let moved_hive = matches!(action, "core_rollback" | "remove_hive" | "add_hive").then(|| {
-        hive.clone().or_else(|| {
-            payload
-                .get("hive_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-    });
+    let moved_hive = moved_hive_of(action, &payload, hive.as_deref());
     let result =
         handle_admin_command_inner(ctx, client, action, payload, hive.clone(), origin).await;
     if let Some(moved_hive) = moved_hive {
@@ -19254,6 +19247,35 @@ async fn handle_admin_command_with_origin(
         append_admin_command_log_locked(&ctx.state_dir, &entry);
     }
     result
+}
+
+/// The hive the installation's update looks at once a command of `action` is under way (stage 4):
+/// `Some` for a rollback, a removal or a join, holding the hive it moves (`None` when it names
+/// none, and the update's task is only woken), and `None` for any other action. `core_rollback`'s
+/// is the hive it is called for: the path's, or over the mesh the command's target. `add_hive`'s
+/// and `remove_hive`'s is the hive joined or removed, the payload's `hive_id` (as
+/// `removal_pages_of` reads it), before the hive it is called for: Archi names its own hive as the
+/// target of both (`POST /hives`, `DELETE /hives/{id}`), and the update looked at the motherbee
+/// instead of that hive.
+fn moved_hive_of(
+    action: &str,
+    payload: &serde_json::Value,
+    hive: Option<&str>,
+) -> Option<Option<String>> {
+    let named = || {
+        payload
+            .get("hive_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|hive| !hive.is_empty())
+            .map(str::to_string)
+    };
+    let called = || hive.map(str::to_string);
+    match action {
+        "core_rollback" => Some(called().or_else(named)),
+        "add_hive" | "remove_hive" => Some(named().or_else(called)),
+        _ => None,
+    }
 }
 
 async fn handle_admin_command_inner(
@@ -39592,6 +39614,71 @@ mod tests {
         assert!(!worker1.holds(&elsewhere));
         assert!(!ingress1.holds(&elsewhere));
         assert!(!PagesOf::Hive("worker".to_string()).holds(&published_there));
+    }
+
+    /// The hive the installation's update looks at once a removal, a join or a rollback is under
+    /// way (stage 4): a removal's or a join's is the payload's hive_id, over HTTP and over the mesh,
+    /// where Archi names its own hive as the target; the motherbee was looked at instead. A
+    /// rollback's is the hive it is called for. Any other action looks at none.
+    #[test]
+    fn the_update_looks_at_the_hive_a_removal_or_a_join_names() {
+        let moved = |action: &str, payload: Value, hive: Option<&str>| {
+            moved_hive_of(action, &payload, hive)
+        };
+        let worker2 = Some(Some("worker2".to_string()));
+        for action in ["remove_hive", "add_hive"] {
+            // Archi's DELETE /hives/worker2 or POST /hives over the mesh.
+            assert_eq!(
+                moved(
+                    action,
+                    json!({ "hive_id": "worker2" }),
+                    Some(PRIMARY_HIVE_ID)
+                ),
+                worker2,
+                "{action}"
+            );
+            // The operator's, over HTTP: no hive besides the payload's.
+            assert_eq!(
+                moved(action, json!({ "hive_id": " worker2 " }), None),
+                worker2,
+                "{action}"
+            );
+            assert_eq!(
+                moved(action, json!({}), Some("worker2")),
+                worker2,
+                "{action}"
+            );
+            assert_eq!(
+                moved(action, json!({ "hive_id": " " }), Some("worker2")),
+                worker2,
+                "{action}"
+            );
+            assert_eq!(moved(action, json!({}), None), Some(None), "{action}");
+        }
+        assert_eq!(
+            moved(
+                "core_rollback",
+                json!({ "hive_id": "worker1" }),
+                Some("worker2")
+            ),
+            worker2
+        );
+        assert_eq!(
+            moved("core_rollback", json!({ "hive_id": "worker2" }), None),
+            worker2
+        );
+        assert_eq!(
+            moved(
+                "kill_node",
+                json!({ "hive_id": "worker2" }),
+                Some("worker2")
+            ),
+            None
+        );
+        assert_eq!(
+            moved("get_hive", json!({ "hive_id": "worker2" }), None),
+            None
+        );
     }
 
     /// remove_hive is refused for no page (FINDINGS A-242): it goes to the orchestrator, and its ok

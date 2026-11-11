@@ -1027,9 +1027,10 @@ time comes, in a task of its own, and sleeps until the next one is due:
   0.1.124: the due time is kept per hive, and a hive the superseded update read every 10 min, which
   the new run recorded `not_answered`, waited out that cadence before its 30 s check);
 - **an immediate look,** which never blocks the action: a per-hive `update` or `core_rollback` on a
-  hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at once; a
-  read of `get_installation_update` or of `/versions` makes it look at each hive off the target it
-  has not looked at for 30 s;
+  hive, the end of `add_hive`'s join and `remove_hive` make the task look at that hive at once
+  (`add_hive`'s and `remove_hive`'s is the payload's `hive_id`, whatever the command's target,
+  which Archi sets to its own hive: `moved_hive_of`); a read of `get_installation_update` or of
+  `/versions` makes it look at each hive off the target it has not looked at for 30 s;
 - **the automatic step:** a hive whose outcome was `not_answered`, and that answers again, gets the
   update finished, once per hive and target, core then config, with the same bounds. A core it
   finds under way is followed instead, and the attempt is not spent on it. The attempt is recorded
