@@ -70,8 +70,9 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
 - **At least once.** An inbound event is saved in the store before its transition runs, and the
   transition's commit deletes it, with any earlier event of the instance a failed commit left; a
   creation commits the instance, its internal events, the messages it kept and the event in one
-  transaction (store schema v5: an instance's thread, its person, and its kept messages; an
-  instance's status is `running`, `completed`, `cancelled` or `failed`). After a crash the
+  transaction (store schema v7: an instance's thread, its person and its person's IO node, its
+  kept messages, and what SY.timer did not take of its timers; an instance's status is
+  `running`, `completed`, `cancelled` or `failed`). After a crash the
   start runs again whatever was left, under the same instance id and trace_id, counting each
   event's attempts first: one already run at 3 starts is not run again, and its instance fails
   (`replay_exhausted`). The store commits with `synchronous=FULL`.
@@ -85,7 +86,21 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   SY.timer does not answer at start, or the timer index (or a row of it) cannot be read, the node
   starts `DEGRADED` (`timers_not_reconciled`) and reconciles its timers on a later try, every 30 s;
   a timer SY.timer never got is scheduled again then, and one scheduled after the list was asked is
-  left alone.
+  left alone. A timer fires from 60 s to 366 days ahead, SY.timer's floor and ceiling (a definition
+  that asks more does not load).
+- **A timer SY.timer does not take goes again** (FINDINGS A-254). A `schedule_timer` or a
+  `reschedule_timer` records the timer in the index first, then sends its request without waiting,
+  and the node keeps the request by its trace_id until SY.timer's `TIMER_RESPONSE`, which the SDK
+  hands it on a channel of its own (`wfRouteProfile`). A request the router answers `UNREACHABLE`
+  (`NODE_NOT_FOUND` while SY.timer restarts, `LINK_BUSY`) or `TTL_EXCEEDED`, that SY.timer refuses
+  (`ok: false`), that gets no answer in 30 s, or that does not go (the send queue full) marks its
+  timer in the index, saying why, and the node's log names it. A marked timer goes again, a
+  `TIMER_SCHEDULE` at its `fire_at`, after 5, 10, 20 and 40 s, then each minute, until SY.timer
+  takes it; one whose time comes first is fired by the node itself. Meanwhile `NODE_STATUS_GET` says
+  `DEGRADED` (`timers_not_reconciled`), naming the next timer and why. What goes again is the index
+  row: a timer the instance cancelled since does not go, one it moved goes at its new time, and a
+  later request about the same timer supersedes an earlier one. Before, a schedule refused while
+  SY.timer restarted was lost until the node's next start, and the SDK dropped SY.timer's refusals.
 - **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
   store does not open, or fails during recovery, the node stays up and connected: `NODE_STATUS_GET`
   says `DEGRADED` with `last_error` `store_unavailable` (a corrupt file, a full disk, a file system

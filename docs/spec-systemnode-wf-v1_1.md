@@ -243,7 +243,7 @@ Each `WF.*` node is an independent Go process that:
 - **`fluxbee-go-sdk`** — router connection, message envelope, identity resolution, timer client, admin command helpers.
 - **`cel-go`** — guard expression evaluation.
 - **`modernc.org/sqlite` or `mattn/go-sqlite3`** — persistence.
-- **SY.timer v1.1 or later** — all scheduled events lasting ≥ 60 seconds. WF v1 requires SY.timer v1.1, which extends v1.0 with `client_ref`-based lookup for `TIMER_CANCEL`, `TIMER_RESCHEDULE`, and `TIMER_GET`. See section 10.2 for why.
+- **SY.timer v1.1 or later** — all scheduled events, from 60 seconds to 366 days ahead. WF v1 requires SY.timer v1.1, which extends v1.0 with `client_ref`-based lookup for `TIMER_CANCEL`, `TIMER_RESCHEDULE`, and `TIMER_GET`. See section 10.2 for why.
 - **Go native `time`, `context`** — internal runtime plumbing timeouts (sub-60s internal to the node, never part of the workflow logic).
 
 ### 7.2 File layout
@@ -401,7 +401,7 @@ When a WF node loads its workflow definition, it runs these checks:
 8d. Where the event may be no node's message, no `keep_message` and no `forward` without `message`, either of which would fail the instance. On a state's transition that takes a `TIMER_FIRED` (matched on that `msg`) or an internal event, which has no sender (its `event_match` names no `src`, and its `msg` is `AGENT_CALL_CAP`, §9.6, or one an `emit_internal_event` of the definition emits): among its actions and, with a `target_state`, its state's exit actions and its target's entry actions. The error names the event: `the TIMER_FIRED of states[0].transitions[2]`, `the AGENT_CALL_CAP of ...`, `the internal event TO_SALES of ...`. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one. A `forward` of a kept message goes anywhere.
 8e. What reads an agent's evaluation is checked against what it is, a menu's answer `{reply, option, params}` (§10.10), and against the definition's menus, those of its `send_message` and `forward` actions. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.<f>` names `reply`, `option` or `params` (`event.context.evaluation.optoin` and `event.context.evaluation.param.question` are refused). A guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`, `in`) names an option of one of the menus, or `none`; the empty string names no option, so `event.context.evaluation.option != ''` (any menu's answer) is no typo. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.params.<p>`, and a guard that looks for a name in them (`'question' in event.context.evaluation.params`), names a param of one of the menus, or `reason`. A name the evaluation or no menu has would be a guard that never matches, or a value that fails the instance.
 8f. A `subject` is on a `send_message` or a `forward` to an `IO.*` node only, and is `new`, `same` or `end`. An `end` takes no `menu`: the IO node closes the subject's menu with it, and io.slack drops a menu that comes with an `end` (`an end closes the subject's menu: a menu goes with new or same`).
-9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is ≥ 60 seconds (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. A duration in days is at most `106751d`, the most a duration holds.
+9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is from 60 seconds to 366 days, SY.timer's floor and ceiling (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. SY.timer refuses a timer more than 366 days ahead every time, so before FINDINGS A-254 a `fire_in` of `400d` loaded and its timer never fired (`must be at most 366d`).
 10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles; every `keep_message` keeps under a valid name.
 11. Every `$ref` that is a dot path (no `#`, `/` or `:`) is rooted at `input.`, `state.` or `event.` (a typo such as `inptu.x` is refused), has no empty segment, holds only `$ref` and `default` (`a $ref holds only $ref and default`), and its `default` is a literal, with no `$ref` inside (§10.1). A `$ref` that is not a string is refused.
 12. Every number of the definition fits a double (`1e400` does not): one that does not is refused, by its path. Read as a double, it failed the read of the definition's fields, and the checks of items 1 and 7 were skipped; its value would have been its literal, a string.
@@ -424,7 +424,7 @@ Entry actions run when the instance enters the state (including from `initial_st
 
 An **internal transition** (one without a `target_state`) runs its own actions only and stays in its state: no exit or entry actions run, so the state's timers keep running. An event that arrives early is noted without leaving the state (a due date that fires while an agent is answering, say), and the next state acts on it. A transition whose `target_state` is its own state leaves the state and enters it again.
 
-If an action fails, its `on_error` decides: `fail` halts the transition and routes the instance to its terminal `failed` state (running that state's entry actions, best-effort, when the definition declares it); `continue` logs the failure and goes on. The default is `fail` for `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event` (a lost message, a message not kept or an unset variable leaves the instance inconsistent), `continue` for the timer actions. A send to a node that is not connected is not a failure the WF sees: the router's `UNREACHABLE` comes back as a notice, which the WF does not answer.
+If an action fails, its `on_error` decides: `fail` halts the transition and routes the instance to its terminal `failed` state (running that state's entry actions, best-effort, when the definition declares it); `continue` logs the failure and goes on. The default is `fail` for `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event` (a lost message, a message not kept or an unset variable leaves the instance inconsistent), `continue` for the timer actions. A send to a node that is not connected is not a failure the WF sees: the router's `UNREACHABLE` comes back as a notice, which the WF does not answer. A timer's request to SY.timer is the exception: the router's `UNREACHABLE` of one marks the timer in the WF's index, and the timer goes again until SY.timer takes it (§10.2).
 
 ### 9.2 Transition evaluation
 
@@ -601,13 +601,13 @@ Fields:
 | Field | Description |
 |---|---|
 | `timer_key` | A stable identifier for this timer within the instance. Must be unique within an instance. Used to cancel or reschedule it later. |
-| `fire_in` | Duration string (`"30m"`, `"2h"`, `"1d"`), or a `$ref` to one. Minimum 60s. |
-| `fire_at` | Alternative to `fire_in`. RFC 3339 absolute UTC timestamp, or a `$ref` to one, 60 s ahead at least. |
+| `fire_in` | Duration string (`"30m"`, `"2h"`, `"1d"`), or a `$ref` to one. From 60 s to 366 days (`"366d"`), SY.timer's floor and ceiling. |
+| `fire_at` | Alternative to `fire_in`. RFC 3339 absolute UTC timestamp, or a `$ref` to one, from 60 s to 366 days ahead. |
 | `missed_policy` | Forwarded to SY.timer. `"fire"`, `"drop"`, or `"fire_if_within"` with `missed_within_ms`. |
 
 **At most 10 timer keys in a definition** (FINDINGS A-153). The WF keeps one timer per instance and key, so the keys the `schedule_timer` actions name are the most timers one conversation holds at once. A definition whose `schedule_timer` actions name more than 10 distinct keys is refused at load; a key that only a `cancel_timer` or a `reschedule_timer` names sets no timer. A logic that needs more is two WFs. A node's pending timers are its open conversations' (an instance that ends cancels its own, §11.3), so the node's count follows its conversations: 1000 running instances (§21) hold 10,000 at most, SY.timer's limit per owner.
 
-**A time from state.** `fire_in` and `fire_at` take a `$ref` (with an optional literal `default`, §10.1), resolved when the action runs: the time can come from the instance's state or from an agent's answer, as when an invoice's due date sets the timer that checks its payment (`"fire_in": {"$ref": "state.invoice.due_in"}`). The value must then be a string that parses, and the 60 s floor is checked then; one that does not fails the action, under its `on_error` (a timer action continues by default, so a time an agent gives is worth `"on_error": "fail"`). A literal is checked at load.
+**A time from state.** `fire_in` and `fire_at` take a `$ref` (with an optional literal `default`, §10.1), resolved when the action runs: the time can come from the instance's state or from an agent's answer, as when an invoice's due date sets the timer that checks its payment (`"fire_in": {"$ref": "state.invoice.due_in"}`). The value must then be a string that parses, and the 60 s floor and the 366-day ceiling are checked then; one that does not fails the action, under its `on_error` (a timer action continues by default, so a time an agent gives is worth `"on_error": "fail"`). A literal is checked at load.
 
 **Identification through `client_ref`.**
 
@@ -628,7 +628,7 @@ This `client_ref` is the canonical identifier of the timer for all subsequent op
 
 This dependency on `client_ref` semantics requires `SY.timer v1.1` to support lookup operations (`TIMER_CANCEL`, `TIMER_RESCHEDULE`, `TIMER_GET`) by `client_ref` in addition to `timer_uuid`. WF v1 will not work against SY.timer v1.0 without this extension.
 
-The runtime does not block waiting for the `TIMER_SCHEDULE_RESPONSE`. It logs the schedule action immediately as ok=true and continues with the next action. The response arrives later as a reply on no instance's thread, and is dropped (§14.5): the `client_ref` is sufficient for all subsequent operations. A schedule sent while SY.timer does not answer is not lost: the timer stays in the WF's index, and the next reconciliation schedules it again (§11.4).
+The runtime does not block waiting for SY.timer's answer (`TIMER_RESPONSE`): it records the timer in its index, sends `TIMER_SCHEDULE`, logs the schedule action as ok=true and continues with the next action; the `client_ref` is sufficient for all subsequent operations. It keeps the request, by its `trace_id`, until SY.timer answers, and a request SY.timer does not take is no longer lost (FINDINGS A-254). The router's `UNREACHABLE` (SY.timer not connected, `NODE_NOT_FOUND`, while it restarts; its link full, `LINK_BUSY`) or `TTL_EXCEEDED`, SY.timer's own refusal (`ok: false`: its store failing, its limit of pending timers reached), no answer in 30 s (SY.timer dropped the request under load, or its answer was lost), or a send that did not go (the send queue full during a reconnect) marks the timer in the index, saying why, and the node's log names the timer and the request. A marked timer goes again, a `TIMER_SCHEDULE` at its `fire_at` (60 s ahead at least) with `missed_policy` `fire`, after 5, 10, 20 and 40 s, then each minute (as SY.timer sends again a fire it could not deliver), until SY.timer takes it; SY.timer keeps one pending timer per `client_ref`, so one it holds already is not doubled. A marked timer whose time comes first is fired by the WF itself, as the reconciliation fires a timer lost while the node was down (§11.4). Meanwhile the node is `DEGRADED`, `timers_not_reconciled`, its `last_error` saying how many timers wait and naming the next to go. What goes again is the index row, so the order with the instance's later requests about the timer holds: a timer it cancelled since does not go, and one it moved goes at its new time; a later request about the same timer supersedes an earlier one, whose answer then decides nothing. A `reschedule_timer`'s request is followed the same way: one SY.timer does not take (it answers `TIMER_NOT_FOUND` for a timer it never got) marks the timer, which goes again as a schedule at its new time. A `TIMER_CANCEL` is not followed: a fire of a timer the instance cancelled is dropped as stale (§11.2). Before A-254 a schedule refused while SY.timer restarted was lost until the WF's next start, its instance waiting meanwhile, and SY.timer's own refusals were dropped by the SDK, unseen: the WF's route profile now takes `TIMER_RESPONSE` on a channel of its own, which the SDK does not take for a reply only its calls wait for.
 
 ### 10.3 `cancel_timer`
 
@@ -655,7 +655,7 @@ Changes the fire time of an existing scheduled timer.
 }
 ```
 
-Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op. Its `fire_in` or `fire_at` is a literal or a `$ref`, as in `schedule_timer`.
+Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op. Its `fire_in` or `fire_at` is a literal or a `$ref`, as in `schedule_timer`. The index takes the new time first, and keeps the timer's mark when SY.timer has not taken it, so a refused timer goes again at its new time; a reschedule SY.timer does not take marks the timer the same way (§10.2).
 
 ### 10.5 `set_variable`
 
@@ -852,7 +852,7 @@ Anything these would enable, v1 expresses through combinations of `send_message`
 
 WF has two distinct kinds of time, handled differently:
 
-**Workflow time** — timers that are part of the workflow logic. "Wait 30 minutes for customer response". "Escalate in 2 hours". "Close at end of month". These are always handled via `SY.timer` and go through the `schedule_timer` / `cancel_timer` / `reschedule_timer` actions. Minimum duration: 60 seconds, enforced by SY.timer.
+**Workflow time** — timers that are part of the workflow logic. "Wait 30 minutes for customer response". "Escalate in 2 hours". "Close at end of month". These are always handled via `SY.timer` and go through the `schedule_timer` / `cancel_timer` / `reschedule_timer` actions. From 60 seconds to 366 days ahead, SY.timer's floor and ceiling: the WF checks both, at load for a literal and when the action runs for a `$ref` or a `fire_at`.
 
 **Runtime time** — timers internal to the node's own implementation. Socket read timeouts, debounce delays, internal task timeouts. These are handled with Go native primitives (`time.After`, `context.WithTimeout`, `time.Ticker`) and never touch SY.timer. They are invisible to workflow authors and do not participate in the workflow logic.
 
@@ -897,10 +897,10 @@ The recovery flow is:
 1. The WF loads its persisted running instances, each on the definition it was born with (§13.1).
 2. It asks `SY.timer` for its pending timers (`TIMER_LIST` filtered by `owner = this WF node`, at most 1000). If SY.timer does not answer, the node starts anyway, reports itself `DEGRADED` (`timers_not_reconciled`), and asks again every 30 s; the reconciliation below runs when it answers. So it does when the WF cannot read its own index of timers, or a row of it again (step 3): it stays `DEGRADED` and tries again every 30 s (FINDINGS A-217's review). A one-shot fire SY.timer sent while the WF could not take it (its store down, §14.1) has no other way back: SY.timer sends a fire to a connected node once.
 3. The WF cross-references SY.timer's timers (by `client_ref`) against its own index of the timers its instances scheduled. It goes through the index in the order the timers fire, and reads each row again before it acts on it: a fire it gives an instance may cancel or move a later timer, which then does not fire (before 0.1.90 a timer an earlier fire had cancelled fired anyway). For a running instance's timer:
-   - **Pending in SY.timer, `fire_at` ahead**: nothing to do.
+   - **Pending in SY.timer, `fire_at` ahead**: nothing to do; a mark the index keeps of a request SY.timer did not take is cleared, since SY.timer has the timer (§10.2).
    - **Pending in SY.timer, `fire_at` past**: the WF gives the instance a synthetic `TIMER_FIRED` now, as SY.timer's would go (§14.4), then cancels the pending one in SY.timer so it does not fire again, unless the fire scheduled the same key again.
    - **In the index but not in SY.timer, `fire_at` past**: it fired while the WF was down, and SY.timer dropped the fire. The WF gives the instance a synthetic `TIMER_FIRED`.
-   - **In the index but not in SY.timer, `fire_at` ahead**: SY.timer never got it (it was scheduled while SY.timer did not answer) or lost it. The WF schedules it again, under the same `client_ref`, at its `fire_at` (60 s ahead at least), with `missed_policy` `fire` (the index does not keep the policy). Before 0.1.90 the index row went, and an instance waiting on that timer waited forever.
+   - **In the index but not in SY.timer, `fire_at` ahead**: SY.timer never got it (it was scheduled while SY.timer did not answer) or lost it. The WF schedules it again, under the same `client_ref`, at its `fire_at` (60 s ahead at least), with `missed_policy` `fire` (the index does not keep the policy): a new request, followed as any other (§10.2), so one SY.timer does not take goes again. Before 0.1.90 the index row went, and an instance waiting on that timer waited forever.
    - **Scheduled after the WF asked SY.timer for its list**: left alone, since the list could not have it.
 
    A timer of an instance that no longer runs leaves the index. A timer **in SY.timer but not in the index** is an orphan; the WF cancels it.
@@ -1009,7 +1009,7 @@ CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);
 
 Cap per instance: 100 entries, FIFO. Older entries are pruned when adding new ones. When the instance terminates, its log is preserved until the instance itself is GC'd (retention default 7 days, configurable).
 
-**`wf_instance_timers`** — the index of the timers each instance has scheduled (`instance_id`, `timer_key`, `scheduled_at_ms`, `fire_at_ms`), reconciled with SY.timer at startup (§11.4).
+**`wf_instance_timers`** — the index of the timers each instance has scheduled (`instance_id`, `timer_key`, `scheduled_at_ms`, `fire_at_ms`), reconciled with SY.timer at startup (§11.4). Since schema v7 (FINDINGS A-254) a timer also keeps why SY.timer did not take the last request about it (`refusal`, empty when nothing says so), how many times it went again since (`resends`) and when it goes next (`resend_at_ms`, §10.2).
 
 **`wf_internal_events`** — durable FIFO queue of internal synthetic events emitted by `emit_internal_event` and not yet consumed (`event_id`, `instance_id`, `msg_type`, `msg_name`, `payload_json`, `trace_id`, `created_at_ms`, `attempts`). These rows are transient runtime state, not history. They exist only until the corresponding internal event is consumed or the instance terminates.
 
@@ -1112,17 +1112,18 @@ loop {
 
 Handlers:
 
-- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers are not reconciled: SY.timer did not answer, or the timer index could not be read (§11.4).
+- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers are not reconciled: SY.timer did not answer, or the timer index could not be read (§11.4), or a timer SY.timer did not take waits to go again (§10.2).
 - `WF_HELP` — returns the workflow HELP descriptor.
 - `WF_CANCEL_INSTANCE` — initiates soft abort.
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).
 - `WF_LIST_INSTANCES` — returns instances matching filter.
 - `WF_GET_CODE` — returns the current workflow definition.
 - `TIMER_FIRED` — from SY.timer of its own hive only, for a timer this node scheduled: routes to the instance its `client_ref` names (§11.2).
-- Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` (since 0.1.90; the AI and IO nodes take the system kind only as control too).
+- `TIMER_RESPONSE` — from SY.timer of its own hive only, the answer to a timer request the node sent without waiting: it settles the request's timer, which a refusal marks to go again (§10.2); never answered. The SDK hands it to the loop on a channel of its own.
+- Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` (since 0.1.90; the AI and IO nodes take the system kind only as control too), and SY.timer's `TIMER_RESPONSE` settles a timer, no instance's event.
 - Any other message — taken only from a node the definition names; matched against the running instance on its `meta.thread_id`, or, from a `start_from` node, if it is no reply and it matches the `input_schema`, creates a new instance on its thread; a message the WF takes nowhere may get `NOT_TAKEN` (§14.5).
 
-The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, or a system message without a name — SY.timer's rule and the AI nodes', name by name (FINDINGS A-218).
+The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, or a system message without a name — SY.timer's rule and the AI nodes', name by name (FINDINGS A-218). The router's `UNREACHABLE` or `TTL_EXCEEDED` of a timer request the node waits on marks the request's timer first, to go again (§10.2, FINDINGS A-254).
 
 Internal events emitted by `emit_internal_event` do **not** enter through this inbound loop. They are already bound to a specific instance and are drained from that instance's durable internal queue by the runtime itself.
 
@@ -1181,7 +1182,7 @@ When an event arrives at the WF node, the runtime must decide whether it is for 
 
 While the engine waits for its store (§14.1) none of this runs: a `TIMER_FIRED` is discarded, a sender the current definition does not involve is discarded as in step 2, and any other event gets `NOT_TAKEN`, reason `unavailable` (FINDINGS A-217).
 
-**`NOT_TAKEN`** (since 0.1.94, `docs/wf-orchestration-v1.md` §5.4.6; it took `INVALID_INPUT`'s place) is a `system` message to the sender's uuid, with the message's `trace_id` and `thread_id`, and the payload `{"ok": false, "error": "not_taken", "reason": "<reason>", "detail": "<text>"}`. An `IO.*` node gets it for any message that is no reply and no notice, named or not, and shows it to whoever wrote. Any other sender gets it only for a named request, and only for `no_thread`, `invalid_input` and `unavailable`: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce a `NOT_TAKEN` (FINDINGS A-119), and an agent's late answer is never answered. A WF and an agent act on none: a WF drops every `system` message but a `TIMER_FIRED` (§14.2), and ai.generic ignores a `system` message it does not know. The `not_expected` of an event no transition takes goes once the event's commit consumed it (§14.4), so a start that runs the event again sends it once.
+**`NOT_TAKEN`** (since 0.1.94, `docs/wf-orchestration-v1.md` §5.4.6; it took `INVALID_INPUT`'s place) is a `system` message to the sender's uuid, with the message's `trace_id` and `thread_id`, and the payload `{"ok": false, "error": "not_taken", "reason": "<reason>", "detail": "<text>"}`. An `IO.*` node gets it for any message that is no reply and no notice, named or not, and shows it to whoever wrote. Any other sender gets it only for a named request, and only for `no_thread`, `invalid_input` and `unavailable`: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce a `NOT_TAKEN` (FINDINGS A-119), and an agent's late answer is never answered. A WF and an agent act on none: a WF drops every `system` message but a `TIMER_FIRED` and SY.timer's `TIMER_RESPONSE` (§14.2), and ai.generic ignores a `system` message it does not know. The `not_expected` of an event no transition takes goes once the event's commit consumed it (§14.4), so a start that runs the event again sends it once.
 
 The node's log names every message by its sender, `msg` and thread, and gets the first characters of its payload only when it reaches an instance or starts one: when every message of a node comes to the WF (a Slack channel's, say), the log keeps no text of those the WF discards.
 
@@ -1410,6 +1411,7 @@ A future iteration of identity may introduce a claims model that allows per-ILK 
 | `INVALID_TARGET_STATE` | A transition references a state that does not exist. |
 | `INVALID_TARGET_L2_NAME` | A `send_message` target is not a valid L2 name. |
 | `TIMER_DURATION_BELOW_MINIMUM` | A `schedule_timer` action specifies < 60s. |
+| `TIMER_DURATION_ABOVE_MAXIMUM` | A `schedule_timer` or `reschedule_timer` action specifies more than 366 days (`must be at most 366d`, FINDINGS A-254). |
 | `INSTANCE_NOT_FOUND` | Referenced `instance_id` does not exist. |
 | `INSTANCE_ALREADY_TERMINATED` | Operation on a terminated instance. |
 | `STORAGE_ERROR` | SQLite persistence error. |
@@ -1775,7 +1777,7 @@ This is the Archi-first loop: definitions as data, simple OPA rules using identi
 | A WF asks an agent with a menu, written in the action | What an agent may do is fixed and clear, and never in its role: a role keeps only the agent's trade, so it stays reusable (Case 3) |
 | An optional `catch`, with the log as the default | .NET's model: the designer programs what to do with what no state takes, or leaves it to the log (Case 3) |
 | A cap on agent calls between two triggers | The catch makes a loop easy to write; past the cap the send is not made, and the instance hears it, without failing (Case 3, A-125) |
-| Workflow timers via SY.timer | No duplicated timer infrastructure; minimum 60s enforced |
+| Workflow timers via SY.timer | No duplicated timer infrastructure; its 60 s minimum and 366-day maximum enforced |
 | Runtime timers via Go native | Sub-60s plumbing stays invisible to workflow authors |
 | SQLite per node, monolithic | Same pattern as SY.timer, consistent with Fluxbee |
 | Soft abort only in v1 | Rollback and compensation are complex, deferred |
@@ -1813,7 +1815,7 @@ Workflow authors should be aware of these limits.
 
 - **Guard evaluation: 10 ms.** A guard is stopped at its timeout, and counts as false (§9.3).
 - **`set_variable` evaluation: 1,000,000 CEL cost units.** Past it the action fails (§10.5).
-- **Minimum timer duration: 60 seconds** (SY.timer's own minimum), checked at load for a literal, and when the action runs for a `$ref` (§10.2).
+- **Timers from 60 seconds to 366 days ahead** (SY.timer's own minimum and maximum), checked at load for a literal, and when the action runs for a `$ref` or a `fire_at` (§10.2).
 - **At most 10 timer keys in a definition,** the timers one conversation holds at once, checked at load (§10.2).
 - **A quiet conversation closes:** no event for its `idle_timeout` (4 days by default, 1 hour to 7 days) and no timer pending (§12.5).
 - **100 log entries per instance**, FIFO.

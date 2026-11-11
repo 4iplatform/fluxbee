@@ -341,13 +341,14 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 // when it was asked, at askedAtMS. It goes through the index in the order the timers fire, and reads
 // each row again before it acts: a fire it gives an instance may cancel or move a later timer.
 //
-//   - pending, fire_at ahead: nothing to do;
+//   - pending, fire_at ahead: nothing to do, but a refusal the index keeps of it is cleared: SY.timer
+//     has it (FINDINGS A-254);
 //   - pending, fire_at past: the instance takes a fire now (as SY.timer's would, through the journal),
 //     and the pending one is cancelled unless the fire scheduled the key again;
 //   - not in SY.timer, fire_at past: it fired while the WF was down and the fire was lost; the
 //     instance takes a fire now;
 //   - not in SY.timer, fire_at ahead: SY.timer never got it (it was scheduled while SY.timer did not
-//     answer) or lost it; it is scheduled again;
+//     answer) or lost it; it is scheduled again, a new request (scheduleAgain);
 //   - scheduled after SY.timer was asked: left alone (the list could not hold it);
 //   - in SY.timer but not in the index: an orphan, cancelled.
 //
@@ -397,7 +398,11 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 
 		switch {
 		case existsInSY && syTimer.FireAtUTCMS > now:
-			// Pending, fire_at ahead: nothing to do.
+			// Pending, fire_at ahead: nothing to do. A refusal of it is settled: SY.timer has it
+			// (FINDINGS A-254).
+			if row.Refusal != "" {
+				rt.timerTaken(ctx, timerRef{row.InstanceID, row.TimerKey})
+			}
 
 		case existsInSY:
 			if running {
@@ -457,19 +462,23 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 // index SY.timer does not have: its schedule went while SY.timer did not answer, SY.timer lost it, or
 // SY.timer fired it at a time the instance had moved it from (takeTimerFired). SY.timer keeps a
 // pending timer with the same client_ref, so it never fires twice. The index does not keep the
-// timer's missed_policy: the new schedule has SY.timer's default, fire.
+// timer's missed_policy: the new schedule has SY.timer's default, fire. It is a new request, as an
+// action's: the index first, with no refusal, and a request SY.timer does not take, or that does not
+// go, marks the timer to go again (FINDINGS A-254).
 func (rt *NodeRuntime) scheduleAgain(ctx context.Context, row TimerRow, nowMS int64) {
 	in := time.Duration(row.FireAtMS-nowMS) * time.Millisecond
 	if in < minTimerDuration {
 		in = minTimerDuration
 	}
-	opts := timerScheduleOptions(rt.ActCtx.Dispatcher.NodeL2Name(), row.InstanceID, row.TimerKey)
-	if _, err := rt.ActCtx.Timer.ScheduleIn(ctx, in, opts); err != nil {
-		log.Printf("recover: schedule timer %s/%s again: %v", row.InstanceID, row.TimerKey, err)
-		return
-	}
 	if err := rt.Store.RegisterTimer(ctx, row.InstanceID, row.TimerKey, nowMS, nowMS+in.Milliseconds()); err != nil {
 		log.Printf("recover: register timer %s/%s: %v", row.InstanceID, row.TimerKey, err)
+		return
+	}
+	opts := timerScheduleOptions(rt.ActCtx.Dispatcher.NodeL2Name(), row.InstanceID, row.TimerKey)
+	traceID, err := rt.ActCtx.Timer.ScheduleIn(ctx, in, opts)
+	req := timerRequest{timer: timerRef{row.InstanceID, row.TimerKey}, verb: verbTimerSchedule, traceID: traceID, sentAtMS: nowMS}
+	if err := rt.ActCtx.timerRequestSent(ctx, req, err); err != nil {
+		log.Printf("recover: schedule timer %s/%s again: %v", row.InstanceID, row.TimerKey, err)
 	}
 }
 

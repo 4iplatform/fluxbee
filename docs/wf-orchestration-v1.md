@@ -201,9 +201,14 @@ This is the single place for the track. The cases are worked here one at a time.
     or from the agent's evaluation, cannot be expressed.
   - The operator's pass-through, with a time chosen at run time, needs this.
 - **Nothing under 60 s; no recurring timer; no timer that starts an instance.** So a run cannot
-  be started by a schedule.
+  be started by a schedule. Nothing past 366 days either, SY.timer's ceiling: a definition that
+  asks more is refused since FINDINGS A-254 (it loaded, and its timer never fired).
 - **Every timer request is fire-and-forget.**
-  - SY.timer's refusals go unseen, and the WF's index drifts.
+  - SY.timer's refusals go unseen, and the WF's index drifts. Since FINDINGS A-254 the WF still
+    sends without waiting, but keeps each schedule and reschedule until SY.timer answers: a refused
+    one (the router's `UNREACHABLE`, SY.timer's own refusal, no answer in 30 s) marks its timer in
+    the index, which goes again after 5, 10, 20 and 40 s, then each minute, until SY.timer takes
+    it; the node is `DEGRADED` meanwhile.
   - Re-scheduling a pending key keeps SY.timer's old time.
   - A reschedule after a fire fails silently.
 - **Recovery runs only at start.** Since 0.1.99 SY.timer sends a fire again while the WF is not

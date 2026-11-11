@@ -389,7 +389,13 @@ Common guards:
   right after the transition. At most 100 follow one event; one more fails the instance.
 - **Timer actions:** `schedule_timer` (`timer_key`, `fire_in` or `fire_at`, `missed_policy`),
   `cancel_timer` and `reschedule_timer`, all through SY.timer.
-  - The minimum is 60 s. A time may be a `$ref`; the minimum is then checked when the timer is set.
+  - A timer fires from 60 s to 366 days ahead, SY.timer's minimum and maximum: a definition that
+    asks more is refused, naming the path (`must be at most 366d`). A time may be a `$ref`; the
+    bounds are then checked when the timer is set.
+  - A timer SY.timer does not take (it restarts, its store fails, it does not answer in 30 s) goes
+    again after 5, 10, 20 and 40 s, then each minute, until SY.timer takes it; one whose time comes
+    first is fired by the WF itself. Meanwhile the WF node is `DEGRADED`, `timers_not_reconciled`,
+    and its `last_error` names the timer and why.
   - A definition schedules at most 10 timer keys: the WF keeps one timer per conversation and key,
     so its keys are the most timers a conversation holds at once. A logic that needs more is two
     WFs.

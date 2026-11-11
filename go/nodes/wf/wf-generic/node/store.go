@@ -17,14 +17,16 @@ import (
 )
 
 const (
-	// wfSchemaVersion 6 (Case 5, wf-orchestration-v1 §5.5.1): an instance keeps its person's IO node,
+	// wfSchemaVersion 7 (FINDINGS A-254): a timer of the index keeps why SY.timer did not take the
+	// last request about it, how many times it was sent again since, and when it goes again. Version
+	// 6 (Case 5, wf-orchestration-v1 §5.5.1): an instance keeps its person's IO node,
 	// the node whose message started it (FINDINGS A-139). Version 5 (Case 4, §5.4.10): an instance
 	// keeps its person, the src_ilk and ich of the message that started it, and an instance's status
 	// is no longer cancelling, which nothing set (FINDINGS A-132). Version 4 (0.1.91): an instance keeps its thread,
 	// the conversation's (indexed), and the messages keep_message kept (§5.2.1). Version 3 (0.1.90): a
 	// definition is kept by its hash for as long as a running instance uses it, each instance records
 	// the hash it was born with, and an inbound event is journaled until its transition commits (§5.1).
-	wfSchemaVersion = 6
+	wfSchemaVersion = 7
 	maxLogEntries   = 100
 )
 
@@ -75,6 +77,13 @@ type TimerRow struct {
 	TimerKey      string
 	ScheduledAtMS int64
 	FireAtMS      int64
+	// Refusal is why SY.timer did not take the last request about the timer, empty while nothing
+	// says it did not (FINDINGS A-254): the router's UNREACHABLE or TTL_EXCEEDED, SY.timer's own
+	// refusal, no answer in timerAnswerTimeout, or a send that failed. A refused timer is sent again
+	// at ResendAtMS until SY.timer takes it; Resends counts the times it was.
+	Refusal    string
+	Resends    int
+	ResendAtMS int64
 }
 
 // InternalEventRow is a queued synthetic event emitted by an instance and not yet consumed.
@@ -279,8 +288,12 @@ var wfSchemaStatements = []string{
     timer_key      TEXT NOT NULL,
     scheduled_at_ms INTEGER NOT NULL,
     fire_at_ms     INTEGER NOT NULL,
+    refusal        TEXT NOT NULL DEFAULT '',
+    resends        INTEGER NOT NULL DEFAULT 0,
+    resend_at_ms   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (instance_id, timer_key)
 );`,
+	`CREATE INDEX IF NOT EXISTS idx_wft_resend ON wf_instance_timers(resend_at_ms) WHERE refusal != '';`,
 	`CREATE TABLE IF NOT EXISTS wf_internal_events (
     event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_id    TEXT NOT NULL,
@@ -340,6 +353,11 @@ func ensureWFSchema(db *sql.DB) error {
 	if userVersion >= 1 && userVersion < 6 {
 		if err := migrateToPersonIO(tx); err != nil {
 			return fmt.Errorf("migrate wf schema to v6: %w", err)
+		}
+	}
+	if userVersion >= 1 && userVersion < 7 {
+		if err := migrateToTimerRefusals(tx); err != nil {
+			return fmt.Errorf("migrate wf schema to v7: %w", err)
 		}
 	}
 	for _, stmt := range wfSchemaStatements {
@@ -414,6 +432,30 @@ func migrateToThreads(tx *sql.Tx) error {
 func migrateToPersonIO(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE wf_instances ADD COLUMN person_io TEXT NOT NULL DEFAULT '';`)
 	return err
+}
+
+// migrateToTimerRefusals takes a v6 store (or an older one, once at v6) to v7 (FINDINGS A-254): each
+// timer of the index keeps why SY.timer did not take the last request about it, none for a timer of
+// before; the start's reconcile with SY.timer settles those. A store without the index has it created
+// at its v7 shape.
+func migrateToTimerRefusals(tx *sql.Tx) error {
+	var tables int
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'wf_instance_timers';`).Scan(&tables); err != nil {
+		return err
+	}
+	if tables == 0 {
+		return nil
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE wf_instance_timers ADD COLUMN refusal TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE wf_instance_timers ADD COLUMN resends INTEGER NOT NULL DEFAULT 0;`,
+		`ALTER TABLE wf_instance_timers ADD COLUMN resend_at_ms INTEGER NOT NULL DEFAULT 0;`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // migrateToPersons takes a v4 store (or an older one, once at v4) to v5. Each instance keeps its
@@ -967,16 +1009,83 @@ func (s *Store) queryInternalEvents(ctx context.Context, query string, args ...a
 
 // --- Timer Index ---
 
-// RegisterTimer records a timer that this WF instance has scheduled with SY.timer.
+// RegisterTimer records a timer that this WF instance schedules with SY.timer, at fireAtMS: a new
+// request about it, whose own answer decides, so it carries no refusal (FINDINGS A-254).
 func (s *Store) RegisterTimer(ctx context.Context, instanceID, timerKey string, scheduledAtMS, fireAtMS int64) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO wf_instance_timers (instance_id, timer_key, scheduled_at_ms, fire_at_ms)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(instance_id, timer_key) DO UPDATE SET
     scheduled_at_ms = excluded.scheduled_at_ms,
-    fire_at_ms      = excluded.fire_at_ms;`,
+    fire_at_ms      = excluded.fire_at_ms,
+    refusal         = '',
+    resends         = 0,
+    resend_at_ms    = 0;`,
 		instanceID, timerKey, scheduledAtMS, fireAtMS)
 	return err
+}
+
+// MoveTimer records the new time of a timer its instance moves (reschedule_timer). Its refusal
+// stays: a timer SY.timer has not taken goes again at its new time (FINDINGS A-254).
+func (s *Store) MoveTimer(ctx context.Context, instanceID, timerKey string, scheduledAtMS, fireAtMS int64) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE wf_instance_timers SET scheduled_at_ms = ?, fire_at_ms = ?
+WHERE instance_id = ? AND timer_key = ?;`, scheduledAtMS, fireAtMS, instanceID, timerKey)
+	return err
+}
+
+// RefuseTimer records why SY.timer did not take the last request about a timer of the index, and
+// when the timer goes again (FINDINGS A-254). A timer no longer in the index is left alone.
+func (s *Store) RefuseTimer(ctx context.Context, instanceID, timerKey, refusal string, resendAtMS int64) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE wf_instance_timers SET refusal = ?, resend_at_ms = ?
+WHERE instance_id = ? AND timer_key = ?;`, refusal, resendAtMS, instanceID, timerKey)
+	return err
+}
+
+// TimerSentAgain records that a refused timer was sent again, its resends-th time, and when it goes
+// again unless SY.timer takes it first. Its refusal stays until then.
+func (s *Store) TimerSentAgain(ctx context.Context, instanceID, timerKey string, resends int, resendAtMS int64) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE wf_instance_timers SET resends = ?, resend_at_ms = ?
+WHERE instance_id = ? AND timer_key = ?;`, resends, resendAtMS, instanceID, timerKey)
+	return err
+}
+
+// TimerTaken clears the refusal of a timer SY.timer took.
+func (s *Store) TimerTaken(ctx context.Context, instanceID, timerKey string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE wf_instance_timers SET refusal = '', resends = 0, resend_at_ms = 0
+WHERE instance_id = ? AND timer_key = ?;`, instanceID, timerKey)
+	return err
+}
+
+// RefusedTimersDue returns the refused timers due to go again at nowMS, the earliest first, limit at
+// most.
+func (s *Store) RefusedTimersDue(ctx context.Context, nowMS int64, limit int) ([]TimerRow, error) {
+	return s.queryTimers(ctx, `
+SELECT `+timerColumns+` FROM wf_instance_timers
+WHERE refusal != '' AND resend_at_ms <= ?
+ORDER BY resend_at_ms, instance_id, timer_key
+LIMIT ?;`, nowMS, limit)
+}
+
+// RefusedTimers returns how many timers of the index are refused, and the one that goes again first.
+func (s *Store) RefusedTimers(ctx context.Context) (int, TimerRow, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM wf_instance_timers WHERE refusal != '';`).Scan(&count); err != nil {
+		return 0, TimerRow{}, err
+	}
+	if count == 0 {
+		return 0, TimerRow{}, nil
+	}
+	first, err := s.queryTimers(ctx, `
+SELECT `+timerColumns+` FROM wf_instance_timers WHERE refusal != ''
+ORDER BY resend_at_ms, instance_id, timer_key LIMIT 1;`)
+	if err != nil || len(first) == 0 {
+		return count, TimerRow{}, err
+	}
+	return count, first[0], nil
 }
 
 // DeleteTimer removes a timer entry from the local index.
@@ -990,14 +1099,14 @@ DELETE FROM wf_instance_timers WHERE instance_id = ? AND timer_key = ?;`,
 // ListTimersForInstance returns all timer entries for a given instance (used at termination).
 func (s *Store) ListTimersForInstance(ctx context.Context, instanceID string) ([]TimerRow, error) {
 	return s.queryTimers(ctx, `
-SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms
+SELECT `+timerColumns+`
 FROM wf_instance_timers WHERE instance_id = ?;`, instanceID)
 }
 
 // GetTimerForInstance returns the timer row for a specific instance/timer_key.
 func (s *Store) GetTimerForInstance(ctx context.Context, instanceID, timerKey string) (TimerRow, bool, error) {
 	rows, err := s.queryTimers(ctx, `
-SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms
+SELECT `+timerColumns+`
 FROM wf_instance_timers
 WHERE instance_id = ? AND timer_key = ?;`, instanceID, timerKey)
 	if err != nil {
@@ -1013,9 +1122,11 @@ WHERE instance_id = ? AND timer_key = ?;`, instanceID, timerKey)
 // at boot recovery, which fires the missed ones in that order).
 func (s *Store) ListAllExpectedTimers(ctx context.Context) ([]TimerRow, error) {
 	return s.queryTimers(ctx, `
-SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms FROM wf_instance_timers
+SELECT `+timerColumns+` FROM wf_instance_timers
 ORDER BY fire_at_ms, instance_id, timer_key;`)
 }
+
+const timerColumns = `instance_id, timer_key, scheduled_at_ms, fire_at_ms, refusal, resends, resend_at_ms`
 
 func (s *Store) queryTimers(ctx context.Context, query string, args ...any) ([]TimerRow, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -1026,7 +1137,7 @@ func (s *Store) queryTimers(ctx context.Context, query string, args ...any) ([]T
 	var out []TimerRow
 	for rows.Next() {
 		var r TimerRow
-		if err := rows.Scan(&r.InstanceID, &r.TimerKey, &r.ScheduledAtMS, &r.FireAtMS); err != nil {
+		if err := rows.Scan(&r.InstanceID, &r.TimerKey, &r.ScheduledAtMS, &r.FireAtMS, &r.Refusal, &r.Resends, &r.ResendAtMS); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

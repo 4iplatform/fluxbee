@@ -259,11 +259,17 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   (`storeFailure`; `dbPathProblem` and `pathFault` in `node/store.go`, a read-only file system
   being the disk's fault); it refuses every event (`NOT_TAKEN`
   `unavailable`, `refuseWhileStoreDown`) and opens the store again every 30 s. Timers use
-  `client_ref` `wf:<instance_id>::<timer_key>` (`node/timer.go`).
+  `client_ref` `wf:<instance_id>::<timer_key>` (`node/timer.go`), from 60 s to 366 days ahead.
+  A schedule or a reschedule goes without waiting, and is kept until SY.timer answers: one
+  SY.timer does not take (the router's `UNREACHABLE` or `TTL_EXCEEDED`, SY.timer's refusal, no
+  answer in 30 s, a send that did not go) marks its timer in the index, which goes again after 5,
+  10, 20 and 40 s, then each minute, until SY.timer takes it, the node `DEGRADED` meanwhile
+  (`node/timer_requests.go`, FINDINGS A-254).
 - **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`,
   `CONFIG_SET`; `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE`,
   `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the node's hive
-  (`UNAUTHORIZED` otherwise); `TIMER_FIRED`, taken only from SY.timer of the node's hive. Any
+  (`UNAUTHORIZED` otherwise); `TIMER_FIRED`, taken only from SY.timer of the node's hive, and its
+  `TIMER_RESPONSE` to the node's own timer requests, on a channel of its own (`wfRouteProfile`). Any
   other message is taken only from a node the definition names (`start_from`, an
   `event_match.src`, a target of its sends), and reaches the running instance on its thread or,
   from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`, `node/correlate.go`);

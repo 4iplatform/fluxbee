@@ -35,11 +35,12 @@ type RunOptions struct {
 //     saying why, and a restart applies a corrected config. A node that waits for its store opens it
 //     again from the loop every storeRetryInterval, until the engine runs. A node whose timers are
 //     not reconciled (SY.timer did not answer, or the index could not be read) tries again from the
-//     loop, until they are. Once a GC interval the loop closes the conversations that went quiet
-//     (closeQuietInstances)
+//     loop, until they are. A timer request SY.timer did not take marks its timer, which the loop
+//     sends again until SY.timer takes it (FINDINGS A-254). Once a GC interval the loop closes the
+//     conversations that went quiet (closeQuietInstances)
 //
 // It returns an error only for what the node cannot run without at all: a config file it can read,
-// a router connection, its receive channel, a timer client (and, in a dry run, a config in use). A
+// a router connection, its receive channels, a timer client (and, in a dry run, a config in use). A
 // config or a store it cannot use is a state it reports, never an exit (FINDINGS A-217).
 func Run(ctx context.Context, opts RunOptions) error {
 	clock := opts.Clock
@@ -73,13 +74,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 		return nil
 	}
 
-	profile, err := sdk.NewOperationalRouteProfile().
-		CommandChannel("incoming").
-		PostPendingRule(
-			sdk.RouteAny{},
-			sdk.RouteCommand{Channel: "incoming"},
-		).
-		Build()
+	profile, err := wfRouteProfile()
 	if err != nil {
 		return fmt.Errorf("wf rpc profile invalid: %w", err)
 	}
@@ -89,13 +84,18 @@ func Run(ctx context.Context, opts RunOptions) error {
 	}
 	defer func() { _ = routerDispatcher.Close() }()
 	sender := routerDispatcher.SenderSnapshot()
-	incoming, err := routerDispatcher.TakeCommandReceiver("incoming")
+	incoming, err := routerDispatcher.TakeCommandReceiver(incomingChannel)
 	if err != nil {
 		return fmt.Errorf("take incoming receiver: %w", err)
 	}
+	timerAnswers, err := routerDispatcher.Subscribe(timerAnswersChannel)
+	if err != nil {
+		return fmt.Errorf("take the timer answers' receiver: %w", err)
+	}
 
 	rt := &NodeRuntime{
-		ActCtx:     ActionContext{Dispatcher: NewSDKDispatcher(sender), Clock: clock, SelfILK: sdk.ReadSelfIlkFromEnv()},
+		ActCtx: ActionContext{Dispatcher: NewSDKDispatcher(sender), Clock: clock, SelfILK: sdk.ReadSelfIlkFromEnv(),
+			Requests: newTimerRequests()},
 		NodeUUID:   sender.UUID(),
 		NodeName:   sender.FullName(),
 		Plane:      plane,
@@ -113,27 +113,65 @@ func Run(ctx context.Context, opts RunOptions) error {
 		}
 		rt.ActCtx.Timer = timerSender
 	}
-	rt.serve(ctx, incoming, materialized, loopIntervals{storeRetry: storeRetryInterval, timerRetry: timerReconcileRetryInterval})
+	rt.serve(ctx, incoming, timerAnswers, materialized, loopIntervals{
+		storeRetry: storeRetryInterval, timerRetry: timerReconcileRetryInterval, timerRequests: timerRequestsInterval,
+	})
 	return nil
 }
 
+// The SDK's channels the node takes its messages from: incomingChannel, the receive loop's, and
+// timerAnswersChannel, SY.timer's answers to the timer requests the node sends without waiting.
+const (
+	incomingChannel     = "incoming"
+	timerAnswersChannel = "timer_answers"
+)
+
+// wfRouteProfile is how the SDK routes what reaches the node, beyond the replies its own calls wait
+// for (TimerClient's TIMER_LIST, a confirmed cancel): a TIMER_RESPONSE to timerAnswersChannel, and
+// everything else to incomingChannel. SY.timer's TIMER_RESPONSE goes to a broadcast channel because
+// a broadcast route keeps the SDK from taking it as a reply only a call waits for: once the start's
+// TIMER_LIST had waited for one, the SDK dropped every later TIMER_RESPONSE as an orphan, and
+// SY.timer's refusals of the node's schedules went unseen (FINDINGS A-254). A late answer to a call
+// that timed out is still dropped by the SDK.
+func wfRouteProfile() (sdk.OperationalRouteProfile, error) {
+	return sdk.NewOperationalRouteProfile().
+		CommandChannel(incomingChannel).
+		BroadcastChannel(timerAnswersChannel).
+		PostPendingRule(sdk.RouteExact{MsgType: sdk.SYSTEMKind, Msg: sdk.MsgTimerResponse}, sdk.RouteBroadcast{Channel: timerAnswersChannel}).
+		PostPendingRule(sdk.RouteAny{}, sdk.RouteCommand{Channel: incomingChannel}).
+		Build()
+}
+
 // loopIntervals are how often the receive loop opens the store again while the engine waits for it,
-// and asks SY.timer again while the timers wait for their reconcile.
+// asks SY.timer again while the timers wait for their reconcile, and looks at its timer requests
+// while it waits for SY.timer to answer one or a refused timer waits to go again.
 type loopIntervals struct {
-	storeRetry, timerRetry time.Duration
+	storeRetry, timerRetry, timerRequests time.Duration
 }
 
 // serve is Run once the router is connected: it starts the engine, with a config in use, and runs
-// the receive loop on incoming until ctx is done or incoming closes. The caller sets the timer sender
-// before, and closes rt.Store after.
-func (rt *NodeRuntime) serve(ctx context.Context, incoming <-chan sdk.Message, materialized *Materialized, every loopIntervals) {
+// the receive loop on incoming, and on timerAnswers, SY.timer's answers to the node's timer
+// requests, until ctx is done or incoming closes. The caller sets the timer sender before, and
+// closes rt.Store after.
+func (rt *NodeRuntime) serve(ctx context.Context, incoming, timerAnswers <-chan sdk.Message, materialized *Materialized, every loopIntervals) {
 	// While the engine waits for its store, the store is opened again every every.storeRetry, on the
 	// loop: recovery runs between two messages, as at the start. While the timers wait for their
 	// reconcile, a TIMER_LIST goes out every every.timerRetry, asked off the loop (the loop keeps
-	// serving) and taken on it.
-	var storeRetry, reconcileRetry loopTicker
+	// serving) and taken on it. While a timer request waits for SY.timer's answer, or a refused timer
+	// to go again, the loop looks at them every every.timerRequests (FINDINGS A-254).
+	var storeRetry, reconcileRetry, requestsTick loopTicker
 	defer storeRetry.stop()
 	defer reconcileRetry.stop()
+	defer requestsTick.stop()
+	// watchTimerRequests ticks while the node waits for anything from SY.timer, and stops once it
+	// does not.
+	watchTimerRequests := func() {
+		if rt.Store != nil && rt.ActCtx.Requests.waiting() {
+			requestsTick.start(every.timerRequests)
+		} else {
+			requestsTick.stop()
+		}
+	}
 	// engineUp is what the loop does once the engine runs: no more opens of the store, and SY.timer
 	// asked again while the timers wait for their reconcile.
 	engineUp := func() {
@@ -141,6 +179,7 @@ func (rt *NodeRuntime) serve(ctx context.Context, incoming <-chan sdk.Message, m
 		if rt.timersPending != nil {
 			reconcileRetry.start(every.timerRetry)
 		}
+		watchTimerRequests()
 	}
 	if materialized != nil {
 		if rt.startEngine(ctx, materialized) {
@@ -175,6 +214,14 @@ func (rt *NodeRuntime) serve(ctx context.Context, incoming <-chan sdk.Message, m
 			if err := dispatchGuarded(ctx, msg, rt); err != nil {
 				log.Printf("wf: dispatch error: %v", err)
 			}
+		case msg, ok := <-timerAnswers:
+			if !ok {
+				timerAnswers = nil
+				continue
+			}
+			if err := dispatchGuarded(ctx, msg, rt); err != nil {
+				log.Printf("wf: dispatch error: %v", err)
+			}
 		case <-storeRetry.C:
 			if rt.startEngine(ctx, materialized) {
 				engineUp()
@@ -195,9 +242,12 @@ func (rt *NodeRuntime) serve(ctx context.Context, incoming <-chan sdk.Message, m
 			if rt.timersPending == nil {
 				reconcileRetry.stop()
 			}
+		case <-requestsTick.C:
+			rt.tickTimerRequests(ctx)
 		case <-idleTick:
 			rt.closeQuietInstances(ctx)
 		}
+		watchTimerRequests()
 	}
 }
 
@@ -252,6 +302,8 @@ func (rt *NodeRuntime) startEngine(ctx context.Context, materialized *Materializ
 		log.Printf("wf: the instance store opened at %s: the engine runs", dbPath)
 	}
 	rt.storeDown = nil
+	// The timers a reconcile that could not run left refused go again from the loop (FINDINGS A-254).
+	rt.countRefusedTimers(ctx)
 	rt.Plane.inUse(materialized)
 	cfg := materialized.Config
 	StartGC(ctx, rt.Store, cfg.GCRetentionDays, time.Duration(cfg.GCIntervalSeconds)*time.Second, rt.ActCtx.Clock)
@@ -288,7 +340,8 @@ func (rt *NodeRuntime) openEngine(ctx context.Context, materialized *Materialize
 }
 
 // stopEngine leaves the engine stopped, its store closed: what a failed openEngine set goes, the
-// instances it recovered with it (the next start recovers them again from the store).
+// instances it recovered with it and the timer requests it sent (the next start recovers them again
+// from the store, and reconciles the timers).
 func (rt *NodeRuntime) stopEngine() {
 	if rt.Store != nil {
 		_ = rt.Store.Close()
@@ -297,6 +350,7 @@ func (rt *NodeRuntime) stopEngine() {
 	rt.Def, rt.DefJSON, rt.DefHash = nil, "", ""
 	rt.Registry = nil
 	rt.timersPending = nil
+	rt.ActCtx.Requests.clear()
 }
 
 // storeFailure is how the node reports err, the failure of its store at dbPath (FINDINGS A-217), and

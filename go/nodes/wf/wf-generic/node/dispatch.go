@@ -105,6 +105,11 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	}
 
 	if isNotice(msg) {
+		// The router's refusal of a timer request the node sent is that request's answer: its timer
+		// goes again (FINDINGS A-254). It is never answered either.
+		if rt.takeTimerRequestNotice(ctx, msg) {
+			return nil
+		}
 		log.Printf("wf: ignoring notice type=%s msg=%q src_l2=%q trace_id=%s", msg.Meta.MsgType, msgName, msg.SourceL2Name(), msg.Routing.TraceID)
 		return nil
 	}
@@ -138,6 +143,13 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 		default:
 			return handleWFCancelInstance(ctx, msg, rt)
 		}
+	}
+
+	// SY.timer's answer to a timer request the node sent without waiting settles that request's timer
+	// (FINDINGS A-254), and is never answered.
+	if sdk.IsSystemKind(msg.Meta.MsgType) && msgName == sdk.MsgTimerResponse {
+		rt.takeTimerAnswer(ctx, msg)
+		return nil
 	}
 
 	// A system message is control, never a workflow event, but a TIMER_FIRED: since 0.1.90 a WF sends
@@ -190,7 +202,10 @@ func (rt *NodeRuntime) refuseWhileStoreDown(msg sdk.Message) error {
 // isInfrastructureMessage and the AI SDK's is_infrastructure_message are the same rule, name by name
 // (FINDINGS A-218); a WF also takes replies (isReply) as events. A system message that is none of
 // these, nor one of the node's verbs or a TIMER_FIRED, as a TIMER_HELP meant for SY.timer, is
-// dropped unanswered all the same: a system message is no workflow event (Dispatch).
+// dropped unanswered all the same: a system message is no workflow event (Dispatch). The router's
+// UNREACHABLE or TTL_EXCEEDED of a timer request the node waits on marks the request's timer first
+// (takeTimerRequestNotice, FINDINGS A-254), and SY.timer's TIMER_RESPONSE settles it
+// (takeTimerAnswer).
 func isNotice(msg sdk.Message) bool {
 	if strings.TrimSpace(msg.SourceL2Name()) == "" {
 		return true
@@ -270,9 +285,10 @@ func rawMsgName(msg sdk.Message) string {
 
 func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	resp, err := sdk.BuildManagedNodeStatusResponse(&msg, rt.NodeUUID, rt.Plane.State)
-	if degraded := rt.degradedBy(); degraded != nil && rt.Plane.Configured() != nil {
-		// Its config in use, but its engine waits for its store, or its timers for their reconcile:
-		// DEGRADED, saying why (the orchestrator's get_node_status reports both).
+	if degraded := rt.degradedBy(ctx); degraded != nil && rt.Plane.Configured() != nil {
+		// Its config in use, but its engine waits for its store, or its timers for their reconcile or
+		// for SY.timer to take them: DEGRADED, saying why (the orchestrator's get_node_status reports
+		// both).
 		resp, err = sdk.BuildSystemMessage(rt.NodeUUID, sdk.UnicastDestination(msg.Routing.Src), 16, msg.Routing.TraceID,
 			sdk.MSGNodeStatusGetResponse, map[string]any{
 				"status":       "ok",
@@ -287,15 +303,16 @@ func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 }
 
 // degradedBy is why a node whose config is in use is DEGRADED, nil when it is not: its engine
-// waits for its store (FINDINGS A-217), or its timers for their reconcile with SY.timer (A-118).
-func (rt *NodeRuntime) degradedBy() *sdk.ControlPlaneError {
+// waits for its store (FINDINGS A-217), its timers for their reconcile with SY.timer (A-118), or a
+// timer SY.timer did not take for it to (A-254).
+func (rt *NodeRuntime) degradedBy(ctx context.Context) *sdk.ControlPlaneError {
 	switch {
 	case rt.storeDown != nil:
 		return rt.storeDown.cause
 	case rt.timersPending != nil:
 		return &sdk.ControlPlaneError{Code: errCodeTimersNotReconciled, Message: rt.timersPending.Error()}
 	}
-	return nil
+	return rt.refusedTimersDegraded(ctx)
 }
 
 func handleNodeConfigGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {

@@ -40,17 +40,41 @@ type mockTimerSender struct {
 	scheduled   []string // clientRefs scheduled
 	cancelled   []string // clientRefs cancelled
 	rescheduled []string // clientRefs rescheduled
+	// traces are the trace_ids the schedules and the reschedules that went out went under, in order
+	// (FINDINGS A-254), and in the fire_in of each ScheduleIn.
+	traces      []string
+	in          []time.Duration
 	scheduleErr error
 	cancelErr   error
 }
 
-func (m *mockTimerSender) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
-	m.scheduled = append(m.scheduled, opts.ClientRef)
-	return sdk.TimerID("mock-uuid"), m.scheduleErr
+// sent is the trace_id of the next request that goes out, or err when it does not go.
+func (m *mockTimerSender) sent(err error) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	traceID := fmt.Sprintf("timer-trace-%d", len(m.traces)+1)
+	m.traces = append(m.traces, traceID)
+	return traceID, nil
 }
-func (m *mockTimerSender) Schedule(_ context.Context, _ time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
+
+// lastTrace is the trace_id of the last request that went out.
+func (m *mockTimerSender) lastTrace(t *testing.T) string {
+	t.Helper()
+	if len(m.traces) == 0 {
+		t.Fatal("no timer request went out")
+	}
+	return m.traces[len(m.traces)-1]
+}
+
+func (m *mockTimerSender) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error) {
 	m.scheduled = append(m.scheduled, opts.ClientRef)
-	return sdk.TimerID("mock-uuid"), m.scheduleErr
+	m.in = append(m.in, d)
+	return m.sent(m.scheduleErr)
+}
+func (m *mockTimerSender) Schedule(_ context.Context, _ time.Time, opts sdk.ScheduleOptions) (string, error) {
+	m.scheduled = append(m.scheduled, opts.ClientRef)
+	return m.sent(m.scheduleErr)
 }
 func (m *mockTimerSender) CancelByClientRef(_ context.Context, ref string) error {
 	m.cancelled = append(m.cancelled, ref)
@@ -60,9 +84,9 @@ func (m *mockTimerSender) CancelByClientRefConfirmed(_ context.Context, ref stri
 	m.cancelled = append(m.cancelled, ref)
 	return m.cancelErr
 }
-func (m *mockTimerSender) RescheduleByClientRef(_ context.Context, ref string, _ time.Time) error {
+func (m *mockTimerSender) RescheduleByClientRef(_ context.Context, ref string, _ time.Time) (string, error) {
 	m.rescheduled = append(m.rescheduled, ref)
-	return nil
+	return m.sent(nil)
 }
 func (m *mockTimerSender) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo, error) {
 	return nil, nil

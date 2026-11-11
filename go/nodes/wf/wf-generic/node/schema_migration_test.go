@@ -561,7 +561,54 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', 1, 2, 'hash-asking', 'conv
 		t.Fatalf("the migrated store keeps an instance's person's IO node: %+v %v", again, err)
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != 6 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != 7 {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("a second run is a no-op: %v", err)
+	}
+}
+
+// FINDINGS A-254 (schema v7): each timer of a v6 index keeps why SY.timer did not take it, none for
+// a timer of before, which the start's reconcile settles; its times stay as they were, and the
+// migrated index marks a refused timer and finds it due.
+func TestEnsureWFSchemaMigratesV6ToTimerRefusals(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf-v6.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE wf_instance_timers (instance_id TEXT NOT NULL, timer_key TEXT NOT NULL, scheduled_at_ms INTEGER NOT NULL, fire_at_ms INTEGER NOT NULL, PRIMARY KEY (instance_id, timer_key));`,
+		`INSERT INTO wf_instance_timers VALUES ('wfi:running', 'timeout', 10, 600000);`,
+		`PRAGMA user_version=6;`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("v6 fixture: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("ensureWFSchema: %v", err)
+	}
+	store := &Store{db: db}
+	ctx := context.Background()
+	row, ok, err := store.GetTimerForInstance(ctx, "wfi:running", "timeout")
+	if err != nil || !ok || row.ScheduledAtMS != 10 || row.FireAtMS != 600000 || row.Refusal != "" || row.Resends != 0 || row.ResendAtMS != 0 {
+		t.Fatalf("a v6 timer keeps its times, with no refusal: %+v %v %v", row, ok, err)
+	}
+	if !indexExists(t, db, "idx_wft_resend") {
+		t.Fatal("the refused timers' index is created")
+	}
+	if err := store.RefuseTimer(ctx, "wfi:running", "timeout", "TIMER_SCHEDULE: the router answered UNREACHABLE reason=NODE_NOT_FOUND", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := store.RefusedTimersDue(ctx, 5000, 10); err != nil || len(due) != 1 || due[0].Refusal == "" || due[0].ResendAtMS != 5000 {
+		t.Fatalf("the migrated index keeps a refusal: %+v %v", due, err)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 7 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if err := ensureWFSchema(db); err != nil {
@@ -645,7 +692,7 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', '', 1, 2, NULL,
 		t.Fatal("the store refuses a cancelling instance")
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 6 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 7 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 

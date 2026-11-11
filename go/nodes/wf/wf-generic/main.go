@@ -53,7 +53,8 @@ func main() {
 
 	// A store the node cannot use is a state it reports too (DEGRADED, or FAILED_CONFIG for a bad
 	// db_path), and it opens the store again until it can (FINDINGS A-217). Run fails only for what
-	// the node cannot run without at all: its router connection, its receive channel, a timer client.
+	// the node cannot run without at all: its router connection, its receive channels (its messages,
+	// and SY.timer's answers to its timer requests, FINDINGS A-254), a timer client.
 	if err := node.Run(ctx, node.RunOptions{
 		ConfigPath: configPath,
 		NodeName:   nodeName,

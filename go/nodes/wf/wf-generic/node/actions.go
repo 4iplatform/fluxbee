@@ -28,13 +28,17 @@ type Dispatcher interface {
 	NodeUUID() string
 }
 
-// TimerSender abstracts SY.timer operations (testable without a real SY.timer).
+// TimerSender abstracts SY.timer operations (testable without a real SY.timer). ScheduleIn,
+// Schedule, CancelByClientRef and RescheduleByClientRef send their request without waiting for
+// SY.timer's answer; a schedule and a reschedule return the trace_id their request went under, which
+// SY.timer's TIMER_RESPONSE and the router's UNREACHABLE carry back (FINDINGS A-254).
+// CancelByClientRefConfirmed and List wait for the answer.
 type TimerSender interface {
-	ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error)
-	Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error)
+	ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error)
+	Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (string, error)
 	CancelByClientRef(ctx context.Context, clientRef string) error
 	CancelByClientRefConfirmed(ctx context.Context, clientRef string) error
-	RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) error
+	RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) (string, error)
 	List(ctx context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error)
 }
 
@@ -43,7 +47,10 @@ type ActionContext struct {
 	Store      *Store
 	Dispatcher Dispatcher
 	Timer      TimerSender
-	Clock      ClockFunc
+	// Requests are the timer requests SY.timer has not answered yet, which a refusal of marks their
+	// timer in the index to go again (FINDINGS A-254); nil keeps none.
+	Requests *timerRequests
+	Clock    ClockFunc
 	// SelfILK is the WF node's own ILK (FLUXBEE_NODE_ILK_ID): with the node's name, the writer its
 	// own messages name (docs/cognition-hands-v1.md §5).
 	SelfILK string
@@ -481,7 +488,8 @@ const (
 
 // timerTime resolves a timer action's time when the action runs: its fire_in or its fire_at, each a
 // literal or a $ref (a time taken from state, or from an agent's answer), checked then: a duration
-// that parses, or an RFC3339 time, 60 s ahead at least (SY.timer's floor). It returns when the timer
+// that parses, or an RFC3339 time, 60 s ahead at least (SY.timer's floor) and 366 days at most (its
+// ceiling, past which it refuses the schedule every time, FINDINGS A-254). It returns when the timer
 // fires, and the fire_in it was given (zero for a fire_at).
 func timerTime(action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) (time.Time, time.Duration, error) {
 	resolve := func(field string, value any) (string, error) {
@@ -505,8 +513,11 @@ func timerTime(action ActionDefinition, inst *WFInstance, event sdk.Message, act
 			return time.Time{}, 0, fmt.Errorf("fire_at %q: %w", text, err)
 		}
 		fireAt, _ := time.Parse(time.RFC3339, text)
-		if fireAt.Sub(now) < minTimerDuration {
+		switch ahead := fireAt.Sub(now); {
+		case ahead < minTimerDuration:
 			return time.Time{}, 0, fmt.Errorf("fire_at %s is less than 60s ahead", text)
+		case ahead > wfcel.MaxTimerDelay:
+			return time.Time{}, 0, fmt.Errorf("fire_at %s is more than 366d ahead", text)
 		}
 		return fireAt, 0, nil
 	}
@@ -538,17 +549,24 @@ func execScheduleTimer(ctx context.Context, action ActionDefinition, inst *WFIns
 	if err != nil {
 		return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
 	}
-	if in > 0 {
-		_, err = actx.Timer.ScheduleIn(ctx, in, opts)
-	} else {
-		_, err = actx.Timer.Schedule(ctx, fireAt, opts)
-	}
-	if err != nil {
+	// The index first: from here on the timer is the instance's, whatever becomes of the request,
+	// which goes without waiting for SY.timer's answer. A request SY.timer does not take, or that does
+	// not go, marks the timer to go again (FINDINGS A-254).
+	now := nowMS(actx.Clock)
+	if err := actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, now, fireAt.UnixMilli()); err != nil {
 		return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
 	}
-
-	// Record in local timer index (fire-and-forget to SY.timer is already done above)
-	return actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, nowMS(actx.Clock), fireAt.UnixMilli())
+	var traceID string
+	if in > 0 {
+		traceID, err = actx.Timer.ScheduleIn(ctx, in, opts)
+	} else {
+		traceID, err = actx.Timer.Schedule(ctx, fireAt, opts)
+	}
+	req := timerRequest{timer: timerRef{inst.InstanceID, action.TimerKey}, verb: verbTimerSchedule, traceID: traceID, sentAtMS: now}
+	if err := actx.timerRequestSent(ctx, req, err); err != nil {
+		return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
+	}
+	return nil
 }
 
 func execCancelTimer(ctx context.Context, action ActionDefinition, inst *WFInstance, actx ActionContext) error {
@@ -605,11 +623,18 @@ func execRescheduleTimer(ctx context.Context, action ActionDefinition, inst *WFI
 	if err != nil {
 		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
 	}
-	if err := actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt); err != nil {
+	// The index first, as a schedule's: its refusal, if SY.timer has not taken the timer, stays, so the
+	// timer goes again at its new time (FINDINGS A-254).
+	now := nowMS(actx.Clock)
+	if err := actx.Store.MoveTimer(ctx, inst.InstanceID, action.TimerKey, now, newFireAt.UnixMilli()); err != nil {
 		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
 	}
-
-	return actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, nowMS(actx.Clock), newFireAt.UnixMilli())
+	traceID, err := actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt)
+	req := timerRequest{timer: timerRef{inst.InstanceID, action.TimerKey}, verb: verbTimerReschedule, traceID: traceID, sentAtMS: now}
+	if err := actx.timerRequestSent(ctx, req, err); err != nil {
+		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
+	}
+	return nil
 }
 
 func execSetVariable(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
@@ -722,7 +747,7 @@ func NewSDKTimerSender(dispatcher *sdk.RouterDispatcher, timerNode string) (*SDK
 	}, nil
 }
 
-func (t *SDKTimerSender) ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
+func (t *SDKTimerSender) ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -735,10 +760,10 @@ func (t *SDKTimerSender) ScheduleIn(ctx context.Context, d time.Duration, opts s
 	if err := applyScheduleOptions(payload, opts); err != nil {
 		return "", err
 	}
-	return "", t.sendTimerRequest("TIMER_SCHEDULE", payload)
+	return t.sendTimerRequest(verbTimerSchedule, payload)
 }
 
-func (t *SDKTimerSender) Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
+func (t *SDKTimerSender) Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -754,7 +779,7 @@ func (t *SDKTimerSender) Schedule(ctx context.Context, fireAt time.Time, opts sd
 	if err := applyScheduleOptions(payload, opts); err != nil {
 		return "", err
 	}
-	return "", t.sendTimerRequest("TIMER_SCHEDULE", payload)
+	return t.sendTimerRequest(verbTimerSchedule, payload)
 }
 
 func (t *SDKTimerSender) CancelByClientRef(ctx context.Context, clientRef string) error {
@@ -765,25 +790,26 @@ func (t *SDKTimerSender) CancelByClientRef(ctx context.Context, clientRef string
 	if clientRef == "" {
 		return fmt.Errorf("client_ref must be non-empty")
 	}
-	return t.sendTimerRequest("TIMER_CANCEL", map[string]any{"client_ref": clientRef})
+	_, err := t.sendTimerRequest(verbTimerCancel, map[string]any{"client_ref": clientRef})
+	return err
 }
 
 func (t *SDKTimerSender) CancelByClientRefConfirmed(ctx context.Context, clientRef string) error {
 	return t.syncClient.CancelByClientRef(ctx, clientRef)
 }
 
-func (t *SDKTimerSender) RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) error {
+func (t *SDKTimerSender) RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	clientRef = strings.TrimSpace(clientRef)
 	if clientRef == "" {
-		return fmt.Errorf("client_ref must be non-empty")
+		return "", fmt.Errorf("client_ref must be non-empty")
 	}
 	if newFireAt.IsZero() {
-		return fmt.Errorf("new_fire_at must be non-zero")
+		return "", fmt.Errorf("new_fire_at must be non-zero")
 	}
-	return t.sendTimerRequest("TIMER_RESCHEDULE", map[string]any{
+	return t.sendTimerRequest(verbTimerReschedule, map[string]any{
 		"client_ref":         clientRef,
 		"new_fire_at_utc_ms": newFireAt.UTC().UnixMilli(),
 	})
@@ -793,19 +819,23 @@ func (t *SDKTimerSender) List(ctx context.Context, filter sdk.ListFilter) ([]sdk
 	return t.syncClient.List(ctx, filter)
 }
 
-func (t *SDKTimerSender) sendTimerRequest(verb string, payload map[string]any) error {
+// sendTimerRequest sends verb to SY.timer without waiting for its answer, and returns the trace_id
+// it went under: SY.timer's TIMER_RESPONSE, which the node takes from its timer-answers channel
+// (wfRouteProfile), and the router's UNREACHABLE carry it back (FINDINGS A-254).
+func (t *SDKTimerSender) sendTimerRequest(verb string, payload map[string]any) (string, error) {
+	traceID := uuid.NewString()
 	msg, err := sdk.BuildSystemRequest(
 		t.sender.UUID(),
 		t.timerNode,
 		verb,
 		payload,
-		uuid.NewString(),
+		traceID,
 		sdk.SystemEnvelopeOptions{},
 	)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return t.sender.Send(msg)
+	return traceID, t.sender.Send(msg)
 }
 
 func applyScheduleOptions(payload map[string]any, opts sdk.ScheduleOptions) error {

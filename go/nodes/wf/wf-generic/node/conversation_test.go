@@ -622,6 +622,7 @@ func TestATimerTimeComesFromState(t *testing.T) {
 
 	for payload, want := range map[string]map[string]any{
 		`fire_in "30s": must be at least 60s`:       {"due_in": "30s"},
+		`fire_in "400d": must be at most 366d`:      {"due_in": "400d"},
 		`fire_in "soon": invalid duration "soon"`:   {"due_in": "soon"},
 		`fire_in resolved to int64, not a string`:   {"due_in": 120},
 		`$ref "event.payload.due_in": key "due_in"`: {},
@@ -635,6 +636,19 @@ func TestATimerTimeComesFromState(t *testing.T) {
 	if row := send(tooSoon, "DUE_AT", map[string]any{"due_at": fixedClock().Add(30 * time.Second).Format(time.RFC3339)}); row.Status != "failed" ||
 		!strings.Contains(lastLog(t, rt, tooSoon).ErrorDetail, "is less than 60s ahead") {
 		t.Fatalf("a fire_at under the floor: %+v %+v", row, lastLog(t, rt, tooSoon))
+	}
+	// SY.timer's ceiling (FINDINGS A-254): it refuses a timer more than 366 days ahead every time.
+	tooFar := instance()
+	if row := send(tooFar, "DUE_AT", map[string]any{"due_at": fixedClock().Add(367 * 24 * time.Hour).Format(time.RFC3339)}); row.Status != "failed" ||
+		!strings.Contains(lastLog(t, rt, tooFar).ErrorDetail, "is more than 366d ahead") {
+		t.Fatalf("a fire_at over the ceiling: %+v %+v", row, lastLog(t, rt, tooFar))
+	}
+	if _, pending := timer.pending[timerClientRef(tooFar, "due")]; pending {
+		t.Fatal("a fire_at over the ceiling never goes to SY.timer")
+	}
+	atCeiling := instance()
+	if row := send(atCeiling, "DUE_AT", map[string]any{"due_at": fixedClock().Add(366 * 24 * time.Hour).Format(time.RFC3339)}); row.Status != "running" {
+		t.Fatalf("a fire_at 366 days ahead is SY.timer's: %+v %+v", row, lastLog(t, rt, atCeiling))
 	}
 }
 

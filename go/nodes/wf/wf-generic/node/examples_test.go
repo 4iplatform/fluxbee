@@ -265,7 +265,7 @@ type fakeSYTimer struct {
 	cancelErr error
 }
 
-func (f *fakeSYTimer) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
+func (f *fakeSYTimer) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error) {
 	now := fixedClock()
 	if f.now != nil {
 		now = f.now()
@@ -275,7 +275,7 @@ func (f *fakeSYTimer) ScheduleIn(_ context.Context, d time.Duration, opts sdk.Sc
 	}
 	return "", nil
 }
-func (f *fakeSYTimer) Schedule(_ context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
+func (f *fakeSYTimer) Schedule(_ context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (string, error) {
 	if _, pending := f.pending[opts.ClientRef]; !pending {
 		f.pending[opts.ClientRef] = fireAt
 	}
@@ -291,9 +291,9 @@ func (f *fakeSYTimer) CancelByClientRef(_ context.Context, ref string) error {
 func (f *fakeSYTimer) CancelByClientRefConfirmed(ctx context.Context, ref string) error {
 	return f.CancelByClientRef(ctx, ref)
 }
-func (f *fakeSYTimer) RescheduleByClientRef(_ context.Context, ref string, newFireAt time.Time) error {
+func (f *fakeSYTimer) RescheduleByClientRef(_ context.Context, ref string, newFireAt time.Time) (string, error) {
 	f.pending[ref] = newFireAt
-	return nil
+	return "", nil
 }
 func (f *fakeSYTimer) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo, error) {
 	var timers []sdk.TimerInfo

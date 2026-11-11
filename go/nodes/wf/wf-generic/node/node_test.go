@@ -678,15 +678,17 @@ func (d *chanDispatcher) NodeUUID() string   { return "wf-uuid" }
 // timer pending, only once answering is set, and takes any other request.
 type switchedTimer struct{ answering atomic.Bool }
 
-func (s *switchedTimer) ScheduleIn(context.Context, time.Duration, sdk.ScheduleOptions) (sdk.TimerID, error) {
-	return "timer-uuid", nil
+func (s *switchedTimer) ScheduleIn(context.Context, time.Duration, sdk.ScheduleOptions) (string, error) {
+	return "timer-trace", nil
 }
-func (s *switchedTimer) Schedule(context.Context, time.Time, sdk.ScheduleOptions) (sdk.TimerID, error) {
-	return "timer-uuid", nil
+func (s *switchedTimer) Schedule(context.Context, time.Time, sdk.ScheduleOptions) (string, error) {
+	return "timer-trace", nil
 }
-func (s *switchedTimer) CancelByClientRef(context.Context, string) error                { return nil }
-func (s *switchedTimer) CancelByClientRefConfirmed(context.Context, string) error       { return nil }
-func (s *switchedTimer) RescheduleByClientRef(context.Context, string, time.Time) error { return nil }
+func (s *switchedTimer) CancelByClientRef(context.Context, string) error          { return nil }
+func (s *switchedTimer) CancelByClientRefConfirmed(context.Context, string) error { return nil }
+func (s *switchedTimer) RescheduleByClientRef(context.Context, string, time.Time) (string, error) {
+	return "timer-trace", nil
+}
 func (s *switchedTimer) List(context.Context, sdk.ListFilter) ([]sdk.TimerInfo, error) {
 	if !s.answering.Load() {
 		return nil, errSendFailed
@@ -718,7 +720,7 @@ func TestTheReceiveLoopOpensTheStoreAgainAndThenReconcilesItsTimers(t *testing.T
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		rt.serve(ctx, incoming, materialized, loopIntervals{storeRetry: 10 * time.Millisecond, timerRetry: 10 * time.Millisecond})
+		rt.serve(ctx, incoming, nil, materialized, loopIntervals{storeRetry: 10 * time.Millisecond, timerRetry: 10 * time.Millisecond, timerRequests: 10 * time.Millisecond})
 	}()
 	defer func() {
 		cancel()
