@@ -644,20 +644,23 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
 - **The background task** (`run_background`), in SY.admin, the motherbee only, while an update is
   open: it looks at each hive when its time comes, in a task of its own, and sleeps until the next
   one is due (F2):
-  - **one read of a hive at a time, everywhere:** the explicit run, the follow, the re-read and the
-    automatic step share each hive's read, so at most one `GET_VERSIONS` of a hive is outstanding,
-    and the background task reads one hive at a time. **Why:** the reads go through the
-    motherbee's orchestrator, whose admin worker forwards each within its own 45 s
-    (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`) and runs one SY.admin gave up to that bound; until
-    0.1.127 it ran them one at a time, each queued behind the one before (FINDINGS A-199). A read
-    waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), past that bound; one that timed out
-    anyway keeps the hive unread for another 50 s, so a second never runs beside it. The
-    re-read (`recheck`) takes its turn among the background reads before it claims its hive
-    (since 0.1.124): one waiting for its turn holds no hive, so an explicit run's pass waits only
-    for the read under way. **Why:** woken at a run's open, the task re-read every hive not read
-    yet, each holding its hive while queued behind one read, and a pass could be left to one;
-    the follow and the automatic step still claim first (their hives are in flight, or did not
-    answer);
+  - **one read of a hive at a time, everywhere, and every hive at once:** the explicit run, the
+    follow, the re-read and the automatic step share each hive's read, so at most one
+    `GET_VERSIONS` of a hive is outstanding, and the hives' reads go beside each other, each under
+    its own bound. **Why:** the reads go through the motherbee's orchestrator, whose admin worker
+    forwards each within its own 45 s (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`) and runs one
+    SY.admin gave up to that bound; until 0.1.127 it ran them one at a time, each queued behind
+    the one before (FINDINGS A-199), and the background task read one hive at a time to match.
+    Since 0.1.136 (FINDINGS A-263) it reads every hive at once, as the explicit run does: one
+    read at a time meant that a read a spoke's self-restart lost held up the reads of the hives
+    after it for its whole bound, so their marks came one after the other, and an explicit run's
+    pass waited behind them. A read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`),
+    past that bound; one that timed out anyway keeps the hive unread for another 50 s, so a second
+    never runs beside it. The re-read (`recheck`) claims its hive only for its own read, so an
+    explicit run's pass on a hive waits only for the read of that hive under way (since 0.1.124
+    the re-read took its turn among the background reads before it claimed its hive: woken at a
+    run's open, the task re-read every hive not read yet, each holding its hive while queued
+    behind one read, and a pass could be left to one);
   - **a read of a hive in its restart** (since 0.1.131, FINDINGS A-250 (a)): from SY.admin's
     `restarting` outcome for a hive's core (its core update's answer, or a core found under way)
     to its `settled`, or to the follow's verdict at the settle bound, a read of that hive waits

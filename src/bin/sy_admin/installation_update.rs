@@ -1522,17 +1522,6 @@ impl Bounds {
     }
 }
 
-/// Who reads a hive's `/versions`: an explicit run, or the background task, one hive at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reader {
-    Run,
-    /// The background task, which waits for its turn here.
-    Background,
-    /// The background task with its turn already taken: [`recheck`] takes it before it claims the
-    /// hive, so a read waiting for its turn holds no hive.
-    InTurn,
-}
-
 /// A task acting on a hive: what it does, for which update, since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Holder {
@@ -1565,8 +1554,6 @@ pub(crate) struct Updates {
     /// still be queued at the motherbee's orchestrator (outside a restart, FINDINGS A-250).
     reads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     quiet_until: Mutex<HashMap<String, u64>>,
-    /// The background task reads one hive at a time.
-    background_reads: tokio::sync::Semaphore,
     /// One explicit run at a time.
     running: Mutex<Option<Running>>,
     /// The open update's target checked once after SY.admin's start; the registry's failure said.
@@ -1711,7 +1698,6 @@ impl Updates {
             ticked: Mutex::new(None),
             reads: Mutex::new(HashMap::new()),
             quiet_until: Mutex::new(HashMap::new()),
-            background_reads: tokio::sync::Semaphore::new(1),
             running: Mutex::new(None),
             resume_checked: AtomicBool::new(false),
             registry_said: AtomicBool::new(false),
@@ -1875,10 +1861,12 @@ impl Updates {
         })
     }
 
-    /// One read of `hive`'s `/versions`, at most one outstanding for the hive, everywhere. The
-    /// background task reads one hive at a time. The motherbee's orchestrator forwards a spoke's
-    /// read within its own bound, each read apart since 0.1.127 (FINDINGS A-199), and runs one
-    /// SY.admin gave up to that bound:
+    /// One read of `hive`'s `/versions`, at most one outstanding for the hive, everywhere; the
+    /// hives' reads go at once, each beside the others, whoever reads them (the background task
+    /// since 0.1.136, FINDINGS A-263: it read one hive at a time, so a read a spoke's self-restart
+    /// lost held up the reads of the hives after it for its whole bound). The motherbee's
+    /// orchestrator forwards a spoke's read within its own bound, each read apart since 0.1.127
+    /// (FINDINGS A-199), and runs one SY.admin gave up to that bound:
     /// - **outside a restart,** `bounds.read` waits past that bound, and a read that timed out
     ///   anyway may still be queued there: the hive is not read again for another `bounds.read`
     ///   (the hold), which protects a hive that is slow;
@@ -1897,18 +1885,8 @@ impl Updates {
         &self,
         mesh: &dyn UpdateMesh,
         hive: &str,
-        reader: Reader,
         bounds: &Bounds,
     ) -> Result<Value, String> {
-        let _background = match reader {
-            Reader::Background => Some(
-                self.background_reads
-                    .acquire()
-                    .await
-                    .map_err(|err| err.to_string())?,
-            ),
-            Reader::Run | Reader::InTurn => None,
-        };
         let hive_lock = self.read_lock(hive);
         let _one = hive_lock.lock().await;
         let restart = self.in_restart(hive);
@@ -2590,7 +2568,7 @@ async fn read_until_it_answers(
     bounds: &Bounds,
 ) -> Result<Value, String> {
     loop {
-        let read = updates.read_versions(mesh, hive, Reader::Run, bounds).await;
+        let read = updates.read_versions(mesh, hive, bounds).await;
         match read {
             Ok(snapshot) => return Ok(snapshot),
             Err(why) if tokio::time::Instant::now() + bounds.answer_poll > deadline => {
@@ -3033,7 +3011,7 @@ async fn core_update(
                 return CoreEnd::InFlight;
             }
             // Nothing to restart (FINDINGS A-190): it is on the target once its record says so.
-            let after = updates.read_versions(mesh, hive, Reader::Run, bounds).await;
+            let after = updates.read_versions(mesh, hive, bounds).await;
             let settled = after.as_ref().ok().map(|after| {
                 watch_core(
                     after,
@@ -3500,10 +3478,7 @@ pub(crate) async fn target_is_current(
     bounds: &Bounds,
 ) -> bool {
     let motherbee = mesh.motherbee().to_string();
-    let now_target = match updates
-        .read_versions(mesh, &motherbee, Reader::Background, bounds)
-        .await
-    {
+    let now_target = match updates.read_versions(mesh, &motherbee, bounds).await {
         Ok(snapshot) => target_of(&snapshot),
         Err(why) => {
             tracing::info!(
@@ -3650,9 +3625,7 @@ async fn follow_core(
         Outcome::new(OutcomeStatus::Restarting, RunKind::Background, now, now)
     });
     let read_at = now_epoch_ms();
-    let read = updates
-        .read_versions(mesh, hive, Reader::Background, bounds)
-        .await;
+    let read = updates.read_versions(mesh, hive, bounds).await;
     let now = now_epoch_ms();
     let past_bound = now.saturating_sub(outcome.started_at_ms) > bounds.settle.as_millis() as u64;
     let watch = read.as_ref().ok().map(|snapshot| {
@@ -3879,10 +3852,7 @@ pub(crate) async fn automatic_step(
     let Some(claim) = updates.claim(hive, READING, id) else {
         return;
     };
-    let Ok(snapshot) = updates
-        .read_versions(mesh, hive, Reader::Background, bounds)
-        .await
-    else {
+    let Ok(snapshot) = updates.read_versions(mesh, hive, bounds).await else {
         return;
     };
     // A core update found under way (one SY.admin's restart or a TIMEOUT left without its answer,
@@ -3998,19 +3968,13 @@ pub(crate) async fn recheck(
     if look == Look::AnswerCheck && mesh.orchestrator_connected(hive) == Some(false) {
         return;
     }
-    // Its turn among the background reads first, then the hive: a read waiting for its turn holds
-    // no hive, so an explicit run's pass is never left to it, and waits only for the read under way.
-    let Ok(_turn) = updates.background_reads.acquire().await else {
-        return;
-    };
+    // The hive, then its read, beside the other hives' (FINDINGS A-263): it waits for no other
+    // hive's read, so an explicit run's pass on this hive waits only for this read.
     let Some(_claim) = updates.claim(hive, READING, id) else {
         return;
     };
     let read_at = now_epoch_ms();
-    let Ok(snapshot) = updates
-        .read_versions(mesh, hive, Reader::InTurn, bounds)
-        .await
-    else {
+    let Ok(snapshot) = updates.read_versions(mesh, hive, bounds).await else {
         return;
     };
     updates.set_role(id, hive, text_of(Some(&snapshot), "role"));
@@ -4162,7 +4126,7 @@ pub(crate) async fn run_explicit(
                 return Some(motherbee);
             }
             updates
-                .read_versions(mesh.as_ref(), &hive, Reader::Run, bounds)
+                .read_versions(mesh.as_ref(), &hive, bounds)
                 .await
                 .ok()
         }

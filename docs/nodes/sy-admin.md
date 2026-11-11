@@ -1120,16 +1120,18 @@ superseded, include_rolled_back, elapsed_ms, message, pending, held?}`:
 **The background task** (`run_background`), while an update is open, looks at each hive when its
 time comes, in a task of its own, and sleeps until the next one is due:
 
-- **one read of a hive at a time, everywhere:** the explicit run, the follow, the re-read and the
-  automatic step share each hive's read, so at most one `GET_VERSIONS` of a hive is outstanding;
-  the background task reads one hive at a time. The motherbee's orchestrator forwards a spoke's
-  read within its own bound (45 s, `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), each in a task of its
-  own since 0.1.127 (FINDINGS A-199): a read waits 50 s
-  (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), and one that timed out anyway keeps that hive
-  unread for another 50 s, so a second never runs beside it. The re-read (`recheck`) takes
-  its turn among the background reads (`Reader::InTurn`) before it claims its hive, since 0.1.124:
-  one waiting for its turn holds no hive, so an explicit run's pass waits only for the read under
-  way, never for the re-reads a run's open queues behind it;
+- **one read of a hive at a time, everywhere, and every hive at once:** the explicit run, the
+  follow, the re-read and the automatic step share each hive's read, so at most one
+  `GET_VERSIONS` of a hive is outstanding, and the hives' reads go beside each other: the
+  background task reads every hive at once, each read under its own bound, since 0.1.136
+  (FINDINGS A-263). Before, it read one hive at a time, so a read that a spoke's self-restart lost
+  held up the reads of the hives after it for its whole bound, and an explicit run's pass waited
+  behind them. The motherbee's orchestrator forwards a spoke's read within its own bound (45 s,
+  `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), each in a task of its own since 0.1.127 (FINDINGS
+  A-199): a read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), and one that timed out
+  anyway keeps that hive unread for another 50 s, so a second never runs beside it. A re-read
+  (`recheck`) claims its hive only for its own read, so an explicit run's pass on a hive waits
+  only for the read of that hive under way;
 - **a read of a hive in its restart** (since 0.1.131, FINDINGS A-250): from SY.admin's `restarting`
   outcome for a hive's core (its core update's answer, or a core found under way) to its `settled`,
   or to the follow's verdict at the settle bound, a read of that hive waits 10 s

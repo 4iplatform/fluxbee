@@ -1637,14 +1637,7 @@ async fn a_hive_is_read_once_at_a_time() {
     *lock(&mesh.read_delay) = Duration::from_millis(30);
     let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
     let bounds = quick();
-    let reads = (0..4).map(|n| {
-        let reader = if n % 2 == 0 {
-            Reader::Run
-        } else {
-            Reader::Background
-        };
-        updates.read_versions(dyn_mesh.as_ref(), "worker1", reader, &bounds)
-    });
+    let reads = (0..4).map(|_| updates.read_versions(dyn_mesh.as_ref(), "worker1", &bounds));
     let answers = futures::future::join_all(reads).await;
     assert!(answers.iter().all(Result::is_ok));
     assert_eq!(mesh.most_at_once.load(Ordering::SeqCst), 1);
@@ -1669,13 +1662,11 @@ async fn a_hive_is_read_once_at_a_time() {
             "motherbee"
         }
     }
-    let first = updates
-        .read_versions(&Silent, "egress1", Reader::Background, &bounds)
-        .await;
+    let first = updates.read_versions(&Silent, "egress1", &bounds).await;
     assert!(first.is_err());
     let reads_before = mesh.reads.load(Ordering::SeqCst);
     let quiet = updates
-        .read_versions(dyn_mesh.as_ref(), "egress1", Reader::Run, &bounds)
+        .read_versions(dyn_mesh.as_ref(), "egress1", &bounds)
         .await;
     assert!(quiet.is_err_and(|why| why.contains("still be queued")));
     assert_eq!(mesh.reads.load(Ordering::SeqCst), reads_before);
@@ -1934,7 +1925,7 @@ async fn a_read_asked_again_never_runs_beside_another_of_its_hive() {
     let run_reads = async {
         for _ in 0..6 {
             let _ = updates
-                .read_versions(dyn_mesh.as_ref(), "worker1", Reader::Run, &bounds)
+                .read_versions(dyn_mesh.as_ref(), "worker1", &bounds)
                 .await;
         }
     };
@@ -1949,6 +1940,136 @@ async fn a_read_asked_again_never_runs_beside_another_of_its_hive() {
         .skip(1)
         .take(4)
         .all(|bound| *bound == bounds.restart_read));
+}
+
+/// A spoke of `role` behind the target as worker1 is in `worker_behind`, or restarted onto it and
+/// settled with its config still behind as in `worker_settled_config_behind`.
+fn spoke_as(hive: &str, role: &str, worker1: Value) -> Value {
+    let mut spoke = worker1;
+    spoke["hive_id"] = json!(hive);
+    spoke["role"] = json!(role);
+    spoke
+}
+
+/// FINDINGS A-263, as 0.1.131's deploy saw it: every spoke's core update restarts its
+/// orchestrator, and the follow reads each spoke until it settles. egress1's read reaches its
+/// orchestrator in its few seconds off the router and is never answered, while ingress1 and
+/// worker1 settle. The background task reads every hive at once, each read bounded as before, so
+/// ingress1 and worker1 are read, marked settled and given their config within the bound of
+/// egress1's lost read, beside it. Until 0.1.136 it read one hive at a time, and they waited that
+/// whole bound behind it. As before, egress1's lost read is asked again at once (FINDINGS A-250), a
+/// hive is read once at a time, the update closes, and its results come in the hives' order.
+#[tokio::test]
+async fn the_follow_reads_every_hive_at_once() {
+    let bounds = Bounds {
+        read: Duration::from_secs(30),
+        restart_read: Duration::from_secs(2),
+        flight_check: Duration::from_secs(30),
+        settle: Duration::from_secs(60),
+        ..quick()
+    };
+    let spokes = [
+        ("egress1", "egress"),
+        ("ingress1", "ingress"),
+        ("worker1", "worker"),
+    ];
+    let updates = Updates::load(&temp_state("installation-update-reads-at-once"));
+    let mesh = FakeMesh::new(
+        std::iter::once(motherbee_on_target())
+            .chain(
+                spokes
+                    .iter()
+                    .map(|(hive, role)| spoke_as(hive, role, worker_behind())),
+            )
+            .collect(),
+    );
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let motherbee = mesh.snapshot("motherbee");
+    let RunEnd::Update { update, .. } = run_explicit(
+        &updates,
+        &dyn_mesh,
+        "http",
+        Some("deploy 0.1.136"),
+        &[],
+        &motherbee,
+        &target_of(&motherbee),
+        &bounds,
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        panic!("an update opened");
+    };
+    for (hive, role) in spokes {
+        let entry = &update.hives[hive];
+        assert!(entry.in_restart(), "{hive}: {entry:#?}");
+        // Each spoke settles by its next read; egress1's is lost in its restart.
+        mesh.set_snapshot(hive, spoke_as(hive, role, worker_settled_config_behind()));
+    }
+    mesh.lose_reads("egress1", 1);
+
+    let background = tokio::spawn(run_background(
+        Arc::clone(&updates),
+        Arc::clone(&dyn_mesh),
+        bounds,
+    ));
+    let started = tokio::time::Instant::now();
+    for (hive, _) in spokes {
+        updates.look_now(hive);
+    }
+    // The update's record of `hive`, open or closed by then.
+    let on_target = |hive: &str| {
+        updates.read(|file| {
+            file.open
+                .iter()
+                .chain(file.closed.iter())
+                .find(|record| record.id == update.id)
+                .is_some_and(|record| record.hives[hive].on_target())
+        })
+    };
+    // ingress1 and worker1 within the bound of egress1's lost read, beside it.
+    while !(on_target("ingress1") && on_target("worker1")) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:#?}",
+            updates.read(|file| file.clone())
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < bounds.restart_read,
+        "ingress1 and worker1 waited {elapsed:?}, behind egress1's lost read"
+    );
+    assert!(
+        !on_target("egress1"),
+        "its read is lost, and asked again once its bound is out"
+    );
+
+    // egress1's lost read is asked again at once, and the update closes.
+    wait_done(&updates, &update.id, Duration::from_secs(10)).await;
+    background.abort();
+    assert_eq!(
+        mesh.read_bounds_of("egress1"),
+        vec![bounds.read, bounds.restart_read, bounds.restart_read]
+    );
+    assert_eq!(mesh.lost_reads_left("egress1"), 0);
+    assert_eq!(mesh.most_at_once.load(Ordering::SeqCst), 1);
+    let done = updates.read(|file| file.closed[0].clone());
+    assert_eq!(
+        done.hives.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["egress1", "ingress1", "motherbee", "worker1"]
+    );
+    for (hive, _) in spokes {
+        let entry = &done.hives[hive];
+        let core = entry.core.outcome.as_ref().expect("core");
+        assert_eq!(
+            (core.status, core.by),
+            (OutcomeStatus::Settled, RunKind::Explicit),
+            "{hive}"
+        );
+        assert_eq!(entry.config.state, Standing::OnTarget, "{hive}");
+    }
 }
 
 /// F2 (b) and (c): each hive is looked at by where it stands (in flight every few seconds; one that
@@ -3559,11 +3680,12 @@ async fn a_task_of_a_closed_update_sends_nothing_more() {
     );
 }
 
-/// The background task's re-read takes its turn among the background reads before it claims a
-/// hive: one waiting for its turn holds no hive, so an explicit run's pass is never left to it.
-/// At a run's open every hive not read yet gets such a re-read, all queued behind one read.
+/// A slow read of one hive holds up no other hive (FINDINGS A-263): the background task's re-read
+/// of worker1 goes beside worker2's, which has not answered, and an explicit run's pass on worker1
+/// is never left to a read of another hive. At a run's open every hive not read yet gets such a
+/// re-read; until 0.1.136 they were read one at a time, each queued behind the read under way.
 #[tokio::test]
-async fn a_pass_is_never_left_to_a_queued_read() {
+async fn a_slow_read_of_one_hive_holds_up_no_pass_on_another() {
     // worker2's read answers once the test lets it, every other one at once; a config update
     // applies its version.
     struct SlowWorker2 {
@@ -3631,10 +3753,10 @@ async fn a_pass_is_never_left_to_a_queued_read() {
         answer: tokio::sync::Notify::new(),
         sent: Mutex::new(Vec::new()),
     };
-    let updates = Updates::load(&temp_state("installation-update-queued-read"));
+    let updates = Updates::load(&temp_state("installation-update-slow-read"));
     let id = open_update(&updates, "http", &["motherbee", "worker1", "worker2"]);
     let (the_target, bounds) = (target(), quick());
-    // The background task's re-reads of worker2, whose read is slow, and of worker1, queued.
+    // The background task's re-reads of worker2, whose read is slow, and of worker1 beside it.
     let slow = recheck(
         &updates,
         &mesh,
@@ -3644,7 +3766,7 @@ async fn a_pass_is_never_left_to_a_queued_read() {
         &bounds,
         Look::AnswerCheck,
     );
-    let queued = recheck(
+    let beside = recheck(
         &updates,
         &mesh,
         &id,
@@ -3656,10 +3778,10 @@ async fn a_pass_is_never_left_to_a_queued_read() {
     let run = async {
         mesh.began.notified().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            updates.holder("worker1").is_none(),
-            "a read waiting for its turn holds no hive"
-        );
+        // worker1 was read while worker2's read has not answered, and let go.
+        let worker1 = entry_of(&updates, "worker1");
+        assert_eq!(worker1.config.state, Standing::Pending, "{worker1:#?}");
+        assert!(updates.holder("worker1").is_none(), "its re-read let it go");
         // The run's pass on worker1 goes at once.
         let pass = run_hive(
             &updates,
@@ -3674,10 +3796,10 @@ async fn a_pass_is_never_left_to_a_queued_read() {
         );
         tokio::time::timeout(Duration::from_secs(2), pass)
             .await
-            .expect("the pass is not left to the queued read, nor waits for it");
+            .expect("the pass waits for no read of another hive");
         mesh.answer.notify_one();
     };
-    tokio::join!(slow, queued, run);
+    tokio::join!(slow, beside, run);
     assert_eq!(
         lock(&mesh.sent).clone(),
         vec![(
