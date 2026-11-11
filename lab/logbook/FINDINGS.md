@@ -196,9 +196,12 @@ no change required
     [General/SY.timer] and A-267 [General/orchestrator], low. **Next:** the router alone (0.1.132:
     A-245, A-195, A-261, A-262, A-246, A-247, A-208, A-253, A-265), then 0.1.133 (A-191, A-240,
     A-241, A-255, A-258, A-259, A-260, A-266, A-267).
-23. **0.1.132, the router alone** (building, 2026-11-11): A-245, A-195 (A-261, A-262 with it), A-208
-    (A-247 closed into it), A-246, A-253 (each dropped record named), A-265 (with the stale check's
-    rebuild). **Found by its review:** A-268, A-269, low.
+23. **0.1.132, the router alone** ✅ live and checked on 8.x (2026-11-11): A-245 (a far router's answer
+    reaches a sender on another spoke), A-195 (a new sender's and a new link's first frames are no
+    longer dropped; A-261, A-262 with it), A-265 (a new node reached by name from another spoke in
+    0.33 s, 5.98 s before), A-246, A-253 (each dropped record named), A-208 (A-247 closed into it).
+    **Found by its review:** A-268, A-269; **by its gate:** A-272, low. **Next:** 0.1.133 (A-191,
+    A-240, A-241, A-255, A-258, A-259, A-260, A-266, A-267, A-270, A-271).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -302,8 +305,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
-- The router's 0.1.132, built (2026-11-11): A-195, A-208 (A-247 closed into it), A-245, A-246,
-  A-253, A-261, A-262, A-265.
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
   0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
@@ -324,6 +325,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
 - A-270 🔵 `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances (low; SY.wf-rules; with A-240 in 0.1.133).
 - A-271 🔵 A check that decides an action takes "no answer" for "no": A-267's class, left in the orchestrator (low).
+- A-272 🔵 Every router sends a WAN broadcast back to the peer it came from (low; the router).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1401,6 +1403,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-272 [General/router] 🔵 low (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
+
+- **Seen:** the motherbee logged `foreign_source` drops of its own nodes' broadcasts coming back
+  from ingress1 and worker1 (`src_l2_name` `IO.gate0232b@motherbee`, 0.1.131 and 0.1.132), and
+  worker1 dropped its own node's broadcast coming back from the motherbee (`IO.gate0232e@worker1`);
+  the motherbee's counter reached 40 within 8 minutes of its router's restart.
+- **Why:** `handle_wan_message`'s broadcast arm (`src/router/mod.rs` ~4187-4230) delivers locally
+  and then calls `broadcast_to_wan` toward every WAN peer, the one the frame came from included. A
+  spoke sends every broadcast of the hub back to it, and the hub sends a spoke's broadcast back to
+  that spoke; the receiver drops it by its source check (the cache would drop it next).
+- **Effect:** one frame wasted per spoke and per broadcast, the `foreign_source` counter and its
+  line filled with echoes (most of what A-195 counted), which hides a real drop.
+- **Fix:** split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one
+  it came from (a spoke, with the hub its only peer, sends none).
+
 ### A-271 [General/orchestrator] 🔵 low (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — A check that decides an action takes "no answer" for "no"
 
 - **Why:** A-267 fixed this in `systemd_is_active` only (a killed or failed `systemctl is-active`
@@ -1495,7 +1512,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** read one row more than the limit and, when it is there, answer the cursor of the last
   row listed.
 
-### A-265 [General/router] 🔵 low, BUILT for the router's 0.1.132 (d3a22e6a; the stale check too, f9aeb19b) (found 2026-11-11 by the review fixes of the router's A-195; read in the code) — The hub does not rebuild its FIB when it applies a spoke's LSA
+### A-265 [General/router] ✅ VALIDATED ON 8.x (0.1.132, 2026-11-11; a new node on worker1 reached by name from ingress1 0.33 s after its connect, 5.98 s on 0.1.131) (found 2026-11-11 by the review fixes of the router's A-195; read in the code) — The hub does not rebuild its FIB when it applies a spoke's LSA
 
 - **Why:** `handle_wan_message`'s `Applied` arm (`src/router/mod.rs` ~3850-3875) calls
   `write_lsa_state`, which updates the LSA snapshot, but not `rebuild_fib`. A frame relayed by name
@@ -1508,6 +1525,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Built (0.1.132):** the `Applied` arm rebuilds the FIB after `write_lsa_state`, before the hub
   advertises that LSA's nodes; the stale check rebuilds it too when a hive's stale mark changes (the
   review), so a stale hive's names leave the FIB at once. A-268 is what is left (two builds at once).
+- **Checked on 8.x (0.1.132):** a sender on ingress1 sending by name every 0.25 s from before a node
+  connected on worker1: the first frame sent 0.33 s after the connect was delivered (0.1.131: 5.98 s);
+  no `NODE_NOT_FOUND` came from the hub.
 
 ### A-264 [General/Go SDK] 🔵 low (found 2026-11-11 by A-253's verifier; read in the code) — The Go SDK has no text blob offload: a WF's text over 128 KiB fails, and one between about 96 and 128 KiB misses the turns
 
@@ -1531,7 +1551,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **0.1.131's deploy:** the marks came one after the other, 3 to 8 s after each spoke was ready, with
   one lost read asked again at once: seconds now, so it stays low.
 
-### A-262 [General/router] 🔵 nit, BUILT for the router's 0.1.132 (coa/router-131, the review of A-195) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub sends no advertisement when the set it vouches for to a spoke becomes empty
+### A-262 [General/router] ✅ BUILT (0.1.132, 2026-11-11, with A-195; by its tests) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub sends no advertisement when the set it vouches for to a spoke becomes empty
 
 - `reachability_frame` returns nothing for an empty set (`src/router/mod.rs` ~2527): when the last
   node the hub vouched for to a spoke goes, or its hive goes stale, that spoke keeps the old
@@ -1539,7 +1559,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   every hive runs SY nodes, so the set is never empty.
 - **Fix:** send the empty advertisement to a spoke that had entries.
 
-### A-261 [General/router] 🔵 low, BUILT for the router's 0.1.132 (coa/router-131, the review of A-195: the reads under the locks) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub's LSA snapshot can briefly go back to an older copy
+### A-261 [General/router] ✅ BUILT (0.1.132, 2026-11-11, with A-195: the reads under the locks; by its tests) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub's LSA snapshot can briefly go back to an older copy
 
 - **Why:** `refresh_lsa` (`src/router/mod.rs` ~6575-6580) reads the LSA region and stores the copy
   later under the snapshot's lock, so a write in between is undone until the next refresh; and
@@ -1638,7 +1658,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   check refused `fire_in` 400d naming its path, and took 366d. No definition on 8.x went past 366
   days.
 
-### A-253 [General/storage] 🔵 low, BUILT for the router's 0.1.132 (d2140b67, e6cc7645: the drop kept, each one named in the router's journal) (found 2026-11-10 by 0.1.129's gate; seen on 8.x, the same on 0.1.128) — A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns
+### A-253 [General/storage] ✅ VALIDATED ON 8.x (0.1.132, 2026-11-11; the drop kept, each one named in the router's journal, a forged `thread_id` escaped and cut) (found 2026-11-10 by 0.1.129's gate; seen on 8.x, the same on 0.1.128) — A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns
 
 - **Seen:** the gate's test messages of 100 KB were delivered, and each router logged *"router
   stream lost records in the last 30 s: oversize: 80"* for their copies to SY.storage.
@@ -1655,6 +1675,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   its full length), sequence and size, at most 10 between two alarm lines; the alarm adds *"router
   stream did not name N records too big for a batch…"* for the rest. The stream's other drops
   (queue full, cap, expired, refused) stay counted only, until the talk on logs.
+- **Checked on 8.x (0.1.132):** on worker1, a 100 KB message named once (bytes 100,312, max_bytes
+  97,151); one whose `thread_id` held 6 KB starting with a newline and the alarm's words, named in
+  one line of 494 bytes, escaped and cut (`... (6062 bytes)`), and no line starting with the alarm's
+  words; 15 at once: 10 named and *"did not name 5"*; `ops.py health` gave `streamlost=17`.
 
 ### A-252 [General/join] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a throwaway worker's Syncthing started 3 times, not 4, switched at its join's link) (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — A fresh worker restarts Syncthing once more about a minute after its join, for the posture options
 
@@ -1749,7 +1773,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   tools, no model): an AI observer of tapped traffic would be a feature of its own. IO and WF nodes
   still act on a copy they receive, which is what a tap target such as an audit IO node is for.
 
-### A-247 [General/router] 🔵 low, BUILT for the router's 0.1.132 with A-208, closed into it (b62fb3c8) (found 2026-11-10 by the router's 0.1.129 builder; read in the code) — A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender
+### A-247 [General/router] ✅ BUILT (0.1.132, 2026-11-11), closed into A-208 (found 2026-11-10 by the router's 0.1.129 builder; read in the code) — A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender
 
 - **Why:** in `handle_peer_message`'s `ResolvedRoute::ForwardRouter(peer_uuid)` arms
   (`src/router/mod.rs` ~4883 and ~5033 on `coa/router-129`), the arm's `peer_uuid` shadows the
@@ -1761,7 +1785,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Built (0.1.132), closed into A-208:** both `ForwardRouter` arms bind `next_router`, check the
   TTL first and answer over the link the frame came from.
 
-### A-246 [General/router] 🔵 low, BUILT for the router's 0.1.132 (e7ccae6c) (found 2026-11-10 by the review of the router's 0.1.129; read in the code) — A non-gateway router with no gateway sibling answers a broadcast twice
+### A-246 [General/router] ✅ BUILT (0.1.132, 2026-11-11; the gateway's answer unchanged on 8.x; the several-routers case by its tests) (found 2026-11-10 by the review of the router's 0.1.129; read in the code) — A non-gateway router with no gateway sibling answers a broadcast twice
 
 - **Why:** `forward_broadcast_to_wan` answers `GATEWAY_UNAVAILABLE` itself (`src/router/mod.rs`
   2164-2166 on `coa/router-129`), and the broadcast's sender is answered `LINK_BUSY` as well (1461)
@@ -1774,8 +1798,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   entered answers once (`GATEWAY_UNAVAILABLE` first, then local delivery's reason, then
   `LINK_BUSY`), and a router a broadcast reaches over IRP answers nothing. A gateway's answer is
   unchanged (A-222's tests).
+- **Checked on 8.x (0.1.132):** the gateway's path, as on 0.1.131: with one target's link full, one
+  `LINK_BUSY` from the motherbee's router and the broadcast once to each other target; with none full,
+  no answer and once to each.
 
-### A-245 [General/router] 🔵 low, BUILT for the router's 0.1.132 (510483f2, 217bf029) (found 2026-11-10 by the review of the router's 0.1.129; read in the code; there before it) — A far router's UNREACHABLE reaches only the hub's own nodes
+### A-245 [General/router] ✅ VALIDATED ON 8.x (0.1.132, 2026-11-11; worker1's 1,536 `LINK_BUSY` all reached a sender on ingress1, none on 0.1.131) (found 2026-11-10 by the review of the router's 0.1.129; read in the code; there before it) — A far router's UNREACHABLE reaches only the hub's own nodes
 
 - **Why:** the hub relays an `UNREACHABLE` that comes over the WAN only to its own nodes
   (`src/router/mod.rs` 3674-3688 on `coa/router-129`). A message from an ingress1 node to a worker1
@@ -1788,6 +1815,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   whose LSA lists the sender, one hop of TTL less, only when the adjacent router made it, never back
   where it came from and never twice; an answer it does not hand on is counted and logged with its
   reason, at most once every 30 s.
+- **Checked on 8.x (0.1.132):** a client on worker1 that read nothing, a sender on ingress1 with 2,600
+  messages: the receiver took 1,064 and worker1's router answered the other 1,536 `LINK_BUSY`, all of
+  which reached the sender through the hub; on 0.1.131 the same run gave the sender no answer.
 
 ### A-244 [General/SY.timer] ✅ BUILT (0.1.131, 2026-11-11; a timer's whole life unchanged on 8.x, the leak proven by its tests) (found 2026-11-10 by A-220's builder; read in the code) — SY.timer's per-timer lock map never drops an entry
 
@@ -2314,7 +2344,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   original sender the same way; a local or IRP copy is dropped silently.
 - **Fix, later:** a tap copy's failure is logged, and never answered to the sender.
 
-### A-208 [General/router] 🔵 low, BUILT for the router's 0.1.132 (cdf1805f, d3079d3b; A-247 with it) (found 2026-11-09 by A-203's builder; read in the code) — With several routers on one hive (not supported), an IRP reply goes to the wrong link, and a sibling can register twice
+### A-208 [General/router] ✅ BUILT (0.1.132, 2026-11-11; A-247 with it; no live case: every hive on 8.x runs one router) (found 2026-11-09 by A-203's builder; read in the code) — With several routers on one hive (not supported), an IRP reply goes to the wrong link, and a sibling can register twice
 
 - **Why:**
   - `handle_peer_message` reuses the name `peer_uuid` for the destination router of
@@ -2615,7 +2645,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   link has none.
 - **Fix:** the same marker for the join's link. Not seen on 8.x.
 
-### A-195 [General/router] 🔵 BUILT for the router's 0.1.132 (d6a5d123, c663c69e; A-261 and A-262 with it) (found 2026-11-08 by 0.1.118's gate, its timeline) — WAN frames are dropped at each link-up, before the peer's LSA names their sender
+### A-195 [General/router] ✅ VALIDATED ON 8.x (0.1.132, 2026-11-11; a sender 1 s old reached worker1, all its frames dropped on 0.1.131; A-261 and A-262 with it; most `foreign_source` lines were A-272's echoes) (found 2026-11-08 by 0.1.118's gate, its timeline) — WAN frames are dropped at each link-up, before the peer's LSA names their sender
 
 - **Seen:** when `gate0218`'s WAN link came up, the motherbee's router and `gate0218`'s each
   dropped a frame as `foreign_source` ("its sender is neither a node of the peer that sent it nor
@@ -2632,6 +2662,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reachability, queued before the link goes into the WAN table; the hub tells every spoke of a
   hive's changed nodes as its LSA comes, not at its next 10 s beacon, and its advertisements go out
   one at a time, in the order they were built.
+- **Checked on 8.x (0.1.132):** a sender that connected on ingress1 1 s before sending to a node of
+  worker1 reached it (on 0.1.131 worker1 dropped all its 2,600 frames as `foreign_source`, and the
+  sender got nothing), and ingress1 knew the new node within 1 s (0.1.131: `NODE_NOT_FOUND` for more
+  than 5 s). No link-up drop was logged at the deploy's link-ups. The `foreign_source` lines this
+  entry counted were mostly A-272's echoes of broadcasts, not link-ups.
 
 ### A-194 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.119, 2026-11-08; found 2026-11-08 by 0.1.118's gate, its timeline; read in the code) — The Syncthing watchdog restarts Syncthing while a join's finalize is restarting it
 

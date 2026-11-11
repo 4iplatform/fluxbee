@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.131** | 2026-11-11 | `0f6b54f1` | motherbee + spokes (core), one branch per binary, from the sweep: SY.admin (A-242: no removal refused for published pages, each ok answer names them in `pages_left_up`; A-249 closed with it; A-251: SY.timer's refusals answered by their code; A-250 (a): a short read while a hive restarts, asked again at once), SY.timer 1.5 (A-238: a canceled timer aged by its cancel, schema 4; A-244: the lock map drops a timer's entry), IO (A-91: io.blob CONFIGURED on its defaults, io.cloud UNCONFIGURED `missing_edge_node` without an edge; A-226; A-223's spec), WF (A-254: a timer SY.timer does not take goes again until it does, the store at v7; the 366-day bound in wf.engine and SY.wf-rules), the orchestrator (A-252: a new spoke switches Syncthing's posture at its join's peer link) | ✅ live, checked on 8.x | snap `pre-sweep-0-1-131` (all 4 VMs) · `apt install fluxbee=0.1.130` + 0.1.130's `update_installation` (the older SY.timer and wf.engine read schema 4 and store v7; A-233's and A-212's page refusals come back) |
+| **0.1.132** | 2026-11-11 | `36135e52` | motherbee + spokes (core), the router alone: A-245 (a far router's `UNREACHABLE` or `TTL_EXCEEDED` reaches a sender on another spoke: the hub hands it on toward the spoke whose LSA lists the sender), A-195 (no WAN frame arrives before what names its sender: a new link's first frames are the LSA and the hub's reachability; the hub tells every spoke of a hive's changed nodes as its LSA comes; A-261, A-262 with it), A-265 (the hub rebuilds its FIB as it applies an LSA, and as a hive goes stale), A-246 (a broadcast answered once, by the router it entered), A-253 (a stream record too big for a batch named in the router's journal, its ids quoted, escaped and cut, at most 10 between two alarm lines), A-208 with A-247 (the several-routers mode, unsupported: no wedge, answers over the link a frame came from); `ops.py health` counts the router's lines only when the pattern opens the message | ✅ live, checked on 8.x | snap `pre-router-0-1-132` (all 4 VMs) · `apt install fluxbee=0.1.131` + 0.1.131's `update_installation` (nothing one-way; the wire is the same) |
+| **0.1.131** | 2026-11-11 | `0f6b54f1` | motherbee + spokes (core), one branch per binary, from the sweep: SY.admin (A-242: no removal refused for published pages, each ok answer names them in `pages_left_up`; A-249 closed with it; A-251: SY.timer's refusals answered by their code; A-250 (a): a short read while a hive restarts, asked again at once), SY.timer 1.5 (A-238: a canceled timer aged by its cancel, schema 4; A-244: the lock map drops a timer's entry), IO (A-91: io.blob CONFIGURED on its defaults, io.cloud UNCONFIGURED `missing_edge_node` without an edge; A-226; A-223's spec), WF (A-254: a timer SY.timer does not take goes again until it does, the store at v7; the 366-day bound in wf.engine and SY.wf-rules), the orchestrator (A-252: a new spoke switches Syncthing's posture at its join's peer link) | ✅ replaced by 0.1.132 | snap `pre-sweep-0-1-131` (deleted 2026-11-11) · `apt install fluxbee=0.1.130` + 0.1.130's `update_installation` (the older SY.timer and wf.engine read schema 4 and store v7; A-233's and A-212's page refusals come back) |
 | **0.1.130** | 2026-11-10 | `8604debf` | motherbee + spokes (core), the Go SDK alone: A-228 (an RPC error for a router notice carries `reason`, `original_dst`, `last_hop`), A-239 (`TimerInfo.canceled_reason`; SY.timer serializes the SDK's `TimerInfo`), A-218's ECHO leftovers (`MSGEcho`/`MSGEchoReply` gone; SY.timer and wf-generic take the AI nodes' notice rule; SY.timer answers an ECHO `TIMER_UNKNOWN_VERB`) | ✅ replaced by 0.1.131 | snap `pre-gosdk-0-1-130` (deleted 2026-11-11) · `apt install fluxbee=0.1.129` + 0.1.129's `update_installation` (nothing one-way; the wire is the same) |
 | **0.1.129** | 2026-11-10 | `9b396e3e` | motherbee + spokes (core), the router alone: A-222 (a bounded queue per link, 1,024 frames or 8 MiB counted as heap, the senders' share 960 / 7 MiB; a message past it refused `LINK_BUSY` with an answer, the node never disconnected), A-209 (no router answers a tap copy; the router clears a `via_tap` a node sets), A-221 (an agent's turn goes to cognition only once its link took it) | ✅ replaced by 0.1.130 | snap `pre-router-0-1-129` (deleted 2026-11-10) · `apt install fluxbee=0.1.128` + 0.1.128's `update_installation` (nothing one-way) |
 | **0.1.128** | 2026-11-10 | `89fd1fd8` | motherbee + spokes (core), the Rust SDK alone: A-218 (`TNT_APPROVE`, seven dead action names, ECHO/ECHO_REPLY/TIME_SYNC gone; SY.identity's migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`; the identity shared memory exactly as it was), A-237 (an intermediate answer marked `accepted`), A-248 (an AI node used as a tap target answers nothing, its copies counted) | ✅ replaced by 0.1.129 | snap `pre-sdk-0-1-128` (deleted 2026-11-10) · `apt install fluxbee=0.1.127` + 0.1.127's `update_installation` (SY.identity of 0.1.127 ignores migration row 5, never names the dropped column, and recreates the empty vocabulary table) |
@@ -140,6 +141,69 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.132 — The router alone: far answers, link-ups and named drops
+
+- **Date:** 2026-11-11 (ART) · **Previous version:** 0.1.131 · **Commit:** `36135e52`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the sweep (ultracode, 2026-11-10/11); the router is shared code and ships alone (METHOD
+  §9). The operator's calls: A-208, A-246 and A-247 *"si"* (2026-11-10); A-253 keep the drop and log
+  it (*"hay que logear eso en algun lado.. imagino el log del propio nodo"*).
+- **What changed (rt-gateway only):**
+  - **A-245:** the hub hands a far router's `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke
+    whose LSA lists the sender, one hop of TTL less, only when the adjacent router made it, never
+    back where it came from and never twice; an answer it does not hand on is counted and logged
+    with its reason, at most once every 30 s.
+  - **A-195:** a new link's first frames are the router's LSA and, from the hub, its reachability,
+    queued before the link goes into the WAN table; the hub tells every spoke of a hive's changed
+    nodes as its LSA comes, not at its next 10 s beacon, one advertisement at a time in the order
+    built. With it A-261 (the hub's LSA copy never goes back to an older one) and A-262 (the hub's
+    advertisement goes out with no node too).
+  - **A-265:** the hub rebuilds its FIB as it applies a spoke's LSA, before it advertises that LSA's
+    nodes, and when the stale check marks a hive stale.
+  - **A-246:** a broadcast is answered once, by the router it entered (`GATEWAY_UNAVAILABLE` first,
+    then local delivery's reason, then `LINK_BUSY`); a router a broadcast reaches over IRP answers
+    nothing. A gateway's answer is unchanged.
+  - **A-253:** the drop of a stream record too big for a batch stays; each one is named in the
+    router's journal (*"router stream dropped a record too big for a batch; its sink never gets
+    it"*: stream, sink, subject, producer, `trace_id`, `thread_id`, seq, bytes, max_bytes; the three
+    ids quoted, escaped and cut at 128 bytes), at most 10 between two alarm lines, the alarm adding
+    *"did not name N"* for the rest.
+  - **A-208 with A-247:** the several-routers mode (unsupported) no longer wedges a router that is
+    not the gateway, checks an IRP broadcast against the cache, registers a sibling once, and
+    answers over the link a frame came from.
+  - **Lab:** `ops.py health` counts the router's lines only when the pattern opens the line's
+    message (the review of A-253).
+- **Build and review:** `coa/router-131` (A-245, A-195, their reviews) and `coa/router-132` (the
+  rest, its review round and fixes), rebased onto daily with their subjects at `[0.1.131]`; CI green
+  on the branch and on the integrated head (`d3079d3b`). The reviews found A-268 and A-269.
+- **The deploy:** build in 23 min, publish in 16 s, `ops deploy 0.1.132` in 288 s (snapshots 30 s,
+  the motherbee's apt 116 s, its admin on the version 68 s), health clean; snapshot
+  `pre-router-0-1-132`, `pre-sweep-0-1-131` dropped. The motherbee's router restarted in 0.4 s; each
+  spoke's core restarted with its router, and the spokes settled by their own records 37.4 to 41.8 s
+  after the update's call (0.1.131's: 22.6 to 29.2 s); SY.admin closed the update 41.9 s after it
+  opened it (0.1.131's: about 38 s).
+- **Checked on 8.x (the gate, against the same runs on 0.1.131 first):**
+  - A-245: a client on worker1 that reads nothing, a sender on ingress1: the 1,536 `LINK_BUSY` of
+    worker1's router all reached the sender (0.1.131: none; the receiver took 1,064 both times).
+  - A-195: a sender that connected 1 s before sending reached worker1 (0.1.131: all 2,600 frames
+    dropped there as `foreign_source`, unanswered), and ingress1 knew the new node within 1 s
+    (0.1.131: answered `NODE_NOT_FOUND` for more than 5 s). No link-up drop logged at the deploy's
+    link-ups.
+  - A-265: a node that connected on worker1 was reached by name from ingress1 0.33 s after its
+    connect (0.1.131: 5.98 s); no `NODE_NOT_FOUND` from the hub.
+  - A-246 on the gateway's path: with one target's link full, one `LINK_BUSY` from the motherbee's
+    router and the broadcast once to each other target; with none full, no answer and once to each;
+    the same as on 0.1.131.
+  - A-253 on worker1: a 100 KB message named once (bytes 100,312, max_bytes 97,151); one whose
+    `thread_id` held 6 KB starting with a newline and the alarm's words named in one line of 494
+    bytes, quoted, escaped and cut (`... (6062 bytes)`), no forged line; 15 at once: 10 named and
+    *"did not name 5"*; `ops.py health` gave `streamlost=17`, the alarms' own count.
+  - A-208, A-247: no live case (every hive runs one router); A-261, A-262: by their tests.
+  - Found: A-272, every router sends a WAN broadcast back to the peer it came from (the spokes'
+    echoes are most of the `foreign_source` lines A-195 counted).
+- **PROD after the gate:** all four hives on 0.1.132 (`da117f8b`); worker1 behind egress1; the
+  gate's throwaway clients gone; snapshot `pre-router-0-1-132` on each VM.
 
 ## 0.1.131 — The sweep, one branch per binary
 
