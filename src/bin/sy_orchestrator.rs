@@ -1341,18 +1341,16 @@ enum ReadTarget {
 }
 
 /// The lane of one of SY.admin's commands (FINDINGS A-199). The reads are the ones read in the code
-/// to write and change nothing. `get_node_status` is a read only for a node of another hive, which
-/// this hive asks and writes nothing for: a node of this hive's own gets its status version
-/// written (`advance_node_status_version`).
+/// to write and change nothing; a node's status is one wherever the node runs, since it keeps no
+/// status version (FINDINGS A-240).
 fn admin_request_lane(action: &str, payload: &serde_json::Value, local_hive: &str) -> RequestLane {
     match action {
         "hive_status" | "get_storage" | "list_nodes" | "list_tenant_nodes" | "list_versions"
         | "get_versions" | "list_runtimes" | "get_runtime" | "list_deployments"
         | "get_deployments" | "list_drift_alerts" | "get_drift_alerts" | "get_node_config"
-        | "get_node_state" | "list_hives" | "get_hive" => {
+        | "get_node_state" | "get_node_status" | "list_hives" | "get_hive" => {
             RequestLane::Read(read_target(action, payload, local_hive))
         }
-        "get_node_status" => node_status_lane(payload, local_hive),
         _ => RequestLane::Ordered,
     }
 }
@@ -1371,8 +1369,8 @@ fn system_request_lane(
         Some("GET_RUNTIME") => "get_runtime",
         Some("NODE_CONFIG_GET") => "get_node_config",
         Some("NODE_STATE_GET") => "get_node_state",
+        Some("NODE_STATUS_GET") => "get_node_status",
         Some("INVENTORY_REQUEST") => return RequestLane::Read(ReadTarget::Local),
-        Some("NODE_STATUS_GET") => return node_status_lane(payload, local_hive),
         _ => return RequestLane::Ordered,
     };
     RequestLane::Read(read_target(twin, payload, local_hive))
@@ -1395,15 +1393,6 @@ fn read_target(action: &str, payload: &serde_json::Value, local_hive: &str) -> R
         ReadTarget::Local
     } else {
         ReadTarget::Hive(hive)
-    }
-}
-
-/// A node's status, asked of the hive `get_node_status_flow` sends it to: a read when that is
-/// another hive, ordered when it is this one, which writes the node's status version.
-fn node_status_lane(payload: &serde_json::Value, local_hive: &str) -> RequestLane {
-    match read_target("get_node_status", payload, local_hive) {
-        ReadTarget::Local => RequestLane::Ordered,
-        target => RequestLane::Read(target),
     }
 }
 
@@ -26252,75 +26241,6 @@ async fn get_node_state_flow(
     }
 }
 
-fn node_status_version_path(node_name: &str) -> Result<PathBuf, OrchestratorError> {
-    Ok(node_instance_dir(node_name)?.join("status_version"))
-}
-
-fn node_status_fingerprint_path(node_name: &str) -> Result<PathBuf, OrchestratorError> {
-    Ok(node_instance_dir(node_name)?.join("status_fingerprint.sha256"))
-}
-
-fn read_node_status_version(path: &Path) -> u64 {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<(), OrchestratorError> {
-    if let Some(parent) = path.parent() {
-        ensure_private_dir(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    fs::write(&tmp, contents)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-fn status_fingerprint_hash(value: &serde_json::Value) -> Result<String, OrchestratorError> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn advance_node_status_version(
-    node_name: &str,
-    fingerprint: &serde_json::Value,
-) -> Result<u64, OrchestratorError> {
-    let version_path = node_status_version_path(node_name)?;
-    let fingerprint_path = node_status_fingerprint_path(node_name)?;
-    if let Some(parent) = version_path.parent() {
-        ensure_private_dir(parent)?;
-    }
-
-    let current = read_node_status_version(&version_path);
-    let new_fingerprint = status_fingerprint_hash(fingerprint)?;
-    let old_fingerprint = fs::read_to_string(&fingerprint_path)
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty());
-
-    let next = if current == 0 {
-        1
-    } else if old_fingerprint.as_deref() == Some(new_fingerprint.as_str()) {
-        current
-    } else {
-        current.saturating_add(1)
-    };
-
-    if current != next || !version_path.exists() {
-        write_private_file_atomic(&version_path, next.to_string().as_bytes())?;
-    }
-    if old_fingerprint.as_deref() != Some(new_fingerprint.as_str()) || !fingerprint_path.exists() {
-        write_private_file_atomic(&fingerprint_path, new_fingerprint.as_bytes())?;
-    }
-
-    Ok(next)
-}
-
 /// Whether the router shows this node. The router's own name is no node of its LSA, which lists
 /// the nodes connected to it and its peers': the router shows itself by keeping this hive's LSA
 /// entry fresh, which it restamps on every hello, the same entry every local node's visibility
@@ -26528,8 +26448,7 @@ fn local_node_view(
 
 /// The hive a request about one node goes to: the hive its `node_name` names after `@`, else its
 /// `target` (this hive by default). The status, config and state flows and their lanes
-/// (`read_target`) read it alike, so a status the flow writes here is never taken for a read, and
-/// a read waits on the hive the flow forwards it to.
+/// (`read_target`) read it alike, so a read waits on the hive the flow forwards it to.
 fn node_request_target_hive(payload: &serde_json::Value, local_hive: &str) -> String {
     payload
         .get("node_name")
@@ -26802,37 +26721,7 @@ async fn get_node_status_flow(
         .and_then(epoch_ms_to_iso_utc)
         .or_else(|| config_updated_at_ms.map(|value| value.to_string()));
 
-    let status_fingerprint = serde_json::json!({
-        "lifecycle_state": lifecycle_state,
-        "health_state": health_state,
-        "health_source": health_source,
-        "runtime_requested_version": runtime_requested_version.clone(),
-        "runtime_name": runtime_name.clone(),
-        "runtime_version": runtime_version.clone(),
-        "config_exists": config_exists,
-        "config_valid": config_valid,
-        "config_version": config_version,
-        "state_exists": state_exists,
-        "process_pid": process_pid,
-        "process_exit_code": process_exit_code,
-        "process_restart_count": process_restart_count,
-        "process_started_at": process_started_at.clone(),
-        "identity_ilk_id": identity_ilk_id.clone(),
-        "identity_tenant_id": identity_tenant_id.clone(),
-        "last_error": last_error.clone(),
-    });
-    // The version lives in the node's directory under nodes/. A read creates no state for a core
-    // node, whose directory there, when it has one, is its own: it gets no status version.
-    let status_version = managed.then(|| {
-        advance_node_status_version(&node_name, &status_fingerprint).unwrap_or_else(|err| {
-            tracing::warn!(
-                node_name = node_name,
-                error = %err,
-                "failed to persist node status version"
-            );
-            1
-        })
-    });
+    // A status read writes nothing, for any node (FINDINGS A-240): `observed_at` dates it.
     let mut node_status = serde_json::json!({
         "schema_version": NODE_STATUS_SCHEMA_VERSION,
         "node_name": node_name,
@@ -26841,7 +26730,6 @@ async fn get_node_status_flow(
         "lifecycle_state": lifecycle_state,
         "health_state": health_state,
         "health_source": health_source,
-        "status_version": status_version,
         "runtime": {
             "name": runtime_name,
             "requested_version": runtime_requested_version,
@@ -52965,8 +52853,9 @@ blob:
         );
     }
 
-    /// A status read of a core node takes it from its unit and creates no state for it: no status
-    /// version is kept under nodes/SY. A core node this hive's role does not run is not found.
+    /// A status read of a core node takes it from its unit and creates no state for it. No node's
+    /// status carries a status version any more (FINDINGS A-240). A core node this hive's role does
+    /// not run is not found.
     #[tokio::test]
     async fn a_core_node_status_reads_its_unit_and_writes_nothing() {
         let state = sample_orchestrator_state_for_tests();
@@ -52981,7 +52870,7 @@ blob:
         assert_ne!(node["lifecycle_state"], "UNKNOWN");
         assert_eq!(node["config"], serde_json::json!({ "managed": false }));
         assert_eq!(node["state"], serde_json::json!({ "managed": false }));
-        assert_eq!(node["status_version"], serde_json::Value::Null);
+        assert!(node.get("status_version").is_none(), "{node}");
 
         let elsewhere = get_node_status_flow(
             &state,
@@ -52989,6 +52878,31 @@ blob:
         )
         .await;
         assert_eq!(elsewhere["error_code"], "NODE_NOT_FOUND");
+    }
+
+    /// FINDINGS A-240: a managed node's status is a plain read too. Its flow kept a status version
+    /// and a fingerprint in the node's directory, recreating the directory when it was gone; it
+    /// now writes nothing, so it runs in the read lane beside the changes. A test cannot place a
+    /// managed node's files under nodes/, so the flow's own code is read.
+    #[test]
+    fn a_node_status_read_writes_nothing() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("async fn get_node_status_flow(")
+            .expect("the flow");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        for writer in [
+            "status_version",
+            "write_",
+            "ensure_private_dir(",
+            "create_dir",
+            "fs::write(",
+            "fs::rename(",
+            "set_permissions(",
+            "remove_file(",
+        ] {
+            assert!(!body.contains(writer), "the status flow calls {writer}");
+        }
     }
 
     /// A node's NODE_HELP_RESPONSE as docs/agent-tools-v1.md §3.3 shapes it, with one card.
@@ -53900,8 +53814,8 @@ blob:
     }
 
     /// Which requests are reads: the ones read in the code to write and change nothing. Every other
-    /// action, an unknown one included, keeps the order, and a node's status is a read only where
-    /// it is forwarded: this hive writes the status version of a node of its own.
+    /// action, an unknown one included, keeps the order. A node's status is a read wherever the
+    /// node runs: this hive writes nothing for a node of its own either (FINDINGS A-240).
     #[test]
     fn only_the_reads_leave_the_order() {
         let none = serde_json::json!({});
@@ -53920,6 +53834,7 @@ blob:
             "get_drift_alerts",
             "get_node_config",
             "get_node_state",
+            "get_node_status",
             "list_hives",
             "get_hive",
         ] {
@@ -53963,6 +53878,7 @@ blob:
             "INVENTORY_REQUEST",
             "NODE_CONFIG_GET",
             "NODE_STATE_GET",
+            "NODE_STATUS_GET",
         ] {
             assert!(
                 matches!(
@@ -53999,25 +53915,26 @@ blob:
             system_request_lane(None, &none, "worker1"),
             RequestLane::Ordered
         );
-        // A node's status: the hive its name names wins over `target`, as in get_node_status_flow.
+        // A node's status: the hive its name names wins over `target`, as in get_node_status_flow,
+        // and a node of this hive's own is read here, beside the changes.
         for (payload, lane) in [
             (
                 serde_json::json!({"node_name": "AI.demo@motherbee"}),
-                RequestLane::Ordered,
+                RequestLane::Read(ReadTarget::Local),
             ),
             (
                 serde_json::json!({"node_name": "AI.demo"}),
-                RequestLane::Ordered,
+                RequestLane::Read(ReadTarget::Local),
             ),
             (
                 serde_json::json!({"node_name": "AI.demo", "target": "motherbee"}),
-                RequestLane::Ordered,
+                RequestLane::Read(ReadTarget::Local),
             ),
             (
                 serde_json::json!({"node_name": "AI.demo@motherbee", "target": "worker1"}),
-                RequestLane::Ordered,
+                RequestLane::Read(ReadTarget::Local),
             ),
-            (serde_json::json!({}), RequestLane::Ordered),
+            (serde_json::json!({}), RequestLane::Read(ReadTarget::Local)),
             (
                 serde_json::json!({"node_name": "AI.demo@worker1"}),
                 RequestLane::Read(ReadTarget::Hive("worker1".to_string())),

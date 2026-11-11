@@ -204,7 +204,7 @@ The heap holds one entry per pending timer, the next fire it waits for, found by
 /var/lib/fluxbee/nodes/SY/SY.timer@<hive>/timers.db
 ```
 
-Together with the rest of the node's persistent state (`config.json`, `status_version`, etc.), following the canonical per-node directory convention of the system.
+Together with the rest of the node's persistent state (`config.json`, etc.), following the canonical per-node directory convention of the system.
 
 ### 5.2 Schema
 

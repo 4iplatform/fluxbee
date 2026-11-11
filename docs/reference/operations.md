@@ -695,7 +695,7 @@ orchestrator). SY nodes and the router are not managed this way and cannot be la
 | stop | `DELETE /hives/{hive}/nodes/{name}` with `{"purge_instance": false}` | there is no separate stop action; the node is stopped and not relaunched at boot; its config, ILK, secrets and timers stay |
 | remove | `DELETE /hives/{hive}/nodes/{name}` with `{"purge_instance": true}` | full teardown, below |
 | remove a stopped instance | `DELETE /hives/{hive}/nodes/{name}/instance` | refused while running (`NODE_INSTANCE_RUNNING`) |
-| config, state, status | `GET`/`PUT /hives/{hive}/nodes/{name}/config`, `GET .../state`, `GET .../status` | for an SY node or the router, `status` reads its packaged unit (`sy-<name>`, `rt-gateway`) and the router's LSA, with `config` and `state` not managed and no `status_version` (the read writes nothing); a core node this hive's role does not run answers `NODE_NOT_FOUND` |
+| config, state, status | `GET`/`PUT /hives/{hive}/nodes/{name}/config`, `GET .../state`, `GET .../status` | for an SY node or the router, `status` reads its packaged unit (`sy-<name>`, `rt-gateway`) and the router's LSA, with `config` and `state` not managed; a core node this hive's role does not run answers `NODE_NOT_FOUND`. A status read writes nothing, for any node, and has no `status_version` since 0.1.133 (FINDINGS A-240): `observed_at` dates it |
 
 `run_node` refuses: `SY.*`/`RT.*` names; any node in the root tenant except the core IO runtimes
 `io.cloud`, `io.blob`, `io.web` (`TENANT_ROOT_NOT_ALLOWED`, `genesis_refusal`); a core IO runtime

@@ -250,8 +250,7 @@ Each `WF.*` node is an independent Go process that:
 ├── config.json       # orchestrator-managed
 ├── state.json        # optional runtime state
 ├── secrets.json      # if applicable
-├── wf_instances.db   # SQLite, all instance state
-└── status_version
+└── wf_instances.db   # SQLite, all instance state
 ```
 
 ## 8. Workflow definition format

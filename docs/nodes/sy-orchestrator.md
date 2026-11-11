@@ -153,9 +153,11 @@ it counts as seen while the LSA entry for its hive is fresh (`node_seen_by_route
 `state` read `{"managed": false}`; the health is still what the node answers to
 `NODE_STATUS_GET`. A core node this hive's role does not run (not in its role's list; the
 orchestrator runs everywhere) answers `NODE_NOT_FOUND`. The files some SY nodes keep under
-`/var/lib/fluxbee/nodes/SY/` play no part, and a status read writes nothing for a core node: its
-`status_version` is null. The managed listing (`list_nodes` with `managed`) shows those nodes the
-same way, with `managed: false`.
+`/var/lib/fluxbee/nodes/SY/` play no part. A status read writes nothing, for any node, and the
+answer has no `status_version`: `observed_at` dates it (FINDINGS A-240, since 0.1.133; the
+`status_version` and `status_fingerprint.sha256` files older releases wrote in a managed node's
+directory stay until the node's purge). The managed listing (`list_nodes` with `managed`) shows
+those nodes the same way, with `managed: false`.
 
 ## Managed nodes
 
@@ -931,11 +933,13 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
   read in the code to write and change nothing (`admin_request_lane`, `system_request_lane`):
   hive_status, get_storage, list_nodes, list_tenant_nodes, list_versions, get_versions,
   list_runtimes, get_runtime, list_deployments, get_deployments, list_drift_alerts,
-  get_drift_alerts, get_node_config, get_node_state, list_hives, get_hive; `GET_VERSIONS`,
-  `GET_RUNTIMES`, `LIST_NODES`, `GET_RUNTIME`, `INVENTORY_REQUEST`, `NODE_CONFIG_GET`,
-  `NODE_STATE_GET`. A node's status (`get_node_status`, `NODE_STATUS_GET`) is a read when the node
-  is another hive's, which this hive only asks; for a node of its own it writes the node's status
-  version, so it keeps the order.
+  get_drift_alerts, get_node_config, get_node_state, get_node_status, list_hives, get_hive;
+  `GET_VERSIONS`, `GET_RUNTIMES`, `LIST_NODES`, `GET_RUNTIME`, `INVENTORY_REQUEST`,
+  `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`. A node's status is a read wherever the
+  node runs, since 0.1.133: it no longer writes a status version for a node of this hive
+  (FINDINGS A-240). A status read can then show a node of this hive halfway through a change
+  (`STARTING`, or `NODE_NOT_FOUND` during a purge), as the config and state reads already could,
+  and a node that does not answer its 2 s probe holds one of the 16 local places for that time.
 - **A read runs off the runtime's threads,** on one of tokio's blocking pool, through the
   runtime's handle, as add_hive's join does (`spawn_background_join`). The orchestrator's runtime
   (`#[tokio::main]`) has one worker thread per CPU, two on a spoke cloned from the 2-core
