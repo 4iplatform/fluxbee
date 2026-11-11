@@ -158,6 +158,13 @@ Rules:
 - `node.frontdesk_target` (or `IO_API_FRONTDESK_TARGET`) is infrastructure wiring for the
   intermediate registration handoff. It defaults to the canonical singleton
   `SY.frontdesk.gov@motherbee`.
+- `node.identity_timeout_ms` (or `IO_API_IDENTITY_TIMEOUT_MS`), 10 000 by default, is how long
+  IO.api waits for each of its own SY.identity calls (registering or disabling its ICH,
+  provisioning a subject) and for the Frontdesk's answer to a handoff. It must stay above the
+  Frontdesk's whole registration, whose attempts all end within 8 s (`REGISTER_DEADLINE`,
+  [SY.frontdesk.gov](../nodes/sy-frontdesk-gov.md)): set lower, IO.api answers
+  `frontdesk_unavailable` while the Frontdesk may still register the person (FINDINGS A-223). Only
+  the Frontdesk's tests hold its side (8 s under 10 s); nothing in IO.api checks this one.
 
 The following old fields are rejected rather than ignored:
 
@@ -238,9 +245,10 @@ Large/generated files use the Blob toolchain and publication mechanism, not an E
 - Tenant always comes from `FLUXBEE_NODE_TENANT_ID`.
 - `caller_is_subject` identity comes from instance config.
 - `explicit_subject by_data` resolves/provisions through Identity.
-- Temporary/incomplete explicit subjects use the existing Frontdesk structured handoff. Frontdesk
-  must be `CONFIGURED`; its canonical `type=error` response is surfaced as
-  `frontdesk_unavailable`, not as a malformed response envelope.
+- Temporary/incomplete explicit subjects use the existing Frontdesk structured handoff. The
+  Frontdesk runs a handoff deterministically, with no LLM, in any of its config states: the check
+  that it is `CONFIGURED` guards only its conversations. Its canonical `type=error` response is
+  surfaced as `frontdesk_unavailable`, not as a malformed response envelope.
 - The synchronous Frontdesk RPC accepts only a correlated `user` reply as success and classifies
   `SYSTEM/UNREACHABLE` and `SYSTEM/TTL_EXCEEDED` as transport errors.
 - Message payload is canonical `text/v1`.
