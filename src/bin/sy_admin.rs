@@ -5923,10 +5923,9 @@ enum MeshAccess {
     /// `filter_externalized_channels_for_caller` in the handlers).
     OwnChannel,
     /// `AI.*@H`, `IO.*@H` and `WF.*@H`, the producers (`authorize_artifact_publisher` in the
-    /// handler).
+    /// handlers): each publishes, and takes down only its own publications
+    /// (`handle_unpublish_artifact`; FINDINGS A-243, since 0.1.136, where only `AI.*` might).
     Publisher,
-    /// `AI.*@H`, on its own publications (`handle_unpublish_artifact`).
-    AiPublisher,
     /// Nobody, Archi included: the operator's alone, on loopback or as a step of a plan Archi
     /// stages and the operator confirms (the executor is no mesh caller).
     Nobody,
@@ -5944,8 +5943,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         }
         "teardown_node" => MeshAccess::NodeTeardown,
         "externalize" | "unexternalize" | "list_externalized" => MeshAccess::OwnChannel,
-        "publish_artifact" => MeshAccess::Publisher,
-        "unpublish_artifact" => MeshAccess::AiPublisher,
+        // Each publisher takes its own pages down (FINDINGS A-243): the handler checks the page's
+        // publisher and tenant.
+        "publish_artifact" | "unpublish_artifact" => MeshAccess::Publisher,
         // The public pages that are up (FINDINGS A-212): Archi's read. Taking one down stays the
         // operator's, through a plan.
         "list_published_artifacts" => MeshAccess::Archi,
@@ -6233,7 +6233,6 @@ fn authorize_mesh_caller(
         {
             Ok(MeshAdmission::Admitted)
         }
-        MeshAccess::AiPublisher if node_of_family(name, "AI") => Ok(MeshAdmission::Admitted),
         _ => Err(format!("{caller} may not ask for '{action}' over the mesh")),
     }
 }
@@ -6928,10 +6927,11 @@ async fn handle_unpublish_artifact(
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let action = "unpublish_artifact";
-    // Producer path (mesh, caller_l2_name = Some): the A-62 table lets only an AI.* node ask
-    // (`MeshAccess::AiPublisher`; Archi, which it admits to every action, is no producer and is
-    // refused here), and only for its own publication: the exact router-stamped name that
-    // published it, charged to the tenant it published in, checked below. Operator path
+    // Producer path (mesh, caller_l2_name = Some): the A-62 table lets an AI.*, IO.* or WF.* node
+    // ask, the producers that publish (`MeshAccess::Publisher`; FINDINGS A-243, since 0.1.136,
+    // where only AI.* might; Archi, which it admits to every action, is no producer and is refused
+    // here), and only for its own publication: the exact router-stamped name that published it,
+    // charged to the tenant it published in, checked below. Operator path
     // (caller_l2_name = None): the trusted localhost HTTP server, or the executor running a step
     // of a plan the operator confirmed in Archi, which is how Archi takes a page down (A-120).
     // It may unpublish ANY publication (D2 — a deliberate operator power, so a retired/renamed
@@ -15097,7 +15097,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner."
         }
         "unpublish_artifact" => {
-            "Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own."
+            "Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.*, IO.* or WF.* node takes down only its own."
         }
         "list_published_artifacts" => {
             "List the public pages that are up, newest first: each one's publication_id (what unpublish_artifact takes), status, file name, content type, size, tenant, publisher, edge, and when it went up and expires. Never a link's key."
@@ -17368,7 +17368,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
             "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node on a worker or the motherbee (A-62: a node of an ingress or egress hive asks SY.admin for nothing). The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
-            "Over the mesh only an AI.* producer may unpublish: an IO.* or WF.* publication ends at its expiry or by the operator's unpublish_artifact (POST /artifacts/unpublish, or a plan Archi stages and the operator confirms).",
+            "Each producer takes its own pages down (FINDINGS A-243, since 0.1.136): over the mesh an AI.*, IO.* or WF.* node calls unpublish_artifact for a page it published, and only for one. Any page also ends at its expiry or by the operator's unpublish_artifact (POST /artifacts/unpublish, or a plan Archi stages and the operator confirms).",
             "Call RouterDispatcher::send_admin_rpc with target=None. Do not send tenant_id, publisher_l2_name, path, public key, sha256, raw headers or CSP.",
             "blob_ref must already identify promoted active content available to IO.blob; bytes never travel in ADMIN_COMMAND.",
             "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
@@ -17390,7 +17390,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "unpublish_artifact" => vec![
             "The operator takes down any page, whoever published it: POST /artifacts/unpublish on loopback, or a step of an executor plan, which Archi stages with fluxbee_plan_compiler and SY.admin runs only after the operator confirms it (A-120).",
-            "Over the mesh only an AI.* node may ask (A-62), with RouterDispatcher::send_admin_rpc and target=None, and only for a page it published: the same router-stamped L2 name, else 403 UNAUTHORIZED. Archi takes a page down through the executor, never with an ADMIN_COMMAND of its own.",
+            "Over the mesh the producers may ask (A-62): an AI.*, IO.* or WF.* node (FINDINGS A-243, since 0.1.136; AI.* only before), with RouterDispatcher::send_admin_rpc and target=None, and only for a page it published: the same router-stamped L2 name, charged by identity to the tenant the page was published in, else 403 UNAUTHORIZED. A node of an ingress or egress hive asks SY.admin for nothing. Archi takes a page down through the executor, never with an ADMIN_COMMAND of its own.",
             "Name the page by exactly one of publication_id (pub:<uuid>, returned by publish_artifact) or key, the last segment of its link: of https://<host>/public/<key>, only <key>. It takes no hive: the publication names its edge.",
             "list_published_artifacts (GET /artifacts) lists the pages that are up, each with its publication_id.",
             "A publication that does not exist answers 404 NOT_FOUND.",
@@ -26588,6 +26588,8 @@ mod tests {
             ("IO.api.sales", "externalize"),
             ("AI.support", "publish_artifact"),
             ("AI.support", "unpublish_artifact"),
+            ("IO.api.sales", "unpublish_artifact"),
+            ("WF.invoice", "unpublish_artifact"),
         ] {
             let admitted = mesh_admits(
                 &format!("{name}@worker1"),
@@ -26619,8 +26621,9 @@ mod tests {
     }
 
     /// IO.cloud@motherbee relays the Cloud-exposed actions (the one list `list_cloud_actions`
-    /// advertises), acts on its own channel and publishes as an IO node; nothing else. IO.cloud on
-    /// another hive is an IO node like any other.
+    /// advertises), acts on its own channel, and publishes and takes its own pages down as an IO
+    /// node (FINDINGS A-243; the Cloud's list and take-down are not among the exposed actions);
+    /// nothing else. IO.cloud on another hive is an IO node like any other.
     #[test]
     fn iocloud_on_the_motherbee_relays_only_the_cloud_surface() {
         let relay = "IO.cloud@motherbee";
@@ -26629,6 +26632,7 @@ mod tests {
             "unexternalize",
             "list_externalized",
             "publish_artifact",
+            "unpublish_artifact",
         ];
         for action in every_mesh_action() {
             let admitted = mesh_admits(relay, action, None, &json!({})).is_ok();
@@ -26719,8 +26723,9 @@ mod tests {
         }
     }
 
-    /// IO.* acts on its own channels (the handlers check the owner) and publishes; AI.* publishes
-    /// and unpublishes; WF.* publishes. Nothing else, and never another system node.
+    /// IO.* acts on its own channels (the handlers check the owner); AI.*, IO.* and WF.* publish
+    /// and take their own pages down (the handler checks the publisher, FINDINGS A-243). Nothing
+    /// else, and never another system node.
     #[test]
     fn producers_publish_and_io_nodes_act_on_their_channels() {
         let admitted = |caller: &str| -> Vec<&'static str> {
@@ -26733,6 +26738,7 @@ mod tests {
             admitted("IO.api.sales@worker1"),
             vec![
                 "publish_artifact",
+                "unpublish_artifact",
                 "externalize",
                 "unexternalize",
                 "list_externalized"
@@ -26742,7 +26748,10 @@ mod tests {
             admitted("AI.support@worker1"),
             vec!["publish_artifact", "unpublish_artifact"]
         );
-        assert_eq!(admitted("WF.invoice@motherbee"), vec!["publish_artifact"]);
+        assert_eq!(
+            admitted("WF.invoice@motherbee"),
+            vec!["publish_artifact", "unpublish_artifact"]
+        );
         for caller in [
             "SY.frontdesk.gov@motherbee",
             "SY.storage@motherbee",
@@ -27707,7 +27716,7 @@ mod tests {
             "publish_cloud_endpoint",
             "executor_execute_plan",
             "sync_hint",
-            "unpublish_artifact",
+            "list_published_artifacts",
         ] {
             assert!(
                 mesh_admits(relay, evil, None, &json!({})).is_err(),
@@ -27721,6 +27730,18 @@ mod tests {
                 mesh_admits(relay, self_service, None, &json!({})).is_ok(),
                 "IO.cloud must reach the channel gate for its own '{self_service}'"
             );
+        }
+        // FINDINGS A-243: neither is a page's publish or take-down. As every IO node, IO.cloud
+        // publishes and takes down only the pages it published itself (the handler checks the
+        // page's publisher, so a tenant's page is refused it; it publishes none today). The
+        // Cloud's list and take-down of its tenant's pages are no exposed action: they wait for
+        // the Cloud track.
+        for own_pages in ["publish_artifact", "unpublish_artifact"] {
+            assert!(
+                mesh_admits(relay, own_pages, None, &json!({})).is_ok(),
+                "IO.cloud must reach the publisher check for its own '{own_pages}'"
+            );
+            assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&own_pages));
         }
         // EDGE-06: the exposed provisioning actions come over the mesh from IO.cloud in the admin's
         // hive and from Archi; from nobody else, the orchestrators and the lab's diagnostic nodes
@@ -33603,7 +33624,7 @@ mod tests {
 
     /// Taking a page down is the operator's (A-120): an action of its catalog with its HTTP route,
     /// one the executor runs and Archi stages, behind the operator's confirmation. Over the mesh
-    /// it stays an AI node's, on its own pages.
+    /// it is each producer's, on its own pages (FINDINGS A-243), and no action the Cloud relays.
     #[test]
     fn taking_a_page_down_is_an_operator_action_the_executor_runs() {
         let spec = resolve_internal_action_spec("unpublish_artifact")
@@ -33665,9 +33686,10 @@ mod tests {
         assert!(executor_actions.contains(&"unpublish_artifact"));
         assert_eq!(
             mesh_access("unpublish_artifact"),
-            Some(MeshAccess::AiPublisher)
+            Some(MeshAccess::Publisher)
         );
         assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"unpublish_artifact"));
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"list_published_artifacts"));
     }
 
     #[test]
@@ -42112,6 +42134,120 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    /// Each publisher takes its own pages down over the mesh (FINDINGS A-243, since 0.1.136): an
+    /// IO.* and a WF.* node as an AI.* node does, through the A-62 table and the handler's checks
+    /// (the page's publisher, and the tenant identity charges it to). Each is refused 403
+    /// UNAUTHORIZED for another node's page, by its id or its link's key, and so is IO.cloud, an IO
+    /// node, for a tenant's page; that page stays up with no one asked. The AI.* node's path is the
+    /// one it had. Before, the table refused an IO.* or WF.* node any take-down, its own pages
+    /// included.
+    #[tokio::test]
+    async fn each_publisher_takes_its_own_pages_down_over_the_mesh() {
+        const IO_PUBLISHER: &str = "IO.api.sales@worker1";
+        const WF_PUBLISHER: &str = "WF.invoice@worker1";
+        const CLOUD_RELAY: &str = "IO.cloud@motherbee";
+        let (mut ctx, mut harness) = mesh_test_admin("unpublish-each-publisher");
+        let publishers = [IO_PUBLISHER, WF_PUBLISHER, PAGE_PUBLISHER];
+        ctx.publisher_tenant = Arc::new(move |_, caller| {
+            if publishers.contains(&caller) {
+                Ok(PAGE_TENANT.to_string())
+            } else {
+                Err(format!(
+                    "publisher '{caller}' is not registered in identity"
+                ))
+            }
+        });
+        let io_page = published_page(IO_PUBLISHER);
+        let wf_page = published_page(WF_PUBLISHER);
+        let ai_page = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&io_page, &wf_page, &ai_page]);
+        let ask = |caller: &'static str, params: Value| {
+            dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "unpublish_artifact",
+                None,
+                params,
+                AdminOrigin::Mesh(caller),
+            )
+        };
+
+        for (caller, page) in [
+            (IO_PUBLISHER, &wf_page),
+            (IO_PUBLISHER, &ai_page),
+            (WF_PUBLISHER, &io_page),
+            (WF_PUBLISHER, &ai_page),
+            (PAGE_PUBLISHER, &io_page),
+            (PAGE_PUBLISHER, &wf_page),
+            (CLOUD_RELAY, &io_page),
+        ] {
+            for params in [
+                json!({ "publication_id": page.publication_id }),
+                json!({ "key": page.key }),
+            ] {
+                let refused = ask(caller, params).await.expect("dispatch");
+                assert_eq!(refused.http_status, 403, "{caller}: {}", refused.envelope);
+                assert_eq!(refused.envelope["error_code"], "UNAUTHORIZED");
+                assert_eq!(
+                    refused.envelope["error_detail"],
+                    json!("a node may unpublish only its own publication"),
+                    "{caller}"
+                );
+            }
+        }
+        for page in [&io_page, &wf_page, &ai_page] {
+            assert_eq!(publication_status(&ctx, &page.publication_id), "published");
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        for (caller, page) in [
+            (IO_PUBLISHER, &io_page),
+            (WF_PUBLISHER, &wf_page),
+            (PAGE_PUBLISHER, &ai_page),
+        ] {
+            let params = json!({ "publication_id": page.publication_id });
+            let (result, ()) = tokio::join!(
+                ask(caller, params),
+                take_down(&mut harness, &page.publication_id)
+            );
+            let result = result.expect("dispatch");
+            assert_eq!(result.http_status, 200, "{caller}: {}", result.envelope);
+            assert_eq!(
+                result.envelope["payload"],
+                json!({ "publication_id": page.publication_id, "unpublished": true })
+            );
+            assert_eq!(
+                publication_status(&ctx, &page.publication_id),
+                "unpublished"
+            );
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // The help says so, publish_artifact's and unpublish_artifact's, and no longer AI.* only.
+        let notes: Vec<&str> = admin_action_request_notes("publish_artifact")
+            .into_iter()
+            .chain(admin_action_request_notes("unpublish_artifact"))
+            .collect();
+        assert!(notes.iter().all(|note| !note.contains("only an AI.*")));
+        for action in ["publish_artifact", "unpublish_artifact"] {
+            assert!(
+                admin_action_request_notes(action)
+                    .iter()
+                    .any(|note| note.contains("an AI.*, IO.* or WF.* node")
+                        && note.contains("FINDINGS A-243")),
+                "{action}"
+            );
+        }
+        assert!(admin_action_summary("unpublish_artifact")
+            .contains("over the mesh an AI.*, IO.* or WF.* node takes down only its own"));
     }
 
     /// A page outlives its publisher (FINDINGS A-242): a node launched later under its publisher's

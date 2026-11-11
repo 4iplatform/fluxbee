@@ -293,7 +293,7 @@ caller and the action; a command with no stamped caller is refused too.
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
 | `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
-| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication); `AI.*@H` also `unpublish_artifact` of its own publications | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
+| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication), and `unpublish_artifact` of its own publications only (FINDINGS A-243, since 0.1.136, where only `AI.*@H` might) | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
 
 - **The table lives next to the catalog.** `mesh_access`, right after `INTERNAL_ACTION_REGISTRY`,
   gives every action of the catalog and every mesh command off it its row. An action it does not
@@ -1375,12 +1375,13 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   publication by exactly one of `publication_id` (`pub:<uuid>`) or `key`, the last segment of its
   `/public/<key>` link: 64 lowercase hex characters, as `mint_public_capability` makes it. A
   `publication_id` is read in the form the ledger keeps, lowercase and hyphenated, whatever form
-  of the UUID it comes in (`canonical_publication_id`). Over the mesh only an `AI.*` node may ask
-  (A-62), and only for its own publication: the record's publisher must be its exact
-  router-stamped name, and the record's tenant the one identity's shared memory charges that name
-  to now (`resolve_artifact_publisher`, the read publish makes), else `403 UNAUTHORIZED`. A page
-  outlives its publisher (FINDINGS A-242), so a node launched later under the same name in another
-  tenant does not take it down. The operator takes down any publication by either
+  of the UUID it comes in (`canonical_publication_id`). Over the mesh each publisher takes its own
+  pages down: an `AI.*`, `IO.*` or `WF.*` node may ask (A-62; FINDINGS A-243, since 0.1.136, where
+  only an `AI.*` node might), and only for its own publication: the record's publisher must be its
+  exact router-stamped name, and the record's tenant the one identity's shared memory charges
+  that name to now (`resolve_artifact_publisher`, the read publish makes), else
+  `403 UNAUTHORIZED`. A page outlives its publisher (FINDINGS A-242), so a node launched later
+  under the same name in another tenant does not take it down. The operator takes down any publication by either
   field (FINDINGS A-120): `POST /artifacts/unpublish`, or a step of an executor plan, which
   Archi's plan compiler stages and which runs only once the operator confirms it. The action is
   `confirmation_required`, and takes no hive: the publication names its edge. It reads the
@@ -1822,7 +1823,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_admin_action_help` | `GET /admin/actions/{action}` | Return help metadata for one admin action. |
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
 | `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
-| `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own. |
+| `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.*, IO.* or WF.* node takes down only its own. |
 | `list_published_artifacts` | `GET /artifacts` | List the public pages that are up, newest first: each one's publication_id (what unpublish_artifact takes), status, file name, content type, size, tenant, publisher, edge, and when it went up and expires. Never a link's key. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives, and each hive's installation file. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive, and its installation file. |
