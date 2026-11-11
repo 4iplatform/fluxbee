@@ -158,7 +158,9 @@ warning `router refused a UUID that several hives list`, at most every 30 s).
 ### 3.2 To a name: the FIB
 
 Names resolve through the FIB, a sorted list the router rebuilds whenever its nodes, its siblings,
-the config region or the LSA change (`rebuild_fib`).
+the config region or the LSA change (`rebuild_fib`). The gateway rebuilds it as it applies another
+hive's LSA (since 0.1.132, A-265): until then a frame relayed by name to a node an LSA had just
+added got `NODE_NOT_FOUND` from the hub until its next rebuild, up to 5 s later.
 
 | Source (`FibSource`) | Comes from | Match | Next hop | Admin distance |
 | --- | --- | --- | --- | --- |

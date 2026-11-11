@@ -77,6 +77,10 @@ Separate three things that are conflated today: **data** (which node lives on wh
     hive_id: origin_hive, next_hop_hive, via_hub: true }`; UUID-addressed forwards use
     `next_hop_hive`, while the canonical/authority binding uses `hive_id` (origin) + `via_hub`.
   Each hop re-resolves the unchanged `dst`; the hub, knowing the target directly, forwards onward.
+  Since 0.1.132 (FINDINGS A-265) the hub rebuilds its FIB as it applies a spoke's LSA, before it
+  advertises that LSA's nodes, so a name a spoke has just announced resolves on the hub at once;
+  until then the hub answered a frame relayed by name to it `NODE_NOT_FOUND` until its next
+  rebuild, up to 5 s.
 - Terminal gate (`mod.rs:2858`): a frame whose `src` resolves only via the reachability table is
   **admitted for delivery** instead of dropped (terminal gate closed), carrying the `via_hub` flag
   to the authority decision.

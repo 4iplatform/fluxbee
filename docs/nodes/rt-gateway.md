@@ -162,6 +162,11 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
     them one at a time, and each spoke gets them in the order they were built. It goes with no node
     too, so a spoke whose last vouched-for node is gone drops it; until 0.1.132 none went then, and
     the spoke kept routing to that node through the hub until its entry expired.
+  - **Names on the hub** (A-265, since 0.1.132): the hub rebuilds its forwarding table as it
+    applies an LSA, before the advertisement goes, so a frame another spoke sends by name to a node
+    that LSA added goes on at once. Until 0.1.132 only its copy of the LSA changed, which a frame
+    by UUID reads, and one by name got `NODE_NOT_FOUND` from the hub until its next rebuild, at a
+    message of one of its own nodes or within 5 s.
   - **Errors across the hub** (A-245, since 0.1.132): a message between two spokes passes the
     hub both ways, and the far spoke's router answers it over the hub's link. The hub hands that
     `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke whose LSA lists the sender, one hop of TTL

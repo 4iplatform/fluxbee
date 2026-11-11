@@ -3877,6 +3877,21 @@ async fn handle_wan_message(
                         );
                     }
                     write_lsa_state(ctx).await;
+                    // A-265: the FIB too, before the advertisement below sends the other spokes to
+                    // this LSA's nodes. A frame relayed by name resolves through the FIB, and until
+                    // 0.1.132 the hub answered one for a node this LSA had just added
+                    // NODE_NOT_FOUND until its next rebuild, at a message of one of its own nodes or
+                    // its 5 s loops. A frame by UUID reads the router's copy of the LSA region,
+                    // which `write_lsa_state` has just stored.
+                    rebuild_fib(
+                        &ctx.fib,
+                        &ctx.nodes,
+                        &ctx.peer_nodes,
+                        &ctx.static_routes,
+                        &ctx.lsa_snapshot,
+                        &ctx.reachability,
+                    )
+                    .await;
                     // A-195: the hub tells the other spokes of a hive's new nodes as they come, not
                     // at its next beacon. This session handles its frames in order and each link
                     // keeps the order of its own, so every other spoke has the advertisement before
@@ -17313,6 +17328,79 @@ mod tests {
                 .await
                 .get(LSA_REJECT_FOREIGN_SOURCE),
             None
+        );
+        unlink_test_shm(&lsa_name);
+    }
+
+    /// A-265: the hub rebuilds its FIB as it applies a spoke's LSA, so a frame another spoke sends
+    /// by name to a node that LSA has just added goes on to that node's spoke at once. Until
+    /// 0.1.132 only the LSA region and the router's copy of it changed, and the hub answered such a
+    /// frame NODE_NOT_FOUND until its next rebuild, at a message of one of its own nodes or its 5 s
+    /// loops, up to 5 s.
+    #[tokio::test]
+    async fn the_hub_routes_by_name_to_a_node_an_lsa_has_just_added() {
+        let hub = test_wan_context(None);
+        let lsa_name = format!("/lsa-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        unlink_test_shm(&lsa_name);
+        *hub.lsa_writer.lock().await = Some(
+            LsaRegionWriter::open_or_create(&lsa_name, hub.router_uuid, "motherbee")
+                .expect("lsa region"),
+        );
+        let (hub_to_ingress1, mut ingress1_reads) = link_queue("wan");
+        let (hub_to_worker1, mut worker1_reads) = link_queue("wan");
+        for (hive, link) in [
+            ("ingress1", hub_to_ingress1.clone()),
+            ("worker1", hub_to_worker1.clone()),
+        ] {
+            hub.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: link,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        let sender = Uuid::new_v4();
+        lsa_from(
+            &hub,
+            "ingress1",
+            &hub_to_ingress1,
+            1,
+            &[(sender, "IO.x@ingress1")],
+        )
+        .await;
+        // A node connects on worker1: worker1's LSA names it, and ingress1's node sends to it by
+        // name right after.
+        lsa_from(
+            &hub,
+            "worker1",
+            &hub_to_worker1,
+            1,
+            &[(Uuid::new_v4(), "AI.new@worker1")],
+        )
+        .await;
+        messages_on(&mut ingress1_reads);
+        messages_on(&mut worker1_reads);
+        let by_name = Message {
+            routing: Routing {
+                src: sender.to_string(),
+                src_l2_name: Some("IO.x@ingress1".to_string()),
+                dst: Destination::Unicast("AI.new@worker1".to_string()),
+                ttl: 15,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &by_name).await;
+        let relayed = messages_on(&mut worker1_reads);
+        assert!(has(relayed, &by_name), "on to worker1");
+        assert!(
+            messages_on(&mut ingress1_reads).is_empty(),
+            "and no NODE_NOT_FOUND back"
         );
         unlink_test_shm(&lsa_name);
     }
