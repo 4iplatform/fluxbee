@@ -559,11 +559,13 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
   orchestrator starts again;
 - its boot (`bootstrap_local`) restarts every core service whose running binary was replaced
   (`/proc/<pid>/exe` ends in ` (deleted)`), and every one of its role's whose
-  `systemctl show -p MainPID` gives no answer, asked again (a restart also starts a stopped one;
-  FINDINGS A-282, since 0.1.136), in start order, records it as the last core update
-  (`via: package`; `updated` the replaced ones, `unanswered` the others, apart), rebuilds the
-  per-role core trees for the spokes, and moves managed nodes that follow `current` onto the new
-  version (`reconcile_persisted_custom_nodes`, the pass its 60 s loop repeats).
+  `systemctl show -p MainPID` gives no answer, or whose `/proc/<pid>/exe` link cannot be read
+  for another reason than a process gone, asked again (a restart also starts a stopped one;
+  FINDINGS A-282, since 0.1.136), in start order, records it as the last core update when one of
+  them ran a replaced binary (`via: package`; `updated` the replaced ones, `unanswered` the
+  others, apart), rebuilds the per-role core trees for the spokes, and moves managed nodes that
+  follow `current` onto the new version (`reconcile_persisted_custom_nodes`, the pass its 60 s
+  loop repeats).
 
 ### The spokes (core update)
 

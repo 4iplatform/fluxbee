@@ -81,7 +81,8 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    9. starts each SY node of its role in list order (`start_core_service`), using
       `restart` instead of `start` for a service whose binary a package upgrade replaced (its
       `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45), and
-      for one whose `systemctl show -p MainPID` gives no answer, asked again up to 3 times 250 ms
+      for one whose `systemctl show -p MainPID` gives no answer, or whose `/proc/<pid>/exe` link
+      cannot be read for another reason than a process gone, asked again up to 3 times 250 ms
       apart: a restart also starts a stopped service (`BootBinaryChecks`, FINDINGS A-282, since
       0.1.136). Before, such a check read as "not replaced", and a service the upgrade replaced
       kept its old binary while the package and `/versions` said new. rt-gateway, in step 4, is

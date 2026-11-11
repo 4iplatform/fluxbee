@@ -2578,8 +2578,8 @@ impl BootUpgradeRestart {
                     unanswered = ?self.unanswered,
                     restarted = ?self.restarted,
                     errors = ?self.errors,
-                    "restarted the core services systemctl gave no answer for; none ran a replaced \
-                     binary, so no package upgrade's restart is recorded"
+                    "restarted the core services systemctl gave no answer for; no other service \
+                     was found on a replaced binary, so no package upgrade's restart is recorded"
                 );
             }
             return;
@@ -52346,6 +52346,13 @@ blob:
         assert!(boot.contains(
             "let binaries = check_core_binaries_at_boot(&core_services, &unlisted_core).await;"
         ));
+        // Before the components the list leaves out join `core_services`: as listed, one that
+        // gave no answer would be restarted, which starts it (the motherbee's sy-edge, say).
+        let at = |needle: &str| boot.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(
+            at("check_core_binaries_at_boot(&core_services, &unlisted_core)")
+                < at("core_services.extend(unlisted_core.iter().cloned());")
+        );
         assert!(boot.contains(".filter(|service| binaries.replaced.contains(*service))"));
         assert!(!boot.contains("start_core_service(service, &replaced"));
     }
@@ -52374,6 +52381,12 @@ blob:
         assert_eq!(
             ask(&[]).await,
             (NoAnswer, 1 + SERVICE_CHECK_ASKS_AGAIN as usize)
+        );
+        // Paused time moves no `std::time::Instant`, the limit's clock, so the asks above never
+        // meet the limit; the real clock does, after the pauses between them, which must fit in it.
+        const _: () = assert!(
+            (SERVICE_CHECK_ASKS_AGAIN as u128) * (SERVICE_CHECK_ASK_AGAIN_MS as u128)
+                < REPLACED_BINARY_CHECK_LIMIT.as_millis()
         );
 
         let src = include_str!("sy_orchestrator.rs");
