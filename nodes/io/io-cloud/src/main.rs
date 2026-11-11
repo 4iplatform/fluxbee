@@ -25,10 +25,17 @@
 //! config as part of publishing; `CONFIG_SET` is the manual override. There is deliberately NO
 //! secret field: the endpoint token is minted by `SY.admin` into the vault.
 //!
+//! The record and the override do not reach the node the same way. `publish_cloud_endpoint`
+//! records the edge with `set_node_config`, which only writes the node's `config.json`, and io.cloud
+//! reads that file only when it starts: a running io.cloud trusts an edge recorded that way after
+//! its next start (`restart_node`). A `CONFIG_SET` of `io.edge_node` reaches the live control plane,
+//! and the next request is judged by it (FINDINGS A-91's review).
+//!
 //! Its defaults do not cover its work: with no edge to trust it drops every Cloud request. So it
 //! is CONFIGURED only while its config names an edge (`require_trusted_edge`, FINDINGS A-91); the
 //! orchestrator's seed alone, or a config without `io.edge_node`, is UNCONFIGURED with
-//! `missing_edge_node` as its reason, which NODE_STATUS_GET (DEGRADED) and CONFIG_GET both give.
+//! `missing_edge_node` as its reason, which NODE_STATUS_GET (DEGRADED) and CONFIG_GET both give,
+//! and so does the answer to a CONFIG_SET that leaves it so.
 //!
 //! Two decisions that separate io.cloud from io.api:
 //! - **Motherbee-only, fail-closed in the binary.** io.cloud used to be a packaged systemd
@@ -46,6 +53,7 @@ use fluxbee_sdk::managed_control_plane::{
     build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
     DEFAULT_MANAGED_NODES_ROOT,
 };
+use fluxbee_sdk::node_config::NodeConfigSetPayload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, MSG_NODE_STATUS_GET,
     MSG_NODE_STATUS_GET_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
@@ -313,6 +321,10 @@ const MISSING_EDGE_NODE: &str = "missing_edge_node";
 /// seed alone or a config the contract accepts without it, it is UNCONFIGURED, with
 /// `missing_edge_node` as its reason. A config the contract refused stays FAILED_CONFIG, with the
 /// contract's.
+///
+/// The reason says how the edge gets there, as it is (FINDINGS A-91's review):
+/// `publish_cloud_endpoint` writes it to `config.json`, which io.cloud reads only when it starts, so
+/// a restart follows the publish; a CONFIG_SET of `io.edge_node` applies it at once.
 fn require_trusted_edge(state: &mut IoControlPlaneState) {
     if state.current_state == IoNodeLifecycleState::FailedConfig {
         return;
@@ -325,8 +337,10 @@ fn require_trusted_edge(state: &mut IoControlPlaneState) {
         state.last_error = Some(IoControlPlaneErrorInfo {
             code: MISSING_EDGE_NODE.to_string(),
             message: "IO.cloud trusts no SY.edge (config io.edge_node), so it drops every Cloud \
-                      request; publish_cloud_endpoint publishes its channel on an edge and records \
-                      that edge (or CONFIG_SET io.edge_node)"
+                      request. publish_cloud_endpoint records the edge it publishes on in \
+                      IO.cloud's config.json, which IO.cloud reads only when it starts: after a \
+                      publish, restart IO.cloud (restart_node); or set the edge at once with \
+                      CONFIG_SET io.edge_node (node_control_config_set)"
                 .to_string(),
         });
     }
@@ -358,15 +372,14 @@ fn node_status_payload(control: &IoControlPlaneState) -> Value {
     build_node_status_response_payload(lifecycle, last_error.as_ref())
 }
 
-fn build_reply(
-    sender: &NodeSender,
-    request: &Message,
-    response_msg: &str,
-    payload: Value,
-) -> Message {
+/// The answer to NODE_STATUS_GET (FINDINGS A-91): `node_status_payload` of the live control plane,
+/// to whoever asked, on its trace. The receive loop gives it before anything else, never through
+/// the SDK's default handler, which says HEALTHY whatever the state
+/// (`the_receive_loop_answers_node_status_from_the_config_state`).
+fn node_status_reply(own_uuid: &str, request: &Message, control: &IoControlPlaneState) -> Message {
     Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: own_uuid.to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: request.routing.ttl.max(1),
@@ -374,11 +387,11 @@ fn build_reply(
         },
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(response_msg.to_string()),
-            action: Some(response_msg.to_string()),
+            msg: Some(MSG_NODE_STATUS_GET_RESPONSE.to_string()),
+            action: Some(MSG_NODE_STATUS_GET_RESPONSE.to_string()),
             ..Meta::default()
         },
-        payload,
+        payload: node_status_payload(control),
     }
 }
 
@@ -396,15 +409,8 @@ async fn run_loop(
         };
 
         if is_node_status_request(&msg) {
-            let payload = node_status_payload(&*state.control_plane.read().await);
-            sender
-                .send(build_reply(
-                    sender,
-                    &msg,
-                    MSG_NODE_STATUS_GET_RESPONSE,
-                    payload,
-                ))
-                .await?;
+            let reply = node_status_reply(sender.uuid(), &msg, &*state.control_plane.read().await);
+            sender.send(reply).await?;
             continue;
         }
 
@@ -420,6 +426,7 @@ async fn run_loop(
 
         // Trusted edge is read LIVE from the control plane on EVERY request (hot-apply): a
         // CONFIG_SET that changes `io.edge_node` takes effect on the very next message, no restart.
+        // An edge `publish_cloud_endpoint` records reaches only config.json, read at the next start.
         let effective = state.control_plane.read().await.effective_config.clone();
         let cloud_edge_node = trusted_edge_node(effective.as_ref());
         let cloud_edge_node = cloud_edge_node.as_deref();
@@ -430,13 +437,15 @@ async fn run_loop(
             if msg.meta.ich.as_deref() == Some(state.own_ich.as_str()) {
                 // A request for its own channel from an edge it does not trust, or while it
                 // trusts none (FINDINGS A-91): Cloud gets nothing and waits out the edge's 30 s,
-                // so the drop is said where the operator looks.
+                // so the drop is said where the operator looks, with what fixes it when the door
+                // was published, or moved, since the start (its status is HEALTHY on a moved one).
                 tracing::warn!(
                     trace_id = %msg.routing.trace_id,
                     src_l2_name = ?msg.routing.src_l2_name,
                     trusted_edge = ?cloud_edge_node,
-                    "IO.cloud dropped a request for its channel: its config io.edge_node does not \
-                     name the SY.edge it came through"
+                    "IO.cloud dropped a request for its channel: its live config io.edge_node does \
+                     not name the SY.edge it came through; an edge publish_cloud_endpoint recorded \
+                     since IO.cloud started is trusted after its restart"
                 );
             } else {
                 tracing::debug!(
@@ -676,10 +685,7 @@ fn config_get_answer(
     payload
 }
 
-async fn apply_config_set(
-    state: &Arc<RuntimeState>,
-    payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
-) -> Value {
+async fn apply_config_set(state: &Arc<RuntimeState>, payload: &NodeConfigSetPayload) -> Value {
     let current = state.control_plane.read().await.clone();
     if let Err(err) = ensure_config_version_advances(payload.config_version, current.config_version)
     {
@@ -717,16 +723,7 @@ async fn apply_config_set(
                 );
             }
         };
-    let mut next = IoControlPlaneState {
-        current_state: IoNodeLifecycleState::Configured,
-        config_source: IoConfigSource::Dynamic,
-        schema_version: payload.schema_version,
-        config_version: payload.config_version,
-        effective_config: Some(effective.clone()),
-        last_error: None,
-    };
-    // Applied whatever it names, and CONFIGURED only with an edge to trust (FINDINGS A-91).
-    require_trusted_edge(&mut next);
+    let next = config_set_state(payload, effective.clone());
     if let Err(err) = persist_io_control_plane_state(&state.config.node_name, &next) {
         log_config_set_persist_error(
             &state.config.node_name,
@@ -764,21 +761,55 @@ async fn apply_config_set(
         &[],
         &[],
     );
-
-    let mut response = build_io_config_set_ok_payload(&state.config.node_name, &next);
-    if let Some(object) = response.as_object_mut() {
-        object.insert(
-            "apply".to_string(),
-            json!({
-                "mode":"hot_reload",
-                "hot_applied":hot_applied,
-                "reinit_performed":[],
-                "restart_required":[],
-            }),
+    if let Some(error) = next.last_error.as_ref() {
+        // Applied, and io.cloud cannot work on it: said where the operator looks, with the reason
+        // its status and this answer give (FINDINGS A-91's review).
+        tracing::warn!(
+            node_name = %state.config.node_name,
+            config_version = next.config_version,
+            reason = %error.code,
+            "IO.cloud applied a config that names no SY.edge (io.edge_node): it drops every \
+             Cloud request until it trusts one"
         );
     }
+
+    let mut response = config_set_answer(&state.config.node_name, &next, &hot_applied);
     inject_runtime_status(&mut response, state).await;
     response
+}
+
+/// What a CONFIG_SET leaves: the config it carries, as the contract materialized it, in use whatever
+/// it names, and CONFIGURED only with an edge to trust (`require_trusted_edge`, FINDINGS A-91).
+fn config_set_state(payload: &NodeConfigSetPayload, effective: Value) -> IoControlPlaneState {
+    let mut next = IoControlPlaneState {
+        current_state: IoNodeLifecycleState::Configured,
+        config_source: IoConfigSource::Dynamic,
+        schema_version: payload.schema_version,
+        config_version: payload.config_version,
+        effective_config: Some(effective),
+        last_error: None,
+    };
+    require_trusted_edge(&mut next);
+    next
+}
+
+/// The CONFIG_SET answer: the IO family's `ok`, since the config is applied and persisted, with its
+/// hot apply; and, when that config leaves io.cloud unable to work, the reason as `error`
+/// (`missing_edge_node`, what its status and CONFIG_GET give), where the family's is null (FINDINGS
+/// A-91's review). SY.admin's `node_control_config_set` answers an `ok` with its 200, and gives this
+/// `error` as `node_error`.
+fn config_set_answer(node_name: &str, next: &IoControlPlaneState, hot_applied: &[String]) -> Value {
+    let mut answer = build_io_config_set_ok_payload(node_name, next);
+    answer["apply"] = json!({
+        "mode": "hot_reload",
+        "hot_applied": hot_applied,
+        "reinit_performed": [],
+        "restart_required": [],
+    });
+    if let Some(error) = next.last_error.as_ref() {
+        answer["error"] = json!(error);
+    }
+    answer
 }
 
 /// Attach a small runtime block to CONFIG responses (mirrors io.api's `inject_runtime_status`,
@@ -3345,7 +3376,8 @@ mod tests {
 
     /// FINDINGS A-91: io.cloud's defaults do not cover its work, so the orchestrator's seed alone,
     /// and no config.json at all, boot UNCONFIGURED, naming what it misses, `io.edge_node`; never
-    /// a silent UNCONFIGURED.
+    /// a silent UNCONFIGURED. The reason says how the edge gets there as it is (the review): the
+    /// publish records it in config.json, which a running io.cloud reads at its next start.
     #[test]
     fn the_seed_alone_boots_unconfigured_naming_the_missing_edge() {
         let root = nodes_root("seed");
@@ -3370,19 +3402,22 @@ mod tests {
         );
         let error = state.last_error.expect("what it misses");
         assert_eq!(error.code, MISSING_EDGE_NODE);
-        assert!(error.message.contains("io.edge_node"), "{}", error.message);
-        assert!(
-            error.message.contains("publish_cloud_endpoint"),
-            "{}",
-            error.message
-        );
+        for what in [
+            "io.edge_node",
+            "publish_cloud_endpoint",
+            "config.json, which IO.cloud reads only when it starts",
+            "restart IO.cloud (restart_node)",
+            "CONFIG_SET io.edge_node (node_control_config_set)",
+        ] {
+            assert!(error.message.contains(what), "{what}: {}", error.message);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// What `publish_cloud_endpoint` records (`set_node_config` of `io.edge_node`) boots CONFIGURED
-    /// on that edge. A config the contract accepts without an edge is still UNCONFIGURED, missing
-    /// it, and so is a CONFIG_SET without one; a config the contract refuses is FAILED_CONFIG with
-    /// the contract's reason.
+    /// What `publish_cloud_endpoint` records (`set_node_config` of `io.edge_node`, written to
+    /// config.json) boots CONFIGURED on that edge. A config the contract accepts without an edge is
+    /// still UNCONFIGURED, missing it, and so is a CONFIG_SET without one; a config the contract
+    /// refuses is FAILED_CONFIG with the contract's reason.
     #[test]
     fn only_a_config_that_names_an_edge_is_configured() {
         let root = nodes_root("edge");
@@ -3504,6 +3539,150 @@ mod tests {
         assert_eq!(
             answer["effective_config"]["io"]["edge_node"],
             "SY.edge@ingress1"
+        );
+    }
+
+    /// FINDINGS A-91's review: a CONFIG_SET that names no edge is applied (`ok`, the config in use
+    /// and persisted), and its answer says what io.cloud still misses, as its status does, where the
+    /// family's answer had a null `error`; SY.admin gives it as `node_error` with its 200. One that
+    /// names an edge is CONFIGURED, with no error, and says it applied the edge.
+    #[test]
+    fn a_config_set_without_an_edge_is_applied_and_its_answer_says_what_is_missing() {
+        let set = |config: Value, config_version: u64| NodeConfigSetPayload {
+            node_name: NODE.to_string(),
+            config_version,
+            config,
+            ..NodeConfigSetPayload::default()
+        };
+        let contract = IoCloudAdapterConfigContract;
+
+        let no_edge = set(json!({"io": {"inbound_family": "user"}}), 8);
+        let effective = apply_adapter_config_replace(&contract, &no_edge.config).expect("valid");
+        let next = config_set_state(&no_edge, effective);
+        assert_eq!(next.current_state, IoNodeLifecycleState::Unconfigured);
+        assert_eq!(next.config_source, IoConfigSource::Dynamic);
+        assert_eq!(next.config_version, 8);
+        assert_eq!(
+            next.effective_config,
+            Some(json!({"io": {"inbound_family": "user"}})),
+            "applied"
+        );
+        let answer = config_set_answer(NODE, &next, &[]);
+        assert_eq!(answer["ok"], true, "applied and persisted");
+        assert_eq!(answer["state"], "UNCONFIGURED");
+        assert_eq!(answer["config_version"], 8);
+        assert_eq!(answer["error"]["code"], MISSING_EDGE_NODE);
+        assert_eq!(answer["error"], node_status_payload(&next)["last_error"]);
+        assert_eq!(answer["apply"]["mode"], "hot_reload");
+        assert_eq!(answer["apply"]["hot_applied"], json!([]));
+
+        let edge = set(json!({"io": {"edge_node": "SY.edge@ingress1"}}), 9);
+        let effective = apply_adapter_config_replace(&contract, &edge.config).expect("valid");
+        let next = config_set_state(&edge, effective);
+        assert_eq!(next.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(next.last_error, None);
+        let answer = config_set_answer(NODE, &next, &["io.edge_node".to_string()]);
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["state"], "CONFIGURED");
+        assert_eq!(answer["error"], Value::Null);
+        assert_eq!(answer["apply"]["hot_applied"], json!(["io.edge_node"]));
+        assert_eq!(
+            answer["effective_config"]["io"]["edge_node"],
+            "SY.edge@ingress1"
+        );
+    }
+
+    fn status_request(trace_id: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: "uuid-of-the-orchestrator".to_string(),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast(NODE.to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_NODE_STATUS_GET.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        }
+    }
+
+    /// FINDINGS A-91's review: NODE_STATUS_GET is answered to whoever asked, on its trace, as
+    /// NODE_STATUS_GET_RESPONSE, with the status of the live control plane it is given.
+    #[test]
+    fn node_status_is_answered_to_the_asker_from_the_live_state() {
+        let request = status_request("trace-status-1");
+        assert!(is_node_status_request(&request));
+        let root = nodes_root("status-reply");
+        let missing = boot(&root);
+        let _ = std::fs::remove_dir_all(root);
+
+        let reply = node_status_reply("uuid-of-io-cloud", &request, &missing);
+        assert_eq!(reply.routing.src, "uuid-of-io-cloud");
+        let Destination::Unicast(dst) = &reply.routing.dst else {
+            panic!("a reply goes to whoever asked: {:?}", reply.routing.dst);
+        };
+        assert_eq!(dst, "uuid-of-the-orchestrator");
+        assert_eq!(reply.routing.trace_id, "trace-status-1");
+        assert_eq!(reply.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(
+            reply.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+        assert_eq!(reply.payload, node_status_payload(&missing));
+        assert_eq!(reply.payload["health_state"], "DEGRADED");
+        assert_eq!(reply.payload["last_error"]["code"], MISSING_EDGE_NODE);
+
+        let mut trusting = IoControlPlaneState {
+            effective_config: Some(json!({"io": {"edge_node": "SY.edge@ingress1"}})),
+            ..missing
+        };
+        require_trusted_edge(&mut trusting);
+        let reply = node_status_reply("uuid-of-io-cloud", &request, &trusting);
+        assert_eq!(reply.payload["health_state"], "HEALTHY");
+        assert_eq!(reply.payload["lifecycle_state"], "CONFIGURED");
+    }
+
+    /// FINDINGS A-91's review: the receive loop answers NODE_STATUS_GET from the config state, as
+    /// its first branch, ahead of the config commands and the edge gate, and the SDK's default
+    /// handler, which says HEALTHY whatever the state, is called nowhere.
+    ///
+    /// It is pinned by reading the source because the property is one of ORDER, as io.slack's
+    /// `control_traffic_never_reaches_the_path_out_to_slack`: a test on `node_status_reply` alone
+    /// passes just as happily with the default handler put back ahead of it. The literals are
+    /// split with `concat!` so this test cannot find ITSELF.
+    #[test]
+    fn the_receive_loop_answers_node_status_from_the_config_state() {
+        let src = include_str!("main.rs");
+        assert!(
+            !src.contains(concat!("try_handle_default_", "node_status(")),
+            "the SDK's default handler says HEALTHY whatever the config state"
+        );
+        let loop_at = src
+            .find(concat!("async fn run_", "loop("))
+            .expect("the receive loop");
+        let in_loop = |what: &str| {
+            loop_at
+                + src[loop_at..]
+                    .find(what)
+                    .unwrap_or_else(|| panic!("the receive loop has {what}"))
+        };
+        let receive = in_loop(concat!("incoming.", "recv()"));
+        let status = in_loop(concat!("if is_node_status_", "request(&msg) {"));
+        let reply = in_loop(concat!("node_status_", "reply(sender.uuid(), &msg, "));
+        let config = in_loop(concat!("if is_config_", "command(&msg) {"));
+        let edge_gate = in_loop(concat!("if !message_from_", "configured_edge("));
+        assert!(
+            receive < status && status < reply && reply < config && config < edge_gate,
+            "broken order: receive={receive} status={status} reply={reply} config={config} \
+             edge_gate={edge_gate}"
+        );
+        assert!(
+            !src[receive..status].contains("\n        if "),
+            "nothing is decided between the receive and the status branch"
         );
     }
 

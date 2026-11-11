@@ -82,9 +82,11 @@ Every role also runs `rt-gateway` (started first) and `sy-orchestrator`. The nod
    5. launches one instance of each `boot: true` runtime of `base-nodes.json` in the root
       tenant: `IO.blob@motherbee`, `CONFIGURED` on its defaults, and `IO.cloud@motherbee`,
       `UNCONFIGURED` and `DEGRADED` (`missing_edge_node`) until it trusts the ingress' edge,
-      which `publish_cloud_endpoint` records (FINDINGS A-91);
+      which `publish_cloud_endpoint` records in its `config.json` and IO.cloud reads only when
+      it starts, so a restart of IO.cloud follows the publish (FINDINGS A-91);
    6. prints what is still missing: the AI provider key for the core (`openai` or `anthropic`
-      in the root tenant), the per-tenant secrets of IO nodes, and IO.cloud's edge.
+      in the root tenant), the per-tenant secrets of IO nodes, and IO.cloud's edge (the publish,
+      then IO.cloud's restart).
 
 On a development host, `scripts/install.sh [<version>]` does steps 1 and 3 from the local checkout:
 it builds the package with `packaging/build-deb.sh` and installs it with

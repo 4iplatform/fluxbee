@@ -118,8 +118,9 @@ echo "== [6/6] spawn base node instances (IO.blob on its defaults; IO.cloud wait
 # nodes (IO.cloud, IO.blob). The only other IO node that runs there is IO.web, which the
 # operator starts (boot=false; FINDINGS A-43). IO.blob comes up CONFIGURED on its defaults, which
 # cover everything it does. IO.cloud comes up UNCONFIGURED, its status DEGRADED with
-# missing_edge_node, until it trusts the ingress' SY.edge, which publish_cloud_endpoint records in
-# its config (FINDINGS A-91). Every other runtime (io.api, io.wapp, io.slack, ai.generic, ...) is
+# missing_edge_node, until it trusts the ingress' SY.edge: publish_cloud_endpoint records that edge
+# in its config.json, which IO.cloud reads only when it starts, so a restart of IO.cloud follows
+# the publish (FINDINGS A-91). Every other runtime (io.api, io.wapp, io.slack, ai.generic, ...) is
 # baked but not started: a tenant launches it.
 while IFS=$'\t' read -r rt inst; do
   [ -n "$rt" ] && [ -n "$inst" ] || continue
@@ -167,8 +168,11 @@ cat <<EOF
         -d '{"node_name":"IO.web@$HIVE_ID","runtime":"io.web","runtime_version":"current","tenant_id":"$ROOT_TENANT"}'
 
   - IO.cloud, Fluxbee Cloud's way in, stays DEGRADED (missing_edge_node) until it trusts the
-    ingress' SY.edge, which publishing its door for a Fluxbee Cloud records in its config
-    (publish_cloud_endpoint, docs/io-cloud-api.md section 7). IO.blob needs nothing.
+    ingress' SY.edge. Publishing its door for a Fluxbee Cloud (publish_cloud_endpoint,
+    docs/io-cloud-api.md section 7) records that edge in its config, which IO.cloud reads only
+    when it starts, so restart it after the publish:
+      curl -sS -X POST $ADMIN/hives/$HIVE_ID/nodes/IO.cloud@$HIVE_ID/restart
+    IO.blob needs nothing.
 
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 
