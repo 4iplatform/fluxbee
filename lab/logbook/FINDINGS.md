@@ -324,6 +324,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-262 🔵 The hub sends no advertisement when the set it vouches for to a spoke becomes empty (nit; the router).
 - A-263 🔵 The installation update's follow reads one hive at a time (low; with A-250's gate).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
+- A-265 🔵 The hub does not rebuild its FIB when it applies a spoke's LSA (low; the router).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1401,6 +1402,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-265 [General/router] 🔵 low (found 2026-11-11 by the review fixes of the router's A-195; read in the code) — The hub does not rebuild its FIB when it applies a spoke's LSA
+
+- **Why:** `handle_wan_message`'s `Applied` arm (`src/router/mod.rs` ~3850-3875) calls
+  `write_lsa_state`, which updates the LSA snapshot, but not `rebuild_fib`. A frame relayed by name
+  (`resolve_by_name_inner` over the FIB, `FibSource::LsaNode`) to a node that just connected on a
+  spoke gets `NODE_NOT_FOUND` from the hub until the next rebuild: a message of one of the hub's own
+  nodes, or the 5 s loops. Frames by UUID read the snapshot and are not affected.
+- **Effect:** since A-195 the other spokes learn of a new node at once, so this is the window left
+  for traffic by name between spokes (up to 5 s).
+- **Fix:** rebuild the FIB after `write_lsa_state` in that arm.
+
 ### A-264 [General/Go SDK] 🔵 low (found 2026-11-11 by A-253's verifier; read in the code) — The Go SDK has no text blob offload: a WF's text over 128 KiB fails, and one between about 96 and 128 KiB misses the turns
 
 - **Why:** the Rust SDK puts any `text/v1` payload over about 62 KiB in a blob
@@ -1421,7 +1433,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **To evaluate with 0.1.131's deploy** (A-250's gate, the spokes' orchestrators restart): if the
   follow still lags the spokes' own settle, read the hives at once.
 
-### A-262 [General/router] 🔵 nit (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub sends no advertisement when the set it vouches for to a spoke becomes empty
+### A-262 [General/router] 🔵 nit, BUILT for the router's 0.1.132 (coa/router-131, the review of A-195) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub sends no advertisement when the set it vouches for to a spoke becomes empty
 
 - `reachability_frame` returns nothing for an empty set (`src/router/mod.rs` ~2527): when the last
   node the hub vouched for to a spoke goes, or its hive goes stale, that spoke keeps the old
@@ -1429,7 +1441,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   every hive runs SY nodes, so the set is never empty.
 - **Fix:** send the empty advertisement to a spoke that had entries.
 
-### A-261 [General/router] 🔵 low (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub's LSA snapshot can briefly go back to an older copy
+### A-261 [General/router] 🔵 low, BUILT for the router's 0.1.132 (coa/router-131, the review of A-195: the reads under the locks) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub's LSA snapshot can briefly go back to an older copy
 
 - **Why:** `refresh_lsa` (`src/router/mod.rs` ~6575-6580) reads the LSA region and stores the copy
   later under the snapshot's lock, so a write in between is undone until the next refresh; and
