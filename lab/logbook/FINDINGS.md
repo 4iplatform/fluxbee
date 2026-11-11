@@ -368,7 +368,13 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator).
 - A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic).
 - A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk).
-- A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin).
+- A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives, to decide).
+- A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin).
+- A-306 🔵 A version's removal holds the manifest lock through its read of every hive's use; a publish waits with no bound (low; SY.admin).
+- A-307 🔵 SY.wf-rules handles one request at a time; a queued request starts its 60 s late (low; SY.wf-rules; to decide).
+- A-308 🔵 Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer (low; the orchestrator).
+- A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
+- A-310 🔵 Runtime retention skips a node config it cannot read, and can delete a version only that node pins (low; the orchestrator).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1446,6 +1452,80 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-310 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it) — Runtime retention skips a node config it cannot read, and can delete a version only that node pins
+
+- **Why:** `persisted_runtime_keep_versions_with_root` (`src/bin/sy_orchestrator.rs` ~23523) logs
+  *"runtime retention skipping unreadable persisted node config"* and skips the node, so the
+  version it pins is not kept.
+- **Effect:** the next retention pass (the watchdog's verify, or a runtime `SYSTEM_UPDATE`) deletes
+  from `dist/runtimes` a version directory that only that node pins and that the manifest no
+  longer lists, under the running node. Since 0.1.133 a version leaves the manifest only through
+  `remove_runtime_version`, which refuses while such a node may run (A-281's `USAGE_UNREADABLE`),
+  so the window is a version removed by hand or before 0.1.133.
+- **Fix, later:** keep every version of the runtime while such a config exists and its unit runs
+  or gives no answer, and log it.
+
+### A-309 [General/SDK] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; latent) — The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call
+
+- **Why:** `crates/fluxbee_sdk/src/rpc.rs` ~1103 inserts the `PendingEntry` before the send
+  (~1111); only an answer, the inner timeout or a failed send removes it. A caller that wraps the
+  call in an outer timeout or a `select!` and drops it leaves the entry for the life of the
+  process, and a send dropped before it went is never sent.
+- **Today:** nothing drops one since A-281's orchestrator review removed the usage fan-out's outer
+  cut (`84653ab5`, 0.1.133); the review checked `sy_orchestrator`, `sy_admin`, `sy_architect`,
+  `sy_cognition`, `sy_identity` and `sy_storage`. The next caller that wraps an RPC in a timeout
+  would leak again.
+- **Fix, later:** a drop guard that removes the entry and marks the trace stale, in a release of
+  the Rust SDK of its own (METHOD §9), with the SDK's lows.
+
+### A-308 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it) — Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer
+
+- **Why:** `read_target` maps `list_versions` and `list_tenant_nodes` to the same
+  `ReadTarget::EveryHive` (`src/bin/sy_orchestrator.rs` ~1495), 4 places; `list_versions_flow`
+  (~21212) asks the hives one after another, each through the 45 s forward.
+- **Effect:** while a worker's orchestrator does not answer, 4 `/versions` reads (Archi, the
+  operator, `ops.py versions`) hold the places for 45 s or more, and a Cloud `list_nodes` waits
+  past the Cloud's 20 s.
+- **Fix, later:** a target of its own for `list_tenant_nodes`, as 0.1.133 gives the runtime reads
+  (`ReadTarget::RuntimeUse`), or `list_versions` asks every hive at once with a 10 s bound.
+
+### A-307 [WF/wf-rules] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it, longer since 0.1.133) — SY.wf-rules handles one request at a time, and a request queued behind another starts its 60 s late
+
+- **Why:** SY.wf-rules serves its requests in turn, and each request's 60 s start when its turn
+  comes. Since 0.1.133 a purge waits up to 35 s for each removal while a hive cannot be read.
+- **Effect:** two callers on one hive's SY.wf-rules while some hive is not read: the second can end
+  just past SY.admin's 75 s, so SY.admin answers `TIMEOUT` for a change that may still complete.
+  Bounding a request by its arrival alone is worse: the Go SDK's `SendWithMatcher` sends even with
+  an expired context (`go/fluxbee-go-sdk/dispatcher.go` ~627-687), so a deploy would answer
+  `PACKAGE_PUBLISH_FAILED` while SY.admin installs its package.
+- **Fix, later (to decide):** (a) a change whose turn comes with less than about 20 s left is
+  refused at once, nothing changed, with a retryable `BUSY` (SY.admin maps it to 409; its help and
+  Archi's handbook would name it); or (b) the requests run at the same time, with a lock per
+  workflow.
+
+### A-306 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it) — A version's removal holds the manifest lock through its read of every hive's use, and a publish waits on it with no bound
+
+- **Why:** `remove_runtime_version` takes `runtime_manifest_lock` and the file lock, then reads the
+  version's use (up to SY.admin's 30 s); `handle_publish_runtime_package` waits on
+  `runtime_manifest_lock` with no bound.
+- **Effect:** while a hive is not read, each removal (SY.wf-rules' purges included) holds every
+  runtime publish for up to 30 s, and a publish queued behind several waits longer with no answer.
+  The hold is the same as 0.1.132's.
+- **Fix, later:** read the use before taking the locks, then check the manifest again under them
+  and read again only if it changed; or a bounded wait for the publish that answers a retryable
+  code.
+
+### A-305 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code) — `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass
+
+- **Why:** `internal_inventory_unavailable` (`src/bin/sy_admin.rs` ~9828) answers 503 with
+  `payload: null`, although its comment and the help call it worth a retry; `RUNTIME_REMOVE_FAILED`
+  is the same when the manifest's lock is not taken within 60 s. Since 0.1.133
+  `RUNTIME_USAGE_UNKNOWN` carries `retryable: true`.
+- **Effect:** a caller that reads the payload cannot tell them from a final refusal. SY.wf-rules
+  takes `INVENTORY_UNAVAILABLE` as retryable on its own (0.1.133), and Archi reads the help's
+  "retry".
+- **Fix, later:** `payload.retryable: true` on both.
+
 ### A-304 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.admin review fixes; read in the code; there before it) — A-62's workflow-package admission misses a WF node on a hive cut off from the LSA
 
 - **Why:** `workflow_nodes_elsewhere` reads the connected nodes, which leave out the nodes of a hive
@@ -1455,6 +1535,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   of every hive since 0.1.133. Refusing whenever any hive is stale would block every workflow's
   deploy on every hive.
 - **Fix, to decide later:** refuse only when a cut-off hive may hold a `WF.<x>`, or leave it.
+- **Widened by 0.1.133 (SY.wf-rules' review of A-281):** `wf.<x>` is one runtime for every hive.
+  Since 0.1.133 a deploy numbers its versions above every version the dist holds, so a deploy of a
+  name another hive also runs (its `WF.<x>` stopped, or its hive cut off) no longer stops at
+  `VERSION_CONFLICT` on 0.0.1: it publishes above that hive's versions, and its purge, like a
+  delete's, asks for their removal. A-281's read refuses while the other node runs or its hive is
+  not read, but a stopped node is not counted (A-300), and the runtime's current moves to this
+  hive's version. Before, only a third deploy reached the other hive's versions.
+  `docs/nodes/sy-wf-rules.md` describes it.
+- **Options:** (a) SY.admin refuses a publish or a removal of `wf.<x>` while another hive holds a
+  `WF.<x>` config, connected or not; (b) SY.wf-rules numbers and purges only the versions it
+  published; the shared current would still move between hives; (c) SY.wf-rules refuses a
+  compile while the dist holds another hive's versions of `wf.<x>`, naming them; (d) a docs rule
+  only. The review recommends (a), with this item.
 
 ### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
 
@@ -1819,11 +1912,31 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   delete answers 422 `PACKAGE_PUBLISH_FAILED` after the workflow, its node and its state are gone
   whenever a hive cannot be read (worker1's copy lagging a `wf.<x>` deployed seconds before
   included), and the versions left behind block a new workflow of the same name: its versions
-  start again at 0.0.1, and the publish answers `VERSION_CONFLICT`. In flight: SY.wf-rules' delete
-  answers ok and names the versions left (`packages_left`), and a re-created name numbers its
-  versions above them (`coa/wfrules-usage-133`); the orchestrator counts a worker whose copy lags
-  and asks the spokes at the same time, each with a bound, within SY.admin's 30 s
-  (`coa/orch-usage-133`).
+  start again at 0.0.1, and the publish answers `VERSION_CONFLICT`. Built: SY.wf-rules' delete
+  answers ok and names each version left in `packages_left` (`{runtime, version, error_code,
+  detail, retryable, unanswered_hives}`) with a warning, also removes the versions its slots
+  named (a worker whose copy lags answered `[]` with a version left), and a name created again
+  numbers its versions above every version the dist holds (`coa/wfrules-usage-133`, `b04ecc2c`);
+  the motherbee asks every worker at once for its nodes alone (`GET_RUNTIME`'s `usage_only`,
+  answered from the node configs whatever its copy lists), each within 10 s, so a worker whose
+  copy lags is counted and a silent one is named `TIMEOUT` in about 10 s (`coa/orch-usage-133`).
+- **The orchestrator's review round (`84653ab5`):** the motherbee's runtime reads wait in places
+  of their own (`ReadTarget::RuntimeUse`, 4 at a time), never behind `list_versions`'s 45 s asks,
+  and Fluxbee Cloud's `list_nodes` never behind them; a hive's ask ends by the forward's own 10 s,
+  with no outer cut, which left its request in the router client for good (A-309); a node whose
+  `config.json` cannot be read while its unit runs or gives systemd no answer makes its hive
+  `USAGE_UNREADABLE` (on the motherbee, the whole use an error). Found on the way: A-308, A-310.
+- **SY.wf-rules' review round (`f11b6c58` to `b04ecc2c`):** each removal is waited for up to 35 s
+  (SY.admin reads every hive's use first) and a deploy's or a rollback's whole purge 15 s; each
+  version left says whether asking again may remove it and which hives were not read; a dist that
+  cannot be listed has its own warning; `fluxbee-factory-reset` counts the versions left
+  (`packages_left=` beside `problems=` in its log line); the lifecycle e2e's default name is
+  `testwfrules` (`test-wf-rules` is refused since 0.1.98). Found on the way: A-305, A-306, A-307,
+  and a name on two hives (A-304's addition), all for later.
+- **The integration (0.1.133):** SY.admin's texts were written before the orchestrator's last two
+  rounds: they said the motherbee asks the workers one at a time and a delete fails with
+  `PACKAGE_PUBLISH_FAILED`; one commit aligns SY.admin's notes and tests, Archi's handbook,
+  `sy-admin.md` and `operations.md` with the built behaviour.
 - **By design:** a failed join's registry entry is a hive that may run nodes and is not read, so it
   refuses every removal until the join is finished or the hive removed; the 409 names it.
 - **SY.admin's review fixes (`coa/admin-usage-133`, `a75c2d4f`):** an ingress or an egress is exempt
