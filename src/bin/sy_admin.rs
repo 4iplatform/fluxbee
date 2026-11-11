@@ -6843,8 +6843,15 @@ async fn handle_unpublish_artifact(
         Ok(publication) => publication,
         Err(detail) => return Ok(internal_invalid_request(action, &detail)),
     };
-    let _publication_guard = ctx.publication_lock.lock().await;
-    let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+    // The publication lock only to read the page's row (FINDINGS A-274): the take-down takes it
+    // again to write each state, never across the edge's or IO.blob's call
+    // (`take_down_publication`). Read under it, the row is never one of a publish under way, which
+    // holds the lock from its row's `curated` to its `published`.
+    let ledger = {
+        let _publication_guard = ctx.publication_lock.lock().await;
+        load_admin_publication_ledger(&ctx.publication_ledger_path)
+    };
+    let ledger = match ledger {
         Ok(ledger) => ledger,
         Err(err) => return Ok(internal_service_error(action, "LEDGER_FAILED", &err)),
     };
@@ -6887,16 +6894,24 @@ async fn handle_unpublish_artifact(
             }),
         });
     }
-    let edge_skipped = match take_down_publication(ctx, client, &mut ledger, record).await {
-        Ok(edge_skipped) => edge_skipped,
+    let payload = match take_down_publication(ctx, client, record).await {
+        Ok(TakeDown::Unpublished { edge_skipped }) => {
+            let mut payload =
+                serde_json::json!({"publication_id": publication_id, "unpublished": true});
+            if let Some(why) = edge_skipped {
+                payload["edge_skipped"] = serde_json::json!(why);
+            }
+            payload
+        }
+        // Another take-down, or the expiry sweep, recorded the page down while this one ran: the
+        // answer is the one this take-down would have had after it, the page already down.
+        Ok(TakeDown::DownMeanwhile) => {
+            serde_json::json!({"publication_id": publication_id, "unpublished": false})
+        }
         Err((error_code, detail)) => {
             return Ok(internal_service_error(action, error_code, &detail))
         }
     };
-    let mut payload = serde_json::json!({"publication_id": publication_id, "unpublished": true});
-    if let Some(why) = edge_skipped {
-        payload["edge_skipped"] = serde_json::json!(why);
-    }
     Ok(InternalAdminDispatchResult {
         http_status: 200,
         envelope: serde_json::json!({
@@ -6927,11 +6942,41 @@ fn drop_old_down_publications(ledger: &mut AdminPublicationLedger, now: u64) -> 
     before - ledger.publications.len()
 }
 
+/// How a take-down ended (`take_down_publication`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TakeDown {
+    /// This take-down recorded the page `unpublished`; `edge_skipped` says why its edge was not
+    /// asked, when it was not (`publication_edge_hive_gone`).
+    Unpublished { edge_skipped: Option<String> },
+    /// Another writer recorded the page down while this one ran, another take-down `unpublished`
+    /// or the expiry sweep `expired`, or its row went: this one wrote nothing over it.
+    DownMeanwhile,
+}
+
 /// Takes a page that is up down, `unpublish_artifact`'s work, which the factory reset asks for
 /// each page: the edge removes it (the row goes to `edge_removed`), then IO.blob releases its copy
-/// (`unpublished`), the ledger written after each. The caller holds the publication lock and
-/// passes the ledger it loaded under it. The error is `(error_code, detail)`; the same call again
-/// finishes what a failed step left.
+/// (`unpublished`), the ledger written after each. `record` is the page's row as the caller read it
+/// under the publication lock. The error is `(error_code, detail)`; the same call again finishes
+/// what a failed step left.
+///
+/// The edge's and IO.blob's calls go OUTSIDE `publication_lock` (FINDINGS A-274), as the expiry
+/// sweep's do (`retire_expired_publication`, FINDINGS A-260): each may take its 30 s, and an edge
+/// that is listed but down held the lock up to 60 s per take-down (the factory reset's, page after
+/// page) against every publish, every other take-down and the sweep. The lock is taken only to
+/// write each state, on the ledger loaded again, and only while the row is still at the state this
+/// take-down read (`advance_publication`): a page published meanwhile, the same blob's included,
+/// keeps its row, and a state another writer recorded meanwhile is never written over. When this
+/// take-down finds the row changed meanwhile:
+/// - at `edge_removed`, another take-down or the sweep got past the edge too: it goes on to the
+///   release, as for a row a take-down left half-way, and writes `unpublished` only while the row
+///   is still at `edge_removed`;
+/// - at `unpublished` (another take-down) or `expired` (the sweep), or its row gone (a row goes
+///   only once its page is down, `drop_old_down_publications`): the page is down, so it asks no
+///   one more and writes nothing, and answers as it would have after the other writer, the page
+///   already down (`TakeDown::DownMeanwhile`, `unpublished: false`).
+///
+/// No writer moves a row back to `curated` or `published`: a publish writes only its own new row,
+/// under the lock from its `curated` to its `published`.
 ///
 /// An edge whose hive the hive registry no longer lists (removed, or renamed) cannot be asked:
 /// its step is skipped and only the copy is released, and the answer is why
@@ -6941,13 +6986,13 @@ fn drop_old_down_publications(ledger: &mut AdminPublicationLedger, now: u64) -> 
 async fn take_down_publication(
     ctx: &AdminContext,
     client: &RouterDispatcher,
-    ledger: &mut AdminPublicationLedger,
-    mut record: AdminPublicationRecord,
-) -> Result<Option<String>, (&'static str, String)> {
+    record: AdminPublicationRecord,
+) -> Result<TakeDown, (&'static str, String)> {
+    let publication_id = record.publication_id.as_str();
     let edge_skipped = match publication_edge_hive_gone(ctx, &record.edge_node) {
         Some(hive) => {
             tracing::warn!(
-                publication_id = %record.publication_id,
+                publication_id = %publication_id,
                 edge = %record.edge_node,
                 "the page's edge is on a hive the registry no longer lists: only its copy is released"
             );
@@ -6958,29 +7003,45 @@ async fn take_down_publication(
             ))
         }
         None => {
-            unpublish_edge_blob(client, &record.edge_node, &record.publication_id)
+            unpublish_edge_blob(client, &record.edge_node, publication_id)
                 .await
                 .map_err(|err| ("EDGE_UNPUBLISH_FAILED", err))?;
             None
         }
     };
-    record.status = "edge_removed".to_string();
-    ledger
-        .publications
-        .insert(record.publication_id.clone(), record.clone());
-    persist_admin_publication_ledger(&ctx.publication_ledger_path, ledger)
-        .map_err(|err| ("LEDGER_FAILED", err))?;
-    release_curated_blob(client, ctx, &record.publication_id)
+    let down_meanwhile = |found: Option<String>| {
+        tracing::info!(
+            publication_id = %publication_id,
+            found = found.as_deref().unwrap_or("no row"),
+            "another writer took the page down meanwhile: this take-down wrote nothing over it"
+        );
+        TakeDown::DownMeanwhile
+    };
+    match advance_publication(ctx, publication_id, &record.status, "edge_removed", None)
+        .await
+        .map_err(|err| ("LEDGER_FAILED", err))?
+    {
+        PublicationAdvance::Written => {}
+        PublicationAdvance::Moved(Some(found)) if found == "edge_removed" => {}
+        PublicationAdvance::Moved(found) => return Ok(down_meanwhile(found)),
+    }
+    release_curated_blob(client, ctx, publication_id)
         .await
         .map_err(|err| ("BLOB_RELEASE_FAILED", err))?;
-    record.status = "unpublished".to_string();
-    record.released_at = Some(Utc::now().timestamp().max(0) as u64);
-    ledger
-        .publications
-        .insert(record.publication_id.clone(), record);
-    persist_admin_publication_ledger(&ctx.publication_ledger_path, ledger)
-        .map_err(|err| ("LEDGER_FAILED", err))?;
-    Ok(edge_skipped)
+    let released_at = Utc::now().timestamp().max(0) as u64;
+    match advance_publication(
+        ctx,
+        publication_id,
+        "edge_removed",
+        "unpublished",
+        Some(released_at),
+    )
+    .await
+    .map_err(|err| ("LEDGER_FAILED", err))?
+    {
+        PublicationAdvance::Written => Ok(TakeDown::Unpublished { edge_skipped }),
+        PublicationAdvance::Moved(found) => Ok(down_meanwhile(found)),
+    }
 }
 
 /// The hive of a publication's edge when the hive registry no longer lists it (`HiveRegistry::
@@ -7763,12 +7824,13 @@ async fn sweep_expired_publications_once(
 /// page due, every sweep, against each publish and take-down. The lock is taken only to read the
 /// record and to write each state: the record is copied under it, each call made with the lock
 /// free, and each state written under it again, the ledger loaded anew, only while the row is still
-/// at the state this retirement read (`advance_expired_publication`). So a state another writer
-/// recorded meanwhile, another sweep's `edge_removed` or `expired`, a take-down's `unpublished`, a
-/// row dropped, is never written over, and a page published meanwhile keeps its row. A row already
-/// at `edge_removed` (a retirement or a take-down stopped half-way) resumes at the release. Returns
-/// `Ok(true)` if it advanced the record to `expired`, `Ok(false)` if there was nothing to do or the
-/// row moved on without it.
+/// at the state this retirement read (`advance_publication`). So a state another writer recorded
+/// meanwhile, another sweep's `edge_removed` or `expired`, a take-down's `edge_removed` or
+/// `unpublished` (a take-down, too, holds no lock across its calls, FINDINGS A-274), a row dropped,
+/// is never written over, and a page published meanwhile keeps its row. A row already at
+/// `edge_removed` (a retirement or a take-down stopped half-way, or under way) resumes at the
+/// release. Returns `Ok(true)` if it advanced the record to `expired`, `Ok(false)` if there was
+/// nothing to do or the row moved on without it.
 async fn retire_expired_publication(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -7807,8 +7869,8 @@ async fn retire_expired_publication(
             ),
             None => unpublish_edge_blob(client, &record.edge_node, publication_id).await?,
         }
-        if !advance_expired_publication(ctx, publication_id, &record.status, "edge_removed", None)
-            .await?
+        if advance_publication(ctx, publication_id, &record.status, "edge_removed", None).await?
+            != PublicationAdvance::Written
         {
             return Ok(false);
         }
@@ -7816,41 +7878,54 @@ async fn retire_expired_publication(
     // Curated public/ blob refcount release (idempotent on io.blob's side by publication_id).
     release_curated_blob(client, ctx, publication_id).await?;
     let released_at = Utc::now().timestamp().max(0) as u64;
-    advance_expired_publication(
+    let advanced = advance_publication(
         ctx,
         publication_id,
         "edge_removed",
         "expired",
         Some(released_at),
     )
-    .await
+    .await?;
+    Ok(advanced == PublicationAdvance::Written)
 }
 
-/// Writes the next state of an expired page's retirement (FINDINGS A-260): under the publication
+/// What `advance_publication` found on the row it was to move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublicationAdvance {
+    /// The row was still at the state read: the next one is written.
+    Written,
+    /// Another writer moved the row meanwhile, to this state, or dropped it (`None`): nothing is
+    /// written.
+    Moved(Option<String>),
+}
+
+/// Writes the next state of a page's take-down (FINDINGS A-274, `take_down_publication`) or of an
+/// expired page's retirement (FINDINGS A-260, `retire_expired_publication`): under the publication
 /// lock, the ledger loaded again, `to` on the row of `publication_id` (and `released_at`, when
-/// given), only while that row is still at `from`, the state the retirement read before its call.
-/// A row another writer moved meanwhile, or dropped, is left as it is, and the answer is false.
-async fn advance_expired_publication(
+/// given), only while that row is still at `from`, the state the take-down or the retirement read
+/// before its call. A row another writer moved meanwhile, or dropped, is left as it is, and the
+/// answer says what was found in its place.
+async fn advance_publication(
     ctx: &AdminContext,
     publication_id: &str,
     from: &str,
     to: &str,
     released_at: Option<u64>,
-) -> Result<bool, String> {
+) -> Result<PublicationAdvance, String> {
     let _publication_guard = ctx.publication_lock.lock().await;
     let mut ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
     let Some(record) = ledger.publications.get_mut(publication_id) else {
-        return Ok(false);
+        return Ok(PublicationAdvance::Moved(None));
     };
     if record.status != from {
-        return Ok(false);
+        return Ok(PublicationAdvance::Moved(Some(record.status.clone())));
     }
     record.status = to.to_string();
     if released_at.is_some() {
         record.released_at = released_at;
     }
     persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger)?;
-    Ok(true)
+    Ok(PublicationAdvance::Written)
 }
 
 /// Opens Fluxbee Cloud's public door and returns the token ONCE.
@@ -17171,7 +17246,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Name the page by exactly one of publication_id (pub:<uuid>, returned by publish_artifact) or key, the last segment of its link: of https://<host>/public/<key>, only <key>. It takes no hive: the publication names its edge.",
             "list_published_artifacts (GET /artifacts) lists the pages that are up, each with its publication_id.",
             "A publication that does not exist answers 404 NOT_FOUND.",
-            "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true; a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
+            "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true (false when another take-down, or the expiry sweep, recorded the page down while this one ran); a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
             "A page whose edge is on a hive the hive registry no longer lists (removed, or renamed) gets no edge step, since that edge cannot be asked: IO.blob releases its copy, and the answer says why in edge_skipped.",
             "No log keeps a link's key: the command log, the executor's run log and Archi's journal keep it as its SHA-256, key_sha256.",
         ],
@@ -42292,6 +42367,490 @@ mod tests {
                 .await
                 .is_none(),
             "no second release"
+        );
+    }
+
+    // --- a take-down holds no lock across its calls (FINDINGS A-274) ------------------------
+
+    /// The operator's take-down of the page `params` names, in a task of its own, as each request
+    /// runs (A-68).
+    fn spawn_take_down(
+        ctx: &AdminContext,
+        params: Value,
+    ) -> tokio::task::JoinHandle<InternalAdminDispatchResult> {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            handle_unpublish_artifact(&ctx, &ctx.rpc, params, None)
+                .await
+                .expect("dispatch")
+        })
+    }
+
+    /// One pass of the expiry sweep, in a task of its own.
+    fn spawn_sweep(ctx: &AdminContext) -> tokio::task::JoinHandle<Result<(), String>> {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { sweep_expired_publications_once(&ctx, &ctx.rpc).await })
+    }
+
+    /// The next request SY.admin sends: `msg`, about the page `page`.
+    async fn next_asked(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        msg: &str,
+        page: &str,
+        what: &str,
+    ) -> Message {
+        let asked = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect(what);
+        assert_eq!(asked.meta.msg.as_deref(), Some(msg), "{what}");
+        assert_eq!(asked.payload, json!({ "publication_id": page }), "{what}");
+        asked
+    }
+
+    /// The edge's answer to `unpublish`: the page `removed`, or gone from it already.
+    fn edge_unpublished(unpublish: &Message, page: &str, removed: bool) -> Message {
+        reply_to(
+            unpublish,
+            MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+            json!({ "status": "ok", "publication_id": page, "removed": removed }),
+        )
+    }
+
+    /// IO.blob's answer to `release`: the copy `released`, or released already.
+    fn blob_released(release: &Message, released: bool) -> Message {
+        reply_to(
+            release,
+            MSG_BLOB_RELEASE_RESPONSE,
+            json!({ "status": "ok", "released": released }),
+        )
+    }
+
+    fn publication_row(ctx: &AdminContext, publication_id: &str) -> AdminPublicationRecord {
+        load_admin_publication_ledger(&ctx.publication_ledger_path)
+            .expect("ledger")
+            .publications[publication_id]
+            .clone()
+    }
+
+    /// A take-down's and the sweep's writes (`advance_publication`): a state is written only while
+    /// the row is still at the one read; a row at another state, or gone, is left as it is, and the
+    /// answer says what was found in its place.
+    #[tokio::test]
+    async fn a_state_is_written_only_while_the_row_is_at_the_one_read() {
+        let (ctx, _harness) = opa_test_admin("advance-publication");
+        let page = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&page]);
+        let id = page.publication_id.as_str();
+        let advance = |from: &'static str, to: &'static str, released_at: Option<u64>| {
+            let ctx = ctx.clone();
+            let id = id.to_string();
+            async move {
+                advance_publication(&ctx, &id, from, to, released_at)
+                    .await
+                    .expect("the ledger")
+            }
+        };
+
+        assert_eq!(
+            advance("curated", "edge_removed", None).await,
+            PublicationAdvance::Moved(Some("published".to_string()))
+        );
+        assert_eq!(publication_row(&ctx, id).status, "published");
+        assert_eq!(
+            advance("published", "edge_removed", None).await,
+            PublicationAdvance::Written
+        );
+        assert_eq!(
+            advance("edge_removed", "unpublished", Some(17)).await,
+            PublicationAdvance::Written
+        );
+        assert_eq!(
+            advance("edge_removed", "expired", Some(18)).await,
+            PublicationAdvance::Moved(Some("unpublished".to_string()))
+        );
+        let row = publication_row(&ctx, id);
+        assert_eq!(row.status, "unpublished");
+        assert_eq!(row.released_at, Some(17));
+
+        let gone = format!("pub:{}", Uuid::new_v4());
+        assert_eq!(
+            advance_publication(&ctx, &gone, "published", "edge_removed", None)
+                .await
+                .expect("the ledger"),
+            PublicationAdvance::Moved(None)
+        );
+        assert!(!load_admin_publication_ledger(&ctx.publication_ledger_path)
+            .expect("the ledger")
+            .publications
+            .contains_key(&gone));
+    }
+
+    /// A take-down holds no publication lock while it waits for the edge or IO.blob (FINDINGS
+    /// A-274). A page's edge, listed, has not answered its take-down yet: a publish of the same
+    /// blob takes the lock meanwhile, curates, publishes and answers. The take-down then writes its
+    /// states on the ledger loaded again, so the page published meanwhile keeps its row, and the
+    /// page taken down is `unpublished`. Before, the take-down held the lock across the edge's 30 s
+    /// and IO.blob's 30 s, and the publish waited behind it.
+    #[tokio::test]
+    async fn a_slow_edge_does_not_hold_a_publish_during_a_take_down() {
+        let (mut ctx, mut harness) = opa_test_admin("unpublish-slow-edge");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
+        ctx.public_edge_node = Some(PAGE_EDGE.to_string());
+        land_blob(&ctx, &page_blob_ref());
+        let page = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&page]);
+        let id = page.publication_id.as_str();
+        let wait = Duration::from_secs(5);
+
+        let take_down = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the take-down asks the edge",
+        )
+        .await;
+        // The edge has not answered the take-down: a publish of the same blob goes through all
+        // the same.
+        let publish = handle_publish_artifact(
+            &ctx,
+            &ctx.rpc,
+            json!({ "blob_ref": page_blob_ref() }),
+            Some(PAGE_PUBLISHER),
+        );
+        let drive_publish = async {
+            let curate = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the publish's curate, while the take-down waits for the edge");
+            assert_eq!(curate.meta.msg.as_deref(), Some(MSG_BLOB_CURATE));
+            let curated = json!({
+                "status": "ok",
+                "public_name": "ab".repeat(32),
+                "sha256": "ab".repeat(32),
+                "size": 3,
+            });
+            harness
+                .inject(reply_to(&curate, MSG_BLOB_CURATE_RESPONSE, curated))
+                .await
+                .unwrap();
+            let edge_publish = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the edge's publish");
+            assert_eq!(
+                edge_publish.meta.msg.as_deref(),
+                Some(MSG_EDGE_PUBLISH_BLOB)
+            );
+            harness
+                .inject(reply_to(
+                    &edge_publish,
+                    MSG_EDGE_PUBLISH_BLOB_RESPONSE,
+                    json!({ "status": "ok" }),
+                ))
+                .await
+                .unwrap();
+        };
+        let (published, ()) = tokio::join!(publish, drive_publish);
+        let published = published.expect("dispatch");
+        assert_eq!(published.http_status, 200, "{}", published.envelope);
+        let new_page = published.envelope["payload"]["publication_id"]
+            .as_str()
+            .expect("its id")
+            .to_string();
+
+        // Now the edge answers the take-down, and IO.blob releases the page's copy.
+        harness
+            .inject(edge_unpublished(&unpublish, id, true))
+            .await
+            .unwrap();
+        let release = next_asked(&mut harness, MSG_BLOB_RELEASE, id, "IO.blob's release").await;
+        harness.inject(blob_released(&release, true)).await.unwrap();
+        let result = take_down.await.expect("the take-down");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(
+            result.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": true })
+        );
+        assert_eq!(publication_status(&ctx, id), "unpublished");
+        assert_eq!(publication_status(&ctx, &new_page), "published");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// Two take-downs of one page run at once (FINDINGS A-274), the operator's and the factory
+    /// reset's, say: the first holds no lock while it waits for the edge, so the second reads the
+    /// row and asks the edge too, and neither writes over the other's state. When the first has
+    /// taken the page down before the second's edge answers, the second asks IO.blob nothing and
+    /// answers `unpublished: false`, as it would have after the first. When the first has only got
+    /// past the edge (`edge_removed`), the second goes on to the release; the one whose
+    /// `unpublished` lands first answers `unpublished: true`, the other `false`. Before, the second
+    /// waited for the lock until the first was done.
+    #[tokio::test]
+    async fn two_take_downs_of_one_page_write_no_state_over_each_other() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-twice-at-once");
+        let down_first = published_page(PAGE_PUBLISHER);
+        let past_the_edge = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&down_first, &past_the_edge]);
+
+        // The first takes the page down while the second waits for the edge.
+        let id = down_first.publication_id.as_str();
+        let first = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let first_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the first asks the edge",
+        )
+        .await;
+        let second = spawn_take_down(&ctx, json!({ "key": down_first.key }));
+        let second_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the second asks the edge too, while the first waits for it",
+        )
+        .await;
+        harness
+            .inject(edge_unpublished(&first_unpublish, id, true))
+            .await
+            .unwrap();
+        let release = next_asked(&mut harness, MSG_BLOB_RELEASE, id, "the first's release").await;
+        harness.inject(blob_released(&release, true)).await.unwrap();
+        let first = first.await.expect("the first");
+        assert_eq!(
+            first.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": true })
+        );
+        let taken_down = publication_row(&ctx, id);
+        assert_eq!(taken_down.status, "unpublished");
+        assert!(taken_down.released_at.is_some());
+        harness
+            .inject(edge_unpublished(&second_unpublish, id, false))
+            .await
+            .unwrap();
+        let second = second.await.expect("the second");
+        assert_eq!(second.http_status, 200, "{}", second.envelope);
+        assert_eq!(
+            second.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": false })
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the second asks IO.blob nothing"
+        );
+        assert_eq!(
+            publication_row(&ctx, id).released_at,
+            taken_down.released_at,
+            "the first's state stays"
+        );
+
+        // The first has got past the edge when the second's edge answers: the second goes on to
+        // the release.
+        let id = past_the_edge.publication_id.as_str();
+        let first = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let first_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the first asks the edge",
+        )
+        .await;
+        let second = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let second_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the second asks the edge too, while the first waits for it",
+        )
+        .await;
+        harness
+            .inject(edge_unpublished(&first_unpublish, id, true))
+            .await
+            .unwrap();
+        let first_release =
+            next_asked(&mut harness, MSG_BLOB_RELEASE, id, "the first's release").await;
+        assert_eq!(publication_status(&ctx, id), "edge_removed");
+        harness
+            .inject(edge_unpublished(&second_unpublish, id, false))
+            .await
+            .unwrap();
+        let second_release = next_asked(
+            &mut harness,
+            MSG_BLOB_RELEASE,
+            id,
+            "the second's release: the row is at edge_removed, the first's",
+        )
+        .await;
+        harness
+            .inject(blob_released(&first_release, true))
+            .await
+            .unwrap();
+        let first = first.await.expect("the first");
+        assert_eq!(
+            first.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": true })
+        );
+        let taken_down = publication_row(&ctx, id);
+        assert_eq!(taken_down.status, "unpublished");
+        harness
+            .inject(blob_released(&second_release, false))
+            .await
+            .unwrap();
+        let second = second.await.expect("the second");
+        assert_eq!(
+            second.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": false })
+        );
+        assert_eq!(
+            publication_row(&ctx, id).released_at,
+            taken_down.released_at,
+            "the first's state stays"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// `page` passes its expires_at: moved back a minute, as time would move on, under the
+    /// publication lock, which nothing holds while a take-down waits for the edge.
+    async fn lapse(ctx: &AdminContext, page: &str) {
+        let _publication_guard =
+            tokio::time::timeout(Duration::from_secs(5), ctx.publication_lock.lock())
+                .await
+                .expect("the lock is free while the take-down waits for the edge");
+        let mut ledger =
+            load_admin_publication_ledger(&ctx.publication_ledger_path).expect("ledger");
+        ledger
+            .publications
+            .get_mut(page)
+            .expect("the row")
+            .expires_at = Utc::now().timestamp().max(0) as u64 - 60;
+        persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger).expect("ledger");
+    }
+
+    /// A take-down and the expiry sweep run on one page at once (FINDINGS A-274): the page passes
+    /// its expires_at while its take-down waits for the edge, and the sweep, which the take-down no
+    /// longer holds up, retires it meanwhile. Neither writes over the other's state. When the sweep
+    /// has recorded the page `expired` first, the take-down asks IO.blob nothing and answers
+    /// `unpublished: false`, as it would have after the sweep; when the take-down has recorded it
+    /// `unpublished` first, the sweep writes and releases nothing. Before, the sweep waited for the
+    /// lock until the take-down was done.
+    #[tokio::test]
+    async fn a_take_down_and_the_expiry_sweep_write_no_state_over_each_other() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-and-sweep");
+        let swept_first = published_page(PAGE_PUBLISHER);
+        let taken_down_first = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&swept_first, &taken_down_first]);
+
+        // The sweep retires the page while its take-down waits for the edge.
+        let id = swept_first.publication_id.as_str();
+        let take_down = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let take_down_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the take-down asks the edge",
+        )
+        .await;
+        lapse(&ctx, id).await;
+        let sweep = spawn_sweep(&ctx);
+        let sweep_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the sweep asks the edge too, while the take-down waits for it",
+        )
+        .await;
+        harness
+            .inject(edge_unpublished(&sweep_unpublish, id, true))
+            .await
+            .unwrap();
+        let release = next_asked(&mut harness, MSG_BLOB_RELEASE, id, "the sweep's release").await;
+        harness.inject(blob_released(&release, true)).await.unwrap();
+        sweep.await.expect("the sweep").expect("swept");
+        let expired = publication_row(&ctx, id);
+        assert_eq!(expired.status, "expired");
+        harness
+            .inject(edge_unpublished(&take_down_unpublish, id, false))
+            .await
+            .unwrap();
+        let result = take_down.await.expect("the take-down");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(
+            result.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": false })
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the take-down asks IO.blob nothing"
+        );
+        let row = publication_row(&ctx, id);
+        assert_eq!(row.status, "expired", "the sweep's state stays");
+        assert_eq!(row.released_at, expired.released_at);
+
+        // The take-down takes the page down while the sweep waits for the edge.
+        let id = taken_down_first.publication_id.as_str();
+        let take_down = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let take_down_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the take-down asks the edge",
+        )
+        .await;
+        lapse(&ctx, id).await;
+        let sweep = spawn_sweep(&ctx);
+        let sweep_unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the sweep asks the edge too, while the take-down waits for it",
+        )
+        .await;
+        harness
+            .inject(edge_unpublished(&take_down_unpublish, id, true))
+            .await
+            .unwrap();
+        let release = next_asked(
+            &mut harness,
+            MSG_BLOB_RELEASE,
+            id,
+            "the take-down's release",
+        )
+        .await;
+        harness.inject(blob_released(&release, true)).await.unwrap();
+        let result = take_down.await.expect("the take-down");
+        assert_eq!(
+            result.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": true })
+        );
+        harness
+            .inject(edge_unpublished(&sweep_unpublish, id, false))
+            .await
+            .unwrap();
+        sweep.await.expect("the sweep").expect("swept");
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the sweep asks IO.blob nothing"
+        );
+        assert_eq!(
+            publication_status(&ctx, id),
+            "unpublished",
+            "the take-down's state stays"
         );
     }
 

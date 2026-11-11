@@ -1234,12 +1234,13 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   (`publication_edge_hive_gone`, FINDINGS A-242). It holds the publication lock only to read a
   page's row and to write each of its states, never across the edge's or IO.blob's call (30 s
   each), and writes a state only while the row is still at the one it read, so a state another
-  writer recorded meanwhile stays (`retire_expired_publication`, `advance_expired_publication`,
-  FINDINGS A-260): an edge that is listed but down, or a slow IO.blob, holds up no publish or
-  take-down. The ledger keeps a page's row for 30 days once the page is down, `expired` or
-  `unpublished` (since its `released_at`, or its `expires_at` for a row without one); each sweep
-  first drops the rows down for longer, and keeps every other row (`drop_old_down_publications`,
-  `PUBLICATION_LEDGER_KEEP_DOWN_SECS`, FINDINGS A-231).
+  writer recorded meanwhile stays (`retire_expired_publication`, `advance_publication`, FINDINGS
+  A-260): an edge that is listed but down, or a slow IO.blob, holds up no publish or take-down.
+  A take-down holds the lock the same way (FINDINGS A-274, below), so the two may run on one page
+  at once, and neither writes over the other's state. The ledger keeps a page's row for 30 days
+  once the page is down, `expired` or `unpublished` (since its `released_at`, or its `expires_at`
+  for a row without one); each sweep first drops the rows down for longer, and keeps every other
+  row (`drop_old_down_publications`, `PUBLICATION_LEDGER_KEEP_DOWN_SECS`, FINDINGS A-231).
 - **A producer on a worker** (FINDINGS A-81) promotes its blob there, and Syncthing brings it to
   the motherbee about 10 s later. Before the publication lock, unless the blob is in the
   motherbee's `active/` already, SY.admin asks the producer's hive to scan its blob folder
@@ -1267,8 +1268,8 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   tenant does not take it down. The operator takes down any publication by either
   field (FINDINGS A-120): `POST /artifacts/unpublish`, or a step of an executor plan, which
   Archi's plan compiler stages and which runs only once the operator confirms it. The action is
-  `confirmation_required`, and takes no hive: the publication names its edge. Under the
-  publication lock:
+  `confirmation_required`, and takes no hive: the publication names its edge. It reads the
+  page's row under the publication lock:
   - a publication the ledger does not hold answers `404 NOT_FOUND`;
   - one already down answers ok, `unpublished: false`, and asks no one: `unpublished`, `expired`,
     or past its `expires_at`, which the edge no longer serves. That last one keeps its row for the
@@ -1283,6 +1284,17 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
     taken down, and would stay `published` until it expires; the expiry sweep skips that edge the
     same way. This admin's own hive, and a registry whose directory is missing, always have the
     edge asked.
+
+  A take-down holds the publication lock only to read the row and to write each of its states,
+  never across the edge's or IO.blob's call, as the expiry sweep (FINDINGS A-274): an edge that is
+  listed but down, or a slow IO.blob, holds up no publish, no other take-down and no sweep, the
+  factory reset's take-downs included. Each state is written on the ledger loaded again, and only
+  while the row is still at the one the take-down read (`take_down_publication`,
+  `advance_publication`), so a page published meanwhile keeps its row and a state another writer
+  recorded meanwhile stays. When another take-down, or the sweep, got past the edge meanwhile
+  (`edge_removed`), this one goes on to the release; when one of them recorded the page down
+  meanwhile (`unpublished`, `expired`), this one asks no one more, writes nothing, and answers ok
+  with `unpublished: false`, as it would have after that one.
 
   The answer carries the `publication_id` either way. A request can carry a live link in any
   field, so the command log keeps only a `publication_id` that is one, in its canonical form, and
