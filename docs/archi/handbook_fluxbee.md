@@ -1742,8 +1742,9 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
 - Stage it with `fluxbee_plan_compiler`: one `reset_base_runtime` step, args `hive: "motherbee"`
   and `runtime`. The operator confirms the plan, and SY.admin's executor runs it as the operator.
   It is closed to the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as SCMD.
-- Each hive's orchestrator moves the running nodes within its next reconcile pass (60 s); a node
-  pinned to a version stays.
+- Each hive's orchestrator moves the running nodes within its next reconcile pass (60 s), in place.
+  A node of the base runtime pinned to a version stays; a running node of a package built on it
+  moves with it, pinned to its package's version or not (§7.2).
 - The hand-published version stays available. If the operator wants it gone,
   `remove_runtime_version` deletes it once every hive's nodes were read and none runs on it. A
   base that packages are built on (`wf.engine` with deployed workflows, `ai.generic` with
