@@ -509,6 +509,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gov-common"
+version = "0.1.0"
+dependencies = [
+ "fluxbee-sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,6 +854,7 @@ name = "io-cloud"
 version = "0.1.0"
 dependencies = [
  "fluxbee-sdk",
+ "gov-common",
  "io-common",
  "serde_json",
  "tokio",

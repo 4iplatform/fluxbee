@@ -484,11 +484,22 @@ async fn run_loop(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Cloud's id of this attempt (docs/io-cloud-api.md §4.2): echoed in the answer, and logged
+        // here next to the trace_id, so the request_id Cloud reports leads the operator to the
+        // trace. Debug-quoted: Cloud writes it.
+        let request_id = msg
+            .payload
+            .get("request_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         let started = std::time::Instant::now();
         tracing::info!(
             trace_id = %msg.routing.trace_id,
             ich = %ich,
             op = %op,
+            request_id = ?request_id,
             routed_from = %msg.routing.src,
             "IO.cloud received a Cloud request"
         );
@@ -532,13 +543,7 @@ async fn run_loop(
                 .map(|value| value.is_null())
                 .unwrap_or(true)
             {
-                if let Some(request_id) = msg
-                    .payload
-                    .get("request_id")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
+                if let Some(request_id) = &request_id {
                     obj.insert("request_id".to_string(), json!(request_id));
                 }
             }
@@ -2224,8 +2229,9 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
             "register_human cannot register a person into the root tenant",
         ));
     }
-    // Email is the human's stable unique key; identity owns idempotency on (cloud, email, tenant).
-    // Require a real address so a bare token can never collide with io.cloud's own channel keys.
+    // The email is the person's account key, in the whole hive: the handler provisions its `cloud`
+    // channel installation-wide, so one email is one account. Require a real address so a bare
+    // token can never collide with io.cloud's own channel keys.
     let Some(email) = handoff
         .get("subject")
         .and_then(|s| s.get("email"))
@@ -2239,6 +2245,9 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
             "params.subject.email is required and must be an email address",
         ));
     };
+    if let Err(detail) = check_handoff_subject(&handoff["subject"]) {
+        return Err(cloud_error_code("INVALID_REQUEST", &detail));
+    }
     let request_id = payload
         .get("request_id")
         .and_then(Value::as_str)
@@ -2252,20 +2261,15 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
         obj.insert("tenant_id".to_string(), Value::String(tenant_id.clone()));
     }
     // What goes on must parse as the frontdesk's handoff, read here with that contract's own type
-    // once the tenant_id is in (FINDINGS A-293). The checks above name the usual faults; past them
-    // only a subject field of another type fails (`subject.phone` a number, `subject.attributes`
-    // a list). Such a message would take the frontdesk's conversational path, not its
-    // registration: an LLM turn on the JSON or, while the frontdesk has no model,
-    // `node_not_configured`, retryable, which would read to Cloud as FRONTDESK_UNAVAILABLE on
-    // every attempt.
+    // once the tenant_id is in (FINDINGS A-293). The checks above name each field the contract
+    // reads today; this parse holds the gate to the type itself, should it change. A message that
+    // does not parse takes the frontdesk's conversational path, not its registration: an LLM turn
+    // on the JSON or, while the frontdesk has no model, `node_not_configured`, retryable, which
+    // would read to Cloud as FRONTDESK_UNAVAILABLE on every attempt.
     if let Err(err) = serde_json::from_value::<FrontdeskHandoffPayload>(handoff.clone()) {
         return Err(cloud_error_code(
             "INVALID_REQUEST",
-            &format!(
-                "params is not a frontdesk_handoff the frontdesk can read (params.subject's \
-                 display_name, email, phone and company_name are strings, its attributes an \
-                 object): {err}"
-            ),
+            &format!("params is not a frontdesk_handoff the frontdesk can read: {err}"),
         ));
     }
     Ok(RegisterHumanRequest {
@@ -2274,6 +2278,40 @@ fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest,
         email,
         request_id,
     })
+}
+
+/// The handoff subject's fields besides the email, each checked by name, so that a refusal says
+/// which one is wrong (FINDINGS A-293). `display_name` is required, a string with the person's
+/// name: without it the frontdesk answers `missing_required_fields` (unless an earlier attempt
+/// left it a name), and the person stays a pending signup. `phone` and `company_name` are
+/// strings, `attributes` an object, each optional (null is none): the types the frontdesk's
+/// handoff takes.
+fn check_handoff_subject(subject: &Value) -> Result<(), String> {
+    if subject
+        .get("display_name")
+        .and_then(Value::as_str)
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        return Err(
+            "params.subject.display_name is required and must be a string with the person's name"
+                .to_string(),
+        );
+    }
+    for field in ["phone", "company_name"] {
+        if !matches!(
+            subject.get(field),
+            None | Some(Value::Null | Value::String(_))
+        ) {
+            return Err(format!("params.subject.{field} must be a string"));
+        }
+    }
+    if !matches!(
+        subject.get("attributes"),
+        None | Some(Value::Null | Value::Object(_))
+    ) {
+        return Err("params.subject.attributes must be an object".to_string());
+    }
+    Ok(())
 }
 
 /// Matcher for the frontdesk's reply: a `user`-kind FrontdeskResultPayload is success; the router's
@@ -2800,9 +2838,11 @@ mod tests {
         );
     }
 
-    /// FINDINGS A-293: a handoff the frontdesk cannot parse is refused before anything is created,
-    /// where it went on to the frontdesk's conversational path, whose retryable answers would read
-    /// to Cloud as FRONTDESK_UNAVAILABLE for a request no attempt can register.
+    /// FINDINGS A-293: a handoff the frontdesk cannot parse, or without the person's name, is
+    /// refused before anything is created, and the refusal names the field. A field of another
+    /// type went on to the frontdesk's conversational path, whose retryable answers would read to
+    /// Cloud as FRONTDESK_UNAVAILABLE for a request no attempt can register; a handoff without a
+    /// name was answered `missing_required_fields`, and left a pending signup.
     #[test]
     fn register_human_refuses_a_handoff_the_frontdesk_cannot_read() {
         let request = |subject: Value| {
@@ -2814,23 +2854,47 @@ mod tests {
                 }
             })
         };
-        for subject in [
-            json!({"display_name": "Juan Perez", "email": "juan@acme.com", "phone": 5491100000000_u64}),
-            json!({"display_name": ["Juan", "Perez"], "email": "juan@acme.com"}),
-            json!({"display_name": "Juan Perez", "email": "juan@acme.com",
-                   "company_name": {"name": "ACME"}}),
-            json!({"display_name": "Juan Perez", "email": "juan@acme.com", "attributes": ["vip"]}),
+        for (field, subject) in [
+            (
+                "phone",
+                json!({"display_name": "Juan Perez", "email": "juan@acme.com",
+                       "phone": 5491100000000_u64}),
+            ),
+            (
+                "display_name",
+                json!({"display_name": ["Juan", "Perez"], "email": "juan@acme.com"}),
+            ),
+            (
+                "company_name",
+                json!({"display_name": "Juan Perez", "email": "juan@acme.com",
+                       "company_name": {"name": "ACME"}}),
+            ),
+            (
+                "attributes",
+                json!({"display_name": "Juan Perez", "email": "juan@acme.com",
+                       "attributes": ["vip"]}),
+            ),
+            ("display_name", json!({"email": "juan@acme.com"})),
+            (
+                "display_name",
+                json!({"display_name": null, "email": "juan@acme.com"}),
+            ),
+            (
+                "display_name",
+                json!({"display_name": "  ", "email": "juan@acme.com"}),
+            ),
         ] {
             let Err(err) = parse_register_human_request(&request(subject.clone())) else {
                 panic!("{subject} would reach the frontdesk");
             };
             assert_eq!(err["error_code"], "INVALID_REQUEST", "{subject}");
+            // The check of that field refused it: the detail names it, and no value Cloud sent.
+            let detail = err["error_detail"].as_str().unwrap_or_default();
             assert!(
-                err["error_detail"]
-                    .as_str()
-                    .is_some_and(|detail| detail.contains("frontdesk_handoff")),
-                "{err}"
+                detail.starts_with(&format!("params.subject.{field} ")),
+                "{subject}: {detail}"
             );
+            assert!(!detail.contains("5491100000000"), "{detail}");
         }
         // Every field the frontdesk reads, null where it takes none, and one it does not read.
         let ok = parse_register_human_request(&request(json!({
@@ -2838,10 +2902,105 @@ mod tests {
             "company_name": null, "attributes": {"crm_customer_id": "crm-123"}, "nickname": 7
         })))
         .expect("a handoff the frontdesk reads");
-        // What io.cloud forwards is a handoff the frontdesk parses.
-        assert!(
-            io_common::frontdesk_contract::parse_frontdesk_handoff_payload(&ok.handoff).is_some()
+        // What io.cloud forwards is a handoff the frontdesk parses, with its own contract.
+        assert!(gov_common::frontdesk_contract::parse_frontdesk_handoff(
+            Some(FRONTDESK_HANDOFF_MSG),
+            &ok.handoff
+        )
+        .is_some());
+    }
+
+    /// FINDINGS A-293: IO.cloud's gate reads the handoff with io-common's copy of the frontdesk's
+    /// contract, and SY.frontdesk.gov parses it with gov-common's. A field made required, or given
+    /// another type, in one copy alone would let the gate pass a handoff the frontdesk takes for a
+    /// conversation, whose retryable answers read to Cloud as FRONTDESK_UNAVAILABLE on every
+    /// attempt. The two copies take the same shapes, to the same handoff.
+    #[test]
+    fn io_commons_handoff_contract_is_the_frontdesks() {
+        use gov_common::frontdesk_contract as frontdesk;
+        use io_common::frontdesk_contract as io;
+        assert_eq!(
+            io::FRONTDESK_HANDOFF_PAYLOAD_TYPE,
+            frontdesk::FRONTDESK_HANDOFF_PAYLOAD_TYPE
         );
+        assert_eq!(io::FRONTDESK_HANDOFF_MSG, frontdesk::FRONTDESK_HANDOFF_MSG);
+        assert_eq!(
+            io::FRONTDESK_SCHEMA_VERSION_V1,
+            frontdesk::FRONTDESK_SCHEMA_VERSION_V1
+        );
+
+        let handoff = json!({
+            "type": "frontdesk_handoff", "schema_version": 1, "operation": "complete_registration",
+            "subject": {
+                "display_name": "Juan Perez", "email": "juan@acme.com",
+                "phone": "+54 9 11 0000-0000", "company_name": "ACME",
+                "attributes": {"crm_customer_id": "crm-123"}
+            },
+            "tenant_id": TEST_TENANT, "context": {"source": "io.cloud"}
+        });
+        let with = |field: &str, value: Value| {
+            let mut shape = handoff.clone();
+            shape[field] = value;
+            shape
+        };
+        let with_subject = |field: &str, value: Value| {
+            let mut shape = handoff.clone();
+            shape["subject"][field] = value;
+            shape
+        };
+        let without = |field: &str| {
+            let mut shape = handoff.clone();
+            shape.as_object_mut().expect("an object").remove(field);
+            shape
+        };
+        let shapes = [
+            handoff.clone(),
+            without("subject"),
+            without("tenant_id"),
+            without("context"),
+            without("schema_version"),
+            without("operation"),
+            without("type"),
+            with("subject", json!({})),
+            with("subject", Value::Null),
+            with("subject", json!("Juan Perez")),
+            with("tenant_id", Value::Null),
+            with("tenant_id", json!(7)),
+            with("context", json!([1, "two", {"three": 3}])),
+            with("schema_version", json!(2)),
+            with("schema_version", json!("1")),
+            with("schema_version", json!(1.0)),
+            with("schema_version", json!(-1)),
+            with("schema_version", json!(4_294_967_296_u64)),
+            with("operation", json!("rename_person")),
+            with("operation", json!(1)),
+            with("type", json!("text")),
+            with("type", json!("FRONTDESK_HANDOFF")),
+            with("extra", json!({"ignored": true})),
+            with_subject("display_name", json!(true)),
+            with_subject("display_name", Value::Null),
+            with_subject("email", json!(["juan@acme.com"])),
+            with_subject("email", Value::Null),
+            with_subject("phone", json!(5_491_100_000_000_u64)),
+            with_subject("company_name", json!({"name": "ACME"})),
+            with_subject("attributes", json!(["vip"])),
+            with_subject("attributes", Value::Null),
+            with_subject("nickname", json!(7)),
+            json!({"type": "text", "content": "frontdesk_handoff"}),
+            json!("frontdesk_handoff"),
+            Value::Null,
+        ];
+        let mut handoffs = 0;
+        for shape in &shapes {
+            let ours = io::parse_frontdesk_handoff_payload(shape)
+                .map(|parsed| serde_json::to_value(parsed).expect("io-common's handoff"));
+            let theirs = frontdesk::parse_frontdesk_handoff_payload(shape)
+                .map(|parsed| serde_json::to_value(parsed).expect("gov-common's handoff"));
+            handoffs += usize::from(theirs.is_some());
+            assert_eq!(ours, theirs, "{shape}");
+        }
+        // The shapes hold handoffs as well as what is none.
+        assert!(handoffs > 0 && handoffs < shapes.len());
     }
 
     #[test]
@@ -3990,6 +4149,15 @@ mod tests {
     /// One `register_human` through the handler: the test answers SY.identity's ILK_PROVISION with
     /// a new temporary person, then the handoff with `frontdesk_answer`, and gives Cloud's answer.
     async fn register_human_answered_by(frontdesk_answer: Value) -> Value {
+        register_human_answered_with(move |handoff| {
+            answer_to(handoff, USER_KIND, None, frontdesk_answer)
+        })
+        .await
+    }
+
+    /// The same, with the handoff answered by the message `answer` makes of it: the frontdesk's,
+    /// or the router's in its place.
+    async fn register_human_answered_with(answer: impl FnOnce(&Message) -> Message) -> Value {
         let (state, mut router) = io_cloud_on_a_test_router();
         let sender = state.dispatcher.sender_snapshot();
         let request = Message {
@@ -4041,10 +4209,23 @@ mod tests {
                 &handoff.routing.dst,
                 Destination::Unicast(target) if target == DEFAULT_FRONTDESK_TARGET
             ));
+            // The frontdesk runs it as a handoff, by gov-common's own reading (FINDINGS A-293): a
+            // `user` message with its mark and shape, from an IO node.
+            assert_eq!(handoff.meta.msg_type, USER_KIND);
+            assert!(gov_common::frontdesk_contract::parse_frontdesk_handoff(
+                handoff.meta.msg.as_deref(),
+                &handoff.payload
+            )
+            .is_some());
+            assert!(
+                gov_common::frontdesk_contract::frontdesk_handoff_sender_allowed(Some(
+                    state.config.node_name.as_str()
+                ))
+            );
             router
-                .inject(answer_to(&handoff, USER_KIND, None, frontdesk_answer))
+                .inject(answer(&handoff))
                 .await
-                .expect("the frontdesk answers");
+                .expect("the handoff is answered");
         };
         let (answer, ()) = tokio::join!(handle_register_human(&sender, &state, &request), peers);
         answer
@@ -4106,6 +4287,40 @@ mod tests {
         assert_eq!(registered["status"], "ok");
         assert_eq!(registered["registration_status"], "complete");
         assert_eq!(registered["ilk_id"], TEST_TEMP_ILK);
+    }
+
+    /// FINDINGS A-293, through the handler: the handoff answered by neither the frontdesk's verdict
+    /// nor its error. A reply that is neither is INVALID_FRONTDESK_RESPONSE; the router's
+    /// UNREACHABLE in its place (the frontdesk down, or its link full) is FRONTDESK_UNAVAILABLE at
+    /// once, as a frontdesk that does not answer within the 20 s. Neither names the person
+    /// (docs/io-cloud-api.md §5.2).
+    #[tokio::test]
+    async fn a_handoff_answered_by_no_verdict_and_no_error() {
+        let not_a_verdict =
+            register_human_answered_by(json!({"type": "text", "content": "not a verdict"})).await;
+        assert_eq!(not_a_verdict["status"], "error");
+        assert_eq!(not_a_verdict["error_code"], "INVALID_FRONTDESK_RESPONSE");
+        assert!(not_a_verdict.get("ilk_id").is_none(), "{not_a_verdict}");
+
+        let unreachable = register_human_answered_with(|handoff| {
+            answer_to(
+                handoff,
+                SYSTEM_KIND,
+                Some(MSG_UNREACHABLE),
+                json!({"original_dst": DEFAULT_FRONTDESK_TARGET, "reason": "NODE_NOT_FOUND"}),
+            )
+        })
+        .await;
+        assert_eq!(unreachable["status"], "error");
+        assert_eq!(unreachable["error_code"], "FRONTDESK_UNAVAILABLE");
+        assert!(unreachable.get("ilk_id").is_none(), "{unreachable}");
+        // From the router's answer, not from the 20 s running out.
+        assert!(
+            unreachable["error_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("reason=NODE_NOT_FOUND")),
+            "{unreachable}"
+        );
     }
 
     /// FINDINGS A-293: only the frontdesk's own `retryable: true` makes an error one to send again;

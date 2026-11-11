@@ -367,11 +367,12 @@ handed out (§5.3, §5.4). The pages its nodes published stay up until they expi
 | `params.type` | required | `"frontdesk_handoff"` |
 | `params.schema_version` | required | `1` (a number) |
 | `params.operation` | required | `"complete_registration"` |
-| `params.subject.display_name` | required | a string |
-| `params.subject.email` | required | a real address; the person's key in the tenant |
+| `params.subject.display_name` | required | the person's name, a string with text |
+| `params.subject.email` | required | a real address; the person's account key, in the whole hive |
 | `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity; strings, `.attributes` an object |
 
-A field of another type is refused with `INVALID_REQUEST` before anything is created.
+A required field missing or empty, or a field of another type, is refused with `INVALID_REQUEST`
+before anything is created; `error_detail` names the field.
 
 **One email is one account, in the whole hive.** The person is charged to the tenant at the root;
 their email (the account's `cloud` channel) belongs to no tenant.
@@ -414,22 +415,30 @@ anyone. Send only emails Cloud has verified.
   - `ACCOUNT_IN_ROOT_TENANT`: the account is charged to the root tenant (registered before 0.1.54);
     the operator reassigns it.
   - `TENANT_ROOT_NOT_REGISTRABLE`, `INVALID_REQUEST` (the handoff shape), `ILK_DELETED` (that
-    account is marked deleted: restore it), `IDENTITY_UNAVAILABLE`.
-  - On a frontdesk refusal, `success:false` with its code, and the identity stays temporary.
+    account is marked deleted: restore it).
+  - `IDENTITY_UNAVAILABLE`: the identity registry did not answer; send it again (below).
+  - On a frontdesk refusal, `success:false` with its code, and the identity stays temporary. The
+    frontdesk's codes are lowercase. `identity_unavailable` (the identity registry did not answer
+    in time; the frontdesk keeps the case open): send it again (below). `missing_required_fields`
+    and `invalid_request`: fix the request. Any other (`tenant_unresolved`,
+    `tenant_not_registrable`, `register_failed`, `in_conversation`, `unknown`) is final: give the
+    operator the `request_id`.
 - **When the frontdesk gives no verdict**, the answer is one of these codes. When the frontdesk
   sent an error, the answer also names the person (`ilk_id`), and `error_detail` starts with the
-  frontdesk's own code (`"ai_runtime_busy: …"`).
+  frontdesk's own code when it gave one (`"ai_runtime_busy: …"`).
 
   | `error_code` | what happened | what Cloud does |
   |---|---|---|
-  | `FRONTDESK_UNAVAILABLE` | the frontdesk did not answer within 20 s (§6), or answered with an error that says sending the request again may pass (it was busy) | send the same request again after a few seconds; it is safe (below) |
+  | `FRONTDESK_UNAVAILABLE` | the frontdesk could not be reached (at once), did not answer within 20 s (§6), or answered with an error that says sending the request again may pass (it was busy) | send it again after a few seconds, a few times at most (below) |
   | `FRONTDESK_REJECTED` | the frontdesk answered with an error that does not say so: it failed on this registration, and may have done part of it | do not resend it in a loop: read the person (`get_ilk` by email: its `registration_status`) and give the operator the `request_id` |
   | `INVALID_FRONTDESK_RESPONSE` | the frontdesk answered something that is neither its verdict nor an error: a fault on the hive's side | as `FRONTDESK_REJECTED` |
 
-  **Sending `register_human` again is safe.** One email is one account, so the retry takes over
-  the temporary identity an earlier attempt left, or answers `existing: true` when that attempt
-  completed after all. A 504 from the edge on `register_human` is answered the same way: send it
-  again.
+  **Sending `register_human` again is safe**, and on the codes above that say so, or a 504 from
+  the edge, it is what to do: the same params with a new `request_id`, about 3 times at most,
+  waiting longer each time; then stop and give the operator the last `request_id`. Each try the
+  frontdesk does not answer holds IO.cloud, which serves one request at a time (§6), for 20 s.
+  One email is one account, so a retry takes over the temporary identity an earlier attempt
+  left, or answers `existing: true` when that attempt completed after all.
 
 #### `set_ilk_tenant`
 
@@ -968,7 +977,8 @@ completing inside**. Treat it as **unknown**, not failed:
 - `delete_node`: a retry answers `NODE_NOT_FOUND` once the timed-out attempt finished, as it does
   while the node's hive cannot be reached (`unreachable_hives` then names it): in both cases, read
   `list_nodes` to know.
-- `register_human`: safe to send again, on `FRONTDESK_UNAVAILABLE` or a 504 (§5.2).
+- `register_human`: safe to send again, a few times at most, on `FRONTDESK_UNAVAILABLE` or a 504
+  (§5.2).
 
 **IO.cloud serves one request at a time.** Concurrent calls queue, and a queued one can spend the
 edge's 30 s and get a 504. Serialize your calls.
@@ -1079,13 +1089,18 @@ post '{"op":"list_cloud_actions"}'
 
 - **`register_human`: a frontdesk error that says sending the request again may pass** (the
   frontdesk was busy) answers `FRONTDESK_UNAVAILABLE`, as a frontdesk that does not answer in time
-  does: send the request again. It answered `FRONTDESK_REJECTED`, which stays for an error that does
-  not say so. Both, and `INVALID_FRONTDESK_RESPONSE`, are listed with what to do (§5.2), and
-  `error_detail` starts with the frontdesk's own code.
-- **`register_human` refuses a `subject` field of another type** with `INVALID_REQUEST`, before
-  anything is created: `display_name`, `phone` and `company_name` are strings, `attributes` an
-  object (§5.2). Such a request went on to the frontdesk, which took it for a conversation, not a
-  registration.
+  does: send the request again, a few times at most. It answered `FRONTDESK_REJECTED`, which stays
+  for an error that does not say so. Both, `INVALID_FRONTDESK_RESPONSE` and the frontdesk's own
+  codes are listed with what to do (§5.2), and `error_detail` starts with the frontdesk's own code
+  when it gave one.
+- **`register_human` refuses a `subject` without a `display_name`, or with a field of another
+  type**, with `INVALID_REQUEST` naming the field, before anything is created: `display_name` is a
+  string with the person's name, `phone` and `company_name` are strings, `attributes` an object
+  (§5.2). A request without a name was answered `missing_required_fields` by the frontdesk and
+  left a pending signup; one with a field of another type went on to the frontdesk, which took it
+  for a conversation, not a registration.
+- **IO.cloud logs the `request_id` of each request**, next to its trace, so the operator finds the
+  trace from the `request_id` you report (§4.2).
 
 ### 0.1.136
 

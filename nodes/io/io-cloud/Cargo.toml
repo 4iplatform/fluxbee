@@ -15,3 +15,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# The frontdesk's handoff contract, which SY.frontdesk.gov parses with: io-common's copy, the one
+# IO.cloud's register_human gate reads with, is held to it (FINDINGS A-293).
+gov-common = { path = "../../gov/common" }
