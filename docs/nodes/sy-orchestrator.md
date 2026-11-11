@@ -463,7 +463,11 @@ worker forwards as `GET_VERSIONS`, each in a task of its own since 0.1.127 (a re
 [Messages](#messages)), within `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s): SY.admin keeps at
 most one read of a hive outstanding, waits 50 s for it (past that bound, so a read it gave up has
 ended before it asks again), and paces them (a hive in flight every 3 s, one left as it is every
-10 min).
+10 min). While a hive's core update restarts it, SY.admin waits 10 s and asks again at once
+(FINDINGS A-250): a read it gave up then still runs here to its 45 s, in one of the 4 places the
+worker keeps for each target hive (`WORKER_READS_PER_TARGET_MAX`), and its answer reaches
+SY.admin late, which drops it; a read past those 4 waits for a place, and none of them holds
+another hive's read or a local one.
 
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
   applies retention.

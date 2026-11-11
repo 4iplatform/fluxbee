@@ -1264,12 +1264,14 @@ every hive is on it.
   (on a newer release), or one with a copy edited by hand: each is recorded `excluded`. It never
   tries a hive twice: an error, or a copy that did not arrive in time, is left for the operator
   with its `next`. It opens nothing: only a run opens an update.
-- **What SY.admin reads by itself** while an update is open: a hive in flight every 3 s; a hive
-  that did not answer, only once it shows up connected again (checked every 30 s, without asking
-  it); a hive left as it is, or in error, every 10 minutes. The operator's per-hive `update` or
-  `core_rollback`, a join and a removal make it look at that hive at once, and so does your read
-  of `get_installation_update`. A core that did not settle stays pending until its record changes:
-  run the update again, or the per-hive `update`.
+- **What SY.admin reads by itself** while an update is open: a hive in flight every 3 s, and again
+  at once when its core update restarts it and a read gets no answer within 10 s (its
+  orchestrator restarting itself, a few seconds off the mesh); a hive that did not answer, only
+  once it shows up connected again (checked every 30 s, without asking it); a hive left as it is,
+  or in error, every 10 minutes. The operator's per-hive `update` or `core_rollback`, a join and a
+  removal make it look at that hive at once, and so does your read of `get_installation_update`. A
+  core that did not settle stays pending until its record changes: run the update again, or the
+  per-hive `update`.
 
 ### 4.4.5 A worker behind the egress
 

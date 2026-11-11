@@ -655,9 +655,28 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     yet, each holding its hive while queued behind one read, and a pass could be left to one;
     the follow and the automatic step still claim first (their hives are in flight, or did not
     answer);
+  - **a read of a hive in its restart** (since 0.1.131, FINDINGS A-250 (a)): from SY.admin's
+    `restarting` outcome for a hive's core (its core update's answer, or a core found under way)
+    to its `settled`, or to the follow's verdict at the settle bound, a read of that hive waits
+    10 s (`JSR_ADMIN_INSTALLATION_RESTART_READ_TIMEOUT_SECS`), whoever reads it, and one that
+    times out leaves no hold and passes one it finds. The follow asks it again at once, in a look
+    of its own: each look still holds the hive for one read, and SY.admin's reads of a hive still
+    wait for each other, so two never run at once. A read that is answered ends a hold. The read
+    SY.admin gave up runs on at the motherbee's orchestrator to its 45 s, in one of the 4 places
+    it keeps for each target hive (A-199's step 1), and SY.admin drops its late answer; only a hive
+    whose reads go unanswered for 40 s fills those places, and a fifth read then waits there for
+    one. Each such loss is one line of SY.admin's log, `installation update: a read of a hive in
+    its restart got no answer within its bound: asked again at once`, which `ops.py timeline`
+    shows.
+    **Why:** each spoke's orchestrator restarts itself for the new binary and is off its router
+    for 4 to 5 s; a read that reached it then, or just before it stopped, was never answered, and
+    SY.admin waited its 50 s, then held the hive 50 s more, so the update closed 40 to 90 s after
+    the spokes settled (below, "Later: the spoke reports its settle"). Outside a restart the 50 s
+    and the hold stay: they protect a hive that is slow, not restarting. A core update that did not
+    answer in time is followed, but not as a restart, for that reason;
   - a hive in flight is read every 3 s (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`) until it
-    settles; then its config goes, `by` the run that sent its core, or `by: background` for a core
-    the task found under way (F12);
+    settles, a read lost in its restart at once (above); then its config goes, `by` the run that
+    sent its core, or `by: background` for a core the task found under way (F12);
   - a hive that did not answer, or not read yet (`unknown`): a check of shared memory every 30 s
     (`JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS`), which asks no one; it is read only once shared
     memory shows its orchestrator (`connected_nodes_from_shm`), and read anyway when shared memory
@@ -762,6 +781,45 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
   divergence); a hive in error, without an answer, `sync_pending` at its bound or left as it is, a
   stale target or a superseded update is not verified, each hive named with its `next`. Its wait
   for each `update_installation` step is SY.admin's ceiling with a margin, 580 s.
+
+### Later: the spoke reports its settle (A-250 b)
+
+The right design for how SY.admin learns that a hive's core update settled. The operator deferred
+it on 2026-11-10 by cost and benefit, to come back to in another stage: *"lo correcto es b) pero
+costo/beneficio actual no vale, igual deja documentado porque vamos a volver a esto en otra
+etapa"*. What was built instead, for 0.1.131, is (a): a short read while a hive restarts, asked
+again at once (above, "a read of a hive in its restart").
+
+- **What the deploys showed** (FINDINGS A-250 with `ops.py timeline`, each from the timeline's
+  start; lab/DEPLOYMENTS.md):
+  - 0.1.127 (t = 18:12:00): the update opened at 21.7 s; the spokes settled by their own records at
+    47.3 s (egress1), 57.5 s (ingress1) and 61.1 s (worker1); SY.admin marked them settled at
+    96.9 s, 95.7 s and 146.6 s, and closed the update at 147.9 s, 126 s after its call. Its reads
+    had reached egress1's and worker1's old orchestrators just before each restarted itself;
+    worker1 waited twice.
+  - 0.1.128 (t = 19:40:20): the spokes' orchestrators were off their routers from 35.2 to 40.4 s
+    (egress1), 39.7 to 43.9 s (ingress1) and 42.8 to 47.2 s (worker1), and each settled within a
+    second of coming back; SY.admin marked worker1 at 83.6 s, egress1 at 85.3 s and ingress1 at
+    134.9 s (two waits). The update closed 116 s after its call, the spokes settled 31 s after it.
+  - 0.1.129: the update closed about 128 s after its call, the same way.
+  - 0.1.130, the counter-case: no orchestrator binary changed, none restarted itself, and the
+    update closed 6 s after its call.
+- **The design:** the datum's owner reports it. The orchestrator a core update installed settles
+  that update on its hive (`settle_core_generation`, at its start and at the dist recheck; its
+  `/versions` then says `core.last_update.settled`), so it is the one that knows when. Once it
+  settled, it tells SY.admin@motherbee: a system notice naming its hive, the update (its
+  `started_at_ms`) and its settle (`at_ms`, and what it left open, if anything).
+- **SY.admin** takes the notice as a look at once at that hive: the follow reads its `/versions`
+  once, which stays the record (a notice never moves a hive by itself), and marks it settled from
+  that read. The update closes within a second of the last spoke's settle, where (a) takes up to
+  one restart read's 10 s and the follow's 3 s.
+- **What it needs:** the message and its place in the system policy (a report from a spoke's
+  orchestrator to SY.admin@motherbee only, which changes nothing); the orchestrator's send once it
+  settled, asked again while SY.admin does not answer (SY.admin may be restarting too); SY.admin's
+  handler, taking it only from a hive's own orchestrator as the router stamps the sender. Each
+  binary ships in its own release ([METHOD](../lab/logbook/METHOD.md) §9).
+- **What stays:** the follow and its reads, (a) included, for a notice lost and for a hive whose
+  orchestrator is from before the notice; and the settle bound.
 
 ## 7. `/versions`
 

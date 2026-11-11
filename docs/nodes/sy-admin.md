@@ -985,10 +985,25 @@ time comes, in a task of its own, and sleeps until the next one is due:
   its turn among the background reads (`Reader::InTurn`) before it claims its hive, since 0.1.124:
   one waiting for its turn holds no hive, so an explicit run's pass waits only for the read under
   way, never for the re-reads a run's open queues behind it;
-- a hive in flight is read every 3 s (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`) until it settles,
-  then its config goes, `by` the run that sent its core (`background` for a core it found under
-  way). Before that config, and before the automatic step, the task checks that the motherbee
-  still holds the target (`stale_target` otherwise, said once in the log);
+- **a read of a hive in its restart** (since 0.1.131, FINDINGS A-250): from SY.admin's `restarting`
+  outcome for a hive's core (its core update's answer, or a core found under way) to its `settled`,
+  or to the follow's verdict at the settle bound, a read of that hive waits 10 s
+  (`JSR_ADMIN_INSTALLATION_RESTART_READ_TIMEOUT_SECS`), and one that times out leaves no hold and
+  passes one it finds: the hive's orchestrator restarts itself for the new binary, and a read that
+  reaches it in the few seconds it is off its router, or just before it stops, is never answered.
+  The follow asks it again at once, in a look of its own (each look holds the hive for one read,
+  and the hive's reads still wait for each other), and logs `installation update: a read of a hive
+  in its restart got no answer within its bound: asked again at once`. The read given up runs on
+  at the motherbee's orchestrator to its 45 s, in one of the 4 places it keeps for each target
+  hive, and SY.admin drops its late answer. A read that is answered ends a hold. Outside a
+  restart, a core update that did not answer in time included, the 50 s and the hold stay: they
+  protect a hive that is slow. The spoke reporting its settle itself is the design for later
+  ([hive-config-update-v1](../hive-config-update-v1.md) §6, "Later: the spoke reports its settle");
+- a hive in flight is read every 3 s (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`) until it settles
+  (a read lost in its restart at once, above), then its config goes, `by` the run that sent its
+  core (`background` for a core it found under way). Before that config, and before the automatic
+  step, the task checks that the motherbee still holds the target (`stale_target` otherwise, said
+  once in the log);
 - a hive that did not answer, or not read yet (`unknown`): a check of shared memory every 30 s
   (`JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS`), which asks no one; it is read only once shared
   memory shows its orchestrator (`connected_nodes_from_shm`), and read anyway when shared memory
