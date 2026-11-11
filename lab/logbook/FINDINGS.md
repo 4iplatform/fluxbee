@@ -346,8 +346,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
 - A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; the small fix, SY.admin in 0.1.136).
 - A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin, the orchestrator and SY.wf-rules' delete; with A-271's class in 0.1.133).
-- A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator).
-- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart; the orchestrator in 0.1.136).
+- A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator; built for 0.1.136; the boot's restart on no answer to decide).
+- A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart; built for 0.1.136; a refused API port to decide).
 - A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
 - A-285 🔵 The texts Archi and Cloud read do not describe 0.1.133's new answers (low; SY.admin and SY.architect in 0.1.133; the SDK's catalog later).
 - A-286 🔵 Archi's SCMD reads take `+` for a space where SY.admin keeps it (low; SY.architect).
@@ -365,6 +365,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-298 🔵 Archi's runtime publish that makes a version current recreates the motherbee's nodes of that runtime: new ILK, owned secrets purged, `launched_by: "archi"` (medium; to decide; SY.architect).
 - A-299 🔵 A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it (low; the orchestrator).
 - A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator).
+- A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator).
+- A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic).
+- A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk).
+- A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1442,6 +1446,52 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-304 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.admin review fixes; read in the code; there before it) — A-62's workflow-package admission misses a WF node on a hive cut off from the LSA
+
+- **Why:** `workflow_nodes_elsewhere` reads the connected nodes, which leave out the nodes of a hive
+  the LSA holds stale, so while worker1 is cut off another hive's SY.wf-rules may publish
+  `wf.<x>` although `WF.<x>@worker1` exists.
+- **Effect:** bounded: a publish moves no pinned WF node, and a removal goes through A-281's read
+  of every hive since 0.1.133. Refusing whenever any hive is stale would block every workflow's
+  deploy on every hive.
+- **Fix, to decide later:** refuse only when a cut-off hive may hold a `WF.<x>`, or leave it.
+
+### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
+
+- **Why:** `identity_shm_ilk_tenant` gives nothing when the SHM cannot be read for a moment, so
+  `resolve_case_tenant` gives `CASE_TENANT_MISSING`, answered `tenant_unresolved` with `retryable`
+  false, although sending it again would pass.
+- **Effect:** the Cloud reads a final refusal for a passing failure (`docs/io-cloud-api.md` says it
+  is final); the operator sees the frontdesk's warning *identity SHM unreadable*.
+- **Fix, later (the frontdesk):** an unreadable SHM answers a retryable code, as SY.identity's own
+  passing failures do since 0.1.125 (`identity_unavailable`).
+
+### A-302 [WF/wf-generic] 🔵 low (found 2026-11-11 by A-284's review fixes; read in the code) — Which wf.engine a WF node runs shows only in its unit's ExecStart
+
+- **Why:** wf-generic's `NodeRuntime.VersionStr` is a fixed `"1.0"` that nothing reads
+  (`go/nodes/wf/wf-generic/node/node.go:102`); `get_node_status`'s `runtime_version` and the
+  config's `_system.runtime_version` hold the workflow package's version.
+- **Effect:** while a deploy is under way (Syncthing can bring `wf.engine` to a worker before its
+  core update, and its orchestrator relaunches the WF node at its next pass), nothing the operator
+  reads says which engine each WF node runs; only the unit's ExecStart or the orchestrator's
+  relaunch lines do.
+- **Fix, later:** the WF node reports the engine version it runs, and `get_node_status` shows it
+  next to the package's.
+
+### A-301 [General/orchestrator] 🔵 low (found 2026-11-11 by A-277's review fixes; read in the code; there before it) — A fresh join under a removed hive's name reuses a surviving identity key
+
+- **Why:** `ensure_local_identity_key` (`src/bin/sy_orchestrator.rs` ~1875) reuses any `<hive>.key`
+  it finds. When a removal's key deletion failed (`identity_key_cleanup: delete_failed`), a new join
+  under the same name lists the hive again at its accept (~32862) with the old key, so the old box,
+  if it still runs, is let back in past A-277's refusal: its publishes count again, and its stale
+  snapshot competes with the new box's every 30 s. A narrow window stays even with that fixed: a
+  re-add within one 10 s recheck keeps the old box's session open (the recheck finds the hive
+  listed again, and no restart follows a `delete_failed`).
+- **Fix, later (the orchestrator):** a fresh join (`resumed == false`) deletes a surviving key before
+  `create_dir_all`, and refuses with `IO_ERROR` when it cannot; the recheck could also compare the
+  session's key with the key file (`src/mesh_hmac.rs` is shared code).
+- **Gates:** never join a gate hive again under a name whose box may still run with a surviving key.
+
 ### A-300 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's SY.admin review; read in the code; there before it) — A node pinned to a version is not counted as its use between crash-loop restarts, and the version can be removed under it
 
 - **Why:** the global usage lists a node whose unit runs or gives no answer. A unit between
@@ -1560,6 +1610,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   this becomes the usual case under load (the old runtime ran such a turn, late).
 - **Fix, later (cognition):** an In turn whose `trace_id` the agent answered `ai_runtime_busy` is
   dropped or marked unanswered; the busy answer's trace entry says `busy` since 0.1.135.
+- **Built on `coa/cognition-136` (0.1.136).** From its review: cognition drops the refused turn even
+  when the busy answer never reached the sender (the router copies the agent's send for cognition
+  at entry, before routing, so a busy answer lost to `LINK_BUSY` still drops it); under io.slack
+  the person reads *Error (invalid_text_payload)* and is never told to send again, so A-291's fix
+  (post the answer's `message`, with a send-again hint when `retryable`) goes with this one. The
+  4,096 refusals it remembers are a count: under refusals above about 3 a second for a whole
+  20-minute queue drain, a refused turn still waiting can be analyzed again (wasted calls; its line
+  stays out).
 
 ### A-291 [IO/io.slack] 🔵 low (found 2026-11-11 by A-257's review; read in the code; there before it) — io.slack posts an agent's error answer as *invalid_text_payload*
 
@@ -1666,6 +1724,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `INSTANCES_ACTIVE` (safe: nothing is purged). The count fails exactly for busy workflows.
 - **Fix, later (the WF alone):** a count-only `WF_LIST_INSTANCES` (`count_only: true`: a `COUNT(*)`
   with the same filters, no rows) that SY.wf-rules asks for.
+- **Built on `coa/wf-136` (0.1.136). Found on the way (the builder):** SY.wf-rules read the count
+  through a float64 into an int: a count of -1, or 1e300 (MinInt64 on amd64), read as a node with
+  none, and a delete without force would have purged its instances; 2.5 read as 2. Since 0.1.136 a
+  count that is not a whole number from 0 is a failed count (`INSTANCES_UNKNOWN`). And the engine
+  answered a `WF_LIST_INSTANCES` it could not decode, or one with a status none of the four, from
+  the fields it could read (a count of `Running` was 0); since 0.1.136 both are refused
+  `INVALID_REQUEST`. Neither is reachable on PROD: a correct engine sends no such count, SY.admin
+  checks the status, and SY.wf-rules sends `running`.
 
 ### A-283 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's review; read in the code; there before it; to decide) — The Syncthing watchdog waits on an API that never answers, and never repairs it
 
@@ -1683,6 +1749,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-11):** the safe part, and a bounded restart: after 5 min with no
   answer, `systemctl restart` of Syncthing, at most once an hour, with a drift alert and a log
   line. In 0.1.136 (the orchestrator).
+- **Built on `coa/orch-136` (0.1.136):** a tick counts toward the restart only when Syncthing
+  answered for no folder, and a slow folder is asked last; the unit gains `TimeoutStopSec=30`, so
+  each hive's first 0.1.136 start restarts Syncthing once (*"syncthing runs a stale binary or unit;
+  restarting"*). **To decide (the operator), from its review (there before it):** when Syncthing is
+  active but its API port refuses connections or times out the 2 s connect, every tick tries a
+  start that does nothing and waits 30 s for health, a stopped core service waits about 35 s, and
+  nothing repairs Syncthing. Proposed: count those ticks too (reason *API port refused*), so the
+  same 5 min, once-an-hour restart repairs it.
 
 ### A-282 [General/orchestrator] 🔵 low (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — A replaced binary is taken for current when `systemctl show` gives no answer
 
@@ -1695,6 +1769,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (the orchestrator):** ask again; at boot, a check with no answer restarts (a restart
   also starts a stopped service), recorded in `BootUpgradeRestart` apart from a real replacement;
   Syncthing's caller never restarts on every ensure while `systemctl show` fails.
+- **Built on `coa/orch-136` (0.1.136).** **To decide (the operator), from its review:** any start
+  of the orchestrator restarts a service of the role whose `systemctl show -p MainPID` gives no
+  answer 4 times in 1 s, so a `systemctl restart sy-orchestrator`, or a spoke's start after its
+  core update with systemd's bus busy, restarts rt-gateway and every node reconnects once, with
+  only a journal warning. Proposed: restart on no answer only when the same boot found a replaced
+  binary (the boot's own sign of an upgrade), each such restart recorded in `core.last_update`;
+  one line in `BootBinaryChecks::restarts`. Lost: a package upgrade where every replaced service's
+  check gives no answer keeps its old binary, as before A-282.
 
 ### A-281 [General/admin] 🟡 medium (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — `remove_runtime_version` removes a version whose usage it could not read
 
@@ -1703,7 +1785,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (~18820) fills a missing `usage_global_visible` with `in_use: false`. The orchestrator's global
   usage (`global_visible_runtime_usage_summary`, `src/bin/sy_orchestrator.rs` ~20128) answers
   `{status: error}` with no list when the motherbee's own read fails, and counts only the hives that
-  answered: a spoke that is down, or whose read fails, appears only in `skipped_hives`.
+  answered: a spoke that is down appears only in `skipped_hives`, and one whose own node scan fails
+  answers ok with a failed usage, which counted as no node (`USAGE_UNREADABLE` since 0.1.133).
 - **Effect:** worker1's orchestrator is restarting, so its `GET_RUNTIME` times out, while AI.x@worker1
   runs pinned to ai.generic 0.3.1; the operator removes 0.3.1; SY.admin sees no running node and
   deletes it from dist; worker1's receive-only mirror deletes it when it reconnects; AI.x runs on
@@ -1735,6 +1818,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`coa/orch-usage-133`).
 - **By design:** a failed join's registry entry is a hive that may run nodes and is not read, so it
   refuses every removal until the join is finished or the hive removed; the 409 names it.
+- **SY.admin's review fixes (`coa/admin-usage-133`, `a75c2d4f`):** an ingress or an egress is exempt
+  by the role its registry entry records, in any join state; a hive whose join is not done is
+  named with its status, its join phase and what to do (finish the join or `remove_hive`); the
+  dependents check comes before the use's read; a node pinned to a version whose unit does not run
+  is not counted (A-300), and the texts say to stop it first. Same class, fixed with it:
+  `teardown_node` refuses 503 `INVENTORY_UNAVAILABLE`, nothing removed, for a node whose hive the
+  LSA holds stale (or does not list) while the registry still lists it; before, it removed the
+  node's secrets and purged its ILK.
 
 ### A-280 [General/admin] 🔵 low (found 2026-11-11 by A-274's review; read in the code; there before it) — A publish holds the publication lock across its curate and the edge's publish, and on its failure paths across a clean-up its budget does not bound
 
@@ -1805,6 +1896,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   registry entry.
 - **The operator's call (2026-11-11):** SY.identity refuses a hive the hive registry no longer
   lists. In 0.1.136 (SY.identity).
+- **Built on `coa/identity-136` (0.1.136).** Its residual is the orchestrator's: A-301 (a fresh join
+  under a removed hive's name reuses a surviving key).
+- **Docs at its integration:** `docs/host-posture-and-exposure-spec-v1.md` still expects *"no key
+  for hive"* for a removed hive (A-48's infra steps (2) and (8), and the D6-13/A6-9 row); from
+  0.1.136 the line is `auth: hive '<hive>' is not in the hive registry (removed or never joined)`.
+- **Its gate:** after a removed box's sessions are cut, its refusals come about once a second (the
+  subscription's), then about twice a second once its next reconcile push, within 30 s, finds the
+  publish stream closed.
 
 ### A-276 [General/identity] 🔵 low (found 2026-11-11 by A-191's builder; read in the code) — A replica cut off during a purge can bring back a purged node ILK
 
@@ -1920,6 +2019,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   lines only when the pattern opens the line's message (2026-11-11).
 - **Fix, later:** the router refuses at HELLO a name that is not an L2 name (letters, digits, `.`,
   `-`, `_` and one `@`) of a bounded length.
+- **Another sender (A-293's review, 2026-11-11):** IO.cloud logs the Cloud's `op` unescaped
+  (`op = %op`) on its received and completed lines; a trusted sender, left for the router's fix.
 
 ### A-268 [General/router] 🔵 low (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 
@@ -2076,6 +2177,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   answers without its model (default system and admin only; the frontdesk's override is
   `parse_frontdesk_handoff` and its sender rule); then the SDK's copy of the handoff's shape, its
   gov-common dev-dependency and `tests/frontdesk_handoff_contract.rs` go.
+- **For the AI SDK's next change (A-292's review, 2026-11-11):** pin the busy answer's exact
+  shape: export `ai_runtime_busy` and the `busy` act (or a recognizer) for cognition's
+  `is_busy_answer`, or an SDK test that the busy reply's payload has exactly `type`, `code`,
+  `message` and `retryable` and that the trace's last entry is the agent's with act `busy`.
+  Without it, a new field in the busy answer silently turns A-292 off with every test green. Also:
+  `run_direct_message`'s comment (`runtime.rs` ~772 on `coa/aisdk-135`) and
+  `docs/nodes/sy-frontdesk-gov.md` say IO.cloud takes any error answer to a handoff for
+  `FRONTDESK_REJECTED`, which is stale once 0.1.136 (A-293) ships: update both when 0.1.135 and
+  0.1.136 are merged, and ship the follow-up (answer `ai_runtime_busy` instead of dropping) only
+  after 0.1.136 runs on every motherbee.
 
 ### A-256 [IO/io.cloud] 🔵 low (found 2026-11-10 by A-91's builder; read in the code) — io.cloud accepts `io.inbound_family` and ignores it
 

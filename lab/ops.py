@@ -796,7 +796,7 @@ TIMELINE_MILESTONES = (
     r"hive ready|lifecycle node|service active|ADD_HIVE|add_hive|finalize|join|bootstrap|"
     r"core update|SYSTEM_UPDATE|update category|settle|revert|receive-only|awaiting_update|"
     r"installation update|automatic step|"
-    r"dist check|peer|restart|WAN|uplink|(^|\s)(WARN|ERROR)\s"
+    r"dist check|peer|restart|WAN|uplink|ai_runtime_busy|(^|\s)(WARN|ERROR)\s"
 )
 
 # Runs on each VM: the units' journal lines in the window (UTC), as "epoch_us<TAB>unit<TAB>message",
