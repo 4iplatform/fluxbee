@@ -751,8 +751,9 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
 ## 10. Known limits
 
 The several-routers mode is not supported (§1): nothing starts a second router in a hive, and no
-gate runs one. With one router per hive nothing in this section applies. The defects found in its
-code are fixed with the router's releases, and what is left is listed as a known limit.
+gate runs one. With one router per hive nothing in this section applies. The defects listed first
+were fixed in 0.1.132 on the operator's call (2026-11-10); the rest are known limits, not
+scheduled to be fixed.
 
 Fixed in 0.1.132:
 

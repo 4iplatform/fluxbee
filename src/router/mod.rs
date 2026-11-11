@@ -14583,9 +14583,10 @@ mod tests {
     /// broadcast toward the WAN, to the gateway sibling, and goes on: it holds no guard of the
     /// sibling table while it does, and the hand-over locks that table again. A message to the
     /// motherbee's SY.admin by its UUID and by its name, one the motherbee's frontdesk is resolved
-    /// to, and a broadcast: each is done in time, the first three on the gateway's link with one
-    /// hop less, the broadcast at this router's node. Until 0.1.132 each of them wedged the IRP
-    /// task for good, holding the table and, but for the first, the router's nodes.
+    /// to, and a broadcast: each is done in time (`hand_over`'s bound is the check), on the
+    /// gateway's link with one hop less, the broadcast at this router's node as well, and nothing
+    /// goes back to the sibling. Until 0.1.132 each of them wedged the IRP task for good, holding
+    /// the table and, but for the first, the router's nodes.
     #[tokio::test]
     async fn a_router_that_is_not_the_gateway_hands_a_siblings_frame_on_and_goes_on() {
         let mut scene = Siblings::new(false).await;
@@ -14615,8 +14616,14 @@ mod tests {
             has(messages_on(&mut scene.local), &broadcast),
             "its node got the broadcast"
         );
-        assert!(scene.peers.try_lock().is_ok(), "the sibling table is free");
-        assert!(scene.nodes.try_lock().is_ok(), "and so are the nodes");
+        let handed = messages_on(&mut scene.gateway_link);
+        assert_eq!(handed.len(), 1, "the broadcast: to the gateway");
+        assert_eq!(handed[0].routing.trace_id, broadcast.routing.trace_id);
+        assert_eq!(handed[0].routing.ttl, 15, "the broadcast: one hop less");
+        assert!(
+            messages_on(&mut scene.switch1_link).is_empty(),
+            "the broadcast: nothing to answer"
+        );
     }
 
     /// `handle_message` on worker1's RT.switch2, a router that is not the gateway, with `nodes`,

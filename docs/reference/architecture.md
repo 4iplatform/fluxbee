@@ -339,10 +339,10 @@ orchestrator starts and watches only that unit (`bootstrap_local`, `watchdog_tic
 refuses `add_router` and `delete_router` (`resolve_internal_action_spec`).
 
 The code still has a mode with several routers on one host. It is not supported: nothing starts a
-second router, and no gate runs one. The defects found in its code are fixed with the router's
-releases (since 0.1.132 a router that is not the gateway no longer wedges handing a sibling's frame
-on, an answer goes back to the sibling the frame came from, and a broadcast reaches each router's
-nodes once and is answered once); what is fixed and what is still a known limit is in
+second router, and no gate runs one. Some of its defects were fixed in 0.1.132 on the operator's
+call (2026-11-10): a router that is not the gateway no longer wedges handing a sibling's frame on,
+an answer goes back to the sibling the frame came from, and a broadcast reaches each router's nodes
+once and is answered once. The rest are known limits, not scheduled to be fixed; both lists are in
 [routing-and-policy.md](routing-and-policy.md) §10. How it works:
 
 - `JSR_ROUTER_NAME` names a router; without it the name is `wan.gateway_name` (default
