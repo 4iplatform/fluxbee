@@ -118,7 +118,8 @@ the method and path to one admin action, sent as `ADMIN_COMMAND` to `SY.admin@<h
 (`handle_local_architect_scmd`). `SCMD: help` lists the forms.
 
 Each segment of the path is percent-decoded once, after the path is split, as SY.admin's HTTP
-routes decode theirs (`translate_scmd`, FINDINGS A-287): in
+routes decode theirs (`scmd_path_parts`, FINDINGS A-287), and Archi's own two paths are matched
+the same way (`local_architect_scmd`: `/architect/control/config%2Dget` is config-get): in
 `/hives/worker1/nodes/AI.sales%40worker1/status` the node is `AI.sales@worker1`, a `%2F` stays
 inside its segment (one route prefix, never two segments), and the vault key of
 `/hives/{hive}/vault/secrets/{key}/metadata` is decoded once, never twice. A `%` without two hex

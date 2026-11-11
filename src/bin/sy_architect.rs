@@ -12106,20 +12106,35 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
     }))
 }
 
+/// The two SCMD paths Archi answers itself, never SY.admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalArchitectScmd {
+    ConfigGet,
+    ConfigSet,
+}
+
+/// Which of Archi's own paths an SCMD names, its path read as `translate_scmd` reads every other
+/// (`scmd_path_parts`): `/architect/control/config%2Dget` is config-get, where its segments were
+/// matched as written and it went on to `translate_scmd`, which has no route for it.
+fn local_architect_scmd(parsed: &ParsedScmd) -> Option<LocalArchitectScmd> {
+    let (segments, _) = scmd_path_parts(&parsed.path);
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match (parsed.method.as_str(), segments.as_slice()) {
+        ("GET", ["architect", "control", "config-get"]) => Some(LocalArchitectScmd::ConfigGet),
+        ("POST", ["architect", "control", "config-set"]) => Some(LocalArchitectScmd::ConfigSet),
+        _ => None,
+    }
+}
+
 async fn handle_local_architect_scmd(
     state: &ArchitectState,
     parsed: &ParsedScmd,
 ) -> Result<Option<Value>, ArchitectError> {
-    let segments: Vec<&str> = parsed
-        .path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    match (parsed.method.as_str(), segments.as_slice()) {
-        ("GET", ["architect", "control", "config-get"]) => {
+    match local_architect_scmd(parsed) {
+        Some(LocalArchitectScmd::ConfigGet) => {
             Ok(Some(handle_architect_local_config_get(state).await?))
         }
-        ("POST", ["architect", "control", "config-set"]) => {
+        Some(LocalArchitectScmd::ConfigSet) => {
             let body = parsed.body.clone().unwrap_or_else(|| json!({}));
             if !body.is_object() {
                 return Err(
@@ -12128,7 +12143,7 @@ async fn handle_local_architect_scmd(
             }
             Ok(Some(handle_architect_local_config_set(state, body).await?))
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -13284,25 +13299,31 @@ fn render_executor_plan_submission(execution_id: &str, plan: &Value) -> String {
     format!("EXECUTOR_PLAN {execution_id}\n{pretty}")
 }
 
-fn translate_scmd(
-    local_hive_id: &str,
-    parsed: ParsedScmd,
-) -> Result<AdminTranslation, ArchitectError> {
-    let (path_only, raw_query) = match parsed.path.split_once('?') {
+/// An SCMD path's segments and its raw query (after the `?`). Each segment is decoded once, after
+/// the path is split, as SY.admin's HTTP routes decode theirs (FINDINGS A-287), where only the
+/// vault key's was: `AI.sales%40worker1` is AI.sales@worker1, a `%2F` stays inside its segment,
+/// and a `%` that is no escape goes as it came, a name SY.admin refuses or finds nothing by, as in
+/// the query (A-279). A `+` stays a `+`, as in the query (A-286); SY.admin's routes read one in a
+/// path as a space, and a node's, a runtime's, a hive's or a vault key's name holds neither.
+/// `translate_scmd` and Archi's own paths (`local_architect_scmd`) read a path with it.
+fn scmd_path_parts(path: &str) -> (Vec<String>, Option<&str>) {
+    let (path_only, raw_query) = match path.split_once('?') {
         Some((path, query)) => (path, Some(query)),
-        None => (parsed.path.as_str(), None),
+        None => (path, None),
     };
-    // Each segment decoded once, after the path is split, as SY.admin's HTTP routes decode theirs
-    // (FINDINGS A-287), where only the vault key's was: `AI.sales%40worker1` is AI.sales@worker1,
-    // a `%2F` stays inside its segment, and a `%` that is no escape goes as it came, a name
-    // SY.admin refuses or finds nothing by, as in the query (A-279). A `+` stays a `+`, as in the
-    // query (A-286); SY.admin's routes read one in a path as a space, and a node's, a runtime's, a
-    // hive's or a vault key's name holds neither.
-    let decoded: Vec<String> = path_only
+    let segments = path_only
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(percent_decode)
         .collect();
+    (segments, raw_query)
+}
+
+fn translate_scmd(
+    local_hive_id: &str,
+    parsed: ParsedScmd,
+) -> Result<AdminTranslation, ArchitectError> {
+    let (decoded, raw_query) = scmd_path_parts(&parsed.path);
     let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
     let admin_target = format!("SY.admin@{local_hive_id}");
 
@@ -33198,6 +33219,55 @@ mod tests {
             parse("curl -X GET /hives/worker1/nodes%2FAI.sales%40worker1/status")
         )
         .is_err());
+    }
+
+    /// The review of FINDINGS A-287: the two paths Archi answers itself are read as
+    /// `translate_scmd` reads every other, each segment decoded once after the path is split and
+    /// the query apart, where their segments were matched as written: `config%2Dget` went on to
+    /// `translate_scmd`, which has no route for it ("unsupported SCMD path").
+    #[test]
+    fn archis_own_scmd_paths_are_decoded_as_every_other() {
+        for (raw, local) in [
+            (
+                "curl -X GET /architect/control/config-get",
+                Some(LocalArchitectScmd::ConfigGet),
+            ),
+            (
+                "curl -X GET /architect/control/config%2Dget",
+                Some(LocalArchitectScmd::ConfigGet),
+            ),
+            (
+                "curl -X GET '/architect/control/config-get?requested_by=archi'",
+                Some(LocalArchitectScmd::ConfigGet),
+            ),
+            (
+                "curl -X POST /architect/control/config%2dset -d '{\"config\":{}}'",
+                Some(LocalArchitectScmd::ConfigSet),
+            ),
+            (
+                "curl -X POST /%61rchitect/control/config-set -d '{\"config\":{}}'",
+                Some(LocalArchitectScmd::ConfigSet),
+            ),
+            // An encoded `/` stays inside its segment: two segments, no path of Archi's.
+            (
+                "curl -X POST /architect%2Fcontrol/config-set -d '{\"config\":{}}'",
+                None,
+            ),
+            ("curl -X GET /architect/control/config-set", None),
+            ("curl -X POST /architect/control/config-get", None),
+            ("curl -X GET /architect/control/config%2Dget%2", None),
+            ("curl -X GET /hives/motherbee/nodes", None),
+        ] {
+            assert_eq!(local_architect_scmd(&parse(raw)), local, "{raw}");
+        }
+        assert!(
+            translate_scmd(
+                "motherbee",
+                parse("curl -X GET /architect/control/config%2Dget")
+            )
+            .is_err(),
+            "SY.admin has no route for Archi's own path"
+        );
     }
 
     /// FINDINGS A-279: Archi's read tool names the timer list among the lists that answer in pages,
