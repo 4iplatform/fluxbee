@@ -572,7 +572,9 @@ When a WF takes a message nowhere, it answers `NOT_TAKEN`
   - `not_expected`: "the conversation does not expect a message from you now";
   - `invalid_input`: "the message is not valid here";
   - `no_thread`: "the message has no conversation";
-  - a reason the node does not know: "Not taken.".
+  - `unavailable` (the WF cannot use its instance store, and takes no message until it can;
+    FINDINGS A-217, A-226): "the conversation cannot take messages right now; try again later";
+  - a reason the node does not know: "Not taken.", with a `warn` line.
 - The text is fixed by the reason: the answer's `detail` is never posted. An answer is shown once,
   and one for a message not remembered is dropped with a log line.
 - Any other system message stays ignored, and never reaches the channel.

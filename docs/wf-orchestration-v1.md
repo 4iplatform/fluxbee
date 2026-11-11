@@ -1332,6 +1332,9 @@ design chat; the build design is §5.4.10, the review round §5.4.11, and the ga
 - **"Not taken" is the engine's answer `NOT_TAKEN`,** a system message to the sender, with a reason:
   `no_conversation`, `not_expected`, `invalid_input` or `no_thread`. It takes `INVALID_INPUT`'s
   place.
+  - *Changed by A-217 (0.1.123):* a fifth reason, `unavailable`: the WF node cannot use its
+    instance store, and takes no message until it can. Any other sender gets it for a named
+    request, as `no_thread` and `invalid_input`.
 - **The IO node shows it to whoever wrote, as an error.** io.slack posts a message that only that
   person sees, where they wrote.
 - **Today's rules stay for everyone else:**
@@ -1431,6 +1434,8 @@ Read in the code on 2026-11-02, at `3d9325b4`. Five pieces; the contracts betwee
       instance's log keeps today's `unhandled event` entry.
   - **To any other sender,** only a named request gets it (`neverAnswered`), for `no_thread` and
     `invalid_input`, as `INVALID_INPUT` today.
+  - *Changed by A-217 (0.1.123):* and `unavailable`, to both, while the WF node cannot use its
+    instance store (§5.4.6).
   - `isReply` takes `NOT_TAKEN` instead of `INVALID_INPUT`, so it never starts an instance and is
     never answered.
 - **A-135:** a message with no thread starts nothing, and `creationThread` goes. A sender other than
@@ -1504,6 +1509,8 @@ ai.generic: its config, its runner and its docs. SY.architect and the frontdesk 
   - The reasons' texts: `no_conversation`, "no conversation here takes this message"; `not_expected`,
     "the conversation does not expect a message from you now"; `invalid_input`, "the message is not
     valid here"; `no_thread`, "the message has no conversation".
+    - *Added by A-226 (the operator's call, 2026-11-10):* `unavailable` (A-217), "the conversation
+      cannot take messages right now; try again later".
   - Any other system message stays ignored, as today.
 - **The facts:** a message's `meta.context.wf.vars`, when it is a non-empty object, is a context line
   under its text: `key: value` pairs, escaped, each value cut at 200 characters, 10 keys at most.

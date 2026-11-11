@@ -196,13 +196,15 @@ impl RelayedMessages {
     }
 }
 
-/// What a reason says to whoever wrote: the reasons the engine gives, or `None`.
+/// What a reason says to whoever wrote: the reasons the engine gives, or `None`. `unavailable` is
+/// a WF whose store is down, which takes no message until it opens again (FINDINGS A-217, A-226).
 fn reason_text(reason: &str) -> Option<&'static str> {
     match reason {
         "no_conversation" => Some("no conversation here takes this message"),
         "not_expected" => Some("the conversation does not expect a message from you now"),
         "invalid_input" => Some("the message is not valid here"),
         "no_thread" => Some("the message has no conversation"),
+        "unavailable" => Some("the conversation cannot take messages right now; try again later"),
         _ => None,
     }
 }
@@ -530,6 +532,10 @@ mod tests {
             text("no_thread"),
             "Not taken: the message has no conversation"
         );
+        assert_eq!(
+            text("unavailable"),
+            "Not taken: the conversation cannot take messages right now; try again later"
+        );
         assert_eq!(text("<!here> anything"), "Not taken.");
         assert_eq!(not_taken_text(&json!({})), "Not taken.");
     }
@@ -558,6 +564,40 @@ mod tests {
                     "user": "U0JUAN",
                     "text": "Not taken: the conversation does not expect a message from you now",
                     "thread_ts": "1793000000.000100",
+                })
+            )]
+        );
+    }
+
+    /// A WF whose store is down answers `unavailable` (FINDINGS A-217, A-226): whoever wrote reads
+    /// that the conversation takes no message now, never the store's error the answer carries as
+    /// its `detail`, and the node knows the reason.
+    #[tokio::test]
+    async fn a_wf_whose_store_is_down_is_shown_as_unavailable() {
+        let api = FakeWebApi::start(&[]).await;
+        let slack = api.client().await;
+        let relayed = RelayedMessages::new();
+        relayed.remember(
+            &relayed_message("trace-1", "U0JUAN", None),
+            crate::now_epoch_ms(),
+        );
+        let mut answer = not_taken("trace-1", Some(WF));
+        answer.payload = json!({
+            "ok": false,
+            "error": "not_taken",
+            "reason": "unavailable",
+            "detail": "database disk image is malformed"
+        });
+        assert!(reason_text("unavailable").is_some());
+        show(&slack, &relayed, &answer).await;
+        assert_eq!(
+            api.calls(),
+            vec![(
+                "chat.postEphemeral".to_string(),
+                json!({
+                    "channel": "C0SALES",
+                    "user": "U0JUAN",
+                    "text": "Not taken: the conversation cannot take messages right now; try again later",
                 })
             )]
         );
