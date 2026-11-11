@@ -959,6 +959,10 @@ person: when its provider gave no answer, the error carries the operator's text 
   or that they could not be counted: a WF node that is not `RUNNING` keeps them, and the removal
   ends them. The operator's confirmation removes the workflow with `force`. To let them finish,
   wait; to end them one by one, cancel them.
+  - Without `force` it is refused while the node runs instances (`INSTANCES_ACTIVE`) and when they
+    cannot be counted (`INSTANCES_UNKNOWN`: the node is not `RUNNING`, or does not answer).
+  - `ORCHESTRATOR_ERROR`, with `force` too: the WF node's config read was refused or got no
+    answer, so nothing changed. Ask again.
   - `PACKAGE_PUBLISH_FAILED` after a removal: the workflow, its node and its state are gone, and
     only some of its old versions stayed (their `remove_runtime_version` was refused or not
     answered, the reason in the detail). Say so; never that the removal failed, and never run it

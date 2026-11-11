@@ -1668,7 +1668,9 @@ states, named in the answer. Source: `handle_web_status` and `io_web_status` in
 - `starting`, `stopped`, `failed`: the orchestrator's lifecycle;
 - `absent`: the orchestrator has no `IO.web@motherbee` (`NODE_NOT_FOUND`), never launched or
   purged. io.web starts only with an explicit `run_node`, in the root tenant;
-- `unknown`: neither read says (`view_error`, `answer_error`).
+- `unknown`: neither read says (`view_error`, `answer_error`), or the orchestrator's
+  `lifecycle_state` is `UNKNOWN`: the hive's systemd did not answer for io.web's unit (FINDINGS
+  A-271, since 0.1.133). Read it again.
 
 Times are RFC 3339. A read, so it is not in the audit log; over the mesh only Archi may ask for it
 (`mesh_access`).

@@ -16544,7 +16544,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "force",
                 "bool",
-                "Force delete even if active instances exist.",
+                "Delete even when the WF node runs instances, or when they cannot be counted (the node is not RUNNING, or does not answer): they go with the node. Without it such a delete is refused, INSTANCES_ACTIVE or INSTANCES_UNKNOWN.",
             ),
             admin_action_body_field(
                 "hive",
@@ -16600,12 +16600,12 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "limit",
                 "u32",
-                "Optional result limit. Defaults inside SY.timer and is capped there.",
+                "Optional: at most this many timers on the page, 100 without it, up to 1000 (a larger limit is cut to 1000).",
             ),
             admin_action_body_field(
                 "cursor",
                 "string",
-                "Optional: the next_cursor of the page before. SY.timer answers a page that fits one frame, with next_cursor while more timers follow.",
+                "Optional: the next_cursor of the page before, <fire_at_utc_ms>:<uuid>, passed back as it came. A page ends at limit or where one frame (128 KiB) fills, and has next_cursor while timers follow, whichever cut it (since 0.1.133, FINDINGS A-266); the answer has no total. A cursor that is not one is refused, TIMER_INVALID_PAYLOAD (400).",
             ),
         ],
         _ => Vec::new(),
@@ -17214,6 +17214,13 @@ const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDIN
 /// Which pages a node's purge names, and the publish it does not wait for.
 const NODE_PAGES_LEFT_UP_NOTE: &str = "A node's purge names the pages the node published (publisher_l2_name); a stop names none. A publish of the node in flight at its purge is not waited for: its page may still go up within 110 s, unnamed, and stays up until it expires like the rest.";
 
+/// What the node actions that check the node's unit answer while systemd does not (FINDINGS
+/// A-271).
+const NODE_UNIT_UNANSWERED_NOTE: &str = "502 SERVICE_FAILED with retryable: true in its payload: the hive's systemd did not answer whether the node's unit runs, though asked again for up to a second, and nothing was done (run_node undoes its launch, its config and identity included; FINDINGS A-271, since 0.1.133). Ask again: the same action is answered once systemd answers.";
+
+/// What the node reads say of a node's lifecycle (FINDINGS A-271).
+const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and the router sees the node), STARTING (its unit runs and the router does not see it yet), STOPPED, FAILED or UNKNOWN. UNKNOWN: the hive's systemd did not answer whether the node's unit runs (FINDINGS A-271, since 0.1.133): read it again, and never take it for STOPPED. A managed node whose unit does not run and that has no config or state left reads UNKNOWN too.";
+
 /// What `remove_runtime_version` refuses, nothing removed.
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: the detail names each node (the first 20) with its hive and lifecycle, RUNNING, STARTING (its unit runs and the router does not see it yet) or UNKNOWN (its hive's systemd did not answer whether its unit runs: it is listed until systemd answers that it does not), and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again.";
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): the motherbee's orchestrator did not answer the read, refused it or failed its own nodes' read, or a worker, or a hive whose join is under way, did not answer it (UNREACHABLE: down, restarting, or stale in the LSA) or answered it with an error (RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet). An ingress or an egress receives no runtime, and is never one of them. payload.unanswered_hives names each, {hive, reason, detail}, payload.retryable is true, and nothing was removed. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
@@ -17316,6 +17323,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "list_tenant_nodes" => vec![
             "Every managed node charged to the tenant, on every connected hive: node_name, hive, runtime, lifecycle_state, health_state, identity (ilk_id, tenant_id), launched_by (cloud, archi, operator, system) and relaunch_on_boot (false once stopped).",
             "A hive that does not answer is listed in unreachable_hives. Fluxbee Cloud reads its tenant's nodes this way (list_nodes).",
+            NODE_LIFECYCLE_NOTE,
             "Nodes come in the order of their hive, then their name.",
             PAGE_NOTE,
         ],
@@ -17324,7 +17332,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For all nodes across the system, use GET /inventory or GET /inventory/summary instead.",
             "For node software versions, use GET /versions or GET /hives/{hive}/versions and map node names to core/runtime entries.",
             "Nodes come in the order of their name; node_count counts every node of the hive.",
+            NODE_LIFECYCLE_NOTE,
             PAGE_NOTE,
+        ],
+        "get_node_status" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "payload.node_status holds lifecycle_state, read from the node's unit (an SY node's packaged unit, the router's rt-gateway) and the router's LSA, and health_state: for a RUNNING node what it reports (health_source NODE_REPORTED), or what the orchestrator infers when it does not answer (ORCHESTRATOR_INFERRED); UNKNOWN for any other node. A read writes nothing; observed_at dates it.",
+            NODE_LIFECYCLE_NOTE,
+            "A node that does not exist answers 404 NODE_NOT_FOUND: a managed node is gone only when nothing of it is left and systemd answers that its unit neither runs nor failed.",
         ],
         "run_node" => vec![
             "Use this only when creating/spawning a new managed instance.",
@@ -17334,6 +17349,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "A tenant that is not active (pending or suspended) starts no node: TENANT_NOT_ACTIVE.",
             "WF.* managed nodes must use an already published workflow package runtime, for example wf.invoice. Do not spawn WF.* directly with the base runtime wf.engine; use wf_rules_compile_apply with auto_spawn=true to publish and deploy workflows.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
+            NODE_UNIT_UNANSWERED_NOTE,
         ],
         "start_node" => vec![
             "Use this when the persisted managed node instance already exists and needs to be started again.",
@@ -17341,6 +17357,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Refused with TENANT_NOT_ACTIVE while the node's tenant is pending or suspended.",
             "It also sets relaunch_on_boot again, which a stop (kill_node without purge_instance) clears.",
             "The hive target comes from the /hives/{hive} path in HTTP.",
+            "A node whose unit runs, or that the router sees, answers ok with state already_running.",
+            NODE_UNIT_UNANSWERED_NOTE,
         ],
         "restart_node" => vec![
             "Use this when the managed node instance already exists and should be restarted.",
@@ -17353,6 +17371,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
             "Without purge_instance it is a stop that lasts: the boot and periodic relaunches leave the node down (relaunch_on_boot false) until start_node or restart_node. A node that dies on its own is still relaunched.",
             "With purge_instance it is the full teardown: its timers, the secrets it owns and its identity go, and the name is free again.",
+            NODE_UNIT_UNANSWERED_NOTE,
             PAGES_LEFT_UP_NOTE,
             NODE_PAGES_LEFT_UP_NOTE,
         ],
@@ -17369,6 +17388,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "remove_node_instance" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "Refused while the node's unit runs or the router sees the node (NODE_INSTANCE_RUNNING, 409): stop it first (kill_node).",
+            NODE_UNIT_UNANSWERED_NOTE,
             PAGES_LEFT_UP_NOTE,
             NODE_PAGES_LEFT_UP_NOTE,
         ],
@@ -17695,6 +17716,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "workflow_name is required.",
             "Delete is a direct command to SY.wf-rules, not a node CONFIG_SET operation.",
             "SY.wf-rules purges the workflow's WF node (kill_node with purge_instance) and answers {deleted, wf_node: {node_name, action}}.",
+            "Without force it is refused, with nothing changed, while the WF node runs instances (INSTANCES_ACTIVE, with the count) and when they cannot be counted (INSTANCES_UNKNOWN, saying why): the node is not RUNNING (its state named), or its status read or its count failed or got no answer (FINDINGS A-270, since 0.1.133). A node that is not RUNNING keeps its instances in its store, and force removes them with it.",
+            "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR (502): whether the node exists is unknown, and nothing changed. Ask again.",
             "Then SY.wf-rules removes every published version of wf.<workflow_name> (remove_runtime_version). A removal SY.admin refuses (RUNTIME_IN_USE, or RUNTIME_USAGE_UNKNOWN while a hive's nodes cannot be read: FINDINGS A-281) makes it answer PACKAGE_PUBLISH_FAILED with that refusal, though the workflow, its node and its state are gone: those versions stay in dist.",
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of its WF node, wf_node.node_name.",
@@ -17801,7 +17824,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "web.state is declared (web.hosts), absent (no web section, or no key set) or invalid (web.reason says why). hive.yaml is read at boot.",
             "certificate.names are the names the ACME client certifies (config.names of GET /acme/status); certificate.served is the leaf the edge served at the ACME client's last look (edge.last_seen there), last_answer_at the edge's last answer, and hosts_missing the web hosts that leaf does not cover (null without a leaf). GET /acme/status asks the edge afresh.",
             "routes.state is the edge's answer to the last push of the full set (routes.set, pushed at the start and every 60 s): acknowledged, refused, no_answer, no_edge (no admin.public_edge_node and not exactly one connected ingress; routes.detail says which) or not_pushed before the first push. acknowledged_at is the edge's last acknowledgement.",
-            "io_web.state: running (it answered NODE_STATUS_GET in 3 s: io_web.answer); otherwise the orchestrator's view (lifecycle_state, as GET /hives/motherbee/nodes/IO.web@motherbee/status reads it): silent (it runs but did not answer), starting, stopped, failed, absent (no IO.web@motherbee: it starts only with run_node, in the root tenant); unknown when neither says (view_error, answer_error).",
+            "io_web.state: running (it answered NODE_STATUS_GET in 3 s: io_web.answer); otherwise the orchestrator's view (lifecycle_state, as GET /hives/motherbee/nodes/IO.web@motherbee/status reads it): silent (it runs but did not answer), starting, stopped, failed, absent (no IO.web@motherbee: it starts only with run_node, in the root tenant); unknown when neither says (view_error, answer_error), or when the orchestrator's lifecycle_state is UNKNOWN (the hive's systemd did not answer for io.web's unit: read it again).",
         ],
         _ => vec![],
     }
@@ -30340,8 +30363,8 @@ mod tests {
             json!([
                 { "name": "owner_l2_name", "type": "string", "description": "Optional canonical L2 owner filter. When omitted, SY.timer returns timers for the full hive." },
                 { "name": "status_filter", "type": "string", "description": "Optional timer status filter: pending, fired, canceled, or all." },
-                { "name": "limit", "type": "u32", "description": "Optional result limit. Defaults inside SY.timer and is capped there." },
-                { "name": "cursor", "type": "string", "description": "Optional: the next_cursor of the page before. SY.timer answers a page that fits one frame, with next_cursor while more timers follow." }
+                { "name": "limit", "type": "u32", "description": "Optional: at most this many timers on the page, 100 without it, up to 1000 (a larger limit is cut to 1000)." },
+                { "name": "cursor", "type": "string", "description": "Optional: the next_cursor of the page before, <fire_at_utc_ms>:<uuid>, passed back as it came. A page ends at limit or where one frame (128 KiB) fills, and has next_cursor while timers follow, whichever cut it (since 0.1.133, FINDINGS A-266); the answer has no total. A cursor that is not one is refused, TIMER_INVALID_PAYLOAD (400)." }
             ])
         );
     }
@@ -36838,6 +36861,61 @@ mod tests {
             .iter()
             .any(|note| note.contains("RUNTIME_USAGE_UNKNOWN")
                 && note.contains("PACKAGE_PUBLISH_FAILED")));
+    }
+
+    /// FINDINGS A-285: the help Archi and the operator read says what 0.1.133 answers. A node
+    /// action whose unit check systemd did not answer is 502 SERVICE_FAILED with retryable: true,
+    /// nothing done (A-271); a node read's lifecycle_state can be UNKNOWN, read again (A-271); a
+    /// workflow's delete needs force also when its instances cannot be counted, and a config read
+    /// with no answer refuses it with force too (A-270). timer_list's fields are pinned with its
+    /// contract (`timer_list_request_contract_exposes_owner_filter`), and RUNTIME_IN_USE's detail
+    /// by `runtime_in_use_names_each_node_with_its_hive_and_state`.
+    #[test]
+    fn the_help_says_what_the_node_actions_answer_since_0_1_133() {
+        for action in [
+            "run_node",
+            "start_node",
+            "kill_node",
+            "remove_node_instance",
+        ] {
+            assert!(
+                admin_action_request_notes(action).contains(&NODE_UNIT_UNANSWERED_NOTE),
+                "{action}"
+            );
+        }
+        assert!(NODE_UNIT_UNANSWERED_NOTE.starts_with("502 SERVICE_FAILED with retryable: true"));
+        assert!(NODE_UNIT_UNANSWERED_NOTE.contains("nothing was done"));
+        assert!(NODE_UNIT_UNANSWERED_NOTE.contains("Ask again"));
+
+        for action in ["get_node_status", "list_nodes", "list_tenant_nodes"] {
+            assert!(
+                admin_action_request_notes(action).contains(&NODE_LIFECYCLE_NOTE),
+                "{action}"
+            );
+        }
+        assert!(NODE_LIFECYCLE_NOTE
+            .contains("UNKNOWN: the hive's systemd did not answer whether the node's unit runs"));
+        assert!(NODE_LIFECYCLE_NOTE.contains("read it again"));
+        assert!(admin_action_request_notes("web_status")
+            .iter()
+            .any(|note| note.contains("lifecycle_state is UNKNOWN")));
+
+        let force = admin_action_body_optional_fields("wf_rules_delete")
+            .into_iter()
+            .find(|field| field["name"] == json!("force"))
+            .expect("force");
+        let force = force["description"].as_str().unwrap_or_default();
+        for words in ["cannot be counted", "not RUNNING", "INSTANCES_UNKNOWN"] {
+            assert!(force.contains(words), "{force}");
+        }
+        let notes = admin_action_request_notes("wf_rules_delete").join(" ");
+        for words in [
+            "INSTANCES_UNKNOWN",
+            "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR",
+            "Ask again",
+        ] {
+            assert!(notes.contains(words), "{words}");
+        }
     }
 
     /// The executor runs it as the operator, and no mesh caller reaches it, Archi included.
