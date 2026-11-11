@@ -330,7 +330,10 @@ At the router where it enters from a node (`handle_message`):
    (`pattern_match`: exact, or `*` wildcards).
 3. `ttl >= 2`: a copy to every sibling router (`broadcast_to_peers`).
 4. `ttl >= 3`: toward the WAN. The gateway sends it to every WAN peer; another router sends it to
-   the gateway sibling (`forward_broadcast_to_wan`).
+   the gateway sibling (`forward_broadcast_to_wan`), a hop that takes one off, and the gateway
+   sends a sibling's copy on to the WAN only with `ttl >= 3` left. So from a router that is not
+   the gateway a broadcast needs `ttl >= 4` to cross the WAN; with 3 it reaches its hive's nodes
+   and no other hive, and its sender is not told (§10).
 
 A sibling delivers it to its own nodes and, with `ttl >= 3`, sends it toward the WAN as in step 4,
 unless the gateway sibling handed it over: the gateway sent it toward the WAN itself, so it goes
@@ -803,8 +806,9 @@ Fixed in 0.1.132:
   against the broadcast cache, as one from a node or from the WAN is (§4). Until then a router
   delivered every copy that reached it, and the gateway, which gets a broadcast from the router it
   entered and again from each sibling that sends it on toward the WAN, delivered it and sent it to
-  the WAN once per copy. Those copies still travel to the gateway, which drops them; since 0.1.134
-  a sibling no longer sends one the gateway handed it back to the gateway (A-272, §4).
+  the WAN once per copy. Those copies still travel to the gateway, which drops them (Known limits,
+  below); since 0.1.134 a sibling no longer sends one the gateway handed it back to the gateway
+  (A-272, §4).
 - **Two links from one sibling at once register it once** (A-208): the check and the entry take
   one guard, as on the side that dials.
 
@@ -817,6 +821,16 @@ Known limits:
 - **Hub-vouched nodes need the gateway.** Only the gateway holds the reachability table, so a node
   vouched for by the hub cannot reach a node on a sibling router (`remote_source_from_gateway`
   comment), nor can a sibling resolve it.
+- **A broadcast that enters a router that is not the gateway needs `ttl >= 4` to cross the WAN,
+  and reaches the gateway more than once.** Its hand-over to the gateway sibling takes a hop, and
+  the gateway sends a sibling's copy on to the WAN only with `ttl >= 3` left (§4): with `ttl` 3 it
+  reaches the nodes of its hive's routers and no other hive, and its sender is not told, since its
+  router handed it to the gateway, and the gateway answers nothing for a copy a sibling hands it
+  (A-246). The gateway gets it twice from the router it entered (as a sibling, step 3, and toward
+  the WAN, step 4), and once more from each other sibling, which sends its own copy on toward the
+  WAN; it takes the first, and its cache drops the others. Another sibling's copy is one hop
+  shorter, so when it comes first the broadcast leaves for the WAN with one hop less, and with
+  `ttl` 4 not at all. The SDKs send 16.
 
 ---
 
