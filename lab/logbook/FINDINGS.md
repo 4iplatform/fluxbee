@@ -283,7 +283,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
-  across chat turns; the atoms become a document of their own.
+  across chat turns; the atoms become a document of their own. **A large topic (the operator,
+  2026-11-11), to think about first:** a repository that keeps the solutions as sources (scripts),
+  with their versions, since several solutions can live in one tenant.
 
 ### IO
 
