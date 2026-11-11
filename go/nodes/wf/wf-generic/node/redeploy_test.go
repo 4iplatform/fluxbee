@@ -69,16 +69,23 @@ func TestARedeployKeepsARunningInstanceOnItsDefinition(t *testing.T) {
 
 // A running instance whose definition is not kept, or no longer loads (one written before 0.1.90,
 // with meta.type), cannot go on: recovery fails it (definition_unavailable), loudly, instead of an
-// instance that errs on every event forever.
+// instance that errs on every event forever. So does one born with an earlier version of the
+// workflow whose timer is more than 366 days ahead, at the first start of an engine of FINDINGS
+// A-254: SY.timer refused that timer every time, and the instance waited for a fire that never came.
 func TestAnInstanceWhoseDefinitionIsGoneFailsAtRecovery(t *testing.T) {
 	rt, _ := newTestRuntime(t, "", deployWorkflowJSON("v1"), &mockTimerLister{})
 	putRunningInstance(t, rt, "wfi:lost", "waiting")
 	putRunningInstance(t, rt, "wfi:outdated", "waiting")
+	putRunningInstance(t, rt, "wfi:too-far", "waiting")
 	outdated := strings.Replace(askingWorkflowJSON, `"meta": {"msg": "ASK"}`, `"meta": {"msg": "ASK", "type": "system"}`, 1)
-	if err := rt.Store.PutDefinition(context.Background(), DefinitionRow{Hash: "outdated", WorkflowType: "deploy", DefinitionJSON: outdated}); err != nil {
-		t.Fatal(err)
+	tooFar := strings.Replace(deployWorkflowJSON("v0"), `{"name": "waiting", "transitions"`,
+		`{"name": "waiting", "entry_actions": [{"type": "schedule_timer", "timer_key": "renewal", "fire_in": "400d"}], "transitions"`, 1)
+	for hash, definition := range map[string]string{"outdated": outdated, "too-far": tooFar} {
+		if err := rt.Store.PutDefinition(context.Background(), DefinitionRow{Hash: hash, WorkflowType: "deploy", DefinitionJSON: definition}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	for id, hash := range map[string]string{"wfi:lost": "never-kept", "wfi:outdated": "outdated"} {
+	for id, hash := range map[string]string{"wfi:lost": "never-kept", "wfi:outdated": "outdated", "wfi:too-far": "too-far"} {
 		if _, err := rt.Store.db.Exec(`UPDATE wf_instances SET definition_hash = ? WHERE instance_id = ?;`, hash, id); err != nil {
 			t.Fatal(err)
 		}
@@ -86,7 +93,7 @@ func TestAnInstanceWhoseDefinitionIsGoneFailsAtRecovery(t *testing.T) {
 	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"wfi:lost", "wfi:outdated"} {
+	for _, id := range []string{"wfi:lost", "wfi:outdated", "wfi:too-far"} {
 		if row := mustGetInstance(t, rt, id); row.Status != "failed" {
 			t.Fatalf("%s: %+v", id, row)
 		}
@@ -94,8 +101,13 @@ func TestAnInstanceWhoseDefinitionIsGoneFailsAtRecovery(t *testing.T) {
 			t.Fatalf("%s: its log names the cause: %+v", id, entry)
 		}
 	}
-	if _, kept, _ := rt.Store.GetDefinition(context.Background(), "outdated"); kept {
-		t.Fatal("a definition no running instance uses goes")
+	if entry := lastLog(t, rt, "wfi:too-far"); !strings.Contains(entry.ErrorDetail, "fire_in: must be at most 366d") {
+		t.Fatalf("the cause names the timer past SY.timer's ceiling: %+v", entry)
+	}
+	for _, hash := range []string{"outdated", "too-far"} {
+		if _, kept, _ := rt.Store.GetDefinition(context.Background(), hash); kept {
+			t.Fatalf("%s: a definition no running instance uses goes", hash)
+		}
 	}
 }
 

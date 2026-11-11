@@ -1031,6 +1031,8 @@ A store of schema version 3 migrates at the node's start: each instance takes it
 
 **The upgrade to 0.1.91.** A definition written before 0.1.91 no longer loads: it has no `start_from`, and may have `thread_id_ref`. Its node is `FAILED_CONFIG` (`invalid_definition`) until the workflow is redeployed with `start_from`, and the running instances born with such a definition fail at the next start (`definition_unavailable`).
 
+**The upgrade past FINDINGS A-254.** A definition whose literal `fire_in`, or a `$ref`'s `default`, is more than 366 days no longer loads (`must be at most 366d`, §9 item 9): SY.timer refused that timer every time, and it never fired. Its node is `FAILED_CONFIG` (`invalid_definition`) while it is the current definition, until the workflow is redeployed within SY.timer's ceiling; and the running instances born with such a definition, the current one or an earlier version the node keeps for them, fail at the first start of the new engine (`definition_unavailable`), not only those of the current definition.
+
 **`wf_inbound_events`** — the inbound journal: an event the runtime took and has not finished, with the starts that ran it again (`attempts`, §14.4).
 
 ```sql
