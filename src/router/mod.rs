@@ -2499,7 +2499,11 @@ async fn vouched_nodes(ctx: &WanContext) -> Vouched {
 
 /// The hub's `WAN_REACHABILITY` frame for the link of `target_hive`, whose router is
 /// `target_router`: every node it vouches for but the target's own (split-horizon: a spoke learns
-/// its own nodes from its own LSA). None when there is no node to tell of.
+/// its own nodes from its own LSA). It goes with no node too: the spoke takes each advertisement
+/// for the hub's whole set, so an empty one takes back the last nodes the hub vouched for to it.
+/// Until 0.1.131 none went then, and the spoke kept those nodes until they expired, a dead interval
+/// after the last advertisement, routing them to the hub, which answered `NODE_NOT_FOUND` (A-195's
+/// review).
 fn reachability_frame(
     ctx: &WanContext,
     vouched: &Vouched,
@@ -2523,9 +2527,6 @@ fn reachability_frame(
                 vpn_id: node.vpn_id,
             });
         }
-    }
-    if entries.is_empty() {
-        return None;
     }
     let payload = WanReachabilityPayload {
         origin_hive: ctx.hive_id.clone(),
@@ -2551,13 +2552,15 @@ fn reachability_frame(
 /// EDGE-01 LSA bucket binding; the receiver additionally gates on the voucher being the primary hub.
 ///
 /// The hub sends it with its LSA beacon, every hello interval; to a spoke whose link comes up,
-/// right after its LSA (`bring_wan_peer_up`); and to every peer as soon as an LSA changes a hive's
-/// nodes (A-195). Until 0.1.131 only the beacon sent it, so for up to a hello interval a spoke
-/// dropped every frame the hub relayed from a node it had not vouched for yet: one that had just
-/// connected to another spoke, or any, once the spoke's own link had come up again. A spoke takes
-/// each advertisement for the hub's whole set, so the hub builds and queues them one at a time
-/// (`reachability_adverts`), and each link gets them in the order they were built: an older one
-/// queued after a newer would take back what the newer added, until the next beacon.
+/// right after its LSA (`bring_wan_peer_up`); and to every peer as soon as an LSA adds to the nodes
+/// it vouches for (A-195), a node gone waiting for the next one (`apply_lsa_payload`). Until
+/// 0.1.131 only the beacon sent it, so for up to a hello interval a spoke dropped every frame the
+/// hub relayed from a node it had not vouched for yet: one that had just connected to another
+/// spoke, or any, once the spoke's own link had come up again. It goes with no node too
+/// (`reachability_frame`). A spoke takes each advertisement for the hub's whole set, so the hub
+/// builds and queues them one at a time (`reachability_adverts`), and each link gets them in the
+/// order they were built: an older one queued after a newer would take back what the newer added,
+/// until the next beacon.
 async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
     let _in_order = ctx.reachability_adverts.lock().await;
     let peers: Vec<(String, WanPeer)> = {
@@ -2670,7 +2673,8 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
     let now = now_epoch_ms();
     {
         let mut table = ctx.reachability.lock().await;
-        // Replace the full set vouched by this hub (removed nodes disappear on the next beacon).
+        // Replace the full set vouched by this hub: removed nodes disappear with the hub's next
+        // advertisement, an empty one included.
         table.retain(|_, entry| entry.next_hop_hive != peer_hive);
         for entry in payload.entries {
             let Ok(uuid) = Uuid::parse_str(&entry.uuid) else {
@@ -2782,13 +2786,13 @@ async fn broadcast_lsa_direct(
 #[derive(Debug)]
 enum LsaApplyResult {
     /// Applied, without the nodes it listed under another hive's name. `duplicate_uuids` names the
-    /// nodes it listed under a UUID already taken (`apply_lsa_payload`). `nodes_changed` says
-    /// whether the hive's nodes are not the ones it had, for the hub to tell the other spokes at
+    /// nodes it listed under a UUID already taken (`apply_lsa_payload`). `nodes_added` says
+    /// whether it adds to the nodes the hub vouches for, for the hub to tell the other spokes at
     /// once (A-195).
     Applied {
         foreign_nodes: Vec<String>,
         duplicate_uuids: Vec<String>,
-        nodes_changed: bool,
+        nodes_added: bool,
     },
     Rejected {
         reason: &'static str,
@@ -2916,10 +2920,26 @@ async fn apply_lsa_payload(
         }
         nodes.push(node);
     }
-    // A-195: the nodes kept are compared with the hive's last ones as sets: a router lists its
-    // nodes in its map's order, which differs from one LSA to the next, so a list's order says
-    // nothing. A hive new here had none.
-    let nodes_changed = was_stale || lsa_node_set(&nodes) != lsa_node_set(&entry.nodes);
+    // A-195: what the other spokes must hear of at once is what this LSA adds to what the hub
+    // vouches for, which they need before the first frame the hub relays from it: a node the hive's
+    // last LSA did not list, or listed with another name or VPN; every node of a hive that was stale
+    // until this LSA; and another hive's node whose UUID this hive no longer lists, which the hub
+    // vouches for again. The nodes kept are compared with the last ones as sets: a router lists its
+    // nodes in its map's order, which differs from one LSA to the next. A hive new here had none.
+    // A node gone is told with the hub's next advertisement, its beacon's at the latest: no frame
+    // waits for it (a spoke that routes to it meanwhile gets `NODE_NOT_FOUND` from the hub), and a
+    // node that restarts costs each spoke one advertisement, not two (A-195's review).
+    let kept_uuids: HashSet<Uuid> = nodes
+        .iter()
+        .filter_map(|node| Uuid::parse_str(&node.uuid).ok())
+        .collect();
+    let frees_a_uuid = entry
+        .nodes
+        .iter()
+        .filter_map(|node| Uuid::parse_str(&node.uuid).ok())
+        .any(|uuid| !kept_uuids.contains(&uuid) && listed_elsewhere.contains(&uuid));
+    let nodes_added =
+        was_stale || frees_a_uuid || !lsa_node_set(&nodes).is_subset(&lsa_node_set(&entry.nodes));
     entry.nodes = nodes;
     entry.routes = payload.routes;
     entry.vpns = payload.vpns;
@@ -2927,7 +2947,7 @@ async fn apply_lsa_payload(
     LsaApplyResult::Applied {
         foreign_nodes,
         duplicate_uuids,
-        nodes_changed,
+        nodes_added,
     }
 }
 
@@ -2939,7 +2959,17 @@ fn lsa_node_set(nodes: &[LsaNode]) -> HashSet<(&str, &str, u32)> {
         .collect()
 }
 
+/// Writes this router's LSA state, its own hive's and every other's, to the hive's LSA region, and
+/// stores the copy it wrote in `lsa_snapshot`. The writer's guard is taken before anything is read,
+/// so every write is of the state as it was after the write before: until 0.1.131 the state was
+/// read first, and of two writes at once (the beacon's, a session's after an LSA) the one that had
+/// read the older state could write last, and for up to a hello interval the region and the
+/// snapshot left out what the newer LSA brought (A-195's review).
 async fn write_lsa_state(ctx: &WanContext) {
+    let mut writer_guard = ctx.lsa_writer.lock().await;
+    let Some(writer) = writer_guard.as_mut() else {
+        return;
+    };
     let self_seq = {
         let guard = ctx.lsa_seq.lock().await;
         *guard
@@ -2982,11 +3012,6 @@ async fn write_lsa_state(ctx: &WanContext) {
     hives.sort_by(|a, b| a.0.cmp(&b.0));
     drop(state_guard);
     hives.insert(0, (ctx.hive_id.clone(), self_state));
-
-    let mut writer_guard = ctx.lsa_writer.lock().await;
-    let Some(writer) = writer_guard.as_mut() else {
-        return;
-    };
 
     let mut hive_entries: Vec<RemoteHiveEntry> = Vec::new();
     let mut node_entries: Vec<RemoteNodeEntry> = Vec::new();
@@ -3802,7 +3827,7 @@ async fn handle_wan_message(
                 LsaApplyResult::Applied {
                     foreign_nodes,
                     duplicate_uuids,
-                    nodes_changed,
+                    nodes_added,
                 } => {
                     if !foreign_nodes.is_empty() {
                         let reject_count = count_lsa_rejects(
@@ -3837,11 +3862,12 @@ async fn handle_wan_message(
                         );
                     }
                     write_lsa_state(ctx).await;
-                    // A-195: the hub tells the other spokes of a hive's nodes as they change, not
+                    // A-195: the hub tells the other spokes of a hive's new nodes as they come, not
                     // at its next beacon. This session handles its frames in order and each link
                     // keeps the order of its own, so every other spoke has the advertisement before
-                    // the first frame the hub relays to it from a node this LSA added.
-                    if nodes_changed {
+                    // the first frame the hub relays to it from a node this LSA added. A node gone
+                    // waits for the next advertisement (`apply_lsa_payload`).
+                    if nodes_added {
                         let _ = broadcast_reachability(ctx).await;
                     }
                 }
@@ -6653,6 +6679,12 @@ fn format_prefixed_uuid(prefix: &str, bytes: &[u8; 16]) -> String {
     format!("{}:{}", prefix, Uuid::from_bytes(*bytes))
 }
 
+/// Reads the hive's LSA region into `lsa_snapshot`, and rebuilds the FIB from it. The region is
+/// read with `lsa_snapshot`'s guard held: a gateway stores each copy it writes there too
+/// (`write_lsa_state`), and a copy read before that write must not replace it. Until 0.1.131 the
+/// region was read first, and a refresh that read it just before a write could store its older
+/// copy after the writer's: until the next refresh the hub named no sender for a node that had just
+/// connected on a spoke, and dropped its first frame as a foreign source's (A-195's review).
 async fn refresh_lsa(
     lsa_reader: &Arc<Mutex<Option<LsaRegionReader>>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
@@ -6663,12 +6695,15 @@ async fn refresh_lsa(
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) -> Option<LsaSnapshot> {
-    let snapshot = read_lsa_snapshot_for_routing(lsa_reader, hive_id, HEARTBEAT_STALE_MS).await;
-    if let Some(snapshot) = snapshot.clone() {
-        {
-            let mut guard = lsa_snapshot.lock().await;
-            *guard = Some(snapshot.clone());
+    let snapshot = {
+        let mut stored = lsa_snapshot.lock().await;
+        let snapshot = read_lsa_snapshot_for_routing(lsa_reader, hive_id, HEARTBEAT_STALE_MS).await;
+        if let Some(snapshot) = snapshot.as_ref() {
+            *stored = Some(snapshot.clone());
         }
+        snapshot
+    };
+    if snapshot.is_some() {
         rebuild_fib(
             fib,
             nodes,
@@ -16313,12 +16348,15 @@ mod tests {
         wan_frame_from(ctx, hive, link, &lsa).await;
     }
 
-    /// A-195 on the hub: an LSA that changes a hive's nodes (one added, one gone, a VPN changed)
-    /// sends every spoke the hub's reachability at once, each without its own nodes; the same nodes
-    /// again, in another order too, send nothing; a hive that was stale counts as changed. Until
-    /// 0.1.131 only the beacon sent it, every hello interval.
+    /// A-195 on the hub: an LSA that adds to a hive's nodes (a node new or back, one in another
+    /// VPN, the nodes of a hive that was stale) sends every spoke the hub's reachability at once,
+    /// each without its own nodes, and with no node when it has none to hear of; the same nodes
+    /// again, in another order too, send nothing. Nor does a node gone, which the next
+    /// advertisement, the beacon's at the latest, tells of (A-195's review: a node that restarts
+    /// costs each spoke one advertisement, not two). Until 0.1.131 only the beacon sent it, every
+    /// hello interval.
     #[tokio::test]
-    async fn the_hub_tells_every_spoke_of_a_hives_changed_nodes_at_once() {
+    async fn the_hub_tells_every_spoke_of_a_hives_new_nodes_at_once() {
         let ctx = test_wan_context(None);
         let (ingress1_link, mut ingress1) = link_queue("wan");
         let (worker1_link, mut worker1) = link_queue("wan");
@@ -16341,10 +16379,10 @@ mod tests {
             vec![names.iter().map(|name| name.to_string()).collect()]
         };
 
-        // ingress1's node: worker1 hears of it; ingress1 has no other spoke's node to hear of.
+        // ingress1's node: worker1 hears of it; ingress1 hears it has no other spoke's node.
         lsa_from(&ctx, "ingress1", &ingress1_link, 1, &[io_x]).await;
         assert_eq!(adverts_on(&mut worker1), names(&["IO.x@ingress1"]));
-        assert!(adverts_on(&mut ingress1).is_empty());
+        assert_eq!(adverts_on(&mut ingress1), names(&[]));
 
         // worker1's two nodes: ingress1 hears of them, worker1 of ingress1's node alone.
         lsa_from(&ctx, "worker1", &worker1_link, 1, &[sales, support]).await;
@@ -16360,17 +16398,25 @@ mod tests {
         assert!(adverts_on(&mut ingress1).is_empty(), "nothing changed");
         assert!(adverts_on(&mut worker1).is_empty(), "nothing changed");
 
-        // A node gone; then the one left in another VPN; then worker1 stale, its nodes left out of
+        // A node gone: no frame waits for it, so it waits for the beacon.
+        lsa_from(&ctx, "worker1", &worker1_link, 4, &[sales]).await;
+        assert!(adverts_on(&mut ingress1).is_empty(), "a node gone waits");
+        assert!(adverts_on(&mut worker1).is_empty(), "a node gone waits");
+        broadcast_reachability(&ctx).await.expect("the beacon's");
+        assert_eq!(adverts_on(&mut ingress1), names(&["AI.sales@worker1"]));
+        assert_eq!(adverts_on(&mut worker1), names(&["IO.x@ingress1"]));
+
+        // The node back; then the other in another VPN; then worker1 stale, its nodes left out of
         // the reachability, and back with the same ones.
-        let gone = lsa_message("worker1", 4, &[sales], ctx.router_uuid);
-        let mut moved = lsa_message("worker1", 5, &[sales], ctx.router_uuid);
-        moved.payload["nodes"][0]["vpn_id"] = serde_json::json!(7);
-        let mut back = moved.clone();
-        back.payload["seq"] = serde_json::json!(6);
+        let back = lsa_message("worker1", 5, &[sales, support], ctx.router_uuid);
+        let mut moved = lsa_message("worker1", 6, &[sales, support], ctx.router_uuid);
+        moved.payload["nodes"][1]["vpn_id"] = serde_json::json!(7);
+        let mut unstale = moved.clone();
+        unstale.payload["seq"] = serde_json::json!(7);
         for (case, lsa, stale_before) in [
-            ("a node gone", gone, false),
+            ("a node back", back, false),
             ("a node's VPN changed", moved, false),
-            ("back from stale", back, true),
+            ("back from stale", unstale, true),
         ] {
             if stale_before {
                 ctx.lsa_state
@@ -16383,7 +16429,7 @@ mod tests {
             wan_frame_from(&ctx, "worker1", &worker1_link, &lsa).await;
             assert_eq!(
                 adverts_on(&mut ingress1),
-                names(&["AI.sales@worker1"]),
+                names(&["AI.sales@worker1", "AI.support@worker1"]),
                 "{case}"
             );
             assert_eq!(
@@ -16391,6 +16437,118 @@ mod tests {
                 names(&["IO.x@ingress1"]),
                 "{case}"
             );
+        }
+    }
+
+    /// A-195's review on the hub: a node gone waits for the next advertisement, unless another
+    /// hive lists its UUID too, the hub vouching for neither node of that UUID until now: that
+    /// node is vouched for again at once. And a spoke left with no node to hear of hears so with
+    /// the beacon, an advertisement with no node; until 0.1.131 none went, and the spoke kept the
+    /// last nodes the hub had vouched for to it until they expired.
+    #[tokio::test]
+    async fn a_node_gone_waits_for_the_next_advertisement_unless_it_frees_another_hives_uuid() {
+        let ctx = test_wan_context(None);
+        let (ingress1_link, mut ingress1) = link_queue("wan");
+        let (worker1_link, mut worker1) = link_queue("wan");
+        for (hive, sender) in [
+            ("ingress1", ingress1_link.clone()),
+            ("worker1", worker1_link.clone()),
+        ] {
+            ctx.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        let shared = Uuid::new_v4();
+        let io_x = (Uuid::new_v4(), "IO.x@ingress1");
+        let io_y = (shared, "IO.y@ingress1");
+        let dup = (shared, "AI.dup@worker1");
+        let sales = (Uuid::new_v4(), "AI.sales@worker1");
+        let names = |names: &[&str]| -> Vec<Vec<String>> {
+            vec![names.iter().map(|name| name.to_string()).collect()]
+        };
+        lsa_from(&ctx, "ingress1", &ingress1_link, 1, &[io_x, io_y]).await;
+        assert_eq!(
+            adverts_on(&mut worker1),
+            names(&["IO.x@ingress1", "IO.y@ingress1"])
+        );
+        assert_eq!(adverts_on(&mut ingress1), names(&[]));
+
+        // worker1 lists IO.y's UUID too: neither node of that UUID is vouched for.
+        lsa_from(&ctx, "worker1", &worker1_link, 1, &[sales, dup]).await;
+        assert_eq!(adverts_on(&mut ingress1), names(&["AI.sales@worker1"]));
+        assert_eq!(adverts_on(&mut worker1), names(&["IO.x@ingress1"]));
+
+        // worker1 no longer lists it: IO.y is vouched for again, at once.
+        lsa_from(&ctx, "worker1", &worker1_link, 2, &[sales]).await;
+        assert_eq!(
+            adverts_on(&mut worker1),
+            names(&["IO.x@ingress1", "IO.y@ingress1"])
+        );
+        assert_eq!(adverts_on(&mut ingress1), names(&["AI.sales@worker1"]));
+
+        // worker1's last node gone: nothing at once, and the beacon tells ingress1 it has none.
+        lsa_from(&ctx, "worker1", &worker1_link, 3, &[]).await;
+        assert!(adverts_on(&mut ingress1).is_empty(), "a node gone waits");
+        assert!(adverts_on(&mut worker1).is_empty(), "a node gone waits");
+        broadcast_reachability(&ctx).await.expect("the beacon's");
+        assert_eq!(adverts_on(&mut ingress1), names(&[]));
+        assert_eq!(
+            adverts_on(&mut worker1),
+            names(&["IO.x@ingress1", "IO.y@ingress1"])
+        );
+    }
+
+    /// A-195's review end to end: the hub's advertisement with no node takes back, on the spoke,
+    /// the last node the hub had vouched for to it, and the spoke no longer routes to that node
+    /// through the hub. Until 0.1.131 the hub sent none, and the spoke kept the node until its
+    /// entry expired, a dead interval after the last advertisement.
+    #[tokio::test]
+    async fn a_spoke_drops_the_last_node_the_hub_vouched_for_once_the_hub_has_none() {
+        let hub = test_wan_context(None);
+        let ingress1 = wan_context_of("ingress1", None);
+        let (hub_to_ingress1, mut ingress1_reads) = link_queue("wan");
+        let (hub_to_worker1, _worker1_reads) = link_queue("wan");
+        for (hive, link) in [
+            ("ingress1", hub_to_ingress1.clone()),
+            ("worker1", hub_to_worker1.clone()),
+        ] {
+            hub.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: link,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        let (ingress1_to_hub, _hub_reads_ingress1) = link_queue("wan");
+        let sales = Uuid::new_v4();
+        for (seq, nodes) in [(1, vec![(sales, "AI.sales@worker1")]), (2, vec![])] {
+            lsa_from(&hub, "worker1", &hub_to_worker1, seq, &nodes).await;
+            broadcast_reachability(&hub).await.expect("the beacon's");
+            for frame in messages_on(&mut ingress1_reads) {
+                handle_wan_message(
+                    &frame,
+                    &ingress1_to_hub,
+                    &ingress1,
+                    "motherbee",
+                    hub.router_uuid,
+                    "RT.gateway@motherbee",
+                    1,
+                )
+                .await
+                .expect("handled");
+            }
+            let vouched: Vec<Uuid> = ingress1.reachability.lock().await.keys().copied().collect();
+            let expected = if nodes.is_empty() {
+                vec![]
+            } else {
+                vec![sales]
+            };
+            assert_eq!(vouched, expected, "worker1 with {} nodes", nodes.len());
         }
     }
 
@@ -16434,7 +16592,8 @@ mod tests {
                 },
             );
         }
-        // ingress1's LSA named its node long ago.
+        // ingress1's LSA named its node long ago, and the hub told ingress1 it had no other spoke's
+        // node to vouch for.
         lsa_from(
             &hub,
             "ingress1",
@@ -16443,7 +16602,7 @@ mod tests {
             &[(receiver, "IO.x@ingress1")],
         )
         .await;
-        assert!(messages_on(&mut ingress1_reads).is_empty());
+        assert_eq!(adverts_on(&mut ingress1_reads), [Vec::<String>::new()]);
 
         // A node connects on worker1: worker1's LSA names it, then its first frame comes.
         let new_node = Uuid::new_v4();
@@ -16586,8 +16745,9 @@ mod tests {
 
     /// A-195: a new link's first frames are its LSA and, from a hub, its reachability, queued
     /// before the link goes into the WAN table. A hive with no other peer (a spoke's uplink, or a
-    /// hive coming up again while its old session still holds its entry) sends no reachability,
-    /// nor does a hub with no node to vouch for to it.
+    /// hive coming up again while its old session still holds its entry) sends no reachability; a
+    /// hub with no node to vouch for to it sends one with no node, which takes back any the spoke
+    /// kept from the hub's last session (A-195's review).
     #[tokio::test]
     async fn a_new_links_first_frames_are_its_lsa_and_from_a_hub_its_reachability() {
         let first_frames = |reads: &mut LinkReceiver| -> Vec<String> {
@@ -16649,7 +16809,12 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(first_frames(&mut ingress1_reads), [MSG_LSA]);
+        let frames = messages_on(&mut ingress1_reads);
+        let kinds: Vec<Option<&str>> = frames.iter().map(|msg| msg.meta.msg.as_deref()).collect();
+        assert_eq!(kinds, [Some(MSG_LSA), Some(MSG_WAN_REACHABILITY)]);
+        let nothing: WanReachabilityPayload =
+            serde_json::from_value(frames[1].payload.clone()).expect("a reachability payload");
+        assert!(nothing.entries.is_empty(), "no node to vouch for");
         // worker1, a third: ingress1's node.
         let (worker1_link, mut worker1_reads) = link_queue("wan");
         bring_wan_peer_up(
@@ -16679,7 +16844,10 @@ mod tests {
     /// advertisement the advertisements' lock, before it reads the WAN table and its state, and
     /// holds it until its frames are queued: so each link gets the LSAs in their seq's order and
     /// the advertisements in the order they were built, and a link that comes up meanwhile misses
-    /// neither.
+    /// neither. Each guard is bound at the top of its function's body and never dropped, so it is
+    /// held until the function returns, past the frames it queues: one taken in a nested block, or
+    /// bound to `_`, would be let go before (A-195's review). The tests that follow check the order
+    /// on the links themselves.
     #[test]
     fn a_new_links_first_frames_and_every_advertisement_keep_their_order() {
         let src = include_str!("mod.rs");
@@ -16690,34 +16858,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}"));
             &code[start..start + code[start..].find("\n}\n").expect("its end")]
         };
+        let seq_guard = "\n    let mut seq_guard = ctx.lsa_seq.lock().await;\n";
+        let in_order = "\n    let _in_order = ctx.reachability_adverts.lock().await;\n";
         let up = body("bring_wan_peer_up");
         let at = |what: &str| up.find(what).unwrap_or_else(|| panic!("{what}"));
-        assert!(at("ctx.lsa_seq.lock()") < at("build_lsa("));
-        assert!(at("build_lsa(") < at("ctx.reachability_adverts.lock()"));
-        assert!(at("ctx.reachability_adverts.lock()") < at("reachability_frame("));
+        assert!(at(seq_guard) < at("build_lsa("));
+        assert!(at("build_lsa(") < at(in_order));
+        assert!(at(in_order) < at("reachability_frame("));
         assert!(at("reachability_frame(") < at(".insert(hive.to_string(), peer)"));
         for (name, guard, state) in [
+            ("bring_wan_peer_up", seq_guard, "ctx.wan_peers.lock()"),
+            ("broadcast_lsa", seq_guard, "ctx.wan_peers.lock()"),
             (
-                "bring_wan_peer_up",
-                "ctx.lsa_seq.lock()",
-                "ctx.wan_peers.lock()",
+                "broadcast_lsa_direct",
+                "\n    let mut seq_guard = lsa_seq.lock().await;\n",
+                "wan_peers.lock()",
             ),
-            (
-                "broadcast_lsa",
-                "ctx.lsa_seq.lock()",
-                "ctx.wan_peers.lock()",
-            ),
-            ("broadcast_lsa_direct", "lsa_seq.lock()", "wan_peers.lock()"),
-            (
-                "broadcast_reachability",
-                "ctx.reachability_adverts.lock()",
-                "ctx.wan_peers.lock()",
-            ),
-            (
-                "broadcast_reachability",
-                "ctx.reachability_adverts.lock()",
-                "vouched_nodes(",
-            ),
+            ("broadcast_reachability", in_order, "ctx.wan_peers.lock()"),
+            ("broadcast_reachability", in_order, "vouched_nodes("),
         ] {
             let body = body(name);
             let taken = body
@@ -16732,6 +16890,232 @@ mod tests {
                 "{name} holds it until its frames are queued"
             );
         }
+    }
+
+    /// A-195, on the link itself: a new link has its LSA before it is in the WAN table, where
+    /// another task could hand it a frame. The table is held while the link comes up on the hub:
+    /// the LSA is on the link, and the link is not in the table. Let go, the hub's reachability
+    /// follows the LSA, and the link is in the table (A-195's review).
+    #[tokio::test]
+    async fn a_new_link_has_its_lsa_before_it_is_in_the_wan_table() {
+        let hub = test_wan_context(None);
+        hub.lsa_state.lock().await.insert(
+            "ingress1".to_string(),
+            RemoteHiveState {
+                nodes: vec![LsaNode {
+                    uuid: Uuid::new_v4().to_string(),
+                    name: "IO.x@ingress1".to_string(),
+                    vpn_id: 0,
+                }],
+                ..RemoteHiveState::default()
+            },
+        );
+        let (ingress1_link, _ingress1_reads) = link_queue("wan");
+        let mut table = hub.wan_peers.lock().await;
+        table.insert(
+            "ingress1".to_string(),
+            WanPeer {
+                sender: ingress1_link,
+                router_uuid: Uuid::new_v4(),
+            },
+        );
+        let (worker1_link, mut worker1_reads) = link_queue("wan");
+        let worker1_router = Uuid::new_v4();
+        let up = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            async move {
+                bring_wan_peer_up(
+                    &hub,
+                    "worker1",
+                    WanPeer {
+                        sender: worker1_link,
+                        router_uuid: worker1_router,
+                    },
+                )
+                .await;
+            }
+        });
+        let first = time::timeout(Duration::from_secs(2), worker1_reads.recv())
+            .await
+            .expect("the LSA, while the table is held")
+            .expect("a frame");
+        let first: Message = serde_json::from_slice(&first).expect("a message");
+        assert_eq!(first.meta.msg.as_deref(), Some(MSG_LSA));
+        assert!(!table.contains_key("worker1"), "not in the table yet");
+        drop(table);
+        up.await.expect("the link is up");
+        let then: Vec<Option<String>> = messages_on(&mut worker1_reads)
+            .into_iter()
+            .map(|msg| msg.meta.msg)
+            .collect();
+        assert_eq!(then, [Some(MSG_WAN_REACHABILITY.to_string())]);
+        assert_eq!(
+            hub.wan_peers.lock().await["worker1"].router_uuid,
+            worker1_router
+        );
+    }
+
+    /// A-195's order of the hub's advertisements, on the links themselves: an advertisement reads
+    /// the WAN table and the LSA state only once the one before is queued, so it never holds less
+    /// than that one, and is queued after it. While an advertisement holds the lock, another
+    /// waits, and worker1's LSA comes meanwhile with a new node; let go, the waiting advertisement
+    /// tells ingress1 of it. One built before it waited would tell ingress1 of the state before,
+    /// and take back the node a newer advertisement had told it of (A-195's review).
+    #[tokio::test]
+    async fn an_advertisement_reads_the_state_only_once_the_one_before_is_queued() {
+        let hub = test_wan_context(None);
+        let (ingress1_link, mut ingress1_reads) = link_queue("wan");
+        let (worker1_link, _worker1_reads) = link_queue("wan");
+        for (hive, sender) in [("ingress1", ingress1_link), ("worker1", worker1_link)] {
+            hub.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        let one_before = hub.reachability_adverts.lock().await;
+        let advert = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            async move { broadcast_reachability(&hub).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            messages_on(&mut ingress1_reads).is_empty(),
+            "it waits for the one before"
+        );
+        hub.lsa_state.lock().await.insert(
+            "worker1".to_string(),
+            RemoteHiveState {
+                nodes: vec![LsaNode {
+                    uuid: Uuid::new_v4().to_string(),
+                    name: "AI.new@worker1".to_string(),
+                    vpn_id: 0,
+                }],
+                ..RemoteHiveState::default()
+            },
+        );
+        drop(one_before);
+        advert
+            .await
+            .expect("the advertisement")
+            .expect("its frames queued");
+        assert_eq!(
+            adverts_on(&mut ingress1_reads),
+            [vec!["AI.new@worker1".to_string()]]
+        );
+    }
+
+    /// A-195's review: a write of the LSA region reads the LSA state only once it holds the writer,
+    /// so of two writes at once the last is of the newest state. While a write holds the writer,
+    /// another waits, and worker1's LSA is applied meanwhile with a new node; let go, the waiting
+    /// write stores it, in the region and in the router's copy of it. Until 0.1.131 the state was
+    /// read first, and the waiting write stored the state from before worker1's LSA, until the
+    /// next write.
+    #[tokio::test]
+    async fn an_lsa_region_write_reads_the_state_only_once_it_holds_the_writer() {
+        let ctx = test_wan_context(None);
+        let lsa_name = format!("/lsa-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        unlink_test_shm(&lsa_name);
+        *ctx.lsa_writer.lock().await = Some(
+            LsaRegionWriter::open_or_create(&lsa_name, ctx.router_uuid, "motherbee")
+                .expect("lsa region"),
+        );
+        let write_before = ctx.lsa_writer.lock().await;
+        let write = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move { write_lsa_state(&ctx).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let new_node = Uuid::new_v4();
+        ctx.lsa_state.lock().await.insert(
+            "worker1".to_string(),
+            RemoteHiveState {
+                nodes: vec![LsaNode {
+                    uuid: new_node.to_string(),
+                    name: "AI.new@worker1".to_string(),
+                    vpn_id: 0,
+                }],
+                ..RemoteHiveState::default()
+            },
+        );
+        drop(write_before);
+        write.await.expect("written");
+        assert!(
+            lsa_listed_uuids(&*ctx.lsa_snapshot.lock().await).contains(&new_node),
+            "the router's copy"
+        );
+        let region = LsaRegionReader::open_read_only(&lsa_name)
+            .expect("the region")
+            .read_snapshot();
+        assert!(lsa_listed_uuids(&region).contains(&new_node), "the region");
+        unlink_test_shm(&lsa_name);
+    }
+
+    /// A-195's review: a refresh reads the LSA region only once it holds the router's copy of it,
+    /// so a copy read before the gateway's last write never replaces the one that write stored. The
+    /// copy is held, as the gateway holds it to store what it wrote, and a refresh starts
+    /// meanwhile; the region gets a new node and the gateway stores its copy; let go, the refresh
+    /// keeps the node. Until 0.1.131 the refresh read the region first and stored its older copy
+    /// last, and until the next refresh the hub named no sender for that node.
+    #[tokio::test]
+    async fn a_refresh_never_stores_a_copy_of_the_lsa_region_older_than_the_writers() {
+        let hive_id = format!("lsatest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = format!("/jsr-lsa-{hive_id}");
+        unlink_test_shm(&shm_name);
+        let mut writer = LsaRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+            .expect("lsa region");
+        let worker1 = [lsa_hive("worker1", FLAG_ACTIVE)];
+        writer
+            .write_snapshot(&worker1, &[], &[], &[], &[])
+            .expect("the copy before");
+        let reader = Arc::new(Mutex::new(Some(
+            LsaRegionReader::open_read_only(&shm_name).expect("a reader"),
+        )));
+        let copy: Arc<Mutex<Option<LsaSnapshot>>> = Arc::new(Mutex::new(None));
+        let mut stored = copy.lock().await;
+        let refresh = tokio::spawn({
+            let (reader, copy, hive_id) = (Arc::clone(&reader), Arc::clone(&copy), hive_id.clone());
+            async move {
+                refresh_lsa(
+                    &reader,
+                    &copy,
+                    &hive_id,
+                    &Arc::new(Mutex::new(HashMap::new())),
+                    &Arc::new(Mutex::new(HashMap::new())),
+                    &Arc::new(Mutex::new(Vec::new())),
+                    &Arc::new(Mutex::new(Vec::new())),
+                    &Arc::new(Mutex::new(HashMap::new())),
+                )
+                .await
+            }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let new_node = Uuid::new_v4();
+        writer
+            .write_snapshot(
+                &worker1,
+                &[lsa_node_entry(new_node, "AI.new@worker1", 0)],
+                &[],
+                &[],
+                &[],
+            )
+            .expect("the new copy");
+        *stored = writer.read_snapshot();
+        drop(stored);
+        refresh.await.expect("refreshed");
+        assert!(
+            lsa_listed_uuids(&*copy.lock().await).contains(&new_node),
+            "the writer's copy kept"
+        );
+        unlink_test_shm(&shm_name);
     }
 
     /// R4, the caller: sibling routers' regions are read only through the ownership check.

@@ -145,15 +145,21 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
   (`prepare_local_delivery`).
   - **When the hub sends it** (A-195, since 0.1.131): with its LSA every 10 s; to a spoke whose
-    link comes up, right after its LSA; and to every spoke as soon as an LSA changes a hive's nodes
-    (one added, one gone, a `vpn_id` changed, or the hive back from stale; the same nodes in another
-    order are no change). A spoke drops a relayed frame whose sender the hub has not vouched for
-    (`router dropped a WAN frame`), and the hub handles a spoke's frames in order, so every other
-    spoke has the advertisement before the first frame the hub relays from a node that LSA added.
-    Until 0.1.131 only the 10 s beacon sent it: a frame from a node that had just connected on
-    another spoke, or any for up to 10 s after a spoke's link came up, was dropped without an
-    answer. A spoke takes each advertisement for the hub's whole set, so the hub builds and queues
-    them one at a time, and each spoke gets them in the order they were built.
+    link comes up, right after its LSA; and to every spoke as soon as an LSA adds to the nodes it
+    vouches for (a node new, or listed with another name or `vpn_id`; the nodes of a hive back from
+    stale; or another hive's node whose UUID this hive no longer lists, which the hub vouches for
+    again). The same nodes in another order are no change. A spoke drops a relayed frame whose
+    sender the hub has not vouched for (`router dropped a WAN frame`), and the hub handles a
+    spoke's frames in order, so every other spoke has the advertisement before the first frame the
+    hub relays from a node that LSA added. Until 0.1.131 only the 10 s beacon sent it: a frame from
+    a node that had just connected on another spoke, or any for up to 10 s after a spoke's link
+    came up, was dropped without an answer. A node gone waits for the next advertisement, the
+    beacon's at the latest: no frame waits for it (a spoke that routes to it meanwhile gets
+    `NODE_NOT_FOUND` from the hub), and a node that restarts costs each spoke one advertisement, not
+    two. A spoke takes each advertisement for the hub's whole set, so the hub builds and queues
+    them one at a time, and each spoke gets them in the order they were built. It goes with no node
+    too, so a spoke whose last vouched-for node is gone drops it; until 0.1.131 none went then, and
+    the spoke kept routing to that node through the hub until its entry expired.
   - **Errors across the hub** (A-245, since 0.1.131): a message between two spokes passes the
     hub both ways, and the far spoke's router answers it over the hub's link. The hub hands that
     `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke whose LSA lists the sender, one hop of TTL

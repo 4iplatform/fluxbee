@@ -104,11 +104,13 @@ wrote it, never as the sender wrote it.
   - So a frame must not arrive before what names its sender (A-195, since 0.1.131). A router's
     first frames on a new link, after the handshake, are its LSA and, on the hub, its reachability
     advertisement, queued before the link takes anything else; and the hub advertises a hive's
-    nodes to every other spoke as soon as an LSA changes them, ahead of any frame it relays from a
+    nodes to every other spoke as soon as an LSA adds to them, ahead of any frame it relays from a
     node that LSA added, not only with its beacon every 10 s (`bring_wan_peer_up`,
     `broadcast_reachability`). Until then a frame the hub relayed from a node that had just
     connected on another spoke, or any for up to 10 s after a spoke's link came up, was dropped
-    this way, with no answer to its sender.
+    this way, with no answer to its sender. A node gone waits for the hub's next advertisement, the
+    beacon's at the latest, which goes with no node too (`apply_lsa_payload`,
+    `reachability_frame`).
   - The name becomes `<role>@<that bucket's hive>` (`canonical_wan_src_name`), so a peer can only
     speak as `role@<itself>`, or, as the hub, as the nodes it relays (data only, §6.3).
   - A peer fills only its own LSA bucket: `apply_lsa_payload` rejects an LSA whose `hive` is not the
