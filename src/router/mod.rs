@@ -3205,44 +3205,53 @@ async fn lsa_stale_loop(ctx: Arc<WanContext>) {
     ));
     loop {
         ticker.tick().await;
-        let now = now_epoch_ms();
-        let mut changed = false;
-        {
-            let mut guard = ctx.lsa_state.lock().await;
-            for state in guard.values_mut() {
-                if now.saturating_sub(state.last_updated) > ctx.dead_interval_ms {
-                    if state.flags & FLAG_STALE == 0 {
-                        state.flags |= FLAG_STALE;
-                        changed = true;
-                    }
-                } else if state.flags & FLAG_STALE != 0 {
-                    state.flags &= !FLAG_STALE;
-                    changed = true;
+        lsa_stale_check(&ctx, now_epoch_ms()).await;
+    }
+}
+
+/// One pass of `lsa_stale_loop` at `now`: a hive whose last LSA is older than the dead interval is
+/// marked stale, and one with a newer LSA no longer is; the hub-vouched reachability entries the
+/// hub stopped refreshing expire (Option B). When either changes, the FIB is rebuilt at once, so a
+/// stale hive's nodes and routes, and an expired entry's node, leave it (`rebuild_fib` skips them),
+/// and a frame by name to one is answered `NODE_NOT_FOUND` instead of going toward a hive that is
+/// gone. Until 0.1.132 only an expired entry rebuilt it, and a hive marked stale kept its names in
+/// the FIB until the next rebuild, at a message of one of the router's own nodes or its 5 s loops:
+/// the gap A-265 closed for an LSA applied (A-265's review).
+async fn lsa_stale_check(ctx: &WanContext, now: u64) {
+    let mut stale_changed = false;
+    {
+        let mut guard = ctx.lsa_state.lock().await;
+        for state in guard.values_mut() {
+            if now.saturating_sub(state.last_updated) > ctx.dead_interval_ms {
+                if state.flags & FLAG_STALE == 0 {
+                    state.flags |= FLAG_STALE;
+                    stale_changed = true;
                 }
+            } else if state.flags & FLAG_STALE != 0 {
+                state.flags &= !FLAG_STALE;
+                stale_changed = true;
             }
         }
-        if changed {
-            write_lsa_state(&ctx).await;
-        }
-        // Option B: expire hub-vouched reachability entries the hub stopped refreshing, then
-        // rebuild the FIB if any were dropped so dead multi-hop routes don't linger.
-        let reachability_dropped = {
-            let mut table = ctx.reachability.lock().await;
-            let before = table.len();
-            table.retain(|_, entry| now.saturating_sub(entry.last_updated) <= ctx.dead_interval_ms);
-            before != table.len()
-        };
-        if reachability_dropped {
-            rebuild_fib(
-                &ctx.fib,
-                &ctx.nodes,
-                &ctx.peer_nodes,
-                &ctx.static_routes,
-                &ctx.lsa_snapshot,
-                &ctx.reachability,
-            )
-            .await;
-        }
+    }
+    if stale_changed {
+        write_lsa_state(ctx).await;
+    }
+    let reachability_dropped = {
+        let mut table = ctx.reachability.lock().await;
+        let before = table.len();
+        table.retain(|_, entry| now.saturating_sub(entry.last_updated) <= ctx.dead_interval_ms);
+        before != table.len()
+    };
+    if stale_changed || reachability_dropped {
+        rebuild_fib(
+            &ctx.fib,
+            &ctx.nodes,
+            &ctx.peer_nodes,
+            &ctx.static_routes,
+            &ctx.lsa_snapshot,
+            &ctx.reachability,
+        )
+        .await;
     }
 }
 
@@ -17401,6 +17410,106 @@ mod tests {
         assert!(
             messages_on(&mut ingress1_reads).is_empty(),
             "and no NODE_NOT_FOUND back"
+        );
+        unlink_test_shm(&lsa_name);
+    }
+
+    /// A-265's review: a hive marked stale leaves the hub's FIB at once. A frame ingress1's node
+    /// sends by name to a node of worker1 goes on to worker1 while worker1's LSA is fresh; once the
+    /// stale check marks worker1 stale, the next is answered NODE_NOT_FOUND, and nothing goes to
+    /// worker1. Until 0.1.132 the check wrote the mark to the LSA region but rebuilt the FIB only
+    /// when a reachability entry expired, and the hub has none: until its next rebuild, at a
+    /// message of one of its own nodes or its 5 s loops, it sent such a frame on toward worker1.
+    #[tokio::test]
+    async fn a_hive_marked_stale_leaves_the_hubs_fib_at_once() {
+        let hub = test_wan_context(None);
+        let lsa_name = format!("/lsa-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        unlink_test_shm(&lsa_name);
+        *hub.lsa_writer.lock().await = Some(
+            LsaRegionWriter::open_or_create(&lsa_name, hub.router_uuid, "motherbee")
+                .expect("lsa region"),
+        );
+        let (hub_to_ingress1, mut ingress1_reads) = link_queue("wan");
+        let (hub_to_worker1, mut worker1_reads) = link_queue("wan");
+        for (hive, link) in [
+            ("ingress1", hub_to_ingress1.clone()),
+            ("worker1", hub_to_worker1.clone()),
+        ] {
+            hub.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: link,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        let sender = Uuid::new_v4();
+        lsa_from(
+            &hub,
+            "ingress1",
+            &hub_to_ingress1,
+            1,
+            &[(sender, "IO.x@ingress1")],
+        )
+        .await;
+        lsa_from(
+            &hub,
+            "worker1",
+            &hub_to_worker1,
+            1,
+            &[(Uuid::new_v4(), "AI.sales@worker1")],
+        )
+        .await;
+        messages_on(&mut ingress1_reads);
+        messages_on(&mut worker1_reads);
+        let by_name = || Message {
+            routing: Routing {
+                src: sender.to_string(),
+                src_l2_name: Some("IO.x@ingress1".to_string()),
+                dst: Destination::Unicast("AI.sales@worker1".to_string()),
+                ttl: 15,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let fresh = by_name();
+        wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &fresh).await;
+        assert!(
+            has(messages_on(&mut worker1_reads), &fresh),
+            "on to worker1"
+        );
+
+        // worker1's last LSA is more than a dead interval old; ingress1's is not.
+        let now = now_epoch_ms();
+        hub.lsa_state
+            .lock()
+            .await
+            .get_mut("worker1")
+            .expect("worker1's state")
+            .last_updated = now - hub.dead_interval_ms - 1;
+        lsa_stale_check(&hub, now).await;
+        {
+            let states = hub.lsa_state.lock().await;
+            assert_ne!(states["worker1"].flags & FLAG_STALE, 0, "worker1 stale");
+            assert_eq!(states["ingress1"].flags & FLAG_STALE, 0, "ingress1 not");
+        }
+        let stale = by_name();
+        wan_frame_from(&hub, "ingress1", &hub_to_ingress1, &stale).await;
+        assert!(
+            messages_on(&mut worker1_reads).is_empty(),
+            "nothing toward worker1"
+        );
+        let answers: Vec<_> = messages_on(&mut ingress1_reads)
+            .iter()
+            .map(what_was_answered)
+            .collect();
+        assert_eq!(
+            answers,
+            vec![(stale.routing.trace_id.clone(), "NODE_NOT_FOUND".to_string())]
         );
         unlink_test_shm(&lsa_name);
     }

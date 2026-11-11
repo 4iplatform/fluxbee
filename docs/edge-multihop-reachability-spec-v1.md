@@ -80,7 +80,8 @@ Separate three things that are conflated today: **data** (which node lives on wh
   Since 0.1.132 (FINDINGS A-265) the hub rebuilds its FIB as it applies a spoke's LSA, before it
   advertises that LSA's nodes, so a name a spoke has just announced resolves on the hub at once;
   until then the hub answered a frame relayed by name to it `NODE_NOT_FOUND` until its next
-  rebuild, up to 5 s.
+  rebuild, up to 5 s. It rebuilds it, too, as it marks a spoke stale, whose names then leave it at
+  once.
 - Terminal gate (`mod.rs:2858`): a frame whose `src` resolves only via the reachability table is
   **admitted for delivery** instead of dropped (terminal gate closed), carrying the `via_hub` flag
   to the authority decision.
