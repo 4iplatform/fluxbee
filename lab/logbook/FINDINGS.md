@@ -211,6 +211,9 @@ no change required
     0.1.136 a new finding enters only if it breaks operation; the rest is recorded for later.** The
     SDKs' lows (A-264, A-290, A-294, A-295, A-285's catalog text) and the router's A-269 go with each
     one's next change.
+    **0.1.133 deployed 2026-11-11, and its gate found A-314 (🔴, no node can be launched): 0.1.134 is
+    the orchestrator's hotfix alone, so the router is 0.1.135, the AI SDK 0.1.136 and the sweep's
+    binaries 0.1.137 (the cut-off above moves with them).**
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -378,6 +381,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-311 🔵 `get_hive` reads any file named `info.yaml` its hive id leads to (low; widened by 0.1.136's A-287, so the orchestrator's fix ships with 0.1.136).
 - A-312 🔵 A version with build metadata (`1.2.0+b1`) breaks every node built on it and cannot be removed (low; the runtimes).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide).
+- A-314 🔴 A node unit systemd does not have reads as no answer: no node can be launched on 8.x (since 0.1.133; the orchestrator's hotfix, 0.1.134).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1454,6 +1458,46 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-314 [General/orchestrator] 🔴 (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
+
+- **Seen on 8.x (0.1.133, 2026-11-11 22:41Z):** a `run_node` of `AI.gate0233@worker1` answered
+  `SERVICE_FAILED` *"systemctl did not answer whether the node's unit runs, asked again; the node
+  was not launched, and its config and identity were undone"*. The stopped `AI.facturacion@worker1`
+  and `AI.ventas@worker1` and the three `AI.gate0192*@worker1`, none with a unit, read
+  `lifecycle_state` `UNKNOWN`, and the three gate0192 nodes, pinned to ai.generic 0.1.95, counted in
+  ai.generic's use.
+- **Why:** `service_activity` (`src/bin/sy_orchestrator.rs` ~36727; A-267, A-271, 0.1.133) reads
+  `systemctl is-active` by its exit: 0 active, 3 not running, anything else no answer. On the hives'
+  systemd 255 (Ubuntu 24.04) it exits 4 for a unit whose LoadState is not-found: a new node's unit
+  before its first launch, and a stopped node's transient unit once it is gone. The code's comment
+  took 3 for that case, and its test pinned 4 as no answer.
+- **Effect:** every `run_node` of a new node, every start of a node whose unit is gone, and every
+  `kill_node` (purge included) and `remove_node_instance` of such a node are refused
+  `SERVICE_FAILED`; the reconcile never launches a node whose unit is gone, so after a reboot the
+  nodes that should run stay down; Archi and the Cloud read such nodes `UNKNOWN`, and a managed node
+  with nothing left reads `UNKNOWN` where it was `NODE_NOT_FOUND`. Read in the code, not seen live:
+  a spoke's core update that drops a core node keeps its binary with an error (its unit file is
+  gone, so its check reads as no answer), so that settle never closes; a hive without the
+  `fluxbee-syncthing` unit never gets it repaired and its sync probe answers `SYNC_STATUS_FAILED`;
+  a node directory whose `config.json` cannot be read and whose unit is gone fails the hive's whole
+  runtime-use read (A-281). Nodes already running are not touched.
+- **Why the tests passed:** the test doubles answer not running for a missing unit directly, past
+  `service_activity`; the exit-code test pinned 4 as no answer. Since systemd 253 `is-active` exits
+  4 when every named unit's LoadState is not-found and none is active; bus errors exit 1 (the
+  review read systemd's source at v252, v253, v255 and v258).
+- **Fix (0.1.134, the orchestrator alone, a hotfix; `coa/orch-134`, `7964c265`):** exit 4 reads as
+  not running; exit 1 and a killed check stay no answer. **Its review (`8539bc64`):** reading a
+  missing unit as not running reopens what 0.1.132 had and 0.1.133 refused only by accident: a
+  `kill_node` with purge, or a `remove_node_instance`, of an `SY.*` or `RT.*` name (a core node,
+  whose `fluxbee-node-*` unit never exists) removed the running core node's state (SY.timer's
+  `timers.db`, SY.identity's config and secrets) and answered ok. Both now refuse such a name
+  (`INVALID_REQUEST`), as `run_node` does. SY.admin's catalog example for both names
+  `SY.admin@motherbee`: a managed node's name instead, with SY.admin's next change. Left, low: a
+  core service on the role's list whose unit is not installed is started every 5 s with two
+  warnings, as in 0.1.132 (only a broken install; none on 8.x). The releases planned after it move
+  by one: the router 0.1.135, the AI SDK 0.1.136, the sweep's binaries 0.1.137 (their texts that
+  say 0.1.136 change at their integration).
 
 ### A-313 [General/orchestrator] 🔵 low (found 2026-11-11 by A-283's second review; read in the code; there before it; to decide) — A Syncthing that cannot come up holds the whole watchdog about 35 s a tick
 
