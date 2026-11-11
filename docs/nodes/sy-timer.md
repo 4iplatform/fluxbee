@@ -6,7 +6,7 @@ survives restarts: it lives in a local SQLite database and fires a `TIMER_FIRED`
 target when due.
 
 Source: `go/sy-timer/` (`main.go` handlers, `scheduler.go` firing loop, `persistence.go`
-database, `cron.go` the `cron_spec` parser). Client helpers and constants:
+database, `cron.go` the `cron_spec` parser, `refusals.go` the refusal log). Client helpers and constants:
 `go/fluxbee-go-sdk/timer*.go`.
 
 | | |
@@ -174,6 +174,14 @@ All requests are `SYSTEM` messages to `SY.timer@<hive>`. Every answer is `TIMER_
 (`MsgTimerResponse`) with `{ok: true, verb, ...}` or
 `{ok: false, verb, error: {code, message}}` (`sendTimerResponse`, `sendTimerError`).
 
+Every refusal is logged too (`sendTimerError`, `refusalLog` in `refusals.go`; since 1.6, FINDINGS
+A-258): one `timer_request_refused` line with the `verb`, the `error_code`, the sender
+(`src_l2_name`) and the `trace_id`, never the `message`, which can quote what the request sent
+(FINDINGS A-232). At most 10 lines a minute per sender, from its first refusal: the tenth carries
+`not_logged_until_utc_ms`, the rest of that minute is counted, and one
+`timer_request_refusals_not_logged` line gives the `count` when the minute ends (a sweep every 10 s,
+or the sender's next refusal). Before, only the sender heard of a refusal.
+
 | Verb | Payload | Who may send |
 | --- | --- | --- |
 | `TIMER_SCHEDULE` | `fire_at_utc_ms` or `fire_in_ms` (exactly one), optional `target_l2_name`, `client_ref`, `payload`, `missed_policy`, `missed_within_ms`, `metadata` | any node; it becomes the owner, and the target unless it is a SY node |
@@ -263,7 +271,8 @@ secret.
 - `systemctl status sy-timer`; `journalctl -u sy-timer`. Besides plain lines, the node logs one
   JSON object per event (`logEvent` in `logging.go`): `timer_startup`, `timer_scheduled`,
   `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
-  `timer_missed_policy_applied`, `timer_handler_error`, and for the delivery
+  `timer_missed_policy_applied`, `timer_handler_error`, for a refused request
+  `timer_request_refused` and `timer_request_refusals_not_logged` (Messages, above), and for the delivery
   `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`,
   `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`; for a recurring timer canceled
   because its next fire cannot be computed, `timer_replay_invalid_recurring` and

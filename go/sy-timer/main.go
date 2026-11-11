@@ -62,6 +62,8 @@ type Service struct {
 	dbPath      string
 	db          *sql.DB
 	scheduler   *timerScheduler
+	// refusals logs the requests SY.timer refuses, bounded per sender (refusalLog, FINDINGS A-258).
+	refusals refusalLog
 }
 
 type timerNowInRequest struct {
@@ -227,6 +229,7 @@ func main() {
 	logEvent("timer_startup", startup)
 	log.Printf("SY.timer ready: node=%s db=%s %s %s", service.nodeName, service.dbPath, pending, gc)
 	service.scheduler.start()
+	go service.refusals.sweepEvery(refusalLogSweepInterval)
 	service.run()
 }
 
@@ -1015,7 +1018,11 @@ func (s *Service) sendTimerResponseOnce(incoming fluxbeesdk.Message, payload any
 	return errors.As(err, &tooLarge), err
 }
 
+// sendTimerError answers incoming with a refusal, and logs it first, bounded per sender (refusalLog,
+// FINDINGS A-258): its verb, its code and its sender, not its message. Before, only the sender heard
+// of it.
 func (s *Service) sendTimerError(incoming fluxbeesdk.Message, verb, code, message string) error {
+	s.refusals.note(time.Now(), incoming.SourceL2Name(), verb, code, incoming.Routing.TraceID)
 	return s.sendTimerResponse(incoming, timerErrorPayload(verb, code, message))
 }
 

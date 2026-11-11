@@ -10,7 +10,8 @@ v1.5 in 0.1.131: a canceled timer is kept 7 days from its cancellation, not from
 last fire (FINDINGS A-238), and a timer's lock is kept in memory only while it is in use (FINDINGS
 A-244); v1.6 in 0.1.133: the scheduler's heap holds the pending timers only, a canceled, moved or
 purged timer's entry leaving it at once, and a start whose count of pending timers fails says so
-(FINDINGS A-259)
+(FINDINGS A-259); a refused request gets a line in SY.timer's own log, with its verb, its code and
+its sender, at most 10 a minute per sender (FINDINGS A-258)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -1163,6 +1164,8 @@ A node should check that a `TIMER_FIRED` comes from `SY.timer@<its hive>` (the r
 | `TIMER_INTERNAL` | A response that does not fit in one 128 KiB frame, or another internal error. A message without the router's `routing.src_l2_name` gets no answer at all (§6.1). |
 | `TIMER_UNREACHABLE` | (Go client) `SY.timer` does not answer after the retries of a time operation (§14.4). |
 
+Every refusal is logged in `SY.timer`'s own log too, besides the answer its sender gets (`timer_request_refused`, §16.4; since v1.6, FINDINGS A-258): its verb, its code and its sender, at most 10 lines a minute per sender. Before, only the sender heard of it.
+
 A refusal's code goes with its error, not in its text (`timerError` in `go/sy-timer/errors.go`; FINDINGS A-220, since v1.4): the `message` quotes what the request sent, a `cron_spec` or a zone, and what it quotes never changes the code. Before, the code was read from the message: a junk `cron_spec` that repeated "invalid timezone" in its fields came back `TIMER_INVALID_TIMEZONE`, and a `cron_tz` that read "minimum timer duration", `TIMER_BELOW_MINIMUM`. They are `TIMER_INVALID_CRON` and `TIMER_INVALID_TIMEZONE` now, in that order.
 
 Format of an error response:
@@ -1213,6 +1216,8 @@ The `timers.db` database should be included in the backup snapshots of the `/var
 ### 16.4 Logs
 
 `SY.timer` logs on stdout (captured by systemd), with no levels: plain lines, and one JSON object per event (`logEvent`). Among the events: `timer_startup` (with `pending_count`, or `pending_error` when the start could not count the pending timers; and `gc_deleted` and `gc_stamped`, the canceled timers the start dated, §5.2, or, when the start's GC failed, `gc_error` in place of both counts; §11), `timer_scheduled`, `timer_fired`, `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`, `timer_missed_policy_applied` (with its `outcome`), `timer_handler_error`; for the delivery (§7.8) `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`, `timer_fire_refused`, `timer_fire_lost` and `timer_fire_dropped`; and for recurring timers `timer_recurring_requeued`, `timer_replay_invalid_recurring` and `timer_recurring_next_fire_failed`; the last two are a timer whose next fire cannot be computed, at a start or at a fire, canceled: logged once, with `outcome: canceled`, its `owner_l2_name`, its `client_ref` and its `canceled_reason` (§11). The router's `UNREACHABLE` for a fire sends it again (§7.8); one for no fire in flight is logged as an ignored message.
+
+Every request `SY.timer` refuses gets one `timer_request_refused` line (`refusalLog` in `go/sy-timer/refusals.go`; since v1.6, FINDINGS A-258; the operator's call on A-253: logs for everything): its `verb`, its `error_code`, its sender (`src_l2_name`, the router's stamp) and its `trace_id`. Never its `message`, which can quote what the request sent (FINDINGS A-232); an unknown verb is cut to 64 bytes. The lines are bounded per sender, so a node that loops a refused request cannot flood the journal: at most 10 in a window of a minute from the sender's first refusal, the tenth with `not_logged_until_utc_ms`, the window's end. The sender's other refusals in that window are counted, and one `timer_request_refusals_not_logged` line gives them when the window ends (a sweep every 10 s, or the sender's next refusal): `src_l2_name`, `count`, `since_utc_ms`, `until_utc_ms`, and the `last_verb` and `last_error_code` of the last one. A sender gets at most 10 refusal lines a minute and that count; the windows of senders refused no more leave memory with their count. A response that cannot go at all (over the frame) is answered `TIMER_INTERNAL` and logged as `timer_handler_error`, as before. Before v1.6 a refusal reached its sender only.
 
 ### 16.5 Metrics (future)
 
@@ -1321,6 +1326,7 @@ responseToUser := fmt.Sprintf("The event is on %s", formatted.Formatted)
 | Firing precision | ±5 s | Best-effort, subject to load |
 | `payload` and `metadata` size | 32 KiB each | `TIMER_LIMIT_EXCEEDED`; with both, a `TIMER_FIRED` fits in the router's 128 KiB frame |
 | Delivery retries | up to 1 hour | 5, 10, 20 and 40 s, then each minute; within its window under `fire_if_within`, none under `drop` (§7.8) |
+| Refusal log lines | 10 per sender per minute | Then the rest are counted, and one line gives their number when the minute ends (§16.4, FINDINGS A-258). Constants |
 | Time operations' retries | ~1.4 s total | SDK side: 3 attempts that wait 100 ms, 300 ms and 1 s (§14.4) |
 
 ---
