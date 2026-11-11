@@ -74,13 +74,36 @@ Two paths take each turn:
   copy back merging the turns the intake took meanwhile, then to its file. Its communication stays
   held while it works, even when it does not fit the region.
 
+**A turn the agent refused** (FINDINGS A-292, since 0.1.136). The router copies a message for
+cognition once the agent's link takes it, before the agent reads it. Since 0.1.135 a busy AI
+runtime refuses a turn at once, without running it, and answers `ai_runtime_busy`. That answer is
+no turn:
+
+- **The intake** takes it by its exact shape (`is_busy_answer`): sent by the agent; its payload
+  `{"type": "error", "code": "ai_runtime_busy", "message", "retryable": true}` and nothing else;
+  its trace ending with the agent's entry, whose one act is `busy`.
+- **It drops the turn the agent refused** from its communication's last turns, in the file and
+  the region, with the turn's key: so the package never shows the message as said to the agent
+  and unanswered, and the message sent again is one turn.
+  - The refused message is told apart by its `trace_id` and its trace as it reached the agent
+    (`request_of`), which the answer carries before the agent's entry: a WF can write to the agent
+    twice in one cycle.
+  - One a WF relayed to a person too stays, as that relay ([cognition-hands-v1](../cognition-hands-v1.md)
+    §12.9).
+- **The worker** never gets the refusal and does not analyze the refused turn. When the refusal
+  comes while it analyzes that turn, it drops what the turn derived.
+- **What it does not change:** a refusal the runtime could not send (its direct lane full) leaves
+  the turn as before, and so does one of a turn a cognition older than 0.1.136 took. A message the
+  router delivers to the agent before cognition takes the refusal still carries the refused turn
+  in its package: the router reads the package as it delivers.
+
 Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 
 ## Messages
 
 | Message | Who may send / where it goes | What it does |
 | --- | --- | --- |
-| `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, writes those to its file and rewrites the memory region; then queues them for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
+| `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, in their order, and takes an agent's refusal (`ai_runtime_busy`) as no turn, dropping the turn it refused; writes those to its file and rewrites the memory region; then queues the turns for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
 | `STREAM_APPEND storage.usage` (sent) | to its router's stream | one usage record per LLM call, charged to the agent's tenant, or the writer's in a communication with no agent |
 | `COGNITION_EPISODE` (sent and taken) | a system broadcast to `SY.cognition@*`, taken only from a cognition (`take_episode`) | an episode it made, which every hive's cognition keeps once ([docs/reference/cognition.md](../reference/cognition.md) §4.1) |
 | `COGNITION_CLEAR` → `COGNITION_CLEAR_RESPONSE` | only `SY.admin@motherbee`, as its router names it, and never a tap's copy (`take_clear`); SY.admin's `cognition_clear` | drops every communication and every episode it keeps, in memory and in its file, and writes the memory region empty; answers what it removed and keeps running ([docs/reference/cognition.md](../reference/cognition.md) §5.1) |
@@ -136,8 +159,9 @@ those are the installation's, in its installation file). It accepts `thresholds.
   `degraded_ai_settings_invalid`, `cognition_state_label`), the degraded reasons
   (`ai_settings_invalid`, `ai_provider_missing`), where the provider and the model came from
   (`ai_provider.settings`: `{from: installation_file, version, sha256}` or `{from: hive_yaml}`,
-  with `error` when they cannot be used; `config.ai.settings` in `CONFIG_GET`), the turn counters,
-  and the clears it took (`clears`). Through the admin:
+  with `error` when they cannot be used; `config.ai.settings` in `CONFIG_GET`), the turn counters
+  (the agents' refusals among them: `refusals_total`, `refused_turns_dropped_total`,
+  `refused_turns_not_analyzed_total`), and the clears it took (`clears`). Through the admin:
   `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
 
 ## Links

@@ -195,6 +195,19 @@ Cognition analyzes the first two lines only: a person is at their other end.
 - **The agent reads it** (`render_memory_turn`, `current_message_label`, nodes/ai/ai-generic):
   `<kind> <name> (<ilk>)`, with `via <node>` for a person, and `you, to <whom>` for its own. A turn
   with no writer reads as before.
+- **A turn its agent refused** (FINDINGS A-292, since 0.1.136). Since 0.1.135 a busy AI runtime
+  refuses a turn without running it and answers `ai_runtime_busy`, after its router copied the
+  turn for cognition:
+  - The turn leaves its communication's last turns, and the worker does not analyze it. One a WF
+    relayed to a person too stays, as the relay it was (§12.9).
+  - The refusal is no turn.
+  - **Dropped, not kept with a mark "unanswered":**
+    - the agent never took the message, and its sender is told to send it again; the copy sent
+      again is the one the communication keeps, once;
+    - a mark would show the message twice once it is sent again;
+    - a mark would also need a field in the package, in both SDKs and ai.generic.
+  - How the refusal is recognized and which turn it drops:
+    [SY.cognition](nodes/sy-cognition.md#the-interlocutor-model).
 
 ---
 

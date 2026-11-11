@@ -135,10 +135,11 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   communication holds an answer with its text (`echoes_own_answer`). When the agent's own copy of
   a message comes after its relay, the turn was said to the agent too: it no longer names where
   else it went (`said_to_the_agent_too`), and the worker's write-back keeps it so
-  (`merge_recent_turns` keeps the held copy of a turn, `same_turn`).
-- Then it hands each record to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full queue drops
-  the turn and counts it (`dropped_turns_queue_full_total`); the turn stays in its communication's
-  last turns.
+  (`merge_recent_turns` keeps the held copy of a turn, `same_turn`). An agent's refusal takes the
+  key with the turn it drops (§3.4): the message sent again under that key is a turn again.
+- Then it hands each record but a refusal to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full
+  queue drops the turn and counts it (`dropped_turns_queue_full_total`); the turn stays in its
+  communication's last turns.
 - It acks the batch with the batch's last seq. The ack waits for the intake, never for the
   worker: what was acked and not processed is lost if SY.cognition stops, except its last turns.
 - One task takes the queued turns one at a time, in order (`run_turn_worker`).
@@ -281,6 +282,12 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
 - **Which turns:** those with a thread id and an agent ILK, found as the worker finds them
   (`agent_identity_of`, cached); the worker counts the others. A turn with neither text, files
   nor a menu choice is left out: the package would show it empty.
+- **A turn the agent refused** (FINDINGS A-292, since 0.1.136): the agent's `ai_runtime_busy`, by
+  its exact shape (`is_busy_answer`), is no turn. It drops, in its batch's order, the agent's copy
+  of the message it refused (`refuse_turn`), with the copy's key. The message is told apart by its
+  `trace_id` and its trace before the agent's entry (`request_of`). One a WF relayed to a person
+  too is that relay again. The worker never gets the refusal and does not analyze the refused
+  turn ([SY.cognition](../nodes/sy-cognition.md#the-interlocutor-model)).
 - **What a turn keeps** (`MemoryTurn` in `crates/fluxbee_sdk/src/protocol.rs`):
   - `direction`: `out` when its router names the agent node as the sender, `in` otherwise;
   - `src_ilk`: the sender's ILK, when the message had one;
@@ -766,7 +773,10 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
   `stream_repeats_skipped_total`, `no_agent_ilk_total`, `intake_turns_total` (turns the
   intake added to their communications' last turns, §3.4), `turns_not_analyzed_total` (turns
   with no person at their other end, §3), `relay_turns_total` (the turns a WF relayed between
-  people, §2) and `duplicate_turns_skipped_total` (one message copied twice, §2);
+  people, §2), `duplicate_turns_skipped_total` (one message copied twice, §2), and the agents'
+  refusals (§3.4): `refusals_total`, `refused_turns_dropped_total` (the turns they dropped) and
+  `refused_turns_not_analyzed_total` (the refused turns the worker did not analyze, or whose
+  analysis it dropped);
 - the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, provider errors,
   invalid outputs and other failures (§3.1);
 - the live state: the communications held, their contexts, reasons and co-occurrences, active
