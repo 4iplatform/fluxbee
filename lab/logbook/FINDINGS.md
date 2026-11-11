@@ -268,6 +268,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   own way.
 - A-114 🟡 No IO node writes first to a person; io.api delivers no answer at all.
 - A-91 🔵 io.blob and io.cloud boot UNCONFIGURED while they work.
+- A-255 🔴 A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its
+  restart.
+- A-256 🔵 io.cloud accepts `io.inbound_family` and ignores it (low; with A-149).
 - **io.slack:**
   - A-136 🟡 One interlocutor's conversation is split by where they write in Slack.
   - A-148 🟡 What it lacks against the standard, starting with its revamp's architecture.
@@ -313,6 +316,14 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-253 🔵 A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns (low).
 - A-254 🔵 A WF can lose a timer schedule without knowing it: the schedule goes without waiting for an answer, and a refusal is dropped (low; WF).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
+- A-257 🔵 The frontdesk's handoff waits behind its LLM turns (low; the AI SDK).
+- A-258 🔵 SY.timer's refusals leave no line in its own log (low).
+- A-259 🔵 SY.timer's scheduler keeps a canceled or moved timer's entry until its old fire time (low).
+- A-260 🔵 The expiry sweep holds the publication lock while an edge or IO.blob does not answer (low).
+- A-261 🔵 The hub's LSA snapshot can briefly go back to an older copy (low; the router).
+- A-262 🔵 The hub sends no advertisement when the set it vouches for to a spoke becomes empty (nit; the router).
+- A-263 🔵 The installation update's follow reads one hive at a time (low; with A-250's gate).
+- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1389,6 +1400,112 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-264 [General/Go SDK] 🔵 low (found 2026-11-11 by A-253's verifier; read in the code) — The Go SDK has no text blob offload: a WF's text over 128 KiB fails, and one between about 96 and 128 KiB misses the turns
+
+- **Why:** the Rust SDK puts any `text/v1` payload over about 62 KiB in a blob
+  (`crates/fluxbee_sdk/src/send_normalization.rs`, `payload.rs`); the Go SDK only refuses a frame
+  over 128 KiB (`go/fluxbee-go-sdk/client.go` ~208-229, `MessageTooLargeError`). wf-generic is the
+  only Go producer of turns: SY.timer's messages are system ones, capped at 32 KiB.
+- **Effect:** a WF's text over 128 KiB is never sent; one between about 96 and 128 KiB reaches its
+  node but not `turns` or cognition (A-253's window). Large resolved `vars` in a WF's
+  `meta.context` land in the window with a small text too.
+- **Fix, later:** the Go SDK gets the Rust SDK's `text/v1` offload (the blob layout and its promote;
+  check the WF nodes' access to the blob root). A Go SDK release, alone.
+
+### A-263 [General/admin] 🔵 low (found 2026-11-10 by A-250's builder; read in the code) — The installation update's follow reads one hive at a time
+
+- **Why:** the update's background task reads the hives in turn, so a read lost to one spoke's
+  self-restart (10 s since A-250's option (a)) delays the reads of the hives after it, and an
+  operator's explicit run waits for the task's pass and its re-asks.
+- **To evaluate with 0.1.131's deploy** (A-250's gate, the spokes' orchestrators restart): if the
+  follow still lags the spokes' own settle, read the hives at once.
+
+### A-262 [General/router] 🔵 nit (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub sends no advertisement when the set it vouches for to a spoke becomes empty
+
+- `reachability_frame` returns nothing for an empty set (`src/router/mod.rs` ~2527): when the last
+  node the hub vouched for to a spoke goes, or its hive goes stale, that spoke keeps the old
+  entries until their 40 s expiry and routes to the hub, which answers `NODE_NOT_FOUND`. On 8.x
+  every hive runs SY nodes, so the set is never empty.
+- **Fix:** send the empty advertisement to a spoke that had entries.
+
+### A-261 [General/router] 🔵 low (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub's LSA snapshot can briefly go back to an older copy
+
+- **Why:** `refresh_lsa` (`src/router/mod.rs` ~6575-6580) reads the LSA region and stores the copy
+  later under the snapshot's lock, so a write in between is undone until the next refresh; and
+  `write_lsa_state` (~2976-2986) takes the writer's lock only after it read `lsa_state`, so two
+  writes at once can store the older read last, until the next write (up to 10 s).
+- **Effect:** a node that just connected on one spoke and sends at once to another can have its
+  first frame dropped on the hub as `foreign_source` (A-195's symptom, moved to the hub); a far
+  answer for it can be missed the same way. It needs a thread descheduled at that moment: rare.
+- **Fix:** `refresh_lsa` stores a read only if its heartbeat is not older than the stored one's;
+  `write_lsa_state` takes the writer's lock before it reads.
+
+### A-260 [General/admin] 🔵 low (found 2026-11-10 by A-242's builder; read in the code; there before it) — The expiry sweep holds the publication lock while an edge or IO.blob does not answer
+
+- **Why:** `retire_expired_publication` (`src/bin/sy_admin.rs` ~7731) holds `publication_lock`
+  across `unpublish_edge_blob` (a 30 s bound) and `release_curated_blob`. A-242 removed only the
+  case of an edge whose hive is gone.
+- **Effect:** an edge whose hive is listed but down, or a slow IO.blob, holds the lock about 30 s
+  per page due, every 10 minutes: a `publish_artifact` waiting meanwhile answers `TIMEOUT` past its
+  110 s, and take-downs (Archi's, the factory reset's) queue.
+- **Fix:** the edge's and IO.blob's calls outside the lock (copy the record, call, then lock again,
+  reload and check before writing each state), or a much shorter bound for the sweep's calls.
+
+### A-259 [General/SY.timer] 🔵 low (found 2026-11-10 by A-244's review; read in the code; there before it) — SY.timer's scheduler keeps a canceled, moved or purged timer's entry until its old fire time
+
+- **Why:** nothing removes a heap entry: the only calls are `heap.Push` and `heap.Pop`
+  (`go/sy-timer/scheduler.go` ~599, ~613). `TIMER_CANCEL` only signals the scheduler (`main.go`
+  ~864), `TIMER_RESCHEDULE` pushes a second entry (~914), and an owner's purge deletes rows and
+  signals (~952). A stale entry leaves when it pops, at the cost of a lock and a read.
+- **Effect:** the pending caps count pending rows only, so a node that loops `TIMER_SCHEDULE` (up
+  to 366 days) and `TIMER_CANCEL` is never refused: about 100 B of heap per pair until its fire time
+  or the next start, and each canceled row stays in `timers.db` (up to 64 KiB with its payload and
+  metadata) for 7 days from its cancel. History, fired or canceled, has no cap.
+- **Also:** a start whose count of pending timers fails prints `pending=0` in its ready line, next
+  to a separate error line.
+- **Fix:** a map from a timer's uuid to its heap entry (`timerHeapEntry.index` is kept already) and
+  `heap.Remove` on cancel, reschedule and purge.
+
+### A-258 [General/SY.timer] 🔵 low (found 2026-11-10 by A-254's triage; read in the code) — SY.timer's refusals leave no line in its own log
+
+- A request SY.timer refuses (`TIMER_BELOW_MINIMUM`, `TIMER_FORBIDDEN`, `TIMER_LIMIT_EXCEEDED`, …) is
+  answered to its sender, and SY.timer's journal says nothing: the operator cannot see there who
+  was refused and why. The operator's call on A-253 (2026-11-10): logs for everything.
+- **Fix:** one line per refusal (the verb, the code, the sender), bounded per sender.
+
+### A-257 [General/frontdesk] 🔵 low (found 2026-11-10 by A-223's triage and io.api's builder; read in the code) — The frontdesk's handoff waits behind its LLM turns
+
+- **Why:** SY.frontdesk.gov runs the AI SDK's default pool of 4 workers
+  (`RuntimeConfig::default()`, `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ~3121;
+  `crates/fluxbee_ai_sdk/src/runtime.rs:72`). With 4 LLM turns in flight its dispatch loop waits on
+  `join_next` (~250-269), and a handoff waits behind them.
+- **Effect:** io.api gives up at its 10 s with `frontdesk_unavailable` while the frontdesk may still
+  register the person afterwards (A-223's symptom, from another cause). `NODE_STATUS_GET` and
+  `CONFIG_*` to the frontdesk wait in the same queue.
+- **Fix, later:** control traffic and the handoff not behind the LLM workers (the AI SDK: shared
+  code, alone).
+
+### A-256 [IO/io.cloud] 🔵 low (found 2026-11-10 by A-91's builder; read in the code) — io.cloud accepts `io.inbound_family` and ignores it
+
+- The contract (`nodes/io/common/src/io_cloud_adapter_config.rs`) accepts and stores the optional
+  `io.inbound_family`; io.cloud uses the fixed `"user"` (`CLOUD_INBOUND_FAMILY`). A `CONFIG_SET`
+  of it is accepted and does nothing.
+- **Fix:** with A-149 (io-common), use it or drop it from the contract.
+
+### A-255 [IO/io.cloud] 🔴 (found 2026-11-10 by A-91's builder; confirmed in the code by its review; there before it) — A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its restart
+
+- **Why:** `publish_cloud_endpoint` records the edge with `set_node_config`
+  (`src/bin/sy_admin.rs`, `handle_publish_cloud_endpoint` ~7846-7856); the orchestrator's
+  `set_node_config_flow` only writes `config.json` (`src/bin/sy_orchestrator.rs` ~27285) and sends
+  the node no `CONFIG_SET`; io.cloud reads `config.json` only when it starts.
+- **Effect:** after the first publish on a fresh install, or a move to another edge, Cloud's
+  requests time out at the edge (504) until IO.cloud restarts; publishing again only mints a new
+  token. On 8.x every .deb relaunch hid it. Since A-91 (0.1.131) IO.cloud's status names
+  `missing_edge_node`, each dropped request logs a warn line, and the texts tell the operator to
+  restart IO.cloud after a publish.
+- **Fix:** SY.admin applies the recorded edge live (a `CONFIG_SET` to IO.cloud at its live
+  `config_version` + 1, or its restart), and the restart steps written in 0.1.131 come out.
 
 ### A-254 [WF] 🔵 low (found 2026-11-10 by the Go SDK's 0.1.130 builder; read in the code, not run) — A WF can lose a timer schedule without knowing it
 
