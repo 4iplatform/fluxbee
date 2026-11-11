@@ -375,6 +375,9 @@ struct AdminContext {
     /// The tenant identity charges a node that publishes or takes down a page to
     /// (`publisher_tenant_from_shm`).
     publisher_tenant: PublisherTenant,
+    /// The channels (ICH) identity's shared memory holds now, their owners and whether each is
+    /// enabled (`channel_options_from_shm`).
+    channel_options: ChannelOptions,
     /// The installation's update, its state on disk (docs/hive-config-update-v1.md §6, stage 4).
     installation_update: Arc<installation_update::Updates>,
 }
@@ -385,6 +388,11 @@ type ConnectedNodes = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + S
 /// Reads the tenant of a node, `<name>@<hive>`, from identity's shared memory, given this hive's
 /// config dir: an error says why the node is no publisher.
 type PublisherTenant = Arc<dyn Fn(&Path, &str) -> Result<String, String> + Send + Sync>;
+
+/// Reads the channels (ICH) from identity's shared memory, given this hive's config dir.
+type ChannelOptions = Arc<
+    dyn Fn(&Path) -> Result<Vec<fluxbee_sdk::identity::IdentityIchOption>, String> + Send + Sync,
+>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -763,6 +771,7 @@ async fn main() -> Result<(), AdminError> {
         web: web_routes,
         connected_nodes: Arc::new(connected_nodes_from_shm),
         publisher_tenant: Arc::new(publisher_tenant_from_shm),
+        channel_options: Arc::new(channel_options_from_shm),
         installation_update: installation_update::Updates::load(&state_dir),
     };
     log_registry_caller_roles(&http_ctx.hive_id, &hive_registry(&http_ctx));
@@ -7225,6 +7234,16 @@ fn publisher_tenant_from_shm(config_dir: &Path, caller: &str) -> Result<String, 
     Ok(option.tenant_id)
 }
 
+/// The channels (ICH) identity's shared memory holds now (`ctx.channel_options`): `externalize`
+/// resolves a channel's owner from them, `publish_cloud_endpoint` IO.cloud's channel, and
+/// `unexternalize` its owner.
+fn channel_options_from_shm(
+    config_dir: &Path,
+) -> Result<Vec<fluxbee_sdk::identity::IdentityIchOption>, String> {
+    fluxbee_sdk::identity::list_ich_options_from_hive_config(config_dir)
+        .map_err(|err| err.to_string())
+}
+
 /// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator, in
 /// `hives/` beside the state directory (`HIVE_REGISTRY_DIR` on a motherbee).
 fn hive_registry(ctx: &AdminContext) -> HiveRegistry {
@@ -7876,9 +7895,18 @@ async fn handle_publish_cloud_endpoint(
             "missing edge_node (the SY.edge L2 name to publish on, e.g. SY.edge@ingress1)",
         ));
     };
+    // IO.cloud only, before anything is opened (FINDINGS A-255's review): the door is Fluxbee
+    // Cloud's, and its edge is written into the node's config and applied to it, a CONFIG_SET of
+    // its whole config.
+    if !is_io_cloud_node(&cloud_node) {
+        return Ok(internal_invalid_request(
+            "publish_cloud_endpoint",
+            &format!("cloud_node must be IO.cloud (IO.cloud@<hive>), not '{cloud_node}'"),
+        ));
+    }
 
     // The operator names the NODE; we resolve the ICH.
-    let ich = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
+    let ich = match (ctx.channel_options)(&ctx.config_dir) {
         Ok(options) => match resolve_ich_owned_by(options, &cloud_node) {
             Ok(value) => value,
             Err(detail) => return Ok(internal_invalid_request("publish_cloud_endpoint", &detail)),
@@ -7933,9 +7961,16 @@ async fn handle_publish_cloud_endpoint(
     }
 }
 
-/// How long SY.admin gives IO.cloud, in all, to answer the CONFIG_GET and the CONFIG_SET that apply
-/// the edge `publish_cloud_endpoint` records (FINDINGS A-255). IO.cloud answers one message at a
-/// time, and a Cloud request it relays waits up to 25 s for the hive: this outlasts one.
+/// Whether `node` is IO.cloud, `IO.cloud@<hive>`: the one node whose door `publish_cloud_endpoint`
+/// opens and whose config it writes the edge into.
+fn is_io_cloud_node(node: &str) -> bool {
+    node.split_once('@')
+        .is_some_and(|(name, hive)| name == "IO.cloud" && !hive.is_empty())
+}
+
+/// How long SY.admin gives IO.cloud, in all, to answer the CONFIG_GETs and the CONFIG_SETs that
+/// apply the edge `publish_cloud_endpoint` records (FINDINGS A-255). IO.cloud answers one message at
+/// a time, and a Cloud request it relays waits up to 25 s for the hive: this outlasts one.
 const CLOUD_EDGE_APPLY_BUDGET: Duration = Duration::from_secs(30);
 
 /// What became of the edge `publish_cloud_endpoint` records, in the running IO.cloud (FINDINGS
@@ -7947,9 +7982,51 @@ enum CloudEdgeApply {
     AlreadyTrusted,
     /// It took a CONFIG_SET of its live config with that edge, at this `config_version`.
     Applied(u64),
-    /// It did not take it, and why: the edge is in its `config.json` only, which it reads when it
+    /// It did not take it, and why: it refused the CONFIG_GET or the CONFIG_SET, or SY.admin could
+    /// build no CONFIG_SET on its answer. The edge is in its `config.json`, which it reads when it
     /// starts.
     NotApplied(String),
+    /// SY.admin could not learn whether it trusts that edge, and why: it did not answer the
+    /// CONFIG_GET in time (busy relaying Cloud's requests, or not running), or a CONFIG_SET it may
+    /// still apply.
+    Unchecked(String),
+    /// Another config reached it while SY.admin applied this one (a CONFIG_SET refused as stale),
+    /// and neither try took the edge; why. IO.cloud writes the config it takes to its
+    /// `config.json`, so that config may have replaced the record there too.
+    Superseded(String),
+}
+
+/// One read and write of `apply_cloud_edge` (`try_cloud_edge`).
+#[derive(Debug, Clone, PartialEq)]
+enum CloudEdgeTry {
+    /// Its live config trusts the edge already.
+    Trusted,
+    /// It took the CONFIG_SET at this `config_version`.
+    Applied(u64),
+    /// It refused the CONFIG_GET or the CONFIG_SET for a reason a second try meets again, or
+    /// SY.admin could build no CONFIG_SET on its answer; why.
+    Refused(String),
+    /// It did not answer the CONFIG_GET; why.
+    Unread(String),
+    /// It refused the CONFIG_SET as stale, another config having reached it between the read and
+    /// the write; why.
+    Stale(String),
+    /// It did not answer the CONFIG_SET, which it may still apply; why.
+    Unanswered(String),
+}
+
+impl CloudEdgeTry {
+    fn why(&self) -> String {
+        match self {
+            Self::Trusted => "it trusts the edge".to_string(),
+            Self::Applied(config_version) => {
+                format!("it took the CONFIG_SET at config_version {config_version}")
+            }
+            Self::Refused(why) | Self::Unread(why) | Self::Stale(why) | Self::Unanswered(why) => {
+                why.clone()
+            }
+        }
+    }
 }
 
 /// Records the edge in IO.cloud's managed config, then applies it to the running IO.cloud
@@ -7978,18 +8055,13 @@ async fn record_and_apply_cloud_edge(
         Some(ctx.hive_id.clone()),
     )
     .await;
-    let failure = match record {
-        Ok((status, _)) if status < 400 => None,
-        Ok((status, body)) => Some(format!("(HTTP {status}): {body}")),
-        Err(err) => Some(format!(": {err}")),
-    };
-    if let Some(failure) = failure {
+    if let Some(failure) = cloud_edge_record_failure(&record) {
         return Err(internal_service_error(
             "publish_cloud_endpoint",
             "CONFIG_RECORD_FAILED",
             &format!(
-                "endpoint published but recording edge_node into {cloud_node} config failed \
-                 {failure}. Re-run publish_cloud_endpoint to re-record."
+                "endpoint published but recording edge_node into {cloud_node} config \
+                 failed{failure}. Re-run publish_cloud_endpoint to re-record."
             ),
         ));
     }
@@ -8017,14 +8089,37 @@ async fn record_and_apply_cloud_edge(
             reason = %why,
             "publish_cloud_endpoint: edge_node recorded but not applied to the running IO.cloud"
         ),
+        CloudEdgeApply::Unchecked(why) => tracing::warn!(
+            cloud_node = %cloud_node,
+            edge_node = %edge_node,
+            reason = %why,
+            "publish_cloud_endpoint: edge_node recorded, and SY.admin could not check whether the \
+             running IO.cloud trusts it"
+        ),
+        CloudEdgeApply::Superseded(why) => tracing::warn!(
+            cloud_node = %cloud_node,
+            edge_node = %edge_node,
+            reason = %why,
+            "publish_cloud_endpoint: edge_node not applied: another config reached IO.cloud \
+             meanwhile and may have replaced the record"
+        ),
     }
     Ok(applied)
 }
 
+/// Why the record failed, as `CONFIG_RECORD_FAILED`'s detail says it right after "config failed";
+/// none when the orchestrator took it.
+fn cloud_edge_record_failure(record: &Result<(u16, String), AdminError>) -> Option<String> {
+    match record {
+        Ok((status, _)) if *status < 400 => None,
+        Ok((status, body)) => Some(format!(" (HTTP {status}): {body}")),
+        Err(err) => Some(format!(": {err}")),
+    }
+}
+
 /// Applies `edge_node` to the running `cloud_node` (FINDINGS A-255): a `CONFIG_GET` gives its live
 /// config and `config_version`; unless that config trusts the edge already, a `CONFIG_SET` carries
-/// the same config with `io.edge_node` set, at that `config_version` + 1
-/// (`cloud_edge_config_set`).
+/// the same config with `io.edge_node` set, at that `config_version` + 1 (`try_cloud_edge`).
 ///
 /// A CONFIG_SET, not a restart. A CONFIG_SET replaces the node's whole config, so it carries the
 /// live one and changes only the edge: nothing else IO.cloud holds is lost. IO.cloud takes a
@@ -8032,12 +8127,37 @@ async fn record_and_apply_cloud_edge(
 /// write makes this one stale, refused, never applied over it. A restart would drop the Cloud
 /// requests IO.cloud is relaying, start an IO.cloud an operator stopped, and boot it on the file as
 /// the record left it, whose `io` the record replaces whole.
+///
+/// A CONFIG_SET refused as stale, or not answered, is tried once more within what is left of the
+/// budget (FINDINGS A-255's review). Stale, another writer's CONFIG_SET landed between the read and
+/// the write, and IO.cloud wrote that config to its `config.json` over the record; or IO.cloud
+/// restarted on the record in between, and trusts the edge. Not answered, IO.cloud may have taken
+/// it all the same. The second read tells: its CONFIG_SET is the config the other writer set with
+/// the edge, still a compare-and-set, or none when the edge is trusted. What the tries leave is
+/// `cloud_edge_outcome`.
 async fn apply_cloud_edge(
     client: &RouterDispatcher,
     cloud_node: &str,
     edge_node: &str,
 ) -> CloudEdgeApply {
     let deadline = tokio::time::Instant::now() + CLOUD_EDGE_APPLY_BUDGET;
+    let first = try_cloud_edge(client, cloud_node, edge_node, deadline).await;
+    if !matches!(first, CloudEdgeTry::Stale(_) | CloudEdgeTry::Unanswered(_)) {
+        return cloud_edge_outcome(&[first]);
+    }
+    let again = try_cloud_edge(client, cloud_node, edge_node, deadline).await;
+    cloud_edge_outcome(&[first, again])
+}
+
+/// One read and write of `apply_cloud_edge`, within what is left of its budget: the `CONFIG_GET`,
+/// and unless the live config trusts the edge already, the `CONFIG_SET` built on its answer
+/// (`cloud_edge_config_set`).
+async fn try_cloud_edge(
+    client: &RouterDispatcher,
+    cloud_node: &str,
+    edge_node: &str,
+    deadline: tokio::time::Instant,
+) -> CloudEdgeTry {
     let live = match send_cloud_config_request(
         client,
         cloud_node,
@@ -8049,15 +8169,15 @@ async fn apply_cloud_edge(
     {
         Ok(live) => live,
         Err(err) => {
-            return CloudEdgeApply::NotApplied(format!(
+            return CloudEdgeTry::Unread(format!(
                 "{cloud_node} did not answer its CONFIG_GET: {err}"
             ))
         }
     };
     let (config_version, config) = match cloud_edge_config_set(&live, edge_node) {
-        Ok(None) => return CloudEdgeApply::AlreadyTrusted,
+        Ok(None) => return CloudEdgeTry::Trusted,
         Ok(Some(set)) => set,
-        Err(why) => return CloudEdgeApply::NotApplied(why),
+        Err(why) => return CloudEdgeTry::Refused(why),
     };
     match send_cloud_config_request(
         client,
@@ -8075,9 +8195,32 @@ async fn apply_cloud_edge(
     .await
     {
         Ok(answer) => cloud_edge_set_outcome(&answer, edge_node, config_version),
-        Err(err) => CloudEdgeApply::NotApplied(format!(
+        Err(err) => CloudEdgeTry::Unanswered(format!(
             "{cloud_node} did not answer its CONFIG_SET at config_version {config_version}: {err}"
         )),
+    }
+}
+
+/// What the tries of `apply_cloud_edge` leave (FINDINGS A-255's review): the last one's when it
+/// found the edge trusted or applied it. Otherwise, once a CONFIG_SET was refused as stale, another
+/// config reached IO.cloud meanwhile and may have replaced the record (`Superseded`); else a refusal
+/// leaves the edge recorded and not applied (`NotApplied`), and an answer that did not come leaves
+/// SY.admin not knowing what IO.cloud trusts (`Unchecked`). The why is every try's, in order.
+fn cloud_edge_outcome(tries: &[CloudEdgeTry]) -> CloudEdgeApply {
+    let why = tries
+        .iter()
+        .map(CloudEdgeTry::why)
+        .collect::<Vec<_>>()
+        .join("; read again, ");
+    let raced = tries
+        .iter()
+        .any(|attempt| matches!(attempt, CloudEdgeTry::Stale(_)));
+    match tries.last() {
+        Some(CloudEdgeTry::Trusted) => CloudEdgeApply::AlreadyTrusted,
+        Some(CloudEdgeTry::Applied(config_version)) => CloudEdgeApply::Applied(*config_version),
+        _ if raced => CloudEdgeApply::Superseded(why),
+        Some(CloudEdgeTry::Refused(_)) => CloudEdgeApply::NotApplied(why),
+        _ => CloudEdgeApply::Unchecked(why),
     }
 }
 
@@ -8091,7 +8234,7 @@ async fn send_cloud_config_request(
 ) -> Result<serde_json::Value, String> {
     let Some(limit) = time_left(deadline, CLOUD_EDGE_APPLY_BUDGET) else {
         return Err(format!(
-            "none of its {} s was left",
+            "it was not sent, the {} s SY.admin gives IO.cloud were spent",
             CLOUD_EDGE_APPLY_BUDGET.as_secs()
         ));
     };
@@ -8117,11 +8260,22 @@ async fn send_cloud_config_request(
 /// (FINDINGS A-255): `(config_version, config)`, its live config with `io.edge_node` set, at its
 /// `config_version` + 1; none when that config trusts the edge already. IO.cloud answers its
 /// CONFIG_GET `ok: false` while it trusts no edge, with its `config_version` and the config in use,
-/// if any, all the same: no config in use is `{}`.
+/// if any, all the same: no config in use is `{}`. A CONFIG_GET it refused is no config to build on
+/// (`cloud_config_get_gives_its_state`), and is why.
 fn cloud_edge_config_set(
     live: &serde_json::Value,
     edge_node: &str,
 ) -> Result<Option<(u64, serde_json::Value)>, String> {
+    if live.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        let node_error = live
+            .get("error")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let (code, detail) = extract_node_error_code_and_detail(&node_error, live);
+        if !cloud_config_get_gives_its_state(live, &code) {
+            return Err(format!("it refused its CONFIG_GET: {code}: {detail}"));
+        }
+    }
     let current = live
         .get("config_version")
         .and_then(serde_json::Value::as_u64)
@@ -8167,25 +8321,44 @@ fn cloud_edge_config_set(
     Ok(Some((next, config)))
 }
 
+/// Whether IO.cloud's CONFIG_GET answer `live`, not `ok` with the reason `code`, gives the state it
+/// is in, which the CONFIG_SET is built on (FINDINGS A-255's review): it trusts no edge
+/// (`missing_edge_node`), holds no config (`node_not_configured`, the IO family's), or could not
+/// take the config it has (`FAILED_CONFIG`, with its contract's `invalid_config` or
+/// `internal_error`, or `config_bootstrap_failed`). Anything else is a refusal of the read,
+/// `unauthorized`, `invalid_envelope` or `invalid_config` for a node_name it does not answer to,
+/// whose `effective_config` is null whatever config IO.cloud holds: built on, the CONFIG_SET would
+/// replace that config with the edge alone. (A FAILED_CONFIG IO.cloud refusing a node_name reads as
+/// its state, and refuses the CONFIG_SET's the same way.)
+fn cloud_config_get_gives_its_state(live: &serde_json::Value, code: &str) -> bool {
+    match code {
+        "missing_edge_node" | "node_not_configured" => true,
+        "invalid_config" | "internal_error" | "config_bootstrap_failed" => {
+            live.get("state").and_then(serde_json::Value::as_str) == Some("FAILED_CONFIG")
+        }
+        _ => false,
+    }
+}
+
 /// What IO.cloud's answer to the CONFIG_SET at `config_version` says of `edge_node`: applied when it
-/// is `ok` and the config it now uses trusts that edge; otherwise why not, with its refusal's code
-/// and detail (`stale_config_version` when another config reached it between the read and the
-/// write).
+/// is `ok` and the config it now uses trusts that edge; stale when another config reached it
+/// between the read and the write (`stale_config_version`); otherwise refused, why, with its
+/// refusal's code and detail.
 fn cloud_edge_set_outcome(
     answer: &serde_json::Value,
     edge_node: &str,
     config_version: u64,
-) -> CloudEdgeApply {
+) -> CloudEdgeTry {
     let ok = answer.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
     let trusted = answer
         .pointer("/effective_config/io/edge_node")
         .and_then(serde_json::Value::as_str)
         .map(str::trim);
     if ok && trusted == Some(edge_node) {
-        return CloudEdgeApply::Applied(config_version);
+        return CloudEdgeTry::Applied(config_version);
     }
     if ok {
-        return CloudEdgeApply::NotApplied(format!(
+        return CloudEdgeTry::Refused(format!(
             "it answered its CONFIG_SET at config_version {config_version} with a config that \
              trusts {}",
             trusted.unwrap_or("no edge")
@@ -8196,15 +8369,19 @@ fn cloud_edge_set_outcome(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let (code, detail) = extract_node_error_code_and_detail(&node_error, answer);
-    CloudEdgeApply::NotApplied(format!(
-        "it refused its CONFIG_SET at config_version {config_version}: {code}: {detail}"
-    ))
+    let why =
+        format!("it refused its CONFIG_SET at config_version {config_version}: {code}: {detail}");
+    if code == "stale_config_version" {
+        CloudEdgeTry::Stale(why)
+    } else {
+        CloudEdgeTry::Refused(why)
+    }
 }
 
 /// The answer of `publish_cloud_endpoint`: the externalize's, which carries the token, and whether
-/// the running IO.cloud took the edge (FINDINGS A-255): `edge_applied`, and when it did not, a
-/// `warning` that the edge is recorded but not applied yet, never a plain success. The publish
-/// worked and its token is shown only here, so the answer stays `ok`.
+/// the running IO.cloud took the edge (FINDINGS A-255): `edge_applied`, and when it did not, or
+/// SY.admin could not tell, a `warning` that says so (`cloud_edge_warning`), never a plain success.
+/// The publish worked and its token is shown only here, so the answer stays `ok`.
 fn cloud_endpoint_answer(
     mut externalize: InternalAdminDispatchResult,
     cloud_node: &str,
@@ -8218,27 +8395,53 @@ fn cloud_endpoint_answer(
     else {
         return externalize;
     };
-    let not_applied = match applied {
-        CloudEdgeApply::NotApplied(why) => Some(why),
-        CloudEdgeApply::AlreadyTrusted | CloudEdgeApply::Applied(_) => None,
-    };
+    let warning = cloud_edge_warning(cloud_node, edge_node, applied);
     payload.insert(
         "edge_applied".to_string(),
-        serde_json::json!(not_applied.is_none()),
+        serde_json::json!(warning.is_none()),
     );
-    if let Some(why) = not_applied {
-        payload.insert(
-            "warning".to_string(),
-            serde_json::json!(format!(
-                "{edge_node} is recorded in {cloud_node}'s config but not applied yet: {why}. \
-                 Until {cloud_node} takes it, it drops every Cloud request through that edge (a 504 \
-                 for Cloud): it reads the record when it starts, or takes it at once from \
-                 node_control_config_set (its node_control_config_get config with io.edge_node \
-                 {edge_node}, at config_version one above)."
-            )),
-        );
+    if let Some(warning) = warning {
+        payload.insert("warning".to_string(), serde_json::json!(warning));
     }
     externalize
+}
+
+/// The warning of a publish whose edge the running IO.cloud did not take, or not for sure
+/// (FINDINGS A-255): what is known of the edge, why, what IO.cloud does meanwhile and how the
+/// operator applies the edge at once; none while it trusts the edge. Only a `NotApplied` edge is
+/// said to be in the record IO.cloud reads when it starts: after `Superseded`, another config may
+/// have replaced the record (FINDINGS A-255's review).
+fn cloud_edge_warning(
+    cloud_node: &str,
+    edge_node: &str,
+    applied: &CloudEdgeApply,
+) -> Option<String> {
+    let at_once = format!(
+        "node_control_config_set (its node_control_config_get config with io.edge_node \
+         {edge_node}, at config_version one above)"
+    );
+    match applied {
+        CloudEdgeApply::AlreadyTrusted | CloudEdgeApply::Applied(_) => None,
+        CloudEdgeApply::NotApplied(why) => Some(format!(
+            "{edge_node} is recorded in {cloud_node}'s config but not applied yet: {why}. Until \
+             {cloud_node} takes it, it drops every Cloud request through that edge (a 504 for \
+             Cloud): it reads the record when it starts, or takes it at once from {at_once}."
+        )),
+        CloudEdgeApply::Unchecked(why) => Some(format!(
+            "SY.admin could not check whether {cloud_node} trusts {edge_node}: {why}. The edge is \
+             recorded in its config, which it reads when it starts. If the running {cloud_node} \
+             trusts another edge, or none, it drops every Cloud request through {edge_node} (a 504 \
+             for Cloud) until it takes this one: its node_control_config_get names the edge it \
+             trusts (io.edge_node), and it takes {edge_node} at once from {at_once}."
+        )),
+        CloudEdgeApply::Superseded(why) => Some(format!(
+            "{edge_node} is not applied to {cloud_node}: another config reached it while SY.admin \
+             applied this one ({why}). {cloud_node} writes the config it takes to its config.json, \
+             so the record there may no longer name {edge_node} either. Until {cloud_node} takes \
+             it, it drops every Cloud request through that edge (a 504 for Cloud): publish again, \
+             or apply it at once with {at_once}."
+        )),
+    }
 }
 
 /// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
@@ -8401,19 +8604,18 @@ async fn handle_externalize(
 
     // Resolve ICH -> owner_l2_name from identity SHM, and require the channel to
     // be enabled before it can become public.
-    let owner_l2_name =
-        match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
-            Ok(options) => match resolve_externalize_owner(options, &ich) {
-                Ok(owner) => owner,
-                Err(detail) => return Ok(internal_invalid_request("externalize", &detail)),
-            },
-            Err(err) => {
-                return Ok(internal_invalid_request(
-                    "externalize",
-                    &format!("identity SHM unavailable for ICH resolve: {err}"),
-                ))
-            }
-        };
+    let owner_l2_name = match (ctx.channel_options)(&ctx.config_dir) {
+        Ok(options) => match resolve_externalize_owner(options, &ich) {
+            Ok(owner) => owner,
+            Err(detail) => return Ok(internal_invalid_request("externalize", &detail)),
+        },
+        Err(err) => {
+            return Ok(internal_invalid_request(
+                "externalize",
+                &format!("identity SHM unavailable for ICH resolve: {err}"),
+            ))
+        }
+    };
 
     // Authz gate (v6 §11.1). A node-originated externalize must come from an IO.* node (I1) and may
     // only expose ITS OWN channel (I8). `owner_l2_name` came from identity, `caller` from the router
@@ -8620,8 +8822,7 @@ async fn handle_unexternalize(
     // Authz gate (v6 §11.1), symmetric to externalize: a node may only close ITS OWN channel.
     // Skip the identity resolve entirely on the trusted internal path (caller None).
     if caller_l2_name.is_some() {
-        let owner = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir)
-        {
+        let owner = match (ctx.channel_options)(&ctx.config_dir) {
             Ok(options) => options
                 .into_iter()
                 .find(|o| o.ich_id == ich)
@@ -15478,7 +15679,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "cloud_node",
                 "string",
-                "Optional. The IO.cloud instance to publish; defaults to IO.cloud@<hive>.",
+                "Optional. The IO.cloud instance to publish, IO.cloud@<hive>; any other node is refused (INVALID_REQUEST) before anything is opened. Defaults to IO.cloud@<hive>.",
             ),
         ],
         "publish_runtime_package" => vec![admin_action_body_field(
@@ -16938,8 +17139,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "publish_cloud_endpoint" => vec![
             "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again, it mints a new token; the previous one works 10 more minutes.",
-            "IO.cloud trusts that edge at once (FINDINGS A-255): SY.admin records it in IO.cloud's config (set_node_config of io.edge_node), then applies it to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). No restart of IO.cloud.",
-            "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning: the edge is recorded but not applied yet, and why (IO.cloud did not answer, or refused the CONFIG_SET, stale_config_version when another config reached it meanwhile). Until it takes it, IO.cloud drops every Cloud request through that edge; it reads the record when it starts, or takes it at once from node_control_config_set. The answer stays ok: the token is shown only there.",
+            "IO.cloud trusts that edge at once (FINDINGS A-255): SY.admin records it in IO.cloud's config (set_node_config of io.edge_node), then applies it to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
+            "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
@@ -28903,6 +29104,7 @@ mod tests {
             )),
             connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
             publisher_tenant: Arc::new(|_, _| Err("no shared memory in the tests".to_string())),
+            channel_options: Arc::new(|_| Err("no shared memory in the tests".to_string())),
             installation_update: installation_update::Updates::load(&state_dir),
         };
         (ctx, harness)
@@ -38989,10 +39191,54 @@ mod tests {
         })
     }
 
+    /// IO.cloud's refusal of a CONFIG_GET or a CONFIG_SET, as `build_io_config_set_error_payload`
+    /// gives it: no config whatever it holds, its `config_version`, and the reason.
+    fn cloud_config_refusal(config_version: u64, code: &str, message: &str) -> Value {
+        json!({
+            "ok": false,
+            "node_name": CLOUD_NODE,
+            "state": "CONFIGURED",
+            "config_source": "dynamic",
+            "schema_version": 1,
+            "config_version": config_version,
+            "effective_config": null,
+            "error": { "code": code, "message": message },
+        })
+    }
+
+    /// IO.cloud's refusal of a CONFIG_SET at `config_version` as stale: another config took that
+    /// version first.
+    fn cloud_config_stale(config_version: u64) -> Value {
+        cloud_config_refusal(
+            config_version,
+            "stale_config_version",
+            &format!(
+                "config_version {config_version} must be greater than current {config_version}"
+            ),
+        )
+    }
+
+    /// IO.cloud's ok to a CONFIG_SET at `config_version`, `config` the config it now uses.
+    fn cloud_config_taken(config_version: u64, config: Value) -> Value {
+        json!({
+            "ok": true,
+            "node_name": CLOUD_NODE,
+            "state": "CONFIGURED",
+            "config_source": "dynamic",
+            "schema_version": 1,
+            "config_version": config_version,
+            "effective_config": config,
+            "error": null,
+            "apply": { "mode": "hot_reload", "hot_applied": ["io.edge_node"] },
+        })
+    }
+
     /// The orchestrator's ok to the record.
     fn cloud_edge_recorded() -> Value {
         json!({ "status": "ok", "node_name": CLOUD_NODE, "config_version": 4 })
     }
+
+    const CLOUD_ICH: &str = "ich:14b66389-d425-531c-a140-a591d25e8f39";
 
     /// What the externalize of `publish_cloud_endpoint` answers, the token in it.
     fn cloud_externalize_answer() -> InternalAdminDispatchResult {
@@ -39002,14 +39248,30 @@ mod tests {
                 "status": "ok",
                 "action": "externalize",
                 "payload": {
-                    "url": "/e/ich:14b66389-d425-531c-a140-a591d25e8f39",
-                    "ich": "ich:14b66389-d425-531c-a140-a591d25e8f39",
+                    "url": format!("/e/{CLOUD_ICH}"),
+                    "ich": CLOUD_ICH,
                     "owner_l2_name": CLOUD_NODE,
                     "edge_node": CLOUD_EDGE,
                     "token": "the-token-shown-once",
                 }
             }),
         }
+    }
+
+    /// The warning of the publish's answer when the running IO.cloud did not take the edge, or
+    /// SY.admin could not tell: the answer stays `ok` with the token, which is shown only there,
+    /// says `edge_applied: false`, and asks for no restart.
+    fn cloud_edge_warning_of(applied: &CloudEdgeApply) -> String {
+        let answer =
+            cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, applied);
+        assert_eq!(answer.http_status, 200);
+        assert_eq!(answer.envelope["status"], json!("ok"));
+        let payload = &answer.envelope["payload"];
+        assert_eq!(payload["token"], json!("the-token-shown-once"));
+        assert_eq!(payload["edge_applied"], json!(false));
+        let warning = payload["warning"].as_str().expect("a warning").to_string();
+        assert!(!warning.contains("restart"), "{warning}");
+        warning
     }
 
     /// FINDINGS A-255: the edge `publish_cloud_endpoint` records reaches the running IO.cloud. On a
@@ -39110,24 +39372,68 @@ mod tests {
         );
         for (answer, why) in [
             (
-                json!({ "ok": false, "effective_config": null }),
+                json!({ "ok": true, "effective_config": null }),
                 "no config_version",
             ),
             (
-                json!({ "config_version": 2, "effective_config": "io" }),
+                json!({ "ok": true, "config_version": 2, "effective_config": "io" }),
                 "effective_config is not an object",
             ),
             (
-                json!({ "config_version": 2, "effective_config": { "io": "SY.edge@ingress1" } }),
+                json!({
+                    "ok": true,
+                    "config_version": 2,
+                    "effective_config": { "io": "SY.edge@ingress1" },
+                }),
                 "io is not an object",
             ),
             (
-                json!({ "config_version": u64::MAX, "effective_config": null }),
+                cloud_config_get(u64::MAX, Value::Null),
                 "cannot go one above",
             ),
         ] {
             let err = cloud_edge_config_set(&answer, CLOUD_EDGE).expect_err(why);
             assert!(err.contains(why), "{why}: {err}");
+        }
+    }
+
+    /// A CONFIG_GET IO.cloud refused is no config to build on (FINDINGS A-255's review): its
+    /// effective_config is null whatever config IO.cloud holds, and a CONFIG_SET built on it would
+    /// replace that config with the edge alone. One that is not `ok` for the state IO.cloud is in is
+    /// built on: it trusts no edge, holds no config, or could not take the one it has.
+    #[test]
+    fn a_config_get_io_cloud_refused_is_no_config_to_build_on() {
+        let answer = |state: &str, code: &str| {
+            let mut answer = cloud_config_refusal(7, code, "the reason");
+            answer["state"] = json!(state);
+            answer
+        };
+        for (state, code) in [
+            ("CONFIGURED", "unauthorized"),
+            ("CONFIGURED", "invalid_envelope"),
+            ("CONFIGURED", "invalid_config"),
+            ("UNCONFIGURED", "invalid_config"),
+            ("UNCONFIGURED", "a_reason_it_does_not_give_yet"),
+        ] {
+            let err = cloud_edge_config_set(&answer(state, code), CLOUD_EDGE)
+                .expect_err("a refused read");
+            assert!(
+                err.contains(&format!("it refused its CONFIG_GET: {code}: the reason")),
+                "{state} {code}: {err}"
+            );
+        }
+        for (state, code) in [
+            ("UNCONFIGURED", "missing_edge_node"),
+            ("UNCONFIGURED", "node_not_configured"),
+            ("FAILED_CONFIG", "invalid_config"),
+            ("FAILED_CONFIG", "internal_error"),
+            ("FAILED_CONFIG", "config_bootstrap_failed"),
+        ] {
+            assert_eq!(
+                cloud_edge_config_set(&answer(state, code), CLOUD_EDGE),
+                Ok(Some((8, json!({ "io": { "edge_node": CLOUD_EDGE } })))),
+                "{state} {code}"
+            );
         }
     }
 
@@ -39164,35 +39470,15 @@ mod tests {
         assert!(answer.envelope["payload"].get("warning").is_none());
     }
 
-    /// An edge the running IO.cloud does not take is answered with a warning (FINDINGS A-255): the
-    /// answer stays `ok` with the token, which is shown only there, and says `edge_applied: false`,
-    /// that the edge is recorded but not applied yet, why, and how IO.cloud takes it; never a plain
-    /// success. Here IO.cloud does not run (the router answers its CONFIG_GET UNREACHABLE), and then
-    /// it refuses the CONFIG_SET as stale: another config reached it between the read and the write.
+    /// An edge IO.cloud refuses is answered with a warning (FINDINGS A-255): the answer stays `ok`
+    /// with the token, which is shown only there, and says `edge_applied: false`, that the edge is
+    /// recorded but not applied yet, why, and how IO.cloud takes it; never a plain success. A
+    /// refusal a second try would meet again is not tried again: here IO.cloud cannot write the
+    /// CONFIG_SET to its config.json, and then it refuses the CONFIG_GET, which no CONFIG_SET is
+    /// built on.
     #[tokio::test]
-    async fn an_edge_io_cloud_does_not_take_is_answered_with_a_warning() {
-        let (ctx, mut harness) = opa_test_admin("cloud-edge-not-applied");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
-        let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
-            answer_cloud_config(
-                &mut harness,
-                "CONFIG_GET",
-                MSG_UNREACHABLE,
-                json!({ "reason": "NODE_NOT_FOUND", "original_dst": CLOUD_NODE }),
-            )
-            .await;
-        };
-        let (down, ()) = tokio::join!(apply, drive);
-        let down = down.expect("recorded");
-        let CloudEdgeApply::NotApplied(why) = &down else {
-            panic!("{down:?}");
-        };
-        assert!(
-            why.contains("did not answer its CONFIG_GET") && why.contains("NODE_NOT_FOUND"),
-            "{why}"
-        );
-
+    async fn an_edge_io_cloud_refuses_is_recorded_and_not_applied() {
+        let (ctx, mut harness) = opa_test_admin("cloud-edge-refused");
         let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
             answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
@@ -39207,55 +39493,419 @@ mod tests {
                 &mut harness,
                 "CONFIG_SET",
                 "CONFIG_RESPONSE",
-                json!({
-                    "ok": false,
-                    "node_name": CLOUD_NODE,
-                    "state": "CONFIGURED",
-                    "config_source": "dynamic",
-                    "schema_version": 1,
-                    "config_version": 2,
-                    "effective_config": null,
-                    "error": {
-                        "code": "stale_config_version",
-                        "message": "config_version 2 must be greater than current 2",
-                    },
-                }),
+                cloud_config_refusal(1, "config_persist_error", "No space left on device"),
             )
             .await;
         };
-        let (stale, ()) = tokio::join!(apply, drive);
-        let stale = stale.expect("recorded");
-        let CloudEdgeApply::NotApplied(why) = &stale else {
-            panic!("{stale:?}");
+        let (unwritten, ()) = tokio::join!(apply, drive);
+        let unwritten = unwritten.expect("recorded");
+        let CloudEdgeApply::NotApplied(why) = &unwritten else {
+            panic!("{unwritten:?}");
         };
         assert!(
-            why.contains("stale_config_version") && why.contains("at config_version 2"),
+            why.contains("config_persist_error") && why.contains("at config_version 2"),
+            "{why}"
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "not tried again"
+        );
+
+        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_refusal(
+                    5,
+                    "unauthorized",
+                    "CONFIG_GET/SET requires the configured Admin or Orchestrator origin",
+                ),
+            )
+            .await;
+        };
+        let (unread, ()) = tokio::join!(apply, drive);
+        let unread = unread.expect("recorded");
+        let CloudEdgeApply::NotApplied(why) = &unread else {
+            panic!("{unread:?}");
+        };
+        assert!(
+            why.contains("it refused its CONFIG_GET: unauthorized"),
+            "{why}"
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "no CONFIG_SET on a refused read"
+        );
+
+        for (applied, reason) in [
+            (&unwritten, "config_persist_error"),
+            (&unread, "unauthorized"),
+        ] {
+            let warning = cloud_edge_warning_of(applied);
+            for what in [
+                CLOUD_EDGE,
+                "recorded",
+                "not applied yet",
+                reason,
+                "reads the record when it starts",
+                "node_control_config_set",
+            ] {
+                assert!(warning.contains(what), "{what}: {warning}");
+            }
+        }
+    }
+
+    /// A CONFIG_GET IO.cloud does not answer leaves SY.admin not knowing what it trusts (FINDINGS
+    /// A-255's review): it does not run (here the router answers UNREACHABLE), or a rotation finds it
+    /// busy relaying Cloud's requests. Nothing more is sent. The answer keeps `edge_applied: false`,
+    /// and its warning says SY.admin could not check, and what an IO.cloud that trusts another edge
+    /// does until it takes this one; never that IO.cloud did not take the edge.
+    #[tokio::test]
+    async fn a_config_get_without_an_answer_leaves_the_edge_unchecked() {
+        let (ctx, mut harness) = opa_test_admin("cloud-edge-unchecked");
+        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                MSG_UNREACHABLE,
+                json!({ "reason": "NODE_NOT_FOUND", "original_dst": CLOUD_NODE }),
+            )
+            .await;
+        };
+        let (applied, ()) = tokio::join!(apply, drive);
+        let applied = applied.expect("recorded");
+        let CloudEdgeApply::Unchecked(why) = &applied else {
+            panic!("{applied:?}");
+        };
+        assert!(
+            why.contains("did not answer its CONFIG_GET") && why.contains("NODE_NOT_FOUND"),
             "{why}"
         );
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+        let warning = cloud_edge_warning_of(&applied);
+        for what in [
+            "could not check",
+            CLOUD_EDGE,
+            "NODE_NOT_FOUND",
+            "another edge",
+            "node_control_config_get",
+            "node_control_config_set",
+        ] {
+            assert!(warning.contains(what), "{what}: {warning}");
+        }
+        assert!(!warning.contains("not applied"), "{warning}");
+    }
 
-        for (applied, reason) in [(&down, "NODE_NOT_FOUND"), (&stale, "stale_config_version")] {
+    /// An IO.cloud too busy to answer within the 30 s (it serves one message at a time, and a
+    /// relayed Cloud request waits up to 25 s) leaves the edge unchecked, never refused (FINDINGS
+    /// A-255's review): a rotation answered while Cloud's requests queue at IO.cloud does not tell
+    /// the operator that IO.cloud drops them. A CONFIG_SET without an answer within the budget may
+    /// still be applied, and with the budget spent no second read goes: unchecked as well.
+    #[tokio::test(start_paused = true)]
+    async fn an_io_cloud_that_does_not_answer_in_time_leaves_the_edge_unchecked() {
+        let (ctx, mut harness) = opa_test_admin("cloud-edge-busy");
+        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            let get = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the CONFIG_GET");
+            assert_eq!(get.meta.msg.as_deref(), Some("CONFIG_GET"));
+        };
+        let (busy, ()) = tokio::join!(apply, drive);
+        let busy = busy.expect("recorded");
+        let CloudEdgeApply::Unchecked(why) = &busy else {
+            panic!("{busy:?}");
+        };
+        assert!(why.contains("did not answer its CONFIG_GET"), "{why}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(3, Value::Null),
+            )
+            .await;
+            let set = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the CONFIG_SET");
+            assert_eq!(set.meta.msg.as_deref(), Some("CONFIG_SET"));
+        };
+        let (late, ()) = tokio::join!(apply, drive);
+        let late = late.expect("recorded");
+        let CloudEdgeApply::Unchecked(why) = &late else {
+            panic!("{late:?}");
+        };
+        assert!(
+            why.contains("did not answer its CONFIG_SET at config_version 4")
+                && why.contains("read again")
+                && why.contains("were spent"),
+            "{why}"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        let warning = cloud_edge_warning_of(&late);
+        assert!(warning.contains("could not check"), "{warning}");
+    }
+
+    /// A CONFIG_SET refused as stale is tried once more on the config read again (FINDINGS A-255's
+    /// review): another config reached IO.cloud between the read and the write, here one that moved
+    /// its door to another edge and set its inbound family, and IO.cloud wrote it to its config.json
+    /// over the record. The second CONFIG_SET is that config with the edge, one version above it,
+    /// and IO.cloud takes it.
+    #[tokio::test]
+    async fn a_stale_config_set_is_tried_again_on_the_config_read_again() {
+        let (ctx, mut harness) = opa_test_admin("cloud-edge-stale-again");
+        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let ours = json!({ "io": { "edge_node": CLOUD_EDGE, "inbound_family": "user" } });
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(7, Value::Null),
+            )
+            .await;
+            let first = answer_cloud_config(
+                &mut harness,
+                "CONFIG_SET",
+                "CONFIG_RESPONSE",
+                cloud_config_stale(8),
+            )
+            .await;
+            assert_eq!(first.payload["config_version"], json!(8));
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(
+                    8,
+                    json!({ "io": { "edge_node": "SY.edge@ingress2", "inbound_family": "user" } }),
+                ),
+            )
+            .await;
+            let again = answer_cloud_config(
+                &mut harness,
+                "CONFIG_SET",
+                "CONFIG_RESPONSE",
+                cloud_config_taken(9, ours.clone()),
+            )
+            .await;
+            assert_eq!(again.payload["config_version"], json!(9));
+            assert_eq!(again.payload["config"], ours);
+        };
+        let (applied, ()) = tokio::join!(apply, drive);
+        assert_eq!(applied.expect("recorded"), CloudEdgeApply::Applied(9));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The second read may find the edge trusted (FINDINGS A-255's review): IO.cloud restarted on
+    /// the record between the read and the write, which made the CONFIG_SET stale, or the CONFIG_SET
+    /// got no answer from an IO.cloud on its way down that came back on the record. Nothing more is
+    /// sent, and the answer says the edge is applied.
+    #[tokio::test]
+    async fn a_second_read_that_finds_the_edge_trusted_sends_nothing_more() {
+        let (ctx, mut harness) = opa_test_admin("cloud-edge-found-trusted");
+        for (answer_msg, answer) in [
+            ("CONFIG_RESPONSE", cloud_config_stale(2)),
+            (
+                MSG_UNREACHABLE,
+                json!({ "reason": "NODE_NOT_FOUND", "original_dst": CLOUD_NODE }),
+            ),
+        ] {
+            let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+            let drive = async {
+                answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+                answer_cloud_config(
+                    &mut harness,
+                    "CONFIG_GET",
+                    "CONFIG_RESPONSE",
+                    cloud_config_get(1, Value::Null),
+                )
+                .await;
+                answer_cloud_config(&mut harness, "CONFIG_SET", answer_msg, answer.clone()).await;
+                answer_cloud_config(
+                    &mut harness,
+                    "CONFIG_GET",
+                    "CONFIG_RESPONSE",
+                    cloud_config_get(2, json!({ "io": { "edge_node": CLOUD_EDGE } })),
+                )
+                .await;
+            };
+            let (applied, ()) = tokio::join!(apply, drive);
+            let applied = applied.expect("recorded");
+            assert_eq!(applied, CloudEdgeApply::AlreadyTrusted, "{answer_msg}");
+            assert!(harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none());
             let answer =
-                cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, applied);
-            assert_eq!(answer.http_status, 200);
-            assert_eq!(answer.envelope["status"], json!("ok"));
-            let payload = &answer.envelope["payload"];
-            assert_eq!(payload["token"], json!("the-token-shown-once"));
-            assert_eq!(payload["edge_applied"], json!(false));
-            let warning = payload["warning"].as_str().expect("a warning");
-            for what in [
-                CLOUD_EDGE,
-                "recorded",
-                "not applied yet",
-                reason,
-                "node_control_config_set",
-            ] {
-                assert!(warning.contains(what), "{what}: {warning}");
-            }
-            assert!(!warning.contains("restart"), "{warning}");
+                cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, &applied);
+            assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
+        }
+    }
+
+    /// A CONFIG_SET stale on both tries (FINDINGS A-255's review): another config reached IO.cloud
+    /// each time between the read and the write, and IO.cloud wrote each to its config.json, so
+    /// neither its live config nor the record may name the edge. The warning says another config
+    /// reached it, to publish again or to apply the edge with node_control_config_set, and never that
+    /// the edge is recorded or that IO.cloud reads it when it starts. There is no third try.
+    #[tokio::test]
+    async fn a_config_set_stale_on_both_tries_does_not_say_the_record_holds_the_edge() {
+        let (ctx, mut harness) = opa_test_admin("cloud-edge-superseded");
+        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let drive = async {
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(7, Value::Null),
+            )
+            .await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_SET",
+                "CONFIG_RESPONSE",
+                cloud_config_stale(8),
+            )
+            .await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(8, json!({ "io": { "edge_node": "SY.edge@ingress2" } })),
+            )
+            .await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_SET",
+                "CONFIG_RESPONSE",
+                cloud_config_stale(9),
+            )
+            .await;
+        };
+        let (applied, ()) = tokio::join!(apply, drive);
+        let applied = applied.expect("recorded");
+        let CloudEdgeApply::Superseded(why) = &applied else {
+            panic!("{applied:?}");
+        };
+        assert!(
+            why.contains("at config_version 8")
+                && why.contains("; read again, ")
+                && why.contains("at config_version 9"),
+            "{why}"
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "no third try"
+        );
+        let warning = cloud_edge_warning_of(&applied);
+        for what in [
+            CLOUD_EDGE,
+            "another config reached",
+            "stale_config_version",
+            "may no longer name",
+            "publish again",
+            "node_control_config_set",
+        ] {
+            assert!(warning.contains(what), "{what}: {warning}");
+        }
+        for claim in ["is recorded", "reads the record when it starts"] {
+            assert!(!warning.contains(claim), "{claim}: {warning}");
+        }
+    }
+
+    /// What the tries of the apply leave (FINDINGS A-255's review): the last try's success; else,
+    /// once a CONFIG_SET was stale, another config reached IO.cloud and may have replaced the record;
+    /// else a refusal is not applied, and an answer that did not come leaves the edge unchecked.
+    /// The why is every try's, in order.
+    #[test]
+    fn what_the_tries_of_the_apply_leave() {
+        use crate::CloudEdgeTry::{Applied, Refused, Stale, Trusted, Unanswered, Unread};
+        let stale = || Stale("stale".to_string());
+        let unanswered = || Unanswered("no answer".to_string());
+        for (tries, outcome) in [
+            (vec![Trusted], CloudEdgeApply::AlreadyTrusted),
+            (vec![Applied(4)], CloudEdgeApply::Applied(4)),
+            (
+                vec![Refused("refused".to_string())],
+                CloudEdgeApply::NotApplied("refused".to_string()),
+            ),
+            (
+                vec![Unread("no read".to_string())],
+                CloudEdgeApply::Unchecked("no read".to_string()),
+            ),
+            (vec![stale(), Trusted], CloudEdgeApply::AlreadyTrusted),
+            (vec![stale(), Applied(9)], CloudEdgeApply::Applied(9)),
+            (vec![unanswered(), Trusted], CloudEdgeApply::AlreadyTrusted),
+            (vec![unanswered(), Applied(9)], CloudEdgeApply::Applied(9)),
+            (
+                vec![stale(), stale()],
+                CloudEdgeApply::Superseded("stale; read again, stale".to_string()),
+            ),
+            (
+                vec![stale(), Unread("no read".to_string())],
+                CloudEdgeApply::Superseded("stale; read again, no read".to_string()),
+            ),
+            (
+                vec![stale(), Refused("refused".to_string())],
+                CloudEdgeApply::Superseded("stale; read again, refused".to_string()),
+            ),
+            (
+                vec![stale(), unanswered()],
+                CloudEdgeApply::Superseded("stale; read again, no answer".to_string()),
+            ),
+            (
+                vec![unanswered(), stale()],
+                CloudEdgeApply::Superseded("no answer; read again, stale".to_string()),
+            ),
+            (
+                vec![unanswered(), Refused("refused".to_string())],
+                CloudEdgeApply::NotApplied("no answer; read again, refused".to_string()),
+            ),
+            (
+                vec![unanswered(), Unread("no read".to_string())],
+                CloudEdgeApply::Unchecked("no answer; read again, no read".to_string()),
+            ),
+            (
+                vec![unanswered(), unanswered()],
+                CloudEdgeApply::Unchecked("no answer; read again, no answer".to_string()),
+            ),
+        ] {
+            assert_eq!(cloud_edge_outcome(&tries), outcome, "{tries:?}");
         }
     }
 
@@ -39278,7 +39928,10 @@ mod tests {
         assert_eq!(failed.http_status, 502);
         assert_eq!(failed.envelope["error_code"], json!("CONFIG_RECORD_FAILED"));
         let detail = failed.envelope["error_detail"].as_str().unwrap_or_default();
-        assert!(detail.contains("NODE_CONFIG_NOT_FOUND"), "{detail}");
+        assert!(
+            detail.contains("config failed (HTTP ") && detail.contains("NODE_CONFIG_NOT_FOUND"),
+            "{detail}"
+        );
         assert!(
             harness
                 .next_outgoing_within(Duration::from_millis(200))
@@ -39286,6 +39939,161 @@ mod tests {
                 .is_none(),
             "IO.cloud is not asked"
         );
+    }
+
+    /// CONFIG_RECORD_FAILED's detail reads "config failed: <why>" for an error and "config failed
+    /// (HTTP <status>): <body>" for a refusal (FINDINGS A-255's review).
+    #[test]
+    fn the_record_s_failure_reads_right_after_config_failed() {
+        let failure =
+            |record: Result<(u16, String), AdminError>| cloud_edge_record_failure(&record);
+        assert_eq!(failure(Ok((200, "{}".to_string()))), None);
+        assert_eq!(
+            failure(Ok((404, "no config.json".to_string()))),
+            Some(" (HTTP 404): no config.json".to_string())
+        );
+        assert_eq!(
+            failure(Err("timeout".into())),
+            Some(": timeout".to_string())
+        );
+    }
+
+    /// publish_cloud_endpoint end to end (FINDINGS A-255's review): IO.cloud's channel from
+    /// identity's shared memory, the token minted into the vault for the edge, the edge opening the
+    /// URL with only the token's reference, the record, then IO.cloud's CONFIG_GET and CONFIG_SET.
+    /// The answer carries the token the vault got, once, and `edge_applied: true`.
+    #[tokio::test]
+    async fn publish_cloud_endpoint_opens_the_door_records_and_applies_the_edge() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-publish");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let publish =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let drive = async {
+            let wait = Duration::from_secs(5);
+            let secret_ref = format!("edge_channel_secret:{CLOUD_ICH}");
+            let put = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the token into the vault");
+            assert_eq!(put.meta.msg.as_deref(), Some(MSG_VAULT_PUT));
+            assert_eq!(dst_of(&put), json!(format!("SY.vault@{PRIMARY_HIVE_ID}")));
+            assert_eq!(put.payload["key"], json!(secret_ref));
+            let token = put.payload["value"]["secret"]
+                .as_str()
+                .expect("the minted token")
+                .to_string();
+            harness
+                .inject(reply_to(
+                    &put,
+                    MSG_VAULT_PUT_RESPONSE,
+                    json!({ "status": "ok", "key": secret_ref }),
+                ))
+                .await
+                .unwrap();
+            let open = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the edge's open");
+            assert_eq!(open.meta.msg.as_deref(), Some(MSG_EDGE_OPEN_URL));
+            assert_eq!(dst_of(&open), json!(CLOUD_EDGE));
+            assert_eq!(open.payload["ich"], json!(CLOUD_ICH));
+            assert_eq!(open.payload["owner_l2_name"], json!(CLOUD_NODE));
+            assert_eq!(open.payload["auth_mode"], json!("shared-secret"));
+            assert_eq!(open.payload["secret_ref"], json!(secret_ref));
+            assert!(
+                !open.payload.to_string().contains(&token),
+                "the edge gets the token's reference only"
+            );
+            harness
+                .inject(reply_to(
+                    &open,
+                    MSG_EDGE_OPEN_URL_RESPONSE,
+                    json!({ "status": "ok" }),
+                ))
+                .await
+                .unwrap();
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            answer_cloud_config(
+                &mut harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(3, Value::Null),
+            )
+            .await;
+            let set = answer_cloud_config(
+                &mut harness,
+                "CONFIG_SET",
+                "CONFIG_RESPONSE",
+                cloud_config_taken(4, json!({ "io": { "edge_node": CLOUD_EDGE } })),
+            )
+            .await;
+            assert_eq!(set.payload["config_version"], json!(4));
+            assert_eq!(
+                set.payload["config"],
+                json!({ "io": { "edge_node": CLOUD_EDGE } })
+            );
+            token
+        };
+        let (answer, token) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        assert_eq!(answer.http_status, 200, "{}", answer.envelope);
+        assert_eq!(answer.envelope["status"], json!("ok"));
+        let payload = &answer.envelope["payload"];
+        assert_eq!(payload["token"], json!(token));
+        assert_eq!(payload["url"], json!(format!("/e/{CLOUD_ICH}")));
+        assert_eq!(payload["edge_node"], json!(CLOUD_EDGE));
+        assert_eq!(payload["edge_applied"], json!(true));
+        assert!(payload.get("warning").is_none(), "{payload}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// publish_cloud_endpoint publishes IO.cloud's door only (FINDINGS A-255's review): another node
+    /// named as cloud_node, even one that owns a channel, is refused before anything is opened,
+    /// recorded or applied.
+    #[tokio::test]
+    async fn publish_cloud_endpoint_refuses_a_node_that_is_not_io_cloud() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-not-io-cloud");
+        ctx.channel_options = Arc::new(|_| {
+            Ok(vec![ich_option(
+                CLOUD_ICH,
+                Some("IO.api.support@worker1"),
+                true,
+            )])
+        });
+        for node in [
+            "IO.api.support@worker1",
+            "SY.admin@motherbee",
+            "IO.cloud.support@motherbee",
+            "io.cloud@motherbee",
+            "IO.cloud",
+            "IO.cloud@",
+        ] {
+            let answer = handle_publish_cloud_endpoint(
+                &ctx,
+                &ctx.rpc,
+                json!({ "edge_node": CLOUD_EDGE, "cloud_node": node }),
+            )
+            .await
+            .expect("dispatch");
+            assert_eq!(answer.http_status, 400, "{node}");
+            assert_eq!(answer.envelope["error_code"], json!("INVALID_REQUEST"));
+            let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("cloud_node must be IO.cloud") && detail.contains(node),
+                "{node}: {detail}"
+            );
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing opened, recorded or applied"
+        );
+        assert!(is_io_cloud_node(CLOUD_NODE));
     }
 
     // --- unpublish_artifact: by its id or its link's key, by its publisher only -------------

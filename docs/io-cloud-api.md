@@ -874,12 +874,23 @@ only here.** Give Cloud `https://<public host><url>` and the token.
 
 IO.cloud trusts that edge at once, the first time and whenever the door moves to another edge
 (FINDINGS A-255): after the record, SY.admin applies the edge to the running IO.cloud, a
-`CONFIG_SET` of its live config with that edge at its `config_version` + 1. The answer says so with
-`edge_applied: true`. With `edge_applied: false` it carries a `warning`: the edge is recorded but
-not applied yet, and why (IO.cloud did not answer, or refused the `CONFIG_SET`). Until IO.cloud
-takes it, it drops every Cloud request through that edge (a 504 for Cloud); it reads the record
-when it starts, or takes it at once from a `CONFIG_SET` of `io.edge_node` (`node_control_config_set`,
-its `node_control_config_get` config with the edge, `config_version` one above).
+`CONFIG_SET` of its live config with that edge at its `config_version` + 1. A `CONFIG_SET` refused
+as stale (another config reached IO.cloud between the read and the write) or not answered is tried
+once more on the config read again, within 30 s in all. The answer says so with
+`edge_applied: true`. With `edge_applied: false` it carries a `warning` that says why, and which
+case it is:
+
+- the edge is recorded but not applied yet: IO.cloud refused the read or the `CONFIG_SET`, and it
+  reads the record when it starts;
+- SY.admin could not check whether IO.cloud trusts the edge: IO.cloud did not answer in time (it
+  serves one message at a time, §6) or does not run. A rotation that finds it busy says this, and
+  IO.cloud still trusts the edge it trusted;
+- another config reached IO.cloud meanwhile, neither try took the edge, and that config may have
+  replaced the record: publish again.
+
+Until IO.cloud takes the edge, it drops every Cloud request through it (a 504 for Cloud); a
+`CONFIG_SET` of `io.edge_node` applies it at once (`node_control_config_set`, its
+`node_control_config_get` config with the edge, `config_version` one above).
 
 - **Rotate:** run it again on the same edge. A new token is minted; the previous one works 10 more
   minutes. IO.cloud already trusts that edge: nothing in it changes.
