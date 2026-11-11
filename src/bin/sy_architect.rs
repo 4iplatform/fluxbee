@@ -125,7 +125,7 @@ You are a coordinator, not an executor. You read system state and route all muta
 - For software versions: use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
 - For LLM token usage: `/hives/motherbee/usage?from=<RFC 3339>&to=<RFC 3339>&group_by=day|model|node|tenant` (a period of at most 92 days; add `tenant_id=tnt:<uuid>` for one tenant).
 - For runtime/package info: use `/hives/{hive}/runtimes` or `/hives/{hive}/runtimes/{runtime}`, not `/hives/{hive}/nodes`.
-- For deployments and drift: use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. If these return `entries: []`, report zero entries — do not infer data from broader endpoints. A drift-alerts answer with a `note` holds only what the motherbee recorded: say so, since that hive's own checks are in its journal, not in the answer.
+- For deployments and drift: use `/hives/{hive}/deployments?category=&limit=` or `/hives/{hive}/drift-alerts?category=&severity=&kind=&limit=` (newest first, 50 without a limit, at most 500), or `/deployments` and `/drift-alerts` for every hive (`?hive=` for one). Put what the operator asks for in the query, a severity or a kind: the newest 50 may not hold an older match. If these return `entries: []`, report zero entries — do not infer data from broader endpoints. A drift-alerts answer with a `note` holds only what the motherbee recorded: say so, since that hive's own checks are in its journal, not in the answer.
 - Stored node config: `GET /hives/{hive}/nodes/{node_name}/config` (persisted snapshot). Live node contract: `POST /hives/{hive}/nodes/{node_name}/control/config-get`. Prefer GET first; use control/config-get only when the live contract is needed.
 - For admin action schemas and examples, use `fluxbee_system_get` on `/admin/actions/{action}` when answering questions. Planning tools do their own schema lookup before mutation.
 - Do not use `/admin/actions/{action}` lookups as a substitute for compiling a mutation plan. If the operator wants a change and the target values are known, call `fluxbee_plan_compiler`.
@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (limit up to 1000), next_cursor while timers follow and no total; a cursor that is not one (<fire_at_utc_ms>:<uuid>) is refused with TIMER_INVALID_PAYLOAD (HTTP 400 on SY.admin's route). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/deployments?category=&limit= and /hives/{hive}/drift-alerts?category=&severity=&kind=&limit= (newest first, 50 without a limit, at most 500: filter in the query; /deployments and /drift-alerts read every hive's, ?hive= one hive's), /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (limit up to 1000), next_cursor while timers follow and no total; a cursor that is not one (<fire_at_utc_ms>:<uuid>) is refused with TIMER_INVALID_PAYLOAD (HTTP 400 on SY.admin's route). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -12948,7 +12948,9 @@ const SCMD_VERSIONS_KEYS: &[&str] = &["versions_limit", "versions_before"];
 /// its query (`deployments_payload_from_query`, `drift_alerts_payload_from_query`; FINDINGS A-288),
 /// where all of it was dropped: `limit` only when it is a number, so the orchestrator's default (50)
 /// holds otherwise, and each of the read's `filters` only when it is not empty. The orchestrator
-/// filters by each.
+/// filters by each. Two differences are `scmd_query_params`': a key is read as it came, where
+/// SY.admin's routes decode it, and an empty value is left out, so `?category=core&category=`
+/// filters by core, where SY.admin's routes take the last value and filter by none.
 fn scmd_history_params(raw_query: Option<&str>, filters: &[&str]) -> Value {
     let mut params = json!({});
     for (key, value) in scmd_query_params(raw_query) {
@@ -12973,7 +12975,8 @@ const SCMD_DRIFT_ALERT_FILTERS: &[&str] = &["category", "severity", "kind"];
 
 /// The hive a global read of the deployments or the drift alerts names, `?hive=`: that hive's
 /// history is read then, as on SY.admin's `GET /deployments?hive=` and `GET /drift-alerts?hive=`
-/// (FINDINGS A-288).
+/// (FINDINGS A-288). An empty or blank `?hive=` names none, as an empty filter is none: every
+/// hive's history is read, where SY.admin's route reads the local hive's.
 fn scmd_query_hive(raw_query: Option<&str>) -> Option<String> {
     scmd_query_params(raw_query)
         .get("hive")
@@ -12981,6 +12984,24 @@ fn scmd_query_hive(raw_query: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|hive| !hive.is_empty())
         .map(str::to_string)
+}
+
+/// The tap a `DELETE /hives/{hive}/taps` removes, by its key (`match_src`, `match_dst`, `target`):
+/// the body's, or, when the body names none of the three, the query's, each decoded once, as
+/// SY.admin's route and its example_scmd name it (the review of A-288). Archi read the body only:
+/// an SCMD that named the tap in the query, the catalog's example among them since its quoted path
+/// parses, reached SY.config.routes as `{}` and was refused with NOT_FOUND, the tap left in place.
+fn scmd_tap_key_params(raw_query: Option<&str>, mut params: Value) -> Value {
+    const TAP_KEY: [&str; 3] = ["match_src", "match_dst", "target"];
+    if TAP_KEY.iter().any(|key| params.get(key).is_some()) {
+        return params;
+    }
+    for (key, value) in scmd_query_params(raw_query) {
+        if TAP_KEY.contains(&key.as_str()) {
+            params[key.as_str()] = value;
+        }
+    }
+    params
 }
 
 /// `GET /hives/{hive}/timer/timers?owner_l2_name=&status_filter=&limit=&cursor=`, read as SY.admin's
@@ -14155,7 +14176,7 @@ fn translate_scmd(
                 admin_target,
                 action: "delete_tap".to_string(),
                 target_hive: (*hive_id).to_string(),
-                params,
+                params: scmd_tap_key_params(raw_query, params),
             })
         }
         // The path names the hive: SY.admin's route reads no `?hive=` here (FINDINGS A-288).
@@ -32633,6 +32654,59 @@ mod tests {
         assert_eq!(translated.params, json!({}));
     }
 
+    /// The review of A-288: `DELETE /hives/{hive}/taps` names its tap in the query, as SY.admin's
+    /// route and its example_scmd do. The catalog's example, pasted after `SCMD:`, deletes the tap
+    /// it names, each value decoded once, where Archi read the body only and sent `{}`, which
+    /// SY.config.routes refused with NOT_FOUND. A body that names the tap is read as before.
+    #[test]
+    fn a_tap_delete_reads_its_key_from_the_query() {
+        let admin_src = include_str!("sy_admin.rs");
+        let start = admin_src
+            .find("\"curl -X DELETE '/hives/motherbee/taps?")
+            .expect("delete_tap's example_scmd")
+            + 1;
+        let example =
+            &admin_src[start..start + admin_src[start..].find("'\"").expect("its end") + 1];
+        let translated = translate_scmd("motherbee", parse(example)).expect(example);
+        assert_eq!(translated.action, "delete_tap");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "match_src": "IO.api.sales@motherbee",
+                "match_dst": "AI.sales@motherbee",
+                "target": "IO.slack.sales@motherbee"
+            })
+        );
+
+        let encoded = translate_scmd(
+            "motherbee",
+            parse(
+                "curl -X DELETE '/hives/worker1/taps?match_src=IO.a%40worker1&match_dst=AI.b%40worker1&target=IO.c%2540worker1&mode=x'",
+            ),
+        )
+        .expect("the query's tap");
+        assert_eq!(encoded.target_hive, "worker1");
+        assert_eq!(
+            encoded.params,
+            json!({ "match_src": "IO.a@worker1", "match_dst": "AI.b@worker1", "target": "IO.c%40worker1" })
+        );
+
+        let body = json!({
+            "match_src": "IO.a@motherbee",
+            "match_dst": "AI.b@motherbee",
+            "target": "IO.c@motherbee"
+        });
+        let from_body = translate_scmd(
+            "motherbee",
+            parse(&format!(
+                "curl -X DELETE /hives/motherbee/taps?match_src=IO.z@motherbee -d '{body}'"
+            )),
+        )
+        .expect("the body's tap");
+        assert_eq!(from_body.params, body);
+    }
+
     /// FINDINGS A-197: Archi's read of /admin/actions asks the compact catalog, as its plan
     /// compiler's refresh does: the full one does not fit in one mesh frame. One action's help
     /// stays as it was.
@@ -33074,7 +33148,9 @@ mod tests {
     /// FINDINGS A-288: `GET /deployments` reads its query as SY.admin's route does, where all of it
     /// was dropped: `limit` as a number and `category`, which the orchestrator filters by, and
     /// `?hive=` that hive's deployments (`get_deployments`). A limit that is no number is left out
-    /// (the orchestrator's 50 holds), and so is an empty filter or a drift alert's.
+    /// (the orchestrator's 50 holds), and so is an empty filter or a drift alert's. An empty or
+    /// blank `?hive=` names no hive, as an empty filter is none: every hive's deployments are read
+    /// (`list_deployments`), where SY.admin's route reads the local hive's (the review).
     #[test]
     fn the_deployments_read_carries_its_query() {
         let translate = |path: &str| {
@@ -33224,6 +33300,39 @@ mod tests {
             assert!(pages.contains(text), "{text}: {pages}");
         }
         assert!(!pages.contains("did not give"), "{pages}");
+    }
+
+    /// FINDINGS A-288, the review: the SCMD arms read the history's query, and the texts the model
+    /// reads name it, where they named no query and the model read the newest 50 alerts of every
+    /// kind, an older critical one not among them. The read tool's key paths and the chat's line
+    /// for deployments and drift give `?category=&limit=` and, of the drift alerts,
+    /// `&severity=&kind=`, newest first, 50 without a limit and at most 500 (the orchestrator's),
+    /// and the global reads, every hive's or with `?hive=` one hive's.
+    #[tokio::test]
+    async fn the_read_tool_names_the_history_reads_query() {
+        let (context, _router) = harness_tool_context();
+        let definition = ArchitectSystemGetTool::new(context).definition();
+        let path = definition.parameters_json_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("the path's description");
+        let (key_paths, _pages) = path.split_once(" Pages: ").expect("its pages");
+        assert!(
+            key_paths.contains(
+                "/hives/{hive}/deployments?category=&limit= and \
+                 /hives/{hive}/drift-alerts?category=&severity=&kind=&limit= (newest first, 50 \
+                 without a limit, at most 500: filter in the query; /deployments and /drift-alerts \
+                 read every hive's, ?hive= one hive's)"
+            ),
+            "{key_paths}"
+        );
+        let chat = build_archi_prompt(None);
+        assert!(chat.contains(
+            "- For deployments and drift: use `/hives/{hive}/deployments?category=&limit=` or \
+             `/hives/{hive}/drift-alerts?category=&severity=&kind=&limit=` (newest first, 50 \
+             without a limit, at most 500), or `/deployments` and `/drift-alerts` for every hive \
+             (`?hive=` for one). Put what the operator asks for in the query, a severity or a \
+             kind: the newest 50 may not hold an older match."
+        ));
     }
 
     /// FINDINGS A-198: a plan whose answer did not fit one mesh frame ran: Archi says so, names its

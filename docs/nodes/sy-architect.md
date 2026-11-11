@@ -119,6 +119,11 @@ the method and path to one admin action, sent as `ADMIN_COMMAND` to `SY.admin@<h
 
 An SCMD typed by the operator runs immediately; a mutating action is recorded in the
 `operations` table (`handle_scmd`, `execute_tracked_admin_translation`).
+`DELETE /hives/{hive}/taps` names its tap (`match_src`, `match_dst`, `target`) in the body or, as
+SY.admin's route and its `example_scmd` do, in the query, each value decoded once and read when
+the body names none of the three (`scmd_tap_key_params`, the review of FINDINGS A-288). Before
+0.1.133 the query went unread: an SCMD that named the tap there reached SY.config.routes as `{}`,
+refused with `NOT_FOUND`, and the tap stayed.
 
 **`fluxbee_system_get`** is the LLM's read tool. It builds an SCMD from `{method, path, body}`
 and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`), and it runs reads
@@ -159,6 +164,13 @@ the drift alerts `&severity=&kind=` too, as SY.admin's routes do (`scmd_history_
 only when it is a number, so the orchestrator's 50 holds otherwise), and `?hive=` reads that
 hive's history (`get_deployments`, `get_drift_alerts`); `GET /hives/{hive}/deployments` and
 `/hives/{hive}/drift-alerts` read the same filters. Before 0.1.133 all four dropped their query.
+An empty filter is none, an empty or blank `?hive=` too: every hive's history is read, where
+SY.admin's route reads the local hive's (`scmd_query_hive`). A key that comes twice with an empty
+last value keeps the value before it, where SY.admin's routes take the empty one, no filter; and
+a key is read as it came, where SY.admin's routes decode it. The read tool's key paths and the
+chat's line for deployments and drift name the query: newest first, 50 without a `limit` and at
+most 500 (the orchestrator's), so the model puts what the operator asks for, a severity or a
+kind, in the query, where it read the newest 50 of every kind and missed an older match.
 Archi's own reads of a list, the nodes of a hive a redeploy reads (`list_nodes_for_hive`) and the
 motherbee's nodes its status shows, go page after page with a smaller page when SY.admin says how
 many rows fit (`admin_listing_every_page`); an answer that is not ok is an error, never an empty
