@@ -6966,15 +6966,18 @@ async fn rebuild_fib(
 }
 
 /// Stores `build` as the router's FIB unless a build with a newer generation stored one first.
-/// Builds run at once (a message of one of the router's nodes, the 5 s loops, an LSA applied, the
-/// stale check), and one that read the tables before a change must not replace the FIB of one that
-/// saw it. Each build takes its generation before it reads anything (`build_fib`), and the change's
+/// A build runs at a node's connect, its disconnect and each of its messages, at a sibling's
+/// frame, in the 5 s loops, at the heartbeat that finds a new config, as a gateway applies an LSA
+/// or, on a spoke, the hub's reachability advertisement, and at the stale check, so builds run at
+/// once, and one that read the tables before a change must not replace the FIB of one that saw
+/// it. Each build takes its generation before it reads anything (`build_fib`), and the change's
 /// own rebuild takes one after the change: so a build with a newer generation than that rebuild's
 /// read the change too, and one with an older generation is dropped. Once the rebuild that follows
-/// a change returns, the FIB has seen the change. Until 0.1.134 the last build to store won, and
-/// one that read before a change could undo the change's rebuild until the next build, 5 s at
-/// most: a node an LSA had just added missing from the hub's FIB (A-265), or a stale hive's names
-/// left in it (A-268).
+/// a change returns, the FIB has seen the change, whichever rebuild it is. Until 0.1.134 the last
+/// build to store won, and one that read before a change could undo the change's rebuild until
+/// the next build, 5 s at most: a node an LSA had just added missing from the hub's FIB (A-265),
+/// a stale hive's names left in it, or the nodes the hub had just vouched for missing from a
+/// spoke's (A-268).
 async fn store_fib(fib: &Arc<Mutex<Fib>>, build: FibBuild) {
     let mut fib_guard = fib.lock().await;
     if build.generation <= fib_guard.stored {

@@ -87,7 +87,9 @@ Separate three things that are conflated today: **data** (which node lives on wh
   until then the hub answered a frame relayed by name to it `NODE_NOT_FOUND` until its next
   rebuild, up to 5 s. It rebuilds it, too, as it marks a spoke stale, whose names then leave it at
   once. Since 0.1.134 (FINDINGS A-268) no build that ran at once and read the tables before them
-  undoes these rebuilds: a FIB is stored only by a build newer than the one that stored the last.
+  undoes these rebuilds, nor a spoke's as it applies a reachability advertisement
+  (`apply_wan_reachability`): a FIB is stored only by a build newer than the one that stored the
+  last.
 - Terminal gate (`mod.rs:2858`): a frame whose `src` resolves only via the reachability table is
   **admitted for delivery** instead of dropped (terminal gate closed), carrying the `via_hub` flag
   to the authority decision.
