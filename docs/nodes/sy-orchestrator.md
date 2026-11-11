@@ -282,6 +282,39 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   (`RUNTIME_IN_USE`) until systemctl answers that the unit does not run. Before, each of them read
   no answer as "not running": a remove stopped and purged a node that might run, and the usage
   left out a node on its way up and any node systemctl gave no answer for.
+- **A runtime's use across the hives** (FINDINGS A-281, since 0.1.133). A `get_runtime`
+  (`GET_RUNTIME`) answers, beside its hive's `usage`, `usage_global_visible`: on a spoke its own
+  usage again; on the motherbee its nodes and those of the other hives of its registry, asked for
+  their `GET_RUNTIME` one at a time (`global_visible_runtime_usage_summary`,
+  `group_runtime_usage`). The answer tells a hive where no managed node can run, which is not
+  asked, from one whose use is unknown:
+  - **`hives_without_runtimes`**: each hive whose role, as its registry entry records it whatever
+    the state of its join (`registered_spoke_role`), runs no managed node
+    (`role_runs_managed_nodes`), with that role. The runtimes reach the motherbee and the workers
+    only (`fluxbee-dist-runtimes`, [Syncthing](#syncthing)), and `run_node` launches only what that
+    folder's manifest names, so an ingress or an egress answers every runtime read and launch
+    `RUNTIME_MANIFEST_MISSING`. It is not asked: no node there can use a runtime, and one that is
+    down holds no removal up.
+  - **`skipped_hives`**: each other hive, a worker or one whose role cannot be read (no `info.yaml`
+    that parses, an entry that names another hive, no spoke role), that did not answer with its
+    nodes, with the reason: `UNREACHABLE` (no answer, with its `message`); the answer's error code
+    (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest, `RUNTIME_NOT_FOUND` for one
+    whose manifest lacks the runtime, `RUNTIME_QUERY_FAILED` when it names none); or
+    `USAGE_UNREADABLE` (an `ok` whose own usage failed, with its `message`). Its use is unknown,
+    never none.
+  - **`running_nodes`** (and `in_use`, `running_count`): the motherbee's nodes and the answered
+    hives', by hive, then name.
+
+  A registry that cannot be listed makes the whole `usage_global_visible` an error
+  (`{status: "error", message}`), as a failed read of the motherbee's own nodes does. SY.admin's
+  `remove_runtime_version` refuses the version while a node is listed, and while the use is
+  unknown: an error, or a hive in `skipped_hives`. On 0.1.132 every ingress and egress was in
+  `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`, and an `ok` whose usage failed
+  counted as a hive with no node. The motherbee decides by its registry rather than by what a
+  spoke answers: an ingress's `RUNTIME_MANIFEST_MISSING` is true and stays its answer, and the
+  motherbee's core, which brings SY.admin's refusal, comes before the spokes' cores, so a spoke
+  that answered "none" instead would leave every removal refused, SY.wf-rules' package purges
+  included, until each ingress and egress ran the release.
 
 ### A running node and a new runtime version
 

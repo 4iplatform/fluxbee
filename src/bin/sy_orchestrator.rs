@@ -16544,6 +16544,18 @@ fn folder_forbidden_for_role(folder_id: &str, role: HiveRole) -> bool {
     }
 }
 
+/// Whether a hive of this role can run a managed node (`AI.*`, `IO.*`, `WF.*`): the motherbee,
+/// where the runtimes are published, and a worker, the only spoke `fluxbee-dist-runtimes` reaches
+/// (`folder_forbidden_for_role`). `run_node` launches only what that folder's manifest names, so an
+/// ingress or an egress, which never receives it, answers every runtime read and launch with
+/// RUNTIME_MANIFEST_MISSING. The runtimes' use across the hives asks no hive of such a role
+/// (`group_runtime_usage`, FINDINGS A-281), and `/versions` compares no runtimes for one
+/// (`role_carries_section`).
+fn role_runs_managed_nodes(role: HiveRole) -> bool {
+    role == HiveRole::Motherbee
+        || !folder_forbidden_for_role(SYNCTHING_FOLDER_DIST_RUNTIMES_ID, role)
+}
+
 fn reconcile_syncthing_peer_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
@@ -20704,6 +20716,20 @@ fn local_runtime_usage_summary_with_root(
     }))
 }
 
+/// A runtime's use across the hives: the `usage_global_visible` of a GET_RUNTIME. On a spoke it is
+/// the spoke's own `usage`. On the motherbee it is `group_runtime_usage` over every other hive of
+/// its registry, which tells a hive where no managed node can run from one whose use is unknown
+/// (FINDINGS A-281): SY.admin's `remove_runtime_version` refuses a version while a node is listed,
+/// and since 0.1.133 while the use is unknown (an error, or a hive in `skipped_hives`).
+///
+/// The motherbee tells them apart by the role its registry records, not by what the spoke
+/// answers. An ingress or an egress answers RUNTIME_MANIFEST_MISSING, which is true, and stays its
+/// answer to an operator's read. A spoke that answered "none" instead would do so only once it ran
+/// that release, and the spokes' cores follow the motherbee's, which brings SY.admin's refusal:
+/// until each ingress and egress was updated, every removal would be refused, SY.wf-rules' package
+/// purges included. Read from the registry, the motherbee's own record, the usage is right from the
+/// motherbee's first start on the release, and an ingress or an egress that is down or restarting
+/// never holds a removal up.
 async fn global_visible_runtime_usage_summary(
     state: &OrchestratorState,
     runtime: &str,
@@ -20724,17 +20750,18 @@ async fn global_visible_runtime_usage_summary(
         return local_usage;
     }
 
-    let mut running_nodes = local_usage
-        .get("running_nodes")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut skipped_hives = Vec::new();
-
-    for hive_id in list_managed_hive_ids() {
-        if hive_id == state.hive_id {
-            continue;
+    // A registry that cannot be listed leaves which hives run nodes unknown, never "none".
+    let hives = match registry_hives_with_roles(&hives_root(), &state.hive_id) {
+        Ok(hives) => hives,
+        Err(err) => {
+            return serde_json::json!({
+                "scope": "group_visible_control_plane",
+                "status": "error",
+                "message": format!("the hive registry could not be read: {err}"),
+            });
         }
+    };
+    group_runtime_usage(&local_usage, hives, |hive_id| {
         let mut payload = serde_json::json!({
             "target": hive_id,
             "runtime": runtime,
@@ -20742,45 +20769,128 @@ async fn global_visible_runtime_usage_summary(
         if let Some(version) = version_filter {
             payload["runtime_version"] = serde_json::json!(version);
         }
+        async move {
+            forward_system_action_to_hive(
+                state,
+                &hive_id,
+                "GET_RUNTIME",
+                "GET_RUNTIME_RESPONSE",
+                payload,
+            )
+            .await
+        }
+    })
+    .await
+}
 
-        match forward_system_action_to_hive(
-            state,
-            &hive_id,
-            "GET_RUNTIME",
-            "GET_RUNTIME_RESPONSE",
-            payload,
-        )
-        .await
-        {
-            Ok(response) => {
-                if response
-                    .get("status")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
-                {
-                    if let Some(nodes) = response
-                        .get("usage")
-                        .and_then(|value| value.get("running_nodes"))
-                        .and_then(|value| value.as_array())
-                    {
-                        running_nodes.extend(nodes.iter().cloned());
-                    }
-                } else {
-                    skipped_hives.push(serde_json::json!({
-                        "hive_id": hive_id,
-                        "reason": response
-                            .get("error_code")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!("RUNTIME_QUERY_FAILED")),
-                    }));
-                }
-            }
+/// The hives of the motherbee's registry other than `local_hive`, in name order, each with the
+/// spoke role its entry records (`registered_spoke_role`). An error when the registry cannot be
+/// listed; the orchestrator creates its directory at every start (`ensure_dirs`).
+fn registry_hives_with_roles(
+    root: &Path,
+    local_hive: &str,
+) -> Result<Vec<(String, Option<HiveRole>)>, OrchestratorError> {
+    Ok(fluxbee_sdk::mesh::HiveRegistry::new(root)
+        .entries()?
+        .iter()
+        .filter(|entry| entry.name() != local_hive)
+        .map(|entry| (entry.name().to_string(), registered_spoke_role(entry)))
+        .collect())
+}
+
+/// The spoke role the motherbee's registry records for a hive (`role` in its `info.yaml`),
+/// whatever the state of its join: a join records the role when it accepts the hive, before it
+/// links the hive into that role's folders (`dist_sync_folders_for_role`), and nothing links an
+/// ingress or an egress into the runtimes (`folder_forbidden_for_role`). `None` when the entry has
+/// no `info.yaml` that parses (a join being accepted), names another hive, or records no spoke
+/// role.
+fn registered_spoke_role(entry: &fluxbee_sdk::mesh::HiveEntry) -> Option<HiveRole> {
+    if entry.field("hive_id").map(str::trim) != Some(entry.name()) {
+        return None;
+    }
+    HiveRole::from_role(entry.field("role")).filter(|role| *role != HiveRole::Motherbee)
+}
+
+/// The motherbee's `usage_global_visible`: the nodes `local_usage` lists and those of each hive of
+/// `hives`, asked one at a time, in that order, with `ask` (that hive's GET_RUNTIME).
+///
+/// - A hive whose recorded role runs no managed node (`role_runs_managed_nodes`: an ingress, an
+///   egress) is not asked. It is listed in `hives_without_runtimes` with that role: no node there
+///   can use a runtime.
+/// - Any other hive, a worker or one whose role cannot be read, counts only by an `ok` answer
+///   whose `usage` lists its nodes. Otherwise its use is unknown, never none, and it is in
+///   `skipped_hives` with the reason: `UNREACHABLE` (no answer), the answer's error code
+///   (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest), or `USAGE_UNREADABLE` (an
+///   `ok` whose own usage failed, read before as a hive with no node; FINDINGS A-281).
+async fn group_runtime_usage<F, Fut>(
+    local_usage: &serde_json::Value,
+    hives: Vec<(String, Option<HiveRole>)>,
+    mut ask: F,
+) -> serde_json::Value
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, OrchestratorError>>,
+{
+    let mut running_nodes = local_usage
+        .get("running_nodes")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut skipped_hives = Vec::new();
+    let mut hives_without_runtimes = Vec::new();
+
+    for (hive_id, role) in hives {
+        if let Some(role) = role.filter(|role| !role_runs_managed_nodes(*role)) {
+            hives_without_runtimes.push(serde_json::json!({
+                "hive_id": hive_id,
+                "role": role.as_str(),
+            }));
+            continue;
+        }
+        let response = match ask(hive_id.clone()).await {
+            Ok(response) => response,
             Err(err) => {
                 skipped_hives.push(serde_json::json!({
                     "hive_id": hive_id,
                     "reason": "UNREACHABLE",
                     "message": err.to_string(),
                 }));
+                continue;
+            }
+        };
+        if !response
+            .get("status")
+            .and_then(|value| value.as_str())
+            .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+        {
+            skipped_hives.push(serde_json::json!({
+                "hive_id": hive_id,
+                "reason": response
+                    .get("error_code")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("RUNTIME_QUERY_FAILED")),
+            }));
+            continue;
+        }
+        let usage = response.get("usage");
+        let usage_failed = usage
+            .and_then(|usage| usage.get("status"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|status| status.eq_ignore_ascii_case("error"));
+        match usage
+            .and_then(|usage| usage.get("running_nodes"))
+            .and_then(|value| value.as_array())
+        {
+            Some(nodes) if !usage_failed => running_nodes.extend(nodes.iter().cloned()),
+            _ => {
+                let mut skipped = serde_json::json!({
+                    "hive_id": hive_id,
+                    "reason": "USAGE_UNREADABLE",
+                });
+                if let Some(message) = usage.and_then(|usage| usage.get("message")) {
+                    skipped["message"] = message.clone();
+                }
+                skipped_hives.push(skipped);
             }
         }
     }
@@ -20805,6 +20915,7 @@ async fn global_visible_runtime_usage_summary(
         "running_count": running_nodes.len(),
         "running_nodes": running_nodes,
         "skipped_hives": skipped_hives,
+        "hives_without_runtimes": hives_without_runtimes,
     })
 }
 
@@ -21045,13 +21156,13 @@ const VERSION_COMPARISON_SECTIONS: [&str; 3] = ["core", "vendor", "runtimes"];
 
 /// Does a hive of this role receive this dist section at all?
 ///
-/// `runtimes` is deliberately worker-only (`dist_sync_folders_for_role`): the DMZ contract keeps
-/// the runtime tree away from ingress and egress. Comparing a section a role never receives
+/// `runtimes` goes only where a managed node can run (`role_runs_managed_nodes`): the DMZ contract
+/// keeps the runtime tree away from ingress and egress. Comparing a section a role never receives
 /// yielded `unknown` for those two hives, which pinned the FLEET verdict at `unknown` on a
 /// perfectly healthy four-role deployment — making /versions useless as an instrument.
 fn role_carries_section(role: &str, section: &str) -> bool {
     match section {
-        "runtimes" => matches!(role, "worker" | "motherbee"),
+        "runtimes" => HiveRole::from_role(Some(role)).is_some_and(role_runs_managed_nodes),
         _ => true,
     }
 }
@@ -45088,6 +45199,34 @@ mod tests {
         }
     }
 
+    /// A managed node runs only where the runtimes reach: the motherbee, which publishes them, and
+    /// the workers, the only spokes linked into `fluxbee-dist-runtimes`. The runtimes' use across
+    /// the hives (FINDINGS A-281) and `/versions` read it from that one place.
+    #[test]
+    fn only_a_role_the_runtimes_reach_runs_managed_nodes() {
+        let dist = sample_dist_config();
+        let blob = sample_blob_config();
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            let linked = dist_sync_folders_for_role(&dist, &blob.path, role, true)
+                .iter()
+                .any(|folder| folder.id == SYNCTHING_FOLDER_DIST_RUNTIMES_ID);
+            assert_eq!(role_runs_managed_nodes(role), linked, "{}", role.as_str());
+            assert_eq!(
+                role_carries_section(role.as_str(), "runtimes"),
+                linked,
+                "{}",
+                role.as_str()
+            );
+        }
+        assert!(role_runs_managed_nodes(HiveRole::Worker));
+        assert!(!role_runs_managed_nodes(HiveRole::Ingress));
+        assert!(!role_runs_managed_nodes(HiveRole::Egress));
+        assert!(role_runs_managed_nodes(HiveRole::Motherbee));
+        assert!(role_carries_section("motherbee", "runtimes"));
+        assert!(!role_carries_section("edge", "runtimes"));
+        assert!(role_carries_section("ingress", "core"));
+    }
+
     /// The joins are the only place that adds a spoke to a folder, and whatever hive.yaml's enable
     /// flags say they never add one the reconcile would take back, so the two cannot flip-flop.
     /// With the default flags each role gets exactly its folders.
@@ -53947,6 +54086,199 @@ blob:
         assert_eq!(starting["running_nodes"][0]["lifecycle"], "STARTING");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-281: the motherbee reads each hive's role from its registry. An ingress or an
+    /// egress is one whatever the state of its join; an entry with no `info.yaml` that parses, one
+    /// that names another hive or records no spoke role gives none, and the motherbee's own
+    /// directory is left out. A registry that cannot be listed is an error, never a group of no
+    /// hives.
+    #[test]
+    fn the_registry_gives_each_hive_the_role_it_records() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-usage-registry-{}",
+            Uuid::new_v4().simple()
+        ));
+        let done = "status: connected\njoin:\n  phase: done\n";
+        for (dir, info) in [
+            ("egress1", format!("hive_id: egress1\nrole: egress\n{done}")),
+            (
+                "ingress1",
+                format!("hive_id: ingress1\nrole: ingress\n{done}"),
+            ),
+            (
+                "ingress2",
+                "hive_id: ingress2\nrole: Ingress\nstatus: pending\njoin:\n  phase: harden_ssh\n"
+                    .to_string(),
+            ),
+            ("worker1", format!("hive_id: worker1\nrole: worker\n{done}")),
+            ("norole1", format!("hive_id: norole1\n{done}")),
+            ("other1", format!("hive_id: egress9\nrole: egress\n{done}")),
+            (
+                "mother1",
+                format!("hive_id: mother1\nrole: motherbee\n{done}"),
+            ),
+            ("garbled1", ": not yaml : [".to_string()),
+            (
+                "motherbee",
+                format!("hive_id: motherbee\nrole: motherbee\n{done}"),
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+        }
+        fs::create_dir_all(root.join("accepting1")).unwrap();
+        fs::write(root.join("stray-file"), "not a hive").unwrap();
+
+        let hives = registry_hives_with_roles(&root, "motherbee").expect("the registry is listed");
+        assert_eq!(
+            hives,
+            [
+                ("accepting1", None),
+                ("egress1", Some(HiveRole::Egress)),
+                ("garbled1", None),
+                ("ingress1", Some(HiveRole::Ingress)),
+                ("ingress2", Some(HiveRole::Ingress)),
+                ("mother1", None),
+                ("norole1", None),
+                ("other1", None),
+                ("worker1", Some(HiveRole::Worker)),
+            ]
+            .map(|(hive, role)| (hive.to_string(), role))
+        );
+        fs::remove_dir_all(&root).unwrap();
+        assert!(registry_hives_with_roles(&root, "motherbee").is_err());
+    }
+
+    /// FINDINGS A-281, as 8.x answered on 0.1.132: an ingress and an egress answer GET_RUNTIME
+    /// RUNTIME_MANIFEST_MISSING, which put both in `skipped_hives` on every read, so SY.admin's
+    /// refusal on a skipped hive would refuse every removal. The motherbee asks neither and lists
+    /// them apart. A worker without its manifest, a hive whose role cannot be read, one that does
+    /// not answer and one whose own usage failed are each unknown, never a hive with no node.
+    #[tokio::test]
+    async fn the_group_usage_tells_a_hive_without_runtimes_from_an_unknown_one() {
+        let hives = [
+            ("accepting1", None),
+            ("egress1", Some(HiveRole::Egress)),
+            ("ingress1", Some(HiveRole::Ingress)),
+            ("norole1", None),
+            ("worker1", Some(HiveRole::Worker)),
+            ("worker2", Some(HiveRole::Worker)),
+            ("worker3", Some(HiveRole::Worker)),
+        ]
+        .map(|(hive, role)| (hive.to_string(), role))
+        .to_vec();
+        let local = serde_json::json!({
+            "scope": "hive_local_visible",
+            "in_use": true,
+            "running_count": 1,
+            "running_nodes": [{ "node_name": "AI.local@motherbee", "hive": "motherbee" }],
+        });
+        let asked = StdMutex::new(Vec::new());
+        let usage = group_runtime_usage(&local, hives, |hive_id| {
+            asked.lock().unwrap().push(hive_id.clone());
+            let answer: Result<serde_json::Value, OrchestratorError> = match hive_id.as_str() {
+                "accepting1" => {
+                    Err("target hive 'accepting1' not reachable in LSA (stale/missing)".into())
+                }
+                "worker2" => Ok(serde_json::json!({
+                    "status": "ok",
+                    "usage": {
+                        "running_nodes": [{
+                            "node_name": "AI.sales@worker2",
+                            "hive": "worker2",
+                            "lifecycle": "RUNNING",
+                        }],
+                    },
+                })),
+                "worker3" => Ok(serde_json::json!({
+                    "status": "ok",
+                    "usage": {
+                        "scope": "hive_local_visible",
+                        "status": "error",
+                        "message": "Permission denied (os error 13)",
+                    },
+                })),
+                // What a hive without a runtime manifest answers: an ingress, an egress, or a
+                // worker whose manifest is missing.
+                _ => Ok(serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_MANIFEST_MISSING",
+                    "message": "runtime manifest not found",
+                })),
+            };
+            async move { answer }
+        })
+        .await;
+
+        assert_eq!(
+            asked.into_inner().unwrap(),
+            ["accepting1", "norole1", "worker1", "worker2", "worker3"],
+            "no ingress or egress is asked"
+        );
+        assert_eq!(
+            usage["hives_without_runtimes"],
+            serde_json::json!([
+                { "hive_id": "egress1", "role": "egress" },
+                { "hive_id": "ingress1", "role": "ingress" },
+            ])
+        );
+        let skipped: Vec<(&str, &str)> = usage["skipped_hives"]
+            .as_array()
+            .expect("skipped_hives")
+            .iter()
+            .map(|hive| {
+                (
+                    hive["hive_id"].as_str().unwrap(),
+                    hive["reason"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("accepting1", "UNREACHABLE"),
+                ("norole1", "RUNTIME_MANIFEST_MISSING"),
+                ("worker1", "RUNTIME_MANIFEST_MISSING"),
+                ("worker3", "USAGE_UNREADABLE"),
+            ]
+        );
+        assert_eq!(
+            usage["skipped_hives"][3]["message"],
+            "Permission denied (os error 13)"
+        );
+        assert_eq!(usage["in_use"], true);
+        assert_eq!(usage["running_count"], 2);
+        assert_eq!(usage["running_nodes"][0]["node_name"], "AI.local@motherbee");
+        assert_eq!(usage["running_nodes"][1]["node_name"], "AI.sales@worker2");
+
+        // 8.x's group: only worker1 is asked, and with its answer nothing is unknown.
+        let group = group_runtime_usage(
+            &serde_json::json!({ "running_nodes": [] }),
+            [
+                ("egress1", Some(HiveRole::Egress)),
+                ("ingress1", Some(HiveRole::Ingress)),
+                ("worker1", Some(HiveRole::Worker)),
+            ]
+            .map(|(hive, role)| (hive.to_string(), role))
+            .to_vec(),
+            |hive_id| {
+                assert_eq!(hive_id, "worker1", "only the worker is asked");
+                async {
+                    Ok::<_, OrchestratorError>(serde_json::json!({
+                        "status": "ok",
+                        "usage": { "running_nodes": [] },
+                    }))
+                }
+            },
+        )
+        .await;
+        assert_eq!(group["skipped_hives"], serde_json::json!([]));
+        assert_eq!(group["in_use"], false);
+        assert_eq!(
+            group["hives_without_runtimes"].as_array().map(Vec::len),
+            Some(2)
+        );
     }
 
     /// An SY node runs as its packaged unit and the router as `rt-gateway`, never as a

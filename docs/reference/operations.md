@@ -406,23 +406,26 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   publish, except on a base that packages are built on (`RUNTIME_HAS_DEPENDENTS`: it stays,
   unused). It never deletes `package_version` itself (`RUNTIME_PACKAGE_VERSION`), and
   `publish-runtime.sh` refuses a hand publish under that version.
-- **A version is removed only once every hive's nodes were read (FINDINGS A-281, since
-  0.1.133).** `remove_runtime_version` reads the version's use from the motherbee's orchestrator,
-  which asks every hive of the registry. A node pinned to the version whose unit runs, or whose
-  unit systemd gives no answer for, refuses it, `409 RUNTIME_IN_USE`, whose detail names each node
-  with its hive and lifecycle (`RUNNING`, `STARTING` or `UNKNOWN`). A node whose unit does not run
-  (stopped, failed, between two restarts of a crash loop) is not listed: one relaunched later fails
-  to start once its version is gone, so stop or move it first. A hive whose nodes were not read
-  refuses it too, `409 RUNTIME_USAGE_UNKNOWN`, naming each in `payload.unanswered_hives` with its
-  reason: `UNREACHABLE` (down, its orchestrator restarting, stale in the LSA), the error it answered
-  (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet), `USAGE_UNREADABLE` (its own
-  read failed), and for a join not done its status and phase (finish the join or remove the hive);
-  or the motherbee alone when the read failed there and no hive was counted (a worker whose
-  orchestrator does not answer delays that read past SY.admin's 30 s). An ingress or an egress
-  receives no runtime, by the role the registry records whatever the state of its join, and holds
-  no removal up. Nothing is removed: ask again once each hive answers, and remove a hive gone for
-  good with `remove_hive` first. Before, such a hive counted as one with no node: a version a node
-  of a restarting worker ran on was removed, and the worker's mirror deleted it when it came back.
+- **A version that may be in use stays (FINDINGS A-281, since 0.1.133).** `remove_runtime_version`
+  (`DELETE /hives/motherbee/runtimes/<runtime>/versions/<version>`) first reads the version's use
+  across the hives, the motherbee's `usage_global_visible`, which
+  `GET /hives/motherbee/runtimes/<runtime>` shows for all of a runtime's versions:
+  - `running_nodes`: each node pinned to the version whose unit may run, on the motherbee and on
+    each hive that answered;
+  - `skipped_hives`: each hive whose use is unknown, with its `reason`: `UNREACHABLE` (no answer),
+    the error it answered (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest), or
+    `USAGE_UNREADABLE` (its own read failed). A worker, and a hive whose registry entry gives no
+    role (a join being accepted, an entry that does not parse), are asked;
+  - `hives_without_runtimes`: each ingress and egress, by the role the hive registry records,
+    whatever the state of its join. The runtimes never reach them (`fluxbee-dist-runtimes` goes to
+    the workers only, [below](#how-dist-reaches-the-other-hives)), so no managed node runs there:
+    they are not asked, and one that is down holds no removal up.
+
+  SY.admin refuses the removal (409) while a node is listed or the use is unknown, naming the hives
+  skipped: bring a worker back, or finish or remove a join left behind, then ask again. A registry
+  the motherbee cannot list makes the whole use an error. Before 0.1.133 every ingress and egress
+  was in `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`
+  ([SY.orchestrator](../nodes/sy-orchestrator.md#managed-nodes)).
 - **A workflow's delete can leave its versions in dist (FINDINGS A-281).** SY.wf-rules removes them
   last, after the workflow, its node and its state, through `remove_runtime_version`, and stops at
   the first one refused or not answered within its 5 s: the delete answers
