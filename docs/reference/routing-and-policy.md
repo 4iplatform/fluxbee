@@ -260,7 +260,7 @@ and `ttl: 16`, one less once a hub has handed them on (below) (`build_unreachabl
 | `NODE_NOT_FOUND` | no FIB entry for the name; the UUID is unknown everywhere; or the node left between the FIB rebuild and the delivery, its link's writer stopped included |
 | `VPN_BLOCKED` | the VPN rules, or the edge rules, forbid the pair (§8.2) |
 | `PEER_UNAVAILABLE` | the destination is on a sibling router with no IRP link |
-| `GATEWAY_UNAVAILABLE` | the destination is in another hive and no gateway sibling is linked; also a broadcast with `ttl >= 3` from such a router |
+| `GATEWAY_UNAVAILABLE` | the destination is in another hive and no gateway sibling is linked; also a broadcast with `ttl >= 3` that entered at such a router, answered once by it whatever else was full (§4; A-246, since 0.1.132) |
 | `WAN_UNAVAILABLE` | this router is the gateway and has no live WAN link to the next-hop hive |
 | `OPA_ERROR` | Resolve: no user policy loaded, or its evaluation failed (§5, §7) |
 | `OPA_NO_TARGET` | Resolve: the user policy gave no target |
@@ -327,7 +327,11 @@ peers (`ttl >= 3`). `meta.target` is matched by every router against its own nod
 A link whose queue is at the senders' bound (§1) skips the broadcast, and every other link gets it.
 The router it entered answers its sender `LINK_BUSY` once when any link it handed it to was full, a
 local node's, a sibling router's or a WAN peer's; a router it reached over IRP or the WAN skips its
-own full links and answers nothing (`answer_where_it_arrived`, A-222, since 0.1.129).
+own full links and answers nothing (`answer_where_it_arrived`, A-222, since 0.1.129). On a router
+that is not the gateway, a broadcast with `ttl >= 3` that cannot leave for the WAN at all, with no
+gateway sibling or no link to it, is answered `GATEWAY_UNAVAILABLE` instead, once, by the router it
+entered (`forward_broadcast_to_wan` gives its reason to `handle_message`); a sibling it reached
+answers nothing for it either (A-246, since 0.1.132).
 
 ---
 
@@ -761,6 +765,11 @@ Fixed in 0.1.132:
   (`PEER_UNAVAILABLE`, `LINK_BUSY`), by name or resolved. Until then they went to the third
   sibling, which dropped them, or, with no link to it, nowhere: the sender waited out its own
   timeout.
+- **A broadcast is answered once, by the router it entered** (A-246): `GATEWAY_UNAVAILABLE` when
+  it cannot leave for the WAN at all, else `LINK_BUSY` when a link was full (§4). Until then
+  `forward_broadcast_to_wan` answered `GATEWAY_UNAVAILABLE` itself: a sender whose broadcast also
+  met a full link heard twice, every sibling the broadcast reached with no gateway sibling of its
+  own answered it too, and one whose gateway sibling had no link went unanswered.
 - **A broadcast reaches each router's nodes once** (A-208): a copy that comes over IRP is checked
   against the broadcast cache, as one from a node or from the WAN is (§4). Until then a router
   delivered every copy that reached it, and the gateway, which gets a broadcast from the router it

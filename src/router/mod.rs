@@ -1132,6 +1132,8 @@ async fn handle_message(
     let mut senders: Vec<LocalDelivery> = Vec::new();
     // A broadcast handed to a sibling router's or a WAN peer's link that was full (A-222).
     let mut broadcast_link_full = false;
+    // Why a broadcast could not leave for the WAN, but for a full link (A-246).
+    let mut broadcast_not_toward_wan: Option<&'static str> = None;
     let src_handle = {
         let nodes_guard = nodes.lock().await;
         nodes_guard.get(&src_uuid).cloned()
@@ -1402,16 +1404,12 @@ async fn handle_message(
                 broadcast_link_full |= broadcast_to_peers(peers, &msg).await?;
             }
             if msg.routing.ttl >= 3 {
-                broadcast_link_full |= forward_broadcast_to_wan(
-                    &msg,
-                    is_gateway,
-                    peer_routers,
-                    peers,
-                    wan_peers,
-                    router_uuid,
-                    &src_handle.sender,
-                )
-                .await?;
+                match forward_broadcast_to_wan(&msg, is_gateway, peer_routers, peers, wan_peers)
+                    .await?
+                {
+                    Some(UNREACHABLE_LINK_BUSY) => broadcast_link_full = true,
+                    reason => broadcast_not_toward_wan = reason,
+                }
             }
         }
         Destination::Resolve => {
@@ -1512,10 +1510,14 @@ async fn handle_message(
         }
     }
 
-    // A broadcast is answered once, here, where it entered: `LINK_BUSY` when any link it was handed
-    // to was full, a local node's, a sibling router's or a WAN peer's (A-222).
+    // A broadcast is answered once, here, where it entered: first why it could not leave for the
+    // WAN at all (`GATEWAY_UNAVAILABLE`, A-246), then `LINK_BUSY` when any link it was handed to was
+    // full, a local node's, a sibling router's or a WAN peer's (A-222).
     let local = deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
-    if let Some(reason) = local.or(broadcast_link_full.then_some(UNREACHABLE_LINK_BUSY)) {
+    if let Some(reason) = broadcast_not_toward_wan
+        .or(local)
+        .or(broadcast_link_full.then_some(UNREACHABLE_LINK_BUSY))
+    {
         send_unreachable_to(&msg, &src_handle.sender, router_uuid, reason)?;
     }
 
@@ -2243,21 +2245,28 @@ async fn hand_to_hive(
 }
 
 /// Hands a broadcast toward the WAN: the gateway to every WAN peer, another router to the gateway
-/// sibling. Whether a link it was handed to was full (A-222).
+/// sibling. The reason its sender would be answered `UNREACHABLE` with, if any: `LINK_BUSY` when a
+/// link it was handed to was full (A-222); `GATEWAY_UNAVAILABLE` when it could not leave for the WAN
+/// at all, with no gateway sibling or no link to it. A `FRAME_TOO_LARGE` from that link would be
+/// answered the same way, but cannot come: the caller measured the broadcast first
+/// (`broadcast_over_limit`). It answers no one: the router the broadcast entered answers, once
+/// (`handle_message`). Until 0.1.132 it answered `GATEWAY_UNAVAILABLE` itself, so a sender whose
+/// broadcast also met a full link heard twice, every sibling a broadcast reached answered it too,
+/// and one whose gateway sibling had no link went unanswered (A-246).
 async fn forward_broadcast_to_wan(
     msg: &Message,
     is_gateway: bool,
     peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
     peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
-    router_uuid: Uuid,
-    sender: &LinkSender,
-) -> Result<bool, RouterError> {
+) -> Result<Option<&'static str>, RouterError> {
     if msg.routing.ttl <= 2 {
-        return Ok(false);
+        return Ok(None);
     }
     if is_gateway {
-        return broadcast_to_wan(wan_peers, msg).await;
+        return Ok(broadcast_to_wan(wan_peers, msg)
+            .await?
+            .then_some(UNREACHABLE_LINK_BUSY));
     }
     let gateway_uuid = {
         let guard = peer_routers.lock().await;
@@ -2267,10 +2276,11 @@ async fn forward_broadcast_to_wan(
             .map(|peer| peer.uuid)
     };
     let Some(gateway_uuid) = gateway_uuid else {
-        send_unreachable_to(msg, sender, router_uuid, "GATEWAY_UNAVAILABLE")?;
-        return Ok(false);
+        return Ok(Some("GATEWAY_UNAVAILABLE"));
     };
-    Ok(send_to_peer_router(peers, gateway_uuid, msg).await? == Handover::Busy)
+    Ok(send_to_peer_router(peers, gateway_uuid, msg)
+        .await?
+        .unreachable("GATEWAY_UNAVAILABLE"))
 }
 
 fn match_kind_label(kind: u8) -> &'static str {
@@ -5319,19 +5329,12 @@ async fn handle_peer_message(
                 senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 3 {
-                if let Some(link) = &reply_link {
-                    // A full link skips it without an answer here, as on the WAN (A-222).
-                    let _full = forward_broadcast_to_wan(
-                        &msg,
-                        is_gateway,
-                        peer_routers,
-                        peers,
-                        wan_peers,
-                        router_uuid,
-                        link,
-                    )
-                    .await?;
-                }
+                // Whatever stops it toward the WAN, a full link or no gateway sibling, is not
+                // answered here: the router the broadcast entered answers its sender, once (A-222,
+                // A-246).
+                let _not_answered_here =
+                    forward_broadcast_to_wan(&msg, is_gateway, peer_routers, peers, wan_peers)
+                        .await?;
             }
         }
         Destination::Resolve => {
@@ -14352,6 +14355,7 @@ mod tests {
         switch1_link: LinkReceiver,
         switch3: Uuid,
         switch3_link: LinkReceiver,
+        gateway: Uuid,
         gateway_link: LinkReceiver,
         wan: LinkReceiver,
         /// `SY.admin@motherbee`, in the LSA.
@@ -14451,6 +14455,7 @@ mod tests {
                 switch1_link,
                 switch3,
                 switch3_link,
+                gateway,
                 gateway_link,
                 wan,
                 admin,
@@ -14588,6 +14593,201 @@ mod tests {
         );
         assert!(scene.peers.try_lock().is_ok(), "the sibling table is free");
         assert!(scene.nodes.try_lock().is_ok(), "and so are the nodes");
+    }
+
+    /// `handle_message` on worker1's RT.switch2, a router that is not the gateway, with `nodes`,
+    /// its siblings in `peer_routers` and their links in `peers`.
+    async fn route_from_a_node_on_a_switch(
+        msg: &Message,
+        nodes: &Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        peer_routers: &Arc<Mutex<HashMap<Uuid, PeerRouter>>>,
+        peers: &Arc<Mutex<HashMap<Uuid, PeerHandle>>>,
+    ) {
+        handle_message(
+            msg,
+            nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            peer_routers,
+            peers,
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &stream::StreamHandle::detached(),
+            "worker1",
+            "SY.frontdesk.gov@worker1",
+            "RT.switch2@worker1",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+            None,
+        )
+        .await
+        .expect("handled");
+    }
+
+    /// A-246: a broadcast that enters at a router that is not the gateway is answered once, there.
+    /// GATEWAY_UNAVAILABLE comes first, when it cannot leave for the WAN at all: no gateway sibling,
+    /// even with a local node's link full too, or one with no link, or whose link's writer has
+    /// stopped. LINK_BUSY when a link was full, the gateway sibling's or a local node's. Until
+    /// 0.1.132 the second case was answered twice, GATEWAY_UNAVAILABLE then LINK_BUSY, and a
+    /// gateway sibling with no link, or one whose writer had stopped, not at all.
+    #[tokio::test]
+    async fn a_broadcast_that_enters_at_a_router_that_is_not_the_gateway_is_answered_once() {
+        enum Gateway {
+            Absent,
+            Linked,
+            Full,
+            NotLinked,
+            WriterStopped,
+        }
+        for (case, gateway, node_full, said) in [
+            (
+                "no gateway sibling",
+                Gateway::Absent,
+                false,
+                "GATEWAY_UNAVAILABLE",
+            ),
+            (
+                "no gateway sibling, a local node's link full",
+                Gateway::Absent,
+                true,
+                "GATEWAY_UNAVAILABLE",
+            ),
+            (
+                "a gateway sibling not linked",
+                Gateway::NotLinked,
+                false,
+                "GATEWAY_UNAVAILABLE",
+            ),
+            (
+                "the gateway sibling's writer stopped",
+                Gateway::WriterStopped,
+                false,
+                "GATEWAY_UNAVAILABLE",
+            ),
+            (
+                "the gateway sibling's link full",
+                Gateway::Full,
+                false,
+                "LINK_BUSY",
+            ),
+            (
+                "a local node's link full",
+                Gateway::Linked,
+                true,
+                "LINK_BUSY",
+            ),
+        ] {
+            let sender = Uuid::new_v4();
+            let (sender_tx, mut answers) = link_queue("node");
+            let (local_tx, mut local) = link_queue("node");
+            if node_full {
+                fill_to_the_senders_bound(&local_tx);
+            }
+            let nodes = Arc::new(Mutex::new(HashMap::from([
+                (
+                    sender,
+                    NodeHandle {
+                        name: "WF.demo@worker1".to_string(),
+                        vpn_id: 0,
+                        sender: sender_tx,
+                        connected_at: 0,
+                    },
+                ),
+                (
+                    Uuid::new_v4(),
+                    NodeHandle {
+                        name: "AI.local@worker1".to_string(),
+                        vpn_id: 0,
+                        sender: local_tx,
+                        connected_at: 0,
+                    },
+                ),
+            ])));
+            let gateway_uuid = Uuid::new_v4();
+            let peer_routers = Arc::new(Mutex::new(HashMap::new()));
+            if !matches!(gateway, Gateway::Absent) {
+                peer_routers.lock().await.insert(
+                    gateway_uuid,
+                    PeerRouter {
+                        uuid: gateway_uuid,
+                        is_gateway: true,
+                    },
+                );
+            }
+            let (gateway_tx, gateway_rx) = link_queue("irp");
+            let mut gateway_link = Some(gateway_rx);
+            match gateway {
+                Gateway::Full => fill_to_the_senders_bound(&gateway_tx),
+                Gateway::WriterStopped => gateway_link = None,
+                Gateway::Absent | Gateway::Linked | Gateway::NotLinked => {}
+            }
+            let peers = Arc::new(Mutex::new(HashMap::new()));
+            if !matches!(gateway, Gateway::Absent | Gateway::NotLinked) {
+                peers.lock().await.insert(
+                    gateway_uuid,
+                    PeerHandle {
+                        sender: gateway_tx.clone(),
+                    },
+                );
+            }
+            let broadcast = padded_message(sender, Destination::Broadcast, 0);
+            route_from_a_node_on_a_switch(&broadcast, &nodes, &peer_routers, &peers).await;
+
+            let answers: Vec<_> = messages_on(&mut answers)
+                .iter()
+                .map(what_was_answered)
+                .collect();
+            assert_eq!(
+                answers,
+                vec![(broadcast.routing.trace_id.clone(), said.to_string())],
+                "{case}: answered once"
+            );
+            assert_eq!(
+                has(messages_on(&mut local), &broadcast),
+                !node_full,
+                "{case}: its other node"
+            );
+            if let Some(link) = gateway_link.as_mut() {
+                assert_eq!(
+                    has(messages_on(link), &broadcast),
+                    matches!(gateway, Gateway::Linked),
+                    "{case}: toward the WAN"
+                );
+            }
+        }
+    }
+
+    /// A-246 on a router a broadcast reaches over IRP: whatever stops it there toward the WAN, no
+    /// gateway sibling or the gateway's link full, nothing goes back to the sibling it came from;
+    /// the router the broadcast entered answers its sender. Its node gets it. Until 0.1.132 a router
+    /// with no gateway sibling answered GATEWAY_UNAVAILABLE to the sibling, which handed it to its
+    /// node: the sender heard it from every such router it reached.
+    #[tokio::test]
+    async fn a_router_a_broadcast_reaches_over_irp_answers_nothing() {
+        for gateway_full in [false, true] {
+            let mut scene = Siblings::new(false).await;
+            if gateway_full {
+                let gateway = scene.peers.lock().await[&scene.gateway].sender.clone();
+                fill_to_the_senders_bound(&gateway);
+            } else {
+                scene.peer_routers.lock().await.remove(&scene.gateway);
+                scene.peers.lock().await.remove(&scene.gateway);
+            }
+            let broadcast = scene.message_to(Destination::Broadcast, 16);
+            scene.hand_over(scene.switch1, &broadcast).await;
+            assert!(
+                has(messages_on(&mut scene.local), &broadcast),
+                "gateway full {gateway_full}: its node got it"
+            );
+            assert!(
+                messages_on(&mut scene.switch1_link).is_empty(),
+                "gateway full {gateway_full}: nothing goes back"
+            );
+        }
     }
 
     /// A-247: a frame a sibling hands over for a node of a third sibling is answered over the link
