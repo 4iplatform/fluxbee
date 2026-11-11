@@ -1218,7 +1218,10 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `publication_id` is read in the form the ledger keeps, lowercase and hyphenated, whatever form
   of the UUID it comes in (`canonical_publication_id`). Over the mesh only an `AI.*` node may ask
   (A-62), and only for its own publication: the record's publisher must be its exact
-  router-stamped name, else `403 UNAUTHORIZED`. The operator takes down any publication by either
+  router-stamped name, and the record's tenant the one identity's shared memory charges that name
+  to now (`resolve_artifact_publisher`, the read publish makes), else `403 UNAUTHORIZED`. A page
+  outlives its publisher (FINDINGS A-242), so a node launched later under the same name in another
+  tenant does not take it down. The operator takes down any publication by either
   field (FINDINGS A-120): `POST /artifacts/unpublish`, or a step of an executor plan, which
   Archi's plan compiler stages and which runs only once the operator confirms it. The action is
   `confirmation_required`, and takes no hive: the publication names its edge. Under the

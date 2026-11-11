@@ -372,12 +372,19 @@ struct AdminContext {
     web: Arc<WebRoutes>,
     /// The nodes connected now, given this hive (`connected_nodes_from_shm`).
     connected_nodes: ConnectedNodes,
+    /// The tenant identity charges a node that publishes or takes down a page to
+    /// (`publisher_tenant_from_shm`).
+    publisher_tenant: PublisherTenant,
     /// The installation's update, its state on disk (docs/hive-config-update-v1.md §6, stage 4).
     installation_update: Arc<installation_update::Updates>,
 }
 
 /// Reads the nodes connected now, `<name>@<hive>`, given this admin's hive.
 type ConnectedNodes = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + Sync>;
+
+/// Reads the tenant of a node, `<name>@<hive>`, from identity's shared memory, given this hive's
+/// config dir: an error says why the node is no publisher.
+type PublisherTenant = Arc<dyn Fn(&Path, &str) -> Result<String, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -755,6 +762,7 @@ async fn main() -> Result<(), AdminError> {
         acme: acme_service,
         web: web_routes,
         connected_nodes: Arc::new(connected_nodes_from_shm),
+        publisher_tenant: Arc::new(publisher_tenant_from_shm),
         installation_update: installation_update::Updates::load(&state_dir),
     };
     log_registry_caller_roles(&http_ctx.hive_id, &hive_registry(&http_ctx));
@@ -6796,11 +6804,12 @@ async fn handle_unpublish_artifact(
     // Producer path (mesh, caller_l2_name = Some): the A-62 table lets only an AI.* node ask
     // (`MeshAccess::AiPublisher`; Archi, which it admits to every action, is no producer and is
     // refused here), and only for its own publication: the exact router-stamped name that
-    // published it, checked below. Operator path (caller_l2_name = None): the trusted localhost
-    // HTTP server, or the executor running a step of a plan the operator confirmed in Archi,
-    // which is how Archi takes a page down (A-120). It may unpublish ANY publication (D2 — a
-    // deliberate operator power, so a retired/renamed producer's publication can still be
-    // revoked; mirrors the None-bypass of the channel/externalize seams).
+    // published it, charged to the tenant it published in, checked below. Operator path
+    // (caller_l2_name = None): the trusted localhost HTTP server, or the executor running a step
+    // of a plan the operator confirmed in Archi, which is how Archi takes a page down (A-120).
+    // It may unpublish ANY publication (D2 — a deliberate operator power, so a retired/renamed
+    // producer's publication can still be revoked; mirrors the None-bypass of the
+    // channel/externalize seams).
     let caller: Option<String> = match caller_l2_name {
         Some(_) => match authorize_artifact_publisher(caller_l2_name) {
             Ok(caller) => Some(caller),
@@ -6826,11 +6835,18 @@ async fn handle_unpublish_artifact(
         return Ok(internal_not_found(action, &detail));
     };
     if let Some(caller) = &caller {
+        let not_its_own =
+            || internal_unauthorized(action, "a node may unpublish only its own publication");
         if record.publisher_l2_name != *caller {
-            return Ok(internal_unauthorized(
-                action,
-                "a node may unpublish only its own publication",
-            ));
+            return Ok(not_its_own());
+        }
+        // The name is not enough: a page outlives its publisher (FINDINGS A-242), so a node
+        // launched later under the same name may be another tenant's. Its tenant is read from
+        // identity's shared memory, as publish reads it, and must be the page's.
+        match resolve_artifact_publisher(ctx, caller) {
+            Ok((tenant_id, _)) if tenant_id == record.tenant_id => {}
+            Ok(_) => return Ok(not_its_own()),
+            Err(detail) => return Ok(internal_unauthorized(action, &detail)),
         }
     }
     // A page already down is a no-op: "unpublished" (explicit revoke), "expired" (the TTL sweep
@@ -7167,12 +7183,21 @@ fn authorize_artifact_publisher(caller_l2_name: Option<&str>) -> Result<String, 
     Ok(caller.to_string())
 }
 
+/// The tenant and the name of `caller`, a node that publishes a page or takes one down, as
+/// identity's shared memory holds it now (`ctx.publisher_tenant`, `publisher_tenant_from_shm`).
 fn resolve_artifact_publisher(
     ctx: &AdminContext,
     caller: &str,
 ) -> Result<(String, String), String> {
+    let tenant_id = (ctx.publisher_tenant)(&ctx.config_dir, caller)?;
+    Ok((tenant_id, caller.to_string()))
+}
+
+/// The tenant of `caller` from identity's shared memory: the ILK whose handler is exactly
+/// `caller`, its registration complete, its tenant a valid `tnt:` id; otherwise why not.
+fn publisher_tenant_from_shm(config_dir: &Path, caller: &str) -> Result<String, String> {
     let option =
-        fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(&ctx.config_dir, caller)
+        fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(config_dir, caller)
             .map_err(|err| format!("identity SHM unavailable: {err}"))?
             .map(|(_, option)| option)
             .ok_or_else(|| format!("publisher '{caller}' is not registered in identity"))?;
@@ -7184,7 +7209,7 @@ fn resolve_artifact_publisher(
     if !valid_prefixed_uuid(&option.tenant_id, "tnt") {
         return Err("publisher identity has an invalid tenant_id".to_string());
     }
-    Ok((option.tenant_id, caller.to_string()))
+    Ok(option.tenant_id)
 }
 
 /// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator, in
@@ -28294,6 +28319,7 @@ mod tests {
                 Arc::new(|| Err("no edge in the tests".to_string())),
             )),
             connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
+            publisher_tenant: Arc::new(|_, _| Err("no shared memory in the tests".to_string())),
             installation_update: installation_update::Updates::load(&state_dir),
         };
         (ctx, harness)
@@ -38346,6 +38372,20 @@ mod tests {
         }
     }
 
+    /// Identity's shared memory as these tests read it: `node` charged to `tenant`, and no other
+    /// node registered.
+    fn charge_publisher(ctx: &mut AdminContext, node: &'static str, tenant: &'static str) {
+        ctx.publisher_tenant = Arc::new(move |_, caller| {
+            if caller == node {
+                Ok(tenant.to_string())
+            } else {
+                Err(format!(
+                    "publisher '{caller}' is not registered in identity"
+                ))
+            }
+        });
+    }
+
     fn seed_publications(ctx: &AdminContext, pages: &[&AdminPublicationRecord]) {
         let mut ledger = AdminPublicationLedger::default();
         for page in pages {
@@ -38407,7 +38447,8 @@ mod tests {
     /// for any publisher.
     #[tokio::test]
     async fn a_page_comes_down_by_its_id_or_by_its_links_key() {
-        let (ctx, mut harness) = opa_test_admin("unpublish-own");
+        let (mut ctx, mut harness) = opa_test_admin("unpublish-own");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
         let by_id = published_page(PAGE_PUBLISHER);
         let by_id_written_otherwise = published_page(PAGE_PUBLISHER);
         let by_key = published_page(PAGE_PUBLISHER);
@@ -38459,7 +38500,8 @@ mod tests {
     /// takes it down and records it `expired`.
     #[tokio::test]
     async fn a_page_already_down_answers_unpublished_false() {
-        let (ctx, mut harness) = opa_test_admin("unpublish-down");
+        let (mut ctx, mut harness) = opa_test_admin("unpublish-down");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
         let mut taken_down = published_page(PAGE_PUBLISHER);
         taken_down.status = "unpublished".to_string();
         let mut expired = published_page(PAGE_PUBLISHER);
@@ -38561,6 +38603,63 @@ mod tests {
             assert_eq!(result.envelope["error_code"], "UNAUTHORIZED");
         }
         assert_eq!(publication_status(&ctx, &page.publication_id), "published");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// A page outlives its publisher (FINDINGS A-242): a node launched later under its publisher's
+    /// name, charged to another tenant, does not take it down (403 UNAUTHORIZED, by its id or its
+    /// link's key, and the answer does not name the page's tenant); nor does the name when
+    /// identity cannot say whose it is (no shared memory here). The page stays up, and no one is
+    /// asked; the name charged to the page's tenant takes it down
+    /// (`a_page_comes_down_by_its_id_or_by_its_links_key`).
+    #[tokio::test]
+    async fn a_node_of_its_publishers_name_in_another_tenant_does_not_take_a_page_down() {
+        let (mut ctx, mut harness) = opa_test_admin("unpublish-other-tenant");
+        let page = published_page(PAGE_PUBLISHER);
+        let mut down = published_page(PAGE_PUBLISHER);
+        down.status = "unpublished".to_string();
+        seed_publications(&ctx, &[&page, &down]);
+
+        let unread = handle_unpublish_artifact(
+            &ctx,
+            &ctx.rpc,
+            json!({ "key": page.key }),
+            Some(PAGE_PUBLISHER),
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(unread.http_status, 403, "{}", unread.envelope);
+        assert_eq!(unread.envelope["error_code"], "UNAUTHORIZED");
+        assert_eq!(
+            unread.envelope["error_detail"],
+            json!("no shared memory in the tests")
+        );
+
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, OTHER_TENANT);
+        for params in [
+            json!({ "publication_id": page.publication_id }),
+            json!({ "key": page.key }),
+            json!({ "key": down.key }),
+        ] {
+            let result = handle_unpublish_artifact(&ctx, &ctx.rpc, params, Some(PAGE_PUBLISHER))
+                .await
+                .expect("dispatch");
+            assert_eq!(result.http_status, 403, "{}", result.envelope);
+            assert_eq!(result.envelope["error_code"], "UNAUTHORIZED");
+            assert_eq!(
+                result.envelope["error_detail"],
+                json!("a node may unpublish only its own publication")
+            );
+            assert!(!result.envelope.to_string().contains(PAGE_TENANT));
+        }
+        assert_eq!(publication_status(&ctx, &page.publication_id), "published");
+        assert_eq!(
+            publication_status(&ctx, &down.publication_id),
+            "unpublished"
+        );
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await

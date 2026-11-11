@@ -325,7 +325,9 @@ Two of the checked facts still stand:
     person another's pages.
 - **SY.admin's `unpublish_artifact`:**
   - also takes the link's key;
-  - checks the owner as today: the exact node that published;
+  - checks the owner as today: the exact node that published, and since 0.1.131 in the tenant it
+    published in (FINDINGS A-242: a page outlives its publisher, and a node launched later under
+    its name may be another tenant's);
   - answers `NOT_FOUND` for a publication that does not exist, where it answered
     `INVALID_REQUEST` before 0.1.89.
 - **Answers:**
