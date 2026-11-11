@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.130** | 2026-11-10 | `8604debf` | motherbee + spokes (core), the Go SDK alone: A-228 (an RPC error for a router notice carries `reason`, `original_dst`, `last_hop`), A-239 (`TimerInfo.canceled_reason`; SY.timer serializes the SDK's `TimerInfo`), A-218's ECHO leftovers (`MSGEcho`/`MSGEchoReply` gone; SY.timer and wf-generic take the AI nodes' notice rule; SY.timer answers an ECHO `TIMER_UNKNOWN_VERB`) | ✅ live, checked on 8.x | snap `pre-gosdk-0-1-130` (all 4 VMs) · `apt install fluxbee=0.1.129` + 0.1.129's `update_installation` (nothing one-way; the wire is the same) |
+| **0.1.131** | 2026-11-11 | `0f6b54f1` | motherbee + spokes (core), one branch per binary, from the sweep: SY.admin (A-242: no removal refused for published pages, each ok answer names them in `pages_left_up`; A-249 closed with it; A-251: SY.timer's refusals answered by their code; A-250 (a): a short read while a hive restarts, asked again at once), SY.timer 1.5 (A-238: a canceled timer aged by its cancel, schema 4; A-244: the lock map drops a timer's entry), IO (A-91: io.blob CONFIGURED on its defaults, io.cloud UNCONFIGURED `missing_edge_node` without an edge; A-226; A-223's spec), WF (A-254: a timer SY.timer does not take goes again until it does, the store at v7; the 366-day bound in wf.engine and SY.wf-rules), the orchestrator (A-252: a new spoke switches Syncthing's posture at its join's peer link) | ✅ live, checked on 8.x | snap `pre-sweep-0-1-131` (all 4 VMs) · `apt install fluxbee=0.1.130` + 0.1.130's `update_installation` (the older SY.timer and wf.engine read schema 4 and store v7; A-233's and A-212's page refusals come back) |
+| **0.1.130** | 2026-11-10 | `8604debf` | motherbee + spokes (core), the Go SDK alone: A-228 (an RPC error for a router notice carries `reason`, `original_dst`, `last_hop`), A-239 (`TimerInfo.canceled_reason`; SY.timer serializes the SDK's `TimerInfo`), A-218's ECHO leftovers (`MSGEcho`/`MSGEchoReply` gone; SY.timer and wf-generic take the AI nodes' notice rule; SY.timer answers an ECHO `TIMER_UNKNOWN_VERB`) | ✅ replaced by 0.1.131 | snap `pre-gosdk-0-1-130` (deleted 2026-11-11) · `apt install fluxbee=0.1.129` + 0.1.129's `update_installation` (nothing one-way; the wire is the same) |
 | **0.1.129** | 2026-11-10 | `9b396e3e` | motherbee + spokes (core), the router alone: A-222 (a bounded queue per link, 1,024 frames or 8 MiB counted as heap, the senders' share 960 / 7 MiB; a message past it refused `LINK_BUSY` with an answer, the node never disconnected), A-209 (no router answers a tap copy; the router clears a `via_tap` a node sets), A-221 (an agent's turn goes to cognition only once its link took it) | ✅ replaced by 0.1.130 | snap `pre-router-0-1-129` (deleted 2026-11-10) · `apt install fluxbee=0.1.128` + 0.1.128's `update_installation` (nothing one-way) |
 | **0.1.128** | 2026-11-10 | `89fd1fd8` | motherbee + spokes (core), the Rust SDK alone: A-218 (`TNT_APPROVE`, seven dead action names, ECHO/ECHO_REPLY/TIME_SYNC gone; SY.identity's migration v5 drops `identity_vocabulary` and `identity_tenants.approved_by`; the identity shared memory exactly as it was), A-237 (an intermediate answer marked `accepted`), A-248 (an AI node used as a tap target answers nothing, its copies counted) | ✅ replaced by 0.1.129 | snap `pre-sdk-0-1-128` (deleted 2026-11-10) · `apt install fluxbee=0.1.127` + 0.1.127's `update_installation` (SY.identity of 0.1.127 ignores migration row 5, never names the dropped column, and recreates the empty vocabulary table) |
 | **0.1.127** | 2026-11-10 | `d2b344bb` | motherbee + spokes (core), one branch per binary: SY.orchestrator (A-199's step 1: reads apart, at most 4 waiting on one hive, a command that panics answered; hive-config stage 5: the blob folders follow their dist folder, and the blob GC runs only on the motherbee (A-188); A-196's restart marker; A-232's refusals); SY.admin (A-233: no purge while a node has a page up or a publish in flight; A-231, the ledger keeps a page down 30 days; A-234, the HTTP head and body caps; A-232; A-171, the manifest's lock file); SY.vault (A-200, one pass at the boot's announcement); SY.timer (A-220, canceled with a reason, schema v3; `LINK_BUSY` retried; A-232) | ✅ replaced by 0.1.128 | snap `pre-reads-0-1-127` (deleted 2026-11-10) · `apt install fluxbee=0.1.126` + 0.1.126's `update_installation` (SY.timer of 0.1.126 reads the v3 table) |
@@ -139,6 +140,66 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.131 — The sweep, one branch per binary
+
+- **Date:** 2026-11-11 (ART) · **Previous version:** 0.1.130 · **Commit:** `0f6b54f1`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the operator's sweep of small items and bugs (ultracode, 2026-11-10: *"ahora mejor sacar
+  todos los temas chicos y bugs que podamos"*), and the calls of 2026-11-10/11: A-242 (*"nada se
+  traba con las paginas"*), A-250 option (a), A-91, A-226, A-254 option (b). One branch per binary,
+  each reviewed adversarially and fixed once; none is shared code.
+- **What changed:**
+  - **SY.admin:** A-242, no removal (a node's purge, `teardown_node`, `purge_ilk`, `purge_tenant`, a
+    workflow's delete, `remove_hive`) is refused for published pages: A-233's and A-212's refusals
+    and their in-flight count are gone, each ok answer names the pages left up (`pages_left_up`: at
+    most 20 rows and 8 KiB, soonest to expire first, no key), the expiry sweep skips an edge whose
+    hive is gone, the factory reset asks each purge once and takes down the late pages 120 s after
+    its last removal (step [8]); over the mesh a node takes down only its own pages in its own
+    tenant (the review). A-249 closed with it. A-251: SY.timer's refusals answered 400, 404, 501 or
+    502 by their code. A-250's option (a): while a hive restarts, the update's read waits 10 s and is
+    asked again at once; after `add_hive` or `remove_hive` it looks at the payload's hive.
+  - **SY.timer 1.5:** A-238, a canceled timer is kept 7 days from its cancel (`canceled_at_utc`,
+    schema 4; an undated one dated at the start); A-244, a timer's lock entry leaves with its last
+    holder.
+  - **IO:** A-91, io.blob boots CONFIGURED on its defaults and io.cloud UNCONFIGURED
+    (`missing_edge_node`) until its config names its edge, both answering their status from their
+    config state; A-226, io.slack's text for `NOT_TAKEN` `unavailable`; A-223's spec. Their texts
+    say to restart IO.cloud after a first `publish_cloud_endpoint` (A-255, SY.admin's fix next).
+  - **WF:** A-254, a timer SY.timer does not take (the router's `UNREACHABLE` or `TTL_EXCEEDED`, a
+    refusal, no answer in 30 s, a failed send) is marked in the WF's index (store v7) and sent again
+    after 5, 10, 20 and 40 s, then each minute, the node `DEGRADED` meanwhile; one less than 60 s
+    from its time is fired by the WF itself; a move goes as a delay; a held time is compared. The
+    366-day bound at load, at SY.wf-rules' check and compile, and at run time.
+  - **The orchestrator:** A-252, a new spoke switches Syncthing off public discovery, relays and
+    NAT at its join's peer link, with the restart the link costs anyway.
+- **Build and review:** `coa/admin-131`, `coa/timer-131`, `coa/io-131`, `coa/wf-131`,
+  `coa/orch-131`, each with its review round and fixes, CI green on each and on the integrated head.
+  The reviews found A-255 to A-265, recorded in FINDINGS.
+- **The deploy:** build in about 14 min, publish in 12 s, `ops deploy 0.1.131` in 279 s, health
+  clean; snapshot `pre-sweep-0-1-131`, `pre-gosdk-0-1-130` dropped. Every spoke's orchestrator
+  restarted itself (A-250's case): the spokes settled by their own records 22.6 to 29.2 s after the
+  update's call, SY.admin marked each 1 to 5 s later, one read lost to a restart asked again at once, and the
+  update closed about 38 s after its call (0.1.127's took 148 s).
+- **Checked on 8.x (the gate):**
+  - SY.timer 1.5 on the motherbee and worker1: `gc_stamped=2` and `350`, `gc_deleted=0`; schema 4,
+    no canceled row without its date, every canceled timer still listed; a throwaway owner
+    scheduled, moved, canceled twice (the first date kept) and let one fire.
+  - A-251's three codes. Paging with `limit` found A-266.
+  - A-91: IO.blob's config answer `CONFIGURED` (was `node_not_configured`), IO.cloud CONFIGURED with
+    its edge, both HEALTHY on 0.1.131.
+  - A-242 with `AI.gate0231@worker1`: two pages up through its purge and its tenant's purge, each
+    answer naming both; one taken down (404), one expired (404) and retired by the sweep.
+  - A-254 with `WF.gate0231@worker1`: SY.timer@worker1 stopped as an instance started; the refusal,
+    `DEGRADED`, the timer sent again 6 s later and taken, the fire on time; a move to the 60 s floor
+    taken; `fire_in` 400d refused at the check.
+  - A-252 with the throwaway worker `gate0231` (VM 104): joined in about 140 s, Syncthing started 3
+    times (gate0227's 4); removed in 3.0 s (`pages_left_up` 0); VM 104 destroyed.
+  - Not seen live: A-226's text (it needs a person writing through io.slack; its tests cover it).
+  - Found: A-266 (TIMER_LIST's `limit`) and A-267 (the watchdog's last tick at a self-restart).
+- **PROD after the gate:** all four hives on 0.1.131 (`9bc916af`); worker1 behind egress1; no page
+  up; the gate's tenant, node, WF and hive removed (the six system ILKs of `gate0231` stay, for
+  A-191's cleanup); snapshot `pre-sweep-0-1-131` on each VM.
 
 ## 0.1.130 — The Go SDK alone
 

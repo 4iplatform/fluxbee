@@ -188,6 +188,14 @@ no change required
     type, its bytes unchanged), A-218's ECHO leftovers (the notice rules match the AI nodes'). Its
     update closed in 6 s with no orchestrator restarting, which confirms A-250's cause. **Found by its
     builder:** A-254 [WF], low.
+22. **0.1.131, one branch per binary, from the sweep (ultracode)** ✅ live and checked on 8.x
+    (2026-11-11): SY.admin (A-242, no removal refused for pages, each naming them; A-249 closed with
+    it; A-251; A-250's option (a), the update closed 38 s after its call), SY.timer 1.5 (A-238, A-244),
+    IO (A-91, A-226, A-223's spec), WF (A-254 with the 366-day bound) and the orchestrator (A-252).
+    **Found by its builders and reviews:** A-255 to A-265. **Found by its gate:** A-266
+    [General/SY.timer] and A-267 [General/orchestrator], low. **Next:** the router alone (0.1.132:
+    A-245, A-195, A-261, A-262, A-246, A-247, A-208, A-253, A-265), then 0.1.133 (A-191, A-240,
+    A-241, A-255, A-258, A-259, A-260, A-266, A-267).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -267,7 +275,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-149 🟡 The family has no written standard, and its nodes answer health and config each their
   own way.
 - A-114 🟡 No IO node writes first to a person; io.api delivers no answer at all.
-- A-91 🔵 io.blob and io.cloud boot UNCONFIGURED while they work.
 - A-255 🔴 A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its
   restart.
 - A-256 🔵 io.cloud accepts `io.inbound_family` and ignores it (low; with A-149).
@@ -297,24 +304,15 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
   0.1.125; A-219 ✅ 0.1.126 (worker1 behind egress1); A-210 mostly (SY.edge's part after
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
-- A-226 🔵 io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable` (low).
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-238 🔵 A canceled timer can be deleted at the next start, aged by its creation (low).
 - A-240 🔵 A local get_node_status writes on every read (low).
 - A-241 🔵 A spoke's blob staging is never cleaned (low, to decide).
-- A-242 🔵 remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin (low).
 - A-243 🔵 Who can take a page down: IO/WF nodes publish but cannot unpublish; the Cloud can neither list nor unpublish (to decide).
-- A-244 🔵 SY.timer's per-timer lock map never drops an entry (low).
 - A-245 🔵 A far router's UNREACHABLE reaches only the hub's own nodes: a spoke's sender to another spoke waits out its timeout (low; the router).
 - A-246 🔵 A non-gateway router with no gateway sibling answers a broadcast twice (low; multi-router hives only, not supported).
 - A-247 🔵 A sibling router's TTL and UNREACHABLE answers go to the forward target instead of the sender (low; multi-router hives only, not supported).
-- A-249 🔵 A-233's guards leave two narrow cases: a kill SY.admin stops waiting for, and the reset's step [3] (low).
-- A-250 🔵 The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 90 s late (seen in 0.1.127's and 0.1.128's deploys; a design call for the operator).
-- A-251 🔵 SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500 (low).
-- A-252 🔵 A fresh worker restarts Syncthing once more about a minute after its join, for the posture options (low).
 - A-253 🔵 A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns (low).
-- A-254 🔵 A WF can lose a timer schedule without knowing it: the schedule goes without waiting for an answer, and a refusal is dropped (low; WF).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - A-257 🔵 The frontdesk's handoff waits behind its LLM turns (low; the AI SDK).
 - A-258 🔵 SY.timer's refusals leave no line in its own log (low).
@@ -326,6 +324,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
 - A-265 🔵 The hub does not rebuild its FIB when it applies a spoke's LSA (low; the router).
 - A-266 🔵 `TIMER_LIST` says nothing of the timers its `limit` left out (low; SY.timer).
+- A-267 🔵 The watchdog's last tick during the orchestrator's own stop reads a healthy service as down (low).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1403,6 +1402,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-267 [General/orchestrator] 🔵 low (found 2026-11-11 by 0.1.131's deploy timeline; seen on 8.x, read in the code) — The watchdog's last tick, during the orchestrator's own stop, reads a healthy service as down and tries to start it
+
+- **Seen:** worker1's old orchestrator logged *"service not active; attempting restart"* for
+  `sy-opa-rules` at 06:27:42, the moment its own self-restart began, while sy-opa-rules had been
+  active since 06:27:39 (`NRestarts=0`; no restart followed).
+- **Why:** `systemd_is_active` (`src/bin/sy_orchestrator.rs` ~35638) takes any failure of its
+  `systemctl is-active` child as "not active" (`unwrap_or(false)` and `success()`); the stop's
+  SIGTERM reaches that child too, so the watchdog's tick in flight sees the service down and calls
+  `systemd_start`.
+- **Effect:** a false warning at each self-restart, and a start of a running service that can land
+  if the stop does not kill that call first.
+- **Fix:** active only on exit 0, inactive only on systemctl's "inactive" exit (3); a killed or
+  failed check is unknown and starts nothing.
+
 ### A-266 [General/SY.timer] 🔵 low (found 2026-11-11 by 0.1.131's gate; seen on 8.x, read in the code) — `TIMER_LIST` says nothing of the timers its `limit` left out
 
 - **Seen:** `GET /hives/motherbee/timer/timers?status_filter=all&limit=1` listed one of the
@@ -1446,6 +1459,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   operator's explicit run waits for the task's pass and its re-asks.
 - **To evaluate with 0.1.131's deploy** (A-250's gate, the spokes' orchestrators restart): if the
   follow still lags the spokes' own settle, read the hives at once.
+- **0.1.131's deploy:** the marks came one after the other, 3 to 8 s after each spoke was ready, with
+  one lost read asked again at once: seconds now, so it stays low.
 
 ### A-262 [General/router] 🔵 nit, BUILT for the router's 0.1.132 (coa/router-131, the review of A-195) (found 2026-11-11 by the review of the router's A-195; read in the code; there before it) — The hub sends no advertisement when the set it vouches for to a spoke becomes empty
 
@@ -1533,7 +1548,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** SY.admin applies the recorded edge live (a `CONFIG_SET` to IO.cloud at its live
   `config_version` + 1, or its restart), and the restart steps written in 0.1.131 come out.
 
-### A-254 [WF] 🔵 low (found 2026-11-10 by the Go SDK's 0.1.130 builder; read in the code, not run) — A WF can lose a timer schedule without knowing it
+### A-254 [WF] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a timer refused while SY.timer was down went again 6 s later and fired on time; fire_in 400d a COMPILE_ERROR) (found 2026-11-10 by the Go SDK's 0.1.130 builder; read in the code, not run) — A WF can lose a timer schedule without knowing it
 
 - **Why:** wf-generic's `SDKTimerSender.sendTimerRequest` (`go/nodes/wf/wf-generic/node/actions.go`
   ~785-799) sends `schedule_timer` without waiting for an answer, and the timer is recorded in the
@@ -1546,6 +1561,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (WF):** the schedule waits for SY.timer's answer (an RPC), or a refusal of a schedule
   the WF sent marks that timer in its index and retries it.
 - **The operator's call (2026-11-10, the sweep):** *"si"*, option (b): the WF records a refused schedule and tries again, without blocking, plus the 366-day bound; a Go release (wf.engine, SY.wf-rules).
+- **Validated (0.1.131, 2026-11-11):** `WF.gate0231@worker1` started an instance as SY.timer@worker1
+  was stopped: *"not taken by SY.timer ... UNREACHABLE reason=NODE_NOT_FOUND"*, DEGRADED
+  `timers_not_reconciled`; the watchdog brought SY.timer back in 2 s, the WF sent the timer again
+  6 s after the refusal and SY.timer took it (HEALTHY again at 7 s); it fired at its 2 minutes and
+  the instance ended `done`. A move to `1m`, the floor, was taken as a delay (+51 s). SY.wf-rules'
+  check refused `fire_in` 400d naming its path, and took 366d. No definition on 8.x went past 366
+  days.
 
 ### A-253 [General/storage] 🔵 low (found 2026-11-10 by 0.1.129's gate; seen on 8.x, the same on 0.1.128) — A user message between 96 KiB and the frame's 128 KiB reaches its node but not SY.storage's turns
 
@@ -1559,7 +1581,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the turn truncated with a mark, or raise the batch's bound to the frame's.
 - **The operator's call (2026-11-10, the sweep):** keep the drop, but *"hay que logear eso en algun lado.. imagino el log del propio nodo, para todo tenemos que tener logs"*: the router's own line names the dropped record (its trace, thread and size), with the router's release. Logs for everything are a topic of their own, later.
 
-### A-252 [General/join] 🔵 low (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — A fresh worker restarts Syncthing once more about a minute after its join, for the posture options
+### A-252 [General/join] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a throwaway worker's Syncthing started 3 times, not 4, switched at its join's link) (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — A fresh worker restarts Syncthing once more about a minute after its join, for the posture options
 
 - **Seen:** the throwaway worker `gate0227` joined at 18:23:56 and was done at 18:26:18; at
   18:28:04 its orchestrator's first peer reconcile logged *"switched off public discovery, relays
@@ -1568,16 +1590,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reconcile (A-47, A-50) sets them at its first round.
 - **Fix, later (with A-193's join timings):** the join writes the posture's options with the rest
   of its config, so the reconcile finds nothing to change.
+- **Validated (0.1.131, 2026-11-11):** `gate0231` (VM 104) joined in about 140 s; its orchestrator
+  logged the switch inside the finalize, next to the link's one restart; Syncthing started 3 times
+  (gate0227's 4), no reconcile restarted it in the next 4 minutes, and no restart marker was left.
+  Removed in 3.0 s; VM 104 destroyed.
 
-### A-251 [General/admin] 🔵 low (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500
+### A-251 [General/admin] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; 400 TIMER_INVALID_PAYLOAD naming no value, 404 TIMER_NOT_FOUND, 400 TIMER_INVALID_TIMEZONE) (found 2026-11-10 by 0.1.127's gate; seen on 8.x) — SY.admin answers SY.timer's refusal of a bad cursor with HTTP 500
 
 - **Seen:** `GET /hives/motherbee/timer/timers?cursor=<not one>` answered HTTP 500
   `TIMER_INVALID_PAYLOAD` (the refusal itself is right, and it names no value since 0.1.127).
 - **Why:** SY.admin's map from an error code to an HTTP status does not name `TIMER_INVALID_PAYLOAD`,
   so it falls to 500; a client's bad request should be a 400.
 - **Fix, later (SY.admin):** the map takes SY.timer's request errors as 400.
+- **Validated (0.1.131, 2026-11-11):** a bad cursor answers 400 `TIMER_INVALID_PAYLOAD` without the
+  value, an unknown uuid 404 `TIMER_NOT_FOUND`, a bad zone 400 `TIMER_INVALID_TIMEZONE`. Paging with
+  `limit` showed A-266.
 
-### A-250 [General/admin] 🔵 to evaluate (found 2026-11-10 by 0.1.127's deploy; seen on 8.x) — The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 85 s late
+### A-250 [General/admin] ✅ (a) VALIDATED ON 8.x (0.1.131, 2026-11-11; the update closed about 38 s after its call, each spoke marked 3 to 8 s after it was ready) · (b) for a later stage (found 2026-11-10 by 0.1.127's deploy; seen on 8.x) — The installation update's follow loses a read to each spoke's self-restart and sees the hive settled 40 to 85 s late
 
 - **Seen (0.1.127's deploy, `ops timeline`, t = 18:12:00):** the update was opened at 21.7 s; the
   spokes settled by their own records at 47.3 s (egress1), 57.5 s (ingress1) and 61.1 s (worker1);
@@ -1607,8 +1636,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   moment. If the lag stays, the options: the follow uses a short read bound while a hive is
   restarting; the spoke tells SY.admin when it settles; or a forward fails at once when its target
   orchestrator reconnects (A-195). A design call for the operator.
+- **Validated, option (a) (0.1.131, 2026-11-11):** every spoke's orchestrator restarted itself for the
+  new binary. The spokes were ready at 201.1 s (ingress1), 201.5 s (egress1) and 208.4 s (worker1)
+  of the deploy's timeline; SY.admin marked them settled at 208.9 s, 207.7 s and 211.4 s, with one
+  read lost to a restart asked again at once, and closed the update at 212.0 s: about 38 s after
+  the call, where 0.1.127's took 148 s and 0.1.128's 135 s. The marks came one after the other
+  (A-263). The review's fix rides along: after `add_hive` or `remove_hive` the update looks at the
+  payload's `hive_id`, not the command's target (Archi's own hive).
 
-### A-249 [General/admin] 🔵 low (found 2026-11-10 by the builder of A-233's review fixes; read in the code) — A-233's in-flight guards leave two narrow cases
+### A-249 [General/admin] ✅ CLOSED (0.1.131, 2026-11-11; both cases moot with A-242: no purge count and no refusal for a publish in flight) (found 2026-11-10 by the builder of A-233's review fixes; read in the code) — A-233's in-flight guards leave two narrow cases
 
 - **A kill SY.admin stops waiting for:** SY.admin waits 180 s for a kill with purge; past that it
   counts the purge out while the orchestrator may still be working. A publish already queued
@@ -1668,12 +1704,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   refusal as delivered, when the sender and the target are on two spokes.
 - **Fix, later (the router):** the hub relays a far `UNREACHABLE` on toward the sender's hive.
 
-### A-244 [General/SY.timer] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — SY.timer's per-timer lock map never drops an entry
+### A-244 [General/SY.timer] ✅ BUILT (0.1.131, 2026-11-11; a timer's whole life unchanged on 8.x, the leak proven by its tests) (found 2026-11-10 by A-220's builder; read in the code) — SY.timer's per-timer lock map never drops an entry
 
 - **Why:** `timerLock` (`go/sy-timer/scheduler.go` ~585) adds a small mutex per timer that ever fired,
   and since A-220's race fix per timer canceled or rescheduled, and never removes it, for the
   process's life (about 100 bytes each).
 - **Fix, later:** reference-counted entries, or drop a timer's lock when the timer leaves the store.
+- **Built (0.1.131, 2026-11-11):** `lockTimer` drops a timer's entry with its last holder. On 8.x a
+  throwaway owner scheduled, moved, canceled twice and let one fire, all as before.
 
 ### A-243 [General/admin] 🔵 to decide (found 2026-11-10 by A-233's builder; read in the code) — Who can take a page down: IO and WF nodes publish but cannot unpublish, and the Cloud can neither list nor unpublish
 
@@ -1686,8 +1724,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Cloud the list and the unpublish for its own tenant's pages through IO.cloud; or leave pages to
   expire.
 - **The operator (2026-11-10):** answers with A-242's talk.
+- **0.1.131 (A-242):** the Cloud's `delete_node` (a kill with purge) is no longer refused for a page
+  up, and IO.cloud's view of its answer keeps no `pages_left_up`: the Cloud is not told which pages
+  stay public. The operator's answer is pending.
 
-### A-242 [General/orchestrator] 🔵 low (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
+### A-242 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a node's and a tenant's purge with two pages up, each naming them; the spawn's rollback stays by design) (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
 
 - **remove_hive:** `remove_hive_flow` (`src/bin/sy_orchestrator.rs` ~21482 on c7402e88) leaves the pages
   its nodes published up until they expire; the purge rule (A-233) does not reach it.
@@ -1711,6 +1752,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-10):** *"si, nada se traba con las paginas.. porque quedan en el edge,
   solas mueren despues.. 24hrs asi que no veo problema"*. No removal (a hive, a node, a tenant) is
   refused for published pages; A-233's and A-212's refusals go. For SY.admin's next release.
+- **Validated (0.1.131, 2026-11-11):** `AI.gate0231@worker1` published two pages (3600 s and 60 s) and
+  was purged in 2.8 s with both up; the answer's `pages_left_up` named both, with no key, and the
+  long page still answered 200. Its tenant's purge (1.3 s) named them again. The long page, taken
+  down, answered 404; the short one answered 404 at its expiry and the sweep retired it (06:36:51,
+  `expired`, its copy released). `remove_hive` of a throwaway worker named no page (count 0). The
+  factory reset's dry run lists its new step [8]. The spawn's rollback that purges an ILK stays as
+  it is, by design (docs/control-path-hardening-v1.md §4: the node never ran).
 
 ### A-241 [General/blob] 🔵 low (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
 
@@ -1738,7 +1786,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`crates/fluxbee_sdk/src/timer.rs:199-200`); SY.admin's routes and Archi show it.
 - **Fix (the Go SDK, with A-228's release):** the field in `TimerInfo`.
 
-### A-238 [General/SY.timer] 🔵 low (found 2026-11-10 by A-220's builder; read in the code) — A canceled timer can be deleted at the next start, aged by its creation instead of its cancellation
+### A-238 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; SY.timer 1.5 dated the 352 canceled timers at its first start and deleted none) (found 2026-11-10 by A-220's builder; read in the code) — A canceled timer can be deleted at the next start, aged by its creation instead of its cancellation
 
 - **Why:** the history GC runs before the replay at a start (`go/sy-timer/main.go:210-214`) and ages
   a canceled timer by its last fire or its creation, not by when it was canceled
@@ -1746,6 +1794,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   or last fire is older than 7 days is deleted at the next start, its reason with it. Already so
   before A-220; documented in docs/sy-timer.md §7.5.
 - **Fix, later:** age a canceled timer by its cancellation time.
+- **Validated (0.1.131, 2026-11-11):** SY.timer 1.5 on the motherbee and worker1: the ready lines say
+  `gc_deleted=0 gc_stamped=2` and `gc_stamped=350`; the stores are at schema 4 with `canceled_at_utc`
+  and no canceled row without it; every canceled timer listed before the deploy is listed after it;
+  a second cancel keeps the first one's date. No row was older than 7 days, so the deleting case
+  rests on its tests.
 
 ### A-237 [General/SDK] ✅ BUILT (0.1.128, 2026-11-10; by its test: metadata only) (found 2026-11-10 by A-219's builder; read in the code) — A reply whose status is neither ok, accepted nor blocked is marked failed in its metadata
 
@@ -1798,6 +1851,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   operator can take them down, and the factory reset takes every page down.
 - **Fix, to decide (SY.admin):** the tenant's rule (2026-09-28: a purge never cascades), refusing
   the purge while the node has pages up, or leaving them to expire.
+- **Superseded (0.1.131, A-242, the operator's call of 2026-11-10):** no removal is refused for pages
+  or a publish in flight any more; each answer names the pages it leaves up.
 
 ### A-232 [General/shared] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; SY.admin, the orchestrator and SY.timer; SY.identity's refusal waits, noted in A-242) (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
 
@@ -1865,7 +1920,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   fact of the message, apart from its addressee.
 - **The operator (2026-11-10):** *"si, tema cognition no termino"*: with the cognition track, not the sweep.
 
-### A-226 [IO/io.slack] 🔵 low (found 2026-11-10 by A-217's builder; read in the code) — io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable`
+### A-226 [IO/io.slack] ✅ BUILT (0.1.131, 2026-11-11; by its tests: the live text needs a person writing through io.slack) (found 2026-11-10 by A-217's builder; read in the code) — io.slack has no text for a WF's `NOT_TAKEN` reason `unavailable`
 
 - **Why:** since A-217 a WF whose store is down answers `NOT_TAKEN` with the reason `unavailable`.
   io.slack has a text per reason, and shows an unknown one as "Not taken." with a warning
@@ -1912,6 +1967,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (io.api, with the IO standard A-149):** io.api's handoff wait is longer than the
   frontdesk's whole attempt (its identity timeout plus A-216's retries).
 - **Closed (2026-11-10, the sweep's triage):** already fixed by 0.1.125 (A-216's review round bounds every ILK_REGISTER attempt of a registration by one 8 s deadline, under io.api's 10 s wait); io.api's doc to correct with the IO release.
+- **0.1.131:** io.api's spec names `node.identity_timeout_ms` (10 s) and the rule that it stays above
+  the frontdesk's 8 s deadline; the frontdesk runs a handoff in any config state.
 
 ### A-222 [General/router] ✅ VALIDATED ON 8.x (0.1.129, 2026-11-10; a client that stopped reading took 39 frames of 100 KB, the other 41 refused `LINK_BUSY` at once, locally and across the WAN; all 39 delivered in order after) (found 2026-11-10 by A-203's builder; read in the code) — A node that stops reading without an error is never disconnected, and the router's queue for it grows without limit
 
@@ -2126,6 +2183,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   page first; a tenant's purge is refused `TENANT_HAS_PAGES` while one is up (the operator's
   2026-09-28 rule: a purge never cascades); a page on a removed edge comes down without asking it.
   **Checked on 8.x:** `GET /artifacts` answered `ok` with no page live and no key field.
+- **Superseded (0.1.131, A-242, the operator's call of 2026-11-10):** a tenant's purge is no longer
+  refused for its pages; its answer names them (`pages_left_up`), and they die at their expiry.
 
 ### A-211 [General/packaging] ✅ VALIDATED ON 8.x (0.1.124, 2026-11-10) (from the sweep of 2026-11-07; checked on 8.x) — wf-generic ships as a core binary that nothing runs
 
@@ -5616,7 +5675,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **One WARN line per failed proxied request:** now aggregated per interval. *Live:* one line,
   `failed=1`, with the request id of the 502 before io.web started.
 
-### A-91 [IO] 🔵 TO EVALUATE (found 2026-10-24) — io.blob and io.cloud boot UNCONFIGURED while they work; io.web boots CONFIGURED
+### A-91 [IO] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; IO.blob CONFIGURED and HEALTHY on its defaults; IO.cloud CONFIGURED with its edge, `missing_edge_node` without one) (found 2026-10-24) — io.blob and io.cloud boot UNCONFIGURED while they work; io.web boots CONFIGURED
 
 - **What happens:**
   - The SDK's boilerplate rule reads a seed-only `config.json` as UNCONFIGURED. So io.blob and
@@ -5626,6 +5685,10 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **To decide** with the IO family's review: whether the siblings should materialize their
   defaults the same way, so that a node's state says whether it works.
 - **The operator's call (2026-11-10, the sweep):** *"si funcionan 100% sin configurar si, sino algo tenemos que decir que falta"*: boot CONFIGURED when the defaults cover everything they do; otherwise say what is missing.
+- **Validated (0.1.131, 2026-11-11):** IO.blob's config answer went from `node_not_configured` to
+  `CONFIGURED`, HEALTHY, on 0.1.131; IO.cloud, whose config names `SY.edge@ingress1`, stays
+  CONFIGURED and HEALTHY. Without an edge IO.cloud says `missing_edge_node` (its tests); its review
+  found A-255, which the texts of this release describe until SY.admin's fix.
 
 ### A-90 [io.web] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; the share per client and the stalled body by tests; found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
 
