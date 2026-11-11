@@ -1451,6 +1451,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   ingress1 at 134.9 s (two waits). The spokes ran 0.1.127's reads apart this time, so the loss is
   not a queue: a read that reaches a spoke's orchestrator in its few seconds off the router, or
   just before it stops, gets no answer, and SY.admin waits its 50 s.
+- **The operator's call (2026-11-10):** *"a-250 por ahora a), lo correcto es b) pero costo/beneficio
+  actual no vale, igual deja documentado porque vamos a volver a esto en otra etapa"*. Now: (a), SY.admin's
+  follow uses a short read bound while a hive restarts and asks again at once. Later, in another
+  stage: (b), the spoke tells SY.admin when it settles (the datum's owner reports it), recorded as
+  the right design in docs/hive-config-update-v1.md.
 - **0.1.130's deploy (2026-11-10), the counter-case:** no orchestrator binary changed, so no
   spoke's orchestrator restarted itself, and the update closed 6 s after its call: the lag comes
   from the self-restart window and nothing else.
@@ -1535,6 +1540,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **To decide:** let a publisher take its own pages down (any node allowed to publish), and give the
   Cloud the list and the unpublish for its own tenant's pages through IO.cloud; or leave pages to
   expire.
+- **The operator (2026-11-10):** answers with A-242's talk.
 
 ### A-242 [General/orchestrator] 🔵 low (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
 
@@ -1550,6 +1556,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   SY.identity's (`list_ilks`, `list_tenants`) waits for its next release.
 - **To decide (remove_hive):** refuse it while the hive's nodes have pages up, as a purge is, or take
   them down as part of the operator's explicit removal.
+- **The operator (2026-11-10), in talk:** no removal should be blocked by published pages; a page has a
+  fixed expiry that does not renew, the edge serves it and makes it disappear, so a hive going away is
+  incidental. Read in the code the same day: that expiry exists already (24 h by default, 30 days at
+  most, no renewal; SY.admin's sweep takes the edge's row down and deletes the public copy, the edge
+  refuses an expired row on its own), and the operator's path takes any page down whoever published
+  it. Proposed: no refusal for pages on `remove_hive`, a node's purge (A-233) or a tenant's purge
+  (A-212); the answer names the pages left up and when each expires. Waiting for the operator's yes.
 
 ### A-241 [General/blob] 🔵 low (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
 
