@@ -339,6 +339,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; the orchestrator; to decide).
 - A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
 - A-285 🔵 The texts Archi and Cloud read do not describe 0.1.133's new answers (low; SY.admin and SY.architect in 0.1.133; the SDK's catalog later).
+- A-286 🔵 Archi's SCMD reads take `+` for a space where SY.admin keeps it (low; SY.architect).
+- A-287 🔵 Archi's SCMD paths go to SY.admin undecoded: `AI.sales%40worker1` matches no node (low; SY.architect).
+- A-288 🔵 Archi's SCMD reads of deployments and drift alerts drop their query (low; SY.architect; with A-279 in 0.1.133).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1416,6 +1419,39 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-288 [Archi] 🔵 low (found 2026-11-11 by A-279's review; read in the code; there before it) — Archi's SCMD reads of deployments and drift alerts drop their query
+
+- **Why:** the SCMD arms of `GET /deployments`, `/drift-alerts`, `/hives/{hive}/deployments` and
+  `/hives/{hive}/drift-alerts` (`src/bin/sy_architect.rs` ~13578, ~13584, ~14093, ~14099 on A-279's
+  branch) send `params: {}`, while SY.admin's own routes read `?limit=&category=`, `?severity=&kind=`
+  for drift alerts and `?hive=` on the global ones (`deployments_payload_from_query`,
+  `drift_alerts_payload_from_query`), which the orchestrator filters by.
+- **Effect:** Archi asking for one hive's or one kind's alerts, or a short page, gets everything.
+- **Fix (0.1.133, A-279's review):** those arms read their query through `scmd_query_params`, as
+  SY.admin's routes do; a test each.
+
+### A-287 [Archi] 🔵 low (found 2026-11-11 by A-279's builder; read in the code; there before it) — Archi's SCMD paths go to SY.admin undecoded: `AI.sales%40worker1` matches no node
+
+- **Why:** `translate_scmd` (`src/bin/sy_architect.rs`) copies each path segment as it comes (node
+  names, ILK and tenant ids, route prefixes, VPN patterns, WF instance ids, timer uuids, action
+  names); only the vault key segment is decoded. SY.admin's HTTP routes decode every segment
+  (`decode_percent`).
+- **Effect:** a path the model writes encoded (`/hives/worker1/nodes/AI.sales%40worker1/status`)
+  works over SY.admin's HTTP route and finds nothing through Archi.
+- **Fix, later (SY.architect):** `translate_scmd` decodes each segment once, as SY.admin's routes do.
+
+### A-286 [Archi] 🔵 low (found 2026-11-11 by A-279's builder; read in the code; there before it) — Archi's SCMD reads take `+` for a space where SY.admin keeps it
+
+- **Why:** `percent_decode_simple` (`src/bin/sy_architect.rs`), used by every SCMD read's query since
+  A-279, reads `+` as a space; SY.admin's `parse_query` and `decode_query_component` keep it (their
+  comment: a raw `+` offset is commoner).
+- **Effect:** through Archi, `/hives/motherbee/usage?from=2026-11-01T00:00:00+01:00&to=...` reaches
+  SY.storage as `2026-11-01T00:00:00 01:00`, refused *"from is not an RFC 3339 time"*
+  (`src/bin/sy_storage.rs` ~1231); the same query over SY.admin's HTTP route works. `Z` and `-03:00`
+  offsets are not affected.
+- **Fix, later (SY.architect):** the SCMD reads decode with `+` kept, as SY.admin does; Archi's own
+  HTTP `query_param` keeps its reading.
+
 ### A-285 [Archi] 🔵 low (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
 
 - **`delete_workflow` (A-270):** a WF node that is not RUNNING, or whose instances cannot be
@@ -1523,6 +1559,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   lists without the timer list (~1039), and SY.admin's catalog text for `timer_list`'s `cursor`
   names only the frame's cut.
 - **Fix:** the translation decodes as `scmd_page_params` does; the tool text names the timer list.
+- **Found and fixed with it (A-279's builder):** `percent_decode_simple` sliced the text at byte
+  offsets, so a `%` before a character of more than one byte (`%aé`) panicked the request's task
+  (no answer; the process stays up), and `%+A` decoded to a newline.
 
 ### A-278 [WF/Go SDK] 🔵 medium (found 2026-11-11 by A-266's builder and review; read in the code; there before it) — A WF with more than 1000 pending timers cannot reconcile them
 
