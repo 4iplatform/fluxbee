@@ -360,6 +360,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-293 🔵 io.cloud answers `FRONTDESK_REJECTED` to a retryable frontdesk error (low; io.cloud).
 - A-294 🔵 One answer over the frame limit stops the whole AI runtime (low; the AI SDK).
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
+- A-296 🔵 A deployments read filtered by category also answers the local snapshot rows of every category (low; the orchestrator).
+- A-297 🔵 SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee (low; SY.admin).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1437,6 +1439,28 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-297 [General/admin] 🔵 low (found 2026-11-11 by A-288's review; read in the code) — SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee
+
+- **Why:** `GET /deployments?hive=` and `GET /drift-alerts?hive=` take the value untrimmed, so an
+  empty one is `Some("")`; `normalize_admin_payload` drops it and the orchestrator's
+  `target_hive_from_payload` falls back to the local hive. Archi (A-288, 0.1.133) reads an empty
+  filter as none, every hive's history; SY.admin's `get_deployments`/`get_drift_alerts` help and
+  `example_scmd` name no query either.
+- **Fix, later (SY.admin):** trim it and drop it when empty, as its other filters; the help names
+  the filters.
+
+### A-296 [General/orchestrator] 🔵 low (found 2026-11-11 by A-288's review; read in the code; there before it) — A deployments read filtered by category also answers the local snapshot rows of every category
+
+- **Why:** `get_deployments_flow` and `list_deployments` pass no category to
+  `enrich_deployment_history_entries` (`src/bin/sy_orchestrator.rs` ~21433), which appends the
+  local-core-, local-runtime- and local-vendor-<hive> rows (`local_deployment_history_snapshot_entries`,
+  ~21338) when no filtered row names the local hive, then sorts and cuts to the limit.
+- **Effect:** `GET /deployments?category=vendor&limit=5` on a motherbee whose vendor rows do not
+  name it answers core and runtime rows; through SY.admin's route, and since A-288 (0.1.133) through
+  Archi's filtered reads, which report them as vendor deployments.
+- **Fix, later (the orchestrator):** the category reaches the enrichment, which appends only that
+  category's snapshot row, or none (the drift alerts' synthetic rows went for the same class, U-4b).
+
 ### A-295 [General/Rust SDK] 🔵 low (found 2026-11-11 by A-257's builder; read in the code; there before it) — The Rust SDK's command channels are unbounded
 
 - **Why:** `RouterDispatcher`'s command channels are `mpsc::unbounded_channel`
@@ -1527,6 +1551,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Effect:** Archi asking for one hive's or one kind's alerts, or a short page, gets everything.
 - **Fix (0.1.133, A-279's review):** those arms read their query through `scmd_query_params`, as
   SY.admin's routes do; a test each.
+- **Built for 0.1.133 (with A-279's review, 2026-11-11):** the four arms read their query as
+  SY.admin's routes do, and the read tool and the chat name the filters. **Its sibling, fixed with
+  it:** the SCMD of `DELETE /hives/{hive}/taps` read the tap's key from the body only, while SY.admin's
+  route and its `delete_tap` example name it in the query, so the example reached SY.config.routes
+  empty and was refused `NOT_FOUND`; it now reads the query when the body names none.
 
 ### A-287 [Archi] 🔵 low (found 2026-11-11 by A-279's builder; read in the code; there before it) — Archi's SCMD paths go to SY.admin undecoded: `AI.sales%40worker1` matches no node
 
@@ -1656,7 +1685,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   as they come; Archi's other paged reads decode through `scmd_page_params` (~12914), and SY.admin's
   own route decodes too (`parse_query`). SY.timer's cursor is `<fire_at>:<uuid>`: one Archi
   writes as `%3A`, or an owner with `%40`, reaches SY.timer encoded and is refused
-  `TIMER_INVALID_PAYLOAD` or matches nothing.
+  `TIMER_INVALID_PAYLOAD` (an owner with no `@` is no canonical L2 name; A-279's review).
 - **Effect:** since A-266 (0.1.133) a timer list cut by its limit (100 by default) answers
   `next_cursor`, so Archi pages it far more often. Archi's `fluxbee_get` tool text names the paged
   lists without the timer list (~1039), and SY.admin's catalog text for `timer_list`'s `cursor`
