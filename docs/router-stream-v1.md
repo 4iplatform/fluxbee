@@ -246,12 +246,29 @@ the motherbee and the workers, where they read them, and no longer on the ingres
 - **One batch in flight per sink,** so each sink receives in order.
 - **Expired:** a record older than `STREAM_MAX_AGE_SECS` when its turn comes is skipped for that
   sink and counted.
-- **Oversize:** a record that alone does not fit in a frame is skipped and counted.
+- **Oversize:** a record that alone does not fit in a batch (`STREAM_BATCH_MAX_BYTES` with the
+  batch's envelope; for a turn, a copy over about 95 KiB) is skipped and counted. It is also named
+  in the router's journal (A-253, since 0.1.132): `router stream dropped a record too big for a
+  batch; its sink never gets it`, with the stream, the sink, the subject, the producer, the
+  trace_id and thread_id the record carries (`-` for one it lacks), its seq, its size (`bytes`)
+  and the most it could have had (`max_bytes`). A burst cannot flood the journal: at most
+  `STREAM_OVERSIZE_NAMED_PER_INTERVAL` (10) are named every alarm interval, the stream's sinks
+  together; the others are only counted, and the alarm gives their number a line of its own
+  (§2.6). Until 0.1.132 such a record was only counted, and nobody could tell which conversation
+  had lost a turn.
+  - **Who reaches it:** a frame may be up to 128 KiB, so a turn whose copy is between about 95 and
+    128 KiB reaches its node but neither `turns` nor cognition. The Rust SDK normally sends a text
+    over about 62 KiB as a blob (`crates/fluxbee_sdk/src/send_normalization.rs`; it sends the text
+    inline only when the blob cannot be written), and the IO nodes the same
+    (`nodes/io/common/src/text_v1_blob.rs`), so their turns stay under it. What can reach it: a
+    WF's text, since the Go SDK has no blob offload (`go/fluxbee-go-sdk/client.go`), and a WF's
+    large `meta.context` (its resolved `vars`) even with a short text; a payload that is not text;
+    and a raw client. SY.timer cannot: its messages are system ones, which the router never copies.
+    The later fix is the Go SDK's text offload (FINDINGS A-264).
+  - NATS took up to 1 MB.
 - **Counted once:** a skipped record is counted when the sink's cursor passes it, which happens
   right away ahead of a batch; one met after the first record of a batch ends that batch and is
-  passed by the next plan. A batch sent again counts nothing more.
-  - Only text over 64 KB goes to blobs, so turns between about 96 and 128 KB are a new loss.
-  - NATS took up to 1 MB.
+  passed by the next plan. A batch sent again counts nothing more, and names nothing more.
 
 ### 2.6 The window, the alarm and the constants
 
@@ -277,11 +294,21 @@ pub const STREAM_NODE_APPEND_QUEUE: usize = 1_024;
 pub const STREAM_QUEUE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// At most one alarm line per interval, with the counts since the last one (D5, "log reducido").
 pub const STREAM_ALARM_INTERVAL_SECS: u64 = 30;
+/// At most this many records too big for a batch are named in the router's journal, each in a
+/// line of its own, every alarm interval; the others are only counted, and the alarm gives their
+/// number a line of its own (A-253). A burst of them costs at most this many lines, and that one,
+/// every interval.
+pub const STREAM_OVERSIZE_NAMED_PER_INTERVAL: u64 = 10;
 ```
 
 **The alarm:** when anything is dropped (cap, full queue, expired, oversize, refused), the stream
 logs one WARN line per `STREAM_ALARM_INTERVAL_SECS` with the counts by reason. The counters are
-also in its status, and `lab/ops.py health` sums them per hive (`streamlost`).
+also in its status, and `lab/ops.py health` sums them per hive (`streamlost`). A record dropped as
+oversize is named as well, in a line of its own (§2.5); when an interval had more than
+`STREAM_OVERSIZE_NAMED_PER_INTERVAL`, the alarm adds `router stream did not name N records too big
+for a batch in the last 30 s: at most 10 are named every 30 s, and every one is in the oversize
+count`. `lab/ops.py health` sums neither: the records they speak of are in the alarm line's
+`oversize` count already (A-253, since 0.1.132).
 
 A third bound covers the queue to the disk thread: `STREAM_QUEUE_MAX_BYTES` (16 MB) of payload
 waiting, both queues together, so a stalled disk cannot grow the router's memory; past it a record

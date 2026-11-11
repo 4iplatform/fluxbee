@@ -324,6 +324,19 @@ pushes them in acknowledged batches to their sinks.
   crowd out usage records.
 - **Delivery:** `STREAM_BATCH` of at most 256 records or 96 KiB, one batch in flight per sink,
   `STREAM_ACK` expected within 5 s, retries every 0.5 to 8 s.
+  - **A record too big for a batch** (for a turn, a copy over about 95 KiB) never reaches its
+    sink: it is skipped and counted as `oversize`, and named in the journal, `router stream
+    dropped a record too big for a batch; its sink never gets it`, with the sink, the subject, the
+    producer, the trace_id and thread_id it carries, and its size against the most it could have
+    had (A-253, since 0.1.132). At most 10 are named every 30 s
+    (`STREAM_OVERSIZE_NAMED_PER_INTERVAL`); the others are only counted, and the alarm says how
+    many (below). Until 0.1.132 they were only counted.
+  - **Who sends one:** a frame may be up to 128 KiB, so such a turn reaches its node but neither
+    `turns` nor cognition. The Rust SDK normally sends a text over about 62 KiB as a blob, and so
+    do the IO nodes, so their turns stay under it. A WF's text can reach it, since the Go SDK has
+    no blob offload, and so can a WF's large `meta.context` (its resolved `vars`) with a short
+    text, a payload that is not text, and a raw client. SY.timer cannot: its messages are system
+    ones, never copied. The later fix is the Go SDK's text offload (FINDINGS A-264).
 - **Never blocking:** the router only hands a record to a bounded queue (4096 turns, 1024 node
   appends, 16 MiB in total) and never waits. If the stream directory cannot be used, records are
   kept in memory only (`router stream cannot use its directory`).
@@ -340,6 +353,12 @@ last line, by reason (`AlarmSnapshot::since`, `usage_since`):
 router stream lost records in the last 30 s: dropped (queue full): N, dropped (cap): N, refused appends: N, expired: N, oversize: N, disk errors: N
 router stream lost usage records in the last 30 s: N
 ```
+
+Each record lost as `oversize` is also named in a line of its own, `router stream dropped a record
+too big for a batch; its sink never gets it` (above), at most 10 every 30 s; when there were more,
+the alarm adds `router stream did not name N records too big for a batch in the last 30 s: at most
+10 are named every 30 s, and every one is in the oversize count` (A-253, since 0.1.132).
+`lab/ops.py health` sums neither: their records are in the `oversize` count already.
 
 `lab/ops.py health` reads `journalctl -u rt-gateway` (and `-u sy-storage`) since a given time on
 every hive and reports, per hive (`HEALTH_SCRIPT`):

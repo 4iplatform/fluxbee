@@ -55,6 +55,11 @@ pub const STREAM_USAGE_RESERVE_BYTES: u64 = 1024 * 1024;
 pub const STREAM_USAGE_QUEUE_RESERVE: usize = 128;
 /// At most one alarm line per interval, with the counts since the last one (D5, "log reducido").
 pub const STREAM_ALARM_INTERVAL_SECS: u64 = 30;
+/// At most this many records too big for a batch are named in the router's journal, each in a
+/// line of its own, every alarm interval; the others are only counted, and the alarm gives their
+/// number a line of its own (A-253). A burst of them costs at most this many lines, and that one,
+/// every interval.
+pub const STREAM_OVERSIZE_NAMED_PER_INTERVAL: u64 = 10;
 /// How often the disk thread trims what every sink took and saves the cursors.
 const STREAM_HOUSEKEEPING_INTERVAL_MS: u64 = 1_000;
 /// A batch's envelope (stream name, field names) on top of its records.
@@ -460,6 +465,39 @@ struct Shared {
     sinks: HashMap<String, SinkState>,
     role: String,
     hive_id: String,
+    /// Which of the records too big for a batch the senders name in the journal (A-253).
+    oversize_names: OversizeNames,
+}
+
+/// The records too big for a batch that the senders name in the router's journal, at most
+/// `STREAM_OVERSIZE_NAMED_PER_INTERVAL` every alarm interval, the stream's sinks together; the
+/// others are only counted (A-253). Each such record is counted as `oversize` as well, once.
+#[derive(Debug, Default)]
+struct OversizeNames {
+    /// When the current interval started, and how many were named in it.
+    interval_started_ms: u64,
+    named: u64,
+    /// Those not named since the start, which the alarm reports by interval.
+    unnamed: u64,
+}
+
+impl OversizeNames {
+    /// Of `records`, just passed for being too big for a batch, the ones to name: as many as the
+    /// interval has room for, in order. The rest are counted as not named.
+    fn take(&mut self, mut records: Vec<Record>, now: u64) -> Vec<Record> {
+        if now.saturating_sub(self.interval_started_ms) >= STREAM_ALARM_INTERVAL_SECS * 1000 {
+            self.interval_started_ms = now;
+            self.named = 0;
+        }
+        let room = usize::try_from(STREAM_OVERSIZE_NAMED_PER_INTERVAL.saturating_sub(self.named))
+            .unwrap_or(usize::MAX);
+        if records.len() > room {
+            self.unnamed += (records.len() - room) as u64;
+            records.truncate(room);
+        }
+        self.named += records.len() as u64;
+        records
+    }
 }
 
 impl Shared {
@@ -544,12 +582,13 @@ enum BatchPlan {
     },
 }
 
-/// The next batch for `sink`, from its cursor (§2.5). Records of other sinks are passed over.
-/// Records this sink loses (past the window, too big for a frame) are passed and counted only
+/// The next batch for `sink`, from its cursor (§2.5), and the records it passed for being too big
+/// for a batch that its sender is to name in the journal (A-253). Records of other sinks are passed
+/// over. Records this sink loses (past the window, too big for a batch) are passed and counted only
 /// ahead of the batch, where the cursor moves past them right away; one after the first record of
-/// the batch ends it, and the next plan passes it. So each is counted once, however often the
-/// batch is sent again.
-fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
+/// the batch ends it, and the next plan passes it. So each is counted once, and named at most once,
+/// however often the batch is sent again.
+fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> (BatchPlan, Vec<Record>) {
     let cursor = shared.sinks.get(sink).map(|s| s.cursor).unwrap_or(0);
     // Up to `passed`: resolved ahead of the batch. Up to `scanned`: what a full ack resolves.
     let mut passed = cursor;
@@ -557,7 +596,7 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
     let mut out: Vec<Record> = Vec::new();
     let mut bytes = BATCH_ENVELOPE_BYTES;
     let mut expired = 0u64;
-    let mut oversize = 0u64;
+    let mut oversize: Vec<Record> = Vec::new();
     let mut usage_lost = 0u64;
     for record in shared.records.iter() {
         if record.seq <= cursor {
@@ -586,7 +625,7 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
             if aged {
                 expired += 1;
             } else {
-                oversize += 1;
+                oversize.push(record.clone());
             }
             if &*record.subject == SUBJECT_STORAGE_USAGE {
                 usage_lost += 1;
@@ -605,25 +644,82 @@ fn plan_batch(shared: &mut Shared, sink: &str, now: u64) -> BatchPlan {
         out.push(record.clone());
     }
     shared.usage_lost += usage_lost;
+    let oversize_count = oversize.len() as u64;
+    let to_name = shared.oversize_names.take(oversize, now);
     let state = shared.sinks.entry(sink.to_string()).or_default();
     state.expired += expired;
-    state.oversize += oversize;
+    state.oversize += oversize_count;
     if passed > state.cursor {
         state.cursor = passed;
     }
     let Some(last_seq) = out.last().map(|r| r.seq) else {
-        return if passed > cursor {
+        let plan = if passed > cursor {
             BatchPlan::Skipped
         } else {
             BatchPlan::Idle
         };
+        return (plan, to_name);
     };
     state.in_flight_up_to = last_seq;
-    BatchPlan::Send {
+    let plan = BatchPlan::Send {
         records: out,
         last_seq,
         scanned_up_to: scanned,
-    }
+    };
+    (plan, to_name)
+}
+
+/// The largest payload a record of its subject and producer may have and still fit in a batch of
+/// its own: one byte more and `plan_batch` passes it as too big.
+fn largest_payload(record: &Record) -> usize {
+    STREAM_BATCH_MAX_BYTES.saturating_sub(
+        BATCH_ENVELOPE_BYTES
+            + BATCH_RECORD_OVERHEAD_BYTES
+            + record.subject.len()
+            + record.producer.len(),
+    )
+}
+
+/// The trace_id and thread_id a record carries, when it has them: a turn's copy those of its
+/// message (`routing.trace_id`, `meta.thread_id`), a usage record its own (`trace_id`,
+/// `thread_id`).
+fn record_ids(payload: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+        return (None, None);
+    };
+    let text = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    (
+        text("/routing/trace_id").or_else(|| text("/trace_id")),
+        text("/meta/thread_id").or_else(|| text("/thread_id")),
+    )
+}
+
+/// Names in the router's journal a record its stream dropped for being too big for a batch, which
+/// its sink never gets (A-253): the sink, the subject, the producer, the trace_id and thread_id
+/// when it has them, its size and the most it could have had. Its sender calls it, outside the
+/// lock, for the ones `plan_batch` gave it, at most `STREAM_OVERSIZE_NAMED_PER_INTERVAL` every
+/// alarm interval. Until 0.1.132 such a record was only counted, in the alarm line, and nobody
+/// could tell which conversation's turn was missing from `turns` and cognition.
+fn name_oversize_record(stream: &str, sink: &str, record: &Record) {
+    let (trace_id, thread_id) = record_ids(&record.payload);
+    tracing::warn!(
+        stream = %stream,
+        sink = %sink,
+        subject = %record.subject,
+        producer = %record.producer,
+        trace_id = %trace_id.as_deref().unwrap_or("-"),
+        thread_id = %thread_id.as_deref().unwrap_or("-"),
+        seq = record.seq,
+        bytes = record.payload.len(),
+        max_bytes = largest_payload(record),
+        "router stream dropped a record too big for a batch; its sink never gets it"
+    );
 }
 
 /// The ack's new cursor, when it is the sink's and covers the batch in flight (§2.5). STREAM_*
@@ -920,6 +1016,7 @@ pub fn open(
         sinks: HashMap::new(),
         role: role.to_string(),
         hive_id: hive_id.to_string(),
+        oversize_names: OversizeNames::default(),
     };
     for sink in &sinks {
         let cursor = recovered.cursors.get(sink).copied().unwrap_or(0);
@@ -1109,6 +1206,9 @@ fn run_disk(
             if let Some(line) = now.usage_since(&alarm_seen) {
                 tracing::warn!(stream = %stream_name, "{line}");
             }
+            if let Some(line) = now.unnamed_since(&alarm_seen) {
+                tracing::warn!(stream = %stream_name, "{line}");
+            }
             alarm_seen = now;
         }
     }
@@ -1183,19 +1283,26 @@ struct AlarmSnapshot {
     oversize: u64,
     /// Of those, `storage.usage` records (§7.4).
     usage_lost: u64,
+    /// Of the oversize records, those not named in the journal (A-253).
+    oversize_unnamed: u64,
 }
 
 impl AlarmSnapshot {
     fn take(counters: &Counters, shared: &Arc<StdMutex<Shared>>) -> Self {
-        let (expired, oversize, sink_usage_lost) = shared
+        let (expired, oversize, sink_usage_lost, oversize_unnamed) = shared
             .lock()
             .map(|shared| {
                 let (expired, oversize) = shared.sinks.values().fold((0, 0), |(e, o), state| {
                     (e + state.expired, o + state.oversize)
                 });
-                (expired, oversize, shared.usage_lost)
+                (
+                    expired,
+                    oversize,
+                    shared.usage_lost,
+                    shared.oversize_names.unnamed,
+                )
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
         Self {
             dropped_queue: counters.dropped_queue_turns.load(Ordering::Relaxed)
                 + counters.dropped_queue_nodes.load(Ordering::Relaxed),
@@ -1206,7 +1313,21 @@ impl AlarmSnapshot {
             expired,
             oversize,
             usage_lost: counters.usage_lost.load(Ordering::Relaxed) + sink_usage_lost,
+            oversize_unnamed,
         }
+    }
+
+    /// A line of its own for the oversize records that were not named since `before` (A-253):
+    /// each is in the main line's oversize count already, so `ops.py health` never reads this one.
+    fn unnamed_since(&self, before: &Self) -> Option<String> {
+        (self.oversize_unnamed > before.oversize_unnamed).then(|| {
+            format!(
+                "router stream did not name {} records too big for a batch in the last \
+                 {STREAM_ALARM_INTERVAL_SECS} s: at most {STREAM_OVERSIZE_NAMED_PER_INTERVAL} are \
+                 named every {STREAM_ALARM_INTERVAL_SECS} s, and every one is in the oversize count",
+                self.oversize_unnamed - before.oversize_unnamed
+            )
+        })
     }
 
     /// A line of its own for the usage records lost since `before`: they are already counted by
@@ -1338,10 +1459,14 @@ async fn run_sink(
 ) {
     let mut backoff = STREAM_RETRY_MIN_MS;
     loop {
-        let plan = match shared.lock() {
+        let (plan, too_big) = match shared.lock() {
             Ok(mut shared) => plan_batch(&mut shared, &sink, now_ms()),
             Err(_) => return,
         };
+        // Named with the lock let go: the other senders and the status take it (A-253).
+        for record in &too_big {
+            name_oversize_record(&stream_name, &sink, record);
+        }
         let (records, last_seq, scanned_up_to) = match plan {
             BatchPlan::Idle => {
                 tokio::select! {
@@ -1504,6 +1629,7 @@ mod tests {
             sinks: HashMap::new(),
             role: "worker".to_string(),
             hive_id: "worker1".to_string(),
+            oversize_names: OversizeNames::default(),
         };
         for r in records {
             shared.turn_bytes += r.size();
@@ -1633,7 +1759,7 @@ mod tests {
             record(4, fresh, SUBJECT_STORAGE_TURNS, r#"{"ok":4}"#),
         ]);
         for attempt in 0..2 {
-            match plan_batch(&mut shared, "SY.storage@motherbee", now) {
+            match plan_batch(&mut shared, "SY.storage@motherbee", now).0 {
                 BatchPlan::Send {
                     records,
                     last_seq,
@@ -1667,7 +1793,7 @@ mod tests {
             record(3, now, SUBJECT_STORAGE_TURNS, "{}"),
         ]);
         let sink = "SY.storage@motherbee";
-        match plan_batch(&mut shared, sink, now) {
+        match plan_batch(&mut shared, sink, now).0 {
             BatchPlan::Send { records, .. } => {
                 assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1])
             }
@@ -1677,7 +1803,7 @@ mod tests {
         let state = shared.sinks.get_mut(sink).unwrap();
         state.cursor = 1;
         state.in_flight_up_to = 0;
-        match plan_batch(&mut shared, sink, now) {
+        match plan_batch(&mut shared, sink, now).0 {
             BatchPlan::Send { records, .. } => {
                 assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3])
             }
@@ -1704,7 +1830,7 @@ mod tests {
         assert_eq!(shared.sinks[sink].expired, 1);
         // The next plan starts past it and counts nothing more.
         assert!(matches!(
-            plan_batch(&mut shared, sink, now),
+            plan_batch(&mut shared, sink, now).0,
             BatchPlan::Send { .. }
         ));
         assert_eq!(shared.sinks[sink].expired, 1);
@@ -1717,7 +1843,7 @@ mod tests {
             .map(|seq| record(seq, now, SUBJECT_STORAGE_TURNS, "{}"))
             .collect();
         let mut shared = shared_with(records);
-        match plan_batch(&mut shared, "SY.storage@motherbee", now) {
+        match plan_batch(&mut shared, "SY.storage@motherbee", now).0 {
             BatchPlan::Send { records, .. } => {
                 assert_eq!(records.len(), STREAM_BATCH_MAX_RECORDS)
             }
@@ -1911,5 +2037,184 @@ mod tests {
         let line = after.since(&before).unwrap();
         assert!(line.contains("dropped (cap): 3") && line.contains("expired: 2"));
         assert!(!line.contains("refused"));
+    }
+
+    /// What `log` writes to the router's journal while it runs, as plain text.
+    fn journal_of(log: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Journal(Arc<StdMutex<Vec<u8>>>);
+        impl Write for Journal {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("the journal").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let journal = Journal::default();
+        let writer = journal.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        let text = journal.0.lock().expect("the journal").clone();
+        String::from_utf8(text).expect("text")
+    }
+
+    /// A-253: the records too big for a batch are handed to their sender to name, at most
+    /// `STREAM_OVERSIZE_NAMED_PER_INTERVAL` every alarm interval and in order; the others are
+    /// counted as not named. Each is counted as oversize once, and named at most once: a plan
+    /// that passes nothing new names nothing. The next interval names again.
+    #[test]
+    fn records_too_big_for_a_batch_are_named_at_most_so_often() {
+        let now = 1_000_000_000;
+        let big = format!("\"{}\"", "x".repeat(STREAM_BATCH_MAX_BYTES));
+        let limit = STREAM_OVERSIZE_NAMED_PER_INTERVAL;
+        let sink = "SY.storage@motherbee";
+        let mut shared = shared_with(
+            (1..=limit + 2)
+                .map(|seq| record(seq, now, SUBJECT_STORAGE_TURNS, &big))
+                .collect(),
+        );
+        let (plan, named) = plan_batch(&mut shared, sink, now);
+        assert_eq!(plan, BatchPlan::Skipped);
+        assert_eq!(
+            named.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            (1..=limit).collect::<Vec<_>>()
+        );
+        assert_eq!(shared.sinks[sink].oversize, limit + 2, "every one counted");
+        assert_eq!(shared.oversize_names.unnamed, 2);
+
+        // Later in the same interval: counted, not named; then nothing new, nothing named.
+        shared
+            .records
+            .push_back(record(limit + 3, now, SUBJECT_STORAGE_TURNS, &big));
+        let (_, named) = plan_batch(&mut shared, sink, now + 1_000);
+        assert!(named.is_empty());
+        let (plan, named) = plan_batch(&mut shared, sink, now + 2_000);
+        assert_eq!((plan, named.len()), (BatchPlan::Idle, 0));
+        assert_eq!(shared.sinks[sink].oversize, limit + 3);
+        assert_eq!(shared.oversize_names.unnamed, 3);
+
+        // The next interval names again.
+        let later = now + STREAM_ALARM_INTERVAL_SECS * 1000;
+        shared
+            .records
+            .push_back(record(limit + 4, later, SUBJECT_STORAGE_TURNS, &big));
+        let (_, named) = plan_batch(&mut shared, sink, later);
+        assert_eq!(
+            named.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![limit + 4]
+        );
+    }
+
+    /// A-253: the line that names a record too big for a batch gives its sink, subject and
+    /// producer, the trace_id and thread_id it carries (a turn's copy those of its message, a usage
+    /// record its own), and its size against the most it could have had; `-` for an id it lacks.
+    /// It is not the alarm line `ops.py health` sums.
+    #[test]
+    fn a_record_too_big_for_a_batch_is_named_with_its_trace_and_thread() {
+        let turn = json!({
+            "routing": {"src": "a", "dst": "b", "ttl": 16, "trace_id": "trace-of-the-turn"},
+            "meta": {"type": "user", "thread_id": "thread-of-the-turn"},
+            "payload": {"type": "text", "content": "x".repeat(STREAM_BATCH_MAX_BYTES)},
+        });
+        let usage = json!({
+            "record_id": "r1",
+            "trace_id": "trace-of-the-call",
+            "thread_id": "thread-of-the-call",
+            "raw_usage": "x".repeat(STREAM_BATCH_MAX_BYTES),
+        });
+        let usage_record = Record {
+            source: Source::Nodes,
+            ..record(8, 0, SUBJECT_STORAGE_USAGE, &usage.to_string())
+        };
+        for (record, trace_id, thread_id) in [
+            (
+                record(7, 0, SUBJECT_STORAGE_TURNS, &turn.to_string()),
+                "trace-of-the-turn",
+                "thread-of-the-turn",
+            ),
+            (usage_record, "trace-of-the-call", "thread-of-the-call"),
+        ] {
+            let line = journal_of(|| {
+                name_oversize_record("RT.gateway.stream@worker1", "SY.storage@motherbee", &record)
+            });
+            for part in [
+                "router stream dropped a record too big for a batch".to_string(),
+                "sink=SY.storage@motherbee".to_string(),
+                format!("subject={}", record.subject),
+                "producer=AI.sales@worker1".to_string(),
+                format!("trace_id={trace_id}"),
+                format!("thread_id={thread_id}"),
+                format!("bytes={}", record.payload.len()),
+                format!("max_bytes={}", largest_payload(&record)),
+            ] {
+                assert!(line.contains(&part), "{part} in {line}");
+            }
+            assert!(!line.contains("router stream lost"), "{line}");
+        }
+        let line = journal_of(|| {
+            name_oversize_record(
+                "RT.gateway.stream@worker1",
+                "SY.storage@motherbee",
+                &record(9, 0, SUBJECT_STORAGE_TURNS, "\"no ids\""),
+            )
+        });
+        assert!(
+            line.contains("trace_id=-") && line.contains("thread_id=-"),
+            "{line}"
+        );
+    }
+
+    /// A-253: the most a record may have, as its line gives it, is what a batch takes: a payload
+    /// of that size goes in a batch, one byte more is passed as too big, counted and named.
+    #[test]
+    fn the_most_a_record_may_have_is_what_a_batch_takes() {
+        let now = 1_000_000_000;
+        let sink = "SY.storage@motherbee";
+        let largest = largest_payload(&record(1, now, SUBJECT_STORAGE_TURNS, ""));
+        for (extra, too_big) in [(0, false), (1, true)] {
+            let payload = "x".repeat(largest + extra);
+            let mut shared = shared_with(vec![record(1, now, SUBJECT_STORAGE_TURNS, &payload)]);
+            let (plan, named) = plan_batch(&mut shared, sink, now);
+            assert_eq!(
+                matches!(plan, BatchPlan::Send { .. }),
+                !too_big,
+                "{extra} over"
+            );
+            assert_eq!(
+                shared.sinks[sink].oversize,
+                u64::from(too_big),
+                "{extra} over"
+            );
+            assert_eq!(named.len(), usize::from(too_big), "{extra} over");
+        }
+    }
+
+    /// A-253: the alarm gives the records too big for a batch that were not named a line of their
+    /// own, apart from the line `ops.py health` sums, whose oversize count has them already.
+    #[test]
+    fn the_alarm_says_how_many_records_too_big_for_a_batch_it_did_not_name() {
+        let before = AlarmSnapshot::default();
+        let after = AlarmSnapshot {
+            oversize: 14,
+            oversize_unnamed: 4,
+            ..AlarmSnapshot::default()
+        };
+        let line = after.unnamed_since(&before).expect("a line");
+        assert!(
+            line.starts_with("router stream did not name 4 records too big for a batch"),
+            "{line}"
+        );
+        assert!(!line.contains("router stream lost"), "{line}");
+        assert_eq!(
+            after.since(&before).as_deref(),
+            Some("router stream lost records in the last 30 s: oversize: 14")
+        );
+        assert_eq!(after.unnamed_since(&after), None);
     }
 }
