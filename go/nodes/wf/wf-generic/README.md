@@ -89,7 +89,8 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   left alone. A timer fires from 60 s to 366 days ahead, SY.timer's floor and ceiling (a definition
   that asks more does not load).
 - **A timer SY.timer does not take goes again** (FINDINGS A-254). A `schedule_timer` or a
-  `reschedule_timer` records the timer in the index first, then sends its request without waiting,
+  `reschedule_timer` records the timer in the index first (a `cancel_timer` drops it first, whatever
+  becomes of its cancel, a fire of it then dropped as stale), then sends its request without waiting,
   and the node keeps the request by its trace_id until SY.timer's `TIMER_RESPONSE`, which the SDK
   hands it on a channel of its own (`wfRouteProfile`). A request the router answers `UNREACHABLE`
   (`NODE_NOT_FOUND` while SY.timer restarts, `LINK_BUSY`) or `TTL_EXCEEDED`, that SY.timer refuses

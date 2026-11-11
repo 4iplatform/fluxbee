@@ -643,6 +643,8 @@ Cancels a timer previously scheduled by this instance.
 
 The runtime constructs the `client_ref` as `wf:<instance_id>::<timer_key>` and sends `TIMER_CANCEL` to SY.timer using that `client_ref`. SY.timer resolves it to the underlying timer and cancels it. If the timer has already fired, the cancel is a no-op. If no timer with that `client_ref` exists, the cancel is also a no-op (logged as warning, not an error).
 
+The timer leaves the WF's index first, whatever becomes of the cancel, which goes without waiting: a cancel that does not go (the send queue full during a reconnect) is logged and does not fail the action, and a fire SY.timer still sends of the timer is dropped as stale (§11.2), the next start's reconciliation cancelling it as an orphan (§11.4). Before A-254's review such a cancel failed the action and left the timer in the index, where the mark of a refused schedule sent it to SY.timer again, and the instance took the fire of a timer it had cancelled.
+
 ### 10.4 `reschedule_timer`
 
 Changes the fire time of an existing scheduled timer.

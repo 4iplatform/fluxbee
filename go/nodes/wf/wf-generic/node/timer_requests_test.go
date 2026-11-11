@@ -369,6 +369,49 @@ func TestARefusedTimerTheInstanceCancelsDoesNotGoAgain(t *testing.T) {
 	}
 }
 
+// FINDINGS A-254's review: a cancel_timer drops its timer from the index whatever its cancel's send
+// returns. During a reconnect a schedule that did not go is marked, and the cancel that follows does
+// not go either: the action failed, the row stayed with its mark, the loop sent the timer again once
+// the link was back, SY.timer took it, and the instance took the fire of a timer it had cancelled.
+// Now the action does not fail, nothing goes again, and a fire SY.timer still sends is dropped.
+func TestACancelThatDoesNotGoStillDropsTheTimer(t *testing.T) {
+	tc := newRefusalTest(t)
+	tc.timer.scheduleErr = errors.New("sender queue full")
+	instanceID := startInstance(t, tc.rt, from("IO.in@motherbee", msgWithName("START")))
+	if row, ok := tc.deadline(instanceID); !ok || row.Refusal == "" {
+		t.Fatalf("the schedule did not go: its timer is marked: %+v %v", row, ok)
+	}
+	tc.timer.cancelErr = errors.New("sender queue full")
+	tc.tell(instanceID, "DROP")
+	if _, ok := tc.deadline(instanceID); ok {
+		t.Fatal("the cancel drops the timer, its send failing")
+	}
+	logs, err := tc.rt.Store.GetRecentLog(context.Background(), instanceID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range logs {
+		if entry.ActionType == "cancel_timer" && !entry.OK {
+			t.Fatalf("the cancel does not fail: %+v", entry)
+		}
+	}
+
+	tc.timer.scheduleErr, tc.timer.cancelErr = nil, nil
+	scheduled := len(tc.timer.scheduled)
+	tc.later(time.Minute)
+	tc.tick()
+	if len(tc.timer.scheduled) != scheduled {
+		t.Fatalf("a cancelled timer never goes again: %v", tc.timer.scheduled[scheduled:])
+	}
+	if health, code, message := tc.health(); health != "HEALTHY" {
+		t.Fatalf("nothing is refused: %s %s %q", health, code, message)
+	}
+	tc.dispatch(timerFiredFor(t, testNodeName, instanceID, "deadline", fixedClock().Add(2*time.Hour)))
+	if row := mustGetInstance(t, tc.rt, instanceID); row.CurrentState != "waiting" || row.Status != "running" {
+		t.Fatalf("a fire SY.timer still sends of it is dropped: %+v", row)
+	}
+}
+
 // A refusal keeps the order with the instance's later move of the same timer: the timer goes again at
 // its new time. A schedule refused and then moved keeps its refusal (SY.timer never got the timer,
 // and answers the reschedule TIMER_NOT_FOUND); a refusal of a schedule a move has superseded decides

@@ -1450,10 +1450,11 @@ func TestTheSalesInvoiceExampleActsOnALateAnswerAsItSays(t *testing.T) {
 }
 
 // A team_untaken that fires once the case is taken never hands the case back (wf-orchestration-v1
-// §5.4.5). Its cancel goes fire-and-forget. Lost on its way to SY.timer, the fire comes, and the
-// engine drops it: the instance no longer has the timer. Never sent (the send failed, and the timer
-// stayed in the index), the fire reaches the instance, and team_untaken's guard on team_taken takes
-// nothing: the default logs it. Either way the team keeps the case, and nobody is told.
+// §5.4.5). Its cancel goes fire-and-forget, and the index drops the timer whatever becomes of the
+// cancel: lost on its way to SY.timer, or never sent (the send failed), the fire comes, and the
+// engine drops it, the instance no longer having the timer. Before A-254's review a cancel never sent
+// left the timer in the index, the fire reached the instance, and team_untaken's guard on team_taken
+// took nothing: the default logged it. Either way the team keeps the case, and nobody is told.
 func TestTheSalesInvoiceExampleKeepsATakenCaseOnAStaleUntakenFire(t *testing.T) {
 	handOver := func(c *salesConversation) {
 		c.t.Helper()
@@ -1489,13 +1490,14 @@ func TestTheSalesInvoiceExampleKeepsATakenCaseOnAStaleUntakenFire(t *testing.T) 
 		c.supervisor("Hi Ana, I will help you now.")
 		c.timer.cancelErr = nil
 		if _, ok := c.pending("team_untaken"); !ok {
-			t.Fatalf("the timer stays: %v", c.timer.pending)
+			t.Fatalf("SY.timer keeps the timer: %v", c.timer.pending)
 		}
-		sent := len(c.disp.sent)
+		instanceID := c.running().InstanceID
+		logged, sent := lastLog(t, c.rt, instanceID), len(c.disp.sent)
 		c.fire("team_untaken")
 		stays(c, sent)
-		if !c.logged("unhandled event TIMER_FIRED from SY.timer@worker1 in state with_team") {
-			t.Fatal("the default logs the fire")
+		if entry := lastLog(t, c.rt, instanceID); entry != logged {
+			t.Fatalf("the instance never sees the fire: %+v", entry)
 		}
 	})
 }

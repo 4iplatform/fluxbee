@@ -595,11 +595,22 @@ func execCancelTimer(ctx context.Context, action ActionDefinition, inst *WFInsta
 		return nil
 	}
 
-	clientRef := timerClientRef(inst.InstanceID, action.TimerKey)
-	if err := actx.Timer.CancelByClientRef(ctx, clientRef); err != nil {
+	// The index first, as a schedule's: from here on the instance has no such timer, whatever becomes
+	// of the cancel, which goes without waiting for SY.timer's answer. A fire SY.timer still sends of
+	// it (the cancel did not go, or SY.timer did not take it) is dropped, the index having no such
+	// timer (takeTimerFired), and the next start's reconcile cancels it as an orphan. When a cancel
+	// that did not go failed the action, the row stayed, and a refused one went again from the loop:
+	// SY.timer took it, and the instance took the fire of a timer it had cancelled (FINDINGS A-254's
+	// review).
+	if err := actx.Store.DeleteTimer(ctx, inst.InstanceID, action.TimerKey); err != nil {
 		return fmt.Errorf("cancel_timer %q: %w", action.TimerKey, err)
 	}
-	return actx.Store.DeleteTimer(ctx, inst.InstanceID, action.TimerKey)
+	clientRef := timerClientRef(inst.InstanceID, action.TimerKey)
+	if err := actx.Timer.CancelByClientRef(ctx, clientRef); err != nil {
+		log.Printf("instance %s: cancel_timer %q: the cancel did not go to SY.timer (%v); the instance no longer has the timer, and a fire of it is dropped",
+			inst.InstanceID, action.TimerKey, err)
+	}
+	return nil
 }
 
 func execRescheduleTimer(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
