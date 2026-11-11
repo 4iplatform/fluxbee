@@ -333,6 +333,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-277 🔵 A removed hive whose identity key could not be deleted keeps reading the identity store (low; to decide).
 - A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
 - A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
+- A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; SY.admin).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1409,6 +1410,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-280 [General/admin] 🔵 low (found 2026-11-11 by A-274's review; read in the code; there before it) — A publish holds the publication lock across its curate and the edge's publish, and on its failure paths across a clean-up its budget does not bound
+
+- **Why:** `handle_publish_artifact` (`src/bin/sy_admin.rs` ~6637-6773) takes the publication lock
+  before IO.blob's curate (30 s at most) and holds it through the edge's publish (75 s at most),
+  inside its 110 s budget. On a failure path it also holds the lock across `release_curated_blob`
+  (30 s; also inside `curate_publication_blob`, ~7655), and when its last ledger write fails,
+  across `unpublish_edge_blob` and the release (60 s). The budget bounds none of these clean-ups,
+  so the docs' *"one budget of 110 s covers a whole publish_artifact"* is not exact on a failure
+  path.
+- **Effect:** with SY.edge@ingress1 listed but down, each publish holds the lock about 75 s, then
+  up to 30 s more, and every take-down's and every sweep step's read and write waits behind it
+  (A-260 and A-274, 0.1.133, took out only their own holds). The publish itself can answer at
+  about 140 s, after ai.generic gave up at 120 s.
+- **Fix, later:** split the publish the way A-260 and A-274 did (the curate and the edge's publish
+  outside the lock, the row written under it); the take-down must then handle the `curated` row of
+  a publish still under way, which `handle_unpublish_artifact` today rules out by the lock (comment
+  at ~6833-6836). The smaller fix keeps the failure path's clean-up inside the budget, or outside
+  the lock.
 
 ### A-279 [Archi] 🔵 low (found 2026-11-11 by A-266's review; read in the code; there before it) — Archi's timer list passes its query undecoded, so a cursor or an owner it encoded is refused
 
