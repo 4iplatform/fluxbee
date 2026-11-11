@@ -367,7 +367,7 @@ Response:
 }
 ```
 
-If `force: false` (default): refuses if the WF node has running instances. Returns `INSTANCES_ACTIVE` error with count.
+If `force: false` (default): refuses if the WF node has running instances (`INSTANCES_ACTIVE`, with the count), and when it cannot count them (`INSTANCES_UNKNOWN`, §5.7). A workflow whose WF node has no config (never deployed, or already purged) is deleted.
 
 If `force: true`: kills the WF node (via orchestrator), deletes all state directories for that workflow. Instances are lost. This is the "nuclear option" for dev/testing.
 
@@ -428,8 +428,7 @@ Response:
 
 **How `active_instances` is obtained:** sy.wf-rules sends a `WF_LIST_INSTANCES` query to `WF.<workflow_name>@<hive>` with `status: "running"` and `limit: 0`; the WF node answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its own hive (`UNAUTHORIZED` to anyone else, since 0.1.90). The response includes `count`. Timeout: 2 seconds. If the WF node does not respond within the timeout (node down, overloaded, or not spawned), sy.wf-rules returns `"wf_node_timeout": true`. This does not fail the get_status query — the workflow metadata from sy.wf-rules' own state directories is always returned regardless of node availability.
 
-For `delete_workflow` with `force: false`, the same mechanism is used to check for active instances. If the node does not respond within timeout, the delete is refused with error `INSTANCES_UNKNOWN` — sy.wf-rules does not assume zero instances when it cannot confirm.
-```
+For `delete_workflow` with `force: false`, the same mechanism is used to check for active instances, and only a count goes on: a WF node with a config is deleted only once it counted none. Otherwise the delete is refused with error `INSTANCES_UNKNOWN`, its detail saying why and "delete with force to remove it anyway": the node is not `RUNNING` (its state named: `STARTING`, `STOPPED`, `FAILED` or `UNKNOWN`; such a node is not asked for its count), its `get_node_status` failed (the failure named) or timed out, or it did not answer the count within timeout or answered an error (e.g. `node_not_configured`) — sy.wf-rules does not assume zero instances when it cannot confirm. A node that crashed, was stopped or is restarting keeps its instances in its store, and the kill's purge removes the store with the node: before 0.1.133 (A-270) a node that was not `RUNNING`, or whose status read failed, was taken for one with none.
 
 **`list_workflows`:**
 
@@ -604,8 +603,8 @@ This makes the workflow source/versioning central in `SY.wf-rules`, while keepin
 
 The `delete_workflow` command removes a workflow entirely:
 
-1. If `force: false`: read the node's config and status through SY.admin (`get_node_config`, `get_node_status`), and, when it runs, its running instances (`WF_LIST_INSTANCES`). If the WF node has active instances (`status = running` with `active_instances > 0`), refuse with `INSTANCES_ACTIVE` error.
-2. If `force: true` or no active instances:
+1. If `force: false`: read the node's config and status through SY.admin (`get_node_config`, `get_node_status`), and, when it is `RUNNING`, its running instances (`WF_LIST_INSTANCES`). If the WF node has active instances (`active_instances > 0`), refuse with `INSTANCES_ACTIVE` error; if it has a config and they could not be counted (the node is not `RUNNING`, its status read failed or timed out, the count failed), refuse with `INSTANCES_UNKNOWN` (§5.7).
+2. If `force: true`, the node has no config, or it counted no running instances:
    - Call SY.admin's `kill_node` for `WF.<workflow_name>@<hive>` with `purge_instance: true`: the node stops and its instance, timers, owned secrets and identity go (the standard teardown).
    - Remove the state directories for that workflow: `/var/lib/fluxbee/wf-rules/<workflow_name>/`.
    - Remove package versions in `dist` for that workflow that are no longer referenced by any node instance.
@@ -697,7 +696,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | `VERSION_MISMATCH` | Requested version does not match staged version. |
 | `WORKFLOW_NOT_FOUND` | Query or operation on a workflow_name that doesn't exist. |
 | `INSTANCES_ACTIVE` | Delete refused because WF node has active instances (and force=false). |
-| `INSTANCES_UNKNOWN` | Delete refused because WF node did not respond to instance count query within timeout (and force=false). Cannot confirm zero instances. |
+| `INSTANCES_UNKNOWN` | Delete refused (and force=false) because sy.wf-rules cannot count the WF node's running instances: the node is not `RUNNING` (its state named), its status read failed or timed out, or it did not answer the instance count query within timeout or answered an error. Cannot confirm zero instances; delete with force to remove it anyway (§5.7). |
 | `PACKAGE_PUBLISH_FAILED` | sy.wf-rules could not materialize/install the workflow package in dist. |
 | `ORCHESTRATOR_ERROR` | A node action through SY.admin failed (the code is kept for compatibility of callers). |
 | `INVALID_WORKFLOW_NAME` | workflow_name does not match `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`, the runtime naming policy, since its runtime is `wf.<workflow_name>`: no hyphens (since 0.1.98; a hyphen passed the check and the package's publish refused it). |

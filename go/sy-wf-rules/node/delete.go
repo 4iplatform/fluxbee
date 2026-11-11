@@ -27,11 +27,8 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 	}
 
 	if !req.Force {
-		if snapshot.Timeout {
-			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: "cannot confirm active instances because wf node status timed out"}
-		}
-		if snapshot.InstancesError != "" {
-			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: fmt.Sprintf("cannot confirm active instances: the wf node answered %s (delete with force to remove it anyway)", snapshot.InstancesError)}
+		if reason := instancesUnconfirmed(snapshot); reason != "" {
+			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: fmt.Sprintf("cannot confirm active instances: %s (delete with force to remove it anyway)", reason)}
 		}
 		if snapshot.ConfigExists && snapshot.ActiveInstances != nil && *snapshot.ActiveInstances > 0 {
 			return nil, WfRulesError{Code: "INSTANCES_ACTIVE", Detail: fmt.Sprintf("wf node still has %d running instances", *snapshot.ActiveInstances)}
@@ -67,4 +64,30 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
 	return result, nil
+}
+
+// instancesUnconfirmed is why a delete without force cannot tell that the WF node runs no
+// instances, or "" when it can: the node has no config (never deployed, or already purged), or it
+// counted them. Only a RUNNING node is asked to count. One that crashed, was stopped or is
+// restarting keeps its instances in its store, and the kill's purge removes the store with the
+// node: before 0.1.133, a delete a second after a restart_node read STARTING, took the node for
+// one with none, and purged them (A-270).
+func instancesUnconfirmed(snapshot wfNodeSnapshot) string {
+	switch {
+	case snapshot.Timeout:
+		return "the wf node status timed out"
+	case !snapshot.ConfigExists:
+		return ""
+	case snapshot.StatusError != "":
+		return fmt.Sprintf("the wf node's status read failed: %s", snapshot.StatusError)
+	case !snapshot.Running && snapshot.LifecycleState == "":
+		return "the wf node's status names no lifecycle_state"
+	case !snapshot.Running:
+		return fmt.Sprintf("the wf node is %s, not RUNNING", snapshot.LifecycleState)
+	case snapshot.InstancesError != "":
+		return fmt.Sprintf("the wf node answered %s", snapshot.InstancesError)
+	case snapshot.ActiveInstances == nil:
+		return "the wf node's running instances were not counted"
+	}
+	return ""
 }

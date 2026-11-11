@@ -153,9 +153,17 @@ waits 75 s for the answer (`wf_rules_request_timeout`, overridable with
 
 - `WORKFLOW_NOT_FOUND` if no slot exists.
 - Without `force`, it refuses while the WF node has running instances (`INSTANCES_ACTIVE`) or
-  when it cannot tell (`INSTANCES_UNKNOWN`: the node's status timed out or its instance query
-  failed). It counts instances by asking the WF node `WF_LIST_INSTANCES` with
-  `status: running` directly (2 s timeout, `node/wf_client.go`).
+  when it cannot tell (`INSTANCES_UNKNOWN`, saying why and "delete with force to remove it
+  anyway"): the node is not `RUNNING` (its state named: `STARTING`, `STOPPED`, `FAILED` or
+  `UNKNOWN`), its status read failed (the failure named) or timed out, or its instance query
+  failed. It counts instances by asking a `RUNNING` WF node `WF_LIST_INSTANCES` with
+  `status: running` directly (2 s timeout, `node/wf_client.go`), and a node with a config is
+  deleted only once it counted none (`instancesUnconfirmed`). A node that crashed, was stopped or
+  is restarting keeps its instances in its store, which the kill's purge removes: before 0.1.133
+  (A-270) such a node was taken for one with none, and a delete a second after a `restart_node`
+  read `STARTING` and purged them.
+- A workflow whose WF node has no config (never deployed, or already purged) has none to lose,
+  and is deleted without a node step.
 - If the node exists it is removed with `kill_node` (`force: true`, `purge_instance: true`)
   through SY.admin; then the workflow directory is deleted and every published version of
   `wf.<workflow>` is removed from the motherbee's dist.
@@ -295,7 +303,9 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
 - A node step that fails after publishing refuses the deploy, `WF_NODE_NOT_DEPLOYED` (SY.admin
   502), with `wf_node.action` `restart_failed` (or `none`), the `warning` and what is current;
   re-run apply once the cause is fixed.
-- `ORCHESTRATOR_ERROR` when SY.admin or the orchestrator refuses a node query or a delete.
+- `ORCHESTRATOR_ERROR` when SY.admin or the orchestrator refuses a node's config read
+  (`get_node_config`) or a delete's `kill_node`. A status read it refuses makes a delete without
+  `force` `INSTANCES_UNKNOWN`, naming the refusal.
 
 ## Health
 

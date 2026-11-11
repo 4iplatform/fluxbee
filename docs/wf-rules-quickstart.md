@@ -508,8 +508,9 @@ Response (abridged):
 }
 ```
 
-`active_instances` is the node's own count (SY.wf-rules asks it `WF_LIST_INSTANCES`); it is `null`,
-with `instances_error`, when the node does not answer.
+`active_instances` is the node's own count (SY.wf-rules asks it `WF_LIST_INSTANCES`); it is `null`
+when SY.wf-rules cannot count them: the node is not running (`running: false`), does not answer
+(`wf_node_timeout`), or answers an error (`instances_error`).
 
 **List all the workflows of the hive:**
 
@@ -531,13 +532,18 @@ The rollback is only one level deep (current ↔ backup). If you need to go back
 
 ### 2.6 Delete a workflow
 
-**Safe deletion (fails if there are active instances):**
+**Safe deletion (fails if there are active instances, or if they cannot be counted):**
 
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
   -H "Content-Type: application/json" \
   -d '{"workflow_name": "invoice", "force": false}' | jq .
 ```
+
+It is refused with `INSTANCES_ACTIVE` while the node runs instances, and with `INSTANCES_UNKNOWN`
+while SY.wf-rules cannot count them: the node is not `RUNNING` (stopped, failed, or still starting
+after a restart: its instances wait in its store), or it does not answer. The detail says which.
+Wait for the node, or start it, and delete again; or delete with force.
 
 **Forced deletion (kills the node and deletes everything, including in-flight instances):**
 

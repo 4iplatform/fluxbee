@@ -19,6 +19,11 @@ type wfNodeSnapshot struct {
 	HealthState     string
 	ActiveInstances *int
 	Timeout         bool
+	// LifecycleState is the lifecycle_state get_node_status answered (RUNNING, STARTING, STOPPED,
+	// FAILED, UNKNOWN), and StatusError why that read failed, other than by a timeout (a timeout is
+	// Timeout). Only a RUNNING node is asked for its running instances.
+	LifecycleState string
+	StatusError    string
 	// InstancesError is why a WF node that answered could not count its running instances (e.g.
 	// node_not_configured while its config is not in use); a timeout is Timeout instead.
 	InstancesError string
@@ -138,10 +143,13 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 	if err != nil {
 		if isRPCTimeout(rpcCtx, err) {
 			snapshot.Timeout = true
+		} else {
+			snapshot.StatusError = err.Error()
 		}
 		return snapshot, nil
 	}
-	if !strings.EqualFold(stringValueFromMap(nodeStatus, "lifecycle_state"), "RUNNING") {
+	snapshot.LifecycleState = strings.TrimSpace(stringValueFromMap(nodeStatus, "lifecycle_state"))
+	if !strings.EqualFold(snapshot.LifecycleState, "RUNNING") {
 		return snapshot, nil
 	}
 	snapshot.Running = true

@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,5 +115,180 @@ func TestDeleteWorkflowForceRemovesStateAndPackages(t *testing.T) {
 	// Its packages are removed through SY.admin, which owns the dist tree (A-68).
 	if removed := svc.admin.(*fakeAdminClient).removedVersions; len(removed) != 1 || removed[0] != "wf.invoice@0.0.1" {
 		t.Fatalf("want the workflow's package removed through the admin, got %v", removed)
+	}
+}
+
+// applyWorkflowForDelete compiles and applies workflow "invoice" on this hive.
+func applyWorkflowForDelete(t *testing.T, svc *Service) {
+	t.Helper()
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+		t.Fatalf("ApplyWorkflow: %v", err)
+	}
+}
+
+// deployedWFNodeConfig is get_node_config's answer for a WF node that exists.
+func deployedWFNodeConfig(context.Context, string) (map[string]any, error) {
+	return map[string]any{"status": "ok", "config": map[string]any{"_system": map[string]any{"runtime_version": "0.0.1"}}}, nil
+}
+
+// purgingKill is a kill_node that records it ran, with the force and the purge a delete asks.
+func purgingKill(t *testing.T, killed *bool) func(context.Context, string, bool, bool) (map[string]any, error) {
+	return func(_ context.Context, _ string, force, purgeInstance bool) (map[string]any, error) {
+		*killed = true
+		if !force || !purgeInstance {
+			t.Fatalf("a delete kills with force and purge_instance, got force=%v purge_instance=%v", force, purgeInstance)
+		}
+		return map[string]any{"status": "ok"}, nil
+	}
+}
+
+// refusedDelete checks a delete refused with code, its detail saying each of says, that changed
+// nothing: the node was not killed, and the workflow and its packages are there.
+func refusedDelete(t *testing.T, svc *Service, err error, killed bool, code string, says ...string) {
+	t.Helper()
+	var refusal WfRulesError
+	if !errors.As(err, &refusal) || refusal.Code != code {
+		t.Fatalf("want %s, got %v", code, err)
+	}
+	for _, text := range says {
+		if !strings.Contains(refusal.Detail, text) {
+			t.Fatalf("%s's detail %q does not say %q", code, refusal.Detail, text)
+		}
+	}
+	removed := svc.admin.(*fakeAdminClient).removedVersions
+	if killed || !svc.store.WorkflowExists("invoice") || len(removed) != 0 {
+		t.Fatalf("a refused delete changes nothing: killed=%v, workflow kept=%v, packages removed=%v", killed, svc.store.WorkflowExists("invoice"), removed)
+	}
+}
+
+// A WF node that is not RUNNING keeps its instances in its store, and only the node counts them:
+// a delete without force refuses it, naming its state, and changes nothing; with force it goes
+// anyway. A delete a second after a restart read STARTING and purged the live instances (A-270).
+func TestDeleteWorkflowWithoutForceRefusesAWFNodeThatIsNotRunning(t *testing.T) {
+	for _, tc := range []struct{ state, says string }{
+		{"STARTING", "the wf node is STARTING, not RUNNING"},
+		{"STOPPED", "the wf node is STOPPED, not RUNNING"},
+		{"FAILED", "the wf node is FAILED, not RUNNING"},
+		{"UNKNOWN", "the wf node is UNKNOWN, not RUNNING"},
+		{"", "the wf node's status names no lifecycle_state"},
+	} {
+		t.Run(fmt.Sprintf("state %q", tc.state), func(t *testing.T) {
+			svc := newTestService(t)
+			applyWorkflowForDelete(t, svc)
+			killed := false
+			svc.nodes = &fakeNodeClient{
+				getNodeConfigFunc: deployedWFNodeConfig,
+				getNodeStatusFunc: func(context.Context, string) (map[string]any, error) {
+					return map[string]any{"lifecycle_state": tc.state, "health_state": "UNKNOWN"}, nil
+				},
+				killNodeFunc: purgingKill(t, &killed),
+			}
+			svc.wfNodes = &fakeWFNodeClient{countRunningInstancesFunc: func(string) (int, error) {
+				t.Fatal("a node that is not running is not asked for its instances")
+				return 0, nil
+			}}
+
+			_, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+			refusedDelete(t, svc, err, killed, "INSTANCES_UNKNOWN", tc.says, "delete with force to remove it anyway")
+
+			result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice", Force: true})
+			if err != nil || !result.Deleted || result.WFNode.Action != "deleted" || !killed {
+				t.Fatalf("with force: result=%#v, err=%v, killed=%v", result, err, killed)
+			}
+			if svc.store.WorkflowExists("invoice") {
+				t.Fatal("with force the workflow goes")
+			}
+		})
+	}
+}
+
+// A status read that failed says nothing of the node's instances either: a delete without force
+// refuses, naming the failure (A-270), as it refused one that timed out.
+func TestDeleteWorkflowWithoutForceRefusesWhenTheWFNodeStatusCannotBeRead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		says string
+	}{
+		{"refused", &nodeActionError{Status: "error", Code: "NODE_STATUS_GET_FAILED", Message: "worker1 did not answer"}, "the wf node's status read failed: NODE_STATUS_GET_FAILED: worker1 did not answer"},
+		{"malformed", fmt.Errorf("get_node_status answered without node_status"), "the wf node's status read failed: get_node_status answered without node_status"},
+		{"timed out", context.DeadlineExceeded, "the wf node status timed out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService(t)
+			applyWorkflowForDelete(t, svc)
+			killed := false
+			svc.nodes = &fakeNodeClient{
+				getNodeConfigFunc: deployedWFNodeConfig,
+				getNodeStatusFunc: func(context.Context, string) (map[string]any, error) { return nil, tc.err },
+				killNodeFunc:      purgingKill(t, &killed),
+			}
+			svc.wfNodes = &fakeWFNodeClient{}
+
+			_, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+			refusedDelete(t, svc, err, killed, "INSTANCES_UNKNOWN", tc.says, "delete with force to remove it anyway")
+		})
+	}
+}
+
+// Only a count lets a delete without force go on: a RUNNING node whose instances were not counted
+// is refused too (A-270).
+func TestDeleteWorkflowWithoutForceRefusesAWFNodeWhoseInstancesWereNotCounted(t *testing.T) {
+	svc := newTestService(t)
+	applyWorkflowForDelete(t, svc)
+	killed := false
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: deployedWFNodeConfig, killNodeFunc: purgingKill(t, &killed)}
+	svc.wfNodes = nil
+
+	_, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+	refusedDelete(t, svc, err, killed, "INSTANCES_UNKNOWN", "the wf node's running instances were not counted")
+}
+
+// A RUNNING node that counted no running instances is removed without force, with its purge, and
+// the workflow's state and packages go.
+func TestDeleteWorkflowWithoutForceRemovesARunningWFNodeWithNoInstances(t *testing.T) {
+	svc := newTestService(t)
+	applyWorkflowForDelete(t, svc)
+	killed := false
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: deployedWFNodeConfig, killNodeFunc: purgingKill(t, &killed)}
+	svc.wfNodes = &fakeWFNodeClient{countRunningInstancesFunc: func(string) (int, error) { return 0, nil }}
+
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+	if err != nil || !result.Deleted || result.WFNode.Action != "deleted" || !killed {
+		t.Fatalf("result=%#v, err=%v, killed=%v", result, err, killed)
+	}
+	if svc.store.WorkflowExists("invoice") {
+		t.Fatal("the workflow's state goes")
+	}
+	if removed := svc.admin.(*fakeAdminClient).removedVersions; len(removed) != 1 || removed[0] != "wf.invoice@0.0.1" {
+		t.Fatalf("want the workflow's package removed through the admin, got %v", removed)
+	}
+}
+
+// A workflow whose WF node has no config (never deployed, or already purged) has no instances to
+// lose: a delete without force removes it, with no node step, and asks no status.
+func TestDeleteWorkflowWithoutForceRemovesAWorkflowWithNoWFNode(t *testing.T) {
+	svc := newTestService(t)
+	applyWorkflowForDelete(t, svc)
+	svc.nodes = &fakeNodeClient{
+		getNodeStatusFunc: func(context.Context, string) (map[string]any, error) {
+			t.Fatal("a node with no config is not asked for its status")
+			return nil, nil
+		},
+		killNodeFunc: func(context.Context, string, bool, bool) (map[string]any, error) {
+			t.Fatal("a node with no config is not killed")
+			return nil, nil
+		},
+	}
+
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice"})
+	if err != nil || !result.Deleted || result.WFNode.Action != "none" || result.WFNode.Reason != "node not managed" {
+		t.Fatalf("result=%#v, err=%v", result, err)
+	}
+	if svc.store.WorkflowExists("invoice") {
+		t.Fatal("the workflow's state goes")
 	}
 }
