@@ -32503,7 +32503,7 @@ mod tests {
             "curl -X GET '/hives/motherbee/nodes",
             "curl -X GET ''",
         ] {
-            let err = parse_scmd(raw).err().expect(raw).to_string();
+            let err = parse_scmd(raw).expect_err(raw).to_string();
             assert!(err.contains("must be relative"), "{raw}: {err}");
         }
     }
