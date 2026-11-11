@@ -403,7 +403,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `wf_rules_*` | `SY.wf-rules@<hive>` | the writes as `CONFIG_SET` with `operation` (`send_wf_rules_config_set`); `delete_workflow` and the reads as `command` / `query` messages (`send_l2_action_request`) |
 | `wf_rules_check` | `SY.wf-rules@<hive>` only; it stages nothing | `CONFIG_SET`, `operation: check`, a fresh `check_id` and no version; only the answer that echoes that `check_id` counts (`send_wf_rules_check`) |
 | `wf_list_instances`, `wf_get_instance`, `wf_cancel_instance` | the WF node, `WF.<workflow>@<hive>` | `WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_CANCEL_INSTANCE` → `WF_*_RESPONSE` (`handle_wf_instance_command`) |
-| `timer_*` | `SY.timer@<hive>` | `TIMER_*` → `TIMER_RESPONSE` (`handle_timer_rpc`) |
+| `timer_*` | `SY.timer@<hive>` | `TIMER_*` → `TIMER_RESPONSE` (`handle_timer_rpc`); a refusal keeps SY.timer's code, its HTTP status by what it says: `TIMER_INVALID_PAYLOAD` and `TIMER_INVALID_TIMEZONE` 400, `TIMER_NOT_FOUND` 404, `TIMER_STORAGE_ERROR` 502, `TIMER_UNKNOWN_VERB` 501 (FINDINGS A-251) |
 | `list_streams` | every `RT.<router>.stream@<hive>` in the LSA | `STREAM_STATUS` (`handle_list_streams`) |
 | `get_llm_usage`, `GET /config/storage/metrics` | `SY.storage@motherbee` | `USAGE_QUERY`, `STORAGE_METRICS_GET` |
 | `cognition_clear` | `SY.cognition@<hive>` | `COGNITION_CLEAR` → `COGNITION_CLEAR_RESPONSE` (`handle_cognition_clear`) |

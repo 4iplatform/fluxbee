@@ -12560,6 +12560,15 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // not have, and one already ended.
         "INSTANCE_NOT_FOUND" => 404,
         "INSTANCE_ALREADY_TERMINATED" => 409,
+        // SY.timer's refusals of the reads SY.admin's timer routes send it, in its own TIMER_*
+        // vocabulary (docs/sy-timer.md §15, FINDINGS A-251): a request it cannot take (a cursor
+        // that is not one, a malformed payload, a zone that is none), a timer it does not have,
+        // its store failing, and a verb an SY.timer older than the route does not know.
+        // TIMER_INTERNAL stays a 500.
+        "TIMER_INVALID_PAYLOAD" | "TIMER_INVALID_TIMEZONE" => 400,
+        "TIMER_NOT_FOUND" => 404,
+        "TIMER_STORAGE_ERROR" => 502,
+        "TIMER_UNKNOWN_VERB" => 501,
         // A store that failed: the WF engine's, or the file SY.cognition could not clear; and the
         // memory region SY.cognition could not write once its file was cleared (`cognition_clear`).
         "STORE_ERROR" | "REGION_ERROR" => 502,
@@ -29186,6 +29195,95 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body_json["status"], json!("ok"));
         assert_eq!(body_json["error_code"], serde_json::Value::Null);
+    }
+
+    /// SY.timer's refusals of the reads SY.admin's timer routes send it answer as what they say
+    /// (FINDINGS A-251): a cursor that is not one, a malformed request or a zone that is none is
+    /// the client's (400), a timer SY.timer does not have 404, its store failing 502, a verb an
+    /// older SY.timer does not know 501; TIMER_INTERNAL stays a 500. The answer keeps SY.timer's
+    /// code and its message.
+    #[tokio::test]
+    async fn sy_timer_refusals_answer_by_what_they_say() {
+        let (ctx, mut harness) = opa_test_admin("timer-refusals");
+        let timer_uuid = Uuid::new_v4().to_string();
+        for (action, verb, payload, code, status) in [
+            (
+                "timer_list",
+                "TIMER_LIST",
+                json!({ "cursor": "nope" }),
+                "TIMER_INVALID_PAYLOAD",
+                400,
+            ),
+            (
+                "timer_now_in",
+                "TIMER_NOW_IN",
+                json!({ "duration": "1h", "tz": "Nowhere/Zone" }),
+                "TIMER_INVALID_TIMEZONE",
+                400,
+            ),
+            (
+                "timer_get",
+                "TIMER_GET",
+                json!({ "timer_uuid": timer_uuid }),
+                "TIMER_NOT_FOUND",
+                404,
+            ),
+            (
+                "timer_list",
+                "TIMER_LIST",
+                json!({}),
+                "TIMER_STORAGE_ERROR",
+                502,
+            ),
+            (
+                "timer_format",
+                "TIMER_FORMAT",
+                json!({ "layout": "2006", "tz": "UTC" }),
+                "TIMER_UNKNOWN_VERB",
+                501,
+            ),
+            (
+                "timer_get",
+                "TIMER_GET",
+                json!({ "timer_uuid": timer_uuid }),
+                "TIMER_INTERNAL",
+                500,
+            ),
+        ] {
+            let message = format!("{code}, as SY.timer words it");
+            let ask = handle_timer_rpc(
+                &ctx,
+                &ctx.rpc,
+                action,
+                verb,
+                payload,
+                PRIMARY_HIVE_ID.to_string(),
+            );
+            let refuse = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("the request to SY.timer");
+                assert_eq!(sent.meta.msg.as_deref(), Some(verb));
+                assert_eq!(dst_of(&sent), json!(format!("SY.timer@{PRIMARY_HIVE_ID}")));
+                let refusal = json!({
+                    "ok": false,
+                    "verb": verb,
+                    "error": { "code": code, "message": message },
+                });
+                harness
+                    .inject(reply_to(&sent, "TIMER_RESPONSE", refusal))
+                    .await
+                    .unwrap();
+            };
+            let (answer, ()) = tokio::join!(ask, refuse);
+            let (http_status, body) = answer.expect("answered");
+            assert_eq!(http_status, status, "{code}: {body}");
+            let envelope: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(envelope["status"], json!("error"));
+            assert_eq!(envelope["error_code"], json!(code));
+            assert_eq!(envelope["error_detail"], json!(message));
+        }
     }
 
     #[test]

@@ -224,6 +224,12 @@ cancelling are not exposed: a timer belongs to the node that created it.
 | `POST /hives/{hive}/timer/parse` | `TIMER_PARSE` |
 | `POST /hives/{hive}/timer/format` | `TIMER_FORMAT` |
 
+A refusal from SY.timer comes back with its code as `error_code` and its message as
+`error_detail`, under the HTTP status of what it says (`error_code_to_http_status`, FINDINGS
+A-251): `TIMER_INVALID_PAYLOAD` (a cursor that is not one, a malformed request) and
+`TIMER_INVALID_TIMEZONE` 400, `TIMER_NOT_FOUND` 404, `TIMER_STORAGE_ERROR` 502,
+`TIMER_UNKNOWN_VERB` 501 (an SY.timer older than the route) and `TIMER_INTERNAL` 500.
+
 ## Config
 
 None beyond `/etc/fluxbee/hive.yaml` (`hive_id`). Paths are constants (`configDir`,

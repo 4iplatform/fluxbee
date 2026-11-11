@@ -567,7 +567,7 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 - the same request with `cursor` set to it, and `limit` lowered by what came, lists the next;
 - the last page has no `next_cursor`.
 
-Both SDKs' `List` follow the pages up to the limit (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk), so a WF reconciles all its timers at start (`Recover`). `SY.admin`'s `timer_list` answers one page, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`.
+Both SDKs' `List` follow the pages up to the limit (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk), so a WF reconciles all its timers at start (`Recover`). `SY.admin`'s `timer_list` answers one page, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
 
 ### 7.7 `TIMER_PURGE_OWNER` (exclusive use of `SY.orchestrator`)
 
@@ -1169,6 +1169,8 @@ Format of an error response:
   }
 }
 ```
+
+SY.admin's read-only timer routes (docs/nodes/sy-timer.md, "SY.admin HTTP routes") answer SY.timer's refusals by what they say (`error_code_to_http_status`, FINDINGS A-251): `TIMER_INVALID_PAYLOAD` and `TIMER_INVALID_TIMEZONE` 400, `TIMER_NOT_FOUND` 404, `TIMER_STORAGE_ERROR` 502, `TIMER_UNKNOWN_VERB` 501 (an SY.timer older than the route), and `TIMER_INTERNAL` 500, each with SY.timer's code as `error_code` and its message as `error_detail`.
 
 ---
 
