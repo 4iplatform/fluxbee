@@ -857,8 +857,13 @@ is not running (exit 3). A stopped core unit comes back within seconds. A check 
 (another exit, or a check that could not run or was killed, as systemd's stop of the orchestrator
 kills the one in flight) starts nothing, and the next tick asks again (`ServiceActivity`,
 FINDINGS A-267, since 0.1.133); before, the last tick of each self-restart took the services it
-was checking for down and started them. The Syncthing check skips such a tick the same way, and
-the sync probe starts nothing on one. The other callers read one as "not ready yet" (the waits),
+was checking for down and started them. When systemctl gives no answer for a service at 12 checks
+in a row, a minute at least, the watchdog warns once that it cannot keep that service running, and
+says so when systemctl answers again (`note_service_answer`). The Syncthing check skips such a tick
+the same way, with the same count. The sync probe (`SYSTEM_SYNC_HINT`, a spoke's finalize) asks
+again, up to 3 times 250 ms apart within its time; still with no answer, it starts nothing and says
+that systemctl did not answer, not that Syncthing is down: the hint answers `SYNC_STATUS_FAILED`,
+and the finalize lists it in its errors. The other callers read one as "not ready yet" (the waits),
 "not running" (the reports, the vendor step of a finalize), an error that leaves the config
 update unrecorded, or, where Syncthing is stopped or restarted anyway, as possibly running. The
 same tick logs managed nodes that left the router, verifies runtimes, runs the blob GC (on the

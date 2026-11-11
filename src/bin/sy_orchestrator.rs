@@ -713,6 +713,9 @@ struct OrchestratorState {
     /// update only: a later one, installed while this orchestrator still runs, is never settled
     /// with this orchestrator's list.
     open_core_settle: std::sync::Mutex<Option<String>>,
+    /// FINDINGS A-267: the watchdog's checks in a row that systemctl gave no answer for, by service
+    /// (`note_service_answer`).
+    watchdog_unanswered: std::sync::Mutex<HashMap<String, u32>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -722,6 +725,15 @@ impl OrchestratorState {
             .get()
             .cloned()
             .ok_or_else(|| "orchestrator rpc client unavailable".into())
+    }
+
+    /// FINDINGS A-267: counts one of the watchdog's checks of `service` (`note_service_answer`).
+    fn note_watchdog_check(&self, service: &str, activity: ServiceActivity) {
+        let mut unanswered = self
+            .watchdog_unanswered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        note_service_answer(&mut unanswered, service, activity);
     }
 
     /// F18: acquire the per-hive_id topology lock, held across the whole
@@ -992,6 +1004,7 @@ async fn main() -> Result<(), OrchestratorError> {
         core_awaiting_update: std::sync::Mutex::new(None),
         vendor_awaiting_update: std::sync::Mutex::new(None),
         open_core_settle: std::sync::Mutex::new(None),
+        watchdog_unanswered: std::sync::Mutex::new(HashMap::new()),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -3328,7 +3341,7 @@ impl Drop for WatchdogRunGuard {
 
 /// The watchdog's step for one core service, by what systemctl answers for it: `start` runs only
 /// when it answers that the service is not running (FINDINGS A-267). A check with no answer starts
-/// nothing, and the next tick asks again.
+/// nothing, and the next tick asks again; a run of them is reported (`note_service_answer`).
 fn keep_core_service_running(
     service: &str,
     activity: ServiceActivity,
@@ -3351,6 +3364,58 @@ fn keep_core_service_running(
     }
 }
 
+/// How many of the watchdog's checks in a row systemctl may give no answer for a service before the
+/// watchdog says that it cannot keep the service running (FINDINGS A-267): 12 ticks of 5 s, a
+/// minute at least.
+const WATCHDOG_UNANSWERED_REPORT_CHECKS: u32 = 12;
+
+/// What the watchdog said of systemctl's answers for a service after one check (FINDINGS A-267).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnansweredChecks {
+    /// Nothing: systemctl answered, or its checks with no answer are too few yet.
+    Quiet,
+    /// That it gave no answer at WATCHDOG_UNANSWERED_REPORT_CHECKS checks in a row: said once.
+    Reported,
+    /// That it answers again, after a run of checks with no answer that was reported.
+    Ended,
+}
+
+/// Counts the watchdog's checks in a row that systemctl gave no answer for, by service (FINDINGS
+/// A-267). A check with no answer starts nothing, so a systemctl that kept failing (a D-Bus
+/// problem, say) would leave the watchdog keeping nothing running without a word: the run's 12th
+/// check warns, once, and the answer that ends a run so reported says so. Any answer ends the run.
+fn note_service_answer(
+    unanswered: &mut HashMap<String, u32>,
+    service: &str,
+    activity: ServiceActivity,
+) -> UnansweredChecks {
+    if activity != ServiceActivity::Unknown {
+        let reported = unanswered
+            .remove(service)
+            .is_some_and(|checks| checks >= WATCHDOG_UNANSWERED_REPORT_CHECKS);
+        if !reported {
+            return UnansweredChecks::Quiet;
+        }
+        tracing::info!(
+            service,
+            "systemctl answers for the service again; the watchdog keeps it running again"
+        );
+        return UnansweredChecks::Ended;
+    }
+    let checks = unanswered.entry(service.to_string()).or_insert(0);
+    *checks = checks.saturating_add(1);
+    if *checks != WATCHDOG_UNANSWERED_REPORT_CHECKS {
+        return UnansweredChecks::Quiet;
+    }
+    tracing::warn!(
+        service,
+        checks = *checks,
+        "systemctl has not answered whether the service runs for a minute; the watchdog cannot \
+         keep it running until it does"
+    );
+    UnansweredChecks::Reported
+}
+
 async fn watchdog_tick(state: &OrchestratorState) {
     let core_services = std::iter::once("rt-gateway".to_string()).chain(
         state
@@ -3360,7 +3425,9 @@ async fn watchdog_tick(state: &OrchestratorState) {
             .map(|node_name| name_to_service(node_name)),
     );
     for service in core_services {
-        keep_core_service_running(&service, systemd_activity(&service), systemd_start);
+        let activity = systemd_activity(&service);
+        state.note_watchdog_check(&service, activity);
+        keep_core_service_running(&service, activity, systemd_start);
     }
 
     if let Ok(snapshot) = load_router_snapshot(state) {
@@ -4618,12 +4685,24 @@ fn system_sync_hint_response_json(
 
 #[derive(Debug, Clone)]
 struct SyncthingConvergenceProbe {
-    service_active: bool,
+    /// What systemctl answered for Syncthing, asked again while it gave no answer (FINDINGS A-267).
+    service: ServiceActivity,
     api_healthy: bool,
     folder_status: Option<SyncthingFolderStatus>,
     warnings: Vec<String>,
     converged: bool,
 }
+
+impl SyncthingConvergenceProbe {
+    fn service_active(&self) -> bool {
+        self.service == ServiceActivity::Active
+    }
+}
+
+/// What the sync probe says when systemctl gave no answer for Syncthing, asked again (FINDINGS
+/// A-267): it says nothing of Syncthing itself.
+const SYNCTHING_UNANSWERED: &str =
+    "systemctl did not answer whether syncthing runs, asked again; nothing was started";
 
 async fn wait_for_syncthing_folder_convergence(
     state: &OrchestratorState,
@@ -4634,17 +4713,14 @@ async fn wait_for_syncthing_folder_convergence(
     wait_for_idle: bool,
 ) -> Result<SyncthingConvergenceProbe, OrchestratorError> {
     let desired_sync = effective_syncthing_runtime_config(desired_blob, desired_dist);
-    let activity = systemd_activity(SYNCTHING_SERVICE_NAME);
-    let mut service_active = activity == ServiceActivity::Active;
-    let mut api_healthy = if service_active {
-        syncthing_api_healthy(desired_sync.sync_api_port).await
-    } else {
-        false
-    };
+    // FINDINGS A-267: a check with no answer is asked again, within the probe's time; one that
+    // still has none starts nothing, and the probe says that systemctl did not answer.
+    let check_limit = Duration::from_millis(timeout_ms);
+    let mut service = systemd_activity_asked_again(SYNCTHING_SERVICE_NAME, check_limit).await;
+    let mut api_healthy = service != ServiceActivity::Inactive
+        && syncthing_api_healthy(desired_sync.sync_api_port).await;
 
-    // A check with no answer starts nothing (FINDINGS A-267): the probe answers that Syncthing is
-    // not active.
-    if activity != ServiceActivity::Unknown && (!service_active || !api_healthy) {
+    if service != ServiceActivity::Unknown && !(service == ServiceActivity::Active && api_healthy) {
         // A probe starts Syncthing as the watchdog does: on the installed binary while the vendor
         // still syncs (FINDINGS A-189).
         ensure_blob_sync_runtime(
@@ -4654,20 +4730,20 @@ async fn wait_for_syncthing_folder_convergence(
             VendorPolicy::KeepInstalled,
         )
         .await?;
-        service_active = systemd_activity(SYNCTHING_SERVICE_NAME) == ServiceActivity::Active;
-        api_healthy = if service_active {
-            syncthing_api_healthy(desired_sync.sync_api_port).await
-        } else {
-            false
-        };
+        service = systemd_activity_asked_again(SYNCTHING_SERVICE_NAME, check_limit).await;
+        api_healthy = service != ServiceActivity::Inactive
+            && syncthing_api_healthy(desired_sync.sync_api_port).await;
     }
 
-    if !service_active || !api_healthy {
+    if service != ServiceActivity::Active || !api_healthy {
         return Ok(SyncthingConvergenceProbe {
-            service_active,
+            service,
             api_healthy,
             folder_status: None,
-            warnings: Vec::new(),
+            warnings: (service == ServiceActivity::Unknown)
+                .then(|| SYNCTHING_UNANSWERED.to_string())
+                .into_iter()
+                .collect(),
             converged: false,
         });
     }
@@ -4691,7 +4767,7 @@ async fn wait_for_syncthing_folder_convergence(
     loop {
         if !folder_status.is_healthy() {
             return Ok(SyncthingConvergenceProbe {
-                service_active,
+                service,
                 api_healthy,
                 folder_status: Some(folder_status),
                 warnings,
@@ -4701,7 +4777,7 @@ async fn wait_for_syncthing_folder_convergence(
 
         if folder_status.is_converged() {
             return Ok(SyncthingConvergenceProbe {
-                service_active,
+                service,
                 api_healthy,
                 folder_status: Some(folder_status),
                 warnings,
@@ -4711,7 +4787,7 @@ async fn wait_for_syncthing_folder_convergence(
 
         if !wait_for_idle || Instant::now() >= deadline {
             return Ok(SyncthingConvergenceProbe {
-                service_active,
+                service,
                 api_healthy,
                 folder_status: Some(folder_status),
                 warnings,
@@ -4876,7 +4952,19 @@ async fn handle_system_sync_hint_for_folder(
         }
     };
 
-    if !probe.service_active || !probe.api_healthy {
+    // FINDINGS A-267: no answer from systemctl, asked again, says nothing of Syncthing: its status
+    // could not be taken.
+    if probe.service == ServiceActivity::Unknown {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_STATUS_FAILED",
+            "message": SYNCTHING_UNANSWERED,
+            "channel": request.channel,
+            "folder_id": request.folder_id,
+            "api_healthy": probe.api_healthy,
+        });
+    }
+    if !probe.service_active() || !probe.api_healthy {
         return serde_json::json!({
             "status": "error",
             "error_code": "SYNC_UNHEALTHY",
@@ -4884,7 +4972,7 @@ async fn handle_system_sync_hint_for_folder(
             "channel": request.channel,
             "folder_id": request.folder_id,
             "api_healthy": probe.api_healthy,
-            "service_active": probe.service_active,
+            "service_active": probe.service_active(),
         });
     }
 
@@ -8328,12 +8416,11 @@ async fn apply_config_update_local(
     let mut restarted = Vec::new();
     let mut errors = Vec::new();
     for service in restart {
-        let activity = if systemd_unit_exists(&service) {
-            systemd_activity(&service)
-        } else {
-            ServiceActivity::Inactive
-        };
-        match activity {
+        // One check and its three answers (FINDINGS A-267). `systemctl is-active` answers 3, not
+        // running, for a unit systemd does not have, so no unit check comes first: that one took a
+        // failed `systemctl show` for "no such unit", and so a reader with no answer for a stopped
+        // one.
+        match systemd_activity(&service) {
             ServiceActivity::Active => {}
             ServiceActivity::Inactive => {
                 tracing::info!(
@@ -18708,8 +18795,9 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     }
 
     // FINDINGS A-267: a check with no answer, such as the one systemd's stop of this orchestrator
-    // kills, restarts nothing: the next tick asks again.
+    // kills, restarts nothing: the next tick asks again, and a run of them is reported.
     let activity = systemd_activity(SYNCTHING_SERVICE_NAME);
+    state.note_watchdog_check(SYNCTHING_SERVICE_NAME, activity);
     if activity == ServiceActivity::Unknown {
         tracing::debug!(
             service = SYNCTHING_SERVICE_NAME,
@@ -31636,6 +31724,9 @@ async fn add_hive_finalize_local_flow(
             .await
             {
                 Ok(probe) => {
+                    let service_active = probe.service_active();
+                    // The probe's warnings go in the errors, a systemctl that did not answer for
+                    // Syncthing included (FINDINGS A-267).
                     let mut errors = probe.warnings;
                     if let Some(status) = probe.folder_status.as_ref() {
                         if !status.error.is_empty() {
@@ -31646,7 +31737,7 @@ async fn add_hive_finalize_local_flow(
                         }
                     }
                     (
-                        probe.service_active,
+                        service_active,
                         probe.api_healthy,
                         probe.folder_status,
                         probe.converged,
@@ -35711,6 +35802,36 @@ fn service_activity(status: std::io::Result<std::process::ExitStatus>) -> Servic
         Ok(Some(3)) => ServiceActivity::Inactive,
         _ => ServiceActivity::Unknown,
     }
+}
+
+/// How many times a caller that takes one answer from systemctl asks again when a check gives
+/// none, and how far apart (FINDINGS A-267): a systemctl that fails once answers at the next ask.
+const SERVICE_CHECK_ASKS_AGAIN: u32 = 3;
+const SERVICE_CHECK_ASK_AGAIN_MS: u64 = 250;
+
+/// systemctl's answer for `service`, asked again while a check gives none, SERVICE_CHECK_ASKS_AGAIN
+/// times at most, SERVICE_CHECK_ASK_AGAIN_MS apart, and never past `limit` (FINDINGS A-267):
+/// Unknown when it still gave none.
+async fn systemd_activity_asked_again(service: &str, limit: Duration) -> ServiceActivity {
+    ask_again_while_unanswered(|| systemd_activity(service), limit).await
+}
+
+/// `check`'s answer, asked again while it is Unknown (`systemd_activity_asked_again`).
+async fn ask_again_while_unanswered(
+    mut check: impl FnMut() -> ServiceActivity,
+    limit: Duration,
+) -> ServiceActivity {
+    let deadline = Instant::now() + limit;
+    let pause = Duration::from_millis(SERVICE_CHECK_ASK_AGAIN_MS);
+    let mut activity = check();
+    for _ in 0..SERVICE_CHECK_ASKS_AGAIN {
+        if activity != ServiceActivity::Unknown || Instant::now() + pause > deadline {
+            break;
+        }
+        time::sleep(pause).await;
+        activity = check();
+    }
+    activity
 }
 
 fn systemd_unit_exists(service: &str) -> bool {
@@ -52351,6 +52472,7 @@ blob:
             core_awaiting_update: StdMutex::new(None),
             vendor_awaiting_update: StdMutex::new(None),
             open_core_settle: StdMutex::new(None),
+            watchdog_unanswered: StdMutex::new(HashMap::new()),
             rpc: OnceLock::new(),
         }
     }
@@ -57632,7 +57754,9 @@ blob:
 
     /// FINDINGS A-267: the watchdog starts a core service only when systemctl answers that it does
     /// not run. Before, a check killed by the orchestrator's own stop read as "not running", and
-    /// the tick in flight started a healthy service.
+    /// the tick in flight started a healthy service. The other callers that would start or restart
+    /// something on a check (the Syncthing check, the sync probe and its hint, the config update)
+    /// are read in their code.
     #[test]
     fn the_watchdog_starts_a_core_service_only_on_a_not_running_answer() {
         for (activity, starts) in [
@@ -57677,10 +57801,110 @@ blob:
                     .rfind("ensure_blob_sync_runtime(")
                     .expect("the restart")
         );
+        // The probe asks again before it takes no answer, and starts nothing on one; the sync
+        // hint then says that systemctl did not answer, not that Syncthing is unhealthy.
+        let probe = body("async fn wait_for_syncthing_folder_convergence(");
+        assert!(probe.contains(
+            "if service != ServiceActivity::Unknown && !(service == ServiceActivity::Active && \
+             api_healthy) {"
+        ));
         assert!(
-            body("async fn wait_for_syncthing_folder_convergence(").contains(
-                "if activity != ServiceActivity::Unknown && (!service_active || !api_healthy) {"
+            !probe.contains("systemd_activity("),
+            "every check asks again"
+        );
+        let hint = body("async fn handle_system_sync_hint_for_folder(");
+        assert!(
+            hint.find("if probe.service == ServiceActivity::Unknown {")
+                .expect("the hint's unknown")
+                < hint
+                    .find("\"SYNC_UNHEALTHY\"")
+                    .expect("the hint's unhealthy")
+        );
+        // The config update takes one answer per reader, with no unit check before it, which took
+        // a failed check for a reader this hive does not run.
+        let update = body("async fn apply_config_update_local(");
+        assert!(update.contains("match systemd_activity(&service) {"));
+        assert!(!update.contains("systemd_unit_exists("));
+    }
+
+    /// FINDINGS A-267: a caller that takes one answer from systemctl asks again while a check gives
+    /// none, three times at most, 250 ms apart and never past its time; the first answer ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_with_no_answer_is_asked_again_three_times_within_its_time() {
+        use ServiceActivity::{Active, Inactive, Unknown};
+        async fn ask(answers: &[ServiceActivity], limit_ms: u64) -> (ServiceActivity, usize) {
+            let asked = std::cell::Cell::new(0);
+            let answer = ask_again_while_unanswered(
+                || {
+                    let answer = answers
+                        .get(asked.get())
+                        .copied()
+                        .unwrap_or(ServiceActivity::Unknown);
+                    asked.set(asked.get() + 1);
+                    answer
+                },
+                Duration::from_millis(limit_ms),
             )
+            .await;
+            (answer, asked.get())
+        }
+        assert_eq!(ask(&[Active], 10_000).await, (Active, 1));
+        assert_eq!(ask(&[Unknown, Inactive], 10_000).await, (Inactive, 2));
+        assert_eq!(
+            ask(&[Unknown, Unknown, Unknown, Active], 10_000).await,
+            (Active, 4)
+        );
+        assert_eq!(ask(&[], 10_000).await, (Unknown, 4), "three times, no more");
+        assert_eq!(
+            ask(&[Unknown, Active], 100).await,
+            (Unknown, 1),
+            "never past its time"
+        );
+    }
+
+    /// FINDINGS A-267: the watchdog counts its checks in a row that systemctl gives no answer for,
+    /// by service: the 12th, a minute at least, is reported once, the answer that ends a run so
+    /// reported says so, and a shorter run ends without a word.
+    #[test]
+    fn the_watchdog_reports_a_systemctl_that_does_not_answer_for_a_minute() {
+        use ServiceActivity::{Active, Inactive, Unknown};
+        let mut unanswered = HashMap::new();
+        let said: Vec<UnansweredChecks> = (0..WATCHDOG_UNANSWERED_REPORT_CHECKS + 3)
+            .map(|_| note_service_answer(&mut unanswered, "sy-timer", Unknown))
+            .collect();
+        let reported: Vec<usize> = said
+            .iter()
+            .enumerate()
+            .filter(|(_, said)| **said == UnansweredChecks::Reported)
+            .map(|(check, _)| check + 1)
+            .collect();
+        assert_eq!(reported, vec![WATCHDOG_UNANSWERED_REPORT_CHECKS as usize]);
+        assert!(said.iter().all(|said| *said != UnansweredChecks::Ended));
+        assert_eq!(
+            note_service_answer(&mut unanswered, "rt-gateway", Unknown),
+            UnansweredChecks::Quiet,
+            "by service"
+        );
+        assert_eq!(
+            note_service_answer(&mut unanswered, "sy-timer", Inactive),
+            UnansweredChecks::Ended
+        );
+        assert!(!unanswered.contains_key("sy-timer"));
+        for _ in 1..WATCHDOG_UNANSWERED_REPORT_CHECKS {
+            assert_eq!(
+                note_service_answer(&mut unanswered, "sy-timer", Unknown),
+                UnansweredChecks::Quiet
+            );
+        }
+        assert_eq!(
+            note_service_answer(&mut unanswered, "sy-timer", Active),
+            UnansweredChecks::Quiet,
+            "a run too short to report ends without a word"
+        );
+        assert_eq!(
+            note_service_answer(&mut unanswered, "sy-timer", Unknown),
+            UnansweredChecks::Quiet,
+            "and the count starts again"
         );
     }
 
