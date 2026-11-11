@@ -710,9 +710,12 @@ and waits until it is idle: default 30 s, at most 300 s.
 
 The orchestrator runs Syncthing as `fluxbee-syncthing.service` (`syncthing_unit_contents`):
 user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the GUI and API on
-`127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`. Every link
-is TCP to the motherbee's static address, so only the motherbee listens off loopback, on
-22000/tcp; a spoke only dials (`syncthing_owned_listen_address`).
+`127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`, and
+`TimeoutStopSec=30`: every Fluxbee unit bounds its stop, and Syncthing gets 30 s to close its
+database (FINDINGS A-283, since 0.1.136; before, systemd's default of 90 s). The release that
+brings it restarts Syncthing once on each hive, at its orchestrator's start: the unit changed.
+Every link is TCP to the motherbee's static address, so only the motherbee listens off
+loopback, on 22000/tcp; a spoke only dials (`syncthing_owned_listen_address`).
 
 Before it starts the service (`ensure_blob_sync_runtime`), the orchestrator holds the vendored
 binary, `dist/vendor/syncthing/syncthing`, to `dist/vendor/manifest.json`: its size and sha256
@@ -1042,40 +1045,59 @@ Syncthing check restarts Syncthing for a folder only when Syncthing answers that
 not healthy (curl's exit 0 with a status that says so, or exit 22, an error status). A check with
 no answer (a kill, a command that could not run, curl reaching nothing in time) acts on nothing at
 once, and 12 in a row, a minute at least, are warned of once with the check named ("a check has
-given no answer for a minute", `note_check_answer`; the Syncthing check counts its own way,
-below). Two of them have a periodic repair that runs all the same, about once a minute: the
-egress re-applies its NAT whatever its check says, and the ingress' reconcile loads its saved SSH
-ruleset again when its own check gives no answer (the same rules on a table that is there). The
-others wait for an answer: a worker's default route is replaced only once `ip route` answers that
-it drifted (its periodic step re-asserts only the IPv6 sysctl), and Syncthing is restarted for a
-folder only once Syncthing answers for it. Before, each read as a "no": the tick in flight when
-systemd stops the orchestrator applied a healthy NAT table again, or restarted Syncthing.
+given no answer for a minute", `note_check_answer`; a Syncthing folder counts this way only at a
+tick at which Syncthing answers for another folder, below). Two of them have a periodic repair
+that runs all the same, about once a minute: the egress re-applies its NAT whatever its check
+says, and the ingress' reconcile loads its saved SSH ruleset again when its own check gives no
+answer (the same rules on a table that is there). The others wait for an answer: a worker's
+default route is replaced only once `ip route` answers that it drifted (its periodic step
+re-asserts only the IPv6 sysctl), and Syncthing is restarted for a folder only once Syncthing
+answers for it. Before, each read as a "no": the tick in flight when systemd stops the
+orchestrator applied a healthy NAT table again, or restarted Syncthing.
 
 **A Syncthing REST API that gives no answer** (FINDINGS A-283, since 0.1.136; the operator's call
 of 2026-11-11). The Syncthing check asks Syncthing's `/rest/db/status` for each of the hive's
 folders in turn, each with a 10 s timeout, and stops at the first one Syncthing gives no answer
-for (`check_syncthing_folders`); on that tick it skips the folder-error reads too
-(`report_blob_folder_errors`). Before, a REST API that took connections and never answered held
+for (`check_syncthing_folders`). Before, a REST API that took connections and never answered held
 each tick about 2 min on the motherbee (10 folders and 2 folder-error reads; about 80 s on
-worker1), and since the tick is the whole watchdog's, a crashed rt-gateway or SY service waited
-that long for its start instead of 5 s. Now such a tick takes about 10 s, 15 s when it runs the
-peer reconcile, which asks the API once (5 s at most). The check counts its ticks with no answer
-in a row as one run (`SyncthingApiWatch`): at the 12th it warns once and appends a `syncthing`
-drift alert `api_unanswered` with the last error. Once the run has lasted 5 min from its first
-tick, the watchdog runs `systemctl restart fluxbee-syncthing`, with a `syncthing` drift alert
-`api_unanswered_restart` and a warning that say why (the seconds without an answer and the last
-error), waits for the service and its API port as every restart of Syncthing does, and clears the
-pending restart it applied (`syncthing-restart-pending`, below). That tick can take up to the
-unit's stop timeout (systemd's default, 90 s) when Syncthing does not stop on SIGTERM, and up to
-30 s for each of the two waits; the restart runs off the runtime's threads. It restarts at most
-once an hour: while the API still gives no answer, the next restart waits an hour from the last
-one. That hour lives in the orchestrator's memory, so an orchestrator that starts again first
-waits a whole 5 min run of its own. A tick whose asks all get an answer ends the run, which is
-logged when it was reported, and so does a config change's reconcile, which can start or restart
-Syncthing (without a word). A join's or a removal's hold on Syncthing (below) is kept: the check
-asks nothing while the hold lasts and asks again right before the restart, and the run starts
-again after the hold, since the join restarts Syncthing itself. Before, nothing repaired such a
-Syncthing: the unhealthy path only starts a running one.
+worker1), and since the tick is the whole watchdog's, a stopped (or start-limited) rt-gateway or
+SY service waited that long for its start instead of 5 s; a crashed one systemd restarts itself
+(`Restart=always`). Now such a tick takes about 10 s.
+
+- **The API's no answer, or a folder's.** A tick at which Syncthing answered for no folder is the
+  API's no answer: a hung API, or a Syncthing stuck inside that answers no folder's status. A
+  folder that gives no answer after Syncthing answered for another at the same tick is that
+  folder's alone, its status slow under a long scan, say: the tick counts as answered, the folder
+  counts as its own check (12 such ticks in a row are warned of once, `note_check_answer`), and
+  the next ticks ask it after the others until it answers (`SyncthingApiWatch::ask_last`), so it
+  never keeps them from being asked. The folder-error reads (`report_blob_folder_errors`) are
+  skipped at a tick that is the API's no answer, and a folder that gave none is not asked for its
+  errors.
+- **The report.** The check counts the ticks that are the API's no answer in a row as one run
+  (`SyncthingApiWatch`): at the 12th it warns once and opens a `syncthing` condition
+  `api_unanswered` in the drift alerts, a `warning` row with `state: open` and the last error. The
+  tick the API answers at ends the run and closes the condition, an `info` row with
+  `state: closed` that says how long, at least, it gave no answer; a run too short to report ends
+  without a word, and so does a config change's reconcile, which can start or restart Syncthing.
+  While a run lasts, the peer reconcile does not ask the API (it waits for its next minute); a
+  restart it owes stays in its marker (`syncthing-restart-pending`, below).
+- **The restart.** Once the run has lasted 5 min from its first tick, the watchdog runs
+  `systemctl restart fluxbee-syncthing`, with a `syncthing` drift alert `api_unanswered_restart`
+  and a warning that say why (the seconds without an answer and the last error), waits for the
+  service and its API port as every restart of Syncthing does, and clears the pending restart it
+  applied (`restart_syncthing_for_pending`, the restart a join's link and a removal's unlink run
+  too). That tick can take up to the unit's stop timeout, 30 s, when Syncthing does not stop on
+  SIGTERM, and up to 30 s for each of the two waits; the restart runs off the runtime's threads.
+  It restarts at most once an hour: while the API still gives no answer, the next restart waits an
+  hour from the last one. The hour counts from the last restart's drift alert, which an
+  orchestrator that starts again reads, with whether the condition is open
+  (`SyncthingApiWatch::resumed`): the hour holds across its restarts, and each restart has its
+  row.
+- **A join's or a removal's hold** on Syncthing (below) is kept: the check asks nothing while the
+  hold lasts and asks again right before the restart, and the run starts again after the hold,
+  since the join restarts Syncthing itself.
+
+Before, nothing repaired such a Syncthing: the unhealthy path only starts a running one.
 
 The same tick logs managed nodes that left the router, verifies runtimes, runs the blob GC (on the
 motherbee when its `blob.gc` turns it on, FINDINGS A-188; on a worker, every hour whatever its

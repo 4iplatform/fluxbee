@@ -86,6 +86,12 @@ const LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
+/// How long systemd waits for Syncthing to stop before it kills it (`TimeoutStopSec`, FINDINGS
+/// A-283, the review): every Fluxbee unit bounds its stop, 15 s; Syncthing gets 30 s to close its
+/// database. Before, systemd's default of 90 s held the watchdog's restart of a Syncthing that
+/// does not stop on SIGTERM, the hung one the restart is for, and every core service's start with
+/// it.
+const SYNCTHING_STOP_TIMEOUT_SECS: u64 = 30;
 /// How long a join waits for a new spoke's Syncthing to connect. The motherbee only accepts
 /// (host posture stage 2), so the spoke dials: after a motherbee restart that is its next
 /// reconnection attempt, up to `reconnectionIntervalS` later: 10 s once the spoke switched to the
@@ -585,9 +591,10 @@ struct DriftAlertEntry {
     severity: String,
     kind: String,
     message: String,
-    /// `open` or `closed` on a condition SY.admin reports (`record_drift_alert`): it writes a row
-    /// when a condition opens and an `info` row when it closes. The orchestrator's own detectors
-    /// record no state.
+    /// `open` or `closed` on a condition: one SY.admin reports (`record_drift_alert`), or the
+    /// orchestrator's own Syncthing REST API with no answer (`api_unanswered`, FINDINGS A-283):
+    /// a row when it opens and an `info` row when it closes (`drift_condition_entry`). The
+    /// orchestrator's other detectors record no state.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,8 +724,9 @@ struct OrchestratorState {
     /// the watchdog's of each core service, by its name (`note_service_answer`), and the other
     /// checks that decide an action, by what they run (`note_check_answer`).
     unanswered_checks: std::sync::Mutex<HashMap<String, u32>>,
-    /// FINDINGS A-283: the Syncthing check's run of ticks its REST API gave no answer in, and when
-    /// the watchdog last restarted Syncthing for one (`SyncthingApiWatch`).
+    /// FINDINGS A-283: the Syncthing check's run of ticks its REST API gave no answer in, the
+    /// condition it opened, when the watchdog last restarted Syncthing for one, and the folders to
+    /// ask last (`SyncthingApiWatch`).
     syncthing_api: std::sync::Mutex<SyncthingApiWatch>,
     /// How this hive asks systemd about a node's unit (FINDINGS A-271): systemctl itself
     /// (`UnitChecks::SYSTEMCTL`); a test's state answers as a host without the unit does.
@@ -766,10 +774,12 @@ impl OrchestratorState {
     }
 
     /// FINDINGS A-271: counts one answer, or no answer, of `check`, a check that decides an action
-    /// (an nft table, the default route, a node's unit in the reconcile), named by what it runs.
+    /// (an nft table, the default route, a node's unit in the reconcile, a Syncthing folder whose
+    /// status gives no answer while Syncthing answers for another), named by what it runs.
     /// `report_at` checks in a row are a minute at least: the run of no answers that reaches it is
     /// warned of once, since what the check decides waits meanwhile, and the answer that ends a run
-    /// so reported says so. The Syncthing folder checks count by tick (`note_syncthing_api_tick`).
+    /// so reported says so. A tick at which Syncthing answers for no folder counts as the REST
+    /// API's (`note_syncthing_api_tick`).
     fn note_check_answer(&self, check: &str, answered: bool, report_at: u32) {
         let mut unanswered = self
             .unanswered_checks
@@ -790,17 +800,43 @@ impl OrchestratorState {
     }
 
     /// FINDINGS A-283: counts one tick of the Syncthing check that asked Syncthing's REST API
-    /// (`SyncthingApiWatch::tick`); `unanswered` says why the API gave no answer, when it gave
-    /// none. The run's report is a warning and a `syncthing` drift alert, once a run, and the
-    /// answer that ends a run so reported says so.
-    fn note_syncthing_api_tick(&self, unanswered: Option<&str>, now: Instant) -> SyncthingApiTick {
-        let tick = self
-            .syncthing_api
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .tick(unanswered.is_none(), now);
+    /// (`SyncthingApiWatch::tick`), by its folders' answers (`checks`). A tick at which the API
+    /// answered for no folder is the API's: its run's report is a warning and a `syncthing`
+    /// condition that opens, once a run, and the tick the API answers at closes it, with a line
+    /// that says so. At another tick, a folder whose status gave no answer counts as its own check
+    /// (`note_check_answer`), and so does each folder Syncthing answered for.
+    fn note_syncthing_api_tick(
+        &self,
+        checks: &SyncthingFolderChecks,
+        now: Instant,
+    ) -> SyncthingApiTick {
+        let api_unanswered = checks.api_unanswered();
+        let tick = {
+            let mut watch = self
+                .syncthing_api
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            watch.take_folders(checks);
+            watch.tick(api_unanswered.is_none(), now, now_epoch_ms())
+        };
+        if api_unanswered.is_none() {
+            for folder in &checks.answered {
+                self.note_check_answer(
+                    &syncthing_folder_check_name(folder),
+                    true,
+                    WATCHDOG_UNANSWERED_REPORT_CHECKS,
+                );
+            }
+            if let Some(folder) = checks.unanswered_folder() {
+                self.note_check_answer(
+                    &syncthing_folder_check_name(folder),
+                    false,
+                    WATCHDOG_UNANSWERED_REPORT_CHECKS,
+                );
+            }
+        }
         if tick.reported {
-            let last = unanswered.unwrap_or_default();
+            let last = api_unanswered.unwrap_or_default();
             tracing::warn!(
                 checks = WATCHDOG_UNANSWERED_REPORT_CHECKS,
                 unanswered_secs = tick.unanswered_for.as_secs(),
@@ -809,26 +845,52 @@ impl OrchestratorState {
                  answers, and Syncthing is restarted once it has given none for 5 min, at most \
                  once an hour"
             );
-            append_drift_alert(
+            append_drift_condition(drift_condition_entry(
                 "syncthing",
-                "api_unanswered",
-                "warning",
+                SYNCTHING_API_UNANSWERED_KIND,
                 &self.hive_id,
+                true,
                 syncthing_api_unanswered_message(tick.unanswered_for, last),
-                None,
-                None,
-                None,
-            );
+            ));
         }
         if tick.ended {
-            tracing::info!("Syncthing's REST API answers again");
+            tracing::info!(
+                unanswered_secs = tick.unanswered_for.as_secs(),
+                "Syncthing's REST API answers again"
+            );
+            append_drift_condition(drift_condition_entry(
+                "syncthing",
+                SYNCTHING_API_UNANSWERED_KIND,
+                &self.hive_id,
+                false,
+                syncthing_api_answers_again_message(tick.unanswered_for),
+            ));
         }
         tick
     }
 
+    /// FINDINGS A-283: the folders whose status Syncthing gave no answer for when last asked,
+    /// which the next tick asks last (`check_syncthing_folders`).
+    fn syncthing_folders_asked_last(&self) -> Vec<String> {
+        self.syncthing_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ask_last
+            .clone()
+    }
+
+    /// FINDINGS A-283, the review: whether Syncthing's REST API has given no answer since the last
+    /// tick it answered at. The peer reconcile does not ask it meanwhile.
+    fn syncthing_api_run_open(&self) -> bool {
+        self.syncthing_api
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .run_open()
+    }
+
     /// FINDINGS A-283: a join or a removal that owns Syncthing restarts it, so a run of no answers
-    /// from before says nothing of the process after it: the run starts again. The last restart
-    /// stays.
+    /// from before says nothing of the process after it: the run starts again. The condition and
+    /// the last restart stay.
     fn forget_syncthing_api_run(&self) {
         self.syncthing_api
             .lock()
@@ -836,13 +898,13 @@ impl OrchestratorState {
             .forget_run();
     }
 
-    /// FINDINGS A-283: the watchdog restarts Syncthing for its API now; the next restart waits
-    /// SYNCTHING_API_RESTART_EVERY.
-    fn note_syncthing_api_restart(&self, now: Instant) {
+    /// FINDINGS A-283: the watchdog restarts Syncthing for its API now, `now_ms` in epoch ms; the
+    /// next restart waits SYNCTHING_API_RESTART_EVERY.
+    fn note_syncthing_api_restart(&self, now_ms: u64) {
         self.syncthing_api
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .restarted(now);
+            .restarted(now_ms);
     }
 
     /// F18: acquire the per-hive_id topology lock, held across the whole
@@ -1114,7 +1176,13 @@ async fn main() -> Result<(), OrchestratorError> {
         vendor_awaiting_update: std::sync::Mutex::new(None),
         open_core_settle: std::sync::Mutex::new(None),
         unanswered_checks: std::sync::Mutex::new(HashMap::new()),
-        syncthing_api: std::sync::Mutex::new(SyncthingApiWatch::default()),
+        // FINDINGS A-283, the review: the last restart for Syncthing's REST API and its open
+        // condition come from the drift store, so the hour between two restarts holds across this
+        // orchestrator's restarts.
+        syncthing_api: std::sync::Mutex::new(SyncthingApiWatch::resumed(
+            &fs::read_to_string(drift_alerts_path()).unwrap_or_default(),
+            &hive.hive_id,
+        )),
         unit_checks: UnitChecks::SYSTEMCTL,
         rpc: OnceLock::new(),
     });
@@ -3828,28 +3896,36 @@ async fn watchdog_tick(state: &OrchestratorState) {
     }
 
     // Host posture stage 2: Syncthing peers (A-47, A-50), about once a minute. A condition that
-    // lasts is logged once.
+    // lasts is logged once. Not while Syncthing's REST API gives no answer (FINDINGS A-283, the
+    // review): the reconcile's first ask of it could only fail, after 5 s more of this tick, and a
+    // restart it owes stays in its marker (A-196) for the watchdog's restart or its next round.
     if SYNCTHING_ADDRESS_TICKS
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(SYNCTHING_ADDRESS_EVERY_TICKS)
     {
-        match reconcile_syncthing_peer_addresses(state).await {
-            Ok(Some(notes)) => {
-                syncthing_reconcile_busy_for(None);
-                report_syncthing_reconcile(&notes);
-            }
-            // A topology operation is running; a long one is reported once.
-            Ok(None) => {
-                if syncthing_reconcile_busy_for(Some(Instant::now()))
-                    > Duration::from_secs(SYNCTHING_RECONCILE_BUSY_REPORT_SECS)
-                {
-                    report_syncthing_reconcile(&[format!(
-                        "a topology operation (a join or a removal; on a spoke, a finalize) has run for more than {} minutes; the Syncthing reconcile waits for it",
-                        SYNCTHING_RECONCILE_BUSY_REPORT_SECS / 60
-                    )]);
+        if state.syncthing_api_run_open() {
+            tracing::debug!(
+                "Syncthing's REST API gives no answer; the peer reconcile waits for it"
+            );
+        } else {
+            match reconcile_syncthing_peer_addresses(state).await {
+                Ok(Some(notes)) => {
+                    syncthing_reconcile_busy_for(None);
+                    report_syncthing_reconcile(&notes);
                 }
+                // A topology operation is running; a long one is reported once.
+                Ok(None) => {
+                    if syncthing_reconcile_busy_for(Some(Instant::now()))
+                        > Duration::from_secs(SYNCTHING_RECONCILE_BUSY_REPORT_SECS)
+                    {
+                        report_syncthing_reconcile(&[format!(
+                            "a topology operation (a join or a removal; on a spoke, a finalize) has run for more than {} minutes; the Syncthing reconcile waits for it",
+                            SYNCTHING_RECONCILE_BUSY_REPORT_SECS / 60
+                        )]);
+                    }
+                }
+                Err(err) => report_syncthing_reconcile_failure(&err.to_string()),
             }
-            Err(err) => report_syncthing_reconcile_failure(&err.to_string()),
         }
     }
 
@@ -15484,7 +15560,7 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig) -> String {
     let service_group =
         linux_user_primary_group(service_user).unwrap_or_else(|| service_user.to_string());
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nUMask=0027\nExecStart={} --no-browser --no-restart --no-upgrade --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nUMask=0027\nExecStart={} --no-browser --no-restart --no-upgrade --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\nTimeoutStopSec={SYNCTHING_STOP_TIMEOUT_SECS}\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
         blob.sync_data_dir.display(),
@@ -17830,15 +17906,17 @@ fn clear_syncthing_restart_pending(marker: &Path, applied: Option<&str>) {
 }
 
 /// Restarts Syncthing onto what config.xml holds, and clears the pending restart that applied
-/// (FINDINGS A-196).
+/// (FINDINGS A-196). The token's read and `systemctl restart` run off the runtime's threads: a
+/// Syncthing that does not stop takes the unit's whole stop timeout (FINDINGS A-283, whose
+/// restart for an API with no answer is this one too).
 async fn restart_syncthing_for_pending(
     sync: &BlobRuntimeConfig,
     marker: &Path,
 ) -> Result<(), OrchestratorError> {
-    let applied = syncthing_restart_pending_token(marker);
-    let mut restart = Command::new("systemctl");
-    restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
-    run_cmd(restart, "systemctl restart")?;
+    let applied = tokio::task::block_in_place(|| {
+        let applied = syncthing_restart_pending_token(marker);
+        systemd_restart(SYNCTHING_SERVICE_NAME).map(|()| applied)
+    })?;
     wait_for_service_active(
         SYNCTHING_SERVICE_NAME,
         Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
@@ -19325,8 +19403,14 @@ fn count_entries_not_the_syncthing_users(folder: &Path) -> Result<usize, Orchest
 
 /// Syncthing's own per-file errors in the blob folders, reported once when they appear or their
 /// count changes (FINDINGS A-56): a file it cannot read never makes the folder unhealthy, so the
-/// folder health alone would never show it.
-fn report_blob_folder_errors(hive_id: &str, sync: &BlobRuntimeConfig, blob: &BlobRuntimeConfig) {
+/// folder health alone would never show it. Not for `skip`, a folder whose status Syncthing gave no
+/// answer for at this tick: its errors would wait as long (FINDINGS A-283).
+fn report_blob_folder_errors(
+    hive_id: &str,
+    sync: &BlobRuntimeConfig,
+    blob: &BlobRuntimeConfig,
+    skip: Option<&str>,
+) {
     static REPORTED: OnceLock<std::sync::Mutex<HashMap<String, usize>>> = OnceLock::new();
     let mut folders = Vec::new();
     if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
@@ -19335,7 +19419,7 @@ fn report_blob_folder_errors(hive_id: &str, sync: &BlobRuntimeConfig, blob: &Blo
     if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
         folders.push(SYNCTHING_FOLDER_BLOB_PUBLIC_ID);
     }
-    for folder in folders {
+    for folder in folders.into_iter().filter(|folder| Some(*folder) != skip) {
         let (count, first) = match syncthing_folder_errors(sync, folder) {
             Ok(errors) => errors,
             Err(err) => {
@@ -19490,28 +19574,62 @@ fn syncthing_watchdog_restarts(
 struct SyncthingFolderChecks {
     /// The folders' answers together (`CheckAnswer::and`).
     folders: CheckAnswer,
-    /// Why Syncthing gave no answer for a folder, when it gave none: the tick asked no folder
-    /// after that one.
-    unanswered: Option<String>,
+    /// The folders Syncthing answered for, healthy or not, in the order the tick asked them.
+    answered: Vec<String>,
+    /// The folder Syncthing gave no answer for, and why, when it gave none: the tick asked no
+    /// folder after it.
+    unanswered: Option<(String, String)>,
+}
+
+impl SyncthingFolderChecks {
+    /// Why Syncthing's REST API gave no answer at this tick, when it gave none: it answered for no
+    /// folder the tick asked (FINDINGS A-283, the review). A folder it gives no answer for after
+    /// it answered for another is that folder's alone, its status slow under a long scan, say:
+    /// the tick counts as answered, and the folder is asked last from then on
+    /// (`SyncthingApiWatch::ask_last`), so it never keeps the others from being asked.
+    fn api_unanswered(&self) -> Option<&str> {
+        match &self.unanswered {
+            Some((_, why)) if self.answered.is_empty() => Some(why),
+            _ => None,
+        }
+    }
+
+    /// The folder Syncthing gave no answer for, when it gave none.
+    fn unanswered_folder(&self) -> Option<&str> {
+        self.unanswered.as_ref().map(|(folder, _)| folder.as_str())
+    }
 }
 
 /// The Syncthing check's asks of each folder in turn (`check`), up to the first one Syncthing gives
 /// no answer for (FINDINGS A-283): each waits up to 10 s, and the watchdog's tick, which keeps the
 /// core services running, waits for all of them. Before, a REST API that took connections and
 /// never answered held each tick about 2 min on the motherbee (10 folders and 2 folder-error
-/// reads), and a crashed rt-gateway waited that long for its start.
+/// reads), and a stopped rt-gateway waited that long for its start. The folders of `ask_last`,
+/// which gave no answer when last asked, are asked after the others, in that order: one whose
+/// status stays slow never keeps the others from being asked (FINDINGS A-283, the review).
 fn check_syncthing_folders(
     folder_ids: &[String],
+    ask_last: &[String],
     mut check: impl FnMut(&str) -> Result<bool, FolderStatusError>,
 ) -> SyncthingFolderChecks {
     let mut checks = SyncthingFolderChecks {
         folders: CheckAnswer::Yes,
+        answered: Vec::new(),
         unanswered: None,
     };
-    for folder in folder_ids {
+    let first = folder_ids
+        .iter()
+        .filter(|folder| !ask_last.contains(*folder));
+    let last = ask_last
+        .iter()
+        .filter(|folder| folder_ids.contains(*folder));
+    for folder in first.chain(last) {
         let result = check(folder);
-        if let Err(FolderStatusError::NoAnswer(err)) = &result {
-            checks.unanswered = Some(err.clone());
+        match &result {
+            Err(FolderStatusError::NoAnswer(err)) => {
+                checks.unanswered = Some((folder.clone(), err.clone()));
+            }
+            _ => checks.answered.push(folder.clone()),
         }
         checks.folders = checks.folders.and(syncthing_folder_answer(folder, result));
         if checks.unanswered.is_some() {
@@ -19521,36 +19639,64 @@ fn check_syncthing_folders(
     checks
 }
 
+/// The name a Syncthing folder's status check counts under when Syncthing answers for another
+/// folder at the same tick (`note_check_answer`, FINDINGS A-271): a folder whose status gives no
+/// answer at 12 such ticks in a row is warned of once, as any check that decides an action is.
+fn syncthing_folder_check_name(folder: &str) -> String {
+    format!("syncthing db status folder={folder}")
+}
+
 /// How long Syncthing's REST API may give no answer, from the first tick of the Syncthing check it
 /// gave none in, before the watchdog restarts Syncthing (FINDINGS A-283, the operator's call of
 /// 2026-11-11).
 const SYNCTHING_API_RESTART_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// The least time between two of those restarts: one an hour at most. The watchdog keeps it in
-/// memory, so an orchestrator that starts again waits a whole run of its own first.
+/// The least time between two of those restarts: one an hour at most. It counts from the last
+/// restart's drift alert, which the orchestrator reads again when it starts
+/// (`SyncthingApiWatch::resumed`), so the hour holds across its restarts (FINDINGS A-283, the
+/// review).
 const SYNCTHING_API_RESTART_EVERY: Duration = Duration::from_secs(60 * 60);
 
-/// The Syncthing check's run of ticks in which Syncthing's REST API gave no answer, and the
-/// watchdog's last restart of Syncthing for one (FINDINGS A-283).
-#[derive(Debug, Default)]
+/// The `syncthing` drift alert of Syncthing's REST API giving no answer, a condition: a `warning`
+/// row with `state: open` when a run of ticks with no answer is reported, and an `info` row with
+/// `state: closed` when the API answers again (FINDINGS A-283).
+const SYNCTHING_API_UNANSWERED_KIND: &str = "api_unanswered";
+
+/// The `syncthing` drift alert of the watchdog's restart of Syncthing for its REST API (FINDINGS
+/// A-283): one row a restart.
+const SYNCTHING_API_RESTART_KIND: &str = "api_unanswered_restart";
+
+/// The Syncthing check's run of ticks in which Syncthing's REST API gave no answer, the drift
+/// alert it opened, the watchdog's last restart of Syncthing for one, and the folders to ask last
+/// (FINDINGS A-283).
+#[derive(Debug, Default, PartialEq, Eq)]
 struct SyncthingApiWatch {
     /// The run's first tick; None while the API answers.
     unanswered_since: Option<Instant>,
     /// The run's ticks.
     unanswered_ticks: u32,
-    /// When the watchdog last restarted Syncthing for a run.
-    restarted_at: Option<Instant>,
+    /// The `api_unanswered` condition is open: a run was reported, and the API has not answered
+    /// since. The tick it answers at closes it (`SyncthingApiTick::ended`).
+    open: bool,
+    /// When the watchdog last restarted Syncthing for its API, in epoch ms, as its drift alert
+    /// says.
+    restarted_at_ms: Option<u64>,
+    /// The folders whose status Syncthing gave no answer for when last asked, while it answered
+    /// for others or not: the next ticks ask them after the others (`check_syncthing_folders`),
+    /// until Syncthing answers for each.
+    ask_last: Vec<String>,
 }
 
 /// What one tick says of the run (`SyncthingApiWatch::tick`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SyncthingApiTick {
-    /// The run reached WATCHDOG_UNANSWERED_REPORT_CHECKS ticks at this one: a warning and a drift
-    /// alert, once a run.
+    /// The run reached WATCHDOG_UNANSWERED_REPORT_CHECKS ticks at this one: a warning and the
+    /// condition's open row, once a run.
     reported: bool,
-    /// The API answered at this tick, after a run that was reported.
+    /// The API answered at this tick, with the condition open: an info line and its closed row.
     ended: bool,
-    /// How long the run has lasted, from its first tick to this one; zero when the API answered.
+    /// How long the run has lasted, from its first tick to this one: at an answer, only when it
+    /// ends the condition, and zero when the run was no run of this orchestrator's.
     unanswered_for: Duration,
     /// Restart Syncthing now: the run has lasted SYNCTHING_API_RESTART_AFTER, and the watchdog did
     /// not restart it for its API within the last SYNCTHING_API_RESTART_EVERY.
@@ -19558,39 +19704,88 @@ struct SyncthingApiTick {
 }
 
 impl SyncthingApiWatch {
+    /// The watch an orchestrator starts with, from `store`, the drift store's rows (FINDINGS
+    /// A-283, the review): this hive's newest `api_unanswered_restart`, so the hour between two
+    /// restarts holds across the orchestrator's own restarts, and whether its `api_unanswered`
+    /// condition is still open, so the next tick the API answers at closes it. Before, both lived
+    /// in memory only: an orchestrator restarted within the hour could restart Syncthing again,
+    /// and the store, which keeps one such row an hour, dropped the second one's in silence.
+    fn resumed(store: &str, hive_id: &str) -> Self {
+        let mut watch = Self::default();
+        for row in store
+            .lines()
+            .filter_map(|line| serde_json::from_str::<DriftAlertEntry>(line).ok())
+            .filter(|row| row.hive_id == hive_id && row.category == "syncthing")
+        {
+            // The store only appends, so the last row of a kind is its newest.
+            match row.kind.as_str() {
+                SYNCTHING_API_RESTART_KIND => watch.restarted_at_ms = Some(row.detected_at),
+                SYNCTHING_API_UNANSWERED_KIND => {
+                    watch.open = row.state.as_deref() == Some("open");
+                }
+                _ => {}
+            }
+        }
+        watch
+    }
+
     /// Takes one tick of the Syncthing check that asked the API: `answered` when the API answered
-    /// for every folder the tick asked.
-    fn tick(&mut self, answered: bool, now: Instant) -> SyncthingApiTick {
+    /// at it (`SyncthingFolderChecks::api_unanswered`). `now` times the run, in this orchestrator's
+    /// memory; `now_ms`, in epoch ms, the hour since the last restart, which the drift store keeps.
+    fn tick(&mut self, answered: bool, now: Instant, now_ms: u64) -> SyncthingApiTick {
+        let run_for = self
+            .unanswered_since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         if answered {
-            let reported = self.unanswered_ticks >= WATCHDOG_UNANSWERED_REPORT_CHECKS;
+            let ended = std::mem::take(&mut self.open);
             self.forget_run();
             return SyncthingApiTick {
-                ended: reported,
+                ended,
+                unanswered_for: if ended { run_for } else { Duration::ZERO },
                 ..SyncthingApiTick::default()
             };
         }
-        let since = *self.unanswered_since.get_or_insert(now);
+        self.unanswered_since.get_or_insert(now);
         self.unanswered_ticks = self.unanswered_ticks.saturating_add(1);
-        let unanswered_for = now.saturating_duration_since(since);
-        let restarted_long_ago = self
-            .restarted_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= SYNCTHING_API_RESTART_EVERY);
+        let reported = self.unanswered_ticks == WATCHDOG_UNANSWERED_REPORT_CHECKS;
+        self.open |= reported;
+        let restarted_long_ago = self.restarted_at_ms.is_none_or(|at| {
+            Duration::from_millis(now_ms.saturating_sub(at)) >= SYNCTHING_API_RESTART_EVERY
+        });
         SyncthingApiTick {
-            reported: self.unanswered_ticks == WATCHDOG_UNANSWERED_REPORT_CHECKS,
+            reported,
             ended: false,
-            unanswered_for,
-            restart: unanswered_for >= SYNCTHING_API_RESTART_AFTER && restarted_long_ago,
+            unanswered_for: run_for,
+            restart: run_for >= SYNCTHING_API_RESTART_AFTER && restarted_long_ago,
         }
     }
 
-    /// Ends the run without a word: the next tick with no answer starts another.
+    /// Keeps the folders to ask last from one tick's asks: one Syncthing gave no answer for joins
+    /// them, one it answered for leaves them.
+    fn take_folders(&mut self, checks: &SyncthingFolderChecks) {
+        self.ask_last
+            .retain(|folder| !checks.answered.contains(folder));
+        if let Some(folder) = checks.unanswered_folder() {
+            if !self.ask_last.iter().any(|last| last == folder) {
+                self.ask_last.push(folder.to_string());
+            }
+        }
+    }
+
+    /// Ends the run without a word: the next tick with no answer starts another. The condition,
+    /// the last restart and the folders to ask last stay.
     fn forget_run(&mut self) {
         self.unanswered_since = None;
         self.unanswered_ticks = 0;
     }
 
-    fn restarted(&mut self, now: Instant) {
-        self.restarted_at = Some(now);
+    /// Whether a run of ticks with no answer is going on.
+    fn run_open(&self) -> bool {
+        self.unanswered_since.is_some()
+    }
+
+    fn restarted(&mut self, now_ms: u64) {
+        self.restarted_at_ms = Some(now_ms);
     }
 }
 
@@ -19603,6 +19798,20 @@ fn syncthing_api_unanswered_message(unanswered_for: Duration, last: &str) -> Str
          watchdog restarts Syncthing once it has given none for {} min, at most once an hour",
         unanswered_for.as_secs(),
         SYNCTHING_API_RESTART_AFTER.as_secs() / 60
+    )
+}
+
+/// The drift alert that closes the condition: the API answers again (FINDINGS A-283, the review).
+/// `unanswered_for` is the run this orchestrator saw, from its first tick: less than the API's
+/// whole silence when the condition opened before this orchestrator started, and zero when it saw
+/// no run.
+fn syncthing_api_answers_again_message(unanswered_for: Duration) -> String {
+    if unanswered_for.is_zero() {
+        return "Syncthing's REST API answers again".to_string();
+    }
+    format!(
+        "Syncthing's REST API answers again, after at least {} s with no answer",
+        unanswered_for.as_secs()
     )
 }
 
@@ -19619,25 +19828,24 @@ fn syncthing_api_restart_message(unanswered_for: Duration, last: &str) -> String
 /// (FINDINGS A-283, the operator's call of 2026-11-11): `systemctl restart`, at most once an hour,
 /// with a `syncthing` drift alert and a log line that say why. Before, nothing repaired a Syncthing
 /// whose API took connections and never answered: the unhealthy path only starts a running one.
-/// The restart applies what config.xml holds, so it clears the pending restart it read before it
-/// (FINDINGS A-196).
+/// The restart is every pending one's (`restart_syncthing_for_pending`): it applies what
+/// config.xml holds, so it clears the pending restart it read before it (FINDINGS A-196).
 async fn restart_syncthing_for_unanswered_api(
     state: &OrchestratorState,
     sync: &BlobRuntimeConfig,
     unanswered_for: Duration,
     last: &str,
 ) -> Result<(), OrchestratorError> {
-    state.note_syncthing_api_restart(Instant::now());
     tracing::warn!(
         service = SYNCTHING_SERVICE_NAME,
         unanswered_secs = unanswered_for.as_secs(),
         last,
-        "Syncthing's REST API has given no answer for 5 min; restarting syncthing, which the \
-         watchdog does at most once an hour"
+        "Syncthing's REST API has given no answer for at least 5 min; restarting syncthing, which \
+         the watchdog does at most once an hour"
     );
     append_drift_alert(
         "syncthing",
-        "api_unanswered_restart",
+        SYNCTHING_API_RESTART_KIND,
         "warning",
         &state.hive_id,
         syncthing_api_restart_message(unanswered_for, last),
@@ -19645,20 +19853,11 @@ async fn restart_syncthing_for_unanswered_api(
         None,
         None,
     );
-    let marker = syncthing_restart_pending_marker();
-    // Off the runtime's threads: the stop of a Syncthing that does not answer can take its whole
-    // stop timeout.
-    let applied = tokio::task::block_in_place(|| {
-        let applied = syncthing_restart_pending_token(&marker);
-        systemd_restart(SYNCTHING_SERVICE_NAME).map(|()| applied)
-    })?;
-    wait_for_service_active(
-        SYNCTHING_SERVICE_NAME,
-        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
-    )
-    .await?;
-    wait_for_syncthing_health(sync).await?;
-    clear_syncthing_restart_pending(&marker, applied.as_deref());
+    // Taken after the row is stamped: the hour counts from no earlier than the row a later start
+    // of this orchestrator reads it from, so the next restart's row is never within the store's
+    // hour of this one's.
+    state.note_syncthing_api_restart(now_epoch_ms());
+    restart_syncthing_for_pending(sync, &syncthing_restart_pending_marker()).await?;
     tracing::info!(
         service = SYNCTHING_SERVICE_NAME,
         "syncthing restarted after its REST API gave no answer"
@@ -19735,8 +19934,8 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     let service_active = activity == ServiceActivity::Active;
     let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
     // FINDINGS A-271: what Syncthing answers for each folder; one it gives no answer for says
-    // nothing of the folder. FINDINGS A-283: it ends the tick's asks, and a run of such ticks is
-    // reported and, once it has lasted, repaired by a restart.
+    // nothing of the folder. FINDINGS A-283: it ends the tick's asks, and a run of ticks at which
+    // Syncthing answers for no folder is reported and, once it has lasted, repaired by a restart.
     let mut folders = CheckAnswer::Yes;
     if service_active && api_healthy {
         let mut folder_ids = Vec::new();
@@ -19761,12 +19960,13 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
                 .map(|folder| folder.id),
             );
         }
-        let checks = check_syncthing_folders(&folder_ids, |folder| {
+        let ask_last = state.syncthing_folders_asked_last();
+        let checks = check_syncthing_folders(&folder_ids, &ask_last, |folder| {
             check_syncthing_folder(&desired_sync, folder)
         });
         folders = checks.folders;
         if !folder_ids.is_empty() {
-            let tick = state.note_syncthing_api_tick(checks.unanswered.as_deref(), Instant::now());
+            let tick = state.note_syncthing_api_tick(&checks, Instant::now());
             if tick.restart {
                 // A join that started during this tick's checks owns Syncthing by now (FINDINGS
                 // A-194): it restarts Syncthing itself, and the run starts again after it.
@@ -19778,14 +19978,20 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
                     state,
                     &desired_sync,
                     tick.unanswered_for,
-                    checks.unanswered.as_deref().unwrap_or_default(),
+                    checks.api_unanswered().unwrap_or_default(),
                 )
                 .await;
             }
         }
-        // A tick the API gave no answer in asks it nothing more (FINDINGS A-283).
-        if checks.unanswered.is_none() {
-            report_blob_folder_errors(&state.hive_id, &desired_sync, &desired_blob);
+        // A tick the API gave no answer at asks it nothing more, and a folder it gave none for is
+        // not asked for its errors (FINDINGS A-283).
+        if checks.api_unanswered().is_none() {
+            report_blob_folder_errors(
+                &state.hive_id,
+                &desired_sync,
+                &desired_blob,
+                checks.unanswered_folder(),
+            );
         }
     }
     if !syncthing_watchdog_restarts(service_active, api_healthy, folders) {
@@ -22435,6 +22641,42 @@ fn append_drift_alert(
         remote_hash_before,
         remote_hash_after,
     };
+    if let Err(err) = write_drift_alert(entry) {
+        tracing::warn!(kind = kind, error = %err, "could not record a drift alert");
+    }
+}
+
+/// A row of a condition of the orchestrator's own, as SY.admin's certificate conditions are
+/// (`record_drift_alert_flow`): a `warning` row with `state: open` when it opens, an `info` row
+/// with `state: closed` when it closes, so the history says whether it still holds (FINDINGS
+/// A-283, the review: Syncthing's REST API with no answer). The store writes each change of state,
+/// and a repeat of the newest within the hour only once (`drift_alerts_with`).
+fn drift_condition_entry(
+    category: &str,
+    kind: &str,
+    hive_id: &str,
+    open: bool,
+    message: String,
+) -> DriftAlertEntry {
+    DriftAlertEntry {
+        alert_id: String::new(),
+        detected_at: 0,
+        category: category.to_string(),
+        trigger: "detected".to_string(),
+        hive_id: hive_id.to_string(),
+        severity: if open { "warning" } else { "info" }.to_string(),
+        kind: kind.to_string(),
+        message,
+        state: Some(if open { "open" } else { "closed" }.to_string()),
+        local_hash: None,
+        remote_hash_before: None,
+        remote_hash_after: None,
+    }
+}
+
+/// Records a condition's row (`drift_condition_entry`). Never fails, as `append_drift_alert`.
+fn append_drift_condition(entry: DriftAlertEntry) {
+    let kind = entry.kind.clone();
     if let Err(err) = write_drift_alert(entry) {
         tracing::warn!(kind = kind, error = %err, "could not record a drift alert");
     }
@@ -48669,6 +48911,19 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
         assert_eq!(users, [SYNCTHING_SERVICE_USER]);
     }
 
+    /// FINDINGS A-283, the review: the Syncthing unit bounds its stop as every Fluxbee unit does,
+    /// so the watchdog's restart of a Syncthing that does not stop on SIGTERM waits 30 s for its
+    /// kill, not systemd's default of 90 s.
+    #[test]
+    fn the_syncthing_unit_bounds_its_stop() {
+        let unit = syncthing_unit_contents(&sample_blob_config());
+        let stops: Vec<&str> = unit
+            .lines()
+            .filter_map(|line| line.strip_prefix("TimeoutStopSec="))
+            .collect();
+        assert_eq!(stops, ["30"]);
+    }
+
     #[test]
     fn blob_runtime_from_hive_defaults_include_gc() {
         let hive: HiveFile = serde_yaml::from_str("hive_id: sandbox\n").expect("parse hive");
@@ -61169,7 +61424,7 @@ blob:
         );
         assert_eq!(watchdog.matches("check_syncthing_folder(").count(), 1);
         assert!(watchdog.contains(
-            "check_syncthing_folders(&folder_ids, |folder| {\n            check_syncthing_folder(&desired_sync, folder)\n        });"
+            "check_syncthing_folders(&folder_ids, &ask_last, |folder| {\n            check_syncthing_folder(&desired_sync, folder)\n        });"
         ));
         assert!(body("fn check_syncthing_folders(")
             .contains("checks.folders.and(syncthing_folder_answer(folder, result))"));
@@ -61189,7 +61444,7 @@ blob:
         let ask = |answers: Vec<Result<bool, FolderStatusError>>| {
             let mut answers = answers.into_iter();
             let mut asked = Vec::new();
-            let checks = check_syncthing_folders(&folders, |folder| {
+            let checks = check_syncthing_folders(&folders, &[], |folder| {
                 asked.push(folder.to_string());
                 answers.next().expect("a folder asked once too often")
             });
@@ -61205,10 +61460,10 @@ blob:
         let (checks, asked) = ask(vec![Ok(true), timeout(), Ok(true)]);
         assert_eq!(asked, ["fluxbee-blob", "fluxbee-dist-vendor"]);
         assert_eq!(checks.folders, NoAnswer);
-        assert!(checks
-            .unanswered
-            .as_deref()
-            .is_some_and(|why| why.contains("fluxbee-dist-vendor") && why.contains("a timeout")));
+        assert_eq!(checks.unanswered_folder(), Some("fluxbee-dist-vendor"));
+        assert!(checks.unanswered.as_ref().is_some_and(|(_, why)| why
+            .contains("fluxbee-dist-vendor")
+            && why.contains("a timeout")));
         // The first folder gives no answer: none after it is asked.
         let (checks, asked) = ask(vec![timeout()]);
         assert_eq!((checks.folders, asked.len()), (NoAnswer, 1));
@@ -61227,6 +61482,7 @@ blob:
             checks,
             SyncthingFolderChecks {
                 folders: No,
+                answered: folders.clone(),
                 unanswered: None
             }
         );
@@ -61235,83 +61491,439 @@ blob:
             checks,
             SyncthingFolderChecks {
                 folders: Yes,
+                answered: folders.clone(),
                 unanswered: None
             }
         );
     }
 
+    /// FINDINGS A-283, the review: a tick is the REST API's no answer only when Syncthing answered
+    /// for no folder at it. A folder whose status gives no answer after another got one is that
+    /// folder's (a long scan, say): the tick counts as answered, and the folder is asked after the
+    /// others from then on, until it answers, so it neither keeps them from being asked nor has
+    /// Syncthing restarted. Before, the first folder with no answer counted as the whole API's:
+    /// one slow first folder kept every later one from being asked and restarted a working
+    /// Syncthing once an hour.
+    #[test]
+    fn a_folder_with_no_answer_is_asked_last_and_is_no_answer_of_the_api() {
+        let folders: Vec<String> = ["fluxbee-blob", "fluxbee-dist-vendor", "fluxbee-dist-policy"]
+            .map(str::to_string)
+            .to_vec();
+        let slow = |slow: &'static [&'static str]| {
+            move |folder: &str| -> Result<bool, FolderStatusError> {
+                if slow.contains(&folder) {
+                    Err(FolderStatusError::NoAnswer(format!(
+                        "syncthing db status folder={folder}: no answer, a timeout (curl exit 28)"
+                    )))
+                } else {
+                    Ok(true)
+                }
+            }
+        };
+        // One tick of the watchdog: the folders asked, the watch keeping the ones to ask last.
+        let tick = |watch: &mut SyncthingApiWatch,
+                    answers: &dyn Fn(&str) -> Result<bool, FolderStatusError>| {
+            let mut asked = Vec::new();
+            let checks = check_syncthing_folders(&folders, &watch.ask_last.clone(), |folder| {
+                asked.push(folder.to_string());
+                answers(folder)
+            });
+            watch.take_folders(&checks);
+            (checks, asked)
+        };
+        let mut watch = SyncthingApiWatch::default();
+
+        // fluxbee-blob, asked first, is slow: the first tick stops at it, Syncthing answered for
+        // no folder, so it is the API's no answer, and the folder is asked last from then on.
+        let blob_slow = slow(&["fluxbee-blob"]);
+        let (checks, asked) = tick(&mut watch, &blob_slow);
+        assert_eq!(asked, ["fluxbee-blob"]);
+        assert!(checks
+            .api_unanswered()
+            .is_some_and(|why| why.contains("fluxbee-blob")));
+        assert_eq!(watch.ask_last, ["fluxbee-blob"]);
+        // The next ticks ask the others first, which answer: the API answers, and only that
+        // folder gave none.
+        for _ in 0..3 {
+            let (checks, asked) = tick(&mut watch, &blob_slow);
+            assert_eq!(
+                asked,
+                ["fluxbee-dist-vendor", "fluxbee-dist-policy", "fluxbee-blob"]
+            );
+            assert_eq!(checks.api_unanswered(), None);
+            assert_eq!(checks.unanswered_folder(), Some("fluxbee-blob"));
+            assert_eq!(
+                checks.answered,
+                ["fluxbee-dist-vendor", "fluxbee-dist-policy"]
+            );
+        }
+        // Two slow folders: both asked last, in the order they gave none; the third is still
+        // asked at every tick.
+        let two_slow = slow(&["fluxbee-blob", "fluxbee-dist-vendor"]);
+        let (_, asked) = tick(&mut watch, &two_slow);
+        assert_eq!(asked, ["fluxbee-dist-vendor"]);
+        assert_eq!(watch.ask_last, ["fluxbee-blob", "fluxbee-dist-vendor"]);
+        for _ in 0..3 {
+            let (checks, asked) = tick(&mut watch, &two_slow);
+            assert_eq!(asked, ["fluxbee-dist-policy", "fluxbee-blob"]);
+            assert_eq!(checks.api_unanswered(), None);
+        }
+        // A folder that answers leaves the folders to ask last.
+        let (checks, asked) = tick(&mut watch, &slow(&[]));
+        assert_eq!(
+            asked,
+            ["fluxbee-dist-policy", "fluxbee-blob", "fluxbee-dist-vendor"]
+        );
+        assert_eq!(checks.api_unanswered(), None);
+        assert_eq!(checks.unanswered, None);
+        assert!(watch.ask_last.is_empty());
+        // A Syncthing that answers for no folder, a hung API or a stuck model, is the API's at
+        // every tick, whatever the order.
+        let none = slow(&["fluxbee-blob", "fluxbee-dist-vendor", "fluxbee-dist-policy"]);
+        for _ in 0..4 {
+            let (checks, asked) = tick(&mut watch, &none);
+            assert_eq!(asked.len(), 1);
+            assert!(checks.api_unanswered().is_some());
+        }
+        // A folder the hive no longer syncs is asked nowhere, at the end or not.
+        let ask_last = ["fluxbee-gone".to_string(), "fluxbee-blob".to_string()];
+        let mut asked = Vec::new();
+        check_syncthing_folders(&folders, &ask_last, |folder| {
+            asked.push(folder.to_string());
+            Ok(true)
+        });
+        assert_eq!(
+            asked,
+            ["fluxbee-dist-vendor", "fluxbee-dist-policy", "fluxbee-blob"]
+        );
+    }
+
+    /// FINDINGS A-283, the review: a folder whose status gives no answer while Syncthing answers
+    /// for another counts as its own check, warned of after 12 such ticks in a row as any check's
+    /// (`note_check_answer`); a tick that is the API's counts in the API's run alone; and the peer
+    /// reconcile does not ask the API while its run is open.
+    #[test]
+    fn a_folder_with_no_answer_counts_as_its_own_check_while_the_api_answers() {
+        let state = sample_orchestrator_state_for_tests();
+        let checks = |answered: &[&str], unanswered: Option<&str>| SyncthingFolderChecks {
+            folders: CheckAnswer::Yes,
+            answered: answered.iter().map(|folder| folder.to_string()).collect(),
+            unanswered: unanswered.map(|folder| (folder.to_string(), "a timeout".to_string())),
+        };
+        let counted = |folder: &str| {
+            state
+                .unanswered_checks
+                .lock()
+                .expect("the counts")
+                .get(&syncthing_folder_check_name(folder))
+                .copied()
+        };
+        let now = Instant::now();
+        let tick = state
+            .note_syncthing_api_tick(&checks(&["fluxbee-dist-vendor"], Some("fluxbee-blob")), now);
+        assert_eq!(tick, SyncthingApiTick::default());
+        assert_eq!(counted("fluxbee-blob"), Some(1));
+        assert_eq!(counted("fluxbee-dist-vendor"), None);
+        assert!(!state.syncthing_api_run_open());
+        assert_eq!(state.syncthing_folders_asked_last(), ["fluxbee-blob"]);
+        // The API's no answer: no folder's count moves, the API's run opens.
+        state.note_syncthing_api_tick(&checks(&[], Some("fluxbee-blob")), now);
+        assert_eq!(counted("fluxbee-blob"), Some(1));
+        assert!(state.syncthing_api_run_open());
+        // The folder answers: its count ends, and so does the API's run.
+        state.note_syncthing_api_tick(&checks(&["fluxbee-blob"], None), now);
+        assert_eq!(counted("fluxbee-blob"), None);
+        assert!(!state.syncthing_api_run_open());
+        assert!(state.syncthing_folders_asked_last().is_empty());
+
+        // The watchdog's tick skips the peer reconcile while the run is open.
+        let src = include_str!("sy_orchestrator.rs");
+        let tick = &src[src.find("async fn watchdog_tick(").expect("the tick")..];
+        let tick = &tick[..tick.find("\n}\n").expect("its end")];
+        let skip = tick
+            .find("if state.syncthing_api_run_open() {")
+            .expect("the skip");
+        let reconcile = tick
+            .find("reconcile_syncthing_peer_addresses(state)")
+            .expect("the reconcile");
+        assert!(skip < reconcile);
+        assert!(tick[skip..reconcile].contains("} else {"));
+        assert_eq!(
+            tick.matches("reconcile_syncthing_peer_addresses(").count(),
+            1
+        );
+    }
+
     /// FINDINGS A-283: a run of ticks Syncthing's REST API gives no answer in is reported at its
-    /// 12th tick, once; Syncthing is restarted once the run has lasted 5 min, and again only an
-    /// hour after that restart while the run goes on; an answer ends the run, said when it was
-    /// reported, and a run too short to report ends without a word. A join's hold starts the run
-    /// again, and the last restart stays.
+    /// 12th tick, once, which opens the condition; Syncthing is restarted once the run has lasted
+    /// 5 min, and again only an hour after that restart while the run goes on; the answer that
+    /// ends the run closes the condition, saying how long the run lasted, and a run too short to
+    /// report ends without a word. A join's hold starts the run again; the condition and the last
+    /// restart stay.
     #[test]
     fn the_syncthing_api_watch_restarts_after_5_min_at_most_once_an_hour() {
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // The epoch's ms at `at(secs)`.
+        let ms = |secs: u64| 1_790_000_000_000 + secs * 1000;
         let mut watch = SyncthingApiWatch::default();
-        assert_eq!(watch.tick(true, at(0)), SyncthingApiTick::default());
+        assert_eq!(watch.tick(true, at(0), ms(0)), SyncthingApiTick::default());
 
         // A tick every 10 s with no answer, from 10 s: reported at the 12th, once; no restart
         // before the run has lasted 5 min.
         let mut reported = Vec::new();
         for tick in 1..=30u64 {
-            let said = watch.tick(false, at(tick * 10));
+            let said = watch.tick(false, at(tick * 10), ms(tick * 10));
             assert!(!said.ended);
             assert_eq!(said.unanswered_for, Duration::from_secs((tick - 1) * 10));
             if said.reported {
                 reported.push(tick);
             }
             assert!(!said.restart, "tick {tick}");
+            assert_eq!(watch.open, said.reported || !reported.is_empty());
         }
         assert_eq!(reported, [u64::from(WATCHDOG_UNANSWERED_REPORT_CHECKS)]);
-        let said = watch.tick(false, at(310));
+        let said = watch.tick(false, at(310), ms(310));
         assert!(said.restart && !said.reported);
         assert_eq!(said.unanswered_for, SYNCTHING_API_RESTART_AFTER);
-        watch.restarted(at(310));
+        watch.restarted(ms(310));
 
         // Still no answer: the next restart waits an hour from that one.
-        assert!(!watch.tick(false, at(320)).restart);
-        assert!(!watch.tick(false, at(310 + 3599)).restart);
-        assert!(watch.tick(false, at(310 + 3600)).restart);
+        assert!(!watch.tick(false, at(320), ms(320)).restart);
+        assert!(!watch.tick(false, at(310 + 3599), ms(310 + 3599)).restart);
+        assert!(watch.tick(false, at(310 + 3600), ms(310 + 3600)).restart);
 
-        // An answer ends the run, and says so since it was reported.
-        let said = watch.tick(true, at(4000));
+        // An answer ends the run and closes the condition, with how long the run lasted.
+        let said = watch.tick(true, at(4000), ms(4000));
         assert!(said.ended && !said.restart && !said.reported);
-        assert_eq!(said.unanswered_for, Duration::ZERO);
+        assert_eq!(said.unanswered_for, Duration::from_secs(3990));
+        assert!(!watch.open);
+        assert_eq!(
+            watch.tick(true, at(4005), ms(4005)),
+            SyncthingApiTick::default()
+        );
 
         // A new run counts from its own first tick: 5 min of it, and an hour since the last
         // restart (310 s), which has passed.
         for secs in [4010, 4100, 4309] {
-            assert!(!watch.tick(false, at(secs)).restart, "{secs}");
+            assert!(!watch.tick(false, at(secs), ms(secs)).restart, "{secs}");
         }
-        assert!(watch.tick(false, at(4310)).restart);
-        watch.restarted(at(4310));
+        assert!(watch.tick(false, at(4310), ms(4310)).restart);
+        watch.restarted(ms(4310));
         // Within the hour of that restart, a new run that lasts restarts nothing. That run, 4 ticks
         // long, was too short to report, so its end says nothing.
-        assert_eq!(watch.tick(true, at(4320)), SyncthingApiTick::default());
-        assert!(!watch.tick(false, at(4330)).restart);
-        assert!(!watch.tick(false, at(4330 + 600)).restart);
+        assert_eq!(
+            watch.tick(true, at(4320), ms(4320)),
+            SyncthingApiTick::default()
+        );
+        assert!(!watch.tick(false, at(4330), ms(4330)).restart);
+        assert!(!watch.tick(false, at(4330 + 600), ms(4330 + 600)).restart);
 
         // A run too short to report ends without a word.
         let mut quiet = SyncthingApiWatch::default();
         for tick in 1..u64::from(WATCHDOG_UNANSWERED_REPORT_CHECKS) {
-            assert!(!quiet.tick(false, at(tick)).reported);
+            assert!(!quiet.tick(false, at(tick), ms(tick)).reported);
         }
-        assert_eq!(quiet.tick(true, at(100)), SyncthingApiTick::default());
+        assert_eq!(
+            quiet.tick(true, at(100), ms(100)),
+            SyncthingApiTick::default()
+        );
 
         // A join's hold starts the run again: its 5 min count from the first tick after it, and
-        // the tick after the hold, which would have been the 12th, is no report.
+        // the tick after the hold, which would have been the 12th, is no report. A condition open
+        // before the hold stays open, and the answer after it closes it.
         let mut held = SyncthingApiWatch::default();
         for tick in 1..=11u64 {
-            held.tick(false, at(tick * 30));
+            held.tick(false, at(tick * 30), ms(tick * 30));
         }
         held.forget_run();
-        let said = held.tick(false, at(400));
+        let said = held.tick(false, at(400), ms(400));
         assert!(!said.reported && !said.restart);
         assert_eq!(said.unanswered_for, Duration::ZERO);
-        assert!(!held.tick(false, at(699)).restart);
-        assert!(held.tick(false, at(700)).restart);
+        assert!(!held.tick(false, at(699), ms(699)).restart);
+        assert!(held.tick(false, at(700), ms(700)).restart);
+        held.open = true;
+        held.forget_run();
+        let said = held.tick(true, at(710), ms(710));
+        assert!(said.ended);
+        assert_eq!(said.unanswered_for, Duration::ZERO, "no run since the hold");
+    }
+
+    /// FINDINGS A-283, the review: an orchestrator that starts again takes the last restart for
+    /// the API, and whether its condition is open, from the drift store: the hour between two
+    /// restarts holds across its restarts, so each restart has its row (the store keeps one an
+    /// hour), and the first answer closes a condition its last run opened. Another hive's rows,
+    /// and another category's, say nothing of this one.
+    #[test]
+    fn the_syncthing_api_watch_resumes_from_the_drift_store() {
+        let row = |hive: &str, category: &str, kind: &str, at: u64, state: Option<&str>| {
+            serde_json::to_string(&DriftAlertEntry {
+                alert_id: format!("{category}-{kind}-{hive}-{at}"),
+                detected_at: at,
+                category: category.to_string(),
+                trigger: "detected".to_string(),
+                hive_id: hive.to_string(),
+                severity: "warning".to_string(),
+                kind: kind.to_string(),
+                message: "m".to_string(),
+                state: state.map(str::to_string),
+                local_hash: None,
+                remote_hash_before: None,
+                remote_hash_after: None,
+            })
+            .expect("a row")
+        };
+        let base = 1_790_000_000_000u64;
+        let minute = 60_000;
+        let store = [
+            row(
+                "worker1",
+                "syncthing",
+                SYNCTHING_API_RESTART_KIND,
+                base,
+                None,
+            ),
+            row(
+                "worker1",
+                "syncthing",
+                SYNCTHING_API_UNANSWERED_KIND,
+                base,
+                Some("open"),
+            ),
+            row(
+                "worker1",
+                "syncthing",
+                SYNCTHING_API_RESTART_KIND,
+                base + 10 * minute,
+                None,
+            ),
+            row(
+                "motherbee",
+                "syncthing",
+                SYNCTHING_API_RESTART_KIND,
+                base + 20 * minute,
+                None,
+            ),
+            row(
+                "worker1",
+                "posture",
+                SYNCTHING_API_RESTART_KIND,
+                base + 20 * minute,
+                None,
+            ),
+            "not a row".to_string(),
+        ]
+        .join("\n");
+        let mut watch = SyncthingApiWatch::resumed(&store, "worker1");
+        assert_eq!(
+            watch,
+            SyncthingApiWatch {
+                open: true,
+                restarted_at_ms: Some(base + 10 * minute),
+                ..SyncthingApiWatch::default()
+            }
+        );
+        // A 5 min run 30 min after the last restart restarts nothing; one an hour after it does.
+        let t0 = Instant::now();
+        let run = |watch: &mut SyncthingApiWatch, from_ms: u64| {
+            let mut restart = false;
+            for tick in 0..=30u64 {
+                let at = t0 + Duration::from_secs(tick * 10);
+                restart = watch.tick(false, at, from_ms + tick * 10_000).restart;
+            }
+            restart
+        };
+        assert!(!run(&mut watch, base + 40 * minute));
+        watch.forget_run();
+        assert!(run(&mut watch, base + 70 * minute));
+        // The condition it opened closes at the first answer.
+        let mut open = SyncthingApiWatch::resumed(&store, "worker1");
+        assert!(open.tick(true, t0, base + 41 * minute).ended);
+        // Closed in the store: nothing to close.
+        let closed = [
+            store.clone(),
+            row(
+                "worker1",
+                "syncthing",
+                SYNCTHING_API_UNANSWERED_KIND,
+                base + minute,
+                Some("closed"),
+            ),
+        ]
+        .join("\n");
+        assert!(!SyncthingApiWatch::resumed(&closed, "worker1").open);
+        assert_eq!(
+            SyncthingApiWatch::resumed("", "worker1"),
+            SyncthingApiWatch::default()
+        );
+        assert_eq!(
+            SyncthingApiWatch::resumed(&store, "worker2"),
+            SyncthingApiWatch::default()
+        );
+    }
+
+    /// FINDINGS A-283, the review: the condition's rows go through the store as a condition's:
+    /// open, closed and open again within the hour are all written, a second open in a row is
+    /// not, and a closed row is `info`. Before, the report was a detector's row with no state:
+    /// nothing said when the API answered again, and a second run within the hour wrote nothing.
+    #[test]
+    fn the_syncthing_api_condition_opens_and_closes_in_the_drift_store() {
+        let base = 1_790_000_000_000u64;
+        let minute = 60_000;
+        let mut store = String::new();
+        let mut append = |open: bool, at: u64| {
+            let mut entry = drift_condition_entry(
+                "syncthing",
+                SYNCTHING_API_UNANSWERED_KIND,
+                "worker1",
+                open,
+                if open {
+                    syncthing_api_unanswered_message(Duration::from_secs(110), "a timeout")
+                } else {
+                    syncthing_api_answers_again_message(Duration::from_secs(240))
+                },
+            );
+            entry.detected_at = at;
+            match drift_alerts_with(&store, &entry).expect("the store") {
+                Some(body) => {
+                    store = body;
+                    true
+                }
+                None => false,
+            }
+        };
+        assert!(append(true, base));
+        assert!(!append(true, base + minute), "a second open in a row");
+        assert!(append(false, base + 4 * minute));
+        assert!(append(true, base + 30 * minute));
+        assert!(append(false, base + 34 * minute));
+        let rows: Vec<DriftAlertEntry> = store
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a row"))
+            .collect();
+        let states: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.state.as_deref().unwrap_or_default(),
+                    row.severity.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("open", "warning"),
+                ("closed", "info"),
+                ("open", "warning"),
+                ("closed", "info")
+            ]
+        );
+        assert!(rows[1].message.contains("answers again") && rows[1].message.contains("240 s"));
+        assert_eq!(
+            syncthing_api_answers_again_message(Duration::ZERO),
+            "Syncthing's REST API answers again"
+        );
     }
 
     /// FINDINGS A-283: the watchdog counts a tick when it asked Syncthing's REST API, skips the
@@ -61348,11 +61960,14 @@ blob:
                 .count(),
             3
         );
-        // One count a tick that asked, with why the API gave no answer.
+        // One count a tick that asked, by its folders' answers, which ask the folders that gave
+        // none last.
         assert_eq!(watchdog.matches("note_syncthing_api_tick(").count(), 1);
-        assert!(watchdog.contains(
-            "state.note_syncthing_api_tick(checks.unanswered.as_deref(), Instant::now());"
-        ));
+        assert!(watchdog.contains("state.note_syncthing_api_tick(&checks, Instant::now());"));
+        assert!(
+            at("let ask_last = state.syncthing_folders_asked_last();")
+                < at("check_syncthing_folders(&folder_ids, &ask_last, |folder| {")
+        );
         assert!(!watchdog.contains("note_check_answer("));
         let counted = at("if !folder_ids.is_empty() {");
         assert!(counted < at("note_syncthing_api_tick("));
@@ -61365,21 +61980,37 @@ blob:
         assert!(decides < again);
         assert!(watchdog[again..restart].contains("state.forget_syncthing_api_run();"));
         assert!(watchdog[again..restart].contains("return Ok(());"));
-        // The folder-error reads only on a tick the API answered in.
+        assert!(watchdog[restart..].contains("checks.api_unanswered().unwrap_or_default(),"));
+        // The folder-error reads only on a tick the API answered at, and not for a folder it gave
+        // no answer for.
         let errors = at("report_blob_folder_errors(");
         let only_answered = watchdog[..errors]
-            .rfind("if checks.unanswered.is_none() {")
+            .rfind("if checks.api_unanswered().is_none() {")
             .expect("the guard");
         assert!(!watchdog[only_answered..errors].contains('}'));
+        assert!(watchdog[errors..].contains("checks.unanswered_folder(),"));
         assert_eq!(watchdog.matches("report_blob_folder_errors(").count(), 1);
 
+        // The restart: its row, then the hour from it, then every pending restart's own.
         let restart = body("async fn restart_syncthing_for_unanswered_api(");
         let at = |needle: &str| restart.find(needle).unwrap_or_else(|| panic!("{needle}"));
-        assert!(at("state.note_syncthing_api_restart(Instant::now());") < at("block_in_place("));
-        assert!(at("\"api_unanswered_restart\"") < at("block_in_place("));
-        assert!(at("block_in_place(") < at("systemd_restart(SYNCTHING_SERVICE_NAME)"));
-        assert!(at("syncthing_restart_pending_token(&marker)") < at("systemd_restart("));
-        assert!(restart.contains("clear_syncthing_restart_pending(&marker, applied.as_deref());"));
+        assert!(
+            at("SYNCTHING_API_RESTART_KIND")
+                < at("state.note_syncthing_api_restart(now_epoch_ms());")
+        );
+        assert!(
+            at("state.note_syncthing_api_restart(now_epoch_ms());")
+                < at("restart_syncthing_for_pending(sync, &syncthing_restart_pending_marker())")
+        );
+        assert!(!restart.contains("systemd_restart("));
+        let pending = body("async fn restart_syncthing_for_pending(");
+        let at = |needle: &str| pending.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("block_in_place(") < at("syncthing_restart_pending_token(marker)"));
+        assert!(
+            at("syncthing_restart_pending_token(marker)")
+                < at("systemd_restart(SYNCTHING_SERVICE_NAME)")
+        );
+        assert!(pending.contains("clear_syncthing_restart_pending(marker, applied.as_deref());"));
 
         // The alerts say why, and what comes next.
         let report = syncthing_api_unanswered_message(
