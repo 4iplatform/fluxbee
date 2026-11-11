@@ -696,7 +696,9 @@ built (stage 3c)"). SY.admin's `set_installation_ai` sends two `SYSTEM_UPDATE`s 
   - it restarts only its start readers (`installation_start_readers`): `sy-cognition` and
     `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker, none on an ingress or an
     egress; and of those, only the ones its role runs that systemd has active, since one that does
-    not run reads the file at its next start;
+    not run reads the file at its next start. One systemctl does not answer for (FINDINGS A-267)
+    is not restarted and is an error of the update, which then records nothing, so the update run
+    again asks again;
   - only when their engine changed, or nothing says what they run (`config_update_plan`): the
     version's default provider with its model (`ai_settings::engine_of`) against the one in
     `/var/lib/fluxbee/orchestrator/config-applied.json`, the update this hive applied last
@@ -850,12 +852,19 @@ SY.admin sends them to the motherbee's orchestrator, which answers from a task o
 ## Watchdog
 
 Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every SY service of its
-role's list with `systemctl is-active`, and runs `systemctl start` on any that is not
-active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
-the router, verifies runtimes, runs the blob GC (on the motherbee when its `blob.gc` turns it on,
-FINDINGS A-188; on a worker, every hour whatever its `blob.gc` says, a pass that cleans only its
-own `blob/staging`, A-241; both off the runtime's threads), checks Syncthing and its peers,
-re-applies egress and the ingress' SSH table, reports an
+role's list with `systemctl is-active`, and runs `systemctl start` on any that systemctl answers
+is not running (exit 3). A stopped core unit comes back within seconds. A check with no answer
+(another exit, or a check that could not run or was killed, as systemd's stop of the orchestrator
+kills the one in flight) starts nothing, and the next tick asks again (`ServiceActivity`,
+FINDINGS A-267, since 0.1.133); before, the last tick of each self-restart took the services it
+was checking for down and started them. The Syncthing check skips such a tick the same way, and
+the sync probe starts nothing on one. The other callers read one as "not ready yet" (the waits),
+"not running" (the reports, the vendor step of a finalize), an error that leaves the config
+update unrecorded, or, where Syncthing is stopped or restarted anyway, as possibly running. The
+same tick logs managed nodes that left the router, verifies runtimes, runs the blob GC (on the
+motherbee when its `blob.gc` turns it on, FINDINGS A-188; on a worker, every hour whatever its
+`blob.gc` says, a pass that cleans only its own `blob/staging`, A-241; both off the runtime's
+threads), checks Syncthing and its peers, re-applies egress and the ingress' SSH table, reports an
 active host firewall (`watchdog_host_rules`), and runs the loopback check. Its egress step skips
 while an egress switch is open on a worker (A-219): the switch owns the route until it commits or
 reverts. While a join runs, its Syncthing is the join's:

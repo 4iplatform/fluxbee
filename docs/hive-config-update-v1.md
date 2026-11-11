@@ -383,7 +383,8 @@ The operator's change and the update with category `config`, live and checked on
     ai.generic takes the new version at its next request, SY.admin's executor and Archi at their
     next use;
   - only those its release runs and systemd has active: one that does not run reads the file at its
-    next start;
+    next start. One systemctl does not answer for (since 0.1.133, FINDINGS A-267) is not restarted
+    and is an error of the update, which then records nothing, so the update run again asks again;
   - only when their engine changed, or when nothing says what they run (`config_update_plan`).
     The engine is `ai_settings::engine_of` the version's values, the default provider with its
     model, against the one this hive applied last, recorded in

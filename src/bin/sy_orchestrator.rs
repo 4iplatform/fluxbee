@@ -3215,7 +3215,8 @@ async fn wait_for_router_ready(
 
     let start = Instant::now();
     loop {
-        let rt_gateway_active = systemd_is_active("rt-gateway");
+        // A check with no answer is not ready yet: it is asked again (FINDINGS A-267).
+        let rt_gateway_active = systemd_activity("rt-gateway") == ServiceActivity::Active;
 
         let mut socket_ready = false;
         let mut shm_ready = false;
@@ -3325,27 +3326,41 @@ impl Drop for WatchdogRunGuard {
     }
 }
 
-async fn watchdog_tick(state: &OrchestratorState) {
-    if !systemd_is_active("rt-gateway") {
-        tracing::warn!(
-            service = "rt-gateway",
-            "service not active; attempting restart"
-        );
-        if let Err(err) = systemd_start("rt-gateway") {
-            tracing::warn!(service = "rt-gateway", error = %err, "service restart failed");
-        }
-    }
-    for node_name in &state.system_nodes.nodes {
-        let service = name_to_service(node_name);
-        if !systemd_is_active(&service) {
-            tracing::warn!(
-                service = service.as_str(),
-                "service not active; attempting restart"
+/// The watchdog's step for one core service, by what systemctl answers for it: `start` runs only
+/// when it answers that the service is not running (FINDINGS A-267). A check with no answer starts
+/// nothing, and the next tick asks again.
+fn keep_core_service_running(
+    service: &str,
+    activity: ServiceActivity,
+    start: impl FnOnce(&str) -> Result<(), OrchestratorError>,
+) {
+    match activity {
+        ServiceActivity::Active => {}
+        ServiceActivity::Unknown => {
+            tracing::debug!(
+                service,
+                "systemctl did not answer whether the service runs; nothing started"
             );
-            if let Err(err) = systemd_start(&service) {
-                tracing::warn!(service = service.as_str(), error = %err, "service restart failed");
+        }
+        ServiceActivity::Inactive => {
+            tracing::warn!(service, "service not active; attempting restart");
+            if let Err(err) = start(service) {
+                tracing::warn!(service, error = %err, "service restart failed");
             }
         }
+    }
+}
+
+async fn watchdog_tick(state: &OrchestratorState) {
+    let core_services = std::iter::once("rt-gateway".to_string()).chain(
+        state
+            .system_nodes
+            .nodes
+            .iter()
+            .map(|node_name| name_to_service(node_name)),
+    );
+    for service in core_services {
+        keep_core_service_running(&service, systemd_activity(&service), systemd_start);
     }
 
     if let Ok(snapshot) = load_router_snapshot(state) {
@@ -4619,14 +4634,17 @@ async fn wait_for_syncthing_folder_convergence(
     wait_for_idle: bool,
 ) -> Result<SyncthingConvergenceProbe, OrchestratorError> {
     let desired_sync = effective_syncthing_runtime_config(desired_blob, desired_dist);
-    let mut service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    let activity = systemd_activity(SYNCTHING_SERVICE_NAME);
+    let mut service_active = activity == ServiceActivity::Active;
     let mut api_healthy = if service_active {
         syncthing_api_healthy(desired_sync.sync_api_port).await
     } else {
         false
     };
 
-    if !service_active || !api_healthy {
+    // A check with no answer starts nothing (FINDINGS A-267): the probe answers that Syncthing is
+    // not active.
+    if activity != ServiceActivity::Unknown && (!service_active || !api_healthy) {
         // A probe starts Syncthing as the watchdog does: on the installed binary while the vendor
         // still syncs (FINDINGS A-189).
         ensure_blob_sync_runtime(
@@ -4636,7 +4654,7 @@ async fn wait_for_syncthing_folder_convergence(
             VendorPolicy::KeepInstalled,
         )
         .await?;
-        service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+        service_active = systemd_activity(SYNCTHING_SERVICE_NAME) == ServiceActivity::Active;
         api_healthy = if service_active {
             syncthing_api_healthy(desired_sync.sync_api_port).await
         } else {
@@ -7000,12 +7018,17 @@ async fn wait_for_service_active(
 ) -> Result<(), OrchestratorError> {
     let start = Instant::now();
     loop {
-        if systemd_is_active(service) {
+        // A check with no answer is not active yet: it is asked again (FINDINGS A-267).
+        let activity = systemd_activity(service);
+        if activity == ServiceActivity::Active {
             tracing::info!(service = service, "service active");
             return Ok(());
         }
         if start.elapsed() >= timeout {
-            return Err(format!("{} bootstrap timeout (systemd inactive)", service).into());
+            return Err(format!(
+                "{service} bootstrap timeout (systemd's last answer: {activity:?})"
+            )
+            .into());
         }
         time::sleep(Duration::from_millis(250)).await;
     }
@@ -8218,10 +8241,10 @@ fn config_update_plan(
 /// start readers whose engine changed or is unknown (`config_update_plan`), only those this hive
 /// runs, each behind the core's health gate, and then records what it applied with when each
 /// running reader became active. A reader that does not run is left as it is: it reads the file at
-/// its next start. A restart that fails leaves the record as it was; the readers that did restart
-/// are then active since another time than the record's, so the same update run again restarts
-/// them again. The restarts run inline: this orchestrator answers its other system messages once
-/// they end, a few seconds later.
+/// its next start. A restart that fails, or a reader systemctl does not answer for (FINDINGS
+/// A-267), leaves the record as it was; the readers that did restart are then active since another
+/// time than the record's, so the same update run again restarts them again. The restarts run
+/// inline: this orchestrator answers its other system messages once they end, a few seconds later.
 async fn apply_config_update_local(
     state: &OrchestratorState,
     request: &SystemUpdateRequest,
@@ -8305,14 +8328,30 @@ async fn apply_config_update_local(
     let mut restarted = Vec::new();
     let mut errors = Vec::new();
     for service in restart {
-        if !(systemd_unit_exists(&service) && systemd_is_active(&service)) {
-            tracing::info!(
-                service = %service,
-                "config update: not running, so not restarted; it reads the installation file at \
-                 its next start"
-            );
-            unchanged.push(service);
-            continue;
+        let activity = if systemd_unit_exists(&service) {
+            systemd_activity(&service)
+        } else {
+            ServiceActivity::Inactive
+        };
+        match activity {
+            ServiceActivity::Active => {}
+            ServiceActivity::Inactive => {
+                tracing::info!(
+                    service = %service,
+                    "config update: not running, so not restarted; it reads the installation \
+                     file at its next start"
+                );
+                unchanged.push(service);
+                continue;
+            }
+            // FINDINGS A-267: neither restarted nor taken for stopped, and the update is not
+            // recorded: run again, it asks again.
+            ServiceActivity::Unknown => {
+                errors.push(format!(
+                    "{service}: systemctl did not answer whether it runs, so it was not restarted"
+                ));
+                continue;
+            }
         }
         match restart_core_service_with_health_gate(&service).await {
             Ok(()) => restarted.push(service),
@@ -8321,10 +8360,11 @@ async fn apply_config_update_local(
     }
     if errors.is_empty() {
         // When each running reader became active, now that it runs this version: the next update
-        // tells a reader restarted since from one that still runs it (stage 3c's review, F2).
+        // tells a reader restarted since from one that still runs it (stage 3c's review, F2). One
+        // systemctl does not answer for is left out, so the next update restarts it (A-267).
         let active_since = services
             .iter()
-            .filter(|service| systemd_is_active(service))
+            .filter(|service| systemd_activity(service) == ServiceActivity::Active)
             .filter_map(|service| {
                 systemd_active_since(service).map(|since| (service.clone(), since))
             })
@@ -10111,7 +10151,8 @@ fn active_host_firewalls() -> Vec<&'static str> {
             active.push("ufw");
         }
     }
-    if systemd_is_active("firewalld") {
+    // A check with no answer reports nothing; the next pass asks again (FINDINGS A-267).
+    if systemd_activity("firewalld") == ServiceActivity::Active {
         active.push("firewalld");
     }
     active
@@ -18230,14 +18271,17 @@ struct SyncthingRuntimeOutcome {
 
 /// A running Syncthing keeps the binary and the unit it started with (A-57): it is stale when
 /// either changed under it. A replaced binary also shows on the process itself, so a restart a
-/// failed call never reached is caught by the next one.
+/// failed call never reached is caught by the next one. A check with no answer counts as running
+/// (FINDINGS A-267): the caller starts Syncthing either way, and a restart starts a stopped one as
+/// a start would, where a start leaves a running one stale.
 fn syncthing_runs_stale(
-    active: bool,
+    activity: ServiceActivity,
     binary_updated: bool,
     unit_changed: bool,
     runs_replaced_binary: bool,
 ) -> bool {
-    active && (binary_updated || unit_changed || runs_replaced_binary)
+    activity != ServiceActivity::Inactive
+        && (binary_updated || unit_changed || runs_replaced_binary)
 }
 
 /// Syncthing installed from the vendor, under its unit, running and healthy, with this hive's
@@ -18296,7 +18340,7 @@ async fn ensure_blob_sync_runtime(
     // Restart a stale Syncthing now, before the checks below: they already use the new unit's
     // port and home.
     let stale = syncthing_runs_stale(
-        systemd_is_active(SYNCTHING_SERVICE_NAME),
+        systemd_activity(SYNCTHING_SERVICE_NAME),
         binary_updated,
         unit_changed,
         service_runs_replaced_binary(SYNCTHING_SERVICE_NAME),
@@ -18583,7 +18627,9 @@ fn syncthing_folder_errors(
 }
 
 fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
-    if systemd_is_active(SYNCTHING_SERVICE_NAME) {
+    // A check with no answer stops it too (FINDINGS A-267): a stop changes nothing for a stopped
+    // service, and the sync is off.
+    if systemd_activity(SYNCTHING_SERVICE_NAME) != ServiceActivity::Inactive {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
             "stopping blob sync service"
@@ -18661,7 +18707,17 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         return Ok(());
     }
 
-    let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+    // FINDINGS A-267: a check with no answer, such as the one systemd's stop of this orchestrator
+    // kills, restarts nothing: the next tick asks again.
+    let activity = systemd_activity(SYNCTHING_SERVICE_NAME);
+    if activity == ServiceActivity::Unknown {
+        tracing::debug!(
+            service = SYNCTHING_SERVICE_NAME,
+            "systemctl did not answer whether syncthing runs; nothing restarted"
+        );
+        return Ok(());
+    }
+    let service_active = activity == ServiceActivity::Active;
     let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
     let mut folders_healthy = true;
     if service_active && api_healthy {
@@ -31389,10 +31445,12 @@ async fn add_hive_finalize_local_flow(
     let vendor_result = match apply_system_update_local(state, &vendor_request).await {
         Ok(result) => result,
         Err(err) => {
+            // A check with no answer is no running Syncthing: the vendor step's error stands
+            // (FINDINGS A-267).
             if let Some(mismatch) = vendor_still_arriving(
                 &SyncthingVendorPaths::local(),
                 &err.to_string(),
-                systemd_is_active(SYNCTHING_SERVICE_NAME),
+                systemd_activity(SYNCTHING_SERVICE_NAME) == ServiceActivity::Active,
             ) {
                 // FINDINGS A-190: the Syncthing the bootstrap installed runs, and the peer link
                 // below brings dist/vendor; until then `/versions` reports it, and the recheck
@@ -31579,7 +31637,7 @@ async fn add_hive_finalize_local_flow(
                     )
                 }
                 Err(err) => (
-                    systemd_is_active(SYNCTHING_SERVICE_NAME),
+                    systemd_activity(SYNCTHING_SERVICE_NAME) == ServiceActivity::Active,
                     false,
                     None,
                     false,
@@ -31587,7 +31645,8 @@ async fn add_hive_finalize_local_flow(
                 ),
             }
         } else if desired_sync.sync_enabled {
-            let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+            let service_active =
+                systemd_activity(SYNCTHING_SERVICE_NAME) == ServiceActivity::Active;
             let api_healthy =
                 service_active && syncthing_api_healthy(desired_sync.sync_api_port).await;
             (service_active, api_healthy, None, false, Vec::new())
@@ -35602,14 +35661,39 @@ fn run_cmd_output(mut cmd: Command, label: &str) -> Result<String, OrchestratorE
     Err(format!("{label} failed (exit={code}): {detail}").into())
 }
 
-fn systemd_is_active(service: &str) -> bool {
-    Command::new("systemctl")
-        .arg("is-active")
-        .arg("--quiet")
-        .arg(service)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+/// What `systemctl is-active` answers for a service (FINDINGS A-267).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceActivity {
+    /// Exit 0: active (or reloading).
+    Active,
+    /// Exit 3, LSB's "not running": inactive, failed, or on its way up or down.
+    Inactive,
+    /// No answer: systemctl could not run, failed otherwise, or was killed, as systemd's stop of
+    /// this orchestrator kills the check in flight. It says nothing of the service: no caller
+    /// starts anything on it.
+    Unknown,
+}
+
+fn systemd_activity(service: &str) -> ServiceActivity {
+    service_activity(
+        Command::new("systemctl")
+            .arg("is-active")
+            .arg("--quiet")
+            .arg(service)
+            .status(),
+    )
+}
+
+/// `systemctl is-active`'s answer from how it ended: active only on exit 0, not running only on
+/// exit 3. Before, any other end read as not running, and the watchdog tick in flight when systemd
+/// stopped the orchestrator (its own restart) took the healthy services it checked for down and
+/// started them.
+fn service_activity(status: std::io::Result<std::process::ExitStatus>) -> ServiceActivity {
+    match status.map(|status| status.code()) {
+        Ok(Some(0)) => ServiceActivity::Active,
+        Ok(Some(3)) => ServiceActivity::Inactive,
+        _ => ServiceActivity::Unknown,
+    }
 }
 
 fn systemd_unit_exists(service: &str) -> bool {
@@ -57456,14 +57540,93 @@ blob:
 
     #[test]
     fn syncthing_restarts_only_a_running_service_left_on_an_old_binary_or_unit() {
-        // active, binary_updated, unit_changed, runs_replaced_binary
-        assert!(syncthing_runs_stale(true, true, false, false));
-        assert!(syncthing_runs_stale(true, false, true, false));
+        use ServiceActivity::{Active, Inactive, Unknown};
+        // activity, binary_updated, unit_changed, runs_replaced_binary
+        assert!(syncthing_runs_stale(Active, true, false, false));
+        assert!(syncthing_runs_stale(Active, false, true, false));
         // A restart an earlier call lost: nothing changed now, but the process runs a deleted file.
-        assert!(syncthing_runs_stale(true, false, false, true));
-        assert!(!syncthing_runs_stale(true, false, false, false));
+        assert!(syncthing_runs_stale(Active, false, false, true));
+        assert!(!syncthing_runs_stale(Active, false, false, false));
         // A stopped service starts on what is on disk: nothing to restart.
-        assert!(!syncthing_runs_stale(false, true, true, true));
+        assert!(!syncthing_runs_stale(Inactive, true, true, true));
+        // FINDINGS A-267: a check with no answer may hide a running one, and a restart also
+        // starts a stopped one.
+        assert!(syncthing_runs_stale(Unknown, false, true, false));
+        assert!(!syncthing_runs_stale(Unknown, false, false, false));
+    }
+
+    /// FINDINGS A-267: `systemctl is-active` says active only by exit 0 and not running only by
+    /// exit 3; a check that fails otherwise, cannot run, or is killed, as systemd's stop of this
+    /// orchestrator kills the watchdog's check in flight, answers nothing. Real children, each
+    /// ending one of those ways.
+    #[test]
+    fn a_service_check_answers_only_by_exit_0_or_3() {
+        let ends =
+            |script: &str| service_activity(Command::new("sh").arg("-c").arg(script).status());
+        assert_eq!(ends("exit 0"), ServiceActivity::Active);
+        assert_eq!(ends("exit 3"), ServiceActivity::Inactive);
+        assert_eq!(ends("exit 1"), ServiceActivity::Unknown);
+        assert_eq!(ends("exit 4"), ServiceActivity::Unknown);
+        assert_eq!(ends("kill -TERM $$"), ServiceActivity::Unknown);
+        assert_eq!(ends("kill -KILL $$"), ServiceActivity::Unknown);
+        assert_eq!(
+            service_activity(Command::new("/nonexistent/systemctl").status()),
+            ServiceActivity::Unknown
+        );
+    }
+
+    /// FINDINGS A-267: the watchdog starts a core service only when systemctl answers that it does
+    /// not run. Before, a check killed by the orchestrator's own stop read as "not running", and
+    /// the tick in flight started a healthy service.
+    #[test]
+    fn the_watchdog_starts_a_core_service_only_on_a_not_running_answer() {
+        for (activity, starts) in [
+            (ServiceActivity::Active, false),
+            (ServiceActivity::Inactive, true),
+            (ServiceActivity::Unknown, false),
+        ] {
+            let mut started = Vec::new();
+            keep_core_service_running("sy-opa-rules", activity, |service| {
+                started.push(service.to_string());
+                Ok(())
+            });
+            let expected = if starts {
+                vec!["sy-opa-rules".to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(started, expected, "{activity:?}");
+        }
+        // A start that fails is only logged.
+        keep_core_service_running("rt-gateway", ServiceActivity::Inactive, |_| {
+            Err("systemctl start failed".into())
+        });
+
+        // The Syncthing check leaves a tick with no answer before anything restarts Syncthing, and
+        // the probe starts nothing on one.
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        let watchdog = body("async fn watchdog_blob_sync(");
+        let unknown = watchdog
+            .find("if activity == ServiceActivity::Unknown {")
+            .expect("the watchdog's unknown");
+        assert!(watchdog[unknown..]
+            .split_once("return Ok(());")
+            .is_some_and(|(before, _)| !before.contains("ensure_blob_sync_runtime(")));
+        assert!(
+            unknown
+                < watchdog
+                    .rfind("ensure_blob_sync_runtime(")
+                    .expect("the restart")
+        );
+        assert!(
+            body("async fn wait_for_syncthing_folder_convergence(").contains(
+                "if activity != ServiceActivity::Unknown && (!service_active || !api_healthy) {"
+            )
+        );
     }
 
     #[test]
