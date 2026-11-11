@@ -136,7 +136,7 @@ any tenant. Choosing the right tenant for the person in the session is Cloud's j
 
 | shape | who | how to tell |
 |---|---|---|
-| `{"ok":false,"error_code":"…","message":"…"}` with a real HTTP status | **the edge**: the request never reached IO.cloud | has `ok`, no `status` |
+| `{"ok":false,"error_code":"…","message":"…"}` with a real HTTP status | **the edge** answered: a 4xx, a 503 or a 502 `HANDLER_UNREACHABLE` never reached IO.cloud; a 504 or another 5xx may have (unknown, §6) | has `ok`, no `status` |
 | `{"status":"error","error_code":"…","error_detail":…}` with **HTTP 200** | **IO.cloud or the hive**: it arrived and failed | has `status`, no `ok` |
 
 **A business error comes back with HTTP 200.** Checking `r.ok` is not enough:
@@ -652,7 +652,7 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `tenant_id` (root) | required | the node's tenant |
 | `params.node_name` | required | **must start with `IO.`**; a `@hive` suffix picks the server (omit it if unsure) |
 | `params.runtime` | send it | what to run (e.g. `io.api`). Omitted, it is derived from the name's first two segments, which rarely exists |
-| `params.runtime_version` | optional | default `"current"`: the node follows it, and when the operator makes another version current the hive restarts the node on it within a minute. A version named here pins it |
+| `params.runtime_version` | optional | default `"current"`, or a version to pin the node to. What a new version of the runtime does to the node is below the error table |
 | `params.config` | optional | object; IO.cloud overwrites `config.tenant_id` with the envelope's `tenant_id` |
 | `params.add_channels` | optional | `[{"ich_id":"ich:…","type":…,"address":…}]` |
 | `params.identity_change_reason` | optional | text |
@@ -682,6 +682,20 @@ or delete. Nodes launched before 0.1.68 carry no `launched_by`: `list_nodes` sho
 (`launched_by: null`), and start, stop and delete answer `NODE_NOT_FOUND`; the operator handles
 them. Configuring a node after it is launched, routing it or wiring it into a solution is the
 operator's work, through Archi.
+
+**A new version of the node's runtime** is the operator's to roll out:
+
+- when the operator makes another version current, the hive relaunches a running node on
+  `current` on it within a minute of the version reaching the node's hive, and leaves a pinned
+  node as it is;
+- a publish through Archi that makes the new version current does more today, to every node of
+  that runtime on the motherbee, yours included, running or stopped, pinned or not: it deletes the
+  node and launches it again under the same name, on `current`. The node comes back with a new
+  identity (a credential assigned to the old one no longer reaches it), without the credentials it
+  owned, with the runtime's default config unless the operator keeps its own, and with
+  `launched_by: "archi"`, so `start_node`, `stop_node` and `delete_node` answer `NODE_NOT_FOUND`.
+  That waits for the operator's decision; if it happens to a node of yours, give the operator its
+  name.
 
 #### `list_nodes`
 
@@ -1034,8 +1048,9 @@ post '{"op":"list_cloud_actions"}'
    (`docs/ilk-tenant-model-v1.md`). Model spending is recorded per call and read with `get_usage`
    (§5.5); pricing it is Cloud's.
 9. **Public pages** (§5.7). Cloud can neither list nor take down its tenant's pages. Each stays up
-   until its fixed expiry (24 h by default, 30 days at most), also after its node or its tenant is
-   deleted or suspended; the operator can take one down sooner.
+   until its fixed expiry (24 h by default, 30 days at most), also after its node is deleted or its
+   tenant deleted or suspended; the agent that published it, or the operator, can take it down
+   sooner.
 
 ---
 
@@ -1049,12 +1064,13 @@ post '{"op":"list_cloud_actions"}'
 - **`lifecycle_state` can be `UNKNOWN`** in `list_nodes` and `get_node_status`: the hive's systemd
   did not answer for the node. The hive no longer reports a `STOPPED` it did not see. Read it again.
 - **`SERVICE_FAILED` on `provision_node`, `start_node`, `stop_node` and `delete_node`** means the
-  hive's systemd did not answer whether the node runs, asked again for a second: nothing was done,
-  and a provision leaves nothing of the node behind (in 0.1.132 its config and identity stayed, and
-  a retry answered `NODE_ALREADY_EXISTS`). Send it again. The answer has no retry flag: match on the
-  code.
-- **`get_node_status` of a node on the motherbee no longer waits behind a change** the hive runs (a
-  node on another hive stopped waiting in 0.1.127).
+  hive's systemd did not answer whether the node runs, asked again for a second: nothing was done.
+  Send it again. New: `start_node` answers it (in 0.1.132 it went on as if the node did not run),
+  and a provision leaves nothing of the node behind (in 0.1.132 its config and identity stayed,
+  and a retry answered `NODE_ALREADY_EXISTS`); `stop_node` and `delete_node` answered it already,
+  after one check. The answer has no retry flag: match on the code.
+- **`get_node_status` no longer waits behind a change on any hive**, the node's own included
+  (0.1.127 freed a node of another hive only from the motherbee's changes).
 
 ### 0.1.131
 
@@ -1065,8 +1081,8 @@ post '{"op":"list_cloud_actions"}'
 ### 0.1.127
 
 - **`list_nodes`, and `get_node_status` of a node on another hive, no longer wait behind a change**
-  the hive runs (a provision, a delete, the operator's work), where they could reach IO.cloud's 20 s
-  and answer `ADMIN_UNAVAILABLE`.
+  the motherbee runs (a provision, a delete, the operator's work), where they could reach
+  IO.cloud's 20 s and answer `ADMIN_UNAVAILABLE`.
 - **A request that fails inside the hive's node launcher answers `INTERNAL_ERROR`** at once, where
   it went unanswered until IO.cloud's wait ran out. Do not retry it in a loop: give the operator the
   `request_id`.
@@ -1098,8 +1114,9 @@ post '{"op":"list_cloud_actions"}'
 
 ### 0.1.106
 
-- **`restore_ilk`:** an email blocks a restore only when another person charged to the same tenant
-  holds it; another tenant holding it answered `ILK_KEY_CONFLICT`.
+- **`restore_ilk`:** a vouched email (`identification.email`) blocks a restore only when another
+  person charged to the same tenant holds it; before 0.1.106, one in any tenant did. The account's
+  email still blocks it in the whole hive (§5.2).
 
 ### 0.1.104
 
@@ -1115,7 +1132,8 @@ post '{"op":"list_cloud_actions"}'
 - **A failed start stays wanted:** after `START_FAILED` the hive tries the node again every minute
   until `stop_node`.
 - **A node on `current` follows it:** when the operator makes another version current, the hive
-  restarts the node on it within a minute; a version named in `runtime_version` pins it.
+  restarts the node on it within a minute; a version named in `runtime_version` pins it. A publish
+  through Archi does more today (§5.4).
 
 ### 0.1.85
 
