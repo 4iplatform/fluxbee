@@ -142,9 +142,11 @@ own HTTP routes decode theirs: a cursor written with `%3A`, or an owner with `%4
 as it does written raw; an escape that is none goes as it came, and `+` reads as a space, where
 SY.admin's routes keep it. The path's description tells the model to follow `next_cursor`, and on
 `REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages));
-of the timer list, SY.timer's own page, it says that it gives 100 timers without a `limit` (at most
-1000), `next_cursor` while timers follow and no `total`, and that a cursor it did not give is
-refused with `TIMER_INVALID_PAYLOAD` ([SY.timer §7.6](../sy-timer.md)).
+of the timer list, SY.timer's own page, it says that it gives 100 timers without a `limit` (`limit`
+up to 1000), `next_cursor` while timers follow and no `total`, and that a cursor that is not one
+(`<fire_at_utc_ms>:<uuid>`) is refused with `TIMER_INVALID_PAYLOAD` (HTTP 400 on SY.admin's route;
+the model reads the mesh answer's `error_code`). A well-formed cursor SY.timer never gave is no
+error: it lists the timers after the place it names ([SY.timer §7.6](../sy-timer.md)).
 `GET /hives/{hive}/commands` (FINDINGS A-201) reads SY.admin's command log
 (`list_recent_commands`), newest first, with `?action=&status=&since_ms=`: each command with its
 outcome, an executor plan's steps among them (origin `executor`). `GET /artifacts` (FINDINGS

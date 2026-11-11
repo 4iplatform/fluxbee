@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (at most 1000), next_cursor while timers follow and no total; a cursor it did not give is refused with TIMER_INVALID_PAYLOAD (HTTP 400). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (limit up to 1000), next_cursor while timers follow and no total; a cursor that is not one (<fire_at_utc_ms>:<uuid>) is refused with TIMER_INVALID_PAYLOAD (HTTP 400 on SY.admin's route). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -8946,9 +8946,10 @@ fn query_bool_param(query: &str, key: &str) -> Option<bool> {
 }
 
 /// A query value or a path segment, percent-decoded: `%` and two hex digits are the byte they name,
-/// and `+` is a space. A `%` without two hex digits after it stays as it came, and so does what
-/// follows it; bytes that are no UTF-8 read as U+FFFD. Read byte by byte (FINDINGS A-279): a `%`
-/// before a character of more than one byte panicked, and `%+A` was a newline.
+/// and `+` is a space. A `%` without two hex digits after it stays as it came, and what follows it
+/// is read by the same rules (`%+A` is `% A`, `%%41` is `%A`); bytes that are no UTF-8 read as
+/// U+FFFD. Read byte by byte (FINDINGS A-279): a `%` before a character of more than one byte
+/// panicked, and `%+A` was a newline.
 fn percent_decode_simple(raw: &str) -> String {
     let hex = |byte: u8| char::from(byte).to_digit(16);
     let bytes = raw.as_bytes();
@@ -32791,10 +32792,10 @@ mod tests {
 
     /// FINDINGS A-279: the timer list's query reaches SY.admin decoded, as SY.admin's own HTTP route
     /// decodes it: a cursor (`<fire_at_utc_ms>:<uuid>`) written `%3A` is the one SY.timer gave and
-    /// an owner written `%40` the owner it knows, where both went encoded, the cursor refused
-    /// (TIMER_INVALID_PAYLOAD) and the owner matching none. A value written raw goes as it came, an
-    /// escape that is none stays as it came for SY.timer to refuse, a limit that is no number is
-    /// left out (SY.timer's default holds), and a value is decoded once.
+    /// an owner written `%40` the owner it knows, where both went encoded and SY.timer refused both
+    /// (TIMER_INVALID_PAYLOAD: a cursor with no `:`, an owner with no `@`). A value written raw goes
+    /// as it came, an escape that is none goes as it came, a limit that is no number is left out
+    /// (SY.timer's default holds), and a value is decoded once.
     #[test]
     fn the_timer_list_reaches_sy_timer_decoded() {
         let translate = |path: &str| {
@@ -32824,9 +32825,18 @@ mod tests {
             json!({ "owner_l2_name": "WF.onboarding@worker1", "cursor": cursor })
         );
 
+        // An escape that is none goes as it came: SY.timer refuses this cursor, with no `:`, and
+        // this owner, with no `@`.
         assert_eq!(
-            translate("/hives/worker1/timer/timers?cursor=1775577600000%3A%ZZ&owner_l2_name=WF.x%4&limit=ten").params,
-            json!({ "cursor": "1775577600000:%ZZ", "owner_l2_name": "WF.x%4" })
+            translate("/hives/worker1/timer/timers?cursor=%ZZ&owner_l2_name=WF.x%4&limit=ten")
+                .params,
+            json!({ "cursor": "%ZZ", "owner_l2_name": "WF.x%4" })
+        );
+        // Beside an escape that is one, too; this cursor is well formed, so SY.timer reads it as a
+        // place in its order and lists the timers after it (docs/sy-timer.md §7.6).
+        assert_eq!(
+            translate("/hives/worker1/timer/timers?cursor=1775577600000%3A%ZZ").params,
+            json!({ "cursor": "1775577600000:%ZZ" })
         );
         assert_eq!(
             translate("/hives/worker1/timer/timers?cursor=1775577600000%253A9d8c").params,
@@ -32892,8 +32902,9 @@ mod tests {
 
     /// FINDINGS A-279: a `%` without two hex digits after it stays as it came, whatever follows it:
     /// before a character of more than one byte it panicked (a byte index inside the character),
-    /// and before a sign it was a byte (`%+A` a newline). Two hex digits are the byte they name,
-    /// `+` is a space, and bytes that are no UTF-8 read as U+FFFD.
+    /// and before a sign it was a byte (`%+A` a newline). What follows it is read by the same
+    /// rules. Two hex digits are the byte they name, `+` is a space, and bytes that are no UTF-8
+    /// read as U+FFFD.
     #[test]
     fn percent_decoding_keeps_an_escape_that_is_none() {
         for (raw, decoded) in [
@@ -32907,6 +32918,8 @@ mod tests {
             ("100%", "100%"),
             // A sign is no hex digit: the `%` stays, and the `+` is a space.
             ("%+A", "% A"),
+            // The `%` stays, and the escape after it is one.
+            ("%%41", "%A"),
             ("%aé", "%aé"),
             ("%3é", "%3é"),
             ("%€", "%€"),
@@ -32918,8 +32931,11 @@ mod tests {
     }
 
     /// FINDINGS A-279: Archi's read tool names the timer list among the lists that answer in pages,
-    /// with what is its own: 100 timers without a limit (at most 1000), no total, and a cursor it
-    /// did not give refused with TIMER_INVALID_PAYLOAD.
+    /// with what is its own: 100 timers without a limit (limit up to 1000), no total, and a cursor
+    /// that is not one refused with TIMER_INVALID_PAYLOAD. The review: never "a cursor it did not
+    /// give", since SY.timer reads a well-formed cursor it never gave as a place in its order and
+    /// lists the timers after it (docs/sy-timer.md §7.6); and the 400 is the status of SY.admin's
+    /// HTTP route, while the model reads the mesh answer, its error_code.
     #[tokio::test]
     async fn the_read_tool_pages_the_timer_list() {
         let (context, _router) = harness_tool_context();
@@ -32934,12 +32950,13 @@ mod tests {
         );
         for text in [
             "/artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=",
-            "/hives/{hive}/timer/timers gives 100 timers without a limit (at most 1000)",
+            "/hives/{hive}/timer/timers gives 100 timers without a limit (limit up to 1000)",
             "next_cursor while timers follow and no total",
-            "TIMER_INVALID_PAYLOAD (HTTP 400)",
+            "a cursor that is not one (<fire_at_utc_ms>:<uuid>) is refused with TIMER_INVALID_PAYLOAD (HTTP 400 on SY.admin's route)",
         ] {
             assert!(pages.contains(text), "{text}: {pages}");
         }
+        assert!(!pages.contains("did not give"), "{pages}");
     }
 
     /// FINDINGS A-198: a plan whose answer did not fit one mesh frame ran: Archi says so, names its
