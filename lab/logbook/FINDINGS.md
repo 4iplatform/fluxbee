@@ -1492,6 +1492,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (0.1.136, the orchestrator):** `get_hive` refuses a hive id that fails `valid_hive_id`
   (`INVALID_HIVE_ID`), as `remove_hive` does, and so do `read_hive_info` and the existence probes,
   as a defense. 0.1.136's own change widens it, so it ships with it.
+- **Built on `coa/orch-136` (`111633b3`, its two-lens review's fixes `c23a485f`):** `get_hive` refuses
+  such an id and reads nothing; `read_hive_info` and `write_hive_info` refuse it before any path is
+  built; the inventory's, the deployments' and the drift alerts' probes and the add flows' stale
+  directory probe answer it as no hive, with no path touched; every refusal of a hive id (add_hive's
+  accept and each role's join flow, `remove_hive`, `get_hive`) is one answer whose message names the
+  rule in SY.admin's and SY.identity's words (*"hive_id must be a hive id: 1 to 64 letters, digits,
+  '_' or '-'"*), where the accept named a lowercase-only rule. The audit found no other path or
+  shell a request's hive id reaches unchecked; no legitimate id is refused. **With it in 0.1.136:**
+  SY.admin's help for `get_hive`, `add_hive` and `remove_hive` names `INVALID_HIVE_ID` (Archi reads
+  it); Archi's reconcile of a timed-out `add_hive` closes its record on `INVALID_HIVE_ID` as on
+  `NOT_FOUND` (it stayed open, and a retry was `OPERATION_ALREADY_TRACKED`); at the rebase on
+  0.1.133, A-281's registry reader (`registry_hives_with_roles`) skips a directory whose name is not
+  a hive id, as `read_registry_snapshot` does.
 
 ### A-310 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it) — Runtime retention skips a node config it cannot read, and can delete a version only that node pins
 
