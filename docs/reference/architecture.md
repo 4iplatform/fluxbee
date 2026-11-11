@@ -427,11 +427,13 @@ message to or from P, so a hive can neither take, redirect nor copy traffic it d
 Spoke-to-spoke traffic goes through the motherbee (design: Option B in
 [edge-multihop-reachability-spec-v1.md](../edge-multihop-reachability-spec-v1.md)). A gateway with
 two or more WAN peers sends each one a `WAN_REACHABILITY` message with the nodes of the other hives
-it knows (`broadcast_reachability`). A spoke accepts it only from the motherbee's gateway
-(`wan_reachability_voucher_allowed`, rule 6 in §7.3) and routes those nodes through the motherbee,
-which relays the frames, and a far spoke's `UNREACHABLE` or `TTL_EXCEEDED` back to their sender
-(`relay_far_answer`, FINDINGS A-245). A node learned this way gets data only: the router drops its
-protected system actions (`prepare_local_delivery`, `src_via_hub`).
+it knows (`broadcast_reachability`): with its LSA every `hello_interval`, to a spoke whose link
+comes up, and to every spoke as soon as an LSA changes a hive's nodes (FINDINGS A-195). A spoke
+accepts it only from the motherbee's gateway (`wan_reachability_voucher_allowed`, rule 6 in §7.3)
+and routes those nodes through the motherbee, which relays the frames, and a far spoke's
+`UNREACHABLE` or `TTL_EXCEEDED` back to their sender (`relay_far_answer`, FINDINGS A-245). A node
+learned this way gets data only: the router drops its protected system actions
+(`prepare_local_delivery`, `src_via_hub`).
 
 ### 5.3 Identity sync: 9100/tcp with a per-hive HMAC
 

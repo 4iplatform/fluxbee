@@ -101,6 +101,14 @@ wrote it, never as the sender wrote it.
     `foreign_source` and logged, at most every 30 s, as `router dropped a WAN frame: its sender is
     neither a node of the peer that sent it nor one that peer relays as the hub`. Until 0.1.83 the
     UUID was looked up in every bucket, so a spoke could send as another spoke's node.
+  - So a frame must not arrive before what names its sender (A-195, since 0.1.131). A router's
+    first frames on a new link, after the handshake, are its LSA and, on the hub, its reachability
+    advertisement, queued before the link takes anything else; and the hub advertises a hive's
+    nodes to every other spoke as soon as an LSA changes them, ahead of any frame it relays from a
+    node that LSA added, not only with its beacon every 10 s (`bring_wan_peer_up`,
+    `broadcast_reachability`). Until then a frame the hub relayed from a node that had just
+    connected on another spoke, or any for up to 10 s after a spoke's link came up, was dropped
+    this way, with no answer to its sender.
   - The name becomes `<role>@<that bucket's hive>` (`canonical_wan_src_name`), so a peer can only
     speak as `role@<itself>`, or, as the hub, as the nodes it relays (data only, §6.3).
   - A peer fills only its own LSA bucket: `apply_lsa_payload` rejects an LSA whose `hive` is not the
@@ -129,7 +137,8 @@ wrote it, never as the sender wrote it.
 Tests: `router_overwrites_spoofed_src_l2_name`,
 `edge01_wan_canonicalization_defeats_cross_hive_name_forgery`,
 `the_motherbee_drops_a_spokes_frame_sent_as_another_spokes_node`,
-`a_hive_cannot_take_another_nodes_uuid_whichever_lsa_comes_first`.
+`a_hive_cannot_take_another_nodes_uuid_whichever_lsa_comes_first`,
+`a_spoke_delivers_the_first_frame_the_hub_relays_from_a_node_that_just_connected`.
 
 ---
 

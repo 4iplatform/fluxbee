@@ -492,6 +492,7 @@ impl Router {
                 fib: Arc::clone(&self.fib),
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
+                reachability_adverts: Mutex::new(()),
                 log_stream: self.stream.clone(),
                 memory_reader: Arc::clone(&self.memory_reader),
                 opa: Arc::clone(&self.opa),
@@ -2422,23 +2423,25 @@ async fn build_local_lsa_payload(
     }
 }
 
-async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<(), RouterError> {
-    let peers: Vec<(String, WanPeer)> = {
+/// Sends this router's LSA, with the next seq, to every WAN peer. `lsa_seq`'s guard is held until
+/// every frame is queued, as in `broadcast_lsa_direct` and `bring_wan_peer_up` (A-195): each link
+/// gets the LSAs in the order of their seq, as its peer requires (an LSA whose seq is not above the
+/// last one's is `stale_seq`), and a link that comes up meanwhile gets this LSA or a later one.
+async fn broadcast_lsa(ctx: &WanContext) -> Result<(), RouterError> {
+    let mut seq_guard = ctx.lsa_seq.lock().await;
+    let peers: Vec<WanPeer> = {
         let guard = ctx.wan_peers.lock().await;
-        guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        guard.values().cloned().collect()
     };
     if peers.is_empty() {
         return Ok(());
     }
-    let mut seq_guard = ctx.lsa_seq.lock().await;
     *seq_guard = seq_guard.saturating_add(1);
-    let seq = *seq_guard;
-    drop(seq_guard);
     let payload = build_local_lsa_payload(
         ctx.router_uuid,
         &ctx.router_name,
         &ctx.hive_id,
-        seq,
+        *seq_guard,
         &ctx.nodes,
         &ctx.peer_nodes,
         &ctx.static_routes,
@@ -2446,12 +2449,7 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
         &ctx.tap_rules,
     )
     .await;
-    for (hive, peer) in peers.iter() {
-        if let Some(target) = target_hive {
-            if target != hive {
-                continue;
-            }
-        }
+    for peer in peers.iter() {
         let msg = build_lsa(
             &ctx.router_uuid.to_string(),
             &peer.router_uuid.to_string(),
@@ -2464,12 +2462,104 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// What a hub vouches for (Option B), from its LSA state: each hive's nodes, a stale hive's left
+/// out, and the UUIDs that two hives list, a stale one included. Such a UUID resolves to neither
+/// hive here (`find_remote_node`), and is vouched for to no spoke either, so no spoke routes it to
+/// one of them.
+struct Vouched {
+    hives: Vec<(String, Vec<LsaNode>)>,
+    contested: HashSet<Uuid>,
+}
+
+async fn vouched_nodes(ctx: &WanContext) -> Vouched {
+    let guard = ctx.lsa_state.lock().await;
+    let mut listed_by: HashMap<Uuid, usize> = HashMap::new();
+    for st in guard.values() {
+        let uuids: HashSet<Uuid> = st
+            .nodes
+            .iter()
+            .filter_map(|node| Uuid::parse_str(&node.uuid).ok())
+            .collect();
+        for uuid in uuids {
+            *listed_by.entry(uuid).or_default() += 1;
+        }
+    }
+    let contested: HashSet<Uuid> = listed_by
+        .into_iter()
+        .filter(|(_, hives)| *hives > 1)
+        .map(|(uuid, _)| uuid)
+        .collect();
+    let hives: Vec<(String, Vec<LsaNode>)> = guard
+        .iter()
+        .filter(|(_, st)| st.flags & FLAG_STALE == 0)
+        .map(|(hive, st)| (hive.clone(), st.nodes.clone()))
+        .collect();
+    Vouched { hives, contested }
+}
+
+/// The hub's `WAN_REACHABILITY` frame for the link of `target_hive`, whose router is
+/// `target_router`: every node it vouches for but the target's own (split-horizon: a spoke learns
+/// its own nodes from its own LSA). None when there is no node to tell of.
+fn reachability_frame(
+    ctx: &WanContext,
+    vouched: &Vouched,
+    target_hive: &str,
+    target_router: Uuid,
+    seq: u64,
+) -> Option<Vec<u8>> {
+    let mut entries: Vec<WanReachabilityEntry> = Vec::new();
+    for (origin_hive, nodes) in vouched.hives.iter() {
+        if origin_hive == target_hive {
+            continue;
+        }
+        for node in nodes {
+            if Uuid::parse_str(&node.uuid).is_ok_and(|uuid| vouched.contested.contains(&uuid)) {
+                continue;
+            }
+            entries.push(WanReachabilityEntry {
+                uuid: node.uuid.clone(),
+                name: node.name.clone(),
+                hive_id: origin_hive.clone(),
+                vpn_id: node.vpn_id,
+            });
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let payload = WanReachabilityPayload {
+        origin_hive: ctx.hive_id.clone(),
+        router_id: ctx.router_uuid.to_string(),
+        router_name: ctx.router_name.clone(),
+        seq,
+        timestamp: seq.to_string(),
+        entries,
+    };
+    let msg = build_wan_reachability(
+        &ctx.router_uuid.to_string(),
+        &target_router.to_string(),
+        &Uuid::new_v4().to_string(),
+        payload,
+    );
+    serde_json::to_vec(&msg).ok()
+}
+
 /// Option B: the hub advertises which spoke nodes are reachable THROUGH it, so a spoke can resolve
 /// and forward toward a non-adjacent hive. Sent to each WAN peer with SPLIT-HORIZON (a peer is
 /// never told its own nodes). A leaf with fewer than 2 WAN peers naturally sends nothing. Authored
 /// in THIS router's own authenticated bucket (`origin_hive == this hive`), so it never violates the
 /// EDGE-01 LSA bucket binding; the receiver additionally gates on the voucher being the primary hub.
+///
+/// The hub sends it with its LSA beacon, every hello interval; to a spoke whose link comes up,
+/// right after its LSA (`bring_wan_peer_up`); and to every peer as soon as an LSA changes a hive's
+/// nodes (A-195). Until 0.1.131 only the beacon sent it, so for up to a hello interval a spoke
+/// dropped every frame the hub relayed from a node it had not vouched for yet: one that had just
+/// connected to another spoke, or any, once the spoke's own link had come up again. A spoke takes
+/// each advertisement for the hub's whole set, so the hub builds and queues them one at a time
+/// (`reachability_adverts`), and each link gets them in the order they were built: an older one
+/// queued after a newer would take back what the newer added, until the next beacon.
 async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
+    let _in_order = ctx.reachability_adverts.lock().await;
     let peers: Vec<(String, WanPeer)> = {
         let guard = ctx.wan_peers.lock().await;
         guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -2477,74 +2567,69 @@ async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
     if peers.len() < 2 {
         return Ok(()); // only a hub (>=2 peers) can relay between spokes
     }
-    let (state, contested) = {
-        let guard = ctx.lsa_state.lock().await;
-        // A UUID that two hives list resolves to neither here (`find_remote_node`); it is not
-        // vouched for either, so no spoke routes it to one of them.
-        let mut listed_by: HashMap<Uuid, usize> = HashMap::new();
-        for st in guard.values() {
-            let uuids: HashSet<Uuid> = st
-                .nodes
-                .iter()
-                .filter_map(|node| Uuid::parse_str(&node.uuid).ok())
-                .collect();
-            for uuid in uuids {
-                *listed_by.entry(uuid).or_default() += 1;
-            }
-        }
-        let contested: HashSet<Uuid> = listed_by
-            .into_iter()
-            .filter(|(_, hives)| *hives > 1)
-            .map(|(uuid, _)| uuid)
-            .collect();
-        let state: Vec<(String, Vec<LsaNode>)> = guard
-            .iter()
-            .filter(|(_, st)| st.flags & FLAG_STALE == 0)
-            .map(|(hive, st)| (hive.clone(), st.nodes.clone()))
-            .collect();
-        (state, contested)
-    };
+    let vouched = vouched_nodes(ctx).await;
     let seq = now_epoch_ms();
     for (target_hive, peer) in peers.iter() {
-        let mut entries: Vec<WanReachabilityEntry> = Vec::new();
-        for (origin_hive, nodes) in state.iter() {
-            if origin_hive == target_hive {
-                continue; // split-horizon: the target learns its own nodes via its own LSA
-            }
-            for node in nodes {
-                if Uuid::parse_str(&node.uuid).is_ok_and(|uuid| contested.contains(&uuid)) {
-                    continue;
-                }
-                entries.push(WanReachabilityEntry {
-                    uuid: node.uuid.clone(),
-                    name: node.name.clone(),
-                    hive_id: origin_hive.clone(),
-                    vpn_id: node.vpn_id,
-                });
-            }
-        }
-        if entries.is_empty() {
-            continue;
-        }
-        let payload = WanReachabilityPayload {
-            origin_hive: ctx.hive_id.clone(),
-            router_id: ctx.router_uuid.to_string(),
-            router_name: ctx.router_name.clone(),
-            seq,
-            timestamp: seq.to_string(),
-            entries,
-        };
-        let msg = build_wan_reachability(
-            &ctx.router_uuid.to_string(),
-            &peer.router_uuid.to_string(),
-            &Uuid::new_v4().to_string(),
-            payload,
-        );
-        if let Ok(data) = serde_json::to_vec(&msg) {
-            peer.sender.queue_own(data);
+        if let Some(frame) = reachability_frame(ctx, &vouched, target_hive, peer.router_uuid, seq) {
+            peer.sender.queue_own(frame);
         }
     }
     Ok(())
+}
+
+/// Puts the link of a WAN session that just came up in the WAN table, its first frames queued ahead
+/// of anything another task can hand it: this router's LSA and, from a hub, the reachability it
+/// vouches for (A-195). Until 0.1.131 the link went into the table first, so a frame another task
+/// handed it in between went out before the LSA, and the peer dropped it, its sender not yet named;
+/// and the hub's reachability waited for its next beacon, up to a hello interval in which the
+/// spoke dropped every frame the hub relayed to it from another spoke.
+///
+/// `lsa_seq`'s guard and the advertisements' lock are held until the link is in the table: an LSA
+/// or an advertisement built after these goes to the link too, and one built before has nothing
+/// these lack.
+async fn bring_wan_peer_up(ctx: &WanContext, hive: &str, peer: WanPeer) {
+    let mut seq_guard = ctx.lsa_seq.lock().await;
+    *seq_guard = seq_guard.saturating_add(1);
+    let payload = build_local_lsa_payload(
+        ctx.router_uuid,
+        &ctx.router_name,
+        &ctx.hive_id,
+        *seq_guard,
+        &ctx.nodes,
+        &ctx.peer_nodes,
+        &ctx.static_routes,
+        &ctx.vpn_rules,
+        &ctx.tap_rules,
+    )
+    .await;
+    let lsa = build_lsa(
+        &ctx.router_uuid.to_string(),
+        &peer.router_uuid.to_string(),
+        &Uuid::new_v4().to_string(),
+        payload,
+    );
+    if let Ok(frame) = serde_json::to_vec(&lsa) {
+        peer.sender.queue_own(frame);
+    }
+    let _in_order = ctx.reachability_adverts.lock().await;
+    // A hub: with this link it has two peers or more (`broadcast_reachability`). A hive that comes
+    // up again while its old session still holds its entry is not counted twice.
+    let other_peers = ctx
+        .wan_peers
+        .lock()
+        .await
+        .keys()
+        .filter(|other| other.as_str() != hive)
+        .count();
+    if other_peers > 0 {
+        let vouched = vouched_nodes(ctx).await;
+        if let Some(frame) =
+            reachability_frame(ctx, &vouched, hive, peer.router_uuid, now_epoch_ms())
+        {
+            peer.sender.queue_own(frame);
+        }
+    }
+    ctx.wan_peers.lock().await.insert(hive.to_string(), peer);
 }
 
 /// Ingest a hub-authored `MSG_WAN_REACHABILITY` (Option B). Gated: only the primary hub may vouch
@@ -2645,6 +2730,9 @@ fn lsa_listed_uuids(snapshot: &Option<LsaSnapshot>) -> HashSet<Uuid> {
         .collect()
 }
 
+/// `broadcast_lsa` for a node's connection, which has no WAN context: as a node connects or leaves,
+/// every WAN peer gets the LSA that lists it or no longer does. `lsa_seq`'s guard is held until
+/// every frame is queued, as there (A-195).
 async fn broadcast_lsa_direct(
     router_uuid: Uuid,
     router_name: &str,
@@ -2657,22 +2745,20 @@ async fn broadcast_lsa_direct(
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_seq: &Arc<Mutex<u64>>,
 ) -> Result<(), RouterError> {
-    let peers: Vec<(String, WanPeer)> = {
+    let mut seq_guard = lsa_seq.lock().await;
+    let peers: Vec<WanPeer> = {
         let guard = wan_peers.lock().await;
-        guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        guard.values().cloned().collect()
     };
     if peers.is_empty() {
         return Ok(());
     }
-    let mut seq_guard = lsa_seq.lock().await;
     *seq_guard = seq_guard.saturating_add(1);
-    let seq = *seq_guard;
-    drop(seq_guard);
     let payload = build_local_lsa_payload(
         router_uuid,
         router_name,
         hive_id,
-        seq,
+        *seq_guard,
         nodes,
         peer_nodes,
         static_routes,
@@ -2680,7 +2766,7 @@ async fn broadcast_lsa_direct(
         tap_rules,
     )
     .await;
-    for (_hive, peer) in peers {
+    for peer in peers {
         let msg = build_lsa(
             &router_uuid.to_string(),
             &peer.router_uuid.to_string(),
@@ -2696,10 +2782,13 @@ async fn broadcast_lsa_direct(
 #[derive(Debug)]
 enum LsaApplyResult {
     /// Applied, without the nodes it listed under another hive's name. `duplicate_uuids` names the
-    /// nodes it listed under a UUID already taken (`apply_lsa_payload`).
+    /// nodes it listed under a UUID already taken (`apply_lsa_payload`). `nodes_changed` says
+    /// whether the hive's nodes are not the ones it had, for the hub to tell the other spokes at
+    /// once (A-195).
     Applied {
         foreign_nodes: Vec<String>,
         duplicate_uuids: Vec<String>,
+        nodes_changed: bool,
     },
     Rejected {
         reason: &'static str,
@@ -2788,6 +2877,8 @@ async fn apply_lsa_payload(
             }
         }
     };
+    // A hive that was stale until this LSA had its nodes left out of the hub's reachability.
+    let was_stale = entry.flags & FLAG_STALE != 0;
     entry.last_seq = payload.seq;
     entry.last_updated = now_epoch_ms();
     entry.flags &= !FLAG_STALE;
@@ -2825,6 +2916,10 @@ async fn apply_lsa_payload(
         }
         nodes.push(node);
     }
+    // A-195: the nodes kept are compared with the hive's last ones as sets: a router lists its
+    // nodes in its map's order, which differs from one LSA to the next, so a list's order says
+    // nothing. A hive new here had none.
+    let nodes_changed = was_stale || lsa_node_set(&nodes) != lsa_node_set(&entry.nodes);
     entry.nodes = nodes;
     entry.routes = payload.routes;
     entry.vpns = payload.vpns;
@@ -2832,7 +2927,16 @@ async fn apply_lsa_payload(
     LsaApplyResult::Applied {
         foreign_nodes,
         duplicate_uuids,
+        nodes_changed,
     }
+}
+
+/// An LSA's nodes as `(uuid, name, vpn_id)`, in no order.
+fn lsa_node_set(nodes: &[LsaNode]) -> HashSet<(&str, &str, u32)> {
+    nodes
+        .iter()
+        .map(|node| (node.uuid.as_str(), node.name.as_str(), node.vpn_id))
+        .collect()
 }
 
 async fn write_lsa_state(ctx: &WanContext) {
@@ -3049,7 +3153,7 @@ async fn lsa_broadcast_loop(ctx: Arc<WanContext>) {
     loop {
         ticker.tick().await;
         write_lsa_state(&ctx).await;
-        let _ = broadcast_lsa(&ctx, None).await;
+        let _ = broadcast_lsa(&ctx).await;
         // Option B: the hub re-advertises transitive reachability alongside its LSA beacon.
         let _ = broadcast_reachability(&ctx).await;
     }
@@ -3546,18 +3650,15 @@ where
     }
     tx.queue_own(serde_json::to_vec(&accept)?);
 
-    {
-        let mut guard = ctx.wan_peers.lock().await;
-        guard.insert(
-            peer_hello.hive_id.clone(),
-            WanPeer {
-                sender: tx.clone(),
-                router_uuid: peer_uuid,
-            },
-        );
-    }
-
-    let _ = broadcast_lsa(&ctx, Some(&peer_hello.hive_id)).await;
+    bring_wan_peer_up(
+        &ctx,
+        &peer_hello.hive_id,
+        WanPeer {
+            sender: tx.clone(),
+            router_uuid: peer_uuid,
+        },
+    )
+    .await;
 
     // A hive removed while its link is up is cut off within one registry recheck.
     let unregistered = hive_unregistered(registry, &peer_hello.hive_id, ctx.hive_registry_recheck);
@@ -3701,6 +3802,7 @@ async fn handle_wan_message(
                 LsaApplyResult::Applied {
                     foreign_nodes,
                     duplicate_uuids,
+                    nodes_changed,
                 } => {
                     if !foreign_nodes.is_empty() {
                         let reject_count = count_lsa_rejects(
@@ -3735,6 +3837,13 @@ async fn handle_wan_message(
                         );
                     }
                     write_lsa_state(ctx).await;
+                    // A-195: the hub tells the other spokes of a hive's nodes as they change, not
+                    // at its next beacon. This session handles its frames in order and each link
+                    // keeps the order of its own, so every other spoke has the advertisement before
+                    // the first frame the hub relays to it from a node this LSA added.
+                    if nodes_changed {
+                        let _ = broadcast_reachability(ctx).await;
+                    }
                 }
                 LsaApplyResult::Rejected {
                     reason,
@@ -5583,6 +5692,9 @@ struct WanContext {
     fib: Arc<Mutex<Vec<FibEntry>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
+    /// Held while a reachability advertisement is built and queued (`broadcast_reachability`,
+    /// `bring_wan_peer_up`), so each link gets them in the order they were built (A-195).
+    reachability_adverts: Mutex<()>,
     log_stream: stream::StreamHandle,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     opa: Arc<Mutex<OpaResolver>>,
@@ -12769,14 +12881,14 @@ mod tests {
                 router_uuid: Uuid::new_v4(),
             },
         );
-        broadcast_lsa(&ctx, None).await.expect("an LSA");
+        broadcast_lsa(&ctx).await.expect("an LSA");
         assert_eq!(
             wan_tx.depth().0,
             LINK_QUEUE_SENDERS_FRAMES + 1,
             "the LSA went though senders are refused"
         );
         fill_to_the_brim(&wan_tx);
-        broadcast_lsa(&ctx, None).await.expect("an LSA");
+        broadcast_lsa(&ctx).await.expect("an LSA");
         assert_eq!(wan_tx.depth().0, LINK_QUEUE_MAX_FRAMES, "skipped");
         let lsas = messages_on(&mut wan)
             .into_iter()
@@ -13023,15 +13135,16 @@ mod tests {
             "broadcast_to_wan",
             "deliver_locally",
         ];
-        // The ANNOUNCE, UNREACHABLE and TTL_EXCEEDED, LSAs and reachability, the WAN and IRP
-        // handshakes, and another router's UNREACHABLE relayed to its node or, from the hub,
-        // toward its node's spoke (A-245).
+        // The ANNOUNCE, UNREACHABLE and TTL_EXCEEDED, LSAs and reachability, a new WAN link's first
+        // ones among them (A-195), the WAN and IRP handshakes, and another router's UNREACHABLE
+        // relayed to its node or, from the hub, toward its node's spoke (A-245).
         let routers_own = [
             "handle_node",
             "send_unreachable_to",
             "send_ttl_exceeded_to",
             "broadcast_lsa",
             "broadcast_reachability",
+            "bring_wan_peer_up",
             "broadcast_lsa_direct",
             "handle_wan_connection",
             "handle_wan_message",
@@ -14423,6 +14536,7 @@ mod tests {
             fib: Arc::new(Mutex::new(Vec::new())),
             broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
+            reachability_adverts: Mutex::new(()),
             log_stream: stream::StreamHandle::detached(),
             memory_reader: Arc::new(Mutex::new(None)),
             opa: Arc::new(Mutex::new(OpaResolver::new())),
@@ -14685,13 +14799,15 @@ mod tests {
     }
 
     /// The peer's side of an accepted link, brought up as `hive`: its HELLO, then the router's
-    /// HELLO, WAN_ACCEPT and LSA. The LSA goes out once the session holds the hive's entry.
-    async fn bring_up_accepted_link(peer: &mut tokio::io::DuplexStream, hive: &str) {
-        bring_up_accepted_link_with(peer, &wan_hello_frame(hive)).await;
+    /// HELLO, WAN_ACCEPT and LSA; the UUID of the router its HELLO named. The session queues the
+    /// LSA right before it puts the hive's entry in its WAN table (A-195): a test that reads the
+    /// entry waits for it (`wan_peer_entry`).
+    async fn bring_up_accepted_link(peer: &mut tokio::io::DuplexStream, hive: &str) -> Uuid {
+        bring_up_accepted_link_with(peer, &wan_hello_frame(hive)).await
     }
 
     /// The same with the peer's HELLO given.
-    async fn bring_up_accepted_link_with(peer: &mut tokio::io::DuplexStream, hello: &[u8]) {
+    async fn bring_up_accepted_link_with(peer: &mut tokio::io::DuplexStream, hello: &[u8]) -> Uuid {
         write_frame(peer, hello).await.expect("send hello");
         for expected in [MSG_HELLO, fluxbee_sdk::protocol::MSG_WAN_ACCEPT, MSG_LSA] {
             assert_eq!(
@@ -14699,6 +14815,28 @@ mod tests {
                 Some(expected)
             );
         }
+        let hello: Message = serde_json::from_slice(hello).expect("a HELLO");
+        let hello: WanHelloPayload = serde_json::from_value(hello.payload).expect("its payload");
+        Uuid::parse_str(&hello.router_id).expect("its router")
+    }
+
+    /// Waits until `hive`'s entry in the WAN table is the one of the session whose peer's router is
+    /// `router`.
+    async fn wan_peer_entry(ctx: &WanContext, hive: &str, router: Uuid) {
+        for _ in 0..10_000 {
+            if ctx
+                .wan_peers
+                .lock()
+                .await
+                .get(hive)
+                .map(|peer| peer.router_uuid)
+                == Some(router)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{hive} has no entry of the session with {router}");
     }
 
     /// A request from a node of this hive to `dst`, a node of another hive.
@@ -14745,8 +14883,8 @@ mod tests {
         let ctx = test_wan_context(None);
         let (server, mut worker1) = tokio::io::duplex(64 * 1024);
         let session = spawn_accepted_link(server, &ctx);
-        bring_up_accepted_link(&mut worker1, "worker1").await;
-        assert!(ctx.wan_peers.lock().await.contains_key("worker1"));
+        let router = bring_up_accepted_link(&mut worker1, "worker1").await;
+        wan_peer_entry(&ctx, "worker1", router).await;
 
         end_in_a_partial_frame(worker1).await;
         let err = time::timeout(Duration::from_secs(2), session)
@@ -14786,12 +14924,12 @@ mod tests {
         let ctx = test_wan_context(None);
         let (old_server, mut old_link) = tokio::io::duplex(64 * 1024);
         let old_session = spawn_accepted_link(old_server, &ctx);
-        bring_up_accepted_link(&mut old_link, "worker1").await;
-        let old_router = ctx.wan_peers.lock().await["worker1"].router_uuid;
+        let old_router = bring_up_accepted_link(&mut old_link, "worker1").await;
+        wan_peer_entry(&ctx, "worker1", old_router).await;
         let (new_server, mut new_link) = tokio::io::duplex(64 * 1024);
         let new_session = spawn_accepted_link(new_server, &ctx);
-        bring_up_accepted_link(&mut new_link, "worker1").await;
-        let new_router = ctx.wan_peers.lock().await["worker1"].router_uuid;
+        let new_router = bring_up_accepted_link(&mut new_link, "worker1").await;
+        wan_peer_entry(&ctx, "worker1", new_router).await;
         assert_ne!(old_router, new_router);
 
         drop(old_link);
@@ -15972,6 +16110,473 @@ mod tests {
             [(message.routing.trace_id.clone(), "LINK_BUSY".to_string())],
             "the sender hears of its own message once, and never of the copy"
         );
+    }
+
+    /// The names each `WAN_REACHABILITY` on `link` vouches for, sorted.
+    fn adverts_on(link: &mut LinkReceiver) -> Vec<Vec<String>> {
+        messages_on(link)
+            .into_iter()
+            .filter(|msg| msg.meta.msg.as_deref() == Some(MSG_WAN_REACHABILITY))
+            .map(|msg| {
+                let payload: WanReachabilityPayload =
+                    serde_json::from_value(msg.payload).expect("a reachability payload");
+                let mut names: Vec<String> = payload
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect();
+                names.sort();
+                names
+            })
+            .collect()
+    }
+
+    /// Hands `ctx` `frame` as `hive`'s router sent it, over `link`.
+    async fn wan_frame_from(ctx: &WanContext, hive: &str, link: &LinkSender, frame: &Message) {
+        handle_wan_message(
+            frame,
+            link,
+            ctx,
+            hive,
+            Uuid::new_v4(),
+            &format!("RT.gateway@{hive}"),
+            1,
+        )
+        .await
+        .expect("handled");
+    }
+
+    /// Hands `ctx` the LSA `hive` sends with `nodes`, over `link`.
+    async fn lsa_from(
+        ctx: &WanContext,
+        hive: &str,
+        link: &LinkSender,
+        seq: u64,
+        nodes: &[(Uuid, &str)],
+    ) {
+        let lsa = lsa_message(hive, seq, nodes, ctx.router_uuid);
+        wan_frame_from(ctx, hive, link, &lsa).await;
+    }
+
+    /// A-195 on the hub: an LSA that changes a hive's nodes (one added, one gone, a VPN changed)
+    /// sends every spoke the hub's reachability at once, each without its own nodes; the same nodes
+    /// again, in another order too, send nothing; a hive that was stale counts as changed. Until
+    /// 0.1.131 only the beacon sent it, every hello interval.
+    #[tokio::test]
+    async fn the_hub_tells_every_spoke_of_a_hives_changed_nodes_at_once() {
+        let ctx = test_wan_context(None);
+        let (ingress1_link, mut ingress1) = link_queue("wan");
+        let (worker1_link, mut worker1) = link_queue("wan");
+        for (hive, sender) in [
+            ("ingress1", ingress1_link.clone()),
+            ("worker1", worker1_link.clone()),
+        ] {
+            ctx.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        let io_x = (Uuid::new_v4(), "IO.x@ingress1");
+        let sales = (Uuid::new_v4(), "AI.sales@worker1");
+        let support = (Uuid::new_v4(), "AI.support@worker1");
+        let names = |names: &[&str]| -> Vec<Vec<String>> {
+            vec![names.iter().map(|name| name.to_string()).collect()]
+        };
+
+        // ingress1's node: worker1 hears of it; ingress1 has no other spoke's node to hear of.
+        lsa_from(&ctx, "ingress1", &ingress1_link, 1, &[io_x]).await;
+        assert_eq!(adverts_on(&mut worker1), names(&["IO.x@ingress1"]));
+        assert!(adverts_on(&mut ingress1).is_empty());
+
+        // worker1's two nodes: ingress1 hears of them, worker1 of ingress1's node alone.
+        lsa_from(&ctx, "worker1", &worker1_link, 1, &[sales, support]).await;
+        assert_eq!(
+            adverts_on(&mut ingress1),
+            names(&["AI.sales@worker1", "AI.support@worker1"])
+        );
+        assert_eq!(adverts_on(&mut worker1), names(&["IO.x@ingress1"]));
+
+        // The same nodes again, and in the other order: a router lists them in no fixed order.
+        lsa_from(&ctx, "worker1", &worker1_link, 2, &[sales, support]).await;
+        lsa_from(&ctx, "worker1", &worker1_link, 3, &[support, sales]).await;
+        assert!(adverts_on(&mut ingress1).is_empty(), "nothing changed");
+        assert!(adverts_on(&mut worker1).is_empty(), "nothing changed");
+
+        // A node gone; then the one left in another VPN; then worker1 stale, its nodes left out of
+        // the reachability, and back with the same ones.
+        let gone = lsa_message("worker1", 4, &[sales], ctx.router_uuid);
+        let mut moved = lsa_message("worker1", 5, &[sales], ctx.router_uuid);
+        moved.payload["nodes"][0]["vpn_id"] = serde_json::json!(7);
+        let mut back = moved.clone();
+        back.payload["seq"] = serde_json::json!(6);
+        for (case, lsa, stale_before) in [
+            ("a node gone", gone, false),
+            ("a node's VPN changed", moved, false),
+            ("back from stale", back, true),
+        ] {
+            if stale_before {
+                ctx.lsa_state
+                    .lock()
+                    .await
+                    .get_mut("worker1")
+                    .expect("worker1's state")
+                    .flags |= FLAG_STALE;
+            }
+            wan_frame_from(&ctx, "worker1", &worker1_link, &lsa).await;
+            assert_eq!(
+                adverts_on(&mut ingress1),
+                names(&["AI.sales@worker1"]),
+                "{case}"
+            );
+            assert_eq!(
+                adverts_on(&mut worker1),
+                names(&["IO.x@ingress1"]),
+                "{case}"
+            );
+        }
+    }
+
+    /// A-195 end to end: a node that has just connected on worker1 sends to a node of ingress1. The
+    /// hub relays the frame and ingress1 delivers it: the hub's advertisement of the new node, sent
+    /// as worker1's LSA named it, reaches ingress1 ahead of the frame, on the same link. Until
+    /// 0.1.131 ingress1 dropped the frame as a foreign source's, unless the hub's beacon had come
+    /// in between.
+    #[tokio::test]
+    async fn a_spoke_delivers_the_first_frame_the_hub_relays_from_a_node_that_just_connected() {
+        let hub = test_wan_context(None);
+        let lsa_name = format!("/lsa-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        unlink_test_shm(&lsa_name);
+        *hub.lsa_writer.lock().await = Some(
+            LsaRegionWriter::open_or_create(&lsa_name, hub.router_uuid, "motherbee")
+                .expect("lsa region"),
+        );
+        let ingress1 = wan_context_of("ingress1", None);
+        let receiver = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = link_queue("node");
+        ingress1.nodes.lock().await.insert(
+            receiver,
+            NodeHandle {
+                name: "IO.x@ingress1".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let (hub_to_ingress1, mut ingress1_reads) = link_queue("wan");
+        let (hub_to_worker1, _worker1_reads) = link_queue("wan");
+        for (hive, link) in [
+            ("ingress1", hub_to_ingress1.clone()),
+            ("worker1", hub_to_worker1.clone()),
+        ] {
+            hub.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: link,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+        }
+        // ingress1's LSA named its node long ago.
+        lsa_from(
+            &hub,
+            "ingress1",
+            &hub_to_ingress1,
+            1,
+            &[(receiver, "IO.x@ingress1")],
+        )
+        .await;
+        assert!(messages_on(&mut ingress1_reads).is_empty());
+
+        // A node connects on worker1: worker1's LSA names it, then its first frame comes.
+        let new_node = Uuid::new_v4();
+        lsa_from(
+            &hub,
+            "worker1",
+            &hub_to_worker1,
+            1,
+            &[(new_node, "AI.new@worker1")],
+        )
+        .await;
+        let first = Message {
+            routing: Routing {
+                src: new_node.to_string(),
+                src_l2_name: Some("AI.new@worker1".to_string()),
+                dst: Destination::Unicast(receiver.to_string()),
+                ttl: 15,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        handle_wan_message(
+            &first,
+            &hub_to_worker1,
+            &hub,
+            "worker1",
+            Uuid::new_v4(),
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("handled");
+
+        // ingress1 reads its link in order.
+        let frames = messages_on(&mut ingress1_reads);
+        let kinds: Vec<Option<&str>> = frames.iter().map(|f| f.meta.msg.as_deref()).collect();
+        assert_eq!(
+            kinds,
+            [Some(MSG_WAN_REACHABILITY), None],
+            "the advertisement first"
+        );
+        let (ingress1_to_hub, _hub_reads_ingress1) = link_queue("wan");
+        for frame in &frames {
+            handle_wan_message(
+                frame,
+                &ingress1_to_hub,
+                &ingress1,
+                "motherbee",
+                hub.router_uuid,
+                "RT.gateway@motherbee",
+                1,
+            )
+            .await
+            .expect("handled");
+        }
+        let delivered = messages_on(&mut receiver_rx);
+        assert_eq!(delivered.len(), 1, "delivered");
+        assert_eq!(delivered[0].routing.trace_id, first.routing.trace_id);
+        assert_eq!(
+            delivered[0].routing.src_l2_name.as_deref(),
+            Some("AI.new@worker1")
+        );
+        assert_eq!(
+            ingress1
+                .lsa_reject_counters
+                .lock()
+                .await
+                .get(LSA_REJECT_FOREIGN_SOURCE),
+            None
+        );
+        unlink_test_shm(&lsa_name);
+    }
+
+    /// A-195 at a link-up: a spoke that comes up on the hub reads its HELLO, WAN_ACCEPT and LSA,
+    /// then its reachability, the other spokes' nodes, before anything else. Until 0.1.131 the
+    /// reachability waited for the hub's next beacon, up to a hello interval.
+    #[tokio::test]
+    async fn a_spoke_whose_link_comes_up_hears_the_hubs_reachability_right_after_its_lsa() {
+        let ctx = test_wan_context(None);
+        let mut other_spokes = Vec::new();
+        for (hive, name) in [
+            ("ingress1", "IO.x@ingress1"),
+            ("worker1", "AI.sales@worker1"),
+        ] {
+            ctx.lsa_state.lock().await.insert(
+                hive.to_string(),
+                RemoteHiveState {
+                    nodes: vec![LsaNode {
+                        uuid: Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        vpn_id: 0,
+                    }],
+                    ..RemoteHiveState::default()
+                },
+            );
+            let (link, reads) = link_queue("wan");
+            ctx.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: link,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+            other_spokes.push(reads);
+        }
+        let (server, mut worker2) = tokio::io::duplex(64 * 1024);
+        let session = spawn_accepted_link(server, &ctx);
+        let router = bring_up_accepted_link(&mut worker2, "worker2").await;
+        let advert = time::timeout(Duration::from_secs(2), read_system_message(&mut worker2))
+            .await
+            .expect("a frame right after the LSA");
+        assert_eq!(advert.meta.msg.as_deref(), Some(MSG_WAN_REACHABILITY));
+        let payload: WanReachabilityPayload =
+            serde_json::from_value(advert.payload).expect("a reachability payload");
+        let mut vouched: Vec<String> = payload
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        vouched.sort();
+        assert_eq!(vouched, ["AI.sales@worker1", "IO.x@ingress1"]);
+        wan_peer_entry(&ctx, "worker2", router).await;
+        for reads in &mut other_spokes {
+            assert!(
+                messages_on(reads).is_empty(),
+                "the other spokes hear nothing new"
+            );
+        }
+        drop(worker2);
+        time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends")
+            .expect("session task")
+            .expect("session result");
+    }
+
+    /// A-195: a new link's first frames are its LSA and, from a hub, its reachability, queued
+    /// before the link goes into the WAN table. A hive with no other peer (a spoke's uplink, or a
+    /// hive coming up again while its old session still holds its entry) sends no reachability,
+    /// nor does a hub with no node to vouch for to it.
+    #[tokio::test]
+    async fn a_new_links_first_frames_are_its_lsa_and_from_a_hub_its_reachability() {
+        let first_frames = |reads: &mut LinkReceiver| -> Vec<String> {
+            messages_on(reads)
+                .into_iter()
+                .map(|msg| msg.meta.msg.unwrap_or_default())
+                .collect()
+        };
+        let hub = test_wan_context(None);
+        hub.lsa_state.lock().await.insert(
+            "ingress1".to_string(),
+            RemoteHiveState {
+                nodes: vec![LsaNode {
+                    uuid: Uuid::new_v4().to_string(),
+                    name: "IO.x@ingress1".to_string(),
+                    vpn_id: 0,
+                }],
+                ..RemoteHiveState::default()
+            },
+        );
+        // worker2 first: the hub's only peer.
+        let (old_link, mut old_reads) = link_queue("wan");
+        let old_router = Uuid::new_v4();
+        bring_wan_peer_up(
+            &hub,
+            "worker2",
+            WanPeer {
+                sender: old_link,
+                router_uuid: old_router,
+            },
+        )
+        .await;
+        assert_eq!(first_frames(&mut old_reads), [MSG_LSA]);
+        // worker2 again, its old session's entry still there.
+        let (new_link, mut new_reads) = link_queue("wan");
+        let new_router = Uuid::new_v4();
+        bring_wan_peer_up(
+            &hub,
+            "worker2",
+            WanPeer {
+                sender: new_link,
+                router_uuid: new_router,
+            },
+        )
+        .await;
+        assert_eq!(first_frames(&mut new_reads), [MSG_LSA]);
+        assert_eq!(
+            hub.wan_peers.lock().await["worker2"].router_uuid,
+            new_router
+        );
+        // ingress1, the second peer: worker2's nodes, none, are nothing to vouch for.
+        let (ingress1_link, mut ingress1_reads) = link_queue("wan");
+        bring_wan_peer_up(
+            &hub,
+            "ingress1",
+            WanPeer {
+                sender: ingress1_link,
+                router_uuid: Uuid::new_v4(),
+            },
+        )
+        .await;
+        assert_eq!(first_frames(&mut ingress1_reads), [MSG_LSA]);
+        // worker1, a third: ingress1's node.
+        let (worker1_link, mut worker1_reads) = link_queue("wan");
+        bring_wan_peer_up(
+            &hub,
+            "worker1",
+            WanPeer {
+                sender: worker1_link,
+                router_uuid: Uuid::new_v4(),
+            },
+        )
+        .await;
+        assert_eq!(
+            first_frames(&mut worker1_reads),
+            [MSG_LSA, MSG_WAN_REACHABILITY]
+        );
+        let peers: Vec<String> = {
+            let mut peers: Vec<String> = hub.wan_peers.lock().await.keys().cloned().collect();
+            peers.sort();
+            peers
+        };
+        assert_eq!(peers, ["ingress1", "worker1", "worker2"]);
+    }
+
+    /// A-195's order, as the source shows it. A new link's LSA and reachability are queued before
+    /// the link goes into the WAN table, with `lsa_seq`'s guard and the advertisements' lock held
+    /// until it is there. Every LSA broadcast takes `lsa_seq`'s guard, and every reachability
+    /// advertisement the advertisements' lock, before it reads the WAN table and its state, and
+    /// holds it until its frames are queued: so each link gets the LSAs in their seq's order and
+    /// the advertisements in the order they were built, and a link that comes up meanwhile misses
+    /// neither.
+    #[test]
+    fn a_new_links_first_frames_and_every_advertisement_keep_their_order() {
+        let src = include_str!("mod.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let body = |name: &str| {
+            let start = code
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("{name}"));
+            &code[start..start + code[start..].find("\n}\n").expect("its end")]
+        };
+        let up = body("bring_wan_peer_up");
+        let at = |what: &str| up.find(what).unwrap_or_else(|| panic!("{what}"));
+        assert!(at("ctx.lsa_seq.lock()") < at("build_lsa("));
+        assert!(at("build_lsa(") < at("ctx.reachability_adverts.lock()"));
+        assert!(at("ctx.reachability_adverts.lock()") < at("reachability_frame("));
+        assert!(at("reachability_frame(") < at(".insert(hive.to_string(), peer)"));
+        for (name, guard, state) in [
+            (
+                "bring_wan_peer_up",
+                "ctx.lsa_seq.lock()",
+                "ctx.wan_peers.lock()",
+            ),
+            (
+                "broadcast_lsa",
+                "ctx.lsa_seq.lock()",
+                "ctx.wan_peers.lock()",
+            ),
+            ("broadcast_lsa_direct", "lsa_seq.lock()", "wan_peers.lock()"),
+            (
+                "broadcast_reachability",
+                "ctx.reachability_adverts.lock()",
+                "ctx.wan_peers.lock()",
+            ),
+            (
+                "broadcast_reachability",
+                "ctx.reachability_adverts.lock()",
+                "vouched_nodes(",
+            ),
+        ] {
+            let body = body(name);
+            let taken = body
+                .find(guard)
+                .unwrap_or_else(|| panic!("{name}: {guard}"));
+            let read = body
+                .find(state)
+                .unwrap_or_else(|| panic!("{name}: {state}"));
+            assert!(taken < read, "{name} takes {guard} before {state}");
+            assert!(
+                !body.contains("drop("),
+                "{name} holds it until its frames are queued"
+            );
+        }
     }
 
     /// R4, the caller: sibling routers' regions are read only through the ownership check.

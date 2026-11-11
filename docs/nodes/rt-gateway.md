@@ -118,6 +118,11 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   as after any failed attempt. The peer's `WAN_ACCEPT` closes the handshake and is otherwise
   ignored; until 0.1.124 it was counted and logged as a frame from a foreign source after every
   connection.
+- **A new link's first frames** after the handshake are the router's LSA and, on the hub, its
+  `WAN_REACHABILITY`: both are queued before the link goes into the gateway's WAN table, where
+  another task could hand it a frame (`bring_wan_peer_up`, A-195, since 0.1.131). Until then a
+  frame handed to the link in between went out before the LSA, and the peer dropped it, its sender
+  not yet named.
 - **A session's end (A-203, A-207).** A session ends on a clean close, a read error (a peer gone
   without TLS `close_notify`, as a router stopped for its update), an error handling a frame, a
   write error on its link (`wan peer session closed: its link no longer writes`), nothing heard
@@ -139,6 +144,16 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   reach another spoke through it. A spoke accepts this only from the motherbee's gateway (rule 6
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
   (`prepare_local_delivery`).
+  - **When the hub sends it** (A-195, since 0.1.131): with its LSA every 10 s; to a spoke whose
+    link comes up, right after its LSA; and to every spoke as soon as an LSA changes a hive's nodes
+    (one added, one gone, a `vpn_id` changed, or the hive back from stale; the same nodes in another
+    order are no change). A spoke drops a relayed frame whose sender the hub has not vouched for
+    (`router dropped a WAN frame`), and the hub handles a spoke's frames in order, so every other
+    spoke has the advertisement before the first frame the hub relays from a node that LSA added.
+    Until 0.1.131 only the 10 s beacon sent it: a frame from a node that had just connected on
+    another spoke, or any for up to 10 s after a spoke's link came up, was dropped without an
+    answer. A spoke takes each advertisement for the hub's whole set, so the hub builds and queues
+    them one at a time, and each spoke gets them in the order they were built.
   - **Errors across the hub** (A-245, since 0.1.131): a message between two spokes passes the
     hub both ways, and the far spoke's router answers it over the hub's link. The hub hands that
     `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke whose LSA lists the sender, one hop of TTL
