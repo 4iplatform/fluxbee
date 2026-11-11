@@ -756,6 +756,11 @@ Fixed in 0.1.132:
   too, and the router stopped routing at the first broadcast with a `ttl` of 3 or more a sibling
   handed it. It now takes the link of the sibling the frame came from once, and holds no guard of
   the table while it hands the frame on.
+- **A frame a sibling hands over for a node of a third sibling is answered back to that sibling**
+  (A-247): its `TTL_EXCEEDED`, and the `UNREACHABLE` of a hand-over that did not go
+  (`PEER_UNAVAILABLE`, `LINK_BUSY`), by name or resolved. Until then they went to the third
+  sibling, which dropped them, or, with no link to it, nowhere: the sender waited out its own
+  timeout.
 - **A broadcast reaches each router's nodes once** (A-208): a copy that comes over IRP is checked
   against the broadcast cache, as one from a node or from the WAN is (§4). Until then a router
   delivered every copy that reached it, and the gateway, which gets a broadcast from the router it

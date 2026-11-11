@@ -5234,21 +5234,26 @@ async fn handle_peer_message(
                             send_unreachable_to(&msg, link, router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
-                    ResolvedRoute::ForwardRouter(peer_uuid) => {
-                        if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                            if msg.routing.ttl <= 1 {
-                                send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
-                                return Ok(());
+                    // A node of a third sibling: the frame goes on to that router, and its answers
+                    // back to the sibling it came from. Until 0.1.132 this arm's binding took the
+                    // name of that sibling, and a TTL_EXCEEDED or an UNREACHABLE went to the next
+                    // router, which dropped it, or with no link to it nowhere, the TTL's check
+                    // skipped too (A-247).
+                    ResolvedRoute::ForwardRouter(next_router) => {
+                        if msg.routing.ttl <= 1 {
+                            if let Some(link) = &reply_link {
+                                send_ttl_exceeded_to(&msg, link, router_uuid)?;
                             }
+                            return Ok(());
                         }
-                        let Some(reason) = send_to_peer_router(peers, peer_uuid, &msg)
+                        let Some(reason) = send_to_peer_router(peers, next_router, &msg)
                             .await?
                             .unreachable("PEER_UNAVAILABLE")
                         else {
                             return Ok(());
                         };
-                        if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
+                        if let Some(link) = &reply_link {
+                            send_unreachable_to(&msg, link, router_uuid, reason)?;
                         }
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
@@ -5394,21 +5399,22 @@ async fn handle_peer_message(
                         send_unreachable_to(&msg, link, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
-                ResolvedRoute::ForwardRouter(peer_uuid) => {
-                    if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                        if msg.routing.ttl <= 1 {
-                            send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
-                            return Ok(());
+                // As by name: the frame goes on to the third sibling, its answers back (A-247).
+                ResolvedRoute::ForwardRouter(next_router) => {
+                    if msg.routing.ttl <= 1 {
+                        if let Some(link) = &reply_link {
+                            send_ttl_exceeded_to(&msg, link, router_uuid)?;
                         }
+                        return Ok(());
                     }
-                    let Some(reason) = send_to_peer_router(peers, peer_uuid, &msg)
+                    let Some(reason) = send_to_peer_router(peers, next_router, &msg)
                         .await?
                         .unreachable("PEER_UNAVAILABLE")
                     else {
                         return Ok(());
                     };
-                    if let Some(peer) = peers.lock().await.get(&peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
+                    if let Some(link) = &reply_link {
+                        send_unreachable_to(&msg, link, router_uuid, reason)?;
                     }
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
@@ -14582,6 +14588,60 @@ mod tests {
         );
         assert!(scene.peers.try_lock().is_ok(), "the sibling table is free");
         assert!(scene.nodes.try_lock().is_ok(), "and so are the nodes");
+    }
+
+    /// A-247: a frame a sibling hands over for a node of a third sibling is answered over the link
+    /// it came in on, never over the third sibling's. RT.switch1's node sends to
+    /// SY.frontdesk.gov@worker1, a node of RT.switch3, by name and resolved: with no TTL left it
+    /// hears TTL_EXCEEDED; with RT.switch3's link full, LINK_BUSY; with no link to RT.switch3,
+    /// PEER_UNAVAILABLE; with neither, TTL_EXCEEDED. Nothing goes to RT.switch3. Until 0.1.132 these
+    /// answers went to RT.switch3, which dropped them, or, with no link to it, nowhere.
+    #[tokio::test]
+    async fn a_siblings_frame_for_a_third_sibling_is_answered_where_it_came_from() {
+        for (how, dst) in [
+            (
+                "by name",
+                Destination::Unicast("SY.frontdesk.gov@worker1".to_string()),
+            ),
+            ("resolved", Destination::Resolve),
+        ] {
+            for (case, ttl, linked, full, said) in [
+                ("no TTL left", 1, true, false, MSG_TTL_EXCEEDED),
+                ("RT.switch3's link full", 16, true, true, "LINK_BUSY"),
+                (
+                    "no link to RT.switch3",
+                    16,
+                    false,
+                    false,
+                    "PEER_UNAVAILABLE",
+                ),
+                ("no TTL left nor link", 1, false, false, MSG_TTL_EXCEEDED),
+            ] {
+                let mut scene = Siblings::new(false).await;
+                let third = scene.peers.lock().await[&scene.switch3].sender.clone();
+                if full {
+                    fill_to_the_senders_bound(&third);
+                }
+                if !linked {
+                    scene.peers.lock().await.remove(&scene.switch3);
+                }
+                let msg = scene.message_to(dst.clone(), ttl);
+                scene.hand_over(scene.switch1, &msg).await;
+                let answers: Vec<_> = messages_on(&mut scene.switch1_link)
+                    .iter()
+                    .map(what_was_answered)
+                    .collect();
+                assert_eq!(
+                    answers,
+                    vec![(msg.routing.trace_id.clone(), said.to_string())],
+                    "{how}, {case}: answered where it came from"
+                );
+                assert!(
+                    messages_on(&mut scene.switch3_link).is_empty(),
+                    "{how}, {case}: nothing to RT.switch3"
+                );
+            }
+        }
     }
 
     /// A-208: two links from one sibling at once register it once. Both HELLOs are read while the
