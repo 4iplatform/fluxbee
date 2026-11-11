@@ -338,8 +338,11 @@ second one: the package ships one `rt-gateway` unit (`UNITS` in `packaging/build
 orchestrator starts and watches only that unit (`bootstrap_local`, `watchdog_tick`), and SY.admin
 refuses `add_router` and `delete_router` (`resolve_internal_action_spec`).
 
-The code still has a mode with several routers on one host. It is not supported, and its known
-defects are not being fixed ([routing-and-policy.md](routing-and-policy.md) §10). How it works:
+The code still has a mode with several routers on one host. It is not supported: nothing starts a
+second router, and no gate runs one. The defects found in its code are fixed with the router's
+releases (since 0.1.132 a router that is not the gateway no longer wedges handing a sibling's frame
+on, and a broadcast reaches each router's nodes once); what is fixed and what is still a known
+limit is in [routing-and-policy.md](routing-and-policy.md) §10. How it works:
 
 - `JSR_ROUTER_NAME` names a router; without it the name is `wan.gateway_name` (default
   `RT.gateway`), and the router with that name is the gateway (`is_gateway_name` in

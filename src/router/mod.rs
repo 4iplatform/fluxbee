@@ -273,6 +273,7 @@ impl Router {
         let shm_pd = Arc::clone(&self.shm);
         let opa_pd = Arc::clone(&self.opa);
         let opa_reader_pd = Arc::clone(&self.opa_reader);
+        let broadcast_cache_pd = Arc::clone(&self.broadcast_cache);
         let router_uuid = self.cfg.router_uuid;
         let router_name = self.cfg.router_l2_name.clone();
         let shm_name = self.cfg.shm_name.clone();
@@ -300,6 +301,7 @@ impl Router {
                 shm_pd,
                 opa_pd,
                 opa_reader_pd,
+                broadcast_cache_pd,
                 memory_reader_pd,
                 lsa_snapshot_pd,
                 reachability_pd,
@@ -342,6 +344,7 @@ impl Router {
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
         let opa_reader = Arc::clone(&self.opa_reader);
+        let broadcast_cache = Arc::clone(&self.broadcast_cache);
         let memory_reader = Arc::clone(&self.memory_reader);
         let hive_id = self.cfg.hive_id.clone();
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
@@ -372,6 +375,7 @@ impl Router {
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
                 let opa_reader = Arc::clone(&opa_reader);
+                let broadcast_cache = Arc::clone(&broadcast_cache);
                 let memory_reader = Arc::clone(&memory_reader);
                 let hive_id = hive_id.clone();
                 let identity_frontdesk_node_name = identity_frontdesk_node_name.clone();
@@ -395,6 +399,7 @@ impl Router {
                         shm,
                         opa,
                         opa_reader,
+                        broadcast_cache,
                         memory_reader,
                         hive_id,
                         identity_frontdesk_node_name,
@@ -4466,6 +4471,7 @@ async fn peer_discovery_loop(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    broadcast_cache: Arc<Mutex<BroadcastCache>>,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
@@ -4528,6 +4534,7 @@ async fn peer_discovery_loop(
                     let shm = Arc::clone(&shm);
                     let opa = Arc::clone(&opa);
                     let opa_reader = Arc::clone(&opa_reader);
+                    let broadcast_cache = Arc::clone(&broadcast_cache);
                     let memory_reader = Arc::clone(&memory_reader);
                     let hive_id = hive_id.to_string();
                     let self_router_name = self_router_name.to_string();
@@ -4554,6 +4561,7 @@ async fn peer_discovery_loop(
                             shm,
                             opa,
                             opa_reader,
+                            broadcast_cache,
                             memory_reader,
                             &hive_id,
                             &identity_frontdesk_node_name,
@@ -4678,6 +4686,7 @@ async fn connect_to_peer(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    broadcast_cache: Arc<Mutex<BroadcastCache>>,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
@@ -4736,6 +4745,7 @@ async fn connect_to_peer(
                 &shm,
                 &opa,
                 &opa_reader,
+                &broadcast_cache,
                 &memory_reader,
                 hive_id,
                 identity_frontdesk_node_name,
@@ -4778,6 +4788,7 @@ async fn handle_peer_incoming(
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
+    broadcast_cache: Arc<Mutex<BroadcastCache>>,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: String,
     identity_frontdesk_node_name: String,
@@ -4797,16 +4808,17 @@ async fn handle_peer_incoming(
     }
     let payload: RouterHelloPayload = serde_json::from_value(msg.payload)?;
     let peer_uuid = Uuid::parse_str(&payload.router_id)?;
+    let (tx, rx) = link_queue("irp");
+    tx.set_peer(peer_uuid.to_string());
+    // The sibling is looked for and entered under one guard, as `connect_to_peer` does: a link
+    // that finds it there ends. Until 0.1.132 the two took a guard each, and two links from one
+    // sibling at once could both find it absent and both enter it, the later one in place of the
+    // other (A-208).
     {
-        let peers_guard = peers.lock().await;
+        let mut peers_guard = peers.lock().await;
         if peers_guard.contains_key(&peer_uuid) {
             return Ok(());
         }
-    }
-    let (tx, rx) = link_queue("irp");
-    tx.set_peer(peer_uuid.to_string());
-    {
-        let mut peers_guard = peers.lock().await;
         peers_guard.insert(peer_uuid, PeerHandle { sender: tx.clone() });
     }
     let writer_task = tokio::spawn(write_link_frames(writer, rx));
@@ -4832,6 +4844,7 @@ async fn handle_peer_incoming(
                 &shm,
                 &opa,
                 &opa_reader,
+                &broadcast_cache,
                 &memory_reader,
                 &hive_id,
                 &identity_frontdesk_node_name,
@@ -4991,6 +5004,7 @@ async fn handle_peer_message(
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    broadcast_cache: &Arc<Mutex<BroadcastCache>>,
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
@@ -5101,10 +5115,23 @@ async fn handle_peer_message(
         reachability,
     )
     .await;
+    // The link of the sibling the frame came from, taken once: every answer goes back over it
+    // (A-208). A `let` lets go of the sibling table at its end, so no guard of it is held below
+    // while the frame is handed on, which on a router that is not the gateway locks the table
+    // again (`send_to_peer_router`, through `forward_to_hive` and `forward_broadcast_to_wan`).
+    // Until 0.1.132 each answer looked the link up in an `if let` whose guard lived through its
+    // block, the hand-over included, and the task waited there for itself for good, holding the
+    // table and, in the by-name, resolve and broadcast arms, the router's nodes: the router
+    // stopped routing.
+    let reply_link = peers
+        .lock()
+        .await
+        .get(peer_uuid)
+        .map(|peer| peer.sender.clone());
     let mut senders: Vec<LocalDelivery> = Vec::new();
     if msg.routing.ttl == 0 {
-        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-            send_ttl_exceeded_to(&msg, &peer.sender, router_uuid)?;
+        if let Some(link) = &reply_link {
+            send_ttl_exceeded_to(&msg, link, router_uuid)?;
         }
         return Ok(());
     }
@@ -5125,8 +5152,8 @@ async fn handle_peer_message(
                         dst_handle.vpn_id,
                     ) {
                         senders.push(LocalDelivery::to(&dst_handle.name, dst_handle.sender));
-                    } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                    } else if let Some(link) = &reply_link {
+                        send_unreachable_to(&msg, link, router_uuid, "VPN_BLOCKED")?;
                     }
                 } else {
                     let remote = {
@@ -5145,7 +5172,7 @@ async fn handle_peer_message(
                             &remote.name,
                             remote.vpn_id,
                         ) {
-                            if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                            if let Some(link) = &reply_link {
                                 forward_to_hive(
                                     &remote.next_hop_hive,
                                     &msg,
@@ -5154,15 +5181,15 @@ async fn handle_peer_message(
                                     peers,
                                     wan_peers,
                                     router_uuid,
-                                    &peer.sender,
+                                    link,
                                 )
                                 .await?;
                             }
-                        } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                        } else if let Some(link) = &reply_link {
+                            send_unreachable_to(&msg, link, router_uuid, "VPN_BLOCKED")?;
                         }
-                    } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                    } else if let Some(link) = &reply_link {
+                        send_unreachable_to(&msg, link, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
             } else {
@@ -5183,8 +5210,8 @@ async fn handle_peer_message(
                 match route {
                     ResolvedRoute::Drop => {}
                     ResolvedRoute::Unreachable(reason) => {
-                        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
+                        if let Some(link) = &reply_link {
+                            send_unreachable_to(&msg, link, router_uuid, reason)?;
                         }
                     }
                     ResolvedRoute::Deliver(dst_uuid) => {
@@ -5200,16 +5227,11 @@ async fn handle_peer_message(
                                     &dst_handle.name,
                                     dst_handle.sender.clone(),
                                 ));
-                            } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                                send_unreachable_to(
-                                    &msg,
-                                    &peer.sender,
-                                    router_uuid,
-                                    "VPN_BLOCKED",
-                                )?;
+                            } else if let Some(link) = &reply_link {
+                                send_unreachable_to(&msg, link, router_uuid, "VPN_BLOCKED")?;
                             }
-                        } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                        } else if let Some(link) = &reply_link {
+                            send_unreachable_to(&msg, link, router_uuid, "NODE_NOT_FOUND")?;
                         }
                     }
                     ResolvedRoute::ForwardRouter(peer_uuid) => {
@@ -5230,7 +5252,7 @@ async fn handle_peer_message(
                         }
                     }
                     ResolvedRoute::ForwardHive(hive_id) => {
-                        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                        if let Some(link) = &reply_link {
                             forward_to_hive(
                                 &hive_id,
                                 &msg,
@@ -5239,7 +5261,7 @@ async fn handle_peer_message(
                                 peers,
                                 wan_peers,
                                 router_uuid,
-                                &peer.sender,
+                                link,
                             )
                             .await?;
                         }
@@ -5248,14 +5270,24 @@ async fn handle_peer_message(
             }
         }
         Destination::Broadcast => {
+            // A copy a sibling hands over is checked against the cache a node's broadcast and the
+            // WAN's are (`handle_message`, `handle_wan_message`), so a router delivers a broadcast
+            // once however many copies reach it. Until 0.1.132 none was: its nodes got the
+            // broadcast once per copy that reached them, and a gateway sent each copy on to the
+            // WAN (routing-and-policy.md §10, A-208).
+            let trace_id = match Uuid::parse_str(&msg.routing.trace_id) {
+                Ok(value) => value,
+                Err(_) => return Ok(()),
+            };
+            {
+                let mut cache = broadcast_cache.lock().await;
+                if !cache.check_and_add(trace_id) {
+                    return Ok(());
+                }
+            }
             if broadcast_over_limit(&msg)? {
-                if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                    send_unreachable_to(
-                        &msg,
-                        &peer.sender,
-                        router_uuid,
-                        UNREACHABLE_FRAME_TOO_LARGE,
-                    )?;
+                if let Some(link) = &reply_link {
+                    send_unreachable_to(&msg, link, router_uuid, UNREACHABLE_FRAME_TOO_LARGE)?;
                 }
                 return Ok(());
             }
@@ -5282,7 +5314,7 @@ async fn handle_peer_message(
                 senders.push(LocalDelivery::to(&handle.name, handle.sender.clone()));
             }
             if msg.routing.ttl >= 3 {
-                if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                if let Some(link) = &reply_link {
                     // A full link skips it without an answer here, as on the WAN (A-222).
                     let _full = forward_broadcast_to_wan(
                         &msg,
@@ -5291,7 +5323,7 @@ async fn handle_peer_message(
                         peers,
                         wan_peers,
                         router_uuid,
-                        &peer.sender,
+                        link,
                     )
                     .await?;
                 }
@@ -5309,15 +5341,15 @@ async fn handle_peer_message(
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!("opa resolve failed: {err}");
-                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, "OPA_ERROR")?;
+                    if let Some(link) = &reply_link {
+                        send_unreachable_to(&msg, link, router_uuid, "OPA_ERROR")?;
                     }
                     return Ok(());
                 }
             };
             let Some(target) = resolved_target.as_deref() else {
-                if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                    send_unreachable_to(&msg, &peer.sender, router_uuid, "OPA_NO_TARGET")?;
+                if let Some(link) = &reply_link {
+                    send_unreachable_to(&msg, link, router_uuid, "OPA_NO_TARGET")?;
                 }
                 return Ok(());
             };
@@ -5338,8 +5370,8 @@ async fn handle_peer_message(
             match route {
                 ResolvedRoute::Drop => {}
                 ResolvedRoute::Unreachable(reason) => {
-                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
+                    if let Some(link) = &reply_link {
+                        send_unreachable_to(&msg, link, router_uuid, reason)?;
                     }
                 }
                 ResolvedRoute::Deliver(dst_uuid) => {
@@ -5355,11 +5387,11 @@ async fn handle_peer_message(
                                 &dst_handle.name,
                                 dst_handle.sender.clone(),
                             ));
-                        } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                            send_unreachable_to(&msg, &peer.sender, router_uuid, "VPN_BLOCKED")?;
+                        } else if let Some(link) = &reply_link {
+                            send_unreachable_to(&msg, link, router_uuid, "VPN_BLOCKED")?;
                         }
-                    } else if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-                        send_unreachable_to(&msg, &peer.sender, router_uuid, "NODE_NOT_FOUND")?;
+                    } else if let Some(link) = &reply_link {
+                        send_unreachable_to(&msg, link, router_uuid, "NODE_NOT_FOUND")?;
                     }
                 }
                 ResolvedRoute::ForwardRouter(peer_uuid) => {
@@ -5380,7 +5412,7 @@ async fn handle_peer_message(
                     }
                 }
                 ResolvedRoute::ForwardHive(hive_id) => {
-                    if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
+                    if let Some(link) = &reply_link {
                         forward_to_hive(
                             &hive_id,
                             &msg,
@@ -5389,7 +5421,7 @@ async fn handle_peer_message(
                             peers,
                             wan_peers,
                             router_uuid,
-                            &peer.sender,
+                            link,
                         )
                         .await?;
                     }
@@ -5400,8 +5432,8 @@ async fn handle_peer_message(
 
     let local = deliver_locally(senders, &msg, memory_reader, hive_id, false, log_stream).await?;
     if let Some(reason) = answer_where_it_arrived(local, &msg) {
-        if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
-            send_unreachable_to(&msg, &peer.sender, router_uuid, reason)?;
+        if let Some(link) = &reply_link {
+            send_unreachable_to(&msg, link, router_uuid, reason)?;
         }
     }
     Ok(())
@@ -9074,6 +9106,7 @@ mod tests {
                     &shm.writer,
                     &Arc::new(Mutex::new(OpaResolver::new())),
                     &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+                    &Arc::new(Mutex::new(BroadcastCache::new())),
                     &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
                     "motherbee",
                     "SY.frontdesk.gov@motherbee",
@@ -9355,6 +9388,7 @@ mod tests {
             &shm.writer,
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
@@ -12034,6 +12068,7 @@ mod tests {
             Arc::clone(&shm.writer),
             Arc::new(Mutex::new(OpaResolver::new())),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(BroadcastCache::new())),
             Arc::new(Mutex::new(None)),
             "motherbee".to_string(),
             "SY.frontdesk.gov@motherbee".to_string(),
@@ -12097,6 +12132,7 @@ mod tests {
                     shm,
                     Arc::new(Mutex::new(OpaResolver::new())),
                     Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(BroadcastCache::new())),
                     Arc::new(Mutex::new(None)),
                     "motherbee",
                     "SY.frontdesk.gov@motherbee",
@@ -13876,6 +13912,7 @@ mod tests {
             &shm,
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
@@ -14239,6 +14276,7 @@ mod tests {
             &shm,
             &Arc::new(Mutex::new(OpaResolver::new())),
             &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
             &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
             "worker1",
             "SY.frontdesk.gov@worker1",
@@ -14276,6 +14314,345 @@ mod tests {
             deliver_from_peer(false).await.is_none(),
             "a sibling that is not the gateway cannot speak for another hive's node"
         );
+    }
+
+    /// worker1 with several routers, the mode that is not supported (routing-and-policy.md §10), as
+    /// one of them sees it. This router has a node of its own, `AI.local@worker1`. Its siblings are
+    /// `RT.switch1`, whose node `WF.sender@worker1` sends; `RT.switch3`, with
+    /// `SY.frontdesk.gov@worker1`; and, unless this router is the gateway itself, the gateway
+    /// `RT.gateway`. Each sibling's IRP link, and the gateway's WAN link to the motherbee, is a
+    /// queue the test reads. The LSA lists the motherbee's `SY.admin@motherbee` and
+    /// `SY.frontdesk.gov@motherbee`.
+    struct Siblings {
+        shm: TestShm,
+        router: Uuid,
+        is_gateway: bool,
+        /// The frontdesk a message with no `src_ilk` resolves to.
+        frontdesk: &'static str,
+        nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>>,
+        local: LinkReceiver,
+        peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>>,
+        peer_routers: Arc<Mutex<HashMap<Uuid, PeerRouter>>>,
+        peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>>,
+        wan_peers: Arc<Mutex<HashMap<String, WanPeer>>>,
+        fib: Arc<Mutex<Vec<FibEntry>>>,
+        static_routes: Arc<Mutex<Vec<StaticRoute>>>,
+        lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+        reachability: Arc<Mutex<HashMap<Uuid, ReachabilityEntry>>>,
+        broadcast_cache: Arc<Mutex<BroadcastCache>>,
+        /// `WF.sender@worker1`, the node of `RT.switch1` that sends.
+        sender: Uuid,
+        switch1: Uuid,
+        switch1_link: LinkReceiver,
+        switch3: Uuid,
+        switch3_link: LinkReceiver,
+        gateway_link: LinkReceiver,
+        wan: LinkReceiver,
+        /// `SY.admin@motherbee`, in the LSA.
+        admin: Uuid,
+    }
+
+    impl Siblings {
+        async fn new(is_gateway: bool) -> Self {
+            let (local_tx, local) = link_queue("node");
+            let nodes = Arc::new(Mutex::new(HashMap::from([(
+                Uuid::new_v4(),
+                NodeHandle {
+                    name: "AI.local@worker1".to_string(),
+                    vpn_id: 0,
+                    sender: local_tx,
+                    connected_at: 0,
+                },
+            )])));
+            let (switch1, switch3, gateway) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+            let sender = Uuid::new_v4();
+            let peer_nodes = Arc::new(Mutex::new(HashMap::new()));
+            for (uuid, name, router) in [
+                (sender, "WF.sender@worker1", switch1),
+                (Uuid::new_v4(), "SY.frontdesk.gov@worker1", switch3),
+            ] {
+                peer_nodes.lock().await.insert(
+                    uuid,
+                    PeerNode {
+                        uuid,
+                        name: name.to_string(),
+                        vpn_id: 0,
+                        router_uuid: router,
+                    },
+                );
+            }
+            let (switch1_tx, switch1_link) = link_queue("irp");
+            let (switch3_tx, switch3_link) = link_queue("irp");
+            let (gateway_tx, gateway_link) = link_queue("irp");
+            let (wan_tx, wan) = link_queue("wan");
+            let mut routers = HashMap::new();
+            let mut links = HashMap::new();
+            for (router, sender) in [(switch1, switch1_tx), (switch3, switch3_tx)] {
+                routers.insert(
+                    router,
+                    PeerRouter {
+                        uuid: router,
+                        is_gateway: false,
+                    },
+                );
+                links.insert(router, PeerHandle { sender });
+            }
+            let mut wan_peers = HashMap::new();
+            if is_gateway {
+                wan_peers.insert(
+                    "motherbee".to_string(),
+                    WanPeer {
+                        sender: wan_tx,
+                        router_uuid: Uuid::new_v4(),
+                    },
+                );
+            } else {
+                routers.insert(
+                    gateway,
+                    PeerRouter {
+                        uuid: gateway,
+                        is_gateway: true,
+                    },
+                );
+                links.insert(gateway, PeerHandle { sender: gateway_tx });
+            }
+            let admin = Uuid::new_v4();
+            let lsa_snapshot = Arc::new(Mutex::new(Some(lsa_of(
+                vec![lsa_hive("motherbee", FLAG_ACTIVE)],
+                vec![
+                    lsa_node_entry(admin, "SY.admin@motherbee", 0),
+                    lsa_node_entry(Uuid::new_v4(), "SY.frontdesk.gov@motherbee", 0),
+                ],
+            ))));
+            let scene = Self {
+                shm: TestShm::new("rt-sibs"),
+                router: Uuid::new_v4(),
+                is_gateway,
+                frontdesk: "SY.frontdesk.gov@worker1",
+                nodes,
+                local,
+                peer_nodes,
+                peer_routers: Arc::new(Mutex::new(routers)),
+                peers: Arc::new(Mutex::new(links)),
+                wan_peers: Arc::new(Mutex::new(wan_peers)),
+                fib: Arc::new(Mutex::new(Vec::new())),
+                static_routes: Arc::new(Mutex::new(Vec::new())),
+                lsa_snapshot,
+                reachability: Arc::new(Mutex::new(HashMap::new())),
+                broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
+                sender,
+                switch1,
+                switch1_link,
+                switch3,
+                switch3_link,
+                gateway_link,
+                wan,
+                admin,
+            };
+            rebuild_fib(
+                &scene.fib,
+                &scene.nodes,
+                &scene.peer_nodes,
+                &scene.static_routes,
+                &scene.lsa_snapshot,
+                &scene.reachability,
+            )
+            .await;
+            scene
+        }
+
+        /// A message `WF.sender@worker1` sends to `dst`, with `ttl`.
+        fn message_to(&self, dst: Destination, ttl: u8) -> Message {
+            let mut msg = padded_message(self.sender, dst, 0);
+            msg.routing.ttl = ttl;
+            msg
+        }
+
+        /// `handle_peer_message` on this router for `msg`, handed over by the sibling `from`. It
+        /// must be done within 2 s.
+        async fn hand_over(&self, from: Uuid, msg: &Message) {
+            time::timeout(
+                Duration::from_secs(2),
+                handle_peer_message(
+                    msg,
+                    &from,
+                    &self.peers,
+                    &self.peer_nodes,
+                    &self.peer_routers,
+                    &self.nodes,
+                    &self.wan_peers,
+                    &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+                    &self.static_routes,
+                    &self.shm.writer,
+                    &Arc::new(Mutex::new(OpaResolver::new())),
+                    &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+                    &self.broadcast_cache,
+                    &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                    "worker1",
+                    self.frontdesk,
+                    &self.fib,
+                    self.router,
+                    self.is_gateway,
+                    &self.lsa_snapshot,
+                    &self.reachability,
+                    &stream::StreamHandle::detached(),
+                ),
+            )
+            .await
+            .expect("handled in time, with no table left held")
+            .expect("handled");
+        }
+    }
+
+    /// A-208, the known limit of routing-and-policy.md §10: a broadcast that comes over IRP is
+    /// checked against the router's broadcast cache, as one from a node or from the WAN is, so a
+    /// router delivers it once however many copies reach it. On the gateway, a broadcast of
+    /// RT.switch1's node comes from RT.switch1, then again from RT.switch3, which sends its own
+    /// copy on toward the WAN: the gateway's node gets it once, and the motherbee once. One the
+    /// gateway has seen already, from one of its own nodes or from the WAN, goes to neither. Until
+    /// 0.1.132 each copy was delivered and sent on.
+    #[tokio::test]
+    async fn a_broadcast_that_comes_over_irp_reaches_a_router_once() {
+        let mut scene = Siblings::new(true).await;
+        let broadcast = scene.message_to(Destination::Broadcast, 15);
+        scene.hand_over(scene.switch1, &broadcast).await;
+        let mut again = broadcast.clone();
+        again.routing.ttl = 14;
+        scene.hand_over(scene.switch3, &again).await;
+        assert_eq!(
+            messages_on(&mut scene.local).len(),
+            1,
+            "its node got it once"
+        );
+        assert_eq!(
+            messages_on(&mut scene.wan).len(),
+            1,
+            "and the motherbee once"
+        );
+
+        let seen = scene.message_to(Destination::Broadcast, 15);
+        scene
+            .broadcast_cache
+            .lock()
+            .await
+            .check_and_add(Uuid::parse_str(&seen.routing.trace_id).expect("a UUID"));
+        scene.hand_over(scene.switch1, &seen).await;
+        assert!(messages_on(&mut scene.local).is_empty(), "one it has seen");
+        assert!(messages_on(&mut scene.wan).is_empty(), "goes nowhere");
+        for link in [&mut scene.switch1_link, &mut scene.switch3_link] {
+            assert!(messages_on(link).is_empty(), "and nobody is answered");
+        }
+    }
+
+    /// A-208: a router that is not the gateway hands a sibling's frame on toward another hive, or a
+    /// broadcast toward the WAN, to the gateway sibling, and goes on: it holds no guard of the
+    /// sibling table while it does, and the hand-over locks that table again. A message to the
+    /// motherbee's SY.admin by its UUID and by its name, one the motherbee's frontdesk is resolved
+    /// to, and a broadcast: each is done in time, the first three on the gateway's link with one
+    /// hop less, the broadcast at this router's node. Until 0.1.132 each of them wedged the IRP
+    /// task for good, holding the table and, but for the first, the router's nodes.
+    #[tokio::test]
+    async fn a_router_that_is_not_the_gateway_hands_a_siblings_frame_on_and_goes_on() {
+        let mut scene = Siblings::new(false).await;
+        scene.frontdesk = "SY.frontdesk.gov@motherbee";
+        for (case, dst) in [
+            ("by UUID", Destination::Unicast(scene.admin.to_string())),
+            (
+                "by name",
+                Destination::Unicast("SY.admin@motherbee".to_string()),
+            ),
+            ("resolved", Destination::Resolve),
+        ] {
+            let msg = scene.message_to(dst, 16);
+            scene.hand_over(scene.switch1, &msg).await;
+            let handed = messages_on(&mut scene.gateway_link);
+            assert_eq!(handed.len(), 1, "{case}: to the gateway");
+            assert_eq!(handed[0].routing.trace_id, msg.routing.trace_id, "{case}");
+            assert_eq!(handed[0].routing.ttl, 15, "{case}: one hop less");
+            assert!(
+                messages_on(&mut scene.switch1_link).is_empty(),
+                "{case}: nothing to answer"
+            );
+        }
+        let broadcast = scene.message_to(Destination::Broadcast, 16);
+        scene.hand_over(scene.switch1, &broadcast).await;
+        assert!(
+            has(messages_on(&mut scene.local), &broadcast),
+            "its node got the broadcast"
+        );
+        assert!(scene.peers.try_lock().is_ok(), "the sibling table is free");
+        assert!(scene.nodes.try_lock().is_ok(), "and so are the nodes");
+    }
+
+    /// A-208: two links from one sibling at once register it once. Both HELLOs are read while the
+    /// sibling table is held, so both links wait for it; let go, one enters the sibling and the
+    /// other finds it there and ends. Until 0.1.132 the check and the entry took a guard each: both
+    /// links found the sibling absent, both entered it, the later one in place of the other, and
+    /// neither ended.
+    #[tokio::test]
+    async fn two_links_from_one_sibling_at_once_register_it_once() {
+        let shm = TestShm::new("rt-irptwice");
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sibling = Uuid::new_v4();
+        let held = peers.lock().await;
+        let mut links = Vec::new();
+        for _ in 0..2 {
+            let (mut client, server) = UnixStream::pair().expect("socket pair");
+            write_frame(&mut client, &router_hello_frame(sibling))
+                .await
+                .expect("hello");
+            let link = tokio::spawn(handle_peer_incoming(
+                server,
+                Uuid::new_v4(),
+                Arc::clone(&peers),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::clone(&shm.writer),
+                Arc::new(Mutex::new(OpaResolver::new())),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(BroadcastCache::new())),
+                Arc::new(Mutex::new(None)),
+                "motherbee".to_string(),
+                "SY.frontdesk.gov@motherbee".to_string(),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(HashMap::new())),
+                stream::StreamHandle::detached(),
+                false,
+            ));
+            links.push((client, link));
+        }
+        // Both read their HELLO and wait for the table.
+        time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+
+        let ended = time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(at) = links.iter().position(|(_, link)| link.is_finished()) {
+                    return at;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second link finds the sibling there and ends");
+        let (_, link) = links.remove(ended);
+        link.await.expect("join").expect("ends without an error");
+        let (other_client, other) = links.remove(0);
+        assert!(!other.is_finished(), "the link that entered it stays up");
+        assert!(peers.lock().await.contains_key(&sibling));
+
+        drop(other_client);
+        time::timeout(Duration::from_secs(2), other)
+            .await
+            .expect("it ends when its sibling closes")
+            .expect("join")
+            .expect("at EOF");
+        assert!(peers.lock().await.is_empty(), "and its entry goes with it");
     }
 
     #[tokio::test]

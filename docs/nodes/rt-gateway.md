@@ -73,7 +73,9 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   router looks in `/dev/shm` for live regions of other routers of its hive and the one with the
   lower UUID connects. A link that ends, however it ends, takes the sibling out of the router's
   table, so a later look can link them again; until 0.1.124 one that ended on a read error stayed
-  there, and the two were not linked again until that router restarted (A-203).
+  there, and the two were not linked again until that router restarted (A-203). Two links from
+  one sibling at once register it once (A-208, since 0.1.132). What is fixed in that mode and what
+  is still a known limit: [routing-and-policy.md](../reference/routing-and-policy.md) §10.
 - **WAN** (gateway only): TCP on `wan.listen` when set; there is no default address in code. The
   motherbee template sets `0.0.0.0:9000` (`packaging/hive.yaml.example`); spokes have no
   `wan.listen` and connect out to `wan.uplinks`. There is no HTTP or status port.

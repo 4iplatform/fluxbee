@@ -33,7 +33,8 @@ envelope in [protocol.md](protocol.md).
   ships one `rt-gateway` unit, the orchestrator starts and watches only that one, and SY.admin
   refuses `add_router` and `delete_router` ([architecture.md](architecture.md) §4.2). The code
   still has a mode with several routers in a hive, which is not supported. What this page says
-  about sibling routers and IRP describes that mode; §10 lists its known defects.
+  about sibling routers and IRP describes that mode; §10 lists what has been fixed in it and its
+  known limits.
 - **Links.**
   - Nodes connect to `/var/run/fluxbee/routers/<uuid>.sock` (0600; the router UUID, no dashes).
     The router serves a connection only when the peer's uid (`SO_PEERCRED`) is its own, root in
@@ -316,10 +317,12 @@ At the router where it enters from a node (`handle_message`):
 4. `ttl >= 3`: toward the WAN. The gateway sends it to every WAN peer; another router sends it to
    the gateway sibling (`forward_broadcast_to_wan`).
 
-A sibling delivers it to its own nodes and, with `ttl >= 3`, sends it toward the WAN as in step 4. A
-gateway that receives it from the WAN checks the same cache, delivers it to its nodes, and passes it
-to its siblings (`ttl >= 2`) and to its WAN peers (`ttl >= 3`). `meta.target` is matched by every
-router against its own nodes.
+A sibling delivers it to its own nodes and, with `ttl >= 3`, sends it toward the WAN as in step 4.
+Every router checks a copy that comes over IRP against the same cache, so one it has seen in the
+last 30 s, from one of its own nodes, from another sibling or from the WAN, goes no further there
+(`handle_peer_message`, since 0.1.132, A-208). A gateway that receives it from the WAN checks the
+same cache, delivers it to its nodes, and passes it to its siblings (`ttl >= 2`) and to its WAN
+peers (`ttl >= 3`). `meta.target` is matched by every router against its own nodes.
 
 A link whose queue is at the senders' bound (§1) skips the broadcast, and every other link gets it.
 The router it entered answers its sender `LINK_BUSY` once when any link it handed it to was full, a
@@ -740,16 +743,29 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
 
 ## 10. Known limits
 
-These are defects of the several-routers mode, which is not supported (§1); they are not being
-fixed. With one router per hive none of them applies.
+The several-routers mode is not supported (§1): nothing starts a second router in a hive, and no
+gate runs one. With one router per hive nothing in this section applies. The defects found in its
+code are fixed with the router's releases, and what is left is listed as a known limit.
 
-- **Broadcast duplicates.** A broadcast reaches the gateway's nodes once per sibling router plus
-  one, because copies that arrive over IRP are not checked against the broadcast cache
-  (`handle_peer_message`). With a `ttl` of 4 or more, a broadcast that enters at another router
-  reaches the gateway twice from that router, once with all its siblings and once toward the WAN
-  (`handle_message`), and once more from every other sibling, which sends its copy on toward the
-  WAN, that is to the gateway (`forward_broadcast_to_wan`). One that enters at the gateway, from
-  one of its nodes or from the WAN, comes back once from each sibling the same way.
+Fixed in 0.1.132:
+
+- **A router that is not the gateway no longer wedges** when it hands a sibling's frame on toward
+  another hive, or a broadcast toward the WAN (A-208). `handle_peer_message` held the sibling
+  table while `send_to_peer_router` locked it again, through `forward_to_hive` or
+  `forward_broadcast_to_wan`: the task waited for itself for good, with the router's nodes held
+  too, and the router stopped routing at the first broadcast with a `ttl` of 3 or more a sibling
+  handed it. It now takes the link of the sibling the frame came from once, and holds no guard of
+  the table while it hands the frame on.
+- **A broadcast reaches each router's nodes once** (A-208): a copy that comes over IRP is checked
+  against the broadcast cache, as one from a node or from the WAN is (§4). Until then a router
+  delivered every copy that reached it, and the gateway, which gets a broadcast from the router it
+  entered and again from each sibling that sends it on toward the WAN, delivered it and sent it to
+  the WAN once per copy. Those copies still travel to the gateway, which drops them.
+- **Two links from one sibling at once register it once** (A-208): the check and the entry take
+  one guard, as on the side that dials.
+
+Known limits:
+
 - **Errors from the WAN never reach a sibling router's node.** An `UNREACHABLE` or `TTL_EXCEEDED`
   that comes back over the WAN goes to a node of the gateway router, or, from the hub, on toward
   another spoke (§3.6): `handle_wan_message` never looks among its siblings' nodes, so an error for
