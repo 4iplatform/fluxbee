@@ -165,6 +165,11 @@ const MSG_TNT_RESTORE: &str = "TNT_RESTORE";
 const MSG_TNT_RESTORE_RESPONSE: &str = "TNT_RESTORE_RESPONSE";
 const MSG_TNT_PURGE: &str = "TNT_PURGE";
 const MSG_TNT_PURGE_RESPONSE: &str = "TNT_PURGE_RESPONSE";
+// FINDINGS A-191: the system ILKs of a hive SY.admin removed are marked retired, never purged on
+// their own (`retire_hive_system_ilks`). SY.admin's `retire_hive_ilks` sends it, and remove_hive
+// once the hive is gone.
+const MSG_ILK_RETIRE_HIVE: &str = "ILK_RETIRE_HIVE";
+const MSG_ILK_RETIRE_HIVE_RESPONSE: &str = "ILK_RETIRE_HIVE_RESPONSE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentityDbSecretSource {
@@ -379,9 +384,30 @@ struct TntLifecycleRequest {
     tenant_id: String,
 }
 
-/// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason). Its own delete is the
-/// only reason: deleting a tenant marks no ILK (docs/ilk-tenant-model-v1.md §2.3).
+/// ILK_RETIRE_HIVE: the hive SY.admin removed (FINDINGS A-191).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkRetireHiveRequest {
+    hive_id: String,
+}
+
+/// Why an ilk is marked deleted (persisted in identity_ilks.deleted_reason, 16 characters at most).
+/// A person's or a node's own delete is `direct`: deleting a tenant marks no ILK
+/// (docs/ilk-tenant-model-v1.md §2.3).
 const DELETED_REASON_DIRECT: &str = "direct";
+/// A system ILK is never deleted: it is retired (FINDINGS A-191), marked with a reason that starts
+/// with this prefix, by a release that runs its node no more on its hive (`RETIRED_REASON_NODE`) or
+/// by its hive's removal (`RETIRED_REASON_HIVE`). Only a retired one can be purged, and only by the
+/// operator (`check_ilk_purgeable`).
+const RETIRED_REASON_PREFIX: &str = "retired: ";
+const RETIRED_REASON_NODE: &str = "retired: node";
+const RETIRED_REASON_HIVE: &str = "retired: hive";
+/// identity_ilks.deleted_reason is a VARCHAR(16) (migration v2).
+const DELETED_REASON_MAX_LEN: usize = 16;
+const _: () = assert!(
+    RETIRED_REASON_NODE.len() <= DELETED_REASON_MAX_LEN
+        && RETIRED_REASON_HIVE.len() <= DELETED_REASON_MAX_LEN
+);
 
 /// Everything a lifecycle op (mark / restore / purge, ilk or tenant) changed, so the handler
 /// persists it in ONE transaction and emits the matching deltas.
@@ -497,7 +523,8 @@ struct IlkRecord {
     definition: Value,
     channels: Vec<ChannelRecord>,
     deleted_at_ms: Option<u64>,
-    /// Why it is marked: `direct`, its own delete.
+    /// Why it is marked: `direct`, its own delete, or for a system ILK `retired: node` or
+    /// `retired: hive` (`RETIRED_REASON_PREFIX`).
     #[serde(default)]
     deleted_reason: Option<String>,
 }
@@ -989,13 +1016,16 @@ impl IdentityStore {
     }
 
     /// Seeds the deterministic system ILK of each SY node this release runs on the hive
-    /// (`system_nodes_for_hive`), the root tenant first. The records it changed.
+    /// (`system_nodes_for_hive`), the root tenant first: a marked one comes back unmarked, so a
+    /// release that runs a node again un-marks its ILK. Then retires the ILKs of this hive's nodes
+    /// the release no longer runs there (`retire_dropped_system_ilks`, FINDINGS A-191). The
+    /// records it changed, which the primary persists and a replica pushes with its own.
     fn ensure_system_ilks_from_hive(&mut self, hive: &HiveFile) -> Vec<IlkRecord> {
         self.ensure_default_root_tenant();
         let nodes = system_nodes_for_hive(hive);
         let mut changed = Vec::new();
-        for base_name in nodes {
-            let node_name = ensure_l2_name(&base_name, &hive.hive_id);
+        for base_name in &nodes {
+            let node_name = ensure_l2_name(base_name, &hive.hive_id);
             let ilk_id = deterministic_system_ilk_id(&node_name);
             let next = IlkRecord {
                 ilk_id: ilk_id.clone(),
@@ -1005,7 +1035,7 @@ impl IdentityStore {
                 identification: json!({
                     "node_name": node_name,
                     "system_node": base_name,
-                    "service": name_to_service(&base_name),
+                    "service": name_to_service(base_name),
                     "hive_id": hive.hive_id.as_str(),
                     "source": SYSTEM_ILK_SOURCE
                 }),
@@ -1030,7 +1060,54 @@ impl IdentityStore {
                 changed.push(next);
             }
         }
+        changed.extend(self.retire_dropped_system_ilks(&hive.hive_id, &nodes, now_epoch_ms()));
         changed
+    }
+
+    /// Marks retired (FINDINGS A-191) each system ILK seeded for `hive_id` (`seeded_system_node`)
+    /// whose node `runs`, the release's SY nodes for that hive, no longer names: a node a release
+    /// dropped, as 0.1.79 dropped SY.policy. The mark is the delete model's: the ILK leaves every
+    /// lookup and the identity SHM, its rows stay, and nothing purges it but the operator. Only
+    /// `hive_id`'s ILKs, never another hive's; and none when `runs` is empty or lacks SY.identity,
+    /// which is no list of this release for a hive SY.identity runs on. The records it marked.
+    fn retire_dropped_system_ilks(
+        &mut self,
+        hive_id: &str,
+        runs: &[String],
+        now_ms: u64,
+    ) -> Vec<IlkRecord> {
+        if !runs.iter().any(|node| node == IDENTITY_NODE_BASE_NAME) {
+            tracing::warn!(
+                hive_id,
+                nodes = ?runs,
+                "the release's SY nodes for this hive are empty or lack SY.identity: no system ILK is retired"
+            );
+            return Vec::new();
+        }
+        let mut dropped: Vec<(String, String)> = self
+            .ilks
+            .values()
+            .filter(|ilk| ilk.deleted_at_ms.is_none())
+            .filter_map(|ilk| {
+                let node = seeded_system_node(ilk, hive_id)?;
+                (!runs.iter().any(|run| run == node))
+                    .then(|| (ilk.ilk_id.clone(), node.to_string()))
+            })
+            .collect();
+        dropped.sort_unstable();
+        let marked: Vec<IlkRecord> = dropped
+            .iter()
+            .filter_map(|(ilk_id, _)| self.mark_ilk_unchecked(ilk_id, RETIRED_REASON_NODE, now_ms))
+            .collect();
+        if !marked.is_empty() {
+            let nodes: Vec<&str> = dropped.iter().map(|(_, node)| node.as_str()).collect();
+            tracing::info!(
+                hive_id,
+                nodes = ?nodes,
+                "retired the system ILKs of the SY nodes this release no longer runs on this hive"
+            );
+        }
+        marked
     }
 
     /// ILK_PROVISION: find the ILK that holds (channel, address, scope), or mint a temporary one
@@ -1839,15 +1916,29 @@ impl IdentityStore {
         ))
     }
 
+    /// What ILK_DELETE and ILK_RESTORE take: any ILK but a system one (SYSTEM_ILK_PROTECTED). Only
+    /// the retire paths mark a system ILK, and only the seed or a join again of its hive un-marks
+    /// it (FINDINGS A-191).
     fn check_ilk_markable(&self, ilk_id: &str) -> Result<&IlkRecord, String> {
         let entry = self
             .ilks
             .get(ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
-        if is_well_known_system_ilk(entry) || entry.ilk_type.trim() == "system" {
+        if is_system_ilk(entry) {
             return Err("SYSTEM_ILK_PROTECTED".to_string());
         }
         Ok(entry)
+    }
+
+    /// What ILK_PURGE takes: any ILK `check_ilk_markable` takes, and a retired system ILK
+    /// (`is_retired_system_ilk`, FINDINGS A-191), which the operator purges once it made no
+    /// history. Any other system ILK answers SYSTEM_ILK_PROTECTED, one marked for another reason
+    /// included.
+    fn check_ilk_purgeable(&self, ilk_id: &str) -> Result<&IlkRecord, String> {
+        match self.ilks.get(ilk_id) {
+            Some(entry) if is_retired_system_ilk(entry) => Ok(entry),
+            _ => self.check_ilk_markable(ilk_id),
+        }
     }
 
     /// Mark one ilk (validated by the caller). Hidden at once: out of the ich lookup (and so out
@@ -2049,14 +2140,11 @@ impl IdentityStore {
     /// ILK_RESTORE: un-mark. A person also comes back while their tenant is marked, still charged
     /// to it, and can then be charged elsewhere (`set_ilk_tenant`): what happens to a tenant never
     /// strands a person. Any other ILK waits for its tenant to be restored (a node is born and dies
-    /// in its tenant, D6).
+    /// in its tenant, D6). A retired system ILK comes back only with its node (FINDINGS A-191).
     fn restore_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         self.check_ilk_tenant_scope(&req)?;
-        let entry = self
-            .ilks
-            .get(&req.ilk_id)
-            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        let entry = self.check_ilk_markable(&req.ilk_id)?;
         if entry.deleted_at_ms.is_none() {
             return Err("ILK_NOT_DELETED".to_string());
         }
@@ -2078,11 +2166,12 @@ impl IdentityStore {
         ))
     }
 
-    /// ILK_PURGE: physical and final. Only a MARKED ilk can be purged.
+    /// ILK_PURGE: physical and final. Only a MARKED ilk can be purged, a system ILK only once it
+    /// is retired (`check_ilk_purgeable`, FINDINGS A-191).
     fn purge_ilk(&mut self, req: IlkDeleteRequest) -> Result<(Value, LifecycleChanges), String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         self.check_ilk_tenant_scope(&req)?;
-        let entry = self.check_ilk_markable(&req.ilk_id)?;
+        let entry = self.check_ilk_purgeable(&req.ilk_id)?;
         if entry.deleted_at_ms.is_none() {
             return Err(lifecycle_error(
                 "ILK_NOT_DELETED",
@@ -2100,6 +2189,59 @@ impl IdentityStore {
                 "ilk_id": req.ilk_id,
                 "state": "purged",
                 "removed_alias_count": changes.purged_aliases.len(),
+            }),
+            changes,
+        ))
+    }
+
+    /// ILK_RETIRE_HIVE (FINDINGS A-191): marks retired every system ILK of `hive_id`, a hive
+    /// SY.admin removed (`is_system_ilk_of_hive`). The mark is the delete model's and nothing
+    /// more: the ILKs leave every lookup and the identity SHM, their rows stay, and nothing purges
+    /// one but the operator. A hive joined again under the same name gets them back unmarked, from
+    /// its replica's seed. Refused for `own_hive`, the primary's, which is never removed. Answers
+    /// how many it marked and which, and how many were marked already.
+    fn retire_hive_system_ilks(
+        &mut self,
+        hive_id: &str,
+        own_hive: &str,
+        now_ms: u64,
+    ) -> Result<(Value, LifecycleChanges), String> {
+        let hive_id = hive_id.trim();
+        if !json_router::mesh_hmac::is_valid_hive_id(hive_id) {
+            return Err(lifecycle_error(
+                "INVALID_REQUEST",
+                "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'",
+            ));
+        }
+        if hive_id == own_hive {
+            return Err(lifecycle_error(
+                "HIVE_NOT_REMOVED",
+                "the primary's own hive is never removed: its system ILKs are never retired",
+            ));
+        }
+        let mut ilk_ids: Vec<String> = self
+            .ilks
+            .values()
+            .filter(|ilk| is_system_ilk_of_hive(ilk, hive_id))
+            .map(|ilk| ilk.ilk_id.clone())
+            .collect();
+        ilk_ids.sort_unstable();
+        let mut changes = LifecycleChanges::default();
+        let mut already_retired = 0usize;
+        for ilk_id in &ilk_ids {
+            match self.mark_ilk_unchecked(ilk_id, RETIRED_REASON_HIVE, now_ms) {
+                Some(marked) => changes.ilks.push(marked),
+                None => already_retired += 1,
+            }
+        }
+        let retired: Vec<&str> = changes.ilks.iter().map(|ilk| ilk.ilk_id.as_str()).collect();
+        Ok((
+            json!({
+                "status": "ok",
+                "hive_id": hive_id,
+                "count": retired.len(),
+                "ilk_ids": retired,
+                "already_retired": already_retired,
             }),
             changes,
         ))
@@ -2772,11 +2914,12 @@ impl IdentityStore {
                 // delete_ilk handler's SYSTEM_ILK_PROTECTED guard, and closes the
                 // forged-snapshot DOS where a publish snapshot omitting
                 // SY.identity@<hive> would otherwise reconcile-delete it mesh-wide.
+                // Unless this copy is retired (FINDINGS A-191): the operator's purge of a
+                // retired one reaches every replica as this delta.
                 if self
                     .ilks
                     .get(&ilk_id)
-                    .map(is_well_known_system_ilk)
-                    .unwrap_or(false)
+                    .is_some_and(|ilk| is_well_known_system_ilk(ilk) && !is_retired_system_ilk(ilk))
                 {
                     return;
                 }
@@ -2800,6 +2943,16 @@ impl IdentityStore {
                 self.aliases.remove(&old_ilk_id);
             }
         }
+    }
+
+    /// A replica applies one of the primary's deltas, then seeds this hive's system ILKs again
+    /// (FINDINGS A-191): a mark the primary put on the ILK of a node this release runs here (a
+    /// hive's retirement that crossed a join again under its name) comes off at once, here and at
+    /// the replica's next push, as the seed takes it off at every start. The records the seed
+    /// changed.
+    fn apply_primary_delta(&mut self, delta: IdentityDelta, hive: &HiveFile) -> Vec<IlkRecord> {
+        self.apply_delta(delta);
+        self.ensure_system_ilks_from_hive(hive)
     }
 
     /// All ilks owned by `hive_id` (active **and** soft-deleted tombstones), for a
@@ -2837,7 +2990,7 @@ impl IdentityStore {
                     tracing::warn!(
                         ilk_id = %ilk.ilk_id,
                         hive_id = %hive_id,
-                        "replica push ignored: an id in another spelling, a change of the ILK's tenant, or a node channel that names another scope, a Fluxbee Cloud account, or a channel another ILK holds"
+                        "replica push ignored: an id in another spelling, a change of the ILK's tenant, a node channel that names another scope, a Fluxbee Cloud account, or a channel another ILK holds, or the mark of a system ILK the primary does not hold (purged)"
                     );
                 }
                 acceptable
@@ -2967,8 +3120,12 @@ fn delta_authorized_for_hive(
         }
         IdentityDelta::IlkDelete { ilk_id } => {
             is_canonical_id(ilk_id, "ilk")
-                && store.ilks.get(ilk_id).and_then(ilk_owning_hive).as_deref()
-                    == Some(publisher_hive)
+                && store.ilks.get(ilk_id).is_some_and(|existing| {
+                    ilk_owning_hive(existing).as_deref() == Some(publisher_hive)
+                        // A system ILK leaves only by the operator's purge, on the primary, even
+                        // a retired one (FINDINGS A-191).
+                        && !is_well_known_system_ilk(existing)
+                })
         }
         // Tenant lifecycle is primary-only, like TenantUpsert.
         IdentityDelta::TenantDelete { .. } => false,
@@ -3076,6 +3233,12 @@ impl IdentityRuntime {
         allowed_exacts.insert(MSG_ILK_UPDATE, bootstrap.clone());
         allowed_exacts.insert(MSG_ILK_SET_DEFINITION, bootstrap.clone());
         allowed_exacts.insert(MSG_ILK_DELETE, bootstrap);
+        // A removed hive's system ILKs are retired on the operator's SY.admin's word alone
+        // (FINDINGS A-191): no prefix, no other hive's SY.admin.
+        allowed_exacts.insert(
+            MSG_ILK_RETIRE_HIVE,
+            HashSet::from([format!("SY.admin@{PRIMARY_HIVE_ID}")]),
+        );
         if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
             allowed_exacts
                 .entry(MSG_ILK_REGISTER)
@@ -3802,13 +3965,36 @@ impl IdentityRuntime {
             }
             MSG_ILK_PURGE => {
                 match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                    Ok(req) => match refuse_system_ilk_purge(&self.store, &req.ilk_id, src_l2_name)
+                    {
+                        Some(refusal) => refusal,
+                        None => {
+                            self.run_lifecycle_op(&mut deltas, "failed to purge ilk", |store| {
+                                store.purge_ilk(req)
+                            })
+                            .await
+                        }
+                    },
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                }
+            }
+            MSG_ILK_RETIRE_HIVE => {
+                match serde_json::from_value::<IlkRetireHiveRequest>(msg.payload.clone()) {
                     Ok(req) => {
-                        self.run_lifecycle_op(&mut deltas, "failed to purge ilk", |store| {
-                            store.purge_ilk(req)
-                        })
+                        let now_ms = now_epoch_ms();
+                        let own_hive = self.hive_id.clone();
+                        self.run_lifecycle_op(
+                            &mut deltas,
+                            "failed to retire the hive's system ilks",
+                            |store| store.retire_hive_system_ilks(&req.hive_id, &own_hive, now_ms),
+                        )
                         .await
                     }
-                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                    // A fixed text: the request's values are not repeated (FINDINGS A-232).
+                    Err(_) => error_payload(
+                        "INVALID_REQUEST",
+                        "ILK_RETIRE_HIVE takes {hive_id}, the removed hive's id, and nothing else",
+                    ),
                 }
             }
             MSG_TNT_DELETE => {
@@ -4676,14 +4862,24 @@ async fn main() -> Result<(), IdentityError> {
                     match event {
                         ReplicaSyncEvent::Snapshot(store) => {
                             // Same as the boot bootstrap: adopt the primary's state, then
-                            // re-seed this hive's deterministic system ILKs on top of it.
+                            // re-seed this hive's deterministic system ILKs on top of it. What the
+                            // primary purged meanwhile is gone with the old store: a retired
+                            // system ILK whose IlkDelete this replica missed included (A-191).
                             let metrics = store.metrics();
                             runtime.store = *store;
                             replica_has_baseline = true;
                             runtime.store.ensure_system_ilks_from_hive(&hive);
                             tracing::info!(metrics = %metrics, "identity full sync applied (delta stream subscribed)");
                         }
-                        ReplicaSyncEvent::Delta(envelope) => runtime.store.apply_delta(envelope.delta),
+                        ReplicaSyncEvent::Delta(envelope) => {
+                            let reseeded = runtime.store.apply_primary_delta(envelope.delta, &hive);
+                            if !reseeded.is_empty() {
+                                tracing::warn!(
+                                    count = reseeded.len(),
+                                    "the primary's delta changed this hive's system ILKs: seeded them again, pushed at the next reconcile"
+                                );
+                            }
+                        }
                     }
                     if let Some(writer) = identity_shm.as_mut() {
                         if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
@@ -6726,6 +6922,48 @@ fn is_well_known_system_ilk(ilk: &IlkRecord) -> bool {
         .unwrap_or(false)
 }
 
+/// A system ILK: a well-known one, or any of type `system`. The admin paths never mark one
+/// (SYSTEM_ILK_PROTECTED); only the retire paths do (FINDINGS A-191).
+fn is_system_ilk(ilk: &IlkRecord) -> bool {
+    is_well_known_system_ilk(ilk) || ilk.ilk_type.trim() == "system"
+}
+
+/// A well-known system ILK marked retired (FINDINGS A-191): by a release that runs its node no
+/// more on its hive, or by its hive's removal, its reason starting with `RETIRED_REASON_PREFIX`.
+/// The only system ILK the operator may purge, and the only one a replica drops on the primary's
+/// `IlkDelete`.
+fn is_retired_system_ilk(ilk: &IlkRecord) -> bool {
+    is_well_known_system_ilk(ilk)
+        && ilk.deleted_at_ms.is_some()
+        && ilk
+            .deleted_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(RETIRED_REASON_PREFIX))
+}
+
+/// A well-known system ILK of `hive_id` (FINDINGS A-191): its `identification.hive_id` is that
+/// hive, and so is the hive its node name carries (`ilk_owning_hive`).
+fn is_system_ilk_of_hive(ilk: &IlkRecord, hive_id: &str) -> bool {
+    is_well_known_system_ilk(ilk)
+        && identification_str(&ilk.identification, "hive_id") == Some(hive_id)
+        && ilk_owning_hive(ilk).as_deref() == Some(hive_id)
+}
+
+/// The SY node a system ILK of `hive_id` stands for, when the record has the shape
+/// `ensure_system_ilks_from_hive` gives it there: a well-known ILK of that hive whose node name is
+/// `<system_node>@<hive_id>` and whose id is that name's deterministic one. `None` for any other
+/// ILK, another hive's above all.
+fn seeded_system_node<'a>(ilk: &'a IlkRecord, hive_id: &str) -> Option<&'a str> {
+    if !is_system_ilk_of_hive(ilk, hive_id) {
+        return None;
+    }
+    let node = identification_str(&ilk.identification, "system_node")?;
+    let node_name = identification_str(&ilk.identification, "node_name")?;
+    (node_name == format!("{node}@{hive_id}")
+        && ilk.ilk_id == deterministic_system_ilk_id(node_name))
+    .then_some(node)
+}
+
 /// The SY nodes this hive's system ILKs are seeded for: the release's list for the motherbee on
 /// the primary, and the worker's on a replica (SY.identity runs on those two roles only).
 fn system_nodes_for_hive(hive: &HiveFile) -> Vec<String> {
@@ -6782,6 +7020,7 @@ fn response_name(action: &str) -> &'static str {
         MSG_TNT_DELETE => MSG_TNT_DELETE_RESPONSE,
         MSG_TNT_RESTORE => MSG_TNT_RESTORE_RESPONSE,
         MSG_TNT_PURGE => MSG_TNT_PURGE_RESPONSE,
+        MSG_ILK_RETIRE_HIVE => MSG_ILK_RETIRE_HIVE_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         "CONFIG_GET" | "CONFIG_SET" => "CONFIG_RESPONSE",
         _ => "SYSTEM_ERROR",
@@ -6807,6 +7046,7 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_TNT_DELETE
             | MSG_TNT_RESTORE
             | MSG_TNT_PURGE
+            | MSG_ILK_RETIRE_HIVE
     )
 }
 
@@ -6819,6 +7059,7 @@ fn is_lifecycle_action(action: &str) -> bool {
             | MSG_TNT_DELETE
             | MSG_TNT_RESTORE
             | MSG_TNT_PURGE
+            | MSG_ILK_RETIRE_HIVE
     )
 }
 
@@ -6987,6 +7228,25 @@ fn authorize_orchestrator_ilk_scope(
         "UNAUTHORIZED",
         "an orchestrator may only register, update, delete or purge its own hive's nodes",
     ))
+}
+
+/// Who purges a system ILK (FINDINGS A-191): the operator, through SY.admin, and only a retired one
+/// (`check_ilk_purgeable`). An orchestrator purges the ILKs of the nodes it ran, never a system
+/// one, whatever its hive: deleting a system ILK is the operator's explicit word, for one that made
+/// no history. `None` lets the purge go on to its own checks.
+fn refuse_system_ilk_purge(
+    store: &IdentityStore,
+    ilk_id: &str,
+    caller: Option<&str>,
+) -> Option<Value> {
+    let system = store.ilks.get(ilk_id).is_some_and(is_system_ilk);
+    let operator = caller.is_some_and(|caller| caller.trim().starts_with("SY.admin@"));
+    (system && !operator).then(|| {
+        error_payload(
+            "SYSTEM_ILK_PROTECTED",
+            "a system ILK is purged only by the operator, through SY.admin, once it is retired",
+        )
+    })
 }
 
 /// A node of `hive`: not a person, and its `identification.node_name` ends in `@<hive>`.
@@ -7243,10 +7503,15 @@ fn is_pending_signup(ilk: &IlkRecord) -> bool {
 /// What a replica may push for one of its ILKs: every id in its canonical spelling (another
 /// spelling would overwrite an existing row in the primary's database), never another tenant for
 /// an ILK the primary holds (a node is born and dies in its tenant, D6), only channels it may hold
-/// (see `replica_channels_acceptable`), and no channel another ILK holds or keeps reserved.
+/// (see `replica_channels_acceptable`), and no channel another ILK holds or keeps reserved. Nor a
+/// marked system ILK the primary does not hold (FINDINGS A-191): that is the retired ILK the
+/// operator purged while the replica was cut off, which its next full sync drops.
 fn replica_push_acceptable(incoming: &IlkRecord, store: &IdentityStore) -> bool {
     let existing = store.ilks.get(&incoming.ilk_id);
     ilk_record_ids_canonical(incoming)
+        && !(existing.is_none()
+            && incoming.deleted_at_ms.is_some()
+            && is_well_known_system_ilk(incoming))
         && existing.is_none_or(|existing| existing.tenant_id == incoming.tenant_id)
         && replica_channels_acceptable(incoming, existing)
         && incoming.channels.iter().all(|channel| {
@@ -14103,6 +14368,587 @@ mod tests {
         ));
         assert!(store.reconcile_hive_ilks("worker1", vec![moved]).is_empty());
         assert_eq!(store.ilks[&node.ilk_id].tenant_id, LC_TENANT);
+    }
+
+    // ---- FINDINGS A-191: a removed hive's and a retired node's system ILKs are retired ----
+
+    fn rt_hive(hive_id: &str, role: &str) -> HiveFile {
+        HiveFile {
+            hive_id: hive_id.to_string(),
+            role: Some(role.to_string()),
+            government: None,
+            identity: None,
+        }
+    }
+
+    /// The deterministic id of the system ILK of `node_name`.
+    fn rt_id(node_name: &str) -> String {
+        deterministic_system_ilk_id(node_name)
+    }
+
+    /// A system ILK as a release seeded it for `node` on `hive_id`.
+    fn rt_seeded(node: &str, hive_id: &str) -> IlkRecord {
+        let node_name = format!("{node}@{hive_id}");
+        IlkRecord {
+            ilk_id: rt_id(&node_name),
+            ilk_type: "system".to_string(),
+            registration_status: "complete".to_string(),
+            tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+            identification: json!({
+                "node_name": node_name,
+                "system_node": node,
+                "service": name_to_service(node),
+                "hive_id": hive_id,
+                "source": SYSTEM_ILK_SOURCE,
+            }),
+            definition: json!({}),
+            channels: Vec::new(),
+            deleted_at_ms: None,
+            deleted_reason: None,
+        }
+    }
+
+    /// The motherbee's store as 8.x holds it: the system ILKs this release seeds for the motherbee
+    /// and worker1, the SY.policy ILKs of both (0.1.79 retired the node), worker2's seven (removed
+    /// on 2026-10-06, SY.policy among them), gate0217's six (a throwaway worker removed on
+    /// 2026-11-08), an agent of worker1 and a person.
+    fn rt_prod_store() -> IdentityStore {
+        let mut store = IdentityStore::with_default_tenant();
+        let motherbee_nodes = HiveRole::Motherbee.settings().system_nodes.nodes;
+        let worker_nodes = HiveRole::Worker.settings().system_nodes.nodes;
+        let with_policy = |nodes: &[&'static str]| {
+            let mut nodes = nodes.to_vec();
+            nodes.push("SY.policy");
+            nodes
+        };
+        for (hive_id, nodes) in [
+            ("motherbee", with_policy(motherbee_nodes)),
+            ("worker1", with_policy(worker_nodes)),
+            ("worker2", with_policy(worker_nodes)),
+            ("gate0217", worker_nodes.to_vec()),
+        ] {
+            for node in nodes {
+                let ilk = rt_seeded(node, hive_id);
+                store.ilks.insert(ilk.ilk_id.clone(), ilk);
+            }
+        }
+        let agent = ilk_for("AI.pruebas@worker1", &t_ilk("pruebas"));
+        store.ilks.insert(agent.ilk_id.clone(), agent);
+        let person = IlkRecord {
+            ilk_id: t_ilk("ana"),
+            ilk_type: "human".to_string(),
+            registration_status: "complete".to_string(),
+            tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+            identification: json!({ "display_name": "Ana" }),
+            definition: json!({}),
+            channels: Vec::new(),
+            deleted_at_ms: None,
+            deleted_reason: None,
+        };
+        store.ilks.insert(person.ilk_id.clone(), person);
+        store
+    }
+
+    /// Whether the identity SHM `store` writes holds the ILK `ilk_id`.
+    fn rt_in_shm(store: &IdentityStore, ilk_id: &str) -> bool {
+        let uuid = *parse_prefixed_uuid(ilk_id, "ilk")
+            .expect("an ilk id")
+            .as_bytes();
+        identity_shm_entries(store)
+            .expect("the SHM entries")
+            .ilks
+            .iter()
+            .any(|entry| entry.ilk_id == uuid)
+    }
+
+    #[test]
+    fn every_retire_reason_starts_with_the_prefix_and_fits_its_column() {
+        for reason in [RETIRED_REASON_NODE, RETIRED_REASON_HIVE] {
+            assert!(reason.starts_with(RETIRED_REASON_PREFIX), "{reason}");
+            assert!(reason.len() <= DELETED_REASON_MAX_LEN, "{reason}");
+        }
+        assert!(!DELETED_REASON_DIRECT.starts_with(RETIRED_REASON_PREFIX));
+    }
+
+    /// The primary's start on 8.x: SY.policy@motherbee, which this release does not run, is marked
+    /// retired and handed back for the database; every ILK of the release's motherbee nodes, and
+    /// every other hive's ILK (worker1's SY.policy included), stays as it was. The marked one
+    /// leaves the identity SHM and keeps its row; a second start changes nothing.
+    #[test]
+    fn the_primary_retires_the_ilks_of_the_nodes_its_release_no_longer_runs() {
+        let mut store = rt_prod_store();
+        let before = store.ilks.clone();
+        let motherbee = rt_hive("motherbee", "motherbee");
+        let policy = rt_id("SY.policy@motherbee");
+        assert!(rt_in_shm(&store, &policy));
+
+        let changed = store.ensure_system_ilks_from_hive(&motherbee);
+        let ids: Vec<&str> = changed.iter().map(|ilk| ilk.ilk_id.as_str()).collect();
+        assert_eq!(ids, vec![policy.as_str()]);
+        let marked = &store.ilks[&policy];
+        assert!(marked.deleted_at_ms.is_some());
+        assert_eq!(marked.deleted_reason.as_deref(), Some(RETIRED_REASON_NODE));
+        assert_eq!(&changed[0], marked);
+        assert_eq!(
+            marked.identification, before[&policy].identification,
+            "its row stays whole"
+        );
+        for (ilk_id, ilk) in &before {
+            if *ilk_id != policy {
+                assert_eq!(&store.ilks[ilk_id], ilk, "{ilk_id}");
+            }
+        }
+        assert!(!rt_in_shm(&store, &policy));
+        assert!(rt_in_shm(&store, &rt_id("SY.identity@motherbee")));
+        assert!(rt_in_shm(&store, &rt_id("SY.policy@worker1")));
+
+        assert!(store.ensure_system_ilks_from_hive(&motherbee).is_empty());
+    }
+
+    /// A release that runs a node again un-marks its ILK at the next start: the seed upserts a
+    /// marked ILK of a node it runs.
+    #[test]
+    fn a_release_that_runs_the_node_again_unmarks_its_ilk() {
+        let mut store = rt_prod_store();
+        let timer = rt_id("SY.timer@motherbee");
+        store
+            .mark_ilk_unchecked(&timer, RETIRED_REASON_NODE, 5)
+            .expect("as a release that dropped SY.timer left it");
+        assert!(!rt_in_shm(&store, &timer));
+
+        let changed = store.ensure_system_ilks_from_hive(&rt_hive("motherbee", "motherbee"));
+        let back = changed
+            .iter()
+            .find(|ilk| ilk.ilk_id == timer)
+            .expect("handed back for the database");
+        assert!(back.deleted_at_ms.is_none() && back.deleted_reason.is_none());
+        assert_eq!(&store.ilks[&timer], back);
+        assert!(rt_in_shm(&store, &timer));
+    }
+
+    /// The guard: a list of SY nodes that is empty, or lacks SY.identity, is no list of this
+    /// release for a hive SY.identity runs on, and retires nothing. A list with it retires what it
+    /// lacks, of that hive only.
+    #[test]
+    fn a_list_without_sy_identity_retires_nothing() {
+        let mut store = rt_prod_store();
+        let before = store.ilks.clone();
+        let names = |nodes: &[&str]| {
+            nodes
+                .iter()
+                .map(|node| node.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(store
+            .retire_dropped_system_ilks("motherbee", &[], 1)
+            .is_empty());
+        assert!(store
+            .retire_dropped_system_ilks("motherbee", &names(&["SY.admin", "SY.vault"]), 1)
+            .is_empty());
+        assert_eq!(store.ilks, before);
+
+        let marked = store.retire_dropped_system_ilks("motherbee", &names(&["SY.identity"]), 1);
+        assert_eq!(
+            marked.len(),
+            HiveRole::Motherbee.settings().system_nodes.nodes.len(),
+            "every motherbee node but SY.identity, and SY.policy"
+        );
+        assert!(marked
+            .iter()
+            .all(|ilk| ilk_owning_hive(ilk).as_deref() == Some("motherbee")));
+        assert!(store.ilks[&rt_id("SY.identity@motherbee")]
+            .deleted_at_ms
+            .is_none());
+        assert!(store.ilks[&rt_id("SY.policy@worker1")]
+            .deleted_at_ms
+            .is_none());
+    }
+
+    /// A replica's start retires its own hive's dropped nodes only, never another hive's, and the
+    /// primary takes its push of the mark, as a delta and in its snapshot. A push of another hive's
+    /// ILK marked is refused both ways.
+    #[test]
+    fn a_replica_retires_its_own_hive_s_only_and_the_primary_takes_the_mark() {
+        let mut primary = rt_prod_store();
+        let mut replica = primary.clone();
+        let worker1 = rt_hive("worker1", "worker");
+        let policy = rt_id("SY.policy@worker1");
+
+        let changed = replica.ensure_system_ilks_from_hive(&worker1);
+        let ids: Vec<&str> = changed.iter().map(|ilk| ilk.ilk_id.as_str()).collect();
+        assert_eq!(ids, vec![policy.as_str()]);
+        for other in [
+            "SY.policy@motherbee",
+            "SY.policy@worker2",
+            "SY.timer@gate0217",
+        ] {
+            assert!(
+                replica.ilks[&rt_id(other)].deleted_at_ms.is_none(),
+                "{other}"
+            );
+        }
+
+        let pushed = replica.ilks[&policy].clone();
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert {
+                ilk: pushed.clone()
+            },
+            "worker1",
+            &primary
+        ));
+        let deltas = primary.reconcile_hive_ilks("worker1", replica.self_owned_ilks("worker1"));
+        assert_eq!(deltas.len(), 1, "the mark only");
+        assert_eq!(primary.ilks[&policy], pushed);
+
+        let mut forged = primary.ilks[&rt_id("SY.policy@worker2")].clone();
+        forged.deleted_at_ms = Some(1);
+        forged.deleted_reason = Some(RETIRED_REASON_NODE.to_string());
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert {
+                ilk: forged.clone()
+            },
+            "worker1",
+            &primary
+        ));
+        let mut snapshot = replica.self_owned_ilks("worker1");
+        snapshot.push(forged);
+        assert!(primary.reconcile_hive_ilks("worker1", snapshot).is_empty());
+        assert!(primary.ilks[&rt_id("SY.policy@worker2")]
+            .deleted_at_ms
+            .is_none());
+    }
+
+    /// ILK_RETIRE_HIVE marks exactly the removed hive's system ILKs, gate0217's six and worker2's
+    /// seven, with the hive's reason, and nothing else; again, it marks none. Never the primary's
+    /// own hive, nor a name that is no hive id.
+    #[test]
+    fn ilk_retire_hive_marks_exactly_the_removed_hive_s_system_ilks() {
+        let mut store = rt_prod_store();
+        let before = store.ilks.clone();
+        let worker_nodes = HiveRole::Worker.settings().system_nodes.nodes;
+        let mut gate: Vec<String> = worker_nodes
+            .iter()
+            .map(|node| rt_id(&format!("{node}@gate0217")))
+            .collect();
+        gate.sort_unstable();
+
+        let (ok, changes) = store
+            .retire_hive_system_ilks("gate0217", "motherbee", 7)
+            .expect("gate0217");
+        assert_eq!(ok["count"], json!(6));
+        assert_eq!(ok["ilk_ids"], json!(gate));
+        assert_eq!(ok["already_retired"], json!(0));
+        assert_eq!(ok["hive_id"], json!("gate0217"));
+        assert_eq!(changes.ilks.len(), 6);
+        assert!(changes.purged_ilks.is_empty());
+        for ilk in &changes.ilks {
+            assert_eq!(ilk.deleted_at_ms, Some(7));
+            assert_eq!(ilk.deleted_reason.as_deref(), Some(RETIRED_REASON_HIVE));
+            assert_eq!(&store.ilks[&ilk.ilk_id], ilk);
+            assert!(!rt_in_shm(&store, &ilk.ilk_id));
+        }
+        for (ilk_id, ilk) in &before {
+            if !gate.contains(ilk_id) {
+                assert_eq!(&store.ilks[ilk_id], ilk, "{ilk_id}");
+            }
+        }
+
+        let (ok, _) = store
+            .retire_hive_system_ilks("worker2", "motherbee", 8)
+            .expect("worker2");
+        assert_eq!(ok["count"], json!(7));
+        assert!(store.ilks[&rt_id("SY.policy@worker2")]
+            .deleted_at_ms
+            .is_some());
+
+        let (ok, changes) = store
+            .retire_hive_system_ilks("gate0217", "motherbee", 9)
+            .expect("again");
+        assert_eq!(ok["count"], json!(0));
+        assert_eq!(ok["already_retired"], json!(6));
+        assert!(changes.ilks.is_empty());
+
+        let err = store
+            .retire_hive_system_ilks("motherbee", "motherbee", 1)
+            .expect_err("the primary's own hive");
+        assert_eq!(lc_code(err), "HIVE_NOT_REMOVED");
+        for bad in ["", "../etc", "worker 1", "gate/0217"] {
+            let err = store
+                .retire_hive_system_ilks(bad, "motherbee", 1)
+                .expect_err(bad);
+            assert_eq!(lc_code(err), "INVALID_REQUEST", "{bad}");
+        }
+        assert!(store.ilks[&rt_id("SY.identity@motherbee")]
+            .deleted_at_ms
+            .is_none());
+    }
+
+    /// ILK_RETIRE_HIVE is the motherbee's SY.admin's alone, on the primary only: any other caller
+    /// is refused before anything else, a replica answers NOT_PRIMARY, and the primary rebuilds its
+    /// SHM from the store once it marked them, as for any lifecycle change.
+    #[tokio::test]
+    async fn ilk_retire_hive_is_the_motherbee_s_sy_admin_s_on_the_primary() {
+        let primary = IdentityRuntime::new(&test_hive(None), PathBuf::from("/tmp"), true, None);
+        assert!(primary.is_authorized(MSG_ILK_RETIRE_HIVE, Some("SY.admin@motherbee")));
+        for caller in [
+            None,
+            Some("SY.admin@worker1"),
+            Some("SY.architect@motherbee"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.identity@motherbee"),
+            Some("IO.cloud@motherbee"),
+        ] {
+            assert!(
+                !primary.is_authorized(MSG_ILK_RETIRE_HIVE, caller),
+                "{caller:?}"
+            );
+        }
+        assert!(action_requires_primary(MSG_ILK_RETIRE_HIVE));
+        assert!(is_lifecycle_action(MSG_ILK_RETIRE_HIVE));
+        assert_eq!(
+            response_name(MSG_ILK_RETIRE_HIVE),
+            MSG_ILK_RETIRE_HIVE_RESPONSE
+        );
+
+        let answer = |hive_id: &str, is_primary: bool, caller: &str| {
+            let hive = rt_hive(hive_id, if is_primary { "motherbee" } else { "worker" });
+            let caller = caller.to_string();
+            let identity = format!("SY.identity@{hive_id}");
+            async move {
+                let mut runtime =
+                    IdentityRuntime::new(&hive, PathBuf::from("/tmp"), is_primary, None);
+                let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+                    &identity,
+                    build_identity_rpc_profile().expect("profile"),
+                );
+                let request = Message {
+                    routing: Routing {
+                        src: Uuid::new_v4().to_string(),
+                        src_l2_name: Some(caller),
+                        dst: Destination::Unicast(identity.clone()),
+                        ttl: 16,
+                        trace_id: Uuid::new_v4().to_string(),
+                    },
+                    meta: Meta {
+                        msg_type: SYSTEM_KIND.to_string(),
+                        msg: Some(MSG_ILK_RETIRE_HIVE.to_string()),
+                        ..Meta::default()
+                    },
+                    payload: json!({ "hive_id": "gate0217" }),
+                };
+                let mut control = IdentityControlState {
+                    schema_version: IDENTITY_CONFIG_SCHEMA_VERSION,
+                    config_version: 0,
+                    secret_source: IdentityDbSecretSource::Missing,
+                    db_ready: false,
+                    last_error: None,
+                };
+                let deltas = runtime
+                    .process_system_message(
+                        &client.sender_snapshot(),
+                        &request,
+                        None,
+                        &mut control,
+                        &identity,
+                    )
+                    .await
+                    .expect("handled");
+                assert!(deltas.is_empty());
+                let reply = harness
+                    .next_outgoing_within(Duration::from_secs(1))
+                    .await
+                    .expect("an answer");
+                assert_eq!(
+                    reply.meta.msg.as_deref(),
+                    Some(MSG_ILK_RETIRE_HIVE_RESPONSE)
+                );
+                reply.payload["error_code"].clone()
+            }
+        };
+        assert_eq!(
+            answer("motherbee", true, "SY.orchestrator@motherbee").await,
+            json!("UNAUTHORIZED_REGISTRAR")
+        );
+        assert_eq!(
+            answer("worker1", false, "SY.admin@motherbee").await,
+            json!("NOT_PRIMARY")
+        );
+        // Past both checks: a primary without its database writes nothing.
+        assert_eq!(
+            answer("motherbee", true, "SY.admin@motherbee").await,
+            json!("DB_NOT_READY")
+        );
+    }
+
+    /// Only a retired system ILK is purged, and only by the operator through SY.admin: an
+    /// unmarked one, or one marked for another reason, stays SYSTEM_ILK_PROTECTED, and so do an
+    /// admin's delete and restore of a system ILK, retired or not. An orchestrator's purge of one,
+    /// even of its own hive, is refused before the purge runs.
+    #[test]
+    fn only_a_retired_system_ilk_is_purged_and_only_by_the_operator() {
+        let mut store = rt_prod_store();
+        store
+            .retire_hive_system_ilks("gate0217", "motherbee", 7)
+            .expect("retire");
+        let retired = rt_id("SY.timer@gate0217");
+        let active = rt_id("SY.timer@worker1");
+        let direct = rt_id("SY.cognition@worker1");
+        store
+            .mark_ilk_unchecked(&direct, DELETED_REASON_DIRECT, 3)
+            .expect("marked without the prefix");
+
+        assert_eq!(
+            store.restore_ilk(lc_ilk(&retired)).expect_err("restore"),
+            "SYSTEM_ILK_PROTECTED"
+        );
+        assert_eq!(
+            store.delete_ilk(lc_ilk(&active), 1).expect_err("delete"),
+            "SYSTEM_ILK_PROTECTED"
+        );
+        for refused in [&active, &direct] {
+            assert_eq!(
+                store.purge_ilk(lc_ilk(refused)).expect_err(refused),
+                "SYSTEM_ILK_PROTECTED"
+            );
+        }
+        for caller in [
+            Some("SY.orchestrator@gate0217"),
+            Some("SY.orchestrator@motherbee"),
+            None,
+        ] {
+            let refusal = refuse_system_ilk_purge(&store, &retired, caller).expect("refused");
+            assert_eq!(refusal["error_code"], json!("SYSTEM_ILK_PROTECTED"));
+        }
+        assert!(refuse_system_ilk_purge(&store, &retired, Some("SY.admin@motherbee")).is_none());
+        assert!(
+            refuse_system_ilk_purge(&store, &t_ilk("pruebas"), Some("SY.orchestrator@worker1"))
+                .is_none(),
+            "a node's own ILK goes on to the purge's checks"
+        );
+
+        let (ok, changes) = store.purge_ilk(lc_ilk(&retired)).expect("a retired one");
+        assert_eq!(ok["state"], json!("purged"));
+        assert_eq!(changes.purged_ilks, vec![retired.clone()]);
+        assert!(!store.ilks.contains_key(&retired));
+        assert!(store.ilks.contains_key(&rt_id("SY.identity@gate0217")));
+    }
+
+    /// The purge reaches every replica: its IlkDelete drops the replica's copy of a retired system
+    /// ILK. An unmarked one stays (the forged-snapshot guard), and so does one marked without the
+    /// retire prefix. A replica never sends one: its IlkDelete of a system ILK of its own hive is
+    /// refused, retired or not.
+    #[test]
+    fn a_replica_drops_a_retired_system_ilk_on_the_purge_s_delta() {
+        let mut replica = rt_prod_store();
+        replica
+            .retire_hive_system_ilks("gate0217", "motherbee", 7)
+            .expect("the primary's marks, as their upserts left them");
+        let retired = rt_id("SY.timer@gate0217");
+        replica.apply_delta(IdentityDelta::IlkDelete {
+            ilk_id: retired.clone(),
+        });
+        assert!(!replica.ilks.contains_key(&retired));
+        assert!(!rt_in_shm(&replica, &retired));
+
+        let unmarked = rt_id("SY.identity@worker1");
+        replica.apply_delta(IdentityDelta::IlkDelete {
+            ilk_id: unmarked.clone(),
+        });
+        assert!(replica.ilks.contains_key(&unmarked));
+        let direct = rt_id("SY.cognition@worker2");
+        replica
+            .mark_ilk_unchecked(&direct, DELETED_REASON_DIRECT, 1)
+            .expect("marked");
+        replica.apply_delta(IdentityDelta::IlkDelete {
+            ilk_id: direct.clone(),
+        });
+        assert!(replica.ilks.contains_key(&direct));
+
+        let mut primary = rt_prod_store();
+        primary.ensure_system_ilks_from_hive(&rt_hive("worker1", "worker"));
+        for ilk_id in [rt_id("SY.policy@worker1"), rt_id("SY.timer@worker1")] {
+            assert!(!delta_authorized_for_hive(
+                &IdentityDelta::IlkDelete {
+                    ilk_id: ilk_id.clone()
+                },
+                "worker1",
+                &primary
+            ));
+        }
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkDelete {
+                ilk_id: t_ilk("pruebas")
+            },
+            "worker1",
+            &primary
+        ));
+    }
+
+    /// A replica cut off while the operator purged its retired ILK: its stale push does not bring
+    /// it back on the primary, as a snapshot or as a delta, and its next sync with the primary (a
+    /// full snapshot and the seed on top, as every subscription starts) drops it.
+    #[test]
+    fn a_replica_that_missed_the_purge_drops_it_at_its_next_sync() {
+        let worker1 = rt_hive("worker1", "worker");
+        let mut primary = rt_prod_store();
+        let mut replica = primary.clone();
+        replica.ensure_system_ilks_from_hive(&worker1);
+        primary.reconcile_hive_ilks("worker1", replica.self_owned_ilks("worker1"));
+        let policy = rt_id("SY.policy@worker1");
+        assert_eq!(primary.ilks[&policy], replica.ilks[&policy]);
+
+        primary
+            .purge_ilk(lc_ilk(&policy))
+            .expect("the operator's purge");
+
+        let stale = replica.self_owned_ilks("worker1");
+        assert!(stale.iter().any(|ilk| ilk.ilk_id == policy));
+        assert!(primary.reconcile_hive_ilks("worker1", stale).is_empty());
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert {
+                ilk: replica.ilks[&policy].clone()
+            },
+            "worker1",
+            &primary
+        ));
+        assert!(!primary.ilks.contains_key(&policy));
+
+        let mut synced = IdentityStore::from_full_sync_chunks(&primary.build_full_sync_chunks(8))
+            .expect("the full sync");
+        synced.ensure_system_ilks_from_hive(&worker1);
+        assert!(!synced.ilks.contains_key(&policy));
+        assert!(!rt_in_shm(&synced, &policy));
+        assert!(synced.ilks.contains_key(&rt_id("SY.timer@worker1")));
+    }
+
+    /// The primary's mark on a node this replica runs (a retirement of its hive that crossed a join
+    /// again under its name) comes off at once: the replica seeds again after the delta, and its
+    /// push takes the mark off on the primary too.
+    #[test]
+    fn a_replica_takes_the_primary_s_mark_off_a_node_it_runs() {
+        let worker1 = rt_hive("worker1", "worker");
+        let mut primary = rt_prod_store();
+        primary.ensure_system_ilks_from_hive(&worker1);
+        let mut replica = primary.clone();
+        primary
+            .retire_hive_system_ilks("worker1", "motherbee", 9)
+            .expect("the crossed retirement");
+        let timer = rt_id("SY.timer@worker1");
+        let marked = primary.ilks[&timer].clone();
+        assert!(marked.deleted_at_ms.is_some());
+
+        let changed =
+            replica.apply_primary_delta(IdentityDelta::IlkUpsert { ilk: marked }, &worker1);
+        assert!(changed.iter().any(|ilk| ilk.ilk_id == timer));
+        assert!(replica.ilks[&timer].deleted_at_ms.is_none());
+        assert!(rt_in_shm(&replica, &timer));
+
+        primary.reconcile_hive_ilks("worker1", replica.self_owned_ilks("worker1"));
+        assert!(primary.ilks[&timer].deleted_at_ms.is_none());
+        // Its retired SY.policy stays retired.
+        assert!(replica.ilks[&rt_id("SY.policy@worker1")]
+            .deleted_at_ms
+            .is_some());
     }
 
     /// FINDINGS A-232: a listing's refusal of a cursor names the field and what it takes, never

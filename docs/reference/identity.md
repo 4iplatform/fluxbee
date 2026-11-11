@@ -58,7 +58,7 @@ Where identity lives:
 | `identification` | Free JSON. The keys the code reads: `node_name`, `email` (an email the channel vouches for, §2.7), `display_name`. A person's `claimed_email`, an email they only typed, is stored and returned but never read as a key. |
 | `definition` | An agent's cognitive definition (§4). `{}` for any other type. |
 | `channels` | Its ICHs (`ChannelRecord`, §2.5). |
-| `deleted_at_ms`, `deleted_reason` | The delete mark (§2.8). The only reason written is `direct`. |
+| `deleted_at_ms`, `deleted_reason` | The delete mark (§2.8). The reason is `direct` for a delete, and `retired: node` or `retired: hive` for a retired system ILK (§2.9); the column holds 16 characters. |
 
 Two identification keys are unique, and the database enforces both
 (`ensure_primary_schema`):
@@ -91,8 +91,9 @@ Rules:
 - A system ILK is charged to the root tenant, is `complete`, and carries
   `identification.source = "hive.system_nodes"` (`is_well_known_system_ilk`), the name these
   records were first written with, when the lists came from hive.yaml.
-- A system ILK cannot be registered over (`SYSTEM_ILK_PROTECTED` in `register_ilk`), marked or
-  purged (`check_ilk_markable`).
+- A system ILK cannot be registered over (`SYSTEM_ILK_PROTECTED` in `register_ilk`), nor deleted,
+  restored or purged by a caller (`check_ilk_markable`). It is retired instead, and only a retired
+  one is purged, by the operator (§2.9).
 - In the SHM the type is a byte: 0 human, 1 agent, 2 system (`SHM_ILK_TYPE_*`). An unknown
   string is written as `human`, the least privileged (`parse_ilk_type_for_shm`). The router shows
   an unknown byte to OPA as `"unknown"` (`inject_identity_data` in `src/router/mod.rs`).
@@ -290,12 +291,14 @@ Delete is a reversible mark. Purge is a separate, final step.
 - A key an active ILK holds now answers `ILK_KEY_CONFLICT` (`check_ilk_restorable`).
 - A restored person whose `cloud` channel stayed in an old scope moves it to the
   installation-wide scope when that key is free (`move_account_to_installation_scope`).
+- System ILKs answer `SYSTEM_ILK_PROTECTED`, a retired one included (§2.9).
 
 **`ILK_PURGE`** (`purge_ilk`): only a marked ILK (`ILK_NOT_DELETED` otherwise). It removes the
 ILK, its lookups and every alias that names it (`remove_ilk_physically`). Public pages of the
 ILK's node never refuse it (FINDINGS A-242): they stay up until they expire, and SY.admin's ok
 answer names them (`pages_left_up`; SY.admin reads the ILK's node with `ILK_GET` before the purge
-while some page is up, [SY.admin](../nodes/sy-admin.md#publications-and-the-audit-log)).
+while some page is up, [SY.admin](../nodes/sy-admin.md#publications-and-the-audit-log)). A system
+ILK only once it is retired, and only from SY.admin (§2.9).
 
 All three take two optional guards (`IlkDeleteRequest`, `check_ilk_tenant_scope`):
 
@@ -305,6 +308,43 @@ All three take two optional guards (`IlkDeleteRequest`, `check_ilk_tenant_scope`
 Every lifecycle op validates before it changes anything. `run_lifecycle_op` snapshots the
 store, writes the changes in one database transaction (`persist_lifecycle_in_db`), and restores
 the snapshot on any error.
+
+### 2.9 Retired system ILKs
+
+A system ILK names a node, and what a node did names its ILK: it is never deleted on its own
+(FINDINGS A-191, the operator's call of 2026-11-11). Once its node is gone it is **retired**: marked
+as a delete marks (§2.8), with a reason that starts with `retired:` (`RETIRED_REASON_PREFIX`). It
+leaves every lookup and the SHM, its row stays, and its node name stays reserved.
+
+- **A node the release no longer runs on a hive** (`retire_dropped_system_ilks`, reason
+  `retired: node`): at each start, after the seed, SY.identity marks each system ILK seeded for its
+  own hive (`seeded_system_node`: its `identification.hive_id` and the hive of its node name are
+  that hive, its id the name's deterministic one) whose `system_node` the release's list for that hive
+  (`system_nodes_for_hive`, by the hive's role alone) no longer names. A list that is empty or lacks
+  SY.identity retires nothing, with a warning. The primary writes the marks to its database; a
+  replica pushes them with its own ILKs, and the primary takes a replica's mark of its own hive's
+  ILK only (§5.4). SY.policy's, which 0.1.79 dropped, are the first.
+- **A removed hive** (`ILK_RETIRE_HIVE {hive_id}`, `retire_hive_system_ilks`, reason
+  `retired: hive`): SY.admin sends it after a successful `remove_hive`, and for its
+  `retire_hive_ilks`, which refuses the motherbee and a hive the registry still lists. SY.identity
+  takes it from `SY.admin@motherbee` alone, on the primary, refuses its own hive
+  (`HIVE_NOT_REMOVED`), and marks each well-known system ILK whose `identification.hive_id` and node
+  name are that hive's. It answers `{hive_id, count, ilk_ids, already_retired}`: the ILKs it
+  marked now, and how many were marked before.
+- **Only the seed un-marks one:** a release that runs the node again, or the hive joined again
+  under the same name, whose replica seeds its ILKs at its start and after every delta of the
+  primary's (`apply_primary_delta`), then pushes them. `ILK_DELETE` and `ILK_RESTORE` refuse a
+  system ILK.
+- **Only the operator purges one, and only a retired one** (`check_ilk_purgeable`,
+  `refuse_system_ilk_purge`): `ILK_PURGE` from SY.admin; an orchestrator's purge of a system ILK,
+  of its own hive or not, and the purge of an unmarked system ILK or of one marked for another
+  reason answer `SYSTEM_ILK_PROTECTED`. The operator purges one that made no history (no LLM usage
+  of its node, no message from or to it, no conversation SY.cognition keeps under it); one that
+  made history stays retired.
+- **The purge reaches every replica:** its `IlkDelete` removes a replica's retired copy, while an
+  unmarked system ILK stays protected from any `IlkDelete`. A replica cut off at the purge pushes
+  its stale copy in vain (the primary takes no marked system ILK it does not hold), and drops it
+  at its next full snapshot.
 
 ---
 
@@ -523,7 +563,8 @@ workers, so an agent with a definition runs on a worker too.
   `ILK_UPDATE`, `ILK_SET_DEFINITION`;
 - the channel switch `ICH_SET_ENABLED`;
 - the tenant writes: `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR`;
-- the lifecycle: delete, restore and purge, of ILKs and of tenants.
+- the lifecycle: delete, restore and purge, of ILKs and of tenants, and a removed hive's
+  `ILK_RETIRE_HIVE` (§2.9).
 
 A replica answers them with `NOT_PRIMARY`; it does not forward them. The callers target
 `SY.identity@motherbee` directly (`IdentityProvisionConfig` in `nodes/io/common/src/provision.rs`;
@@ -577,7 +618,12 @@ converges to the union of the mesh.
   - Tenant deltas from a replica are refused.
   - A publish that claims the primary's own hive is refused.
 - A snapshot reconciles that hive's ILKs to exactly the pushed set (`reconcile_hive_ilks`). Well-known
-  system ILKs are never removed this way.
+  system ILKs are never removed this way, nor by a replica's `IlkDelete`, retired or not; and a
+  marked system ILK the primary does not hold is not taken (`replica_push_acceptable`): it is a
+  purge the replica missed (§2.9).
+- A replica seeds its hive's system ILKs again after each full snapshot and each delta of the
+  primary's, so its own nodes' ILKs are never left marked (`apply_primary_delta`). It applies the
+  `IlkDelete` of a well-known system ILK only to a copy it holds retired, the operator's purge.
 - The primary persists the ILK changes it applied, updates its SHM, and broadcasts them to its
   delta subscribers.
 
@@ -659,7 +705,8 @@ All are system messages to `SY.identity@<hive>`. SY.identity checks the router-s
 | `ILK_SET_TENANT` | `SY.admin@`, `SY.architect@` (same hive) |
 | `ILK_DELETE` | `SY.admin@` (same hive), `SY.orchestrator@` (its own hive's nodes), `SY.identity@<hive>` |
 | `ILK_RESTORE` | `SY.admin@` (same hive) |
-| `ILK_PURGE` | `SY.admin@` (same hive), `SY.orchestrator@` (its own hive's nodes) |
+| `ILK_PURGE` | `SY.admin@` (same hive), `SY.orchestrator@` (its own hive's nodes, never a system ILK) |
+| `ILK_RETIRE_HIVE` | `SY.admin@motherbee` only |
 | `ICH_SET_ENABLED` | `IO.*` (its own channel only), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@` (same hive), the configured frontdesk |
 | `ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET` | `SY.admin@` (same hive) |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` (same hive) |
@@ -683,6 +730,8 @@ The configured frontdesk is `hive.yaml` `government.identity_frontdesk`, made a 
   in `@H`.
 - Anything else answers `UNAUTHORIZED`, with the warning `identity refused an orchestrator outside
   its own hive's nodes`. An ILK that does not exist answers as before (`ILK_NOT_FOUND`).
+- `ILK_PURGE` of a system ILK, `@H` included, answers `SYSTEM_ILK_PROTECTED`: only the operator,
+  through SY.admin, purges one, once it is retired (§2.9).
 
 ### 7.2 SY.admin (the operator)
 
@@ -708,6 +757,7 @@ on the motherbee, so `{hive}` is `motherbee` in practice.
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | `restore_tenant` → `TNT_RESTORE` |
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | `purge_tenant` → `TNT_PURGE`, after the vault check; its ok answer names the pages left up (`pages_left_up`) |
 | `GET /hives/{hive}/identity/tenants/{tenant_id}/nodes` | `list_tenant_nodes` |
+| `POST /hives/{hive_id}/system-ilks/retire` (the removed hive) | `retire_hive_ilks` → `ILK_RETIRE_HIVE`, refused for the motherbee and a hive the registry lists (§2.9); `remove_hive` sends it too once the hive is gone |
 
 - `pending_signup` keeps only the temporary people who hold a Cloud account key, wherever they
   are charged (`is_pending_signup`).
@@ -753,7 +803,8 @@ SY.admin re-checks every relayed request (`enforce_cloud_relay_content`, `stamp_
 | `ILK_DELETED` | A marked ILK holds that key. |
 | `TENANT_DELETED`, `TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_NOT_ACTIVE` | The tenant's state refuses the operation. |
 | `TENANT_ROOT_PROTECTED`, `TENANT_ROOT_NOT_REGISTRABLE` | The root tenant is not editable, and takes no person. |
-| `SYSTEM_ILK_PROTECTED` | A system ILK. |
+| `SYSTEM_ILK_PROTECTED` | A system ILK: never deleted or restored, and purged only once retired, by SY.admin (§2.9). |
+| `HIVE_NOT_REMOVED` | `ILK_RETIRE_HIVE` of the primary's own hive; from SY.admin's `retire_hive_ilks`, the motherbee or a hive the registry still lists (§2.9). |
 | `DUPLICATE_EMAIL` | The vouched email (`identification.email`) is taken in that tenant and no merge applies. A `claimed_email` never answers it. |
 | `CLOUD_CHANNEL_RESERVED`, `INVALID_SCOPE`, `ICH_ID_CONFLICT`, `ICH_CONFLICT`, `ACCOUNT_AMBIGUOUS` | Channel and scope rules (§2.5, §2.6). `ICH_CONFLICT`: another ILK holds the channel. |
 | `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS` | A tenant lifecycle guard (§3.6). |

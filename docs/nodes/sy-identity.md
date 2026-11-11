@@ -68,7 +68,18 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
    node name, so SY.vault and other nodes compute the same id without asking. Their
    `identification.source` is `hive.system_nodes` (`SYSTEM_ILK_SOURCE`), the name they were first
    written with; it marks them as seeded (`is_well_known_system_ilk`), wherever the list comes
-   from. A node a release drops keeps its ILK: the seeding only adds.
+   from. A marked one of a node the release runs comes back unmarked. **A node a release drops
+   has its ILK retired** (FINDINGS A-191, `retire_dropped_system_ilks`): each system ILK seeded
+   for this hive (`identification.hive_id` and the hive of its node name, its id the name's
+   deterministic one, `seeded_system_node`) whose `system_node` the release's list for the hive no
+   longer names is marked with the reason `retired: node`, as 0.1.79 dropped SY.policy. The mark is
+   the delete model's: the ILK leaves the lookups and the SHM, its row stays, nothing purges it
+   but the operator (below). Only this hive's ILKs, never another hive's; and nothing, with a
+   warning, when the list is empty or lacks SY.identity. The list depends on the hive's role
+   alone (motherbee or worker, from `hive.yaml`) and on the release's table, compiled into the
+   binary: no configuration changes it. The primary writes the records it changed to its database;
+   a replica pushes them with its own ILKs (below), and the primary takes a replica's mark of its
+   own hive's ILK only.
 7. Opens or creates the SHM region and rebuilds it from the store (next section). Limits in
    `hive.yaml` lowered below what the store holds stop the start here. If the region cannot be
    opened, it logs `identity shm unavailable` and goes on.
@@ -160,13 +171,22 @@ Identity is created in two steps:
   items per kind. `IDENTITY_DELTA_SUBSCRIBE` starts a stream of `IDENTITY_DELTA` frames
   (tenant, ILK and alias upserts and deletes), each acknowledged with `IDENTITY_DELTA_ACK`
   (2 s, 3 tries); the primary sends `IDENTITY_SYNC_HEARTBEAT` every 20 s and a replica that hears
-  nothing for 60 s subscribes again from a full snapshot.
+  nothing for 60 s subscribes again from a full snapshot. A replica takes the snapshot as its whole
+  store and seeds its hive's system ILKs on top, so what the primary purged while the replica was
+  cut off is gone after it. After each delta it seeds them again (`apply_primary_delta`): a mark
+  the primary puts on a node this release runs here (a hive's retirement that crossed a join
+  again under its name) comes off at once and goes back with its next push. A delta's
+  `IlkDelete` never removes a well-known system ILK, but one this replica holds retired: that is
+  the operator's purge.
 - **Replica to primary:** with `IDENTITY_DELTA_PUBLISH` a replica sends its own hive's ILKs
   (`node_name` ending in `@<its hive>`), as a full snapshot every 30 s
   (`IDENTITY_PUBLISH_RECONCILE_SECS`, `push_local_deltas_upstream`), and only once it holds a
   baseline from the primary. The primary accepts a publish only for the authenticated hive and
   only ILKs that hive owns (`delta_authorized_for_hive`), with every id in its canonical spelling
-  and no channel another ILK holds (`replica_push_acceptable`), stores them and passes them on.
+  and no channel another ILK holds (`replica_push_acceptable`), stores them and passes them on. It
+  never takes a replica's `IlkDelete` of a well-known system ILK, nor a marked system ILK it does
+  not hold: that is a purge the replica missed, which its next full snapshot drops (FINDINGS
+  A-191).
 - Limits: 64 concurrent sync connections, 256 delta subscribers, 1024 queued frames per
   subscriber (a slow one is dropped and resyncs).
 
@@ -189,7 +209,8 @@ request gets `UNAUTHORIZED_REGISTRAR`.
 | `ILK_SET_TENANT` | `SY.admin@`, `SY.architect@` | yes |
 | `ILK_DELETE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes), `SY.identity@<hive>` | yes |
 | `ILK_RESTORE` | `SY.admin@` | yes |
-| `ILK_PURGE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes) | yes |
+| `ILK_PURGE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes; never a system ILK) | yes |
+| `ILK_RETIRE_HIVE` | `SY.admin@motherbee` only | yes |
 | `ICH_SET_ENABLED` | `IO.*` (only for an ICH it owns), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@`, the configured frontdesk | yes |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` | yes |
 | `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` | yes |
@@ -241,7 +262,8 @@ launches as type `agent`, and marks and purges it when the launch fails; on tear
 SY.admin's `teardown_node`, which deletes the node's secrets, then marks and purges the ILK
 (`src/bin/sy_orchestrator.rs`);
 SY.admin sends the operator's and Fluxbee Cloud's tenant and ILK operations
-(`handle_identity_command` in `src/bin/sy_admin.rs`).
+(`handle_identity_command` in `src/bin/sy_admin.rs`), and `ILK_RETIRE_HIVE` for its
+`retire_hive_ilks` and after each `remove_hive` (`handle_retire_hive_ilks`).
 
 ## Delete marks, purge removes
 
@@ -253,8 +275,24 @@ Deleting is reversible; purging is physical and final (`delete_ilk`, `restore_il
   who tries to take them). A second delete answers `already_deleted: true`. System ILKs are
   refused (`SYSTEM_ILK_PROTECTED`).
 - `ILK_RESTORE` un-marks it (`ILK_NOT_DELETED` if it was not marked). A person comes back even
-  while its tenant is marked; any other ILK waits for its tenant (`TENANT_DELETED`).
+  while its tenant is marked; any other ILK waits for its tenant (`TENANT_DELETED`). System ILKs
+  are refused (`SYSTEM_ILK_PROTECTED`).
 - `ILK_PURGE` removes a marked ILK and its aliases (`ILK_NOT_DELETED` if it is not marked).
+- **A system ILK is never deleted: it is retired** (FINDINGS A-191). Only two paths mark one, both
+  with a reason that starts with `retired:` (`RETIRED_REASON_PREFIX`): the seed, for a node the
+  release no longer runs on the hive (`retired: node`, above), and `ILK_RETIRE_HIVE {hive_id}` for
+  a hive SY.admin removed (`retired: hive`, `retire_hive_system_ilks`), which marks each
+  well-known system ILK whose `identification.hive_id` and node name are that hive's, answers
+  `{hive_id, count, ilk_ids, already_retired}`, and refuses the primary's own hive
+  (`HIVE_NOT_REMOVED`). It is SY.admin's alone (`SY.admin@motherbee`), on the primary; like a
+  delete, it is written in one transaction, sent to the replicas as `IlkUpsert` deltas, and the
+  SHM is rebuilt. Only the seed un-marks one: a release that runs the node again, or the hive
+  joined again under the same name, whose replica seeds its ILKs at its start.
+- `ILK_PURGE` of a system ILK is taken only for a retired one (`check_ilk_purgeable`), and only from
+  SY.admin (`refuse_system_ilk_purge`): the operator purges one that made no history, and an
+  orchestrator never purges one. Any other system ILK, one marked for another reason included,
+  answers `SYSTEM_ILK_PROTECTED`. The purge reaches every replica: its `IlkDelete` removes a
+  replica's retired copy, and a replica that missed it drops it at its next full snapshot.
 - `TNT_DELETE` marks the tenant only and never marks an ILK. It is refused while the tenant
   sponsors active tenants (`TENANT_HAS_CHILDREN`) or still has node identities
   (`TENANT_HAS_NODES`: kill and purge them first); the answer reports `people_charged`. Before
@@ -306,8 +344,10 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
 ## Health
 
 - `systemctl status sy-identity`; log lines: `identity sync listener ready`,
-  `identity sync auth: required (per-hive HMAC)`, `seeded deterministic system ILKs from
-  hive.yaml`, `identity full sync bootstrap applied`, `identity delta subscriber registered`.
+  `identity sync auth: required (per-hive HMAC)`, `seeded deterministic system ILKs for the
+  release's SY nodes of this hive`, `retired the system ILKs of the SY nodes this release no longer
+  runs on this hive` (with the nodes), `identity full sync bootstrap applied`, `identity delta
+  subscriber registered`.
 - `PING` → `PONG {state, database{source, configured, ready}}` and `STATUS` →
   `{role: primary|replica, state, schema_version, config_version, database{..., last_error}}`.
   `state` is `configured`, `missing_secret`, `db_not_ready` or `replica_non_primary`
@@ -336,9 +376,11 @@ On the motherbee (`127.0.0.1:8080`), sent to `SY.identity@<hive in the URL>`:
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | `TNT_RESTORE` |
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | `TNT_PURGE` |
 | `GET /hives/{hive}/identity/tenants/{tenant_id}/nodes` | admin query `list_tenant_nodes` |
+| `POST /hives/{hive_id}/system-ilks/retire` (the removed hive; `retire_hive_ilks`, and `DELETE /hives/{hive_id}` once the hive is gone) | `ILK_RETIRE_HIVE` |
 
 `fluxbee-factory-reset` uses the delete and purge routes for every non-system ILK and every
-tenant but the root (`purge_identity` in `packaging/fluxbee-factory-reset`).
+tenant but the root (`purge_identity` in `packaging/fluxbee-factory-reset`); it leaves the system
+ILKs, retired ones included.
 
 ## Links
 

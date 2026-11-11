@@ -124,7 +124,9 @@ worker (A-219, [edge-egress-nat-spec](edge-egress-nat-spec.md) §15). Three case
       settled by the orchestrator it installs, with its own list.
     - Not built, since no release needs it yet: a node dropped from the **motherbee's** list. dpkg
       owns the motherbee's core, so its package has to stop and remove it. A dropped node's
-      system ILK stays registered too: SY.identity's seed only adds.
+      system ILK, on any role, is retired by SY.identity at its next start (FINDINGS A-191, since
+      0.1.133): marked, never purged on its own, and un-marked by a release that runs the node
+      again.
 - **The frontdesk's name stays in each hive's `hive.yaml`, as the join writes it** (decided
   2026-11-10, when the router's release came to move it):
   - the router and SY.identity read it at their start, and the join writes it, so moving it into

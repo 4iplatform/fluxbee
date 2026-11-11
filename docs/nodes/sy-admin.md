@@ -391,6 +391,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | routes, VPNs, taps | `SY.config.routes@<hive>` | `msg_type: admin` (`build_admin_request`) |
 | `inventory` | `SY.orchestrator@motherbee` | `INVENTORY_REQUEST` (`handle_inventory_http`) |
 | identity actions | `SY.identity@motherbee`, the primary, whatever hive the path names, writes and reads alike: a spoke's replica refuses SY.admin of another hive (F-07; writes A-143, reads 2026-11-07), and every replica holds the primary's identities | `ILK_*`, `TNT_*` (`handle_identity_command`, `identity_command_hive`, `handle_identity_query`) |
+| `retire_hive_ilks`, and `remove_hive` once the hive is gone | `SY.identity@motherbee` | `ILK_RETIRE_HIVE` ([A removed hive's system ILKs](#a-removed-hives-system-ilks)) |
 | vault actions | `SY.vault@motherbee`; another hive is refused with `400 INVALID_REQUEST` ("SY.vault runs only on the motherbee") | `VAULT_*` (`handle_vault_command`) |
 | `teardown_node` | `SY.identity@motherbee`, then `SY.vault@motherbee`, then SY.identity again | `ILK_GET`, `VAULT_LIST`, `VAULT_DELETE`, `ILK_DELETE`, `ILK_PURGE` ([Node teardown](#node-teardown)) |
 | `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core, vendor or config; default runtime), `SYSTEM_SYNC_HINT` |
@@ -491,6 +492,38 @@ same payload: a step that failed says `error` with `error_code` and `error_detai
 says `skipped`. The ok answer adds `pages_left_up`, the node's public pages that are up
 ([the pages](#publications-and-the-audit-log)), to every caller but the node's own orchestrator,
 which reads none of it: the purge that called it, which SY.admin answers, names them.
+
+## A removed hive's system ILKs
+
+A hive's SY nodes have deterministic system ILKs, `SY.<node>@<hive>`, which SY.identity seeds. When
+the hive goes, they are **retired**, never deleted (FINDINGS A-191; the operator's call of
+2026-11-11: an ILK that made history is disabled, never deleted): SY.identity marks them as a
+delete marks, with the reason `retired: hive`, so they leave every lookup and the identity SHM
+while their rows stay ([SY.identity](sy-identity.md#delete-marks-purge-removes)).
+
+- **`retire_hive_ilks {hive_id}`** (`POST /hives/{hive_id}/system-ilks/retire`,
+  `handle_retire_hive_ilks`): only for a hive that is gone (`hive_removed`). The motherbee, and a
+  hive the registry still lists (`HiveRegistry::lists`, a join in flight included), answer
+  `409 HIVE_NOT_REMOVED`; a registry SY.admin cannot read, `503 HIVE_REGISTRY_UNREADABLE`; a name
+  that is no hive id, `400 INVALID_REQUEST`. None repeats the value sent. Otherwise SY.admin sends
+  `ILK_RETIRE_HIVE {hive_id}` to `SY.identity@motherbee`, which takes it from `SY.admin@motherbee`
+  alone, and its answer is the action's: `{hive_id, count, ilk_ids, already_retired}`. Running it
+  again marks none. It is a write the operator confirms; Archi reaches it like every action open
+  to it and stages it in a plan.
+- **`remove_hive` runs it** once the orchestrator removed the hive (`with_system_ilks_retired`),
+  and its ok answer names the result in `payload.system_ilks_retired`. A request that does not
+  reach SY.identity, which the removal of an unreachable hive restarts (`identity_restart`), is
+  asked again, up to 3 times 2 s apart (`RETIRE_AFTER_REMOVAL_ATTEMPTS`). A retire that fails leaves
+  the removal ok, since the hive is gone and removing it again would only answer `NOT_FOUND`:
+  `system_ilks_retired` is `{count: null, error_code, error_detail}` and `payload.warning` says to
+  run `retire_hive_ilks`, after any warning of the orchestrator's. The executor keeps
+  `system_ilks_retired` in a step's essentials, so Archi reads it whatever the frame drops.
+- A hive joined again under the same name gets its ILKs back unmarked from its own SY.identity.
+  The ILKs of the SY nodes a release no longer runs on a hive are retired by SY.identity itself at
+  its start (`retired: node`).
+- **Only the operator purges a retired system ILK** (`purge_ilk`), once it made no history; one that
+  made history stays retired. `delete_ilk` and `restore_ilk` refuse a system ILK
+  (`SYSTEM_ILK_PROTECTED`).
 
 ## A node's self-description
 
@@ -1631,7 +1664,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 25, 120 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 26, 121 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -1665,7 +1698,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_storage` | `GET /config/storage` | Read storage configuration and status. |
 | `add_hive` | `POST /hives` | Create a hive and bootstrap it. |
 | `get_hive` | `GET /hives/{hive_id}` | Read one hive definition. |
-| `remove_hive` | `DELETE /hives/{hive_id}` | Remove a hive. |
+| `remove_hive` | `DELETE /hives/{hive_id}` | Remove a hive, and retire its system ILKs once it is gone. |
+| `retire_hive_ilks` | `POST /hives/{hive_id}/system-ilks/retire` | Retire the system ILKs of a removed hive, its `SY.*@<hive>` identities: marked, reversibly, out of every lookup and of the identity SHM, never purged. Refused for the motherbee and for a hive the registry still lists ([A removed hive's system ILKs](#a-removed-hives-system-ilks)). |
 | `add_route` | `POST /hives/{hive}/routes` | Add a route rule to a hive. |
 | `delete_route` | `DELETE /hives/{hive}/routes/{prefix}` | Delete a route rule from a hive. |
 | `add_vpn` | `POST /hives/{hive}/vpns` | Add a VPN pattern to a hive. |
@@ -1693,9 +1727,9 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_ilk` | `GET /hives/{hive}/identity/ilks/{ilk_id}` | Read one identity ilk. |
 | `set_ilk_definition` | `POST /hives/{hive}/identity/ilks/{ilk_id}/definition` | Set the cognitive definition hashes for one identity agent ILK. |
 | `delete_ilk` | `DELETE /hives/{hive}/identity/ilks/{ilk_id}` | Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED). |
-| `restore_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/restore` | Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant). |
+| `restore_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/restore` | Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant). Refuses system ILKs (SYSTEM_ILK_PROTECTED). |
 | `set_ilk_tenant` | `PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant` | Charge one person to another tenant, its cost center (a temporary only out of a deleted tenant); channels keep their scope. |
-| `purge_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/purge` | Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise). |
+| `purge_ilk` | `POST /hives/{hive}/identity/ilks/{ilk_id}/purge` | Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise); a system ILK only once it is retired (SYSTEM_ILK_PROTECTED otherwise). |
 | `delete_tenant` | `DELETE /hives/{hive}/identity/tenants/{tenant_id}` | Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable. |
 | `restore_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/restore` | Undo the deleted mark of one tenant: it comes back as it was. |
 | `purge_tenant` | `POST /hives/{hive}/identity/tenants/{tenant_id}/purge` | Physically and finally remove one tenant ALREADY marked deleted and the ILKs marked in it. |

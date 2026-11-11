@@ -4208,9 +4208,10 @@ fn drop_executor_previews(envelope: &mut serde_json::Value) {
 /// payload the ids it names and the small fields Archi reads of a step's answer (a deploy's
 /// `wf_node` and `warning`, a change's `version` and `pending`, `nothing_to_do`, the hives an
 /// installation update holds, a removal's `pages_left_up` (its count and more whole, the pages
-/// that fit; FINDINGS A-242), and of the update its `id`, `state`, `held`, `stale_target` and
-/// `superseded_by`, never its hives: Archi reads an update whose answer was cut again), each cut
-/// short.
+/// that fit; FINDINGS A-242), a hive's removal its `system_ilks_retired` (FINDINGS A-191: when its
+/// count is null, Archi runs retire_hive_ilks), and of the update its `id`, `state`, `held`,
+/// `stale_target` and `superseded_by`, never its hives: Archi reads an update whose answer was cut
+/// again), each cut short.
 fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value {
     let mut kept = serde_json::Map::new();
     for key in ["status", "error_code"] {
@@ -4233,6 +4234,7 @@ fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value 
                 ("held", 512),
                 ("nothing_to_do", 16),
                 ("pages_left_up", 1024),
+                ("system_ilks_retired", 1024),
             ] {
                 if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
                     fields.insert(key.to_string(), mesh_reply::bounded_value(value, max_bytes));
@@ -5058,7 +5060,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "25";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "26";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -5242,6 +5244,14 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "remove_hive",
         route: InternalActionRoute::Command("remove_hive"),
+        requires_target: false,
+        allow_legacy_hive_id: true,
+    },
+    // A removed hive's system ILKs, marked retired in SY.identity (`handle_retire_hive_ilks`,
+    // FINDINGS A-191).
+    InternalActionSpec {
+        action: "retire_hive_ilks",
+        route: InternalActionRoute::Command("retire_hive_ilks"),
         requires_target: false,
         allow_legacy_hive_id: true,
     },
@@ -5880,6 +5890,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "add_hive"
         | "get_hive"
         | "remove_hive"
+        // Archi stages it after a removal that did not retire the hive's system ILKs (FINDINGS
+        // A-191); the operator confirms it.
+        | "retire_hive_ilks"
         | "add_route"
         | "delete_route"
         | "add_vpn"
@@ -10891,6 +10904,13 @@ async fn handle_hive_paths(
         };
     }
     match (method, rest) {
+        // The path's hive is the removed one (FINDINGS A-191), as in DELETE /hives/{hive_id}.
+        ("POST", ["system-ilks", "retire"]) => {
+            let payload = serde_json::json!({ "hive_id": hive });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "retire_hive_ilks", payload, None).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["status"]) => {
             let mut payload = serde_json::Map::new();
             payload.insert("scope".to_string(), serde_json::json!("hive"));
@@ -12545,6 +12565,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "TENANT_DELETED"
         | "ILK_NOT_DELETED"
         | "ILK_KEY_CONFLICT"
+        // retire_hive_ilks: the motherbee, or a hive the registry still lists (FINDINGS A-191).
+        | "HIVE_NOT_REMOVED"
         // teardown_node: the ILK named is not the node's, or the node is still connected; nothing
         // was removed.
         | "NODE_ILK_MISMATCH"
@@ -14232,6 +14254,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "publish_artifact"
             | "unpublish_artifact"
             | "remove_hive"
+            | "retire_hive_ilks"
             | "add_route"
             | "delete_route"
             | "add_vpn"
@@ -14285,6 +14308,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
         action,
         "publish_runtime_package"
             | "remove_hive"
+            // The system ILKs of a removed hive leave every lookup (reversible).
+            | "retire_hive_ilks"
             | "delete_route"
             | "delete_vpn"
             | "delete_tap"
@@ -14394,10 +14419,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "delete_ilk" => {
             "Mark one identity ILK deleted (reversible: hidden, its keys stay reserved until purge). Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
         }
-        "restore_ilk" => "Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant).",
+        "restore_ilk" => "Undo the deleted mark of one identity ILK (a person also while their tenant is marked; any other ILK waits for its tenant). Refuses system ILKs (SYSTEM_ILK_PROTECTED).",
         "set_ilk_tenant" => "Charge one person to another tenant, its cost center (a temporary only out of a deleted tenant); channels keep their scope.",
         "purge_ilk" => {
-            "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise)."
+            "Physically and finally remove one identity ILK that is ALREADY marked deleted (ILK_NOT_DELETED otherwise); a system ILK only once it is retired (SYSTEM_ILK_PROTECTED otherwise)."
         }
         "delete_tenant" => {
             "Mark one identity tenant deleted, i.e. disable it (reversible; name/domain stay reserved). No ILK is marked: its people stay usable."
@@ -14486,7 +14511,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "set_node_config" => "Persist node config changes.",
         "set_storage" => "Persist storage configuration changes.",
         "add_hive" => "Create a hive and bootstrap it.",
-        "remove_hive" => "Remove a hive.",
+        "remove_hive" => "Remove a hive, and retire its system ILKs once it is gone.",
+        "retire_hive_ilks" => {
+            "Retire the system ILKs of a removed hive, its SY.*@<hive> identities: marked, reversibly, out of every lookup and of the identity SHM, never purged. Refused for the motherbee and for a hive the registry still lists. remove_hive does it itself; run it for a hive removed before, or after a removal whose answer did not retire them."
+        }
         "add_route" => "Add a route rule to a hive. Route action must be FORWARD (forward to next_hop_hive) or DROP. match_kind defaults to PREFIX when omitted. priority defaults to 100 when omitted.",
         "delete_route" => "Delete a route rule from a hive.",
         "add_vpn" => "Add a VPN pattern to a hive.",
@@ -14737,6 +14765,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "set_storage" => vec!["PUT /config/storage"],
         "add_hive" => vec!["POST /hives"],
         "remove_hive" => vec!["DELETE /hives/{hive_id}"],
+        "retire_hive_ilks" => vec!["POST /hives/{hive_id}/system-ilks/retire"],
         "add_route" => vec!["POST /hives/{hive}/routes"],
         "delete_route" => vec!["DELETE /hives/{hive}/routes/{prefix}"],
         "add_vpn" => vec!["POST /hives/{hive}/vpns"],
@@ -14849,6 +14878,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "hive_id",
             "string",
             "Hive id, for example worker-220.",
+        )],
+        "retire_hive_ilks" => vec![admin_action_path_param(
+            "hive_id",
+            "string",
+            "The removed hive, for example gate0217: never the motherbee, nor a hive the registry still lists.",
         )],
         // The hive and the tenant, as the routes store them; the hive is the step's target.
         "delete_tenant" | "restore_tenant" | "purge_tenant" | "list_tenant_nodes" => vec![
@@ -16327,6 +16361,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220","ssh_user":"administrator","ssh_key":"<bootstrap-pem-or-omit>"}'"#
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
+        "retire_hive_ilks" => "curl -X POST /hives/gate0217/system-ilks/retire",
         "set_hive_egress" => r#"curl -X PUT /hives/worker1/egress -d '{}'"#,
         "clear_hive_egress" => "curl -X DELETE /hives/worker1/egress",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
@@ -16639,6 +16674,15 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For HTTP usage the hive id is in the path; over the mesh, payload.hive_id names the hive removed.",
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages a node of the hive published and the pages its edge serves (edge_node on the hive). The hive's cleanup stops its edge (FINDINGS A-236), so those are served no more once it ran, and taking one down releases only its copy (edge_skipped).",
+            "Once the hive is removed, SY.admin retires its system ILKs (retire_hive_ilks, FINDINGS A-191) and the ok answer names the result in payload.system_ilks_retired: SY.identity's {count, ilk_ids, already_retired}. A retire that fails leaves the removal ok: system_ilks_retired is {count: null, error_code, error_detail} and payload.warning says so. Then run retire_hive_ilks for the hive; never remove it again, it is gone (NOT_FOUND).",
+        ],
+        "retire_hive_ilks" => vec![
+            "Motherbee-only operation. For HTTP usage the hive id is in the path; over the mesh and in a plan, hive_id names the removed hive.",
+            "SY.identity marks retired, with the reason 'retired: hive', each system ILK of that hive: identification.hive_id and the hive of its node name, SY.<node>@<hive>. A retired ILK leaves every lookup and the identity SHM; its row stays, and so does its node name, reserved. Nothing is purged.",
+            "Refused with 409 HIVE_NOT_REMOVED for the motherbee and for a hive the registry still lists, a join in flight included: remove the hive first (remove_hive). A registry SY.admin cannot read refuses it (503 HIVE_REGISTRY_UNREADABLE), and a hive id that is not one 400 INVALID_REQUEST.",
+            "The answer is SY.identity's: hive_id, count and ilk_ids (the ILKs marked now) and already_retired (those marked before). Running it again is safe and marks none; a hive with no system ILK answers count 0.",
+            "A hive joined again under the same name gets its system ILKs back unmarked: its SY.identity seeds them at its start. SY.identity retires by itself, at its start, the ILKs of the SY nodes its release no longer runs on its hive (reason 'retired: node').",
+            "A retired system ILK is purged (purge_ilk) only on the operator's word and only when it made no history: no LLM usage of its node, no message from or to it, no conversation SY.cognition keeps under it. One that made history stays retired. delete_ilk and restore_ilk refuse a system ILK (SYSTEM_ILK_PROTECTED).",
         ],
         "get_llm_usage" => vec![
             "One record per model call (docs/router-stream-v1.md §7.4), kept by SY.storage on the motherbee: only /hives/motherbee/usage answers.",
@@ -16824,6 +16868,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "purge_ilk" => vec![
             "Final: removes the ILK row, its ICHs and aliases; replicas get IlkDelete deltas.",
             "Requires the ILK to be marked first (ILK_NOT_DELETED otherwise). Operator-only: not offered to Archi's executor nor to Fluxbee Cloud.",
+            "A system ILK is refused (SYSTEM_ILK_PROTECTED) unless it is retired: its hive removed (retire_hive_ilks) or its node no longer run by the release (FINDINGS A-191). Purge a retired one only on the operator's word and when it made no history; otherwise it stays retired.",
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of the ILK's node (its identification.node_name): while any page is up, SY.admin asks SY.identity whose ILK it is (ILK_GET) before it sends the purge, and an ILK that cannot be read gives {count: null, error}. An ILK of no node, a person's, names none.",
         ],
@@ -19110,18 +19155,33 @@ async fn handle_reset_base_runtime(
     ))
 }
 
+/// A future on the heap, made by a function of its own. A debug build keeps, in the frame of an
+/// async function, a copy of each future it awaits, call site by call site: `handle_hive_paths` and
+/// `handle_http` await a command at some sixty routes, and a teardown's test needed 2.09 MB of a
+/// test thread's 2 MiB stack (FINDINGS A-191's first build overflowed it). Boxed, each route holds
+/// the box, and that test needs half of it.
+type BoxedFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 /// The single choke-point for admin commands. All entry paths land here — HTTP handlers call it
 /// directly (origin "http"); the internal L2 dispatch and the executor call
 /// `handle_admin_command_with_origin` with their origin. Every call is appended to the command
 /// audit log (redacted) so `list_recent_commands` can answer "what was done to this backend lately".
-async fn handle_admin_command(
-    ctx: &AdminContext,
-    client: &RouterDispatcher,
-    action: &str,
+/// Boxed (`BoxedFuture`): the HTTP routes call it at every route.
+fn handle_admin_command<'a>(
+    ctx: &'a AdminContext,
+    client: &'a RouterDispatcher,
+    action: &'a str,
     payload: serde_json::Value,
     hive: Option<String>,
-) -> Result<(u16, String), AdminError> {
-    handle_admin_command_with_origin(ctx, client, action, payload, hive, AdminOrigin::Http).await
+) -> BoxedFuture<'a, Result<(u16, String), AdminError>> {
+    Box::pin(handle_admin_command_with_origin(
+        ctx,
+        client,
+        action,
+        payload,
+        hive,
+        AdminOrigin::Http,
+    ))
 }
 
 async fn handle_admin_command_with_origin(
@@ -19342,6 +19402,9 @@ async fn handle_admin_command_inner(
     ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
+    if action == "retire_hive_ilks" {
+        return handle_retire_hive_ilks(ctx, client, &payload).await;
+    }
     if matches!(
         action,
         "vault_list"
@@ -19386,8 +19449,19 @@ async fn handle_admin_command_inner(
     )
     .await;
     let answer = build_admin_http_response(action, response);
-    Ok(match pages_of {
+    // A hive removed, its system ILKs are retired once it is gone (FINDINGS A-191): the hive whose
+    // pages the answer names, the payload's hive_id, taken once the request is answered so that no
+    // more state is kept across it.
+    let removed_hive = match &pages_of {
+        Some(PagesOf::Hive(hive_id)) if action == "remove_hive" => Some(hive_id.clone()),
+        _ => None,
+    };
+    let answer = match pages_of {
         Some(whose) => with_pages_left_up(answer, |_| Some(pages_left_up(ctx, &whose))),
+        None => answer,
+    };
+    Ok(match removed_hive {
+        Some(hive_id) => with_system_ilks_retired(ctx, client, answer, &hive_id).await,
         None => answer,
     })
 }
@@ -20648,6 +20722,168 @@ async fn handle_identity_command(
     }
 }
 
+/// `retire_hive_ilks {hive_id}` (FINDINGS A-191): SY.identity marks retired the system ILKs of a
+/// removed hive, its `SY.*@<hive>` identities (ILK_RETIRE_HIVE): reversibly, out of every lookup and
+/// of the identity SHM, never purged. Only a hive that is gone (`hive_removed`). remove_hive runs it
+/// itself once the hive is gone (`with_system_ilks_retired`); the operator, or Archi in a plan,
+/// runs it for a hive removed before, or after a removal whose answer says it did not. Boxed
+/// (`BoxedFuture`), as the retire after a removal: `handle_admin_command_inner` keeps no copy of it.
+fn handle_retire_hive_ilks<'a>(
+    ctx: &'a AdminContext,
+    client: &'a RouterDispatcher,
+    payload: &'a serde_json::Value,
+) -> BoxedFuture<'a, Result<(u16, String), AdminError>> {
+    Box::pin(async move {
+        let action = "retire_hive_ilks";
+        let hive_id = payload
+            .get("hive_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        // The refusals name no value (FINDINGS A-232).
+        if !is_valid_hive_id(hive_id) {
+            return Ok(admin_error_response(
+                action,
+                "INVALID_REQUEST",
+                "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'",
+            ));
+        }
+        if let Err((code, detail)) = hive_removed(ctx, hive_id) {
+            return Ok(admin_error_response(action, code, &detail));
+        }
+        send_identity_command(
+            ctx,
+            client,
+            action,
+            serde_json::json!({ "hive_id": hive_id }),
+        )
+        .await
+    })
+}
+
+/// Whether `hive_id` is a removed hive, whose system ILKs may be retired (FINDINGS A-191): not the
+/// motherbee, which is never removed, nor a hive the registry lists (`HiveRegistry::lists`, a join
+/// in flight included). A registry SY.admin cannot read cannot tell.
+fn hive_removed(ctx: &AdminContext, hive_id: &str) -> Result<(), (&'static str, String)> {
+    if hive_id == ctx.hive_id {
+        return Err((
+            "HIVE_NOT_REMOVED",
+            "the motherbee is never removed: its system ILKs are never retired".to_string(),
+        ));
+    }
+    let registry = hive_registry(ctx);
+    if let Err(err) = registry.entries() {
+        return Err((
+            "HIVE_REGISTRY_UNREADABLE",
+            format!(
+                "the hive registry cannot be read ({err}): whether the hive is gone is unknown"
+            ),
+        ));
+    }
+    if registry.lists(hive_id) {
+        return Err((
+            "HIVE_NOT_REMOVED",
+            "the hive is still in the registry: remove it first (remove_hive)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// How many times a removal asks SY.identity to retire the hive's system ILKs while the request
+/// does not reach it (FINDINGS A-191), and how long it waits between two.
+const RETIRE_AFTER_REMOVAL_ATTEMPTS: u32 = 3;
+const RETIRE_AFTER_REMOVAL_RETRY: Duration = Duration::from_secs(2);
+
+/// A hive removed, its system ILKs are retired (`handle_retire_hive_ilks`, FINDINGS A-191), and the
+/// ok answer names what became of them in `payload.system_ilks_retired`: SY.identity's `{count,
+/// ilk_ids, already_retired}`, or `{count: null, error_code, error_detail}` with a `warning` to run
+/// retire_hive_ilks. The removal stays ok either way: the hive is gone, and removing it again would
+/// only answer NOT_FOUND. A removal that failed retires nothing and is answered as it is.
+fn with_system_ilks_retired<'a>(
+    ctx: &'a AdminContext,
+    client: &'a RouterDispatcher,
+    answer: (u16, String),
+    hive_id: &'a str,
+) -> BoxedFuture<'a, (u16, String)> {
+    Box::pin(async move {
+        let (status, body) = answer;
+        let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(&body) else {
+            return (status, body);
+        };
+        if envelope.get("status").and_then(|value| value.as_str()) != Some("ok")
+            || !envelope
+                .get("payload")
+                .is_some_and(serde_json::Value::is_object)
+        {
+            return (status, body);
+        }
+        // A removal that did not reach the hive restarts the motherbee's SY.identity
+        // (`identity_restart` in its answer), which may not be on the mesh yet: a request that did
+        // not reach it is asked again, a few seconds apart. The retire is idempotent.
+        let ask = serde_json::json!({ "hive_id": hive_id });
+        let mut attempt = 1;
+        let retired = loop {
+            let retired = match handle_retire_hive_ilks(ctx, client, &ask).await {
+                Ok((_, retired)) => {
+                    serde_json::from_str(&retired).unwrap_or(serde_json::Value::Null)
+                }
+                Err(err) => serde_json::json!({
+                    "status": "error",
+                    "error_code": "SERVICE_FAILED",
+                    "error_detail": err.to_string(),
+                }),
+            };
+            let unreached = retired.get("error_code").and_then(|value| value.as_str())
+                == Some("TRANSPORT_ERROR");
+            if !unreached || attempt >= RETIRE_AFTER_REMOVAL_ATTEMPTS {
+                break retired;
+            }
+            attempt += 1;
+            tokio::time::sleep(RETIRE_AFTER_REMOVAL_RETRY).await;
+        };
+        let payload = &mut envelope["payload"];
+        if retired.get("status").and_then(|value| value.as_str()) == Some("ok") {
+            let answer = &retired["payload"];
+            payload["system_ilks_retired"] = serde_json::json!({
+                "count": answer.get("count").cloned().unwrap_or(serde_json::Value::Null),
+                "ilk_ids": answer.get("ilk_ids").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "already_retired": answer
+                    .get("already_retired")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            return (status, envelope.to_string());
+        }
+        let code = retired
+            .get("error_code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("SERVICE_FAILED")
+            .to_string();
+        tracing::warn!(
+            hive_id,
+            error_code = %code,
+            "remove_hive: the hive is removed, its system ILKs were not retired"
+        );
+        payload["system_ilks_retired"] = serde_json::json!({
+            "count": serde_json::Value::Null,
+            "error_code": code,
+            "error_detail": retired.get("error_detail").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        let warning = format!(
+            "the hive is removed, its system ILKs were not retired ({code}): run retire_hive_ilks \
+             for it, never remove_hive again"
+        );
+        // After the orchestrator's own warning, when it gave one (an egress or an ingress it could
+        // not reach).
+        let warning = match payload.get("warning").and_then(|value| value.as_str()) {
+            Some(earlier) => format!("{earlier}; {warning}"),
+            None => warning,
+        };
+        payload["warning"] = serde_json::json!(warning);
+        (status, envelope.to_string())
+    })
+}
+
 /// One identity action, sent to the primary's SY.identity as such (`identity_command_hive`), with
 /// none of the checks `handle_identity_command` runs around a purge. A teardown sends its ILK's
 /// read, mark and purge this way, and so does `purge_ilk_pages_of` its read.
@@ -20672,6 +20908,8 @@ async fn send_identity_command(
         "create_tenant" => ("TNT_CREATE", "TNT_CREATE_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
+        // FINDINGS A-191: SY.identity takes it from SY.admin@motherbee alone.
+        "retire_hive_ilks" => ("ILK_RETIRE_HIVE", "ILK_RETIRE_HIVE_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),
     };
     let response = send_system_request(
@@ -35087,7 +35325,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "25");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "26");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
@@ -39738,6 +39976,308 @@ mod tests {
         for page in pages {
             assert_eq!(publication_status(&ctx, &page.publication_id), page.status);
         }
+    }
+
+    // --- A-191: a removed hive's system ILKs are retired -----------------------------------------
+
+    /// The system ILKs SY.identity seeded for a throwaway worker, as ILK_RETIRE_HIVE names them.
+    fn gate_system_ilks() -> Vec<String> {
+        let mut ids: Vec<String> = [
+            "SY.config.routes",
+            "SY.identity",
+            "SY.opa.rules",
+            "SY.cognition",
+            "SY.timer",
+            "SY.wf-rules",
+        ]
+        .iter()
+        .map(|node| fluxbee_sdk::deterministic_system_ilk_id(&format!("{node}@gate0217")))
+        .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// SY.identity's answer to ILK_RETIRE_HIVE for gate0217.
+    fn gate_retired() -> Value {
+        json!({
+            "status": "ok",
+            "hive_id": "gate0217",
+            "count": 6,
+            "ilk_ids": gate_system_ilks(),
+            "already_retired": 0,
+        })
+    }
+
+    /// The hive registry of `ctx`, empty, so a retire can tell a removed hive.
+    fn create_hive_registry(ctx: &AdminContext) -> PathBuf {
+        let registry = ctx.state_dir.parent().expect("root").join("hives");
+        fs::create_dir_all(&registry).expect("the registry");
+        registry
+    }
+
+    /// retire_hive_ilks is an action of the catalog with its route, help and example: a write the
+    /// operator confirms, which Archi stages in a plan after a removal that did not retire, and
+    /// asks for over the mesh like every action open to it. Nobody else on the mesh.
+    #[test]
+    fn retire_hive_ilks_is_an_action_of_the_catalog_archi_reaches() {
+        let spec = resolve_internal_action_spec("retire_hive_ilks").expect("registered");
+        assert!(matches!(
+            spec.route,
+            InternalActionRoute::Command("retire_hive_ilks")
+        ));
+        assert!(!spec.requires_target);
+        assert!(spec.allow_legacy_hive_id);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["confirmation_required"], json!(true));
+        assert_eq!(doc["executor_available"], json!(true));
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["POST /hives/{hive_id}/system-ilks/retire"])
+        );
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/gate0217/system-ilks/retire"),
+            vec!["POST"]
+        );
+        assert_eq!(
+            doc["executor_contract"]["function_schema"]["required"],
+            json!(["hive_id"])
+        );
+        assert_eq!(doc["request_contract"]["body"]["kind"], json!("none"));
+        assert!(admin_action_example_scmd("retire_hive_ilks").is_some());
+        let notes = admin_action_request_notes("retire_hive_ilks");
+        assert!(notes.iter().any(|note| note.contains("HIVE_NOT_REMOVED")));
+        assert!(notes.iter().any(|note| note.contains("made no history")));
+        assert!(admin_action_request_notes("remove_hive")
+            .iter()
+            .any(|note| note.contains("system_ilks_retired")));
+        assert!(executor_visible_action_specs(None)
+            .iter()
+            .any(|spec| spec.action == "retire_hive_ilks"));
+
+        assert_eq!(mesh_access("retire_hive_ilks"), Some(MeshAccess::Archi));
+        let params = json!({ "hive_id": "gate0217" });
+        assert!(mesh_admits(
+            "SY.architect@motherbee",
+            "retire_hive_ilks",
+            Some(PRIMARY_HIVE_ID),
+            &params
+        )
+        .is_ok());
+        for caller in [
+            "IO.cloud@motherbee",
+            "SY.orchestrator@worker1",
+            "SY.wf-rules@worker1",
+            "SY.identity@worker1",
+            "AI.support@worker1",
+        ] {
+            assert!(
+                mesh_admits(caller, "retire_hive_ilks", None, &params).is_err(),
+                "{caller}"
+            );
+        }
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"retire_hive_ilks"));
+        assert_eq!(error_code_to_http_status("HIVE_NOT_REMOVED"), 409);
+    }
+
+    /// retire_hive_ilks retires only a hive that is gone: the motherbee, a hive the registry lists
+    /// and a name that is no hive id are refused, and a registry SY.admin cannot read too, each with
+    /// nothing sent and no value repeated. A removed hive's request goes to the primary's
+    /// SY.identity as ILK_RETIRE_HIVE {hive_id}, over HTTP as in a plan, and its answer is the
+    /// action's, a refusal included.
+    #[tokio::test]
+    async fn retire_hive_ilks_retires_only_a_hive_that_is_gone() {
+        let (ctx, mut harness) = opa_test_admin("retire-hive-ilks");
+        let query = HashMap::new();
+        let retire = |hive: &'static str| {
+            handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "retire_hive_ilks",
+                json!({ "hive_id": hive }),
+                None,
+            )
+        };
+        let code_of = |body: &str| -> Value {
+            serde_json::from_str::<Value>(body).expect("JSON")["error_code"].clone()
+        };
+
+        let (status, body) = retire("gate0217").await.expect("answered");
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(code_of(&body), json!("HIVE_REGISTRY_UNREADABLE"));
+
+        let registry = create_hive_registry(&ctx);
+        fs::create_dir_all(registry.join("worker1")).expect("worker1 in the registry");
+        fs::create_dir_all(registry.join("worker9")).expect("worker9 joining");
+        for (hive, status_code, code) in [
+            (PRIMARY_HIVE_ID, 409, "HIVE_NOT_REMOVED"),
+            ("worker1", 409, "HIVE_NOT_REMOVED"),
+            ("worker9", 409, "HIVE_NOT_REMOVED"),
+            ("../etc", 400, "INVALID_REQUEST"),
+            ("", 400, "INVALID_REQUEST"),
+        ] {
+            let (status, body) = retire(hive).await.expect("answered");
+            assert_eq!(status, status_code, "{hive}: {body}");
+            assert_eq!(code_of(&body), json!(code), "{hive}");
+            if ["worker1", "worker9", "../etc"].contains(&hive) {
+                assert!(!body.contains(hive), "the refusal repeats no value: {body}");
+            }
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+
+        // POST /hives/gate0217/system-ilks/retire: the path's hive is the removed one.
+        let route = handle_hive_paths(
+            "POST",
+            "/hives/gate0217/system-ilks/retire",
+            &query,
+            &[],
+            &ctx,
+            &ctx.rpc,
+        );
+        let (result, sent) = tokio::join!(
+            route,
+            answer_teardown(&mut harness, vec![("ILK_RETIRE_HIVE", gate_retired())])
+        );
+        assert_eq!(
+            dst_of(&sent[0]),
+            json!(format!("SY.identity@{PRIMARY_HIVE_ID}"))
+        );
+        assert_eq!(sent[0].payload, json!({ "hive_id": "gate0217" }));
+        let (status, body) = result.expect("answered").expect("routed");
+        assert_eq!(status, 200, "{body}");
+        let envelope: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(envelope["payload"]["count"], json!(6));
+        assert_eq!(envelope["payload"]["ilk_ids"], json!(gate_system_ilks()));
+
+        // Archi's step in a plan: the hive_id of its args.
+        let refused = json!({
+            "status": "error",
+            "error_code": "HIVE_NOT_REMOVED",
+            "message": "the primary's own hive is never removed: its system ILKs are never retired",
+        });
+        let (result, _) = tokio::join!(
+            dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "retire_hive_ilks",
+                Some(PRIMARY_HIVE_ID),
+                json!({ "hive_id": "gate0217" }),
+                AdminOrigin::Mesh("SY.architect@motherbee"),
+            ),
+            answer_teardown(&mut harness, vec![("ILK_RETIRE_HIVE", refused)])
+        );
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 409, "{}", result.envelope);
+        assert_eq!(result.envelope["error_code"], json!("HIVE_NOT_REMOVED"));
+    }
+
+    /// remove_hive retires the hive's system ILKs once the orchestrator removed it, and names what
+    /// became of them (system_ilks_retired). A retire that fails leaves the removal ok, with the
+    /// refusal named and a warning after the orchestrator's own, which the executor keeps for
+    /// Archi: removing the hive again would only answer NOT_FOUND. A removal that failed retires
+    /// nothing.
+    #[tokio::test]
+    async fn remove_hive_retires_the_hive_s_system_ilks_once_it_is_gone() {
+        let (ctx, mut harness) = opa_test_admin("remove-hive-retire");
+        create_hive_registry(&ctx);
+        let remove = |hive: &'static str| {
+            handle_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "remove_hive",
+                json!({ "hive_id": hive }),
+                None,
+            )
+        };
+
+        // The hive did not answer its cleanup, so the orchestrator restarted SY.identity, which is
+        // not on the mesh at the first ask: the retire is asked again.
+        let removed = json!({
+            "status": "ok",
+            "hive_id": "gate0217",
+            "identity_key_cleanup": "deleted",
+            "identity_restart": "restarted",
+        });
+        let drive = async {
+            answer_admin_relay(&mut harness, "remove_hive", removed).await;
+            let first = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("ILK_RETIRE_HIVE");
+            assert_eq!(first.meta.msg.as_deref(), Some("ILK_RETIRE_HIVE"));
+            let gone = json!({
+                "reason": "NODE_NOT_FOUND",
+                "original_dst": format!("SY.identity@{PRIMARY_HIVE_ID}"),
+            });
+            harness
+                .inject(reply_to(&first, MSG_UNREACHABLE, gone))
+                .await
+                .unwrap();
+            answer_teardown(&mut harness, vec![("ILK_RETIRE_HIVE", gate_retired())]).await
+        };
+        let (answer, sent) = tokio::join!(remove("gate0217"), drive);
+        assert_eq!(sent[0].payload, json!({ "hive_id": "gate0217" }));
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+        let envelope: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(envelope["status"], json!("ok"));
+        assert_eq!(
+            envelope["payload"]["system_ilks_retired"],
+            json!({ "count": 6, "ilk_ids": gate_system_ilks(), "already_retired": 0 })
+        );
+        assert!(envelope["payload"].get("warning").is_none(), "{body}");
+        assert_eq!(envelope["payload"]["pages_left_up"]["count"], json!(0));
+
+        let removed = json!({
+            "status": "ok",
+            "hive_id": "egress9",
+            "warning": "egress NAT teardown not confirmed (host unreachable)",
+        });
+        let unready = json!({
+            "status": "error",
+            "error_code": "DB_NOT_READY",
+            "message": "identity primary DB is not ready",
+        });
+        let drive = async {
+            answer_admin_relay(&mut harness, "remove_hive", removed).await;
+            answer_teardown(&mut harness, vec![("ILK_RETIRE_HIVE", unready)]).await
+        };
+        let (answer, _) = tokio::join!(remove("egress9"), drive);
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+        let envelope: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(envelope["status"], json!("ok"));
+        let retired = &envelope["payload"]["system_ilks_retired"];
+        assert_eq!(retired["count"], Value::Null);
+        assert_eq!(retired["error_code"], json!("DB_NOT_READY"));
+        let warning = envelope["payload"]["warning"].as_str().expect("a warning");
+        assert!(
+            warning.starts_with("egress NAT teardown not confirmed (host unreachable); "),
+            "{warning}"
+        );
+        assert!(warning.contains("retire_hive_ilks"), "{warning}");
+        let kept = executor_result_essentials(&envelope);
+        assert_eq!(
+            kept["payload"]["system_ilks_retired"]["error_code"],
+            json!("DB_NOT_READY")
+        );
+
+        let missing =
+            json!({ "status": "error", "error_code": "NOT_FOUND", "message": "hive not found" });
+        let (answer, _) = tokio::join!(
+            remove("gate0217"),
+            answer_admin_relay(&mut harness, "remove_hive", missing)
+        );
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 404, "{body}");
+        assert!(!body.contains("system_ilks_retired"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
     }
 
     /// A workflow's delete is refused for no page of its WF node (FINDINGS A-242): its ok answer

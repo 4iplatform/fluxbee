@@ -1377,6 +1377,39 @@ time; `clear_hive_egress` takes a worker back.
   still have committed. A worker on a release before this action ignores it, and nothing changed:
   the operator brings it to the motherbee's release first (`update_installation`).
 
+### 4.4.6 A removed hive's system ILKs
+
+Each hive's SY nodes have system ILKs, `SY.<node>@<hive>`. They are never deleted on their own: an
+ILK is history, since what a node did names its ILK. When a hive is removed, or a release stops
+running a node, its system ILKs are **retired** (FINDINGS A-191): marked, reversibly, out of every
+lookup and of the identity SHM, their rows kept. `list_ilks` with `include_deleted=true` shows them,
+`deleted_reason` `retired: hive` or `retired: node`.
+
+- **After `remove_hive`**, read `payload.system_ilks_retired` in its answer (the step's
+  `result_preview` carries it):
+  - `count` a number: the hive's system ILKs are retired (`ilk_ids`; `already_retired` counts the
+    ones retired before). Tell the operator.
+  - `count` null: the hive is removed, its ILKs are not retired (`error_code` says why, and
+    `warning` says so). Never stage `remove_hive` again: the hive is gone, and it would answer
+    `NOT_FOUND`. Stage `retire_hive_ilks`, args `hive_id` (the removed hive), in a plan the operator
+    confirms, once what failed answers again (`DB_NOT_READY`, a timeout).
+- **A hive removed before this was built** (worker2, the throwaway gate workers before 0.1.133):
+  its system ILKs are still active. On the operator's word, stage one `retire_hive_ilks` step per
+  hive. Running it again is safe: it answers `count` 0.
+- **Its refusals:** `HIVE_NOT_REMOVED` (409) for the motherbee and for a hive the registry still
+  lists, a join in flight included: never retire a hive that runs, remove it first on the operator's
+  word. `HIVE_REGISTRY_UNREADABLE` (503): retry once, then tell the operator. `INVALID_REQUEST`
+  (400): a name that is no hive id.
+- **SY.identity retires by itself** the ILKs of the SY nodes its release no longer runs on a hive
+  (`retired: node`; SY.policy's since 0.1.79), and a hive joined again under the same name gets its
+  ILKs back unmarked. Nothing to stage for either.
+- **Purging a retired system ILK** (`purge_ilk`) is final. Stage it only on the operator's explicit
+  word, and only for one that made no history: no LLM usage of its node (`get_llm_usage` grouped by
+  node, over all its time), no message from or to it in the message log, no conversation SY.cognition
+  keeps under it. When you cannot tell, it made history: leave it retired, and say why. SY.policy's,
+  which ran in PROD for months, stay retired. SY.identity refuses to purge a system ILK that is not
+  retired, and refuses `delete_ilk` and `restore_ilk` of any system ILK (`SYSTEM_ILK_PROTECTED`).
+
 ### 4.5 Secrets and vault (Model D')
 
 `SY.vault` is the canonical secret backend. Secrets live **entirely** in vault — nodes never receive plaintext secrets through `CONFIG_SET` and never persist them locally. Consumers discover their secret at boot/refresh by querying vault for a `resource_type` (e.g. `openai`, `postgres`, `slack`).

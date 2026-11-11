@@ -266,6 +266,21 @@ and the pages its edge serves, which stay up until they expire. The cleanup stop
 (FINDINGS A-236), so the latter are served no more once it ran; taking one down then releases only
 its copy (`edge_skipped`), and the expiry sweep retires it the same way.
 
+**The removed hive's system ILKs** (FINDINGS A-191): once the hive is gone, SY.admin asks
+SY.identity to retire its `SY.*@<hive>` identities (`ILK_RETIRE_HIVE`): marked, reversibly, out of
+every lookup and of the identity SHM, never purged. The ok answer names the result in
+`system_ilks_retired` (`{count, ilk_ids, already_retired}`). A retire that fails leaves the removal
+ok: `system_ilks_retired` is `{count: null, error_code, error_detail}` and `warning` says so; then
+run `retire_hive_ilks` (`POST /hives/<id>/system-ilks/retire`), never the removal again, which
+would only answer `NOT_FOUND`. The same action retires the ILKs of a hive removed before this
+release (worker2, the throwaway gate workers); it is refused for the motherbee and for a hive the
+registry still lists (`409 HIVE_NOT_REMOVED`). A hive joined again under the same name gets its
+system ILKs back unmarked from its own SY.identity at its start. A retired system ILK is purged
+(`purge_ilk`) only on the operator's word, and only when it made no history (no LLM usage, no
+message, no conversation under it); one that made history stays retired. The system ILKs of the SY
+nodes a release no longer runs on a hive (SY.policy's, dropped in 0.1.79) are retired by
+SY.identity itself at its start.
+
 ## A worker behind the egress (`set_hive_egress`, `clear_hive_egress`)
 
 A worker that joins after the motherbee declares `egress.gateway_ip` gets the motherbee's `egress`
