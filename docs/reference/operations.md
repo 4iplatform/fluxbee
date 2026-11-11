@@ -256,7 +256,11 @@ leaves every `fluxbee-dist*` folder and both blob folders, whatever the blob's f
 (`identity_key_cleanup` in the answer). When the spoke did not answer, the motherbee restarts its
 `sy-identity` to close any session the removed hive still holds (`identity_restart`). The
 motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
-the identity key of every hive with no `hives/<id>/`.
+the identity key of every hive with no `hives/<id>/`. Public pages never refuse the removal
+(FINDINGS A-242): the ok answer names in `pages_left_up` the pages a node of the hive published
+and the pages its edge serves, which stay up until they expire. The cleanup stops the hive's edge
+(FINDINGS A-236), so the latter are served no more once it ran; taking one down then releases only
+its copy (`edge_skipped`), and the expiry sweep retires it the same way.
 
 ## A worker behind the egress (`set_hive_egress`, `clear_hive_egress`)
 
@@ -681,17 +685,14 @@ tenant (`TENANT_ROOT_REQUIRED`; both `core_io_refusal`); a tenant that is not ac
 whose runtime is not a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`). Start, restart and the
 boot relaunch refuse the same root-tenant cases.
 
-**Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first). A node
-with a public page up is not purged (FINDINGS A-233; a purge never cascades into another store):
-SY.admin answers `409 NODE_HAS_PAGES` before it sends anything, naming the node's pages by their
-`publication_id`. Take them down first: `GET /artifacts` lists them (`publisher_l2_name` is the
-node), `POST /artifacts/unpublish {"publication_id": ...}` takes one down; a ledger that cannot be
-read refuses the purge too (`PAGES_CHECK_FAILED`). A publish of the node in flight refuses it the
-same way, `409 NODE_HAS_PAGES` saying that a publish of the node is in flight: its page is not in
-the ledger until the publish ends, within 110 s; then take its page down and purge again. From the
-purge's check until its answer, the node's own publishes answer `409 NODE_BEING_PURGED`. The same
-holds for removing a stopped instance, `teardown_node`, and `purge_ilk` of the node's ILK.
-Otherwise:
+**Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first). It is
+never refused for the node's public pages (FINDINGS A-242): they stay up until they expire (24 h
+after their publish by default, 30 days at most, never renewed), and SY.admin's ok answer names
+the ones up in `payload.pages_left_up` (`{count, pages: [{publication_id, expires_at, ...}], more}`,
+never a link's key). Take any of them down sooner with `POST /artifacts/unpublish
+{"publication_id": ...}`; `GET /artifacts` lists every page that is up. A publish of the node under
+way is not waited for: its page may still go up within 110 s. The same holds for removing a
+stopped instance, `teardown_node` and `purge_ilk` of the node's ILK. In order:
 
 1. stops the unit and clears `relaunch_on_boot`, so whatever fails after, the reconcile does not
    launch the node again;
@@ -766,9 +767,8 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
 `--confirm-hive <id>`). It needs every hive alive and works through SY.admin: without SY.admin's
 answer it stops at its start, when it lists the hives, before it changes anything.
 
-1. takes down every published page that is up (FINDINGS A-212), first: a purge never cascades, so
-   a node with a page up is not purged (`NODE_HAS_PAGES`, FINDINGS A-233) and neither is its
-   tenant (`TENANT_HAS_PAGES`). SY.admin lists them (`GET /artifacts`,
+1. takes down every published page that is up (FINDINGS A-212), first: pages are what users
+   made, though no removal waits for one (FINDINGS A-242). SY.admin lists them (`GET /artifacts`,
    `list_published_artifacts`, each by its `publication_id`, never by its link's key) and the
    reset takes each down (`POST /artifacts/unpublish`): the edge stops serving its
    `/public/<key>` link, and IO.blob releases its copy in `blob/public/`. It lists again until
@@ -779,22 +779,22 @@ answer it stops at its start, when it lists the hives, before it changes anythin
    most. The dry run lists the pages;
 2. deletes every workflow with `force` on motherbee and worker hives;
 3. kills and purges every node not in the system set (`SY.*`, `RT.*` and the `boot: true`
-   instances of `base-nodes.json`), on every hive. A node that published a page after step 1 has
-   its purge, or its workflow's delete, refused with `NODE_HAS_PAGES`: the pages come down again,
-   and the purge is asked once more; a page that stays up leaves that node's failure. While a
-   publish of the node is in flight, the purge is refused the same way: it is asked again every
-   5 s until the publish ends (120 s at most), and then its page comes down like the others; a
-   publish that does not end in time leaves that node's failure;
+   instances of `base-nodes.json`), on every hive, each once;
 4. marks and purges every non-system ILK, deletes every vault secret except
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
-   but the root. A tenant with a page still up is not purged (`TENANT_HAS_PAGES`): step 1 takes
-   them down first, and a page it could not take down shows again as that tenant's failure;
+   but the root;
 5. clears the user OPA policy on every hive;
 6. has every hive that runs SY.cognition drop its state through SY.admin's `cognition_clear`, the
    motherbee's included (FINDINGS A-160); truncates every table of `fluxbee_storage` with
    SY.storage and the frontdesk held down (masked for the boot, then started again); removes the
    nodes' conversation state; and clears Archi's sessions. The dry run lists the cognition hives,
-   and each answer is printed.
+   and each answer is printed;
+7. takes down the pages published after step 1, once a node went in steps 2 to 4 (a workflow's
+   WF node, a user node, or the ILK of a node that died on its own): a publish under way when its
+   node went is not stopped, and its page goes up within SY.admin's 110 s for one publish. The
+   reset waits until 120 s after its last removal, then takes down every page that is up, as in
+   step 1 (`take_down_late_pages`); a page it cannot take down is a counted problem. With no node
+   removed, it waits for nothing.
 
 It keeps the installation, `/etc/fluxbee`, the vault master key, TLS, the spokes (with their SSH
 and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and the history,

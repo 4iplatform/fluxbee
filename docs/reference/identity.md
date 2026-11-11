@@ -292,10 +292,10 @@ Delete is a reversible mark. Purge is a separate, final step.
   installation-wide scope when that key is free (`move_account_to_installation_scope`).
 
 **`ILK_PURGE`** (`purge_ilk`): only a marked ILK (`ILK_NOT_DELETED` otherwise). It removes the
-ILK, its lookups and every alias that names it (`remove_ilk_physically`). SY.admin sends it only
-once the public pages of the ILK's node are down and no publish of the node is in flight
-(`NODE_HAS_PAGES`, FINDINGS A-233,
-[SY.admin](../nodes/sy-admin.md#publications-and-the-audit-log)).
+ILK, its lookups and every alias that names it (`remove_ilk_physically`). Public pages of the
+ILK's node never refuse it (FINDINGS A-242): they stay up until they expire, and SY.admin's ok
+answer names them (`pages_left_up`; SY.admin reads the ILK's node with `ILK_GET` before the purge
+while some page is up, [SY.admin](../nodes/sy-admin.md#publications-and-the-audit-log)).
 
 All three take two optional guards (`IlkDeleteRequest`, `check_ilk_tenant_scope`):
 
@@ -420,13 +420,12 @@ It is refused while:
   (`tenant_people` skips aliases);
 - SY.vault holds secrets of the tenant (`TENANT_HAS_SECRETS`). SY.admin checks this before it
   forwards the purge, and refuses when the vault cannot be listed (`VAULT_CHECK_FAILED`,
-  `purge_tenant_vault_block` in `src/bin/sy_admin.rs`);
-- public pages of the tenant are up (`TENANT_HAS_PAGES`, FINDINGS A-212): the pages SY.admin's
-  publication ledger holds for the tenant, its publisher's when it published, that are not
-  taken down or expired. SY.admin checks this first, before it asks anyone, names how many and
-  the first 20 `publication_id`s, and refuses when the ledger cannot be read
-  (`PAGES_CHECK_FAILED`, `purge_tenant_pages_block`). Take them down first: `GET /artifacts`
-  lists them, `POST /artifacts/unpublish` takes one down.
+  `purge_tenant_vault_block` in `src/bin/sy_admin.rs`).
+
+Public pages of the tenant never refuse it (FINDINGS A-242): they stay up until they expire,
+and SY.admin's ok answer names those up, the pages whose ledger row names the tenant (its
+publisher's when it published), in `pages_left_up`. `POST /artifacts/unpublish` takes one down
+sooner.
 
 When it goes through, it removes every ILK charged to the tenant (people already marked on their
 own included), and drops the channels other ILKs still hold in its scope
@@ -757,7 +756,7 @@ SY.admin re-checks every relayed request (`enforce_cloud_relay_content`, `stamp_
 | `SYSTEM_ILK_PROTECTED` | A system ILK. |
 | `DUPLICATE_EMAIL` | The vouched email (`identification.email`) is taken in that tenant and no merge applies. A `claimed_email` never answers it. |
 | `CLOUD_CHANNEL_RESERVED`, `INVALID_SCOPE`, `ICH_ID_CONFLICT`, `ICH_CONFLICT`, `ACCOUNT_AMBIGUOUS` | Channel and scope rules (§2.5, §2.6). `ICH_CONFLICT`: another ILK holds the channel. |
-| `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS`, `TENANT_HAS_PAGES` | A tenant lifecycle guard (§3.6). |
+| `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS` | A tenant lifecycle guard (§3.6). |
 
 Database errors map to their own codes (`map_db_write_error_code`). Their message never echoes
 the row's values (`db_error_summary`).

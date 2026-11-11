@@ -459,11 +459,9 @@ executor may ask for it too. In order:
    down then. Anyone else gets `409 NODE_STILL_CONNECTED` while the shared-memory regions list
    the node, or `503 INVENTORY_UNAVAILABLE` when they cannot be read, and nothing is removed
    (`teardown_live_node_refusal`). Otherwise a node redeployed onto the ILK of a teardown that
-   failed half-way could be purged alive. **A node with a public page up** waits for it to come
-   down, and one with a publish in flight for it to end: `409 NODE_HAS_PAGES`, its own
-   orchestrator's call included, and nothing is removed (`start_node_purge`, FINDINGS A-233;
-   [the pages](#publications-and-the-audit-log)). From here until the teardown answers, the node
-   publishes nothing (`NODE_BEING_PURGED`).
+   failed half-way could be purged alive. **The node's public pages refuse nothing** (FINDINGS
+   A-242): they stay up until they expire, and the ok answer names them
+   ([the pages](#publications-and-the-audit-log)).
 2. **The ILK is the node's**: `ILK_GET` to SY.identity, whose `identification.node_name` must be
    the node, else `409 NODE_ILK_MISMATCH` and nothing is removed. An ILK SY.identity does not
    hold is reported `not_found` and skips step 4. Over the mesh it skips step 3 too, since
@@ -472,11 +470,8 @@ executor may ask for it too. In order:
 3. **Its secrets**: `VAULT_LIST` with `filter.ilk`, then `VAULT_DELETE` of each in its own tenant,
    through `handle_vault_command` like every admin vault call.
 4. **The ILK**: `ILK_DELETE` (the mark), then `ILK_PURGE`; `ILK_NOT_FOUND` counts as done. Both go
-   to SY.identity as such (`send_identity_command`): step 1 checked the pages and step 2 read the
-   ILK, so before the purge only the ledger is read again, and SY.identity is not asked whose the
-   ILK is a second time, as `purge_ilk`'s own check would (`purge_ilk_pages_block`). A page of the
-   node found up then leaves the ILK marked: `TEARDOWN_INCOMPLETE`, its ILK step
-   `NODE_HAS_PAGES`.
+   to SY.identity as such (`send_identity_command`): step 2 read the ILK, and `purge_ilk`'s own
+   read of it (`purge_ilk_pages_of`) would only name its pages again.
 
 The secrets go first because the ILK is what ties them to the node: when one cannot be deleted,
 step 4 does not run, so a retry can still prove which secrets are the node's. The payload is the
@@ -493,7 +488,9 @@ same whatever happened:
 `status` is `ok` only when every step was done. Otherwise it is `502 TEARDOWN_INCOMPLETE` with the
 same payload: a step that failed says `error` with `error_code` and `error_detail` (per key in
 `errors`, or on `vault_secrets_purged` itself when the listing failed), and one that did not run
-says `skipped`.
+says `skipped`. The ok answer adds `pages_left_up`, the node's public pages that are up
+([the pages](#publications-and-the-audit-log)), to every caller but the node's own orchestrator,
+which reads none of it: the purge that called it, which SY.admin answers, names them.
 
 ## A node's self-description
 
@@ -1137,10 +1134,11 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   3. **The outputs dropped.** Every output and args goes; each event keeps its step, status, tool,
      error code and error text (cut to 256 bytes), and of its output its status, its error code,
      its ids and the fields Archi reads (`wf_node`, `warning`, `pending`, `version`, `held`,
-     `nothing_to_do`, and of an installation update its `id`, `state`, `held`, `stale_target` and
-     `superseded_by`, never its hives: Archi reads an update whose answer was cut again;
-     `executor_result_essentials`). Its run id, time and summary line go. If the answer still does
-     not fit, each step keeps only its last event (`collapse_executor_events`).
+     `nothing_to_do`, a removal's `pages_left_up` cut to 1 KiB, and of an installation update its
+     `id`, `state`, `held`, `stale_target` and `superseded_by`, never its hives: Archi reads an
+     update whose answer was cut again; `executor_result_essentials`). Its run id, time and
+     summary line go. If the answer still does not fit, each step keeps only its last event
+     (`collapse_executor_events`).
   4. **REPLY_TOO_LARGE.** An answer past all of it goes as `REPLY_TOO_LARGE`, with `action_ran`
      and an `outcome` that keeps the run's `execution_id`, `plan_status`, `completed_steps`,
      `total_steps`, `failed_step_id` and `log_path`.
@@ -1192,7 +1190,9 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/var/lib/fluxbee/state/sy-admin/publications.json`, and asks the public edge to serve it under
   `/public/<key>` (`handle_publish_artifact`). The edge is `admin.public_edge_node`, or the one
   connected ingress hive (`resolve_public_edge_node`). Expiry: default 1 day, 60 s to 30 days
-  (`PUBLICATION_*_SECS`). The sweep retires expired ones every 600 s. The ledger keeps a page's
+  (`PUBLICATION_*_SECS`). The sweep retires expired ones every 600 s; it asks no edge whose hive
+  the hive registry no longer lists, and releases only the page's copy, as a take-down does
+  (`publication_edge_hive_gone`, FINDINGS A-242). The ledger keeps a page's
   row for 30 days once the page is down, `expired` or `unpublished` (since its `released_at`, or
   its `expires_at` for a row without one); each sweep first drops the rows down for longer, and
   keeps every other row (`drop_old_down_publications`, `PUBLICATION_LEDGER_KEEP_DOWN_SECS`,
@@ -1209,13 +1209,9 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   its answer: the wait for the blob, the publication lock, the curate (30 s at most) and the
   edge's publish (75 s at most) each get what is left. A step with nothing left answers
   `TIMEOUT`; at the edge's step, after releasing what was curated.
-- **A node being purged publishes nothing** (FINDINGS A-233). A publish writes its page's row
-  only at its end, so SY.admin counts the publishes and the purges of each node under way, by the
-  node's `<name>@<hive>` (`NodeWork`, one lock, never held across a wait). A publish is counted
-  from its caller's check until its answer; while a purge of its node is under way it answers
-  `409 NODE_BEING_PURGED`, naming the node and nothing it sent. A purge is counted from its check
-  until its answer comes back, and while a publish of its node is in flight it is refused with
-  `409 NODE_HAS_PAGES` (below).
+- **A page outlives its publisher** (FINDINGS A-242). A purge of the node while its publish is
+  under way neither waits for the publish nor stops it, and the page, once up, stays up until it
+  expires or is taken down, as every page the node published before.
 - **Taking a page down.** `unpublish_artifact` (`handle_unpublish_artifact`) names the
   publication by exactly one of `publication_id` (`pub:<uuid>`) or `key`, the last segment of its
   `/public/<key>` link: 64 lowercase hex characters, as `mint_public_capability` makes it. A
@@ -1237,9 +1233,10 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
     `BLOB_RELEASE_FAILED`; the same request again finishes it;
   - an edge on a hive the hive registry no longer lists (removed, or renamed: its directory is
     gone) cannot be asked, so its step is skipped: only the `BLOB_RELEASE`, and the answer says
-    why in `edge_skipped` (`publication_edge_hive_gone`). Otherwise such a page would stay
-    `published`, and block its tenant's purge, until it expires. This admin's own hive, and a
-    registry whose directory is missing, always have the edge asked.
+    why in `edge_skipped` (`publication_edge_hive_gone`). Otherwise such a page could not be
+    taken down, and would stay `published` until it expires; the expiry sweep skips that edge the
+    same way. This admin's own hive, and a registry whose directory is missing, always have the
+    edge asked.
 
   The answer carries the `publication_id` either way. A request can carry a live link in any
   field, so the command log keeps only a `publication_id` that is one, in its canonical form, and
@@ -1265,42 +1262,41 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `INVALID_CURSOR`. It reads the ledger without the publication lock, which a publish holds for up
   to 110 s (the file is replaced whole), asks no one, and, a read, is not in the command log.
   Archi reads it (`GET /artifacts` through `fluxbee_system_get`); the Cloud's relay does not.
-- **A tenant with pages up is not purged** (FINDINGS A-212), by the rule of its vault secrets: a
-  purge never cascades into another store (the operator's call of 2026-09-28). While a page whose
-  record names the tenant is up (its publisher's tenant when it published), `purge_tenant` answers
-  `409 TENANT_HAS_PAGES` before anything is sent: how many pages, the first 20 by their
-  `publication_id`, and the way to take them down, `GET /artifacts` and
-  `POST /artifacts/unpublish` (`purge_tenant_pages_block`, checked before the vault's
-  `purge_tenant_vault_block`). A ledger that cannot be read refuses the purge too
-  (`PAGES_CHECK_FAILED`).
-- **A node with pages up is not purged** (FINDINGS A-233), by the same rule. While a page whose
-  `publisher_l2_name` is the node is up, every action that purges the node answers
-  `409 NODE_HAS_PAGES` before anything is sent, with the same detail (how many pages, the first 20
-  by their `publication_id`, `GET /artifacts` and `POST /artifacts/unpublish`;
-  `node_pages_refusal`): `kill_node` with `purge_instance` and `remove_node_instance` (the node
-  `<name>@<hive>` as the orchestrator reads it, `purged_node_name`), `teardown_node` (after its
-  live-node check, so its own orchestrator's call after the kill too) and `purge_ilk`. **A publish
-  of the node in flight** refuses the purge the same way, its page being on its way and not in the
-  ledger yet: `409 NODE_HAS_PAGES`, its detail saying that a publish of the node is in flight; it
-  ends within 110 s, and then its page comes down like any other (`start_node_purge`). The purge is
-  counted, then the ledger read, so a publish that ended first has its row read, and from that
-  check until the purge's answer the node publishes nothing (`NODE_BEING_PURGED`): a `kill_node`
-  until the orchestrator answers, its own `teardown_node` call included. A page's record names its
-  publisher, not its ILK: while any page is up or any publish is in flight, `purge_ilk` asks
-  SY.identity whose ILK it is (`ILK_GET`, its `identification.node_name`) before it sends
-  `ILK_PURGE` (`purge_ilk_pages_block`); an ILK of no node, one SY.identity does not hold, or an id
-  it refuses goes on to the purge, which answers the same. With neither, no publish of its node can
-  start meanwhile: `ILK_PURGE` takes a marked ILK, which no longer resolves a publisher. A ledger
-  that cannot be read, or an ILK that cannot be read while a page is up or a publish in flight,
-  refuses the purge (`PAGES_CHECK_FAILED`). A plain stop (`kill_node` without `purge_instance`) is
-  no purge. SY.wf-rules' `wf_rules_delete` purges its WF node through `kill_node`, so a workflow
-  whose node has a page up is not deleted either.
-- **The factory reset takes every page down** through these two actions first, before it deletes
-  the workflows and purges the user nodes and the tenants; a purge refused while a publish of the
-  node is in flight is asked again every 5 s until that publish ends (120 s at most), and a purge
-  refused for a page published after the take-down takes the pages down again and is asked once
-  more (`unpublish_pages`, `purge_once_publishes_end` and `purge_once_pages_are_down` in
-  `packaging/fluxbee-factory-reset`; see [operations](../reference/operations.md#factory-reset)).
+- **No removal is refused for a page** (FINDINGS A-242, the operator's call of 2026-11-10). A
+  page has a fixed expiry that never renews, past which the edge serves it no more and the sweep
+  retires it, so it outlives its node, its tenant and its hive until then; the operator takes it
+  down sooner (`unpublish_artifact`, whoever published it). A removal goes as asked, and its ok
+  answer names the pages it leaves up in `payload.pages_left_up`: `{count, pages, more}`, the pages
+  that are up (as `GET /artifacts` lists them), soonest to expire first, at most 20 of them in at
+  most 8 KiB (`more` counts the rest), each `{publication_id, expires_at, status,
+  filename_original (cut to 96 bytes), publisher_l2_name, tenant_id, edge_node}` and never a
+  link's key (`pages_left_up`, `with_pages_left_up`). A ledger that cannot be read gives
+  `{count: null, error}` and refuses nothing; a refusal or a failure names none. Whose pages:
+  - a node's purge (`kill_node` with `purge_instance`, `remove_node_instance`, the node as the
+    orchestrator reads it, `purged_node_name`), its `teardown_node` (to every caller but its own
+    orchestrator) and a workflow's delete (`wf_rules_delete`, the WF node SY.wf-rules names in
+    `wf_node.node_name`): the pages whose `publisher_l2_name` is the node;
+  - `purge_ilk`: those of the ILK's node, its `identification.node_name`, which goes with the
+    purge, so SY.admin reads it first (`ILK_GET`), and only while some page is up
+    (`purge_ilk_pages_of`); an ILK of no node names none, and one that cannot be read gives
+    `{count: null, error}`;
+  - `purge_tenant`: those whose `tenant_id` is the tenant (its publisher's when it published),
+    once SY.vault holds no secret of the tenant (`purge_tenant_vault_block`, still a refusal);
+  - `remove_hive`: those a node of the hive published and those its edge serves (`edge_node` on
+    the hive), the hive being the payload's `hive_id` the orchestrator removes, never the
+    command's target (`removal_pages_of`). The hive's cleanup stops its edge (FINDINGS A-236), so
+    its pages are served no more once it ran, and taking one down releases only its copy.
+
+  A publish of the node under way at its purge is not waited for: its page may go up within
+  110 s, unnamed. Over the mesh the answer stays within its frame (SY.wf-rules and Archi read
+  it), and an executor answer cut to fit keeps a step's `pages_left_up`, its `count` and `more`
+  whole and the pages that fit in 1 KiB (`executor_result_essentials`).
+- **The factory reset takes every page down** through these two actions, first and once more at
+  the end: no removal waits for a page, and a publish under way when its node went may put its
+  page up within 110 s, so once a node was removed the reset waits until 120 s after its last
+  removal and takes down every page that is up again (`unpublish_pages` and
+  `take_down_late_pages` in `packaging/fluxbee-factory-reset`; see
+  [operations](../reference/operations.md#factory-reset)).
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
   hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048

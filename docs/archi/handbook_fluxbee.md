@@ -1023,21 +1023,27 @@ The ownership and call path are fixed:
   link, its key may go in the `unpublish_artifact` step, as above (the logs keep only its
   SHA-256).
 - A page stays up until it is taken down (`unpublish_artifact`; the factory reset takes every
-  page down) or expires. A tenant with a page up cannot be purged: its purge answers
-  `TENANT_HAS_PAGES` and names the pages by their `publication_id`, and they come down first,
-  each with an `unpublish_artifact` step the operator confirms.
-- Nor can a node with a page up (FINDINGS A-233): `kill_node` with `purge_instance`,
-  `remove_node_instance`, `teardown_node` and `purge_ilk` of its ILK answer `NODE_HAS_PAGES`,
-  naming the node's pages by their `publication_id`, and nothing is removed; a workflow whose node
-  has one is not deleted either (`wf_rules_delete`). Read `/artifacts`, take the pages whose
-  `publisher_l2_name` is the node down first (one `unpublish_artifact` step each), then purge it,
-  in the same plan if the operator wants. A plain stop (`kill_node` without `purge_instance`) is
-  never refused for a page.
-- While a publish of the node is in flight, its purge is refused the same way: `NODE_HAS_PAGES`,
-  its detail saying that a publish of the node is in flight. Its page is not listed yet: the
-  publish ends within 110 s. Tell the operator, then read `/artifacts` again, take the node's
-  pages down and stage the purge again. From the purge's check until its answer, the node's own
-  publishes are refused (`NODE_BEING_PURGED`).
+  page down) or expires. Its expiry is fixed when it is published and never renews: 24 h by
+  default, 30 days at most. Then the edge stops serving it, and SY.admin's sweep retires it.
+- **No removal is refused for a page** (FINDINGS A-242). A node's purge (`kill_node` with
+  `purge_instance`, `remove_node_instance`, `teardown_node`), a workflow's delete
+  (`wf_rules_delete`) and `remove_hive` go on with the pages up, and the pages stay public until
+  they expire. Do not stage `unpublish_artifact` steps before a removal, unless the operator asks
+  for the pages to come down.
+- **After the removal, say what stays public.** The removal's answer names the pages it left up
+  in `payload.pages_left_up`: `count`, `pages` (each with its `publication_id`, `expires_at` in
+  epoch seconds, `status`, `filename_original`, `publisher_l2_name`, `tenant_id` and
+  `edge_node`), and `more`, the pages it did not name. The step's `result_preview` carries it.
+  When the answer was cut (`output_truncated`, or `pages_left_up` cut short) or `count` is null,
+  read `/artifacts` and pick the rows whose `publisher_l2_name` is the removed node (a hive's:
+  its nodes, or an `edge_node` on it).
+- When `count` is more than 0, tell the operator which pages stay public and until when: each
+  `expires_at` as a date. Offer to take them down now, one `unpublish_artifact` step each, in a
+  plan the operator confirms; never stage it without their yes.
+- A publish of the node under way at its purge is not stopped: its page may still go up within
+  110 s, and the removal's answer does not name it. Read `/artifacts` again when that matters.
+- After `remove_hive`, a page whose `edge_node` is on the removed hive is served no more once the
+  hive's cleanup stopped its edge; taking it down releases only its copy (`edge_skipped`).
 
 Rules for Archi:
 
@@ -1074,7 +1080,7 @@ Normal operator requests should not create or redesign these.
 ### 4.4.1 Node teardown semantics
 
 - `purge_instance=true` is a real tabula-rasa for orchestrator-owned node state: instance directory, timers, `node_ilk_map`, ILK, and dedicated vault secrets are removed. Routes, VPNs, and taps are not auto-deleted; teardown returns `routing_references` so the operator can clean those deliberately.
-- Public pages are not: a node with a page up, or with a publish in flight, is not purged (`NODE_HAS_PAGES`, FINDINGS A-233). Stage the `unpublish_artifact` steps of its pages before the purge (§4.3.1); for a publish in flight, wait for it to end (within 110 s) and take its page down too.
+- Public pages are not: they stay up until they expire, and the purge is never refused for them (FINDINGS A-242). Its answer names them (`pages_left_up`): tell the operator which pages stay public and until when, and offer to take them down (§4.3.1).
 
 ### 4.4.2 Clearing a hive's cognition
 
