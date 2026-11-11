@@ -1656,6 +1656,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (0.1.133, SY.admin):** a usage that is missing, has `status: error` or a non-empty
   `skipped_hives` refuses the removal (409, naming the hives that did not answer), the
   `in_use: false` default goes, and `RUNTIME_IN_USE`'s detail names each node's state (A-285).
+- **Seen on 8.x (2026-11-11, 0.1.132):** every global usage lists egress1 and ingress1 in
+  `skipped_hives` with `RUNTIME_MANIFEST_MISSING`: those roles receive no runtimes. Refusing on any
+  skipped hive would refuse every removal for good, so A-281 has an orchestrator part too
+  (`coa/orch-usage-133`): a hive whose role runs no managed nodes is never reported as skipped; a
+  worker or the motherbee with no manifest still is.
 
 ### A-280 [General/admin] 🔵 low (found 2026-11-11 by A-274's review; read in the code; there before it) — A publish holds the publication lock across its curate and the edge's publish, and on its failure paths across a clean-up its budget does not bound
 
