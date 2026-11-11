@@ -492,8 +492,13 @@ def unpublish_pages():
         progress = 0
         for p in pages:
             pid = p.get("publication_id")
-            # The publication lock a publish in flight holds (up to 110 s), then the edge and
-            # IO.blob (30 s each).
+            # SY.admin's take-down holds the publication lock up to three times, each briefly: to
+            # read the page's row, to write edge_removed and to write unpublished (FINDINGS A-274).
+            # Each hold may wait behind the publishes queued at that moment (up to 110 s each), and
+            # the edge's and IO.blob's calls (30 s each) come between them: while nodes publish, a
+            # take-down can outlast this timeout. It goes on in SY.admin all the same, and a page
+            # still up is asked again by the next pass, when this one took a page down, and by [8],
+            # which runs whenever [1]-[3] removed a node (a node that publishes is one of them).
             status, resp = api("POST", "/artifacts/unpublish", {"publication_id": pid}, timeout=180)
             if ok(status, resp):
                 done += 1

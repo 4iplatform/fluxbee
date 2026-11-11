@@ -1235,12 +1235,15 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   page's row and to write each of its states, never across the edge's or IO.blob's call (30 s
   each), and writes a state only while the row is still at the one it read, so a state another
   writer recorded meanwhile stays (`retire_expired_publication`, `advance_publication`, FINDINGS
-  A-260): an edge that is listed but down, or a slow IO.blob, holds up no publish or take-down.
-  A take-down holds the lock the same way (FINDINGS A-274, below), so the two may run on one page
-  at once, and neither writes over the other's state. The ledger keeps a page's row for 30 days
-  once the page is down, `expired` or `unpublished` (since its `released_at`, or its `expires_at`
-  for a row without one); each sweep first drops the rows down for longer, and keeps every other
-  row (`drop_old_down_publications`, `PUBLICATION_LEDGER_KEEP_DOWN_SECS`, FINDINGS A-231).
+  A-260): the sweep's own calls, even to an edge that is listed but down or to a slow IO.blob,
+  hold up no publish or take-down. A publish still holds the lock across its curate and the
+  edge's publish (up to 110 s, and a release on its failure path can add 30 s), and each of the
+  sweep's reads and writes waits for it. A take-down holds the lock as the sweep does (FINDINGS
+  A-274, below), so the two may run on one page at once, and neither writes over the other's
+  state. The ledger keeps a page's row for 30 days once the page is down, `expired` or
+  `unpublished` (since its `released_at`, or its `expires_at` for a row without one); each sweep
+  first drops the rows down for longer, and keeps every other row (`drop_old_down_publications`,
+  `PUBLICATION_LEDGER_KEEP_DOWN_SECS`, FINDINGS A-231).
 - **A producer on a worker** (FINDINGS A-81) promotes its blob there, and Syncthing brings it to
   the motherbee about 10 s later. Before the publication lock, unless the blob is in the
   motherbee's `active/` already, SY.admin asks the producer's hive to scan its blob folder
@@ -1278,6 +1281,10 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
     then `BLOB_RELEASE` to `IO.blob@motherbee` (the row goes to `unpublished`), each with 30 s,
     and the answer is `unpublished: true`. A failed step answers `EDGE_UNPUBLISH_FAILED` or
     `BLOB_RELEASE_FAILED`; the same request again finishes it;
+  - a row at `edge_removed`, a take-down past its edge (stopped there, or under way), has had its
+    edge's step, so the edge is not asked again: only the `BLOB_RELEASE`, as the expiry sweep
+    does, and the answer carries no `edge_skipped`. An edge that is down fails no retry after a
+    `BLOB_RELEASE_FAILED` (FINDINGS A-274's review);
   - an edge on a hive the hive registry no longer lists (removed, or renamed: its directory is
     gone) cannot be asked, so its step is skipped: only the `BLOB_RELEASE`, and the answer says
     why in `edge_skipped` (`publication_edge_hive_gone`). Otherwise such a page could not be
@@ -1286,10 +1293,13 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
     edge asked.
 
   A take-down holds the publication lock only to read the row and to write each of its states,
-  never across the edge's or IO.blob's call, as the expiry sweep (FINDINGS A-274): an edge that is
-  listed but down, or a slow IO.blob, holds up no publish, no other take-down and no sweep, the
-  factory reset's take-downs included. Each state is written on the ledger loaded again, and only
-  while the row is still at the one the take-down read (`take_down_publication`,
+  never across the edge's or IO.blob's call, as the expiry sweep (FINDINGS A-274): its own calls,
+  even to an edge that is listed but down or to a slow IO.blob, hold up no publish, no other
+  take-down and no sweep, and neither do the factory reset's take-downs. A publish still holds the
+  lock across its curate and the edge's publish (up to 110 s, and a release on its failure path
+  can add 30 s): each of the take-down's holds, its read and each of its writes, waits for the
+  publish under way and for those queued before it. Each state is written on the ledger loaded
+  again, and only while the row is still at the one the take-down read (`take_down_publication`,
   `advance_publication`), so a page published meanwhile keeps its row and a state another writer
   recorded meanwhile stays. When another take-down, or the sweep, got past the edge meanwhile
   (`edge_removed`), this one goes on to the release; when one of them recorded the page down

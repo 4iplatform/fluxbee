@@ -6945,8 +6945,9 @@ fn drop_old_down_publications(ledger: &mut AdminPublicationLedger, now: u64) -> 
 /// How a take-down ended (`take_down_publication`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TakeDown {
-    /// This take-down recorded the page `unpublished`; `edge_skipped` says why its edge was not
-    /// asked, when it was not (`publication_edge_hive_gone`).
+    /// This take-down recorded the page `unpublished`; `edge_skipped` says why it skipped the
+    /// page's edge, its hive gone (`publication_edge_hive_gone`), and is `None` when it asked the
+    /// edge or read the row past it (`edge_removed`).
     Unpublished { edge_skipped: Option<String> },
     /// Another writer recorded the page down while this one ran, another take-down `unpublished`
     /// or the expiry sweep `expired`, or its row went: this one wrote nothing over it.
@@ -6959,6 +6960,14 @@ enum TakeDown {
 /// under the publication lock. The error is `(error_code, detail)`; the same call again finishes
 /// what a failed step left.
 ///
+/// A row read at `edge_removed` has had its edge's step: a writer records `edge_removed` only once
+/// the edge removed the page, or once it skipped an edge whose hive is gone. Its edge is not asked
+/// again, and only the release is left, as for the expiry sweep (`retire_expired_publication`).
+/// Asked again, an edge that is down failed with `EDGE_UNPUBLISH_FAILED` a take-down that had only
+/// the release left: the retry after a `BLOB_RELEASE_FAILED`, or a take-down that read the row
+/// while another one waited for IO.blob (FINDINGS A-274's review). Such a take-down skips no edge,
+/// and its answer carries no `edge_skipped`.
+///
 /// The edge's and IO.blob's calls go OUTSIDE `publication_lock` (FINDINGS A-274), as the expiry
 /// sweep's do (`retire_expired_publication`, FINDINGS A-260): each may take its 30 s, and an edge
 /// that is listed but down held the lock up to 60 s per take-down (the factory reset's, page after
@@ -6968,8 +6977,8 @@ enum TakeDown {
 /// keeps its row, and a state another writer recorded meanwhile is never written over. When this
 /// take-down finds the row changed meanwhile:
 /// - at `edge_removed`, another take-down or the sweep got past the edge too: it goes on to the
-///   release, as for a row a take-down left half-way, and writes `unpublished` only while the row
-///   is still at `edge_removed`;
+///   release, as for a row read at `edge_removed`, and writes `unpublished` only while the row is
+///   still at `edge_removed`;
 /// - at `unpublished` (another take-down) or `expired` (the sweep), or its row gone (a row goes
 ///   only once its page is down, `drop_old_down_publications`): the page is down, so it asks no
 ///   one more and writes nothing, and answers as it would have after the other writer, the page
@@ -6989,26 +6998,6 @@ async fn take_down_publication(
     record: AdminPublicationRecord,
 ) -> Result<TakeDown, (&'static str, String)> {
     let publication_id = record.publication_id.as_str();
-    let edge_skipped = match publication_edge_hive_gone(ctx, &record.edge_node) {
-        Some(hive) => {
-            tracing::warn!(
-                publication_id = %publication_id,
-                edge = %record.edge_node,
-                "the page's edge is on a hive the registry no longer lists: only its copy is released"
-            );
-            Some(format!(
-                "its edge {} is on hive {hive}, which the hive registry no longer lists (removed or \
-                 renamed): the edge was not asked, and only the page's copy was released",
-                record.edge_node
-            ))
-        }
-        None => {
-            unpublish_edge_blob(client, &record.edge_node, publication_id)
-                .await
-                .map_err(|err| ("EDGE_UNPUBLISH_FAILED", err))?;
-            None
-        }
-    };
     let down_meanwhile = |found: Option<String>| {
         tracing::info!(
             publication_id = %publication_id,
@@ -7017,14 +7006,42 @@ async fn take_down_publication(
         );
         TakeDown::DownMeanwhile
     };
-    match advance_publication(ctx, publication_id, &record.status, "edge_removed", None)
-        .await
-        .map_err(|err| ("LEDGER_FAILED", err))?
-    {
-        PublicationAdvance::Written => {}
-        PublicationAdvance::Moved(Some(found)) if found == "edge_removed" => {}
-        PublicationAdvance::Moved(found) => return Ok(down_meanwhile(found)),
-    }
+    // The edge first, unless the row read is past it (`edge_removed`): then only the release is
+    // left, and this take-down skipped no edge.
+    let edge_skipped = if record.status == "edge_removed" {
+        None
+    } else {
+        let edge_skipped = match publication_edge_hive_gone(ctx, &record.edge_node) {
+            Some(hive) => {
+                tracing::warn!(
+                    publication_id = %publication_id,
+                    edge = %record.edge_node,
+                    "the page's edge is on a hive the registry no longer lists: only its copy is released"
+                );
+                Some(format!(
+                    "its edge {} is on hive {hive}, which the hive registry no longer lists \
+                     (removed or renamed): the edge was not asked, and only the page's copy was \
+                     released",
+                    record.edge_node
+                ))
+            }
+            None => {
+                unpublish_edge_blob(client, &record.edge_node, publication_id)
+                    .await
+                    .map_err(|err| ("EDGE_UNPUBLISH_FAILED", err))?;
+                None
+            }
+        };
+        match advance_publication(ctx, publication_id, &record.status, "edge_removed", None)
+            .await
+            .map_err(|err| ("LEDGER_FAILED", err))?
+        {
+            PublicationAdvance::Written => {}
+            PublicationAdvance::Moved(Some(found)) if found == "edge_removed" => {}
+            PublicationAdvance::Moved(found) => return Ok(down_meanwhile(found)),
+        }
+        edge_skipped
+    };
     release_curated_blob(client, ctx, publication_id)
         .await
         .map_err(|err| ("BLOB_RELEASE_FAILED", err))?;
@@ -42704,6 +42721,124 @@ mod tests {
             .await
             .unwrap();
         let second = second.await.expect("the second");
+        assert_eq!(
+            second.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": false })
+        );
+        assert_eq!(
+            publication_row(&ctx, id).released_at,
+            taken_down.released_at,
+            "the first's state stays"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// A row at `edge_removed` has had its edge's step, so a take-down that reads it there asks
+    /// the edge nothing: only IO.blob's release, as the expiry sweep, and `unpublished: true` with
+    /// no `edge_skipped` (FINDINGS A-274's review). The retry after a `BLOB_RELEASE_FAILED`, and a
+    /// take-down that read the row while another one waited for IO.blob, asked the edge again, and
+    /// failed with `EDGE_UNPUBLISH_FAILED` while the edge was down, although only the release was
+    /// left.
+    #[tokio::test]
+    async fn a_take_down_of_a_row_past_the_edge_asks_only_io_blob() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-past-the-edge");
+        let retried = published_page(PAGE_PUBLISHER);
+        let meanwhile = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&retried, &meanwhile]);
+
+        // IO.blob refuses the release of a take-down past the edge: the row stays at
+        // edge_removed, and the retry asks IO.blob alone.
+        let id = retried.publication_id.as_str();
+        let first = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the first asks the edge",
+        )
+        .await;
+        harness
+            .inject(edge_unpublished(&unpublish, id, true))
+            .await
+            .unwrap();
+        let release = next_asked(&mut harness, MSG_BLOB_RELEASE, id, "the first's release").await;
+        harness
+            .inject(reply_to(
+                &release,
+                MSG_BLOB_RELEASE_RESPONSE,
+                json!({ "status": "error", "error_code": "SERVICE_FAILED", "error_detail": "disk full" }),
+            ))
+            .await
+            .unwrap();
+        let first = first.await.expect("the first");
+        assert_eq!(first.http_status, 502, "{}", first.envelope);
+        assert_eq!(first.envelope["error_code"], json!("BLOB_RELEASE_FAILED"));
+        assert_eq!(publication_status(&ctx, id), "edge_removed");
+        let retry = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let release = next_asked(
+            &mut harness,
+            MSG_BLOB_RELEASE,
+            id,
+            "the retry's release, and no edge before it",
+        )
+        .await;
+        harness.inject(blob_released(&release, true)).await.unwrap();
+        let retry = retry.await.expect("the retry");
+        assert_eq!(retry.http_status, 200, "{}", retry.envelope);
+        assert_eq!(
+            retry.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": true })
+        );
+        let taken_down = publication_row(&ctx, id);
+        assert_eq!(taken_down.status, "unpublished");
+        assert!(taken_down.released_at.is_some());
+
+        // A second take-down reads the row at edge_removed while the first waits for IO.blob: it
+        // asks IO.blob alone too, and the first's unpublished stays.
+        let id = meanwhile.publication_id.as_str();
+        let first = spawn_take_down(&ctx, json!({ "publication_id": id }));
+        let unpublish = next_asked(
+            &mut harness,
+            MSG_EDGE_UNPUBLISH_BLOB,
+            id,
+            "the first asks the edge",
+        )
+        .await;
+        harness
+            .inject(edge_unpublished(&unpublish, id, true))
+            .await
+            .unwrap();
+        let first_release =
+            next_asked(&mut harness, MSG_BLOB_RELEASE, id, "the first's release").await;
+        assert_eq!(publication_status(&ctx, id), "edge_removed");
+        let second = spawn_take_down(&ctx, json!({ "key": meanwhile.key }));
+        let second_release = next_asked(
+            &mut harness,
+            MSG_BLOB_RELEASE,
+            id,
+            "the second's release, and no edge before it",
+        )
+        .await;
+        harness
+            .inject(blob_released(&first_release, true))
+            .await
+            .unwrap();
+        let first = first.await.expect("the first");
+        assert_eq!(
+            first.envelope["payload"],
+            json!({ "publication_id": id, "unpublished": true })
+        );
+        let taken_down = publication_row(&ctx, id);
+        assert_eq!(taken_down.status, "unpublished");
+        harness
+            .inject(blob_released(&second_release, false))
+            .await
+            .unwrap();
+        let second = second.await.expect("the second");
+        assert_eq!(second.http_status, 200, "{}", second.envelope);
         assert_eq!(
             second.envelope["payload"],
             json!({ "publication_id": id, "unpublished": false })
