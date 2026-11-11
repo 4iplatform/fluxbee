@@ -161,7 +161,10 @@ EOF
   - each model call has 5 min, its provider's own retries included;
   - a message has 47 min: up to 8 model turns of a tool loop, one plain call after them, and 2 min
     for its tools;
-  - 4 workers and a queue of 128.
+  - 4 workers run the turns in the order they came, and up to 128 wait for one; the next is
+    answered `ai_runtime_busy` (`retryable: true`) without running. A `system` or `admin` message
+    (status, config) runs at once beside the workers, never behind a turn (FINDINGS A-257;
+    [the AI SDK's runtime](../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)).
 - **A message runs once.** When it fails or runs out of time, the sender gets an `ai_runtime_error` or
   `ai_runtime_timeout` error and the message is not run again: it may already have called the model
   or a tool such as `publish_html_page`.

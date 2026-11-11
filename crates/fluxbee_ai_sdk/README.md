@@ -522,18 +522,40 @@ registered case ends saved as `completed` and is never deleted by the model.
   would bounce it forever (FINDINGS A-112). SY.timer and the WF engine leave the same ones
   unanswered (FINDINGS A-218).
 - **A tap copy never reaches it:** the runtime takes no message with `meta.via_tap` to
-  `on_message` and answers none (`run_handler`, FINDINGS A-248), whatever its kind. Each copy is a
-  debug line and counts in `tap_copies_ignored`, in the runtime's periodic `ai runtime metrics`
-  line (every 30 s by default), which shows at info. A copy is another node's message, which a
-  router sends a tap's target to be observed: it keeps the original sender, so an answer would go
-  to that sender.
+  `on_message` and answers none (`ignored_tap_copy`, FINDINGS A-248), whatever its kind; nor does
+  a copy take a worker or a place in the queue (below). Each copy is a debug line and counts in
+  `tap_copies_ignored`, in the runtime's periodic `ai runtime metrics` line (every 30 s by
+  default), which shows at info. A copy is another node's message, which a router sends a tap's
+  target to be observed: it keeps the original sender, so an answer would go to that sender.
 - **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`.
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:
     `.command_channel(AI_RUNTIME_CHANNEL).post_pending_rule(RouteMatch::Any, RouteTarget::Command(AI_RUNTIME_CHANNEL))`.
-  - `RuntimeConfig::default()` gives 4 workers, a queue of 128 and `DEFAULT_HANDLER_TIMEOUT`
-    (47 min) per message: a whole tool loop, `DEFAULT_MAX_TURNS` (8) model turns plus one plain
-    call, each bounded by `MODEL_CALL_TIMEOUT`, and 2 min for its tools.
+  - `RuntimeConfig::default()` gives 4 workers, a queue of 128, 64 places for what runs without
+    the model (`DEFAULT_DIRECT_CAPACITY`) and `DEFAULT_HANDLER_TIMEOUT` (47 min) per message: a
+    whole tool loop, `DEFAULT_MAX_TURNS` (8) model turns plus one plain call, each bounded by
+    `MODEL_CALL_TIMEOUT`, and 2 min for its tools.
+  - **Two lanes** (FINDINGS A-257). The runtime reads each message as it comes, however busy its
+    workers are, and places it:
+    - **What runs without the model** (`runs_without_model`) starts at once, beside the workers:
+      any `system` or `admin` message, which ai.generic and the frontdesk take to their control
+      plane, never to the model (`NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`,
+      `VAULT_SECRET_CHANGED`, a notice or a reply); and the frontdesk's handoff, a `user` message
+      an IO node marks `frontdesk_handoff` (its `meta.msg` and its payload's `type`), which the
+      frontdesk runs in code while the IO node waits for the answer (io.api 10 s, IO.cloud 20 s).
+      Up to `direct_capacity` run at once. One more is dropped, neither run nor answered, as a
+      `system` request whose handler fails: its caller's own timeout reports it.
+    - **Everything else is an LLM turn:** a conversation's turn, a WF's message. It takes one of
+      the `worker_pool_size` workers, in the order turns came, as before; up to `queue_capacity`
+      wait for one. One more is answered at once with `ai_runtime_busy` (`retryable: true`: it
+      never ran), sent from the other lane, and never run.
+    - So a status request or a handoff never waits behind an LLM turn, nothing waits without a
+      bound, and with a free worker each message runs as it comes, as before. A `user` message the
+      node answers in code that the runtime cannot tell apart (the frontdesk's case of the root
+      tenant, a turn to an agent that is not configured) is a turn.
+    - Each one turned away counts in the `ai runtime metrics` line (`turns_refused`,
+      `direct_dropped`, beside `turns_queued` and `turns_waiting`), and a WARN line says so at once,
+      then at most once every 10 s with how many since.
   - A handler runs once. When it returns an error or runs out of time it may already have called a
     model (billed) or a tool that acts, so the runtime never runs it again: a conversational message
     gets an error reply (`ai_runtime_error` or `ai_runtime_timeout`, `retryable: false`); a `system`

@@ -338,6 +338,14 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   `ai_runtime_error` or `ai_runtime_timeout` error and the message is not run again (it may already
   have called the model or `ILK_REGISTER`); a `system` request gets no answer. The node keeps
   running.
+- **Conversations that keep every worker busy**: the AI runtime runs 4 conversation turns at once
+  and lets up to 128 more wait, in the order they came; the next is answered `ai_runtime_busy`
+  (`retryable: true`) without running. A handoff runs as it comes beside them, never behind a
+  turn, and so does every `system` or `admin` request (`NODE_STATUS_GET`, `CONFIG_GET`,
+  `CONFIG_SET`, `VAULT_SECRET_CHANGED`): io.api has its answer within the registration's 8 s
+  (FINDINGS A-257; `runs_without_model`,
+  [the AI SDK](../../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)). Up to 64 of those run
+  at once; one more is dropped unanswered, and its sender's own timeout reports it.
 
 ## Health
 

@@ -62,7 +62,8 @@ pub use output::{
     AiFinalOutput, AiUserArtifact,
 };
 pub use runtime::{
-    NodeRuntime, RetryPolicy, RuntimeConfig, AI_RUNTIME_CHANNEL, DEFAULT_HANDLER_TIMEOUT,
+    runs_without_model, NodeRuntime, RetryPolicy, RuntimeConfig, AI_RUNTIME_CHANNEL,
+    DEFAULT_DIRECT_CAPACITY, DEFAULT_HANDLER_TIMEOUT,
 };
 pub use summary_refresh::{
     refresh_conversation_summary, SummaryRefreshConfig, SummaryRefreshInput,
