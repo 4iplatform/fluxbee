@@ -326,6 +326,11 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-270 🔵 `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances (low; SY.wf-rules; with A-240 in 0.1.133).
 - A-271 🔵 A check that decides an action takes "no answer" for "no": A-267's class, left in the orchestrator (low).
 - A-272 🔵 Every router sends a WAN broadcast back to the peer it came from (low; the router).
+- A-273 🔵 `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door open and its new token lost (low; to decide).
+- A-274 🔵 A take-down holds the publication lock across its edge and IO.blob calls (low; SY.admin).
+- A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; to decide).
+- A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
+- A-277 🔵 A removed hive whose identity key could not be deleted keeps reading the identity store (low; to decide).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1403,6 +1408,58 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-277 [General/identity] 🔵 low (found 2026-11-11 by the review fixes of identity's 0.1.133 branch; read in the code) — A removed hive whose identity key could not be deleted keeps reading the identity store
+
+- **Why:** `server_auth_handshake` (`src/bin/sy_identity.rs` ~5721) checks only the hive's key file,
+  not the hive registry; `remove_hive_flow` (`src/bin/sy_orchestrator.rs` ~22100) restarts
+  sy-identity only when it deleted the key (`identity_key_cleanup: delete_failed` leaves it), so a
+  removed hive the cleanup did not reach keeps its delta subscription, and a new `FULL_SYNC` still
+  authenticates, until the orchestrator's next start deletes the orphan key
+  (`sweep_orphan_identity_keys`, ~1888) and sy-identity restarts.
+- **Since 0.1.133:** the primary drops that hive's publishes (A-191's review); its reads stay.
+- **Fix, to decide (the auth path):** the handshake answers a hive the registry no longer lists
+  with the same uniform rejection, after checking that a join's first handshake comes after its
+  registry entry.
+
+### A-276 [General/identity] 🔵 low (found 2026-11-11 by A-191's builder; read in the code) — A replica cut off during a purge can bring back a purged node ILK
+
+- **Why:** when a node ILK of a replica's hive is purged (or torn down) while that replica is cut
+  off, its stale self-owned snapshot, or the backlog its publish loop drains after it reconnects,
+  still carries the record, and the primary's `reconcile_hive_ilks` (`src/bin/sy_identity.rs`
+  ~2823) upserts any acceptable ILK it does not hold. A-191's guard (0.1.133) covers marked system
+  ILKs only.
+- **Fix, later:** the primary refuses a replica's push of a node ILK it purged (a tombstone kept
+  long enough for every replica), next to A-159's chapter on deleting ILKs.
+
+### A-275 [General/admin] 🔵 low (found 2026-11-11 by A-191's builder; read in the code) — A removed hive's managed nodes keep their ILKs active and their vault secrets
+
+- **Why:** `remove_hive`'s spoke cleanup (`remove_hive_cleanup_script`, `src/bin/sy_orchestrator.rs`
+  ~21956) stops the `fluxbee-node-*` units and deletes their state, but `teardown_node` is not run
+  for those nodes: their agent, IO and WF ILKs stay active on the primary, and their dedicated
+  secrets stay in SY.vault. A-191 (0.1.133) retires a removed hive's system ILKs only.
+- **To decide:** the operator's rule for ILKs (2026-11-10: one with history is disabled, never
+  deleted) suggests `remove_hive` marks them retired as it does the system ones; whether their
+  secrets are deleted with them, or kept until the operator says.
+
+### A-274 [General/admin] 🔵 low (found 2026-11-11 by A-260's builder; read in the code; there before it) — A take-down holds the publication lock across its edge and IO.blob calls
+
+- **Why:** `take_down_publication` (`src/bin/sy_admin.rs` ~6919) is called with the publication
+  ledger held (`&mut AdminPublicationLedger`) and awaits the edge's unpublish and IO.blob's release,
+  30 s each at most. `unpublish_artifact`, Archi's take-downs and the factory reset's [0] pass go
+  through it.
+- **Effect:** with an edge that is listed but down, each take-down holds every publish for up to
+  60 s, and the factory reset takes its pages down one after another.
+- **Fix:** A-260's split: the calls outside the lock, the write under it only while the row is
+  still at the state read.
+
+### A-273 [General/admin] 🔵 low (found 2026-11-11 by A-255's builder; read in the code; there before it) — `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door already open and its new token lost
+
+- **Why:** the externalize has already minted a new token and the edge holds it when the record
+  step (`set_node_config` of IO.cloud's `io.edge_node`, `src/bin/sy_admin.rs` ~7870-7905) fails;
+  the error answer carries no token and says to publish again, which rotates the token once more.
+- **To decide:** whether the failed record is retried before answering, the door closed again, or
+  the token handed over with the error (A-124: a token through Archi reaches the AI provider).
+
 ### A-272 [General/router] 🔵 low (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
 
 - **Seen:** the motherbee logged `foreign_source` drops of its own nodes' broadcasts coming back
@@ -1622,6 +1679,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `io.inbound_family`; io.cloud uses the fixed `"user"` (`CLOUD_INBOUND_FAMILY`). A `CONFIG_SET`
   of it is accepted and does nothing.
 - **Fix:** with A-149 (io-common), use it or drop it from the contract.
+- **Also (A-255's builder, 2026-11-11):** `publish_cloud_endpoint`'s record (`set_node_config` of
+  `{io: {edge_node}}`) replaces config.json's whole `io` object, dropping `io.inbound_family`, and
+  each rotation bumps the file's `_system.config_version` while the live one stays; nothing compares
+  the two today. Harmless while IO.cloud reads no other `io` field.
 
 ### A-255 [IO/io.cloud] 🔴 (found 2026-11-10 by A-91's builder; confirmed in the code by its review; there before it) — A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its restart
 
