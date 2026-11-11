@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands and /artifacts take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /artifacts (the public pages that are up, newest first: each one's publication_id, file, tenant, publisher, created and expires; never a link's key), /hives/{hive}/timer/timers?owner_l2_name=&status_filter= (the hive's timers by fire time: the pending ones unless status_filter is fired, canceled or all), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets, /hives/{hive}/commands, /artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. /hives/{hive}/timer/timers gives 100 timers without a limit (at most 1000), next_cursor while timers follow and no total; a cursor it did not give is refused with TIMER_INVALID_PAYLOAD (HTTP 400). An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -8945,7 +8945,12 @@ fn query_bool_param(query: &str, key: &str) -> Option<bool> {
     })
 }
 
+/// A query value or a path segment, percent-decoded: `%` and two hex digits are the byte they name,
+/// and `+` is a space. A `%` without two hex digits after it stays as it came, and so does what
+/// follows it; bytes that are no UTF-8 read as U+FFFD. Read byte by byte (FINDINGS A-279): a `%`
+/// before a character of more than one byte panicked, and `%+A` was a newline.
 fn percent_decode_simple(raw: &str) -> String {
+    let hex = |byte: u8| char::from(byte).to_digit(16);
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -8954,9 +8959,9 @@ fn percent_decode_simple(raw: &str) -> String {
             out.push(b' ');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = &raw[i + 1..i + 3];
-            if let Ok(value) = u8::from_str_radix(hex, 16) {
-                out.push(value);
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                // Two hex digits: one byte, at most 0xff.
+                out.push((high << 4 | low) as u8);
                 i += 3;
             } else {
                 out.push(bytes[i]);
@@ -12841,6 +12846,11 @@ fn env_timeout_secs(name: &str) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
+/// The query of an SCMD read, each value percent-decoded here, once, for every read (FINDINGS
+/// A-279): a value written encoded, a cursor's `%3A` or an owner's `%40`, reaches SY.admin as the
+/// same value written raw, as on SY.admin's own HTTP routes (`parse_query`, which keeps a `+` that
+/// `percent_decode_simple` reads as a space). A pair without `=`, or with an empty key or value, is
+/// left out; a key is taken as it came.
 fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> {
     let mut params = serde_json::Map::new();
     let Some(query) = raw_query else {
@@ -12854,7 +12864,7 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
         if key.is_empty() || value.is_empty() {
             continue;
         }
-        params.insert(key.to_string(), Value::String(value.to_string()));
+        params.insert(key.to_string(), Value::String(percent_decode_simple(value)));
     }
     params
 }
@@ -12864,11 +12874,6 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
 /// rest, so a limit that is not a number goes as it came.
 fn scmd_usage_params(raw_query: Option<&str>) -> Value {
     let mut params = scmd_query_params(raw_query);
-    for value in params.values_mut() {
-        if let Value::String(text) = value {
-            *text = percent_decode_simple(text);
-        }
-    }
     if let Some(limit) = params
         .get("limit")
         .and_then(Value::as_str)
@@ -12882,8 +12887,8 @@ fn scmd_usage_params(raw_query: Option<&str>) -> Value {
 }
 
 /// The params of a WF instance read: `base` (the hive and the node, the instance), and from the
-/// query its `texts` as they came and its `numbers` as numbers; SY.admin checks them, so a number
-/// that is not one goes as it came.
+/// query its `texts` as texts and its `numbers` as numbers; SY.admin checks them, so a number that
+/// is not one goes as it came.
 fn scmd_wf_instance_params(
     raw_query: Option<&str>,
     base: Value,
@@ -12895,7 +12900,6 @@ fn scmd_wf_instance_params(
         let Value::String(text) = value else {
             continue;
         };
-        let text = percent_decode_simple(&text);
         if numbers.contains(&key.as_str()) {
             params[key] = text
                 .parse::<u64>()
@@ -12920,7 +12924,6 @@ fn scmd_page_params(raw_query: Option<&str>, base: Value, keys: &[&str]) -> Valu
         if !keys.contains(&key.as_str()) {
             continue;
         }
-        let text = percent_decode_simple(&text);
         params[key.as_str()] = if key == "cursor" {
             json!(text)
         } else {
@@ -12936,27 +12939,43 @@ const SCMD_PAGE_KEYS: &[&str] = &["limit", "cursor"];
 /// Which of the installation's versions a versions read lists.
 const SCMD_VERSIONS_KEYS: &[&str] = &["versions_limit", "versions_before"];
 
+/// `GET /hives/{hive}/timer/timers?owner_l2_name=&status_filter=&limit=&cursor=`, read as SY.admin's
+/// HTTP route reads it: the texts decoded (FINDINGS A-279), so a cursor
+/// (`<fire_at_utc_ms>:<uuid>`) written `%3A` is the one SY.timer gave and an owner written `%40` the
+/// owner it knows; a limit only when it is a number, so SY.timer's default (100) holds otherwise.
+fn scmd_timer_list_params(raw_query: Option<&str>) -> Value {
+    let mut params = json!({});
+    for (key, value) in scmd_query_params(raw_query) {
+        let Value::String(text) = value else {
+            continue;
+        };
+        match key.as_str() {
+            "owner_l2_name" | "status_filter" | "cursor" => params[key.as_str()] = json!(text),
+            "limit" => {
+                if let Ok(limit) = text.parse::<u64>() {
+                    params["limit"] = json!(limit);
+                }
+            }
+            _ => {}
+        }
+    }
+    params
+}
+
 fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
     let mut filter = serde_json::Map::new();
-    let Some(query) = raw_query else {
-        return json!({});
-    };
     // The next page (FINDINGS A-198): beside the filter, as SY.admin's route takes it.
     let mut cursor = None;
-    for pair in query.split('&').filter(|segment| !segment.is_empty()) {
-        let (key, value) = match pair.split_once('=') {
-            Some(parts) => parts,
-            None => continue,
-        };
-        if key.is_empty() || value.is_empty() {
+    for (key, value) in scmd_query_params(raw_query) {
+        let Value::String(text) = value else {
             continue;
-        }
-        match key {
+        };
+        match key.as_str() {
             "prefix" | "tenant_id" | "resource_type" | "ilk" => {
-                filter.insert(key.to_string(), Value::String(percent_decode_simple(value)));
+                filter.insert(key, Value::String(text));
             }
             "tags" => {
-                let tags = percent_decode_simple(value)
+                let tags = text
                     .split(',')
                     .map(str::trim)
                     .filter(|tag| !tag.is_empty())
@@ -12967,11 +12986,11 @@ fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
                 }
             }
             "limit" => {
-                if let Ok(limit) = value.parse::<u64>() {
+                if let Ok(limit) = text.parse::<u64>() {
                     filter.insert("limit".to_string(), json!(limit));
                 }
             }
-            "cursor" => cursor = Some(percent_decode_simple(value)),
+            "cursor" => cursor = Some(text),
             _ => {}
         }
     }
@@ -14101,41 +14120,14 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
-        ("GET", ["hives", hive_id, "timer", "timers"]) => {
-            let mut params = json!({});
-            if let Some(query) = raw_query {
-                for pair in query.split('&').filter(|segment| !segment.is_empty()) {
-                    let (key, value) = match pair.split_once('=') {
-                        Some(parts) => parts,
-                        None => continue,
-                    };
-                    if value.is_empty() {
-                        continue;
-                    }
-                    match key {
-                        "owner_l2_name" => {
-                            params["owner_l2_name"] = Value::String(value.to_string())
-                        }
-                        "status_filter" => {
-                            params["status_filter"] = Value::String(value.to_string())
-                        }
-                        "limit" => {
-                            if let Ok(limit) = value.parse::<u64>() {
-                                params["limit"] = json!(limit);
-                            }
-                        }
-                        "cursor" => params["cursor"] = Value::String(value.to_string()),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(AdminTranslation {
-                admin_target,
-                action: "timer_list".to_string(),
-                target_hive: (*hive_id).to_string(),
-                params,
-            })
-        }
+        // A hive's timers, one page of SY.timer's: next_cursor while timers follow
+        // (docs/sy-timer.md §7.6).
+        ("GET", ["hives", hive_id, "timer", "timers"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "timer_list".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: scmd_timer_list_params(raw_query),
+        }),
         ("GET", ["hives", hive_id, "timer", "timers", timer_uuid]) => Ok(AdminTranslation {
             admin_target,
             action: "timer_get".to_string(),
@@ -32795,6 +32787,159 @@ mod tests {
             "worker1",
             "the hive filters the log"
         );
+    }
+
+    /// FINDINGS A-279: the timer list's query reaches SY.admin decoded, as SY.admin's own HTTP route
+    /// decodes it: a cursor (`<fire_at_utc_ms>:<uuid>`) written `%3A` is the one SY.timer gave and
+    /// an owner written `%40` the owner it knows, where both went encoded, the cursor refused
+    /// (TIMER_INVALID_PAYLOAD) and the owner matching none. A value written raw goes as it came, an
+    /// escape that is none stays as it came for SY.timer to refuse, a limit that is no number is
+    /// left out (SY.timer's default holds), and a value is decoded once.
+    #[test]
+    fn the_timer_list_reaches_sy_timer_decoded() {
+        let translate = |path: &str| {
+            translate_scmd("motherbee", parse(&format!("curl -X GET {path}")))
+                .expect("translation should succeed")
+        };
+        let cursor = "1775577600000:9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001";
+
+        let encoded = translate("/hives/worker1/timer/timers?owner_l2_name=WF.onboarding%40worker1&status_filter=all&limit=50&cursor=1775577600000%3A9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001");
+        assert_eq!(encoded.action, "timer_list");
+        assert_eq!(encoded.target_hive, "worker1");
+        assert_eq!(
+            encoded.params,
+            json!({ "owner_l2_name": "WF.onboarding@worker1", "status_filter": "all", "limit": 50, "cursor": cursor })
+        );
+        assert_eq!(
+            translate("/hives/worker1/timer/timers?cursor=1775577600000%3a9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001").params,
+            json!({ "cursor": cursor }),
+            "lower-case hex digits are the same escape"
+        );
+
+        let raw = translate(&format!(
+            "/hives/worker1/timer/timers?owner_l2_name=WF.onboarding@worker1&cursor={cursor}"
+        ));
+        assert_eq!(
+            raw.params,
+            json!({ "owner_l2_name": "WF.onboarding@worker1", "cursor": cursor })
+        );
+
+        assert_eq!(
+            translate("/hives/worker1/timer/timers?cursor=1775577600000%3A%ZZ&owner_l2_name=WF.x%4&limit=ten").params,
+            json!({ "cursor": "1775577600000:%ZZ", "owner_l2_name": "WF.x%4" })
+        );
+        assert_eq!(
+            translate("/hives/worker1/timer/timers?cursor=1775577600000%253A9d8c").params,
+            json!({ "cursor": "1775577600000%3A9d8c" }),
+            "an escaped % is a %: decoded once"
+        );
+        assert_eq!(translate("/hives/worker1/timer/timers").params, json!({}));
+    }
+
+    /// FINDINGS A-279: every SCMD read decodes its query's values once, where the query is read
+    /// (`scmd_query_params`): a workflow's name and the installation update's history written
+    /// encoded reach SY.admin as written raw, where they went encoded; the reads that decoded
+    /// before decode once, never twice.
+    #[test]
+    fn every_scmd_read_decodes_its_query_once() {
+        let translate = |path: &str| {
+            translate_scmd("motherbee", parse(&format!("curl -X GET {path}")))
+                .expect("translation should succeed")
+        };
+        for (path, action, params) in [
+            (
+                "/hives/motherbee/wf-rules?workflow_name=sales%2Eorders",
+                "wf_rules_get_workflow",
+                json!({ "workflow_name": "sales.orders" }),
+            ),
+            (
+                "/hives/motherbee/wf-rules/status?workflow_name=sales%2Eorders",
+                "wf_rules_get_status",
+                json!({ "workflow_name": "sales.orders" }),
+            ),
+            (
+                "/installation/update?history=tru%65",
+                "get_installation_update",
+                json!({ "history": "true" }),
+            ),
+            // An escaped `%` is a `%`.
+            (
+                "/hives/worker1/nodes?cursor=worker1%257CAI.a",
+                "list_nodes",
+                json!({ "cursor": "worker1%7CAI.a" }),
+            ),
+            (
+                "/hives/motherbee/vault/secrets?prefix=infra%253A&cursor=0a%251b&limit=20",
+                "vault_list",
+                json!({ "filter": { "prefix": "infra%3A", "limit": 20 }, "cursor": "0a%1b" }),
+            ),
+            (
+                "/hives/worker1/nodes/WF.sales/wf/instances?status=run%2525",
+                "wf_list_instances",
+                json!({ "hive": "worker1", "node_name": "WF.sales", "status": "run%25" }),
+            ),
+            (
+                "/hives/motherbee/usage?tenant_id=tnt:a&since=2026-10-17T10:00:00Z%257Cr1",
+                "get_llm_usage",
+                json!({ "tenant_id": "tnt:a", "since": "2026-10-17T10:00:00Z%7Cr1", "all_tenants": false }),
+            ),
+        ] {
+            let translated = translate(path);
+            assert_eq!(translated.action, action, "{path}");
+            assert_eq!(translated.params, params, "{path}");
+        }
+    }
+
+    /// FINDINGS A-279: a `%` without two hex digits after it stays as it came, whatever follows it:
+    /// before a character of more than one byte it panicked (a byte index inside the character),
+    /// and before a sign it was a byte (`%+A` a newline). Two hex digits are the byte they name,
+    /// `+` is a space, and bytes that are no UTF-8 read as U+FFFD.
+    #[test]
+    fn percent_decoding_keeps_an_escape_that_is_none() {
+        for (raw, decoded) in [
+            ("1775577600000%3A9d8c", "1775577600000:9d8c"),
+            ("WF.onboarding%40worker1", "WF.onboarding@worker1"),
+            ("%3a", ":"),
+            ("caf%C3%A9", "café"),
+            ("a+b", "a b"),
+            ("%ZZ", "%ZZ"),
+            ("%4", "%4"),
+            ("100%", "100%"),
+            // A sign is no hex digit: the `%` stays, and the `+` is a space.
+            ("%+A", "% A"),
+            ("%aé", "%aé"),
+            ("%3é", "%3é"),
+            ("%€", "%€"),
+            ("%FF", "\u{FFFD}"),
+            ("", ""),
+        ] {
+            assert_eq!(percent_decode_simple(raw), decoded, "{raw}");
+        }
+    }
+
+    /// FINDINGS A-279: Archi's read tool names the timer list among the lists that answer in pages,
+    /// with what is its own: 100 timers without a limit (at most 1000), no total, and a cursor it
+    /// did not give refused with TIMER_INVALID_PAYLOAD.
+    #[tokio::test]
+    async fn the_read_tool_pages_the_timer_list() {
+        let (context, _router) = harness_tool_context();
+        let definition = ArchitectSystemGetTool::new(context).definition();
+        let path = definition.parameters_json_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("the path's description");
+        let (key_paths, pages) = path.split_once(" Pages: ").expect("its pages");
+        assert!(
+            key_paths.contains("/hives/{hive}/timer/timers?owner_l2_name=&status_filter="),
+            "{key_paths}"
+        );
+        for text in [
+            "/artifacts and /hives/{hive}/timer/timers take ?limit=&cursor=",
+            "/hives/{hive}/timer/timers gives 100 timers without a limit (at most 1000)",
+            "next_cursor while timers follow and no total",
+            "TIMER_INVALID_PAYLOAD (HTTP 400)",
+        ] {
+            assert!(pages.contains(text), "{text}: {pages}");
+        }
     }
 
     /// FINDINGS A-198: a plan whose answer did not fit one mesh frame ran: Archi says so, names its

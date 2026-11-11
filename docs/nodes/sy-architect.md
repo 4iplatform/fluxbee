@@ -131,12 +131,20 @@ actions in `PROGRAMMER_QUERY_ALLOWED_ACTIONS`.
 **Pages** (FINDINGS A-198): the reads of lists that grow with the installation take
 `?limit=&cursor=` (`/inventory`, `/inventory/{hive}`, `/hives/{hive}/status`,
 `/hives/{hive}/nodes`, `/versions`, `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
-`/hives/{hive}/commands`, `/artifacts`, and `cursor` beside the filter of
-`/hives/{hive}/vault/secrets`), and the installation's versions
-`?versions_limit=&versions_before=` (`/installation`, `/versions`, `/hives/{hive}/versions`);
-`translate_scmd` passes them to SY.admin, the numbers as numbers (`scmd_page_params`,
-`scmd_vault_list_params`). The path's description tells the model to follow `next_cursor`, and on
-`REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages)).
+`/hives/{hive}/commands`, `/artifacts`, `/hives/{hive}/timer/timers` beside its `owner_l2_name`
+and `status_filter`, and `cursor` beside the filter of `/hives/{hive}/vault/secrets`), and the
+installation's versions `?versions_limit=&versions_before=` (`/installation`, `/versions`,
+`/hives/{hive}/versions`); `translate_scmd` passes them to SY.admin, the numbers as numbers
+(`scmd_page_params`, `scmd_vault_list_params`, and `scmd_timer_list_params`, whose `limit` goes
+only when it is a number, as on SY.admin's route). Every query value of an SCMD read is
+percent-decoded once, where the query is read (`scmd_query_params`, FINDINGS A-279), as SY.admin's
+own HTTP routes decode theirs: a cursor written with `%3A`, or an owner with `%40`, reaches SY.admin
+as it does written raw; an escape that is none goes as it came, and `+` reads as a space, where
+SY.admin's routes keep it. The path's description tells the model to follow `next_cursor`, and on
+`REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages));
+of the timer list, SY.timer's own page, it says that it gives 100 timers without a `limit` (at most
+1000), `next_cursor` while timers follow and no `total`, and that a cursor it did not give is
+refused with `TIMER_INVALID_PAYLOAD` ([SY.timer §7.6](../sy-timer.md)).
 `GET /hives/{hive}/commands` (FINDINGS A-201) reads SY.admin's command log
 (`list_recent_commands`), newest first, with `?action=&status=&since_ms=`: each command with its
 outcome, an executor plan's steps among them (origin `executor`). `GET /artifacts` (FINDINGS
