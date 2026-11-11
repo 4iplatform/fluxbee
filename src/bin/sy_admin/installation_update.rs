@@ -14,9 +14,11 @@
 //!   last [`HISTORY_KEPT`] closed ones. A run whose target differs closes the open update as
 //!   superseded; one with the same target resumes it. An update whose only hives off the target
 //!   are the operator's core rollbacks is `held` (A-5's one allowed divergence).
-//! - **The reads** of a hive's `/versions` go through the motherbee's orchestrator, which takes its
-//!   admin messages one at a time and forwards a spoke's read within 45 s: SY.admin waits past that
-//!   bound, and keeps at most one read of a hive outstanding ([`Updates::read_versions`]).
+//! - **The reads** of a hive's `/versions` go through the motherbee's orchestrator, which forwards
+//!   a spoke's read within 45 s, each read apart since 0.1.127 (FINDINGS A-199): SY.admin waits
+//!   past that bound, and keeps at most one read of a hive outstanding
+//!   ([`Updates::read_versions`]). While a hive's core update restarts it, a read waits 10 s, and
+//!   one its restart lost is asked again at once (FINDINGS A-250).
 //! - **The background task** ([`run_background`]), while an update is open: it follows a hive in
 //!   flight to its settle and then sends its config, finishes the update once for a hive that did
 //!   not answer and now does (the automatic step, §6), never for an excluded one, and reads again
@@ -370,6 +372,19 @@ impl HiveEntry {
 
     fn in_flight(&self) -> bool {
         self.core.state == Standing::InFlight || self.config.state == Standing::InFlight
+    }
+
+    /// Its core update restarts it: from SY.admin's `restarting` outcome for it (the update's
+    /// answer, or a core found under way) to its `settled`, or to the follow's verdict at the
+    /// settle bound (FINDINGS A-250). A core update that did not answer in time is followed too,
+    /// but not as a restart: the hive may be slow.
+    fn in_restart(&self) -> bool {
+        self.core.state == Standing::InFlight
+            && self
+                .core
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == OutcomeStatus::Restarting)
     }
 
     /// The automatic step finishes the update for this hive: it did not answer an attempt of this
@@ -1455,8 +1470,15 @@ pub(crate) struct Bounds {
     /// One read of a hive's `/versions` (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`, 50): past the
     /// motherbee's orchestrator's own bound for forwarding it (45 s,
     /// `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), so a read SY.admin gives up is no longer queued
-    /// there.
+    /// there. Outside a restart: it protects a hive that is slow.
     pub(crate) read: Duration,
+    /// One read of a hive's `/versions` while its core update restarts it, from SY.admin's
+    /// `restarting` outcome for it to its `settled`
+    /// (`JSR_ADMIN_INSTALLATION_RESTART_READ_TIMEOUT_SECS`, 10, FINDINGS A-250): its orchestrator
+    /// restarts itself for the new binary, and a read that reaches it in the few seconds it is off
+    /// its router, or just before it stops, is never answered. One that times out leaves no hold,
+    /// and the follow asks again at once ([`Updates::read_versions`]).
+    pub(crate) restart_read: Duration,
 }
 
 impl Bounds {
@@ -1479,6 +1501,9 @@ impl Bounds {
             slow_check: secs("JSR_ADMIN_INSTALLATION_SLOW_CHECK_SECS", 600)
                 .max(Duration::from_secs(1)),
             read: secs("JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS", 50),
+            // A read lost in a restart is asked again at once: never a bound of nothing.
+            restart_read: secs("JSR_ADMIN_INSTALLATION_RESTART_READ_TIMEOUT_SECS", 10)
+                .max(Duration::from_secs(1)),
         }
     }
 
@@ -1537,7 +1562,7 @@ pub(crate) struct Updates {
     /// The update the background task looked at last: its first look at another forgets `due`.
     ticked: Mutex<Option<String>>,
     /// One read of a hive's `/versions` at a time, and until when a read SY.admin gave up may
-    /// still be queued at the motherbee's orchestrator.
+    /// still be queued at the motherbee's orchestrator (outside a restart, FINDINGS A-250).
     reads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     quiet_until: Mutex<HashMap<String, u64>>,
     /// The background task reads one hive at a time.
@@ -1839,11 +1864,35 @@ impl Updates {
         )
     }
 
-    /// One read of `hive`'s `/versions`, at most one outstanding for the hive, everywhere: the
-    /// motherbee's orchestrator takes its admin messages one at a time and forwards a spoke's read
-    /// within its own bound, which `bounds.read` waits past. A read that timed out anyway may still
-    /// be queued there: the hive is not read again for another `bounds.read`. The background task
-    /// reads one hive at a time.
+    /// Whether the open update's record has `hive`'s core update restarting it
+    /// ([`HiveEntry::in_restart`], FINDINGS A-250).
+    fn in_restart(&self, hive: &str) -> bool {
+        self.read(|file| {
+            file.open
+                .as_ref()
+                .and_then(|update| update.hives.get(hive))
+                .is_some_and(HiveEntry::in_restart)
+        })
+    }
+
+    /// One read of `hive`'s `/versions`, at most one outstanding for the hive, everywhere. The
+    /// background task reads one hive at a time. The motherbee's orchestrator forwards a spoke's
+    /// read within its own bound, each read apart since 0.1.127 (FINDINGS A-199), and runs one
+    /// SY.admin gave up to that bound:
+    /// - **outside a restart,** `bounds.read` waits past that bound, and a read that timed out
+    ///   anyway may still be queued there: the hive is not read again for another `bounds.read`
+    ///   (the hold), which protects a hive that is slow;
+    /// - **while the hive's core update restarts it** ([`HiveEntry::in_restart`], FINDINGS A-250),
+    ///   a read waits `bounds.restart_read`, and one that times out leaves no hold, nor waits for
+    ///   one: its orchestrator restarts itself for the new binary, and a read that reaches it in
+    ///   the few seconds it is off its router, or just before it stops, is never answered. The
+    ///   follow asks again at once; the read SY.admin gave up runs on at the motherbee's
+    ///   orchestrator to its 45 s in one of the 4 places it keeps for each target hive, and the
+    ///   dispatcher drops its late answer (an `admin` reply without `ADMIN_COMMAND`: stale, or
+    ///   past the stale table's 30 s unmatched). A read of the hive still under way, SY.admin's
+    ///   own, is waited for all the same (this lock).
+    ///
+    /// A read that is answered ends any hold: the hive answers.
     pub(crate) async fn read_versions(
         &self,
         mesh: &dyn UpdateMesh,
@@ -1862,23 +1911,33 @@ impl Updates {
         };
         let hive_lock = self.read_lock(hive);
         let _one = hive_lock.lock().await;
+        let restart = self.in_restart(hive);
         let now = now_epoch_ms();
         let quiet_until = lock(&self.quiet_until).get(hive).copied();
-        if let Some(until) = quiet_until.filter(|until| *until > now) {
+        if let Some(until) = quiet_until.filter(|until| !restart && *until > now) {
             return Err(format!(
                 "a read of its /versions SY.admin gave up may still be queued at the motherbee's \
                  orchestrator: not read again for {} s",
                 (until - now) / 1000 + 1
             ));
         }
-        let read = mesh.versions(hive, bounds.read).await;
-        if let Err(why) = &read {
-            if super::infer_transport_error_code(why) == "TIMEOUT" {
+        let bound = if restart {
+            bounds.restart_read
+        } else {
+            bounds.read
+        };
+        let read = mesh.versions(hive, bound).await;
+        match &read {
+            Ok(_) => {
+                lock(&self.quiet_until).remove(hive);
+            }
+            Err(why) if !restart && super::infer_transport_error_code(why) == "TIMEOUT" => {
                 lock(&self.quiet_until).insert(
                     hive.to_string(),
                     now_epoch_ms().saturating_add(bounds.read.as_millis() as u64),
                 );
             }
+            Err(_) => {}
         }
         read
     }
@@ -3519,7 +3578,9 @@ fn refresh_automatic_result(updates: &Updates, id: &str, hive: &str) {
 
 /// A hive in flight: a core read again until it settles, then its config sent (by the run that
 /// sent the core, or, for one found under way, by the background task); past the settle bound,
-/// what stopped it. A config apply a previous process left in flight is sent again.
+/// what stopped it. A config apply a previous process left in flight is sent again. A read the
+/// hive's restart lost is asked again at once (FINDINGS A-250), by the next look, once this one
+/// let the hive go: each look still holds the hive for one read.
 pub(crate) async fn follow(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -3535,8 +3596,9 @@ pub(crate) async fn follow(
         return;
     };
     let automatic = entry.automatic.is_some();
+    let mut ask_again = false;
     if entry.core.state == Standing::InFlight {
-        follow_core(updates, mesh, &claim, id, hive, target, bounds, entry).await;
+        ask_again = follow_core(updates, mesh, &claim, id, hive, target, bounds, entry).await;
     } else if entry.config.state == Standing::InFlight {
         if !target_is_current(updates, mesh, id, target, bounds).await {
             return;
@@ -3558,8 +3620,17 @@ pub(crate) async fn follow(
     if automatic {
         refresh_automatic_result(updates, id, hive);
     }
+    // The background task passes over a hive another task holds: the look at once comes once
+    // the hive is let go.
+    drop(claim);
+    if ask_again {
+        updates.look_now(hive);
+    }
 }
 
+/// One look at a core in flight. True when its read was lost to the hive's restart (no answer
+/// within the restart's bound, the settle bound not past, FINDINGS A-250): it is asked again at
+/// once.
 #[allow(clippy::too_many_arguments)]
 async fn follow_core(
     updates: &Updates,
@@ -3570,9 +3641,9 @@ async fn follow_core(
     target: &Target,
     bounds: &Bounds,
     entry: HiveEntry,
-) {
+) -> bool {
     let Some(core_target) = &target.core else {
-        return;
+        return false;
     };
     let mut outcome = entry.core.outcome.clone().unwrap_or_else(|| {
         let now = now_epoch_ms();
@@ -3616,10 +3687,10 @@ async fn follow_core(
             // The core is on the target: the config of the same run goes now, while the motherbee
             // still holds this target.
             let Ok(snapshot) = read else {
-                return;
+                return false;
             };
             if !target_is_current(updates, mesh, id, target, bounds).await {
-                return;
+                return false;
             }
             let known = updates.read(UpdatesFile::known_cores);
             let decision = decide(
@@ -3762,9 +3833,28 @@ async fn follow_core(
                 Some(next_unanswered(hive, Category::Core, target)),
             );
         }
-        // Not readable while its orchestrator restarts: looked at again.
-        None => {}
+        // Not readable while its orchestrator restarts: looked at again. A read its restart lost
+        // (its orchestrator off its router for a few seconds, or stopping as the read reached
+        // it) is asked again at once: the next read finds it back (FINDINGS A-250). Whether it
+        // was a restart's read is the open update's record, as the read found it: only this look
+        // writes the hive's record while it holds the hive, and a run that superseded the update
+        // meanwhile left the hive out of a restart.
+        None => {
+            let why = read.err().unwrap_or_default();
+            if super::infer_transport_error_code(&why) == "TIMEOUT" && updates.in_restart(hive) {
+                tracing::info!(
+                    update = %id,
+                    hive = %hive,
+                    bound_ms = bounds.restart_read.as_millis() as u64,
+                    error = %why,
+                    "installation update: a read of a hive in its restart got no answer within its \
+                     bound: asked again at once"
+                );
+                return true;
+            }
+        }
     }
+    false
 }
 
 /// The automatic step (§6): a hive that did not answer an attempt of this update and now does gets

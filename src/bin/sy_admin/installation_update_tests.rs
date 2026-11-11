@@ -997,6 +997,11 @@ struct FakeMesh {
     /// How long a read takes.
     read_delay: Mutex<Duration>,
     registry_fails: AtomicBool,
+    /// The next reads of a hive its restart loses (FINDINGS A-250): each waits out the bound it
+    /// was given and fails as SY.admin's dispatcher does when no answer comes.
+    lost_reads: Mutex<HashMap<String, usize>>,
+    /// The bound each read was given, by hive, in order.
+    read_bounds: Mutex<Vec<(String, Duration)>>,
 }
 
 impl FakeMesh {
@@ -1021,7 +1026,27 @@ impl FakeMesh {
             most_at_once: AtomicUsize::new(0),
             read_delay: Mutex::new(Duration::ZERO),
             registry_fails: AtomicBool::new(false),
+            lost_reads: Mutex::new(HashMap::new()),
+            read_bounds: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The next `count` reads of `hive` are lost.
+    fn lose_reads(&self, hive: &str, count: usize) {
+        lock(&self.lost_reads).insert(hive.to_string(), count);
+    }
+
+    fn lost_reads_left(&self, hive: &str) -> usize {
+        lock(&self.lost_reads).get(hive).copied().unwrap_or(0)
+    }
+
+    /// The bounds the reads of `hive` were given, in order.
+    fn read_bounds_of(&self, hive: &str) -> Vec<Duration> {
+        lock(&self.read_bounds)
+            .iter()
+            .filter(|(of, _)| of == hive)
+            .map(|(_, bound)| *bound)
+            .collect()
     }
 
     fn set_down(&self, hive: &str, down: bool) {
@@ -1055,8 +1080,9 @@ impl FakeMesh {
 
 #[async_trait]
 impl UpdateMesh for FakeMesh {
-    async fn versions(&self, hive: &str, _timeout: Duration) -> Result<Value, String> {
+    async fn versions(&self, hive: &str, timeout: Duration) -> Result<Value, String> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        lock(&self.read_bounds).push((hive.to_string(), timeout));
         let at_once = {
             let mut reading = lock(&self.reading_now);
             let count = reading.entry(hive.to_string()).or_insert(0);
@@ -1064,6 +1090,22 @@ impl UpdateMesh for FakeMesh {
             *count
         };
         self.most_at_once.fetch_max(at_once, Ordering::SeqCst);
+        let lost = match lock(&self.lost_reads).get_mut(hive) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        };
+        if lost {
+            tokio::time::sleep(timeout).await;
+            *lock(&self.reading_now).get_mut(hive).expect("reading") -= 1;
+            return Err(format!(
+                "timeout waiting response trace_id=t target=SY.orchestrator@motherbee \
+                 request_msg=get_versions response_msg=admin timeout_ms={}",
+                timeout.as_millis()
+            ));
+        }
         let delay = *lock(&self.read_delay);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -1177,6 +1219,7 @@ fn quick() -> Bounds {
         retry_check: Duration::from_millis(10),
         slow_check: Duration::from_secs(600),
         read: Duration::from_millis(500),
+        restart_read: Duration::from_millis(500),
     }
 }
 
@@ -1636,6 +1679,276 @@ async fn a_hive_is_read_once_at_a_time() {
         .await;
     assert!(quiet.is_err_and(|why| why.contains("still be queued")));
     assert_eq!(mesh.reads.load(Ordering::SeqCst), reads_before);
+}
+
+/// An explicit run with `bounds` whose core update for worker1 answers `restarting`: its record
+/// has worker1 in its restart. The update's id.
+async fn run_into_restart(updates: &Arc<Updates>, mesh: &Arc<FakeMesh>, bounds: &Bounds) -> String {
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let motherbee = mesh.snapshot("motherbee");
+    let RunEnd::Update { update, .. } = run_explicit(
+        updates,
+        &dyn_mesh,
+        "http",
+        Some("deploy 0.1.131"),
+        &[],
+        &motherbee,
+        &target_of(&motherbee),
+        bounds,
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        panic!("an update opened");
+    };
+    let worker = &update.hives["worker1"];
+    assert!(worker.in_restart(), "{worker:#?}");
+    update.id
+}
+
+/// worker1 restarted onto the target and settled by the orchestrator it installed, its config
+/// still the version before.
+fn worker_settled_config_behind() -> Value {
+    let mut settled = worker_behind();
+    settled["core"]["installed"] =
+        json!({"manifest_hash": H_NEW, "source": "update", "installed_at_ms": "2"});
+    settled["core"]["last_update"] = settled_update();
+    settled["core"]["last_update"]["started_at_ms"] = json!("900");
+    settled
+}
+
+/// Waits until the update `id` is done, at most `within`.
+async fn wait_done(updates: &Updates, id: &str, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    while updates.state_of(id) != Some(UpdateState::Done) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:#?}",
+            updates.read(|file| file.clone())
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// FINDINGS A-250, as 8.x's deploys saw it: worker1's core update answers `restarting`, and its
+/// orchestrator restarts itself for the new binary; the follow's read reaches it then and is never
+/// answered, while worker1 settles. That read waits the restart's short bound, leaves no hold, and
+/// is asked again at once: the second read finds worker1 settled, its config goes, and the update
+/// closes. The long bound, a hold or the follow's cadence (30 s each here) would have kept it open
+/// far past the 5 s the test gives it.
+#[tokio::test]
+async fn a_read_lost_in_a_restart_is_asked_again_at_once() {
+    let bounds = Bounds {
+        read: Duration::from_secs(30),
+        restart_read: Duration::from_millis(200),
+        flight_check: Duration::from_secs(30),
+        settle: Duration::from_secs(60),
+        ..quick()
+    };
+    let updates = Updates::load(&temp_state("installation-update-restart-lost-read"));
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind()]);
+    let id = run_into_restart(&updates, &mesh, &bounds).await;
+    // worker1 settles while the follow's first read is lost.
+    mesh.set_snapshot("worker1", worker_settled_config_behind());
+    mesh.lose_reads("worker1", 1);
+
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let background = tokio::spawn(run_background(Arc::clone(&updates), dyn_mesh, bounds));
+    // The follow's first look: 3 s after the core's answer on 8.x, its cadence here 30 s.
+    updates.look_now("worker1");
+    wait_done(&updates, &id, Duration::from_secs(5)).await;
+    background.abort();
+
+    // The run's read before the restart, the lost one, and the one answered.
+    assert_eq!(
+        mesh.read_bounds_of("worker1"),
+        vec![bounds.read, bounds.restart_read, bounds.restart_read]
+    );
+    assert_eq!(mesh.lost_reads_left("worker1"), 0);
+    let done = updates.read(|file| file.closed[0].clone());
+    let worker = &done.hives["worker1"];
+    let core = worker.core.outcome.as_ref().expect("core");
+    assert_eq!(
+        (core.status, core.by),
+        (OutcomeStatus::Settled, RunKind::Explicit)
+    );
+    assert!(core.settled_ms.is_some());
+    assert_eq!(worker.config.state, Standing::OnTarget);
+    assert_eq!(mesh.most_at_once.load(Ordering::SeqCst), 1);
+}
+
+/// FINDINGS A-250 changes nothing outside a restart: a core update that did not answer in time is
+/// followed, but not as a restart (the hive may be slow). Its read lost waits the long bound, keeps
+/// the hive unread for another (the next look reads nothing), and is not asked again at once. Once
+/// its core update restarts it, a read waits the short bound, passes a hold it finds, and one lost
+/// is asked again at once, the hive let go meanwhile; the read that is answered ends the hold.
+#[tokio::test]
+async fn a_read_outside_a_restart_keeps_the_long_bound_and_the_hold() {
+    let bounds = Bounds {
+        read: Duration::from_secs(1),
+        restart_read: Duration::from_millis(50),
+        ..quick()
+    };
+    let updates = Updates::load(&temp_state("installation-update-slow-hive"));
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind()]);
+    mesh.behave("worker1", Behaves::TimesOutButApplies);
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let motherbee = mesh.snapshot("motherbee");
+    let RunEnd::Update { update, .. } = run_explicit(
+        &updates,
+        &dyn_mesh,
+        "http",
+        None,
+        &[],
+        &motherbee,
+        &target(),
+        &bounds,
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        panic!("an update opened");
+    };
+    let id = update.id;
+    let worker = entry_of(&updates, "worker1");
+    assert_eq!(
+        worker.core.outcome.as_ref().map(|o| o.status),
+        Some(OutcomeStatus::NotAnswered)
+    );
+    assert!(worker.in_flight() && !worker.in_restart());
+
+    // Its read is lost: the long bound, then the hold; not asked again at once.
+    mesh.lose_reads("worker1", 1);
+    follow(
+        &updates,
+        dyn_mesh.as_ref(),
+        &id,
+        "worker1",
+        &target(),
+        &bounds,
+    )
+    .await;
+    assert_eq!(mesh.read_bounds_of("worker1").last(), Some(&bounds.read));
+    assert_ne!(updates.due_at("worker1"), 0, "not looked at at once");
+    let reads = mesh.reads.load(Ordering::SeqCst);
+    follow(
+        &updates,
+        dyn_mesh.as_ref(),
+        &id,
+        "worker1",
+        &target(),
+        &bounds,
+    )
+    .await;
+    assert_eq!(mesh.reads.load(Ordering::SeqCst), reads, "held: not read");
+
+    // Its core update restarts it: the short bound, past the hold; lost, asked again at once, and
+    // the hive let go.
+    let now = now_epoch_ms();
+    updates.record(
+        &id,
+        "worker1",
+        Category::Core,
+        Standing::InFlight,
+        Some("its services restart onto the new release".to_string()),
+        Some(Outcome::new(
+            OutcomeStatus::Restarting,
+            RunKind::Explicit,
+            now,
+            now,
+        )),
+        None,
+    );
+    assert!(lock(&updates.quiet_until)
+        .get("worker1")
+        .is_some_and(|until| *until > now_epoch_ms()));
+    mesh.lose_reads("worker1", 1);
+    follow(
+        &updates,
+        dyn_mesh.as_ref(),
+        &id,
+        "worker1",
+        &target(),
+        &bounds,
+    )
+    .await;
+    assert_eq!(mesh.reads.load(Ordering::SeqCst), reads + 1);
+    assert_eq!(
+        mesh.read_bounds_of("worker1").last(),
+        Some(&bounds.restart_read)
+    );
+    assert_eq!(updates.due_at("worker1"), 0, "looked at again at once");
+    assert!(updates.holder("worker1").is_none(), "one read a look");
+
+    // Answered: the hold ends, and the follow takes worker1 to its settle and its config.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !entry_of(&updates, "worker1").on_target() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:#?}",
+            entry_of(&updates, "worker1")
+        );
+        follow(
+            &updates,
+            dyn_mesh.as_ref(),
+            &id,
+            "worker1",
+            &target(),
+            &bounds,
+        )
+        .await;
+    }
+    assert!(!lock(&updates.quiet_until).contains_key("worker1"));
+}
+
+/// FINDINGS A-250 keeps one read of a hive at a time, everywhere (A-204, A-205): while the follow
+/// asks a restarting hive again at once after each read its restart lost, an explicit run reads
+/// the same hive over and over. No read of it ever runs beside another, and the update closes once
+/// the hive answers.
+#[tokio::test]
+async fn a_read_asked_again_never_runs_beside_another_of_its_hive() {
+    // The follow's cadence stays quick's: the first read answered, the follow's or the run's,
+    // shows the core still restarting.
+    let bounds = Bounds {
+        read: Duration::from_secs(30),
+        restart_read: Duration::from_millis(100),
+        settle: Duration::from_secs(60),
+        ..quick()
+    };
+    let updates = Updates::load(&temp_state("installation-update-restart-one-read"));
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind()]);
+    let id = run_into_restart(&updates, &mesh, &bounds).await;
+    // Its next four reads are lost, whoever reads; an answer takes 20 ms. The update closes only
+    // after them: the first answer shows the core restarting, the next one settled.
+    mesh.lose_reads("worker1", 4);
+    *lock(&mesh.read_delay) = Duration::from_millis(20);
+
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let background = tokio::spawn(run_background(
+        Arc::clone(&updates),
+        Arc::clone(&dyn_mesh),
+        bounds,
+    ));
+    updates.look_now("worker1");
+    // An explicit run's reads of worker1 meanwhile: its first read of every hive, its pass's.
+    let run_reads = async {
+        for _ in 0..6 {
+            let _ = updates
+                .read_versions(dyn_mesh.as_ref(), "worker1", Reader::Run, &bounds)
+                .await;
+        }
+    };
+    tokio::join!(run_reads, wait_done(&updates, &id, Duration::from_secs(10)));
+    background.abort();
+
+    assert_eq!(mesh.most_at_once.load(Ordering::SeqCst), 1);
+    assert_eq!(mesh.lost_reads_left("worker1"), 0);
+    assert!(mesh
+        .read_bounds_of("worker1")
+        .iter()
+        .skip(1)
+        .take(4)
+        .all(|bound| *bound == bounds.restart_read));
 }
 
 /// F2 (b) and (c): each hive is looked at by where it stands (in flight every few seconds; one that
