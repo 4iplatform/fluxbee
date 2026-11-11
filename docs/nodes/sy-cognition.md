@@ -88,14 +88,32 @@ no turn:
   - The refused message is told apart by its `trace_id` and its trace as it reached the agent
     (`request_of`), which the answer carries before the agent's entry: a WF can write to the agent
     twice in one cycle.
+  - A turn stands for every copy of its message the agent got: a WF can send it one text twice in
+    one cycle, under one key. While the agent took one of them, the turn stays.
   - One a WF relayed to a person too stays, as that relay ([cognition-hands-v1](../cognition-hands-v1.md)
     §12.9).
-- **The worker** never gets the refusal and does not analyze the refused turn. When the refusal
-  comes while it analyzes that turn, it drops what the turn derived.
+- **The worker** never gets the refusal, and does not analyze the refused turn. One a WF relayed
+  to a person too it analyzes once, as that relay: the relay itself, or the agent's copy when the
+  relay came after it and was its duplicate. When the refusal comes while it analyzes the turn, it
+  drops what the turn derived and calls no model it has not called yet; a turn that is a relay
+  again keeps it.
+- **It remembers** the last 4,096 refusals (`COGNITION_REFUSALS_KEPT`), in memory only: a full
+  turn queue's drain at about three refusals a second. Past that, a refused turn that still waits
+  for the worker is analyzed, as before 0.1.136, and stays out of the last turns.
+- **The journal** names the refusals at info: the first at once, with its `trace_id` and what it
+  left (`turn`: `dropped`, `relay_again`, `kept_for_another_copy` or `no_turn_held`), then at most
+  one line every 10 s with how many came since (`refusals`), the end of a burst included (the
+  heartbeat names it). The counters are in `STATUS` (below).
 - **What it does not change:** a refusal the runtime could not send (its direct lane full) leaves
   the turn as before, and so does one of a turn a cognition older than 0.1.136 took. A message the
   router delivers to the agent before cognition takes the refusal still carries the refused turn
   in its package: the router reads the package as it delivers.
+- **What it does not see:** whether the sender was told. The router copies the agent's answer for
+  cognition as the agent sends it, before routing it, so the turn drops even when the answer never
+  reaches the sender (its link full, `LINK_BUSY`), or reaches a person who does not read it as
+  "send it again": io.slack shows any error answer as `invalid_text_payload` until its revamp
+  (FINDINGS A-291). The agent's next package then lacks the message, where up to 0.1.135 it showed
+  it unanswered.
 
 Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 

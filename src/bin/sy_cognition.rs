@@ -514,11 +514,17 @@ struct HeldTurn {
     /// Empty in a turn held before 0.1.136.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     key: String,
-    /// The message its agent got, when the turn is the agent's copy of one (`request_of`): the
-    /// agent's refusal of that message names it (`refused_request`). Empty on the agent's own
-    /// answers, on a relay its agent did not get or refused, and in a turn held before 0.1.136.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    request: String,
+    /// The messages its agent got that it stands for, when the turn is the agent's copy of one
+    /// (`request_of`), and the agent did not refuse: the agent's refusal of one names it
+    /// (`refused_request`). A WF can send the agent one text twice in one cycle, under one key: the
+    /// turn stands for each copy (`said_to_the_agent_too`). Empty on the agent's own answers, on a
+    /// relay its agent did not get or refused, and in a turn held before 0.1.136.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requests: Vec<String>,
+    /// The copies of it its agent refused while another one, which the agent took, kept the turn:
+    /// when the agent refuses the last one too, the refusal is theirs as well (`refuse_turn`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused: Vec<String>,
     /// Where a WF relayed it besides its agent, once the agent's copy made it the agent's
     /// (`said_to_the_agent_too`, `relayed_too`): the relay it is again when the agent refuses that
     /// copy (docs/cognition-hands-v1.md §12.9).
@@ -527,7 +533,7 @@ struct HeldTurn {
 }
 
 /// Where a WF relayed a turn (docs/cognition-hands-v1.md §12.9): the person its message named, and
-/// the IO node it went to.
+/// the IO node it went to (`relayed_of`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Relayed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -910,6 +916,7 @@ async fn main() -> Result<(), CognitionError> {
                 if let Some(memory_region) = app_state.memory_region.lock().await.as_mut() {
                     memory_region.update_heartbeat();
                 }
+                log_refusals_since_last_line(&app_state, std::time::Instant::now());
                 tracing::debug!(
                     node_name = %sender.full_name(),
                     config_version = snapshot.config_version,
@@ -1596,36 +1603,126 @@ struct IntakeTally {
 }
 
 /// How many refusals this cognition remembers (`Refusals`), the oldest out first. A refusal matters
-/// while the turn it refused may wait in the worker's queue, which holds `COGNITION_TURN_QUEUE`, or
-/// in the copy of its communication the worker took for one turn.
-const COGNITION_REFUSALS_KEPT: usize = COGNITION_TURN_QUEUE;
+/// while the turn it refused may wait in the worker's queue, or in the copy of its communication
+/// the worker took for one turn. The refusals of turns the full queue dropped count as well: under
+/// load the queue (`COGNITION_TURN_QUEUE`, 256 turns of up to two model calls, about 5 s each)
+/// takes some 20 minutes to drain while the agents go on refusing, and this many cover that drain
+/// at about three refusals a second, in about a megabyte. Past that, a refused turn that still
+/// waits is analyzed, as before 0.1.136, and its line stays out of the last turns.
+const COGNITION_REFUSALS_KEPT: usize = COGNITION_TAKES_KEPT;
 
 /// The turns its agents refused without running them (FINDINGS A-292), each by the agent's
-/// communication and the message refused (`refused_request`): the worker analyzes none of them,
-/// and its write-back never brings one back into its communication's last turns
+/// communication and the message refused (`refused_request`), with what the refusal left of the
+/// turn (`Refused`): the worker analyzes none of them but as the relay a WF made of one too, and
+/// its write-back never brings one back into its communication's last turns
 /// (`merge_recent_turns`). In memory only: what could bring one back, the worker's queue and its
 /// copy, does not outlive the process, and the file never has a turn after its refusal dropped it.
+/// With them, when the journal last named them (`RefusalLog`).
 #[derive(Debug, Default)]
 struct Refusals {
-    recent: VecDeque<(CommunicationKey, String)>,
+    recent: VecDeque<Refused>,
+    log: RefusalLog,
+}
+
+/// A refusal `Refusals` keeps: the agent's communication, the message refused, and the relay a WF
+/// made of that message too, which the turn is again (`refuse_turn`); none when nothing of the turn
+/// is left in the communication.
+#[derive(Debug)]
+struct Refused {
+    key: CommunicationKey,
+    request: String,
+    relayed: Option<Box<Relayed>>,
 }
 
 impl Refusals {
-    fn record(&mut self, key: &CommunicationKey, request: &str) {
-        self.recent.push_back((key.clone(), request.to_string()));
+    fn record(&mut self, key: &CommunicationKey, request: String, relayed: Option<&Relayed>) {
+        self.recent.push_back(Refused {
+            key: key.clone(),
+            request,
+            relayed: relayed.cloned().map(Box::new),
+        });
         while self.recent.len() > COGNITION_REFUSALS_KEPT {
             self.recent.pop_front();
         }
     }
 
-    /// Whether the agent of `key` refused `request` (`request_of`). An agent's communication is
-    /// never taken (§12.6), so its turns, and its refusals, are all under its own key.
+    /// The agent of `key`'s refusal of `request` (`request_of`), if it refused it. An agent's
+    /// communication is never taken (§12.6), so its turns, and its refusals, are all under its own
+    /// key.
+    fn of(&self, key: &CommunicationKey, request: &str) -> Option<&Refused> {
+        if request.is_empty() {
+            return None;
+        }
+        self.recent
+            .iter()
+            .rev()
+            .find(|refused| refused.key == *key && refused.request == request)
+    }
+
+    /// Whether the agent of `key` refused `request`.
     fn holds(&self, key: &CommunicationKey, request: &str) -> bool {
-        !request.is_empty()
-            && self
-                .recent
-                .iter()
-                .any(|(refused_key, refused)| refused_key == key && refused == request)
+        self.of(key, request).is_some()
+    }
+
+    /// Whether the agent of `key` refused `request` and nothing of the turn is left: no turn of its
+    /// communication, nor the relay a WF made of the message too.
+    fn dropped(&self, key: &CommunicationKey, request: &str) -> bool {
+        self.of(key, request)
+            .is_some_and(|refused| refused.relayed.is_none())
+    }
+}
+
+/// The least time between two of the journal's lines on the agents' refusals (`RefusalLog`), as the
+/// AI runtime names its own.
+const COGNITION_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// When the journal names the agents' refusals the intake takes: the first at once, then at most
+/// one line every `COGNITION_REFUSAL_LOG_INTERVAL`, with how many came since the last; the end of a
+/// burst at the heartbeat, once its line is due (`log_refusals_since_last_line`). Under load they
+/// come at the rate the agents refuse turns, and a line for each would flood the journal.
+#[derive(Debug, Default)]
+struct RefusalLog {
+    logged_at: Option<std::time::Instant>,
+    unlogged: u64,
+}
+
+impl RefusalLog {
+    /// Counts one; when its line is due, how many to name in it (this one and those since the
+    /// last).
+    fn note(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.unlogged += 1;
+        self.flush(now)
+    }
+
+    /// How many were counted and not named yet, once their line is due: the end of a burst, which
+    /// no later refusal would name. None when there are none, or the last line is too recent.
+    fn flush(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.unlogged == 0
+            || self
+                .logged_at
+                .is_some_and(|at| now.duration_since(at) < COGNITION_REFUSAL_LOG_INTERVAL)
+        {
+            return None;
+        }
+        self.logged_at = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
+    }
+}
+
+/// The heartbeat's line on the agents' refusals the intake took since the journal's last one, once
+/// that line is due (`RefusalLog`): the end of a burst.
+fn log_refusals_since_last_line(app_state: &CognitionAppState, now: std::time::Instant) {
+    let since = app_state
+        .refusals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .log
+        .flush(now);
+    if let Some(refusals) = since {
+        tracing::info!(
+            refusals,
+            "sy.cognition took more agents' refusals of turns they never ran (ai_runtime_busy) since its last line on them"
+        );
     }
 }
 
@@ -1914,7 +2011,8 @@ fn hold_recent_turns(
         // is the agent's own answer a WF relays in a later cycle, under that cycle's trace
         // (docs/cognition-hands-v1.md §12.4). When the agent's copy comes after the relay, the
         // turn was said to the agent too (§12.9); either way the turn keeps where the relay went,
-        // for the agent's refusal of its copy. A held turn this changed is written.
+        // and stands for each copy the agent got, for the agent's refusal of one. A held turn this
+        // changed is written.
         if held.turn_keys.contains(&recent.turn_key) || echoes_own_answer(held, &recent) {
             let changed = if recent.turn.to_via.is_none() {
                 said_to_the_agent_too(&mut held.turns, &recent)
@@ -1941,7 +2039,11 @@ fn hold_recent_turns(
             HeldTurn {
                 turn: recent.turn,
                 key: recent.turn_key,
-                request: recent.request,
+                requests: Some(recent.request)
+                    .filter(|request| !request.is_empty())
+                    .into_iter()
+                    .collect(),
+                refused: Vec::new(),
                 relayed: None,
             },
         );
@@ -1952,11 +2054,14 @@ fn hold_recent_turns(
     touched
 }
 
-/// An agent's refusal of a turn it never ran (FINDINGS A-292), into its communication: the agent's
-/// copy of the message it refused leaves the last turns with its key (`refuse_turn`), so no package
-/// shows that message as said to the agent and unanswered, and the message sent again is one turn.
-/// The refusal is remembered (`Refusals`) whether or not a turn was held. Whether the communication
-/// changed. A communication neither held nor in the file had no such turn, and none is started.
+/// An agent's refusal of a turn it never ran (FINDINGS A-292), into its communication: the turn
+/// that stands for the agent's copy of the message it refused leaves the last turns with its key
+/// (`refuse_turn`), so no package shows that message as said to the agent and unanswered, and the
+/// message sent again is one turn. What it left is remembered for the worker (`Refusals`), and so
+/// is a refusal no held turn stood for; one another copy kept the turn for is not: the worker
+/// analyzes that turn. Named in the journal at most once an interval (`RefusalLog`). Whether the
+/// communication changed. A communication neither held nor in the file had no such turn, and none
+/// is started.
 fn take_refusal(
     threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
     store: &CognitionStore,
@@ -1965,15 +2070,16 @@ fn take_refusal(
     loads: &mut StoreLoads,
     tally: &mut IntakeTally,
 ) -> bool {
-    refusals.record(&refusal.key, &refusal.request);
-    let held = match threads.entry(refusal.key.clone()) {
-        std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+    let refused = match threads.entry(refusal.key.clone()) {
+        std::collections::hash_map::Entry::Occupied(held) => {
+            refuse_turn(held.into_mut(), &refusal.request)
+        }
         std::collections::hash_map::Entry::Vacant(vacant) => match store.load(&refusal.key) {
             Ok(Some(stored)) => {
                 loads.loaded += 1;
-                vacant.insert(stored)
+                refuse_turn(vacant.insert(stored), &refusal.request)
             }
-            Ok(None) => return false,
+            Ok(None) => None,
             Err(err) => {
                 loads.failed += 1;
                 tracing::warn!(
@@ -1983,60 +2089,97 @@ fn take_refusal(
                     error = %err,
                     "sy.cognition could not read a communication from its file; the turn its agent refused stays in it"
                 );
-                return false;
+                None
             }
         },
     };
-    let refused = refuse_turn(held, &refusal.request);
-    tracing::debug!(
-        thread_id = %refusal.key.thread_id,
-        agent_ilk = %refusal.key.agent_ilk,
-        trace_id = %refusal.trace_id,
-        refused = ?refused,
-        "sy.cognition took an agent's refusal of a turn it never ran"
-    );
-    match refused {
-        Some(RefusedTurn::Dropped) => {
-            tally.refused_dropped += 1;
-            true
+    let (left, changed) = match &refused {
+        None => {
+            refusals.record(&refusal.key, refusal.request.clone(), None);
+            ("no_turn_held", false)
         }
-        Some(RefusedTurn::Relayed) => true,
-        None => false,
+        Some(RefusedTurn::Kept) => ("kept_for_another_copy", true),
+        Some(RefusedTurn::Dropped { requests }) => {
+            for request in requests {
+                refusals.record(&refusal.key, request.clone(), None);
+            }
+            tally.refused_dropped += 1;
+            ("dropped", true)
+        }
+        Some(RefusedTurn::Relayed { relayed, requests }) => {
+            for request in requests {
+                refusals.record(&refusal.key, request.clone(), Some(relayed));
+            }
+            ("relay_again", true)
+        }
+    };
+    match refusals.log.note(std::time::Instant::now()) {
+        Some(since) => tracing::info!(
+            thread_id = %refusal.key.thread_id,
+            agent_ilk = %refusal.key.agent_ilk,
+            trace_id = %refusal.trace_id,
+            turn = left,
+            refusals = since,
+            "sy.cognition took an agent's refusal of a turn it never ran (ai_runtime_busy); refusals counts it and those since its last line on them"
+        ),
+        None => tracing::debug!(
+            thread_id = %refusal.key.thread_id,
+            agent_ilk = %refusal.key.agent_ilk,
+            trace_id = %refusal.trace_id,
+            turn = left,
+            "sy.cognition took an agent's refusal of a turn it never ran (ai_runtime_busy)"
+        ),
     }
+    changed
 }
 
-/// What an agent's refusal did to its communication's last turns (`refuse_turn`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What an agent's refusal did to its communication's last turns (`refuse_turn`), with the messages
+/// whose refusal it is: the one refused, and the copies of it the agent refused while another kept
+/// the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RefusedTurn {
-    /// The agent's copy of the message left them, with its key.
-    Dropped,
+    /// Another copy of the message, which the agent took, keeps the turn.
+    Kept,
+    /// The turn left them, with its key.
+    Dropped { requests: Vec<String> },
     /// A WF relayed the message to a person too: the turn is that relay again.
-    Relayed,
+    Relayed {
+        relayed: Relayed,
+        requests: Vec<String>,
+    },
 }
 
-/// The agent's refusal of `request` in its communication: the last turn that is the agent's copy
-/// of that message, one turn for one refusal. It leaves the last turns, and its key the
-/// communication's keys, so the message sent again under the same key (a WF's send again in the
-/// same cycle) is a turn again. One a WF relayed to a person too stays, as that relay: it was said
-/// to them, not to the agent (docs/cognition-hands-v1.md §12.9). None when no held turn is that
-/// copy: it had no text nor files, or came before 0.1.136.
+/// The agent's refusal of `request` in its communication: the last turn that stands for that copy
+/// of a message (`HeldTurn::requests`), one turn for one refusal. While it stands for another copy,
+/// which the agent took, it stays (a WF can send the agent one text twice in one cycle). Otherwise
+/// it leaves the last turns, and its key the communication's keys, so the message sent again under
+/// the same key (a WF's send again in the same cycle) is a turn again. One a WF relayed to a person
+/// too stays, as that relay: it was said to them, not to the agent (docs/cognition-hands-v1.md
+/// §12.9). None when no held turn stands for that copy: it had no text nor files, or came before
+/// 0.1.136.
 fn refuse_turn(held: &mut ThreadCognitionState, request: &str) -> Option<RefusedTurn> {
     let at = held
         .turns
         .iter()
-        .rposition(|turn| !turn.request.is_empty() && turn.request == request)?;
+        .rposition(|turn| turn.requests.iter().any(|taken| taken == request))?;
     let turn = &mut held.turns[at];
-    turn.request.clear();
+    turn.requests.retain(|taken| taken != request);
+    if !turn.requests.is_empty() {
+        turn.refused.push(request.to_string());
+        return Some(RefusedTurn::Kept);
+    }
+    let mut requests = std::mem::take(&mut turn.refused);
+    requests.push(request.to_string());
     if let Some(relayed) = turn.relayed.take() {
-        turn.turn.to = relayed.to;
-        turn.turn.to_via = Some(relayed.to_via);
-        return Some(RefusedTurn::Relayed);
+        turn.turn.to = relayed.to.clone();
+        turn.turn.to_via = Some(relayed.to_via.clone());
+        return Some(RefusedTurn::Relayed { relayed, requests });
     }
     let dropped = held.turns.remove(at);
     if !dropped.key.is_empty() {
         held.turn_keys.retain(|key| *key != dropped.key);
     }
-    Some(RefusedTurn::Dropped)
+    Some(RefusedTurn::Dropped { requests })
 }
 
 /// Whether a turn is its agent's own answer coming back: the agent wrote it, received it, and the
@@ -2054,45 +2197,56 @@ fn echoes_own_answer(held: &ThreadCognitionState, recent: &RecentTurn) -> bool {
         })
 }
 
-/// A relay the agent's own copy of comes after: it was said to the agent too, so it no longer
-/// names where else it went (docs/cognition-hands-v1.md §12.9), and keeps it (`relayed`) with the
-/// message the agent got, for the agent's refusal of it. A WF that forwards one message to an IO
-/// node and to the agent has its router copy each, and the two can come in two batches, either
-/// first. Whether a held turn changed.
+/// The agent's copy of a turn its communication holds already: the turn stands for that copy too
+/// (`HeldTurn::requests`), for the agent's refusal of it (FINDINGS A-292). A relay the agent's copy
+/// comes after was said to the agent too, so it no longer names where else it went
+/// (docs/cognition-hands-v1.md §12.9), and keeps it (`relayed`). A WF that forwards one message to
+/// an IO node and to the agent has its router copy each, and the two can come in two batches,
+/// either first; and a WF can send the agent one text twice in one cycle, under one key. Found by
+/// its key; by its writer, node and text only in a relay held before 0.1.136, which has no key.
+/// Whether a held turn changed.
 fn said_to_the_agent_too(turns: &mut [HeldTurn], copy: &RecentTurn) -> bool {
-    if copy.turn.direction != MemoryTurnDirection::In {
+    if copy.turn.direction != MemoryTurnDirection::In || copy.request.is_empty() {
         return false;
     }
     let Some(held) = turns.iter_mut().rev().find(|held| {
         held.turn.direction == MemoryTurnDirection::In
-            && held.turn.to_via.is_some()
-            && held.turn.writer == copy.turn.writer
-            && held.turn.via == copy.turn.via
-            && held.turn.text == copy.turn.text
+            && if held.key.is_empty() {
+                held.turn.to_via.is_some()
+                    && held.turn.writer == copy.turn.writer
+                    && held.turn.via == copy.turn.via
+                    && held.turn.text == copy.turn.text
+            } else {
+                held.key == copy.turn_key
+            }
     }) else {
         return false;
     };
+    let mut changed = false;
     if let Some(to_via) = held.turn.to_via.take() {
         held.relayed = Some(Relayed {
             to: held.turn.to.take(),
             to_via,
         });
+        changed = true;
     }
-    held.request = copy.request.clone();
-    true
+    if !held.requests.contains(&copy.request) {
+        held.requests.push(copy.request.clone());
+        changed = true;
+    }
+    changed
 }
 
 /// A relay whose agent's copy came first (`said_to_the_agent_too` is the other order): the turn
 /// stays the agent's, and keeps where the relay went (`relayed`), the line it is again when the
-/// agent refuses its copy. Found by its key, which the two copies share. Whether a held turn
-/// changed.
+/// agent refuses its copies. Found by its key, which the copies share. Whether a held turn changed.
 fn relayed_too(turns: &mut [HeldTurn], relay: &RecentTurn) -> bool {
     let Some(to_via) = relay.turn.to_via.clone() else {
         return false;
     };
     let Some(held) = turns.iter_mut().rev().find(|held| {
         held.key == relay.turn_key
-            && !held.request.is_empty()
+            && !held.requests.is_empty()
             && held.relayed.is_none()
             && held.turn.to_via.is_none()
     }) else {
@@ -2169,7 +2323,7 @@ fn same_turn(a: &HeldTurn, b: &HeldTurn) -> bool {
 /// The worker's turn back into what is held: its derivations replace the held ones, and what the
 /// intake owns stays as the intake left it. The turns are the copy's with those the intake took
 /// while the model answered, merged, so none is lost even if what is held was started again; none
-/// its agent refused comes back (`refusals`).
+/// its agent refused comes back (`refusals`, by any copy of a message the turn stood for).
 fn write_back_turn(
     threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
     key: &CommunicationKey,
@@ -2178,7 +2332,10 @@ fn write_back_turn(
 ) {
     if let Some(held) = threads.get_mut(key) {
         updated.turns = merge_recent_turns(&updated.turns, &held.turns, |turn| {
-            refusals.holds(key, &turn.request)
+            turn.requests
+                .iter()
+                .chain(&turn.refused)
+                .any(|request| refusals.holds(key, request))
         });
         updated.turn_keys = std::mem::take(&mut held.turn_keys);
         // The intake's node, which a communication that took its thread's people while the models
@@ -2268,13 +2425,15 @@ enum WriteBack {
     /// result is dropped, never written over the row.
     Unreadable,
     /// Its agent refused the turn without running it while the models answered (FINDINGS A-292):
-    /// the turn is no turn of its communication, and what it derived is dropped.
+    /// the turn is no turn of its communication, and what it derived is dropped. A turn that is
+    /// the relay a WF made of the message too again keeps it: it was analyzed once.
     Refused,
 }
 
 /// The worker's turn back into what is held (`write_back_turn`), its file row and the region's
 /// rewrite with it, unless a clear came after `clears`, its turn's, while the model answered, or
-/// its agent refused `request`, the message the turn is (`request_of`): then nothing comes back.
+/// its agent refused `request`, the message the turn is (`request_of`), and nothing of the turn is
+/// left in the communication (`Refusals::dropped`): then nothing comes back.
 /// It goes to `key`, or to the agent's communication that took it while the models answered
 /// (`Takes::follow`), back from the file first when it is not held, so its turns are merged and
 /// never written over. What came of it, and the region's write.
@@ -2302,7 +2461,7 @@ async fn write_back_worker_turn(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let target = takes.follow(key);
-        if refusals.holds(&target, request) {
+        if refusals.dropped(&target, request) {
             outcome = WriteBack::Refused;
             return Vec::new();
         }
@@ -2369,29 +2528,42 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         thread_id: thread_id.clone(),
         agent_ilk: agent_ilk.clone(),
     };
-    // A turn its agent refused without running it is no turn of its communication (FINDINGS
-    // A-292): the intake dropped it, and it is not analyzed. One refused while it is analyzed
-    // derives nothing (`WriteBack::Refused`).
-    let request = request_of(&msg);
+    // The message the turn is, when it is the agent's copy of one it got (`request_of`): the
+    // agent's refusal of it names it (FINDINGS A-292). A relay, or the agent's own answer, is none.
+    let request = if turn.relay || msg.routing.src_l2_name.as_deref() == Some(agent_node.as_str()) {
+        String::new()
+    } else {
+        request_of(&msg)
+    };
+    // A turn its agent refused without running it is no turn of its communication: the intake
+    // dropped it, and it is not analyzed. One a WF relayed to a person too is that relay again:
+    // this copy came first, the relay's record was its duplicate, and this copy is analyzed as the
+    // relay (docs/cognition-hands-v1.md §12.9). One refused while it is analyzed derives nothing
+    // (`WriteBack::Refused`).
     let refused = app_state
         .refusals
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .holds(&key, &request);
-    if refused {
-        app_state
-            .runtime_state
-            .lock()
-            .await
-            .refused_turns_not_analyzed_total += 1;
-        tracing::debug!(
-            trace_id = %msg.routing.trace_id,
-            thread_id = %thread_id,
-            agent_ilk = %agent_ilk,
-            "sy.cognition took a turn its agent refused without running it: not analyzed"
-        );
-        return;
-    }
+        .of(&key, &request)
+        .map(|refused| refused.relayed.as_deref().cloned());
+    let relayed_again = match refused {
+        Some(None) => {
+            app_state
+                .runtime_state
+                .lock()
+                .await
+                .refused_turns_not_analyzed_total += 1;
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                agent_ilk = %agent_ilk,
+                "sy.cognition took a turn its agent refused without running it: not analyzed"
+            );
+            return;
+        }
+        Some(Some(relayed)) => Some(relayed),
+        None => None,
+    };
     // Only a turn with a person at its other end is analyzed (docs/cognition-hands-v1.md §6): a turn
     // between agents, or a WF's own text, stays among the communication's last turns, which the
     // intake took and wrote, and in `turns`.
@@ -2457,12 +2629,14 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     let facts = |ilk: &str| message_writer::ilk_facts(&app_state.hive_id, ilk);
     let owner = feeling_owner(&msg, &agent_node, facts);
     let speaker = narrator_speaker(&msg, &agent_node, facts);
-    // Whom a relay was written to, so the tagger reads it between people (§12.9).
-    let addressee = if turn.relay {
-        relay_addressee(&msg, facts)
-    } else {
-        None
+    // Where a relay went, and so whom it was written to, which the tagger reads between people
+    // (§12.9): its message's, or the relay a WF made too of a message its agent refused.
+    let relayed = match &relayed_again {
+        Some(relayed) => Some(relayed.clone()),
+        None if turn.relay => relayed_of(&msg, facts),
+        None => None,
     };
+    let addressee = relayed.as_ref().map(relay_addressee);
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
     let (thresholds, semantic_tagger_config, ai_settings_error) = {
         let control_state = app_state.control_state.lock().await;
@@ -2474,7 +2648,12 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     };
     let ts = chrono::Utc::now().to_rfc3339();
     let src_ilk = msg.meta.src_ilk.clone();
-    let dst_ilk = msg.meta.dst_ilk.clone();
+    // A relay's is the person its message named: the agent's copy analyzed as the relay a WF made
+    // of it too takes that one's.
+    let dst_ilk = match &relayed_again {
+        Some(relayed) => relayed.to.as_ref().and_then(|to| to.ilk.clone()),
+        None => msg.meta.dst_ilk.clone(),
+    };
     let ich = msg.meta.ich.clone();
     {
         let mut state = app_state.runtime_state.lock().await;
@@ -2592,6 +2771,28 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         }
     };
 
+    // A refusal that came while the tagger answered: no summarizer call for a turn whose result the
+    // write-back would drop (`WriteBack::Refused`, FINDINGS A-292).
+    let refused = app_state
+        .refusals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .dropped(&key, &request);
+    if refused {
+        app_state
+            .runtime_state
+            .lock()
+            .await
+            .refused_turns_not_analyzed_total += 1;
+        tracing::debug!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            agent_ilk = %agent_ilk,
+            "sy.cognition dropped a turn its agent refused without running it while the tagger answered"
+        );
+        return;
+    }
+
     // The derivations run on a copy, without the lock: the intake goes on taking turns while the
     // summarizer answers, and they stay (`write_back_turn`). Every region write keeps the worker's
     // communication, and the one that took it (`sync_held_state`), so it is still held: the copy is
@@ -2627,7 +2828,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         &msg,
         &agent_node,
         &agent_ilk,
-        turn.relay,
+        relayed.as_ref(),
         &thread_state.turns,
         facts,
     );
@@ -2851,19 +3052,23 @@ fn is_io_node(name: &str) -> bool {
         .starts_with("IO.")
 }
 
-/// Whom a relay was written to, in words, for the tagger: the person the message names and the IO
-/// node it went to, or the node alone (docs/cognition-hands-v1.md §12.9). None for any other turn.
-fn relay_addressee(message: &Message, facts: impl Fn(&str) -> Option<IlkFacts>) -> Option<String> {
-    let io_node = relay_destination(message)?;
-    Some(
-        match turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
-            .as_ref()
-            .and_then(party_words)
-        {
-            Some(person) => format!("{person} via {io_node}"),
-            None => io_node,
-        },
-    )
+/// Where a relay went (docs/cognition-hands-v1.md §12.9): the IO node its router names as its
+/// destination (`relay_destination`), and the person its message names, as its turn keeps them
+/// (`recent_turn_of`). None for any other turn.
+fn relayed_of(message: &Message, facts: impl Fn(&str) -> Option<IlkFacts>) -> Option<Relayed> {
+    Some(Relayed {
+        to_via: relay_destination(message)?,
+        to: turn_party(message.meta.dst_ilk.as_deref(), None, &facts),
+    })
+}
+
+/// Whom a relay was written to, in words, for the tagger: the person it named and the IO node it
+/// went to, or the node alone (docs/cognition-hands-v1.md §12.9).
+fn relay_addressee(relayed: &Relayed) -> String {
+    match relayed.to.as_ref().and_then(party_words) {
+        Some(person) => format!("{person} via {}", relayed.to_via),
+        None => relayed.to_via.clone(),
+    }
 }
 
 /// Whose communication a copy of a turn joins (docs/cognition-hands-v1.md §12.4). Its router copies
@@ -2985,14 +3190,14 @@ fn turn_key(message: &Message) -> String {
 
 /// Whom a turn is to, and the ILKs of the people an episode of it would be about: its writer and
 /// whom it is to (docs/cognition-hands-v1.md §12.4). The agent's answer is to its `dst_ilk`; a turn
-/// the agent got is to the agent; a turn a WF relayed is to the person its message names, else to
-/// the last other person who wrote through the IO node it went to, else to that node, which names
-/// no one (§12.9).
+/// the agent got is to the agent; a turn a WF relayed (`relayed`, where it went: `relayed_of`) is
+/// to the person its message names, else to the last other person who wrote through the IO node it
+/// went to, else to that node, which names no one (§12.9).
 fn episode_people(
     message: &Message,
     agent_node: &str,
     agent_ilk: &str,
-    relay: bool,
+    relayed: Option<&Relayed>,
     turns: &[HeldTurn],
     facts: impl Fn(&str) -> Option<IlkFacts>,
 ) -> (Option<MemoryTurnParty>, Vec<String>) {
@@ -3009,30 +3214,30 @@ fn episode_people(
     };
     let counterpart = if sent {
         turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
-    } else if relay {
-        let to_via = relay_destination(message);
-        turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
-            .filter(another_person)
-            .or_else(|| {
-                turns
-                    .iter()
-                    .rev()
-                    .map(|held| &held.turn)
-                    .filter(|turn| {
-                        turn.direction == MemoryTurnDirection::In
-                            && to_via.is_some()
-                            && turn.via == to_via
-                    })
-                    .filter_map(|turn| turn.writer.clone())
-                    .find(another_person)
-            })
-            .or_else(|| {
-                to_via.clone().map(|node| MemoryTurnParty {
-                    ilk: None,
-                    name: Some(node),
-                    kind: None,
+    } else if let Some(relayed) = relayed {
+        Some(
+            relayed
+                .to
+                .clone()
+                .filter(another_person)
+                .or_else(|| {
+                    turns
+                        .iter()
+                        .rev()
+                        .map(|held| &held.turn)
+                        .filter(|turn| {
+                            turn.direction == MemoryTurnDirection::In
+                                && turn.via.as_deref() == Some(relayed.to_via.as_str())
+                        })
+                        .filter_map(|turn| turn.writer.clone())
+                        .find(another_person)
                 })
-            })
+                .unwrap_or_else(|| MemoryTurnParty {
+                    ilk: None,
+                    name: Some(relayed.to_via.clone()),
+                    kind: None,
+                }),
+        )
     } else if agent_ilk != NO_AGENT_ILK {
         Some(MemoryTurnParty {
             ilk: Some(agent_ilk.to_string()),
@@ -6119,7 +6324,8 @@ mod tests {
             Self {
                 turn,
                 key: String::new(),
-                request: String::new(),
+                requests: Vec::new(),
+                refused: Vec::new(),
                 relayed: None,
             }
         }
@@ -9407,6 +9613,8 @@ mod tests {
                 .expect("a turn")
                 .turn
         };
+        let addressee =
+            |message: &Message| relayed_of(message, known).as_ref().map(relay_addressee);
         let mut to_ana = relayed("ilk:juan", "Te pido disculpas");
         to_ana.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
         to_ana.meta.dst_ilk = Some("ilk:ana".to_string());
@@ -9422,7 +9630,15 @@ mod tests {
             })
         );
         assert_eq!(
-            relay_addressee(&to_ana, known).as_deref(),
+            relayed_of(&to_ana, known),
+            Some(Relayed {
+                to: turn.to.clone(),
+                to_via: "IO.web@worker1".to_string()
+            }),
+            "as its turn keeps it"
+        );
+        assert_eq!(
+            addressee(&to_ana).as_deref(),
             Some("person Ana Pérez (ilk:ana) via IO.web@worker1")
         );
 
@@ -9431,13 +9647,13 @@ mod tests {
         assert_eq!(turn.to_via.as_deref(), Some("IO.slack.team@motherbee"));
         assert_eq!(turn.to, None);
         assert_eq!(
-            relay_addressee(&to_team, known).as_deref(),
+            addressee(&to_team).as_deref(),
             Some("IO.slack.team@motherbee")
         );
 
         let got = turn_of(&person_says("hello"));
         assert_eq!((got.to, got.to_via), (None, None));
-        assert_eq!(relay_addressee(&person_says("hello"), known), None);
+        assert_eq!(addressee(&person_says("hello")), None);
         let mut answer = agent_says("I'm passing it to invoicing now");
         answer.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
         answer.meta.dst_ilk = Some("ilk:ana".to_string());
@@ -9465,7 +9681,7 @@ mod tests {
             &to_ana,
             TEST_AGENT_NODE,
             TEST_AGENT,
-            true,
+            relayed_of(&to_ana, known).as_ref(),
             std::slice::from_ref(&pedro),
             known,
         );
@@ -9478,7 +9694,7 @@ mod tests {
             &to_team,
             TEST_AGENT_NODE,
             TEST_AGENT,
-            true,
+            relayed_of(&to_team, known).as_ref(),
             std::slice::from_ref(&pedro),
             known,
         );
@@ -9492,7 +9708,7 @@ mod tests {
             &to_web,
             TEST_AGENT_NODE,
             TEST_AGENT,
-            true,
+            relayed_of(&to_web, known).as_ref(),
             std::slice::from_ref(&pedro),
             known,
         );
@@ -10333,7 +10549,7 @@ mod tests {
         let held = &threads[&key(TEST_THREAD)];
         assert_eq!(texts(&held.turns), ["Approve 20% for Ana."]);
         assert_eq!(held.turns[0].turn.ts, turn_ts(TEST_TS + 5_000));
-        assert_eq!(held.turns[0].request, request_of(&again));
+        assert_eq!(held.turns[0].requests, [request_of(&again)]);
         assert_eq!(held.turn_keys, [turn_key(&again)]);
         drop(threads);
         let queued: Vec<(u64, bool)> = std::iter::from_fn(|| turn_rx.try_recv().ok())
@@ -10410,7 +10626,8 @@ mod tests {
         stored.turns.push(HeldTurn {
             turn: turn.turn,
             key: turn.turn_key,
-            request: turn.request,
+            requests: vec![turn.request],
+            refused: Vec::new(),
             relayed: None,
         });
         store
@@ -10455,7 +10672,8 @@ mod tests {
         let held = HeldTurn {
             turn: turn.turn.clone(),
             key: turn.turn_key.clone(),
-            request: turn.request.clone(),
+            requests: vec![turn.request.clone()],
+            refused: vec!["an earlier copy".to_string()],
             relayed: Some(Relayed {
                 to: None,
                 to_via: "IO.slack.team@motherbee".to_string(),
@@ -10463,7 +10681,8 @@ mod tests {
         };
         let row = serde_json::to_value(&held).expect("a row");
         assert_eq!(row["text"], json!("Is my invoice ready?"));
-        assert_eq!(row["request"], json!(turn.request));
+        assert_eq!(row["requests"], json!([turn.request]));
+        assert_eq!(row["refused"], json!(["an earlier copy"]));
         assert_eq!(
             serde_json::from_value::<HeldTurn>(row.clone()).expect("read"),
             held
@@ -10485,8 +10704,293 @@ mod tests {
         let package = build_memory_package_for_thread(TEST_THREAD, &state, (Vec::new(), 0));
         assert_eq!(package.turns, [turn.turn]);
         let carried = serde_json::to_value(&package.turns[0]).expect("the package's turn");
-        for field in ["key", "request", "relayed"] {
+        for field in ["key", "requests", "refused", "relayed"] {
             assert!(carried.get(field).is_none(), "{field}");
         }
+    }
+
+    // --- The review of A-292 ---
+
+    /// The refusal of a turn that waits at the end of a full queue outlasts the refusals its drain
+    /// brings, those of turns the full queue dropped among them: 256 turns at about 5 s each, at
+    /// three refusals a second. Past `COGNITION_REFUSALS_KEPT` the oldest goes first.
+    #[test]
+    fn a_refusal_outlasts_a_full_queues_drain() {
+        let mut refusals = Refusals::default();
+        let waiting = key(TEST_THREAD);
+        refusals.record(&waiting, "the waiting turn".to_string(), None);
+        let drain = COGNITION_TURN_QUEUE * 5 * 3;
+        let other = |n: usize| key(&format!("thread:{n}"));
+        for n in 0..drain {
+            refusals.record(&other(n), format!("turn {n}"), None);
+        }
+        assert!(refusals.dropped(&waiting, "the waiting turn"));
+        for n in drain..COGNITION_REFUSALS_KEPT {
+            refusals.record(&other(n), format!("turn {n}"), None);
+        }
+        assert!(
+            !refusals.holds(&waiting, "the waiting turn"),
+            "the oldest goes first"
+        );
+        assert_eq!(refusals.recent.len(), COGNITION_REFUSALS_KEPT);
+    }
+
+    /// A message a WF forwards to the agent and relays to a person too, which the agent refuses, is
+    /// analyzed once, as the relay it is again (docs/cognition-hands-v1.md §12.9): the relay, when
+    /// it came first or the refusal came before it; the agent's copy, as that relay, when the copy
+    /// came first and the relay was its duplicate.
+    #[tokio::test]
+    async fn a_refused_message_a_wf_relayed_too_is_analyzed_once_as_the_relay() {
+        for order in ["relay first", "copy first", "one batch"] {
+            let dir = TestDir::new();
+            let (app_state, mut router) = test_app_state("cogrefan", None, &dir.0);
+            // The analysis stops at its first model call, which counts it.
+            app_state.control_state.lock().await.ai_settings_error =
+                Some("no model in the tests".to_string());
+            let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+            let greeting = agent_says("A person of the team takes your case.");
+            let batch = turns_batch("cogrefan", &[(1, TEST_TS, &greeting)]);
+            take_stream_batch(&app_state, &turn_tx, &batch).await;
+            next_outgoing(&mut router).await;
+            turn_rx.try_recv().expect("the greeting");
+
+            let mut to_agent = person_says("My invoice 123 was charged twice.");
+            to_agent.routing.src_l2_name = Some(RELAY_WF.to_string());
+            let mut to_team = to_agent.clone();
+            to_team.routing.dst = Destination::Unicast("IO.slack.team@motherbee".to_string());
+            let busy = busy_answer_to(&to_agent);
+            let batches = match order {
+                "relay first" => vec![
+                    batch_of("cogrefan", RELAY_WF, &[(2, TEST_TS + 1_000, &to_team)]),
+                    turns_batch("cogrefan", &[(3, TEST_TS + 1_001, &to_agent)]),
+                    turns_batch("cogrefan", &[(4, TEST_TS + 1_040, &busy)]),
+                ],
+                "copy first" => vec![
+                    turns_batch("cogrefan", &[(2, TEST_TS + 1_000, &to_agent)]),
+                    batch_of("cogrefan", RELAY_WF, &[(3, TEST_TS + 1_001, &to_team)]),
+                    turns_batch("cogrefan", &[(4, TEST_TS + 1_040, &busy)]),
+                ],
+                _ => {
+                    let mut batch = turns_batch(
+                        "cogrefan",
+                        &[
+                            (2, TEST_TS + 1_000, &to_agent),
+                            (3, TEST_TS + 1_001, &to_team),
+                            (4, TEST_TS + 1_040, &busy),
+                        ],
+                    );
+                    let mut payload: StreamBatch =
+                        serde_json::from_value(batch.payload.clone()).expect("batch");
+                    payload.records[1].producer = RELAY_WF.to_string();
+                    batch.payload = serde_json::to_value(payload).expect("batch");
+                    vec![batch]
+                }
+            };
+            for batch in &batches {
+                take_stream_batch(&app_state, &turn_tx, batch).await;
+                next_outgoing(&mut router).await;
+            }
+            if order == "copy first" {
+                let refusals = app_state.refusals.lock().expect("refusals");
+                let refused = refusals
+                    .of(&key(TEST_THREAD), &request_of(&to_agent))
+                    .expect("the refusal");
+                assert_eq!(
+                    refused
+                        .relayed
+                        .as_ref()
+                        .map(|relayed| relayed.to_via.as_str()),
+                    Some("IO.slack.team@motherbee")
+                );
+            }
+            let held = app_state.thread_states.lock().await[&key(TEST_THREAD)].clone();
+            assert_eq!(
+                held.turns[1].turn.to_via.as_deref(),
+                Some("IO.slack.team@motherbee"),
+                "{order}"
+            );
+
+            let queued: Vec<CognitionTurn> =
+                std::iter::from_fn(|| turn_rx.try_recv().ok()).collect();
+            assert_eq!(queued.len(), 2, "{order}");
+            for turn in queued {
+                handle_turn(turn, Arc::clone(&app_state)).await;
+            }
+            let state = app_state.runtime_state.lock().await;
+            assert_eq!(
+                state.semantic_tagger_calls_total, 1,
+                "analyzed once: {order}"
+            );
+            assert_eq!(
+                state.refused_turns_not_analyzed_total,
+                u64::from(order == "one batch"),
+                "{order}"
+            );
+        }
+    }
+
+    /// A WF can send its agent one text twice in one cycle, under one key: the turn stands for both
+    /// copies. The agent's refusal of one keeps it for the other, which the agent took and
+    /// answers, and the worker analyzes it; the refusal of both drops it, and the worker analyzes
+    /// neither.
+    #[tokio::test]
+    async fn a_turn_two_copies_stand_for_leaves_only_when_both_are_refused() {
+        let first = supervisor_says("Approve 20% for Ana.");
+        let mut second = supervisor_says("Approve 20% for Ana.");
+        second.routing.trace_id = first.routing.trace_id.clone();
+        trace_of(&mut second).last_mut().expect("entry")["t"] = json!("2026-10-30T12:05:00.051Z");
+        assert_eq!(turn_key(&first), turn_key(&second));
+        assert_ne!(request_of(&first), request_of(&second));
+        let refused_first = [
+            (1, TEST_TS, &first),
+            (2, TEST_TS + 1, &second),
+            (3, TEST_TS + 40, &busy_answer_to(&first)),
+        ];
+
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogreftwo");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+        app_state.control_state.lock().await.ai_settings_error =
+            Some("no model in the tests".to_string());
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        take_stream_batch(&app_state, &turn_tx, &turns_batch(&hive_id, &refused_first)).await;
+        next_outgoing(&mut router).await;
+        let answer = agent_says("Approved: 20% on her next invoice.");
+        let batch = turns_batch(&hive_id, &[(4, TEST_TS + 3_000, &answer)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let package = region_package(&app_state).await.expect("the package");
+        assert_eq!(
+            texts(&package.turns),
+            ["Approve 20% for Ana.", "Approved: 20% on her next invoice."],
+            "kept for the copy the agent took"
+        );
+        {
+            let threads = app_state.thread_states.lock().await;
+            let held = &threads[&key(TEST_THREAD)];
+            assert_eq!(held.turns[0].requests, [request_of(&second)]);
+            assert_eq!(held.turns[0].refused, [request_of(&first)]);
+            assert!(held.turn_keys.contains(&turn_key(&first)));
+        }
+        let carrier = turn_rx.try_recv().expect("the first copy");
+        assert!(!carrier.duplicate);
+        assert!(turn_rx.try_recv().expect("the second copy").duplicate);
+        handle_turn(carrier, Arc::clone(&app_state)).await;
+        {
+            let state = app_state.runtime_state.lock().await;
+            assert_eq!(state.semantic_tagger_calls_total, 1, "the turn is analyzed");
+            assert_eq!(state.refused_turns_not_analyzed_total, 0);
+            assert_eq!(
+                (state.refusals_total, state.refused_turns_dropped_total),
+                (1, 0)
+            );
+        }
+        unlink();
+
+        // The agent refuses the second copy too: the turn leaves, and its first copy, the one the
+        // worker takes, is not analyzed.
+        let dir = TestDir::new();
+        let (app_state, mut router) = test_app_state("cogreftwo", None, &dir.0);
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        take_stream_batch(
+            &app_state,
+            &turn_tx,
+            &turns_batch("cogreftwo", &refused_first),
+        )
+        .await;
+        next_outgoing(&mut router).await;
+        let batch = turns_batch("cogreftwo", &[(4, TEST_TS + 41, &busy_answer_to(&second))]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        {
+            let threads = app_state.thread_states.lock().await;
+            let held = &threads[&key(TEST_THREAD)];
+            assert!(held.turns.is_empty() && held.turn_keys.is_empty());
+        }
+        {
+            let refusals = app_state.refusals.lock().expect("refusals");
+            assert!(refusals.dropped(&key(TEST_THREAD), &request_of(&first)));
+            assert!(refusals.dropped(&key(TEST_THREAD), &request_of(&second)));
+        }
+        handle_turn(
+            turn_rx.try_recv().expect("the first copy"),
+            Arc::clone(&app_state),
+        )
+        .await;
+        let state = app_state.runtime_state.lock().await;
+        assert_eq!(state.refused_turns_not_analyzed_total, 1);
+        assert_eq!(state.semantic_tagger_calls_total, 0);
+        assert_eq!(
+            (state.refusals_total, state.refused_turns_dropped_total),
+            (2, 1)
+        );
+    }
+
+    /// The agent's copy of a relayed message finds that relay by its key: a person's same words a
+    /// WF relayed in another cycle stay that cycle's relay.
+    #[tokio::test]
+    async fn the_agents_copy_finds_its_own_relay_by_its_key() {
+        let dir = TestDir::new();
+        let (app_state, mut router) = test_app_state("cogrelkey", None, &dir.0);
+        let (turn_tx, _turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        let greeting = agent_says("Shall I issue the credit note?");
+        let batch = turns_batch("cogrelkey", &[(1, TEST_TS, &greeting)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let yes_once = relayed("ilk:ana", "yes");
+        let yes_again = relayed("ilk:ana", "yes");
+        assert_ne!(turn_key(&yes_once), turn_key(&yes_again), "two cycles");
+        let batch = batch_of(
+            "cogrelkey",
+            RELAY_WF,
+            &[
+                (2, TEST_TS + 1_000, &yes_once),
+                (3, TEST_TS + 60_000, &yes_again),
+            ],
+        );
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        // The first cycle's copy for the agent comes last.
+        let mut copy = yes_once.clone();
+        copy.routing.dst = Destination::Unicast(TEST_AGENT_NODE.to_string());
+        let batch = turns_batch("cogrelkey", &[(4, TEST_TS + 60_001, &copy)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+
+        let threads = app_state.thread_states.lock().await;
+        let held = &threads[&key(TEST_THREAD)];
+        let lines: Vec<(Option<&str>, &[String])> = held
+            .turns
+            .iter()
+            .map(|held| (held.turn.to_via.as_deref(), held.requests.as_slice()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (None, &[][..]),
+                (None, &[request_of(&copy)][..]),
+                (Some("IO.slack.team@motherbee"), &[][..]),
+            ]
+        );
+    }
+
+    /// The journal names the agents' refusals at once, then at most once an interval with how
+    /// many came since its last line, and the end of a burst once that line is due.
+    #[test]
+    fn the_refusals_are_named_at_once_then_once_an_interval() {
+        let mut log = RefusalLog::default();
+        let start = std::time::Instant::now();
+        assert_eq!(log.flush(start), None, "nothing to name");
+        assert_eq!(log.note(start), Some(1));
+        assert_eq!(log.note(start + Duration::from_secs(1)), None);
+        assert_eq!(log.note(start + Duration::from_secs(9)), None);
+        assert_eq!(log.flush(start + Duration::from_secs(9)), None, "too soon");
+        assert_eq!(log.flush(start + COGNITION_REFUSAL_LOG_INTERVAL), Some(2));
+        assert_eq!(log.flush(start + COGNITION_REFUSAL_LOG_INTERVAL * 3), None);
+        // The next refusal after a quiet interval is named at once again.
+        assert_eq!(
+            log.note(start + COGNITION_REFUSAL_LOG_INTERVAL * 3),
+            Some(1)
+        );
     }
 }

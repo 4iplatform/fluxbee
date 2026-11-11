@@ -199,13 +199,22 @@ Cognition analyzes the first two lines only: a person is at their other end.
   refuses a turn without running it and answers `ai_runtime_busy`, after its router copied the
   turn for cognition:
   - The turn leaves its communication's last turns, and the worker does not analyze it. One a WF
-    relayed to a person too stays, as the relay it was (§12.9).
+    relayed to a person too stays, as the relay it was (§12.9), and is analyzed once, as that
+    relay. One that also stands for another copy of its text, which the agent took (a WF can send
+    it one text twice in one cycle), stays as it was.
   - The refusal is no turn.
   - **Dropped, not kept with a mark "unanswered":**
     - the agent never took the message, and its sender is told to send it again; the copy sent
       again is the one the communication keeps, once;
     - a mark would show the message twice once it is sent again;
     - a mark would also need a field in the package, in both SDKs and ai.generic.
+  - **What the drop costs:** cognition cannot see whether the sender was told. The router copies
+    the agent's answer as the agent sends it, before routing it, so the turn drops even when the
+    answer never reaches the sender (its link full, `LINK_BUSY`), or reaches a person who does not
+    read it as "send it again" (io.slack shows it as `invalid_text_payload`, FINDINGS A-291). The
+    agent's next package then lacks what the person said, where up to 0.1.135 it showed it
+    unanswered; io.slack's fix (the answer's message, with a send-again hint) closes the second
+    case.
   - How the refusal is recognized and which turn it drops:
     [SY.cognition](nodes/sy-cognition.md#the-interlocutor-model).
 
