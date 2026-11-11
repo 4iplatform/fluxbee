@@ -294,27 +294,33 @@ one SY.identity answers, the identity map (an older map's other forms are read c
     only (`fluxbee-dist-runtimes`, [Syncthing](#syncthing)), and `run_node` launches only what that
     folder's manifest names, so an ingress or an egress answers every runtime read and launch
     `RUNTIME_MANIFEST_MISSING`. It is not asked: no node there can use a runtime, and one that is
-    down holds no removal up.
+    down holds no removal up. An entry keeps its role until the hive is removed
+    ([add_hive](#hives-add_hive-and-remove_hive)), so a box an earlier attempt linked as a worker
+    never reads as an ingress or an egress.
   - **`skipped_hives`**: each other hive, a worker or one whose role cannot be read (no `info.yaml`
     that parses, an entry that names another hive, no spoke role), that did not answer with its
-    nodes, with the reason: `UNREACHABLE` (no answer, with its `message`); the answer's error code
-    (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest, `RUNTIME_NOT_FOUND` for one
-    whose manifest lacks the runtime, `RUNTIME_QUERY_FAILED` when it names none); or
-    `USAGE_UNREADABLE` (an `ok` whose own usage failed, with its `message`). Its use is unknown,
-    never none.
-  - **`running_nodes`** (and `in_use`, `running_count`): the motherbee's nodes and the answered
-    hives', by hive, then name.
+    nodes, with the reason and the `message` that came with it: `UNREACHABLE` (no answer); the
+    answer's error code (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest,
+    `RUNTIME_NOT_FOUND` for one whose manifest lacks the runtime, `RUNTIME_QUERY_FAILED` when it
+    names none); or `USAGE_UNREADABLE` (an `ok` whose own usage failed). Its use is unknown, never
+    none.
+  - **`running_nodes`** (and `running_count`): the motherbee's nodes and the answered hives', by
+    hive, then name.
+  - **`in_use`**: true while a node is listed, false only once every hive asked was counted, and
+    `null` (unknown) while none is listed and a hive is in `skipped_hives`.
 
   A registry that cannot be listed makes the whole `usage_global_visible` an error
-  (`{status: "error", message}`), as a failed read of the motherbee's own nodes does. SY.admin's
-  `remove_runtime_version` refuses the version while a node is listed, and while the use is
-  unknown: an error, or a hive in `skipped_hives`. On 0.1.132 every ingress and egress was in
-  `skipped_hives` on every read, for its `RUNTIME_MANIFEST_MISSING`, and an `ok` whose usage failed
-  counted as a hive with no node. The motherbee decides by its registry rather than by what a
-  spoke answers: an ingress's `RUNTIME_MANIFEST_MISSING` is true and stays its answer, and the
-  motherbee's core, which brings SY.admin's refusal, comes before the spokes' cores, so a spoke
-  that answered "none" instead would leave every removal refused, SY.wf-rules' package purges
-  included, until each ingress and egress ran the release.
+  (`{status: "error", message}`), as a failed read of the motherbee's own nodes does
+  (`global_visible_runtime_usage_summary_with_roots`). SY.admin's `remove_runtime_version` refuses
+  the version while a node is listed, and while the use is unknown: an error, or a hive in
+  `skipped_hives`. On 0.1.132 every ingress and egress was in `skipped_hives` on every read, for
+  its `RUNTIME_MANIFEST_MISSING`, an `ok` whose usage failed counted as a hive with no node, an
+  error answer's `message` was dropped, and `in_use` read false with a hive skipped. The motherbee
+  decides by its registry rather than by what a spoke answers: an ingress's
+  `RUNTIME_MANIFEST_MISSING` is true and stays its answer, and the motherbee's core, which brings
+  SY.admin's refusal, comes before the spokes' cores, so a spoke that answered "none" instead would
+  leave every removal refused, SY.wf-rules' package purges included, until each ingress and egress
+  ran the release.
 
 ### A running node and a new runtime version
 
@@ -407,6 +413,18 @@ Both are motherbee-only ("add_hive/remove_hive are motherbee-only").
 A join already running answers `JOIN_IN_PROGRESS`; a connected hive, `HIVE_EXISTS`. `role` is
 `worker` (default), `egress` or `ingress`; `ssh_access` is refused ("SSH exists only inside
 add_hive and is always revoked at its end (D32)").
+
+A pending, interrupted or failed hive is resumed by the same request, under the role its entry
+records: an entry keeps its role until the hive is removed (FINDINGS A-281, since 0.1.133). A
+request that names another role, or none for a hive recorded as an ingress or an egress, is
+refused with `HIVE_EXISTS` before anything is written (`add_hive_role_refusal`): its `role` and
+`message` name the recorded role, and `remove_hive` comes first. A join records the role when it
+accepts the hive, before it links the box into that role's folders, and a failed attempt keeps
+those links (the peer reconcile leaves the device of a hive that is not connected as it is).
+Before, a retry rewrote the role: a worker's attempt linked into `fluxbee-dist-runtimes`, with
+nodes running there, retried as an egress, read as a hive that runs no managed node, which the
+runtimes' use across the hives does not ask ([managed nodes](#managed-nodes)), so a version those
+nodes ran could be removed.
 
 The worker join (`add_hive_flow`), in order:
 

@@ -20735,23 +20735,43 @@ async fn global_visible_runtime_usage_summary(
     runtime: &str,
     version_filter: Option<&str>,
 ) -> serde_json::Value {
-    let local_usage = match local_runtime_usage_summary(state, runtime, version_filter) {
-        Ok(value) => value,
-        Err(err) => {
-            return serde_json::json!({
-                "scope": "group_visible_control_plane",
-                "status": "error",
-                "message": err.to_string(),
-            });
-        }
-    };
+    global_visible_runtime_usage_summary_with_roots(
+        state,
+        &node_files_root(),
+        &hives_root(),
+        runtime,
+        version_filter,
+    )
+    .await
+}
+
+/// `global_visible_runtime_usage_summary` over the managed nodes' files under `nodes_root` and the
+/// hive registry under `registry_root`.
+async fn global_visible_runtime_usage_summary_with_roots(
+    state: &OrchestratorState,
+    nodes_root: &Path,
+    registry_root: &Path,
+    runtime: &str,
+    version_filter: Option<&str>,
+) -> serde_json::Value {
+    let local_usage =
+        match local_runtime_usage_summary_with_root(state, nodes_root, runtime, version_filter) {
+            Ok(value) => value,
+            Err(err) => {
+                return serde_json::json!({
+                    "scope": "group_visible_control_plane",
+                    "status": "error",
+                    "message": err.to_string(),
+                });
+            }
+        };
 
     if !state.is_motherbee {
         return local_usage;
     }
 
     // A registry that cannot be listed leaves which hives run nodes unknown, never "none".
-    let hives = match registry_hives_with_roles(&hives_root(), &state.hive_id) {
+    let hives = match registry_hives_with_roles(registry_root, &state.hive_id) {
         Ok(hives) => hives,
         Err(err) => {
             return serde_json::json!({
@@ -20801,9 +20821,11 @@ fn registry_hives_with_roles(
 /// The spoke role the motherbee's registry records for a hive (`role` in its `info.yaml`),
 /// whatever the state of its join: a join records the role when it accepts the hive, before it
 /// links the hive into that role's folders (`dist_sync_folders_for_role`), and nothing links an
-/// ingress or an egress into the runtimes (`folder_forbidden_for_role`). `None` when the entry has
-/// no `info.yaml` that parses (a join being accepted), names another hive, or records no spoke
-/// role.
+/// ingress or an egress into the runtimes (`folder_forbidden_for_role`). The entry keeps that role
+/// until the hive is removed (`add_hive_role_refusal`), so no attempt of its join linked the box as
+/// another role: a failed one keeps its links, the peer reconcile leaving the device of a hive
+/// that is not connected as it is. `None` when the entry has no `info.yaml` that parses (a join
+/// being accepted), names another hive, or records no spoke role.
 fn registered_spoke_role(entry: &fluxbee_sdk::mesh::HiveEntry) -> Option<HiveRole> {
     if entry.field("hive_id").map(str::trim) != Some(entry.name()) {
         return None;
@@ -20821,7 +20843,12 @@ fn registered_spoke_role(entry: &fluxbee_sdk::mesh::HiveEntry) -> Option<HiveRol
 ///   whose `usage` lists its nodes. Otherwise its use is unknown, never none, and it is in
 ///   `skipped_hives` with the reason: `UNREACHABLE` (no answer), the answer's error code
 ///   (`RUNTIME_MANIFEST_MISSING` for a worker without its manifest), or `USAGE_UNREADABLE` (an
-///   `ok` whose own usage failed, read before as a hive with no node; FINDINGS A-281).
+///   `ok` whose own usage failed, read before as a hive with no node; FINDINGS A-281), and the
+///   `message` that came with it.
+///
+/// `in_use` is true while a node is listed, false only when none is and every hive asked was
+/// counted, and null (unknown) when none is listed and a hive is in `skipped_hives`: it said false
+/// then, "not in use" for a use nobody read.
 async fn group_runtime_usage<F, Fut>(
     local_usage: &serde_json::Value,
     hives: Vec<(String, Option<HiveRole>)>,
@@ -20863,13 +20890,17 @@ where
             .and_then(|value| value.as_str())
             .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
         {
-            skipped_hives.push(serde_json::json!({
+            let mut skipped = serde_json::json!({
                 "hive_id": hive_id,
                 "reason": response
                     .get("error_code")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!("RUNTIME_QUERY_FAILED")),
-            }));
+            });
+            if let Some(message) = response.get("message") {
+                skipped["message"] = message.clone();
+            }
+            skipped_hives.push(skipped);
             continue;
         }
         let usage = response.get("usage");
@@ -20909,9 +20940,18 @@ where
         (a_hive, a_name).cmp(&(b_hive, b_name))
     });
 
+    // A listed node is in use whatever the hives not counted; with none listed, the use is known
+    // only once every hive that may run a node was counted.
+    let in_use = if !running_nodes.is_empty() {
+        serde_json::json!(true)
+    } else if skipped_hives.is_empty() {
+        serde_json::json!(false)
+    } else {
+        serde_json::Value::Null
+    };
     serde_json::json!({
         "scope": "group_visible_control_plane",
-        "in_use": !running_nodes.is_empty(),
+        "in_use": in_use,
         "running_count": running_nodes.len(),
         "running_nodes": running_nodes,
         "skipped_hives": skipped_hives,
@@ -32966,6 +33006,11 @@ async fn accept_add_hive(
         }
         _ => {}
     }
+    // A pending, interrupted or failed entry resumes only under the role it records, kept until
+    // the hive is removed (FINDINGS A-281, the review).
+    if let Some(refusal) = add_hive_role_refusal(&root, &hive_id, role.as_str()) {
+        return refusal;
+    }
 
     let join_id = Uuid::new_v4().to_string();
     let now = now_epoch_ms().to_string();
@@ -35954,6 +35999,42 @@ fn hive_status_is_resumable(status: Option<&str>) -> bool {
         status,
         Some("pending") | Some("joining") | Some("interrupted") | Some("failed")
     )
+}
+
+/// The refusal of an `add_hive` that names another role than the one the hive's entry under
+/// `root` records (FINDINGS A-281, the review): `HIVE_EXISTS` naming the recorded role, before
+/// anything is written; the hive is in the registry, as a connected one is, and SY.admin answers
+/// that code 409. An entry keeps its role until the hive is removed (`remove_hive`, whose
+/// cleanup stops the box's managed nodes and unlinks its recorded Syncthing device). A join records
+/// the role when it accepts the hive, before it links the box into that role's folders, and a
+/// failed attempt keeps those links: the peer reconcile leaves the device of a hive that is not
+/// connected as it is. Rewritten by a retry, the role would no longer be the one the box was
+/// linked as: a worker's attempt linked into `fluxbee-dist-runtimes`, with nodes running there,
+/// retried as an egress, is a hive the runtimes' use across the hives does not ask
+/// (`group_runtime_usage`), and a version those nodes run could be removed. `None` when the entry
+/// records no role (no `info.yaml` yet, one that does not parse, no `role`) or the one asked.
+fn add_hive_role_refusal(root: &Path, hive_id: &str, requested: &str) -> Option<serde_json::Value> {
+    let info = read_hive_info(root, hive_id).ok()?;
+    let recorded = HiveRole::from_role(info.get("role").and_then(|value| value.as_str()))?;
+    if recorded.as_str() == requested {
+        return None;
+    }
+    let status = info
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("none");
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "HIVE_EXISTS",
+        "hive_id": hive_id,
+        "role": recorded.as_str(),
+        "message": format!(
+            "hive '{hive_id}' is in the registry with role {recorded} (status {status}), and \
+             add_hive resumes it only with that role; to join it with role {requested}, remove it \
+             first (remove_hive)",
+            recorded = recorded.as_str(),
+        ),
+    }))
 }
 
 fn valid_hive_id(value: &str) -> bool {
@@ -39093,6 +39174,78 @@ mod tests {
         // An unreadable/absent info.yaml is not a resume signal either.
         assert!(!hive_status_is_resumable(None));
         assert!(!hive_status_is_resumable(Some("")));
+    }
+
+    /// FINDINGS A-281, the review: an entry keeps the role it records until the hive is removed. A
+    /// worker's join that linked the box into the runtimes and failed at its tail, retried as an
+    /// egress, read as a hive the runtimes' use across the hives does not ask. The retry is refused,
+    /// HIVE_EXISTS naming the recorded role and remove_hive, and nothing is written; the same role
+    /// resumes, and an entry that records no role takes the one asked.
+    #[test]
+    fn a_hive_entry_keeps_the_role_it_records_until_the_hive_is_removed() {
+        let root = std::env::temp_dir().join(format!("fluxbee-join-role-{}", Uuid::new_v4()));
+        for (hive, info) in [
+            (
+                "worker3",
+                "hive_id: worker3\nrole: worker\nstatus: failed\njoin:\n  phase: done\n  error_code: DIST_SYNC_TIMEOUT\n",
+            ),
+            ("ingress2", "hive_id: ingress2\nrole: Ingress\nstatus: pending\n"),
+            ("norole1", "hive_id: norole1\nstatus: interrupted\n"),
+            ("garbled1", ": not yaml : ["),
+        ] {
+            fs::create_dir_all(root.join(hive)).unwrap();
+            fs::write(root.join(hive).join("info.yaml"), info).unwrap();
+        }
+        fs::create_dir_all(root.join("accepting1")).unwrap();
+
+        let refusal = add_hive_role_refusal(&root, "worker3", "egress").expect("refused");
+        assert_eq!(refusal["status"], "error");
+        assert_eq!(refusal["error_code"], "HIVE_EXISTS");
+        assert_eq!(refusal["hive_id"], "worker3");
+        assert_eq!(refusal["role"], "worker");
+        let message = refusal["message"].as_str().unwrap();
+        for part in ["role worker", "status failed", "role egress", "remove_hive"] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        assert_eq!(
+            read_hive_info(&root, "worker3").unwrap()["role"],
+            "worker",
+            "nothing is written"
+        );
+        // A retry that names no role asks for a worker, so an ingress's is refused too.
+        assert_eq!(
+            add_hive_role_refusal(&root, "ingress2", "worker").expect("refused")["role"],
+            "ingress"
+        );
+        assert!(add_hive_role_refusal(&root, "worker3", "worker").is_none());
+        assert!(add_hive_role_refusal(&root, "ingress2", "ingress").is_none());
+        for hive in ["norole1", "garbled1", "accepting1", "absent1"] {
+            assert!(
+                add_hive_role_refusal(&root, hive, "egress").is_none(),
+                "{hive}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `accept_add_hive` refuses another role under the topology lock, after the status checks
+    /// and before it writes the entry, which would record the role asked.
+    #[test]
+    fn accept_add_hive_refuses_another_role_before_it_writes_the_entry() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("async fn accept_add_hive(")
+            .expect("accept_add_hive");
+        let body = &src[start..];
+        let lock = body.find("try_lock_hive_topology(&hive_id)").expect("lock");
+        let status = body
+            .find("match hive_status(&root, &hive_id)")
+            .expect("status");
+        let refusal = body
+            .find("add_hive_role_refusal(&root, &hive_id, role.as_str())")
+            .expect("refusal");
+        let write = body.find("update_join_state(&hive_id").expect("write");
+        assert!(lock < status && status < refusal && refusal < write);
     }
 
     /// The join record must survive a read-modify-write cycle, because the background join
@@ -54154,7 +54307,8 @@ blob:
     /// RUNTIME_MANIFEST_MISSING, which put both in `skipped_hives` on every read, so SY.admin's
     /// refusal on a skipped hive would refuse every removal. The motherbee asks neither and lists
     /// them apart. A worker without its manifest, a hive whose role cannot be read, one that does
-    /// not answer and one whose own usage failed are each unknown, never a hive with no node.
+    /// not answer and one whose own usage failed are each unknown, never a hive with no node, and
+    /// with no node listed `in_use` says so (null).
     #[tokio::test]
     async fn the_group_usage_tells_a_hive_without_runtimes_from_an_unknown_one() {
         let hives = [
@@ -54243,14 +54397,41 @@ blob:
                 ("worker3", "USAGE_UNREADABLE"),
             ]
         );
+        // Each skipped hive keeps the message that came with its reason, an error answer's too
+        // (SY.admin quotes it in its refusal).
+        assert_eq!(
+            usage["skipped_hives"][0]["message"],
+            "target hive 'accepting1' not reachable in LSA (stale/missing)"
+        );
+        assert_eq!(
+            usage["skipped_hives"][2]["message"],
+            "runtime manifest not found"
+        );
         assert_eq!(
             usage["skipped_hives"][3]["message"],
             "Permission denied (os error 13)"
         );
+        // A listed node is in use whatever the hives not counted.
         assert_eq!(usage["in_use"], true);
         assert_eq!(usage["running_count"], 2);
         assert_eq!(usage["running_nodes"][0]["node_name"], "AI.local@motherbee");
         assert_eq!(usage["running_nodes"][1]["node_name"], "AI.sales@worker2");
+
+        // worker1's orchestrator is restarting and no node is listed: the use is unknown, never
+        // "not in use" (in_use said false).
+        let restarting = group_runtime_usage(
+            &serde_json::json!({ "running_nodes": [] }),
+            vec![("worker1".to_string(), Some(HiveRole::Worker))],
+            |_| async {
+                Err::<serde_json::Value, OrchestratorError>(
+                    "timeout waiting GET_RUNTIME_RESPONSE".into(),
+                )
+            },
+        )
+        .await;
+        assert_eq!(restarting["skipped_hives"][0]["reason"], "UNREACHABLE");
+        assert_eq!(restarting["running_count"], 0);
+        assert_eq!(restarting["in_use"], serde_json::Value::Null);
 
         // 8.x's group: only worker1 is asked, and with its answer nothing is unknown.
         let group = group_runtime_usage(
@@ -54279,6 +54460,82 @@ blob:
             group["hives_without_runtimes"].as_array().map(Vec::len),
             Some(2)
         );
+    }
+
+    /// FINDINGS A-281: a registry the motherbee cannot list makes its whole use across the hives an
+    /// error, never a group of no hives, which would read as no node anywhere but on the
+    /// motherbee. Listed with only an ingress and an egress, it asks nobody and nothing is unknown.
+    /// A spoke answers its own nodes and reads no registry.
+    #[tokio::test]
+    async fn the_global_usage_is_an_error_when_the_registry_cannot_be_listed() {
+        let scratch =
+            std::env::temp_dir().join(format!("fluxbee-usage-global-{}", Uuid::new_v4().simple()));
+        let nodes_root = scratch.join("nodes");
+        let registry_root = scratch.join("hives");
+        let motherbee = sample_orchestrator_state_for_tests();
+
+        let unread = global_visible_runtime_usage_summary_with_roots(
+            &motherbee,
+            &nodes_root,
+            &registry_root,
+            "ai.generic",
+            Some("0.3.1"),
+        )
+        .await;
+        assert_eq!(unread["scope"], "group_visible_control_plane", "{unread}");
+        assert_eq!(unread["status"], "error", "{unread}");
+        assert!(
+            unread["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("the hive registry could not be read")),
+            "{unread}"
+        );
+        for field in ["in_use", "running_nodes", "skipped_hives"] {
+            assert!(unread.get(field).is_none(), "{field}: {unread}");
+        }
+
+        for (hive, role) in [("egress1", "egress"), ("ingress1", "ingress")] {
+            fs::create_dir_all(registry_root.join(hive)).unwrap();
+            fs::write(
+                registry_root.join(hive).join("info.yaml"),
+                format!("hive_id: {hive}\nrole: {role}\nstatus: connected\n"),
+            )
+            .unwrap();
+        }
+        let listed = global_visible_runtime_usage_summary_with_roots(
+            &motherbee,
+            &nodes_root,
+            &registry_root,
+            "ai.generic",
+            Some("0.3.1"),
+        )
+        .await;
+        assert!(listed.get("status").is_none(), "{listed}");
+        assert_eq!(listed["skipped_hives"], serde_json::json!([]), "{listed}");
+        assert_eq!(listed["in_use"], false, "{listed}");
+        assert_eq!(
+            listed["hives_without_runtimes"].as_array().map(Vec::len),
+            Some(2),
+            "{listed}"
+        );
+
+        fs::remove_dir_all(&registry_root).unwrap();
+        let mut spoke = sample_orchestrator_state_for_tests();
+        spoke.hive_id = "worker1".to_string();
+        spoke.is_motherbee = false;
+        spoke.role = HiveRole::Worker;
+        let own = global_visible_runtime_usage_summary_with_roots(
+            &spoke,
+            &nodes_root,
+            &registry_root,
+            "ai.generic",
+            Some("0.3.1"),
+        )
+        .await;
+        assert_eq!(own["scope"], "hive_local_visible", "{own}");
+        assert_eq!(own["in_use"], false, "{own}");
+
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     /// An SY node runs as its packaged unit and the router as `rt-gateway`, never as a
