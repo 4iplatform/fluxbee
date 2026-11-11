@@ -27,7 +27,7 @@ REMOVED (operator decisions, 2026-09-28):
     state and its packages, running instances included). A version of its package SY.admin does
     not remove (a hive that may run it cannot be read, FINDINGS A-281) stays in the motherbee's
     dist: the delete is done all the same, and the reset names each such version, which a re-run
-    does not remove;
+    does not remove, and counts them in its log line (packages_left=);
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
@@ -460,6 +460,42 @@ def rm_path(path):
         os.remove(path)
 
 
+def delete_workflows(workflows):
+    """wf_rules_delete with force, each workflow once, on its hive. Answers the deletes that failed
+    and the versions of the deleted workflows' packages left in the motherbee's dist. A delete is
+    done even when its purge left versions there (SY.admin removes none while a hive that may run
+    it cannot be read, FINDINGS A-281): its answer names each in packages_left, which the reset
+    prints and counts, and a re-run does not remove them, since the workflow is no longer listed.
+    An SY.wf-rules before 0.1.133 names none."""
+    failed = []
+    packages_left = []
+    for hive, wf in workflows:
+        status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
+                           {"workflow_name": wf, "force": True}, timeout=180)
+        good = ok(status, resp)
+        print("  %-5s %s (on %s)" % ("OK" if good else "FAIL", wf, hive))
+        if not good:
+            failed.append((wf, status, str(resp)[:200]))
+            print("    %s %s" % (status, str(resp)[:200]))
+            continue
+        named = payload(resp).get("packages_left")
+        for pkg in named if isinstance(named, list) else []:
+            packages_left.append(pkg)
+            print("    left in the motherbee's dist: %s %s (%s)" % (
+                pkg.get("runtime"), pkg.get("version") or "(versions not listed)", pkg.get("error_code")))
+    return failed, packages_left
+
+
+def summary_line(hive_id, workflows, nodes, pages, ilks, secrets, tables, packages_left, problems, secs):
+    """The run's one line, printed last and appended to LOG_PATH: what it removed, the versions of
+    deleted workflows' packages it left in the motherbee's dist (packages_left, which a re-run does
+    not remove and which are no failed step), and how many steps failed."""
+    return ("%s factory-reset hive=%s workflows=%d nodes=%d pages=%d ilks=%d secrets=%d tables=%d "
+            "packages_left=%d problems=%d (%.0fs)") % (
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, workflows, nodes, pages, ilks, secrets, tables,
+        packages_left, problems, secs)
+
+
 def kill_user_nodes(nodes):
     """kill_node with purge_instance, each node once: SY.admin refuses no purge for a page the node
     published (FINDINGS A-242), and the last take-down catches a page that went up meanwhile."""
@@ -686,25 +722,7 @@ def main():
     pages_done, page_fail = unpublish_pages()
 
     print("== [1/9] delete workflows")
-    wf_fail = []
-    packages_left = []
-    for hive, wf in workflows:
-        status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
-                           {"workflow_name": wf, "force": True}, timeout=180)
-        good = ok(status, resp)
-        print("  %-5s %s (on %s)" % ("OK" if good else "FAIL", wf, hive))
-        if not good:
-            wf_fail.append((wf, status, str(resp)[:200]))
-            print("    %s %s" % (status, str(resp)[:200]))
-            continue
-        # Deleted, though its purge may have left versions of its package in the motherbee's dist
-        # (SY.admin removes none while a hive that may run it cannot be read, FINDINGS A-281): the
-        # answer names each, and the workflow is no longer listed for a run of the reset to retry.
-        named = payload(resp).get("packages_left")
-        for pkg in named if isinstance(named, list) else []:
-            packages_left.append(pkg)
-            print("    left in the motherbee's dist: %s %s (%s)" % (
-                pkg.get("runtime"), pkg.get("version") or "(versions not listed)", pkg.get("error_code")))
+    wf_fail, packages_left = delete_workflows(workflows)
     print("== [2/9] kill+purge user nodes")
     node_fail = kill_user_nodes(user_nodes)
 
@@ -799,9 +817,8 @@ def main():
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
     problems = (len(wf_fail) + len(node_fail) + len(page_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail)
                 + len(opa_fail) + len(left) + len(cog_fail))
-    summary = "%s factory-reset hive=%s workflows=%d nodes=%d pages=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
-        time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), pages_done, len(ilks_now),
-        len(secrets_now), len(tables), problems, time.time() - t0)
+    summary = summary_line(hive_id, len(workflows), len(user_nodes), pages_done, len(ilks_now),
+                           len(secrets_now), len(tables), len(packages_left), problems, time.time() - t0)
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
         with open(LOG_PATH, "a") as f:

@@ -16,7 +16,10 @@ through a stand-in for its `api`, with SY.admin's ledger in a temporary director
   refusal of any other kind is the node's failure, counted, never asked again;
 - once a node was removed, the last page step waits until 120 s after the last removal and takes
   down a page a publish under way then put up; with no node removed it waits for nothing; a page
-  it cannot take down is counted.
+  it cannot take down is counted;
+- a workflow's delete that left versions of its package in the motherbee's dist (packages_left,
+  FINDINGS A-281) is done: the reset names each version and counts them in the line it logs,
+  which says packages_left=N beside problems=N.
 
 Usage: python3 scripts/factory_reset_pages_check.py
 """
@@ -282,6 +285,73 @@ class NodePurgeTest(NoKey, unittest.TestCase):
         for gone in ("NODE_HAS_PAGES", "TENANT_HAS_PAGES", "NODE_BEING_PURGED",
                      "PAGES_CHECK_FAILED", "is in flight"):
             self.assertNotIn(gone, source)
+
+
+class WorkflowDeleteTest(unittest.TestCase):
+    """[1/9]: each workflow's delete is asked once, with force. One whose purge left versions of its
+    package in the motherbee's dist is done (FINDINGS A-281): the reset names each version, and the
+    line it logs counts them, where it said only problems=0 and the log of such a run read clean."""
+
+    def setUp(self):
+        self.reset = load_reset()
+
+    def delete(self, answers, workflows):
+        asked = []
+
+        def api(method, path, body=None, host=None, timeout=60):
+            assert (method, body["force"]) == ("POST", True), (method, body)
+            asked.append((path, body["workflow_name"]))
+            return answers[body["workflow_name"]]
+
+        self.reset.api = api
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = self.reset.delete_workflows(workflows)
+        return result, asked, out.getvalue()
+
+    @staticmethod
+    def deleted(**fields):
+        """SY.admin's answer to a delete SY.wf-rules did: its payload passed on whole."""
+        return 200, {"status": "ok", "action": "wf_rules_delete",
+                     "payload": dict({"status": "ok", "deleted": True,
+                                      "wf_node": {"node_name": "WF.x@motherbee", "action": "deleted"}}, **fields)}
+
+    def test_the_versions_a_delete_left_are_named_and_counted_in_the_logged_line(self):
+        left = [{"runtime": "wf.invoice", "version": "0.0.1", "error_code": "RUNTIME_USAGE_UNKNOWN",
+                 "detail": "the nodes of worker1 (TIMEOUT) were not read", "retryable": True,
+                 "unanswered_hives": [{"hive": "worker1", "reason": "TIMEOUT", "detail": "no answer"}]},
+                {"runtime": "wf.invoice", "version": "0.0.2", "error_code": "PURGE_STOPPED",
+                 "detail": "the purge stopped at wf.invoice 0.0.1", "retryable": True}]
+        unlisted = {"runtime": "wf.billing", "version": "", "error_code": "DIST_UNREADABLE",
+                    "detail": "cannot list the versions of wf.billing in this hive's dist", "retryable": False}
+        answers = {
+            "invoice": self.deleted(packages_left=left, warning="workflow invoice is deleted, but ..."),
+            "billing": self.deleted(packages_left=[unlisted], warning="workflow billing is deleted, but ..."),
+            "orders": self.deleted(packages_left=[]),
+            # An SY.wf-rules before 0.1.133 names none.
+            "legacy": self.deleted(),
+            "stuck": (502, {"status": "error", "action": "wf_rules_delete", "error_code": "ORCHESTRATOR_ERROR",
+                            "error_detail": "kill_node: no answer"}),
+        }
+        workflows = [("motherbee", "invoice"), ("worker1", "billing"), ("worker1", "orders"),
+                     ("worker1", "legacy"), ("motherbee", "stuck")]
+        (failed, packages_left), asked, out = self.delete(answers, workflows)
+
+        self.assertEqual(asked, [("/hives/%s/wf-rules/delete" % hive, wf) for hive, wf in workflows])
+        self.assertEqual([wf for wf, _, _ in failed], ["stuck"])
+        self.assertEqual(packages_left, left + [unlisted])
+        for line in ("OK    invoice (on motherbee)",
+                     "left in the motherbee's dist: wf.invoice 0.0.1 (RUNTIME_USAGE_UNKNOWN)",
+                     "left in the motherbee's dist: wf.invoice 0.0.2 (PURGE_STOPPED)",
+                     "left in the motherbee's dist: wf.billing (versions not listed) (DIST_UNREADABLE)",
+                     "OK    legacy (on worker1)",
+                     "FAIL  stuck (on motherbee)"):
+            self.assertIn(line, out)
+
+        summary = self.reset.summary_line("motherbee", len(workflows), 0, 0, 0, 0, 0, len(packages_left),
+                                          len(failed), 12.0)
+        self.assertIn(" factory-reset hive=motherbee workflows=5 ", summary)
+        self.assertIn(" packages_left=3 problems=1 (12s)", summary)
 
 
 class LatePagesTest(NoKey, unittest.TestCase):
