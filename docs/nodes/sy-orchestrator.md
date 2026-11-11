@@ -80,8 +80,18 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
       removed, a node the list added is installed;
    9. starts each SY node of its role in list order (`start_core_service`), using
       `restart` instead of `start` for a service whose binary a package upgrade replaced (its
-      `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45); a
-      failure only warns;
+      `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45), and
+      for one whose `systemctl show -p MainPID` gives no answer, asked again up to 3 times 250 ms
+      apart: a restart also starts a stopped service (`BootBinaryChecks`, FINDINGS A-282, since
+      0.1.136). Before, such a check read as "not replaced", and a service the upgrade replaced
+      kept its old binary while the package and `/versions` said new. rt-gateway, in step 4, is
+      started the same way; a core component the role's list leaves out is restarted only on a
+      replaced binary, since a restart would start a service the role does not run. The restarts
+      are recorded as the last core update (`via: package`): `updated` names the services on a
+      replaced binary, and `unanswered`, apart, those restarted on no answer. Only a boot that
+      found a replaced binary records them: one whose checks only gave no answer could be any
+      start, a spoke's after its core update among them, whose record SY.admin follows, so it
+      only logs them. A failure only warns;
    10. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
        timeout only warns.
 
@@ -716,6 +726,14 @@ match. What happens then is each caller's (`VendorPolicy`, FINDINGS A-189):
   Syncthing was syncing never started Syncthing again. With no Syncthing installed they fail as
   before, which the start and the watchdog only log.
 - **`update category=vendor`, and the motherbee's setup for an ingress join,** fail.
+
+A running Syncthing keeps the binary and the unit it started with, so the same call restarts it,
+instead of starting it, when it installed a new binary or wrote a new unit, or when the running
+process' binary was replaced on disk (`syncthing_runs_stale`, FINDINGS A-57), which catches a
+restart an earlier call never reached. That last check asks `systemctl show -p MainPID` again, up
+to 3 times 250 ms apart, while it gives no answer (FINDINGS A-282, since 0.1.136; before, it was
+asked once). One that still gives none restarts nothing by itself, and the next call asks again:
+a restart on it would restart Syncthing at every call while `systemctl show` fails.
 
 | Folder | Holds | Who gets it |
 | --- | --- | --- |

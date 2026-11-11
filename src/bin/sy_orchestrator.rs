@@ -2154,12 +2154,14 @@ async fn bootstrap_local(
         .filter(|name| *name != "sy-orchestrator" && !core_services.contains(*name))
         .cloned()
         .collect();
+    // FINDINGS A-282: a listed service `systemctl show` gives no answer for, asked again, is
+    // restarted too.
+    let binaries = check_core_binaries_at_boot(&core_services, &unlisted_core).await;
     core_services.extend(unlisted_core.iter().cloned());
-    let replaced = services_running_replaced_binary(&core_services);
-    let mut upgrade_restart = BootUpgradeRestart::begin(&core_services, &replaced);
+    let mut upgrade_restart = BootUpgradeRestart::begin(&core_services, &binaries);
 
     tracing::info!("starting rt-gateway");
-    start_core_service("rt-gateway", &replaced, &mut upgrade_restart)?;
+    start_core_service("rt-gateway", &binaries, &mut upgrade_restart)?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
     // docs/control-path-hardening-v1.md §6: an active ufw or firewalld is reported, never written
     // to; the ingress applies its SSH table (never fatal: the edge serves without it).
@@ -2231,15 +2233,15 @@ async fn bootstrap_local(
             node = node_name.as_str(),
             "starting configured lifecycle node"
         );
-        if let Err(err) = start_core_service(&service, &replaced, &mut upgrade_restart) {
+        if let Err(err) = start_core_service(&service, &binaries, &mut upgrade_restart) {
             tracing::warn!(service = service.as_str(), error = %err, "failed to start service");
         }
     }
     for service in unlisted_core
         .iter()
-        .filter(|service| replaced.contains(*service))
+        .filter(|service| binaries.replaced.contains(*service))
     {
-        if let Err(err) = start_core_service(service, &replaced, &mut upgrade_restart) {
+        if let Err(err) = start_core_service(service, &binaries, &mut upgrade_restart) {
             tracing::warn!(service = service.as_str(), error = %err, "failed to restart service");
         }
     }
@@ -2295,23 +2297,113 @@ async fn finish_bootstrap(
     Ok(())
 }
 
-/// Of `services`, the ones running a binary that was replaced on disk since they started.
-fn services_running_replaced_binary(services: &[String]) -> HashSet<String> {
-    services
-        .iter()
-        .filter(|service| service_runs_replaced_binary(service))
-        .cloned()
-        .collect()
+/// How long a replaced-binary check asks `systemctl show` again while it gives no answer (FINDINGS
+/// A-282): SERVICE_CHECK_ASKS_AGAIN asks fit in it, as in a node action's.
+const REPLACED_BINARY_CHECK_LIMIT: Duration = Duration::from_secs(1);
+
+/// What the boot found of the core services' binaries (FINDINGS A-45, A-282): the services running
+/// a binary replaced on disk since they started, and those of the role's list `systemctl show` gave
+/// no answer for, asked again. The boot restarts both: a restart also starts a stopped service,
+/// where a start leaves a running one on its old binary.
+#[derive(Debug, Default)]
+struct BootBinaryChecks {
+    replaced: HashSet<String>,
+    unanswered: HashSet<String>,
 }
 
-fn service_runs_replaced_binary(service: &str) -> bool {
-    let props = systemd_unit_show(service, &["MainPID"]);
-    let Some(pid) = parse_systemd_u64(props.get("MainPID")).filter(|pid| *pid > 0) else {
-        return false;
+impl BootBinaryChecks {
+    /// Takes `service`'s answer. `listed`: rt-gateway or an SY service of the role's list, which
+    /// the boot starts either way, so a restart on no answer only stands in for a start. A core
+    /// component the list leaves out is restarted only on a yes: a restart would start a service
+    /// the role does not run.
+    fn take(&mut self, service: &str, answer: CheckAnswer, listed: bool) {
+        match answer {
+            CheckAnswer::Yes => {
+                self.replaced.insert(service.to_string());
+            }
+            CheckAnswer::No => {}
+            CheckAnswer::NoAnswer if listed => {
+                tracing::warn!(
+                    service,
+                    "systemctl did not answer whether the service runs a binary a package upgrade \
+                     replaced, asked again; the boot restarts it all the same"
+                );
+                self.unanswered.insert(service.to_string());
+            }
+            CheckAnswer::NoAnswer => tracing::warn!(
+                service,
+                "systemctl did not answer whether the service runs a binary a package upgrade \
+                 replaced, asked again; not restarted, since the role does not run it and a \
+                 restart would start it"
+            ),
+        }
+    }
+
+    /// Whether the boot restarts `service` instead of starting it.
+    fn restarts(&self, service: &str) -> bool {
+        self.replaced.contains(service) || self.unanswered.contains(service)
+    }
+}
+
+/// The boot's check of each core service's binary (`service_runs_replaced_binary`): `listed`,
+/// rt-gateway and the SY services of the role's list, and `unlisted`, the core components the list
+/// leaves out. A check with no answer is asked again, SERVICE_CHECK_ASKS_AGAIN times at most,
+/// SERVICE_CHECK_ASK_AGAIN_MS apart (FINDINGS A-282).
+async fn check_core_binaries_at_boot(listed: &[String], unlisted: &[String]) -> BootBinaryChecks {
+    let mut checks = BootBinaryChecks::default();
+    for (services, is_listed) in [(listed, true), (unlisted, false)] {
+        for service in services {
+            let answer = ask_again_while_unanswered(
+                || service_runs_replaced_binary(service),
+                REPLACED_BINARY_CHECK_LIMIT,
+            )
+            .await;
+            checks.take(service, answer, is_listed);
+        }
+    }
+    checks
+}
+
+/// Whether `service` runs a binary replaced on disk since it started (FINDINGS A-45, A-282), by its
+/// main process (`systemctl show -p MainPID`) and that process' `/proc/<pid>/exe`
+/// (`replaced_binary_answer`). Before, a `systemctl show` that failed or was killed read as "not
+/// replaced": the boot after a package upgrade started (a no-op) a service it had to restart, and
+/// the service kept its old binary while the package and `/versions` said new (U-1's shape).
+fn service_runs_replaced_binary(service: &str) -> CheckAnswer {
+    replaced_binary_answer(
+        systemctl_show_value(
+            Command::new("systemctl")
+                .arg("show")
+                .arg(service)
+                .arg("--property=MainPID")
+                .arg("--value")
+                .output(),
+        ),
+        |pid| fs::read_link(format!("/proc/{pid}/exe")),
+    )
+}
+
+/// `service_runs_replaced_binary`'s answer from the `MainPID` systemctl printed (None when it gave
+/// no answer, `systemctl_show_value`) and its process' exe link (`exe`): yes when the link ends in
+/// " (deleted)"; no when it does not, when there is no main process (`MainPID` 0: a stopped
+/// service, or no such unit), or when that process is gone by the time its link is read (what
+/// starts next runs what is on disk); no answer otherwise.
+fn replaced_binary_answer(
+    main_pid: Option<String>,
+    exe: impl FnOnce(u64) -> std::io::Result<PathBuf>,
+) -> CheckAnswer {
+    let Some(pid) = main_pid.and_then(|pid| pid.parse::<u64>().ok()) else {
+        return CheckAnswer::NoAnswer;
     };
-    fs::read_link(format!("/proc/{pid}/exe"))
-        .map(|exe| exe_link_is_replaced(&exe))
-        .unwrap_or(false)
+    if pid == 0 {
+        return CheckAnswer::No;
+    }
+    match exe(pid) {
+        Ok(exe) if exe_link_is_replaced(&exe) => CheckAnswer::Yes,
+        Ok(_) => CheckAnswer::No,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => CheckAnswer::No,
+        Err(_) => CheckAnswer::NoAnswer,
+    }
 }
 
 /// `/proc/<pid>/exe` of a process whose binary was unlinked, as dpkg does when it installs a new
@@ -2320,50 +2412,93 @@ fn exe_link_is_replaced(exe: &Path) -> bool {
     exe.to_string_lossy().ends_with(" (deleted)")
 }
 
-/// `systemctl start`, or `restart` for a service in `replaced`: `start` leaves a running service
-/// on its old binary.
+/// `systemctl start`, or `restart` for a service the boot restarts (`BootBinaryChecks::restarts`):
+/// `start` leaves a running service on its old binary.
 fn start_core_service(
     service: &str,
-    replaced: &HashSet<String>,
+    binaries: &BootBinaryChecks,
     upgrade_restart: &mut BootUpgradeRestart,
 ) -> Result<(), OrchestratorError> {
-    if !replaced.contains(service) {
-        return systemd_start(service);
-    }
-    tracing::info!(
+    start_core_service_with(
         service,
-        "restarting onto the binary the package upgrade installed"
-    );
-    let result = systemd_restart(service);
+        binaries,
+        upgrade_restart,
+        systemd_start,
+        systemd_restart,
+    )
+}
+
+/// `start_core_service`, with systemd's `start` and `restart` given.
+fn start_core_service_with(
+    service: &str,
+    binaries: &BootBinaryChecks,
+    upgrade_restart: &mut BootUpgradeRestart,
+    start: impl FnOnce(&str) -> Result<(), OrchestratorError>,
+    restart: impl FnOnce(&str) -> Result<(), OrchestratorError>,
+) -> Result<(), OrchestratorError> {
+    if !binaries.restarts(service) {
+        return start(service);
+    }
+    if binaries.unanswered.contains(service) {
+        tracing::info!(
+            service,
+            "restarting: systemctl gave no answer whether it runs a replaced binary, and a restart \
+             also starts a stopped one"
+        );
+    } else {
+        tracing::info!(
+            service,
+            "restarting onto the binary the package upgrade installed"
+        );
+    }
+    let result = restart(service);
     upgrade_restart.record(service, &result);
     result
 }
 
 /// The restarts a boot does after a package upgrade, recorded like a core update (`/versions`:
-/// `core.last_update`, `via: package`).
+/// `core.last_update`, `via: package`): `updated`, the services that ran a replaced binary, and
+/// apart from them `unanswered`, those of the role's list `systemctl show` gave no answer for,
+/// restarted all the same (FINDINGS A-282). Only a service on a replaced binary makes a record:
+/// that is what tells a package upgrade's boot. A boot whose checks only gave no answer could be
+/// any start of this orchestrator, a spoke's after its core update among them, whose record
+/// SY.admin follows and this one would replace: its restarts are logged, not recorded.
 struct BootUpgradeRestart {
     started_at_ms: Option<String>,
-    attempted: Vec<String>,
+    updated: Vec<String>,
+    unanswered: Vec<String>,
     restarted: Vec<String>,
     errors: Vec<String>,
 }
 
 impl BootUpgradeRestart {
-    fn begin(order: &[String], replaced: &HashSet<String>) -> Self {
-        let attempted = upgrade_restart_order(order, replaced);
-        let started_at_ms = (!attempted.is_empty()).then(|| now_epoch_ms().to_string());
-        if let Some(started_at_ms) = &started_at_ms {
-            tracing::info!(services = ?attempted, "core services run replaced binaries; restarting them in start order");
+    fn begin(order: &[String], binaries: &BootBinaryChecks) -> Self {
+        let upgrade = Self::planned(order, binaries, now_epoch_ms());
+        if let Some(started_at_ms) = &upgrade.started_at_ms {
+            tracing::info!(
+                services = ?upgrade.updated,
+                unanswered = ?upgrade.unanswered,
+                "core services run replaced binaries; restarting them in start order"
+            );
             write_core_update_last_record(&serde_json::json!({
                 "phase": "restarting",
                 "via": "package",
                 "started_at_ms": started_at_ms,
-                "updated": attempted,
+                "updated": upgrade.updated,
+                "unanswered": upgrade.unanswered,
             }));
         }
+        upgrade
+    }
+
+    /// The restarts `binaries` calls for, in the boot's start order (`order`), none of them done
+    /// yet, and nothing written.
+    fn planned(order: &[String], binaries: &BootBinaryChecks, now_ms: u64) -> Self {
+        let updated = upgrade_restart_order(order, &binaries.replaced);
         Self {
-            started_at_ms,
-            attempted,
+            started_at_ms: (!updated.is_empty()).then(|| now_ms.to_string()),
+            updated,
+            unanswered: upgrade_restart_order(order, &binaries.unanswered),
             restarted: Vec::new(),
             errors: Vec::new(),
         }
@@ -2378,39 +2513,52 @@ impl BootUpgradeRestart {
 
     fn finish(&self) {
         let Some(started_at_ms) = &self.started_at_ms else {
+            if !self.unanswered.is_empty() {
+                tracing::warn!(
+                    unanswered = ?self.unanswered,
+                    restarted = ?self.restarted,
+                    errors = ?self.errors,
+                    "restarted the core services systemctl gave no answer for; none ran a replaced \
+                     binary, so no package upgrade's restart is recorded"
+                );
+            }
             return;
         };
         write_core_update_last_record(&boot_upgrade_restart_record(
             started_at_ms,
-            &self.attempted,
+            &self.updated,
+            &self.unanswered,
             &self.restarted,
             &self.errors,
         ));
     }
 }
 
-/// The services of `replaced`, in the boot's start order (`order`).
-fn upgrade_restart_order(order: &[String], replaced: &HashSet<String>) -> Vec<String> {
+/// The services of `services`, in the boot's start order (`order`).
+fn upgrade_restart_order(order: &[String], services: &HashSet<String>) -> Vec<String> {
     order
         .iter()
-        .filter(|service| replaced.contains(*service))
+        .filter(|service| services.contains(*service))
         .cloned()
         .collect()
 }
 
 fn boot_upgrade_restart_record(
     started_at_ms: &str,
-    attempted: &[String],
+    updated: &[String],
+    unanswered: &[String],
     restarted: &[String],
     errors: &[String],
 ) -> serde_json::Value {
+    let all_restarted = restarted.len() == updated.len() + unanswered.len();
     serde_json::json!({
         "phase": "done",
         "via": "package",
-        "status": if errors.is_empty() && restarted.len() == attempted.len() { "ok" } else { "error" },
+        "status": if errors.is_empty() && all_restarted { "ok" } else { "error" },
         "started_at_ms": started_at_ms,
         "finished_at_ms": now_epoch_ms().to_string(),
-        "updated": attempted,
+        "updated": updated,
+        "unanswered": unanswered,
         "restarted": restarted,
         "errors": errors,
     })
@@ -18829,15 +18977,17 @@ struct SyncthingRuntimeOutcome {
 /// either changed under it. A replaced binary also shows on the process itself, so a restart a
 /// failed call never reached is caught by the next one. A check with no answer counts as running
 /// (FINDINGS A-267): the caller starts Syncthing either way, and a restart starts a stopped one as
-/// a start would, where a start leaves a running one stale.
+/// a start would, where a start leaves a running one stale. The process' check restarts only on
+/// its yes (FINDINGS A-282): one with no answer, asked again, would restart Syncthing at every
+/// call while `systemctl show` fails.
 fn syncthing_runs_stale(
     activity: ServiceActivity,
     binary_updated: bool,
     unit_changed: bool,
-    runs_replaced_binary: bool,
+    runs_replaced_binary: CheckAnswer,
 ) -> bool {
     activity != ServiceActivity::Inactive
-        && (binary_updated || unit_changed || runs_replaced_binary)
+        && (binary_updated || unit_changed || runs_replaced_binary == CheckAnswer::Yes)
 }
 
 /// Syncthing installed from the vendor, under its unit, running and healthy, with this hive's
@@ -18893,13 +19043,27 @@ async fn ensure_blob_sync_runtime(
         }
     };
     let unit_changed = ensure_syncthing_unit(&sync)?;
+    // FINDINGS A-282: the process' check is asked again while `systemctl show` gives no answer;
+    // one that still gives none restarts nothing by itself, and the next call asks again.
+    let runs_replaced_binary = ask_again_while_unanswered(
+        || service_runs_replaced_binary(SYNCTHING_SERVICE_NAME),
+        REPLACED_BINARY_CHECK_LIMIT,
+    )
+    .await;
+    if runs_replaced_binary == CheckAnswer::NoAnswer {
+        tracing::warn!(
+            service = SYNCTHING_SERVICE_NAME,
+            "systemctl did not answer whether syncthing runs a replaced binary, asked again; not \
+             restarted for it"
+        );
+    }
     // Restart a stale Syncthing now, before the checks below: they already use the new unit's
     // port and home.
     let stale = syncthing_runs_stale(
         systemd_activity(SYNCTHING_SERVICE_NAME),
         binary_updated,
         unit_changed,
-        service_runs_replaced_binary(SYNCTHING_SERVICE_NAME),
+        runs_replaced_binary,
     );
     if stale {
         tracing::info!(
@@ -36789,22 +36953,41 @@ async fn systemd_activity_asked_again(service: &str, limit: Duration) -> Service
     ask_again_while_unanswered(|| systemd_activity(service), limit).await
 }
 
-/// `check`'s answer, asked again while it is Unknown (`systemd_activity_asked_again`).
-async fn ask_again_while_unanswered(
-    mut check: impl FnMut() -> ServiceActivity,
+/// A check whose answer can be none (FINDINGS A-267, A-271): `ServiceActivity::Unknown`,
+/// `CheckAnswer::NoAnswer`.
+trait CheckOutcome: Copy {
+    fn answered(self) -> bool;
+}
+
+impl CheckOutcome for ServiceActivity {
+    fn answered(self) -> bool {
+        self != ServiceActivity::Unknown
+    }
+}
+
+impl CheckOutcome for CheckAnswer {
+    fn answered(self) -> bool {
+        self != CheckAnswer::NoAnswer
+    }
+}
+
+/// `check`'s answer, asked again while it gives none (`systemd_activity_asked_again`; a
+/// replaced-binary check, FINDINGS A-282).
+async fn ask_again_while_unanswered<A: CheckOutcome>(
+    mut check: impl FnMut() -> A,
     limit: Duration,
-) -> ServiceActivity {
+) -> A {
     let deadline = Instant::now() + limit;
     let pause = Duration::from_millis(SERVICE_CHECK_ASK_AGAIN_MS);
-    let mut activity = check();
+    let mut answer = check();
     for _ in 0..SERVICE_CHECK_ASKS_AGAIN {
-        if activity != ServiceActivity::Unknown || Instant::now() + pause > deadline {
+        if answer.answered() || Instant::now() + pause > deadline {
             break;
         }
         time::sleep(pause).await;
-        activity = check();
+        answer = check();
     }
-    activity
+    answer
 }
 
 /// How long a node action (run, start, restart, kill, remove) asks systemctl again for its unit
@@ -51705,22 +51888,249 @@ blob:
         assert!(upgrade_restart_order(&order, &HashSet::new()).is_empty());
     }
 
-    /// A-45: the outcome is `ok` only when every service it set out to restart restarted.
+    /// A-45: the outcome is `ok` only when every service it set out to restart restarted, those
+    /// restarted on no answer (FINDINGS A-282) among them.
     #[test]
     fn a_boot_upgrade_restart_is_ok_only_when_every_service_restarted() {
         let attempted = ["rt-gateway".to_string(), "sy-identity".to_string()];
-        let ok = boot_upgrade_restart_record("1", &attempted, &attempted, &[]);
+        let ok = boot_upgrade_restart_record("1", &attempted, &[], &attempted, &[]);
         assert_eq!(ok["status"], "ok");
         assert_eq!(ok["phase"], "done");
         assert_eq!(ok["via"], "package");
+        assert_eq!(ok["unanswered"], serde_json::json!([]));
         let failed = boot_upgrade_restart_record(
             "1",
             &attempted,
+            &[],
             &attempted[..1],
             &["sy-identity: systemctl restart failed".to_string()],
         );
         assert_eq!(failed["status"], "error");
         assert_eq!(failed["restarted"], serde_json::json!(["rt-gateway"]));
+        let unanswered = ["sy-admin".to_string()];
+        let short = boot_upgrade_restart_record("1", &attempted, &unanswered, &attempted, &[]);
+        assert_eq!(short["status"], "error", "sy-admin was not restarted");
+        let mut all = attempted.to_vec();
+        all.extend(unanswered.iter().cloned());
+        let both = boot_upgrade_restart_record("1", &attempted, &unanswered, &all, &[]);
+        assert_eq!(both["status"], "ok");
+    }
+
+    /// FINDINGS A-282: whether a service runs a replaced binary is answered only when `systemctl
+    /// show` answers its `MainPID`: yes by an exe link that ends in " (deleted)"; no by one that
+    /// does not, by no main process (`0`), or by a process gone before its link is read. A show
+    /// that fails otherwise, answers no value or no number, is killed or cannot run, and a link
+    /// that cannot be read otherwise, are no answer, never "not replaced". Real children.
+    #[test]
+    fn a_replaced_binary_check_answers_only_when_systemctl_answers() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let link = |path: &str| -> std::io::Result<PathBuf> { Ok(PathBuf::from(path)) };
+        let check = |script: &str, exe: std::io::Result<PathBuf>| {
+            let mut read = None;
+            let answer =
+                replaced_binary_answer(systemctl_show_value(child_ending_as(script)), |pid| {
+                    read = Some(pid);
+                    exe
+                });
+            (answer, read)
+        };
+        assert_eq!(
+            check("echo 4242", link("/usr/bin/sy-identity (deleted)")),
+            (Yes, Some(4242))
+        );
+        assert_eq!(
+            check("echo 4242", link("/usr/bin/sy-identity")),
+            (No, Some(4242))
+        );
+        assert_eq!(
+            check("echo 0", link("/usr/bin/sy-identity (deleted)")),
+            (No, None),
+            "no main process: stopped, or no such unit"
+        );
+        assert_eq!(
+            check("echo 4242", Err(std::io::ErrorKind::NotFound.into())),
+            (No, Some(4242)),
+            "the process is gone: what starts next runs what is on disk"
+        );
+        assert_eq!(
+            check(
+                "echo 4242",
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            ),
+            (NoAnswer, Some(4242))
+        );
+        for unanswered in [
+            "exit 1",
+            "echo 4242; exit 1",
+            "exit 0",
+            "echo '[not set]'",
+            "kill -TERM $$",
+            "kill -KILL $$",
+        ] {
+            assert_eq!(
+                check(unanswered, link("/usr/bin/sy-identity (deleted)")),
+                (NoAnswer, None),
+                "{unanswered}"
+            );
+        }
+        assert_eq!(
+            replaced_binary_answer(
+                systemctl_show_value(Command::new("/nonexistent/systemctl").output()),
+                |_| link("/usr/bin/sy-identity (deleted)")
+            ),
+            NoAnswer
+        );
+    }
+
+    /// FINDINGS A-282: at boot, a service of the role's list that `systemctl show` gives no answer
+    /// for, asked again, is restarted (a restart also starts a stopped one), as one on a replaced
+    /// binary is, and recorded apart (`unanswered`, not `updated`). A core component the list
+    /// leaves out is restarted only on a replaced binary: a restart would start a service the role
+    /// does not run. Before, no answer read as "not replaced", and `start` left a running service
+    /// on its old binary while the package said new.
+    #[test]
+    fn the_boot_restarts_a_service_whose_binary_check_gives_no_answer() {
+        use CheckAnswer::{No, NoAnswer, Yes};
+        let mut binaries = BootBinaryChecks::default();
+        for (service, answer, listed) in [
+            ("rt-gateway", Yes, true),
+            ("sy-identity", NoAnswer, true),
+            ("sy-admin", No, true),
+            ("sy-edge", NoAnswer, false),
+            ("sy-extra", Yes, false),
+        ] {
+            binaries.take(service, answer, listed);
+        }
+        assert!(!binaries.restarts("sy-edge"));
+        let order: Vec<String> = [
+            "rt-gateway",
+            "sy-identity",
+            "sy-admin",
+            "sy-edge",
+            "sy-extra",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let mut upgrade = BootUpgradeRestart::planned(&order, &binaries, 1_000);
+        let calls = std::cell::RefCell::new(Vec::new());
+        for service in ["rt-gateway", "sy-identity", "sy-admin", "sy-extra"] {
+            start_core_service_with(
+                service,
+                &binaries,
+                &mut upgrade,
+                |service| {
+                    calls.borrow_mut().push(format!("start {service}"));
+                    Ok(())
+                },
+                |service| {
+                    calls.borrow_mut().push(format!("restart {service}"));
+                    Ok(())
+                },
+            )
+            .expect("started");
+        }
+        assert_eq!(
+            calls.into_inner(),
+            [
+                "restart rt-gateway",
+                "restart sy-identity",
+                "start sy-admin",
+                "restart sy-extra"
+            ]
+        );
+        assert_eq!(upgrade.started_at_ms.as_deref(), Some("1000"));
+        assert_eq!(upgrade.updated, ["rt-gateway", "sy-extra"]);
+        assert_eq!(upgrade.unanswered, ["sy-identity"]);
+        let record = boot_upgrade_restart_record(
+            "1000",
+            &upgrade.updated,
+            &upgrade.unanswered,
+            &upgrade.restarted,
+            &upgrade.errors,
+        );
+        assert_eq!(record["status"], "ok");
+        assert_eq!(
+            record["updated"],
+            serde_json::json!(["rt-gateway", "sy-extra"])
+        );
+        assert_eq!(record["unanswered"], serde_json::json!(["sy-identity"]));
+        assert_eq!(
+            record["restarted"],
+            serde_json::json!(["rt-gateway", "sy-identity", "sy-extra"])
+        );
+
+        // A boot whose checks only gave no answer restarts those services all the same, and
+        // records no package upgrade: it could be any start of this orchestrator, and its record
+        // would take the place of a spoke's last core update, which SY.admin follows.
+        let mut unanswered_only = BootBinaryChecks::default();
+        unanswered_only.take("rt-gateway", NoAnswer, true);
+        unanswered_only.take("sy-admin", No, true);
+        assert!(unanswered_only.restarts("rt-gateway"));
+        let quiet = BootUpgradeRestart::planned(&order, &unanswered_only, 1_000);
+        assert!(quiet.started_at_ms.is_none());
+        assert_eq!(quiet.unanswered, ["rt-gateway"]);
+
+        // The boot asks each check again while it gives none, as a node action does.
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        let boot_checks = body("async fn check_core_binaries_at_boot(");
+        assert!(boot_checks.contains(
+            "ask_again_while_unanswered(\n                || service_runs_replaced_binary(service),"
+        ));
+        let boot = body("async fn bootstrap_local(");
+        assert!(boot.contains(
+            "let binaries = check_core_binaries_at_boot(&core_services, &unlisted_core).await;"
+        ));
+        assert!(boot.contains(".filter(|service| binaries.replaced.contains(*service))"));
+        assert!(!boot.contains("start_core_service(service, &replaced"));
+    }
+
+    /// FINDINGS A-282: a replaced-binary check with no answer is asked again as a unit check is:
+    /// three times at most, its first answer ending it. Syncthing's staleness check asks the same
+    /// way, and one that still gives none restarts nothing by itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_replaced_binary_check_with_no_answer_is_asked_again() {
+        use CheckAnswer::{NoAnswer, Yes};
+        async fn ask(answers: &[CheckAnswer]) -> (CheckAnswer, usize) {
+            let asked = std::cell::Cell::new(0);
+            let answer = ask_again_while_unanswered(
+                || {
+                    let answer = answers.get(asked.get()).copied().unwrap_or(NoAnswer);
+                    asked.set(asked.get() + 1);
+                    answer
+                },
+                REPLACED_BINARY_CHECK_LIMIT,
+            )
+            .await;
+            (answer, asked.get())
+        }
+        assert_eq!(ask(&[Yes]).await, (Yes, 1));
+        assert_eq!(ask(&[NoAnswer, NoAnswer, Yes]).await, (Yes, 3));
+        assert_eq!(
+            ask(&[]).await,
+            (NoAnswer, 1 + SERVICE_CHECK_ASKS_AGAIN as usize)
+        );
+
+        let src = include_str!("sy_orchestrator.rs");
+        let ensure = &src[src
+            .find("async fn ensure_blob_sync_runtime(")
+            .expect("the ensure")..];
+        let ensure = &ensure[..ensure.find("\n}\n").expect("its end")];
+        let asked_again = ensure
+            .find(
+                "ask_again_while_unanswered(\n        || service_runs_replaced_binary(SYNCTHING_SERVICE_NAME),",
+            )
+            .expect("asked again");
+        let stale = ensure
+            .find("let stale = syncthing_runs_stale(")
+            .expect("the staleness");
+        assert!(asked_again < stale);
+        assert!(ensure[stale..].starts_with(
+            "let stale = syncthing_runs_stale(\n        systemd_activity(SYNCTHING_SERVICE_NAME),\n        binary_updated,\n        unit_changed,\n        runs_replaced_binary,\n    );"
+        ));
     }
 
     /// A manifest whose io.api pointer names `current`.
@@ -60108,19 +60518,26 @@ blob:
 
     #[test]
     fn syncthing_restarts_only_a_running_service_left_on_an_old_binary_or_unit() {
+        use CheckAnswer::{No, NoAnswer, Yes};
         use ServiceActivity::{Active, Inactive, Unknown};
         // activity, binary_updated, unit_changed, runs_replaced_binary
-        assert!(syncthing_runs_stale(Active, true, false, false));
-        assert!(syncthing_runs_stale(Active, false, true, false));
+        assert!(syncthing_runs_stale(Active, true, false, No));
+        assert!(syncthing_runs_stale(Active, false, true, No));
         // A restart an earlier call lost: nothing changed now, but the process runs a deleted file.
-        assert!(syncthing_runs_stale(Active, false, false, true));
-        assert!(!syncthing_runs_stale(Active, false, false, false));
+        assert!(syncthing_runs_stale(Active, false, false, Yes));
+        assert!(!syncthing_runs_stale(Active, false, false, No));
         // A stopped service starts on what is on disk: nothing to restart.
-        assert!(!syncthing_runs_stale(Inactive, true, true, true));
+        assert!(!syncthing_runs_stale(Inactive, true, true, Yes));
         // FINDINGS A-267: a check with no answer may hide a running one, and a restart also
         // starts a stopped one.
-        assert!(syncthing_runs_stale(Unknown, false, true, false));
-        assert!(!syncthing_runs_stale(Unknown, false, false, false));
+        assert!(syncthing_runs_stale(Unknown, false, true, No));
+        assert!(!syncthing_runs_stale(Unknown, false, false, No));
+        // FINDINGS A-282: the process' check with no answer, asked again, restarts nothing by
+        // itself, or every call would restart Syncthing while `systemctl show` fails; a new binary
+        // or unit still does.
+        assert!(!syncthing_runs_stale(Active, false, false, NoAnswer));
+        assert!(!syncthing_runs_stale(Unknown, false, false, NoAnswer));
+        assert!(syncthing_runs_stale(Active, true, false, NoAnswer));
     }
 
     /// FINDINGS A-267, A-314: `systemctl is-active` says active only by exit 0 and not running
