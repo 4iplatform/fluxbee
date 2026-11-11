@@ -7705,7 +7705,7 @@ async fn sweep_expired_publications_once(
     client: &Arc<RouterDispatcher>,
 ) -> Result<(), String> {
     // Snapshot the due set under a SHORT lock, then RELEASE it — never hold publication_lock across
-    // the network RPCs. The serial internal-admin loop (run_internal_admin_loop) and
+    // the network RPCs. The internal-admin loop's commands (run_internal_admin_loop) and
     // handle_publish/unpublish_artifact all contend on this lock; holding it across an unbounded
     // batch of 30s edge/blob RPCs would head-of-line-block the whole admin control plane (a mesh
     // publish issued mid-sweep would stall and blow its 120s RPC timeout). Each retirement below
