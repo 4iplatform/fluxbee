@@ -172,10 +172,13 @@ Identity is created in two steps:
   `/var/lib/fluxbee/hives/<hive>/`, the authority on which hives exist) before it looks for the
   hive's key, with the `IDENTITY_AUTH_ERROR` "authentication failed" that every refusal gets; only
   its log says why: `auth: hive '<hive>' is not in the hive registry (removed or never joined)`.
-  A hive's open delta subscription and publish stream end when its hive leaves the registry,
-  within one recheck (10 s, `IDENTITY_REGISTRY_RECHECK_SECS`, the router's for a WAN link), with
-  the warning `identity sync session closed: the hive is no longer in the registry (removed)`,
-  and its reconnects are refused. Until 0.1.136 the key alone was enough: a removed hive whose key
+  It checks again when the request arrives: a hive removed since its handshake gets no snapshot,
+  no subscription and no publish stream, and its connection closes unanswered. A hive's open
+  delta subscription and publish stream end when its hive leaves the registry, within one recheck
+  (10 s, `IDENTITY_REGISTRY_RECHECK_SECS`, the router's for a WAN link), with the warning
+  `identity sync session closed: the hive is no longer in the registry (removed)`, and its
+  reconnects are refused (see "A removed hive still connected" under Failure behavior for when a
+  restart ends them first). Until 0.1.136 the key alone was enough: a removed hive whose key
   the removal could not delete (`identity_key_cleanup: delete_failed`) kept its subscription and
   could take a new full sync until the orchestrator's next start swept the key. A join is listed
   before its first handshake: the orchestrator creates the hive's directory when it accepts the
@@ -207,12 +210,13 @@ Identity is created in two steps:
   (`HiveRegistry::lists`, `/var/lib/fluxbee/hives/<hive>`, the authority on which hives exist), with
   the warning `dropped an identity publish of a hive the registry no longer lists (removed)`. A
   removed hive's SY.identity can outlive its removal: for the moment before the hive's cleanup
-  stops it, or, when the cleanup did not reach it, until its sessions end within a recheck
-  (above, FINDINGS A-277); with `identity.sync.auth` off, for good. Until then the primary's
-  deltas still reach it, and it seeds its ILKs again after each one, so its next push would take
-  the removal's retire marks off them, and an empty snapshot would remove its nodes' ILKs. The
-  registry drops the hive before the removal answers, so before SY.admin retires its ILKs, and
-  lists a hive joined again from the moment its join is accepted, before its SY.identity starts.
+  stops it, or, when the cleanup did not reach it, until its sessions end, at once when the
+  removal deleted its key and within a recheck when it could not (FINDINGS A-277, under Failure
+  behavior); with `identity.sync.auth` off, for good. Until then the primary's deltas still reach
+  it, and it seeds its ILKs again after each one, so its next push would take the removal's
+  retire marks off them, and an empty snapshot would remove its nodes' ILKs. The registry drops
+  the hive before the removal answers, so before SY.admin retires its ILKs, and lists a hive
+  joined again from the moment its join is accepted, before its SY.identity starts.
 - Limits: 64 concurrent sync connections, 256 delta subscribers, 1024 queued frames per
   subscriber (a slow one is dropped and resyncs).
 
@@ -369,16 +373,30 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
 - **HMAC failure:** the primary logs `identity sync request failed`; the replica logs the failure
   and reconnects.
 - **A removed hive still connected:** for a moment after a removal it is the hive's SY.identity
-  before its cleanup stops it; otherwise one the cleanup did not reach. Within 10 s the primary
-  ends its sessions (`identity sync session closed: the hive is no longer in the registry
-  (removed)`, FINDINGS A-277), and until then logs `dropped an identity publish of a hive the
-  registry no longer lists (removed)` for each frame it publishes and applies none. Then each of
-  its reconnects, about two a second (its subscription's and its publish's) for as long as it
-  runs, is refused: `identity sync request failed` with `auth: hive '<hive>' is not in the hive
-  registry (removed or never joined)`, whether or not the removal deleted its key. The
-  orchestrator still restarts `sy-identity` after deleting the key of a hive its cleanup did not
-  reach (`identity_restart`): no longer needed to close the session, it only makes every replica
-  subscribe again.
+  before its cleanup stops it; otherwise one the cleanup did not reach. For that one, when the
+  removal deleted its key, the orchestrator restarts `sy-identity` (`identity_restart:
+  restarted`), which ends every session at once (the other replicas reconnect and subscribe
+  again); otherwise (`identity_key_cleanup: delete_failed` or `no_key`, or `identity_restart:
+  failed`) the primary ends the hive's sessions within one recheck, 10 s (`identity sync session
+  closed: the hive is no longer in the registry (removed)`, FINDINGS A-277), and until then logs
+  `dropped an identity publish of a hive the registry no longer lists (removed)` for each frame
+  it publishes and applies none. From then on, for as long as it runs, each of its reconnects is
+  refused: `identity sync request failed` with `auth: hive '<hive>' is not in the hive registry
+  (removed or never joined)`, whether or not the removal deleted its key. That is about one a
+  second from the cut (its subscription's), and two once its next reconcile push, within 30 s
+  (`IDENTITY_PUBLISH_RECONCILE_SECS`), finds its publish stream closed: its publish loop reads
+  nothing between frames. A request that arrives after the removal on a connection authenticated
+  before it is refused too: `auth: hive '<hive>' is no longer in the hive registry (removed after
+  its handshake): its <full sync|delta subscription|publish> is refused`. The restart stays
+  needed: the recheck reads the registry, not the key, so without it a session opened with a key
+  the removal deleted would go on if the hive were joined again within one recheck, since the
+  new join's accept lists the hive at once.
+- **A hive joined again under a removed hive's name (a known limit):** the new join keeps a key
+  that survived the removal (`ensure_local_identity_key` keeps a key it finds). A removed box
+  that still runs with that key (its cleanup not reached, `identity_key_cleanup: delete_failed`)
+  is then admitted again from the new join's accept, and its publishes are applied again. Until
+  a fresh join gets a new key in the orchestrator, do not join a hive again under the name of a
+  removed one whose box may still run.
 - Startup errors (wrong role, bad `hive.yaml`, missing HMAC key on a replica) end the process;
   systemd restarts it every 5 s.
 
