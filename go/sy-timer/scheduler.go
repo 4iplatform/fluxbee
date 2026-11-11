@@ -52,8 +52,15 @@ func (h *timerHeap) Pop() any {
 type timerScheduler struct {
 	service *Service
 
-	mu     sync.Mutex
-	items  timerHeap
+	mu    sync.Mutex
+	items timerHeap
+	// queued is each pending timer's entry in items, by its uuid: the next fire it waits for, one per
+	// timer. TIMER_RESCHEDULE moves it, and TIMER_CANCEL and TIMER_PURGE_OWNER take it out, so items
+	// holds the pending timers only, and the retries of fires on their way, which are not here
+	// (retryLater): each leaves at its time, within the retry window (FINDINGS A-259). Before, nothing
+	// took an entry out: a canceled, moved or purged timer's stayed until its old fire time, up to 366
+	// days ahead, and was dropped then.
+	queued map[string]*timerHeapEntry
 	wakeCh chan struct{}
 	// lockMu guards locks: the timers being worked on, each with its lock (lockTimer).
 	lockMu sync.Mutex
@@ -86,10 +93,14 @@ const (
 // deliveryRetryDelays are the waits before each new attempt of a fire; the last one repeats.
 var deliveryRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute}
 
-// afterFireRead, set by tests only, runs in a fire between its read of the timer and its save, with
-// the timer's lock held: where a change that did not take the lock was written over (FINDINGS
-// A-220's review).
+// afterFireRead, set by tests only, runs in a fire right after its read of a pending timer, before its
+// save, with the timer's lock held: where a change that did not take the lock was written over
+// (FINDINGS A-220's review), and where a purge, which takes none, lands (FINDINGS A-259).
 var afterFireRead func(timerUUID string)
+
+// afterFireSave, set by tests only, runs in a fire right after its save, before its send, with the
+// timer's lock held: where a purge lands after a recurring timer's next fire is saved (FINDINGS A-259).
+var afterFireSave func(timerUUID string)
 
 // transientUnreachable are the router's UNREACHABLE reasons for a target that is down, restarting or
 // behind a link that is down, and LINK_BUSY: its link queue is full, a refusal that clears as the
@@ -123,6 +134,7 @@ func newTimerScheduler(service *Service) *timerScheduler {
 	return &timerScheduler{
 		service: service,
 		items:   timerHeap{},
+		queued:  map[string]*timerHeapEntry{},
 		wakeCh:  make(chan struct{}, 1),
 		locks:   map[string]*timerLockEntry{},
 		sent:    map[string]*fireAttempt{},
@@ -271,7 +283,10 @@ func (s *timerScheduler) processDue(ctx context.Context, now time.Time) {
 // and its send; TIMER_CANCEL and TIMER_RESCHEDULE take the same lock (lockOwnedTimerForMutation), so
 // neither lands between them to be written over (FINDINGS A-220's review). The save is made only
 // while the row is still pending: a purge, which takes no lock, is not written over, and its fire
-// is not sent.
+// is not sent. Nor is the purged timer left in the heap (FINDINGS A-259): the fire queues the timer
+// again (a recurring timer's next fire, a timer moved later) before its save, or before a second
+// read, so a purge after its first read takes that entry out after it is queued, or the save or the
+// read finds the timer gone and the fire takes the entry out itself.
 func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, now time.Time) {
 	unlock := s.lockTimer(timerUUID)
 	defer unlock()
@@ -283,12 +298,17 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 	if row.Status != "pending" {
 		return
 	}
-	if row.FireAtUTC > now.UTC().UnixMilli() {
-		s.push(row.UUID, row.FireAtUTC)
-		return
-	}
 	if afterFireRead != nil {
 		afterFireRead(row.UUID)
+	}
+	if row.FireAtUTC > now.UTC().UnixMilli() {
+		// Moved later (TIMER_RESCHEDULE) after this entry left the heap: the move queued the timer at
+		// its new time, and this keeps it there. Read again after it, for a purge since the read above.
+		s.push(row.UUID, row.FireAtUTC)
+		if _, err := getTimer(ctx, s.service.db, row.UUID); errors.Is(err, sql.ErrNoRows) {
+			s.remove(row.UUID)
+		}
+		return
 	}
 	actual := time.Now().UTC()
 	fire := &fireAttempt{row: *row, attempt: 1, deadline: deliveryDeadline(*row, actual)}
@@ -309,6 +329,8 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 		if next := time.UnixMilli(nextFireAt).UTC(); next.Before(fire.deadline) {
 			fire.deadline = next
 		}
+		// Queued before the save, which says whether the timer is still there (above).
+		s.push(row.UUID, nextFireAt)
 	} else {
 		row.Status = "fired"
 	}
@@ -325,6 +347,7 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 		return
 	}
 	if !saved {
+		s.remove(row.UUID)
 		logEvent("timer_fire_dropped", map[string]any{
 			"timer_uuid": row.UUID,
 			"attempt":    fire.attempt,
@@ -332,13 +355,15 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 		})
 		return
 	}
+	if afterFireSave != nil {
+		afterFireSave(row.UUID)
+	}
 	if row.Kind == "recurring" {
 		logEvent("timer_recurring_requeued", map[string]any{
 			"timer_uuid":     row.UUID,
 			"fire_at_utc_ms": row.FireAtUTC,
 			"fire_count":     row.FireCount,
 		})
-		s.push(row.UUID, row.FireAtUTC)
 	}
 	s.deliver(fire)
 }
@@ -448,7 +473,7 @@ func (s *timerScheduler) retryLater(fire *fireAttempt, reason string) {
 	fields["retry_at_utc_ms"] = next.UnixMilli()
 	logEvent("timer_fire_undelivered", fields)
 	fire.attempt++
-	s.pushEntry(&timerHeapEntry{timerUUID: fire.row.UUID, fireAtUTC: next.UnixMilli(), retry: fire})
+	s.pushRetry(fire, next.UnixMilli())
 }
 
 // retryFire sends a fire again, unless its timer was canceled or purged since.
@@ -589,17 +614,47 @@ func (s *timerScheduler) emitTimerFired(row timerRow, actual time.Time, traceID 
 	return s.service.sender.Send(msg)
 }
 
+// push queues timerUUID's next fire at fireAtUTC. A timer queued already moves there (TIMER_RESCHEDULE,
+// a fire that finds its timer moved later): a timer is in the heap once (queued, FINDINGS A-259).
 func (s *timerScheduler) push(timerUUID string, fireAtUTC int64) {
-	s.pushEntry(&timerHeapEntry{timerUUID: timerUUID, fireAtUTC: fireAtUTC})
-}
-
-func (s *timerScheduler) pushEntry(entry *timerHeapEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	heap.Push(&s.items, entry)
+	if entry, ok := s.queued[timerUUID]; ok {
+		entry.fireAtUTC = fireAtUTC
+		heap.Fix(&s.items, entry.index)
+	} else {
+		entry = &timerHeapEntry{timerUUID: timerUUID, fireAtUTC: fireAtUTC}
+		heap.Push(&s.items, entry)
+		s.queued[timerUUID] = entry
+	}
 	s.signal()
 }
 
+// pushRetry queues a fire's next attempt at fireAtUTC (retryLater). It is not its timer's entry: a
+// recurring timer whose last fire is sent again waits for its next fire too.
+func (s *timerScheduler) pushRetry(fire *fireAttempt, fireAtUTC int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	heap.Push(&s.items, &timerHeapEntry{timerUUID: fire.row.UUID, fireAtUTC: fireAtUTC, retry: fire})
+	s.signal()
+}
+
+// remove takes the entries of timerUUIDs out of the heap, for those that have one: a canceled or
+// purged timer leaves it at once, not at its old fire time (FINDINGS A-259). A retry of a fire sent
+// already stays: it leaves at its time, dropped because its timer was canceled or purged (retryFire).
+func (s *timerScheduler) remove(timerUUIDs ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, timerUUID := range timerUUIDs {
+		if entry, ok := s.queued[timerUUID]; ok {
+			heap.Remove(&s.items, entry.index)
+			delete(s.queued, timerUUID)
+		}
+	}
+	s.signal()
+}
+
+// popDue takes out the first entry when it is due: a timer's own entry leaves queued with it.
 func (s *timerScheduler) popDue(nowUTCMS int64) *timerHeapEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -610,7 +665,11 @@ func (s *timerScheduler) popDue(nowUTCMS int64) *timerHeapEntry {
 	if entry.fireAtUTC > nowUTCMS {
 		return nil
 	}
-	return heap.Pop(&s.items).(*timerHeapEntry)
+	heap.Pop(&s.items)
+	if s.queued[entry.timerUUID] == entry {
+		delete(s.queued, entry.timerUUID)
+	}
+	return entry
 }
 
 // lockTimer takes a timer's lock and returns what releases it; calling that again does nothing. A

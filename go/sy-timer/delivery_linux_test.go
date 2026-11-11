@@ -224,7 +224,7 @@ func TestARetryStopsWhenItsTimerIsPurged(t *testing.T) {
 	if err := service.handleMessage(unreachable(t, traceID, "NODE_NOT_FOUND")); err != nil {
 		t.Fatalf("handle UNREACHABLE: %v", err)
 	}
-	if _, err := deleteTimersByOwner(context.Background(), service.db, "WF.demo@motherbee"); err != nil {
+	if _, _, err := deleteTimersByOwner(context.Background(), service.db, "WF.demo@motherbee"); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 	service.scheduler.processDue(context.Background(), time.Now().UTC().Add(time.Second))

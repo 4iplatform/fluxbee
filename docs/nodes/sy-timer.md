@@ -52,7 +52,9 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    `SY.timer ready: node=... db=... pending=N gc_deleted=M gc_stamped=S` (S: the canceled timers
    step 5 dated), starts the scheduler and serves messages. When step 5 failed, the line says
    `gc=failed` in place of both counts, and `timer_startup` gives `gc_error` (`startupGC`): the
-   failed GC's counts are 0, which would read as nothing to delete or to date.
+   failed GC's counts are 0, which would read as nothing to delete or to date. A count of the
+   pending timers that fails is `pending=failed` the same way, with `pending_error` in
+   `timer_startup` (`startupPending`, since 1.6, FINDINGS A-259); before, the line said `pending=0`.
 
 ## Timers
 
@@ -99,8 +101,13 @@ Rules enforced in `main.go`:
 ### Firing
 
 The scheduler (`timerScheduler` in `scheduler.go`) keeps pending timers in a min-heap by fire
-time and sleeps until the next one (at most one hour when the heap is empty). When a timer is
-due, `fireTimerByUUID` re-reads it, skips it unless still `pending`, and sends:
+time and sleeps until the next one (at most one hour when the heap is empty). The heap holds one
+entry per pending timer, found by its uuid (`queued`), and the retries of fires on their way (below):
+`TIMER_CANCEL` takes the timer's entry out, `TIMER_RESCHEDULE` moves it, and `TIMER_PURGE_OWNER`
+takes out the owner's pending timers' entries (since 1.6, FINDINGS A-259). Before, nothing took an
+entry out: a canceled, moved or purged timer's stayed until its old fire time, up to 366 days ahead,
+and a node that looped a schedule and its cancel grew the heap, unseen by the pending caps. When a
+timer is due, `fireTimerByUUID` re-reads it, skips it unless still `pending`, and sends:
 
 - `TIMER_FIRED`, a `SYSTEM` unicast to `target_l2_name` (TTL 16, new trace id), with payload
   `timer_uuid`, `owner_l2_name`, `kind`, `scheduled_fire_at_utc_ms`, `actual_fire_at_utc_ms`,
@@ -118,7 +125,9 @@ A fire holds its timer's lock (`lockTimer`) from its read of the row to its save
 waits, then sees what the fire wrote, so a one-shot that fired is `TIMER_ALREADY_FIRED` and a
 recurring timer canceled after its fire stays canceled. Before, the fire's save wrote over them. The
 save is made only while the row is still `pending` (`updateTimerIfStatus`): the fire of a timer
-purged meanwhile (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_fire_dropped`). The
+purged meanwhile (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_fire_dropped`), nor
+is the timer left in the heap: the fire puts a recurring timer's next fire there before its save,
+and takes it out again when the save finds the timer gone (since 1.6). The
 scheduler keeps a timer's lock only while something holds it or waits for it (since 1.5, FINDINGS
 A-244); before, it kept one for every timer that ever fired, was canceled or rescheduled, until
 SY.timer stopped.

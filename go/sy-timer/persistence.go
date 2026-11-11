@@ -327,12 +327,29 @@ ORDER BY fire_at_utc ASC
 	return collectTimerRows(rows)
 }
 
-func deleteTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (int64, error) {
-	result, err := db.ExecContext(ctx, `DELETE FROM timers WHERE owner_l2_name=?`, ownerL2Name)
+// deleteTimersByOwner deletes every timer of ownerL2Name, in any status, in one statement, and returns
+// how many, and the uuids of the pending ones among them: their entries leave the scheduler's heap
+// (TIMER_PURGE_OWNER, FINDINGS A-259).
+func deleteTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (deleted int64, pending []string, err error) {
+	rows, err := db.QueryContext(ctx, `DELETE FROM timers WHERE owner_l2_name=? RETURNING uuid, status`, ownerL2Name)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return result.RowsAffected()
+	defer rows.Close()
+	for rows.Next() {
+		var timerUUID, status string
+		if err := rows.Scan(&timerUUID, &status); err != nil {
+			return 0, nil, err
+		}
+		deleted++
+		if status == "pending" {
+			pending = append(pending, timerUUID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	return deleted, pending, nil
 }
 
 func countPendingTimers(ctx context.Context, db *sql.DB) (int64, error) {

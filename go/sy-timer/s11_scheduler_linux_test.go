@@ -184,3 +184,30 @@ func TestAStartWhoseHistoryGCFailedSaysSo(t *testing.T) {
 		t.Fatalf("a GC that failed: deleted %d, dated %d, %q, %v (%v)", deleted, stamped, line, fields, err)
 	}
 }
+
+// A start gives its count of pending timers in its timer_startup event and its ready line (§11). A
+// count that failed is 0, as for a hive with no pending timer: the start says pending=failed instead,
+// with the error in the event, and gives no count (FINDINGS A-259). Before, the ready line said
+// pending=0, next to a separate error line.
+func TestAStartWhoseCountOfPendingTimersFailedSaysSo(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insertOwnedTimer(t, db, timerRow{UUID: "timer-pending", OwnerL2Name: "WF.demo@motherbee", TargetL2Name: "WF.demo@motherbee",
+		Kind: "oneshot", FireAtUTC: now.Add(time.Hour).UnixMilli(), MissedPolicy: "fire", Payload: `{}`, Status: "pending",
+		CreatedAtUTC: now.UnixMilli()})
+
+	count, err := countPendingTimers(ctx, db)
+	fields := map[string]any{}
+	if line := startupPending(fields, count, err); err != nil || line != "pending=1" || len(fields) != 1 || fields["pending_count"] != int64(1) {
+		t.Fatalf("a count of one pending timer: %q, %v (%v)", line, fields, err)
+	}
+
+	_ = db.Close()
+	count, err = countPendingTimers(ctx, db)
+	fields = map[string]any{}
+	if line := startupPending(fields, count, err); err == nil || count != 0 || line != "pending=failed" ||
+		len(fields) != 1 || fields["pending_error"] != err.Error() {
+		t.Fatalf("a count that failed: %d, %q, %v (%v)", count, line, fields, err)
+	}
+}

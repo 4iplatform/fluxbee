@@ -1,14 +1,16 @@
 # SY.timer — System Node
 
-**Status:** v1.5 implemented / aligned with current runtime
+**Status:** v1.6 implemented / aligned with current runtime
 **Date:** 2026-04-13; checked against the code on 2026-10-27; v1.2 on 2026-11-04, in 0.1.99: a fire saved
 before it goes and sent again while its target is down, caps, reads by the owner, a node's own
 target (FINDINGS A-115); v1.3 for the next release: `TIMER_LIST` in pages (FINDINGS A-151); v1.4 in
 0.1.127: a recurring timer SY.timer cannot schedule is canceled, and a timer SY.timer cancels says
 why in `canceled_reason`; a refusal's code goes with its error, not in its text (FINDINGS A-220);
-v1.5 for the next release: a canceled timer is kept 7 days from its cancellation, not from its
-creation or its last fire (FINDINGS A-238), and a timer's lock is kept in memory only while it is in
-use (FINDINGS A-244)
+v1.5 in 0.1.131: a canceled timer is kept 7 days from its cancellation, not from its creation or its
+last fire (FINDINGS A-238), and a timer's lock is kept in memory only while it is in use (FINDINGS
+A-244); v1.6 in 0.1.133: the scheduler's heap holds the pending timers only, a canceled, moved or
+purged timer's entry leaving it at once, and a start whose count of pending timers fails says so
+(FINDINGS A-259)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -161,25 +163,29 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
                if timer.status != 'pending':
                    continue  // canceled
                if timer.fire_at_utc > now():
-                   push back to heap; continue  // rescheduled later
+                   keep it in the heap at that time  // rescheduled later, which queued it there
+                   if a read again finds it gone (purged): take it out
+                   continue
                if timer.is_recurring:
                    compute next fire_at from cron_spec, from now
                    if it cannot be computed:
                        cancel it, with its canceled_reason (§11); send nothing; continue
-                   update db while still pending, push back to heap
+                   put its next fire in the heap, then update db while still pending
                else:
                    update db while still pending: status = 'fired'
-               if the update failed: push back in 30 s; continue  // nothing sent
-               if the row was no longer pending (purged): continue  // nothing sent
+               if the update failed: move it in the heap to 30 s from now; continue  // nothing sent
+               if the row was no longer pending (purged): take it out of the heap; continue  // nothing sent
                send TIMER_FIRED to timer.target (§7.8)
    }
 ```
 
+The heap holds one entry per pending timer, the next fire it waits for, found by its uuid (`queued`), and the retries of fires on their way (§7.8), which are no timer's entry and leave at their time, within the hour of retries. `TIMER_CANCEL` takes the timer's entry out (§7.3), `TIMER_RESCHEDULE` moves it (§7.4), and `TIMER_PURGE_OWNER` takes out the entries of the owner's pending timers (§7.7). Since v1.6 (FINDINGS A-259); before, nothing took an entry out: a canceled, moved or purged timer's entry stayed until its old fire time, up to 366 days ahead, and was dropped then, and a node that looped a schedule a year ahead and its cancel grew the heap by about 100 bytes a pair, which the pending caps (§19), counting pending rows only, never saw.
+
 ### 4.4 Concurrency
 
-- One global mutex for the heap structure.
+- One global mutex for the heap and its index of pending timers (`queued`, §4.3).
 - One mutex per timer being worked on (`lockTimer`: a map by uuid, whose entry counts who holds it or waits for it and leaves with the last of them, since v1.5, FINDINGS A-244; before, the map kept a mutex for every timer that ever fired, was canceled or rescheduled, until `SY.timer` stopped), taken by the fire and its retries, and by `TIMER_CANCEL` and `TIMER_RESCHEDULE` (`lockOwnedTimerForMutation`, since v1.4, FINDINGS A-220's review). A fire holds it from its read of the row to its save and its send; a cancel or a reschedule that lands meanwhile waits, reads the timer again, and sees what the fire wrote: it wins, or loses cleanly. A one-shot that fired is `TIMER_ALREADY_FIRED`; a recurring timer canceled after a fire stays canceled. Before, they took no lock, and the fire's save wrote over them: a recurring timer its owner was told is canceled kept firing, and a one-shot rescheduled during its fire fired again at its new time.
-- A fire saves its row only while it is still `pending` (`updateTimerIfStatus`): `TIMER_PURGE_OWNER`, which takes no timer lock, is not written over, and the fire of a purged timer is not sent (`timer_fire_dropped`).
+- A fire saves its row only while it is still `pending` (`updateTimerIfStatus`): `TIMER_PURGE_OWNER`, which takes no timer lock, is not written over, and the fire of a purged timer is not sent (`timer_fire_dropped`). Nor is the purged timer left in the heap (since v1.6, FINDINGS A-259): the fire puts a recurring timer's next fire in the heap before its save, and keeps a timer it finds rescheduled later there before it reads it again, so either the purge takes that entry out after it, or the save or the read finds the timer gone and the fire takes the entry out itself.
 - SQLite operations serialized by the driver (SQLite in WAL mode allows multiple readers + one writer).
 
 ---
@@ -429,6 +435,8 @@ If the timer has already fired (`status = 'fired'`): `TIMER_ALREADY_FIRED`.
 
 A cancel dates the timer (`canceled_at_utc`, since v1.5, FINDINGS A-238): it is kept 7 days from then (§5.2). A cancel by `timer_uuid` of a timer canceled already answers the same, and keeps its first date.
 
+A cancel takes the timer out of the scheduler's heap at once (§4.3, since v1.6, FINDINGS A-259); before, its entry stayed there until its old fire time. A fire of a recurring timer that is being sent again (§7.8) is dropped at its next attempt, as before.
+
 **Response OK:**
 ```json
 {
@@ -473,6 +481,8 @@ It can also identify the timer by the `client_ref` of the active owner:
 Validation: the same ownership check. It only applies to timers in `status='pending'`. For recurring timers, reschedule is not allowed in v1 (cancel and recreate). Error `TIMER_RECURRING_NOT_RESCHEDULABLE`.
 
 The 60 s minimum and the 366-day maximum apply to the `new_fire_at` too.
+
+The timer's entry in the scheduler's heap moves to the new time: a timer is in the heap once (§4.3, since v1.6, FINDINGS A-259). Before, each reschedule added an entry, and the old one stayed until its time.
 
 ### 7.5 `TIMER_GET`
 
@@ -588,6 +598,7 @@ Deletes **all the timers** of a given `owner_l2_name`.
 - Idempotent deletion: if there are no timers, it answers `ok` with `deleted_count: 0`.
 - It deletes both `pending` and historical timers (`fired`, `canceled`) — consistent with the spirit of "the node no longer exists".
 - Silent: it does not emit `TIMER_FIRED` for the deleted pending timers; they are considered canceled.
+- The deleted pending timers leave the scheduler's heap at once (§4.3, since v1.6, FINDINGS A-259): the deletion is one statement (`DELETE ... RETURNING uuid, status`), and the entries of the pending ones are taken out after it. It takes no timer lock: a fire of one of them that is under way is not sent, and leaves no entry behind (§4.4). Before, their entries stayed until their old fire times.
 
 **Response:** the count only; the owner is not repeated.
 ```json
@@ -801,7 +812,7 @@ Returns a complete descriptor of the node's capabilities, meant for both human a
     "verb": "TIMER_HELP",
     "node_family": "SY",
     "node_kind": "SY.timer",
-    "version": "1.5",
+    "version": "1.6",
     "description": "System node providing persistent timers and authoritative time/timezone services.",
     "operations": [
       {
@@ -858,7 +869,7 @@ At node startup:
    - One-shot with `fire_at_utc <= now`: apply `missed_policy` (§10). If it fires: it is queued, due at once, and fires as any due timer (§4.3, §7.8). If it is dropped: save `status='canceled'` with its `canceled_reason`, and log a `timer_missed_policy_applied` event whose `outcome` says why.
 
 A recurring timer whose next fire cannot be computed when it fires is canceled the same way, logged once as `timer_recurring_next_fire_failed`, and that fire is not sent; a row that cannot be saved stays `pending` and is tried again in 30 s (`timer_fire_persist_failed`). A save that fails at the replay stops the start, as any other there: systemd starts `SY.timer` again.
-5. Log `SY.timer ready: ... pending=N gc_deleted=M gc_stamped=S` (S: the canceled timers step 2 dated, none once every one has its date), start the tick loop, and serve requests. When step 2 failed, the line says `gc=failed` in place of both counts (`startupGC`, since v1.5): a failed GC returns 0 for both, which would read as one that found nothing to delete or to date.
+5. Log `SY.timer ready: ... pending=N gc_deleted=M gc_stamped=S` (S: the canceled timers step 2 dated, none once every one has its date), start the tick loop, and serve requests. When step 2 failed, the line says `gc=failed` in place of both counts (`startupGC`, since v1.5): a failed GC returns 0 for both, which would read as one that found nothing to delete or to date. When the count of pending timers fails (`countPendingTimers`, after the replay), the line says `pending=failed`, and `timer_startup` gives `pending_error` in place of `pending_count` (`startupPending`, since v1.6, FINDINGS A-259): before, it said `pending=0`, next to a separate error line.
 
 **Guarantee:** a timer created with `fire_at_utc = T` will fire at time `T` of the OS clock, subject to the node's availability and to its `missed_policy`. There is no accumulated drift.
 
@@ -1201,7 +1212,7 @@ The `timers.db` database should be included in the backup snapshots of the `/var
 
 ### 16.4 Logs
 
-`SY.timer` logs on stdout (captured by systemd), with no levels: plain lines, and one JSON object per event (`logEvent`). Among the events: `timer_startup` (with `pending_count`, `gc_deleted` and `gc_stamped`, the canceled timers the start dated, §5.2; or, when the start's GC failed, `gc_error` in place of both counts, §11), `timer_scheduled`, `timer_fired`, `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`, `timer_missed_policy_applied` (with its `outcome`), `timer_handler_error`; for the delivery (§7.8) `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`, `timer_fire_refused`, `timer_fire_lost` and `timer_fire_dropped`; and for recurring timers `timer_recurring_requeued`, `timer_replay_invalid_recurring` and `timer_recurring_next_fire_failed`; the last two are a timer whose next fire cannot be computed, at a start or at a fire, canceled: logged once, with `outcome: canceled`, its `owner_l2_name`, its `client_ref` and its `canceled_reason` (§11). The router's `UNREACHABLE` for a fire sends it again (§7.8); one for no fire in flight is logged as an ignored message.
+`SY.timer` logs on stdout (captured by systemd), with no levels: plain lines, and one JSON object per event (`logEvent`). Among the events: `timer_startup` (with `pending_count`, or `pending_error` when the start could not count the pending timers; and `gc_deleted` and `gc_stamped`, the canceled timers the start dated, §5.2, or, when the start's GC failed, `gc_error` in place of both counts; §11), `timer_scheduled`, `timer_fired`, `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`, `timer_missed_policy_applied` (with its `outcome`), `timer_handler_error`; for the delivery (§7.8) `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`, `timer_fire_refused`, `timer_fire_lost` and `timer_fire_dropped`; and for recurring timers `timer_recurring_requeued`, `timer_replay_invalid_recurring` and `timer_recurring_next_fire_failed`; the last two are a timer whose next fire cannot be computed, at a start or at a fire, canceled: logged once, with `outcome: canceled`, its `owner_l2_name`, its `client_ref` and its `canceled_reason` (§11). The router's `UNREACHABLE` for a fire sends it again (§7.8); one for no fire in flight is logged as an ignored message.
 
 ### 16.5 Metrics (future)
 

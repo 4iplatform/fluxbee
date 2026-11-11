@@ -530,7 +530,7 @@ func TestATimersLockLeavesWithItsLastHolder(t *testing.T) {
 	answered := make(chan error, 1)
 	go func() { answered <- service.handleMessage(cancel) }()
 	waitForTimerLockRefs(t, service.scheduler, "timer-purged", 2)
-	if _, err := deleteTimersByOwner(ctx, service.db, "WF.demo@motherbee"); err != nil {
+	if _, _, err := deleteTimersByOwner(ctx, service.db, "WF.demo@motherbee"); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 	fireDone()

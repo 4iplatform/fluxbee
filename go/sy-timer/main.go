@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version             = "1.5"
+	version             = "1.6"
 	defaultNodeBaseName = "SY.timer"
 	configDir           = "/etc/fluxbee"
 	routerSockDir       = "/var/run/fluxbee/routers"
@@ -214,20 +214,33 @@ func main() {
 	if err := service.scheduler.replayPending(context.Background(), time.Now().UTC()); err != nil {
 		log.Fatalf("failed to replay pending timers: %v", err)
 	}
-	pendingCount, err := countPendingTimers(context.Background(), db)
-	if err != nil {
-		log.Printf("failed to count pending timers: %v", err)
+	pendingCount, pendingErr := countPendingTimers(context.Background(), db)
+	if pendingErr != nil {
+		log.Printf("failed to count pending timers: %v", pendingErr)
 	}
 	startup := map[string]any{
-		"node_name":     service.nodeName,
-		"db_path":       service.dbPath,
-		"pending_count": pendingCount,
+		"node_name": service.nodeName,
+		"db_path":   service.dbPath,
 	}
+	pending := startupPending(startup, pendingCount, pendingErr)
 	gc := startupGC(startup, deleted, stamped, gcErr)
 	logEvent("timer_startup", startup)
-	log.Printf("SY.timer ready: node=%s db=%s pending=%d %s", service.nodeName, service.dbPath, pendingCount, gc)
+	log.Printf("SY.timer ready: node=%s db=%s %s %s", service.nodeName, service.dbPath, pending, gc)
 	service.scheduler.start()
 	service.run()
+}
+
+// startupPending puts the start's count of pending timers in the timer_startup event's fields
+// (pending_count), and returns it for the ready line (pending=N). A count that failed is 0, which
+// would read as a hive with no pending timer: it is pending=failed instead, with pending_error in the
+// event (FINDINGS A-259).
+func startupPending(fields map[string]any, count int64, err error) string {
+	if err != nil {
+		fields["pending_error"] = err.Error()
+		return "pending=failed"
+	}
+	fields["pending_count"] = count
+	return fmt.Sprintf("pending=%d", count)
 }
 
 // startupGC puts the start's history GC (gcHistoricalTimers) in the timer_startup event's fields, and
@@ -861,7 +874,7 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 	if err := updateTimer(context.Background(), s.db, *row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_STORAGE_ERROR", err.Error())
 	}
-	s.signalScheduler()
+	s.dequeueTimers(row.UUID)
 	logEvent("timer_canceled", map[string]any{
 		"timer_uuid":     row.UUID,
 		"owner_l2_name":  row.OwnerL2Name,
@@ -945,11 +958,11 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 	if !isCanonicalL2Name(ownerL2Name) {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INVALID_PAYLOAD", "owner_l2_name must be a canonical L2 name")
 	}
-	deletedCount, err := deleteTimersByOwner(context.Background(), s.db, ownerL2Name)
+	deletedCount, pending, err := deleteTimersByOwner(context.Background(), s.db, ownerL2Name)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_STORAGE_ERROR", err.Error())
 	}
-	s.signalScheduler()
+	s.dequeueTimers(pending...)
 	logEvent("timer_owner_purged", map[string]any{
 		"owner_l2_name": ownerL2Name,
 		"deleted_count": deletedCount,
@@ -1017,18 +1030,20 @@ func timerErrorPayload(verb, code, message string) map[string]any {
 	}
 }
 
-func (s *Service) signalScheduler() {
-	if s.scheduler != nil {
-		s.scheduler.signal()
-	}
-}
-
+// enqueueTimer queues a timer scheduled or moved (TIMER_RESCHEDULE) for its fire at fireAtUTCMS: a
+// timer queued already moves there (timerScheduler.push).
 func (s *Service) enqueueTimer(timerUUID string, fireAtUTCMS int64) {
 	if s.scheduler != nil {
 		s.scheduler.push(timerUUID, fireAtUTCMS)
-		return
 	}
-	s.signalScheduler()
+}
+
+// dequeueTimers takes canceled or purged timers out of the scheduler's heap: they wait for no fire
+// (FINDINGS A-259).
+func (s *Service) dequeueTimers(timerUUIDs ...string) {
+	if s.scheduler != nil {
+		s.scheduler.remove(timerUUIDs...)
+	}
 }
 
 func loadLocation(raw string) (*time.Location, error) {
