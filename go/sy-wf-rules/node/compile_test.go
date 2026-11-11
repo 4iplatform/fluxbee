@@ -114,6 +114,35 @@ func TestCompileWorkflowRejectsInvalidDefinitionAndDoesNotWriteStaged(t *testing
 	}
 }
 
+// A timer more than 366 days ahead is refused at check and at compile, naming its path, and nothing is
+// staged: SY.timer refuses such a schedule every time, so a definition with a fire_in of 400d was
+// staged, deployed, and its timer never fired (FINDINGS A-254). 366 days is SY.timer's own ceiling.
+func TestATimerPastSYTimersCeilingIsACompileError(t *testing.T) {
+	timed := func(fireIn string) map[string]any {
+		definition := validWorkflowDefinition()
+		state := definition["states"].([]any)[0].(map[string]any)
+		transition := state["transitions"].([]any)[0].(map[string]any)
+		transition["actions"].([]any)[1].(map[string]any)["fire_in"] = fireIn
+		return definition
+	}
+	svc := newTestService(t)
+	const path = "states[0].transitions[0].actions[1].fire_in: must be at most 366d"
+	if _, err := svc.CheckWorkflow(CompileRequest{WorkflowName: "invoice", Definition: timed("400d")}); err == nil ||
+		!strings.Contains(err.Error(), "COMPILE_ERROR") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("a check refuses it, naming the path: %v", err)
+	}
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: timed("400d")}); err == nil ||
+		!strings.Contains(err.Error(), "COMPILE_ERROR") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("a compile refuses it, naming the path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "staged", "metadata.json")); !os.IsNotExist(err) {
+		t.Fatalf("nothing is staged: %v", err)
+	}
+	if meta, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: timed("366d")}); err != nil || meta.Version != 1 {
+		t.Fatalf("366 days is SY.timer's: %+v %v", meta, err)
+	}
+}
+
 // A solution's WFs and agents run on one hive (cognition-hands-v1 §12.4): a check and a compile
 // refuse a definition that names an agent or a WF on another hive, naming each path, and stage
 // nothing; an IO node, a door, may be on any hive.

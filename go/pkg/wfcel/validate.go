@@ -1364,8 +1364,9 @@ func eachRef(path string, value any, visit func(path string, ref Ref)) {
 }
 
 // validateTimerFireSpec checks a timer action's time: exactly one of fire_in (a duration, 60 s at
-// least) and fire_at (an RFC3339 UTC time), each a literal string or a $ref. A $ref is resolved when
-// the action runs, and the 60 s floor checked then; its default, a literal, is checked here.
+// least and 366 days at most) and fire_at (an RFC3339 UTC time), each a literal string or a $ref. A
+// $ref is resolved when the action runs, and the bounds checked then; its default, a literal, is
+// checked here.
 func validateTimerFireSpec(path string, fireIn, fireAt any) ValidationErrors {
 	hasFireIn, hasFireAt := IsTimeSet(fireIn), IsTimeSet(fireAt)
 	switch {
@@ -1416,20 +1417,25 @@ func validateTimeValue(path string, value any, kind string, check func(string) e
 }
 
 // CheckFireIn checks a fire_in duration, written in the definition or resolved from a $ref: it
-// parses (ParseWorkflowDuration) and is 60 s at least, SY.timer's floor.
+// parses (ParseWorkflowDuration), and is 60 s at least, SY.timer's floor, and 366 days at most, its
+// ceiling (MaxTimerDelay): SY.timer refuses a schedule past it every time, so a fire_in of 400d
+// loaded and its timer never fired (FINDINGS A-254).
 func CheckFireIn(value string) error {
 	duration, err := ParseWorkflowDuration(value)
 	if err != nil {
 		return err
 	}
-	if duration < MinTimerDuration {
+	switch {
+	case duration < MinTimerDuration:
 		return fmt.Errorf("must be at least 60s")
+	case duration > MaxTimerDelay:
+		return fmt.Errorf("must be at most 366d")
 	}
 	return nil
 }
 
-// CheckFireAt checks a fire_at time: an RFC3339 UTC timestamp. Its 60 s floor depends on when the
-// action runs, and is checked then.
+// CheckFireAt checks a fire_at time: an RFC3339 UTC timestamp. Its bounds, 60 s ahead at least and
+// 366 days at most, depend on when the action runs, and are checked then.
 func CheckFireAt(value string) error {
 	if _, err := time.Parse(time.RFC3339, value); err != nil {
 		return fmt.Errorf("must be RFC3339 UTC timestamp")

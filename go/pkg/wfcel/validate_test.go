@@ -535,7 +535,9 @@ func TestValidateDefinitionForwardKeepMessageAndTheWFBlock(t *testing.T) {
 }
 
 // 0.1.91 (item 8): fire_in and fire_at take a literal or a $ref, resolved when the action runs (and
-// the 60 s floor checked then); a $ref's default is a literal, checked as one.
+// the 60 s floor and the 366-day ceiling checked then); a $ref's default is a literal, checked as one.
+// A fire_in past SY.timer's ceiling is refused, by its path: SY.timer refused its schedule every
+// time, so a definition with 400d loaded and its timer never fired (FINDINGS A-254).
 func TestValidateDefinitionTimerTimesFromState(t *testing.T) {
 	timer := func(spec string) error {
 		t.Helper()
@@ -551,6 +553,8 @@ func TestValidateDefinitionTimerTimesFromState(t *testing.T) {
 		`"fire_in": {"$ref": "event.payload.due_in", "default": "30d"},`,
 		`"fire_at": {"$ref": "state.due_at"},`,
 		`"fire_at": "2026-11-01T12:00:00Z",`,
+		`"fire_in": "366d",`,
+		`"fire_in": {"$ref": "state.x", "default": "8784h"},`,
 	} {
 		if err := timer(valid); err != nil {
 			t.Fatalf("%s: %v", valid, err)
@@ -558,15 +562,18 @@ func TestValidateDefinitionTimerTimesFromState(t *testing.T) {
 	}
 	const at = "states[0].entry_actions[1]"
 	for spec, want := range map[string]string{
-		`"fire_in": "30s",`:                                 at + ".fire_in: must be at least 60s",
-		`"fire_in": 300,`:                                   at + `.fire_in: must be a duration (e.g. "5m") or a $ref`,
-		`"fire_in": {"$ref": "state."},`:                    at + ".fire_in.$ref: path segments must not be empty",
-		`"fire_in": {"$ref": "state.x", "defualt": "5m"},`:  at + ".fire_in: a $ref holds only $ref and default",
-		`"fire_in": {"$ref": "state.x", "default": "10s"},`: at + ".fire_in.default: must be at least 60s",
-		`"fire_in": {"$ref": "state.x", "default": 600},`:   at + `.fire_in.default: must be a duration (e.g. "5m")`,
-		`"fire_at": "tomorrow",`:                            at + ".fire_at: must be RFC3339 UTC timestamp",
-		`"fire_in": "5m", "fire_at": {"$ref": "state.x"},`:  at + ": fire_in and fire_at are mutually exclusive",
-		`"fire_in": "",`:                                    at + ": exactly one of fire_in or fire_at is required",
+		`"fire_in": "30s",`:                                  at + ".fire_in: must be at least 60s",
+		`"fire_in": 300,`:                                    at + `.fire_in: must be a duration (e.g. "5m") or a $ref`,
+		`"fire_in": {"$ref": "state."},`:                     at + ".fire_in.$ref: path segments must not be empty",
+		`"fire_in": {"$ref": "state.x", "defualt": "5m"},`:   at + ".fire_in: a $ref holds only $ref and default",
+		`"fire_in": {"$ref": "state.x", "default": "10s"},`:  at + ".fire_in.default: must be at least 60s",
+		`"fire_in": "400d",`:                                 at + ".fire_in: must be at most 366d",
+		`"fire_in": "8785h",`:                                at + ".fire_in: must be at most 366d",
+		`"fire_in": {"$ref": "state.x", "default": "367d"},`: at + ".fire_in.default: must be at most 366d",
+		`"fire_in": {"$ref": "state.x", "default": 600},`:    at + `.fire_in.default: must be a duration (e.g. "5m")`,
+		`"fire_at": "tomorrow",`:                             at + ".fire_at: must be RFC3339 UTC timestamp",
+		`"fire_in": "5m", "fire_at": {"$ref": "state.x"},`:   at + ": fire_in and fire_at are mutually exclusive",
+		`"fire_in": "",`:                                     at + ": exactly one of fire_in or fire_at is required",
 	} {
 		assertErrorContains(t, timer(spec), want)
 	}
@@ -893,6 +900,32 @@ func TestADefinitionSchedulesTenTimerKeysAtMost(t *testing.T) {
 	}
 	assertErrorContains(t, load(schedule(1, 10)...),
 		"states: schedule 11 timer keys (invoice_timeout, k01, k02, k03, k04, k05, k06, k07, k08, k09, k10): a definition schedules 10 at most")
+}
+
+// A fire_in is SY.timer's: 60 s to 366 days, the ceiling past which SY.timer refuses a schedule
+// every time (FINDINGS A-254). A $ref's value is checked the same way when the action runs.
+func TestAFireInIsWithinSYTimersBounds(t *testing.T) {
+	for _, value := range []string{"60s", "1m", "366d", "8784h"} {
+		if err := CheckFireIn(value); err != nil {
+			t.Fatalf("%s: %v", value, err)
+		}
+	}
+	for value, want := range map[string]string{
+		"59s":       "must be at least 60s",
+		"367d":      "must be at most 366d",
+		"8784h1ms":  "must be at most 366d",
+		"400d":      "must be at most 366d",
+		"106751d":   "must be at most 366d",
+		"106752d":   "at most 106751d",
+		"next year": "invalid duration",
+	} {
+		if err := CheckFireIn(value); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: %v, want %q", value, err, want)
+		}
+	}
+	if MaxTimerDelay != 366*24*time.Hour {
+		t.Fatalf("the ceiling is SY.timer's, 366 days: %v", MaxTimerDelay)
+	}
 }
 
 // A day count past what a duration holds is refused: "213504d" wrapped to 25m26s, and an agent's

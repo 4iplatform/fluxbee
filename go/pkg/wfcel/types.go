@@ -11,6 +11,10 @@ const (
 	WorkflowSchemaVersion = "1"
 	GuardEvalTimeout      = 10 * time.Millisecond
 	MinTimerDuration      = 60 * time.Second
+	// MaxTimerDelay is the furthest ahead a timer fires: SY.timer's ceiling, past which it refuses a
+	// schedule every time (TIMER_ABOVE_MAXIMUM). A fire_in of 400d loaded, and its timer never fired
+	// (FINDINGS A-254).
+	MaxTimerDelay = 366 * 24 * time.Hour
 )
 
 type ClockFunc func() time.Time
