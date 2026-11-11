@@ -223,7 +223,9 @@ def cmd_opa_status(a):
 # `streamlost` sums them. The usage records among them come again in a line of their own,
 # `usagelost` (A-70 stage 3). SY.storage (the motherbee only) logs at most one line per 30 s with
 # the usage records it refused, stored under another tenant than they claimed, or could not verify;
-# `usagerej` sums them. A journal that cannot be read is reported, never counted as zero.
+# `usagerej` sums them. A journal that cannot be read is reported, never counted as zero. Each of the
+# router's patterns must open the line's message (after its time, level and target): a node name, a
+# trace_id or a thread_id that another line quotes is never counted (the review of A-253).
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then
   echo "journal unreadable: $(printf '%%s' "$log" | head -1)"; exit 1
@@ -232,12 +234,12 @@ if ! storage=$(journalctl -u sy-storage --since "%s" --no-pager -o cat 2>&1); th
   echo "journal unreadable: $(printf '%%s' "$storage" | head -1)"; exit 1
 fi
 echo "failed=$(systemctl --failed --no-legend --plain | wc -l)" \
-     "denials=$(printf '%%s\n' "$log" | grep -c 'dropped protected SYSTEM action')" \
-     "srcdrops=$(printf '%%s\n' "$log" | grep -c 'routing.src is not the sending node')" \
-     "streamlost=$(printf '%%s\n' "$log" | grep 'router stream lost records' \
+     "denials=$(printf '%%s\n' "$log" | grep -cE '^[^ ]+ +WARN [^ ]+: router dropped protected SYSTEM action')" \
+     "srcdrops=$(printf '%%s\n' "$log" | grep -cE '^[^ ]+ +WARN [^ ]+: router dropped a message whose routing.src is not the sending node')" \
+     "streamlost=$(printf '%%s\n' "$log" | grep -E '^[^ ]+ +WARN [^ ]+: router stream lost records in the last' \
                    | sed 's/.*router stream lost records in the last [0-9]* s//' \
                    | grep -oE ': [0-9]+' | awk '{s+=$2} END {print s+0}')" \
-     "usagelost=$(printf '%%s\n' "$log" | grep 'router stream lost usage records' \
+     "usagelost=$(printf '%%s\n' "$log" | grep -E '^[^ ]+ +WARN [^ ]+: router stream lost usage records in the last' \
                   | sed 's/.*router stream lost usage records in the last [0-9]* s//' \
                   | grep -oE ': [0-9]+' | awk '{s+=$2} END {print s+0}')" \
      "usagerej=$(printf '%%s\n' "$storage" \
