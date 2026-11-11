@@ -248,7 +248,10 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   second pass in a row with no answer for it is warned of once (`reconcile_unit_active`,
   `note_check_answer`; FINDINGS A-271, since 0.1.133). Before, such a node that the router did not
   see, one still starting, had its unit stopped and was launched again.
-- **Stop and removal.** `kill_node` runs `systemctl stop` and `reset-failed` on the unit. With
+- **Stop and removal.** `kill_node` and `remove_node_instance` refuse an SY.* or RT.* name
+  (`INVALID_REQUEST`), as `run_node` does: a core node runs under its own unit, never a
+  `fluxbee-node-*` one, and a purge removed its state while it ran (FINDINGS A-314's review, since
+  0.1.134). `kill_node` runs `systemctl stop` and `reset-failed` on the unit. With
   `purge_instance`, and in `remove_node_instance` (refused while the node runs), it also removes
   the instance directory and sends one `teardown_node {node_name, ilk_id}` to
   `SY.admin@motherbee` (`teardown_node_via_admin`, 120 s, since each of SY.admin's store calls can

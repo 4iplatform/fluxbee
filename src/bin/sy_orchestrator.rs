@@ -22797,6 +22797,26 @@ fn managed_reconcile_candidate_allowed(node_name: &str) -> bool {
     managed_spawn_disallowed_reason(node_name).is_none()
 }
 
+/// Why kill_node and remove_node_instance refuse a node (FINDINGS A-314's review): an SY.* node is
+/// a core node and an RT.* name is the router's own, each running under its own unit (sy-*,
+/// rt-gateway), never a managed `fluxbee-node-*` one. Their node unit is one systemd does not
+/// have, so it reads as not running: a kill with purge removed the running core node's state
+/// (SY.timer's timers.db, SY.cognition's database, SY.identity's config and secrets) and answered
+/// ok, as 0.1.132 did; 0.1.133 refused it only because it read that unit as no answer.
+fn managed_node_action_disallowed_reason(node_name: &str) -> Option<&'static str> {
+    match node_kind_from_name(node_name).as_str() {
+        "SY" => Some(
+            "SY.* nodes are core nodes: they run under their own unit and are never stopped, \
+             purged or removed as a managed node",
+        ),
+        "RT" => Some(
+            "the RT. prefix is the router's own: such a node is never stopped, purged or removed \
+             as a managed node",
+        ),
+        _ => None,
+    }
+}
+
 fn node_l2_and_hive(name: &str, default_hive: &str) -> (String, String) {
     if let Some((local, hive)) = name.rsplit_once('@') {
         let local = local.trim();
@@ -29476,6 +29496,15 @@ async fn kill_node_flow(
             "message": "node_name is required",
         });
     };
+    if let Some(message) = managed_node_action_disallowed_reason(node_name_ref) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+            "target": target_hive,
+            "node_name": node_name_ref,
+        });
+    }
     let unit = unit_from_node_name(node_name_ref);
     // SO-04: serialize with any concurrent lifecycle/config op on this node.
     let _node_lock = state.lock_node(node_name_ref).await;
@@ -29902,6 +29931,15 @@ async fn remove_node_instance_flow(
             });
         }
     };
+    if let Some(message) = managed_node_action_disallowed_reason(&node_name) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+            "target": target_hive,
+            "node_name": node_name,
+        });
+    }
 
     // SO-04: serialize with any concurrent lifecycle op on this node.
     let _node_lock = state.lock_node(&node_name).await;
@@ -60754,6 +60792,42 @@ blob:
                 .is_some_and(|message| message.starts_with(UNIT_UNANSWERED)),
             "{kill}"
         );
+    }
+
+    /// FINDINGS A-314's review: kill_node and remove_node_instance refuse an SY.* or RT.* name
+    /// before anything else, a purge included. Such a node runs under its own core unit, so its
+    /// node unit is one systemd does not have and reads as not running, and the purge removed the
+    /// running core node's state and answered ok. A managed node's kill is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_or_removal_of_a_core_node_is_refused_before_anything_is_done() {
+        let state = sample_orchestrator_state_for_tests();
+        for name in [
+            "SY.timer@motherbee",
+            "SY.identity@motherbee",
+            "RT.gateway@motherbee",
+        ] {
+            for payload in [
+                serde_json::json!({ "node_name": name }),
+                serde_json::json!({ "node_name": name, "purge_instance": true, "force": true }),
+            ] {
+                let kill = kill_node_flow(&state, &payload).await;
+                assert_eq!(kill["error_code"], "INVALID_REQUEST", "{kill}");
+                assert_eq!(kill["node_name"], name, "{kill}");
+            }
+            let remove =
+                remove_node_instance_flow(&state, &serde_json::json!({ "node_name": name })).await;
+            assert_eq!(remove["error_code"], "INVALID_REQUEST", "{remove}");
+            assert_eq!(remove["node_name"], name, "{remove}");
+        }
+        for name in ["AI.ghost@motherbee", "WF.x@worker1", "IO.slack@motherbee"] {
+            assert_eq!(managed_node_action_disallowed_reason(name), None, "{name}");
+        }
+        let kill = kill_node_flow(
+            &state,
+            &serde_json::json!({ "node_name": "AI.ghost@motherbee" }),
+        )
+        .await;
+        assert_eq!(kill["status"], "not_found", "{kill}");
     }
 
     /// FINDINGS A-271: the core's restart leaves a service out only when systemctl answers that
