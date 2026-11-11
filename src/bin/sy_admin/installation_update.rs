@@ -2400,7 +2400,7 @@ impl UpdateMesh for LiveMesh {
         let name = format!("SY.orchestrator@{hive}");
         (self.connected_nodes)(&self.admin_hive)
             .ok()
-            .map(|nodes| nodes.contains(&name))
+            .map(|connected| connected.nodes.contains(&name))
     }
 
     fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String> {

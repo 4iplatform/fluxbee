@@ -468,9 +468,12 @@ executor may ask for it too. In order:
    `RT.*`) and its ILK as `ilk:<uuid>` in canonical form, else `400 INVALID_REQUEST`. **A node
    still connected is alive**: only its own orchestrator, whose call follows its kill, tears it
    down then. Anyone else gets `409 NODE_STILL_CONNECTED` while the shared-memory regions list
-   the node, or `503 INVENTORY_UNAVAILABLE` when they cannot be read, and nothing is removed
+   the node, or `503 INVENTORY_UNAVAILABLE` when they cannot be read, or when the node's hive,
+   which the hive registry still lists, is stale in the LSA or not in it, and nothing is removed
    (`teardown_live_node_refusal`). Otherwise a node redeployed onto the ILK of a teardown that
-   failed half-way could be purged alive. **The node's public pages refuse nothing** (FINDINGS
+   failed half-way could be purged alive. A node of a hive cut off is not connected, and may run:
+   before 0.1.133 it read as gone, and its secrets and its ILK went while it ran. A hive the
+   registry no longer lists holds nothing up. **The node's public pages refuse nothing** (FINDINGS
    A-242): they stay up until they expire, and the ok answer names them
    ([the pages](#publications-and-the-audit-log)).
 2. **The ILK is the node's**: `ILK_GET` to SY.identity, whose `identification.node_name` must be
@@ -584,31 +587,42 @@ each hive's receive-only mirror deletes it when it syncs. Before it writes, it r
 use on every hive from the motherbee's orchestrator (`get_runtime` with the version, its
 `usage_global_visible`; `read_runtime_version_use`): `running_nodes`, the nodes of every hive
 pinned to the version whose unit may run, each with its `hive` and `lifecycle`, and
-`skipped_hives`, the hives whose nodes the orchestrator did not count. Only a read that counted
-every hive that may run a node on a runtime, and lists no node, lets the version go
-(`runtime_version_removable`). An ingress or an egress (the registry's role, `hive_runs_no_runtime`)
-receives no runtime: the orchestrator shares `dist/runtimes` with the workers alone, so each answers
-every such read `RUNTIME_MANIFEST_MISSING` (FINDINGS A-24) and is in `skipped_hives` on every
-read, and a read that skipped it missed no node. Otherwise, with nothing removed:
+`skipped_hives`, the hives whose nodes the orchestrator did not count
+([SY.orchestrator](sy-orchestrator.md)). Only a read that counted every hive that may run a node on
+a runtime, and lists no node, lets the version go (`runtime_version_removable`). An ingress or an
+egress, by the role its registry entry records whatever the state of its join
+(`registered_hive`), receives no runtime: the orchestrator links only the workers into
+`fluxbee-dist-runtimes`. The motherbee's orchestrator asks neither and lists them apart
+(`hives_without_runtimes`) since 0.1.133; one before it put each in `skipped_hives` on every read,
+for its `RUNTIME_MANIFEST_MISSING` (FINDINGS A-24), and SY.admin never takes one there for a hive
+not read. Otherwise, with nothing removed:
 
-- **`409 RUNTIME_IN_USE`** while a node is listed. The detail names each node, the first 20 of
-  them, with its hive and lifecycle: `RUNNING`, `STARTING` (its unit runs and the router does not
-  see it yet) or `UNKNOWN` (systemd did not answer whether its unit runs; it is listed until
-  systemd answers that it does not: [SY.orchestrator](sy-orchestrator.md), FINDINGS A-271). Before
-  0.1.133 it said "still running" of each. `payload.usage_global_visible.running_nodes` lists them
-  all, and `payload.unanswered_hives` the hives not counted besides. Stop each node that runs on
-  the version, or move it to another, then ask again.
+- **`409 RUNTIME_IN_USE`** while a node is listed, whatever else was not counted. The detail names
+  each node, the first 20 of them, with its hive and lifecycle: `RUNNING`, `STARTING` (its unit
+  runs and the router does not see it yet) or `UNKNOWN` (systemd did not answer whether its unit
+  runs; it is listed until systemd answers that it does not: [SY.orchestrator](sy-orchestrator.md),
+  FINDINGS A-271). Before 0.1.133 it said "still running" of each.
+  `payload.usage_global_visible.running_nodes` lists them all, and `payload.unanswered_hives` the
+  hives not counted besides. Stop each node that runs on the version, or move it to another, then
+  ask again. A node whose unit does not run is not listed: stopped, failed, or between two restarts
+  of a crash loop. One relaunched later (`relaunch_on_boot`) fails to start once its version is
+  gone, so stop it (`kill_node`) or move it first.
 - **`409 RUNTIME_USAGE_UNKNOWN`** when the use could not be read on every hive (FINDINGS A-281,
   since 0.1.133). `payload.unanswered_hives` names each hive not read, `{hive, reason, detail}`,
   the detail names them with their reasons, and `payload.retryable` is true:
-  - the motherbee, when its orchestrator did not answer the read (`TIMEOUT`, `TRANSPORT_ERROR`),
-    refused it (its code), failed the read of its own nodes (`USAGE_READ_FAILED`: its usage has
-    `status: error` and no list) or gave no usage, or one without `running_nodes` or
-    `skipped_hives` (`NO_USAGE`);
-  - a worker of its `skipped_hives`, or a hive whose role the registry does not give (a join under
-    way): one that did not answer its `GET_RUNTIME` (`UNREACHABLE`: down, its orchestrator
-    restarting, or stale in the LSA), or that answered it with an error (its code:
-    `RUNTIME_NOT_FOUND` while its copy of the manifest does not list the runtime yet).
+  - the motherbee alone, when the read failed there, and the detail says that no hive's nodes were
+    counted: its orchestrator did not answer the read (`TIMEOUT`, `TRANSPORT_ERROR`; a worker
+    whose orchestrator does not answer delays it past SY.admin's 30 s, since the motherbee asks
+    the workers one at a time), refused it (its code), could not make it (`USAGE_READ_FAILED`: its
+    usage says `status: error`, its own nodes or its registry unread) or gave no usage of every
+    hive (`NO_USAGE`: none, or one without `running_nodes` or `skipped_hives`);
+  - a worker of its `skipped_hives`, or a hive whose role its registry entry does not record: one
+    that did not answer its `GET_RUNTIME` (`UNREACHABLE`: down, its orchestrator restarting, or
+    stale in the LSA), answered it with an error (its code: `RUNTIME_NOT_FOUND` while its copy of
+    the manifest does not list the runtime yet, `RUNTIME_MANIFEST_MISSING` for a worker without
+    one) or gave no list of its nodes (`USAGE_UNREADABLE`). A hive whose join the registry does not
+    record as done also gets its `status`, its `join_phase` and `next`: finish its join (`add_hive`
+    again) or remove it (`remove_hive`).
 
   Ask again once each hive answers. A hive gone for good is removed with `remove_hive` first: the
   orchestrator asks only the hives of the registry. Before 0.1.133 a hive not counted read as one
@@ -617,14 +631,26 @@ read, and a read that skipped it missed no node. Otherwise, with nothing removed
   deleted it when it came back, and the node failed at its next start. A read the motherbee's
   orchestrator did not answer was `RUNTIME_REMOVE_FAILED`.
 
-The other refusals: `409 RUNTIME_CURRENT_CONFLICT` for the runtime's current version while other
-versions remain, `409 RUNTIME_PACKAGE_VERSION` for the version the installed package brought
-(FINDINGS A-122), `404 RUNTIME_NOT_FOUND` or `RUNTIME_VERSION_NOT_FOUND`, and after the read of the
-use `409 RUNTIME_HAS_DEPENDENTS` while packages are built on the runtime. SY.wf-rules removes its
-workflows' old versions through this action ([SY.wf-rules](sy-wf-rules.md)): a deploy or a
-rollback whose removal is refused goes on, and the next one tries that version again; a
-workflow's delete answers `PACKAGE_PUBLISH_FAILED` with the refusal, after the workflow, its node
-and its state are gone, and that version stays in dist.
+The other refusals: `400 INVALID_REQUEST` for a missing or invalid runtime or version,
+`409 RUNTIME_CURRENT_CONFLICT` for the runtime's current version while other versions remain,
+`409 RUNTIME_PACKAGE_VERSION` for the version the installed package brought (FINDINGS A-122),
+`404 RUNTIME_NOT_FOUND` or `RUNTIME_VERSION_NOT_FOUND`, and `409 RUNTIME_HAS_DEPENDENTS` while
+packages are built on the runtime. The manifest alone decides that last one, before the read of the
+use since 0.1.133: a removal that could never pass no longer waits for every hive, nor is refused
+`RUNTIME_USAGE_UNKNOWN` while one does not answer. `502 SERVICE_FAILED` when the manifest it wrote
+cannot be read back: the version was removed.
+
+SY.wf-rules removes its workflows' old versions through this action
+([SY.wf-rules](sy-wf-rules.md)), giving each removal 5 s: a deploy or a rollback whose removal is
+refused, or not answered in time, goes on, and the next one tries that version again. A workflow's
+delete removes every version last, after the workflow, its node and its state are gone, and stops
+at the first removal that fails: it answers `PACKAGE_PUBLISH_FAILED` with that failure, and every
+version not removed stays in dist, all of them possibly. Its state gone, a workflow created again
+under that name numbers its versions from 0.0.1 again, and its publish of a version that stayed
+with other contents is refused `VERSION_CONFLICT`, which SY.wf-rules answers
+`PACKAGE_PUBLISH_FAILED`: remove each version of `wf.<name>` that stayed (`get_runtime` lists them)
+with `remove_runtime_version` once every hive answers, then deploy. `fluxbee-factory-reset` counts
+such a delete as failed, and a second run no longer lists the workflow, so its versions stay too.
 
 ## Workflows: the check and the instances
 

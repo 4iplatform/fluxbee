@@ -964,9 +964,14 @@ person: when its provider gave no answer, the error carries the operator's text 
   - `ORCHESTRATOR_ERROR`, with `force` too: the WF node's config read was refused or got no
     answer, so nothing changed. Ask again.
   - `PACKAGE_PUBLISH_FAILED` after a removal: the workflow, its node and its state are gone, and
-    only some of its old versions stayed (their `remove_runtime_version` was refused or not
-    answered, the reason in the detail). Say so; never that the removal failed, and never run it
-    again.
+    its versions not removed yet stayed in dist, all of them possibly. The first
+    `remove_runtime_version` refused, or not answered within 5 s, stopped the rest (the reason in
+    the detail). Say so; never that the removal failed, and never run it again.
+  - While such a version stays, a workflow created again under that name can be refused at its
+    deploy: its versions start again at `0.0.1`, and one that stayed with other contents (another
+    definition, or another hive) answers `PACKAGE_PUBLISH_FAILED` with `VERSION_CONFLICT`. Remove
+    each version of `wf.<workflow_name>` that stayed (`remove_runtime_version`, once every hive
+    answers), then deploy.
 - **Operating instances** (the node is `WF.<workflow_name>`):
   - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and its
     last change (`updated_at_ms`), which is not when it entered its state: that is its last
@@ -1693,11 +1698,16 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
   - `RUNTIME_IN_USE` while a node runs on the version. Its detail names each node with its hive
     and state: `RUNNING`, `STARTING` (its unit runs and the router does not see it yet) or
     `UNKNOWN` (its hive's systemd did not answer; it stays listed until systemd answers). Tell the
-    operator which nodes, and that each must be stopped or moved to another version first.
-  - `RUNTIME_USAGE_UNKNOWN` when some worker's nodes could not be read: `payload.unanswered_hives`
-    names each hive and why (`UNREACHABLE`: down, restarting, or stale). It is never "not in use":
-    ask again once the hive answers. A hive gone for good is removed with `remove_hive` first. An
-    ingress or an egress receives no runtime, so it never refuses a removal.
+    operator which nodes, and that each must be stopped or moved to another version first. A node
+    whose unit does not run (stopped, failed, between two restarts) is not listed: relaunched
+    later, it fails to start once its version is gone.
+  - `RUNTIME_USAGE_UNKNOWN` when some hive's nodes could not be read: `payload.unanswered_hives`
+    names each hive and why. A worker down, restarting or stale (`UNREACHABLE`), or one that could
+    not read its nodes; a hive whose join is not done, with its `status` and `join_phase` (finish
+    the join with `add_hive`, or remove the hive with `remove_hive`); or the motherbee alone, when
+    the read failed there and no hive was counted. It is never "not in use": ask again once the
+    hive answers. A hive gone for good is removed with `remove_hive` first. An ingress or an egress
+    receives no runtime, so it never refuses a removal.
 
 ---
 

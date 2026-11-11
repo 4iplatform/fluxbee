@@ -408,20 +408,31 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   `publish-runtime.sh` refuses a hand publish under that version.
 - **A version is removed only once every hive's nodes were read (FINDINGS A-281, since
   0.1.133).** `remove_runtime_version` reads the version's use from the motherbee's orchestrator,
-  which asks every hive of the registry. A node pinned to the version whose unit may run refuses
-  it, `409 RUNTIME_IN_USE`, whose detail names each node with its hive and lifecycle (`RUNNING`,
-  `STARTING` or `UNKNOWN`: systemd did not answer for its unit). A worker whose nodes were not
-  read refuses it too, `409 RUNTIME_USAGE_UNKNOWN`, naming each in `payload.unanswered_hives` with
-  its reason: `UNREACHABLE` (down, its orchestrator restarting, stale in the LSA), the error it
-  answered (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet), or, for the
-  motherbee, a read its orchestrator did not answer or could not make. An ingress or an egress
-  receives no runtime (it answers `RUNTIME_MANIFEST_MISSING` to every such read) and refuses
-  nothing. Nothing is removed: ask
-  again once each hive answers, and remove a hive gone for good with `remove_hive` first. Before,
-  such a hive counted as one with no node: a version a node of a restarting worker ran on was
-  removed, and the worker's mirror deleted it when it came back. A workflow's delete whose purge
-  meets the refusal answers `PACKAGE_PUBLISH_FAILED` after the workflow and its node are gone, and
-  that version stays in dist.
+  which asks every hive of the registry. A node pinned to the version whose unit runs, or whose
+  unit systemd gives no answer for, refuses it, `409 RUNTIME_IN_USE`, whose detail names each node
+  with its hive and lifecycle (`RUNNING`, `STARTING` or `UNKNOWN`). A node whose unit does not run
+  (stopped, failed, between two restarts of a crash loop) is not listed: one relaunched later fails
+  to start once its version is gone, so stop or move it first. A hive whose nodes were not read
+  refuses it too, `409 RUNTIME_USAGE_UNKNOWN`, naming each in `payload.unanswered_hives` with its
+  reason: `UNREACHABLE` (down, its orchestrator restarting, stale in the LSA), the error it answered
+  (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet), `USAGE_UNREADABLE` (its own
+  read failed), and for a join not done its status and phase (finish the join or remove the hive);
+  or the motherbee alone when the read failed there and no hive was counted (a worker whose
+  orchestrator does not answer delays that read past SY.admin's 30 s). An ingress or an egress
+  receives no runtime, by the role the registry records whatever the state of its join, and holds
+  no removal up. Nothing is removed: ask again once each hive answers, and remove a hive gone for
+  good with `remove_hive` first. Before, such a hive counted as one with no node: a version a node
+  of a restarting worker ran on was removed, and the worker's mirror deleted it when it came back.
+- **A workflow's delete can leave its versions in dist (FINDINGS A-281).** SY.wf-rules removes them
+  last, after the workflow, its node and its state, through `remove_runtime_version`, and stops at
+  the first one refused or not answered within its 5 s: the delete answers
+  `PACKAGE_PUBLISH_FAILED`, and the versions not removed stay, all of them possibly. A workflow
+  created again under that name numbers its versions from 0.0.1 again, so its deploy is refused
+  (`VERSION_CONFLICT`, answered `PACKAGE_PUBLISH_FAILED`) while a version that stayed has other
+  contents: remove each version of `wf.<name>` that stayed
+  (`GET /hives/motherbee/runtimes/wf.<name>` lists them) with `remove_runtime_version` once every
+  hive answers, then deploy. `fluxbee-factory-reset` counts such a delete as failed, and its next
+  run no longer lists the workflow.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on
   `dist/runtimes-manifest.lock` from its read of the manifest to its write: SY.admin's
   `publish_runtime_package`, `remove_runtime_version` (across its read of the version's use, up to

@@ -382,8 +382,18 @@ struct AdminContext {
     installation_update: Arc<installation_update::Updates>,
 }
 
-/// Reads the nodes connected now, `<name>@<hive>`, given this admin's hive.
-type ConnectedNodes = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + Sync>;
+/// Reads the nodes connected now, and the hives whose nodes that read holds, given this admin's
+/// hive.
+type ConnectedNodes = Arc<dyn Fn(&str) -> Result<ConnectedNow, String> + Send + Sync>;
+
+/// The nodes connected now, `<name>@<hive>` (`connected_node_names`), and the hives whose nodes the
+/// read holds: this admin's own, and each other hive the LSA holds as fresh. The nodes of a hive
+/// the LSA holds as stale, or does not list, are not in it either way: whether they run is unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConnectedNow {
+    nodes: Vec<String>,
+    hives: Vec<String>,
+}
 
 /// Reads the tenant of a node, `<name>@<hive>`, from identity's shared memory, given this hive's
 /// config dir: an error says why the node is no publisher.
@@ -6398,19 +6408,19 @@ const NON_ROUTER_REGIONS: &[&str] = &[
 
 /// The nodes connected now, `<name>@<hive>`, read from shared memory with no message to anyone
 /// (a busy orchestrator never holds it up): this hive's from the regions of its routers, every
-/// other hive's from the LSA. An error when the regions cannot be read.
-fn connected_nodes_from_shm(admin_hive: &str) -> Result<Vec<String>, String> {
+/// other hive's from the LSA, with the hives that read holds. An error when the regions cannot be
+/// read.
+fn connected_nodes_from_shm(admin_hive: &str) -> Result<ConnectedNow, String> {
     let lsa = LsaRegionReader::open_read_only(&format!("/jsr-lsa-{admin_hive}"))
         .map_err(|err| format!("the LSA region cannot be read: {err}"))?
         .read_snapshot()
         .ok_or("the LSA region gave no consistent snapshot")?;
     let local_nodes = local_router_nodes(admin_hive)?;
-    Ok(connected_node_names(
-        admin_hive,
-        &local_nodes,
-        &lsa,
-        now_epoch_ms(),
-    ))
+    let now = now_epoch_ms();
+    Ok(ConnectedNow {
+        nodes: connected_node_names(admin_hive, &local_nodes, &lsa, now),
+        hives: connected_hive_names(admin_hive, &lsa, now),
+    })
 }
 
 /// The nodes in the regions of this hive's routers, found as a router finds its peers'
@@ -6473,18 +6483,13 @@ fn connected_node_names(
         if !usable(node.name_len, node.flags) {
             continue;
         }
-        let Some(entry) = lsa.hives.get(node.hive_index as usize) else {
+        let Some(hive) = lsa
+            .hives
+            .get(node.hive_index as usize)
+            .and_then(|entry| fresh_remote_hive(admin_hive, entry, now))
+        else {
             continue;
         };
-        let Some(hive) = remote_hive_name(entry) else {
-            continue;
-        };
-        if hive == admin_hive
-            || entry.flags & HIVE_FLAG_SELF != 0
-            || remote_hive_is_stale(entry, now)
-        {
-            continue;
-        }
         names.push(qualified_node_name(
             &shm_node_name(&node.name, node.name_len),
             &hive,
@@ -6493,6 +6498,29 @@ fn connected_node_names(
     names.sort();
     names.dedup();
     names
+}
+
+/// The hives whose nodes `connected_node_names` reads: this one, from its routers' regions, and
+/// each other hive the LSA holds as fresh (`fresh_remote_hive`).
+fn connected_hive_names(admin_hive: &str, lsa: &LsaSnapshot, now: u64) -> Vec<String> {
+    let mut hives: Vec<String> = std::iter::once(admin_hive.to_string())
+        .chain(
+            lsa.hives
+                .iter()
+                .filter_map(|entry| fresh_remote_hive(admin_hive, entry, now)),
+        )
+        .collect();
+    hives.sort();
+    hives.dedup();
+    hives
+}
+
+/// The name of an LSA hive entry whose nodes are read as the router reaches them: another hive
+/// than this one, which the LSA holds neither as stale nor as deleted.
+fn fresh_remote_hive(admin_hive: &str, entry: &RemoteHiveEntry, now: u64) -> Option<String> {
+    let hive = remote_hive_name(entry)?;
+    (hive != admin_hive && entry.flags & HIVE_FLAG_SELF == 0 && !remote_hive_is_stale(entry, now))
+        .then_some(hive)
 }
 
 /// A node name of a shared-memory entry, its recorded length clamped to the buffer.
@@ -6555,12 +6583,12 @@ fn admit_mesh_caller(
     {
         MeshAdmission::Admitted => Ok(()),
         MeshAdmission::WorkflowPackage { workflow, hive } => {
-            let nodes = (ctx.connected_nodes)(&ctx.hive_id).map_err(|detail| {
+            let connected = (ctx.connected_nodes)(&ctx.hive_id).map_err(|detail| {
                 MeshRefusal::InventoryUnavailable(format!(
                     "whether WF.{workflow} runs on another hive cannot be read: {detail}"
                 ))
             })?;
-            workflow_nodes_elsewhere(&nodes, &workflow, &hive).map_err(|detail| {
+            workflow_nodes_elsewhere(&connected.nodes, &workflow, &hive).map_err(|detail| {
                 MeshRefusal::Unauthorized(format!(
                     "{caller} may not change wf.{workflow}: {detail}"
                 ))
@@ -17222,8 +17250,13 @@ const NODE_UNIT_UNANSWERED_NOTE: &str = "502 SERVICE_FAILED with retryable: true
 const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and the router sees the node), STARTING (its unit runs and the router does not see it yet), STOPPED, FAILED or UNKNOWN. UNKNOWN: the hive's systemd did not answer whether the node's unit runs (FINDINGS A-271, since 0.1.133): read it again, and never take it for STOPPED. A managed node whose unit does not run and that has no config or state left reads UNKNOWN too.";
 
 /// What `remove_runtime_version` refuses, nothing removed.
-const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: the detail names each node (the first 20) with its hive and lifecycle, RUNNING, STARTING (its unit runs and the router does not see it yet) or UNKNOWN (its hive's systemd did not answer whether its unit runs: it is listed until systemd answers that it does not), and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again.";
-const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): the motherbee's orchestrator did not answer the read, refused it or failed its own nodes' read, or a worker, or a hive whose join is under way, did not answer it (UNREACHABLE: down, restarting, or stale in the LSA) or answered it with an error (RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet). An ingress or an egress receives no runtime, and is never one of them. payload.unanswered_hives names each, {hive, reason, detail}, payload.retryable is true, and nothing was removed. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
+const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. A node whose unit does not run is not listed (stopped, failed, or between two restarts of a crash loop): one relaunched later (relaunch_on_boot) fails to start once its version is gone, so stop it (kill_node) or move it first.";
+const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable is true. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT, TRANSPORT_ERROR; a worker whose orchestrator does not answer delays it, since the motherbee asks the workers one at a time), refused it (its code), could not make it (USAGE_READ_FAILED) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive): it did not answer (UNREACHABLE: down, restarting, or stale in the LSA), answered an error (RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet) or gave no list of its nodes (USAGE_UNREADABLE). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
+
+/// What a workflow's delete leaves when SY.wf-rules' purge of its versions meets a removal that
+/// fails (`purgeOnPrimary` in go/sy-wf-rules/node/package_publish.go), and what a workflow created
+/// again under the name meets: its versions start again at 0.0.1 (`Store.NextVersion`).
+const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes every published version of wf.<workflow_name> last, with one remove_runtime_version each that SY.wf-rules gives 5 s, and stops at the first that fails: a refusal (RUNTIME_IN_USE, or RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281) or no answer in time. It then answers PACKAGE_PUBLISH_FAILED with that failure, though the workflow, its node and its state are gone, and every version not removed stays in dist, all of them possibly. A workflow created again under that name publishes from 0.0.1 again, and a version that stayed with other contents refuses its deploy (VERSION_CONFLICT, answered PACKAGE_PUBLISH_FAILED): remove each version of wf.<workflow_name> that stayed (get_runtime lists them) with remove_runtime_version once every hive answers, then deploy.";
 
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
@@ -17378,7 +17411,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "teardown_node" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP; over the mesh, from node_name. Body: {\"ilk_id\": \"ilk:<uuid>\"} (node_name from the path when the body has none; a bare name is a node of the path's hive).",
             "Callers: the operator's HTTP API, Archi and the executor, and SY.orchestrator@<hive> for a node of its own hive, which calls it when a node is purged (kill_node with purge_instance).",
-            "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, retry) when the connected nodes cannot be read from shared memory; nothing is removed.",
+            "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, retry) when the connected nodes cannot be read from shared memory, or when the node's hive, which the hive registry still lists, is stale in the LSA or not in it, so its nodes cannot be read (since 0.1.133); nothing is removed. A hive the registry no longer lists does not hold it up.",
             PAGES_LEFT_UP_NOTE,
             "Steps, in order: SY.identity must hold the ILK as this node's (identification.node_name), else NODE_ILK_MISMATCH and nothing is removed; then every SY.vault secret dedicated to the ILK is deleted in its own tenant; then the ILK is marked (ILK_DELETE) and purged (ILK_PURGE). An ILK SY.identity does not hold is reported not_found: the operator's HTTP API and the executor still delete its leftover secrets, a mesh caller (the orchestrator, Archi) leaves them.",
             "The payload is the same on success and on failure: node_name, ilk_id, ilk_deleted, not_found, vault_secrets_purged {status, scanned, deleted, errors[{key, error_code, error_detail}]} and ilk_delete {status ok|error|skipped, error_code, error_detail}. A step that did not run says skipped. The ok answer adds pages_left_up, the node's pages (publisher_l2_name), to every caller but the node's own orchestrator: the purge that called it names them.",
@@ -17718,7 +17751,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.wf-rules purges the workflow's WF node (kill_node with purge_instance) and answers {deleted, wf_node: {node_name, action}}.",
             "Without force it is refused, with nothing changed, while the WF node runs instances (INSTANCES_ACTIVE, with the count) and when they cannot be counted (INSTANCES_UNKNOWN, saying why): the node is not RUNNING (its state named), or its status read or its count failed or got no answer (FINDINGS A-270, since 0.1.133). A node that is not RUNNING keeps its instances in its store, and force removes them with it.",
             "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR (502): whether the node exists is unknown, and nothing changed. Ask again.",
-            "Then SY.wf-rules removes every published version of wf.<workflow_name> (remove_runtime_version). A removal SY.admin refuses (RUNTIME_IN_USE, or RUNTIME_USAGE_UNKNOWN while a hive's nodes cannot be read: FINDINGS A-281) makes it answer PACKAGE_PUBLISH_FAILED with that refusal, though the workflow, its node and its state are gone: those versions stay in dist.",
+            WF_DELETE_VERSIONS_LEFT_NOTE,
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of its WF node, wf_node.node_name.",
         ],
@@ -17749,10 +17782,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "remove_runtime_version" => vec![
             "Motherbee-only (409 NOT_PRIMARY elsewhere): it removes the version from the motherbee's dist and runtimes manifest, and each hive's mirror deletes it when it syncs. In HTTP runtime and runtime_version come from the path; the executor step's args are hive, runtime and runtime_version.",
-            "Refused, with nothing removed: 409 RUNTIME_CURRENT_CONFLICT for the runtime's current version while other versions remain; 409 RUNTIME_PACKAGE_VERSION for the version the installed package brought (the way back with reset_base_runtime); 404 RUNTIME_NOT_FOUND or RUNTIME_VERSION_NOT_FOUND; 409 RUNTIME_HAS_DEPENDENTS while packages are built on the runtime; 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_REMOVE_FAILED (the manifest's lock not taken within 60 s, or a step of the removal failed: what it changed is put back).",
+            "Refused, with nothing removed: 400 INVALID_REQUEST for a missing or invalid runtime or runtime_version; 409 RUNTIME_CURRENT_CONFLICT for the runtime's current version while other versions remain; 409 RUNTIME_PACKAGE_VERSION for the version the installed package brought (the way back with reset_base_runtime); 404 RUNTIME_NOT_FOUND or RUNTIME_VERSION_NOT_FOUND; 409 RUNTIME_HAS_DEPENDENTS while packages are built on the runtime, before the version's use is read; 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_REMOVE_FAILED (the manifest's lock not taken within 60 s, or a step of the removal failed: what it changed is put back).",
             RUNTIME_REMOVAL_IN_USE_NOTE,
             RUNTIME_REMOVAL_UNKNOWN_NOTE,
-            "SY.wf-rules removes its workflows' old versions with it: a deploy or a rollback whose removal is refused goes on, and the next one tries that version again; a workflow's delete answers PACKAGE_PUBLISH_FAILED with the refusal, and that version stays in dist.",
+            "502 SERVICE_FAILED when the manifest it wrote cannot be read back: the version was removed, and get_runtime shows the runtime as it is now.",
+            "SY.wf-rules removes its workflows' old versions with it, each removal given 5 s: a deploy or a rollback whose removal is refused, or not answered in time, goes on, and the next one tries that version again.",
+            WF_DELETE_VERSIONS_LEFT_NOTE,
         ],
         "reset_base_runtime" => vec![
             "Confirm with the operator first: every node that follows the runtime's current moves onto the package's version, the WF and config-only packages built on it with them.",
@@ -18864,17 +18899,24 @@ const RUNTIME_IN_USE_NODES_NAMED: usize = 20;
 /// it. The payload keeps each reason whole.
 const RUNTIME_USE_REASON_MAX_CHARS: usize = 200;
 
-/// A hive whose nodes the read of a runtime version's use did not count (FINDINGS A-281): the
-/// motherbee, when its orchestrator did not answer that read, refused it, failed the read of its
-/// own nodes or gave no usage; or a hive that orchestrator lists in `skipped_hives`, one that did
-/// not answer its `GET_RUNTIME` (`UNREACHABLE`) or answered it with an error (that error's code,
-/// `RUNTIME_NOT_FOUND` while its copy of the manifest does not list the runtime yet), but an
-/// ingress or an egress (`hive_runs_no_runtime`).
+/// What ends a join the hive registry does not record as done, as `installation_skipped_hives`
+/// says it.
+const UNFINISHED_JOIN_NEXT: &str = "finish its join (add_hive again) or remove it (remove_hive)";
+
+/// A hive whose nodes the read of a runtime version's use did not count (FINDINGS A-281). Either
+/// a hive the motherbee's orchestrator lists in `skipped_hives`, a worker or a hive whose role its
+/// registry entry does not record, that did not answer its `GET_RUNTIME` (`UNREACHABLE`), answered
+/// it with an error (that error's code: `RUNTIME_NOT_FOUND` while its copy of the manifest does not
+/// list the runtime yet) or gave no list of its nodes (`USAGE_UNREADABLE`); never an ingress or an
+/// egress (`RegisteredHive::WithoutRuntimes`). Or the motherbee, whose read failed, so that no
+/// hive was counted (`RuntimeVersionUse::NotRead`).
 #[derive(Debug)]
 struct UnreadHive {
     hive: String,
     reason: String,
     detail: Option<String>,
+    /// What the registry records of a join it does not record as done.
+    join: Option<UnfinishedJoin>,
 }
 
 impl UnreadHive {
@@ -18892,33 +18934,118 @@ impl UnreadHive {
             hive: text("hive_id").unwrap_or_else(|| "?".to_string()),
             reason: text("reason").unwrap_or_else(|| "RUNTIME_QUERY_FAILED".to_string()),
             detail: text("message"),
+            join: None,
         }
     }
 
+    /// `{hive, reason, detail}`, and for a join not done its `status`, its `join_phase` and what
+    /// ends it (`next`), as `installation_skipped_hives` names them.
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut named = serde_json::json!({
             "hive": self.hive,
             "reason": self.reason,
             "detail": self.detail,
-        })
+        });
+        if let Some(join) = &self.join {
+            named["status"] = serde_json::json!(join.status);
+            named["join_phase"] = serde_json::json!(join.phase);
+            named["next"] = serde_json::json!(UNFINISHED_JOIN_NEXT);
+        }
+        named
     }
 
-    /// `<hive> (<reason>: <detail>)`, the detail cut to `RUNTIME_USE_REASON_MAX_CHARS`.
+    /// `<hive> (<reason>: <detail>)`, the detail cut to `RUNTIME_USE_REASON_MAX_CHARS`, with the
+    /// state of a join not done and what ends it.
     fn describe(&self) -> String {
-        match &self.detail {
-            Some(detail) if detail.chars().count() > RUNTIME_USE_REASON_MAX_CHARS => format!(
-                "{} ({}: {}...)",
-                self.hive,
-                self.reason,
-                detail
-                    .chars()
-                    .take(RUNTIME_USE_REASON_MAX_CHARS)
-                    .collect::<String>()
-            ),
-            Some(detail) => format!("{} ({}: {detail})", self.hive, self.reason),
-            None => format!("{} ({})", self.hive, self.reason),
+        let mut text = format!("{} ({}", self.hive, self.reason);
+        if let Some(detail) = &self.detail {
+            text.push_str(": ");
+            text.extend(detail.chars().take(RUNTIME_USE_REASON_MAX_CHARS));
+            if detail.chars().count() > RUNTIME_USE_REASON_MAX_CHARS {
+                text.push_str("...");
+            }
         }
+        if let Some(join) = &self.join {
+            text.push_str(&format!(
+                "; its join is not done, status {}, phase {}: {UNFINISHED_JOIN_NEXT}",
+                join.status.as_deref().unwrap_or("not recorded"),
+                join.phase.as_deref().unwrap_or("not recorded"),
+            ));
+        }
+        text.push(')');
+        text
     }
+}
+
+/// A join the motherbee's hive registry does not record as done: its entry's `status`, which is not
+/// `connected`, or its join's `phase`, which is not `done`, as recorded (none when not recorded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnfinishedJoin {
+    status: Option<String>,
+    phase: Option<String>,
+}
+
+/// What the motherbee's hive registry records of a hive the read of a runtime's use did not count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisteredHive {
+    /// Its entry records the role ingress or egress, whatever the state of its join: a join records
+    /// the role when it accepts the hive, and the orchestrator never links those roles into
+    /// `fluxbee-dist-runtimes` (`folder_forbidden_for_role` in src/bin/sy_orchestrator.rs), so no
+    /// node there runs on a runtime.
+    WithoutRuntimes,
+    /// Its entry does not record a finished join (`UnfinishedJoin`).
+    JoinUnfinished(UnfinishedJoin),
+    /// A connected hive whose join is done, or one the registry no longer lists: nothing to add.
+    Other,
+}
+
+/// How the registry records `hive`, from its entry's `info.yaml` (`registry_hive_info`). The role
+/// counts in any state of the join, as the motherbee's orchestrator reads it, from an entry that
+/// names the same hive; a join is done as the strict reading has it (`HiveEntry::role`): status
+/// `connected`, and no join phase but `done`.
+fn registered_hive(registry: &HiveRegistry, hive: &str) -> RegisteredHive {
+    if !registry.lists(hive) {
+        return RegisteredHive::Other;
+    }
+    let info = registry_hive_info(registry, hive);
+    let text = |key: &str| {
+        info.as_ref()
+            .and_then(|info| info.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let runs_no_runtime = text("hive_id") == Some(hive)
+        && text("role").is_some_and(|role| {
+            role.eq_ignore_ascii_case("ingress") || role.eq_ignore_ascii_case("egress")
+        });
+    if runs_no_runtime {
+        return RegisteredHive::WithoutRuntimes;
+    }
+    let phase = info
+        .as_ref()
+        .and_then(|info| info.pointer("/join/phase"))
+        .map(|phase| phase.as_str().unwrap_or_default().trim().to_string());
+    let status = text("status").map(str::to_string);
+    if status.as_deref() == Some("connected")
+        && phase.as_deref().is_none_or(|phase| phase == "done")
+    {
+        return RegisteredHive::Other;
+    }
+    RegisteredHive::JoinUnfinished(UnfinishedJoin {
+        status,
+        phase: phase.filter(|phase| !phase.is_empty()),
+    })
+}
+
+/// A hive's `info.yaml` in the motherbee's registry, as written; none when it is missing or does not
+/// parse (a join being accepted).
+fn registry_hive_info(registry: &HiveRegistry, hive: &str) -> Option<serde_json::Value> {
+    if !is_valid_hive_id(hive) {
+        return None;
+    }
+    let raw = fs::read_to_string(registry.root().join(hive).join("info.yaml")).ok()?;
+    serde_yaml::from_str(&raw).ok()
 }
 
 /// What `remove_runtime_version` knows of a version's use, from the motherbee's orchestrator:
@@ -18941,8 +19068,14 @@ enum RuntimeVersionUse {
     },
     /// No node is listed, and some hive was not counted.
     Unknown {
-        usage: Option<serde_json::Value>,
+        usage: serde_json::Value,
         unread: Vec<UnreadHive>,
+    },
+    /// The read failed on the motherbee, so no hive's nodes were counted: `failure` says how, the
+    /// motherbee its hive.
+    NotRead {
+        usage: Option<serde_json::Value>,
+        failure: UnreadHive,
     },
 }
 
@@ -18972,43 +19105,34 @@ async fn read_runtime_version_use(
     .map_err(|err| err.to_string());
     let registry = hive_registry(ctx);
     runtime_version_use(&ctx.hive_id, answer, |hive| {
-        hive_runs_no_runtime(&registry, hive)
+        registered_hive(&registry, hive)
     })
-}
-
-/// Whether `hive` runs no node on a runtime: an ingress or an egress, by the registry's strict
-/// reading (`HiveRegistry::role`), receives no runtime (the orchestrator shares `dist/runtimes`
-/// with the workers alone, and A-11 reads the same hives: `installation_node_check_hives`), so its
-/// orchestrator answers every read of a runtime's use `RUNTIME_MANIFEST_MISSING` (FINDINGS A-24),
-/// and a read that skipped it missed no node. Any other hive may run one: a worker, and a hive
-/// whose role the registry does not give (a join under way, an entry it cannot read).
-fn hive_runs_no_runtime(registry: &HiveRegistry, hive: &str) -> bool {
-    matches!(
-        registry.role(hive),
-        Some(HiveRole::Ingress | HiveRole::Egress)
-    )
 }
 
 /// The orchestrator's answer to the read of a version's use, or why none came, as
 /// `remove_runtime_version` takes it (FINDINGS A-281). No answer, a refusal, an answer without a
-/// usage, a usage whose own read failed (`status: error`, with no list) and a hive not counted are
-/// each no "not in use", but a hive not counted that runs no runtime (`runs_no_runtime`: an
-/// ingress or an egress). Before 0.1.133 a usage missing from the answer read as `in_use: false`
-/// and every hive not counted as one with no node: a version a node of a restarting worker ran on
-/// was removed, and the worker's mirror deleted it when it came back.
+/// usage and a usage whose own read failed (`status: error`, with no list) count no hive
+/// (`NotRead`); a hive in `skipped_hives` was not counted, but an ingress or an egress, which runs
+/// no node on a runtime (`registered` says `WithoutRuntimes`: the motherbee's orchestrator lists
+/// none there since 0.1.133, and each was there on every read before), and `registered` adds what
+/// the registry records of a join not done. A listed node refuses the removal whatever was not
+/// counted besides. Before 0.1.133 a usage missing from the answer read as `in_use: false` and
+/// every hive not counted as one with no node: a version a node of a restarting worker ran on was
+/// removed, and the worker's mirror deleted it when it came back.
 fn runtime_version_use(
     admin_hive: &str,
     answer: Result<serde_json::Value, String>,
-    runs_no_runtime: impl Fn(&str) -> bool,
+    registered: impl Fn(&str) -> RegisteredHive,
 ) -> RuntimeVersionUse {
     let not_read = |reason: &str, detail: String, usage: Option<serde_json::Value>| {
-        RuntimeVersionUse::Unknown {
+        RuntimeVersionUse::NotRead {
             usage,
-            unread: vec![UnreadHive {
+            failure: UnreadHive {
                 hive: admin_hive.to_string(),
                 reason: reason.to_string(),
                 detail: Some(detail),
-            }],
+                join: None,
+            },
         }
     };
     let answer = match answer {
@@ -19047,13 +19171,14 @@ fn runtime_version_use(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("error"));
     if failed {
+        // Its own nodes' read, or its registry's, failed: the message says which.
         let detail = usage
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("no reason given");
         return not_read(
             "USAGE_READ_FAILED",
-            format!("its orchestrator could not read its own nodes: {detail}"),
+            format!("its orchestrator could not make the read: {detail}"),
             Some(usage),
         );
     }
@@ -19068,37 +19193,40 @@ fn runtime_version_use(
             skipped
                 .iter()
                 .map(UnreadHive::skipped)
-                .filter(|hive| !runs_no_runtime(&hive.hive))
+                .filter_map(|hive| match registered(&hive.hive) {
+                    RegisteredHive::WithoutRuntimes => None,
+                    RegisteredHive::JoinUnfinished(join) => Some(UnreadHive {
+                        join: Some(join),
+                        ..hive
+                    }),
+                    RegisteredHive::Other => Some(hive),
+                })
                 .collect::<Vec<_>>()
         });
-    let (Some(nodes), Some(unread)) = (nodes, unread) else {
-        return not_read(
+    match (nodes, unread) {
+        (Some(nodes), unread) if !nodes.is_empty() => RuntimeVersionUse::InUse {
+            usage,
+            nodes,
+            unread: unread.unwrap_or_default(),
+        },
+        (Some(_), Some(unread)) if !unread.is_empty() => {
+            RuntimeVersionUse::Unknown { usage, unread }
+        }
+        (Some(_), Some(_)) => RuntimeVersionUse::Unused(usage),
+        _ => not_read(
             "NO_USAGE",
             "its orchestrator's usage lists no running_nodes or no skipped_hives".to_string(),
             Some(usage),
-        );
-    };
-    if !nodes.is_empty() {
-        return RuntimeVersionUse::InUse {
-            usage,
-            nodes,
-            unread,
-        };
+        ),
     }
-    if !unread.is_empty() {
-        return RuntimeVersionUse::Unknown {
-            usage: Some(usage),
-            unread,
-        };
-    }
-    RuntimeVersionUse::Unused(usage)
 }
 
 /// `remove_runtime_version`'s decision on a version's use: the usage when the version can go,
 /// otherwise its refusal, 409 with nothing removed. `RUNTIME_IN_USE` names each node listed with
 /// its hive and lifecycle (`runtime_in_use_detail`); `RUNTIME_USAGE_UNKNOWN` (FINDINGS A-281) each
-/// hive whose nodes were not counted, with why, and what to do. Both payloads keep the usage
-/// (`usage_global_visible`) and name the hives not counted (`unanswered_hives`).
+/// hive whose nodes were not counted, with why, and what to do, or, when the read failed on the
+/// motherbee, that no hive was counted. Both payloads keep the usage (`usage_global_visible`) and
+/// name the hives not counted (`unanswered_hives`, the motherbee for a read that failed there).
 fn runtime_version_removable(
     runtime: &str,
     runtime_version: &str,
@@ -19147,6 +19275,28 @@ fn runtime_version_removable(
             serde_json::json!({
                 "usage_global_visible": usage,
                 "unanswered_hives": named(&unread),
+                "retryable": true,
+            }),
+        )),
+        // The read did not end on the motherbee: no hive was counted, the motherbee's own nodes
+        // included, so naming the motherbee alone would read as a hive whose nodes are unknown.
+        RuntimeVersionUse::NotRead { usage, failure } => Err(refusal(
+            "RUNTIME_USAGE_UNKNOWN",
+            format!(
+                "cannot tell whether runtime '{runtime}' version '{runtime_version}' is in use: the \
+                 read of its use failed on {}, so no hive's nodes were counted, and nothing was \
+                 removed.{} Ask again",
+                failure.describe(),
+                if failure.reason == "TIMEOUT" {
+                    " A worker whose orchestrator does not answer delays that read: the motherbee \
+                     asks the workers one at a time."
+                } else {
+                    ""
+                }
+            ),
+            serde_json::json!({
+                "usage_global_visible": usage,
+                "unanswered_hives": [failure.to_json()],
                 "retryable": true,
             }),
         )),
@@ -19783,16 +19933,9 @@ async fn handle_remove_runtime_version(
         ));
     }
 
-    // Removed only once every hive's nodes were read and none runs on the version (FINDINGS A-281).
-    let usage_global = match runtime_version_removable(
-        runtime,
-        runtime_version,
-        read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,
-    ) {
-        Ok(usage) => usage,
-        Err(refusal) => return Ok(refusal),
-    };
-
+    // The manifest alone decides this one: it goes before the read of the version's use, which
+    // waits on every hive (up to 30 s, under the manifest's lock) and would refuse, while a hive
+    // does not answer, a removal that can never pass.
     let dependents = match runtime_dependents_summary_local(&manifest, &runtime_key) {
         Ok(value) => value,
         Err(err) => {
@@ -19827,6 +19970,16 @@ async fn handle_remove_runtime_version(
             .to_string(),
         ));
     }
+
+    // Removed only once every hive's nodes were read and none runs on the version (FINDINGS A-281).
+    let usage_global = match runtime_version_removable(
+        runtime,
+        runtime_version,
+        read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,
+    ) {
+        Ok(usage) => usage,
+        Err(refusal) => return Ok(refusal),
+    };
 
     let updated_manifest = match remove_runtime_version_from_manifest_local(
         &manifest,
@@ -22324,7 +22477,9 @@ async fn handle_teardown_node(
     let ilk_id = request.ilk_id.as_str();
     let mut report = TeardownReport::new(&request);
     if let Some(refusal) =
-        teardown_live_node_refusal(&request, origin, || (ctx.connected_nodes)(&ctx.hive_id))
+        teardown_live_node_refusal(&request, origin, &ctx.hive_id, &hive_registry(ctx), || {
+            (ctx.connected_nodes)(&ctx.hive_id)
+        })
     {
         return Ok(report.answer(Some(refusal)));
     }
@@ -22416,34 +22571,59 @@ async fn handle_teardown_node(
 /// A teardown that must not run because its node is still connected: every caller but the node's
 /// own orchestrator, whose call follows its kill, is held to it. Otherwise a node redeployed onto
 /// the ILK of a teardown that failed half-way could be purged alive. `connected` reads the nodes
-/// connected now; when it cannot, the teardown waits (`INVENTORY_UNAVAILABLE`).
+/// connected now; when it cannot, the teardown waits (`INVENTORY_UNAVAILABLE`). So it does when the
+/// node's hive is not among the hives that read holds (stale in the LSA, or not in it) while the
+/// hive registry still lists it: a node of a hive cut off is not connected, and may run. Before
+/// 0.1.133 such a node read as gone, and its secrets and its ILK went while it ran. A hive the
+/// registry no longer lists holds nothing up.
 fn teardown_live_node_refusal(
     request: &TeardownNodeRequest,
     origin: AdminOrigin<'_>,
-    connected: impl FnOnce() -> Result<Vec<String>, String>,
+    admin_hive: &str,
+    registry: &HiveRegistry,
+    connected: impl FnOnce() -> Result<ConnectedNow, String>,
 ) -> Option<(u16, &'static str, String)> {
     if teardown_by_own_orchestrator(request, origin) {
         return None;
     }
-    match connected() {
-        Ok(nodes) if nodes.contains(&request.node_name) => Some((
+    let unreadable = |why: String, next: &str| {
+        Some((
+            503,
+            "INVENTORY_UNAVAILABLE",
+            format!(
+                "whether {} is still connected cannot be read: {why}; nothing was removed{next}",
+                request.node_name
+            ),
+        ))
+    };
+    let connected = match connected() {
+        Ok(connected) => connected,
+        Err(detail) => return unreadable(detail, ""),
+    };
+    if connected.nodes.contains(&request.node_name) {
+        return Some((
             409,
             "NODE_STILL_CONNECTED",
             format!(
                 "{} is still connected: stop it (kill_node) before tearing it down; nothing was removed",
                 request.node_name
             ),
-        )),
-        Ok(_) => None,
-        Err(detail) => Some((
-            503,
-            "INVENTORY_UNAVAILABLE",
-            format!(
-                "whether {} is still connected cannot be read: {detail}; nothing was removed",
-                request.node_name
-            ),
-        )),
+        ));
     }
+    if request.hive != admin_hive
+        && !connected.hives.contains(&request.hive)
+        && registry.lists(&request.hive)
+    {
+        return unreadable(
+            format!(
+                "its hive {}, which the hive registry still lists, is stale in the LSA or not in it",
+                request.hive
+            ),
+            ". Ask again once the hive is back, or remove the hive (remove_hive) if it is gone for \
+             good",
+        );
+    }
+    None
 }
 
 /// Step 3 of a teardown: every secret dedicated to the ILK, each deleted in the tenant it belongs
@@ -27323,6 +27503,23 @@ mod tests {
                 "WF.invoice@worker1",
             ]
         );
+        // The hives that read holds: a stale or deleted one is not one, so a node of it is unknown,
+        // never gone (`teardown_live_node_refusal`).
+        assert_eq!(
+            connected_hive_names("motherbee", &lsa, now),
+            ["ingress1", "motherbee", "worker1"]
+        );
+    }
+
+    /// A read of the connected nodes that holds this admin's hive and `hives`, with `nodes`.
+    fn connected_now(hives: &[&str], nodes: &[&str]) -> ConnectedNow {
+        ConnectedNow {
+            nodes: nodes.iter().map(|node| node.to_string()).collect(),
+            hives: std::iter::once(PRIMARY_HIVE_ID)
+                .chain(hives.iter().copied())
+                .map(str::to_string)
+                .collect(),
+        }
     }
 
     /// A workflow deploy launches its node for whoever asked: the admin stamps the requester on
@@ -33615,10 +33812,10 @@ mod tests {
         assert_eq!(error_code_to_http_status("INVENTORY_UNAVAILABLE"), 503);
 
         ctx.connected_nodes = Arc::new(|_| {
-            Ok(vec![
-                "WF.invoice@worker1".to_string(),
-                "WF.invoice@worker2".to_string(),
-            ])
+            Ok(connected_now(
+                &["worker1", "worker2"],
+                &["WF.invoice@worker1", "WF.invoice@worker2"],
+            ))
         });
         let refused = dispatch_internal_admin_command(
             &ctx,
@@ -33634,10 +33831,10 @@ mod tests {
         assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
 
         ctx.connected_nodes = Arc::new(|_| {
-            Ok(vec![
-                "WF.invoice@worker1".to_string(),
-                "WF.billing@worker2".to_string(),
-            ])
+            Ok(connected_now(
+                &["worker1", "worker2"],
+                &["WF.invoice@worker1", "WF.billing@worker2"],
+            ))
         });
         // Admitted: the publisher answers for itself (the tests have no runtime manifest).
         let admitted = dispatch_internal_admin_command(
@@ -33967,7 +34164,7 @@ mod tests {
             .is_none());
 
         // The operator, once the node is gone: the leftover secrets go.
-        ctx.connected_nodes = Arc::new(|_| Ok(vec!["IO.other@worker1".to_string()]));
+        ctx.connected_nodes = Arc::new(|_| Ok(connected_now(&["worker1"], &["IO.other@worker1"])));
         let teardown = handle_admin_command(
             &ctx,
             &ctx.rpc,
@@ -34033,16 +34230,31 @@ mod tests {
     }
 
     /// A node still connected is torn down only by its own orchestrator, right after its kill:
-    /// the operator, Archi and the executor wait until shared memory no longer lists it.
+    /// the operator, Archi and the executor wait until shared memory no longer lists it. A node of
+    /// a hive the LSA holds as stale, or does not list, while the registry still lists the hive is
+    /// not read as gone: its hive is cut off, and it may run. Before 0.1.133 it was, and its secrets
+    /// and its ILK went while it ran; a hive the registry no longer lists holds nothing up.
     #[test]
     fn a_connected_node_is_torn_down_only_by_its_own_orchestrator() {
+        let registry = HiveRegistry::new(test_temp_dir("teardown-registry"));
+        write_registry_entry(
+            registry.root(),
+            "worker1",
+            "hive_id: worker1\nstatus: connected\nrole: worker\njoin:\n  phase: done\n",
+        );
         let request =
             TeardownNodeRequest::from_params(&teardown_params("AI.sales@worker1")).unwrap();
         let own = AdminOrigin::Mesh("SY.orchestrator@worker1");
         assert_eq!(
-            teardown_live_node_refusal(&request, own, || -> Result<Vec<String>, String> {
-                panic!("the orchestrator's own teardown reads nothing")
-            }),
+            teardown_live_node_refusal(
+                &request,
+                own,
+                PRIMARY_HIVE_ID,
+                &registry,
+                || -> Result<ConnectedNow, String> {
+                    panic!("the orchestrator's own teardown reads nothing")
+                }
+            ),
             None
         );
         for origin in [
@@ -34051,22 +34263,66 @@ mod tests {
             AdminOrigin::Mesh("SY.architect@motherbee"),
             AdminOrigin::Mesh("SY.orchestrator@worker2"),
         ] {
-            let code = |connected: Result<Vec<String>, String>| {
-                teardown_live_node_refusal(&request, origin, || connected)
-                    .map(|(status, code, _)| (status, code))
+            let refusal = |connected: Result<ConnectedNow, String>| {
+                teardown_live_node_refusal(&request, origin, PRIMARY_HIVE_ID, &registry, || {
+                    connected
+                })
+            };
+            let code = |connected: Result<ConnectedNow, String>| {
+                refusal(connected).map(|(status, code, _)| (status, code))
             };
             assert_eq!(
-                code(Ok(vec!["AI.sales@worker1".to_string()])),
+                code(Ok(connected_now(&["worker1"], &["AI.sales@worker1"]))),
                 Some((409, "NODE_STILL_CONNECTED")),
                 "{origin:?}"
             );
-            assert_eq!(code(Ok(vec!["AI.sales@worker2".to_string()])), None);
+            assert_eq!(
+                code(Ok(connected_now(&["worker1"], &["AI.sales@worker2"]))),
+                None
+            );
             assert_eq!(
                 code(Err("no regions".to_string())),
                 Some((503, "INVENTORY_UNAVAILABLE"))
             );
+            // worker1 stale in the LSA, or not in it, and still in the registry.
+            let (status, code, detail) =
+                refusal(Ok(connected_now(&["worker2"], &[]))).expect("refused");
+            assert_eq!((status, code), (503, "INVENTORY_UNAVAILABLE"));
+            assert_eq!(
+                detail,
+                "whether AI.sales@worker1 is still connected cannot be read: its hive worker1, \
+                 which the hive registry still lists, is stale in the LSA or not in it; nothing \
+                 was removed. Ask again once the hive is back, or remove the hive (remove_hive) if \
+                 it is gone for good"
+            );
         }
+        // A hive the registry no longer lists: removed, nothing holds the teardown up.
+        let gone = TeardownNodeRequest::from_params(&teardown_params("AI.sales@worker9")).unwrap();
+        assert_eq!(
+            teardown_live_node_refusal(
+                &gone,
+                AdminOrigin::Http,
+                PRIMARY_HIVE_ID,
+                &registry,
+                || Ok(connected_now(&["worker1"], &[]))
+            ),
+            None
+        );
+        // A node of this admin's own hive is read from its routers' regions.
+        let local =
+            TeardownNodeRequest::from_params(&teardown_params("AI.sales@motherbee")).unwrap();
+        assert_eq!(
+            teardown_live_node_refusal(
+                &local,
+                AdminOrigin::Http,
+                PRIMARY_HIVE_ID,
+                &registry,
+                || Ok(ConnectedNow::default())
+            ),
+            None
+        );
         assert_eq!(error_code_to_http_status("NODE_STILL_CONNECTED"), 409);
+        let _ = fs::remove_dir_all(registry.root());
     }
 
     /// Over HTTP: a connected node is refused before anything is sent, a box whose regions cannot
@@ -34087,7 +34343,8 @@ mod tests {
         assert_eq!(body["error_code"], json!("INVENTORY_UNAVAILABLE"));
         assert_eq!(body["payload"]["node_name"], json!("WF.invoice@worker1"));
 
-        ctx.connected_nodes = Arc::new(|_| Ok(vec!["WF.invoice@worker1".to_string()]));
+        ctx.connected_nodes =
+            Arc::new(|_| Ok(connected_now(&["worker1"], &["WF.invoice@worker1"])));
         let (status, body) = handle_hive_paths("POST", path, &query, &ilk, &ctx, &ctx.rpc)
             .await
             .expect("answered")
@@ -34104,8 +34361,25 @@ mod tests {
             .await
             .is_none());
 
+        // worker1 cut off, and still in the registry: its node may run, and nothing is sent.
+        ctx.connected_nodes = Arc::new(|_| Ok(connected_now(&[], &[])));
+        let (status, body) = handle_hive_paths("POST", path, &query, &ilk, &ctx, &ctx.rpc)
+            .await
+            .expect("answered")
+            .expect("routed");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error_code"], json!("INVENTORY_UNAVAILABLE"));
+        assert!(body["error_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("its hive worker1, which the hive registry")));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
         // Gone: the teardown runs, for the node of the path's hive.
-        ctx.connected_nodes = Arc::new(|_| Ok(Vec::new()));
+        ctx.connected_nodes = Arc::new(|_| Ok(connected_now(&["worker1"], &[])));
         let teardown = handle_hive_paths("POST", path, &query, &ilk, &ctx, &ctx.rpc);
         let drive = answer_teardown(&mut harness, vec![("ILK_GET", ilk_of("WF.other@worker1"))]);
         let (result, _) = tokio::join!(teardown, drive);
@@ -36472,23 +36746,27 @@ mod tests {
     /// What a removal of ai.generic 0.3.1 decides, as its handler does: the read of the version's
     /// use (`read_runtime_version_use`), answered by the motherbee's orchestrator with `answer`,
     /// then the decision on it (`runtime_version_removable`): the usage, or the refusal's status
-    /// and body. The registry holds two workers, an ingress, an egress and a worker whose join is
-    /// under way.
+    /// and body. The registry holds two workers, an ingress, an egress, an ingress whose join is
+    /// under way, a worker whose join is under way and one whose join failed.
     async fn removal_decided_on(answer: Value) -> Result<Value, (u16, Value)> {
         let (ctx, mut harness) = opa_test_admin("runtime-use");
         let registry = hive_registry(&ctx);
-        for (hive, role, status) in [
-            ("worker1", "worker", "connected"),
-            ("worker2", "worker", "connected"),
-            ("ingress1", "ingress", "connected"),
-            ("egress1", "egress", "connected"),
-            ("joining3", "worker", "joining"),
+        for (hive, info) in [
+            ("worker1", "role: worker\nstatus: connected\n"),
+            ("worker2", "role: worker\nstatus: connected\n"),
+            ("ingress1", "role: ingress\nstatus: connected\n"),
+            ("egress1", "role: egress\nstatus: connected\n"),
+            (
+                "ingress2",
+                "role: ingress\nstatus: joining\njoin:\n  phase: harden_ssh\n",
+            ),
+            ("joining3", "role: worker\nstatus: joining\n"),
+            (
+                "failed4",
+                "role: worker\nstatus: failed\njoin:\n  phase: sync_wait\n",
+            ),
         ] {
-            write_registry_entry(
-                registry.root(),
-                hive,
-                &format!("hive_id: {hive}\nrole: {role}\nstatus: {status}\n"),
-            );
+            write_registry_entry(registry.root(), hive, &format!("hive_id: {hive}\n{info}"));
         }
         let decide = async {
             runtime_version_removable(
@@ -36542,7 +36820,8 @@ mod tests {
 
     /// The refusal of a version whose use was not read on every hive: 409 RUNTIME_USAGE_UNKNOWN,
     /// nothing removed, `payload.unanswered_hives` naming each hive not read with its reason, the
-    /// usage kept, and the detail saying what to do.
+    /// usage kept, and the detail saying what to do. A read that failed on the motherbee names the
+    /// motherbee alone, and says that no hive was counted.
     fn assert_usage_unknown(refusal: &(u16, Value), unread: &[(&str, &str)]) {
         let (status, body) = refusal;
         assert_eq!(*status, 409, "{body}");
@@ -36563,10 +36842,24 @@ mod tests {
             .collect();
         assert_eq!(named, unread, "{body}");
         let detail = body["error_detail"].as_str().expect("error_detail");
+        let asked = "cannot tell whether runtime 'ai.generic' version '0.3.1' is in use: ";
+        if let [(PRIMARY_HIVE_ID, reason)] = unread {
+            assert!(
+                detail.starts_with(&format!(
+                    "{asked}the read of its use failed on motherbee ({reason}: its orchestrator"
+                )),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("), so no hive's nodes were counted, and nothing was removed."),
+                "{detail}"
+            );
+            assert!(detail.ends_with(" Ask again"), "{detail}");
+            assert!(!detail.contains("the nodes of motherbee"), "{detail}");
+            return;
+        }
         assert!(
-            detail.starts_with(
-                "cannot tell whether runtime 'ai.generic' version '0.3.1' is in use: the nodes of "
-            ),
+            detail.starts_with(&format!("{asked}the nodes of ")),
             "{detail}"
         );
         for (hive, reason) in unread {
@@ -36584,28 +36877,42 @@ mod tests {
 
     /// FINDINGS A-281: a version is removed only once every hive's nodes were read and none runs
     /// on it. A usage whose own read failed (`status: error`, no list), a usage that names a hive
-    /// it did not count (a worker that did not answer, or answered an error, or a hive whose join
-    /// is under way), and an answer with no usage are no "not in use": each is refused
-    /// RUNTIME_USAGE_UNKNOWN, naming the hives and why. Before, the first and the last read as no
-    /// node, and the usage's `skipped_hives` was never looked at: worker1 restarting its
-    /// orchestrator, a version AI.x@worker1 ran on was removed.
+    /// it did not count (a worker that did not answer, answered an error or gave no list of its
+    /// nodes, or a hive whose join is not done), and an answer with no usage are no "not in use":
+    /// each is refused RUNTIME_USAGE_UNKNOWN, naming the hives and why, a join not done with its
+    /// status and phase. Before, the first and the last read as no node, and the usage's
+    /// `skipped_hives` was never looked at: worker1 restarting its orchestrator, a version
+    /// AI.x@worker1 ran on was removed.
     #[tokio::test]
     async fn a_version_whose_use_was_not_read_on_every_hive_is_not_removed() {
-        // The motherbee's orchestrator could not read its own nodes.
-        let failed = json!({
-            "scope": "group_visible_control_plane",
-            "status": "error",
-            "message": "Permission denied (os error 13)",
-        });
-        let refusal = removal_decided_on(runtime_read_with_usage(failed.clone()))
-            .await
-            .expect_err("refused");
-        assert_usage_unknown(&refusal, &[("motherbee", "USAGE_READ_FAILED")]);
-        let (_, body) = &refusal;
-        assert_eq!(body["payload"]["usage_global_visible"], failed);
-        assert!(body["payload"]["unanswered_hives"][0]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("Permission denied (os error 13)")));
+        // The motherbee's orchestrator could not read its own nodes, or its hive registry: no hive
+        // was counted.
+        for message in [
+            "Permission denied (os error 13)",
+            "the hive registry could not be read: No such file or directory (os error 2)",
+        ] {
+            let failed = json!({
+                "scope": "group_visible_control_plane",
+                "status": "error",
+                "message": message,
+            });
+            let refusal = removal_decided_on(runtime_read_with_usage(failed.clone()))
+                .await
+                .expect_err("refused");
+            assert_usage_unknown(&refusal, &[("motherbee", "USAGE_READ_FAILED")]);
+            let (_, body) = &refusal;
+            assert_eq!(body["payload"]["usage_global_visible"], failed);
+            assert_eq!(
+                body["payload"]["unanswered_hives"][0]["detail"],
+                json!(format!(
+                    "its orchestrator could not make the read: {message}"
+                ))
+            );
+            assert!(!body["error_detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("A worker whose orchestrator does not answer"));
+        }
 
         // worker1 did not answer, and worker2's copy of the manifest does not list the runtime yet.
         // The ingress and the egress, which receive no runtime, are not named.
@@ -36640,15 +36947,71 @@ mod tests {
             "{detail}"
         );
 
-        // A hive whose join is under way, whose role the registry does not give yet, may run one.
-        let joining = global_usage(
+        // A worker whose join is under way, and one whose join failed, may run one: each is named
+        // with its status and its phase as the registry records them, and what ends the join. A
+        // worker that answered with no list of its nodes (USAGE_UNREADABLE) is not counted either.
+        let unfinished = global_usage(
             json!([]),
-            json!([{ "hive_id": "joining3", "reason": "UNREACHABLE" }]),
+            json!([
+                { "hive_id": "failed4", "reason": "RUNTIME_MANIFEST_MISSING" },
+                { "hive_id": "joining3", "reason": "UNREACHABLE" },
+                {
+                    "hive_id": "worker2",
+                    "reason": "USAGE_UNREADABLE",
+                    "message": "Input/output error (os error 5)",
+                },
+            ]),
         );
-        let refusal = removal_decided_on(runtime_read_with_usage(joining))
+        let refusal = removal_decided_on(runtime_read_with_usage(unfinished))
             .await
             .expect_err("refused");
-        assert_usage_unknown(&refusal, &[("joining3", "UNREACHABLE")]);
+        assert_usage_unknown(
+            &refusal,
+            &[
+                ("failed4", "RUNTIME_MANIFEST_MISSING"),
+                ("joining3", "UNREACHABLE"),
+                ("worker2", "USAGE_UNREADABLE"),
+            ],
+        );
+        let (_, body) = &refusal;
+        assert_eq!(
+            body["payload"]["unanswered_hives"],
+            json!([
+                {
+                    "hive": "failed4",
+                    "reason": "RUNTIME_MANIFEST_MISSING",
+                    "detail": null,
+                    "status": "failed",
+                    "join_phase": "sync_wait",
+                    "next": "finish its join (add_hive again) or remove it (remove_hive)",
+                },
+                {
+                    "hive": "joining3",
+                    "reason": "UNREACHABLE",
+                    "detail": null,
+                    "status": "joining",
+                    "join_phase": null,
+                    "next": "finish its join (add_hive again) or remove it (remove_hive)",
+                },
+                {
+                    "hive": "worker2",
+                    "reason": "USAGE_UNREADABLE",
+                    "detail": "Input/output error (os error 5)",
+                },
+            ])
+        );
+        assert_eq!(
+            body["error_detail"],
+            json!(
+                "cannot tell whether runtime 'ai.generic' version '0.3.1' is in use: the nodes of \
+                 failed4 (RUNTIME_MANIFEST_MISSING; its join is not done, status failed, phase \
+                 sync_wait: finish its join (add_hive again) or remove it (remove_hive)), joining3 \
+                 (UNREACHABLE; its join is not done, status joining, phase not recorded: finish its \
+                 join (add_hive again) or remove it (remove_hive)), worker2 (USAGE_UNREADABLE: \
+                 Input/output error (os error 5)) were not read, and nothing was removed. Ask again \
+                 once each hive answers; a hive gone for good is removed with remove_hive first"
+            )
+        );
 
         // An answer with no usage, and a usage that does not say which hives it did not count.
         for answer in [
@@ -36673,19 +37036,27 @@ mod tests {
         let refusal = removal_decided_on(refused).await.expect_err("refused");
         assert_usage_unknown(&refusal, &[("motherbee", "MANIFEST_INVALID")]);
 
-        // Every hive answered, and no node runs on the version: it goes.
-        let counted = global_usage(json!([]), json!([]));
+        // Every hive answered, and no node runs on the version: it goes. The ingresses and the
+        // egresses the motherbee's orchestrator did not ask (since 0.1.133) hold nothing up.
+        let mut counted = global_usage(json!([]), json!([]));
+        counted["hives_without_runtimes"] = json!([
+            { "hive_id": "egress1", "role": "egress" },
+            { "hive_id": "ingress1", "role": "ingress" },
+        ]);
         let usage = removal_decided_on(runtime_read_with_usage(counted.clone()))
             .await
             .expect("removable");
         assert_eq!(usage, counted);
     }
 
-    /// An ingress and an egress receive no runtime, so their orchestrators answer every read of a
-    /// runtime's use RUNTIME_MANIFEST_MISSING, and the motherbee's lists them in `skipped_hives`
-    /// on every read (FINDINGS A-24): a read that skipped them, whatever the reason, missed no
-    /// node, and the version goes once every worker was counted. Taken for hives not read, they
-    /// refused every removal, SY.wf-rules' purges included.
+    /// An ingress and an egress receive no runtime: an orchestrator before 0.1.133 lists them in
+    /// `skipped_hives` on every read (each answers RUNTIME_MANIFEST_MISSING, FINDINGS A-24), so a
+    /// read that skipped them, whatever the reason, missed no node, and the version goes once every
+    /// worker was counted. The role is the one the registry entry records, whatever the state of
+    /// the join: a join records it when it accepts the hive, and the runtimes never reach those
+    /// roles. Taken for hives not read, they refused every removal, SY.wf-rules' purges included;
+    /// read by the strict role, an ingress whose join failed refused every removal until
+    /// remove_hive.
     #[tokio::test]
     async fn an_ingress_or_an_egress_not_counted_refuses_no_removal() {
         let usage = global_usage(
@@ -36693,6 +37064,7 @@ mod tests {
             json!([
                 { "hive_id": "egress1", "reason": "UNREACHABLE", "message": "stale in the LSA" },
                 { "hive_id": "ingress1", "reason": "RUNTIME_MANIFEST_MISSING" },
+                { "hive_id": "ingress2", "reason": "UNREACHABLE" },
             ]),
         );
         let removable = removal_decided_on(runtime_read_with_usage(usage.clone()))
@@ -36702,27 +37074,86 @@ mod tests {
 
         let registry = HiveRegistry::new(test_temp_dir("runtime-use-roles"));
         let done = "join:\n  phase: done\n";
-        for (hive, role, status) in [
-            ("worker1", "worker", "connected"),
-            ("ingress1", "ingress", "connected"),
-            ("egress1", "egress", "connected"),
-            ("ingress2", "ingress", "joining"),
+        for (dir, info) in [
+            (
+                "worker1",
+                format!("hive_id: worker1\nrole: worker\nstatus: connected\n{done}"),
+            ),
+            (
+                "ingress1",
+                format!("hive_id: ingress1\nrole: ingress\nstatus: connected\n{done}"),
+            ),
+            (
+                "egress1",
+                format!("hive_id: egress1\nrole: EGRESS\nstatus: connected\n{done}"),
+            ),
+            (
+                "ingress2",
+                "hive_id: ingress2\nrole: ingress\nstatus: joining\njoin:\n  phase: harden_ssh\n"
+                    .to_string(),
+            ),
+            (
+                "egress3",
+                "hive_id: egress3\nrole: egress\nstatus: failed\n".to_string(),
+            ),
+            (
+                "worker4",
+                "hive_id: worker4\nrole: worker\nstatus: failed\njoin:\n  phase: sync_wait\n"
+                    .to_string(),
+            ),
+            (
+                "worker5",
+                "hive_id: worker5\nrole: worker\nstatus: connected\njoin:\n  phase: bootstrap\n"
+                    .to_string(),
+            ),
+            (
+                "other6",
+                format!("hive_id: egress9\nrole: egress\nstatus: connected\n{done}"),
+            ),
         ] {
-            write_registry_entry(
-                registry.root(),
-                hive,
-                &format!("hive_id: {hive}\nrole: {role}\nstatus: {status}\n{done}"),
+            write_registry_entry(registry.root(), dir, &info);
+        }
+        fs::create_dir_all(registry.root().join("accepting7")).unwrap();
+        for hive in ["ingress1", "egress1", "ingress2", "egress3"] {
+            assert_eq!(
+                registered_hive(&registry, hive),
+                RegisteredHive::WithoutRuntimes,
+                "{hive}"
             );
         }
-        assert!(hive_runs_no_runtime(&registry, "ingress1"));
-        assert!(hive_runs_no_runtime(&registry, "egress1"));
-        for hive in ["worker1", "ingress2", "gone1", PRIMARY_HIVE_ID] {
-            assert!(!hive_runs_no_runtime(&registry, hive), "{hive}");
+        let unfinished = |status: Option<&str>, phase: Option<&str>| {
+            RegisteredHive::JoinUnfinished(UnfinishedJoin {
+                status: status.map(str::to_string),
+                phase: phase.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            registered_hive(&registry, "worker4"),
+            unfinished(Some("failed"), Some("sync_wait"))
+        );
+        assert_eq!(
+            registered_hive(&registry, "worker5"),
+            unfinished(Some("connected"), Some("bootstrap"))
+        );
+        assert_eq!(
+            registered_hive(&registry, "accepting7"),
+            unfinished(None, None)
+        );
+        for hive in ["worker1", "other6", "gone1", "..", PRIMARY_HIVE_ID] {
+            assert_eq!(
+                registered_hive(&registry, hive),
+                RegisteredHive::Other,
+                "{hive}"
+            );
         }
+        let _ = fs::remove_dir_all(registry.root());
     }
 
     /// No answer from the motherbee's orchestrator is no "not in use" either: refused, naming the
-    /// motherbee and how the read failed. Before, RUNTIME_REMOVE_FAILED, which reads as a removal
+    /// motherbee and how the read failed, and saying no hive was counted, where it read "the nodes
+    /// of motherbee were not read" of a healthy motherbee. A timeout says that a worker whose
+    /// orchestrator does not answer delays the read: the motherbee asks the workers one at a time,
+    /// each for longer than SY.admin waits. Before, RUNTIME_REMOVE_FAILED, which reads as a removal
     /// that failed under way.
     #[test]
     fn a_read_of_a_versions_use_with_no_answer_refuses_the_removal() {
@@ -36730,15 +37161,27 @@ mod tests {
             ("timed out waiting for the reply", "TIMEOUT"),
             ("router connection closed", "TRANSPORT_ERROR"),
         ] {
-            let version_use = runtime_version_use(PRIMARY_HIVE_ID, Err(err.to_string()), |_| false);
+            let version_use = runtime_version_use(PRIMARY_HIVE_ID, Err(err.to_string()), |_| {
+                RegisteredHive::Other
+            });
             let (status, body) =
                 runtime_version_removable("ai.generic", "0.3.1", version_use).expect_err("refused");
             let body: Value = serde_json::from_str(&body).expect("a body");
             assert_usage_unknown(&(status, body.clone()), &[("motherbee", reason)]);
-            assert!(body["payload"]["unanswered_hives"][0]["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains(err)));
+            assert_eq!(
+                body["payload"]["unanswered_hives"][0]["detail"],
+                json!(format!("its orchestrator did not answer the read: {err}"))
+            );
             assert_eq!(body["payload"]["usage_global_visible"], Value::Null);
+            let detail = body["error_detail"].as_str().unwrap_or_default();
+            assert_eq!(
+                detail.contains(
+                    " A worker whose orchestrator does not answer delays that read: the motherbee \
+                     asks the workers one at a time. Ask again"
+                ),
+                reason == "TIMEOUT",
+                "{detail}"
+            );
         }
         assert_eq!(error_code_to_http_status("RUNTIME_USAGE_UNKNOWN"), 409);
     }
@@ -36812,7 +37255,7 @@ mod tests {
                 json!(many),
                 json!([]),
             ))),
-            |_| false,
+            |_| RegisteredHive::Other,
         );
         let (_, body) =
             runtime_version_removable("ai.generic", "0.3.1", version_use).expect_err("refused");
@@ -36823,44 +37266,101 @@ mod tests {
             "AI.n19@worker1 (worker1, RUNNING), and 3 more (payload.usage_global_visible.running_nodes)."
         ));
         assert!(!detail.contains("AI.n20@worker1"), "{detail}");
+
+        // A usage that lists a node is in use, whatever else it leaves out: no skipped_hives (a
+        // spoke's own usage) is RUNTIME_IN_USE, never NO_USAGE.
+        let listed = json!({
+            "scope": "hive_local_visible",
+            "in_use": true,
+            "running_count": 1,
+            "running_nodes": [running_node("AI.sales@motherbee", "RUNNING")],
+        });
+        let (status, body) = removal_decided_on(runtime_read_with_usage(listed.clone()))
+            .await
+            .expect_err("refused");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("RUNTIME_IN_USE"), "{body}");
+        assert_eq!(body["payload"]["usage_global_visible"], listed);
+        assert_eq!(body["payload"]["unanswered_hives"], json!([]));
     }
 
     /// The handler decides on that read and that decision alone (FINDINGS A-281): no usage of its
-    /// own, no default that reads as unused.
+    /// own, no default that reads as unused. RUNTIME_HAS_DEPENDENTS, which the manifest alone
+    /// decides, comes before the read, which waits on every hive: a removal that can never pass is
+    /// not answered RUNTIME_USAGE_UNKNOWN, retryable, while a hive does not answer.
     #[test]
     fn the_removal_decides_on_the_use_read_on_every_hive() {
         let source = include_str!("sy_admin.rs");
         let handler = "async fn handle_remove_runtime_version(";
         let start = source.find(handler).expect("the handler");
         let body = &source[start..start + source[start..].find("\n}\n").expect("its end")];
-        assert!(body.contains(
+        let read =
             "runtime_version_removable(\n        runtime,\n        runtime_version,\n        \
-             read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,"
-        ));
+                    read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,";
+        assert!(body.contains(read));
         assert!(!body.contains("in_use"), "{handler}");
         assert!(!body.contains("running_nodes"), "{handler}");
+        let dependents = body
+            .find("runtime_dependents_summary_local(&manifest, &runtime_key)")
+            .expect("the dependents' check");
+        assert!(dependents < body.find(read).expect("the read"));
     }
 
     /// The help says what a runtime version's removal answers (FINDINGS A-281): RUNTIME_IN_USE
     /// with each node's state, and RUNTIME_USAGE_UNKNOWN with the hives not read and what to do,
-    /// where a workflow's delete meets them too; reset_base_runtime's way to remove a hand publish
-    /// no longer reads as "once no node runs it".
+    /// where a workflow's delete meets them too, with what it leaves and what a workflow created
+    /// again under the name then meets; reset_base_runtime's way to remove a hand publish no
+    /// longer reads as "once no node runs it".
     #[test]
     fn the_help_says_what_a_runtime_versions_removal_answers() {
         let notes = admin_action_request_notes("remove_runtime_version");
-        assert!(notes.contains(&RUNTIME_REMOVAL_IN_USE_NOTE));
-        assert!(notes.contains(&RUNTIME_REMOVAL_UNKNOWN_NOTE));
-        assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE
-            .contains("a hive gone for good is removed with remove_hive first"));
-        assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE
-            .contains("An ingress or an egress receives no runtime, and is never one of them."));
+        for note in [
+            RUNTIME_REMOVAL_IN_USE_NOTE,
+            RUNTIME_REMOVAL_UNKNOWN_NOTE,
+            WF_DELETE_VERSIONS_LEFT_NOTE,
+        ] {
+            assert!(notes.contains(&note), "{note}");
+        }
+        let all = notes.join(" ");
+        for words in [
+            "400 INVALID_REQUEST",
+            "502 SERVICE_FAILED",
+            "before the version's use is read",
+        ] {
+            assert!(all.contains(words), "{words}");
+        }
+        for words in [
+            "a hive gone for good is removed with remove_hive first",
+            "An ingress or an egress, by the role its registry entry records in any state of its \
+             join, receives no runtime and is never one of them.",
+            "gave no usage of every hive (NO_USAGE)",
+            "gave no list of its nodes (USAGE_UNREADABLE)",
+            "no hive's nodes were counted",
+            "a worker whose orchestrator does not answer delays it",
+            "finish its join with add_hive again, or remove it with remove_hive",
+        ] {
+            assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE.contains(words), "{words}");
+        }
+        assert!(
+            RUNTIME_REMOVAL_IN_USE_NOTE.contains("A node whose unit does not run is not listed")
+        );
         assert!(!admin_action_request_notes("reset_base_runtime")
             .join(" ")
             .contains("once no node runs it"));
-        assert!(admin_action_request_notes("wf_rules_delete")
-            .iter()
-            .any(|note| note.contains("RUNTIME_USAGE_UNKNOWN")
-                && note.contains("PACKAGE_PUBLISH_FAILED")));
+        assert!(
+            admin_action_request_notes("wf_rules_delete").contains(&WF_DELETE_VERSIONS_LEFT_NOTE)
+        );
+        for words in [
+            "stops at the first that fails",
+            "RUNTIME_USAGE_UNKNOWN",
+            "PACKAGE_PUBLISH_FAILED",
+            "every version not removed stays in dist, all of them possibly",
+            "publishes from 0.0.1 again",
+            "VERSION_CONFLICT",
+            "with remove_runtime_version once every hive answers",
+        ] {
+            assert!(WF_DELETE_VERSIONS_LEFT_NOTE.contains(words), "{words}");
+        }
     }
 
     /// FINDINGS A-285: the help Archi and the operator read says what 0.1.133 answers. A node
@@ -42721,7 +43221,7 @@ mod tests {
         assert_eq!(sent.len(), 4);
 
         // The operator's, once the node is gone from shared memory.
-        ctx.connected_nodes = Arc::new(|_| Ok(Vec::new()));
+        ctx.connected_nodes = Arc::new(|_| Ok(connected_now(&["worker1"], &[])));
         let ilk = serde_json::to_vec(&json!({ "ilk_id": TEST_ILK })).unwrap();
         let query = HashMap::new();
         let path = "/hives/worker1/nodes/AI.sales/teardown";
