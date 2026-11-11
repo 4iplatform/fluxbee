@@ -366,9 +366,13 @@ The worker join (`add_hive_flow`), in order:
    spoke the finalize (`add_hive_finalize_local_flow`) runs a core update over what step 4 copied,
    which restarts nothing when nothing is new, then the vendor's: a vendor still on its way (its
    manifest or binary missing), with a Syncthing installed and running, is reported in
-   `vendor.awaiting_update` and the finalize goes on (FINDINGS A-190). It links the motherbee's Syncthing, and waits for its core
-   folder with what is left of the motherbee's wait (`finalize_probe_budget_ms`, a 10 s margin
-   for the reply). Its answer's `timings_ms` gives each step's time.
+   `vendor.awaiting_update` and the finalize goes on (FINDINGS A-190). It links the motherbee's
+   Syncthing and, when the motherbee answers on its Syncthing port then, switches the spoke's
+   Syncthing off public discovery, relays and NAT with the link's one restart (host posture stage
+   3, `spoke_link_posture_step`, FINDINGS A-252; otherwise its peer reconcile switches it later),
+   and waits for its core folder with what is left of the motherbee's wait
+   (`finalize_probe_budget_ms`, a 10 s margin for the reply). Its answer's `timings_ms` gives each
+   step's time.
 6. Mark the hive `connected`, then revoke the SSH access: remove the sudoers file and the
    motherbee key from `authorized_keys` (`revoke_bootstrap_ssh_access`). A failed join revokes
    too (`best_effort_revoke_bootstrap`), except after a transient failure, where the key stays so
@@ -854,6 +858,9 @@ reverts. While a join runs, its Syncthing is the join's:
 the motherbee's while an `add_hive` or `remove_hive` is in flight, a spoke's while its finalize
 runs. The Syncthing check and the peer reconcile leave it alone until the join is done, and the
 check asks again right before it restarts Syncthing (`a_join_owns_syncthing`, FINDINGS A-194).
+A spoke's finalize takes the peer reconcile's stage-3 step itself, in its link; a reconcile
+already under way when the finalize starts records the posture's facts under the same lock
+(`SYNCTHING_POSTURE_LOCK`, FINDINGS A-252).
 A join's peer link, and `remove_hive`'s unlink, record the restart they need with their change
 (`syncthing-restart-pending`, the peer reconcile's marker): a restart that failed, or that the
 orchestrator's death cut short, is done by the link run again, or by the peer reconcile once the

@@ -754,7 +754,9 @@ while a topology operation runs; one that lasts more than 15 minutes is. The dev
 waits for an entry's join record to say `done`, so it never races a join's tail.
 
 **An ingress join waits 90 s** for the spoke to connect: the motherbee only accepts now, so the
-spoke dials, and Syncthing's default reconnection interval is 60 s until stage 3.
+spoke dials. A spoke that switched at its finalize's link (stage 3 below, FINDINGS A-252) redials
+every 10 s; one whose motherbee did not answer then keeps Syncthing's default, 60 s, until it
+switches.
 
 **Listen addresses do not change in stage 2.**
 
@@ -776,10 +778,17 @@ reports `discoveryEnabled: false`. The whole set switches together, in one write
    plain TCP connect to it succeeds. Both facts are recorded the first time they hold, in
    `/var/lib/fluxbee/orchestrator/syncthing-posture.json` (written durably; a file that does not
    decode is moved aside by its writer and the facts are derived again), and never undone (D22).
-   From the switch on, the spoke keeps the owned options. While the spoke runs an
-   `ADD_HIVE_FINALIZE`, its reconcile neither writes config.xml nor restarts Syncthing, and the
-   finalize's convergence probe asks again while the API port refuses connections (a restart),
-   for at most 30 s.
+   From the switch on, the spoke keeps the owned options. The spoke's peer reconcile takes this
+   step, and since 0.1.131 so does its join's finalize, right after its peer link writes the
+   motherbee device and before the link's restart, with the address the reconcile derives from
+   the first `wan.uplinks` (FINDINGS A-252). A new spoke whose motherbee answers then switches
+   with the restart its link costs anyway; before, it switched at its first reconcile about a
+   minute after the join, which restarted Syncthing once more. A link at another address, or a
+   motherbee that does not answer yet, switches nothing there, and the reconcile takes the step as
+   before. Both hold one lock from their read of the facts to their write, so neither puts back
+   facts the other replaced. While the spoke runs an `ADD_HIVE_FINALIZE`, its reconcile neither
+   writes config.xml nor restarts Syncthing, and the finalize's convergence probe asks again
+   while the API port refuses connections (a restart), for at most 30 s.
 2. **Every hive reports its facts** in its `/versions` snapshot (`syncthing_posture`: whether it
    runs Syncthing, the two facts, switched).
 3. **The motherbee polls**, about every 60 s, in its own task (not the single-flight watchdog
@@ -795,7 +804,12 @@ reports `discoveryEnabled: false`. The whole set switches together, in one write
 
 **Unit tests** cover the options edit on the PROD motherbee's block, both predicates, the
 snapshot-to-facts contract, the spoke's static fact on PROD shapes (IPv6, the local device), the
-wait set from the registry and the folders, and the motherbee's combined write.
+wait set from the registry and the folders, and the motherbee's combined write. For A-252: a new
+spoke's link on Syncthing's default options switches with one restart and leaves its first
+reconcile nothing to do; a motherbee that does not answer, or a link at another address than the
+reconcile's, switches nothing; a change of the options alone is owed the link's restart; the
+step holds the facts' lock from its read to its write; and each role's join sends the address its
+spoke derives from the hive.yaml it wrote.
 
 **Residuals.**
 
