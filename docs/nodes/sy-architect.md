@@ -396,22 +396,32 @@ skills, handbooks and a personality.
   `{source: {kind: "bundle_upload", blob_path}, set_current, sync_to, update_to}`
   (`handle_package_publish_request`); `set_current` is true unless the request says false. That
   is all it sends: Archi recreates no node (FINDINGS A-298). Its answer is SY.admin's
-  (`status`, `payload`, `error`) with `next`, what follows a publish that went through, for the
-  operator to read:
+  (`status`, `payload`, `error`) with `next`, what follows a publish that installed its version,
+  for the operator to read. It is there whenever SY.admin's `payload` names that version
+  (`runtime_version`), a follow-up of `sync_to` or `update_to` that failed included: the status
+  is then `error`, and the version is installed, current with `set_current`.
   - **With `set_current`:** each hive's orchestrator moves its running nodes of that runtime that
     follow `current` onto the new version within a minute of the version reaching that hive (its
     reconcile, FINDINGS A-109), in place: each keeps its ILK, its secrets, its config and its
-    `launched_by`. A node pinned to a version and a stopped node stay as they are; a stopped node
-    that follows `current` runs the new version when it is started (`start_node` resolves
-    `current` again).
-  - **Without it:** no node moves; a node launched with that `runtime_version` runs it.
+    `launched_by`. A package built on that runtime (`config_only`, `workflow`) runs its `current`
+    (`resolve_runtime_spawn_entrypoint`), so the reconcile relaunches its running nodes onto the
+    new version too, pinned to the package's version or not, in place (`running_node_move`: their
+    unit no longer runs the target's start script). A node of that runtime pinned to a version,
+    and a stopped node, stay as they are; a stopped node that follows `current`, or of a package
+    built on that runtime, runs the new version when it is started (`start_node` resolves what
+    it runs again).
+  - **Without it:** this publish moves no node, whether or not the version was current already (a
+    version published again); a node launched with that `runtime_version` runs it.
   - **A node's config is its own,** written at its launch from the template of the version it was
     launched on (`config/default-config.json`, or the package's `config_template`). A package's new
     template reaches only the nodes launched after it: an `ai.generic` node reads its own
     `config.json` alone, so a config-only package's new template config never reaches a node
     launched before it. To give an existing node another config, change it with a config change of
     its own (`node_control_config_set`, the node's `CONFIG_SET`), which keeps its ILK and its
-    secrets; Archi stages it as a plan the operator confirms.
+    secrets; Archi stages it as a plan the operator confirms. The new template's content is in the
+    `.zip` that was uploaded (its `config/default-config.json`, or its `config_template`): no read
+    shows a published version's template (`get_runtime` carries none, and SY.admin removes the
+    uploaded bundle once it is installed).
   - **Up to 0.1.135** a publish with `set_current` then took every node of that runtime on the
     motherbee, by runtime name, running or stopped, pinned or not, and ran `kill_node` with `force`
     and `purge_instance` and then `run_node` on `current` (`redeploy_runtime_nodes_with_current`):

@@ -10785,24 +10785,38 @@ async fn handle_executor_plan_request(
 
 /// What follows a publish that made its version current (FINDINGS A-298): Archi recreates no node.
 /// Each hive's orchestrator moves the running nodes of the runtime that follow `current` onto it
-/// within a minute of the version reaching that hive (its reconcile, FINDINGS A-109), in place;
-/// a pinned or stopped node stays as it is, and a stopped one that follows `current` runs it when
-/// it is started. A node's config is its own, written at its launch from the template of the
-/// version it was launched on: a config change of its own changes it, never a publish.
+/// within a minute of the version reaching that hive (its reconcile, FINDINGS A-109), in place.
+/// A package built on the runtime (`config_only`, `workflow`) runs its `current`
+/// (`resolve_runtime_spawn_entrypoint`), so the reconcile relaunches its running nodes onto it
+/// too, pinned to their package's version or not (`running_node_move`: their unit no longer runs
+/// the target's start script). A node of the runtime pinned to a version, and a stopped node, stay
+/// as they are; a stopped one that follows `current`, or of such a package, runs it when it is
+/// started. A node's config is its own, written at its launch from the template of the version it
+/// was launched on: a config change of its own changes it, never a publish, and no read shows a
+/// published version's template (`get_runtime` carries none; SY.admin removes the uploaded bundle
+/// once it is installed).
 const PUBLISH_NEXT_CURRENT: &str = "The version is current. No node is recreated: each hive \
     moves its running nodes of this runtime that follow current onto it within a minute of the \
     version reaching that hive, in place, each with its ILK, its secrets, its config and who \
-    launched it. A node pinned to a version and a stopped node stay as they are; a stopped node \
-    that follows current runs this version when it is started. A node's config stays its own: \
-    the package's template config reaches only the nodes launched after it; to change an \
-    existing node's config, set it (node_control_config_set).";
-/// What follows a publish that did not make its version current.
-const PUBLISH_NEXT_NOT_CURRENT: &str = "The version is published, not current: no node moves to \
-    it. A node launched with this runtime_version runs it.";
+    launched it. The running nodes of the packages built on this runtime (config_only, \
+    workflow) run its current, so each hive relaunches them onto it too, pinned or not, in \
+    place. A node of this runtime pinned to a version, and a stopped node, stay as they are; a \
+    stopped node that follows current, or of a package built on this runtime, runs this version \
+    when it is started. A node's config stays its own: the package's template config reaches \
+    only the nodes launched after it. To put an existing node on it, set its config \
+    (node_control_config_set) from the package's config/default-config.json, in the package \
+    that was uploaded: no read shows it after the publish.";
+/// What follows a publish that did not make its version current: it may be current already (a
+/// version published again), so the text says what this publish did, not what the version is.
+const PUBLISH_NEXT_NOT_CURRENT: &str = "This publish did not move current: no node moves to \
+    this version. A node launched with this runtime_version runs it.";
 
 /// Archi's publish of an uploaded package (the Publish Software panel, `POST /api/package/publish`):
 /// SY.admin's `publish_runtime_package`, `set_current` true unless the request says false. Its
-/// answer is SY.admin's, with what follows it (`next`) when the publish went through. Up to
+/// answer is SY.admin's, with what follows it (`next`) when the publish went through: SY.admin's
+/// payload names the version it installed, even when a follow-up of `sync_to` or `update_to`
+/// failed (its status is then an error, and the version is installed, current with
+/// `set_current`). Up to
 /// 0.1.135 a publish that made its version current then killed every motherbee node of that
 /// runtime with its instance purged and ran it again on `current`: a new ILK, its owned secrets
 /// gone, `launched_by: "archi"` (FINDINGS A-298).
@@ -10845,12 +10859,17 @@ async fn handle_package_publish_request(
                 .and_then(|value| value.as_str())
                 .unwrap_or("ok")
                 .to_string();
-            // Archi recreates no node (FINDINGS A-298): the answer says what follows instead.
-            let next = match (output_status_is_success(Some(status.as_str())), set_current) {
-                (false, _) => None,
-                (true, true) => Some(PUBLISH_NEXT_CURRENT),
-                (true, false) => Some(PUBLISH_NEXT_NOT_CURRENT),
-            };
+            // Archi recreates no node (FINDINGS A-298): the answer says what follows instead,
+            // once the version is installed, whatever a follow-up answered.
+            let installed = output
+                .pointer("/payload/runtime_version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| !version.trim().is_empty());
+            let next = installed.then_some(if set_current {
+                PUBLISH_NEXT_CURRENT
+            } else {
+                PUBLISH_NEXT_NOT_CURRENT
+            });
             json!({
                 "status": status,
                 "action": "publish_runtime_package",
@@ -18495,7 +18514,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             <div id="publish-filename" class="publish-filename"></div>
             <label class="publish-label">
               <input type="checkbox" id="publish-promote-current" />
-              Promote To Current: running nodes on current move to it in place, keeping their config
+              Promote To Current: running nodes on current, and those of packages built on it, move to it in place, keeping their config
             </label>
             <button id="publish-btn" class="publish-btn" type="button">Publish</button>
           </div>
@@ -30449,25 +30468,29 @@ mod tests {
     /// no `run_node`, where up to 0.1.135 every motherbee node of the runtime was killed with its
     /// instance purged (its ILK and the secrets it owned gone) and run again on `current`. Its
     /// answer says what follows instead: the hive moves the running nodes that follow `current`
-    /// within a minute, in place, and leaves pinned and stopped ones; without `set_current`, that
-    /// no node moves. A publish that failed says nothing of what follows.
+    /// within a minute, in place, and the running nodes of the packages built on the runtime with
+    /// them, pinned or not (they run its `current`); it leaves the runtime's pinned nodes and the
+    /// stopped ones; without `set_current`, that this publish moved no node. A publish that
+    /// installed its version says what follows even when a follow-up (`update_to`) failed; one
+    /// that failed says nothing of what follows.
     #[tokio::test]
     async fn a_publish_recreates_no_node_and_says_what_follows() {
-        let publish = |state: &Arc<ArchitectState>, set_current: Option<bool>| {
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                handle_package_publish_request(
-                    &state,
-                    PackagePublishRequest {
-                        blob_name: "ai-sales-1-2-0_0123456789abcdef.zip".to_string(),
-                        set_current,
-                        sync_to: Vec::new(),
-                        update_to: Vec::new(),
-                    },
-                )
-                .await
-            })
-        };
+        let publish =
+            |state: &Arc<ArchitectState>, set_current: Option<bool>, update_to: Vec<String>| {
+                let state = Arc::clone(state);
+                tokio::spawn(async move {
+                    handle_package_publish_request(
+                        &state,
+                        PackagePublishRequest {
+                            blob_name: "ai-sales-1-2-0_0123456789abcdef.zip".to_string(),
+                            set_current,
+                            sync_to: Vec::new(),
+                            update_to,
+                        },
+                    )
+                    .await
+                })
+            };
         let published = json!({ "status": "ok", "action": "publish_runtime_package",
                                 "payload": { "runtime_name": "ai.sales", "runtime_version": "1.2.0" } });
         for (set_current, next) in [
@@ -30476,7 +30499,7 @@ mod tests {
             (Some(false), PUBLISH_NEXT_NOT_CURRENT),
         ] {
             let (state, mut router) = harness_state();
-            let answer = publish(&state, set_current);
+            let answer = publish(&state, set_current, Vec::new());
             let sent =
                 answer_admin_command(&mut router, "publish_runtime_package", published.clone())
                     .await;
@@ -30501,16 +30524,62 @@ mod tests {
             "No node is recreated",
             "within a minute of the version reaching that hive, in place",
             "each with its ILK, its secrets, its config and who launched it",
-            "A node pinned to a version and a stopped node stay as they are",
+            // A config_only or workflow package runs its base's current
+            // (resolve_runtime_spawn_entrypoint): the reconcile moves its running nodes, pinned to
+            // the package's version or not (running_node_move).
+            "The running nodes of the packages built on this runtime (config_only, workflow) run \
+             its current, so each hive relaunches them onto it too, pinned or not, in place",
+            "A node of this runtime pinned to a version, and a stopped node, stay as they are",
+            "a stopped node that follows current, or of a package built on this runtime, runs this \
+             version when it is started",
             "the package's template config reaches only the nodes launched after it",
-            "(node_control_config_set)",
+            "(node_control_config_set) from the package's config/default-config.json, in the \
+             package that was uploaded: no read shows it after the publish",
         ] {
             assert!(PUBLISH_NEXT_CURRENT.contains(text), "{text}");
         }
-        assert!(PUBLISH_NEXT_NOT_CURRENT.contains("not current: no node moves to it"));
+        assert!(
+            !PUBLISH_NEXT_CURRENT.contains("A node pinned to a version and a stopped node"),
+            "a package's node pinned to its version moves with its base's current"
+        );
+        // It may be current already (a version published again): the text says what this publish
+        // did, never that the version is not current.
+        assert!(PUBLISH_NEXT_NOT_CURRENT
+            .starts_with("This publish did not move current: no node moves to this version."));
+        assert!(!PUBLISH_NEXT_NOT_CURRENT.contains("not current"));
+
+        // The version installed and made current, a follow-up failed: what follows is said.
+        let (state, mut router) = harness_state();
+        let answer = publish(&state, None, vec!["worker1".to_string()]);
+        let sent = answer_admin_command(
+            &mut router,
+            "publish_runtime_package",
+            json!({ "status": "error", "action": "publish_runtime_package",
+                    "payload": { "runtime_name": "ai.sales", "runtime_version": "1.2.0",
+                                 "follow_up": { "requested": { "sync_to": [], "update_to": ["worker1"] },
+                                                "sync_hint": [],
+                                                "update": [{ "hive": "worker1", "http_status": 502,
+                                                             "response": { "status": "error" } }] } },
+                    "error_code": "SERVICE_FAILED",
+                    "error_detail": "publish succeeded but one or more follow-up operations failed" }),
+        )
+        .await;
+        assert_eq!(sent.payload["params"]["update_to"], json!(["worker1"]));
+        let answer = answer.await.expect("the publish");
+        assert!(router
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        assert_eq!(answer["status"], "error", "{answer}");
+        assert_eq!(answer["payload"]["runtime_version"], "1.2.0", "{answer}");
+        assert_eq!(answer["next"], PUBLISH_NEXT_CURRENT, "{answer}");
+        assert_eq!(
+            answer["error"], "publish succeeded but one or more follow-up operations failed",
+            "{answer}"
+        );
 
         let (state, mut router) = harness_state();
-        let answer = publish(&state, None);
+        let answer = publish(&state, None, Vec::new());
         answer_admin_command(
             &mut router,
             "publish_runtime_package",
