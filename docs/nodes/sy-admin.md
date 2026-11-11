@@ -208,7 +208,7 @@ Before 0.1.123 the caller then waited to its own timeout, with no reason (FINDIN
 ### Pages
 
 The listings that grow with the installation answer in pages. Each page names where the next one
-starts, and `total` says how many rows there are in all:
+starts, and `total` says how many rows there are in all (`timer_list` answers none, below):
 
 | Action | Ask a page with | Next page | Rows | Order |
 | --- | --- | --- | --- | --- |
@@ -268,6 +268,12 @@ starts, and `total` says how many rows there are in all:
   steps back neither hides nor repeats an entry; entries written before 0.1.123 have none and page
   after every entry with one. Its pages also stay within half a frame, whatever the entries'
   params.
+- **`timer_list` is SY.timer's page, as SY.timer answers it** ([SY.timer §7.6](../sy-timer.md)),
+  so the last two points hold for it only in part. SY.admin asks one `TIMER_LIST` and answers it,
+  with no `total`. A timer whose fire time moves between two pages (a recurring timer's fire, a
+  `TIMER_RESCHEDULE`) takes its new place in the order, so it can come twice or not at all. A
+  cursor that is not one is refused with `TIMER_INVALID_PAYLOAD` (HTTP status 400), and a
+  well-formed one SY.timer never gave lists the timers after the place it names.
 
 ## Who may call what
 

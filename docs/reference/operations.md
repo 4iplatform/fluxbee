@@ -1002,13 +1002,18 @@ node's `ADMIN_COMMAND`) an answer is one frame, at most 128 KiB (FINDINGS A-198)
 - **A list that grows with the installation answers in pages** when asked to: `/inventory`,
   `/inventory/{hive}`, `/hives/{hive}/status`, `/hives/{hive}/nodes`,
   `/hives/{hive}/identity/tenants/{tenant_id}/nodes`, `/versions` (a page of hives),
-  `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`, `/hives/{hive}/commands` and
-  `/hives/{hive}/vault/secrets` take `?limit=&cursor=` (an empty `cursor` is none). The answer has
-  `next_cursor` while rows follow (pass it back as `cursor`) and `total`. Without `limit` every
-  row comes, as before, but for two lists that never gave every row: `/hives/{hive}/vault/secrets`
-  gives its `limit`, 200 by default, and `/hives/{hive}/commands` 50 by default. A cursor the list
-  did not give is refused, `INVALID_CURSOR` (400). The installation's versions in `/installation`
-  and `/hives/motherbee/versions` are the newest 20 (`versions_total`;
+  `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`, `/hives/{hive}/commands`,
+  `/hives/{hive}/vault/secrets` and `/hives/{hive}/timer/timers` take `?limit=&cursor=` (an empty
+  `cursor` is none). The answer has `next_cursor` while rows follow (pass it back as `cursor`) and
+  `total`. Without `limit` every row comes, as before, but for three lists that never gave every
+  row: `/hives/{hive}/vault/secrets` gives its `limit`, 200 by default, `/hives/{hive}/commands` 50
+  by default, and `/hives/{hive}/timer/timers` 100 timers by default (at most 1000), fewer when
+  one frame fills first. A cursor the list did not give is refused, `INVALID_CURSOR` (400). The
+  timer list is SY.timer's page as SY.timer answers it ([SY.timer §7.6](../sy-timer.md)): it has
+  no `total`, a cursor that is not one is refused `TIMER_INVALID_PAYLOAD` (400), and a timer whose
+  fire time moves between two pages (a recurring timer's fire) can come twice or not at all; since
+  0.1.133 a page its `limit` cuts has `next_cursor` too (FINDINGS A-266). The installation's
+  versions in `/installation` and `/hives/motherbee/versions` are the newest 20 (`versions_total`;
   `?versions_before=<versions_next_before>` lists older ones).
 - **A list is no snapshot.** SY.admin gathers a long list from the node behind it page by page,
   within the time the action gives one request: a row written or removed meanwhile may be in it or

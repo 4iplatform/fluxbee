@@ -1845,14 +1845,19 @@ installation answer in pages:
 
 - **Which**: `/inventory`, `/inventory/{hive}`, `/hives/{hive}/nodes`, `/versions` (a page of hives),
   `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
-  `/hives/{hive}/vault/secrets`, `/hives/{hive}/commands` (SY.admin's command log) and
-  `/artifacts` (the public pages that are up) take `?limit=&cursor=`.
-- **How**: read without them first. Most lists then give every row, as always; two give one page
-  even so: `/hives/{hive}/vault/secrets` 200 secrets and `/hives/{hive}/commands` 50 commands.
+  `/hives/{hive}/vault/secrets`, `/hives/{hive}/commands` (SY.admin's command log),
+  `/artifacts` (the public pages that are up) and `/hives/{hive}/timer/timers` (a hive's timers,
+  with `?owner_l2_name=&status_filter=` beside them) take `?limit=&cursor=`.
+- **How**: read without them first. Most lists then give every row, as always; three give one page
+  even so: `/hives/{hive}/vault/secrets` 200 secrets, `/hives/{hive}/commands` 50 commands and
+  `/hives/{hive}/timer/timers` 100 timers (`limit` up to 1000).
   When an answer has `next_cursor`, more rows follow: read the same path again with
   `?cursor=<next_cursor>` (and the same `limit`), until an answer has none. `total` says how many
   rows there are in all. Pass the cursor exactly as it came: a cursor of another list is refused
   with `INVALID_CURSOR`.
+- **The timer list is SY.timer's own page.** It has no `total`, a cursor that is not one is
+  refused with `TIMER_INVALID_PAYLOAD`, and a timer whose fire time moves while you read the pages
+  (a recurring timer that fires) can come twice or not at all.
 - **A list is no snapshot.** SY.admin gathers a long list page by page, so a row written or removed
   while it reads may be in it or not, though never twice. A list that would take longer than one
   request answers `TIMEOUT`: read it in pages.
