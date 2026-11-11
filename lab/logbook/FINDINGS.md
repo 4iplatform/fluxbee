@@ -2004,10 +2004,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`packages_left=` beside `problems=` in its log line); the lifecycle e2e's default name is
   `testwfrules` (`test-wf-rules` is refused since 0.1.98). Found on the way: A-305, A-306, A-307,
   and a name on two hives (A-304's addition), all for later.
-- **The integration (0.1.133):** SY.admin's texts were written before the orchestrator's last two
-  rounds: they said the motherbee asks the workers one at a time and a delete fails with
-  `PACKAGE_PUBLISH_FAILED`; one commit aligns SY.admin's notes and tests, Archi's handbook,
-  `sy-admin.md` and `operations.md` with the built behaviour.
+- **The integration (0.1.133, `coa/a281-133`):** SY.admin's texts were written before the
+  orchestrator's last two rounds: they said the motherbee asks the workers one at a time and a
+  delete fails with `PACKAGE_PUBLISH_FAILED`. One commit (`defd2b60`) aligns SY.admin's notes and
+  tests, Archi's handbook, `sy-admin.md` and `operations.md` with the built behaviour, checked
+  against the code (a delete's removal waits for what is left of its request's 60 s, at most 35 s;
+  `[]` means every version its hive knew of; `TRANSPORT_ERROR` is no timeout), and puts back three
+  meanings `operations.md` lost in a conflict: a node whose unit does not run is not listed, a join
+  not done is named with its status and phase, and the motherbee alone means its read failed.
+- **The integration's review (five lows, fixed in `8879ff2e`):** `RUNTIME_USAGE_UNKNOWN` says
+  `retryable: false` while a hive not read is a join that ended (failed or interrupted: only
+  `add_hive` again or `remove_hive` changes it), and for the motherbee's `USAGE_READ_FAILED` (a node
+  whose `config.json` cannot be read while it may run, or its registry), whose detail now says what
+  to fix instead of *"Ask again"*; SY.wf-rules' `PURGE_STOPPED` after such a refusal says false too;
+  a plan's answer cut to fit the frame keeps a workflow delete's `packages_left` in short; the texts
+  say a `DIST_UNREADABLE` entry blocks a compile of the name until that hive's
+  `dist/runtimes/wf.<name>` is fixed, its versions then read from the motherbee's `get_runtime`; and
+  `wf-standard-path-v1.md` gives a removal 35 s, a deploy's purge 15 s, where it said 5 s.
 - **By design:** a failed join's registry entry is a hive that may run nodes and is not read, so it
   refuses every removal until the join is finished or the hive removed; the 409 names it.
 - **SY.admin's review fixes (`coa/admin-usage-133`, `a75c2d4f`):** an ingress or an egress is exempt
