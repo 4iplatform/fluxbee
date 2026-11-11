@@ -146,7 +146,11 @@ exposure model is in [docs/host-posture-and-exposure-spec-v1.md](../host-posture
 | `require_dist_sync`, `dist_sync_probe_timeout_secs` | fail the join if the dist folders do not sync (probe default 45 s) |
 
 Checks before anything starts: `INVALID_HIVE_ID`, `INVALID_ADDRESS`, `MISSING_WAN_LISTEN` (the
-motherbee needs `wan.listen`), `JOIN_IN_PROGRESS`, `HIVE_EXISTS`. The old `ssh_access` field is
+motherbee needs `wan.listen`), `JOIN_IN_PROGRESS`, `HIVE_EXISTS`. A hive id that is not one
+answers `400 INVALID_HIVE_ID` with the message `hive_id must be a hive id: 1 to 64 letters,
+digits, '_' or '-'`, and nothing is read or changed; since 0.1.136 `DELETE /hives/{hive}` and
+`GET /hives/{hive}` refuse it the same way (FINDINGS A-311), and `GET /hives/{hive}` of a hive the
+registry does not have answers `404 NOT_FOUND`. The old `ssh_access` field is
 refused: SSH exists only inside the join (`reject_removed_add_hive_fields`). So is a password join
 that does not choose `harden_ssh` (`require_password_logins_choice`, A-165). No list in hive.yaml
 says which hives may join: adding a hive is what registers it, and the motherbee's router admits

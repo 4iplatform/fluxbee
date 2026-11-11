@@ -17436,6 +17436,14 @@ const WF_RULES_DEFINITION_NOTE: &str = "A definition requires start_from: the no
 /// What the node routes that send to the node itself say of its name (`node_name_on_hive`).
 const NODE_ON_PATH_HIVE_NOTE: &str = "node_name is a node of the path's hive: a bare name is qualified with it (AI.sales on /hives/worker1 is AI.sales@worker1), and a name of another hive is refused with INVALID_REQUEST.";
 
+/// The words every refusal of a hive id that is not one uses, SY.admin's (`retire_hive_ilks`) and
+/// the orchestrator's (`add_hive`, `remove_hive`, `get_hive`, FINDINGS A-311) alike.
+const HIVE_ID_RULE: &str = "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'";
+
+/// What `add_hive`, `remove_hive` and `get_hive` answer for a hive id that is not one (FINDINGS
+/// A-311): the orchestrator refuses it before any path is built. Its message is `HIVE_ID_RULE`.
+const INVALID_HIVE_ID_NOTE: &str = "A hive_id that is not a hive id (1 to 64 letters, digits, '_' or '-': no '/', '.' or space) answers 400 INVALID_HIVE_ID with the message \"hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'\", and nothing is read or changed (FINDINGS A-311, since 0.1.136).";
+
 /// What every removal says of the public pages it leaves up (`pages_left_up`, FINDINGS A-242).
 const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDINGS A-242): a page outlives its publisher, its tenant and its hive, and stays up until its expires_at (24 h after its publish by default, 30 days at most, never renewed; the edge then serves it no more and SY.admin's sweep retires it) or until it is taken down. The ok answer names the pages it leaves up in payload.pages_left_up: {count, pages: [{publication_id, expires_at (epoch seconds), status, filename_original, publisher_l2_name, tenant_id, edge_node}], more}, soonest to expire first, at most 20 of them in 8 KiB (more counts the rest), never a link's key. A ledger SY.admin cannot read gives {count: null, error}, and refuses nothing. GET /artifacts lists every page that is up; POST /artifacts/unpublish takes one down by its publication_id.";
 /// Which pages a node's purge names, and the publish it does not wait for.
@@ -17538,10 +17546,18 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "add_hive" => vec![
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the body.",
+            INVALID_HIVE_ID_NOTE,
+        ],
+        "get_hive" => vec![
+            "Motherbee-only operation: the hive's entry of the motherbee's hive registry, its info.yaml.",
+            "For HTTP usage the hive id is in the path; over the mesh, payload.hive_id names the hive read.",
+            INVALID_HIVE_ID_NOTE,
+            "A hive the registry does not have answers 404 NOT_FOUND.",
         ],
         "remove_hive" => vec![
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the path; over the mesh, payload.hive_id names the hive removed.",
+            INVALID_HIVE_ID_NOTE,
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages a node of the hive published and the pages its edge serves (edge_node on the hive). The hive's cleanup stops its edge (FINDINGS A-236), so those are served no more once it ran, and taking one down releases only its copy (edge_skipped).",
             "Once the hive is removed, SY.admin retires its system ILKs (retire_hive_ilks, FINDINGS A-191) and the ok answer names the result in payload.system_ilks_retired: SY.identity's {count, ilk_ids, already_retired}. A retire that fails leaves the removal ok: system_ilks_retired is {count: null, error_code, error_detail} and payload.warning says so. Then run retire_hive_ilks for the hive; never remove it again, it is gone (NOT_FOUND).",
@@ -22097,7 +22113,7 @@ fn handle_retire_hive_ilks<'a>(
             return Ok(admin_error_response(
                 action,
                 "INVALID_REQUEST",
-                "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'",
+                HIVE_ID_RULE,
             ));
         }
         if let Err((code, detail)) = hive_removed(ctx, hive_id) {
@@ -43930,6 +43946,45 @@ mod tests {
         let registry = ctx.state_dir.parent().expect("root").join("hives");
         fs::create_dir_all(&registry).expect("the registry");
         registry
+    }
+
+    /// The help Archi reads for add_hive, remove_hive and get_hive names the refusal of a hive id
+    /// that is not one (FINDINGS A-311): 400 INVALID_HIVE_ID, in the words the orchestrator's and
+    /// SY.admin's own refusals use, nothing read or changed; and get_hive of a hive the registry
+    /// does not have, 404 NOT_FOUND.
+    #[test]
+    fn the_hive_actions_help_names_the_refusal_of_a_hive_id() {
+        assert_eq!(
+            HIVE_ID_RULE,
+            "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'"
+        );
+        for action in ["add_hive", "remove_hive", "get_hive"] {
+            let notes = admin_action_request_notes(action);
+            assert!(
+                notes.iter().any(|note| note.contains("400 INVALID_HIVE_ID")
+                    && note.contains(&format!("\"{HIVE_ID_RULE}\""))
+                    && note.contains("nothing is read or changed")),
+                "{action}: {notes:#?}"
+            );
+            // In the help itself, GET /admin/actions/{action}.
+            let spec = resolve_internal_action_spec(action).expect("an action of the catalog");
+            assert!(
+                build_admin_action_doc(spec)
+                    .to_string()
+                    .contains("INVALID_HIVE_ID"),
+                "{action}"
+            );
+        }
+        assert!(admin_action_request_notes("get_hive")
+            .iter()
+            .any(|note| note.contains("A hive the registry does not have answers 404 NOT_FOUND")));
+        assert_eq!(error_code_to_http_status("INVALID_HIVE_ID"), 400);
+        assert_eq!(error_code_to_http_status("NOT_FOUND"), 404);
+        // The rule the words name: letters of either case, digits, '_' and '-', 1 to 64.
+        assert!(is_valid_hive_id("Worker_2-B"));
+        for not_one in ["", "/srv/x", "..", "a.b", "worker 9", &"w".repeat(65)] {
+            assert!(!is_valid_hive_id(not_one), "{not_one:?}");
+        }
     }
 
     /// retire_hive_ilks is an action of the catalog with its route, help and example: a write the
