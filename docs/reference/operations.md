@@ -427,10 +427,13 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   - `skipped_hives`: each hive whose use is unknown, with its `reason` and the `message` that came
     with it: `TIMEOUT` (no answer within 10 s: its orchestrator stopped or restarting while the
     LSA still shows it), `UNREACHABLE` (the request never reached it: down, or stale in the LSA),
-    `USAGE_UNREADABLE` (its own read of its nodes failed), or the error a worker before 0.1.133
-    answered, which reads its mirror first (`RUNTIME_NOT_FOUND` while its mirror does not list the
-    runtime yet, `RUNTIME_MANIFEST_MISSING` without one). A worker, and a hive whose registry entry
-    gives no role (a join being accepted, an entry that does not parse), are asked;
+    `USAGE_UNREADABLE` (its own read of its nodes failed: its nodes' folder could not be read, or
+    a node's `config.json` cannot be read or parsed while its unit runs or systemd gives no
+    answer for it, so that node's runtime is unknown; the `message` names it: fix its config or
+    stop the node), or the error a worker before 0.1.133 answered, which reads its mirror first
+    (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet, `RUNTIME_MANIFEST_MISSING`
+    without one). A worker, and a hive whose registry entry gives no role (a join being accepted,
+    an entry that does not parse), are asked;
   - `hives_without_runtimes`: each ingress and egress, by the role the hive registry records,
     whatever the state of its join; an entry keeps its role until the hive is removed
     ([add_hive](#join-a-hive-add_hive)). The runtimes never reach them (`fluxbee-dist-runtimes`
@@ -439,9 +442,14 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   - `in_use`: true while a node is listed, false only once every hive asked was counted, and
     `null` (unknown) while none is listed and a hive is in `skipped_hives`.
 
-  A registry the motherbee cannot list makes the whole use an error (`status: error`). With a
-  worker that does not answer, the read ends in about 10 s, well within SY.admin's 30 s for it,
-  so the refusal names that worker. SY.admin refuses the removal, with nothing removed:
+  A registry the motherbee cannot list makes the whole use an error (`status: error`), and so
+  does a motherbee node whose `config.json` cannot be read while it may run. With a worker that
+  does not answer, the read ends in about 10 s, within SY.admin's 30 s for it, so the refusal
+  names that worker, as long as the read starts at once: the motherbee runs 4 such reads at a
+  time (removals, and reads of `GET /hives/motherbee/runtimes/<runtime>`), each up to 10 s while
+  a worker does not answer, so a fifth asked meanwhile waits up to 10 s and a ninth up to 20 s,
+  and its refusal may then name the motherbee (`TIMEOUT`); `GET /versions` and Fluxbee Cloud's
+  node lists hold none of those 4. SY.admin refuses the removal, with nothing removed:
   `409 RUNTIME_IN_USE` while a node is listed, its detail naming each node with its hive and
   lifecycle; `409 RUNTIME_USAGE_UNKNOWN` while the use is unknown (an error, or a hive in
   `skipped_hives`), naming each hive not read and why in `payload.unanswered_hives`, with

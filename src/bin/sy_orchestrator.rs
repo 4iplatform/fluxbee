@@ -1384,8 +1384,9 @@ fn system_response_msg(msg: &str) -> Option<String> {
 const WORKER_CONCURRENT_READS_MAX: usize = 16;
 
 /// FINDINGS A-199, the review of step 1: the most reads one worker runs at once that wait on the
-/// same target (one other hive, or every hive for a fan-out). A hive that does not answer, asked
-/// again and again, then holds this many of the forwarding reads' places, and no local read's.
+/// same target (`ReadTarget`: one other hive, every hive for a fan-out, or every hive for a
+/// runtime's use). A hive that does not answer, asked again and again, then holds this many of
+/// the forwarding reads' places for each target it delays, and no local read's.
 const WORKER_READS_PER_TARGET_MAX: usize = 4;
 
 /// The lane a worker runs a request in (FINDINGS A-199, step 1).
@@ -1407,9 +1408,16 @@ enum ReadTarget {
     Local,
     /// Another hive's orchestrator, which the flow forwards the read to.
     Hive(String),
-    /// Every other hive at once (`list_versions`, `list_tenant_nodes`, the motherbee's
-    /// `get_runtime` of its own hive).
+    /// Every other hive at once (`list_versions`, `list_tenant_nodes`).
     EveryHive,
+    /// Every other hive at once for a runtime's use: the motherbee's `get_runtime` of its own
+    /// hive, which asks each worker for its nodes on the runtime, up to
+    /// `RUNTIME_USAGE_HIVE_TIMEOUT` for one that does not answer (FINDINGS A-281, the review).
+    /// Apart from `EveryHive`, so it never waits behind `list_versions`, which asks the hives one
+    /// after another, 45 s for each that does not answer, while SY.admin's `remove_runtime_version`
+    /// waits 30 s for this read; and Fluxbee Cloud's `list_tenant_nodes` (20 s) never waits behind
+    /// it.
+    RuntimeUse,
 }
 
 /// The lane of one of SY.admin's commands (FINDINGS A-199). The reads are the ones read in the code
@@ -1459,9 +1467,10 @@ fn system_request_lane(
 ///
 /// The motherbee's `get_runtime` of its own hive asks every other hive for its nodes on the
 /// runtime (`usage_global_visible`, `group_runtime_usage`; FINDINGS A-281), up to
-/// `RUNTIME_USAGE_HIVE_TIMEOUT` for one that does not answer: it waits on every hive, as
-/// `list_versions` does, so reads asked again while a hive does not answer hold the fan-outs'
-/// places, never this hive's local reads'. A spoke's asks no other hive, and neither does a read
+/// `RUNTIME_USAGE_HIVE_TIMEOUT` for one that does not answer: it waits on every hive, in a target
+/// of its own (`ReadTarget::RuntimeUse`), so reads asked again while a hive does not answer hold
+/// its 4 places and forwarding places, never this hive's local reads' nor the places of
+/// `list_versions` and `list_tenant_nodes`. A spoke's asks no other hive, and neither does a read
 /// of the hive's own nodes alone (`usage_only`, `runtime_read_usage_only`).
 fn read_target(
     action: &str,
@@ -1476,7 +1485,7 @@ fn read_target(
         "get_runtime" => {
             let hive = target_hive_from_payload(payload, local_hive);
             if hive == local_hive && is_motherbee && !runtime_read_usage_only(payload) {
-                return ReadTarget::EveryHive;
+                return ReadTarget::RuntimeUse;
             }
             hive
         }
@@ -20633,6 +20642,13 @@ fn runtime_usage_lifecycle(
     }
 }
 
+/// This hive's nodes on `runtime` (pinned to `version_filter` when given) whose unit may run
+/// (`runtime_usage_lifecycle`), read from their configs: the runtime's `usage`. An error, never a
+/// hive with no node, when the nodes' tree cannot be walked, and when a node's `config.json`
+/// cannot be read or parsed while its unit runs or systemctl gives no answer for it: which runtime
+/// that node runs on is then unknown, and the error names the node (FINDINGS A-281, the review;
+/// such a node counted as one on no runtime). A node whose config cannot be read and whose unit
+/// does not run is left out, as any node whose unit does not run is.
 fn local_runtime_usage_summary(
     state: &OrchestratorState,
     runtime: &str,
@@ -20658,6 +20674,8 @@ fn local_runtime_usage_summary_with_root(
     }
 
     let mut running_nodes = Vec::new();
+    // The nodes that may run whose config cannot be read, each with why: their runtime is unknown.
+    let mut unreadable = Vec::new();
     for kind_entry in fs::read_dir(root)? {
         let kind_entry = kind_entry?;
         if !kind_entry.file_type()?.is_dir() {
@@ -20677,7 +20695,19 @@ fn local_runtime_usage_summary_with_root(
 
             let config = match load_node_effective_config(&config_path) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(err) => {
+                    let unit = unit_from_node_name(&node_name);
+                    let unit_state = match (state.unit_checks.activity)(&unit) {
+                        ServiceActivity::Inactive => continue,
+                        ServiceActivity::Active => "its unit runs",
+                        ServiceActivity::Unknown => "systemctl gives no answer for its unit",
+                    };
+                    unreadable.push(format!(
+                        "the config.json of {node_name} cannot be read ({err}) while {unit_state}, \
+                         so the runtime it runs on is unknown"
+                    ));
+                    continue;
+                }
             };
             let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
                 continue;
@@ -20728,6 +20758,11 @@ fn local_runtime_usage_summary_with_root(
         }
     }
 
+    if !unreadable.is_empty() {
+        unreadable.sort();
+        return Err(unreadable.join("; ").into());
+    }
+
     running_nodes.sort_by(|a, b| {
         let a_name = a
             .get("node_name")
@@ -20755,8 +20790,10 @@ fn local_runtime_usage_summary_with_root(
 /// (for 10-60 s after a workflow's first deploy on the motherbee) answered the whole read
 /// `RUNTIME_NOT_FOUND` (`RUNTIME_MANIFEST_MISSING` with no manifest yet), and was not counted,
 /// though a node's use is its config, which `local_runtime_usage_summary` reads. A read of its
-/// nodes that fails answers `USAGE_UNREADABLE`, never a hive with no node. The motherbee, asked
-/// this way, answers its own nodes and asks no other hive.
+/// nodes that fails answers `USAGE_UNREADABLE` with why, never a hive with no node: a tree that
+/// cannot be walked, or the config of a node that may run (its unit runs, or systemctl gives no
+/// answer for it) that cannot be read or parsed, named. The motherbee, asked this way, answers its
+/// own nodes and asks no other hive.
 fn local_runtime_usage_answer(
     state: &OrchestratorState,
     runtime: &str,
@@ -20873,41 +20910,44 @@ async fn global_visible_runtime_usage_summary_with_roots(
             });
         }
     };
-    group_runtime_usage(&local_usage, hives, RUNTIME_USAGE_HIVE_TIMEOUT, |hive_id| {
-        let payload = runtime_usage_request(&hive_id, runtime, version_filter);
-        async move {
-            forward_system_action_to_hive_with_timeout(
-                state,
-                &hive_id,
-                "GET_RUNTIME",
-                "GET_RUNTIME_RESPONSE",
-                payload,
-                RUNTIME_USAGE_HIVE_TIMEOUT,
-            )
-            .await
-        }
-    })
+    group_runtime_usage(
+        &local_usage,
+        hives,
+        RUNTIME_USAGE_HIVE_TIMEOUT,
+        |hive_id, per_hive| {
+            let payload = runtime_usage_request(&hive_id, runtime, version_filter);
+            async move {
+                forward_system_action_to_hive_with_timeout(
+                    state,
+                    &hive_id,
+                    "GET_RUNTIME",
+                    "GET_RUNTIME_RESPONSE",
+                    payload,
+                    per_hive,
+                )
+                .await
+            }
+        },
+    )
     .await
 }
 
 /// How long the motherbee waits for each hive's answer when it reads a runtime's use across the
 /// hives (FINDINGS A-281, the review). Every hive is asked at once (`group_runtime_usage`), so one
-/// that does not answer costs the whole read about this long: well within SY.admin's 30 s for
-/// `get_runtime`, whose `remove_runtime_version` refusal then names that hive (`TIMEOUT`) rather
-/// than the motherbee, and the motherbee stops waiting before SY.admin does. A worker answers from
-/// its nodes' configs, with one `systemctl is-active` for each node on the runtime: well under a
-/// second, a few on a loaded 2-vCPU spoke. Before, each hive was asked after the one before, with
-/// the forward's 45 s (`system_forward_timeout`), past SY.admin's whole wait for a single hive
-/// that did not answer. `list_tenant_nodes` waits as long for each hive (under Fluxbee Cloud's
-/// 20 s).
+/// that does not answer costs the whole read about this long, and the motherbee stops waiting
+/// before SY.admin does (30 s for `get_runtime`): `remove_runtime_version`'s refusal then names
+/// that hive (`TIMEOUT`) rather than the motherbee, provided the read got its lane place at once.
+/// The motherbee's runtime reads have 4 places of their own (`ReadTarget::RuntimeUse`), each held
+/// up to this long while a worker does not answer: a fifth read asked meanwhile waits up to 10 s
+/// for one, and a ninth up to 20 s, which with its own 10 s reaches SY.admin's 30 s. Each also
+/// takes one of the 16 forwarding places (`WorkerLanes`), which the reads of other targets (4
+/// each: a hive that does not answer, `list_versions`) fill only while at least 4 of those targets
+/// wait at once. A worker answers from its nodes' configs, with one `systemctl is-active` for each
+/// node on the runtime: well under a second, a few on a loaded 2-vCPU spoke. Before, each hive was
+/// asked after the one before, with the forward's 45 s (`system_forward_timeout`), past SY.admin's
+/// whole wait for a single hive that did not answer. `list_tenant_nodes` waits as long for each
+/// hive (under Fluxbee Cloud's 20 s).
 const RUNTIME_USAGE_HIVE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long past its bound `group_runtime_usage` still waits for a hive's ask. The forward ends by
-/// its own wait first (`RUNTIME_USAGE_HIVE_TIMEOUT`), and so takes its request out of the router
-/// client, which then reads a late answer as a stale one; a forward cut by this wait instead leaves
-/// its request there until an answer comes. Only a forward that has not ended by then, its send
-/// held by a router link that takes nothing, is cut, and its hive skipped as `TIMEOUT`.
-const RUNTIME_USAGE_ASK_GRACE: Duration = Duration::from_secs(1);
 
 /// The hives of the motherbee's registry other than `local_hive`, in name order, each with the
 /// spoke role its entry records (`registered_spoke_role`). An error when the registry cannot be
@@ -20943,8 +20983,15 @@ fn registered_spoke_role(entry: &fluxbee_sdk::mesh::HiveEntry) -> Option<HiveRol
 /// `hives`, all asked at once with `ask` (that hive's GET_RUNTIME for its nodes alone,
 /// `runtime_usage_request`), each given `per_hive` to answer (`RUNTIME_USAGE_HIVE_TIMEOUT`): a
 /// hive that does not answer costs the whole read `per_hive`, never one wait after another
-/// (FINDINGS A-281, the review). `ask` ends by its own wait (the forward's); one still running
-/// `RUNTIME_USAGE_ASK_GRACE` later is no longer waited for.
+/// (FINDINGS A-281, the review).
+///
+/// Each ask ends by its own wait, the forward's, which takes its request out of the router client
+/// (a late answer then reads as stale), as each hive's ask of `list_tenant_nodes` does. Nothing
+/// cuts an ask from outside: a forward dropped before its end leaves its request in the router
+/// client for good (`send_with_matcher` removes it only on an answer or at its own timeout, and a
+/// request whose send was dropped is never sent, so no answer comes). Only a send held by a router
+/// link that takes nothing can then hold the read past `per_hive`, and this hive's answer to
+/// SY.admin, sent on that same link, would wait behind it all the same.
 ///
 /// - A hive whose recorded role runs no managed node (`role_runs_managed_nodes`: an ingress, an
 ///   egress) is not asked. It is listed in `hives_without_runtimes` with that role: no node there
@@ -20956,9 +21003,10 @@ fn registered_spoke_role(entry: &fluxbee_sdk::mesh::HiveEntry) -> Option<HiveRol
 ///     stuck while the LSA still shows it);
 ///   - `UNREACHABLE`: the request never reached it (the LSA does not show the hive or its
 ///     orchestrator, a router answered it unreachable, or the motherbee's router link is down);
-///   - `USAGE_UNREADABLE`: its read of its own nodes failed, answered with that code, or as an
-///     `ok` whose `usage` failed by a spoke before 0.1.133 (counted before as a hive with no node;
-///     FINDINGS A-281);
+///   - `USAGE_UNREADABLE`: its read of its own nodes failed (`local_runtime_usage_summary`: a tree
+///     it cannot walk, or the config of a node that may run that it cannot read), answered with
+///     that code, or as an `ok` whose `usage` failed by a spoke before 0.1.133 (counted before as
+///     a hive with no node; FINDINGS A-281);
 ///   - the code of any other error it answered (`RUNTIME_QUERY_FAILED` when it names none): above
 ///     all `RUNTIME_NOT_FOUND` or `RUNTIME_MANIFEST_MISSING` from a spoke before 0.1.133, which
 ///     reads no `usage_only` and answers the whole read, while its manifest does not list the
@@ -20974,7 +21022,7 @@ async fn group_runtime_usage<F, Fut>(
     mut ask: F,
 ) -> serde_json::Value
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(String, Duration) -> Fut,
     Fut: std::future::Future<Output = Result<serde_json::Value, OrchestratorError>>,
 {
     let mut running_nodes = local_usage
@@ -20995,19 +21043,14 @@ where
             None => asked.push(hive_id),
         }
     }
-    // Every hive at once; the answers come back in the order asked.
-    let cut = per_hive + RUNTIME_USAGE_ASK_GRACE;
-    let answers = futures::future::join_all(
-        asked
-            .iter()
-            .map(|hive_id| tokio::time::timeout(cut, ask(hive_id.clone()))),
-    )
-    .await;
+    // Every hive at once, each within its own wait; the answers come back in the order asked.
+    let answers =
+        futures::future::join_all(asked.iter().map(|hive_id| ask(hive_id.clone(), per_hive))).await;
 
     for (hive_id, answer) in asked.into_iter().zip(answers) {
         let response = match answer {
-            Ok(Ok(response)) => response,
-            Ok(Err(err)) => {
+            Ok(response) => response,
+            Err(err) => {
                 let timed_out = err
                     .downcast_ref::<RpcError>()
                     .is_some_and(RpcError::is_timeout);
@@ -21019,14 +21062,6 @@ where
                     } else {
                         err.to_string()
                     },
-                }));
-                continue;
-            }
-            Err(_) => {
-                skipped_hives.push(serde_json::json!({
-                    "hive_id": hive_id,
-                    "reason": "TIMEOUT",
-                    "message": format!("no answer within {} s", cut.as_secs()),
                 }));
                 continue;
             }
@@ -54495,7 +54530,7 @@ blob:
             "running_nodes": [{ "node_name": "AI.local@motherbee", "hive": "motherbee" }],
         });
         let asked = StdMutex::new(Vec::new());
-        let usage = group_runtime_usage(&local, hives, RUNTIME_USAGE_HIVE_TIMEOUT, |hive_id| {
+        let usage = group_runtime_usage(&local, hives, RUNTIME_USAGE_HIVE_TIMEOUT, |hive_id, _| {
             asked.lock().unwrap().push(hive_id.clone());
             let answer: Result<serde_json::Value, OrchestratorError> = match hive_id.as_str() {
                 "accepting1" => {
@@ -54590,7 +54625,7 @@ blob:
             &serde_json::json!({ "running_nodes": [] }),
             vec![("worker1".to_string(), Some(HiveRole::Worker))],
             RUNTIME_USAGE_HIVE_TIMEOUT,
-            |_| async {
+            |_, _| async {
                 Err::<serde_json::Value, OrchestratorError>(
                     "target hive 'worker1' not reachable in LSA (stale/missing)".into(),
                 )
@@ -54612,7 +54647,7 @@ blob:
             .map(|(hive, role)| (hive.to_string(), role))
             .to_vec(),
             RUNTIME_USAGE_HIVE_TIMEOUT,
-            |hive_id| {
+            |hive_id, _| {
                 assert_eq!(hive_id, "worker1", "only the worker is asked");
                 async {
                     Ok::<_, OrchestratorError>(serde_json::json!({
@@ -54819,6 +54854,184 @@ blob:
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// FINDINGS A-281, the review: a node whose config.json cannot be read or parsed, while its
+    /// unit runs or systemctl gives no answer for it, runs on a runtime nobody can name. The
+    /// hive's read of its nodes then fails, naming it: a worker answers `USAGE_UNREADABLE`, and on
+    /// the motherbee the whole use is an error. It was left out as a node on no runtime, so a
+    /// worker answered ok without it and a removal took its version from under it. One whose unit
+    /// does not run is left out, as any node whose unit does not run is.
+    #[tokio::test]
+    async fn a_node_whose_config_cannot_be_read_while_it_may_run_leaves_the_use_unknown() {
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-usage-unread-{}", Uuid::new_v4().simple()));
+        let nodes = root.join("nodes");
+        write_usage_test_node(
+            &nodes,
+            "WF.readable.test@worker1",
+            "wf.readable.test",
+            "0.0.1",
+        );
+        let broken = nodes.join("WF").join("WF.broken.test@worker1");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("config.json"), "{\"_system\": {\"runtime\": ").unwrap();
+        let read = |worker: &OrchestratorState| {
+            local_runtime_usage_answer_with_root(worker, &nodes, "wf.readable.test", Some("0.0.1"))
+        };
+
+        // Its unit runs, or systemctl gives no answer for it; the readable node's unit runs.
+        let checks: [(fn(&str) -> ServiceActivity, &str); 2] = [
+            (|_: &str| ServiceActivity::Active, "its unit runs"),
+            (
+                |unit: &str| {
+                    if unit.contains("broken") {
+                        ServiceActivity::Unknown
+                    } else {
+                        ServiceActivity::Active
+                    }
+                },
+                "systemctl gives no answer for its unit",
+            ),
+        ];
+        for (activity, unit_state) in checks {
+            let mut worker = usage_test_worker("worker1");
+            worker.unit_checks.activity = activity;
+            let answer = read(&worker);
+            assert_eq!(answer["status"], "error", "{answer}");
+            assert_eq!(answer["error_code"], "USAGE_UNREADABLE", "{answer}");
+            assert!(answer.get("usage").is_none(), "{answer}");
+            let message = answer["message"].as_str().unwrap_or_default();
+            assert!(
+                message.starts_with("the config.json of WF.broken.test@worker1 cannot be read (")
+                    && message.ends_with(&format!(
+                        ") while {unit_state}, so the runtime it runs on is unknown"
+                    )),
+                "{message}"
+            );
+        }
+
+        // Its unit does not run: it is left out, and the readable node counts.
+        let mut worker = usage_test_worker("worker1");
+        worker.unit_checks.activity = |unit: &str| {
+            if unit.contains("broken") {
+                ServiceActivity::Inactive
+            } else {
+                ServiceActivity::Active
+            }
+        };
+        let answer = read(&worker);
+        assert_eq!(answer["status"], "ok", "{answer}");
+        assert_eq!(answer["usage"]["running_count"], 1, "{answer}");
+        assert_eq!(
+            answer["usage"]["running_nodes"][0]["node_name"], "WF.readable.test@worker1",
+            "{answer}"
+        );
+
+        // A config that parses but is no object is no config either.
+        fs::write(broken.join("config.json"), "[]").unwrap();
+        let answer = read(&usage_test_worker("worker1"));
+        assert_eq!(answer["error_code"], "USAGE_UNREADABLE", "{answer}");
+        assert!(
+            answer["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("expected object")),
+            "{answer}"
+        );
+
+        // The motherbee's own node: its whole use is an error, which SY.admin reads as a read
+        // that failed there.
+        let mut motherbee = sample_orchestrator_state_for_tests();
+        motherbee.unit_checks.activity = |_: &str| ServiceActivity::Active;
+        let usage = global_visible_runtime_usage_summary_with_roots(
+            &motherbee,
+            &nodes,
+            &root.join("hives"),
+            "wf.readable.test",
+            Some("0.0.1"),
+        )
+        .await;
+        assert_eq!(usage["status"], "error", "{usage}");
+        assert!(
+            usage["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("WF.broken.test@worker1")),
+            "{usage}"
+        );
+        assert!(usage.get("running_nodes").is_none(), "{usage}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-281, the review: a read of another hive's runtime is forwarded without
+    /// `usage_only` (GET /hives/worker1/runtimes/<runtime>, Archi's tool_catalog read), so that
+    /// hive answers the whole read, its manifest, materialization and tool catalog, as before;
+    /// only a read that asks for the nodes alone carries it, as the motherbee's use across the
+    /// hives asks each worker.
+    #[tokio::test]
+    async fn a_forwarded_runtime_read_carries_usage_only_only_when_asked() {
+        let motherbee = sample_orchestrator_state_for_tests();
+        let (_client, mut harness) = attach_test_rpc(&motherbee);
+        for (payload, forwarded) in [
+            (
+                serde_json::json!({ "target": "worker1", "runtime": "ai.generic" }),
+                serde_json::json!({
+                    "target": "worker1",
+                    "runtime": "ai.generic",
+                    "runtime_version": null,
+                }),
+            ),
+            (
+                serde_json::json!({
+                    "target": "worker1",
+                    "runtime": "ai.generic",
+                    "runtime_version": "0.3.1",
+                    "usage_only": false,
+                }),
+                serde_json::json!({
+                    "target": "worker1",
+                    "runtime": "ai.generic",
+                    "runtime_version": "0.3.1",
+                }),
+            ),
+            (
+                serde_json::json!({
+                    "target": "worker1",
+                    "runtime": "ai.generic",
+                    "runtime_version": "0.3.1",
+                    "usage_only": true,
+                }),
+                serde_json::json!({
+                    "target": "worker1",
+                    "runtime": "ai.generic",
+                    "runtime_version": "0.3.1",
+                    "usage_only": true,
+                }),
+            ),
+        ] {
+            let answer =
+                serde_json::json!({ "status": "ok", "hive_id": "worker1", "asked": payload });
+            let worker = async {
+                let ask = harness
+                    .next_outgoing()
+                    .await
+                    .expect("the forwarded GET_RUNTIME");
+                assert_unicast_destination(&ask.routing.dst, "SY.orchestrator@worker1");
+                assert_eq!(ask.meta.msg.as_deref(), Some("GET_RUNTIME"));
+                assert_eq!(ask.payload, forwarded, "{payload}");
+                harness
+                    .inject(test_response_for(
+                        &ask,
+                        SYSTEM_KIND,
+                        "GET_RUNTIME_RESPONSE",
+                        answer.clone(),
+                    ))
+                    .await
+                    .expect("inject the worker's answer");
+            };
+            let (read, ()) = tokio::join!(get_runtime_flow(&motherbee, &payload), worker);
+            assert_eq!(read, answer, "{payload}");
+        }
+    }
+
     /// FINDINGS A-281, the review: the motherbee's use across the hives asks every worker at once,
     /// for its nodes alone (`usage_only`), and gives each RUNTIME_USAGE_HIVE_TIMEOUT. A worker
     /// whose copy lags is counted by the nodes it answers, with a node or with none; a spoke before
@@ -54950,7 +55163,7 @@ blob:
 
         assert!(
             elapsed >= RUNTIME_USAGE_HIVE_TIMEOUT
-                && elapsed < RUNTIME_USAGE_HIVE_TIMEOUT + RUNTIME_USAGE_ASK_GRACE,
+                && elapsed < RUNTIME_USAGE_HIVE_TIMEOUT + Duration::from_millis(100),
             "{elapsed:?}"
         );
         assert_eq!(usage["running_count"], 1, "{usage}");
@@ -54993,24 +55206,38 @@ blob:
         let _ = fs::remove_dir_all(&scratch);
     }
 
-    /// FINDINGS A-281, the review: the motherbee asks the hives at once and stops waiting for each
-    /// at its bound, so the read ends by then however many do not answer, never one wait after
-    /// another (2 + 11 + 9 + 10 s here, past SY.admin's 30 s). An ask that ends by its own wait
-    /// (the forward's timeout) and one that never ends are each skipped as `TIMEOUT`; one never
-    /// delivered (the LSA does not show its orchestrator) as `UNREACHABLE`; the others count. With
-    /// no node listed and a hive skipped, the use is unknown.
+    /// FINDINGS A-281, the review: the motherbee asks the hives at once and gives each its bound,
+    /// so the read ends by then however many do not answer, never one wait after another (2 + 10 +
+    /// 9 + 10 s here, past SY.admin's 30 s). An ask that ends by its own wait (the forward's
+    /// timeout, as forward_system_action_to_hive_with_timeout gives it) is skipped as `TIMEOUT`;
+    /// one never delivered (the LSA does not show its orchestrator) as `UNREACHABLE`; the others
+    /// count. With no node listed and a hive skipped, the use is unknown.
     #[tokio::test(start_paused = true)]
     async fn the_group_usage_stops_waiting_for_each_hive_at_its_bound() {
         let hives: Vec<(String, Option<HiveRole>)> =
             ["worker1", "worker2", "worker3", "worker4", "worker5"]
                 .map(|hive| (hive.to_string(), Some(HiveRole::Worker)))
                 .to_vec();
-        let ask = |hive_id: String| async move {
+        let ask = |hive_id: String, per_hive: Duration| async move {
             let nodes = |nodes: serde_json::Value| {
                 Ok::<_, OrchestratorError>(serde_json::json!({
                     "status": "ok",
                     "usage": { "running_nodes": nodes },
                 }))
+            };
+            // The forward's own wait ends, as forward_system_action_to_hive_with_timeout ends it.
+            let no_answer = |hive_id: &str| {
+                let timeout = RpcError::Timeout {
+                    trace_id: format!("trace-{hive_id}"),
+                    target: format!("SY.orchestrator@{hive_id}"),
+                    request_msg: "GET_RUNTIME".to_string(),
+                    response_msg: "GET_RUNTIME_RESPONSE".to_string(),
+                    timeout_ms: per_hive.as_millis() as u64,
+                };
+                async move {
+                    tokio::time::sleep(per_hive).await;
+                    Err::<serde_json::Value, _>(OrchestratorError::from(timeout))
+                }
             };
             match hive_id.as_str() {
                 "worker1" => {
@@ -55021,29 +55248,15 @@ blob:
                         "lifecycle": "RUNNING",
                     }]))
                 }
-                // Its orchestrator stopped while the LSA still shows it, and the ask does not end
-                // by itself.
-                "worker2" => {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                    nodes(serde_json::json!([]))
-                }
+                // Its orchestrator stopped while the LSA still shows it.
+                "worker2" => no_answer("worker2").await,
                 // A loaded worker that answers within its bound.
                 "worker3" => {
                     tokio::time::sleep(Duration::from_secs(9)).await;
                     nodes(serde_json::json!([]))
                 }
-                // The forward's own wait ends first, as forward_system_action_to_hive_with_timeout
-                // gives it.
-                "worker4" => {
-                    tokio::time::sleep(RUNTIME_USAGE_HIVE_TIMEOUT).await;
-                    Err(OrchestratorError::from(RpcError::Timeout {
-                        trace_id: "trace-worker4".to_string(),
-                        target: "SY.orchestrator@worker4".to_string(),
-                        request_msg: "GET_RUNTIME".to_string(),
-                        response_msg: "GET_RUNTIME_RESPONSE".to_string(),
-                        timeout_ms: 10_000,
-                    }))
-                }
+                // Its orchestrator is stuck.
+                "worker4" => no_answer("worker4").await,
                 _ => Err(OrchestratorError::from(
                     "target orchestrator 'SY.orchestrator@worker5' not visible in LSA for hive \
                      'worker5' (visible: none)",
@@ -55060,9 +55273,9 @@ blob:
         )
         .await;
         let elapsed = started.elapsed();
-        let cut = RUNTIME_USAGE_HIVE_TIMEOUT + RUNTIME_USAGE_ASK_GRACE;
         assert!(
-            elapsed >= cut && elapsed < cut + Duration::from_millis(10),
+            elapsed >= RUNTIME_USAGE_HIVE_TIMEOUT
+                && elapsed < RUNTIME_USAGE_HIVE_TIMEOUT + Duration::from_millis(10),
             "{elapsed:?}"
         );
         assert!(elapsed < Duration::from_secs(30) / 2, "{elapsed:?}");
@@ -55079,22 +55292,15 @@ blob:
             })
             .collect();
         assert_eq!(skipped.len(), 3, "{usage}");
-        assert_eq!(
-            skipped[0],
-            ("worker2", "TIMEOUT", "no answer within 11 s"),
-            "{usage}"
-        );
-        assert_eq!(
-            (skipped[1].0, skipped[1].1),
-            ("worker4", "TIMEOUT"),
-            "{usage}"
-        );
-        assert!(
-            skipped[1]
-                .2
-                .starts_with("no answer within 10 s (timeout waiting response"),
-            "{usage}"
-        );
+        for (skipped, hive) in skipped[..2].iter().zip(["worker2", "worker4"]) {
+            assert_eq!((skipped.0, skipped.1), (hive, "TIMEOUT"), "{usage}");
+            assert!(
+                skipped
+                    .2
+                    .starts_with("no answer within 10 s (timeout waiting response"),
+                "{usage}"
+            );
+        }
         assert_eq!(
             (skipped[2].0, skipped[2].1),
             ("worker5", "UNREACHABLE"),
@@ -55116,28 +55322,71 @@ blob:
         assert_eq!(unknown["in_use"], serde_json::Value::Null, "{unknown}");
     }
 
+    /// FINDINGS A-281, the review: the motherbee never cuts a hive's ask from outside. The ask is
+    /// the forward, which ends by its own wait and then takes its request out of the router
+    /// client; one dropped before its end, as a cut 1 s past the bound dropped it, left its
+    /// request there for good (the SDK removes it only on an answer or at its own timeout, and a
+    /// request whose send was dropped is never sent). An ask that has not ended at the bound, its
+    /// send held 2 s by a router link that takes nothing, is waited for and counted by its answer,
+    /// where it was skipped as `TIMEOUT` at 11 s and its node left out.
+    #[tokio::test(start_paused = true)]
+    async fn the_group_usage_never_cuts_an_ask_that_has_not_ended() {
+        let held = Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let usage = group_runtime_usage(
+            &serde_json::json!({ "running_nodes": [] }),
+            vec![("worker1".to_string(), Some(HiveRole::Worker))],
+            RUNTIME_USAGE_HIVE_TIMEOUT,
+            |_, per_hive| async move {
+                tokio::time::sleep(per_hive + held).await;
+                Ok::<_, OrchestratorError>(serde_json::json!({
+                    "status": "ok",
+                    "usage": { "running_nodes": [{
+                        "node_name": "WF.held.test@worker1",
+                        "hive": "worker1",
+                        "lifecycle": "RUNNING",
+                    }] },
+                }))
+            },
+        )
+        .await;
+        assert_eq!(
+            started.elapsed(),
+            RUNTIME_USAGE_HIVE_TIMEOUT + held,
+            "the read ends with its ask"
+        );
+        assert_eq!(usage["skipped_hives"], serde_json::json!([]), "{usage}");
+        assert_eq!(usage["running_count"], 1, "{usage}");
+        assert_eq!(
+            usage["running_nodes"][0]["node_name"], "WF.held.test@worker1",
+            "{usage}"
+        );
+        assert_eq!(usage["in_use"], true, "{usage}");
+    }
+
     /// FINDINGS A-281, the review: the motherbee's get_runtime of its own hive asks every other
     /// hive for its nodes, up to RUNTIME_USAGE_HIVE_TIMEOUT for one that does not answer, so it
-    /// waits on every hive, as list_versions does, and asked again and again while a hive does not
-    /// answer it holds the fan-outs' places, never a local read's. A spoke's, and a read of the
-    /// hive's own nodes alone (the request a worker gets from that fan-out), ask no other hive.
+    /// waits on every hive, in a target of its own (`ReadTarget::RuntimeUse`): asked again and
+    /// again while a hive does not answer, it holds its own places, never a local read's nor those
+    /// of list_versions and list_tenant_nodes (`EveryHive`). A spoke's, and a read of the hive's
+    /// own nodes alone (the request a worker gets from that fan-out), ask no other hive.
     #[test]
     fn the_motherbees_runtime_read_waits_on_every_hive() {
-        let every = RequestLane::Read(ReadTarget::EveryHive);
+        let runtime_use = RequestLane::Read(ReadTarget::RuntimeUse);
         let local = RequestLane::Read(ReadTarget::Local);
         let worker1 = RequestLane::Read(ReadTarget::Hive("worker1".to_string()));
         for (payload, lane) in [
             (
                 serde_json::json!({ "runtime": "ai.generic" }),
-                every.clone(),
+                runtime_use.clone(),
             ),
             (
                 serde_json::json!({ "runtime": "ai.generic", "target": "motherbee" }),
-                every.clone(),
+                runtime_use.clone(),
             ),
             (
                 serde_json::json!({ "runtime": "ai.generic", "usage_only": false }),
-                every.clone(),
+                runtime_use.clone(),
             ),
             (
                 serde_json::json!({ "runtime": "ai.generic", "usage_only": true }),
@@ -55178,11 +55427,18 @@ blob:
                 "{payload}"
             );
         }
-        // The other runtime read stays this hive's alone.
+        // The other runtime read stays this hive's alone, and the other fan-outs keep theirs.
         assert_eq!(
             admin_request_lane("list_runtimes", &serde_json::json!({}), "motherbee", true),
             local
         );
+        for action in ["list_versions", "list_tenant_nodes"] {
+            assert_eq!(
+                admin_request_lane(action, &serde_json::json!({}), "motherbee", true),
+                RequestLane::Read(ReadTarget::EveryHive),
+                "{action}"
+            );
+        }
     }
 
     /// An SY node runs as its packaged unit and the router as `rt-gateway`, never as a
@@ -56165,6 +56421,100 @@ blob:
         })
         .await;
         assert!(emptied.is_ok(), "no target is kept once its reads end");
+    }
+
+    /// Runs `name` in `lane`, gated as `gated_request` gates it, and gives back its gate.
+    fn run_gated(
+        lanes: &WorkerLanes,
+        log: &LaneLog,
+        lane: &RequestLane,
+        name: &str,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let (gate, opened) = tokio::sync::oneshot::channel();
+        lanes.run(lane.clone(), gated_request(log, name, opened));
+        gate
+    }
+
+    /// FINDINGS A-281, the review: the motherbee's runtime reads wait on every hive in places of
+    /// their own (`ReadTarget::RuntimeUse`). With list_versions's 4 places held (it asks the hives
+    /// one after another, 45 s for each that does not answer), a get_runtime of the motherbee,
+    /// which SY.admin's remove_runtime_version waits 30 s for, still starts at once, where it
+    /// waited for one of those places; and with 4 runtime reads held, Fluxbee Cloud's list_nodes
+    /// (list_tenant_nodes, which the Cloud waits 20 s for) still starts at once. One more of a kind
+    /// waits for its own kind.
+    #[tokio::test]
+    async fn the_motherbees_runtime_reads_wait_in_places_of_their_own() {
+        let versions =
+            admin_request_lane("list_versions", &serde_json::json!({}), "motherbee", true);
+        let tenant_nodes = admin_request_lane(
+            "list_tenant_nodes",
+            &serde_json::json!({ "tenant_id": "tnt:test" }),
+            "motherbee",
+            true,
+        );
+        let runtime = admin_request_lane(
+            "get_runtime",
+            &serde_json::json!({ "runtime": "wf.removed.test", "runtime_version": "0.0.1" }),
+            "motherbee",
+            true,
+        );
+
+        // list_versions holds its places, and one more waits.
+        let lanes = WorkerLanes::start("test", WORKER_CONCURRENT_READS_MAX);
+        let log = LaneLog::default();
+        let mut gates = Vec::new();
+        for read in 0..WORKER_READS_PER_TARGET_MAX {
+            gates.push(run_gated(
+                &lanes,
+                &log,
+                &versions,
+                &format!("versions-{read}"),
+            ));
+        }
+        wait_for_lane_starts(&log, WORKER_READS_PER_TARGET_MAX).await;
+        gates.push(run_gated(&lanes, &log, &versions, "versions-waiting"));
+        run_gated(&lanes, &log, &runtime, "runtime")
+            .send(())
+            .expect("the runtime read waits for its gate");
+        wait_for_lane_entry(&log, "runtime end").await;
+        assert!(
+            !lane_logged(&log, "versions-waiting start"),
+            "{:?}",
+            lane_started(&log)
+        );
+        gates.remove(0).send(()).expect("a versions read's gate");
+        wait_for_lane_entry(&log, "versions-waiting start").await;
+        for gate in gates.drain(..) {
+            let _ = gate.send(());
+        }
+
+        // The runtime reads hold theirs, and one more waits.
+        let lanes = WorkerLanes::start("test", WORKER_CONCURRENT_READS_MAX);
+        let log = LaneLog::default();
+        for read in 0..WORKER_READS_PER_TARGET_MAX {
+            gates.push(run_gated(
+                &lanes,
+                &log,
+                &runtime,
+                &format!("runtime-{read}"),
+            ));
+        }
+        wait_for_lane_starts(&log, WORKER_READS_PER_TARGET_MAX).await;
+        gates.push(run_gated(&lanes, &log, &runtime, "runtime-waiting"));
+        run_gated(&lanes, &log, &tenant_nodes, "tenant-nodes")
+            .send(())
+            .expect("the tenant's nodes read waits for its gate");
+        wait_for_lane_entry(&log, "tenant-nodes end").await;
+        assert!(
+            !lane_logged(&log, "runtime-waiting start"),
+            "{:?}",
+            lane_started(&log)
+        );
+        gates.remove(0).send(()).expect("a runtime read's gate");
+        wait_for_lane_entry(&log, "runtime-waiting start").await;
+        for gate in gates {
+            let _ = gate.send(());
+        }
     }
 
     /// Forwarded reads hold only their own places: with every forwarding place held, a read of
