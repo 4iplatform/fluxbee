@@ -728,6 +728,12 @@ struct OrchestratorState {
     /// condition it opened, when the watchdog last restarted Syncthing for one, and the folders to
     /// ask last (`SyncthingApiWatch`).
     syncthing_api: std::sync::Mutex<SyncthingApiWatch>,
+    /// FINDINGS A-283, the review: the boot's or a config change's Syncthing setup
+    /// (`ensure_blob_sync_runtime`) failed, at its wait for the API port, say, so the folders'
+    /// reconcile it runs after that wait is owed. The first watchdog tick whose API port takes the
+    /// connection runs the setup again (`finish_owed_syncthing_setup`); a setup that succeeds,
+    /// whoever runs it, pays it.
+    syncthing_setup_owed: AtomicBool,
     /// How this hive asks systemd about a node's unit (FINDINGS A-271): systemctl itself
     /// (`UnitChecks::SYSTEMCTL`); a test's state answers as a host without the unit does.
     unit_checks: UnitChecks,
@@ -889,9 +895,10 @@ impl OrchestratorState {
             .run_open()
     }
 
-    /// FINDINGS A-283: a join or a removal that owns Syncthing restarts it, so a run of no answers
-    /// from before says nothing of the process after it: the run starts again. The condition and
-    /// the last restart stay.
+    /// FINDINGS A-283: a join or a removal that owns Syncthing restarts it, and so does a setup
+    /// that restarts it or starts one that did not run (`syncthing_setup_starts_a_process`, the
+    /// review), so a run of no answers from before says nothing of the process after it: the run
+    /// starts again. The condition and the last restart stay.
     fn forget_syncthing_api_run(&self) {
         self.syncthing_api
             .lock()
@@ -906,6 +913,22 @@ impl OrchestratorState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restarted(now_ms);
+    }
+
+    /// FINDINGS A-283, the review: the boot's or a config change's Syncthing setup failed; the
+    /// watchdog runs it again at its first tick whose API port takes the connection.
+    fn owe_syncthing_setup(&self) {
+        self.syncthing_setup_owed.store(true, Ordering::Release);
+    }
+
+    /// Whether a Syncthing setup is owed (`owe_syncthing_setup`).
+    fn syncthing_setup_owed(&self) -> bool {
+        self.syncthing_setup_owed.load(Ordering::Acquire)
+    }
+
+    /// A Syncthing setup succeeded: whatever was owed, it ran.
+    fn syncthing_setup_paid(&self) {
+        self.syncthing_setup_owed.store(false, Ordering::Release);
     }
 
     /// F18: acquire the per-hive_id topology lock, held across the whole
@@ -1165,10 +1188,16 @@ async fn main() -> Result<(), OrchestratorError> {
         identity_sync_port,
         system_nodes,
         egress: EgressState::new(hive.egress.clone()),
-        blob: blob_runtime.clone(),
+        // What the boot's Syncthing step applies, as the watchdog compares it: the effective
+        // config. An egress syncs dist only, so its blob section alone read as a config change at
+        // the first tick, which ran the setup again (FINDINGS A-283, the review).
+        blob_sync_last_desired: Mutex::new(effective_syncthing_runtime_config(
+            &blob_runtime,
+            &dist_runtime,
+        )),
+        blob: blob_runtime,
         dist: dist_runtime,
         installation_not_written: std::sync::Mutex::new(None),
-        blob_sync_last_desired: Mutex::new(blob_runtime),
         hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
         node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         relaunch_waits: std::sync::Mutex::new(HashMap::new()),
@@ -1184,6 +1213,7 @@ async fn main() -> Result<(), OrchestratorError> {
             &fs::read_to_string(drift_alerts_path()).unwrap_or_default(),
             &hive.hive_id,
         )),
+        syncthing_setup_owed: AtomicBool::new(false),
         unit_checks: UnitChecks::SYSTEMCTL,
         rpc: OnceLock::new(),
     });
@@ -2333,9 +2363,14 @@ async fn bootstrap_local(
             ensure_blob_sync_runtime(state, &state.blob, &state.dist, VendorPolicy::KeepInstalled)
                 .await
         {
+            // FINDINGS A-283, the review: a setup that failed, at its 30 s wait for the API port
+            // say, skipped the folders' reconcile after that wait; the watchdog runs it again at its
+            // first tick whose port takes the connection, where that wait ends at once.
+            state.owe_syncthing_setup();
             tracing::warn!(
                 error = %err,
-                "blob sync runtime bootstrap failed; continuing startup and relying on watchdog retries"
+                "blob sync runtime bootstrap failed; continuing startup: the watchdog runs it again \
+                 at its first tick whose Syncthing API port takes the connection"
             );
         }
     } else {
@@ -15708,9 +15743,22 @@ async fn syncthing_api_healthy(api_port: u16) -> bool {
     syncthing_api_port(api_port).await.is_ok()
 }
 
+/// Why Syncthing's API port took no connection (`syncthing_api_port`, FINDINGS A-283).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApiPortError {
+    /// The port refused the connection, or took none within SYNCTHING_HEALTH_TIMEOUT_SECS:
+    /// Syncthing's REST API gave no answer, and why, "API port refused: …" (the operator's call of
+    /// 2026-11-11).
+    Refused(String),
+    /// The connect failed for another reason, one of this host's own: no file descriptor or local
+    /// port left, no buffer, a firewall rule on loopback. The check gave no answer, which says
+    /// nothing of Syncthing (FINDINGS A-283, the review; A-271's rule), and why.
+    NoAnswer(String),
+}
+
 /// Whether Syncthing's API port takes a TCP connection within SYNCTHING_HEALTH_TIMEOUT_SECS, and
 /// why not when it takes none (`syncthing_api_port_answer`).
-async fn syncthing_api_port(api_port: u16) -> Result<(), String> {
+async fn syncthing_api_port(api_port: u16) -> Result<(), ApiPortError> {
     let endpoint = format!("127.0.0.1:{api_port}");
     let connect = time::timeout(
         Duration::from_secs(SYNCTHING_HEALTH_TIMEOUT_SECS),
@@ -15725,19 +15773,34 @@ async fn syncthing_api_port(api_port: u16) -> Result<(), String> {
 /// The API port's answer from its connect (`None`: none within SYNCTHING_HEALTH_TIMEOUT_SECS). A
 /// port that takes no connection, refused or not in time, is Syncthing's REST API giving no
 /// answer, and its reason says so, "API port refused" (FINDINGS A-283, the operator's call of
-/// 2026-11-11).
+/// 2026-11-11). Any other error is the host's, not the port's (FINDINGS A-283, the review): a
+/// connect that fails with "Too many open files" says nothing of Syncthing, and counted as the
+/// port's refusal it would have an orchestrator that leaks its descriptors restart a healthy
+/// Syncthing.
 fn syncthing_api_port_answer(
     endpoint: &str,
     connect: Option<std::io::Result<()>>,
-) -> Result<(), String> {
+) -> Result<(), ApiPortError> {
+    use std::io::ErrorKind::{ConnectionRefused, TimedOut};
     match connect {
         Some(Ok(())) => Ok(()),
-        Some(Err(err)) => Err(format!("API port refused: {endpoint}: {err}")),
-        None => Err(format!(
+        Some(Err(err)) if matches!(err.kind(), ConnectionRefused | TimedOut) => Err(
+            ApiPortError::Refused(format!("API port refused: {endpoint}: {err}")),
+        ),
+        Some(Err(err)) => Err(ApiPortError::NoAnswer(format!(
+            "the connect to {endpoint} failed on this host: {err}"
+        ))),
+        None => Err(ApiPortError::Refused(format!(
             "API port refused: {endpoint} took no connection within \
              {SYNCTHING_HEALTH_TIMEOUT_SECS} s"
-        )),
+        ))),
     }
+}
+
+/// The name the API port's check counts under when it gives no answer (`note_check_answer`,
+/// FINDINGS A-283, the review): 12 such ticks in a row are warned of once, as any check's.
+fn syncthing_api_port_check_name(api_port: u16) -> String {
+    format!("syncthing api port connect 127.0.0.1:{api_port}")
 }
 
 fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
@@ -19174,6 +19237,18 @@ fn syncthing_runs_stale(
         && (binary_updated || unit_changed || runs_replaced_binary == CheckAnswer::Yes)
 }
 
+/// Whether the setup's restart or start leaves a new Syncthing process (FINDINGS A-283, the
+/// review): a restart (`restarted`) does, and so does a start of one systemd answered was not
+/// running (`activity`). Its API port stays closed for its first seconds, which must never count
+/// in a run of ticks with no answer of the process before it (`forget_syncthing_api_run`), or a
+/// run already 5 min long would have the watchdog restart a Syncthing just started. The start of a
+/// running one does nothing and keeps the run: a sync probe at a port that refuses never postpones
+/// the restart. Neither does a start after a check with no answer, which may have done nothing
+/// (FINDINGS A-271).
+fn syncthing_setup_starts_a_process(activity: ServiceActivity, restarted: bool) -> bool {
+    restarted || activity == ServiceActivity::Inactive
+}
+
 /// Syncthing installed from the vendor, under its unit, running and healthy, with this hive's
 /// folders. `policy` says what a vendored binary that does not match its manifest does: each
 /// caller names its own (FINDINGS A-189).
@@ -19243,12 +19318,8 @@ async fn ensure_blob_sync_runtime(
     }
     // Restart a stale Syncthing now, before the checks below: they already use the new unit's
     // port and home.
-    let stale = syncthing_runs_stale(
-        systemd_activity(SYNCTHING_SERVICE_NAME),
-        binary_updated,
-        unit_changed,
-        runs_replaced_binary,
-    );
+    let activity = systemd_activity(SYNCTHING_SERVICE_NAME);
+    let stale = syncthing_runs_stale(activity, binary_updated, unit_changed, runs_replaced_binary);
     if stale {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
@@ -19263,6 +19334,12 @@ async fn ensure_blob_sync_runtime(
             "starting blob sync service"
         );
         systemd_start(SYNCTHING_SERVICE_NAME)?;
+    }
+    // FINDINGS A-283, the review: whoever runs this setup (the boot, the watchdog, a sync probe,
+    // `update category=vendor`, an ingress join), a new process starts the run of ticks with no
+    // answer again.
+    if syncthing_setup_starts_a_process(activity, stale) {
+        state.forget_syncthing_api_run();
     }
     wait_for_service_active(
         SYNCTHING_SERVICE_NAME,
@@ -19282,6 +19359,8 @@ async fn ensure_blob_sync_runtime(
         let mut restart = Command::new("systemctl");
         restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
         run_cmd(restart, "systemctl restart")?;
+        // A new process, as above (FINDINGS A-283, the review).
+        state.forget_syncthing_api_run();
         wait_for_service_active(
             SYNCTHING_SERVICE_NAME,
             Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
@@ -19294,6 +19373,9 @@ async fn ensure_blob_sync_runtime(
         api_port = sync.sync_api_port,
         "blob sync service healthy"
     );
+    // FINDINGS A-283, the review: the folders are reconciled, whoever ran this setup, so a setup
+    // the boot or a config change could not finish is owed no more.
+    state.syncthing_setup_paid();
     Ok(SyncthingRuntimeOutcome {
         binary_updated,
         restarted: stale || folders_repaired,
@@ -19717,8 +19799,10 @@ fn syncthing_folder_check_name(folder: &str) -> String {
 /// gave none in, before the watchdog restarts Syncthing (FINDINGS A-283, the operator's call of
 /// 2026-11-11). It covers a start: a Syncthing that starts keeps its API port closed for a few
 /// seconds, which count as ticks with no answer (`SyncthingFolderChecks::port_refused`), and the
-/// first answer ends the run. A start that keeps it closed longer than this, a database
-/// migration, say, is restarted once; the next restart waits SYNCTHING_API_RESTART_EVERY.
+/// first answer ends the run. A start or restart by this orchestrator starts the run again
+/// (`forget_syncthing_api_run`), so it counts from the new process' first tick. A start that keeps
+/// the port closed longer than this, a database migration, say, is restarted once; the next restart
+/// waits SYNCTHING_API_RESTART_EVERY.
 const SYNCTHING_API_RESTART_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// The least time between two of those restarts: one an hour at most. It counts from the last
@@ -19936,6 +20020,36 @@ async fn restart_syncthing_for_unanswered_api(
     Ok(())
 }
 
+/// Runs the Syncthing setup the boot or a config change could not finish (FINDINGS A-283, the
+/// review; `OrchestratorState::syncthing_setup_owed`), at a tick whose API port took the
+/// connection: its wait for the port ends at once, and the folders' reconcile it skipped runs.
+/// Nothing else runs it again: the config change stays recorded as applied, so that a refused port
+/// costs the next ticks nothing more, and a refused port no longer takes the unhealthy path, whose
+/// setup ran it before A-283. A setup that fails again stays owed, for the next such tick, and the
+/// tick asks the folders all the same, so the watch of the REST API never waits on it.
+async fn finish_owed_syncthing_setup(
+    state: &OrchestratorState,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) {
+    tracing::info!(
+        service = SYNCTHING_SERVICE_NAME,
+        "Syncthing's API port takes connections; running the setup the boot or a config change \
+         could not finish"
+    );
+    // FINDINGS A-189: on the installed binary while the vendor still syncs, as the watchdog's
+    // other setups.
+    if let Err(err) = ensure_blob_sync_runtime(state, blob, dist, VendorPolicy::KeepInstalled).await
+    {
+        tracing::warn!(
+            service = SYNCTHING_SERVICE_NAME,
+            error = %err,
+            "the Syncthing setup the boot or a config change could not finish failed again; the \
+             next tick whose API port takes the connection runs it again"
+        );
+    }
+}
+
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
     // FINDINGS A-194: a join restarts Syncthing to link its peer (the motherbee's in `add_hive`, the
     // spoke's in its finalize, which then probes the folders). The watchdog leaves Syncthing to it
@@ -19981,13 +20095,21 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         // FINDINGS A-283: the reconcile can start or restart Syncthing (a sync turned on again, a
         // new unit), so a run of ticks its REST API gave no answer in starts again after it.
         state.forget_syncthing_api_run();
-        ensure_blob_sync_runtime(
+        // FINDINGS A-283, the review: the config stays recorded as applied, so the next ticks ask
+        // the API port, and one that refuses costs them nothing more. A setup that failed, at its
+        // wait for the port say, is owed instead: the first tick whose port takes the connection
+        // runs it again (`finish_owed_syncthing_setup`).
+        if let Err(err) = ensure_blob_sync_runtime(
             state,
             &desired_blob,
             &desired_dist,
             VendorPolicy::KeepInstalled,
         )
-        .await?;
+        .await
+        {
+            state.owe_syncthing_setup();
+            return Err(err);
+        }
         return Ok(());
     }
 
@@ -20032,34 +20154,58 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             );
         }
         // FINDINGS A-283, the operator's call of 2026-11-11: a port that refuses the connection, or
-        // takes none within 2 s, is the API's no answer too, and no folder is asked.
-        let checks = match syncthing_api_port(desired_sync.sync_api_port).await {
+        // takes none within 2 s, is the API's no answer too, and no folder is asked. The review: a
+        // connect that fails for a reason of this host's own is the check's no answer, which says
+        // nothing of Syncthing: the tick asks nothing more, counts nothing in the API's run and
+        // restarts nothing, and a run of such checks is warned of as any check's.
+        let port = syncthing_api_port(desired_sync.sync_api_port).await;
+        state.note_check_answer(
+            &syncthing_api_port_check_name(desired_sync.sync_api_port),
+            !matches!(port, Err(ApiPortError::NoAnswer(_))),
+            WATCHDOG_UNANSWERED_REPORT_CHECKS,
+        );
+        let checks = match port {
             Ok(()) => {
+                // FINDINGS A-283, the review: the setup the boot or a config change could not
+                // finish runs first, its wait for the port ending at once; the folders are asked
+                // after it whatever it did.
+                if state.syncthing_setup_owed() && !a_join_owns_syncthing(state) {
+                    finish_owed_syncthing_setup(state, &desired_blob, &desired_dist).await;
+                }
                 let ask_last = state.syncthing_folders_asked_last();
                 check_syncthing_folders(&folder_ids, &ask_last, |folder| {
                     check_syncthing_folder(&desired_sync, folder)
                 })
             }
-            Err(refused) => SyncthingFolderChecks::port_refused(refused),
+            Err(ApiPortError::Refused(why)) => SyncthingFolderChecks::port_refused(why),
+            Err(ApiPortError::NoAnswer(why)) => {
+                tracing::debug!(
+                    error = %why,
+                    "the check of Syncthing's API port could not connect, for a reason of this \
+                     host's; nothing counted, nothing restarted"
+                );
+                return Ok(());
+            }
         };
         folders = checks.folders;
-        if checks.port_refused.is_some() || !folder_ids.is_empty() {
-            let tick = state.note_syncthing_api_tick(&checks, Instant::now());
-            if tick.restart {
-                // A join that started during this tick's checks owns Syncthing by now (FINDINGS
-                // A-194): it restarts Syncthing itself, and the run starts again after it.
-                if a_join_owns_syncthing(state) {
-                    state.forget_syncthing_api_run();
-                    return Ok(());
-                }
-                return restart_syncthing_for_unanswered_api(
-                    state,
-                    &desired_sync,
-                    tick.unanswered_for,
-                    checks.api_unanswered().unwrap_or_default(),
-                )
-                .await;
+        // Every tick that asked counts (FINDINGS A-283, the review), a hive with no folder to ask
+        // included: there, a port that takes the connection is the API's answer, and ends the run
+        // its refusals opened.
+        let tick = state.note_syncthing_api_tick(&checks, Instant::now());
+        if tick.restart {
+            // A join that started during this tick's checks owns Syncthing by now (FINDINGS
+            // A-194): it restarts Syncthing itself, and the run starts again after it.
+            if a_join_owns_syncthing(state) {
+                state.forget_syncthing_api_run();
+                return Ok(());
             }
+            return restart_syncthing_for_unanswered_api(
+                state,
+                &desired_sync,
+                tick.unanswered_for,
+                checks.api_unanswered().unwrap_or_default(),
+            )
+            .await;
         }
         // A tick the API gave no answer at asks it nothing more, and a folder it gave none for is
         // not asked for its errors (FINDINGS A-283).
@@ -20091,7 +20237,10 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     // FINDINGS A-283: this path starts a Syncthing that does not run, whose API port takes a few
     // seconds to listen. Those seconds count in a run of their own, never in one from before the
     // start, which could have lasted 5 min already: the run starts again. (A tick at which
-    // Syncthing answered for a folder ended its run already.)
+    // Syncthing answered for a folder ended its run already.) The setup starts it again too when
+    // systemd still says Syncthing does not run (`syncthing_setup_starts_a_process`); this one
+    // also covers a Syncthing systemd started again itself (`Restart=always`) since the tick's
+    // check, whose start by the setup then does nothing.
     state.forget_syncthing_api_run();
     // FINDINGS A-189: on the installed binary while the vendor still syncs.
     ensure_blob_sync_runtime(
@@ -51764,6 +51913,7 @@ blob:
         for (head, strict, keep) in [
             ("async fn bootstrap_local(", 0, 1),
             ("async fn watchdog_blob_sync(", 0, 2),
+            ("async fn finish_owed_syncthing_setup(", 0, 1),
             ("async fn wait_for_syncthing_folder_convergence(", 0, 1),
             ("async fn apply_system_update_local(", 1, 0),
             ("async fn add_ingress_hive_flow(", 1, 0),
@@ -51780,9 +51930,9 @@ blob:
                 "{head}"
             );
         }
-        // No other caller: those six calls and the function's own head.
+        // No other caller: those seven calls and the function's own head.
         let code = &src[..src.find("#[cfg(test)]\nmod tests {").expect("the tests")];
-        assert_eq!(code.matches("ensure_blob_sync_runtime(").count(), 7);
+        assert_eq!(code.matches("ensure_blob_sync_runtime(").count(), 8);
     }
 
     /// FINDINGS A-190: a join's finalize goes on while dist/vendor is still on its way, with the
@@ -52807,8 +52957,10 @@ blob:
             .find("let stale = syncthing_runs_stale(")
             .expect("the staleness");
         assert!(asked_again < stale);
+        assert!(ensure[..stale]
+            .ends_with("let activity = systemd_activity(SYNCTHING_SERVICE_NAME);\n    "));
         assert!(ensure[stale..].starts_with(
-            "let stale = syncthing_runs_stale(\n        systemd_activity(SYNCTHING_SERVICE_NAME),\n        binary_updated,\n        unit_changed,\n        runs_replaced_binary,\n    );"
+            "let stale = syncthing_runs_stale(activity, binary_updated, unit_changed, runs_replaced_binary);"
         ));
     }
 
@@ -54763,6 +54915,7 @@ blob:
             open_core_settle: StdMutex::new(None),
             unanswered_checks: StdMutex::new(HashMap::new()),
             syncthing_api: StdMutex::new(SyncthingApiWatch::default()),
+            syncthing_setup_owed: AtomicBool::new(false),
             // As systemctl answers on a host without the unit: not running, not failed. Asking
             // the test's own host would answer nothing where systemd does not run.
             unit_checks: UnitChecks {
@@ -62124,9 +62277,22 @@ blob:
             at("let ask_last = state.syncthing_folders_asked_last();")
                 < at("check_syncthing_folders(&folder_ids, &ask_last, |folder| {")
         );
-        assert!(!watchdog.contains("note_check_answer("));
-        let counted = at("if checks.port_refused.is_some() || !folder_ids.is_empty() {");
-        assert!(counted < at("note_syncthing_api_tick("));
+        // The folders count through the API's tick alone; the watchdog's own check is its port's
+        // connect (FINDINGS A-283, the review).
+        assert_eq!(watchdog.matches("note_check_answer(").count(), 1);
+        assert!(watchdog.contains(
+            "state.note_check_answer(\n            &syncthing_api_port_check_name(desired_sync.sync_api_port),"
+        ));
+        // Every tick that asked counts, with no guard on the folders: on a hive with no folder to
+        // ask, a port that takes the connection ends the run its refusals opened (FINDINGS A-283,
+        // the review). Before, such a run never closed.
+        assert!(
+            watchdog.contains("folders = checks.folders;\n        // Every tick that asked counts")
+        );
+        assert!(watchdog.contains(
+            "its refusals opened.\n        let tick = state.note_syncthing_api_tick(&checks, Instant::now());\n        if tick.restart {"
+        ));
+        assert!(!watchdog.contains("!folder_ids.is_empty()"));
         // The restart: on the run's word, after the join's hold asked again.
         let decides = at("if tick.restart {");
         let restart = at("return restart_syncthing_for_unanswered_api(");
@@ -62205,17 +62371,20 @@ blob:
     #[tokio::test]
     async fn a_refused_api_port_counts_toward_the_restart_with_its_reason() {
         let endpoint = "127.0.0.1:8384";
+        let refusal = |answer: Result<(), ApiPortError>| match answer {
+            Err(ApiPortError::Refused(why)) => why,
+            other => panic!("not a refusal: {other:?}"),
+        };
         assert_eq!(syncthing_api_port_answer(endpoint, Some(Ok(()))), Ok(()));
-        let refused = syncthing_api_port_answer(
+        let refused = refusal(syncthing_api_port_answer(
             endpoint,
             Some(Err(std::io::ErrorKind::ConnectionRefused.into())),
-        )
-        .expect_err("refused");
+        ));
         assert!(
             refused.starts_with("API port refused: 127.0.0.1:8384: "),
             "{refused}"
         );
-        let timed_out = syncthing_api_port_answer(endpoint, None).expect_err("timed out");
+        let timed_out = refusal(syncthing_api_port_answer(endpoint, None));
         assert_eq!(
             timed_out,
             "API port refused: 127.0.0.1:8384 took no connection within 2 s"
@@ -62226,7 +62395,7 @@ blob:
         assert_eq!(syncthing_api_port(port).await, Ok(()));
         assert!(syncthing_api_healthy(port).await);
         drop(listener);
-        let closed = syncthing_api_port(port).await.expect_err("closed");
+        let closed = refusal(syncthing_api_port(port).await);
         assert!(
             closed.starts_with(&format!("API port refused: 127.0.0.1:{port}")),
             "{closed}"
@@ -62305,16 +62474,98 @@ blob:
         let at = |needle: &str| watchdog.find(needle).unwrap_or_else(|| panic!("{needle}"));
         assert!(watchdog.contains("    if service_active {\n"));
         assert!(!watchdog.contains("api_healthy"));
-        let port = at("let checks = match syncthing_api_port(desired_sync.sync_api_port).await {");
-        assert!(port < at("check_syncthing_folders(&folder_ids, &ask_last, |folder| {"));
-        assert!(watchdog[port..].starts_with(
-            "let checks = match syncthing_api_port(desired_sync.sync_api_port).await {\n            Ok(()) => {"
-        ));
-        assert!(watchdog.contains("Err(refused) => SyncthingFolderChecks::port_refused(refused),"));
+        let port = at("let port = syncthing_api_port(desired_sync.sync_api_port).await;");
+        let matched = at("let checks = match port {\n            Ok(()) => {");
+        assert!(port < matched);
+        assert!(matched < at("check_syncthing_folders(&folder_ids, &ask_last, |folder| {"));
+        let refused =
+            "Err(ApiPortError::Refused(why)) => SyncthingFolderChecks::port_refused(why),";
         assert!(
-            at("Err(refused) => SyncthingFolderChecks::port_refused(refused),")
-                < at("if checks.port_refused.is_some() || !folder_ids.is_empty() {")
+            at(refused) < at("let tick = state.note_syncthing_api_tick(&checks, Instant::now());")
         );
+    }
+
+    /// FINDINGS A-283, the review: only a refusal (`ConnectionRefused`, the kernel's `TimedOut`)
+    /// and the 2 s timeout are the API port's answer. A connect that fails for a reason of this
+    /// host's own (no file descriptor left, no local port, no buffer, a loopback rule) is the
+    /// check's no answer: it says nothing of Syncthing, so the tick asks no folder, counts nothing
+    /// in the API's run and restarts nothing, and a run of them is warned of as any check's.
+    /// Before, every connect error was the port's refusal, and an orchestrator that leaked its
+    /// descriptors had the watchdog restart a healthy Syncthing after 5 min, then every hour.
+    #[test]
+    fn a_connect_that_fails_on_this_host_is_no_answer_of_the_port() {
+        use std::io::{Error, ErrorKind};
+        let endpoint = "127.0.0.1:8384";
+        let answer = |err: Error| syncthing_api_port_answer(endpoint, Some(Err(err)));
+        for refused in [
+            Error::from(ErrorKind::ConnectionRefused),
+            Error::from(ErrorKind::TimedOut),
+            Error::from_raw_os_error(nix::libc::ECONNREFUSED),
+        ] {
+            assert!(
+                matches!(answer(refused), Err(ApiPortError::Refused(_))),
+                "the port's refusal"
+            );
+        }
+        for host in [
+            Error::from_raw_os_error(nix::libc::EMFILE),
+            Error::from_raw_os_error(nix::libc::ENFILE),
+            Error::from_raw_os_error(nix::libc::ENOBUFS),
+            Error::from_raw_os_error(nix::libc::EADDRNOTAVAIL),
+            Error::from_raw_os_error(nix::libc::EPERM),
+            Error::from(ErrorKind::OutOfMemory),
+        ] {
+            let said = format!("{host}");
+            match answer(host) {
+                Err(ApiPortError::NoAnswer(why)) => {
+                    assert!(why.contains(endpoint) && why.contains(&said), "{why}");
+                    assert!(!why.contains("API port refused"), "{why}");
+                }
+                other => panic!("{said}: {other:?}"),
+            }
+        }
+
+        // The watchdog: such a check counts as its own, in the counts any check's no answer goes
+        // to, and the tick ends before any folder is asked, any count of the API's run, and the
+        // unhealthy path.
+        let src = include_str!("sy_orchestrator.rs");
+        let watchdog = &src[src
+            .find("async fn watchdog_blob_sync(")
+            .expect("the watchdog")..];
+        let watchdog = &watchdog[..watchdog.find("\n}\n").expect("its end")];
+        let at = |needle: &str| watchdog.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(watchdog.contains(
+            "state.note_check_answer(\n            &syncthing_api_port_check_name(desired_sync.sync_api_port),\n            !matches!(port, Err(ApiPortError::NoAnswer(_))),\n            WATCHDOG_UNANSWERED_REPORT_CHECKS,\n        );"
+        ));
+        let no_answer = at("Err(ApiPortError::NoAnswer(why)) => {");
+        let ends = no_answer
+            + watchdog[no_answer..]
+                .find("return Ok(());")
+                .expect("the tick ends");
+        assert!(!watchdog[no_answer..ends].contains("port_refused("));
+        assert!(ends < at("let tick = state.note_syncthing_api_tick(&checks, Instant::now());"));
+        assert!(ends < at("if !syncthing_watchdog_restarts(service_active, folders) {"));
+        // A run of them is warned of under the port's own name, as any check's is.
+        let state = sample_orchestrator_state_for_tests();
+        let check = syncthing_api_port_check_name(8384);
+        for _ in 0..WATCHDOG_UNANSWERED_REPORT_CHECKS {
+            state.note_check_answer(&check, false, WATCHDOG_UNANSWERED_REPORT_CHECKS);
+        }
+        assert_eq!(
+            state
+                .unanswered_checks
+                .lock()
+                .expect("the counts")
+                .get(&check),
+            Some(&WATCHDOG_UNANSWERED_REPORT_CHECKS)
+        );
+        assert!(!state.syncthing_api_run_open(), "nothing of the API's run");
+        state.note_check_answer(&check, true, WATCHDOG_UNANSWERED_REPORT_CHECKS);
+        assert!(!state
+            .unanswered_checks
+            .lock()
+            .expect("the counts")
+            .contains_key(&check));
     }
 
     /// FINDINGS A-283, the operator's call of 2026-11-11: a Syncthing that is starting keeps its
@@ -62378,6 +62629,240 @@ blob:
         // An active unit whose port refused takes no such path.
         assert!(!syncthing_watchdog_restarts(true, refused.folders));
         assert!(syncthing_watchdog_restarts(false, refused.folders));
+    }
+
+    /// FINDINGS A-283, the review: a Syncthing setup that restarts Syncthing, or starts one systemd
+    /// answered was not running, starts the run of ticks with no answer again, whoever runs it (a
+    /// sync probe, `update category=vendor`, the boot, the watchdog, an ingress join), and so does
+    /// its restart for the folders it repaired. Before, only the watchdog's own paths did: `update
+    /// category=vendor` restarting a Syncthing whose API had given no answer for 4 min 30 s left
+    /// the run going, and the new process' port, closed while it opened its database, had the tick
+    /// at 5:00 restart it within its first seconds. The start of a running Syncthing does nothing
+    /// and keeps the run, so a sync hint at a refused port never postpones the restart.
+    #[test]
+    fn a_setup_that_starts_a_new_syncthing_starts_the_run_again() {
+        use ServiceActivity::{Active, Inactive, Unknown};
+        // activity before the setup's start, and whether it restarted instead
+        assert!(syncthing_setup_starts_a_process(Active, true));
+        assert!(syncthing_setup_starts_a_process(Unknown, true));
+        assert!(syncthing_setup_starts_a_process(Inactive, false));
+        assert!(
+            !syncthing_setup_starts_a_process(Active, false),
+            "the start of a running one does nothing"
+        );
+        assert!(
+            !syncthing_setup_starts_a_process(Unknown, false),
+            "a start after a check with no answer may have done nothing"
+        );
+
+        let hung = SyncthingFolderChecks {
+            folders: CheckAnswer::NoAnswer,
+            answered: Vec::new(),
+            unanswered: Some(("fluxbee-blob".to_string(), "a timeout".to_string())),
+            port_refused: None,
+        };
+        let refused = SyncthingFolderChecks::port_refused(
+            "API port refused: 127.0.0.1:8384: Connection refused (os error 111)".to_string(),
+        );
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // The vendor update's restart at 4:30 of a hung API: the new process' 40 s of a closed
+        // port count in a run of their own, and nothing restarts it.
+        let state = sample_orchestrator_state_for_tests();
+        for secs in (0..=270).step_by(10) {
+            assert!(!state.note_syncthing_api_tick(&hung, at(secs)).restart);
+        }
+        if syncthing_setup_starts_a_process(Active, true) {
+            state.forget_syncthing_api_run();
+        }
+        for secs in (275..=315).step_by(5) {
+            let tick = state.note_syncthing_api_tick(&refused, at(secs));
+            assert!(!tick.restart, "{secs}");
+            assert_eq!(tick.unanswered_for, Duration::from_secs(secs - 275));
+        }
+        // A sync hint's start of the running one at 4:30 keeps the run: the tick at 5:00 restarts.
+        let state = sample_orchestrator_state_for_tests();
+        for secs in (0..=270).step_by(10) {
+            state.note_syncthing_api_tick(&refused, at(secs));
+        }
+        if syncthing_setup_starts_a_process(Active, false) {
+            state.forget_syncthing_api_run();
+        }
+        assert!(state.note_syncthing_api_tick(&refused, at(300)).restart);
+
+        // The setup starts the run again right after its restart or start, before its waits, and
+        // after the restart for the folders it repaired, whoever calls it.
+        let src = include_str!("sy_orchestrator.rs");
+        let ensure = &src[src
+            .find("async fn ensure_blob_sync_runtime(")
+            .expect("the ensure")..];
+        let ensure = &ensure[..ensure.find("\n}\n").expect("its end")];
+        let at = |needle: &str| ensure.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let forgets = at(
+            "if syncthing_setup_starts_a_process(activity, stale) {\n        state.forget_syncthing_api_run();\n    }",
+        );
+        assert!(at("systemd_restart(SYNCTHING_SERVICE_NAME)?;") < forgets);
+        assert!(at("systemd_start(SYNCTHING_SERVICE_NAME)?;") < forgets);
+        assert!(forgets < at("wait_for_service_active("));
+        let repaired = at("run_cmd(restart, \"systemctl restart\")?;");
+        let repaired_waits = repaired
+            + ensure[repaired..]
+                .find("wait_for_service_active(")
+                .expect("the repair's waits");
+        assert!(ensure[repaired..repaired_waits].contains("state.forget_syncthing_api_run();"));
+        assert_eq!(
+            ensure.matches("state.forget_syncthing_api_run();").count(),
+            2
+        );
+    }
+
+    /// FINDINGS A-283, the review: a Syncthing setup that the boot or a config change could not
+    /// finish, at its 30 s wait for the API port say, skipped the folders' reconcile after that
+    /// wait, and nothing ran it again: the config change stayed recorded as applied, and a refused
+    /// port no longer takes the unhealthy path. It is owed now. The config stays recorded as
+    /// applied, so a refused port costs the next ticks nothing more and still counts in the API's
+    /// run; the first tick whose port takes the connection runs the setup again, its wait ending
+    /// at once, unless a join owns Syncthing, and then asks the folders. A setup that succeeds,
+    /// whoever runs it, pays it; one that fails again stays owed.
+    #[test]
+    fn a_setup_the_boot_or_a_config_change_could_not_finish_runs_at_the_ports_first_answer() {
+        let state = sample_orchestrator_state_for_tests();
+        assert!(!state.syncthing_setup_owed());
+        state.owe_syncthing_setup();
+        assert!(state.syncthing_setup_owed());
+        state.syncthing_setup_paid();
+        assert!(!state.syncthing_setup_owed());
+
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        // The boot owes it when its setup fails.
+        let boot = body("async fn bootstrap_local(");
+        let setup = boot
+            .find(
+                "ensure_blob_sync_runtime(state, &state.blob, &state.dist, VendorPolicy::KeepInstalled)",
+            )
+            .expect("the boot's setup");
+        let warned = setup
+            + boot[setup..]
+                .find("\"blob sync runtime bootstrap failed;")
+                .expect("its warning");
+        assert!(boot[setup..warned].contains("state.owe_syncthing_setup();"));
+
+        // A config change: recorded as applied before its setup, which owes itself on a failure.
+        let watchdog = body("async fn watchdog_blob_sync(");
+        let at = |needle: &str| watchdog.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let changed =
+            at("\"blob/dist sync config changed in hive.yaml; reconciling syncthing runtime\"");
+        assert!(at("*last = desired_sync.clone();") < changed);
+        assert!(watchdog[changed..].contains(
+            ".await\n        {\n            state.owe_syncthing_setup();\n            return Err(err);\n        }\n        return Ok(());"
+        ));
+        // The owed setup runs at a tick whose port took the connection, and there only, before
+        // the folders are asked.
+        let answered = at("let checks = match port {\n            Ok(()) => {");
+        let owed = at(
+            "if state.syncthing_setup_owed() && !a_join_owns_syncthing(state) {\n                    finish_owed_syncthing_setup(state, &desired_blob, &desired_dist).await;\n                }",
+        );
+        assert!(answered < owed);
+        assert!(owed < at("let ask_last = state.syncthing_folders_asked_last();"));
+        assert!(owed < at("Err(ApiPortError::Refused(why)) =>"));
+        assert_eq!(watchdog.matches("finish_owed_syncthing_setup(").count(), 1);
+        // It runs the setup and keeps it owed on a failure: only a setup that succeeds pays it,
+        // at its very end, after its last wait.
+        let finish = body("async fn finish_owed_syncthing_setup(");
+        assert!(finish
+            .contains("ensure_blob_sync_runtime(state, blob, dist, VendorPolicy::KeepInstalled)"));
+        assert!(!finish.contains("syncthing_setup_paid()"));
+        let ensure = body("async fn ensure_blob_sync_runtime(");
+        let paid = ensure
+            .find("state.syncthing_setup_paid();")
+            .expect("the setup pays it");
+        assert!(ensure[paid..]
+            .trim_start_matches("state.syncthing_setup_paid();")
+            .trim_start()
+            .starts_with("Ok(SyncthingRuntimeOutcome {"));
+        assert!(
+            ensure
+                .rfind("wait_for_syncthing_health(&sync).await?;")
+                .expect("its last wait")
+                < paid
+        );
+        // Nothing else owes or pays it.
+        let code = &src[..src.find("#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert_eq!(code.matches("state.owe_syncthing_setup();").count(), 2);
+        assert_eq!(code.matches("state.syncthing_setup_paid();").count(), 1);
+    }
+
+    /// FINDINGS A-283, the review: the watchdog starts from the config the boot's Syncthing step
+    /// applied, the effective one. An egress syncs dist alone, so its blob section, the start's
+    /// value before, read as a config change at the first tick, which ran the setup again, its
+    /// 30 s wait for a port still closed included.
+    #[test]
+    fn the_watchdog_starts_from_the_syncthing_config_the_boot_applied() {
+        let hive: HiveFile = serde_yaml::from_str("hive_id: sandbox\n").expect("a hive");
+        for role in [
+            HiveRole::Motherbee,
+            HiveRole::Worker,
+            HiveRole::Ingress,
+            HiveRole::Egress,
+        ] {
+            let blob = blob_runtime_from_hive(&hive, role);
+            let dist = dist_runtime_from_hive(&hive, role);
+            let applied = effective_syncthing_runtime_config(&blob, &dist);
+            assert!(applied.sync_enabled, "{role:?}");
+            assert_eq!(blob == applied, role != HiveRole::Egress, "{role:?}");
+        }
+        let src = include_str!("sy_orchestrator.rs");
+        let main = &src[src
+            .find("async fn main() -> Result<(), OrchestratorError> {")
+            .expect("main")..];
+        assert!(main.contains(
+            "blob_sync_last_desired: Mutex::new(effective_syncthing_runtime_config(\n            &blob_runtime,\n            &dist_runtime,\n        )),"
+        ));
+    }
+
+    /// FINDINGS A-283, the review: every tick at which Syncthing runs counts in the API's run, a
+    /// hive with no folder to ask included. There, a port that takes the connection is the API's
+    /// answer, and ends the run its refusals opened. Before, such a tick counted nowhere, so the
+    /// run never closed: the peer reconcile never ran again, and the next refusal, hours later,
+    /// found a run hours long and had Syncthing restarted at once.
+    #[test]
+    fn a_hive_with_no_folder_to_ask_ends_a_run_at_its_ports_answer() {
+        let state = sample_orchestrator_state_for_tests();
+        let refused = SyncthingFolderChecks::port_refused(
+            "API port refused: 127.0.0.1:8384: Connection refused (os error 111)".to_string(),
+        );
+        let t0 = Instant::now();
+        state.note_syncthing_api_tick(&refused, t0);
+        assert!(state.syncthing_api_run_open());
+        let checks = check_syncthing_folders(&[], &[], |_| panic!("no folder to ask"));
+        assert_eq!(checks.api_unanswered(), None);
+        state.note_syncthing_api_tick(&checks, t0 + Duration::from_secs(5));
+        assert!(!state.syncthing_api_run_open());
+        let tick = state.note_syncthing_api_tick(&refused, t0 + Duration::from_secs(4 * 3600));
+        assert!(!tick.restart);
+        assert_eq!(tick.unanswered_for, Duration::ZERO);
+
+        // The watchdog counts the tick with no guard on its folders.
+        let src = include_str!("sy_orchestrator.rs");
+        let watchdog = &src[src
+            .find("async fn watchdog_blob_sync(")
+            .expect("the watchdog")..];
+        let watchdog = &watchdog[..watchdog.find("\n}\n").expect("its end")];
+        let counted = watchdog
+            .find("\n        let tick = state.note_syncthing_api_tick(&checks, Instant::now());\n        if tick.restart {")
+            .expect("counted at the branch's own depth");
+        let folders = watchdog
+            .find("folders = checks.folders;")
+            .expect("the folders' answer");
+        assert!(folders < counted);
+        assert!(watchdog[folders..counted]
+            .lines()
+            .skip(1)
+            .all(|line| line.trim_start().starts_with("//")));
     }
 
     /// FINDINGS A-271: the egress re-applies its NAT at once only when nft answers that its table

@@ -64,10 +64,13 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    5. reports an active ufw or firewalld (`report_active_host_firewalls`), applies the ingress'
       SSH table on the ingress role (`reconcile_ingress_ssh`, never fatal), and reconciles egress
       (fatal only on the egress role);
-   6. starts Syncthing if blob or dist sync is enabled (a failure only warns). While
-      `dist/vendor` does not hold the Syncthing its manifest describes, it runs the Syncthing
-      already installed and reports the vendor in `vendor.awaiting_update`; with none installed,
-      Syncthing does not start, as before (FINDINGS A-189, [Syncthing](#syncthing));
+   6. starts Syncthing if blob or dist sync is enabled. A failure only warns, and the watchdog
+      runs that setup again at its first tick whose Syncthing API port takes the connection, the
+      folders' reconcile the failure skipped included ([Watchdog](#watchdog), FINDINGS A-283, since
+      0.1.136). While `dist/vendor` does not hold the Syncthing its manifest describes, it runs
+      the Syncthing already installed and reports the vendor in `vendor.awaiting_update`; with
+      none installed, Syncthing does not start, as before (FINDINGS A-189,
+      [Syncthing](#syncthing));
    7. checks each core binary of its role in `dist/core/bin` against the manifest, its size and
       sha256 (`check_core_dist_at_start`, FINDINGS A-186). One that is missing, of another size
       or hash, or not in the manifest stops nothing: each is a warning in the journal and an
@@ -1083,7 +1086,13 @@ whose port takes no connection 2 s at most.
   warned of once, `note_check_answer`), and the next ticks ask it after the others until it
   answers (`SyncthingApiWatch::ask_last`), so it never keeps them from being asked. The
   folder-error reads (`report_blob_folder_errors`) are skipped at a tick that is the API's no
-  answer, and a folder that gave none is not asked for its errors.
+  answer, and a folder that gave none is not asked for its errors. A connect that fails for
+  another reason than a refusal or a timeout is the host's own (no file descriptor or local port
+  left, no buffer, a firewall rule on loopback) and says nothing of Syncthing: the check gave no
+  answer, so the tick asks nothing more, counts nothing in the run and restarts nothing, and 12
+  such ticks in a row are warned of once, as any check's, named `syncthing api port connect
+  127.0.0.1:<port>` (`note_check_answer`; FINDINGS A-283, the review): an orchestrator out of
+  file descriptors never has a healthy Syncthing restarted.
 - **A running Syncthing whose port takes no connection** takes no unhealthy path
   (`syncthing_watchdog_restarts`): that path, which a Syncthing that does not run and a folder
   Syncthing says is not healthy take (`ensure_blob_sync_runtime`), runs `systemctl start`, which
@@ -1092,21 +1101,47 @@ whose port takes no connection 2 s at most.
   Before, every such tick took it: about 35 s a tick, a stopped core service waiting as long, and
   nothing repaired. What else that path does on its way (a new vendored binary installed, a
   changed unit or a replaced binary restarted onto, the folders' config reconciled once the port
-  answers) waits for the orchestrator's next start, a config change, a Syncthing that stops, or a
-  folder Syncthing says is not healthy; the restart below runs what is installed.
-- **A start** is never restarted for its closed port: a Syncthing that starts keeps its port
-  closed for a few seconds, which count, and the first answer ends the run. When the unhealthy
-  path starts a Syncthing that does not run, the run starts again too, so the seconds after that
-  start never count in a run from before it. A start that keeps its port closed longer than
-  5 min, a database migration, say, is restarted once, and the next restart waits the hour.
+  answers) waits for the orchestrator's next start, a config change, a Syncthing that stops, a
+  folder Syncthing says is not healthy, or, when the boot's or a config change's setup could not
+  finish, the first tick whose port takes the connection (below); the restart below runs what is
+  installed.
+- **A setup that could not finish.** When the boot's or a config change's setup
+  (`ensure_blob_sync_runtime`) fails, at its 30 s wait for the port say, the folders' reconcile it
+  runs after that wait is owed (`syncthing_setup_owed`; FINDINGS A-283, the review). The config
+  change stays recorded as applied, so the next ticks ask the port, and a refused one costs them
+  nothing more and counts in the run. The first tick whose port takes the connection runs the
+  setup again first (`finish_owed_syncthing_setup`), its wait ending at once, unless a join owns
+  Syncthing, then asks the folders as any tick does; a setup that fails again is logged and stays
+  owed for the next such tick. A setup that succeeds, whoever runs it (the unhealthy path, a sync
+  probe, `update category=vendor`), pays it. Before 0.1.136, a refused port took the unhealthy
+  path, whose setup ran it again, 30 s a tick. An egress, which syncs dist alone, no longer reads
+  its start's config as a change at its first tick, which ran the setup again.
+- **A start.** A Syncthing that starts keeps its port closed for a few seconds, which count, and
+  the first answer ends the run. A start or a restart by the orchestrator, other than the restart
+  below, starts the run again, so its first seconds never count in a run of the process before it
+  (`forget_syncthing_api_run`):
+  a setup's, whoever runs it (the boot, a config change, the unhealthy path, a sync probe, `update
+  category=vendor`, an ingress join), when it restarts Syncthing or starts one systemd answered
+  was not running, and its restart for the folders it repaired (`syncthing_setup_starts_a_process`,
+  FINDINGS A-283, the review); the unhealthy path's; and a join's or a removal's (its hold, below).
+  So a start by the orchestrator is never restarted within its first 5 min; one that keeps its
+  port closed longer, a database migration, say, is restarted once, and the next restart waits
+  the hour. The start of a Syncthing that runs does nothing and keeps the run, as does a start
+  after a check with no answer, which may have done nothing: a sync hint at a refused port never
+  postpones the restart. Systemd's own restart of a Syncthing that exited (`Restart=always`, 5 s
+  later) starts the run again when a tick sees the unit down meanwhile, which takes the unhealthy
+  path; one that no tick saw can count its first seconds in the run before it, which costs at most
+  one restart more, within the hour's bound.
 - **The report.** The check counts the ticks that are the API's no answer in a row as one run
   (`SyncthingApiWatch`): at the 12th it warns once and opens a `syncthing` condition
   `api_unanswered` in the drift alerts, a `warning` row with `state: open` and the last error. The
   tick the API answers at ends the run and closes the condition, an `info` row with
   `state: closed` that says how long, at least, it gave no answer; a run too short to report ends
-  without a word, and so do a config change's reconcile and the unhealthy path, which can start or
-  restart Syncthing. While a run lasts, the peer reconcile does not ask the API (it waits for its
-  next minute); a restart it owes stays in its marker (`syncthing-restart-pending`, below).
+  without a word, and so does each start or restart above. Every tick at which Syncthing runs and
+  its port check answers counts, a hive with no folder to ask included: there, a port that takes
+  the connection is the API's answer, and ends the run. While a run lasts, the peer reconcile does
+  not ask the API (it waits for its next minute); a restart it owes stays in its marker
+  (`syncthing-restart-pending`, below).
 - **The restart.** Once the run has lasted 5 min from its first tick, the watchdog runs
   `systemctl restart fluxbee-syncthing`, with a `syncthing` drift alert `api_unanswered_restart`
   and a warning that say why (the seconds without an answer and the last error, `API port
