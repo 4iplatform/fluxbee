@@ -852,8 +852,10 @@ SY.admin sends them to the motherbee's orchestrator, which answers from a task o
 Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every SY service of its
 role's list with `systemctl is-active`, and runs `systemctl start` on any that is not
 active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
-the router, verifies runtimes, runs the blob GC when enabled (on the motherbee only, FINDINGS
-A-188), checks Syncthing and its peers, re-applies egress and the ingress' SSH table, reports an
+the router, verifies runtimes, runs the blob GC (on the motherbee when its `blob.gc` turns it on,
+FINDINGS A-188; on a worker, every hour whatever its `blob.gc` says, a pass that cleans only its
+own `blob/staging`, A-241; both off the runtime's threads), checks Syncthing and its peers,
+re-applies egress and the ingress' SSH table, reports an
 active host firewall (`watchdog_host_rules`), and runs the loopback check. Its egress step skips
 while an egress switch is open on a worker (A-219): the switch owns the route until it commits or
 reverts. While a join runs, its Syncthing is the join's:
@@ -1009,8 +1011,10 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 `/etc/fluxbee/hive.yaml` (`HiveFile`), the hive's own: `hive_id`, `role`, `wan` (`gateway_name`,
 default `RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`path`, default
 `/var/lib/fluxbee/blob`; `sync.api_port`, default 8384; `sync.data_dir`, default
-`/var/lib/fluxbee/syncthing`; `gc`, read on the motherbee only: on a spoke the GC never runs, and
-its start and each GC tick say so, FINDINGS A-188), `dist.path` (default `/var/lib/fluxbee/dist`),
+`/var/lib/fluxbee/syncthing`; `gc`, read on the motherbee only: on a spoke the GC's `active/` pass
+never runs, its start and each of its passes say so when `gc.enabled` is on (FINDINGS A-188), and
+a worker cleans its own staging whatever `gc` says (A-241)), `dist.path` (default
+`/var/lib/fluxbee/dist`),
 `identity.sync.port` (default 9100), `government`, `egress` (with `reachability_url`, the
 internet probe's target, no default; and `ssh_from_wan`, default true), `ingress.ssh_allow_from`
 (the ingress' extra SSH sources), `ai`, read untyped: on the motherbee it is the installation

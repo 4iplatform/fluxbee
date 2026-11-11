@@ -609,12 +609,14 @@ In multi-island v2.x, it is also recommended to confirm propagation before emitt
 
 ## 9. GC (Garbage Collection)
 
-The GC is implemented in `fluxbee_sdk::blob` (`BlobToolkit::run_gc`) and run by `SY.orchestrator`'s watchdog on the motherbee only (`run_blob_gc_housekeeping`), with two phases:
+The GC is implemented in `fluxbee_sdk::blob` and run by `SY.orchestrator`'s watchdog (`run_blob_gc_housekeeping`). On the motherbee, `BlobToolkit::run_gc` has two phases:
 
 - `staging/` cleanup by TTL (`staging_ttl_hours`, default `24h`), unfinished puts' temporaries included.
 - Conservative `active/` GC by retention (`active_retain_days`, default `30d`).
 
-**Only on the motherbee** (FINDINGS A-188, since 0.1.127): the GC pins the sources of live publications from IO.blob's ledger, which only the motherbee holds. A worker's GC would run with no pins, and its deletions in `active/` would reach the motherbee's published sources through `fluxbee-blob`, a send-receive folder. A spoke whose `hive.yaml` turns it on says at its start that it does not run there, and each time it would have run (`blob_gc_refusal`); a worker's join no longer writes `blob.gc`.
+**The `active/` phase only on the motherbee** (FINDINGS A-188, since 0.1.127): the GC pins the sources of live publications from IO.blob's ledger, which only the motherbee holds. A worker's GC would run with no pins, and its deletions in `active/` would reach the motherbee's published sources through `fluxbee-blob`, a send-receive folder. A spoke whose `hive.yaml` turns `blob.gc` on says at its start, and at each of its passes, that it is not read there (`blob_gc_refusal`); a worker's join no longer writes `blob.gc`.
+
+**A spoke cleans its own `staging/`** (FINDINGS A-241, since 0.1.133): a spoke that holds a blob (a worker) runs the staging phase alone (`BlobToolkit::cleanup_staging_orphans`, `clean_own_blob_staging`) every hour, whatever its `blob.gc` says. It deletes each file of its `staging/` older than 24 h (`BLOB_STAGING_TTL_HOURS`) with a blob's name or a put temporary's, and logs how many it deleted and their bytes. Every writer promotes right after its put, so such a file is an unfinished put that nothing will promote; a node that keeps a file in `staging/` while it works on it (§6.2, §6.3) promotes it within those 24 h. The phase never walks `active/` or `public/`, and `staging/` is never synced, so nothing it deletes leaves the hive. It walks by path, so it runs only while the blob root and `staging/` are directories, not links, that root owns and nobody else may write: a staging the start could not take back from the Syncthing user (§10) is not cleaned, and each pass says so. The ingress and the egress hold no blob and run nothing.
 
 It is set in the motherbee's `hive.yaml`, `blob.gc`:
 

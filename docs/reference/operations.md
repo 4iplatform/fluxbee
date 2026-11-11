@@ -177,7 +177,8 @@ What a worker join does (`add_hive_flow`):
    Syncthing's port and home (`render_worker_hive_yaml`). It writes nothing the release defines
    (the role's SY nodes, the blob's and dist's topology): the spoke's orchestrator, of the same
    release, has them. Nor `ai`: the installation file holds it. Nor, since 0.1.127, the blob GC:
-   it runs on the motherbee only (FINDINGS A-188). Pushes the TLS files to
+   it runs on the motherbee only (FINDINGS A-188); since 0.1.133 a worker cleans its own
+   `blob/staging` every hour with no key at all (A-241). Pushes the TLS files to
    `/var/lib/fluxbee/tls/<hive>/`; on a worker, creates and copies the identity sync key
    (`distribute_hive_identity_key_inner`).
 5. Writes one systemd unit per core service (`core_service_unit_contents`), starts `rt-gateway`

@@ -41,6 +41,7 @@ installation** where marked.
 | A-49: unsigned apt repo (waits for O9) | Whoever answers for the repo address installs root software on the motherbee | Internal network | Medium, after O9 | Yes |
 | A-60: managed nodes run as root | A compromised node is root on its host | Local | Medium; to be evaluated | No |
 | The `active/` blob GC walks by path (A-56 residual) | Root deleting outside the tree if a prefix dir is swapped | None while `gc.apply` is off (the default) | Low | Only if the GC is turned on |
+| A worker's staging pass walks by path (A-241, since 0.1.133; always on, deleting) | Root deleting outside the tree if a directory on its path is swapped | None: it walks only while the blob root and `staging/` are directories, not links, that root owns and nobody else may write, so only root could swap one (`clean_own_blob_staging`) | None | No |
 
 **History:**
 

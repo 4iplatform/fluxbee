@@ -27,7 +27,7 @@
   finished once by the automatic step, and a rolled-back egress1 held and left alone by it.
 - **Stage 5 is built for 0.1.127** (§8, "As built (stage 5)"): the blob folders follow the dist
   folders' members, a removed hive leaves both whatever the flags, and the blob GC runs only on the
-  motherbee. Its gate is next (§10).
+  motherbee (since 0.1.133 a worker cleans its own staging, A-241). Its gate is next (§10).
 
 This is the single place for the topic.
 
@@ -82,7 +82,7 @@ worker (A-219, [edge-egress-nat-spec](edge-egress-nat-spec.md) §15). Three case
 | The blob's and dist's topology by role (`enabled`, `sync.enabled`, `public_enabled`, the tool) | the release: the code, by role | a release | with the core's binaries |
 | The frontdesk's name (`government.identity_frontdesk`) | the hive's `hive.yaml` (since 2026-11-10; first planned in the code) | the join | never travels: on a worker it is the only key that names the motherbee |
 | `ai`: the default provider and each provider's model | the installation file | the operator, through SY.admin (Archi) | Syncthing, then `SYSTEM_UPDATE` category `config` |
-| `blob.gc.*` | the motherbee's `hive.yaml` | the operator, on the motherbee | never travels: a worker's GC cannot pin publications (A-188) |
+| `blob.gc.*` | the motherbee's `hive.yaml` | the operator, on the motherbee | never travels: a worker's GC cannot pin publications (A-188); a worker cleans its own staging whatever its `blob.gc` says (A-241) |
 
 ## 3. The release's settings, in the code
 
@@ -861,7 +861,8 @@ again at once (above, "a read of a hive in its restart").
   - `fluxbee-blob` follows the workers' (`fluxbee-dist-runtimes`).
   - `fluxbee-blob-public` follows the ingress's core folder.
   - Removing a hive takes it out of both folders, flags or not (T-21).
-- **A-188:** the blob GC runs only where it can pin publications, on the motherbee.
+- **A-188:** the blob GC runs only where it can pin publications, on the motherbee; a worker cleans
+  only its own staging (A-241, since 0.1.133).
 
 ### As built (stage 5)
 
@@ -880,12 +881,15 @@ again at once (above, "a read of a hive in its restart").
   `fluxbee-blob-public` whenever it is in them, whatever the blob's flags, as it leaves every
   `fluxbee-dist*` folder.
 - **The blob GC** (`run_blob_gc_housekeeping`, `blob_gc_refusal`): it runs on the motherbee only.
-  A spoke whose `hive.yaml` turns it on says so at its start, and again each time the GC would have
-  run, and deletes nothing. A worker's join no longer writes `blob.gc` (§2: it never travels);
-  worker1's `blob.gc`, written at its join, stays: it is read at the start and logged, and never
-  acted on off the motherbee.
-- **Not changed:** a worker's `staging/` is not cleaned, as before (its GC was off); a cleanup of a
-  spoke's own unfinished puts, which never leave it, would be a decision of its own.
+  A spoke whose `hive.yaml` turns it on says so at its start, and again at each of its passes. A
+  worker's join no longer writes `blob.gc` (§2: it never travels); worker1's `blob.gc`, written at
+  its join, stays: it is read at the start and logged, and never acted on off the motherbee.
+- **A worker's `staging/`** was not cleaned at this stage, as before (its GC was off). Since
+  0.1.133 (FINDINGS A-241, the operator's call of 2026-11-10) a spoke that holds a blob cleans its
+  own every hour, whatever its `blob.gc` says: the SDK's staging pass alone, files past 24 h,
+  never `active/` or `public/`, and only while its blob root and staging are root's alone
+  (`clean_own_blob_staging`, [blob-annex-spec](blob-annex-spec.md) §9). Its unfinished puts never
+  leave it.
 
 ## 9. The operator's calls (2026-11-08)
 
@@ -972,7 +976,8 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
    - Built for 0.1.127 (§8, "As built (stage 5)"), with its tests: both blob folders follow their
      dist folder on each role's end, a hive joined while the blob sync was off included, and a
      device taken out by hand comes back; a removed hive leaves both whatever the flags; the GC
-     deletes nothing off the motherbee, and the worker's join writes no `blob.gc`. The reconcile
+     deletes nothing off the motherbee (since 0.1.133 a worker cleans its own staging, A-241), and
+     the worker's join writes no `blob.gc`. The reconcile
      that restores a device runs at the orchestrator's start, so the gate restarts the motherbee's
      orchestrator after it takes the device out.
 

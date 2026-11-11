@@ -27,8 +27,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_sdk::blob::{
-    BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
-    BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
+    BlobConfig as SdkBlobConfig, BlobGcOptions, BlobGcPassReport, BlobToolkit,
+    BLOB_ACTIVE_RETAIN_DAYS, BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
 use fluxbee_sdk::identity::IdentityError;
 use fluxbee_sdk::mesh::{LeafBundle, MeshCa, HIVE_REGISTRY_DIR, MESH_TLS_DIR};
@@ -178,6 +178,9 @@ const DEFAULT_BLOB_GC_INTERVAL_SECS: u64 = 3600;
 const DEFAULT_BLOB_GC_APPLY: bool = false;
 const DEFAULT_BLOB_GC_STAGING_TTL_HOURS: u64 = BLOB_STAGING_TTL_HOURS;
 const DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS: u64 = BLOB_ACTIVE_RETAIN_DAYS;
+/// Who must own the blob root and `blob/staging` for a spoke's staging pass to walk them (FINDINGS
+/// A-241): root, who alone writes them (A-56).
+const BLOB_STAGING_OWNER_UID: u32 = 0;
 const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
 const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
 const IDENTITY_NODE_ILK_MAP_FILE: &str = "identity-node-ilk-map.json";
@@ -1011,9 +1014,7 @@ async fn main() -> Result<(), OrchestratorError> {
     );
     if state.blob.enabled && state.blob.gc_enabled {
         if let Some(refusal) = blob_gc_refusal(state.is_motherbee) {
-            tracing::warn!(
-                "blob.gc.enabled is on in hive.yaml and the GC does not run here: {refusal}"
-            );
+            tracing::warn!("blob.gc.enabled is on in hive.yaml and is not read here: {refusal}");
         }
     }
     ensure_dirs(
@@ -3372,14 +3373,11 @@ async fn watchdog_tick(state: &OrchestratorState) {
     }
 
     let desired_blob = current_blob_runtime_config(state);
-    if should_run_blob_gc(
-        state,
-        desired_blob.gc_enabled,
-        desired_blob.gc_interval_secs,
-    )
-    .await
-    {
-        if let Err(err) = run_blob_gc_housekeeping(state, &desired_blob) {
+    if should_run_blob_gc(state, blob_gc_interval(state.is_motherbee, &desired_blob)).await {
+        // A pass walks and deletes files: off the runtime's threads, like the blocking work below.
+        if let Err(err) =
+            tokio::task::block_in_place(|| run_blob_gc_housekeeping(state, &desired_blob))
+        {
             tracing::warn!(error = %err, "blob gc housekeeping failed");
         }
     }
@@ -22998,30 +22996,42 @@ async fn should_verify_runtimes(state: &OrchestratorState) -> bool {
     true
 }
 
-async fn should_run_blob_gc(
-    state: &OrchestratorState,
-    gc_enabled: bool,
-    gc_interval_secs: u64,
-) -> bool {
-    if !gc_enabled {
+/// Whether this hive's blob GC pass is due: `interval_secs` (`blob_gc_interval`, at least 60)
+/// after the last one; never while it is None.
+async fn should_run_blob_gc(state: &OrchestratorState, interval_secs: Option<u64>) -> bool {
+    let Some(interval_secs) = interval_secs else {
         return false;
-    }
+    };
     let mut guard = state.last_blob_gc.lock().await;
-    if guard.elapsed() < Duration::from_secs(gc_interval_secs.max(60)) {
+    if guard.elapsed() < Duration::from_secs(interval_secs.max(60)) {
         return false;
     }
     *guard = Instant::now();
     true
 }
 
-/// FINDINGS A-188: why the blob GC does not run on this hive; None on the motherbee. The GC pins
-/// the sources of live publications from io.blob's ledger, which only the motherbee holds: a
-/// spoke's would run with no pins, and its deletions in `blob/active` would reach the motherbee's
-/// published sources through `fluxbee-blob`, a send-receive folder.
+/// How often this hive runs its blob GC pass, None when it runs none: the motherbee its GC at
+/// `blob.gc.interval_secs`, while its `blob.gc.enabled` is on; a spoke that holds a blob its
+/// staging pass every DEFAULT_BLOB_GC_INTERVAL_SECS, whatever its `blob.gc` says (FINDINGS
+/// A-241).
+fn blob_gc_interval(is_motherbee: bool, blob: &BlobRuntimeConfig) -> Option<u64> {
+    if is_motherbee {
+        blob.gc_enabled.then_some(blob.gc_interval_secs)
+    } else {
+        blob.enabled.then_some(DEFAULT_BLOB_GC_INTERVAL_SECS)
+    }
+}
+
+/// FINDINGS A-188: why the blob GC's `active/` pass does not run on this hive; None on the
+/// motherbee. The pass pins the sources of live publications from io.blob's ledger, which only the
+/// motherbee holds: a spoke's would run with no pins, and its deletions in `blob/active` would
+/// reach the motherbee's published sources through `fluxbee-blob`, a send-receive folder. A spoke
+/// cleans only its own `blob/staging`, which never leaves it (A-241).
 fn blob_gc_refusal(is_motherbee: bool) -> Option<&'static str> {
     (!is_motherbee).then_some(
-        "the blob GC runs only on the motherbee, where io.blob's publication ledger pins the \
-         sources of live publications (FINDINGS A-188)",
+        "the blob GC's active/ pass runs only on the motherbee, where io.blob's publication \
+         ledger pins the sources of live publications (FINDINGS A-188); this hive cleans only its \
+         own blob/staging, every hour, whatever blob.gc says (A-241)",
     )
 }
 
@@ -23029,14 +23039,22 @@ fn run_blob_gc_housekeeping(
     state: &OrchestratorState,
     blob: &BlobRuntimeConfig,
 ) -> Result<(), OrchestratorError> {
-    if !(blob.enabled && blob.gc_enabled) {
+    // A spoke first, whatever its blob.gc says (FINDINGS A-241): its own staging pass, never the
+    // active one (A-188).
+    if let Some(refusal) = blob_gc_refusal(state.is_motherbee) {
+        if !blob.enabled {
+            return Ok(());
+        }
+        if blob.gc_enabled {
+            tracing::warn!(
+                hive = %state.hive_id,
+                "blob.gc.enabled is on in hive.yaml and is not read here: {refusal}"
+            );
+        }
+        clean_own_blob_staging(&state.hive_id, blob, BLOB_STAGING_OWNER_UID)?;
         return Ok(());
     }
-    if let Some(refusal) = blob_gc_refusal(state.is_motherbee) {
-        tracing::warn!(
-            hive = %state.hive_id,
-            "blob.gc.enabled is on in hive.yaml and nothing was collected: {refusal}"
-        );
+    if !(blob.enabled && blob.gc_enabled) {
         return Ok(());
     }
     let toolkit = BlobToolkit::new(SdkBlobConfig {
@@ -23096,6 +23114,67 @@ fn run_blob_gc_housekeeping(
         );
     }
     Ok(())
+}
+
+/// FINDINGS A-241: a spoke's own staging pass, every DEFAULT_BLOB_GC_INTERVAL_SECS whatever its
+/// `blob.gc` says. The SDK's staging-only pass (`cleanup_staging_orphans`) deletes each file of
+/// `blob/staging` with a blob's name or a put temporary's that is older than its TTL
+/// (DEFAULT_BLOB_GC_STAGING_TTL_HOURS, 24 h): every writer promotes right after its put, so such a
+/// file is a put nothing will promote. It never walks `active/` or `public/`, which Syncthing
+/// shares, and staging is never synced: nothing it deletes leaves this hive. It walks by path, so
+/// it runs only while the blob root and staging are directories, not links, that `owner` owns and
+/// nobody else may write: root, who alone writes them once the start took staging back (A-56),
+/// never while the Syncthing user may still hold it (a host where `fs.protected_hardlinks` is not
+/// 1). The tests pass their own user, since a test cannot chown to root. None when it walked
+/// nothing.
+fn clean_own_blob_staging(
+    hive_id: &str,
+    blob: &BlobRuntimeConfig,
+    owner: u32,
+) -> Result<Option<BlobGcPassReport>, OrchestratorError> {
+    use std::os::unix::fs::MetadataExt;
+    for dir in [blob.path.clone(), blob.path.join("staging")] {
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() && meta.uid() == owner && meta.mode() & 0o022 == 0 => {}
+            Ok(meta) => {
+                tracing::warn!(
+                    hive = %hive_id,
+                    dir = %dir.display(),
+                    link = meta.file_type().is_symlink(),
+                    owner = meta.uid(),
+                    mode = %format!("{:o}", meta.mode() & 0o7777),
+                    "blob staging not cleaned: its path is not root's alone (FINDINGS A-241)"
+                );
+                return Ok(None);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let toolkit = BlobToolkit::new(SdkBlobConfig {
+        blob_root: blob.path.clone(),
+        name_max_chars: BLOB_NAME_MAX_CHARS,
+        max_blob_bytes: None,
+    })?;
+    let report = toolkit.cleanup_staging_orphans(DEFAULT_BLOB_GC_STAGING_TTL_HOURS, true)?;
+    if report.deleted_files > 0 {
+        tracing::info!(
+            hive = %hive_id,
+            ttl_hours = DEFAULT_BLOB_GC_STAGING_TTL_HOURS,
+            deleted = report.deleted_files,
+            deleted_bytes = report.deleted_bytes,
+            "blob staging cleaned: unfinished puts past their TTL deleted (FINDINGS A-241)"
+        );
+    }
+    if !report.errors.is_empty() {
+        tracing::warn!(
+            hive = %hive_id,
+            errors = report.errors.len(),
+            first_error = report.errors.first().cloned().unwrap_or_default(),
+            "blob staging cleanup finished with errors"
+        );
+    }
+    Ok(Some(report))
 }
 
 async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), OrchestratorError> {
@@ -47315,40 +47394,70 @@ blob:
         assert!(!removed.contains(PEER_DEVICE_ID));
     }
 
-    /// FINDINGS A-188: the blob GC runs only on the motherbee, where io.blob's ledger pins the
-    /// sources of live publications. A worker's `blob.gc.enabled`, turned on by hand, deletes
-    /// nothing; the same GC on the motherbee does its work. A worker's join writes no `blob.gc`.
-    #[test]
-    fn the_blob_gc_runs_only_on_the_motherbee() {
-        assert!(blob_gc_refusal(true).is_none());
-        assert!(blob_gc_refusal(false).is_some_and(|refusal| refusal.contains("A-188")));
-        let root = std::env::temp_dir().join(format!("fluxbee-a188-{}", Uuid::new_v4().simple()));
-        let prefix = root.join("staging").join("ab");
-        fs::create_dir_all(&prefix).expect("staging prefix");
-        // An unfinished put's leftover, past its TTL.
-        let leftover = prefix.join(".report_0123456789abcdef.pdf.0001.tmp");
-        fs::write(&leftover, b"unfinished put").expect("leftover");
+    /// A file holding `bytes` at `path`, last modified `age` ago, its directories made.
+    fn a241_file(path: &Path, bytes: &[u8], age: Duration) {
+        fs::create_dir_all(path.parent().expect("its directory")).expect("its directory");
+        fs::write(path, bytes).expect("the file");
         fs::File::options()
             .write(true)
-            .open(&leftover)
-            .and_then(|file| {
-                file.set_modified(std::time::SystemTime::now() - Duration::from_secs(48 * 3600))
-            })
-            .expect("an old mtime");
+            .open(path)
+            .and_then(|file| file.set_modified(std::time::SystemTime::now() - age))
+            .expect("its mtime");
+    }
+
+    /// A blob root with `staging/` and `active/`, the root and staging closed to group and others'
+    /// writes as a spoke's are (0750).
+    fn a241_blob_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-a241-{tag}-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(root.join("staging")).expect("staging");
+        fs::create_dir_all(root.join("active")).expect("active");
+        for dir in [root.clone(), root.join("staging")] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).expect("0750");
+        }
+        root
+    }
+
+    /// FINDINGS A-188 and A-241: the blob GC's `active/` pass runs only on the motherbee, where
+    /// io.blob's ledger pins the sources of live publications. A worker, its `blob.gc` turned on by
+    /// hand included, cleans only its own staging and leaves `active/` alone; the motherbee's GC
+    /// does both. A worker's join writes no `blob.gc`.
+    #[test]
+    fn the_blob_gc_runs_only_on_the_motherbee() {
+        use std::os::unix::fs::MetadataExt;
+        assert!(blob_gc_refusal(true).is_none());
+        assert!(blob_gc_refusal(false)
+            .is_some_and(|refusal| refusal.contains("A-188") && refusal.contains("A-241")));
+        let root = a241_blob_root("a188");
+        let old = Duration::from_secs(48 * 3600);
+        // An unfinished put's leftover and a promoted blob, both past their TTLs.
+        let leftover = root.join("staging/ab/.report_0123456789abcdef.pdf.0001.tmp");
+        let promoted = root.join("active/ab/report_0123456789abcdef.pdf");
+        a241_file(&leftover, b"unfinished put", old);
+        a241_file(&promoted, b"a promoted blob", old);
         let mut blob = sample_blob_config();
         blob.path = root.clone();
         blob.gc_enabled = true;
         blob.gc_apply = true;
         blob.gc_staging_ttl_hours = 1;
+        blob.gc_active_retain_days = 1;
         let mut worker = sample_orchestrator_state_for_tests();
         worker.hive_id = "worker1".to_string();
         worker.is_motherbee = false;
         worker.role = HiveRole::Worker;
-        run_blob_gc_housekeeping(&worker, &blob).expect("a refusal is no error");
-        assert!(leftover.exists(), "a worker's GC deletes nothing");
+        run_blob_gc_housekeeping(&worker, &blob).expect("a worker's pass");
+        assert!(promoted.exists(), "a worker never runs the active pass");
+        // The worker's staging pass, run here with this user's id, since a test cannot chown to
+        // root.
+        let me = fs::metadata(&root).expect("the root").uid();
+        clean_own_blob_staging(&worker.hive_id, &blob, me).expect("the worker's staging pass");
+        assert!(!leftover.exists(), "a worker cleans its own staging");
+        assert!(promoted.exists(), "and leaves active/ alone");
+        a241_file(&leftover, b"unfinished put", old);
         run_blob_gc_housekeeping(&sample_orchestrator_state_for_tests(), &blob)
             .expect("the motherbee's GC runs");
-        assert!(!leftover.exists(), "the motherbee's GC does its work");
+        assert!(!leftover.exists(), "the motherbee's GC cleans staging");
+        assert!(!promoted.exists(), "and active/");
         let _ = fs::remove_dir_all(&root);
 
         let written = render_worker_hive_yaml(
@@ -47366,6 +47475,127 @@ blob:
         assert!(value["blob"].get("path").is_some(), "{written}");
         let hive: HiveFile = serde_yaml::from_str(&written).expect("the orchestrator reads it");
         assert!(!blob_runtime_from_hive(&hive, HiveRole::Worker).gc_enabled);
+    }
+
+    /// FINDINGS A-241: a spoke cleans its own staging: a staged file past the SDK's 24 h TTL and an
+    /// unfinished put's temporary go, their bytes counted, and a prefix left empty goes with them;
+    /// a fresh file stays, and so does everything in `active/`, whatever its age. Run here with
+    /// this user's id, since a test cannot chown to root.
+    #[test]
+    fn a_spoke_cleans_its_own_staging_and_nothing_else() {
+        use std::os::unix::fs::MetadataExt;
+        let root = a241_blob_root("clean");
+        let old = Duration::from_secs(48 * 3600);
+        let staged = root.join("staging/ab/report_0123456789abcdef.pdf");
+        let fresh = root.join("staging/ab/fresh_0123456789abcdef.pdf");
+        let temp = root.join("staging/cd/.report_0123456789abcdef.pdf.0001.tmp");
+        let promoted = root.join("active/ab/report_0123456789abcdef.pdf");
+        a241_file(&staged, b"an unfinished put", old);
+        a241_file(&fresh, b"a put under way", Duration::ZERO);
+        a241_file(&temp, b"a torn put", old);
+        a241_file(&promoted, b"a promoted blob", old);
+        let mut blob = sample_blob_config();
+        blob.path = root.clone();
+        let me = fs::metadata(&root).expect("the root").uid();
+        let report = clean_own_blob_staging("worker1", &blob, me)
+            .expect("the pass")
+            .expect("staging walked");
+        assert_eq!(report.deleted_files, 2, "{report:?}");
+        assert_eq!(
+            report.deleted_bytes,
+            (b"an unfinished put".len() + b"a torn put".len()) as u64
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(!staged.exists() && !temp.exists());
+        assert!(!root.join("staging/cd").exists(), "an emptied prefix goes");
+        assert!(fresh.exists(), "a put under way stays");
+        assert!(promoted.exists(), "active/ is never walked here");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-241: the staging pass walks by path, so it walks nothing where another user could
+    /// turn its walk elsewhere: a staging another user owns, one its group or others may write, a
+    /// staging that is a link (whatever it points at keeps its files), or a blob root that is one.
+    /// A spoke with no staging yet has nothing to clean.
+    #[test]
+    fn a_spoke_walks_its_staging_only_while_it_is_root_s_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let old = Duration::from_secs(48 * 3600);
+        let root = a241_blob_root("gate");
+        let staging = root.join("staging");
+        let leftover = staging.join("ab/report_0123456789abcdef.pdf");
+        a241_file(&leftover, b"an unfinished put", old);
+        let mut blob = sample_blob_config();
+        blob.path = root.clone();
+        let me = fs::metadata(&root).expect("the root").uid();
+        let walked = |blob: &BlobRuntimeConfig, owner: u32| {
+            clean_own_blob_staging("worker1", blob, owner)
+                .expect("no error")
+                .is_some()
+        };
+
+        assert!(!walked(&blob, me + 1), "another user's staging");
+        for mode in [0o770, 0o757] {
+            fs::set_permissions(&staging, fs::Permissions::from_mode(mode)).expect("mode");
+            assert!(!walked(&blob, me), "a staging of mode {mode:o}");
+        }
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o750)).expect("0750");
+        let elsewhere = root.join("elsewhere");
+        fs::rename(&staging, &elsewhere).expect("staging moved away");
+        std::os::unix::fs::symlink(&elsewhere, &staging).expect("a link in its place");
+        assert!(!walked(&blob, me), "a staging that is a link");
+        assert!(elsewhere.join("ab/report_0123456789abcdef.pdf").exists());
+        fs::remove_file(&staging).expect("the link");
+        fs::rename(&elsewhere, &staging).expect("staging back");
+
+        let linked = root.with_extension("link");
+        std::os::unix::fs::symlink(&root, &linked).expect("a linked blob root");
+        let mut through_a_link = blob.clone();
+        through_a_link.path = linked.clone();
+        assert!(!walked(&through_a_link, me), "a blob root that is a link");
+        assert!(leftover.exists(), "nothing was deleted");
+        fs::remove_file(&linked).expect("the link");
+
+        let bare = root.join("bare");
+        fs::create_dir(&bare).expect("a blob root with no staging");
+        fs::set_permissions(&bare, fs::Permissions::from_mode(0o750)).expect("0750");
+        let mut no_staging = blob.clone();
+        no_staging.path = bare;
+        assert!(!walked(&no_staging, me), "no staging yet");
+
+        assert!(walked(&blob, me), "root's alone");
+        assert!(!leftover.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-241: a spoke that holds a blob runs its staging pass every hour, whatever its
+    /// `blob.gc` says, and one that holds none (the ingress, the egress) runs none; the motherbee
+    /// runs its GC as its `blob.gc` says. The watchdog runs a pass off the runtime's threads.
+    #[test]
+    fn a_spoke_runs_its_staging_pass_every_hour_whatever_blob_gc_says() {
+        let mut blob = sample_blob_config();
+        assert!(!blob.gc_enabled);
+        assert_eq!(
+            blob_gc_interval(false, &blob),
+            Some(DEFAULT_BLOB_GC_INTERVAL_SECS)
+        );
+        assert_eq!(blob_gc_interval(true, &blob), None);
+        blob.gc_enabled = true;
+        blob.gc_interval_secs = 60;
+        assert_eq!(
+            blob_gc_interval(false, &blob),
+            Some(DEFAULT_BLOB_GC_INTERVAL_SECS)
+        );
+        assert_eq!(blob_gc_interval(true, &blob), Some(60));
+        blob.enabled = false;
+        assert_eq!(blob_gc_interval(false, &blob), None);
+
+        let src = include_str!("sy_orchestrator.rs");
+        let tick = &src[src.find("async fn watchdog_tick(").expect("the tick")..];
+        let tick = &tick[..tick.find("\n}\n").expect("its end")];
+        assert!(tick.contains(
+            "tokio::task::block_in_place(|| run_blob_gc_housekeeping(state, &desired_blob))"
+        ));
     }
 
     // --- The installation file (docs/hive-config-update-v1.md §4, stage 3b) ---
