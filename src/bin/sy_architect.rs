@@ -12735,7 +12735,10 @@ fn parse_scmd(raw: &str) -> Result<ParsedScmd, ArchitectError> {
         return Err("SCMD syntax must be: curl -X METHOD /relative/path [-d '{...}']".into());
     }
     let method = tokens[2].trim().to_ascii_uppercase();
-    let path = tokens[3].trim().to_string();
+    // A path in quotes is read without them: SY.admin's example_scmd quotes a path with a query,
+    // as a shell needs it (`'/hives/motherbee/timer/timers?owner_l2_name=...&limit=100'`), and the
+    // operator pastes it, or the model copies it into fluxbee_system_get's path (FINDINGS A-279).
+    let path = strip_wrapping_quotes(tokens[3].trim()).to_string();
     if !path.starts_with('/') {
         return Err("SCMD path must be relative and start with '/'".into());
     }
@@ -32335,6 +32338,76 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 6, "the admin catalog has six OPA write examples");
+    }
+
+    /// FINDINGS A-279, the review: SY.admin's catalog quotes a GET example's path when it has a
+    /// query, as a shell needs it, and Archi's read tool tells the model to prefer example_scmd.
+    /// Every such example runs as the catalog writes it, typed after `SCMD:` or its path copied
+    /// into fluxbee_system_get's (which builds the same line), where both were refused ("SCMD path
+    /// must be relative and start with '/'"): it translates to its own action, a read, with each
+    /// key of its query in its params.
+    #[test]
+    fn every_quoted_get_example_in_the_admin_catalog_translates() {
+        let admin_src = include_str!("sy_admin.rs");
+        let mut checked = 0;
+        for (idx, _) in admin_src.match_indices("\"curl -X GET '") {
+            let raw = &admin_src[idx + 1..];
+            let example = &raw[..raw.find("'\"").expect("the quoted path's end") + 1];
+            // The catalog's arm whose text the example is: `"<action>" => ...`.
+            let before = &admin_src[..idx];
+            let arrow = before.rfind("\" => ").expect("the example's arm");
+            let action = &before[before[..arrow].rfind('"').expect("its action") + 1..arrow];
+            let path = example.strip_prefix("curl -X GET ").expect("a GET");
+            assert_eq!(scmd_raw_from_parts("GET", path, None), example);
+            let parsed = parse_scmd(example).unwrap_or_else(|err| panic!("{example}: {err}"));
+            let translated = translate_scmd("motherbee", parsed)
+                .unwrap_or_else(|err| panic!("{example}: {err}"));
+            assert_eq!(translated.action, action, "{example}");
+            assert!(system_get_may_run("GET", &translated.action), "{example}");
+            let query = path
+                .trim_matches('\'')
+                .split_once('?')
+                .map_or("", |(_, query)| query);
+            let params = &translated.params;
+            for (key, _) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+                // vault_list carries its filter's keys in `filter`.
+                let carried = params.get(key).or_else(|| params["filter"].get(key));
+                assert!(carried.is_some(), "{example}: {key} in {params}");
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 8,
+            "the admin catalog has eight GET examples with a quoted path"
+        );
+    }
+
+    /// FINDINGS A-279, the review: an SCMD's path in quotes, single or double, is read without
+    /// them, with a body after it too; a path that is none, in quotes or half in them, is still
+    /// refused.
+    #[test]
+    fn an_scmd_path_in_quotes_is_read_without_them() {
+        let path = "/hives/motherbee/timer/timers?owner_l2_name=WF.onboarding@motherbee&limit=100";
+        for raw in [
+            format!("curl -X GET '{path}'"),
+            format!("curl -X GET \"{path}\""),
+        ] {
+            let parsed = parse(&raw);
+            assert_eq!(parsed.method, "GET", "{raw}");
+            assert_eq!(parsed.path, path, "{raw}");
+            assert!(parsed.body.is_none(), "{raw}");
+        }
+        let with_body = parse(r#"curl -X POST '/hives/motherbee/timer/now-in' -d '{"tz":"UTC"}'"#);
+        assert_eq!(with_body.path, "/hives/motherbee/timer/now-in");
+        assert_eq!(with_body.body, Some(json!({ "tz": "UTC" })));
+        for raw in [
+            "curl -X GET 'hives/motherbee/nodes'",
+            "curl -X GET '/hives/motherbee/nodes",
+            "curl -X GET ''",
+        ] {
+            let err = parse_scmd(raw).err().expect(raw).to_string();
+            assert!(err.contains("must be relative"), "{raw}: {err}");
+        }
     }
 
     /// A node's self-description is a read next to its status (docs/agent-tools-v1.md §3.3), and

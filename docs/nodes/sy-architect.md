@@ -106,9 +106,11 @@ tables `sessions`, `session_profiles`, `messages`, `operations`, `pipeline_runs`
 
 ## Reads, SCMD and mutations
 
-**SCMD** is a curl-like line, `SCMD: curl -X GET /hives/motherbee/nodes`. `parse_scmd` reads it
-and `translate_scmd` maps the method and path to one admin action, sent as `ADMIN_COMMAND` to
-`SY.admin@<hive>` with the `{hive}` of the path as target. The paths are the ones in the
+**SCMD** is a curl-like line, `SCMD: curl -X GET /hives/motherbee/nodes`. `parse_scmd` reads it,
+its path bare or in quotes, as SY.admin's `example_scmd` writes a path with a query
+(`'/hives/motherbee/timer/timers?owner_l2_name=...'`, FINDINGS A-279), and `translate_scmd` maps
+the method and path to one admin action, sent as `ADMIN_COMMAND` to `SY.admin@<hive>` with the
+`{hive}` of the path as target. The paths are the ones in the
 [SY.admin action table](sy-admin.md#action-table) (for example `GET /inventory` → `inventory`,
 `GET /hives/{hive}/vault/secrets` → `vault_list`, `POST /hives/{hive}/nodes` → `run_node`,
 `DELETE /hives/{hive}/nodes/{name}` → `kill_node`). Two paths stay inside Archi:
