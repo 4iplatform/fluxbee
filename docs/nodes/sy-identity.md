@@ -187,6 +187,17 @@ Identity is created in two steps:
   never takes a replica's `IlkDelete` of a well-known system ILK, nor a marked system ILK it does
   not hold: that is a purge the replica missed, which its next full snapshot drops (FINDINGS
   A-191).
+- **A removed hive publishes nothing** (FINDINGS A-191, `ingest_replica_frame`): the primary drops
+  whole, before the authority checks, each frame of a hive the motherbee's registry no longer lists
+  (`HiveRegistry::lists`, `/var/lib/fluxbee/hives/<hive>`, the authority on which hives exist), with
+  the warning `dropped an identity publish of a hive the registry no longer lists (removed)`. A
+  removed hive's SY.identity can outlive its removal: for the moment before the hive's cleanup
+  stops it, or for good when the cleanup did not reach it and its key survived
+  (`identity_key_cleanup: delete_failed`); the primary's deltas still reach it, and it seeds its
+  ILKs again after each one, so its next push would take the removal's retire marks off them, and
+  an empty snapshot would remove its nodes' ILKs. The registry drops the hive before the removal
+  answers, so before SY.admin retires its ILKs, and lists a hive joined again from the moment its
+  join is accepted, before its SY.identity starts.
 - Limits: 64 concurrent sync connections, 256 delta subscribers, 1024 queued frames per
   subscriber (a slow one is dropped and resyncs).
 
@@ -325,6 +336,9 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
 - A replica has no database: its state is in memory and in its SHM region, rebuilt from the
   primary at every start.
 - `/var/lib/fluxbee/identity/keys/<hive>.key`: sync HMAC keys (0600, directory 0700).
+- It reads, never writes, the motherbee's hive registry, `/var/lib/fluxbee/hives/<hive>/`, which
+  SY.orchestrator keeps: the primary takes a replica's publish only while its hive is listed there
+  (`ingest_replica_frame`, FINDINGS A-191).
 
 ## Failure behavior
 
@@ -338,6 +352,12 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
   publish its ILKs (publishing an empty view would delete them on the primary).
 - **HMAC failure:** the primary logs `identity sync request failed`; the replica logs the failure
   and reconnects.
+- **A removed hive still publishing:** the primary logs `dropped an identity publish of a hive the
+  registry no longer lists (removed)` for each frame and applies none. For a moment after a
+  removal it is the hive's SY.identity before its cleanup stops it. Every 30 s for good, it is one
+  the cleanup did not reach whose key the removal could not delete
+  (`identity_key_cleanup: delete_failed`): the motherbee's orchestrator deletes that key at its next
+  start (`sweep_orphan_identity_keys`), and a restart of `sy-identity` then closes the session.
 - Startup errors (wrong role, bad `hive.yaml`, missing HMAC key on a replica) end the process;
   systemd restarts it every 5 s.
 

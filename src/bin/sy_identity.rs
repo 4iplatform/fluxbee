@@ -17,6 +17,7 @@ use tokio_postgres::{error::SqlState, Config as PgConfig, NoTls};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use fluxbee_sdk::mesh::HiveRegistry;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
     VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
@@ -4676,6 +4677,9 @@ async fn main() -> Result<(), IdentityError> {
     // Bounded so a flooding replica backpressures its own connection instead of
     // growing primary memory unboundedly.
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestFrame>(IDENTITY_INGEST_CHANNEL_CAP);
+    // Primary: the hives the motherbee joined, read at each replica frame (FINDINGS A-191,
+    // `ingest_replica_frame`). Only the primary has replicas, and only the motherbee a registry.
+    let hive_registry = HiveRegistry::motherbee();
     if !is_primary {
         if let Some(upstream) = sync_upstream.clone() {
             let sub_key = self_auth_key.clone();
@@ -4751,40 +4755,12 @@ async fn main() -> Result<(), IdentityError> {
                 // (additive union / per-hive reconcile), update the SHM, and
                 // re-broadcast so every subscriber (the other replicas) converges.
                 if let Some(frame) = maybe_ingest {
-                    // Defense-in-depth: a publish claiming the primary's OWN hive
-                    // is an impersonation attempt — the primary owns its ilks and
-                    // nobody publishes them upward. (The sync port itself is not
-                    // yet peer-authenticated; closing the impersonate-primary case
-                    // bounds the blast radius. See ilk-bidirectional-sync.md.)
-                    let claimed = match &frame {
-                        IngestFrame::Delta { publisher_hive, .. } => publisher_hive,
-                        IngestFrame::Snapshot { publisher_hive, .. } => publisher_hive,
-                    };
-                    let applied: Vec<IdentityDelta> = if claimed == &hive.hive_id {
-                        tracing::warn!(hive = %claimed, "rejected identity publish impersonating the primary hive");
-                        Vec::new()
-                    } else { match frame {
-                        IngestFrame::Delta { publisher_hive, delta } => {
-                            if delta_authorized_for_hive(&delta, &publisher_hive, &runtime.store) {
-                                runtime.store.apply_delta(delta.clone());
-                                vec![delta]
-                            } else {
-                                tracing::warn!(hive = %publisher_hive, "rejected unauthorized identity delta from replica");
-                                Vec::new()
-                            }
-                        }
-                        IngestFrame::Snapshot { publisher_hive, ilks } => {
-                            if ilks.iter().all(|ilk| {
-                                ilk_owning_hive(ilk).as_deref() == Some(publisher_hive.as_str())
-                                    && ingest_ilk_type_authorized(ilk, publisher_hive.as_str())
-                            }) {
-                                runtime.store.reconcile_hive_ilks(&publisher_hive, ilks)
-                            } else {
-                                tracing::warn!(hive = %publisher_hive, "rejected publish snapshot containing foreign or unauthorized-system ilks");
-                                Vec::new()
-                            }
-                        }
-                    }};
+                    let applied = ingest_replica_frame(
+                        &mut runtime.store,
+                        frame,
+                        &hive.hive_id,
+                        &hive_registry,
+                    );
                     if !applied.is_empty() {
                         // F-06: persist replica-published ilks so they survive a
                         // primary restart. Previously these were memory/SHM/
@@ -6716,6 +6692,73 @@ enum IngestFrame {
         publisher_hive: String,
         ilks: Vec<IlkRecord>,
     },
+}
+
+/// Primary: applies one frame a replica published and answers the deltas it applied, which the
+/// main loop persists, writes into the SHM and passes on to every subscriber. A delta is checked
+/// against the publisher's authority (`delta_authorized_for_hive`), and a snapshot reconciles that
+/// hive's ILKs (`reconcile_hive_ilks`). A frame is dropped whole, before either, when:
+/// - it claims the primary's own hive: the primary owns its ILKs and nobody publishes them upward;
+/// - its hive is no longer in the motherbee's registry (`HiveRegistry::lists`, the authority on
+///   which hives exist, A-48; FINDINGS A-191): a hive SY.admin removed. Its SY.identity can outlive
+///   the removal, for the moment before the hive's cleanup stops it, or for good when the cleanup
+///   did not reach it and its key was not deleted. It seeds its hive's system ILKs again after each
+///   of the primary's deltas (`apply_primary_delta`), so its next push would take ILK_RETIRE_HIVE's
+///   marks off them, and an empty snapshot would remove its nodes' ILKs. The orchestrator deletes
+///   the hive's directory before it answers the removal, and SY.admin retires the ILKs only after
+///   that answer, or of a hive the registry no longer lists; a hive joined again is listed from the
+///   moment its join is accepted, before its SY.identity starts.
+fn ingest_replica_frame(
+    store: &mut IdentityStore,
+    frame: IngestFrame,
+    own_hive: &str,
+    registry: &HiveRegistry,
+) -> Vec<IdentityDelta> {
+    let claimed = match &frame {
+        IngestFrame::Delta { publisher_hive, .. }
+        | IngestFrame::Snapshot { publisher_hive, .. } => publisher_hive,
+    };
+    if claimed == own_hive {
+        tracing::warn!(hive = %claimed, "rejected identity publish impersonating the primary hive");
+        return Vec::new();
+    }
+    if !registry.lists(claimed) {
+        // Debug-formatted: without the per-hive handshake (identity.sync.auth disabled) the name
+        // is the publisher's own word, unchecked.
+        tracing::warn!(
+            hive = ?claimed,
+            "dropped an identity publish of a hive the registry no longer lists (removed)"
+        );
+        return Vec::new();
+    }
+    match frame {
+        IngestFrame::Delta {
+            publisher_hive,
+            delta,
+        } => {
+            if delta_authorized_for_hive(&delta, &publisher_hive, store) {
+                store.apply_delta(delta.clone());
+                vec![delta]
+            } else {
+                tracing::warn!(hive = %publisher_hive, "rejected unauthorized identity delta from replica");
+                Vec::new()
+            }
+        }
+        IngestFrame::Snapshot {
+            publisher_hive,
+            ilks,
+        } => {
+            if ilks.iter().all(|ilk| {
+                ilk_owning_hive(ilk).as_deref() == Some(publisher_hive.as_str())
+                    && ingest_ilk_type_authorized(ilk, publisher_hive.as_str())
+            }) {
+                store.reconcile_hive_ilks(&publisher_hive, ilks)
+            } else {
+                tracing::warn!(hive = %publisher_hive, "rejected publish snapshot containing foreign or unauthorized-system ilks");
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Replica side: keep an upstream publish connection to the primary alive,
@@ -14949,6 +14992,125 @@ mod tests {
         assert!(replica.ilks[&rt_id("SY.policy@worker1")]
             .deleted_at_ms
             .is_some());
+    }
+
+    /// A hive registry in a temporary directory that lists `hives`, one directory each, as the
+    /// motherbee's orchestrator keeps it.
+    fn rt_registry(hives: &[&str]) -> HiveRegistry {
+        let root = std::env::temp_dir().join(format!("fluxbee-identity-hives-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("the registry");
+        for hive in hives {
+            fs::create_dir_all(root.join(hive)).expect("a joined hive");
+        }
+        HiveRegistry::new(root)
+    }
+
+    /// A removed hive's SY.identity, still up after the removal (its cleanup has not stopped it
+    /// yet, or never reached it and its key survived), cannot undo ILK_RETIRE_HIVE: the primary's
+    /// marks reach it as deltas and it seeds its six again, but the primary drops its pushes whole,
+    /// snapshots and deltas alike, since the registry no longer lists its hive; nor does an empty
+    /// snapshot of it remove its nodes' ILKs. A listed hive's push goes on as before, a publish as
+    /// the primary's own hive stays refused, and the hive joined again under the same name takes
+    /// the marks off from the moment the registry lists it.
+    #[test]
+    fn a_removed_hive_s_identity_cannot_undo_its_retirement() {
+        let gate = rt_hive("gate0217", "worker");
+        let mut primary = rt_prod_store();
+        let agent = ilk_for("AI.gate@gate0217", &t_ilk("gate0217-agent"));
+        primary.ilks.insert(agent.ilk_id.clone(), agent.clone());
+        // The removed hive's replica holds the primary's state, as its last sync left it.
+        let mut replica = primary.clone();
+        let registry = rt_registry(&["worker1"]);
+        let from = |hive: &str| hive.to_string();
+
+        let (_, retired) = primary
+            .retire_hive_system_ilks("gate0217", "motherbee", 7)
+            .expect("the removal's retire");
+        assert_eq!(retired.ilks.len(), 6);
+        for ilk in &retired.ilks {
+            replica.apply_primary_delta(IdentityDelta::IlkUpsert { ilk: ilk.clone() }, &gate);
+            assert!(
+                replica.ilks[&ilk.ilk_id].deleted_at_ms.is_none(),
+                "seeded again: {}",
+                ilk.ilk_id
+            );
+        }
+        let after_retire = primary.ilks.clone();
+        let timer = rt_id("SY.timer@gate0217");
+        for frame in [
+            IngestFrame::Snapshot {
+                publisher_hive: from("gate0217"),
+                ilks: replica.self_owned_ilks("gate0217"),
+            },
+            IngestFrame::Delta {
+                publisher_hive: from("gate0217"),
+                delta: IdentityDelta::IlkUpsert {
+                    ilk: replica.ilks[&timer].clone(),
+                },
+            },
+            IngestFrame::Snapshot {
+                publisher_hive: from("gate0217"),
+                ilks: Vec::new(),
+            },
+            IngestFrame::Delta {
+                publisher_hive: from("gate0217"),
+                delta: IdentityDelta::IlkDelete {
+                    ilk_id: agent.ilk_id.clone(),
+                },
+            },
+        ] {
+            assert!(ingest_replica_frame(&mut primary, frame, "motherbee", &registry).is_empty());
+        }
+        assert_eq!(primary.ilks, after_retire);
+        assert!(retired
+            .ilks
+            .iter()
+            .all(|ilk| !rt_in_shm(&primary, &ilk.ilk_id)));
+
+        // worker1 is listed: its push goes on, the mark of its retired SY.policy included.
+        let mut worker1 = primary.clone();
+        worker1.ensure_system_ilks_from_hive(&rt_hive("worker1", "worker"));
+        let applied = ingest_replica_frame(
+            &mut primary,
+            IngestFrame::Snapshot {
+                publisher_hive: from("worker1"),
+                ilks: worker1.self_owned_ilks("worker1"),
+            },
+            "motherbee",
+            &registry,
+        );
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert!(primary.ilks[&rt_id("SY.policy@worker1")]
+            .deleted_at_ms
+            .is_some());
+        let before = primary.ilks.clone();
+        let mut forged = rt_seeded("SY.timer", "motherbee");
+        forged.deleted_at_ms = Some(9);
+        forged.deleted_reason = Some(RETIRED_REASON_NODE.to_string());
+        let own = IngestFrame::Delta {
+            publisher_hive: from("motherbee"),
+            delta: IdentityDelta::IlkUpsert { ilk: forged },
+        };
+        assert!(ingest_replica_frame(&mut primary, own, "motherbee", &registry).is_empty());
+        assert_eq!(primary.ilks, before);
+
+        // gate0217 joined again: listed from its join's accept, before its SY.identity starts.
+        fs::create_dir_all(registry.root().join("gate0217")).expect("joined again");
+        let applied = ingest_replica_frame(
+            &mut primary,
+            IngestFrame::Snapshot {
+                publisher_hive: from("gate0217"),
+                ilks: replica.self_owned_ilks("gate0217"),
+            },
+            "motherbee",
+            &registry,
+        );
+        assert_eq!(applied.len(), 6, "{applied:?}");
+        for ilk in &retired.ilks {
+            assert!(primary.ilks[&ilk.ilk_id].deleted_at_ms.is_none());
+            assert!(rt_in_shm(&primary, &ilk.ilk_id));
+        }
+        let _ = fs::remove_dir_all(registry.root());
     }
 
     /// FINDINGS A-232: a listing's refusal of a cursor names the field and what it takes, never

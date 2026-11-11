@@ -330,11 +330,13 @@ leaves every lookup and the SHM, its row stays, and its node name stays reserved
   takes it from `SY.admin@motherbee` alone, on the primary, refuses its own hive
   (`HIVE_NOT_REMOVED`), and marks each well-known system ILK whose `identification.hive_id` and node
   name are that hive's. It answers `{hive_id, count, ilk_ids, already_retired}`: the ILKs it
-  marked now, and how many were marked before.
+  marked now, and how many were marked before. The removed hive's own SY.identity, still up after
+  the removal, cannot take the marks off: the primary drops every publish of a hive the registry no
+  longer lists (`ingest_replica_frame`, §5.4).
 - **Only the seed un-marks one:** a release that runs the node again, or the hive joined again
   under the same name, whose replica seeds its ILKs at its start and after every delta of the
-  primary's (`apply_primary_delta`), then pushes them. `ILK_DELETE` and `ILK_RESTORE` refuse a
-  system ILK.
+  primary's (`apply_primary_delta`), then pushes them, which the primary takes once the registry
+  lists the hive again. `ILK_DELETE` and `ILK_RESTORE` refuse a system ILK.
 - **Only the operator purges one, and only a retired one** (`check_ilk_purgeable`,
   `refuse_system_ilk_purge`): `ILK_PURGE` from SY.admin; an orchestrator's purge of a system ILK,
   of its own hive or not, and the purge of an unmarked system ILK or of one marked for another
@@ -609,6 +611,12 @@ converges to the union of the mesh.
 - It pushes its local deltas (`IDENTITY_DELTA_PUBLISH`), and every 30 s the full set of its own
   ILKs (`IDENTITY_PUBLISH_RECONCILE_SECS`). It holds the set until it has a baseline from the
   primary (`replica_has_baseline`).
+- The primary drops whole, deltas and snapshots alike, each frame of a hive the motherbee's
+  registry no longer lists (`ingest_replica_frame`, `HiveRegistry::lists`): a removed hive. Its
+  SY.identity can outlive the removal (until the hive's cleanup stops it, or for good when the
+  cleanup did not reach it and its key survived), and it seeds its hive's system ILKs again after
+  each of the primary's deltas: its push would take the removal's retire marks off them (§2.9).
+  The registry lists a hive from the moment its join is accepted.
 - The primary applies a delta only if the replica owns the ILK (`delta_authorized_for_hive`).
   - A replica may claim `system` only for a deterministic `SY.*` ILK of its own hive
     (`ingest_ilk_type_authorized`).

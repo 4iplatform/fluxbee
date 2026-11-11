@@ -519,8 +519,10 @@ while their rows stay ([SY.identity](sy-identity.md#delete-marks-purge-removes))
   run `retire_hive_ilks`, after any warning of the orchestrator's. The executor keeps
   `system_ilks_retired` in a step's essentials, so Archi reads it whatever the frame drops.
 - A hive joined again under the same name gets its ILKs back unmarked from its own SY.identity.
-  The ILKs of the SY nodes a release no longer runs on a hive are retired by SY.identity itself at
-  its start (`retired: node`).
+  A removed hive's SY.identity that outlives the removal (its cleanup did not reach it, or has not
+  stopped it yet) cannot: the primary drops every publish of a hive the registry no longer lists
+  ([SY.identity](sy-identity.md#sync-between-hives-tcp-9100)). The ILKs of the SY nodes a release
+  no longer runs on a hive are retired by SY.identity itself at its start (`retired: node`).
 - **Only the operator purges a retired system ILK** (`purge_ilk`), once it made no history; one that
   made history stays retired. `delete_ilk` and `restore_ilk` refuse a system ILK
   (`SYSTEM_ILK_PROTECTED`).

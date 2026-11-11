@@ -274,8 +274,10 @@ ok: `system_ilks_retired` is `{count: null, error_code, error_detail}` and `warn
 run `retire_hive_ilks` (`POST /hives/<id>/system-ilks/retire`), never the removal again, which
 would only answer `NOT_FOUND`. The same action retires the ILKs of a hive removed before this
 release (worker2, the throwaway gate workers); it is refused for the motherbee and for a hive the
-registry still lists (`409 HIVE_NOT_REMOVED`). A hive joined again under the same name gets its
-system ILKs back unmarked from its own SY.identity at its start. A retired system ILK is purged
+registry still lists (`409 HIVE_NOT_REMOVED`). The removed hive's own SY.identity, when it
+outlives the removal, cannot take the marks off: the motherbee's SY.identity drops every publish of
+a hive the registry no longer lists. A hive joined again under the same name gets its system ILKs
+back unmarked from its own SY.identity at its start. A retired system ILK is purged
 (`purge_ilk`) only on the operator's word, and only when it made no history (no LLM usage, no
 message, no conversation under it); one that made history stays retired. The system ILKs of the SY
 nodes a release no longer runs on a hive (SY.policy's, dropped in 0.1.79) are retired by
