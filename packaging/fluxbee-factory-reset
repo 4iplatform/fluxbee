@@ -24,7 +24,10 @@ REMOVED (operator decisions, 2026-09-28):
     SY.admin's ledger, read only (FINDINGS A-212);
   - workflows, on every hive that runs SY.wf-rules: wf_rules_delete with force (a workflow is not
     a normal node -- the rule is the source of truth; this removes the rule, the WF node, its
-    state and its packages, running instances included);
+    state and its packages, running instances included). A version of its package SY.admin does
+    not remove (a hive that may run it cannot be read, FINDINGS A-281) stays in the motherbee's
+    dist: the delete is done all the same, and the reset names each such version, which a re-run
+    does not remove;
   - nodes launched by users, on every hive: kill_node + purge_instance, which also deletes the
     node's ILK, its dedicated vault secrets and its timers;
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
@@ -684,6 +687,7 @@ def main():
 
     print("== [1/9] delete workflows")
     wf_fail = []
+    packages_left = []
     for hive, wf in workflows:
         status, resp = api("POST", "/hives/%s/wf-rules/delete" % q(hive),
                            {"workflow_name": wf, "force": True}, timeout=180)
@@ -692,6 +696,15 @@ def main():
         if not good:
             wf_fail.append((wf, status, str(resp)[:200]))
             print("    %s %s" % (status, str(resp)[:200]))
+            continue
+        # Deleted, though its purge may have left versions of its package in the motherbee's dist
+        # (SY.admin removes none while a hive that may run it cannot be read, FINDINGS A-281): the
+        # answer names each, and the workflow is no longer listed for a run of the reset to retry.
+        named = payload(resp).get("packages_left")
+        for pkg in named if isinstance(named, list) else []:
+            packages_left.append(pkg)
+            print("    left in the motherbee's dist: %s %s (%s)" % (
+                pkg.get("runtime"), pkg.get("version") or "(versions not listed)", pkg.get("error_code")))
     print("== [2/9] kill+purge user nodes")
     node_fail = kill_user_nodes(user_nodes)
 
@@ -796,6 +809,10 @@ def main():
     except OSError:
         pass
     print("\n" + summary)
+    if packages_left:
+        print("%d version(s) of deleted workflows' packages stay in the motherbee's dist (see [1/9]): a re-run "
+              "does not remove them; DELETE /hives/motherbee/runtimes/<runtime>/versions/<version> "
+              "(remove_runtime_version) does once every hive answers." % len(packages_left))
     if problems:
         print("Some steps failed (see above). Re-running is safe: every step only removes what is still there.")
         return 1

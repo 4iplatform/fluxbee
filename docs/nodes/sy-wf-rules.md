@@ -387,7 +387,9 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
 - `curl -s 127.0.0.1:8080/hives/<hive>/wf-rules` lists the workflows with their WF node state.
 - A WF node: `GET /hives/<hive>/nodes/WF.<workflow>@<hive>/status`.
 - `fluxbee-factory-reset` removes workflows with `POST /hives/<hive>/wf-rules/delete` and
-  `force: true` on every motherbee and worker hive (`packaging/fluxbee-factory-reset`).
+  `force: true` on every motherbee and worker hive (`packaging/fluxbee-factory-reset`), and
+  prints each version a delete names in `packages_left` (`left in the motherbee's dist: ...`),
+  which a re-run does not remove.
 
 ## Links
 
