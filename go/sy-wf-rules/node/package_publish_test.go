@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -378,8 +379,13 @@ func TestARemovalWaitsForSYAdminsReadOfEveryHive(t *testing.T) {
 	if !errors.As(err, &refused) || refused.Code != "RUNTIME_USAGE_UNKNOWN" || refused.Message != refusal {
 		t.Fatalf("want SY.admin's refusal, got %v", err)
 	}
-	if code, detail := removalFailure(err); code != "RUNTIME_USAGE_UNKNOWN" || detail != refusal {
-		t.Fatalf("packages_left would name %s: %s", code, detail)
+	// packages_left keeps what SY.admin's payload says: the hives it did not read, and that asking
+	// again may pass.
+	want := PackageLeft{ErrorCode: "RUNTIME_USAGE_UNKNOWN", Detail: refusal, Retryable: true, UnansweredHives: []any{
+		map[string]any{"hive": "worker1", "reason": "UNREACHABLE", "detail": "stale in the LSA"},
+	}}
+	if left := removalFailure(err); !reflect.DeepEqual(left, want) {
+		t.Fatalf("packages_left would name:\n got %+v\nwant %+v", left, want)
 	}
 
 	admin.reply = map[string]any{"status": "ok", "payload": map[string]any{"runtime_name": "wf.invoice", "runtime_version": "0.0.2"}}
@@ -388,6 +394,54 @@ func TestARemovalWaitsForSYAdminsReadOfEveryHive(t *testing.T) {
 	}
 	if request, _ := admin.last(t); request.Action != "publish_runtime_package" || request.Timeout != adminRPCTimeout {
 		t.Fatalf("the publish: %+v", request)
+	}
+}
+
+// Each version a purge leaves says whether asking for its removal again, nothing changed first, may
+// remove it (the operator's rule: a refusal that may pass says so, and names what was not read).
+// SY.admin's word, its payload's retryable, decides for its refusals; without one, a use it could
+// not read (RUNTIME_USAGE_UNKNOWN) or the connected nodes it could not read for A-62
+// (INVENTORY_UNAVAILABLE) may pass, and a node that runs the version, or dependents, need a change
+// first. No answer, no SY.admin reached, and a version not asked may pass. The hives SY.admin did
+// not read are kept as it names them.
+func TestEachVersionLeftSaysWhetherAskingAgainMayRemoveIt(t *testing.T) {
+	refusal := func(code string, payload map[string]any) error {
+		return fmt.Errorf("remove wf.invoice 0.0.1 on %s: %w", fluxbeesdk.PrimaryAdminNode, &adminActionError{
+			Status: "error", Code: code, Message: "refused",
+			Payload: map[string]any{"status": "error", "error_code": code, "error_detail": "refused", "payload": payload},
+		})
+	}
+	worker1 := map[string]any{"hive": "worker1", "reason": "TIMEOUT", "detail": "no answer within 10 s"}
+	for _, tc := range []struct {
+		name       string
+		err        error
+		code       string
+		retryable  bool
+		unanswered []any
+	}{
+		{name: "a use not read, as SY.admin says it", err: refusal("RUNTIME_USAGE_UNKNOWN", map[string]any{"unanswered_hives": []any{worker1}, "retryable": true}),
+			code: "RUNTIME_USAGE_UNKNOWN", retryable: true, unanswered: []any{worker1}},
+		{name: "a use not read, SY.admin saying nothing", err: refusal("RUNTIME_USAGE_UNKNOWN", nil), code: "RUNTIME_USAGE_UNKNOWN", retryable: true},
+		{name: "SY.admin's word wins", err: refusal("RUNTIME_USAGE_UNKNOWN", map[string]any{"retryable": false}), code: "RUNTIME_USAGE_UNKNOWN"},
+		{name: "a node runs it, another hive not read", err: refusal("RUNTIME_IN_USE", map[string]any{"unanswered_hives": []any{worker1}}),
+			code: "RUNTIME_IN_USE", unanswered: []any{worker1}},
+		{name: "a node runs it", err: refusal("RUNTIME_IN_USE", map[string]any{"unanswered_hives": []any{}}), code: "RUNTIME_IN_USE"},
+		{name: "dependents", err: refusal("RUNTIME_HAS_DEPENDENTS", map[string]any{"dependents": []any{"x"}}), code: "RUNTIME_HAS_DEPENDENTS"},
+		{name: "the connected nodes not read", err: refusal("INVENTORY_UNAVAILABLE", nil), code: "INVENTORY_UNAVAILABLE", retryable: true},
+		{name: "no answer in time", err: fmt.Errorf("remove: %w", context.DeadlineExceeded), code: "TIMEOUT", retryable: true},
+		{name: "SY.admin not reached", err: &fluxbeesdk.RpcError{Kind: fluxbeesdk.RpcErrDisconnected}, code: "TRANSPORT_ERROR", retryable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			left := removalFailure(tc.err)
+			if left.ErrorCode != tc.code || left.Retryable != tc.retryable || !reflect.DeepEqual(left.UnansweredHives, tc.unanswered) {
+				t.Fatalf("got %+v, want %s retryable %v unanswered %v", left, tc.code, tc.retryable, tc.unanswered)
+			}
+		})
+	}
+	// A version the purge had still to remove was not asked: asking may remove it.
+	left := purgeStoppedAt("wf.invoice", "0.0.1", refusal("RUNTIME_IN_USE", nil), []string{"0.0.2"})
+	if len(left) != 2 || left[0].Retryable || !left[1].Retryable || left[1].ErrorCode != "PURGE_STOPPED" {
+		t.Fatalf("purge stopped at a version in use: %+v", left)
 	}
 }
 

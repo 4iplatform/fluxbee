@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -156,6 +157,14 @@ type PackageLeft struct {
 	Version   string `json:"version"`
 	ErrorCode string `json:"error_code"`
 	Detail    string `json:"detail"`
+	// Retryable says that remove_runtime_version asked again for the version, nothing else changed
+	// first, may remove it (removalFailure): true for a refusal SY.admin says may pass, a TIMEOUT, a
+	// TRANSPORT_ERROR and a PURGE_STOPPED; false for one that needs a change first (RUNTIME_IN_USE:
+	// stop or move the node) and for DIST_UNREADABLE (this hive's dist first).
+	Retryable bool `json:"retryable"`
+	// UnansweredHives are the hives whose nodes SY.admin could not read, as its refusal names them
+	// (its payload.unanswered_hives, each {hive, reason, detail}), when it names any.
+	UnansweredHives []any `json:"unanswered_hives,omitempty"`
 }
 
 func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersion bool) ([]PackageLeft, error) {
@@ -164,20 +173,37 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 	return s.purgeWorkflowPackages(ctx, workflowName, preserveBoundVersion)
 }
 
-// purgeWorkflowPackages removes from the motherbee's dist each version of wf.<workflow> that this
-// hive's dist holds and no slot keeps (current, backup and, with preserveBoundVersion, the version
-// the WF node's config names). It answers the versions it did not remove, none when it removed them
-// all (purgeOnPrimary), and an error, with nothing removed, when it cannot tell which to remove:
-// the runtime's directory cannot be listed, or the version the WF node is bound to cannot be read.
-func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string, preserveBoundVersion bool) ([]PackageLeft, error) {
+// purgeWorkflowPackages removes from the motherbee's dist each version of wf.<workflow> that no slot
+// keeps (current, backup and, with preserveBoundVersion, the version the WF node's config names),
+// among those this hive's dist holds and those named names. A delete names the versions the
+// workflow's slots held, read before its state went: on a worker this hive's dist is a Syncthing
+// copy of the motherbee's, which lists a version published there 10-60 s later, so a delete within
+// that window found no wf.<workflow> here, removed nothing and answered packages_left [], while the
+// version stayed in the motherbee's dist (the review of A-281). A named version the motherbee does
+// not hold (a staged one never applied) SY.admin answers RUNTIME_VERSION_NOT_FOUND, before its read
+// of the version's use, which counts as removed. It answers the versions it did not remove, none
+// when it removed them all (purgeOnPrimary), and an error, with nothing removed, when it cannot
+// tell which to remove: the runtime's directory cannot be listed, or the version the WF node is
+// bound to cannot be read.
+func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string, preserveBoundVersion bool, named ...string) ([]PackageLeft, error) {
 	runtimeName := workflowRuntimeName(workflowName)
-	runtimeDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName)
-	entries, err := os.ReadDir(runtimeDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
+	entries, err := os.ReadDir(filepath.Join(s.cfg.DistRuntimeRoot, runtimeName))
+	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("cannot list the versions of %s in this hive's dist: %w", runtimeName, err)
+	}
+	var versions []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			versions = append(versions, entry.Name())
+		}
+	}
+	for _, version := range named {
+		if !slices.Contains(versions, version) {
+			versions = append(versions, version)
+		}
+	}
+	if len(versions) == 0 {
+		return nil, nil
 	}
 
 	keep := map[string]struct{}{}
@@ -203,11 +229,7 @@ func (s *Service) purgeWorkflowPackages(ctx context.Context, workflowName string
 	// only diverges from the source; on the motherbee, a write of its own raced the admin's
 	// publishes now that the admin serves the mesh concurrently.
 	var obsolete []string
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		version := entry.Name()
+	for _, version := range versions {
 		if _, ok := keep[version]; ok {
 			continue
 		}
@@ -275,10 +297,11 @@ func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versio
 
 // purgeStoppedAt is what a purge that stopped at version leaves: that version, with why its
 // removal failed (removalFailure), and each version it had still to remove, PURGE_STOPPED (a
-// version refused as current earlier in the pass, waiting to be asked again, among them).
+// version refused as current earlier in the pass, waiting to be asked again, among them), which
+// was not asked, so asking may remove it.
 func purgeStoppedAt(runtimeName, version string, err error, notRemoved []string) []PackageLeft {
-	stopped := PackageLeft{Runtime: runtimeName, Version: version}
-	stopped.ErrorCode, stopped.Detail = removalFailure(err)
+	stopped := removalFailure(err)
+	stopped.Runtime, stopped.Version = runtimeName, version
 	left := []PackageLeft{stopped}
 	for _, next := range notRemoved {
 		left = append(left, PackageLeft{
@@ -286,31 +309,54 @@ func purgeStoppedAt(runtimeName, version string, err error, notRemoved []string)
 			Version:   next,
 			ErrorCode: "PURGE_STOPPED",
 			Detail:    fmt.Sprintf("the purge stopped at %s %s (%s) before removing it", runtimeName, version, stopped.ErrorCode),
+			Retryable: true,
 		})
 	}
 	return left
 }
 
-// removalFailure is why a removal of a runtime version failed, as packages_left names it: SY.admin's
-// refusal, with its code and detail; TIMEOUT when no answer came in time, which does not mean the
-// version stayed: SY.admin may still remove it; TRANSPORT_ERROR when SY.admin was not reached.
-func removalFailure(err error) (code, detail string) {
+// removalFailure is why a removal of a runtime version failed, as packages_left names it, without
+// the runtime and the version: SY.admin's refusal, with its code, its detail, the hives it could
+// not read (its payload.unanswered_hives) and whether asking again may pass (its payload.retryable,
+// or passingRemovalRefusal when it says nothing); TIMEOUT when no answer came in time, which does
+// not mean the version stayed: SY.admin may still remove it; TRANSPORT_ERROR when SY.admin was not
+// reached. Both of these are retryable.
+func removalFailure(err error) PackageLeft {
 	var actionErr *adminActionError
 	switch {
 	case errors.As(err, &actionErr):
-		code, detail = actionErr.Code, actionErr.Message
-		if code == "" {
-			code = "SERVICE_FAILED"
+		left := PackageLeft{ErrorCode: actionErr.Code, Detail: actionErr.Message}
+		if left.ErrorCode == "" {
+			left.ErrorCode = "SERVICE_FAILED"
 		}
-		if detail == "" {
-			detail = err.Error()
+		if left.Detail == "" {
+			left.Detail = err.Error()
 		}
-		return code, detail
+		payload, _ := actionErr.Payload["payload"].(map[string]any)
+		if hives, _ := payload["unanswered_hives"].([]any); len(hives) > 0 {
+			left.UnansweredHives = hives
+		}
+		retryable, said := payload["retryable"].(bool)
+		left.Retryable = retryable || !said && passingRemovalRefusal(left.ErrorCode)
+		return left
 	case isRPCTimeout(nil, err):
-		return "TIMEOUT", fmt.Sprintf("no answer in time (%v); SY.admin may still remove it, and remove_runtime_version answers RUNTIME_VERSION_NOT_FOUND once it is gone", err)
+		return PackageLeft{
+			ErrorCode: "TIMEOUT",
+			Detail:    fmt.Sprintf("no answer in time (%v); SY.admin may still remove it, and remove_runtime_version answers RUNTIME_VERSION_NOT_FOUND once it is gone", err),
+			Retryable: true,
+		}
 	default:
-		return "TRANSPORT_ERROR", err.Error()
+		return PackageLeft{ErrorCode: "TRANSPORT_ERROR", Detail: err.Error(), Retryable: true}
 	}
+}
+
+// passingRemovalRefusal is whether a refusal of remove_runtime_version whose payload does not say
+// may pass when asked again, nothing changed first: SY.admin could not read some hive's nodes
+// (RUNTIME_USAGE_UNKNOWN, which says retryable itself since 0.1.133) or the nodes connected now,
+// which it reads from shared memory for A-62 (INVENTORY_UNAVAILABLE, 503). Any other refusal needs
+// a change first, as RUNTIME_IN_USE does (a node runs the version), or is SY.admin's to say.
+func passingRemovalRefusal(code string) bool {
+	return code == "RUNTIME_USAGE_UNKNOWN" || code == "INVENTORY_UNAVAILABLE"
 }
 
 // removeRuntimeVersionOnPrimary asks SY.admin to remove one version from the motherbee's dist, and

@@ -72,6 +72,9 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		}
 	}
 
+	// The versions the slots name go too, even where this hive's dist does not list them (yet): read
+	// before the state goes.
+	slotted := s.slotPackageVersions(workflowName)
 	if err := s.store.DeleteWorkflowState(workflowName); err != nil {
 		return nil, err
 	}
@@ -81,13 +84,27 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 	// as failed, and nothing named the versions left in the motherbee's dist. With A-281, SY.admin
 	// refuses any removal while a hive that may run the version cannot be read (a worker down or
 	// restarting, a join under way), RUNTIME_USAGE_UNKNOWN.
-	left, err := s.purgeWorkflowPackages(ctx, workflowName, false)
+	left, err := s.purgeWorkflowPackages(ctx, workflowName, false, slotted...)
 	if err != nil {
 		left = []PackageLeft{{Runtime: workflowRuntimeName(workflowName), ErrorCode: "DIST_UNREADABLE", Detail: err.Error()}}
 	}
 	result.PackagesLeft = append(result.PackagesLeft, left...)
 	result.Warning = packagesLeftWarning(workflowName, left)
 	return result, nil
+}
+
+// slotPackageVersions is each version of wf.<workflow> the workflow's slots name, as its package
+// numbers it: staged (a rollback's former current, or a compile never applied), backup, and current
+// last, the motherbee's current, which SY.admin removes only once no other version is left (the
+// order purgeOnPrimary keeps when this hive's copy of the manifest does not say which is current).
+func (s *Service) slotPackageVersions(workflowName string) []string {
+	var versions []string
+	for _, slot := range []string{"staged", "backup", "current"} {
+		if meta, err := s.store.ReadMetadata(workflowName, slot); err == nil {
+			versions = append(versions, workflowRuntimeVersion(meta.Version))
+		}
+	}
+	return versions
 }
 
 // packagesLeftWarning is a delete's warning when its purge left versions of the workflow's package
@@ -99,11 +116,14 @@ func packagesLeftWarning(workflowName string, left []PackageLeft) string {
 	}
 	runtimeName := workflowRuntimeName(workflowName)
 	stopped := left[0]
+	if stopped.Version == "" {
+		// DIST_UNREADABLE: nothing was removed, and until this hive's dist can be listed again its
+		// compiles that name no version are refused (highestPublishedVersion), so no deploy of the
+		// name purges anything, and no hive's answer would change that.
+		return fmt.Sprintf("workflow %s is deleted, but its purge could not list the versions of %s in this hive's dist (packages_left: %s), so it removed none: fix this hive's dist/runtimes/%s first (a compile of %s that names no version is refused until it can be listed); then remove_runtime_version removes each version of %s the motherbee's get_runtime lists, or a deploy of %s purges them.", workflowName, runtimeName, stopped.ErrorCode, runtimeName, workflowName, runtimeName, workflowName)
+	}
 	what := fmt.Sprintf("its purge did not remove %d versions of %s from the motherbee's dist (packages_left): it stopped at %s, %s", len(left), runtimeName, stopped.Version, stopped.ErrorCode)
-	switch {
-	case stopped.Version == "":
-		what = fmt.Sprintf("its purge could not list the versions of %s to remove from the motherbee's dist (packages_left: %s)", runtimeName, stopped.ErrorCode)
-	case len(left) == 1:
+	if len(left) == 1 {
 		what = fmt.Sprintf("its purge did not remove %s %s from the motherbee's dist (packages_left: %s)", runtimeName, stopped.Version, stopped.ErrorCode)
 	}
 	return fmt.Sprintf("workflow %s is deleted, but %s. remove_runtime_version removes each version once every hive answers and no node runs it, and a later deploy of %s purges them too.", workflowName, what, workflowName)

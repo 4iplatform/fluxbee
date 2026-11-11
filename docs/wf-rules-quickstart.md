@@ -558,9 +558,10 @@ the node's config read in time: SY.wf-rules cannot tell whether the node exists.
 
 A delete that removed the node and the workflow is done even when some versions of the
 `wf.<workflow>` package could not be removed (SY.admin cannot read a worker's nodes, say): it
-answers ok, `payload.packages_left` names each version left in the motherbee's dist with why, and
-`payload.warning` says so. `remove_runtime_version` removes them once every hive answers, and a
-later deploy of the same name purges them too ([SY.wf-rules](nodes/sy-wf-rules.md#delete)).
+answers ok, `payload.packages_left` names each version left in the motherbee's dist with why
+(and `retryable`, whether asking again may remove it), and `payload.warning` says so.
+`remove_runtime_version` removes them once every hive answers, and a later deploy of the same name
+purges them too ([SY.wf-rules](nodes/sy-wf-rules.md#delete)).
 
 ---
 

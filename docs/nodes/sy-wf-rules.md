@@ -139,13 +139,17 @@ compile and its apply leaves the staged and the current definitions as they were
    apply or rollback removes what this one left.
 
    Since 0.1.133 SY.admin removes a version only once it read the version's use on every hive
-   that may run it, up to 30 s, and refuses it otherwise (`RUNTIME_USAGE_UNKNOWN`, FINDINGS
-   A-281), so each removal waits up to 35 s for SY.admin's answer (`runtimeRemovalTimeout`; 5 s
-   before). The purge stops at the first removal refused or not answered: what refused it holds
-   for the next. Here, between the publish and the node's step, the whole purge is bounded by
-   15 s (`deployPurgeBudget`, `purgeAfterPublish`), what it could take before 0.1.133, so the
-   node's step keeps its time; the deploy goes on whatever the purge leaves, which is logged
-   (`purge left wf.<workflow> <version>: <code>: <detail>`), and the next deploy tries it again.
+   that may run it, up to 30 s (`JSR_ADMIN_ORCH_TIMEOUT_SECS`), and refuses it otherwise
+   (`RUNTIME_USAGE_UNKNOWN`, FINDINGS A-281), so each removal waits up to 35 s for SY.admin's
+   answer (`runtimeRemovalTimeout`; 5 s before). An answer that comes later is a `TIMEOUT`
+   (SY.admin may still remove the version): SY.admin first waits for its manifest's lock, which
+   another removal holds across its own read of the use, and a publish across its install. The
+   purge stops at the first removal refused or not answered: what refused it holds for the next.
+   Here, between the publish and the node's step, the whole purge is bounded by 15 s
+   (`deployPurgeBudget`, `purgeAfterPublish`), so the node's step keeps 40 s at least, as before
+   0.1.133 when its purge stopped at a refused removal (the read, then that removal's 5 s); the
+   deploy goes on whatever the purge leaves, which is logged (`purge left wf.<workflow>
+   <version>: <code>: <detail>`), and the next deploy tries it again.
 4. Deploys `WF.<workflow>@<hive>` (`deployPublishedWorkflow`), always through SY.admin's node
    actions for this hive (`node/node_lifecycle.go`):
    - node config exists: `set_node_config` with only the new runtime binding (`runtime`,
@@ -199,17 +203,23 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
 - A workflow whose WF node has no config (never deployed, or already purged) has none to lose,
   and is deleted without a node step.
 - If the node exists it is removed with `kill_node` (`force: true`, `purge_instance: true`)
-  through SY.admin; then the workflow directory is deleted and every version of `wf.<workflow>`
-  this hive's dist holds is removed from the motherbee's dist (`purgeWorkflowPackages`, through
-  SY.admin's `remove_runtime_version`, each removal waiting up to 35 s: see the deploy's step 3).
-  A failure up to the directory's deletion (the config read, the kill, the deletion itself) fails
-  the delete as before, with its code.
+  through SY.admin; then the workflow directory is deleted, and the versions of `wf.<workflow>`
+  are removed from the motherbee's dist (`purgeWorkflowPackages`, through SY.admin's
+  `remove_runtime_version`, each removal waiting up to 35 s: see the deploy's step 3): every
+  version this hive's dist lists, and each version its slots named (staged, backup, current,
+  read before the directory goes: `slotPackageVersions`), the current last. On a worker this
+  hive's dist is a Syncthing copy of the motherbee's, which lists a version published there
+  10-60 s later; before 0.1.133 a delete within that window removed nothing and answered
+  `packages_left: []`. A version the motherbee does not hold (a staged one never applied) SY.admin
+  answers `RUNTIME_VERSION_NOT_FOUND` at once, which counts as removed. A failure up to the
+  directory's deletion (the config read, the kill, the deletion itself) fails the delete as
+  before, with its code.
 - The answer: `{status: ok, deleted: true, wf_node: {node_name, action, status, reason},
   packages_left: [...], warning}`. Once the node and the directory are gone the workflow is
   deleted (asked again, the delete answers `WORKFLOW_NOT_FOUND`), so since 0.1.133 a purge that
   cannot finish does not fail it: the answer names what stayed. The purge stops at the first
   removal SY.admin refuses or does not answer in time, and `packages_left` names each version it
-  did not remove, `{runtime, version, error_code, detail}`:
+  did not remove, `{runtime, version, error_code, detail, retryable, unanswered_hives}`:
   - the one it stopped at, with SY.admin's code and detail: `RUNTIME_USAGE_UNKNOWN` while a hive
     that may run the version cannot be read (a worker down or restarting, a join under way;
     FINDINGS A-281), or `RUNTIME_IN_USE` while a node runs it; or `TIMEOUT` when no answer came
@@ -217,13 +227,31 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
     `RUNTIME_VERSION_NOT_FOUND`), or `TRANSPORT_ERROR` when SY.admin was not reached;
   - each one it had still to remove, `PURGE_STOPPED`;
   - or, when its versions could not be listed, one entry with the runtime, no version
-    (`version: ""`) and `DIST_UNREADABLE`.
+    (`version: ""`) and `DIST_UNREADABLE`: nothing was removed.
 
-  `packages_left` is `[]` when every version went, and is always there: an answer without it is
-  from an SY.wf-rules before 0.1.133. With any left, `warning` says the workflow is deleted, how
-  many versions of `wf.<workflow>` stayed in the motherbee's dist and where the purge stopped, and
-  that `remove_runtime_version` removes each once every hive answers and no node runs it, and a
-  later deploy of the same name purges them too. Nothing removes them in the background. Before
+  `retryable` says that `remove_runtime_version` asked again for that version, nothing changed
+  first, may remove it: SY.admin's own word when its refusal gives one (`payload.retryable`,
+  true for `RUNTIME_USAGE_UNKNOWN`); without it, true for `RUNTIME_USAGE_UNKNOWN` and
+  `INVENTORY_UNAVAILABLE`; true for `TIMEOUT`, `TRANSPORT_ERROR` and `PURGE_STOPPED`; false for
+  any other refusal (`RUNTIME_IN_USE`: stop or move the node first) and for `DIST_UNREADABLE`.
+  `unanswered_hives` is SY.admin's list of the hives whose nodes it could not read, each
+  `{hive, reason, detail}`, when its refusal names any (`RUNTIME_USAGE_UNKNOWN`, and
+  `RUNTIME_IN_USE` with a hive not read besides).
+
+  `packages_left` is `[]` when every version the delete knew of went (those this hive's dist
+  lists and those its slots named), and is always there: an answer without it is from an
+  SY.wf-rules before 0.1.133. On a worker whose copy lags, the motherbee's dist may hold another
+  version neither names (an older leftover of the same name): `GET
+  /hives/motherbee/runtimes/wf.<workflow>` lists them. With any left, `warning` says the workflow
+  is deleted, how many versions of `wf.<workflow>` stayed in the motherbee's dist and where the
+  purge stopped, and that `remove_runtime_version` removes each once every hive answers and no
+  node runs it, and a later deploy of the same name purges them too; with `DIST_UNREADABLE`, that
+  this hive's `dist/runtimes/wf.<workflow>` must be fixed first, since until it can be listed a
+  compile of the name that names no version is refused too. To remove them by hand, go in
+  `packages_left`'s order, which puts the runtime's current last as far as this hive's copy of
+  the manifest tells: SY.admin refuses the current one (`RUNTIME_CURRENT_CONFLICT`) while another
+  version remains, so one refused so goes after the others. Nothing removes them in the
+  background. Before
   0.1.133 such a delete answered `PACKAGE_PUBLISH_FAILED` though the workflow, its node and its
   state were gone: the factory reset counted it as failed, and running it again never removed the
   versions left, since the workflow was no longer listed; deployed again, the name published its
@@ -272,6 +300,15 @@ In the other direction, SY.admin's A-62 table bounds what `SY.wf-rules@<hive>` m
   shared memory (`authorize_wf_rules_package`, `workflow_nodes_elsewhere`);
 - `sync_hint` of `fluxbee-dist-runtimes` on the motherbee (`announceRuntimes`), with only its own
   fields and a `timeout_ms` of at most 5000.
+
+A workflow's package is one runtime for every hive, `wf.<workflow>`, and SY.admin sees another
+hive's `WF.<workflow>` only while it is connected: one that is stopped, or on a hive the LSA holds
+stale, is not seen (FINDINGS A-304). A deploy of the same name here then stages above that hive's
+versions too (`highestPublishedVersion` counts every version of `wf.<workflow>` the dist holds),
+and its purge, as a delete here, asks SY.admin to remove them: SY.admin removes only a version no
+node of any hive may run on (FINDINGS A-281), and a node whose unit does not run is not counted.
+Before 0.1.133 such a deploy published `0.0.1`, which SY.admin refused (`VERSION_CONFLICT`) while
+that hive still held its own `0.0.1`.
 
 This is the standard path of A-68 (see `docs/wf-standard-path-v1.md`): SY.wf-rules acts on nodes
 only through SY.admin.
@@ -371,10 +408,11 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
   in time (whether the node exists is unknown; nothing changes, with `force` or without). A
   status read it refuses makes a delete without `force` `INSTANCES_UNKNOWN`, naming the refusal.
 - A delete whose purge cannot remove every version of `wf.<workflow>` is done all the same and
-  answers ok, naming each version left in `packages_left`, with a `warning` (see Delete). They
-  stay in the motherbee's dist until `remove_runtime_version` removes them, once every hive
-  answers and no node runs them, or a later deploy of the same name purges them. An apply's or a
-  rollback's purge that cannot finish only logs what it left.
+  answers ok, naming each version left in `packages_left` with why and whether asking again may
+  remove it (`retryable`), and a `warning` (see Delete). They stay in the motherbee's dist until
+  `remove_runtime_version` removes them, once every hive answers and no node runs them, or a later
+  deploy of the same name purges them. An apply's or a rollback's purge that cannot finish only
+  logs what it left.
 - A compile that cannot read this hive's dist or its runtimes manifest stages nothing
   (`WFRULES_ERROR`): the next version, above what they hold, is unknown.
 
@@ -389,7 +427,8 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
 - `fluxbee-factory-reset` removes workflows with `POST /hives/<hive>/wf-rules/delete` and
   `force: true` on every motherbee and worker hive (`packaging/fluxbee-factory-reset`), and
   prints each version a delete names in `packages_left` (`left in the motherbee's dist: ...`),
-  which a re-run does not remove.
+  which a re-run does not remove, and counts them in the line it logs
+  (`state/factory-reset.log`: `packages_left=<n>`, beside `problems=<n>`).
 
 ## Links
 
