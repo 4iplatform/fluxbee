@@ -101,7 +101,7 @@ wrote it, never as the sender wrote it.
     `foreign_source` and logged, at most every 30 s, as `router dropped a WAN frame: its sender is
     neither a node of the peer that sent it nor one that peer relays as the hub`. Until 0.1.83 the
     UUID was looked up in every bucket, so a spoke could send as another spoke's node.
-  - So a frame must not arrive before what names its sender (A-195, since 0.1.131). A router's
+  - So a frame must not arrive before what names its sender (A-195, since 0.1.132). A router's
     first frames on a new link, after the handshake, are its LSA and, on the hub, its reachability
     advertisement, queued before the link takes anything else; and the hub advertises a hive's
     nodes to every other spoke as soon as an LSA adds to them, ahead of any frame it relays from a
@@ -270,9 +270,9 @@ A message that came from another router gets its error over the link it came in 
 hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`). Spokes
 are linked only to the hub, so a message between two spokes passes the hub both ways: the hub hands
 the far router's error on toward the spoke whose LSA lists the sender, one hop of TTL less, and that
-spoke's router gives it to its node (`relay_far_answer`, A-245, since 0.1.131). It does so only for
+spoke's router gives it to its node (`relay_far_answer`, A-245, since 0.1.132). It does so only for
 an error the adjacent router made itself (its `src` is the router of the link it came in on), so an
-error crosses the hub at most once, and never goes back to the hive it came from. Until 0.1.131 the
+error crosses the hub at most once, and never goes back to the hive it came from. Until 0.1.132 the
 hub gave such an error only to its own nodes: a sender on another spoke heard nothing and waited out
 its own timeout. A tap copy gets none, on any router (§8.3).
 

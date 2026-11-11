@@ -120,7 +120,7 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   connection.
 - **A new link's first frames** after the handshake are the router's LSA and, on the hub, its
   `WAN_REACHABILITY`: both are queued before the link goes into the gateway's WAN table, where
-  another task could hand it a frame (`bring_wan_peer_up`, A-195, since 0.1.131). Until then a
+  another task could hand it a frame (`bring_wan_peer_up`, A-195, since 0.1.132). Until then a
   frame handed to the link in between went out before the LSA, and the peer dropped it, its sender
   not yet named.
 - **A session's end (A-203, A-207).** A session ends on a clean close, a read error (a peer gone
@@ -144,27 +144,27 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   reach another spoke through it. A spoke accepts this only from the motherbee's gateway (rule 6
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
   (`prepare_local_delivery`).
-  - **When the hub sends it** (A-195, since 0.1.131): with its LSA every 10 s; to a spoke whose
+  - **When the hub sends it** (A-195, since 0.1.132): with its LSA every 10 s; to a spoke whose
     link comes up, right after its LSA; and to every spoke as soon as an LSA adds to the nodes it
     vouches for (a node new, or listed with another name or `vpn_id`; the nodes of a hive back from
     stale; or another hive's node whose UUID this hive no longer lists, which the hub vouches for
     again). The same nodes in another order are no change. A spoke drops a relayed frame whose
     sender the hub has not vouched for (`router dropped a WAN frame`), and the hub handles a
     spoke's frames in order, so every other spoke has the advertisement before the first frame the
-    hub relays from a node that LSA added. Until 0.1.131 only the 10 s beacon sent it: a frame from
+    hub relays from a node that LSA added. Until 0.1.132 only the 10 s beacon sent it: a frame from
     a node that had just connected on another spoke, or any for up to 10 s after a spoke's link
     came up, was dropped without an answer. A node gone waits for the next advertisement, the
     beacon's at the latest: no frame waits for it (a spoke that routes to it meanwhile gets
     `NODE_NOT_FOUND` from the hub), and a node that restarts costs each spoke one advertisement, not
     two. A spoke takes each advertisement for the hub's whole set, so the hub builds and queues
     them one at a time, and each spoke gets them in the order they were built. It goes with no node
-    too, so a spoke whose last vouched-for node is gone drops it; until 0.1.131 none went then, and
+    too, so a spoke whose last vouched-for node is gone drops it; until 0.1.132 none went then, and
     the spoke kept routing to that node through the hub until its entry expired.
-  - **Errors across the hub** (A-245, since 0.1.131): a message between two spokes passes the
+  - **Errors across the hub** (A-245, since 0.1.132): a message between two spokes passes the
     hub both ways, and the far spoke's router answers it over the hub's link. The hub hands that
     `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke whose LSA lists the sender, one hop of TTL
     less, when the far router made it itself; never back where it came from, and never twice
-    (`relay_far_answer`). Until 0.1.131 the hub gave it only to its own nodes, and a sender on
+    (`relay_far_answer`). Until 0.1.132 the hub gave it only to its own nodes, and a sender on
     another spoke waited out its own timeout, or, as SY.timer does when no answer comes in 30 s,
     counted the message delivered. An answer the router does not hand on is counted and logged, at
     most every 30 s, as `router dropped another router's answer from the WAN: it is for none of its

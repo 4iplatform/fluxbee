@@ -2501,7 +2501,7 @@ async fn vouched_nodes(ctx: &WanContext) -> Vouched {
 /// `target_router`: every node it vouches for but the target's own (split-horizon: a spoke learns
 /// its own nodes from its own LSA). It goes with no node too: the spoke takes each advertisement
 /// for the hub's whole set, so an empty one takes back the last nodes the hub vouched for to it.
-/// Until 0.1.131 none went then, and the spoke kept those nodes until they expired, a dead interval
+/// Until 0.1.132 none went then, and the spoke kept those nodes until they expired, a dead interval
 /// after the last advertisement, routing them to the hub, which answered `NODE_NOT_FOUND` (A-195's
 /// review).
 fn reachability_frame(
@@ -2554,7 +2554,7 @@ fn reachability_frame(
 /// The hub sends it with its LSA beacon, every hello interval; to a spoke whose link comes up,
 /// right after its LSA (`bring_wan_peer_up`); and to every peer as soon as an LSA adds to the nodes
 /// it vouches for (A-195), a node gone waiting for the next one (`apply_lsa_payload`). Until
-/// 0.1.131 only the beacon sent it, so for up to a hello interval a spoke dropped every frame the
+/// 0.1.132 only the beacon sent it, so for up to a hello interval a spoke dropped every frame the
 /// hub relayed from a node it had not vouched for yet: one that had just connected to another
 /// spoke, or any, once the spoke's own link had come up again. It goes with no node too
 /// (`reachability_frame`). A spoke takes each advertisement for the hub's whole set, so the hub
@@ -2582,7 +2582,7 @@ async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
 
 /// Puts the link of a WAN session that just came up in the WAN table, its first frames queued ahead
 /// of anything another task can hand it: this router's LSA and, from a hub, the reachability it
-/// vouches for (A-195). Until 0.1.131 the link went into the table first, so a frame another task
+/// vouches for (A-195). Until 0.1.132 the link went into the table first, so a frame another task
 /// handed it in between went out before the LSA, and the peer dropped it, its sender not yet named;
 /// and the hub's reachability waited for its next beacon, up to a hello interval in which the
 /// spoke dropped every frame the hub relayed to it from another spoke.
@@ -2961,7 +2961,7 @@ fn lsa_node_set(nodes: &[LsaNode]) -> HashSet<(&str, &str, u32)> {
 
 /// Writes this router's LSA state, its own hive's and every other's, to the hive's LSA region, and
 /// stores the copy it wrote in `lsa_snapshot`. The writer's guard is taken before anything is read,
-/// so every write is of the state as it was after the write before: until 0.1.131 the state was
+/// so every write is of the state as it was after the write before: until 0.1.132 the state was
 /// read first, and of two writes at once (the beacon's, a session's after an LSA) the one that had
 /// read the older state could write last, and for up to a hello interval the region and the
 /// snapshot left out what the newer LSA brought (A-195's review).
@@ -4298,7 +4298,7 @@ async fn handle_wan_message(
 /// Hands on an `UNREACHABLE` or `TTL_EXCEEDED` that came over the WAN for a node that is not this
 /// router's, toward the hive of that node, its sender (A-245). Spokes are linked only to the hub,
 /// so a message between two spokes passes the hub both ways, and the far spoke's router answers it
-/// over the link it came in on, the hub's. Until 0.1.131 the hub gave such an answer only to its
+/// over the link it came in on, the hub's. Until 0.1.132 the hub gave such an answer only to its
 /// own nodes: a sender on another spoke never heard of a refusal (`NODE_NOT_FOUND`, `LINK_BUSY`,
 /// `FRAME_TOO_LARGE`, `VPN_BLOCKED`, no TTL left) and waited out its own timeout, and one that
 /// counts no answer as delivered (SY.timer) counted it delivered.
@@ -4312,7 +4312,7 @@ async fn handle_wan_message(
 ///
 /// Anything else is dropped, counted and logged with its reason at most once every 30 s
 /// (`far_answer_dropped`, A-245's review), so a sender that waits out its timeout leaves a trace
-/// on the hub; until 0.1.131 it was dropped without a word. An answer handed on gets a debug line.
+/// on the hub; until 0.1.132 it was dropped without a word. An answer handed on gets a debug line.
 /// It is one of the router's own frames: on a full link it is skipped, counted in the link's
 /// `LINK_BUSY` line, and no one is answered. A spoke hands nothing on: its only peer is the hub,
 /// whose answers are for its own nodes, and an answer the hub relays was made by another router.
@@ -6681,7 +6681,7 @@ fn format_prefixed_uuid(prefix: &str, bytes: &[u8; 16]) -> String {
 
 /// Reads the hive's LSA region into `lsa_snapshot`, and rebuilds the FIB from it. The region is
 /// read with `lsa_snapshot`'s guard held: a gateway stores each copy it writes there too
-/// (`write_lsa_state`), and a copy read before that write must not replace it. Until 0.1.131 the
+/// (`write_lsa_state`), and a copy read before that write must not replace it. Until 0.1.132 the
 /// region was read first, and a refresh that read it just before a write could store its older
 /// copy after the writer's: until the next refresh the hub named no sender for a node that had just
 /// connected on a spoke, and dropped its first frame as a foreign source's (A-195's review).
@@ -15907,7 +15907,7 @@ mod tests {
     /// A-245 on the hub: worker1's router answers, over the hub's link, a message from a node of
     /// ingress1 that the hub relayed to it: `UNREACHABLE` (here `LINK_BUSY`) or `TTL_EXCEEDED`.
     /// The hub hands the answer on to ingress1 as it came, one hop of TTL less, and nothing goes
-    /// back to worker1. Until 0.1.131 the hub gave it only to its own nodes, and the sender on
+    /// back to worker1. Until 0.1.132 the hub gave it only to its own nodes, and the sender on
     /// ingress1 waited out its own timeout.
     #[tokio::test]
     async fn a_far_routers_answer_goes_on_from_the_hub_to_a_sender_on_another_spoke() {
@@ -16353,7 +16353,7 @@ mod tests {
     /// each without its own nodes, and with no node when it has none to hear of; the same nodes
     /// again, in another order too, send nothing. Nor does a node gone, which the next
     /// advertisement, the beacon's at the latest, tells of (A-195's review: a node that restarts
-    /// costs each spoke one advertisement, not two). Until 0.1.131 only the beacon sent it, every
+    /// costs each spoke one advertisement, not two). Until 0.1.132 only the beacon sent it, every
     /// hello interval.
     #[tokio::test]
     async fn the_hub_tells_every_spoke_of_a_hives_new_nodes_at_once() {
@@ -16443,7 +16443,7 @@ mod tests {
     /// A-195's review on the hub: a node gone waits for the next advertisement, unless another
     /// hive lists its UUID too, the hub vouching for neither node of that UUID until now: that
     /// node is vouched for again at once. And a spoke left with no node to hear of hears so with
-    /// the beacon, an advertisement with no node; until 0.1.131 none went, and the spoke kept the
+    /// the beacon, an advertisement with no node; until 0.1.132 none went, and the spoke kept the
     /// last nodes the hub had vouched for to it until they expired.
     #[tokio::test]
     async fn a_node_gone_waits_for_the_next_advertisement_unless_it_frees_another_hives_uuid() {
@@ -16504,7 +16504,7 @@ mod tests {
 
     /// A-195's review end to end: the hub's advertisement with no node takes back, on the spoke,
     /// the last node the hub had vouched for to it, and the spoke no longer routes to that node
-    /// through the hub. Until 0.1.131 the hub sent none, and the spoke kept the node until its
+    /// through the hub. Until 0.1.132 the hub sent none, and the spoke kept the node until its
     /// entry expired, a dead interval after the last advertisement.
     #[tokio::test]
     async fn a_spoke_drops_the_last_node_the_hub_vouched_for_once_the_hub_has_none() {
@@ -16555,7 +16555,7 @@ mod tests {
     /// A-195 end to end: a node that has just connected on worker1 sends to a node of ingress1. The
     /// hub relays the frame and ingress1 delivers it: the hub's advertisement of the new node, sent
     /// as worker1's LSA named it, reaches ingress1 ahead of the frame, on the same link. Until
-    /// 0.1.131 ingress1 dropped the frame as a foreign source's, unless the hub's beacon had come
+    /// 0.1.132 ingress1 dropped the frame as a foreign source's, unless the hub's beacon had come
     /// in between.
     #[tokio::test]
     async fn a_spoke_delivers_the_first_frame_the_hub_relays_from_a_node_that_just_connected() {
@@ -16681,7 +16681,7 @@ mod tests {
     }
 
     /// A-195 at a link-up: a spoke that comes up on the hub reads its HELLO, WAN_ACCEPT and LSA,
-    /// then its reachability, the other spokes' nodes, before anything else. Until 0.1.131 the
+    /// then its reachability, the other spokes' nodes, before anything else. Until 0.1.132 the
     /// reachability waited for the hub's next beacon, up to a hello interval.
     #[tokio::test]
     async fn a_spoke_whose_link_comes_up_hears_the_hubs_reachability_right_after_its_lsa() {
@@ -17012,7 +17012,7 @@ mod tests {
     /// A-195's review: a write of the LSA region reads the LSA state only once it holds the writer,
     /// so of two writes at once the last is of the newest state. While a write holds the writer,
     /// another waits, and worker1's LSA is applied meanwhile with a new node; let go, the waiting
-    /// write stores it, in the region and in the router's copy of it. Until 0.1.131 the state was
+    /// write stores it, in the region and in the router's copy of it. Until 0.1.132 the state was
     /// read first, and the waiting write stored the state from before worker1's LSA, until the
     /// next write.
     #[tokio::test]
@@ -17061,7 +17061,7 @@ mod tests {
     /// so a copy read before the gateway's last write never replaces the one that write stored. The
     /// copy is held, as the gateway holds it to store what it wrote, and a refresh starts
     /// meanwhile; the region gets a new node and the gateway stores its copy; let go, the refresh
-    /// keeps the node. Until 0.1.131 the refresh read the region first and stored its older copy
+    /// keeps the node. Until 0.1.132 the refresh read the region first and stored its older copy
     /// last, and until the next refresh the hub named no sender for that node.
     #[tokio::test]
     async fn a_refresh_never_stores_a_copy_of_the_lsa_region_older_than_the_writers() {

@@ -46,7 +46,7 @@ Separate three things that are conflated today: **data** (which node lives on wh
 - The hub emits it alongside the LSA beacon (`mod.rs:2370-2375`), built from its `lsa_state`
   (all direct spokes), with **split-horizon**: a spoke is never sent its own nodes; each other
   spoke receives the union of the rest.
-- Since 0.1.131 (FINDINGS A-195) the hub also sends it to a spoke whose link comes up, right after
+- Since 0.1.132 (FINDINGS A-195) the hub also sends it to a spoke whose link comes up, right after
   its LSA and before the link takes any other frame (`bring_wan_peer_up`), and to every spoke as
   soon as an LSA adds to a hive's set of `(uuid, name, vpn_id)`, brings a stale hive back, or no
   longer lists a UUID another hive lists (whose node the hub vouches for again). The hub handles a
@@ -58,7 +58,7 @@ Separate three things that are conflated today: **data** (which node lives on wh
   Each advertisement replaces the hub's whole set on the spoke, so the hub builds and queues them
   one at a time (`reachability_adverts`), and one goes with no entry too, which takes back the
   last nodes the hub vouched for to that spoke.
-- Since 0.1.131 (FINDINGS A-245) the hub also hands a far spoke's `UNREACHABLE` or `TTL_EXCEEDED`
+- Since 0.1.132 (FINDINGS A-245) the hub also hands a far spoke's `UNREACHABLE` or `TTL_EXCEEDED`
   on toward the spoke of the sender it is for (`relay_far_answer`), so a sender on one spoke hears
   a refusal from another, as between any other two hives. Only an answer the adjacent router made
   itself goes on, and never back where it came from; one it does not hand on is counted and
