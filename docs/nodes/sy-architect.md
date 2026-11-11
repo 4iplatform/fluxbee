@@ -199,6 +199,17 @@ cannot be read is logged, and the agent runs on each action's help alone. Then
 [SY.admin, the executor](sy-admin.md#the-executor)). Plans sent to `POST /api/executor/plan` or
 pasted in the chat run without that confirmation, unless one is already pending in the session.
 
+**A workflow's removal and a node's unanswered state** (FINDINGS A-285, 0.1.133): the chat's
+prompt and the plan compiler's facts say that `wf_rules_delete` without `force` is refused while
+instances run (`INSTANCES_ACTIVE`) and while the WF node is not `RUNNING` or cannot count them
+(`INSTANCES_UNKNOWN`, naming why; a node that is not `RUNNING` keeps its instances), and that a
+config read of the node with no answer refuses it with `force` too (`ORCHESTRATOR_ERROR`: nothing
+changed, ask again) ([SY.wf-rules](sy-wf-rules.md#delete)). The plan compiler's facts also say
+that a node whose `lifecycle_state` is `UNKNOWN` may run, its hive's systemd gave no answer, so it
+is read again and never taken for stopped, and that `SERVICE_FAILED` with `retryable: true` from
+`run_node`, `start_node`, `kill_node` or `remove_node_instance` did nothing and can be asked again
+([SY.orchestrator](sy-orchestrator.md)).
+
 A confirmed run is verified (`verify_execution_result`): done, no step failed, each workflow it
 deployed has its node running (`wf_deploys_left_not_running`), and each change of the
 installation's `ai` applied on every hive. SY.admin's `set_installation_ai` writes the version and
@@ -294,9 +305,11 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   a node that does not exist (a deploy that must spawn one without a tenant is refused); an update
   is that one step, since SY.wf-rules restarts the node itself; `wf_rules_delete` exactly the workflow its
   operation names, with `force: true`, after the operator confirmed a plan that says how many of
-  its instances run; `add_route` and `add_vpn` exactly the declared route or VPN rule, and the
-  `delete_route` / `delete_vpn` of a replace exactly its prefix or pattern. A pinned step loses its
-  `executor_fill`, so SY.admin's executor cannot add a field back.
+  its instances run, or that they were not counted, as for a WF node that is not `RUNNING`, whose
+  removal ends the instances it keeps all the same (FINDINGS A-285); `add_route` and `add_vpn`
+  exactly the declared route or VPN rule, and the `delete_route` / `delete_vpn` of a replace
+  exactly its prefix or pattern. A pinned step loses its `executor_fill`, so SY.admin's executor
+  cannot add a field back.
 - **The workflow check** (WF Case 5): once the designer's manifest passes validation, each
   declared workflow goes to `wf_rules_check` on its hive (`check_declared_workflows`). A refusal
   goes back to the designer as feedback, with the error's path; a check that cannot run blocks.

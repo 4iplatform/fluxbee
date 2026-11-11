@@ -577,7 +577,9 @@ pub fn deployed_workflows(wf_state: Option<&serde_json::Value>) -> Vec<(String, 
 }
 
 /// A workflow's running instances in one hive's `list_workflows` answer (`active_instances`): None
-/// when SY.wf-rules could not count them (null: its node did not answer, or answered an error).
+/// when SY.wf-rules did not count them (null). It asks only a RUNNING WF node, so a node that is not
+/// RUNNING, which keeps its instances in its store, reads null, as do one with no config, one that
+/// did not answer and one that answered an error.
 pub fn workflow_active_instances(
     wf_state: Option<&serde_json::Value>,
     workflow_name: &str,
@@ -599,7 +601,7 @@ fn running_instances_note(active_instances: Option<u64>) -> String {
     match active_instances {
         Some(0) => "running instances: 0".to_string(),
         Some(count) => format!("running instances: {count}; removing the workflow ends them"),
-        None => "running instances: unknown (SY.wf-rules could not count them); removing the workflow ends any that run".to_string(),
+        None => "running instances: unknown (SY.wf-rules could not count them); removing the workflow ends any its WF node keeps, a stopped one's too".to_string(),
     }
 }
 
@@ -1581,7 +1583,8 @@ mod tests {
     }
 
     /// A removal says how many conversations it ends: the snapshot's `active_instances`, or
-    /// "unknown" when SY.wf-rules could not count them (null).
+    /// "unknown" when SY.wf-rules could not count them (null), which a WF node that is not RUNNING
+    /// reads too: its removal ends the instances it keeps all the same (FINDINGS A-285).
     #[test]
     fn a_removal_notes_the_workflows_running_instances() {
         let removal_notes = |active_instances: serde_json::Value| {
@@ -1608,9 +1611,9 @@ mod tests {
         );
         let notes = removal_notes(json!(null));
         assert!(
-            notes
-                .iter()
-                .any(|note| note.starts_with("running instances: unknown")),
+            notes.iter().any(|note| note
+                == "running instances: unknown (SY.wf-rules could not count them); removing the \
+                    workflow ends any its WF node keeps, a stopped one's too"),
             "{notes:?}"
         );
         let notes = removal_notes(json!(0));

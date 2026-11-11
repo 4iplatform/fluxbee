@@ -156,7 +156,7 @@ Every AI agent loads the same base tools: beyond answering, an agent can do only
 2. Show the operator the checked definition.
 3. Deploy it with `fluxbee_plan_compiler` (`wf_rules_compile_apply`, with `auto_spawn=true` and the `tenant_id` its node runs in: the node is spawned when it does not exist, and an update is that one step, which restarts the node). The operator confirms the plan.
 
-A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs: tell the operator how many run before you stage `wf_rules_delete`, which removes a workflow with running instances only with `force: true`.
+A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs, a stopped WF node's too: tell the operator how many run before you stage `wf_rules_delete`. Without `force: true` it is refused while instances run (INSTANCES_ACTIVE) and while the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: start the node or wait for it, or remove it with force). ORCHESTRATOR_ERROR, with force too, changed nothing: ask again.
 
 ## Pipeline confirmation rules
 
@@ -2482,6 +2482,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - Use `restart_node` only when the managed instance already exists and should be restarted.
 - Use `kill_node` to stop a node process. It does not necessarily delete the persisted instance.
 - Use `remove_node_instance` only to delete the persisted managed instance.
+- A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd did not answer. Read it again before you choose; never take it for stopped. `SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or `remove_node_instance` has that cause: nothing was done, and the same step can be asked again.
 - Use `publish_runtime_package` to publish a runtime package. It does not spawn nodes.
 
 ### Workflow runtime selection
@@ -2490,7 +2491,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - A `WF.<workflow_name>@<hive>` node must run a published workflow package runtime such as `wf.<workflow_name>`, whose manifest type is `workflow` and whose `runtime_base` is `wf.engine`.
 - To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: with `auto_spawn=true` and `tenant_id` it spawns the node when it does not exist, and without them no node is created; on an existing node it restarts it, so never add a `restart_node` after it. A deploy whose node does not run the definition is refused (`WF_NODE_NOT_DEPLOYED`, its `wf_node` says why): the definition is current, and the deploy is not done.
 - The definition was checked before it reached you (`wf_rules_check`, a read that stages nothing): `wf_rules_check` is never an executor step.
-- `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE, or INSTANCES_UNKNOWN when they cannot be counted); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them.
+- `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE), or whose WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: a node that is not RUNNING keeps its instances); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them. A config read of the WF node with no answer refuses it with `force` too (ORCHESTRATOR_ERROR), and nothing changes.
 - `wf_cancel_instance` cancels one instance of a WF node (hive, node_name `WF.<workflow_name>`, instance_id, reason): its cancel transition runs.
 - Only use `run_node` for `WF.*` when the concrete `wf.<workflow_name>` workflow package runtime already exists in the runtime manifest.
 
@@ -30378,6 +30379,39 @@ mod tests {
         let facts = build_plan_compiler_prompt(&[], &[], None);
         assert!(facts.contains("`wf_rules_check` is never an executor step"));
         assert!(facts.contains("never add a `restart_node` after it"));
+    }
+
+    /// FINDINGS A-285: since 0.1.133 (A-270) a workflow's delete without force is refused for more
+    /// than running instances: a WF node that is not RUNNING, or cannot count them, is
+    /// INSTANCES_UNKNOWN, and a config read of the node with no answer is ORCHESTRATOR_ERROR, with
+    /// force too. The chat's prompt and the plan compiler's facts say so, where they named running
+    /// instances only; and the facts say what a node's UNKNOWN state and a retryable SERVICE_FAILED
+    /// are (A-271): its hive's systemd gave no answer.
+    #[test]
+    fn archis_texts_say_what_a_workflow_delete_refuses() {
+        let chat = build_archi_prompt(None);
+        for text in [
+            "Removing a workflow ends the conversations it still runs, a stopped WF node's too",
+            "Without `force: true` it is refused while instances run (INSTANCES_ACTIVE) and while \
+             the WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: start \
+             the node or wait for it, or remove it with force)",
+            "ORCHESTRATOR_ERROR, with force too, changed nothing: ask again",
+        ] {
+            assert!(chat.contains(text), "{text}");
+        }
+        assert!(!chat.contains("with running instances only with `force: true`"));
+        let facts = build_plan_compiler_prompt(&[], &[], None);
+        for text in [
+            "or whose WF node is not RUNNING or cannot count them (INSTANCES_UNKNOWN, naming why: a \
+             node that is not RUNNING keeps its instances)",
+            "A config read of the WF node with no answer refuses it with `force` too \
+             (ORCHESTRATOR_ERROR), and nothing changes",
+            "A node whose `lifecycle_state` is `UNKNOWN` may run: its hive's systemd did not answer",
+            "`SERVICE_FAILED` with `retryable: true` from `run_node`, `start_node`, `kill_node` or \
+             `remove_node_instance` has that cause: nothing was done",
+        ] {
+            assert!(facts.contains(text), "{text}");
+        }
     }
 
     /// docs/hive-config-update-v1.md §4: Archi's provider and the hive's model are the installation
