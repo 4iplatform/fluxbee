@@ -1396,6 +1396,9 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
 - **A hive removed before this was built** (worker2, the throwaway gate workers before 0.1.133):
   its system ILKs are still active. On the operator's word, stage one `retire_hive_ilks` step per
   hive. Running it again is safe: it answers `count` 0.
+- **It has no SCMD.** The catalog's example (`curl -X POST /hives/<hive>/system-ilks/retire`) is
+  SY.admin's HTTP form: SCMD in this chat does not map it, and an operator's SCMD of it answers
+  `unsupported SCMD path`. Never offer it as SCMD; stage the plan step.
 - **Its refusals:** `HIVE_NOT_REMOVED` (409) for the motherbee and for a hive the registry still
   lists, a join in flight included: never retire a hive that runs, remove it first on the operator's
   word. `HIVE_REGISTRY_UNREADABLE` (503): retry once, then tell the operator. `INVALID_REQUEST`
