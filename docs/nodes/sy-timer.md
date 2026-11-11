@@ -110,13 +110,16 @@ gets its next fire time from the cron and goes back on the heap. A stop between 
 fire instead of sending it twice. A row that cannot be saved sends nothing, and the fire is tried
 again in 30 s (`timer_fire_persist_failed`).
 
-A fire holds its timer's lock (`timerLock`) from its read of the row to its save and its send.
+A fire holds its timer's lock (`lockTimer`) from its read of the row to its save and its send.
 `TIMER_CANCEL` and `TIMER_RESCHEDULE` take the same lock and read the timer again under it
 (`lockOwnedTimerForMutation`, since 1.4, FINDINGS A-220's review): one that lands during a fire
 waits, then sees what the fire wrote, so a one-shot that fired is `TIMER_ALREADY_FIRED` and a
 recurring timer canceled after its fire stays canceled. Before, the fire's save wrote over them. The
 save is made only while the row is still `pending` (`updateTimerIfStatus`): the fire of a timer
-purged meanwhile (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_fire_dropped`).
+purged meanwhile (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_fire_dropped`). The
+scheduler keeps a timer's lock only while something holds it or waits for it (since 1.5, FINDINGS
+A-244); before, it kept one for every timer that ever fired, was canceled or rescheduled, until
+SY.timer stopped.
 
 Each attempt goes under a new trace id, and is kept 30 s for the router's answer (`deliver`). An
 `UNREACHABLE` with that trace id, for a target that is not connected (`NODE_NOT_FOUND`,

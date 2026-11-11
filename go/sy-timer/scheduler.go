@@ -55,8 +55,9 @@ type timerScheduler struct {
 	mu     sync.Mutex
 	items  timerHeap
 	wakeCh chan struct{}
+	// lockMu guards locks: the timers being worked on, each with its lock (lockTimer).
 	lockMu sync.Mutex
-	locks  map[string]*sync.Mutex
+	locks  map[string]*timerLockEntry
 
 	sentMu sync.Mutex
 	// sent holds each fire sent in the last deliveryAnswerWindow, by the trace_id of its
@@ -102,6 +103,13 @@ var transientUnreachable = map[string]bool{
 	"LINK_BUSY":           true,
 }
 
+// timerLockEntry is a timer's lock, and how many hold it or wait for it (refs, under the scheduler's
+// lockMu): the map keeps the entry while refs is above zero (lockTimer, FINDINGS A-244).
+type timerLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // fireAttempt is a fire on its way: the row as it was when it fired (the fire's scheduled time and
 // fire_count), which attempt this is, and until when it is sent again.
 type fireAttempt struct {
@@ -116,7 +124,7 @@ func newTimerScheduler(service *Service) *timerScheduler {
 		service: service,
 		items:   timerHeap{},
 		wakeCh:  make(chan struct{}, 1),
-		locks:   map[string]*sync.Mutex{},
+		locks:   map[string]*timerLockEntry{},
 		sent:    map[string]*fireAttempt{},
 	}
 }
@@ -265,9 +273,8 @@ func (s *timerScheduler) processDue(ctx context.Context, now time.Time) {
 // while the row is still pending: a purge, which takes no lock, is not written over, and its fire
 // is not sent.
 func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, now time.Time) {
-	lock := s.timerLock(timerUUID)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := s.lockTimer(timerUUID)
+	defer unlock()
 
 	row, err := getTimer(ctx, s.service.db, timerUUID)
 	if err != nil {
@@ -446,9 +453,8 @@ func (s *timerScheduler) retryLater(fire *fireAttempt, reason string) {
 
 // retryFire sends a fire again, unless its timer was canceled or purged since.
 func (s *timerScheduler) retryFire(ctx context.Context, fire *fireAttempt) {
-	lock := s.timerLock(fire.row.UUID)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := s.lockTimer(fire.row.UUID)
+	defer unlock()
 
 	row, err := getTimer(ctx, s.service.db, fire.row.UUID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -607,15 +613,35 @@ func (s *timerScheduler) popDue(nowUTCMS int64) *timerHeapEntry {
 	return heap.Pop(&s.items).(*timerHeapEntry)
 }
 
-func (s *timerScheduler) timerLock(timerUUID string) *sync.Mutex {
+// lockTimer takes a timer's lock and returns what releases it; calling that again does nothing. A
+// fire and its retries take it, and TIMER_CANCEL and TIMER_RESCHEDULE (lockOwnedTimerForMutation), so
+// neither lands between a fire's read of the row and its save. The map keeps a timer's entry while
+// something holds it or waits for it: the last release takes it out, and a later caller makes a new
+// one, so two callers never hold different locks for one timer. Before, the map kept an entry for
+// every timer that ever fired, was canceled or rescheduled, for the process's life (FINDINGS A-244).
+func (s *timerScheduler) lockTimer(timerUUID string) (unlock func()) {
 	s.lockMu.Lock()
-	defer s.lockMu.Unlock()
-	lock, ok := s.locks[timerUUID]
+	entry, ok := s.locks[timerUUID]
 	if !ok {
-		lock = &sync.Mutex{}
-		s.locks[timerUUID] = lock
+		entry = &timerLockEntry{}
+		s.locks[timerUUID] = entry
 	}
-	return lock
+	entry.refs++
+	s.lockMu.Unlock()
+
+	entry.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+			s.lockMu.Lock()
+			defer s.lockMu.Unlock()
+			entry.refs--
+			if entry.refs == 0 {
+				delete(s.locks, timerUUID)
+			}
+		})
+	}
 }
 
 func nextRecurringFireAt(row timerRow, now time.Time) (int64, string, error) {

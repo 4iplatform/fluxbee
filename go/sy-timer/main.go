@@ -1177,15 +1177,13 @@ func (s *Service) lockOwnedTimerForMutation(ctx context.Context, incoming fluxbe
 	return row, foundByUUID, unlock, nil
 }
 
-// lockTimer takes a timer's lock, the one its fires take (timerScheduler.timerLock), and returns what
+// lockTimer takes a timer's lock, the one its fires take (timerScheduler.lockTimer), and returns what
 // releases it. With no scheduler (some tests) no fire runs, and there is nothing to take.
 func (s *Service) lockTimer(timerUUID string) func() {
 	if s.scheduler == nil {
 		return func() {}
 	}
-	lock := s.scheduler.timerLock(timerUUID)
-	lock.Lock()
-	return lock.Unlock
+	return s.scheduler.lockTimer(timerUUID)
 }
 
 func (s *Service) sendTimerScheduleExistingResponse(incoming fluxbeesdk.Message, verb string, row timerRow, alreadyExisted bool) error {

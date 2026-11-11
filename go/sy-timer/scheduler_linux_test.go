@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -433,6 +434,153 @@ func TestTheFireOfATimerPurgedDuringItIsNotSent(t *testing.T) {
 	}
 	if _, err := getTimer(ctx, service.db, "timer-purged"); err != sql.ErrNoRows {
 		t.Fatalf("the purged timer is back: %v", err)
+	}
+}
+
+// timerLocksKept is how many timers the scheduler keeps a lock for.
+func timerLocksKept(s *timerScheduler) int {
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	return len(s.locks)
+}
+
+// waitForTimerLockRefs waits until n hold or wait for timerUUID's lock.
+func waitForTimerLockRefs(t *testing.T, s *timerScheduler, timerUUID string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.lockMu.Lock()
+		refs := 0
+		if entry := s.locks[timerUUID]; entry != nil {
+			refs = entry.refs
+		}
+		s.lockMu.Unlock()
+		if refs == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d hold or wait for the lock of %s, want %d", refs, timerUUID, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A timer's lock leaves the scheduler with its last holder (FINDINGS A-244): after a fire, its
+// retry, a TIMER_RESCHEDULE, a TIMER_CANCEL, and a cancel that waits for a fire's lock and then finds
+// its timer purged, the scheduler keeps no lock. Before, it kept one for every timer that ever fired,
+// was canceled or rescheduled, for the process's life.
+func TestATimersLockLeavesWithItsLastHolder(t *testing.T) {
+	fastRetries(t)
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	ctx := context.Background()
+	noneKept := func(after string) {
+		t.Helper()
+		if n := timerLocksKept(service.scheduler); n != 0 {
+			t.Fatalf("after %s the scheduler keeps %d timer locks, want none", after, n)
+		}
+	}
+	pending := func(timerUUID string) timerRow {
+		return timerRow{
+			UUID:         timerUUID,
+			OwnerL2Name:  "WF.demo@motherbee",
+			TargetL2Name: "WF.demo@motherbee",
+			Kind:         "oneshot",
+			FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+			MissedPolicy: "fire",
+			Payload:      `{}`,
+			Status:       "pending",
+			CreatedAtUTC: time.Now().UTC().UnixMilli(),
+		}
+	}
+
+	insertDueTimer(t, service, "timer-fired", "fire")
+	traceID := fireOnce(t, service, tx, "timer-fired")
+	noneKept("a fire")
+	if err := service.handleMessage(unreachable(t, traceID, "NODE_NOT_FOUND")); err != nil {
+		t.Fatalf("handle UNREACHABLE: %v", err)
+	}
+	service.scheduler.processDue(ctx, time.Now().UTC().Add(time.Second))
+	if _, fired := mustReadFire(t, tx); fired.TimerUUID != "timer-fired" {
+		t.Fatalf("the retry sent %+v", fired)
+	}
+	noneKept("a retry")
+
+	insertOwnedTimer(t, service.db, pending("timer-changed"))
+	for _, change := range []struct {
+		verb    string
+		request map[string]any
+	}{
+		{verb: "TIMER_RESCHEDULE", request: map[string]any{"timer_uuid": "timer-changed", "new_fire_in_ms": (2 * time.Hour).Milliseconds()}},
+		{verb: "TIMER_CANCEL", request: map[string]any{"timer_uuid": "timer-changed"}},
+	} {
+		if err := service.handleMessage(mustBuildSystemMessage(t, change.request, change.verb)); err != nil {
+			t.Fatalf("%s: %v", change.verb, err)
+		}
+		if response := mustReadTimerResponse(t, tx); !response.OK {
+			t.Fatalf("%s: %+v", change.verb, response.Error)
+		}
+		noneKept("a " + change.verb)
+	}
+
+	// A fire holds the timer's lock; a cancel waits for it, and the timer is purged meanwhile.
+	insertOwnedTimer(t, service.db, pending("timer-purged"))
+	fireDone := service.scheduler.lockTimer("timer-purged")
+	cancel := mustBuildSystemMessage(t, map[string]any{"timer_uuid": "timer-purged"}, "TIMER_CANCEL")
+	answered := make(chan error, 1)
+	go func() { answered <- service.handleMessage(cancel) }()
+	waitForTimerLockRefs(t, service.scheduler, "timer-purged", 2)
+	if _, err := deleteTimersByOwner(ctx, service.db, "WF.demo@motherbee"); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	fireDone()
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancel did not end within 5 s")
+	}
+	if response := mustReadTimerResponse(t, tx); response.OK || response.Error == nil || response.Error.Code != "TIMER_NOT_FOUND" {
+		t.Fatalf("a cancel of a timer purged under it: %+v (error %+v)", response, response.Error)
+	}
+	noneKept("a cancel that found its timer purged")
+}
+
+// A timer's lock keeps its holders apart while its entry comes and goes (FINDINGS A-244): goroutines
+// that take the locks of a few timers over and over, each adding to its timer's count while it holds
+// the lock, lose no addition (and the race detector, in CI, sees any two that overlap), and leave no
+// lock behind. Releasing a lock again does nothing.
+func TestATimersLockKeepsItsHoldersApartAsItsEntryComesAndGoes(t *testing.T) {
+	scheduler := newTimerScheduler(&Service{})
+	const workers, rounds = 32, 500
+	timers := []string{"timer-a", "timer-b", "timer-c", "timer-d"}
+	counts := make([]int, len(timers)) // plain ints: only each timer's lock guards its count
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				i := (w + r) % len(timers)
+				unlock := scheduler.lockTimer(timers[i])
+				counts[i]++
+				unlock()
+				if r%7 == 0 {
+					unlock()
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	for i, count := range counts {
+		if want := workers * rounds / len(timers); count != want {
+			t.Fatalf("%s counted %d, want %d", timers[i], count, want)
+		}
+	}
+	if n := timerLocksKept(scheduler); n != 0 {
+		t.Fatalf("the scheduler keeps %d timer locks, want none", n)
 	}
 }
 

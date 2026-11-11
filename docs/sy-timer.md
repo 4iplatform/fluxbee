@@ -7,7 +7,8 @@ target (FINDINGS A-115); v1.3 for the next release: `TIMER_LIST` in pages (FINDI
 0.1.127: a recurring timer SY.timer cannot schedule is canceled, and a timer SY.timer cancels says
 why in `canceled_reason`; a refusal's code goes with its error, not in its text (FINDINGS A-220);
 v1.5 for the next release: a canceled timer is kept 7 days from its cancellation, not from its
-creation or its last fire (FINDINGS A-238)
+creation or its last fire (FINDINGS A-238), and a timer's lock is kept in memory only while it is in
+use (FINDINGS A-244)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -177,7 +178,7 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
 ### 4.4 Concurrency
 
 - One global mutex for the heap structure.
-- One mutex per timer (a map of mutexes by uuid), taken by the fire and its retries, and by `TIMER_CANCEL` and `TIMER_RESCHEDULE` (`lockOwnedTimerForMutation`, since v1.4, FINDINGS A-220's review). A fire holds it from its read of the row to its save and its send; a cancel or a reschedule that lands meanwhile waits, reads the timer again, and sees what the fire wrote: it wins, or loses cleanly. A one-shot that fired is `TIMER_ALREADY_FIRED`; a recurring timer canceled after a fire stays canceled. Before, they took no lock, and the fire's save wrote over them: a recurring timer its owner was told is canceled kept firing, and a one-shot rescheduled during its fire fired again at its new time.
+- One mutex per timer being worked on (`lockTimer`: a map by uuid, whose entry counts who holds it or waits for it and leaves with the last of them, since v1.5, FINDINGS A-244; before, the map kept a mutex for every timer that ever fired, was canceled or rescheduled, until `SY.timer` stopped), taken by the fire and its retries, and by `TIMER_CANCEL` and `TIMER_RESCHEDULE` (`lockOwnedTimerForMutation`, since v1.4, FINDINGS A-220's review). A fire holds it from its read of the row to its save and its send; a cancel or a reschedule that lands meanwhile waits, reads the timer again, and sees what the fire wrote: it wins, or loses cleanly. A one-shot that fired is `TIMER_ALREADY_FIRED`; a recurring timer canceled after a fire stays canceled. Before, they took no lock, and the fire's save wrote over them: a recurring timer its owner was told is canceled kept firing, and a one-shot rescheduled during its fire fired again at its new time.
 - A fire saves its row only while it is still `pending` (`updateTimerIfStatus`): `TIMER_PURGE_OWNER`, which takes no timer lock, is not written over, and the fire of a purged timer is not sent (`timer_fire_dropped`).
 - SQLite operations serialized by the driver (SQLite in WAL mode allows multiple readers + one writer).
 
