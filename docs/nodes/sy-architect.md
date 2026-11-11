@@ -137,6 +137,18 @@ the body names none of the three (`scmd_tap_key_params`, the review of FINDINGS 
 0.1.133 the query went unread: an SCMD that named the tap there reached SY.config.routes as `{}`,
 refused with `NOT_FOUND`, and the tap stayed.
 
+A recorded mutation whose answer did not come within Archi's wait stays open (`timeout_unknown`),
+as does an `add_hive` whose join runs in the background (`accepted`), and while it is, the same
+action with the same parameters in the same chat is refused `OPERATION_ALREADY_TRACKED`. Such a
+request first reads an open `add_hive` in the motherbee's hive registry, `get_hive` for its hive
+(`reconcile_timeout_unknown_operation`): a hive `connected` with its join `done` closes the record
+as `succeeded_after_timeout`, one `failed` or `interrupted` as `failed` with its join's error, and
+`NOT_FOUND` as `failed` (the hive no longer exists). `INVALID_HIVE_ID` closes it as `failed` too:
+the hive id is not one, and `add_hive` refuses it, so the request goes on and gets `add_hive`'s
+own `INVALID_HIVE_ID` (FINDINGS A-311). `get_hive` refuses such an id since 0.1.136, where it
+answered `NOT_FOUND`; read as any other answer, the record would stay open for good. A join still
+running, or any other answer, leaves the record open.
+
 **`fluxbee_system_get`** is the LLM's read tool. It builds an SCMD from `{method, path, body}`
 and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`), and it runs reads
 only (`system_get_may_run`, FINDINGS A-73): a GET whose action changes nothing, and the POSTs that

@@ -12381,98 +12381,112 @@ async fn reconcile_timeout_unknown_operation(
     if record.status != "timeout_unknown" && record.status != "accepted" {
         return Ok(false);
     }
+    let Some((status, error_summary)) = add_hive_outcome_from_registry(state, record).await? else {
+        return Ok(false);
+    };
+    record.status = status.to_string();
+    record.error_summary = error_summary;
+    record.updated_at_ms = now_epoch_ms();
+    record.completed_at_ms = record.updated_at_ms;
+    save_operation(state, record).await?;
+    Ok(true)
+}
 
-    if record.action == "add_hive" {
-        let params: Value = serde_json::from_str(&record.params_json)
-            .unwrap_or_else(|_| Value::Object(Default::default()));
-        if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
-            let output = execute_admin_translation(
-                state,
-                AdminTranslation {
-                    admin_target: format!("SY.admin@{}", state.hive_id),
-                    action: "get_hive".to_string(),
-                    target_hive: state.hive_id.clone(),
-                    params: json!({ "hive_id": hive_id }),
-                },
-            )
-            .await?;
-            // The hive is GONE (removed, or the join never created it). Nothing will ever
-            // resolve this record, and leaving it open blocks every identical retry with
-            // OPERATION_ALREADY_TRACKED forever. Close it as failed.
-            if output
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|v| v.eq_ignore_ascii_case("not_found"))
-                || output
-                    .get("error_code")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| v.eq_ignore_ascii_case("NOT_FOUND"))
-            {
-                record.status = "failed".to_string();
-                record.error_summary =
-                    format!("hive '{hive_id}' no longer exists; the operation cannot be resolved");
-                record.updated_at_ms = now_epoch_ms();
-                record.completed_at_ms = record.updated_at_ms;
-                save_operation(state, record).await?;
-                return Ok(true);
-            }
-            if output
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|value| value.eq_ignore_ascii_case("ok"))
-                .unwrap_or(false)
-            {
-                // The hive's own recorded status is the source of truth for a background join.
-                // `payload.hive.status`, NOT `payload.status`. get_hive answers
-                // {"status":"ok","hive":<info.yaml>} and the admin nests that whole object under
-                // "payload", so `payload.status` is the literal envelope "ok" on every call —
-                // reading it sent a failed or still-running join straight to the catch-all and
-                // recorded it as succeeded, with the error summary cleared.
-                let hive_status = output
-                    .get("payload")
-                    .and_then(|p| p.get("hive"))
-                    .and_then(|h| h.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let join_phase = output
-                    .get("payload")
-                    .and_then(|p| p.get("hive"))
-                    .and_then(|h| h.get("join"))
-                    .and_then(|j| j.get("phase"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+/// The error summary of an open `add_hive` record whose hive id is not one (FINDINGS A-311).
+const ADD_HIVE_ID_NOT_A_HIVE_ID: &str =
+    "hive_id is not a hive id (1 to 64 letters, digits, '_' or '-'), and add_hive refuses it: \
+     no hive was added";
 
-                // POSITIVE test for success, never a catch-all. A catch-all here recorded a
-                // `pending` hive — one whose join failed during finalize or SSH hardening — as
-                // `succeeded_after_timeout` with the error summary CLEARED. And `connected` is
-                // written well before the flow ends, so it alone does not mean done.
-                if hive_status == "connected" && join_phase == "done" {
-                    record.status = "succeeded_after_timeout".to_string();
-                    record.error_summary.clear();
-                } else if matches!(hive_status, "failed" | "interrupted") {
-                    record.status = "failed".to_string();
-                    record.error_summary = output
-                        .get("payload")
-                        .and_then(|p| p.get("hive"))
-                        .and_then(|h| h.get("join"))
-                        .and_then(|j| j.get("error_detail"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("the background join did not complete")
-                        .to_string();
-                } else {
-                    // joining, pending, connected-but-not-done, or an unrecognised state: still
-                    // open. Leave the record alone and look again next time.
-                    return Ok(false);
-                }
-                record.updated_at_ms = now_epoch_ms();
-                record.completed_at_ms = record.updated_at_ms;
-                save_operation(state, record).await?;
-                return Ok(true);
-            }
-        }
+/// How an open `add_hive` record ends (`reconcile_timeout_unknown_operation`), read in the
+/// motherbee's hive registry: SY.admin's `get_hive` for the record's hive id. Its final status and
+/// error summary; None while the answer settles nothing (a join still running, an answer of
+/// another kind) and for a record of another action. It saves nothing: the reconcile does.
+async fn add_hive_outcome_from_registry(
+    state: &ArchitectState,
+    record: &ChatOperationRecord,
+) -> Result<Option<(&'static str, String)>, ArchitectError> {
+    if record.action != "add_hive" {
+        return Ok(None);
     }
+    let params: Value = serde_json::from_str(&record.params_json)
+        .unwrap_or_else(|_| Value::Object(Default::default()));
+    let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let output = execute_admin_translation(
+        state,
+        AdminTranslation {
+            admin_target: format!("SY.admin@{}", state.hive_id),
+            action: "get_hive".to_string(),
+            target_hive: state.hive_id.clone(),
+            params: json!({ "hive_id": hive_id }),
+        },
+    )
+    .await?;
+    let error_code = output.get("error_code").and_then(Value::as_str);
+    // The hive is GONE (removed, or the join never created it). Nothing will ever
+    // resolve this record, and leaving it open blocks every identical retry with
+    // OPERATION_ALREADY_TRACKED forever. Close it as failed.
+    if output
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|v| v.eq_ignore_ascii_case("not_found"))
+        || error_code.is_some_and(|v| v.eq_ignore_ascii_case("NOT_FOUND"))
+    {
+        return Ok(Some((
+            "failed",
+            format!("hive '{hive_id}' no longer exists; the operation cannot be resolved"),
+        )));
+    }
+    // A hive id that is not one (FINDINGS A-311): `add_hive` refuses it, so no hive was added,
+    // and since 0.1.136 `get_hive` refuses it too (INVALID_HIVE_ID), where it answered NOT_FOUND.
+    // Read as an answer of another kind, the record would stay open for good, and every
+    // identical retry would be OPERATION_ALREADY_TRACKED instead of add_hive's own
+    // INVALID_HIVE_ID.
+    if error_code.is_some_and(|v| v.eq_ignore_ascii_case("INVALID_HIVE_ID")) {
+        return Ok(Some(("failed", ADD_HIVE_ID_NOT_A_HIVE_ID.to_string())));
+    }
+    if !output
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("ok"))
+    {
+        return Ok(None);
+    }
+    // The hive's own recorded status is the source of truth for a background join.
+    // `payload.hive.status`, NOT `payload.status`. get_hive answers
+    // {"status":"ok","hive":<info.yaml>} and the admin nests that whole object under
+    // "payload", so `payload.status` is the literal envelope "ok" on every call —
+    // reading it sent a failed or still-running join straight to the catch-all and
+    // recorded it as succeeded, with the error summary cleared.
+    let hive = output.get("payload").and_then(|p| p.get("hive"));
+    let hive_status = hive
+        .and_then(|h| h.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let join = hive.and_then(|h| h.get("join"));
+    let join_phase = join
+        .and_then(|j| j.get("phase"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
-    Ok(false)
+    // POSITIVE test for success, never a catch-all. A catch-all here recorded a
+    // `pending` hive — one whose join failed during finalize or SSH hardening — as
+    // `succeeded_after_timeout` with the error summary CLEARED. And `connected` is
+    // written well before the flow ends, so it alone does not mean done.
+    if hive_status == "connected" && join_phase == "done" {
+        return Ok(Some(("succeeded_after_timeout", String::new())));
+    }
+    if matches!(hive_status, "failed" | "interrupted") {
+        let detail = join
+            .and_then(|j| j.get("error_detail"))
+            .and_then(Value::as_str)
+            .unwrap_or("the background join did not complete");
+        return Ok(Some(("failed", detail.to_string())));
+    }
+    // joining, pending, connected-but-not-done, or an unrecognised state: still
+    // open. Leave the record alone and look again next time.
+    Ok(None)
 }
 
 fn operation_status_from_output(output: &Value) -> String {
@@ -27474,6 +27488,114 @@ mod tests {
         // And a plain stringly error must not be promoted to "unknown".
         let flattened: ArchitectError = "timeout waiting response for something".into();
         assert!(!admin_error_is_admin_timeout(flattened.as_ref()));
+    }
+
+    /// FINDINGS A-311: an open `add_hive` record (`timeout_unknown`, or `accepted` while its join
+    /// runs) closes as failed when `get_hive` refuses its hive id (INVALID_HIVE_ID, since 0.1.136,
+    /// where such an id answered NOT_FOUND), as it closes when the registry does not have the hive:
+    /// the hive id is not one, and add_hive refuses it. Read as an answer of another kind, the
+    /// record would stay open for good, and every identical retry would be
+    /// OPERATION_ALREADY_TRACKED instead of add_hive's own INVALID_HIVE_ID. The other answers
+    /// settle the record as before.
+    #[tokio::test]
+    async fn an_open_add_hive_closes_on_a_hive_id_that_get_hive_refuses() {
+        // SY.admin's answers to `get_hive`, as its router delivers them: the orchestrator's answer
+        // in `payload`, its error code and message beside it.
+        let refused = |code: &str, message: &str| {
+            json!({ "status": "error", "action": "get_hive",
+                    "payload": { "status": "error", "error_code": code, "message": message },
+                    "error_code": code, "error_detail": message })
+        };
+        let entry = |hive: Value| {
+            json!({ "status": "ok", "action": "get_hive",
+                    "payload": { "status": "ok", "hive": hive },
+                    "error_code": null, "error_detail": null })
+        };
+        let not_a_hive_id = "hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'";
+        let closed = |status: &'static str, summary: &str| Some((status, summary.to_string()));
+        let cases = [
+            (
+                "../x",
+                refused("INVALID_HIVE_ID", not_a_hive_id),
+                closed("failed", ADD_HIVE_ID_NOT_A_HIVE_ID),
+            ),
+            (
+                "a.b",
+                refused("INVALID_HIVE_ID", not_a_hive_id),
+                closed("failed", ADD_HIVE_ID_NOT_A_HIVE_ID),
+            ),
+            (
+                "worker-9",
+                refused("NOT_FOUND", "No such file or directory (os error 2)"),
+                closed(
+                    "failed",
+                    "hive 'worker-9' no longer exists; the operation cannot be resolved",
+                ),
+            ),
+            (
+                "worker-9",
+                entry(json!({ "hive_id": "worker-9", "status": "connected",
+                              "join": { "phase": "done", "error_detail": null } })),
+                closed("succeeded_after_timeout", ""),
+            ),
+            (
+                "worker-9",
+                entry(json!({ "hive_id": "worker-9", "status": "failed",
+                              "join": { "phase": "done", "error_code": "SSH_AUTH_FAILED",
+                                        "error_detail": "ssh: permission denied" } })),
+                closed("failed", "ssh: permission denied"),
+            ),
+            // A join still running, and an answer that says nothing of the hive: still open.
+            (
+                "worker-9",
+                entry(json!({ "hive_id": "worker-9", "status": "connected",
+                              "join": { "phase": "running" } })),
+                None,
+            ),
+            (
+                "worker-9",
+                json!({ "status": "error", "action": "get_hive", "payload": null,
+                        "error_code": "TIMEOUT",
+                        "error_detail": "the orchestrator did not answer" }),
+                None,
+            ),
+        ];
+        let (state, mut router) = harness_state();
+        for (hive_id, answer, outcome) in cases {
+            let record = ChatOperationRecord {
+                operation_id: "op-a311".to_string(),
+                session_id: "session-a311".to_string(),
+                scope_id: operation_scope_id("session-a311"),
+                origin: "scmd".to_string(),
+                action: "add_hive".to_string(),
+                target_hive: PRIMARY_HIVE_ID.to_string(),
+                params_json: json!({ "address": "10.0.0.9", "hive_id": hive_id }).to_string(),
+                params_hash: String::new(),
+                preview_command: String::new(),
+                status: "timeout_unknown".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                dispatched_at_ms: 1,
+                completed_at_ms: 0,
+                request_id: String::new(),
+                trace_id: String::new(),
+                error_summary: String::new(),
+            };
+            let (read, sent) = tokio::join!(
+                add_hive_outcome_from_registry(&state, &record),
+                answer_admin_command(&mut router, "get_hive", answer.clone()),
+            );
+            assert_eq!(
+                sent.payload["params"],
+                json!({ "hive_id": hive_id }),
+                "{answer}"
+            );
+            assert_eq!(read.expect("the registry's answer"), outcome, "{answer}");
+        }
+        // What the operator and the model read of it: the hive id is not one, add_hive refuses it.
+        for text in ["hive_id is not a hive id", "add_hive refuses it"] {
+            assert!(ADD_HIVE_ID_NOT_A_HIVE_ID.contains(text), "{text}");
+        }
     }
 
     fn sample_blob_ref(filename: &str, mime: &str, size: u64) -> BlobRef {
