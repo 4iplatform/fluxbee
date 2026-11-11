@@ -12943,6 +12943,45 @@ const SCMD_PAGE_KEYS: &[&str] = &["limit", "cursor"];
 /// Which of the installation's versions a versions read lists.
 const SCMD_VERSIONS_KEYS: &[&str] = &["versions_limit", "versions_before"];
 
+/// The params of a read of the deployments' or the drift alerts' history, as SY.admin's routes read
+/// its query (`deployments_payload_from_query`, `drift_alerts_payload_from_query`; FINDINGS A-288),
+/// where all of it was dropped: `limit` only when it is a number, so the orchestrator's default (50)
+/// holds otherwise, and each of the read's `filters` only when it is not empty. The orchestrator
+/// filters by each.
+fn scmd_history_params(raw_query: Option<&str>, filters: &[&str]) -> Value {
+    let mut params = json!({});
+    for (key, value) in scmd_query_params(raw_query) {
+        let Value::String(text) = value else {
+            continue;
+        };
+        let text = text.trim();
+        if key == "limit" {
+            if let Ok(limit) = text.parse::<u64>() {
+                params["limit"] = json!(limit);
+            }
+        } else if filters.contains(&key.as_str()) && !text.is_empty() {
+            params[key.as_str()] = json!(text);
+        }
+    }
+    params
+}
+
+/// What a deployments read filters by beside `limit`, and a drift alerts read.
+const SCMD_DEPLOYMENT_FILTERS: &[&str] = &["category"];
+const SCMD_DRIFT_ALERT_FILTERS: &[&str] = &["category", "severity", "kind"];
+
+/// The hive a global read of the deployments or the drift alerts names, `?hive=`: that hive's
+/// history is read then, as on SY.admin's `GET /deployments?hive=` and `GET /drift-alerts?hive=`
+/// (FINDINGS A-288).
+fn scmd_query_hive(raw_query: Option<&str>) -> Option<String> {
+    scmd_query_params(raw_query)
+        .get("hive")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hive| !hive.is_empty())
+        .map(str::to_string)
+}
+
 /// `GET /hives/{hive}/timer/timers?owner_l2_name=&status_filter=&limit=&cursor=`, read as SY.admin's
 /// HTTP route reads it: the texts decoded (FINDINGS A-279), so a cursor
 /// (`<fire_at_utc_ms>:<uuid>`) written `%3A` is the one SY.timer gave and an owner written `%40` the
@@ -13579,18 +13618,42 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: Value::Object(scmd_query_params(raw_query)),
         }),
-        ("GET", ["deployments"]) => Ok(AdminTranslation {
-            admin_target,
-            action: "list_deployments".to_string(),
-            target_hive: local_hive_id.to_string(),
-            params: json!({}),
-        }),
-        ("GET", ["drift-alerts"]) => Ok(AdminTranslation {
-            admin_target,
-            action: "list_drift_alerts".to_string(),
-            target_hive: local_hive_id.to_string(),
-            params: json!({}),
-        }),
+        // The history of every hive, or with `?hive=` that hive's, as SY.admin's
+        // `GET /deployments?hive=` reads it (FINDINGS A-288).
+        ("GET", ["deployments"]) => {
+            let params = scmd_history_params(raw_query, SCMD_DEPLOYMENT_FILTERS);
+            Ok(match scmd_query_hive(raw_query) {
+                Some(hive) => AdminTranslation {
+                    admin_target,
+                    action: "get_deployments".to_string(),
+                    target_hive: hive,
+                    params,
+                },
+                None => AdminTranslation {
+                    admin_target,
+                    action: "list_deployments".to_string(),
+                    target_hive: local_hive_id.to_string(),
+                    params,
+                },
+            })
+        }
+        ("GET", ["drift-alerts"]) => {
+            let params = scmd_history_params(raw_query, SCMD_DRIFT_ALERT_FILTERS);
+            Ok(match scmd_query_hive(raw_query) {
+                Some(hive) => AdminTranslation {
+                    admin_target,
+                    action: "get_drift_alerts".to_string(),
+                    target_hive: hive,
+                    params,
+                },
+                None => AdminTranslation {
+                    admin_target,
+                    action: "list_drift_alerts".to_string(),
+                    target_hive: local_hive_id.to_string(),
+                    params,
+                },
+            })
+        }
         ("GET", ["acme", "status"]) => Ok(AdminTranslation {
             admin_target,
             action: "acme_status".to_string(),
@@ -14094,17 +14157,18 @@ fn translate_scmd(
                 params,
             })
         }
+        // The path names the hive: SY.admin's route reads no `?hive=` here (FINDINGS A-288).
         ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_deployments".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({}),
+            params: scmd_history_params(raw_query, SCMD_DEPLOYMENT_FILTERS),
         }),
         ("GET", ["hives", hive_id, "drift-alerts"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_drift_alerts".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({}),
+            params: scmd_history_params(raw_query, SCMD_DRIFT_ALERT_FILTERS),
         }),
         ("GET", ["hives", hive_id, "opa", "policy"]) => Ok(AdminTranslation {
             admin_target,
@@ -32971,6 +33035,102 @@ mod tests {
             assert_eq!(translated.action, action, "{path}");
             assert_eq!(translated.params, params, "{path}");
         }
+    }
+
+    /// FINDINGS A-288: `GET /deployments` reads its query as SY.admin's route does, where all of it
+    /// was dropped: `limit` as a number and `category`, which the orchestrator filters by, and
+    /// `?hive=` that hive's deployments (`get_deployments`). A limit that is no number is left out
+    /// (the orchestrator's 50 holds), and so is an empty filter or a drift alert's.
+    #[test]
+    fn the_deployments_read_carries_its_query() {
+        let translate = |path: &str| {
+            translate_scmd("motherbee", parse(&format!("curl -X GET {path}")))
+                .expect("translation should succeed")
+        };
+        let every_hive = translate("/deployments?limit=20&category=run%74ime");
+        assert_eq!(every_hive.action, "list_deployments");
+        assert_eq!(every_hive.target_hive, "motherbee");
+        assert_eq!(
+            every_hive.params,
+            json!({ "limit": 20, "category": "runtime" })
+        );
+
+        let one_hive = translate("/deployments?hive=worker1&limit=5");
+        assert_eq!(one_hive.action, "get_deployments");
+        assert_eq!(one_hive.target_hive, "worker1");
+        assert_eq!(one_hive.params, json!({ "limit": 5 }));
+
+        let left_out = translate("/deployments?limit=ten&category=%20&severity=critical&hive=%20");
+        assert_eq!(left_out.action, "list_deployments");
+        assert_eq!(left_out.target_hive, "motherbee");
+        assert_eq!(left_out.params, json!({}));
+        assert_eq!(translate("/deployments").params, json!({}));
+    }
+
+    /// FINDINGS A-288: `GET /drift-alerts` reads its query as SY.admin's route does, where all of it
+    /// was dropped: `limit` as a number, `category`, `severity` and `kind`, which the orchestrator
+    /// filters by, and `?hive=` that hive's alerts (`get_drift_alerts`).
+    #[test]
+    fn the_drift_alerts_read_carries_its_query() {
+        let translate = |path: &str| {
+            translate_scmd("motherbee", parse(&format!("curl -X GET {path}")))
+                .expect("translation should succeed")
+        };
+        let every_hive = translate(
+            "/drift-alerts?category=core&severity=critical&kind=post_sync_mismatch&limit=10",
+        );
+        assert_eq!(every_hive.action, "list_drift_alerts");
+        assert_eq!(every_hive.target_hive, "motherbee");
+        assert_eq!(
+            every_hive.params,
+            json!({ "category": "core", "severity": "critical", "kind": "post_sync_mismatch", "limit": 10 })
+        );
+
+        let one_hive = translate("/drift-alerts?hive=worker1&category=posture&limit=all");
+        assert_eq!(one_hive.action, "get_drift_alerts");
+        assert_eq!(one_hive.target_hive, "worker1");
+        assert_eq!(one_hive.params, json!({ "category": "posture" }));
+        assert_eq!(translate("/drift-alerts").params, json!({}));
+    }
+
+    /// FINDINGS A-288: `GET /hives/{hive}/deployments` reads `limit` and `category` as SY.admin's
+    /// route does, where they were dropped. The path names the hive: a `?hive=` changes nothing
+    /// there, as on SY.admin's route.
+    #[test]
+    fn a_hives_deployments_read_carries_its_query() {
+        let read = translate_scmd(
+            "motherbee",
+            parse(
+                "curl -X GET /hives/worker1/deployments?category=core&limit=3&hive=worker2&kind=x",
+            ),
+        )
+        .expect("translation should succeed");
+        assert_eq!(read.action, "get_deployments");
+        assert_eq!(read.target_hive, "worker1");
+        assert_eq!(read.params, json!({ "category": "core", "limit": 3 }));
+    }
+
+    /// FINDINGS A-288: `GET /hives/{hive}/drift-alerts` reads `limit`, `category`, `severity` and
+    /// `kind` as SY.admin's route does, each decoded once, where they were dropped. The path names
+    /// the hive: a `?hive=` changes nothing there.
+    #[test]
+    fn a_hives_drift_alerts_read_carries_its_query() {
+        let read = translate_scmd(
+            "motherbee",
+            parse("curl -X GET '/hives/motherbee/drift-alerts?category=posture&severity=warning&kind=loopback_service_exposed_sy%2Dadmin&limit=50&hive=worker1'"),
+        )
+        .expect("translation should succeed");
+        assert_eq!(read.action, "get_drift_alerts");
+        assert_eq!(read.target_hive, "motherbee");
+        assert_eq!(
+            read.params,
+            json!({
+                "category": "posture",
+                "severity": "warning",
+                "kind": "loopback_service_exposed_sy-admin",
+                "limit": 50
+            })
+        );
     }
 
     /// FINDINGS A-279: a `%` without two hex digits after it stays as it came, whatever follows it:

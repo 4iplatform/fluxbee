@@ -154,10 +154,15 @@ error: it lists the timers after the place it names ([SY.timer §7.6](../sy-time
 outcome, an executor plan's steps among them (origin `executor`). `GET /artifacts` (FINDINGS
 A-212) lists the public pages that are up (`list_published_artifacts`), newest first, each by its
 `publication_id` and never by its link's key; taking one down stays a plan the operator
-confirms. Archi's own
-reads of a list, the nodes of a hive a redeploy reads (`list_nodes_for_hive`) and the motherbee's
-nodes its status shows, go page after page with a smaller page when SY.admin says how many rows fit
-(`admin_listing_every_page`); an answer that is not ok is an error, never an empty list.
+confirms. `GET /deployments` and `GET /drift-alerts` (FINDINGS A-288) read `?limit=&category=`,
+the drift alerts `&severity=&kind=` too, as SY.admin's routes do (`scmd_history_params`: `limit`
+only when it is a number, so the orchestrator's 50 holds otherwise), and `?hive=` reads that
+hive's history (`get_deployments`, `get_drift_alerts`); `GET /hives/{hive}/deployments` and
+`/hives/{hive}/drift-alerts` read the same filters. Before 0.1.133 all four dropped their query.
+Archi's own reads of a list, the nodes of a hive a redeploy reads (`list_nodes_for_hive`) and the
+motherbee's nodes its status shows, go page after page with a smaller page when SY.admin says how
+many rows fit (`admin_listing_every_page`); an answer that is not ok is an error, never an empty
+list.
 
 **A plan whose answer was too large** (FINDINGS A-198): SY.admin cuts an executor run's answer as
 far as the frame needs, and past that answers `REPLY_TOO_LARGE` with `action_ran` and the run's
