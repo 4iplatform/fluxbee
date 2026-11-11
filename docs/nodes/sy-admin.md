@@ -263,11 +263,11 @@ starts, and `total` says how many rows there are in all (`timer_list` answers no
 - **Cursors are opaque.** Pass `next_cursor` back as it came. A cursor names a place in the order,
   not a row, so a row removed since keeps the place, and a row added before it does not move the
   next page. A cursor the listing did not give (another listing's, or none at all) answers
-  `INVALID_CURSOR` (HTTP status 400), never an empty page. `list_recent_commands`' place is each
-  entry's `seq`, given under the log's lock in the order the entries were written, so a clock that
-  steps back neither hides nor repeats an entry; entries written before 0.1.123 have none and page
-  after every entry with one. Its pages also stay within half a frame, whatever the entries'
-  params.
+  `INVALID_CURSOR` (HTTP status 400), never an empty page; `timer_list`'s is SY.timer's to check
+  (below). `list_recent_commands`' place is each entry's `seq`, given under the log's lock in the
+  order the entries were written, so a clock that steps back neither hides nor repeats an entry;
+  entries written before 0.1.123 have none and page after every entry with one. Its pages also
+  stay within half a frame, whatever the entries' params.
 - **`timer_list` is SY.timer's page, as SY.timer answers it** ([SY.timer §7.6](../sy-timer.md)),
   so the last two points hold for it only in part. SY.admin asks one `TIMER_LIST` and answers it,
   with no `total`. A timer whose fire time moves between two pages (a recurring timer's fire, a

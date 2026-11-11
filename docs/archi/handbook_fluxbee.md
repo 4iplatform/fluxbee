@@ -961,8 +961,10 @@ person: when its provider gave no answer, the error carries the operator's text 
   wait; to end them one by one, cancel them.
   - Without `force` it is refused while the node runs instances (`INSTANCES_ACTIVE`) and when they
     cannot be counted (`INSTANCES_UNKNOWN`: the node is not `RUNNING`, or does not answer).
-  - `ORCHESTRATOR_ERROR`, with `force` too: the WF node's config read was refused or got no
-    answer, so nothing changed. Ask again.
+  - `ORCHESTRATOR_ERROR` from the WF node's config read, with `force` too (its detail says nothing
+    was changed): ask again. Any other `ORCHESTRATOR_ERROR` may come from the node's kill, which
+    may have stopped or removed it: read the workflow's status (`wf_rules_get_status`) before
+    asking again.
   - `PACKAGE_PUBLISH_FAILED` after a removal: the workflow, its node and its state are gone, and
     its versions not removed yet stayed in dist, all of them possibly. The first
     `remove_runtime_version` refused, or not answered within 5 s, stopped the rest (the reason in

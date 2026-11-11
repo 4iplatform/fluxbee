@@ -17244,14 +17244,19 @@ const NODE_PAGES_LEFT_UP_NOTE: &str = "A node's purge names the pages the node p
 
 /// What the node actions that check the node's unit answer while systemd does not (FINDINGS
 /// A-271).
-const NODE_UNIT_UNANSWERED_NOTE: &str = "502 SERVICE_FAILED with retryable: true in its payload: the hive's systemd did not answer whether the node's unit runs, though asked again for up to a second, and nothing was done (run_node undoes its launch, its config and identity included; FINDINGS A-271, since 0.1.133). Ask again: the same action is answered once systemd answers.";
+const NODE_UNIT_UNANSWERED_NOTE: &str = "502 SERVICE_FAILED with retryable: true in its payload: the hive's systemd did not answer whether the node's unit runs, though asked again for up to a second, and nothing was done (FINDINGS A-271, since 0.1.133): run_node launched nothing and undid the config and identity it had written. Ask again: the same action is answered once systemd answers.";
 
 /// What the node reads say of a node's lifecycle (FINDINGS A-271).
-const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and the router sees the node), STARTING (its unit runs and the router does not see it yet), STOPPED, FAILED or UNKNOWN. UNKNOWN: the hive's systemd did not answer whether the node's unit runs (FINDINGS A-271, since 0.1.133): read it again, and never take it for STOPPED. A managed node whose unit does not run and that has no config or state left reads UNKNOWN too.";
+const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and the router sees the node), STARTING (its unit runs and the router does not see it yet), STOPPED, FAILED or UNKNOWN. UNKNOWN: the hive's systemd gave no full answer for the node's unit, whether it runs or, when it does not run, whether it failed (FINDINGS A-271, since 0.1.133): read it again, and never take it for STOPPED. A managed node whose unit does not run and that has no config or state left reads UNKNOWN too, every time.";
 
 /// What `remove_runtime_version` refuses, nothing removed.
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. A node whose unit does not run is not listed (stopped, failed, or between two restarts of a crash loop): one relaunched later (relaunch_on_boot) fails to start once its version is gone, so stop it (kill_node) or move it first.";
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable is true. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT, TRANSPORT_ERROR; a worker whose orchestrator does not answer delays it, since the motherbee asks the workers one at a time), refused it (its code), could not make it (USAGE_READ_FAILED) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive): it did not answer (UNREACHABLE: down, restarting, or stale in the LSA), answered an error (RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet) or gave no list of its nodes (USAGE_UNREADABLE). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
+
+/// A workflow delete's ORCHESTRATOR_ERROR that does not come from the WF node's config read: the
+/// node's kill (`DeleteWorkflow` in go/sy-wf-rules/node/delete.go), which SY.wf-rules waits for
+/// 25 s (`nodeDeleteTimeout`) while SY.admin gives kill_node 180 s.
+const WF_DELETE_KILL_ERROR_NOTE: &str = "Any other ORCHESTRATOR_ERROR may come from the node's kill, refused or not answered within SY.wf-rules' 25 s while the orchestrator went on, which may have stopped or removed the node: read the workflow's status (wf_rules_get_status) before asking again.";
 
 /// What a workflow's delete leaves when SY.wf-rules' purge of its versions meets a removal that
 /// fails (`purgeOnPrimary` in go/sy-wf-rules/node/package_publish.go), and what a workflow created
@@ -17750,7 +17755,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Delete is a direct command to SY.wf-rules, not a node CONFIG_SET operation.",
             "SY.wf-rules purges the workflow's WF node (kill_node with purge_instance) and answers {deleted, wf_node: {node_name, action}}.",
             "Without force it is refused, with nothing changed, while the WF node runs instances (INSTANCES_ACTIVE, with the count) and when they cannot be counted (INSTANCES_UNKNOWN, saying why): the node is not RUNNING (its state named), or its status read or its count failed or got no answer (FINDINGS A-270, since 0.1.133). A node that is not RUNNING keeps its instances in its store, and force removes them with it.",
-            "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR (502): whether the node exists is unknown, and nothing changed. Ask again.",
+            "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR (502), whose detail says nothing was changed: whether the node exists is unknown. Ask again.",
+            WF_DELETE_KILL_ERROR_NOTE,
             WF_DELETE_VERSIONS_LEFT_NOTE,
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of its WF node, wf_node.node_name.",
@@ -37367,7 +37373,9 @@ mod tests {
     /// action whose unit check systemd did not answer is 502 SERVICE_FAILED with retryable: true,
     /// nothing done (A-271); a node read's lifecycle_state can be UNKNOWN, read again (A-271); a
     /// workflow's delete needs force also when its instances cannot be counted, and a config read
-    /// with no answer refuses it with force too (A-270). timer_list's fields are pinned with its
+    /// with no answer refuses it with force too, saying nothing was changed (A-270), while an
+    /// ORCHESTRATOR_ERROR from the node's kill may have stopped or removed it, so the workflow's
+    /// status is read before asking again (the review). timer_list's fields are pinned with its
     /// contract (`timer_list_request_contract_exposes_owner_filter`), and RUNTIME_IN_USE's detail
     /// by `runtime_in_use_names_each_node_with_its_hive_and_state`.
     #[test]
@@ -37385,6 +37393,9 @@ mod tests {
         }
         assert!(NODE_UNIT_UNANSWERED_NOTE.starts_with("502 SERVICE_FAILED with retryable: true"));
         assert!(NODE_UNIT_UNANSWERED_NOTE.contains("nothing was done"));
+        assert!(NODE_UNIT_UNANSWERED_NOTE.contains(
+            "run_node launched nothing and undid the config and identity it had written"
+        ));
         assert!(NODE_UNIT_UNANSWERED_NOTE.contains("Ask again"));
 
         for action in ["get_node_status", "list_nodes", "list_tenant_nodes"] {
@@ -37393,8 +37404,10 @@ mod tests {
                 "{action}"
             );
         }
-        assert!(NODE_LIFECYCLE_NOTE
-            .contains("UNKNOWN: the hive's systemd did not answer whether the node's unit runs"));
+        assert!(NODE_LIFECYCLE_NOTE.contains(
+            "UNKNOWN: the hive's systemd gave no full answer for the node's unit, whether it runs \
+             or, when it does not run, whether it failed"
+        ));
         assert!(NODE_LIFECYCLE_NOTE.contains("read it again"));
         assert!(admin_action_request_notes("web_status")
             .iter()
@@ -37408,14 +37421,25 @@ mod tests {
         for words in ["cannot be counted", "not RUNNING", "INSTANCES_UNKNOWN"] {
             assert!(force.contains(words), "{force}");
         }
-        let notes = admin_action_request_notes("wf_rules_delete").join(" ");
+        let notes = admin_action_request_notes("wf_rules_delete");
+        assert!(notes.contains(&WF_DELETE_KILL_ERROR_NOTE));
+        let notes = notes.join(" ");
         for words in [
             "INSTANCES_UNKNOWN",
-            "With force or without, a config read of the WF node that is refused or gets no answer is ORCHESTRATOR_ERROR",
+            "With force or without, a config read of the WF node that is refused or gets no answer \
+             is ORCHESTRATOR_ERROR (502), whose detail says nothing was changed",
             "Ask again",
+            // The review: an ORCHESTRATOR_ERROR from the node's kill may have stopped or removed
+            // the node, as SY.architect's texts say (A-285, the review).
+            "Any other ORCHESTRATOR_ERROR may come from the node's kill",
+            "which may have stopped or removed the node: read the workflow's status \
+             (wf_rules_get_status) before asking again.",
         ] {
             assert!(notes.contains(words), "{words}");
         }
+        assert!(!notes.contains(
+            "ORCHESTRATOR_ERROR (502): whether the node exists is unknown, and nothing changed"
+        ));
     }
 
     /// The executor runs it as the operator, and no mesh caller reaches it, Archi included.
