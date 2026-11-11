@@ -265,13 +265,15 @@ type fakeSYTimer struct {
 	cancelErr error
 }
 
-func (f *fakeSYTimer) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error) {
-	now := fixedClock()
+func (f *fakeSYTimer) clock() time.Time {
 	if f.now != nil {
-		now = f.now()
+		return f.now()
 	}
+	return fixedClock()
+}
+func (f *fakeSYTimer) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error) {
 	if _, pending := f.pending[opts.ClientRef]; !pending {
-		f.pending[opts.ClientRef] = now.Add(d)
+		f.pending[opts.ClientRef] = f.clock().Add(d)
 	}
 	return "", nil
 }
@@ -290,6 +292,10 @@ func (f *fakeSYTimer) CancelByClientRef(_ context.Context, ref string) error {
 }
 func (f *fakeSYTimer) CancelByClientRefConfirmed(ctx context.Context, ref string) error {
 	return f.CancelByClientRef(ctx, ref)
+}
+func (f *fakeSYTimer) RescheduleInByClientRef(_ context.Context, ref string, d time.Duration) (string, error) {
+	f.pending[ref] = f.clock().Add(d)
+	return "", nil
 }
 func (f *fakeSYTimer) RescheduleByClientRef(_ context.Context, ref string, newFireAt time.Time) (string, error) {
 	f.pending[ref] = newFireAt

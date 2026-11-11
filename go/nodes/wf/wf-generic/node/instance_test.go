@@ -42,10 +42,15 @@ type mockTimerSender struct {
 	rescheduled []string // clientRefs rescheduled
 	// traces are the trace_ids the schedules and the reschedules that went out went under, in order
 	// (FINDINGS A-254), and in the fire_in of each ScheduleIn.
-	traces      []string
-	in          []time.Duration
-	scheduleErr error
-	cancelErr   error
+	traces []string
+	in     []time.Duration
+	// rescheduledIn and rescheduledAt are what each reschedule asked, in order: a delay
+	// (RescheduleInByClientRef) or a time (RescheduleByClientRef), the other zero.
+	rescheduledIn []time.Duration
+	rescheduledAt []time.Time
+	scheduleErr   error
+	cancelErr     error
+	rescheduleErr error
 }
 
 // sent is the trace_id of the next request that goes out, or err when it does not go.
@@ -84,9 +89,15 @@ func (m *mockTimerSender) CancelByClientRefConfirmed(_ context.Context, ref stri
 	m.cancelled = append(m.cancelled, ref)
 	return m.cancelErr
 }
-func (m *mockTimerSender) RescheduleByClientRef(_ context.Context, ref string, _ time.Time) (string, error) {
+func (m *mockTimerSender) RescheduleInByClientRef(_ context.Context, ref string, d time.Duration) (string, error) {
 	m.rescheduled = append(m.rescheduled, ref)
-	return m.sent(nil)
+	m.rescheduledIn, m.rescheduledAt = append(m.rescheduledIn, d), append(m.rescheduledAt, time.Time{})
+	return m.sent(m.rescheduleErr)
+}
+func (m *mockTimerSender) RescheduleByClientRef(_ context.Context, ref string, at time.Time) (string, error) {
+	m.rescheduled = append(m.rescheduled, ref)
+	m.rescheduledIn, m.rescheduledAt = append(m.rescheduledIn, 0), append(m.rescheduledAt, at)
+	return m.sent(m.rescheduleErr)
 }
 func (m *mockTimerSender) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo, error) {
 	return nil, nil

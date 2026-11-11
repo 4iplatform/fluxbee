@@ -655,7 +655,7 @@ Changes the fire time of an existing scheduled timer.
 }
 ```
 
-Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op. Its `fire_in` or `fire_at` is a literal or a `$ref`, as in `schedule_timer`. The index takes the new time first, and keeps the timer's mark when SY.timer has not taken it, so a refused timer goes again at its new time; a reschedule SY.timer does not take marks the timer the same way (§10.2).
+Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op. Its `fire_in` or `fire_at` is a literal or a `$ref`, as in `schedule_timer`. A `fire_in` goes to SY.timer as the delay it is (`new_fire_in_ms`), which SY.timer counts from when it gets the request, its 60 s floor included, as a schedule's `fire_in_ms`; a `fire_at` goes as the time it is (`new_fire_at_utc_ms`). Before A-254's review a `fire_in` went as a time counted on the WF's clock, so a move of `1m`, the least a timer waits, reached SY.timer less than 60 s ahead and was refused (`TIMER_BELOW_MINIMUM`) practically every time. The index takes the new time first, and keeps the timer's mark when SY.timer has not taken it, so a refused timer goes again at its new time; a reschedule SY.timer does not take marks the timer the same way (§10.2).
 
 ### 10.5 `set_variable`
 

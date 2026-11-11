@@ -686,6 +686,9 @@ func (s *switchedTimer) Schedule(context.Context, time.Time, sdk.ScheduleOptions
 }
 func (s *switchedTimer) CancelByClientRef(context.Context, string) error          { return nil }
 func (s *switchedTimer) CancelByClientRefConfirmed(context.Context, string) error { return nil }
+func (s *switchedTimer) RescheduleInByClientRef(context.Context, string, time.Duration) (string, error) {
+	return "timer-trace", nil
+}
 func (s *switchedTimer) RescheduleByClientRef(context.Context, string, time.Time) (string, error) {
 	return "timer-trace", nil
 }

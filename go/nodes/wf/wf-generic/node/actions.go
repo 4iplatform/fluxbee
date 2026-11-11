@@ -29,15 +29,20 @@ type Dispatcher interface {
 }
 
 // TimerSender abstracts SY.timer operations (testable without a real SY.timer). ScheduleIn,
-// Schedule, CancelByClientRef and RescheduleByClientRef send their request without waiting for
-// SY.timer's answer; a schedule and a reschedule return the trace_id their request went under, which
-// SY.timer's TIMER_RESPONSE and the router's UNREACHABLE carry back (FINDINGS A-254).
-// CancelByClientRefConfirmed and List wait for the answer.
+// Schedule, CancelByClientRef, RescheduleInByClientRef and RescheduleByClientRef send their request
+// without waiting for SY.timer's answer; a schedule and a reschedule return the trace_id their
+// request went under, which SY.timer's TIMER_RESPONSE and the router's UNREACHABLE carry back
+// (FINDINGS A-254). CancelByClientRefConfirmed and List wait for the answer.
+//
+// ScheduleIn and RescheduleInByClientRef send a delay (fire_in_ms, new_fire_in_ms), which SY.timer
+// counts from when it gets the request, on its own clock, its 60 s floor included; Schedule and
+// RescheduleByClientRef send a time (fire_at_utc_ms, new_fire_at_utc_ms), for a fire_at.
 type TimerSender interface {
 	ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error)
 	Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (string, error)
 	CancelByClientRef(ctx context.Context, clientRef string) error
 	CancelByClientRefConfirmed(ctx context.Context, clientRef string) error
+	RescheduleInByClientRef(ctx context.Context, clientRef string, d time.Duration) (string, error)
 	RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) (string, error)
 	List(ctx context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error)
 }
@@ -619,7 +624,7 @@ func execRescheduleTimer(ctx context.Context, action ActionDefinition, inst *WFI
 	}
 
 	clientRef := timerClientRef(inst.InstanceID, action.TimerKey)
-	newFireAt, _, err := timerTime(action, inst, event, actx)
+	newFireAt, in, err := timerTime(action, inst, event, actx)
 	if err != nil {
 		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
 	}
@@ -629,7 +634,16 @@ func execRescheduleTimer(ctx context.Context, action ActionDefinition, inst *WFI
 	if err := actx.Store.MoveTimer(ctx, inst.InstanceID, action.TimerKey, now, newFireAt.UnixMilli()); err != nil {
 		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
 	}
-	traceID, err := actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt)
+	// A fire_in goes as the delay it is, as a schedule's: SY.timer counts it from when it gets the
+	// request, its 60 s floor included. Sent as a time counted on the node's clock, before the move's
+	// commit, a move of "1m" reached SY.timer less than 60 s ahead, and SY.timer refused it
+	// (TIMER_BELOW_MINIMUM) practically every time (FINDINGS A-254's review).
+	var traceID string
+	if in > 0 {
+		traceID, err = actx.Timer.RescheduleInByClientRef(ctx, clientRef, in)
+	} else {
+		traceID, err = actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt)
+	}
 	req := timerRequest{timer: timerRef{inst.InstanceID, action.TimerKey}, verb: verbTimerReschedule, traceID: traceID, sentAtMS: now}
 	if err := actx.timerRequestSent(ctx, req, err); err != nil {
 		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
@@ -798,6 +812,27 @@ func (t *SDKTimerSender) CancelByClientRefConfirmed(ctx context.Context, clientR
 	return t.syncClient.CancelByClientRef(ctx, clientRef)
 }
 
+// RescheduleInByClientRef moves the timer under clientRef to fire d from when SY.timer gets the
+// request (new_fire_in_ms), as ScheduleIn's fire_in_ms.
+func (t *SDKTimerSender) RescheduleInByClientRef(ctx context.Context, clientRef string, d time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	clientRef = strings.TrimSpace(clientRef)
+	if clientRef == "" {
+		return "", fmt.Errorf("client_ref must be non-empty")
+	}
+	if d < sdk.MinTimerDuration {
+		return "", fmt.Errorf("minimum timer duration is %d seconds", int(sdk.MinTimerDuration.Seconds()))
+	}
+	return t.sendTimerRequest(verbTimerReschedule, map[string]any{
+		"client_ref":     clientRef,
+		"new_fire_in_ms": d.Milliseconds(),
+	})
+}
+
+// RescheduleByClientRef moves the timer under clientRef to fire at newFireAt (new_fire_at_utc_ms):
+// a fire_at's.
 func (t *SDKTimerSender) RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err

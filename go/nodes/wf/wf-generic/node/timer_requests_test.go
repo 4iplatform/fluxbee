@@ -497,6 +497,9 @@ func (l *loopTimer) Schedule(context.Context, time.Time, sdk.ScheduleOptions) (s
 }
 func (l *loopTimer) CancelByClientRef(context.Context, string) error          { return nil }
 func (l *loopTimer) CancelByClientRefConfirmed(context.Context, string) error { return nil }
+func (l *loopTimer) RescheduleInByClientRef(context.Context, string, time.Duration) (string, error) {
+	return l.schedule()
+}
 func (l *loopTimer) RescheduleByClientRef(context.Context, string, time.Time) (string, error) {
 	return l.schedule()
 }
@@ -669,10 +672,117 @@ func TestSYTimersAnswerToAScheduleReachesTheNode(t *testing.T) {
 	}
 }
 
+// reminderWorkflowJSON reminds in 30 minutes: SOON moves the reminder to a minute from then, the
+// least a timer waits, and AT to the time its payload names.
+const reminderWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "reminder",
+  "start_from": ["IO.in@motherbee"],
+  "input_schema": {"type": "object"},
+  "initial_state": "waiting",
+  "terminal_states": ["done"],
+  "states": [
+    {
+      "name": "waiting",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "reminder", "fire_in": "30m"}],
+      "transitions": [
+        {"event_match": {"msg": "SOON"}, "guard": "true", "actions": [{"type": "reschedule_timer", "timer_key": "reminder", "fire_in": "1m"}]},
+        {"event_match": {"msg": "AT"}, "guard": "true", "actions": [{"type": "reschedule_timer", "timer_key": "reminder", "fire_at": {"$ref": "event.payload.at"}}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'reminder'", "target_state": "done"}
+      ]
+    },
+    {"name": "done"}
+  ]
+}`
+
+// FINDINGS A-254's review: a reschedule_timer's fire_in goes to SY.timer as the delay it is
+// (new_fire_in_ms), as a schedule's does (fire_in_ms): SY.timer counts it from when it gets the
+// request, its 60 s floor included. It went as a time counted on the node's clock before the move's
+// commit, so a move of "1m", the least a timer waits, reached SY.timer less than 60 s ahead, and
+// SY.timer refused it (TIMER_BELOW_MINIMUM) practically every time. A fire_at goes as the time it is.
+func TestARescheduleSendsItsFireInAsADelay(t *testing.T) {
+	timer := &mockTimerSender{}
+	rt, _ := newTestRuntime(t, "", reminderWorkflowJSON, timer)
+	instanceID := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
+	tell := func(msg sdk.Message) {
+		t.Helper()
+		msg = from("IO.in@motherbee", msg)
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
+		if err := Dispatch(context.Background(), msg, rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tell(msgWithName("SOON"))
+	if len(timer.rescheduledIn) != 1 || timer.rescheduledIn[0] != time.Minute || !timer.rescheduledAt[0].IsZero() {
+		t.Fatalf("a fire_in goes as a delay: %v %v", timer.rescheduledIn, timer.rescheduledAt)
+	}
+	if row, _, _ := rt.Store.GetTimerForInstance(context.Background(), instanceID, "reminder"); row.FireAtMS != fixedClock().Add(time.Minute).UnixMilli() {
+		t.Fatalf("the index keeps the timer's time: %+v", row)
+	}
+	at := fixedClock().Add(2 * time.Hour)
+	tell(msgWithNameAndPayload("AT", map[string]any{"at": at.Format(time.RFC3339)}))
+	if len(timer.rescheduledAt) != 2 || !timer.rescheduledAt[1].Equal(at) || timer.rescheduledIn[1] != 0 {
+		t.Fatalf("a fire_at goes as a time: %v %v", timer.rescheduledIn, timer.rescheduledAt)
+	}
+	if row, _, _ := rt.Store.GetTimerForInstance(context.Background(), instanceID, "reminder"); row.FireAtMS != at.UnixMilli() {
+		t.Fatalf("the index keeps the timer's time: %+v", row)
+	}
+}
+
+// What a reschedule sends SY.timer, through the SDK and a router of the test's: a delay as
+// new_fire_in_ms, a time as new_fire_at_utc_ms, each under the timer's client_ref, and nothing else.
+// A delay under SY.timer's floor does not go.
+func TestAReschedulesRequestOnTheWire(t *testing.T) {
+	profile, err := wfRouteProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan sdk.Message, 4)
+	timer, err := NewSDKTimerSender(connectToTestRouterSeeing(t, profile, seen), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ref := timerClientRef("wfi:1", "reminder")
+	at := fixedClock().Add(2 * time.Hour)
+	if _, err := timer.RescheduleInByClientRef(ctx, ref, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := timer.RescheduleByClientRef(ctx, ref, at); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []map[string]any{
+		{"client_ref": ref, "new_fire_in_ms": float64(time.Minute.Milliseconds())},
+		{"client_ref": ref, "new_fire_at_utc_ms": float64(at.UnixMilli())},
+	} {
+		select {
+		case request := <-seen:
+			var payload map[string]any
+			if err := json.Unmarshal(request.Payload, &payload); err != nil || derefString(request.Meta.Msg) != verbTimerReschedule ||
+				fmt.Sprint(payload) != fmt.Sprint(want) {
+				t.Fatalf("%s %s, want %v (%v)", derefString(request.Meta.Msg), request.Payload, want, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reschedule never reached SY.timer")
+		}
+	}
+	if _, err := timer.RescheduleInByClientRef(ctx, ref, time.Minute-time.Millisecond); err == nil {
+		t.Fatal("a delay under SY.timer's floor does not go")
+	}
+}
+
 // connectToTestRouter connects a node named testNodeName, with profile, to a router of the test's: it
 // announces the node and answers as SY.timer of the hive, TIMER_LIST with no timer and any other
 // request refused, TIMER_STORAGE_ERROR, each on its trace_id with SY.timer's name stamped.
 func connectToTestRouter(t *testing.T, profile sdk.OperationalRouteProfile) *sdk.RouterDispatcher {
+	t.Helper()
+	return connectToTestRouterSeeing(t, profile, nil)
+}
+
+// connectToTestRouterSeeing is connectToTestRouter whose router hands each timer request it gets to
+// seen, when it is not nil, before it answers it.
+func connectToTestRouterSeeing(t *testing.T, profile sdk.OperationalRouteProfile, seen chan<- sdk.Message) *sdk.RouterDispatcher {
 	t.Helper()
 	// A socket's path holds about 100 bytes, which a test's own temporary directory may pass.
 	dir, err := os.MkdirTemp("", "wfr")
@@ -686,7 +796,7 @@ func connectToTestRouter(t *testing.T, profile sdk.OperationalRouteProfile) *sdk
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	go serveAsTestRouter(listener)
+	go serveAsTestRouter(listener, seen)
 
 	configDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(configDir, "hive.yaml"), []byte("hive_id: motherbee\n"), 0o644); err != nil {
@@ -703,7 +813,7 @@ func connectToTestRouter(t *testing.T, profile sdk.OperationalRouteProfile) *sdk
 	return dispatcher
 }
 
-func serveAsTestRouter(listener net.Listener) {
+func serveAsTestRouter(listener net.Listener, seen chan<- sdk.Message) {
 	conn, err := listener.Accept()
 	if err != nil {
 		return
@@ -738,6 +848,9 @@ func serveAsTestRouter(listener net.Listener) {
 		verb := derefString(request.Meta.Msg)
 		if !strings.HasPrefix(verb, "TIMER_") { // the node's WITHDRAW as it closes
 			continue
+		}
+		if seen != nil {
+			seen <- request
 		}
 		payload := map[string]any{"ok": true, "verb": verb, "timers": []any{}}
 		if verb != "TIMER_LIST" {
