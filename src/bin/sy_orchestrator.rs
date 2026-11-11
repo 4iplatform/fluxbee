@@ -4524,32 +4524,7 @@ async fn handle_admin(
                 "hives": hives,
             })
         }
-        "get_hive" => {
-            let hive = msg
-                .payload
-                .get("hive_id")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            if let Some(hive_id) = hive {
-                match get_hive(&state.state_dir, &hive_id) {
-                    Ok(payload) => serde_json::json!({
-                        "status": "ok",
-                        "hive": payload,
-                    }),
-                    Err(err) => serde_json::json!({
-                        "status": "error",
-                        "error_code": "NOT_FOUND",
-                        "message": err.to_string(),
-                    }),
-                }
-            } else {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_REQUEST",
-                    "message": "missing hive_id",
-                })
-            }
-        }
+        "get_hive" => get_hive_flow(&hives_root(), &msg.payload),
         "remove_hive" => {
             if !state.is_motherbee {
                 return send_admin_forbidden(
@@ -20858,10 +20833,12 @@ fn inventory_filter_hive(payload: &serde_json::Value) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+/// Whether the inventory lists a hive of the LSA: this hive, or one of the registry. A name that
+/// is not a hive id is no hive of the registry, with no path touched (`registry_has_hive`,
+/// FINDINGS A-311).
 fn hive_is_registered_for_inventory(state: &OrchestratorState, hive_id: &str) -> bool {
     let hive_id = hive_id.trim();
-    !hive_id.is_empty()
-        && (hive_id == state.hive_id || hives_root().join(hive_id).join("info.yaml").exists())
+    !hive_id.is_empty() && (hive_id == state.hive_id || registry_has_hive(&hives_root(), hive_id))
 }
 
 /// One page of a node listing (`inventory`, `list_nodes`; FINDINGS A-198): its nodes in the order
@@ -22538,10 +22515,12 @@ fn read_deployment_history(
     Ok(entries)
 }
 
+/// Whether a hive a deployment or a drift alert names is still there: this hive, or one of the
+/// registry. A name that is not a hive id is no hive of the registry, with no path touched
+/// (`registry_has_hive`, FINDINGS A-311).
 fn hive_present_for_deployments(state: &OrchestratorState, hive_id: &str) -> bool {
     let hive_id = hive_id.trim();
-    !hive_id.is_empty()
-        && (hive_id == state.hive_id || hives_root().join(hive_id).join("info.yaml").exists())
+    !hive_id.is_empty() && (hive_id == state.hive_id || registry_has_hive(&hives_root(), hive_id))
 }
 
 fn file_mtime_epoch_ms(path: &Path) -> Option<u64> {
@@ -23792,9 +23771,42 @@ fn local_hive_entry(state: &OrchestratorState) -> serde_json::Value {
     })
 }
 
-fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
-    let root = hives_root();
-    read_hive_info(&root, hive_id)
+/// `get_hive`: one hive's entry of the registry under `root` (`hives_root()`), its `info.yaml` as
+/// JSON. A hive id that is not one (`valid_hive_id`, as `add_hive` and `remove_hive` check it)
+/// answers INVALID_HIVE_ID, as `remove_hive` does, and nothing is read: joined into the path,
+/// `/srv/x` named a file outside the registry and `..` climbed out of it (FINDINGS A-311). A hive
+/// the registry does not have answers NOT_FOUND.
+fn get_hive_flow(root: &Path, payload: &serde_json::Value) -> serde_json::Value {
+    let Some(hive_id) = payload.get("hive_id").and_then(|value| value.as_str()) else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing hive_id",
+        });
+    };
+    if !valid_hive_id(hive_id) {
+        return invalid_hive_id_answer();
+    }
+    match read_hive_info(root, hive_id) {
+        Ok(hive) => serde_json::json!({
+            "status": "ok",
+            "hive": hive,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "NOT_FOUND",
+            "message": err.to_string(),
+        }),
+    }
+}
+
+/// The answer to a hive id that is not one (`valid_hive_id`), `remove_hive`'s and `get_hive`'s.
+fn invalid_hive_id_answer() -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": "INVALID_HIVE_ID",
+        "message": "invalid hive_id",
+    })
 }
 
 /// The removed hive's mesh credentials (FINDINGS A-48): its WAN TLS leaf and its identity HMAC
@@ -23950,11 +23962,7 @@ fn remove_hive_cleanup_local_flow(
 
 async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
     if !valid_hive_id(hive_id) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_HIVE_ID",
-            "message": "invalid hive_id",
-        });
+        return invalid_hive_id_answer();
     }
     if hive_id == state.hive_id {
         return serde_json::json!({
@@ -24229,8 +24237,25 @@ fn socket_cleanup_timeout(forward_result: &Result<serde_json::Value, Orchestrato
     }
 }
 
+/// A hive's entry of the registry under `root`, its `info.yaml`, for a hive id that is one
+/// (`valid_hive_id`). Any other id names no entry and is refused before a path is built, so no
+/// reader or writer of the registry reaches a file outside it, whoever gave the id (FINDINGS
+/// A-311: `get_hive` joined `/srv/x` or `..` into the path).
+fn hive_info_path(root: &Path, hive_id: &str) -> Result<PathBuf, OrchestratorError> {
+    if !valid_hive_id(hive_id) {
+        return Err(format!("invalid hive id {hive_id:?}: no entry of the hive registry").into());
+    }
+    Ok(root.join(hive_id).join("info.yaml"))
+}
+
+/// Whether the registry under `root` has an entry for `hive_id`, its `info.yaml`. A hive id that
+/// is not one is no hive of the registry, answered with no path touched (FINDINGS A-311).
+fn registry_has_hive(root: &Path, hive_id: &str) -> bool {
+    hive_info_path(root, hive_id).is_ok_and(|path| path.exists())
+}
+
 fn read_hive_info(root: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
-    let path = root.join(hive_id).join("info.yaml");
+    let path = hive_info_path(root, hive_id)?;
     let data = fs::read_to_string(&path)?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&data)?;
     let json = serde_json::to_value(yaml)?;
@@ -24242,7 +24267,7 @@ fn write_hive_info(
     hive_id: &str,
     info: &serde_json::Value,
 ) -> Result<(), OrchestratorError> {
-    let path = root.join(hive_id).join("info.yaml");
+    let path = hive_info_path(root, hive_id)?;
     let yaml = serde_yaml::to_string(info)?;
     // ATOMIC (tmp sibling + rename), not a bare `fs::write`. A background join rewrites this
     // file several times to publish its phase, and a torn write is a dead end: `hive_exists`
@@ -37107,7 +37132,7 @@ fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
 
 fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
     let _ = state_dir;
-    hives_root().join(hive_id).join("info.yaml").exists()
+    registry_has_hive(&hives_root(), hive_id)
 }
 
 fn hive_partial_exists(hive_id: &str) -> bool {
@@ -37116,7 +37141,8 @@ fn hive_partial_exists(hive_id: &str) -> bool {
 }
 
 /// Recorded `status` of an existing hive (`connected`, `pending`, ...), or None
-/// if info.yaml is absent/unreadable. A `pending` hive is one whose worker was
+/// if info.yaml is absent/unreadable or the id is not a hive id (`hive_info_path`,
+/// FINDINGS A-311). A `pending` hive is one whose worker was
 /// bootstrapped but whose finalize (peer-link / SSH controls / status=connected)
 /// did not complete; reading the status lets a retry resume it idempotently
 /// instead of dead-ending at HIVE_EXISTS (F9).
@@ -40710,6 +40736,180 @@ mod tests {
         assert_eq!(hive_status(&root, "missing"), None);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-311: `get_hive` refuses a hive id that is not one with INVALID_HIVE_ID, in
+    /// `remove_hive`'s shape, and reads nothing. Each refused id led to an `info.yaml` planted
+    /// here: above the registry (`..`), in it (`""`, `.`), beside it (`../x`), under it (`a/b`, an
+    /// id one character too long) or anywhere at all (an absolute path). The hive names in use
+    /// keep reading their entries.
+    #[tokio::test]
+    async fn get_hive_refuses_an_id_that_is_not_a_hive_id_and_reads_nothing() {
+        let base = std::env::temp_dir().join(format!("fluxbee-a311-get-{}", Uuid::new_v4()));
+        let root = base.join("hives");
+        let plant = |dir: &Path, hive_id: &str| {
+            fs::create_dir_all(dir).expect("dir");
+            fs::write(
+                dir.join("info.yaml"),
+                format!("hive_id: {hive_id}\nstatus: connected\n"),
+            )
+            .expect("info.yaml");
+        };
+        let too_long = "a".repeat(65);
+        let outside = base.join("srv").join("x");
+        plant(&base, "planted");
+        plant(&root, "planted");
+        plant(&base.join("x"), "planted");
+        plant(&root.join("a").join("b"), "planted");
+        plant(&root.join(&too_long), "planted");
+        plant(&outside, "planted");
+        let absolute = outside.to_string_lossy().to_string();
+        let refused = serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "invalid hive_id",
+        });
+        let state = sample_orchestrator_state_for_tests();
+        for hive_id in [
+            "/srv/x",
+            absolute.as_str(),
+            "..",
+            "../x",
+            "a/b",
+            "",
+            ".",
+            too_long.as_str(),
+        ] {
+            let answer = get_hive_flow(&root, &serde_json::json!({ "hive_id": hive_id }));
+            assert_eq!(answer, refused, "{hive_id:?}");
+            assert_eq!(
+                remove_hive_flow(&state, hive_id).await,
+                answer,
+                "{hive_id:?}: remove_hive's answer"
+            );
+        }
+
+        // The hive names in use, and an id of 64 characters, read their entries.
+        let longest = "a".repeat(64);
+        for hive_id in [
+            "motherbee",
+            "worker1",
+            "ingress1",
+            "egress1",
+            "gate0233",
+            longest.as_str(),
+        ] {
+            assert!(valid_hive_id(hive_id), "{hive_id}");
+            plant(&root.join(hive_id), hive_id);
+            let answer = get_hive_flow(&root, &serde_json::json!({ "hive_id": hive_id }));
+            assert_eq!(answer["status"], "ok", "{hive_id}: {answer}");
+            assert_eq!(answer["hive"]["hive_id"], hive_id, "{answer}");
+        }
+        let missing = get_hive_flow(&root, &serde_json::json!({ "hive_id": "worker2" }));
+        assert_eq!(missing["error_code"], "NOT_FOUND", "{missing}");
+        let no_id = get_hive_flow(&root, &serde_json::json!({}));
+        assert_eq!(no_id["error_code"], "INVALID_REQUEST", "{no_id}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// FINDINGS A-311 through the admin worker: `get_hive` with a path for its hive id, as
+    /// `GET /hives/%2F...` gives one once Archi decodes it, answers INVALID_HIVE_ID, and the
+    /// `info.yaml` at that path is not read.
+    #[tokio::test]
+    async fn the_admin_worker_refuses_get_hive_for_a_path() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-a311-admin-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join("info.yaml"),
+            "hive_id: planted\nstatus: connected\n",
+        )
+        .expect("plant");
+        let mut harness = admin_worker_for_tests().await;
+        harness
+            .inject(test_admin_command(
+                "a311-get-hive",
+                "get_hive",
+                serde_json::json!({ "hive_id": dir.to_string_lossy().to_string() }),
+            ))
+            .await
+            .expect("inject get_hive");
+        let answer = next_outgoing_now(&mut harness, "get_hive answered").await;
+        assert_eq!(answer.meta.action.as_deref(), Some("get_hive"));
+        assert_eq!(
+            answer.payload["error_code"], "INVALID_HIVE_ID",
+            "{}",
+            answer.payload
+        );
+        assert!(answer.payload.get("hive").is_none(), "{}", answer.payload);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-311, the defense: the registry's reader and writer refuse a hive id that is not
+    /// one before they build a path. An id that climbs out of the registry neither reads the
+    /// `info.yaml` planted there, which would parse, nor writes over it or anywhere else.
+    #[test]
+    fn the_registry_reader_and_writer_refuse_an_id_that_climbs_out_of_it() {
+        let base = std::env::temp_dir().join(format!("fluxbee-a311-registry-{}", Uuid::new_v4()));
+        let root = base.join("hives");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).expect("registry");
+        fs::create_dir_all(&outside).expect("outside");
+        let planted = "hive_id: outside\nstatus: connected\n";
+        fs::write(outside.join("info.yaml"), planted).expect("plant");
+
+        let refusal = read_hive_info(&root, "../outside").expect_err("refused, nothing read");
+        assert!(refusal.to_string().contains("invalid hive id"), "{refusal}");
+        assert_eq!(hive_status(&root, "../outside"), None);
+        assert!(!registry_has_hive(&root, "../outside"));
+
+        let entry = serde_json::json!({ "hive_id": "outside", "status": "failed" });
+        let refusal = write_hive_info(&root, "../outside", &entry).expect_err("refused");
+        assert!(refusal.to_string().contains("invalid hive id"), "{refusal}");
+        assert_eq!(
+            fs::read_to_string(outside.join("info.yaml")).expect("planted"),
+            planted
+        );
+        assert!(write_hive_info(&root, "../elsewhere", &entry).is_err());
+        assert!(
+            !base.join("elsewhere").exists(),
+            "no directory made outside the registry"
+        );
+
+        // A hive id keeps its entry.
+        let entry = serde_json::json!({ "hive_id": "worker1", "status": "connected" });
+        write_hive_info(&root, "worker1", &entry).expect("write");
+        assert_eq!(read_hive_info(&root, "worker1").expect("read"), entry);
+        assert!(registry_has_hive(&root, "worker1"));
+        assert!(!registry_has_hive(&root, "worker2"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// FINDINGS A-311: the inventory's and the deployments' probes of the registry answer a name
+    /// that is not a hive id as a hive the registry does not have, touching no path. Joined into
+    /// the path, an absolute name replaced the registry's root, so they told whether an
+    /// `info.yaml` was there.
+    #[test]
+    fn the_registry_probes_answer_a_name_that_is_not_a_hive_id_as_unknown() {
+        let state = sample_orchestrator_state_for_tests();
+        let dir = std::env::temp_dir().join(format!("fluxbee-a311-probe-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("info.yaml"), "hive_id: planted\n").expect("plant");
+        let absolute = dir.to_string_lossy().to_string();
+        for hive_id in [absolute.as_str(), "..", ".", "a/b"] {
+            assert!(
+                !hive_is_registered_for_inventory(&state, hive_id),
+                "{hive_id:?}"
+            );
+            assert!(
+                !hive_present_for_deployments(&state, hive_id),
+                "{hive_id:?}"
+            );
+            assert!(!hive_exists(&state.state_dir, hive_id), "{hive_id:?}");
+        }
+        // This hive is known without the registry, as before.
+        assert!(hive_is_registered_for_inventory(&state, &state.hive_id));
+        assert!(hive_present_for_deployments(&state, &state.hive_id));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // F20: a corrupt/torn SHM writer can report name_len past the buffer (it is a

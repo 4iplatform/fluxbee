@@ -597,6 +597,16 @@ box it restarts the motherbee's `sy-identity` (`identity_restart`). At every boo
 deletes the key of any hive with no directory under `hives/`, when both listings read completely
 (`sweep_orphan_identity_keys`).
 
+**Reading the registry.** `get_hive` (`get_hive_flow`) answers one hive's `info.yaml` as `hive`,
+and `NOT_FOUND` for a hive the registry does not have. A hive id that is not one, 1 to 64
+characters `[A-Za-z0-9_-]` (`valid_hive_id`, the check `add_hive` and `remove_hive` make), answers
+`INVALID_HIVE_ID` as `remove_hive` does, and nothing is read (FINDINGS A-311, since 0.1.136):
+joined into the path, `/srv/x` read `/srv/x/info.yaml` and `..` climbed out of the registry. Every
+read and write of an entry refuses such an id as well (`hive_info_path`), so `list_hives` lists a
+directory whose name is not a hive id by its name alone, as it lists one without an `info.yaml`.
+The inventory leaves out a hive of the LSA with such a name, and a deployment's or a drift alert's
+`present` and `hive_present` are false for one (`registry_has_hive`), with no path touched.
+
 ## Updates
 
 SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `category`
