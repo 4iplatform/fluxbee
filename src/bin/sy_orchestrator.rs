@@ -16161,14 +16161,24 @@ fn ensure_local_syncthing_peer_link(
     })
 }
 
+/// What a spoke's join's link needs to take its peer reconcile's stage-3 step (FINDINGS A-252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpokeLinkPosture<'a> {
+    /// This spoke's own Syncthing device id, which the step tells the motherbee device from.
+    local_device_id: &'a str,
+    /// The motherbee's address as the spoke's peer reconcile derives it
+    /// (`spoke_motherbee_address_in_hive_yaml`).
+    address: SyncthingPeerAddress,
+}
+
 /// Links the peer and restarts Syncthing once when the link, or a change before it, owes a restart.
 ///
-/// `spoke_posture` is a spoke's own, for its join's finalize: the motherbee's address as its peer
-/// reconcile derives it (`spoke_motherbee_address_in_hive_yaml`). With it the link also takes the
-/// stage-3 step that reconcile would take at its next round, before the one restart, so a new spoke
-/// switches Syncthing's options with the restart its link costs anyway instead of another one about
-/// a minute later (FINDINGS A-252). The motherbee passes none: it switches on its own rule, once
-/// every spoke has reported (`run_syncthing_options_switch_loop`).
+/// `spoke_posture` is a spoke's own, for its join's finalize (`spoke_link_posture`). With it the
+/// link also takes the stage-3 step that the spoke's peer reconcile would take at its next round,
+/// before the one restart, so a new spoke switches Syncthing's options with the restart its link
+/// costs anyway instead of another one about a minute later (FINDINGS A-252). The motherbee passes
+/// none: it switches on its own rule, once every spoke has reported
+/// (`run_syncthing_options_switch_loop`).
 async fn ensure_syncthing_peer_link_runtime(
     sync: &BlobRuntimeConfig,
     blob: &BlobRuntimeConfig,
@@ -16178,7 +16188,7 @@ async fn ensure_syncthing_peer_link_runtime(
     peer_address: SyncthingPeerAddress,
     is_motherbee: bool,
     spoke_role: HiveRole,
-    spoke_posture: Option<SyncthingPeerAddress>,
+    spoke_posture: Option<SpokeLinkPosture<'_>>,
 ) -> Result<(), OrchestratorError> {
     if !sync.sync_enabled {
         return Ok(());
@@ -16199,11 +16209,16 @@ async fn ensure_syncthing_peer_link_runtime(
         is_motherbee,
         spoke_role,
     )?;
-    // Blocking work (the device id from the binary, a TCP connect of up to 3 s, durable writes),
-    // off the async workers, as the peer reconcile runs it.
+    // Blocking work (a TCP connect of up to 3 s, durable writes), off the async workers, as the
+    // peer reconcile runs it.
     let options_changed = match spoke_posture {
-        Some(address) if !is_motherbee => tokio::task::block_in_place(|| {
-            spoke_link_posture_step(sync, &config_path, &marker, address)
+        Some(posture) if !is_motherbee => tokio::task::block_in_place(|| {
+            spoke_link_posture_step(
+                &config_path,
+                &syncthing_posture_state_path(),
+                &marker,
+                posture,
+            )
         }),
         _ => false,
     };
@@ -16244,28 +16259,26 @@ async fn ensure_syncthing_peer_link_runtime(
 }
 
 /// On a spoke, right after its join's link wrote the motherbee device: the stage-3 step of its peer
-/// reconcile (`reconcile_spoke_syncthing_options`), with the reconcile's own address, so the link's
-/// restart applies the posture's options too (FINDINGS A-252). The order rule is the reconcile's:
-/// the spoke switches only once its motherbee device has that static address and the address
-/// answers. A link written at another address, or a motherbee that does not answer yet, switches
-/// nothing here, and the reconcile takes the step at its next round, as it did before. Returns
-/// whether config.xml changed; nothing here fails the link.
+/// reconcile (`reconcile_spoke_syncthing_options`) on the facts at `posture_path`, with the
+/// reconcile's own address, so the link's restart applies the posture's options too (FINDINGS
+/// A-252). The order rule is the reconcile's: the spoke switches only once its motherbee device has
+/// that static address and the address answers. A link written at another address, or a
+/// motherbee that does not answer yet, switches nothing here, and the reconcile takes the step at
+/// its next round, as it did before. Returns whether config.xml changed; nothing here fails the
+/// link.
 fn spoke_link_posture_step(
-    sync: &BlobRuntimeConfig,
     config_path: &Path,
+    posture_path: &Path,
     marker: &Path,
-    address: SyncthingPeerAddress,
+    posture: SpokeLinkPosture<'_>,
 ) -> bool {
-    let step = local_syncthing_device_id(sync).and_then(|local_device_id| {
-        reconcile_spoke_syncthing_options_at(
-            config_path,
-            &syncthing_posture_state_path(),
-            marker,
-            &local_device_id,
-            address,
-        )
-    });
-    match step {
+    match reconcile_spoke_syncthing_options_at(
+        config_path,
+        posture_path,
+        marker,
+        posture.local_device_id,
+        posture.address,
+    ) {
         Ok((changed, notes)) => {
             if !notes.is_empty() {
                 tracing::info!(
@@ -16296,6 +16309,27 @@ fn spoke_motherbee_address_in_hive_yaml(config_dir: &Path) -> Result<SyncthingPe
         .and_then(|wan| wan.uplinks)
         .unwrap_or_default();
     spoke_motherbee_static_address(&uplinks)
+}
+
+/// What a spoke's finalize hands its link for the posture's step (FINDINGS A-252): this spoke's
+/// device id, from the one lookup whose result the finalize's reply carries too
+/// (`local_device_id`, none when the hive runs no Syncthing, and the link does nothing), and the
+/// motherbee's address from its hive.yaml. The error says why the step is left to the peer
+/// reconcile.
+fn spoke_link_posture<'a>(
+    local_device_id: Option<&'a Result<String, OrchestratorError>>,
+    config_dir: &Path,
+) -> Result<Option<SpokeLinkPosture<'a>>, String> {
+    let Some(local_device_id) = local_device_id else {
+        return Ok(None);
+    };
+    let local_device_id = local_device_id
+        .as_deref()
+        .map_err(|err| format!("this hive's Syncthing device id is unavailable: {err}"))?;
+    Ok(Some(SpokeLinkPosture {
+        local_device_id,
+        address: spoke_motherbee_address_in_hive_yaml(config_dir)?,
+    }))
 }
 
 // ===========================================================================
@@ -31456,23 +31490,29 @@ async fn add_hive_finalize_local_flow(
     let vendor_ms = step.elapsed().as_millis() as u64;
 
     let step = Instant::now();
+    let runs_syncthing = desired_sync.sync_enabled
+        && (blob_sync_tool_is_syncthing(&desired_sync)
+            || dist_sync_tool_is_syncthing(&desired_dist));
+    // This spoke's Syncthing device id, looked up once (a subprocess, or the running Syncthing's
+    // API, off the async workers): the link's posture step tells this device from the motherbee's
+    // with it, and the reply hands it to the motherbee (FINDINGS A-252).
+    let local_device_id = runs_syncthing
+        .then(|| tokio::task::block_in_place(|| local_syncthing_device_id(&desired_sync)));
     let mut syncthing_peer_linked = false;
     if let (Some(peer_device_id), Some(peer_address)) =
         (syncthing_peer_device_id.as_deref(), syncthing_peer_static)
     {
-        // The motherbee's address as this spoke's peer reconcile derives it: with it the link takes
-        // the reconcile's stage-3 step too, so its one restart also applies the posture's options
-        // (FINDINGS A-252).
-        let spoke_posture = match spoke_motherbee_address_in_hive_yaml(&state.config_dir) {
-            Ok(address) => Some(address),
-            Err(reason) => {
+        // This spoke's device, and the motherbee's address as its peer reconcile derives it: with
+        // them the link takes the reconcile's stage-3 step too, so its one restart also applies the
+        // posture's options (FINDINGS A-252).
+        let spoke_posture = spoke_link_posture(local_device_id.as_ref(), &state.config_dir)
+            .unwrap_or_else(|reason| {
                 tracing::warn!(
                     reason = %reason,
                     "syncthing: the join's link leaves the posture's options to the peer reconcile"
                 );
                 None
-            }
-        };
+            });
         if let Err(err) = ensure_syncthing_peer_link_runtime(
             &desired_sync,
             &desired_blob,
@@ -31505,13 +31545,14 @@ async fn add_hive_finalize_local_flow(
     }
     let peer_link_ms = step.elapsed().as_millis() as u64;
 
-    let syncthing_device_id = if desired_sync.sync_enabled
-        && (blob_sync_tool_is_syncthing(&desired_sync)
-            || dist_sync_tool_is_syncthing(&desired_dist))
-    {
-        local_syncthing_device_id(&desired_sync).ok()
-    } else {
-        None
+    let syncthing_device_id = match local_device_id {
+        Some(Ok(device_id)) => Some(device_id),
+        // Not there before the link: once more, since the link's restart may have brought up the
+        // Syncthing whose API the lookup falls back to.
+        Some(Err(_)) => {
+            tokio::task::block_in_place(|| local_syncthing_device_id(&desired_sync)).ok()
+        }
+        None => None,
     };
     let runtime_manifest_ready = local_runtime_manifest_ready_for_spawn();
     let dist_probe_enabled =
@@ -32426,7 +32467,10 @@ async fn add_hive_flow(
         None
     };
     // Host posture stage 2: the worker reaches the motherbee's Syncthing at the same address it
-    // dials for the WAN uplink, as egress and ingress joins already do (A-47).
+    // dials for the WAN uplink, as egress and ingress joins already do (A-47). The socket-only
+    // path below sends this one. The bootstrap sends the one of the uplink it writes into the
+    // worker's hive.yaml (`uplink_syncthing_address`, FINDINGS A-252); this resolve fails it
+    // before any SSH.
     let mother_syncthing_address = if syncthing_expected {
         let wan_listen = state.wan_listen.clone().unwrap_or_default();
         match resolve_worker_uplink_address(&wan_listen, address)
@@ -33029,6 +33073,27 @@ async fn add_hive_flow(
             });
         }
     };
+    // The motherbee's Syncthing address the finalize links, from the uplink this join writes into
+    // the worker's hive.yaml, as the egress and ingress joins derive theirs: the worker's peer
+    // reconcile derives the motherbee's address from that uplink, and its link's posture step
+    // switches only at that one (FINDINGS A-252). The address resolved before the bootstrap came
+    // from a route lookup of its own, minutes earlier, which may have answered otherwise.
+    let uplink_syncthing_address = if syncthing_expected {
+        match parse_host_port(&worker_uplink)
+            .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))
+        {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_SETUP_FAILED",
+                    "message": format!("motherbee Syncthing address unavailable: {err}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
     let storage_path = state
         .storage_path
         .try_lock()
@@ -33348,7 +33413,7 @@ async fn add_hive_flow(
         dist_sync_probe_timeout_secs,
         mother_syncthing_device_id.as_deref(),
         Some(&state.hive_id),
-        mother_syncthing_address.as_deref(),
+        uplink_syncthing_address.as_deref(),
     )
     .await
     {
@@ -45344,6 +45409,15 @@ mod tests {
         .expect("the link")
     }
 
+    /// What the spoke's finalize hands its link's step: its own device, and the motherbee at
+    /// `address`, as its peer reconcile derives it.
+    fn a252_posture(address: SyncthingPeerAddress) -> SpokeLinkPosture<'static> {
+        SpokeLinkPosture {
+            local_device_id: ST_WORKER1,
+            address,
+        }
+    }
+
     /// FINDINGS A-252: a new spoke takes the stage-3 step at its join's link, right after the link
     /// makes the motherbee device static, so the link's one restart applies the posture's options
     /// too. Its first peer reconcile then finds nothing to change and owes no restart: before, the
@@ -45370,11 +45444,9 @@ mod tests {
             "the link alone leaves Syncthing's defaults"
         );
 
-        let (changed, notes) =
-            reconcile_spoke_syncthing_options_at(&config, &posture, &marker, ST_WORKER1, address)
-                .unwrap();
+        // The link's step, on the facts at the path it is handed.
+        let changed = spoke_link_posture_step(&config, &posture, &marker, a252_posture(address));
         assert!(changed);
-        assert!(notes.is_empty(), "{notes:?}");
         let switched = fs::read_to_string(&config).unwrap();
         for (name, value) in SYNCTHING_OWNED_OPTIONS {
             assert_eq!(st3_option(&switched, name), [value], "{name}");
@@ -45418,21 +45490,28 @@ mod tests {
         assert_eq!(fs::read_to_string(&config).unwrap(), switched);
         assert_eq!(read_syncthing_posture_state_at(&posture).unwrap(), facts);
         assert!(!marker.exists());
-        // A join run again on the switched spoke changes nothing either.
+        // A join run again on the switched spoke changes nothing either, its step included.
+        let again = a252_link(&config, &marker, address);
         assert_eq!(
-            a252_link(&config, &marker, address).and_changed(false, &marker),
+            again.and_changed(
+                spoke_link_posture_step(&config, &posture, &marker, a252_posture(address)),
+                &marker
+            ),
             SyncthingConfigWrite {
                 changed: false,
                 restart: false
             }
         );
+        assert_eq!(fs::read_to_string(&config).unwrap(), switched);
+        assert_eq!(read_syncthing_posture_state_at(&posture).unwrap(), facts);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     /// FINDINGS A-252: the link switches only on the reconcile's facts. While the motherbee's port
     /// does not answer, or when the link wrote the motherbee at another address than the one the
     /// spoke's reconcile derives, nothing switches and only the facts that hold are recorded: the
-    /// reconcile takes the step at its next round, as before.
+    /// reconcile takes the step at its next round, as before. Facts the step cannot read switch
+    /// nothing and fail nothing: the link goes on to its restart.
     #[test]
     fn a252_the_link_switches_only_on_the_reconcile_s_facts() {
         // Port 0: nothing ever answers there.
@@ -45440,17 +45519,12 @@ mod tests {
         let (config, posture, marker, dir) = a252_spoke("a252-closed");
         a252_link(&config, &marker, closed);
         let linked = fs::read_to_string(&config).unwrap();
-        let (changed, notes) =
-            reconcile_spoke_syncthing_options_at(&config, &posture, &marker, ST_WORKER1, closed)
-                .unwrap();
-        assert!(!changed);
-        assert_eq!(
-            notes,
-            [format!(
-                "Syncthing keeps discovery on: {} does not answer yet",
-                closed.config_value()
-            )]
-        );
+        assert!(!spoke_link_posture_step(
+            &config,
+            &posture,
+            &marker,
+            a252_posture(closed)
+        ));
         assert_eq!(fs::read_to_string(&config).unwrap(), linked);
         let facts = read_syncthing_posture_state_at(&posture).unwrap();
         assert!(facts.motherbee_static_at_ms.is_some(), "{facts:?}");
@@ -45460,25 +45534,43 @@ mod tests {
         );
         fs::remove_dir_all(&dir).unwrap();
 
+        // The link at another address than the one the reconcile derives, which answers.
         let motherbee = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let derived = SyncthingPeerAddress::Static(motherbee.local_addr().unwrap());
         let (config, posture, marker, dir) = a252_spoke("a252-other");
         a252_link(&config, &marker, closed);
         let linked = fs::read_to_string(&config).unwrap();
-        let (changed, notes) =
-            reconcile_spoke_syncthing_options_at(&config, &posture, &marker, ST_WORKER1, derived)
-                .unwrap();
-        assert!(!changed);
-        assert_eq!(
-            notes,
-            ["Syncthing keeps discovery on: the motherbee device has no static address yet"]
-        );
+        assert!(!spoke_link_posture_step(
+            &config,
+            &posture,
+            &marker,
+            a252_posture(derived)
+        ));
         assert_eq!(fs::read_to_string(&config).unwrap(), linked);
         let facts = read_syncthing_posture_state_at(&posture).unwrap();
         assert_eq!(
             (facts.motherbee_static_at_ms, facts.switched_at_ms),
             (None, None),
             "{facts:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+
+        // Facts that cannot be read (a directory where the file goes), at the address that answers.
+        let (config, posture, marker, dir) = a252_spoke("a252-unreadable");
+        let link = a252_link(&config, &marker, derived);
+        let linked = fs::read_to_string(&config).unwrap();
+        fs::create_dir_all(&posture).unwrap();
+        let changed = spoke_link_posture_step(&config, &posture, &marker, a252_posture(derived));
+        assert!(!changed);
+        assert_eq!(fs::read_to_string(&config).unwrap(), linked);
+        assert!(posture.is_dir());
+        assert_eq!(
+            link.and_changed(changed, &marker),
+            SyncthingConfigWrite {
+                changed: true,
+                restart: true
+            },
+            "the link's own restart stays owed"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -45502,9 +45594,7 @@ mod tests {
             restart: false,
         };
         assert_eq!(again, unchanged);
-        let (changed, _) =
-            reconcile_spoke_syncthing_options_at(&config, &posture, &marker, ST_WORKER1, address)
-                .unwrap();
+        let changed = spoke_link_posture_step(&config, &posture, &marker, a252_posture(address));
         assert!(changed);
         assert_eq!(
             again.and_changed(changed, &marker),
@@ -45593,11 +45683,19 @@ mod tests {
     }
 
     /// FINDINGS A-252: the finalize's link takes the step between its write and its one restart, and
-    /// only on a spoke: the finalize hands it the address its hive.yaml gives, and the motherbee's
-    /// side of each join hands it none.
+    /// only on a spoke. The step runs on the hive's own facts and marker, the ones the peer
+    /// reconcile and the restart read, with what the finalize hands the link: this spoke's device
+    /// id, from the one lookup its reply carries too, and the address its hive.yaml gives. The
+    /// motherbee's side of each join hands it none.
     #[test]
     fn a252_the_finalize_s_link_takes_the_step_before_its_one_restart() {
-        let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+        // Whitespace out, and a trailing comma before a closing parenthesis, so a needle does not
+        // depend on how rustfmt lays a call out.
+        let squeeze = |text: &str| {
+            text.split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+        };
         let src = include_str!("sy_orchestrator.rs");
         let body_of = |name: &str| {
             let body = &src[src.find(name).unwrap_or_else(|| panic!("{name}"))..];
@@ -45611,7 +45709,27 @@ mod tests {
             at("link.and_changed(options_changed, &marker)") < at("restart_syncthing_for_pending(")
         );
         assert_eq!(link.matches("restart_syncthing_for_pending(").count(), 1);
-        assert!(squeeze(&link).contains(&squeeze("Some(address) if !is_motherbee =>")));
+        let link = squeeze(&link);
+        assert!(link.contains(&squeeze("Some(posture) if !is_motherbee =>")));
+        // What the finalize handed the link, whole: its address is the one the hive.yaml gives,
+        // never the link's own `peer_address`.
+        assert!(link.contains(&squeeze(
+            "spoke_link_posture_step(
+                &config_path,
+                &syncthing_posture_state_path(),
+                &marker,
+                posture,
+            )"
+        )));
+        assert!(link.contains(&squeeze("let marker = syncthing_restart_pending_marker();")));
+        assert!(link.contains(&squeeze("restart_syncthing_for_pending(sync, &marker)")));
+        let reconcile = squeeze(&body_of("fn reconcile_spoke_syncthing_options("));
+        for path in [
+            "&syncthing_posture_state_path(),",
+            "&syncthing_restart_pending_marker(),",
+        ] {
+            assert!(reconcile.contains(&squeeze(path)), "{path}");
+        }
 
         // The call's arguments, up to its closing parenthesis (none of them has one).
         let calls = |body: &str| -> Vec<String> {
@@ -45623,11 +45741,31 @@ mod tests {
                 .collect()
         };
         let finalize = body_of("async fn add_hive_finalize_local_flow(");
-        assert!(squeeze(&finalize).contains(&squeeze(
-            "let spoke_posture = match spoke_motherbee_address_in_hive_yaml(&state.config_dir)"
-        )));
         assert_eq!(calls(&finalize).len(), 1);
         assert!(calls(&finalize)[0].ends_with("state.role,spoke_posture,"));
+        // One lookup of the device id, before the link; the reply looks again only when it failed.
+        let finalize = squeeze(&finalize);
+        let at = |needle: &str| {
+            finalize
+                .find(&squeeze(needle))
+                .unwrap_or_else(|| panic!("{needle}"))
+        };
+        let lookup = at("let local_device_id = runs_syncthing
+            .then(|| tokio::task::block_in_place(|| local_syncthing_device_id(&desired_sync)));");
+        let posture = at(
+            "let spoke_posture = spoke_link_posture(local_device_id.as_ref(), &state.config_dir)",
+        );
+        let call = at("ensure_syncthing_peer_link_runtime(");
+        let reply = at("let syncthing_device_id = match local_device_id {");
+        let again = at("Some(Err(_)) =>");
+        assert!(lookup < posture && posture < call && call < reply && reply < again);
+        assert!(finalize.contains(&squeeze("Some(Ok(device_id)) => Some(device_id),")));
+        assert_eq!(finalize.matches("local_syncthing_device_id(").count(), 2);
+        let tail = &finalize[again..];
+        let second = tail
+            .find("local_syncthing_device_id(")
+            .expect("the second lookup");
+        assert!(second < tail.find("None=>None").expect("no Syncthing"));
         for flow in [
             "async fn add_hive_flow(",
             "async fn add_egress_hive_flow(",
@@ -45643,14 +45781,23 @@ mod tests {
 
     /// FINDINGS A-252: the address a join hands its spoke's finalize, and the one the spoke derives
     /// from the hive.yaml that join wrote, are one, for every role and every uplink shape: each
-    /// join sends the host of the uplink it writes, at Syncthing's port. So the link's step
-    /// switches on the facts the reconcile reads, and the reconcile finds the device in place.
+    /// join sends the host of the uplink it writes, at Syncthing's port, the worker's bootstrap
+    /// included. So the link's step switches on the facts the reconcile reads, and the reconcile
+    /// finds the device in place. The finalize hands the link that address with this spoke's
+    /// device id, or the reason it hands none.
     #[test]
     fn a252_a_join_and_its_spoke_derive_one_motherbee_address() {
         let dir = stage2_writer_dir("a252-yaml");
+        let found: Result<String, OrchestratorError> = Ok(ST_WORKER1.to_string());
+        let not_found: Result<String, OrchestratorError> = Err("syncthing device-id failed".into());
         assert!(spoke_motherbee_address_in_hive_yaml(&dir)
             .unwrap_err()
             .starts_with("hive.yaml unreadable"));
+        assert!(spoke_link_posture(Some(&found), &dir)
+            .unwrap_err()
+            .starts_with("hive.yaml unreadable"));
+        // A hive that runs no Syncthing: its link does nothing, and there is nothing to report.
+        assert_eq!(spoke_link_posture(None, &dir), Ok(None));
         let (blob, dist) = (sample_blob_config(), sample_dist_config());
         // IPv4, and the shapes `resolve_worker_uplink_address` gives an IPv6 wan.listen.
         for uplink in ["10.0.0.1:9000", "fd00::10:9000", "[fd00::10]:9000"] {
@@ -45695,56 +45842,77 @@ mod tests {
                     linked,
                     "{written}"
                 );
+                assert_eq!(
+                    spoke_link_posture(Some(&found), &dir),
+                    Ok(linked.map(|address| SpokeLinkPosture {
+                        local_device_id: ST_WORKER1,
+                        address
+                    })),
+                    "{written}"
+                );
             }
         }
+        // A device id the finalize could not look up leaves the step to the peer reconcile.
+        assert_eq!(
+            spoke_link_posture(Some(&not_found), &dir),
+            Err(
+                "this hive's Syncthing device id is unavailable: syncthing device-id failed".into()
+            )
+        );
         fs::remove_dir_all(&dir).unwrap();
 
         // Each join sends that derivation of the uplink it writes into the spoke's hive.yaml.
         let squeeze = |text: &str| text.split_whitespace().collect::<String>();
         let src = include_str!("sy_orchestrator.rs");
-        for (flow, sent, render) in [
+        let sent = squeeze(
+            "parse_host_port(&worker_uplink)
+                .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))",
+        );
+        for (flow, render) in [
             (
                 "async fn add_hive_flow(",
-                "resolve_worker_uplink_address(&wan_listen, address)
-                    .and_then(|uplink| parse_host_port(&uplink))
-                    .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))",
                 "render_worker_hive_yaml(hive_id, &worker_uplink,",
             ),
             (
                 "async fn add_egress_hive_flow(",
-                "parse_host_port(&worker_uplink)
-                    .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))",
                 "render_egress_hive_yaml(hive_id, &worker_uplink,",
             ),
             (
                 "async fn add_ingress_hive_flow(",
-                "parse_host_port(&worker_uplink)
-                    .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))",
                 "render_ingress_hive_yaml(hive_id, &worker_uplink,",
             ),
         ] {
             let body = &src[src.find(flow).expect("the flow")..];
             let body = squeeze(&body[..body.find("\n}\n").expect("its end")]);
-            assert!(
-                body.contains(&squeeze(sent)),
-                "{flow} sends the uplink's host"
-            );
+            assert!(body.contains(&sent), "{flow} sends the uplink's host");
             assert!(body.contains(&squeeze(render)), "{flow} writes that uplink");
         }
+        // The worker's bootstrap sends that one, not the address its socket-only path sends, which a
+        // route lookup of its own resolved before the bootstrap.
         let worker = &src[src.find("async fn add_hive_flow(").unwrap()..];
         let worker = squeeze(&worker[..worker.find("\n}\n").unwrap()]);
-        assert!(worker.contains(&squeeze(
-            "let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address)"
-        )));
-        assert_eq!(
+        let at = |needle: &str| {
             worker
-                .matches(&squeeze(
-                    "let wan_listen = state.wan_listen.clone().unwrap_or_default();"
-                ))
-                .count(),
-            2,
-            "both derivations read the same wan.listen"
+                .find(&squeeze(needle))
+                .unwrap_or_else(|| panic!("{needle}"))
+        };
+        let uplink =
+            at("let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address)");
+        let derived = at("let uplink_syncthing_address = if syncthing_expected {
+            match parse_host_port(&worker_uplink)");
+        let rendered = at("render_worker_hive_yaml(hive_id, &worker_uplink,");
+        let finalize = rendered
+            + worker[rendered..]
+                .find("add_hive_finalize_via_socket(")
+                .expect("the bootstrap's finalize");
+        assert!(uplink < derived && derived < finalize);
+        let args = &worker[finalize..];
+        let args = &args[..args.find(".await").expect("the call's end")];
+        assert!(
+            args.contains("uplink_syncthing_address.as_deref()"),
+            "{args}"
         );
+        assert!(!args.contains("mother_syncthing_address"), "{args}");
     }
 
     /// Readers report a state that does not decode; its writer moves it aside and derives the

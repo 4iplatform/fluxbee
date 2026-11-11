@@ -720,7 +720,9 @@ and nothing changes.
 
 - A finalize that links a peer without a static address, or with one that is not a
   `tcp://<ip>:<port>` literal, is refused, never written as `dynamic`.
-- The worker join derives the motherbee address from the uplink, as ingress and egress do.
+- The worker join derives the motherbee address from the uplink, as ingress and egress do: its
+  bootstrap from the very uplink it writes into the worker's hive.yaml (FINDINGS A-252), its
+  socket-only path, which writes none, from a resolve of its own.
 - The local device id comes from `syncthing --home <dir> device-id`, bounded to 5 s, when
   `cert.pem` and `key.pem` are regular files (Syncthing v2 dropped the `--device-id` flag, so that
   call always failed: A-53), otherwise from the running Syncthing; never from `config.xml`'s first
@@ -785,10 +787,13 @@ reports `discoveryEnabled: false`. The whole set switches together, in one write
    with the restart its link costs anyway; before, it switched at its first reconcile about a
    minute after the join, which restarted Syncthing once more. A link at another address, or a
    motherbee that does not answer yet, switches nothing there, and the reconcile takes the step as
-   before. Both hold one lock from their read of the facts to their write, so neither puts back
-   facts the other replaced. While the spoke runs an `ADD_HIVE_FINALIZE`, its reconcile neither
-   writes config.xml nor restarts Syncthing, and the finalize's convergence probe asks again
-   while the API port refuses connections (a restart), for at most 30 s.
+   before. A reconcile that starts while the spoke runs an `ADD_HIVE_FINALIZE` neither writes
+   config.xml nor restarts Syncthing. One already under way writes under the same locks (the
+   facts', held from their read to their write, and config.xml's), so neither puts back facts the
+   other replaced, and asks again right before it restarts Syncthing: while the finalize runs, the
+   link's restart applies its write, or the reconcile's next round does. The finalize's
+   convergence probe asks again while the API port refuses connections (a restart), for at most
+   30 s.
 2. **Every hive reports its facts** in its `/versions` snapshot (`syncthing_posture`: whether it
    runs Syncthing, the two facts, switched).
 3. **The motherbee polls**, about every 60 s, in its own task (not the single-flight watchdog
@@ -805,11 +810,13 @@ reports `discoveryEnabled: false`. The whole set switches together, in one write
 **Unit tests** cover the options edit on the PROD motherbee's block, both predicates, the
 snapshot-to-facts contract, the spoke's static fact on PROD shapes (IPv6, the local device), the
 wait set from the registry and the folders, and the motherbee's combined write. For A-252: a new
-spoke's link on Syncthing's default options switches with one restart and leaves its first
-reconcile nothing to do; a motherbee that does not answer, or a link at another address than the
-reconcile's, switches nothing; a change of the options alone is owed the link's restart; the
-step holds the facts' lock from its read to its write; and each role's join sends the address its
-spoke derives from the hive.yaml it wrote.
+spoke's link step, on Syncthing's default options, switches with the link's one restart and
+leaves its first reconcile nothing to do; a motherbee that does not answer, a link at another
+address than the reconcile's, or facts the step cannot read switch nothing; a change of the
+options alone is owed the link's restart; the step holds the facts' lock from its read to its
+write; the finalize looks its device id up once, for the step and its reply; and each role's
+join, the worker's bootstrap included, sends the address its spoke derives from the hive.yaml it
+wrote.
 
 **Residuals.**
 
