@@ -429,8 +429,9 @@ Spoke-to-spoke traffic goes through the motherbee (design: Option B in
 two or more WAN peers sends each one a `WAN_REACHABILITY` message with the nodes of the other hives
 it knows (`broadcast_reachability`). A spoke accepts it only from the motherbee's gateway
 (`wan_reachability_voucher_allowed`, rule 6 in §7.3) and routes those nodes through the motherbee,
-which relays the frames. A node learned this way gets data only: the router drops its protected
-system actions (`prepare_local_delivery`, `src_via_hub`).
+which relays the frames, and a far spoke's `UNREACHABLE` or `TTL_EXCEEDED` back to their sender
+(`relay_far_answer`, FINDINGS A-245). A node learned this way gets data only: the router drops its
+protected system actions (`prepare_local_delivery`, `src_via_hub`).
 
 ### 5.3 Identity sync: 9100/tcp with a per-hive HMAC
 

@@ -3769,6 +3769,8 @@ async fn handle_wan_message(
         if msg.meta.msg.as_deref() == Some(MSG_WAN_ACCEPT) {
             return Ok(());
         }
+        // Another router's answer to a sender: to the node when it is this router's, and from the
+        // hub on toward the spoke of a node of another spoke (A-245).
         if let Some(kind) = msg.meta.msg.as_deref() {
             if kind == MSG_UNREACHABLE || kind == MSG_TTL_EXCEEDED {
                 if let Destination::Unicast(dst) = &msg.routing.dst {
@@ -3780,6 +3782,9 @@ async fn handle_wan_message(
                         if let Some(dst_handle) = dst_handle {
                             let data = serde_json::to_vec(&msg)?;
                             dst_handle.sender.queue_own(data);
+                        } else {
+                            relay_far_answer(ctx, &msg, dst_uuid, peer_hive, peer_router_uuid)
+                                .await?;
                         }
                     }
                 }
@@ -4152,6 +4157,55 @@ async fn handle_wan_message(
     if let Some(reason) = answer_where_it_arrived(local, &msg) {
         send_unreachable_to(&msg, sender, ctx.router_uuid, reason)?;
     }
+    Ok(())
+}
+
+/// Hands on an `UNREACHABLE` or `TTL_EXCEEDED` that came over the WAN for a node that is not this
+/// router's, toward the hive of that node, its sender (A-245). Spokes are linked only to the hub,
+/// so a message between two spokes passes the hub both ways, and the far spoke's router answers it
+/// over the link it came in on, the hub's. Until 0.1.131 the hub gave such an answer only to its
+/// own nodes: a sender on another spoke never heard of a refusal (`NODE_NOT_FOUND`, `LINK_BUSY`,
+/// `FRAME_TOO_LARGE`, `VPN_BLOCKED`, no TTL left) and waited out its own timeout, and one that
+/// counts no answer as delivered (SY.timer) counted it delivered.
+///
+/// The answer goes on, one hop of its TTL taken off, only:
+/// - when the router of `peer_hive` made it, its `src` being that router's UUID: a node's notice,
+///   or an answer another router made, never travels on, so no answer is relayed twice;
+/// - with a hop of TTL left;
+/// - to the hive whose own LSA lists its destination (`find_remote_node`, which resolves a UUID two
+///   hives list, a stale hive's node or this hive's own to none), and never back to `peer_hive`.
+///
+/// Anything else is dropped without a word, as before. It is one of the router's own frames: on a
+/// full link it is skipped, and no one is answered. A spoke hands nothing on: its only peer is the
+/// hub, whose answers are for its own nodes, and an answer the hub relays was made by another
+/// router. No router answers a tap copy (A-209), so no answer to one comes this way either.
+async fn relay_far_answer(
+    ctx: &WanContext,
+    msg: &Message,
+    dst_uuid: Uuid,
+    peer_hive: &str,
+    peer_router_uuid: Uuid,
+) -> Result<(), RouterError> {
+    if Uuid::parse_str(&msg.routing.src).ok() != Some(peer_router_uuid) || msg.routing.ttl <= 1 {
+        return Ok(());
+    }
+    let sender_hive = {
+        let snapshot = ctx.lsa_snapshot.lock().await;
+        find_remote_node(&snapshot, dst_uuid).map(|node| node.next_hop_hive)
+    };
+    let Some(sender_hive) = sender_hive.filter(|hive| hive != peer_hive) else {
+        return Ok(());
+    };
+    let link = {
+        let wan_peers = ctx.wan_peers.lock().await;
+        wan_peers.get(&sender_hive).map(|peer| peer.sender.clone())
+    };
+    let Some(link) = link else {
+        return Ok(());
+    };
+    let mut relayed = msg.clone();
+    relayed.routing.ttl -= 1;
+    link.queue_own(serde_json::to_vec(&relayed)?);
     Ok(())
 }
 
@@ -12970,7 +13024,8 @@ mod tests {
             "deliver_locally",
         ];
         // The ANNOUNCE, UNREACHABLE and TTL_EXCEEDED, LSAs and reachability, the WAN and IRP
-        // handshakes, and another router's UNREACHABLE relayed to its node.
+        // handshakes, and another router's UNREACHABLE relayed to its node or, from the hub,
+        // toward its node's spoke (A-245).
         let routers_own = [
             "handle_node",
             "send_unreachable_to",
@@ -12980,6 +13035,7 @@ mod tests {
             "broadcast_lsa_direct",
             "handle_wan_connection",
             "handle_wan_message",
+            "relay_far_answer",
             "connect_to_peer",
             "handle_peer_message",
         ];
@@ -15502,6 +15558,420 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect();
         assert_eq!(vouched, ["AI.support@worker1"]);
+    }
+
+    /// A-245's hub: the motherbee linked to ingress1, worker1 and egress1, and not to worker2,
+    /// whose LSA region lists each hive's nodes, egress1's bucket stale.
+    struct FarAnswerHub {
+        ctx: Arc<WanContext>,
+        /// worker1's router, which answers, and the hub's end of its link.
+        worker1_router: Uuid,
+        worker1_link: LinkSender,
+        /// The hub's end of ingress1's link.
+        ingress1_link: LinkSender,
+        /// What the hub queues for each spoke it is linked to.
+        to_ingress1: LinkReceiver,
+        to_worker1: LinkReceiver,
+        to_egress1: LinkReceiver,
+    }
+
+    impl FarAnswerHub {
+        /// The hub, its region listing `nodes`, each `(uuid, name, hive)`.
+        async fn new(nodes: &[(Uuid, &str, &str)]) -> Self {
+            let ctx = test_wan_context(None);
+            let hives = ["motherbee", "ingress1", "worker1", "egress1", "worker2"];
+            let buckets = hives
+                .iter()
+                .map(|hive| match *hive {
+                    "motherbee" => lsa_hive(hive, FLAG_ACTIVE | HIVE_FLAG_SELF),
+                    "egress1" => lsa_hive(hive, FLAG_ACTIVE | FLAG_STALE),
+                    _ => lsa_hive(hive, FLAG_ACTIVE),
+                })
+                .collect();
+            let listed = nodes
+                .iter()
+                .map(|(uuid, name, hive)| {
+                    let bucket = hives.iter().position(|each| each == hive).expect("a hive");
+                    lsa_node_entry(*uuid, name, bucket as u16)
+                })
+                .collect();
+            *ctx.lsa_snapshot.lock().await = Some(lsa_of(buckets, listed));
+            let worker1_router = Uuid::new_v4();
+            let (ingress1_link, to_ingress1) = link_queue("wan");
+            let (worker1_link, to_worker1) = link_queue("wan");
+            let (egress1_link, to_egress1) = link_queue("wan");
+            for (hive, sender, router_uuid) in [
+                ("ingress1", ingress1_link.clone(), Uuid::new_v4()),
+                ("worker1", worker1_link.clone(), worker1_router),
+                ("egress1", egress1_link, Uuid::new_v4()),
+            ] {
+                ctx.wan_peers.lock().await.insert(
+                    hive.to_string(),
+                    WanPeer {
+                        sender,
+                        router_uuid,
+                    },
+                );
+            }
+            Self {
+                ctx,
+                worker1_router,
+                worker1_link,
+                ingress1_link,
+                to_ingress1,
+                to_worker1,
+                to_egress1,
+            }
+        }
+
+        /// Hands the hub `frame` as worker1's router sent it.
+        async fn hears_from_worker1(&self, frame: &Message) {
+            handle_wan_message(
+                frame,
+                &self.worker1_link,
+                &self.ctx,
+                "worker1",
+                self.worker1_router,
+                "RT.gateway@worker1",
+                1,
+            )
+            .await
+            .expect("handled");
+        }
+    }
+
+    /// A-245 on the hub: worker1's router answers, over the hub's link, a message from a node of
+    /// ingress1 that the hub relayed to it: `UNREACHABLE` (here `LINK_BUSY`) or `TTL_EXCEEDED`.
+    /// The hub hands the answer on to ingress1 as it came, one hop of TTL less, and nothing goes
+    /// back to worker1. Until 0.1.131 the hub gave it only to its own nodes, and the sender on
+    /// ingress1 waited out its own timeout.
+    #[tokio::test]
+    async fn a_far_routers_answer_goes_on_from_the_hub_to_a_sender_on_another_spoke() {
+        let sender = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut hub = FarAnswerHub::new(&[
+            (sender, "IO.x@ingress1", "ingress1"),
+            (target, "IO.sink@worker1", "worker1"),
+        ])
+        .await;
+        let worker1_router = hub.worker1_router.to_string();
+        let refused = build_unreachable(
+            &worker1_router,
+            &sender.to_string(),
+            &Uuid::new_v4().to_string(),
+            &target.to_string(),
+            "LINK_BUSY",
+        );
+        let out_of_ttl = build_ttl_exceeded(
+            &worker1_router,
+            &sender.to_string(),
+            &Uuid::new_v4().to_string(),
+            "IO.sink@worker1",
+            &router_name(hub.worker1_router),
+        );
+        for answer in [refused, out_of_ttl] {
+            hub.hears_from_worker1(&answer).await;
+            let mut expected = answer.clone();
+            expected.routing.ttl -= 1;
+            let relayed: Vec<serde_json::Value> = messages_on(&mut hub.to_ingress1)
+                .iter()
+                .map(|msg| serde_json::to_value(msg).expect("json"))
+                .collect();
+            assert_eq!(
+                relayed,
+                [serde_json::to_value(&expected).expect("json")],
+                "{:?}: on to ingress1 as it came, one hop less",
+                answer.meta.msg
+            );
+            assert!(
+                messages_on(&mut hub.to_worker1).is_empty(),
+                "nothing goes back to worker1"
+            );
+            assert!(messages_on(&mut hub.to_egress1).is_empty());
+        }
+    }
+
+    /// A-245: what the hub does not hand on goes nowhere, as before, back to worker1 least of all:
+    /// an answer worker1's router did not make (a node's, another router's); one for a node of
+    /// worker1 itself, for a node no hive lists, a stale hive's, one whose UUID two hives list, or
+    /// a node of a hive the hub has no link to; one with no hop of TTL left. On a full link the
+    /// answer is skipped, and no one is answered for it.
+    #[tokio::test]
+    async fn a_far_answer_the_hub_cannot_hand_on_goes_nowhere() {
+        let sender = Uuid::new_v4();
+        let worker1_node = Uuid::new_v4();
+        let stale = Uuid::new_v4();
+        let contested = Uuid::new_v4();
+        let unlinked = Uuid::new_v4();
+        let mut hub = FarAnswerHub::new(&[
+            (sender, "IO.x@ingress1", "ingress1"),
+            (worker1_node, "IO.sink@worker1", "worker1"),
+            (stale, "IO.out@egress1", "egress1"),
+            (contested, "IO.y@ingress1", "ingress1"),
+            (contested, "IO.z@worker1", "worker1"),
+            (unlinked, "IO.w@worker2", "worker2"),
+        ])
+        .await;
+        let worker1_router = hub.worker1_router;
+        let answer = |src: Uuid, dst: Uuid, ttl: u8| {
+            let mut answer = build_unreachable(
+                &src.to_string(),
+                &dst.to_string(),
+                &Uuid::new_v4().to_string(),
+                "IO.sink@worker1",
+                "NODE_NOT_FOUND",
+            );
+            answer.routing.ttl = ttl;
+            answer
+        };
+        for (case, msg) in [
+            (
+                "made by a node of worker1",
+                answer(worker1_node, sender, 16),
+            ),
+            ("made by another router", answer(Uuid::new_v4(), sender, 16)),
+            (
+                "for a node of worker1 itself",
+                answer(worker1_router, worker1_node, 16),
+            ),
+            (
+                "for a node no hive lists",
+                answer(worker1_router, Uuid::new_v4(), 16),
+            ),
+            (
+                "for a node of a stale hive",
+                answer(worker1_router, stale, 16),
+            ),
+            (
+                "for a UUID two hives list",
+                answer(worker1_router, contested, 16),
+            ),
+            (
+                "for a node of a hive with no link",
+                answer(worker1_router, unlinked, 16),
+            ),
+            ("with one hop of TTL", answer(worker1_router, sender, 1)),
+            ("with no TTL", answer(worker1_router, sender, 0)),
+        ] {
+            hub.hears_from_worker1(&msg).await;
+            for (hive, link) in [
+                ("ingress1", &mut hub.to_ingress1),
+                ("worker1", &mut hub.to_worker1),
+                ("egress1", &mut hub.to_egress1),
+            ] {
+                assert!(messages_on(link).is_empty(), "{case}: nothing for {hive}");
+            }
+        }
+
+        // ingress1's link full: the answer is skipped, and nothing goes back for it.
+        fill_to_the_brim(&hub.ingress1_link);
+        hub.hears_from_worker1(&answer(worker1_router, sender, 16))
+            .await;
+        assert_eq!(
+            hub.ingress1_link.depth().0,
+            LINK_QUEUE_MAX_FRAMES,
+            "skipped"
+        );
+        assert!(messages_on(&mut hub.to_ingress1).is_empty(), "only fillers");
+        assert!(messages_on(&mut hub.to_worker1).is_empty(), "no answer");
+    }
+
+    /// A-245 on a spoke: it hands no answer on. Its one peer is the hub: the hub's own answer for a
+    /// node that is not the spoke's, and an answer the hub relays from another spoke's router for
+    /// one, go nowhere, back to the hub least of all.
+    #[tokio::test]
+    async fn a_spoke_hands_no_far_answer_on() {
+        let spoke = wan_context_of("ingress1", None);
+        let hub_router = Uuid::new_v4();
+        let hub_node = Uuid::new_v4();
+        *spoke.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive("ingress1", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("motherbee", FLAG_ACTIVE),
+            ],
+            vec![lsa_node_entry(hub_node, "SY.admin@motherbee", 1)],
+        ));
+        let (hub_link, mut to_hub) = link_queue("wan");
+        spoke.wan_peers.lock().await.insert(
+            "motherbee".to_string(),
+            WanPeer {
+                sender: hub_link.clone(),
+                router_uuid: hub_router,
+            },
+        );
+        for (case, src, dst) in [
+            ("the hub's, for a node of the hub", hub_router, hub_node),
+            (
+                "the hub's, for a node no one lists",
+                hub_router,
+                Uuid::new_v4(),
+            ),
+            (
+                "another spoke's router's, relayed",
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            ),
+        ] {
+            let answer = build_unreachable(
+                &src.to_string(),
+                &dst.to_string(),
+                &Uuid::new_v4().to_string(),
+                "IO.y@worker1",
+                "NODE_NOT_FOUND",
+            );
+            handle_wan_message(
+                &answer,
+                &hub_link,
+                &spoke,
+                "motherbee",
+                hub_router,
+                "RT.gateway@motherbee",
+                1,
+            )
+            .await
+            .expect("handled");
+            assert!(messages_on(&mut to_hub).is_empty(), "{case}");
+        }
+    }
+
+    /// A-245 end to end, a router per hive: a node of ingress1 sends to a node of worker1 whose
+    /// link is full. worker1's router answers `LINK_BUSY` over the hub's link, the hub hands the
+    /// answer on to ingress1, and ingress1's router gives it to the sender, under its message's
+    /// trace_id. A tap copy of the same message, stopped at worker1 the same way, is answered by no
+    /// router (A-209), so nothing comes back for it.
+    #[tokio::test]
+    async fn a_refusal_on_one_spoke_reaches_its_sender_on_another_and_a_tap_copys_never_does() {
+        let hub = test_wan_context(None);
+        let ingress1 = wan_context_of("ingress1", None);
+        let worker1 = wan_context_of("worker1", None);
+        let sender = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let (sender_tx, mut sender_rx) = link_queue("node");
+        ingress1.nodes.lock().await.insert(
+            sender,
+            NodeHandle {
+                name: "IO.x@ingress1".to_string(),
+                vpn_id: 0,
+                sender: sender_tx,
+                connected_at: 0,
+            },
+        );
+        let (target_tx, _target_rx) = link_queue("node");
+        fill_to_the_senders_bound(&target_tx);
+        worker1.nodes.lock().await.insert(
+            target,
+            NodeHandle {
+                name: "IO.sink@worker1".to_string(),
+                vpn_id: 0,
+                sender: target_tx,
+                connected_at: 0,
+            },
+        );
+        // The hub knows both nodes from their hives' LSAs, worker1 the sender from the hub's
+        // reachability.
+        *hub.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive("motherbee", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("ingress1", FLAG_ACTIVE),
+                lsa_hive("worker1", FLAG_ACTIVE),
+            ],
+            vec![
+                lsa_node_entry(sender, "IO.x@ingress1", 1),
+                lsa_node_entry(target, "IO.sink@worker1", 2),
+            ],
+        ));
+        worker1.reachability.lock().await.insert(
+            sender,
+            ReachabilityEntry {
+                name: "IO.x@ingress1".to_string(),
+                origin_hive: "ingress1".to_string(),
+                next_hop_hive: "motherbee".to_string(),
+                vpn_id: 0,
+                last_updated: now_epoch_ms(),
+            },
+        );
+        // Each link, by the end that sends on it and the end that reads it.
+        let (hub_to_ingress1, mut ingress1_reads) = link_queue("wan");
+        let (hub_to_worker1, mut worker1_reads) = link_queue("wan");
+        let (ingress1_to_hub, _hub_reads_ingress1) = link_queue("wan");
+        let (worker1_to_hub, mut hub_reads_worker1) = link_queue("wan");
+        for (hive, link, router_uuid) in [
+            ("ingress1", &hub_to_ingress1, ingress1.router_uuid),
+            ("worker1", &hub_to_worker1, worker1.router_uuid),
+        ] {
+            hub.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: link.clone(),
+                    router_uuid,
+                },
+            );
+        }
+
+        // As ingress1's router hands them to the hub.
+        let (message, copy) =
+            a_message_and_a_tap_copy(sender, "IO.x@ingress1", &target.to_string(), 15, 0);
+        for sent in [&message, &copy] {
+            handle_wan_message(
+                sent,
+                &hub_to_ingress1,
+                &hub,
+                "ingress1",
+                ingress1.router_uuid,
+                "RT.gateway@ingress1",
+                1,
+            )
+            .await
+            .expect("handled");
+            let relayed = messages_on(&mut worker1_reads);
+            assert_eq!(relayed.len(), 1, "the hub relays it to worker1");
+            handle_wan_message(
+                &relayed[0],
+                &worker1_to_hub,
+                &worker1,
+                "motherbee",
+                hub.router_uuid,
+                "RT.gateway@motherbee",
+                1,
+            )
+            .await
+            .expect("handled");
+            for answer in messages_on(&mut hub_reads_worker1) {
+                handle_wan_message(
+                    &answer,
+                    &hub_to_worker1,
+                    &hub,
+                    "worker1",
+                    worker1.router_uuid,
+                    "RT.gateway@worker1",
+                    1,
+                )
+                .await
+                .expect("handled");
+            }
+            for answer in messages_on(&mut ingress1_reads) {
+                handle_wan_message(
+                    &answer,
+                    &ingress1_to_hub,
+                    &ingress1,
+                    "motherbee",
+                    hub.router_uuid,
+                    "RT.gateway@motherbee",
+                    1,
+                )
+                .await
+                .expect("handled");
+            }
+        }
+        let heard: Vec<(String, String)> = messages_on(&mut sender_rx)
+            .iter()
+            .map(what_was_answered)
+            .collect();
+        assert_eq!(
+            heard,
+            [(message.routing.trace_id.clone(), "LINK_BUSY".to_string())],
+            "the sender hears of its own message once, and never of the copy"
+        );
     }
 
     /// R4, the caller: sibling routers' regions are read only through the ownership check.

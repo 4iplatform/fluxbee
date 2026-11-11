@@ -238,7 +238,8 @@ they count like this hive's.
 ### 3.6 UNREACHABLE and TTL_EXCEEDED
 
 Both are system messages from the router's UUID to the sender's UUID, with the original `trace_id`
-and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
+and `ttl: 16`, one less once a hub has handed them on (below) (`build_unreachable`,
+`build_ttl_exceeded`). Payloads:
 `UNREACHABLE {original_dst, reason}` and `TTL_EXCEEDED {original_dst, last_hop: "router:<uuid>"}`.
 `original_dst` is the destination as sent: a name or UUID, `"broadcast"`, or `"null"` for a Resolve.
 
@@ -255,8 +256,14 @@ and `ttl: 16` (`build_unreachable`, `build_ttl_exceeded`). Payloads:
 | `LINK_BUSY` | the link the message would take, a local node's, a sibling router's or a WAN peer's, has its queue at the senders' bound (§1): its peer reads slower than frames come for it, or has stopped reading without closing. Never queued, and the link stays: the same message may go once the link drains. A broadcast goes to every other link, and its sender is answered once, by the router it entered (§4) (A-222, since 0.1.129) |
 
 A message that came from another router gets its error over the link it came in on; that router
-hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`). A tap
-copy gets none, on any router (§8.3).
+hands it to the node when the node is its own (`handle_peer_message`, `handle_wan_message`). Spokes
+are linked only to the hub, so a message between two spokes passes the hub both ways: the hub hands
+the far router's error on toward the spoke whose LSA lists the sender, one hop of TTL less, and that
+spoke's router gives it to its node (`relay_far_answer`, A-245, since 0.1.131). It does so only for
+an error the adjacent router made itself (its `src` is the router of the link it came in on), so an
+error crosses the hub at most once, and never goes back to the hive it came from. Until 0.1.131 the
+hub gave such an error only to its own nodes: a sender on another spoke heard nothing and waited out
+its own timeout. A tap copy gets none, on any router (§8.3).
 
 ### 3.7 Dropped without an answer
 
@@ -268,9 +275,14 @@ copy gets none, on any router (§8.3).
   the link's writer skips it, counts it and logs `router skipped a frame over the size limit; the
   link goes on` (`write_link_frames`). A sender's message over the limit is not queued and is
   answered `FRAME_TOO_LARGE` (§3.6), and a node that sends a frame over it is disconnected;
-- one of the router's own frames (an answer, an LSA, another router's answer relayed to its node)
-  for a link whose queue is full, the router's share included (§1): skipped, and counted in the
-  link's `LINK_BUSY` line (A-222);
+- one of the router's own frames (an answer, an LSA, another router's answer relayed to its node or,
+  from the hub, toward its node's spoke) for a link whose queue is full, the router's share included
+  (§1): skipped, and counted in the link's `LINK_BUSY` line (A-222);
+- an `UNREACHABLE` or `TTL_EXCEEDED` from the WAN for a node that is not this router's, which the
+  hub does not hand on (§3.6): its `src` is not the router of the link it came in on; it has no
+  hop of TTL left (`ttl <= 1`); no hive's LSA lists its destination, or a stale hive's does, or two
+  hives do, or the hive that answered does; or the hub has no link to that hive. On a spoke every
+  such error is dropped: its one link is the hub's;
 - a tap copy that cannot be delivered (§8.3);
 - `STREAM_APPEND`, `OPA_RELOAD` and `WITHDRAW`, which the router consumes; `WITHDRAW` also closes the
   node's connection.
@@ -725,10 +737,10 @@ fixed. With one router per hive none of them applies.
   (`handle_message`), and once more from every other sibling, which sends its copy on toward the
   WAN, that is to the gateway (`forward_broadcast_to_wan`). One that enters at the gateway, from
   one of its nodes or from the WAN, comes back once from each sibling the same way.
-- **Errors from the WAN reach only the gateway's nodes.** An `UNREACHABLE` or `TTL_EXCEEDED` that
-  comes back over the WAN is delivered only to a node of the gateway router: `handle_wan_message`
-  looks its destination up only among the gateway's own nodes, so an error for a node of a sibling
-  router is dropped.
+- **Errors from the WAN never reach a sibling router's node.** An `UNREACHABLE` or `TTL_EXCEEDED`
+  that comes back over the WAN goes to a node of the gateway router, or, from the hub, on toward
+  another spoke (§3.6): `handle_wan_message` never looks among its siblings' nodes, so an error for
+  a node of a sibling router is dropped.
 - **Hub-vouched nodes need the gateway.** Only the gateway holds the reachability table, so a node
   vouched for by the hub cannot reach a node on a sibling router (`remote_source_from_gateway`
   comment), nor can a sibling resolve it.

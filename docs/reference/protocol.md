@@ -317,9 +317,10 @@ its siblings when `ttl` ≥ 2).
 ### 6.1 UNREACHABLE and TTL_EXCEEDED
 
 A router sends them back to the sender of a message it cannot deliver; a router of another hive
-sends them back over the same links. Envelope: `src` the router's UUID, `dst` the sender's UUID,
-`ttl` 16, the failed message's `trace_id`, kind `system` (`build_unreachable`,
-`build_ttl_exceeded`, `protocol.rs`).
+sends them back over the same links, through the hub when the sender is on another spoke (since
+0.1.131, FINDINGS A-245). Envelope: `src` the router's UUID, `dst` the sender's UUID, `ttl` 16 (one
+less once the hub has handed it on), the failed message's `trace_id`, kind `system`
+(`build_unreachable`, `build_ttl_exceeded`, `protocol.rs`).
 
 | `msg` | Payload | Values |
 | --- | --- | --- |

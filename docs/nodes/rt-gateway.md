@@ -139,6 +139,13 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   reach another spoke through it. A spoke accepts this only from the motherbee's gateway (rule 6
   of `policy/system.rego`), and messages from hosts learned that way never get system authority
   (`prepare_local_delivery`).
+  - **Errors across the hub** (A-245, since 0.1.131): a message between two spokes passes the
+    hub both ways, and the far spoke's router answers it over the hub's link. The hub hands that
+    `UNREACHABLE` or `TTL_EXCEEDED` on toward the spoke whose LSA lists the sender, one hop of TTL
+    less, when the far router made it itself; never back where it came from, and never twice
+    (`relay_far_answer`). Until 0.1.131 the hub gave it only to its own nodes, and a sender on
+    another spoke waited out its own timeout, or, as SY.timer does when no answer comes in 30 s,
+    counted the message delivered.
 
 ## Routing
 
@@ -174,7 +181,8 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
   `VPN_BLOCKED`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`, `OPA_ERROR`,
   `OPA_NO_TARGET`, `FRAME_TOO_LARGE`, `LINK_BUSY`; and `TTL_EXCEEDED` when the TTL runs out (every
-  IRP and WAN hop decrements it).
+  IRP and WAN hop decrements it). A router of another hive answers over the link the message came
+  in on, and between two spokes the hub hands its answer on (Multi-hop, above; A-245).
   - **`FRAME_TOO_LARGE`** (since 0.1.124, FINDINGS A-202): the sender's frame passed its SDK's
     128 KiB check, but the router's additions took it over the limit (the sender's name, the action
     class, a resolve's trace entry; an agent's memory package is trimmed to fit). The router does
@@ -204,8 +212,9 @@ until its writer hands it to the socket (`src/router/link.rs`, A-222, since 0.1.
 - **The bound:** 1,024 frames or 8 MiB (`LINK_QUEUE_MAX_FRAMES`, `LINK_QUEUE_MAX_BYTES`). A
   sender's message gets 960 frames or 7 MiB of it (`LINK_QUEUE_SENDERS_FRAMES`,
   `LINK_QUEUE_SENDERS_BYTES`). The rest is for the router's own frames: its answers, LSAs,
-  `WAN_REACHABILITY`, handshakes, another router's answer relayed to a node. So senders that keep a
-  link at their bound never crowd them out: the MiB they leave takes five LSAs at their largest.
+  `WAN_REACHABILITY`, handshakes, another router's answer relayed to a node or, by the hub, toward
+  another spoke. So senders that keep a link at their bound never crowd them out: the MiB they leave
+  takes five LSAs at their largest.
 - **The bytes are the heap a frame holds:** its buffer's capacity, not its length. The router
   builds frames with `serde_json::to_vec`, which can leave up to about twice the length allocated
   (a long string takes its exact size, then the buffer doubles for what follows), so a frame
