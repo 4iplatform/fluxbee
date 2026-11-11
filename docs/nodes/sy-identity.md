@@ -167,6 +167,21 @@ Identity is created in two steps:
   each worker its own. `add_hive` creates the key and copies it over SSH
   (`ensure_local_identity_key`, `distribute_hive_identity_key_inner`). A replica with auth
   required and no key file does not start.
+- **Only a hive the registry lists** (FINDINGS A-277, `SyncAdmission`, since 0.1.136): the
+  primary's handshake refuses a hive the motherbee's registry does not list (`HiveRegistry::lists`,
+  `/var/lib/fluxbee/hives/<hive>/`, the authority on which hives exist) before it looks for the
+  hive's key, with the `IDENTITY_AUTH_ERROR` "authentication failed" that every refusal gets; only
+  its log says why: `auth: hive '<hive>' is not in the hive registry (removed or never joined)`.
+  A hive's open delta subscription and publish stream end when its hive leaves the registry,
+  within one recheck (10 s, `IDENTITY_REGISTRY_RECHECK_SECS`, the router's for a WAN link), with
+  the warning `identity sync session closed: the hive is no longer in the registry (removed)`,
+  and its reconnects are refused. Until 0.1.136 the key alone was enough: a removed hive whose key
+  the removal could not delete (`identity_key_cleanup: delete_failed`) kept its subscription and
+  could take a new full sync until the orchestrator's next start swept the key. A join is listed
+  before its first handshake: the orchestrator creates the hive's directory when it accepts the
+  join, before the bootstrap creates the key and starts the worker's SY.identity, and keeps it
+  while the join runs, fails or is resumed; only the removal deletes it for good. With
+  `identity.sync.auth` off there is no hive to check, and only the publish drop below applies.
 - **Primary to replica:** `IDENTITY_FULL_SYNC_REQUEST` returns the whole store in chunks of 256
   items per kind. `IDENTITY_DELTA_SUBSCRIBE` starts a stream of `IDENTITY_DELTA` frames
   (tenant, ILK and alias upserts and deletes), each acknowledged with `IDENTITY_DELTA_ACK`
@@ -192,12 +207,12 @@ Identity is created in two steps:
   (`HiveRegistry::lists`, `/var/lib/fluxbee/hives/<hive>`, the authority on which hives exist), with
   the warning `dropped an identity publish of a hive the registry no longer lists (removed)`. A
   removed hive's SY.identity can outlive its removal: for the moment before the hive's cleanup
-  stops it, or for good when the cleanup did not reach it and its key survived
-  (`identity_key_cleanup: delete_failed`); the primary's deltas still reach it, and it seeds its
-  ILKs again after each one, so its next push would take the removal's retire marks off them, and
-  an empty snapshot would remove its nodes' ILKs. The registry drops the hive before the removal
-  answers, so before SY.admin retires its ILKs, and lists a hive joined again from the moment its
-  join is accepted, before its SY.identity starts.
+  stops it, or, when the cleanup did not reach it, until its sessions end within a recheck
+  (above, FINDINGS A-277); with `identity.sync.auth` off, for good. Until then the primary's
+  deltas still reach it, and it seeds its ILKs again after each one, so its next push would take
+  the removal's retire marks off them, and an empty snapshot would remove its nodes' ILKs. The
+  registry drops the hive before the removal answers, so before SY.admin retires its ILKs, and
+  lists a hive joined again from the moment its join is accepted, before its SY.identity starts.
 - Limits: 64 concurrent sync connections, 256 delta subscribers, 1024 queued frames per
   subscriber (a slow one is dropped and resyncs).
 
@@ -337,7 +352,8 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
   primary at every start.
 - `/var/lib/fluxbee/identity/keys/<hive>.key`: sync HMAC keys (0600, directory 0700).
 - It reads, never writes, the motherbee's hive registry, `/var/lib/fluxbee/hives/<hive>/`, which
-  SY.orchestrator keeps: the primary takes a replica's publish only while its hive is listed there
+  SY.orchestrator keeps: the primary admits a hive on :9100 only while it is listed there
+  (`SyncAdmission`, FINDINGS A-277), and takes a replica's publish only while its hive is listed
   (`ingest_replica_frame`, FINDINGS A-191).
 
 ## Failure behavior
@@ -352,12 +368,17 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
   publish its ILKs (publishing an empty view would delete them on the primary).
 - **HMAC failure:** the primary logs `identity sync request failed`; the replica logs the failure
   and reconnects.
-- **A removed hive still publishing:** the primary logs `dropped an identity publish of a hive the
-  registry no longer lists (removed)` for each frame and applies none. For a moment after a
-  removal it is the hive's SY.identity before its cleanup stops it. Every 30 s for good, it is one
-  the cleanup did not reach whose key the removal could not delete
-  (`identity_key_cleanup: delete_failed`): the motherbee's orchestrator deletes that key at its next
-  start (`sweep_orphan_identity_keys`), and a restart of `sy-identity` then closes the session.
+- **A removed hive still connected:** for a moment after a removal it is the hive's SY.identity
+  before its cleanup stops it; otherwise one the cleanup did not reach. Within 10 s the primary
+  ends its sessions (`identity sync session closed: the hive is no longer in the registry
+  (removed)`, FINDINGS A-277), and until then logs `dropped an identity publish of a hive the
+  registry no longer lists (removed)` for each frame it publishes and applies none. Then each of
+  its reconnects, about two a second (its subscription's and its publish's) for as long as it
+  runs, is refused: `identity sync request failed` with `auth: hive '<hive>' is not in the hive
+  registry (removed or never joined)`, whether or not the removal deleted its key. The
+  orchestrator still restarts `sy-identity` after deleting the key of a hive its cleanup did not
+  reach (`identity_restart`): no longer needed to close the session, it only makes every replica
+  subscribe again.
 - Startup errors (wrong role, bad `hive.yaml`, missing HMAC key on a replica) end the process;
   systemd restarts it every 5 s.
 

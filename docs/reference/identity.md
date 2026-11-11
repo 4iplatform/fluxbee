@@ -613,10 +613,11 @@ converges to the union of the mesh.
   primary (`replica_has_baseline`).
 - The primary drops whole, deltas and snapshots alike, each frame of a hive the motherbee's
   registry no longer lists (`ingest_replica_frame`, `HiveRegistry::lists`): a removed hive. Its
-  SY.identity can outlive the removal (until the hive's cleanup stops it, or for good when the
-  cleanup did not reach it and its key survived), and it seeds its hive's system ILKs again after
-  each of the primary's deltas: its push would take the removal's retire marks off them (§2.9).
-  The registry lists a hive from the moment its join is accepted.
+  SY.identity can outlive the removal (until the hive's cleanup stops it, or, when the cleanup did
+  not reach it, until the primary ends its sessions within a recheck, below; with
+  `identity.sync.auth` off, for good), and it seeds its hive's system ILKs again after each of the
+  primary's deltas: its push would take the removal's retire marks off them (§2.9). The registry
+  lists a hive from the moment its join is accepted.
 - The primary applies a delta only if the replica owns the ILK (`delta_authorized_for_hive`).
   - A replica may claim `system` only for a deterministic `SY.*` ILK of its own hive
     (`ingest_ilk_type_authorized`).
@@ -641,8 +642,17 @@ converges to the union of the mesh.
   `src/mesh_hmac.rs`).
 - The handshake is a mutual challenge and response (`server_auth_handshake`,
   `client_auth_handshake`).
+- The primary admits only a hive the motherbee's registry lists (FINDINGS A-277, `SyncAdmission`,
+  since 0.1.136). Its handshake refuses any other before it looks for a key, with the
+  `IDENTITY_AUTH_ERROR` "authentication failed" every refusal gets; only its log says why. A
+  hive's open delta subscription and publish stream end when its hive leaves the registry, within
+  one recheck (10 s, `IDENTITY_REGISTRY_RECHECK_SECS`), and its reconnects are refused. Until
+  0.1.136 the key alone was enough, so a removed hive whose key the removal could not delete kept
+  reading the store until the orchestrator's next start swept the key. A join is listed from its
+  accept, before its bootstrap creates the key, so its first handshake passes.
 - `identity.sync.auth` is fail-closed (`auth_mode_required`). Absent, empty or unknown means
-  `required`. Only `disabled`, `off` or `none` turn it off, with a warning.
+  `required`. Only `disabled`, `off` or `none` turn it off, with a warning; then no handshake names
+  a hive, and the registry is checked only on a publish.
 - A replica that requires auth and has no key file refuses to start.
 
 ---

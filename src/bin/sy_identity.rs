@@ -109,6 +109,11 @@ const MAX_CONCURRENT_SYNC_CONNS: usize = 64;
 // (e.g. during full-sync) is dropped rather than pinning its handler task
 // forever (F-02). Generous for large frames over a slow WAN link.
 const IDENTITY_SYNC_WRITE_TIMEOUT_SECS: u64 = 30;
+// How often the primary checks that the hive of an open delta subscription or publish stream is
+// still in the motherbee's registry (FINDINGS A-277, `SyncAdmission`): a hive removed while its
+// session is up is cut off within one check, as the router cuts its WAN link
+// (`HIVE_REGISTRY_RECHECK`, the same 10 s).
+const IDENTITY_REGISTRY_RECHECK_SECS: u64 = 10;
 const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
 const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
 const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
@@ -4677,9 +4682,10 @@ async fn main() -> Result<(), IdentityError> {
     // Bounded so a flooding replica backpressures its own connection instead of
     // growing primary memory unboundedly.
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestFrame>(IDENTITY_INGEST_CHANNEL_CAP);
-    // Primary: the hives the motherbee joined, read at each replica frame (FINDINGS A-191,
+    // Primary: the hives the motherbee joined, read at each handshake and each recheck of an open
+    // session (FINDINGS A-277, `SyncAdmission`), and at each replica frame (FINDINGS A-191,
     // `ingest_replica_frame`). Only the primary has replicas, and only the motherbee a registry.
-    let hive_registry = HiveRegistry::motherbee();
+    let sync_admission = SyncAdmission::motherbee();
     if !is_primary {
         if let Some(upstream) = sync_upstream.clone() {
             let sub_key = self_auth_key.clone();
@@ -4759,7 +4765,7 @@ async fn main() -> Result<(), IdentityError> {
                         &mut runtime.store,
                         frame,
                         &hive.hive_id,
-                        &hive_registry,
+                        &sync_admission.registry,
                     );
                     if !applied.is_empty() {
                         // F-06: persist replica-published ilks so they survive a
@@ -4880,6 +4886,7 @@ async fn main() -> Result<(), IdentityError> {
                             let ingest_tx2 = ingest_tx.clone();
                             let chunks_req_tx2 = chunks_req_tx.clone();
                             let new_sub_tx2 = new_sub_tx.clone();
+                            let admission = sync_admission.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 if let Err(err) = handle_sync_connection(
@@ -4888,6 +4895,7 @@ async fn main() -> Result<(), IdentityError> {
                                     new_sub_tx2,
                                     ingest_tx2,
                                     auth_required,
+                                    admission,
                                 )
                                 .await
                                 {
@@ -5887,12 +5895,76 @@ async fn auth_read_line(
     Ok(line.trim().to_string())
 }
 
-/// Server side: read HELLO, load the claimed hive's key, challenge, verify the
-/// client's proof, then prove ourselves. Returns the authenticated hive_id. On
-/// any failure sends AUTH_ERROR and errors out (the caller closes the conn).
+/// Who the primary admits on :9100 (FINDINGS A-277): a hive the motherbee's registry lists
+/// (`HiveRegistry::lists`, the authority on which hives exist, A-48) that proves it holds its key,
+/// and only while the registry lists it. The key alone was enough until 0.1.136: a removed hive
+/// whose key the removal could not delete (`identity_key_cleanup: delete_failed`) kept its delta
+/// subscription and could take a new full sync, until the orchestrator's next start swept the key
+/// (`sweep_orphan_identity_keys`).
+///
+/// A join is listed before its first handshake: the orchestrator creates the hive's directory when
+/// it accepts the join, before the bootstrap creates the hive's key and starts its SY.identity, and
+/// keeps it while the join runs, fails or is resumed. Only the removal deletes it for good.
+#[derive(Clone, Debug)]
+struct SyncAdmission {
+    /// The motherbee's registry (`HiveRegistry::motherbee`), read at each handshake and each
+    /// recheck, so it always sees the orchestrator's last write.
+    registry: HiveRegistry,
+    /// One `<hive>.key` per hive: `json_router::mesh_hmac::KEYS_DIR`.
+    keys_dir: PathBuf,
+    /// How often an open session checks that its hive is still listed.
+    recheck: Duration,
+}
+
+impl SyncAdmission {
+    fn motherbee() -> Self {
+        Self {
+            registry: HiveRegistry::motherbee(),
+            keys_dir: PathBuf::from(json_router::mesh_hmac::KEYS_DIR),
+            recheck: Duration::from_secs(IDENTITY_REGISTRY_RECHECK_SECS),
+        }
+    }
+
+    /// A hive's key file, as `json_router::mesh_hmac::key_path` names it under `keys_dir`. Only
+    /// for a hive id `mesh_hmac::is_valid_hive_id` took.
+    fn key_path(&self, hive: &str) -> PathBuf {
+        self.keys_dir.join(format!("{hive}.key"))
+    }
+
+    /// Runs `session`, a long-lived session of `hive` (a delta subscription, a publish stream),
+    /// until it ends or the registry stops listing `hive`, checked every `recheck`. Then the
+    /// session is dropped, which closes its connection, and the hive's next handshake is refused.
+    /// Without an authenticated hive (`identity.sync.auth` off) it runs until it ends.
+    async fn while_listed(
+        &self,
+        hive: Option<&str>,
+        what: &str,
+        session: impl future::Future<Output = ()>,
+    ) {
+        let Some(hive) = hive else {
+            session.await;
+            return;
+        };
+        tokio::select! {
+            () = session => {}
+            () = self.registry.until_not(hive, self.recheck, HiveRegistry::lists) => {
+                tracing::warn!(
+                    hive = %hive,
+                    session = what,
+                    "identity sync session closed: the hive is no longer in the registry (removed)"
+                );
+            }
+        }
+    }
+}
+
+/// Server side: read HELLO, check that the registry lists the claimed hive and load its key,
+/// challenge, verify the client's proof, then prove ourselves. Returns the authenticated hive_id.
+/// On any failure sends AUTH_ERROR and errors out (the caller closes the conn).
 async fn server_auth_handshake(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    admission: &SyncAdmission,
 ) -> Result<String, IdentityError> {
     use json_router::mesh_hmac::{self, MeshHmacKey};
     let hello: AuthHello = serde_json::from_str(&auth_read_line(reader).await?)
@@ -5922,7 +5994,16 @@ async fn server_auth_handshake(
     if !mesh_hmac::is_valid_hive_id(&hive) {
         return reject(write_half, format!("auth: invalid hive id '{hive}'")).await;
     }
-    let key = match MeshHmacKey::load_from_file(&identity_hmac_key_path(&hive)) {
+    // The registry before the key (FINDINGS A-277): a removed hive whose key survived is refused
+    // like a hive that never had one, with the same answer.
+    if !admission.registry.lists(&hive) {
+        return reject(
+            write_half,
+            format!("auth: hive '{hive}' is not in the hive registry (removed or never joined)"),
+        )
+        .await;
+    }
+    let key = match MeshHmacKey::load_from_file(&admission.key_path(&hive)) {
         Ok(k) => k,
         Err(err) => {
             return reject(write_half, format!("auth: no key for hive '{hive}': {err}")).await;
@@ -6051,12 +6132,14 @@ async fn handle_sync_connection(
     new_sub_tx: mpsc::UnboundedSender<mpsc::Sender<IdentityDeltaEnvelope>>,
     ingest_tx: mpsc::Sender<IngestFrame>,
     auth_required: bool,
+    admission: SyncAdmission,
 ) -> Result<(), IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    // Per-hive HMAC handshake before any protocol message (when required).
+    // Per-hive HMAC handshake before any protocol message (when required), of a hive the registry
+    // lists (FINDINGS A-277).
     let authed_hive: Option<String> = if auth_required {
-        Some(server_auth_handshake(&mut reader, &mut write_half).await?)
+        Some(server_auth_handshake(&mut reader, &mut write_half, &admission).await?)
     } else {
         None
     };
@@ -6105,12 +6188,19 @@ async fn handle_sync_connection(
             write_timed(&mut write_half, serde_json::to_string(&ack)?.as_bytes()).await?;
             write_timed(&mut write_half, b"\n").await?;
             flush_timed(&mut write_half).await?;
-            tokio::spawn(serve_delta_subscriber(
-                reader,
-                write_half,
-                rx,
-                Duration::from_secs(IDENTITY_SYNC_HEARTBEAT_SECS),
-            ));
+            // It ends when its hive leaves the registry (FINDINGS A-277); its channel closes with
+            // it, and the main loop drops the subscriber at its next broadcast.
+            tokio::spawn(async move {
+                let serve = serve_delta_subscriber(
+                    reader,
+                    write_half,
+                    rx,
+                    Duration::from_secs(IDENTITY_SYNC_HEARTBEAT_SECS),
+                );
+                admission
+                    .while_listed(authed_hive.as_deref(), "delta subscription", serve)
+                    .await;
+            });
             Ok(())
         }
         SYNC_OP_DELTA_PUBLISH => {
@@ -6160,19 +6250,24 @@ async fn handle_sync_connection(
                 .await?;
             write_half.write_all(b"\n").await?;
             write_half.flush().await?;
-            // Read the publish stream until the replica disconnects; the main
-            // loop applies + re-broadcasts the ingested frames.
+            // Read the publish stream until the replica disconnects, or until its hive leaves the
+            // registry (FINDINGS A-277); the main loop applies + re-broadcasts the ingested frames.
             tokio::spawn(async move {
-                if let Err(err) = run_publish_reader(
-                    &mut reader,
-                    &mut write_half,
-                    publisher_hive.clone(),
-                    ingest_tx,
-                )
-                .await
-                {
-                    tracing::warn!(hive = %publisher_hive, error = %err, "identity publish reader ended");
-                }
+                let read = async {
+                    if let Err(err) = run_publish_reader(
+                        &mut reader,
+                        &mut write_half,
+                        publisher_hive.clone(),
+                        ingest_tx,
+                    )
+                    .await
+                    {
+                        tracing::warn!(hive = %publisher_hive, error = %err, "identity publish reader ended");
+                    }
+                };
+                admission
+                    .while_listed(authed_hive.as_deref(), "publish", read)
+                    .await;
             });
             Ok(())
         }
@@ -6701,13 +6796,15 @@ enum IngestFrame {
 /// - it claims the primary's own hive: the primary owns its ILKs and nobody publishes them upward;
 /// - its hive is no longer in the motherbee's registry (`HiveRegistry::lists`, the authority on
 ///   which hives exist, A-48; FINDINGS A-191): a hive SY.admin removed. Its SY.identity can outlive
-///   the removal, for the moment before the hive's cleanup stops it, or for good when the cleanup
-///   did not reach it and its key was not deleted. It seeds its hive's system ILKs again after each
-///   of the primary's deltas (`apply_primary_delta`), so its next push would take ILK_RETIRE_HIVE's
-///   marks off them, and an empty snapshot would remove its nodes' ILKs. The orchestrator deletes
-///   the hive's directory before it answers the removal, and SY.admin retires the ILKs only after
-///   that answer, or of a hive the registry no longer lists; a hive joined again is listed from the
-///   moment its join is accepted, before its SY.identity starts.
+///   the removal: for the moment before the hive's cleanup stops it, or, when the cleanup did not
+///   reach it, until its publish stream ends, within one registry recheck, after which its
+///   handshakes are refused (`SyncAdmission`, FINDINGS A-277); with `identity.sync.auth` off, for
+///   good. It seeds its hive's system ILKs again after each of the primary's deltas
+///   (`apply_primary_delta`), so its next push would take ILK_RETIRE_HIVE's marks off them, and an
+///   empty snapshot would remove its nodes' ILKs. The orchestrator deletes the hive's directory
+///   before it answers the removal, and SY.admin retires the ILKs only after that answer, or of a
+///   hive the registry no longer lists; a hive joined again is listed from the moment its join is
+///   accepted, before its SY.identity starts.
 fn ingest_replica_frame(
     store: &mut IdentityStore,
     frame: IngestFrame,
@@ -15111,6 +15208,364 @@ mod tests {
             assert!(rt_in_shm(&primary, &ilk.ilk_id));
         }
         let _ = fs::remove_dir_all(registry.root());
+    }
+
+    // ---- FINDINGS A-277: the primary admits on :9100 only a hive the registry lists ----
+
+    type AdKey = json_router::mesh_hmac::MeshHmacKey;
+
+    /// The primary's admission in a test: a registry that lists `listed` (`rt_registry`), a keys
+    /// directory with a key of its own for each of `keyed`, and a recheck of 20 ms. The keys come
+    /// back by hive.
+    fn ad_admission(listed: &[&str], keyed: &[&str]) -> (SyncAdmission, HashMap<String, AdKey>) {
+        let admission = SyncAdmission {
+            registry: rt_registry(listed),
+            keys_dir: std::env::temp_dir()
+                .join(format!("fluxbee-identity-keys-{}", Uuid::new_v4())),
+            recheck: Duration::from_millis(20),
+        };
+        let keys = keyed
+            .iter()
+            .map(|hive| {
+                let key = AdKey::generate();
+                key.write_to_file(&admission.key_path(hive))
+                    .expect("a hive's key");
+                (hive.to_string(), key)
+            })
+            .collect();
+        (admission, keys)
+    }
+
+    fn ad_cleanup(admission: &SyncAdmission) {
+        let _ = fs::remove_dir_all(admission.registry.root());
+        let _ = fs::remove_dir_all(&admission.keys_dir);
+    }
+
+    /// One handshake over loopback as `hive` with `key`: the primary's outcome and the replica's.
+    async fn ad_handshake(
+        admission: &SyncAdmission,
+        hive: &str,
+        key: &AdKey,
+    ) -> (Result<String, IdentityError>, Result<(), IdentityError>) {
+        let ((mut p_reader, mut p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        tokio::join!(
+            server_auth_handshake(&mut p_reader, &mut p_writer, admission),
+            client_auth_handshake(&mut r_reader, &mut r_writer, key, hive),
+        )
+    }
+
+    /// What the primary answers a HELLO as `hive` on the wire, and the reason it logs, for a hive
+    /// it refuses at the HELLO. The replica then hangs up.
+    async fn ad_refusal(admission: &SyncAdmission, hive: &str) -> (String, String) {
+        let ((mut p_reader, mut p_writer), (mut r_reader, mut r_writer)) = sync_link().await;
+        let hello = AuthHello {
+            operation: AUTH_OP_HELLO.to_string(),
+            hive: hive.to_string(),
+            nonce: json_router::mesh_hmac::random_nonce(),
+        };
+        auth_write_line(&mut r_writer, &hello)
+            .await
+            .expect("a hello");
+        let (server, answer) = tokio::join!(
+            server_auth_handshake(&mut p_reader, &mut p_writer, admission),
+            async move {
+                let answer = auth_read_line(&mut r_reader).await;
+                drop((r_reader, r_writer));
+                answer
+            },
+        );
+        let reason = server.expect_err(hive).to_string();
+        (answer.expect("an answer"), reason)
+    }
+
+    /// A hive the registry does not list is refused although its key file exists: a removed hive
+    /// whose key the removal could not delete (`identity_key_cleanup: delete_failed`). Its answer
+    /// is every refusal's, byte for byte: a hive with no key, listed or not, and an id that is not
+    /// a hive's get the same; only the primary's log says which.
+    #[tokio::test]
+    async fn a_hive_the_registry_does_not_list_is_refused_although_its_key_exists() {
+        let (admission, keys) = ad_admission(&["worker1", "worker3"], &["worker1", "gate0217"]);
+
+        let (server, client) = ad_handshake(&admission, "gate0217", &keys["gate0217"]).await;
+        let reason = server.expect_err("a removed hive").to_string();
+        assert!(reason.contains("not in the hive registry"), "{reason}");
+        assert!(client.is_err(), "the replica is refused");
+
+        let uniform = serde_json::to_string(&AuthErrorMsg {
+            operation: AUTH_OP_ERROR.to_string(),
+            message: "authentication failed".to_string(),
+        })
+        .expect("the refusal");
+        for (hive, why) in [
+            ("gate0217", "not in the hive registry"),
+            ("worker2", "not in the hive registry"),
+            ("worker3", "no key for hive"),
+            ("../worker1", "invalid hive id"),
+        ] {
+            let (answer, reason) = ad_refusal(&admission, hive).await;
+            assert_eq!(answer, uniform, "{hive}");
+            assert!(reason.contains(why), "{hive}: {reason}");
+        }
+        ad_cleanup(&admission);
+    }
+
+    /// A hive the registry lists is accepted with its key, as before; the registry does not stand
+    /// in for the key: with another hive's, a listed hive is refused.
+    #[tokio::test]
+    async fn a_listed_hive_with_its_key_is_accepted() {
+        let (admission, keys) = ad_admission(&["worker1"], &["worker1", "gate0217"]);
+
+        let (server, client) = ad_handshake(&admission, "worker1", &keys["worker1"]).await;
+        assert_eq!(server.expect("a listed hive"), "worker1");
+        client.expect("the replica took the primary's proof");
+
+        let (server, client) = ad_handshake(&admission, "worker1", &keys["gate0217"]).await;
+        let reason = server.expect_err("another hive's key").to_string();
+        assert!(reason.contains("HMAC verification failed"), "{reason}");
+        assert!(client.is_err());
+        ad_cleanup(&admission);
+    }
+
+    /// A join's first handshake is accepted, a throwaway worker's included: the orchestrator lists
+    /// the hive when it accepts the join (`add_hive`: `hives/<id>/`, then its `info.yaml`, joining,
+    /// phase accepted), and only then does the join's bootstrap create the key
+    /// (`ensure_local_identity_key`) and start the worker's SY.identity. Every later state the join
+    /// writes keeps it listed: running, pending, failed, interrupted (a join to resume) or
+    /// connected. A hive joined again whose key survived its removal is refused until the new
+    /// join's accept lists it, then accepted with that key, which the bootstrap keeps.
+    #[tokio::test]
+    async fn a_join_s_first_handshake_is_accepted() {
+        let (admission, mut keys) = ad_admission(&["worker1"], &["worker1", "gate0217"]);
+        let accept = |hive: &str| {
+            let entry = admission.registry.root().join(hive);
+            fs::create_dir_all(&entry).expect("the accept's entry");
+            let info = format!("hive_id: {hive}\nstatus: joining\njoin:\n  phase: accepted\n");
+            fs::write(entry.join("info.yaml"), info).expect("the accept's info.yaml");
+        };
+
+        // A fresh throwaway worker: listed at the accept, its key from the bootstrap.
+        let fresh = "gate0230";
+        accept(fresh);
+        assert!(
+            !admission.key_path(fresh).exists(),
+            "no key before the bootstrap"
+        );
+        let key = AdKey::generate();
+        key.write_to_file(&admission.key_path(fresh))
+            .expect("the bootstrap's key");
+        let (server, client) = ad_handshake(&admission, fresh, &key).await;
+        assert_eq!(server.expect("the join's first handshake"), fresh);
+        client.expect("admitted");
+        for state in [
+            "status: joining\njoin:\n  phase: waiting_for_host\n",
+            "status: joining\njoin:\n  phase: running\n",
+            "status: pending\njoin:\n  phase: done\n",
+            "status: failed\njoin:\n  phase: done\n  error_code: FINALIZE_FAILED\n",
+            "status: interrupted\njoin:\n  phase: done\n  error_code: JOIN_INTERRUPTED\n",
+            "status: connected\nrole: worker\njoin:\n  phase: done\n",
+        ] {
+            let entry = admission.registry.root().join(fresh);
+            fs::write(
+                entry.join("info.yaml"),
+                format!("hive_id: {fresh}\n{state}"),
+            )
+            .expect("the join's state");
+            let (server, client) = ad_handshake(&admission, fresh, &key).await;
+            assert_eq!(server.expect(state), fresh);
+            client.expect(state);
+        }
+
+        // Removed with its key left behind, then joined again under its name.
+        let again = "gate0217";
+        let key = keys.remove(again).expect("the surviving key");
+        let (server, _) = ad_handshake(&admission, again, &key).await;
+        assert!(server.is_err(), "removed: refused although its key exists");
+        accept(again);
+        let (server, client) = ad_handshake(&admission, again, &key).await;
+        assert_eq!(server.expect("joined again"), again);
+        client.expect("admitted");
+        ad_cleanup(&admission);
+    }
+
+    /// A replica's session opened as `hive`, `request` answered with `answered`.
+    async fn ad_session(
+        upstream: &str,
+        hive: &str,
+        key: &AdKey,
+        request: IdentitySyncRequest,
+        answered: &str,
+    ) -> SyncHalves {
+        let (mut reader, mut writer) = connect_and_auth(upstream, Some(key), hive)
+            .await
+            .expect("admitted");
+        auth_write_line(&mut writer, &request)
+            .await
+            .expect("the request");
+        assert_eq!(next_frame(&mut reader).await["operation"], answered);
+        (reader, writer)
+    }
+
+    /// The subscription still delivers: a delta queued on its channel reaches the replica, which
+    /// acks it.
+    async fn ad_delivers(
+        sub: &mut SyncHalves,
+        channel: &mpsc::Sender<IdentityDeltaEnvelope>,
+        seq: u64,
+    ) {
+        channel
+            .send(ilk_delete_envelope(seq))
+            .await
+            .expect("the subscription's channel");
+        assert_eq!(next_frame(&mut sub.0).await["seq"], seq);
+        send_delta_ack(&mut sub.1, seq).await.expect("the ack");
+    }
+
+    /// The publish stream still takes a frame: the primary queues it as `hive`'s and acks it.
+    async fn ad_takes(
+        publish: &mut SyncHalves,
+        ingest: &mut mpsc::Receiver<IngestFrame>,
+        hive: &str,
+        seq: u64,
+    ) {
+        let frame = serde_json::to_string(&ilk_delete_envelope(seq)).expect("a frame");
+        publish
+            .1
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .expect("the frame");
+        match time::timeout(Duration::from_secs(5), ingest.recv()).await {
+            Ok(Some(IngestFrame::Delta { publisher_hive, .. })) => {
+                assert_eq!(publisher_hive, hive)
+            }
+            _ => panic!("{hive}: the frame was not queued"),
+        }
+        let ack = next_frame(&mut publish.0).await;
+        assert_eq!(ack["operation"], SYNC_OP_DELTA_ACK);
+        assert_eq!(ack["seq"], seq);
+    }
+
+    /// The primary ended the session: the replica reads the end of the stream (or a reset).
+    async fn ad_ended(session: &mut SyncHalves, what: &str) {
+        let mut line = String::new();
+        match time::timeout(
+            Duration::from_secs(5),
+            read_capped_line(&mut session.0, &mut line, MAX_SYNC_LINE_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("{what}: a frame instead of the end: {line}"),
+            Err(_) => panic!("{what}: still open 5 s after the removal"),
+        }
+    }
+
+    /// A hive's open sessions end when its hive leaves the registry, within a recheck: its delta
+    /// subscription, whose channel closes with it so the main loop drops it, and its publish
+    /// stream; its next handshake is refused. While listed they go on past many rechecks, and
+    /// another hive's go on after the removal.
+    #[tokio::test]
+    async fn a_hive_s_open_sessions_end_when_it_leaves_the_registry() {
+        let (admission, keys) = ad_admission(&["worker1", "worker2"], &["worker1", "worker2"]);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let upstream = listener.local_addr().expect("local addr").to_string();
+        let (chunks_req_tx, _chunks_req_rx) = mpsc::unbounded_channel();
+        let (new_sub_tx, mut new_sub_rx) = mpsc::unbounded_channel();
+        let (ingest_tx, mut ingest_rx) = mpsc::channel(16);
+        let primary = admission.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_sync_connection(
+                    stream,
+                    chunks_req_tx.clone(),
+                    new_sub_tx.clone(),
+                    ingest_tx.clone(),
+                    true,
+                    primary.clone(),
+                ));
+            }
+        });
+        let subscribe = || IdentitySyncRequest {
+            operation: SYNC_OP_DELTA_SUBSCRIBE.to_string(),
+            hive_id: None,
+        };
+        let publish = |hive: &str| IdentitySyncRequest {
+            operation: SYNC_OP_DELTA_PUBLISH.to_string(),
+            hive_id: Some(hive.to_string()),
+        };
+
+        let mut sub1 = ad_session(
+            &upstream,
+            "worker1",
+            &keys["worker1"],
+            subscribe(),
+            SYNC_OP_DELTA_SUBSCRIBED,
+        )
+        .await;
+        let channel1 = new_sub_rx.recv().await.expect("worker1's subscriber");
+        let mut sub2 = ad_session(
+            &upstream,
+            "worker2",
+            &keys["worker2"],
+            subscribe(),
+            SYNC_OP_DELTA_SUBSCRIBED,
+        )
+        .await;
+        let channel2 = new_sub_rx.recv().await.expect("worker2's subscriber");
+        let mut pub1 = ad_session(
+            &upstream,
+            "worker1",
+            &keys["worker1"],
+            publish("worker1"),
+            SYNC_OP_PUBLISH_OK,
+        )
+        .await;
+        let mut pub2 = ad_session(
+            &upstream,
+            "worker2",
+            &keys["worker2"],
+            publish("worker2"),
+            SYNC_OP_PUBLISH_OK,
+        )
+        .await;
+
+        time::sleep(Duration::from_millis(150)).await;
+        ad_delivers(&mut sub1, &channel1, 1).await;
+        ad_delivers(&mut sub2, &channel2, 1).await;
+        ad_takes(&mut pub1, &mut ingest_rx, "worker1", 1).await;
+        ad_takes(&mut pub2, &mut ingest_rx, "worker2", 1).await;
+
+        fs::remove_dir_all(admission.registry.root().join("worker1")).expect("the removal");
+        ad_ended(&mut sub1, "worker1's subscription").await;
+        ad_ended(&mut pub1, "worker1's publish stream").await;
+        time::timeout(Duration::from_secs(5), channel1.closed())
+            .await
+            .expect("worker1's subscriber channel closes");
+        assert!(
+            connect_and_auth(&upstream, Some(&keys["worker1"]), "worker1")
+                .await
+                .is_err(),
+            "worker1 cannot come back"
+        );
+
+        time::sleep(Duration::from_millis(150)).await;
+        ad_delivers(&mut sub2, &channel2, 2).await;
+        ad_takes(&mut pub2, &mut ingest_rx, "worker2", 2).await;
+        ad_cleanup(&admission);
+    }
+
+    /// The primary's admission reads what the orchestrator writes: its hive registry, and the keys
+    /// `add_hive` creates where `mesh_hmac::key_path` puts them; it rechecks an open session as
+    /// often as the router rechecks a WAN link.
+    #[test]
+    fn the_primary_s_admission_reads_the_orchestrator_s_registry_and_keys() {
+        let admission = SyncAdmission::motherbee();
+        assert_eq!(admission.registry.root(), HiveRegistry::motherbee().root());
+        for hive in ["worker1", "gate0217"] {
+            assert_eq!(admission.key_path(hive), identity_hmac_key_path(hive));
+        }
+        assert_eq!(admission.recheck, Duration::from_secs(10));
     }
 
     /// FINDINGS A-232: a listing's refusal of a cursor names the field and what it takes, never
