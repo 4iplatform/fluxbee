@@ -570,22 +570,23 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
     "ok": true,
     "verb": "TIMER_LIST",
     "owner_l2_name": "WF.onboarding@motherbee",
-    "count": 3,
-    "timers": [ { ... }, { ... }, { ... } ]
+    "count": 100,
+    "timers": [ { ... }, { ... }, ... ],
+    "next_cursor": "1775577600000:9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001"
   }
 }
 ```
 
-`owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, then by uuid, subject to `status_filter` and `limit` (§12.1). Each timer is as `TIMER_GET` answers it, `canceled_reason` included (§7.5).
+`owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, then by uuid, subject to `status_filter` and `limit` (§12.1). Each timer is as `TIMER_GET` answers it, `canceled_reason` included (§7.5). `next_cursor` is there only while timers follow the page's last one, as here, where the `limit` of 100 cut the list (Pages, below).
 
 **Pages** (since v1.3, FINDINGS A-151; the limit's since v1.6, FINDINGS A-266). A page ends at the request's `limit` or where the frame does, whichever comes first: a response fits one 128 KiB frame, so a page holds at most 96 KiB of timers, encoded (`maxTimerListPageBytes`).
 - While timers follow the page's last one, `next_cursor` says where the next page starts (`"<fire_at_utc_ms>:<uuid>"` of the page's last timer), whichever cut ended the page. `SY.timer` reads one timer past the `limit` to know, and never lists it.
 - The same request with `cursor` set to it lists the next page: the timers right after that one, in the same order, under the same filters. A caller that wants `limit` timers in all lowers `limit` by what came.
 - The page that lists the rest of the list has no `next_cursor`, even when it holds exactly `limit` timers.
 
-Before v1.6 only the frame's cut gave `next_cursor`: a page its `limit` cut, 100 timers without one, read as the whole list. A list in pages is no snapshot: a timer whose fire time moves between two pages (a recurring timer's fire, a `TIMER_RESCHEDULE`) takes its new place in the order, so it can come again on a later page, or not at all.
+Before v1.6 only the frame's cut gave `next_cursor`: a page its `limit` cut, 100 timers without one, read as the whole list. A list in pages is no snapshot: a timer whose fire time moves between two pages (a recurring timer's fire, a `TIMER_RESCHEDULE`) takes its new place in the order, so it can come again on a later page, or not at all. A response has no `total`. The cursor is a place in the order, never a timer `SY.timer` looks up: the timer it names canceled or deleted since, the next page still starts right after its place, and a well-formed cursor `SY.timer` never gave lists the timers after the place it names.
 
-Both SDKs' `List` follow the pages up to their own limit, lowering it by what came, and stop there: what they return carries no cursor (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk). So a WF reconciles its pending timers at start up to 1000, the first by fire time (`Recover`; [spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md) §11.4). `SY.admin`'s `timer_list` answers one page, its `next_cursor` included, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
+Both SDKs' `List` follow the pages up to their own limit, lowering it by what came, and stop there: what they return carries no cursor (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk). So a WF reconciles its pending timers at start up to 1000, the first by fire time (`Recover`; [spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md) §11.4), and cannot tell whether more follow: a WF with more than 1000 pending timers reads the ones past the 1000th as missing from `SY.timer`, though `SY.timer`'s answer says more follow (a limit of the SDKs' `List` and the WF's reconcile, not of `SY.timer`). `SY.admin`'s `timer_list` answers one page, its `next_cursor` included, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
 
 ### 7.7 `TIMER_PURGE_OWNER` (exclusive use of `SY.orchestrator`)
 
