@@ -327,29 +327,51 @@ ORDER BY fire_at_utc ASC
 	return collectTimerRows(rows)
 }
 
-// deleteTimersByOwner deletes every timer of ownerL2Name, in any status, in one statement, and returns
-// how many, and the uuids of the pending ones among them: their entries leave the scheduler's heap
-// (TIMER_PURGE_OWNER, FINDINGS A-259).
+// deleteTimersByOwner deletes every timer of ownerL2Name, in any status, in one transaction, and
+// returns how many, and the uuids of the pending ones among them: their entries leave the scheduler's
+// heap (TIMER_PURGE_OWNER, FINDINGS A-259). The pending ones are deleted first, and only their uuids
+// come back (RETURNING); the rest, the owner's history of up to 7 days, is deleted and counted, not
+// read, as before 1.6. One statement that returned every deleted row read that whole history back,
+// within the orchestrator's 3 s for the purge (the review of A-259).
 func deleteTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (deleted int64, pending []string, err error) {
-	rows, err := db.QueryContext(ctx, `DELETE FROM timers WHERE owner_l2_name=? RETURNING uuid, status`, ownerL2Name)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var timerUUID, status string
-		if err := rows.Scan(&timerUUID, &status); err != nil {
-			return 0, nil, err
-		}
-		deleted++
-		if status == "pending" {
-			pending = append(pending, timerUUID)
-		}
-	}
-	if err := rows.Err(); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `DELETE FROM timers WHERE owner_l2_name=? AND status='pending' RETURNING uuid`, ownerL2Name)
+	if err != nil {
 		return 0, nil, err
 	}
-	return deleted, pending, nil
+	if pending, err = collectUUIDs(rows); err != nil {
+		return 0, nil, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM timers WHERE owner_l2_name=?`, ownerL2Name)
+	if err != nil {
+		return 0, nil, err
+	}
+	history, err := result.RowsAffected()
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, err
+	}
+	return int64(len(pending)) + history, pending, nil
+}
+
+// collectUUIDs reads the uuids rows returns, and closes them.
+func collectUUIDs(rows *sql.Rows) ([]string, error) {
+	defer rows.Close()
+	var uuids []string
+	for rows.Next() {
+		var timerUUID string
+		if err := rows.Scan(&timerUUID); err != nil {
+			return nil, err
+		}
+		uuids = append(uuids, timerUUID)
+	}
+	return uuids, rows.Err()
 }
 
 func countPendingTimers(ctx context.Context, db *sql.DB) (int64, error) {

@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -332,5 +334,45 @@ func TestAPurgeRightAfterARecurringTimersSaveLeavesNoEntry(t *testing.T) {
 	}
 	if timers, retries := queuedTimers(t, service.scheduler); len(timers) != 0 || retries != 0 {
 		t.Fatalf("the purged timer left %v and %d retries in the heap", timers, retries)
+	}
+}
+
+// A fire whose read of its timer fails, the database and not a timer gone, sends nothing and queues
+// the timer again 30 s later, as a fire whose save fails does, and says so: the entry that brought the
+// fire was the timer's one. A timer gone is not queued again. Before, a failed read returned with no
+// line, and the pending timer, out of the heap, waited for the next start (the review of A-259).
+func TestAFireWhoseReadFailsQueuesItsTimerAgain(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	logged := captureLog(t)
+	ctx := context.Background()
+
+	service.scheduler.push("timer-gone", time.Now().UTC().Add(-time.Second).UnixMilli())
+	service.scheduler.processDue(ctx, time.Now().UTC())
+	if timers, retries := queuedTimers(t, service.scheduler); len(timers) != 0 || retries != 0 {
+		t.Fatalf("a fire of a timer gone left %v and %d retries in the heap", timers, retries)
+	}
+
+	insertDueTimer(t, service, "timer-unread", "fire")
+	service.scheduler.push("timer-unread", time.Now().UTC().Add(-time.Second).UnixMilli())
+	if err := service.db.Close(); err != nil {
+		t.Fatalf("close the database: %v", err)
+	}
+	before := time.Now().UTC()
+	service.scheduler.processDue(ctx, time.Now().UTC())
+	after := time.Now().UTC()
+
+	if len(tx) != 0 {
+		t.Fatal("sent the fire of a timer it could not read")
+	}
+	timers, retries := queuedTimers(t, service.scheduler)
+	retryAt, queued := timers["timer-unread"]
+	if len(timers) != 1 || !queued || retries != 0 || retryAt < before.Add(storageRetryDelay).UnixMilli() || retryAt > after.Add(storageRetryDelay).UnixMilli() {
+		t.Fatalf("the heap holds %v and %d retries, want timer-unread 30 s from its fire", timers, retries)
+	}
+	lines := loggedEvents(t, logged, "timer_fire_read_failed")
+	if len(lines) != 1 || lines[0]["timer_uuid"] != "timer-unread" || lines[0]["retry_at_utc_ms"] != float64(retryAt) ||
+		!strings.Contains(fmt.Sprint(lines[0]["error"]), "database is closed") {
+		t.Fatalf("logged %v, want one timer_fire_read_failed of timer-unread, with its error and its retry", lines)
 	}
 }

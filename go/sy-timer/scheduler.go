@@ -59,7 +59,9 @@ type timerScheduler struct {
 	// holds the pending timers only, and the retries of fires on their way, which are not here
 	// (retryLater): each leaves at its time, within the retry window (FINDINGS A-259). Before, nothing
 	// took an entry out: a canceled, moved or purged timer's stayed until its old fire time, up to 366
-	// days ahead, and was dropped then.
+	// days ahead, and was dropped then. A fire whose read or save of its timer fails queues it again 30
+	// s later (fireTimerByUUID): a timer canceled or purged after its entry left the heap and before
+	// that failed read stays queued until then, when its fire finds it gone or no longer pending.
 	queued map[string]*timerHeapEntry
 	wakeCh chan struct{}
 	// lockMu guards locks: the timers being worked on, each with its lock (lockTimer).
@@ -286,13 +288,29 @@ func (s *timerScheduler) processDue(ctx context.Context, now time.Time) {
 // is not sent. Nor is the purged timer left in the heap (FINDINGS A-259): the fire queues the timer
 // again (a recurring timer's next fire, a timer moved later) before its save, or before a second
 // read, so a purge after its first read takes that entry out after it is queued, or the save or the
-// read finds the timer gone and the fire takes the entry out itself.
+// read finds the timer gone and the fire takes the entry out itself. A first read that fails (the
+// database, not a timer gone) queues the timer again in 30 s, as a save that fails does: the entry
+// that brought the fire here was the timer's one (popDue), and for all the fire knows the timer is
+// still pending.
 func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, now time.Time) {
 	unlock := s.lockTimer(timerUUID)
 	defer unlock()
 
 	row, err := getTimer(ctx, s.service.db, timerUUID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
 	if err != nil {
+		// Before, this returned with no line, and the timer, with no entry left, did not fire until
+		// the next start (the review of A-259).
+		retryAt := time.Now().UTC().Add(storageRetryDelay)
+		logEvent("timer_fire_read_failed", map[string]any{
+			"timer_uuid":      timerUUID,
+			"error":           err.Error(),
+			"retry_at_utc_ms": retryAt.UnixMilli(),
+		})
+		log.Printf("fire of %s not sent: its row could not be read: %v", timerUUID, err)
+		s.push(timerUUID, retryAt.UnixMilli())
 		return
 	}
 	if row.Status != "pending" {

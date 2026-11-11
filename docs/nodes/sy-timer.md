@@ -117,7 +117,9 @@ timer is due, `fireTimerByUUID` re-reads it, skips it unless still `pending`, an
 A fire is saved before it is sent (FINDINGS A-115): a one-shot becomes `fired`, a recurring timer
 gets its next fire time from the cron and goes back on the heap. A stop between the two loses that
 fire instead of sending it twice. A row that cannot be saved sends nothing, and the fire is tried
-again in 30 s (`timer_fire_persist_failed`).
+again in 30 s (`timer_fire_persist_failed`); so is a row that cannot be read, the database's
+failure and not a timer gone (`timer_fire_read_failed`, since 1.6, the review of FINDINGS A-259):
+before, that fire logged nothing, and the timer, its entry gone, waited for the next start.
 
 A fire holds its timer's lock (`lockTimer`) from its read of the row to its save and its send.
 `TIMER_CANCEL` and `TIMER_RESCHEDULE` take the same lock and read the timer again under it
@@ -125,9 +127,10 @@ A fire holds its timer's lock (`lockTimer`) from its read of the row to its save
 waits, then sees what the fire wrote, so a one-shot that fired is `TIMER_ALREADY_FIRED` and a
 recurring timer canceled after its fire stays canceled. Before, the fire's save wrote over them. The
 save is made only while the row is still `pending` (`updateTimerIfStatus`): the fire of a timer
-purged meanwhile (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_fire_dropped`), nor
-is the timer left in the heap: the fire puts a recurring timer's next fire there before its save,
-and takes it out again when the save finds the timer gone (since 1.6). The
+purged before its save (`TIMER_PURGE_OWNER` takes no timer lock) is not sent (`timer_fire_dropped`),
+and one saved before the purge is sent. Either way the timer is not left in the heap: the fire puts
+a recurring timer's next fire there before its save, and takes it out again when the save finds the
+timer gone, and a purge after the save takes it out itself (since 1.6). The
 scheduler keeps a timer's lock only while something holds it or waits for it (since 1.5, FINDINGS
 A-244); before, it kept one for every timer that ever fired, was canceled or rescheduled, until
 SY.timer stopped.
@@ -190,7 +193,7 @@ or the sender's next refusal). Before, only the sender heard of a refusal.
 | `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page fits one 128 KiB frame: `next_cursor`, given back as `cursor`, lists the next, and both SDKs' `List` follow the pages (since 1.3, FINDINGS A-151) |
 | `TIMER_CANCEL` | `timer_uuid` or `client_ref` | the owner only (`TIMER_NOT_OWNER`); a `client_ref` with no pending timer answers `ok` with `found: false`; a fired one-shot gives `TIMER_ALREADY_FIRED` |
 | `TIMER_RESCHEDULE` | `timer_uuid` or `client_ref`, and `new_fire_at_utc_ms` or `new_fire_in_ms` | the owner only; pending one-shots only (`TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_ALREADY_FIRED`) |
-| `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status |
+| `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status, in one transaction: the pending ones first, whose uuids come back for the heap, then the history, counted without being read (`deleteTimersByOwner`) |
 | `TIMER_NOW` | none | anyone |
 | `TIMER_NOW_IN` | `tz` | anyone |
 | `TIMER_CONVERT` | `instant_utc_ms`, `to_tz` | anyone |
@@ -265,6 +268,8 @@ secret.
   is not sent. A row that cannot be saved stays `pending`: at a fire it is tried again in 30 s
   (`timer_fire_persist_failed`), at a start the start fails and systemd runs it again. One kept
   before 0.1.124 whose `cron_spec` starts with a zone is such a timer (FINDINGS A-206, A-220).
+- A fire whose read of its timer fails sends nothing and is tried again in 30 s
+  (`timer_fire_read_failed`, since 1.6).
 
 ## Health
 
@@ -273,7 +278,7 @@ secret.
   `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
   `timer_missed_policy_applied`, `timer_handler_error`, for a refused request
   `timer_request_refused` and `timer_request_refusals_not_logged` (Messages, above), and for the delivery
-  `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`,
+  `timer_fire_read_failed`, `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`,
   `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`; for a recurring timer canceled
   because its next fire cannot be computed, `timer_replay_invalid_recurring` and
   `timer_recurring_next_fire_failed` (`outcome: canceled`, with its `canceled_reason`).

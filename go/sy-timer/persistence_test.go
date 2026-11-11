@@ -915,6 +915,54 @@ func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 	}
 }
 
+// deleteTimersByOwner deletes every timer of the owner, in any status, and counts them all, but reads
+// back the uuids of its pending ones only, whose entries leave the scheduler's heap: the owner's
+// history, up to 7 days of it, is deleted and counted without being read (the review of A-259). Another
+// owner's timers stay.
+func TestDeleteTimersByOwnerReturnsItsPendingTimersOnly(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	insert := func(timerUUID, owner, status string) {
+		t.Helper()
+		row := timerRow{UUID: timerUUID, OwnerL2Name: owner, TargetL2Name: owner, Kind: "oneshot",
+			FireAtUTC: now.Add(time.Hour).UnixMilli(), MissedPolicy: "fire", Payload: `{}`, Status: status,
+			CreatedAtUTC: now.Add(-time.Hour).UnixMilli()}
+		if status == "canceled" {
+			row.CanceledAtUTC = nullableNow(now)
+		}
+		if err := insertTimer(ctx, db, row); err != nil {
+			t.Fatalf("insert %s: %v", timerUUID, err)
+		}
+	}
+	insert("timer-pending-1", "WF.demo@motherbee", "pending")
+	insert("timer-pending-2", "WF.demo@motherbee", "pending")
+	insert("timer-fired", "WF.demo@motherbee", "fired")
+	for i := 0; i < 3; i++ {
+		insert(fmt.Sprintf("timer-canceled-%d", i), "WF.demo@motherbee", "canceled")
+	}
+	insert("timer-other", "AI.other@motherbee", "pending")
+
+	deleted, pending, err := deleteTimersByOwner(ctx, db, "WF.demo@motherbee")
+	if err != nil {
+		t.Fatalf("delete timers: %v", err)
+	}
+	sort.Strings(pending)
+	if deleted != 6 || strings.Join(pending, ",") != "timer-pending-1,timer-pending-2" {
+		t.Fatalf("deleted %d, pending %v, want 6 deleted and the two pending ones", deleted, pending)
+	}
+	var left int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM timers WHERE owner_l2_name=?`, "WF.demo@motherbee").Scan(&left); err != nil || left != 0 {
+		t.Fatalf("left %d timers of the owner (%v)", left, err)
+	}
+	if _, err := getTimer(ctx, db, "timer-other"); err != nil {
+		t.Fatalf("another owner's timer: %v", err)
+	}
+	if deleted, pending, err := deleteTimersByOwner(ctx, db, "WF.demo@motherbee"); err != nil || deleted != 0 || len(pending) != 0 {
+		t.Fatalf("a purge again deleted %d, pending %v (%v), want nothing", deleted, pending, err)
+	}
+}
+
 func TestManagedNodeInstanceDirUsesSYKindRoot(t *testing.T) {
 	got, err := managedNodeInstanceDir("SY.timer@motherbee")
 	if err != nil {
