@@ -481,45 +481,65 @@ const escalateWorkflowJSON = `{
 
 // FINDINGS A-254's review: a move SY.timer did not take of a timer it holds goes to its new time. A
 // day after SY.timer took an escalation for 7 days, the instance moves it to an hour from then while
-// SY.timer restarts: the router refuses the TIMER_RESCHEDULE, and the TIMER_SCHEDULE that goes again
-// 5 s later is answered already_existed at the old time, which SY.timer's store kept. Taken as
-// SY.timer's take, the mark was cleared, the node said HEALTHY, and the escalation fired 6 days late
-// (the stale-fire rule rescues only a timer SY.timer holds earlier). Now the timer keeps its mark and
-// goes to its time, a TIMER_RESCHEDULE followed as any request, until SY.timer takes it.
+// SY.timer restarts, and the router refuses the TIMER_RESCHEDULE, or while the link reconnects, and
+// the TIMER_RESCHEDULE does not go: the TIMER_SCHEDULE that goes again 5 s later is answered
+// already_existed at the old time, which SY.timer's store kept. Taken as SY.timer's take, the mark
+// was cleared, the node said HEALTHY, and the escalation fired 6 days late (the stale-fire rule
+// rescues only a timer SY.timer holds earlier). Now the timer keeps its mark and goes to its time, a
+// TIMER_RESCHEDULE followed as any request, until SY.timer takes it.
 func TestAMoveSYTimerDidNotTakeOfATimerItHoldsGoesToItsNewTime(t *testing.T) {
-	tc := newRefusalTestOn(t, escalateWorkflowJSON)
-	instanceID, scheduleTrace := tc.start()
-	heldAt := tc.now.Add(7 * 24 * time.Hour)
-	tc.dispatch(timerTook(scheduleTrace))
-	tc.later(24 * time.Hour)
-	tc.tell(instanceID, "URGENT")
-	movedTo := tc.now.Add(time.Hour)
-	tc.dispatch(unreachable(tc.timer.lastTrace(t), "NODE_NOT_FOUND"))
-	tc.later(5 * time.Second)
-	tc.tick()
-	resendTrace, rescheduled := tc.timer.lastTrace(t), len(tc.timer.rescheduled)
-	logged := nodeLog(t, func() { tc.dispatch(timerHeldAt(resendTrace, heldAt)) })
-	if row, _ := tc.timerRow(instanceID, "escalate"); row.Refusal == "" || row.FireAtMS != movedTo.UnixMilli() {
-		t.Fatalf("SY.timer holds it at its old time: the timer keeps its mark, at its new time: %+v", row)
-	}
-	if len(tc.timer.rescheduled) != rescheduled+1 || tc.timer.rescheduled[rescheduled] != timerClientRef(instanceID, "escalate") ||
-		tc.timer.rescheduledIn[rescheduled] != movedTo.Sub(tc.now) {
-		t.Fatalf("it goes to its time, a TIMER_RESCHEDULE: %v %v", tc.timer.rescheduled, tc.timer.rescheduledIn)
-	}
-	if !strings.Contains(logged, "SY.timer@motherbee holds it at "+msTime(heldAt.UnixMilli())+", later than its time") ||
-		strings.Contains(logged, "taken by SY.timer") {
-		t.Fatalf("the log says where SY.timer holds it, and no take: %s", logged)
-	}
-	if health, code, _ := tc.health(); health != "DEGRADED" || code != errCodeTimersNotReconciled {
-		t.Fatalf("the timer is not reconciled yet: %s %s", health, code)
-	}
+	for _, c := range []struct {
+		name   string
+		refuse func(tc *refusalTest, instanceID string)
+	}{
+		{"the router refuses the move", func(tc *refusalTest, instanceID string) {
+			tc.tell(instanceID, "URGENT")
+			tc.dispatch(unreachable(tc.timer.lastTrace(tc.t), "NODE_NOT_FOUND"))
+		}},
+		{"the move does not go", func(tc *refusalTest, instanceID string) {
+			tc.timer.rescheduleErr = errors.New("sender queue full")
+			tc.tell(instanceID, "URGENT")
+			tc.timer.rescheduleErr = nil
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tc := newRefusalTestOn(t, escalateWorkflowJSON)
+			instanceID, scheduleTrace := tc.start()
+			heldAt := tc.now.Add(7 * 24 * time.Hour)
+			tc.dispatch(timerTook(scheduleTrace))
+			tc.later(24 * time.Hour)
+			c.refuse(tc, instanceID)
+			movedTo := tc.now.Add(time.Hour)
+			if row, _ := tc.timerRow(instanceID, "escalate"); row.Refusal == "" || row.FireAtMS != movedTo.UnixMilli() {
+				t.Fatalf("the move is marked, at its new time: %+v", row)
+			}
+			tc.later(5 * time.Second)
+			tc.tick()
+			resendTrace, rescheduled := tc.timer.lastTrace(t), len(tc.timer.rescheduled)
+			logged := nodeLog(t, func() { tc.dispatch(timerHeldAt(resendTrace, heldAt)) })
+			if row, _ := tc.timerRow(instanceID, "escalate"); row.Refusal == "" || row.FireAtMS != movedTo.UnixMilli() {
+				t.Fatalf("SY.timer holds it at its old time: the timer keeps its mark, at its new time: %+v", row)
+			}
+			if len(tc.timer.rescheduled) != rescheduled+1 || tc.timer.rescheduled[rescheduled] != timerClientRef(instanceID, "escalate") ||
+				tc.timer.rescheduledIn[rescheduled] != movedTo.Sub(tc.now) {
+				t.Fatalf("it goes to its time, a TIMER_RESCHEDULE: %v %v", tc.timer.rescheduled, tc.timer.rescheduledIn)
+			}
+			if !strings.Contains(logged, "SY.timer@motherbee holds it at "+msTime(heldAt.UnixMilli())+", later than its time") ||
+				strings.Contains(logged, "taken by SY.timer") {
+				t.Fatalf("the log says where SY.timer holds it, and no take: %s", logged)
+			}
+			if health, code, _ := tc.health(); health != "DEGRADED" || code != errCodeTimersNotReconciled {
+				t.Fatalf("the timer is not reconciled yet: %s %s", health, code)
+			}
 
-	tc.dispatch(timerMoved(tc.timer.lastTrace(t), movedTo))
-	if row, _ := tc.timerRow(instanceID, "escalate"); row.Refusal != "" || row.FireAtMS != movedTo.UnixMilli() {
-		t.Fatalf("SY.timer took the move: %+v", row)
-	}
-	if health, code, message := tc.health(); health != "HEALTHY" {
-		t.Fatalf("the node is healthy again: %s %s %q", health, code, message)
+			tc.dispatch(timerMoved(tc.timer.lastTrace(t), movedTo))
+			if row, _ := tc.timerRow(instanceID, "escalate"); row.Refusal != "" || row.FireAtMS != movedTo.UnixMilli() {
+				t.Fatalf("SY.timer took the move: %+v", row)
+			}
+			if health, code, message := tc.health(); health != "HEALTHY" {
+				t.Fatalf("the node is healthy again: %s %s %q", health, code, message)
+			}
+		})
 	}
 }
 
