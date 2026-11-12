@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,6 +49,12 @@ func timerInfo(clientRef string, fireAtMS int64) sdk.TimerInfo {
 		MissedPolicy: sdk.MissedPolicyFire,
 		Status:       "pending",
 	}
+}
+
+// wholeList is a complete listing of timers, as listTimers gives one whose last page said no timer
+// follows.
+func wholeList(timers ...sdk.TimerInfo) timerListing {
+	return timerListing{timers: timers, complete: true, throughMS: math.MinInt64}
 }
 
 func TestRecoverLoadsRunningInstances(t *testing.T) {

@@ -236,8 +236,8 @@ func (rt *NodeRuntime) serve(ctx context.Context, incoming, timerAnswers <-chan 
 			listing = true
 			askedAtMS := nowMS(rt.ActCtx.Clock)
 			go func() {
-				listing, err := rt.listTimers(ctx, recoverOpts)
-				timerLists <- timerListResult{listing: listing, err: err, askedAtMS: askedAtMS}
+				listed, err := rt.listTimers(ctx, recoverOpts)
+				timerLists <- timerListResult{listing: listed, err: err, askedAtMS: askedAtMS}
 			}()
 		case result := <-timerLists:
 			listing = false

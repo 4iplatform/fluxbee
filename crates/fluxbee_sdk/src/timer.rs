@@ -2061,33 +2061,17 @@ mod tests {
 
     #[tokio::test]
     async fn timer_client_list_follows_sy_timers_pages() {
-        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let (sender, mut receiver, harness) = TimerTestHarness::new("WF.demo@motherbee");
         let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
             .expect("new timer client");
-        let timer = |uuid: &str, fire_at: i64| {
-            json!({
-                "uuid": uuid, "owner_l2_name": "WF.demo@motherbee", "target_l2_name": "WF.demo@motherbee",
-                "kind": "oneshot", "fire_at_utc_ms": fire_at, "missed_policy": "fire", "status": "pending",
-                "created_at_utc_ms": 1775574000000_i64, "fire_count": 0_u64
-            })
-        };
-        let pages = vec![
-            json!({"ok": true, "verb": "TIMER_LIST", "count": 2_u64,
-                   "timers": [timer("timer-1", 1), timer("timer-2", 2)], "next_cursor": "2:timer-2"}),
-            json!({"ok": true, "verb": "TIMER_LIST", "count": 1_u64, "timers": [timer("timer-3", 3)]}),
-        ];
-        let asked = tokio::spawn(async move {
-            let mut asked = Vec::new();
-            for page in pages {
-                let request = harness.next_request().await.expect("request");
-                asked.push(request.payload.clone());
-                harness
-                    .send_timer_response(&request, page)
-                    .await
-                    .expect("send a page");
-            }
-            asked
-        });
+        let asked = answer_timer_lists(
+            harness,
+            vec![
+                json!({"ok": true, "verb": "TIMER_LIST", "count": 2_u64,
+                       "timers": [listed_timer("timer-1", 1), listed_timer("timer-2", 2)], "next_cursor": "2:timer-2"}),
+                json!({"ok": true, "verb": "TIMER_LIST", "count": 1_u64, "timers": [listed_timer("timer-3", 3)]}),
+            ],
+        );
 
         let response = client
             .list_mine(TimerListFilter {

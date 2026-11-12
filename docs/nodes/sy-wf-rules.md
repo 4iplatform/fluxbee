@@ -374,8 +374,9 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   `node/node.go`; `Recover`, `node/recover.go`). The reconcile reads every page of its pending
   timers in SY.timer, each from the `next_cursor` the page before gave (`listTimers`, FINDINGS
   A-278; until 0.1.137 it read 1000, and took the ones of its index past them as missing), 200 pages
-  at the most; when the list stops before its end, the timers past the last one listed are left as
-  they are, never taken as missing. When SY.timer does not answer, or the timer index cannot be
+  at the most; when the list stops before its end, the timers past the last one listed are never
+  taken as missing: one past its time is fired now, and one ahead of it is left as it is until the
+  node's next start (the log says so). When SY.timer does not answer, or the timer index cannot be
   read, it starts `DEGRADED` and reconciles later. When the store does not open, or fails
   during recovery, the
   engine does not run and the node stays up (FINDINGS A-217): `DEGRADED` with `store_unavailable`,

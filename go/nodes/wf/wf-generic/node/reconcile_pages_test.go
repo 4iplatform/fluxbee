@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -14,7 +15,8 @@ import (
 )
 
 // wfTimersAPage is how many of a WF's timers fit one page of SY.timer's TIMER_LIST: 96 KiB of timers
-// (maxTimerListPageBytes, go/sy-timer), each about 430 bytes listed.
+// (maxTimerListPageBytes, go/sy-timer), each about 430 bytes listed (410 to 460 by the lengths of the
+// node's name and its timer keys).
 const wfTimersAPage = 228
 
 // pagedSYTimer is SY.timer answering TIMER_LIST in pages, as respondTimerList does (go/sy-timer): its
@@ -262,7 +264,8 @@ func TestAReconcileWithAnSYTimerBefore16(t *testing.T) {
 // FINDINGS A-278 — the reconcile reads maxTimerListPages pages at the most: there the list stops,
 // and the timers of the index past the last one listed are left as they are, none taken as missing,
 // while one before it that SY.timer does not have still goes again. An SY.timer that lists right
-// needs 44 pages for the 10,000 timers it keeps for an owner at the most.
+// needs 42 to 48 pages for the 10,000 timers it keeps for an owner at the most (about 90 at the
+// longest client_ref).
 func TestAReconcileReadsItsBoundOfPagesAtTheMost(t *testing.T) {
 	timer := &pagedSYTimer{t: t, frame: 10}
 	rt, _ := newTestRuntime(t, "", validWorkflowJSON(), timer)
@@ -282,6 +285,8 @@ func TestAReconcileReadsItsBoundOfPagesAtTheMost(t *testing.T) {
 // gives a next_cursor, or a next_cursor a page before gave (an SY.timer that takes no cursor answers
 // its first page again), stops it there, and the timers of the index past the last one listed are
 // left as they are, none taken as missing; one before it that SY.timer does not have still goes again.
+// The log counts each timer listed once, a page that came again included, and says the reconcile is
+// done for what was listed, not complete (A-278's review).
 func TestAReconcileStopsAtAPageItCannotGoOnFrom(t *testing.T) {
 	var first sdk.TimerListPage
 	for _, tc := range []struct {
@@ -307,14 +312,191 @@ func TestAReconcileStopsAtAPageItCannotGoOnFrom(t *testing.T) {
 			rt, _ := newTestRuntime(t, "", validWorkflowJSON(), timer)
 			pending := pendingTimers(t, rt, 250, 10, fixedClock().Add(time.Hour).UnixMilli())
 			timer.pending = without(pending, 100)
-			if err := rt.Recover(context.Background(), recoverOpts); err != nil {
-				t.Fatal(err)
-			}
+			logged := nodeLog(t, func() {
+				if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+					t.Fatal(err)
+				}
+			})
 			if missing := takenAsMissing(t, rt, timer, 2500); len(missing) != 1 || missing[0] != *pending[100].ClientRef {
 				t.Fatalf("only the timer SY.timer lost among the 500 listed is taken as missing, %s: %d taken, the first %v",
 					*pending[100].ClientRef, len(missing), missing[:min(3, len(missing))])
 			}
 			askedFrom(t, timer, tc.pages)
+			for _, want := range []string{
+				"SY.timer@motherbee listed 500 pending timer(s) of WF.invoice@motherbee in 2 page(s)",
+				"recover: 1999 timer(s) of WF.invoice@motherbee ahead of their time",
+				"recover: timer reconciliation done for the timers SY.timer@motherbee listed",
+			} {
+				if !strings.Contains(logged, want) {
+					t.Fatalf("the log does not say %q:\n%s", want, logged)
+				}
+			}
+			if strings.Contains(logged, "timer reconciliation complete") {
+				t.Fatalf("the log says the reconcile is complete:\n%s", logged)
+			}
+		})
+	}
+}
+
+// FINDINGS A-278's review — when SY.timer's list stops before its end, no reconcile comes before the
+// node's next start: a list that stops early is no error, so the node is not DEGRADED for it, and the
+// loop asks no list again. So a timer of the index past its time and past the last one listed is
+// fired now, and the one SY.timer may hold is cancelled, as a pending timer past its time is: left as
+// it was, it would never fire, SY.timer having lost it. One whose time is ahead is left as it is,
+// neither taken as missing nor fired, and one SY.timer does not have before the last one listed fires
+// as one lost while the node was down, nothing cancelled. At the start and off the loop alike, the
+// log says the reconcile is done for what was listed.
+func TestAReconcileWhoseListStopsEarlyFiresTheTimersPastTheirTime(t *testing.T) {
+	const instanceID = "wfi:early"
+	at := func(d time.Duration) int64 { return fixedClock().Add(d).UnixMilli() }
+	held := func(key string, fireAtMS int64) sdk.TimerInfo {
+		info := timerInfo(timerClientRef(instanceID, key), fireAtMS)
+		info.UUID = "uuid-" + key
+		return info
+	}
+	// noTimerOnPage(empty) is SY.timer answering its page empty with no timer and a next_cursor: the
+	// list stops there.
+	noTimerOnPage := func(empty int) func(n int, page sdk.TimerListPage) sdk.TimerListPage {
+		return func(n int, page sdk.TimerListPage) sdk.TimerListPage {
+			if n == empty {
+				return sdk.TimerListPage{NextCursor: "1:uuid-none"}
+			}
+			return page
+		}
+	}
+	type timerAt struct {
+		key string
+		at  time.Duration
+	}
+	for _, tc := range []struct {
+		name  string
+		index []timerAt // the index's timers, SY.timer holding those of pending at the same time
+		// pending are the keys SY.timer holds pending, its fires late; the index's other timers it
+		// lost.
+		pending []string
+		frame   int
+		odd     func(n int, page sdk.TimerListPage) sdk.TimerListPage
+		// fired are the keys whose fire the instance takes, cancelled those cancelled in SY.timer,
+		// kept those the index keeps, pages the pages asked.
+		fired, cancelled, kept []string
+		pages                  int
+		offTheLoop             bool
+	}{
+		{
+			name:    "its first page holds none, at the start",
+			index:   []timerAt{{"due", -time.Minute}, {"ahead", time.Hour}},
+			pending: []string{"due", "ahead"},
+			frame:   10, odd: noTimerOnPage(1),
+			fired: []string{"due"}, cancelled: []string{"due"}, kept: []string{"ahead"}, pages: 1,
+		},
+		{
+			name:    "its first page holds none, off the loop",
+			index:   []timerAt{{"due", -time.Minute}, {"ahead", time.Hour}},
+			pending: []string{"ahead"},
+			frame:   10, odd: noTimerOnPage(1),
+			fired: []string{"due"}, cancelled: []string{"due"}, kept: []string{"ahead"}, pages: 1,
+			offTheLoop: true,
+		},
+		{
+			// The first page lists a and b; c fires 1 s after b, within the 2 s a schedule may be
+			// late, so the list may hold it past b; e fires before b by more, so the list would
+			// hold it: SY.timer lost it.
+			name: "it stops after timers past their time",
+			index: []timerAt{{"a", -3 * time.Minute}, {"e", -150 * time.Second}, {"b", -2 * time.Minute},
+				{"c", -119 * time.Second}, {"d", time.Hour}},
+			pending: []string{"a", "b", "c", "d"},
+			frame:   2, odd: noTimerOnPage(2),
+			fired: []string{"a", "b", "c", "e"}, cancelled: []string{"a", "b", "c"}, kept: []string{"d"}, pages: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			timer := &pagedSYTimer{t: t, frame: tc.frame, odd: tc.odd}
+			rt, _ := newTestRuntime(t, "", validWorkflowJSON(), timer)
+			ctx := context.Background()
+			putRunningInstance(t, rt, instanceID, "collecting_data")
+			for _, indexed := range tc.index {
+				if err := rt.Store.RegisterTimer(ctx, instanceID, indexed.key, 1000, at(indexed.at)); err != nil {
+					t.Fatal(err)
+				}
+				if slices.Contains(tc.pending, indexed.key) {
+					timer.pending = append(timer.pending, held(indexed.key, at(indexed.at)))
+				}
+			}
+			var logged string
+			if tc.offTheLoop {
+				// The start could not reconcile (no timer sender then); the loop's list does.
+				rt.ActCtx.Timer = nil
+				if err := rt.Recover(ctx, recoverOpts); err != nil {
+					t.Fatal(err)
+				}
+				rt.ActCtx.Timer = timer
+				rt.timersPending = errors.New("SY.timer did not answer")
+				askedAtMS := nowMS(rt.ActCtx.Clock)
+				logged = nodeLog(t, func() {
+					listed, err := rt.listTimers(ctx, recoverOpts)
+					rt.takeTimerList(ctx, timerListResult{listing: listed, err: err, askedAtMS: askedAtMS}, recoverOpts)
+				})
+			} else {
+				logged = nodeLog(t, func() {
+					if err := rt.Recover(ctx, recoverOpts); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+
+			var cancelled []string
+			for _, key := range tc.cancelled {
+				cancelled = append(cancelled, timerClientRef(instanceID, key))
+			}
+			if fmt.Sprint(timer.cancelled) != fmt.Sprint(cancelled) {
+				t.Fatalf("cancelled in SY.timer: %v, want %v", timer.cancelled, cancelled)
+			}
+			timer.cancelled = nil
+			logs, err := rt.Store.GetRecentLog(ctx, instanceID, 20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fires := 0
+			for _, entry := range logs {
+				if entry.Summary == "unhandled event TIMER_FIRED in state collecting_data" {
+					fires++
+				}
+			}
+			if fires != len(tc.fired) {
+				t.Fatalf("the instance takes %d fires, %v, once each: %d", len(tc.fired), tc.fired, fires)
+			}
+			if missing := takenAsMissing(t, rt, timer, len(tc.kept)); len(missing) != 0 {
+				t.Fatalf("taken as missing: %v", missing)
+			}
+			rows, err := rt.Store.ListTimersForInstance(ctx, instanceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var kept []string
+			for _, row := range rows {
+				kept = append(kept, row.TimerKey)
+			}
+			if fmt.Sprint(kept) != fmt.Sprint(tc.kept) {
+				t.Fatalf("the index keeps %v, want %v", kept, tc.kept)
+			}
+			askedFrom(t, timer, tc.pages)
+
+			wants := []string{
+				"past the last timer SY.timer@motherbee listed, its list stopped before its end: injecting synthetic TIMER_FIRED",
+				"recover: 1 timer(s) of WF.invoice@motherbee ahead of their time",
+				"recover: timer reconciliation done for the timers SY.timer@motherbee listed",
+			}
+			if tc.offTheLoop {
+				wants = append(wants, "wf: timers reconciled with SY.timer as far as its list went, which stopped before its end (the node's next start lists the rest); the node is no longer degraded")
+			}
+			for _, want := range wants {
+				if !strings.Contains(logged, want) {
+					t.Fatalf("the log does not say %q:\n%s", want, logged)
+				}
+			}
+			if strings.Contains(logged, "timer reconciliation complete") {
+				t.Fatalf("the log says the reconcile is complete:\n%s", logged)
+			}
 		})
 	}
 }

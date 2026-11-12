@@ -418,6 +418,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
 - A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
+- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-328 🔵 SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next` (low; SY.admin's next change).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
@@ -1585,6 +1586,29 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   sends Archi's same tools with `tool_choice` `none` (a `tool_choice` change keeps the
   tools-and-system cache).
 
+### A-326 [General/SY.timer] 🔵 low (found 2026-11-12 by A-278's review; read in the code, its query plan checked with SQLite; there before it, more pages since A-278) — Each `TIMER_LIST` page reads every pending timer of the hive
+
+- **Why:** SY.timer's `listTimers` (`go/sy-timer/persistence.go` ~281-323) asks
+  `WHERE owner_l2_name=? AND status=?` (and the cursor) `ORDER BY fire_at_utc, uuid LIMIT limit+1`,
+  the status bound as a parameter. Its indexes are `idx_timers_owner(owner_l2_name)`,
+  `idx_timers_status(status)`, and two partial ones on `status='pending'`, which a bound status
+  cannot use (~122-135), and SY.timer runs no `ANALYZE`. SQLite (3.50.4 and 3.51.0 on the Mac)
+  plans `SEARCH timers USING INDEX idx_timers_status (status=?)` and then
+  `USE TEMP B-TREE FOR ORDER BY`: it reads every pending timer of the hive, every owner's, and
+  sorts the owner's past the cursor. With an index on `(owner_l2_name, status, fire_at_utc, uuid)`
+  it searches that index, with no sort.
+- **Effect:** a page costs in proportion to the hive's pending timers, not to its limit, and since
+  A-278 a WF's reconcile asks a page per frame, about 210 to 240 of its timers: 13 or 14 pages
+  for 3,000, 42 to 48 for 10,000. Measured on the Mac with python3's SQLite, a walk of one owner's
+  10,000 timers: 5.6 ms a page with 15,000 pending on the hive, 14.8 ms with 100,000 (the hive's
+  cap), and 3.5 ms with that index, whatever the hive holds (SY.timer's SQLite, modernc's, measured
+  10 to 16 ms a page at 15,000 for A-278). SY.timer serves one request at a time (`run`,
+  `go/sy-timer/main.go` ~267), so each page holds up the other owners' requests. Small on 8.x
+  today, where no WF holds more than a handful of pending timers (A-278).
+- **Fix, later (SY.timer's own release):** that index, created at the start as the others are;
+  then, a smaller gain, a page that reads only what its frame can hold (it reads `limit+1` rows,
+  1001, where about 238 of a WF's timers fit).
+
 ### A-325 [General/AI runners] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
 
 - **Why:** SY.vault broadcasts `VAULT_SECRET_CHANGED`, a `system` message, at each change of a
@@ -2668,20 +2692,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `TIMER_LIST`, one page as SY.timer answers it, with its `NextCursor`; `ListFilter.Cursor` is
     where a list starts; `List` keeps its signature and what it returns. The Rust SDK's `list`
     hands back SY.timer's `next_cursor` when it stops at its limit with timers following (before,
-    it dropped it), and `list_page` is one page. Every caller compiles unchanged: the WF, and the
-    Rust examples' `list_mine`.
+    it dropped it), and `list_page` is one page. Go's `List` keeps its signature, the WF moves to
+    `ListPage` (its `TimerSender` and its test fakes), and the Rust examples' `list_mine` compile
+    unchanged.
   - **The WF reads every page** (`listTimers`, `node/recover.go`): 1000 a page at the most, about
-    228 of a WF's timers to a page's 96 KiB, each page from the cursor the page before gave, until
-    one gives none. It stops before the end, with a log line that says why, at 200 pages (about
-    45,000 timers; SY.timer keeps 10,000 an owner, 44 pages), at a page of no timer that gives a
-    cursor, at a cursor a page before gave, or at a page of 1000 that gives none, as SY.timer before
-    1.6 answers a page its limit cut (A-266; a frame holds about 400 timers at the most, so the
-    limit 1000 never ends a page, and an older SY.timer is read whole too). When the list stops
-    before its end, an index timer from the last one listed on (within 2 s, the most later SY.timer
-    holds a timer than the index) is left as it is, never taken as missing nor fired; one before it
-    that SY.timer lacks still goes again. A timer that fires, or that an instance schedules or
-    moves, while the pages are read is taken as before (a fire given once; one scheduled or moved
-    after the list was asked left alone).
+    210 to 240 of a WF's timers to a page's 96 KiB (by the lengths of its name and its timer keys),
+    each page from the cursor the page before gave, until one gives none. It stops before the end,
+    with a log line that says why, at 200 pages (about 42,000 to 48,000 timers; SY.timer keeps
+    10,000 an owner, 42 to 48 pages, about 90 at the longest client_ref), at a page of no timer that
+    gives a cursor, at a cursor a page before gave, or at a page of 1000 that gives none, as SY.timer
+    before 1.6 answers a page its limit cut (A-266; a frame holds about 400 timers at the most, so
+    the limit 1000 never ends a page, and an older SY.timer is read whole too). When the list stops
+    before its end, an index timer from the last one listed on (within 2 s: SY.timer normally holds
+    a timer at the index's time or up to 2 s later) is never taken as missing: one ahead of its time
+    is left as it is, and one past it is fired (the review, below); one before it that SY.timer
+    lacks still goes again. One SY.timer holds later still (a move it did not take, or a schedule
+    it took more than 2 s late) can read as missing when its index time is before the last one
+    listed: it goes again once, and SY.timer's `already_existed` settles it. A timer that fires, or
+    that an instance schedules or moves, while the pages are read is taken as before (a fire given
+    once; one scheduled or moved after the list was asked left alone).
   - **Tests** (`node/reconcile_pages_test.go`): 2,500 pending timers in pages of 1000, and of 228,
     none taken as missing nor sent again; the bound (200 pages of 10); a page of no timer with a
     cursor, and a cursor given again; an SY.timer before 1.6, whose frame ends the pages, and whose
@@ -2692,10 +2721,38 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `timer_client_list_stops_at_a_page_of_no_timers`, `timer_client_list_page_is_one_timer_list`
     (Rust).
   - **Its time, measured on the Mac (SQLite and the encoding, no router):** SY.timer lists 3,000 of a
-    WF's pending timers in 14 pages in 0.13 s, and 10,000 in 47 pages in 0.6 s (10 to 16 ms a page,
-    each reading the 1001 timers its limit asks); the WF's reconcile of them takes 0.23 s and
-    0.73 s more. Before, the node ran `DEGRADED` about a minute (3,000) or five (10,000) at each
-    reconcile, sending the timers past the 1000th again 32 a second.
+    WF's pending timers in 14 pages in 0.13 s, and 10,000 in 47 pages in 0.6 s, 10 to 16 ms a page
+    with 8,000 to 15,000 pending timers on the hive (5,000 of other owners); the WF's reconcile of
+    them takes 0.23 s and 0.73 s more. Before, the node ran `DEGRADED` about a minute (3,000) or
+    five (10,000) at each reconcile, sending the timers past the 1000th again 32 a second. A page's
+    cost grows with the hive's pending timers, every owner's, not with the limit: SY.timer's query
+    reads every pending timer of the hive through its status index, then sorts the owner's past the
+    cursor (A-326), and the walk does that at each page. At the hive's cap, 100,000 pending, a page
+    takes about three times as long, and SY.timer serves one request at a time.
+- **The review (2026-11-12; three reviews: the paging, the SDKs' compatibility, operations):**
+  - **A timer past its time and past the last one listed is fired.** A list that stops before its
+    end is no error: the node is not `DEGRADED` for it and the loop asks no list again, so no
+    reconcile comes before the node's next start, where the texts said a later one lists the timers
+    left. Such a timer, SY.timer having lost it, would never have fired; it is now taken as a
+    pending timer past its time: the instance takes a fire now, and the one SY.timer may hold is
+    cancelled unless the fire scheduled the key again (`firePastTimer`; SY.timer answers a cancel
+    of a client_ref it holds nothing pending for `found: false`, and a late fire of it is dropped,
+    the index no longer having it). One ahead of its time waits for the next start, the log line
+    that counts them its only sign. Test:
+    `TestAReconcileWhoseListStopsEarlyFiresTheTimersPastTheirTime` (at the start and off the loop),
+    which fails without the fix.
+  - **The logs:** the listing counts each timer once (a timer whose fire time moved between two
+    pages, a page given again); a reconcile of a list that stopped before its end says it is done
+    for the timers listed, not complete, and off the loop that the node's next start lists the
+    rest. `TestAReconcileStopsAtAPageItCannotGoOnFrom` checks them.
+  - **The texts:** the 2 s margin is SY.timer's usual lateness, not a bound (a move it did not take
+    holds a timer later); a timer the node itself sends again, or moves to its time, while the
+    pages of a reconcile off the loop are read can read as missing once, settled by
+    `already_existed` (as it could with one list, over more pages now); the page counts depend on
+    the names' and keys' lengths; the Go SDK's `List` returns the timers only (the `TIMER_LIST` row
+    of `docs/nodes/sy-timer.md`);
+    the README says scheduled or moved. `wholeList` moved to the tests; the older paging tests of
+    both SDKs use the new helpers.
 
 ### A-277 [General/identity] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; a removed throwaway worker's reconnects refused *"not in the hive registry"*, 132 with its key deleted and 74 with its key pinned in place, none during its joins; with the key pinned sy-identity was not restarted and the 10 s recheck closed its sessions, the last 7.7 s after the answer; at the deploy no refusal, and worker1's replica in sync, its metrics equal and 2 sessions) (found 2026-11-11 by the review fixes of identity's 0.1.133 branch; read in the code) — A removed hive whose identity key could not be deleted keeps reading the identity store
 

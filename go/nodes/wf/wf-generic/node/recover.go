@@ -283,9 +283,10 @@ func (rt *NodeRuntime) giveUpInbound(ctx context.Context, row InboundEventRow, m
 }
 
 // maxTimerListPages bounds the pages of SY.timer's TIMER_LIST a reconcile reads (listTimers). A page
-// holds the timers that fit 96 KiB, about 228 of a WF's (430 bytes each, listed), so the 10,000
-// pending timers SY.timer keeps for an owner at the most take 44 pages: an SY.timer that lists them
-// right never brings a reconcile to the bound, 200 pages.
+// holds the timers that fit 96 KiB: about 210 to 240 of a WF's (410 to 460 bytes each, listed, by
+// the lengths of its name and its timer keys), so the 10,000 pending timers SY.timer keeps for an
+// owner at the most take 42 to 48 pages, and about 90 at the longest client_ref (255 characters):
+// an SY.timer that lists them right never brings a reconcile to the bound, 200 pages.
 const maxTimerListPages = 200
 
 // timerListing is what SY.timer listed of the node's pending timers (listTimers), by fire time, then
@@ -299,18 +300,27 @@ type timerListing struct {
 	pages     int
 }
 
-// wholeList is a complete listing of timers.
-func wholeList(timers ...sdk.TimerInfo) timerListing {
-	return timerListing{timers: timers, complete: true, throughMS: math.MinInt64}
-}
-
-// covers reports whether the listing would hold a timer the index has at fireAtMS, were it pending
-// in SY.timer: always when the listing is complete; otherwise when the timer fires before the last
-// one listed by more than timerFireTolerance, since SY.timer holds a timer at the index's time or
-// up to that much later (it counts a fire_in from when it gets the request). One it does not cover
-// may be pending past the last one listed, so it is never taken as missing (FINDINGS A-278).
+// covers reports whether the listing would hold a timer the index has at fireAtMS, were SY.timer to
+// hold it pending at that time: always when the listing is complete; otherwise when the timer fires
+// before the last one listed by more than timerFireTolerance. SY.timer normally holds a timer at the
+// index's time, or up to that much later (it counts a fire_in from when it gets the request), so one
+// the listing does not cover may be pending past the last one listed: it is never taken as missing
+// (FINDINGS A-278). One SY.timer holds later still, a move it did not take or a schedule it took
+// more than 2 s late, can be past the last one listed while the listing covers it: it reads as
+// missing and goes again once, and SY.timer's already_existed settles it (timerHeld), its fire
+// neither lost nor doubled.
 func (l timerListing) covers(fireAtMS int64) bool {
 	return l.complete || fireAtMS+timerFireTolerance.Milliseconds() < l.throughMS
+}
+
+// distinctTimers is how many timers listed holds, each once: a timer can come on two pages (its fire
+// time moved between them), and a page can come again (listTimers).
+func distinctTimers(listed []sdk.TimerInfo) int {
+	uuids := make(map[string]bool, len(listed))
+	for _, timer := range listed {
+		uuids[timer.UUID] = true
+	}
+	return len(uuids)
 }
 
 // listTimers asks SY.timer for the timers this node has pending, all of them, in pages: the first,
@@ -362,10 +372,10 @@ func (rt *NodeRuntime) listTimers(ctx context.Context, opts RecoverOptions) (tim
 		elapsed := time.Since(started).Round(time.Millisecond)
 		if listing.complete {
 			log.Printf("recover: %s listed %d pending timer(s) of %s in %d page(s), in %s",
-				authority, len(listing.timers), opts.OwnerL2Name, listing.pages, elapsed)
+				authority, distinctTimers(listing.timers), opts.OwnerL2Name, listing.pages, elapsed)
 		} else {
 			log.Printf("recover: %s listed %d pending timer(s) of %s in %d page(s), in %s, and the list stops there, before its end: %s",
-				authority, len(listing.timers), opts.OwnerL2Name, listing.pages, elapsed, stopped)
+				authority, distinctTimers(listing.timers), opts.OwnerL2Name, listing.pages, elapsed, stopped)
 		}
 		return listing, nil
 	}
@@ -396,7 +406,8 @@ type timerListResult struct {
 }
 
 // takeTimerList reconciles with a TIMER_LIST asked off the receive loop: once SY.timer answered and
-// the index was read, the node is no longer DEGRADED; otherwise the loop asks again on its tick.
+// the index was read, the node is no longer DEGRADED, a list that stopped before its end included
+// (reconcileTimers); otherwise the loop asks again on its tick.
 func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult, opts RecoverOptions) {
 	err := result.err
 	if err == nil {
@@ -408,15 +419,19 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 		return
 	}
 	rt.timersPending = nil
+	reconciled := "timers reconciled with SY.timer"
+	if !result.listing.complete {
+		reconciled += " as far as its list went, which stopped before its end (the node's next start lists the rest)"
+	}
 	// The node stays DEGRADED while a timer waits for SY.timer to take it (degradedBy), and the log
 	// says so (FINDINGS A-254's review).
 	switch count, _, err := rt.Store.RefusedTimers(ctx); {
 	case err != nil:
-		log.Printf("wf: timers reconciled with SY.timer; the timers it has not taken could not be counted: %v", err)
+		log.Printf("wf: %s; the timers it has not taken could not be counted: %v", reconciled, err)
 	case count > 0:
-		log.Printf("wf: timers reconciled with SY.timer; %d timer(s) wait for it to take them, the node DEGRADED until it does", count)
+		log.Printf("wf: %s; %d timer(s) wait for it to take them, the node DEGRADED until it does", reconciled, count)
 	default:
-		log.Printf("wf: timers reconciled with SY.timer; the node is no longer degraded")
+		log.Printf("wf: %s; the node is no longer degraded", reconciled)
 	}
 }
 
@@ -430,16 +445,25 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 //     node itself then (timerHeld, A-254's review);
 //   - pending, fire_at past, SY.timer's or the index's (SY.timer holding it later): the instance takes
 //     a fire now (as SY.timer's would, through the journal), in the order of the index, and the
-//     pending one is cancelled unless the fire scheduled the key again;
+//     pending one is cancelled unless the fire scheduled the key again (firePastTimer);
 //   - not listed, from the last timer listed on, when the list stopped before its end (covers):
-//     SY.timer may have it, so it is left as it is, neither taken as missing nor fired, until a
-//     reconcile lists it (FINDINGS A-278);
+//     SY.timer may have it pending, or may have lost it. One whose fire_at is past is taken as a
+//     pending one past its time: the instance takes a fire now, and the one SY.timer may hold is
+//     cancelled unless the fire scheduled the key again (A-278's review). One whose fire_at is ahead
+//     is left as it is, neither taken as missing nor fired, until the node's next start: no reconcile
+//     comes before it, since a list that stopped before its end is no error (the node is not DEGRADED
+//     for it, and the loop asks no list again). Until then one SY.timer lost does not go again, and
+//     the log line that counts them is the only sign (FINDINGS A-278);
 //   - not in SY.timer, fire_at past: it fired while the WF was down and the fire was lost; the
 //     instance takes a fire now;
 //   - not in SY.timer, fire_at ahead: SY.timer never got it (it was scheduled while SY.timer did not
 //     answer) or lost it; it goes again from the loop's tick, paced (timerMissing);
 //   - scheduled, or moved, after SY.timer was asked: left alone; the list may not hold it, or hold
-//     it at its old time (its pages are read one after another, no snapshot);
+//     it at its old time (its pages are read one after another, no snapshot). The node's own
+//     requests while the pages of a reconcile off the loop are read, a refused timer sent again from
+//     the loop's tick or one SY.timer holds late moved to its time (timerHeld), keep the row's
+//     scheduled_at_ms: SY.timer may take such a timer behind a page already read, and it then reads
+//     as missing and goes again once, which SY.timer answers already_existed (timerHeld);
 //   - in SY.timer but not in the index: an orphan, cancelled.
 //
 // An error says the timers are not reconciled, and the node stays DEGRADED until a later reconcile
@@ -447,7 +471,7 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 // sends a fire once, FINDINGS A-217): the index could not be read, and nothing changed (every timer
 // of SY.timer would have read as an orphan), or a row could not be read again, and stays as it was
 // while the others are reconciled. A listing that stopped before its end is no error: what it lists
-// is reconciled, and its listTimers' log says why it stopped.
+// is reconciled, its listTimers' log says why it stopped, and the node's next start lists the rest.
 func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing, opts RecoverOptions, askedAtMS int64) error {
 	actx := rt.ActCtx
 	expectedTimers, err := rt.Store.ListAllExpectedTimers(ctx)
@@ -502,22 +526,22 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 			// (a move to an earlier time it did not take), whose fire would come late.
 			if running {
 				log.Printf("recover: timer %s/%s past fire_at, injecting synthetic TIMER_FIRED", row.InstanceID, row.TimerKey)
-				rt.fireMissedTimer(ctx, inst, row, syTimer.UUID)
-				if _, rearmed, _ := rt.Store.GetTimerForInstance(ctx, row.InstanceID, row.TimerKey); rearmed {
-					log.Printf("recover: timer %s/%s was scheduled again by the fire, keeping it", row.InstanceID, row.TimerKey)
-					continue
-				}
-			} else {
-				_ = rt.Store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
 			}
-			// Cancel the pending one in SY.timer so it does not fire again.
-			if err := actx.Timer.CancelByClientRefConfirmed(ctx, ref); err != nil {
-				log.Printf("recover: cancel past timer %s: %v", ref, err)
-			}
+			rt.firePastTimer(ctx, inst, running, row, syTimer.UUID)
+
+		case running && !listing.covers(row.FireAtMS) && row.FireAtMS <= now:
+			// Past its time, and past the last timer SY.timer listed, the list having stopped before
+			// its end: SY.timer may hold it pending, or may have lost it, and no reconcile comes
+			// before the node's next start. It is fired now, as a pending one past its time, and the
+			// one SY.timer may hold is cancelled (FINDINGS A-278's review).
+			log.Printf("recover: timer %s/%s past fire_at, and past the last timer %s listed, its list stopped before its end: injecting synthetic TIMER_FIRED, and cancelling the one it may hold",
+				row.InstanceID, row.TimerKey, timerAuthority(rt.NodeName))
+			rt.firePastTimer(ctx, inst, running, row, "")
 
 		case running && !listing.covers(row.FireAtMS):
-			// Past the last timer SY.timer listed, the list having stopped before its end: SY.timer
-			// may have it pending, so it is neither taken as missing nor fired (FINDINGS A-278).
+			// Past the last timer SY.timer listed, the list having stopped before its end, and ahead
+			// of its time: SY.timer may have it pending, so it is neither taken as missing nor fired
+			// (FINDINGS A-278).
 			unlisted++
 
 		case row.FireAtMS <= now:
@@ -543,7 +567,7 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 		if listing.throughMS != math.MinInt64 {
 			last = "at " + msTime(listing.throughMS)
 		}
-		log.Printf("recover: %d timer(s) of %s, from the last one %s listed on (%s), are left as they are, none taken as missing: its list stopped before its end",
+		log.Printf("recover: %d timer(s) of %s ahead of their time, from the last one %s listed on (%s), are left as they are until the node's next start, none taken as missing: its list stopped before its end",
 			unlisted, opts.OwnerL2Name, timerAuthority(rt.NodeName), last)
 	}
 
@@ -561,8 +585,35 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 	if unread != nil {
 		return unread
 	}
-	log.Printf("recover: timer reconciliation complete")
+	if listing.complete {
+		log.Printf("recover: timer reconciliation complete")
+	} else {
+		log.Printf("recover: timer reconciliation done for the timers %s listed: its list stopped before its end, and the node's next start lists the rest",
+			timerAuthority(rt.NodeName))
+	}
 	return nil
+}
+
+// firePastTimer settles a timer of the index whose time has come while SY.timer holds it pending,
+// or may (reconcileTimers): the instance takes its fire now (fireMissedTimer), and the one SY.timer
+// holds is cancelled so it does not fire again, unless the fire scheduled the key again. SY.timer
+// answers the cancel of a client_ref it holds no pending timer for found false, and a fire of it
+// that comes all the same is dropped, the index no longer having the timer (takeTimerFired). The
+// timer of an instance that no longer runs leaves the index, and SY.timer's is cancelled.
+func (rt *NodeRuntime) firePastTimer(ctx context.Context, inst *WFInstance, running bool, row TimerRow, timerUUID string) {
+	ref := timerClientRef(row.InstanceID, row.TimerKey)
+	if running {
+		rt.fireMissedTimer(ctx, inst, row, timerUUID)
+		if _, rearmed, _ := rt.Store.GetTimerForInstance(ctx, row.InstanceID, row.TimerKey); rearmed {
+			log.Printf("recover: timer %s/%s was scheduled again by the fire, keeping it", row.InstanceID, row.TimerKey)
+			return
+		}
+	} else {
+		_ = rt.Store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
+	}
+	if err := rt.ActCtx.Timer.CancelByClientRefConfirmed(ctx, ref); err != nil {
+		log.Printf("recover: cancel past timer %s: %v", ref, err)
+	}
 }
 
 // timerMissing marks a timer of the index the reconcile found SY.timer does not have (scheduled while

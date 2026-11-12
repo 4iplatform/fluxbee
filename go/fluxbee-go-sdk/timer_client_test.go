@@ -980,46 +980,11 @@ func TestListMineParsesTimers(t *testing.T) {
 // A list SY.timer answers in pages is listed whole: the next page is asked for after the cursor the
 // page before gave, with what is left of the limit (FINDINGS A-151).
 func TestListFollowsSYTimersPages(t *testing.T) {
-	tx := make(chan []byte, 2)
-	rx := make(chan receivedMessage, 2)
-	client, err := newTestTimerClientWithChannels(
-		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
-		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
-		TimerClientConfig{},
-	)
-	if err != nil {
-		t.Fatalf("new timer client: %v", err)
-	}
-	timer := func(uuid string, fireAt int64) map[string]any {
-		return map[string]any{
-			"uuid": uuid, "owner_l2_name": "WF.demo@motherbee", "target_l2_name": "WF.demo@motherbee",
-			"kind": "oneshot", "fire_at_utc_ms": fireAt, "missed_policy": "fire", "status": "pending",
-			"created_at_utc_ms": int64(1775574000000), "fire_count": int64(0),
-		}
-	}
-	pages := []map[string]any{
-		{"ok": true, "verb": "TIMER_LIST", "count": 2, "timers": []map[string]any{timer("timer-1", 1), timer("timer-2", 2)}, "next_cursor": "2:timer-2"},
-		{"ok": true, "verb": "TIMER_LIST", "count": 1, "timers": []map[string]any{timer("timer-3", 3)}},
-	}
-	asked := make(chan map[string]any, 2)
-	go func() {
-		for _, page := range pages {
-			var request Message
-			if err := json.Unmarshal(<-tx, &request); err != nil {
-				t.Errorf("unmarshal request: %v", err)
-				return
-			}
-			var payload map[string]any
-			_ = json.Unmarshal(request.Payload, &payload)
-			asked <- payload
-			response, err := BuildSystemResponse(&request, "timer-uuid", MsgTimerResponse, page, SystemEnvelopeOptions{})
-			if err != nil {
-				t.Errorf("build response: %v", err)
-				return
-			}
-			rx <- receivedMessage{msg: response}
-		}
-	}()
+	client, asked := answerTimerLists(t, []map[string]any{
+		{"ok": true, "verb": "TIMER_LIST", "count": 2,
+			"timers": []map[string]any{listTestTimer("timer-1", 1), listTestTimer("timer-2", 2)}, "next_cursor": "2:timer-2"},
+		{"ok": true, "verb": "TIMER_LIST", "count": 1, "timers": []map[string]any{listTestTimer("timer-3", 3)}},
+	})
 
 	items, err := client.ListMine(context.Background(), ListFilter{StatusFilter: "pending", Limit: 1000})
 	if err != nil {
