@@ -261,6 +261,15 @@ than a message may carry (128 KiB) answers `ai_runtime_reply_too_large` instead 
 false: the message ran), or nothing when the request's own context is what is too large (nor to a
 `system` or `admin` request), and goes on with the others; before 0.1.142 that stopped the node.
 
+**An answer the WF does not take** (since 0.1.142, FINDINGS A-339). A WF node whose queue is full
+answers an agent's answer `NOT_TAKEN` with reason `node_busy` (since 0.1.141), and one that cannot
+use its store with `unavailable`. The answer never reached the instance, which goes on as if the
+agent had not answered: its timer for the answer, when the definition sets one, runs out. The agent
+answers nothing back and does not send its answer again. Its log has a warning, *a message this
+node sent was not taken*, that names the WF (`refused_by`), the reason and the turn's trace. Tell
+the operator the WF did not take it, not the agent: it was busy (`node_busy`), or without its store
+(`unavailable`, which the WF's status explains, §4.2.7).
+
 ### 4.1.1 Agent tools
 
 What an AI agent can do beyond answering is its **tools**: the functions its model calls while it

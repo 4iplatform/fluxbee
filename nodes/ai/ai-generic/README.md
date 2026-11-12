@@ -46,10 +46,17 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 - **A notice or a reply is never answered,** only logged (the AI SDK's
   `is_infrastructure_message`, which SY.frontdesk.gov runs too): a message the router made, which
   carries no `src_l2_name` (`UNREACHABLE`, `TTL_EXCEEDED`), or one named as a notice or a reply
-  (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any `*_RESPONSE`). A router notice is a WARN with its trace and
-  its reason. An answer to one would go to the router's own UUID, and the two would bounce it
-  forever (FINDINGS A-112). SY.timer and wf-generic leave the same ones unanswered (FINDINGS
-  A-218).
+  (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any `*_RESPONSE`, `NOT_TAKEN`, an error answer `<msg>.error`).
+  A router notice is a WARN with its trace and its reason. An answer to one would go to the
+  router's own UUID, and the two would bounce it forever (FINDINGS A-112). SY.timer and wf-generic
+  leave the same ones unanswered (FINDINGS A-218), SY.timer a `NOT_TAKEN` and a `<msg>.error` since
+  0.1.141.
+- **A `NOT_TAKEN` is a WARN too** (since 0.1.142, FINDINGS A-339; before, the node answered it, and
+  a `<msg>.error`, with `unknown_system_msg`): a node took nowhere a message this one sent, most
+  often its answer to a WF whose queue is full (`node_busy`, since 0.1.141), and nothing of it ran
+  there. The line, *a message this node sent was not taken*, names that node (`refused_by`), the
+  trace and thread, the `reason`, `retryable` and the `detail`, at a router notice's rate. The node
+  does not send its answer again, so the WF goes on as if the agent had not answered.
 - **SY.vault's `VAULT_SECRET_CHANGED` broadcast is not answered either** (since 0.1.142, FINDINGS
   A-325; the AI SDK's `is_vault_secret_changed`): it is an event, which SY.vault takes no answer
   to, and the node asks SY.vault for its key at each model call, so it has nothing to refresh. Its

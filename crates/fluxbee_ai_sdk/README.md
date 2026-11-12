@@ -535,12 +535,22 @@ registered case ends saved as `completed` and is never deleted by the model.
 - **What it never answers:** `is_infrastructure_message(&msg)`, checked first, says the message is
   a notice or a reply: one the router made, without `src_l2_name` (`UNREACHABLE`,
   `TTL_EXCEEDED`), or one named as a notice or a reply (`HELLO`, `ANNOUNCE`, `WITHDRAW`, any
-  `*_RESPONSE`). `note_infrastructure_message(node_name, &msg)` logs it, a router notice as a WARN
-  with its reason: the first of each notice and reason at once, then at most one every 10 s, with
-  how many came since (`notices`; the ones between are debug lines), since a node that answers at
-  the rate messages come (`ai_runtime_busy`, below) may get as many back. An answer to the
-  router's notice would go to the router's own UUID, and the two would bounce it forever (FINDINGS
-  A-112). SY.timer and the WF engine leave the same ones unanswered (FINDINGS A-218).
+  `*_RESPONSE`, `NOT_TAKEN`, an error answer `<msg>.error`).
+  `note_infrastructure_message(node_name, &msg)` logs it, a router notice as a WARN with its
+  reason: the first of each notice and reason at once, then at most one every 10 s, with how many
+  came since (`notices`; the ones between are debug lines), since a node that answers at the rate
+  messages come (`ai_runtime_busy`, below) may get as many back. An answer to the router's notice
+  would go to the router's own UUID, and the two would bounce it forever (FINDINGS A-112). SY.timer
+  and the WF engine leave the same ones unanswered (FINDINGS A-218), SY.timer a `NOT_TAKEN` and a
+  `<msg>.error` since 0.1.141.
+- **A `NOT_TAKEN`** (since 0.1.142, FINDINGS A-339; before, ai.generic and the frontdesk answered it
+  `unknown_system_msg`, as they did a `<msg>.error`) says a node took nowhere a message this one
+  sent on its trace, most often its answer: a WF whose queue is full (`node_busy`, since 0.1.141) or
+  that cannot use its store (`unavailable`). Nothing of that message ran there. It is a WARN as a
+  router notice is, at the same rate, *a message this node sent was not taken*, which names the node
+  (`refused_by`), the `reason`, whether the same message sent again may be taken (`retryable`; one
+  without it, from a node before 0.1.141, is not) and the `detail`. The node does not send the
+  message again: the runtime keeps no message it sent.
 - **Nor SY.vault's broadcast of a secret's change:** `is_vault_secret_changed(&msg)`
   (`VAULT_SECRET_CHANGED`, a `system` message) is an event, which SY.vault takes no answer to. The
   frontdesk reads its key again on it; ai.generic, which asks SY.vault for its key at each model

@@ -493,6 +493,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
+- A-339 🔵 An AI node answers a `NOT_TAKEN` with an `unknown_system_msg` error (low; the AI SDK; found by the review of `coa/rustsdk-143`; built on `coa/aisdk-142`, planned 0.1.142; the resend of an answer not taken proposed, to decide).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
 - A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; found by 0.1.139's gate; its local fix, `block_in_place`, to ask the operator).
@@ -1769,6 +1770,84 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Effect:** misleading only; nothing is left open by it.
 - **Fix, later:** a revoke that fails to authenticate with that same key reports the key as not
   opening the box.
+
+### A-339 [General/AI SDK] 🔵 low (found 2026-11-12 by the review of `coa/rustsdk-143`; read in the code, also on `coa/aisdk-142`; there since the WF engine's `NOT_TAKEN` (0.1.94), more often from 0.1.141) — An AI node answers a `NOT_TAKEN` with an `unknown_system_msg` error
+
+- **Why:** the AI SDK's `is_infrastructure_message` (`crates/fluxbee_ai_sdk/src/control_plane.rs`
+  ~114, the same on `coa/aisdk-142`, `bf7cd152`) takes for a notice or a reply only a message
+  without `src_l2_name`, one without a name, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`,
+  `TTL_EXCEEDED` and any `*_RESPONSE`. A `NOT_TAKEN` (the WF engine's since 0.1.94, the Go SDK's
+  `node_busy` since 0.1.141, the Rust SDK's since 0.1.143, planned) or a `<msg>.error` reply reaches
+  the control plane as a system request it does not know. ai.generic
+  (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ~1361) and SY.frontdesk.gov
+  (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` ~2300) answer it with a
+  `CONFIG_RESPONSE` error `unknown_system_msg`.
+- **Effect:** one wasted message for each `NOT_TAKEN` an AI node gets, and the node's log does not
+  say that one of its messages was not taken. No loop: the answer is a reply, which no SDK answers.
+  The Go SDK (`IsNoticeOrReply`) and the Rust SDK (`may_answer_not_taken`) leave both unanswered.
+- **Fix, later (the AI SDK; best on `coa/aisdk-142`, before 0.1.142 ships; A-325's family):**
+  `is_infrastructure_message` takes `NOT_TAKEN` and `<msg>.error` for replies, and
+  `note_infrastructure_message` logs a `NOT_TAKEN` as it logs an `UNREACHABLE`, with its reason.
+- **Built on `coa/aisdk-142` (planned 0.1.142, the AI SDK alone, with A-294, A-290, A-325 and
+  A-327's `tool_choice`), the fix above as it reads:**
+  - **No answer.** `is_infrastructure_message` takes `NOT_TAKEN` and any name ending in `.error`
+    for replies, the Go SDK's `IsReplyName` name by name, in either kind the control plane takes
+    (`system`, `admin`). ai.generic and SY.frontdesk.gov answer neither, through their own entry
+    (`on_message`) too. Any other `system` message from a node that is no control verb is still
+    answered `unknown_system_msg`.
+  - **One line, on the node that failed.** `note_infrastructure_message` logs a `NOT_TAKEN` as it
+    logs an `UNREACHABLE` (`note_not_taken`): a WARN, *"NOT_TAKEN: a message this node sent was not
+    taken, and nothing of it ran there; not answered, and not sent again"*, which names the node
+    that refused it (`refused_by`), the trace and the thread, the `reason`, `retryable` (false when
+    the `NOT_TAKEN` has none, as from a node before 0.1.141) and the `detail` (quoted, its first 240
+    characters). The first of each reason at once, then at most one every 10 s with how many came
+    since, the ones between at debug; its counts are the router notices', bounded at 32 kinds. A
+    `<msg>.error` gets the info line of any other reply.
+  - **The operator's principle, applied** (A-313's call of 2026-11-12: on a failure, retry and log
+    on the one that fails, never act globally): the agent whose answer was not taken logs it, and
+    nothing else acts on it, the WF included (no answer goes back). The retry is the resend below,
+    proposed and not built: this entry's fix decides the log alone.
+  - **Tests,** each checked failing without its part: the SDK's
+    `a_not_taken_and_an_error_answer_are_replies`; ai.generic's and the frontdesk's
+    `a_not_taken_or_an_error_answer_is_never_answered` (no answer to a `NOT_TAKEN` `node_busy`, nor
+    to a `system` or `admin` `ask.error`, and the warning with `refused_by`, `reason`, `retryable`
+    and the detail). Without the change all three fail on an `unknown_system_msg` answer; without
+    the `.error` arm, on the error answers; without the warning, on the runners' log checks.
+  - **Docs:** the AI SDK's README, ai.generic's and the frontdesk's READMEs, the frontdesk's page,
+    the WF spec's §14.5 (what an agent does with a `NOT_TAKEN`) and Archi's handbook §4.1 (*An
+    answer the WF does not take*).
+  - **At integration, after `coa/gosdk-141`:** three of its texts say an AI node answers a
+    `NOT_TAKEN` `unknown_system_msg`, or that the AI SDK's rule leaves `NOT_TAKEN` and `<msg>.error`
+    out, and take this release's words: `docs/reference/protocol.md` §6.10's row *"An AI node (the
+    AI SDK)"*; the WF spec's §14.5 paragraph on `NOT_TAKEN`, whose older sentence this branch
+    changed, so the rebase stops there; and SY.timer's `isInfrastructureMessage` comment
+    (`go/sy-timer/main.go`, *"name by name but for NOT_TAKEN and <msg>.error"*), with SY.timer's
+    next change.
+- **The resend of an answer not taken (proposed, to decide; not built):** what the runtime could do
+  with a retryable `NOT_TAKEN` for its own answer.
+  - **Today** the answer is lost: the WF's instance goes on as if the agent had not answered (in
+    `wf.sales.invoice` its 120 s for the answer run out, and the person gets no answer to that
+    message), and the model call it cost is wasted.
+  - **Safe, for a retryable `NOT_TAKEN` alone** (`node_busy`; `unavailable` from 0.1.141): nothing
+    of the answer ran at the receiver, so sending it again cannot run it twice, and the receiver
+    says whether it may pass. The other reasons are never sent again.
+  - **Cheap:** no model call runs again. The runtime would keep each answer it sent for a short
+    while, bounded (the last 256 answers or 8 MiB, say, each for 60 s), and on a retryable
+    `NOT_TAKEN` from the node the answer went to (its uuid the answer's destination, its trace the
+    answer's) send the kept answer again after 5, 10 and 20 s (SY.timer's first steps), a line
+    each, then drop it. In the runtime, before the node, so both runners get it.
+  - **Its edges.** A WF takes an agent's answer by its thread, not its trace: an answer sent again
+    after the WF stopped waiting reaches the instance as a late answer, which a definition already
+    meets when a model is slow (`wf.sales.invoice` logs sales' late answers); the last attempt by
+    about 35 s keeps it within a usual wait, and two answers on one thread swap only when the WF
+    asked twice within it. The router copies each message a node sends as a turn at its entry:
+    cognition takes the second copy as the same turn (its key is the trace, the writer and the
+    text), while SY.storage would keep a second turn row (the trace entry's time differs) unless the
+    resend is marked. Under a long backlog (1,024 messages at 30 a second, about 34 s) the attempts
+    may be refused again, each logged.
+  - It fits the operator's principle (the node that failed retries and logs) and A-329's call for
+    SY.timer (a fire not taken is sent again). Best with the IO family's resend of a retryable
+    `NOT_TAKEN` (A-329's leftovers): one rule for both.
 
 ### A-338 [General/blob] 🔵 low (found 2026-11-12 by the review of A-264's build on `coa/gosdk-141`; read in the code, not seen; there since the Rust SDK's text offload, wider from 0.1.141) — A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob
 

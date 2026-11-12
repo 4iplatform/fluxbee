@@ -13345,6 +13345,77 @@ mod tests {
         assert!(logs.text().contains("last_hop=router-worker1"));
     }
 
+    // --- A-339: a NOT_TAKEN or an error answer is never answered ---
+
+    /// A `NOT_TAKEN` as a node sends it (the Go SDK's `BuildNotTaken`, FINDINGS A-329): a `system`
+    /// message from `from` to this node, on the trace and the thread of the message it took
+    /// nowhere.
+    fn not_taken(from: &str, trace_id: &str, reason: &str, retryable: bool) -> Message {
+        let mut msg = sample_request();
+        msg.routing.src = "uuid-of-the-wf".to_string();
+        msg.routing.src_l2_name = Some(from.to_string());
+        msg.routing.trace_id = trace_id.to_string();
+        msg.meta.msg = Some("NOT_TAKEN".to_string());
+        msg.meta.thread_id = Some("conv-a335".to_string());
+        msg.payload = json!({
+            "ok": false,
+            "error": "not_taken",
+            "reason": reason,
+            "detail": format!(
+                "{from} holds 1024 non-system messages, all it can take now; send it again later"
+            ),
+            "retryable": retryable,
+        });
+        msg
+    }
+
+    /// FINDINGS A-339. A WF whose queue is full answers an agent's answer `NOT_TAKEN` `node_busy`
+    /// (its Go SDK, since 0.1.141): nothing of the answer ran there. The node takes it for a reply,
+    /// as it takes an error answer (`<msg>.error`): no answer, through its own entry too, where it
+    /// answered each one `unknown_system_msg`. Its journal says which node did not take a message
+    /// it sent, on which trace, why, and whether sending it again may pass.
+    #[tokio::test]
+    async fn a_not_taken_or_an_error_answer_is_never_answered() {
+        let node = test_node();
+        let (logs, _guard) = LogCapture::start();
+        let busy = not_taken("WF.sales@motherbee", "trace-a335", "node_busy", true);
+        assert!(node
+            .handle_control_plane(busy.clone())
+            .await
+            .expect("control plane")
+            .is_none());
+        assert!(node.on_message(busy).await.expect("on_message").is_none());
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("was not taken"), "{text}");
+        for field in [
+            "trace_id=trace-a335",
+            "refused_by=WF.sales@motherbee",
+            "reason=node_busy",
+            "retryable=true",
+            "all it can take now",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
+
+        // An error answer, named `<msg>.error`, in either kind the control plane takes.
+        for kind in ["system", "admin"] {
+            let mut error = sample_request();
+            error.routing.src_l2_name = Some("AI.other@motherbee".to_string());
+            error.meta.msg_type = kind.to_string();
+            error.meta.msg = Some("ask.error".to_string());
+            error.payload = json!({"type": "error", "code": "ai_runtime_busy", "retryable": true});
+            assert!(
+                node.on_message(error).await.expect("on_message").is_none(),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
+        );
+    }
+
     // --- A-95: a published page's link never reaches the journal ---
 
     /// Collects what the fmt layer writes on this thread while its guard lives.

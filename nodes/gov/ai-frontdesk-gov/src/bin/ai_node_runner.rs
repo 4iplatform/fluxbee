@@ -5008,6 +5008,57 @@ mod tests {
         assert_eq!(answer.payload["error"]["code"], json!("unknown_system_msg"));
     }
 
+    /// FINDINGS A-339, as in ai.generic. A node whose queue is full answers the frontdesk's answer
+    /// `NOT_TAKEN` `node_busy` (the Go SDK since 0.1.141): nothing of the answer ran there. The
+    /// frontdesk takes it for a reply, as it takes an error answer (`<msg>.error`): no answer, where
+    /// it answered each one `unknown_system_msg`. Its journal says which node did not take a
+    /// message it sent, on which trace, why, and whether sending it again may pass.
+    #[tokio::test]
+    async fn a_not_taken_or_an_error_answer_is_never_answered() {
+        let node = test_node();
+        let (logs, _guard) = LogCapture::start();
+        let mut busy = sample_request();
+        busy.routing.src = "uuid-of-the-io-node".to_string();
+        busy.routing.src_l2_name = Some("IO.api.support@motherbee".to_string());
+        busy.routing.trace_id = "trace-a335".to_string();
+        busy.meta.msg = Some("NOT_TAKEN".to_string());
+        busy.meta.thread_id = Some("conv-a335".to_string());
+        busy.payload = json!({
+            "ok": false,
+            "error": "not_taken",
+            "reason": "node_busy",
+            "detail": "IO.api.support@motherbee holds 1024 non-system messages, all it can take \
+                       now; send it again later",
+            "retryable": true,
+        });
+        assert!(node.on_message(busy).await.expect("on_message").is_none());
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("was not taken"), "{text}");
+        for field in [
+            "trace_id=trace-a335",
+            "refused_by=IO.api.support@motherbee",
+            "reason=node_busy",
+            "retryable=true",
+            "all it can take now",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
+
+        // An error answer, named `<msg>.error`, in either kind the control plane takes.
+        for kind in ["system", "admin"] {
+            let mut error = sample_request();
+            error.routing.src_l2_name = Some("AI.other@motherbee".to_string());
+            error.meta.msg_type = kind.to_string();
+            error.meta.msg = Some("ask.error".to_string());
+            error.payload = json!({"type": "error", "code": "ai_runtime_busy", "retryable": true});
+            assert!(
+                node.on_message(error).await.expect("on_message").is_none(),
+                "{kind}"
+            );
+        }
+    }
+
     /// The frontdesk's tools are its own (agent-tools-v1 T10): it reads and saves its case and
     /// registers it, and never deletes it. A registered case ends saved as `completed`, which the
     /// turn's result is read from.

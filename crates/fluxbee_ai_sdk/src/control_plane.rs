@@ -12,13 +12,23 @@ use fluxbee_sdk::protocol::{
 use serde_json::Value;
 use tokio::time::Instant;
 
-use crate::message::Message;
+use crate::message::{Message, AI_ERROR_MSG_SUFFIX};
 use crate::refusal_log::RefusalLog;
 
 /// A liveness probe: the node's name and state.
 pub const MSG_PING: &str = "PING";
 /// The node's state, behavior and config versions.
 pub const MSG_STATUS: &str = "STATUS";
+
+/// A node's answer to a message this one sent, which it took nowhere: a `system` message on that
+/// message's trace and thread, `{"ok": false, "error": "not_taken", "reason", "detail",
+/// "retryable"}`. Nothing of the message ran there. The WF engine sends it since 0.1.94, and the Go
+/// SDK since 0.1.141 for a message its queue has no room for (`node_busy`, retryable, FINDINGS
+/// A-329): a busy WF's answer to an agent's answer. It is a reply, never answered (FINDINGS A-339).
+const MSG_NOT_TAKEN: &str = "NOT_TAKEN";
+
+/// How much of a `NOT_TAKEN`'s `detail` its journal line shows: the node that sent it wrote it.
+const NOT_TAKEN_DETAIL_MAX_CHARS: usize = 240;
 
 /// What an AI node's control plane does with a message it got.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,11 +117,14 @@ pub fn control_caller_authorized(verb: &str, node_name: &str, sender: Option<&st
 /// Whether `msg`, a message of an AI node's control plane, is a notice or a reply rather than a
 /// request, so it gets no answer: the router made it (it carries no `src_l2_name`, which the router
 /// stamps on every message a node sends), as UNREACHABLE and TTL_EXCEEDED, or its name is a
-/// notice's or a reply's: HELLO, ANNOUNCE, WITHDRAW or any `*_RESPONSE`. SY.timer
-/// (`isInfrastructureMessage`) and wf-generic (`isNotice`) leave the same ones unanswered (FINDINGS
-/// A-218). An answer to the router's own notice would go to the router's UUID, which no node has:
-/// the router would answer UNREACHABLE again, and the two would bounce it forever (FINDINGS A-112).
-/// The node checks it before anything else (`note_infrastructure_message` logs it).
+/// notice's or a reply's: HELLO, ANNOUNCE, WITHDRAW, any `*_RESPONSE`, a `NOT_TAKEN` or an error
+/// answer (`<msg>.error`). wf-generic (`isNotice`, `isReply`) leaves the same ones unanswered, and
+/// so do SY.timer (`isInfrastructureMessage`) and the Go SDK (`IsNoticeOrReply`) from 0.1.141
+/// (FINDINGS A-218, A-329). An answer to the router's own notice would go to the router's UUID,
+/// which no node has: the router would answer UNREACHABLE again, and the two would bounce it
+/// forever (FINDINGS A-112). Before 0.1.142 a `NOT_TAKEN` or a `<msg>.error` from a node was
+/// answered `unknown_system_msg` (FINDINGS A-339). The node checks it before anything else
+/// (`note_infrastructure_message` logs it).
 pub fn is_infrastructure_message(msg: &Message) -> bool {
     let from_a_node = msg
         .routing
@@ -122,8 +135,9 @@ pub fn is_infrastructure_message(msg: &Message) -> bool {
         return true;
     }
     match msg.meta.msg.as_deref().unwrap_or_default() {
-        "" | MSG_HELLO | MSG_ANNOUNCE | MSG_WITHDRAW | MSG_UNREACHABLE | MSG_TTL_EXCEEDED => true,
-        name => name.ends_with("_RESPONSE"),
+        "" | MSG_HELLO | MSG_ANNOUNCE | MSG_WITHDRAW | MSG_UNREACHABLE | MSG_TTL_EXCEEDED
+        | MSG_NOT_TAKEN => true,
+        name => name.ends_with("_RESPONSE") || name.ends_with(AI_ERROR_MSG_SUFFIX),
     }
 }
 
@@ -139,14 +153,19 @@ pub fn is_vault_secret_changed(msg: &Message) -> bool {
 }
 
 /// The journal's line for `msg`, a notice or a reply that reached the control plane of the AI node
-/// `node_name` (`is_infrastructure_message`), which gets no answer. The router's notice that a
-/// message of the node's was not delivered is a warning, with its reason: the first of its name
-/// and reason at once, then at most one every 10 s, which names how many came since its last
-/// (`notices`); the ones between are debug lines. An agent answers at the rate messages come (an
-/// `ai_runtime_busy` answer to each turn past its queue, FINDINGS A-257), and as many answers may
-/// come back undelivered.
+/// `node_name` (`is_infrastructure_message`), which gets no answer. Two say that a message of the
+/// node's went nowhere, and are warnings with their reason: the router's notice that it was not
+/// delivered, and a node's `NOT_TAKEN` (`note_not_taken`). The first of each name and reason at
+/// once, then at most one every 10 s, which names how many came since its last (`notices`); the
+/// ones between are debug lines. An agent answers at the rate messages come (an `ai_runtime_busy`
+/// answer to each turn past its queue, FINDINGS A-257), and as many answers may come back
+/// undelivered, or not taken by a busy WF.
 pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
     let name = msg.meta.msg.as_deref().unwrap_or_default();
+    if name == MSG_NOT_TAKEN {
+        note_not_taken(node_name, msg);
+        return;
+    }
     if matches!(name, MSG_UNREACHABLE | MSG_TTL_EXCEEDED) {
         let field = |key: &str| {
             msg.payload
@@ -197,17 +216,81 @@ pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
     );
 }
 
-/// How many kinds of router notice, a name and a reason, keep a count of their own. The router has
-/// a few reasons; a notice of any other past these counts with its name's other reasons
-/// (`OTHER_REASONS`), so the counts stay bounded whatever comes.
+/// The warning for a node's `NOT_TAKEN` (FINDINGS A-339): `refused_by` took nowhere a message this
+/// node sent on the trace, most often its answer (a WF whose queue is full, `node_busy`; one that
+/// cannot use its store, `unavailable`), and nothing of it ran there. It names that node, the
+/// reason, whether the same message sent again may be taken (`retryable`; a `NOT_TAKEN` without
+/// it, from a node before 0.1.141, is not) and the detail, as a router notice is named
+/// (`notice_line_due`): a busy WF refuses each answer that comes while it is full. The node does
+/// not send the message again: the runtime keeps no message it sent.
+fn note_not_taken(node_name: &str, msg: &Message) {
+    let reason = msg
+        .payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let retryable = msg
+        .payload
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let detail = msg
+        .payload
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let detail = match detail.char_indices().nth(NOT_TAKEN_DETAIL_MAX_CHARS) {
+        Some((cut, _)) => format!("{}...", &detail[..cut]),
+        None => detail.to_string(),
+    };
+    let refused_by = msg.routing.src_l2_name.as_deref().unwrap_or_default();
+    let due = notice_line_due(
+        &mut NOTICE_LOGS.lock().unwrap_or_else(PoisonError::into_inner),
+        MSG_NOT_TAKEN,
+        reason,
+        Instant::now(),
+    );
+    let Some(notices) = due else {
+        tracing::debug!(
+            node_name = %node_name,
+            trace_id = %msg.routing.trace_id,
+            thread_id = ?msg.meta.thread_id,
+            refused_by = %refused_by,
+            reason = %reason,
+            retryable,
+            detail = ?detail,
+            "NOT_TAKEN: a message this node sent was not taken, and nothing of it ran there; not \
+             answered, and not sent again (counted in the next warning of its reason)"
+        );
+        return;
+    };
+    tracing::warn!(
+        node_name = %node_name,
+        trace_id = %msg.routing.trace_id,
+        thread_id = ?msg.meta.thread_id,
+        refused_by = %refused_by,
+        reason = %reason,
+        retryable,
+        detail = ?detail,
+        notices,
+        "NOT_TAKEN: a message this node sent was not taken, and nothing of it ran there; not \
+         answered, and not sent again"
+    );
+}
+
+/// How many kinds of notice, a name and a reason, keep a count of their own. The router has a few
+/// reasons, and the nodes that send `NOT_TAKEN` a few more; a notice of any other past these counts
+/// with its name's other reasons (`OTHER_REASONS`), so the counts stay bounded whatever comes.
 const NOTICE_LOG_KINDS: usize = 32;
 const OTHER_REASONS: &str = "*";
 
-/// The router notices' counts, one `RefusalLog` for each name and reason (`notice_line_due`).
+/// The counts of the router's notices and of the `NOT_TAKEN`s, one `RefusalLog` for each name and
+/// reason (`notice_line_due`).
 static NOTICE_LOGS: Mutex<BTreeMap<(String, String), RefusalLog>> = Mutex::new(BTreeMap::new());
 
-/// When the warning for a router notice named `notice` with `reason` is due, how many notices of
-/// that name and reason to name in it, this one and those since its last.
+/// When the warning for a notice named `notice` (a router notice, or a `NOT_TAKEN`) with `reason`
+/// is due, how many notices of that name and reason to name in it, this one and those since its
+/// last.
 fn notice_line_due(
     logs: &mut BTreeMap<(String, String), RefusalLog>,
     notice: &str,
@@ -398,6 +481,31 @@ mod tests {
             assert!(
                 !is_infrastructure_message(&request("system", msg, Some(sender))),
                 "{msg} from {sender}"
+            );
+        }
+    }
+
+    /// FINDINGS A-339: a node's `NOT_TAKEN` (a busy WF's for an agent's answer, since 0.1.141) and
+    /// an error answer (`<msg>.error`) are replies, in either kind the control plane takes, from
+    /// any node: never answered. A name that only holds one of them is no reply.
+    #[test]
+    fn a_not_taken_and_an_error_answer_are_replies() {
+        for (kind, msg) in [
+            ("system", "NOT_TAKEN"),
+            ("SYSTEM", "NOT_TAKEN"),
+            ("admin", "NOT_TAKEN"),
+            ("system", "ask.error"),
+            ("admin", "CONFIG_SET.error"),
+        ] {
+            assert!(
+                is_infrastructure_message(&request(kind, msg, Some("WF.sales@worker1"))),
+                "{msg} as {kind}"
+            );
+        }
+        for msg in ["not_taken", "NOT_TAKEN_AGAIN", "ask.error.v2", "ask.errors"] {
+            assert!(
+                !is_infrastructure_message(&request("system", msg, Some("WF.sales@worker1"))),
+                "{msg}"
             );
         }
     }

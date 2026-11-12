@@ -32,8 +32,11 @@ registers them in SY.identity (`ILK_REGISTER`).
   (an `admin` message, the verb in another case, another sender) is refused with a WARN and an
   `unauthorized` answer. A notice or a reply is never answered, only logged, as in ai.generic: a
   message the router made (`UNREACHABLE`, `TTL_EXCEEDED`) or one named as a notice or a reply (any
-  `*_RESPONSE`). An answer to the router's notice would bounce between the two forever (FINDINGS
-  A-112).
+  `*_RESPONSE`, `NOT_TAKEN`, an error answer `<msg>.error`). An answer to the router's notice would
+  bounce between the two forever (FINDINGS A-112). A `NOT_TAKEN` (a node took nowhere a message the
+  frontdesk sent, its answer to a node whose queue is full, say) is a WARN that names that node, the
+  reason and `retryable`, and the answer is not sent again (since 0.1.142, FINDINGS A-339; before,
+  it was answered `unknown_system_msg`).
 - **Tenant:** the registration goes to the tenant of the case, the one SY.identity holds for the temporary ILK (the
   frontdesk reads it from the identity SHM). The `tenant_id` of a handoff only has to match. The
   frontdesk never creates tenants, and never takes one from the person or from the LLM; with no tenant it answers
