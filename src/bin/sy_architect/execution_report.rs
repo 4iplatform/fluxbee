@@ -5,17 +5,20 @@
 //! showed: a refusal's code and whether asking again may pass went unsaid, and a workflow's delete
 //! that answered ok with two versions left read as a full success. Now Archi's model gets one
 //! turn, with no tool, with each step's answer, and tells the operator what happened, in the
-//! operator's language and as its handbook says (`explain_run`). When that turn fails (Archi has
-//! no AI runtime, the provider fails, no answer within `EXPLANATION_TURN_TIMEOUT`, no text), the
-//! chat keeps the fixed line with each step's code and detail under it (`fallback_text`), with no
-//! model. One model call per plan run, recorded with the stage `EXPLANATION_STAGE`.
+//! operator's language and as its handbook says (`explain_run`). When there is no turn (Archi has
+//! no AI runtime, or the session's turns cannot be read) or it fails (the provider fails, no answer
+//! within `EXPLANATION_TURN_TIMEOUT`, no text), the chat keeps the fixed line with each step's code
+//! and detail under it (`fallback_text`), with no model. One model call per plan run, recorded with
+//! the stage `EXPLANATION_STAGE`.
 //!
 //! No secret and no capability reaches that turn (FINDINGS A-124). Each step's view is built from
 //! an allowlist of fields (`step_view`), never by copying its answer, so a `publish_cloud_endpoint`
 //! token, a page's link, a vault value, an API key or a password is in none of them. Each text a
-//! view keeps is cut, and has any link and anything that reads as a credential taken out
-//! (`scrub`).
+//! view keeps is cut, and as a backstop loses the links, the credentials written with their value
+//! and the runs that read as a key (`scrub`); a short secret in a free text reads as none, which is
+//! why the allowlist keeps no field that holds one.
 
+use std::future::Future;
 use std::time::Duration;
 
 use fluxbee_ai_sdk::{
@@ -48,6 +51,8 @@ const MAX_HIVE_NAMES: usize = 20;
 /// The most counts a step keeps, and how deep in its payload they are read.
 const MAX_COUNTS: usize = 16;
 const COUNT_DEPTH: usize = 3;
+/// The shortest run of a key's characters that reads as a key or a token in a free text (`scrub`).
+const KEY_RUN_MIN_CHARS: usize = 32;
 
 /// The args that say what a step acted on. No other arg is read: a step's args may carry a secret
 /// (`vault_put`'s value, `add_hive`'s password) or a page's link (`unpublish_artifact`).
@@ -88,46 +93,70 @@ or secret is in it, and none is to be asked for.
 
 Tell the operator what happened, in the language the operator writes in, following your handbook. \
 For each step, say what it did: what is done; what stayed and why (a workflow delete's \
-packages_left: each version, its error_code, whether asking again may remove it, and the hives not \
-read); a refusal's error_code, its detail and whether asking again may pass (retryable, \
-unanswered_hives, next); the pages that stay public and until when (pages_left_up); the warning. \
-Say which steps did not run. Never call the run a success when a step failed or something stayed. \
-Offer what your handbook says comes next, for the operator to ask for. This turn has no tools: \
-answer from this report alone, briefly, and do not say how to confirm.";
+packages_left: each version, its error_code and detail, whether asking again may remove it, and \
+the hives not read); a refusal's error_code, its detail and whether asking again may pass \
+(retryable, unanswered_hives, next); the pages that stay public and until when (pages_left_up); \
+the warning. A step's status is done, failed, not_run (the run stopped before it) or not_reported \
+(the run's answer does not say what it did: say so, never that it ran or that it did not, and \
+offer to read SY.admin's command log, which has each step's outcome). An installation update is \
+as you followed it after the run (its state then, after followed_s seconds), not as its step first \
+answered; run.verified says whether the run checked out as done. When pages_left_up has no count \
+(its error says why) or more above 0, or a removal failed, the pages that stay up are not all \
+named here: say so, and offer to read /artifacts. Never call the run a success when a step failed \
+or something stayed. Offer what your handbook says comes next, for the operator to ask for. This \
+turn has no tools: answer from this report alone, briefly, and do not say how to confirm.";
 
 /// Explains the run in `output`, SY.admin's executor answer as Archi keeps it (its `message`, its
-/// `payload.events` and `payload.summary`, its `verification_verdict`), with `plan_steps`, the
-/// confirmed plan's `execution.steps`. With `model`, one turn of it, `memory` before the report;
-/// with none (`Err`, why there is none), or when the turn fails, the fixed line with each step
-/// under it. The run's `message` becomes what the chat says, and `explanation` says how it was
-/// made: its `source` (`model` or `fallback`), its `model_calls`, the `steps` the turn was given,
-/// and the turn's `tokens_used` or why it gave nothing (`error`).
-pub async fn explain_run(
+/// `payload.events` and `payload.summary`, its `verification_verdict`, the installation updates it
+/// followed), with `plan_steps`, the confirmed plan's `execution.steps`. With `model`, one turn of
+/// it, the session's turns (`memory`, read only then) before the report; with none (`Err`, why
+/// there is none), when the session's turns cannot be read, or when the turn fails, the fixed line
+/// with each step under it. The run's `message` becomes what the chat says, and `explanation` says
+/// how it was made: its `source` (`model` or `fallback`), its `model_calls`, the `steps` the turn
+/// was given, and the turn's `tokens_used` (counted in the answer's `token_usage` too) or why it
+/// gave nothing (`error`).
+pub async fn explain_run<M>(
     model: Result<&dyn FunctionCallingModel, String>,
-    memory: Option<ImmediateConversationMemory>,
+    memory: M,
     plan_steps: &[Value],
     output: &mut Value,
     timeout: Duration,
-) {
+) where
+    M: Future<Output = Result<ImmediateConversationMemory, String>>,
+{
     let steps = step_views(output, plan_steps);
     let line = fixed_line(output);
     let (turn, model_calls) = match model {
-        Ok(model) => {
-            let input = model_input(&run_view(output, &line), &steps);
-            (explanation_turn(model, memory, input, timeout).await, 1)
-        }
         Err(why) => (Err(why), 0),
+        Ok(model) => match memory.await {
+            // Without the session's turns the turn would answer with none of them, and not
+            // knowing the operator's language: the chat keeps the fixed line instead.
+            Err(why) => (
+                Err(format!("the session's turns could not be read: {why}")),
+                0,
+            ),
+            Ok(memory) => {
+                let input = model_input(&run_view(output, &line), &steps);
+                (
+                    explanation_turn(model, Some(memory), input, timeout).await,
+                    1,
+                )
+            }
+        },
     };
     let (message, explanation) = match turn {
-        Ok((text, tokens_used)) => (
-            text,
-            json!({
-                "source": "model",
-                "model_calls": model_calls,
-                "tokens_used": tokens_used,
-                "steps": steps,
-            }),
-        ),
+        Ok((text, tokens_used)) => {
+            count_turn_tokens(output, tokens_used);
+            (
+                text,
+                json!({
+                    "source": "model",
+                    "model_calls": model_calls,
+                    "tokens_used": tokens_used,
+                    "steps": steps,
+                }),
+            )
+        }
         Err(why) => {
             let why = scrub(&why);
             tracing::warn!(
@@ -189,6 +218,21 @@ async fn explanation_turn(
     }
 }
 
+/// The turn's tokens in the answer's `token_usage`, which the chat's executor card shows: as
+/// `execution_report`, and in its `total` with the plan compile's.
+fn count_turn_tokens(output: &mut Value, tokens_used: u32) {
+    let Some(answer) = output.as_object_mut() else {
+        return;
+    };
+    let usage = answer.entry("token_usage").or_insert_with(|| json!({}));
+    if !usage.is_object() {
+        *usage = json!({});
+    }
+    let total = usage.get("total").and_then(Value::as_u64).unwrap_or(0) + u64::from(tokens_used);
+    usage["execution_report"] = json!(tokens_used);
+    usage["total"] = json!(total);
+}
+
 /// The turn's message: what it is asked, then the report, `{run, steps}`.
 fn model_input(run: &Value, steps: &[Value]) -> String {
     let report = serde_json::to_string_pretty(&json!({ "run": run, "steps": steps }))
@@ -209,8 +253,9 @@ fn fixed_line(output: &Value) -> String {
         .to_string()
 }
 
-/// The run as the turn sees it: its status, its steps done of all, the step it stopped at, whether
-/// Archi verified it, and its line.
+/// The run as the turn sees it: its status, its steps done of all, the step it stopped at, its
+/// answer's code (`EXECUTION_FAILED`, `EXECUTOR_UNAVAILABLE`...), whether Archi verified it, and
+/// its line.
 fn run_view(output: &Value, line: &str) -> Value {
     let mut view = Map::new();
     let summary = output.pointer("/payload/summary");
@@ -227,6 +272,9 @@ fn run_view(output: &Value, line: &str) -> Value {
     }
     if let Some(step) = summary.and_then(|summary| text_of(summary, "failed_step_id")) {
         view.insert("failed_step_id".into(), json!(clean_name(step)));
+    }
+    if let Some(code) = text_of(output, "error_code") {
+        view.insert("error_code".into(), json!(clean_name(code)));
     }
     if let Some(verified) = output
         .pointer("/verification_verdict/verified_success")
@@ -252,11 +300,20 @@ fn step_views(output: &Value, plan_steps: &[Value]) -> Vec<Value> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    // An answer too large for one mesh frame came back with no events (FINDINGS A-198): its steps
-    // ran, and their outcome is in SY.admin's command log.
+    // A run whose answer says nothing of its steps: one too large for one mesh frame, which came
+    // back with no events (FINDINGS A-198), or an executor that failed before its report (no
+    // summary, no events: `EXECUTOR_UNAVAILABLE`, a step's model run that failed after the steps
+    // before it ran). Its steps may have run, and their outcome is in SY.admin's command log.
     let unreported = output
         .pointer("/payload/answer_too_large")
-        .is_some_and(|value| !value.is_null());
+        .is_some_and(|value| !value.is_null())
+        || !output
+            .pointer("/payload/summary")
+            .is_some_and(Value::is_object);
+    // The installation updates Archi followed after the run (`follow_installation_updates`).
+    let followed = output
+        .get("installation_updates")
+        .filter(|updates| updates.is_object());
     let mut ids: Vec<&str> = Vec::new();
     let planned = plan_steps.iter().filter_map(|step| text_of(step, "id"));
     let ran = events.iter().filter_map(|event| text_of(event, "step_id"));
@@ -276,7 +333,7 @@ fn step_views(output: &Value, plan_steps: &[Value]) -> Vec<Value> {
             let plan_step = plan_steps
                 .iter()
                 .find(|step| text_of(step, "id") == Some(*id));
-            step_view(id, plan_step, &step_events, unreported)
+            step_view(id, plan_step, &step_events, unreported, followed)
         })
         .collect();
     if ids.len() > MAX_STEPS {
@@ -286,11 +343,18 @@ fn step_views(output: &Value, plan_steps: &[Value]) -> Vec<Value> {
 }
 
 /// One step as the turn sees it, from an allowlist of fields: its `id` and `action`; its `status`
-/// (`done`, `failed`, `not_run`, or `not_reported` when the run's answer was too large); what it
-/// acted on (`target`, from `TARGET_ARGS` only); its answer's `answer_status`; its `error_code`
-/// and, for a step that failed or was refused, its `error_detail` cut (its answer's, else those of
-/// the event that failed it); and of its answer's payload, what `payload_view` keeps.
-fn step_view(id: &str, plan_step: Option<&Value>, events: &[&Value], unreported: bool) -> Value {
+/// (`done`, `failed`, `not_run`, or `not_reported` when the run's answer says nothing of its
+/// steps); what it acted on (`target`, from `TARGET_ARGS` only); its answer's `answer_status`;
+/// its `error_code` and, for a step that failed or was refused, its `error_detail` cut (its
+/// answer's, else those of the event that failed it); and of its answer's payload, what
+/// `payload_view` keeps.
+fn step_view(
+    id: &str,
+    plan_step: Option<&Value>,
+    events: &[&Value],
+    unreported: bool,
+    followed: Option<&Value>,
+) -> Value {
     let mut view = Map::new();
     view.insert("id".into(), json!(clean_name(id)));
     let action = events
@@ -412,7 +476,7 @@ fn step_view(id: &str, plan_step: Option<&Value>, events: &[&Value], unreported:
         }
     }
     if let Some(payload) = payload {
-        payload_view(payload, &mut view);
+        payload_view(payload, followed, &mut view);
     }
     Value::Object(view)
 }
@@ -421,8 +485,9 @@ fn step_view(id: &str, plan_step: Option<&Value>, events: &[&Value], unreported:
 /// hives not read (`unanswered_hives`) and what ends it (`next`); the `warning`; the versions a
 /// workflow's delete left (`packages_left`); the pages a removal left up (`pages_left_up`, each by
 /// its publication id and expiry only); a deploy's or a delete's WF node (`wf_node`); an
-/// installation change's hives (`pending`, `held`) and update (`update`); and its counts.
-fn payload_view(payload: &Value, view: &mut Map<String, Value>) {
+/// installation change's hives (`pending`, `held`) and update (`update`), as Archi followed it
+/// when it did (`followed`); and its counts.
+fn payload_view(payload: &Value, followed: Option<&Value>, view: &mut Map<String, Value>) {
     if let Some(retryable) = payload.get("retryable").and_then(Value::as_bool) {
         view.insert("retryable".into(), json!(retryable));
     }
@@ -455,17 +520,19 @@ fn payload_view(payload: &Value, view: &mut Map<String, Value>) {
     }
     for key in ["pending", "held"] {
         if let Some(hives) = payload.get(key).and_then(Value::as_array) {
-            let named: Vec<Value> = hives
-                .iter()
-                .filter_map(name_of)
-                .take(MAX_HIVE_NAMES)
-                .map(Value::String)
-                .collect();
-            view.insert(key.into(), Value::Array(named));
+            view.insert(key.into(), hive_names(hives));
         }
     }
     if let Some(update) = payload.get("update").filter(|update| update.is_object()) {
-        view.insert("update".into(), names(update, &["id", "state"]));
+        let follow = text_of(update, "id")
+            .and_then(|id| followed?.get(id))
+            .filter(|follow| follow.get("update").is_some_and(Value::is_object));
+        match follow {
+            Some(follow) => followed_update_view(follow, view),
+            None => {
+                view.insert("update".into(), names(update, &["id", "state"]));
+            }
+        }
     }
     let mut counts = Map::new();
     collect_counts(payload, "", 1, &mut counts);
@@ -474,7 +541,41 @@ fn payload_view(payload: &Value, view: &mut Map<String, Value>) {
     }
 }
 
-/// A version a workflow's delete left: its `runtime`, `version`, `error_code`, whether asking
+/// An installation update as Archi followed it after the run (`follow_installation_updates`, up to
+/// 10 minutes while its hives only move), never as its step first answered, which SY.admin sends
+/// while hives still move (`open`, its hives `pending`): its `id`, its `state` then,
+/// `superseded_by`, how long it was followed (`followed_s`), and the hives it then left off the
+/// target (`pending`) and held (`held`), in place of the step's.
+fn followed_update_view(follow: &Value, view: &mut Map<String, Value>) {
+    let update = &follow["update"];
+    let mut update_view = names(update, &["id", "state", "superseded_by"]);
+    if let Some(secs) = follow.get("followed_s").and_then(Value::as_u64) {
+        update_view["followed_s"] = json!(secs);
+    }
+    view.insert("update".into(), update_view);
+    for key in ["pending", "held"] {
+        view.remove(key);
+        if let Some(hives) = update.get(key).and_then(Value::as_array) {
+            view.insert(key.into(), hive_names(hives));
+        }
+    }
+}
+
+/// A list of hives as names (each hive, or each hive with its state), at most `MAX_HIVE_NAMES`.
+fn hive_names(hives: &[Value]) -> Value {
+    Value::Array(
+        hives
+            .iter()
+            .filter_map(name_of)
+            .take(MAX_HIVE_NAMES)
+            .map(Value::String)
+            .collect(),
+    )
+}
+
+/// A version a workflow's delete left: its `runtime`, `version`, `error_code`, its `detail` cut
+/// (but a `PURGE_STOPPED`'s, the same for each after the first, as SY.admin keeps it when it cuts
+/// its answer; a `DIST_UNREADABLE`'s says why the folder could not be listed), whether asking
 /// again may remove it (`retryable`) and the hives not read; an entry SY.admin cut to fit the mesh
 /// frame keeps its `truncated_items`.
 fn package_left_view(item: &Value) -> Option<Value> {
@@ -483,6 +584,11 @@ fn package_left_view(item: &Value) -> Option<Value> {
     for key in ["runtime", "version", "error_code"] {
         if let Some(name) = item.get(key).and_then(name_of) {
             view.insert(key.into(), json!(name));
+        }
+    }
+    if item.get("error_code").and_then(Value::as_str) != Some("PURGE_STOPPED") {
+        if let Some(detail) = item.get("detail").and_then(detail_of) {
+            view.insert("detail".into(), json!(clean(&detail, DETAIL_MAX_CHARS)));
         }
     }
     if let Some(retryable) = item.get("retryable").and_then(Value::as_bool) {
@@ -517,9 +623,10 @@ fn unanswered_hive_view(item: &Value) -> Option<Value> {
     Some(Value::Object(view))
 }
 
-/// The pages a removal left up: their `count`, how many it did not name (`more`), and each named
-/// one by its `publication_id` and expiry only (`expires_at`, epoch seconds, and `expires`, the
-/// same in UTC). Never a link, its key, nor anything else of a page.
+/// The pages a removal left up: their `count` (null when SY.admin could not read its ledger, and
+/// its `error` says why), how many it did not name (`more`), and each named one by its
+/// `publication_id` and expiry only (`expires_at`, epoch seconds, and `expires`, the same in UTC).
+/// Never a link, its key, nor anything else of a page.
 fn pages_left_up_view(pages: &Value) -> Value {
     let mut view = Map::new();
     for key in ["count", "more"] {
@@ -529,6 +636,9 @@ fn pages_left_up_view(pages: &Value) -> Value {
         {
             view.insert(key.into(), count.clone());
         }
+    }
+    if let Some(error) = pages.get("error").and_then(detail_of) {
+        view.insert("error".into(), json!(clean(&error, DETAIL_MAX_CHARS)));
     }
     if let Some(list) = pages.get("pages").and_then(Value::as_array) {
         let named = listed(list, |page| {
@@ -552,7 +662,9 @@ fn pages_left_up_view(pages: &Value) -> Value {
 
 /// The numbers, flags and list lengths of a payload, by their path (`removed.file.episodes`; a
 /// list's length as `<path> (items)`), down to `COUNT_DEPTH`, at most `MAX_COUNTS`: no text is
-/// read, and no field whose name reads as a secret's or is not a plain field name.
+/// read, no field whose name reads as a secret's or is not a plain field name, and nothing under a
+/// field named `value`: a vault value is any JSON (`vault_get` answers it as `value`), so a number
+/// or a flag in it is a secret too, as SY.admin's run log redacts it.
 fn collect_counts(value: &Value, prefix: &str, depth: usize, out: &mut Map<String, Value>) {
     let Some(fields) = value.as_object() else {
         return;
@@ -564,6 +676,7 @@ fn collect_counts(value: &Value, prefix: &str, depth: usize, out: &mut Map<Strin
         if (depth == 1 && PAYLOAD_FIELDS.contains(&key.as_str()))
             || !is_field_name(key)
             || super::key_looks_secret(key)
+            || key.eq_ignore_ascii_case("value")
         {
             continue;
         }
@@ -651,59 +764,117 @@ fn step_line(step: &Value) -> String {
         line.push_str(&format!("; next: {next}"));
     }
     if let Some(left) = step.get("packages_left").and_then(Value::as_array) {
-        let versions: Vec<String> = left
-            .iter()
-            .map(|version| {
-                let part = |key: &str| version.get(key).map(plain).unwrap_or_default();
-                if let Some(more) = version.get("more").and_then(Value::as_u64) {
-                    return format!("{more} more");
-                }
-                let retry = match version.get("retryable").and_then(Value::as_bool) {
-                    Some(true) => ", retryable",
-                    _ => "",
-                };
-                format!(
-                    "{} {} ({}{retry})",
-                    part("runtime"),
-                    part("version"),
-                    part("error_code")
-                )
-                .replace("  ", " ")
-            })
-            .collect();
+        let versions: Vec<String> = left.iter().filter_map(package_line).collect();
         if !versions.is_empty() {
             line.push_str(&format!("; versions left: {}", versions.join(", ")));
         }
     }
-    if let Some(pages) = step.get("pages_left_up") {
-        let count = pages.get("count").and_then(Value::as_u64).unwrap_or(0);
-        if count > 0 {
-            let named: Vec<String> = pages
-                .get("pages")
-                .and_then(Value::as_array)
-                .map(|pages| {
-                    pages
-                        .iter()
-                        .filter_map(|page| {
-                            let id = page.get("publication_id")?.as_str()?;
-                            Some(match page.get("expires").and_then(Value::as_str) {
-                                Some(date) => format!("{id} until {date}"),
-                                None => id.to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            line.push_str(&format!("; pages left up: {count}"));
-            if !named.is_empty() {
-                line.push_str(&format!(" ({})", named.join(", ")));
-            }
+    if let Some(pages) = step.get("pages_left_up").and_then(pages_line) {
+        line.push_str(&format!("; {pages}"));
+    }
+    if let Some(update) = step.get("update").and_then(Value::as_object) {
+        let text = |key: &str| update.get(key).and_then(Value::as_str);
+        if let (Some(id), Some(state)) = (text("id"), text("state")) {
+            line.push_str(&format!("; installation update {id}: {state}"));
         }
     }
     if let Some(warning) = field("warning") {
         line.push_str(&format!("; warning: {warning}"));
     }
     line
+}
+
+/// A version left, in `step_line`: `wf.x 0.0.1 (RUNTIME_USAGE_UNKNOWN, retryable, hives not
+/// read: worker1 (TIMEOUT))`; one with no version says why with its detail (`DIST_UNREADABLE`);
+/// the entries SY.admin did not name, `<n> more`.
+fn package_line(entry: &Value) -> Option<String> {
+    if let Some(more) = entry
+        .get("more")
+        .or_else(|| entry.get("truncated_items"))
+        .and_then(Value::as_u64)
+    {
+        return Some(format!("{more} more"));
+    }
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    let mut why: Vec<String> = text("error_code").map(str::to_string).into_iter().collect();
+    if text("version").is_none() {
+        if let Some(detail) = text("detail") {
+            why.push(detail.to_string());
+        }
+    }
+    if entry.get("retryable").and_then(Value::as_bool) == Some(true) {
+        why.push("retryable".to_string());
+    }
+    if let Some(hives) = entry
+        .get("unanswered_hives")
+        .and_then(Value::as_array)
+        .filter(|hives| !hives.is_empty())
+    {
+        why.push(format!("hives not read: {}", hive_list(hives)));
+    }
+    let name: Vec<&str> = [text("runtime"), text("version")]
+        .into_iter()
+        .flatten()
+        .collect();
+    match (name.is_empty(), why.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(name.join(" ")),
+        (true, false) => Some(why.join(", ")),
+        (false, false) => Some(format!("{} ({})", name.join(" "), why.join(", "))),
+    }
+}
+
+/// The pages a removal left up, in `step_line`: `pages left up: 2 (pub:… until <date>, 1 more)`;
+/// when SY.admin could not count them, that /artifacts lists the pages that are up. None when it
+/// left none.
+fn pages_line(pages: &Value) -> Option<String> {
+    if pages.get("count").is_some_and(Value::is_null) {
+        let why = pages
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|error| format!(" ({error})"))
+            .unwrap_or_default();
+        return Some(format!(
+            "pages left up: not counted{why}; /artifacts lists the pages that are up"
+        ));
+    }
+    let count = pages.get("count").and_then(Value::as_u64).unwrap_or(0);
+    if count == 0 {
+        return None;
+    }
+    let mut named: Vec<String> = pages
+        .get("pages")
+        .and_then(Value::as_array)
+        .map(|pages| {
+            pages
+                .iter()
+                .filter_map(|page| {
+                    let id = page.get("publication_id")?.as_str()?;
+                    Some(match page.get("expires").and_then(Value::as_str) {
+                        Some(date) => format!("{id} until {date}"),
+                        None => id.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(more) = pages
+        .get("more")
+        .and_then(Value::as_u64)
+        .filter(|more| *more > 0)
+    {
+        named.push(format!("{more} more"));
+    }
+    let mut line = format!("pages left up: {count}");
+    if !named.is_empty() {
+        line.push_str(&format!(" ({})", named.join(", ")));
+    }
+    Some(line)
 }
 
 /// The hives of a list, each with its reason: `worker1 (TIMEOUT), worker2`.
@@ -754,7 +925,8 @@ fn name_of(value: &Value) -> Option<String> {
     }
 }
 
-/// A detail as text: a string as it is, anything else but null as its compact JSON.
+/// A detail as text: a string as it is, anything else but null as its JSON, pretty, so that
+/// `scrub` reads each of its values as a word of its own.
 fn detail_of(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
@@ -762,7 +934,7 @@ fn detail_of(value: &Value) -> Option<String> {
             let text = text.trim();
             (!text.is_empty()).then(|| text.to_string())
         }
-        other => serde_json::to_string(other).ok(),
+        other => serde_json::to_string_pretty(other).ok(),
     }
 }
 
@@ -793,15 +965,11 @@ fn clean(text: &str, max_chars: usize) -> String {
     cut(&scrub(text), max_chars)
 }
 
-/// A name the turn may carry: its links and credentials taken out (`scrub_word`, without the rule
-/// for a long run of letters and digits, which a name such as a version or an id may be), cut to
-/// `NAME_MAX_CHARS`.
+/// A name the turn may carry: its links, channel ids and credentials taken out (`scrub_text`,
+/// without the rule for a long run of a key's characters, which a name such as a version or an id
+/// may be), cut to `NAME_MAX_CHARS`.
 fn clean_name(text: &str) -> String {
-    let words: Vec<String> = text
-        .split_whitespace()
-        .map(|word| scrub_word(word, false).unwrap_or_else(|| word.to_string()))
-        .collect();
-    cut(&words.join(" "), NAME_MAX_CHARS)
+    cut(&scrub_text(text, false), NAME_MAX_CHARS)
 }
 
 /// `text`, cut to `max_chars` characters, with `…` when cut.
@@ -815,67 +983,172 @@ fn cut(text: &str, max_chars: usize) -> String {
     kept
 }
 
-/// A text with any link and anything that reads as a credential taken out, word by word
-/// (`scrub_word`), and the word after `Bearer`; its whitespace becomes single spaces.
+/// What stands in for a link, and for a credential, a channel id or a key.
+const LINK_REMOVED: &str = "[link removed]";
+const REMOVED: &str = "[removed]";
+
+/// The names a credential's value follows: `token=…`, `"api_key": "…"`, `password: …`,
+/// `Authorization: Bearer …`.
+const CREDENTIALS: &[&str] = &[
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "credential",
+    "credentials",
+    "private_key",
+    "ssh_key",
+];
+
+/// What joins a credential's name to its value within a word.
+const JOINTS: &[&str] = &["=", "\":", "':", ":"];
+
+/// A free text with what reads as a link, a channel id, a credential's value or a key taken out
+/// (`scrub_text`, with the rule for a long run of a key's characters); its whitespace becomes
+/// single spaces.
 fn scrub(text: &str) -> String {
-    let mut words: Vec<String> = Vec::new();
-    let mut after_bearer = false;
-    for word in text.split_whitespace() {
-        let kept = if after_bearer {
-            "[removed]".to_string()
-        } else {
-            scrub_word(word, true).unwrap_or_else(|| word.to_string())
-        };
-        after_bearer = word
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-            .eq_ignore_ascii_case("bearer");
-        words.push(kept);
-    }
-    words.join(" ")
+    scrub_text(text, true)
 }
 
-/// What a word becomes when it must not reach the turn, `None` when it may: a link (`://`, a
-/// page's `/public/` key, a channel's `/e/` path) is `[link removed]`; a credential named with its
-/// value (`token=`, `"api_key":`, `password=`...) is `[removed]`; and with `long_runs`, so is a run
-/// of 32 or more letters, digits, `-`, `_`, `+` or `=` with a letter and a digit in it, as a key
-/// or a token reads.
-fn scrub_word(word: &str, long_runs: bool) -> Option<String> {
-    let lower = word.to_ascii_lowercase();
-    if lower.contains("://") || lower.contains("/public/") || lower.contains("/e/") {
-        return Some("[link removed]".to_string());
-    }
-    const CREDENTIALS: &[&str] = &[
-        "token",
-        "password",
-        "passwd",
-        "secret",
-        "api_key",
-        "apikey",
-        "api-key",
-        "authorization",
-        "credential",
-    ];
-    let names_a_credential = CREDENTIALS.iter().any(|name| {
-        ["=", "\":", "':", ":\""]
-            .iter()
-            .any(|joint| lower.contains(&format!("{name}{joint}")))
-    });
-    if names_a_credential {
-        return Some("[removed]".to_string());
-    }
-    if long_runs {
-        let core = word.trim_matches(|c: char| "\"'()[]{}<>,;:.!?".contains(c));
-        let reads_as_a_key = core.chars().count() >= 32
-            && core
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_+=".contains(c))
-            && core.chars().any(|c| c.is_ascii_alphabetic())
-            && core.chars().any(|c| c.is_ascii_digit());
-        if reads_as_a_key {
-            return Some("[removed]".to_string());
+/// `text`, word by word (`word_kind`): a link becomes `[link removed]`; a channel id, a credential
+/// written with its value in one word (`token=abc`, `"api_key":"k"`) and, with `long_runs`, a word
+/// holding a run of a key's characters, `[removed]`. A word that names a credential and leaves its
+/// value to the next (`password:`, `"token":`, `Bearer`), or a credential's name followed by `=`
+/// or `:` as a word of its own, stays, and that value becomes `[removed]`: after
+/// `Authorization:`, its scheme (`Bearer`, `Basic`) stays and the word after it goes. A short
+/// secret written any other way reads as a plain word.
+fn scrub_text(text: &str, long_runs: bool) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut kept: Vec<String> = Vec::with_capacity(words.len());
+    // The word that is a credential's value, removed whatever it reads as.
+    let mut value_at: Option<usize> = None;
+    for (at, word) in words.iter().copied().enumerate() {
+        if value_at == Some(at) {
+            if is_auth_scheme(word) {
+                kept.push(word.to_string());
+                value_at = Some(at + 1);
+            } else {
+                kept.push(REMOVED.to_string());
+            }
+            continue;
+        }
+        match word_kind(word, long_runs) {
+            WordKind::Removed(with) => kept.push(with.to_string()),
+            WordKind::NamesItsValue => {
+                kept.push(word.to_string());
+                value_at = Some(at + 1);
+            }
+            WordKind::Kept => {
+                kept.push(word.to_string());
+                if is_credential_name(word)
+                    && words
+                        .get(at + 1)
+                        .is_some_and(|joint| matches!(*joint, "=" | ":"))
+                {
+                    value_at = Some(at + 2);
+                }
+            }
         }
     }
-    None
+    kept.join(" ")
+}
+
+/// What a word of a text is to `scrub_text`.
+enum WordKind {
+    /// It may reach the turn as it is.
+    Kept,
+    /// It must not, and this stands in for it.
+    Removed(&'static str),
+    /// It names a credential whose value is the next word; it stays.
+    NamesItsValue,
+}
+
+/// A link (`://`, a page's `/public/` key, a channel's `/e/` path) is `[link removed]`; a channel
+/// id (`ich:<uuid>`, its `/e/` path without the prefix) and a credential with its value in the
+/// word are `[removed]`; a credential's name with its joint at the word's end, and `Bearer`, name
+/// the next word; with `long_runs`, a word holding a run of a key's characters (`holds_a_key_run`)
+/// is `[removed]`.
+fn word_kind(word: &str, long_runs: bool) -> WordKind {
+    let lower = word.to_ascii_lowercase();
+    if lower.contains("://") || lower.contains("/public/") || lower.contains("/e/") {
+        return WordKind::Removed(LINK_REMOVED);
+    }
+    if names_a_channel(&lower) {
+        return WordKind::Removed(REMOVED);
+    }
+    match credential_value_in(&lower) {
+        Some(true) => return WordKind::Removed(REMOVED),
+        Some(false) => return WordKind::NamesItsValue,
+        None => {}
+    }
+    if word
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .eq_ignore_ascii_case("bearer")
+    {
+        return WordKind::NamesItsValue;
+    }
+    if long_runs && holds_a_key_run(word) {
+        return WordKind::Removed(REMOVED);
+    }
+    WordKind::Kept
+}
+
+/// Whether `lower` names a channel by its id: `ich:` at its start or after a character that is
+/// not a letter or a digit (`'ich:…'`, `channel=ich:…`; not `which:`).
+fn names_a_channel(lower: &str) -> bool {
+    lower.match_indices("ich:").any(|(at, _)| {
+        lower[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_ascii_alphanumeric())
+    })
+}
+
+/// Whether `lower` names a credential with its joint (`token=`, `"api_key":`, `password:`):
+/// `Some(true)` when its value is in the word too, `Some(false)` when it is the next word, `None`
+/// when it names none.
+fn credential_value_in(lower: &str) -> Option<bool> {
+    CREDENTIALS.iter().find_map(|name| {
+        JOINTS.iter().find_map(|joint| {
+            let named = format!("{name}{joint}");
+            let at = lower.find(&named)?;
+            let value =
+                lower[at + named.len()..].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            Some(!value.is_empty())
+        })
+    })
+}
+
+/// Whether `word` is a credential's name and nothing else (`password`, `"token"`).
+fn is_credential_name(word: &str) -> bool {
+    let core = word.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    CREDENTIALS
+        .iter()
+        .any(|name| core.eq_ignore_ascii_case(name))
+}
+
+/// Whether `word` is an authorization's scheme, which its credential follows.
+fn is_auth_scheme(word: &str) -> bool {
+    let core = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    core.eq_ignore_ascii_case("bearer") || core.eq_ignore_ascii_case("basic")
+}
+
+/// Whether `word` holds a run of `KEY_RUN_MIN_CHARS` or more of a key's characters (letters,
+/// digits, `-`, `_`, `+`, `/`, `=`: base64 and base64url), a letter and a digit among them, as a
+/// key or a token reads: a JWT's part, a key in a JSON detail, an id after its prefix
+/// (`ilk:<uuid>`). A dotted name or a version breaks at its dots.
+fn holds_a_key_run(word: &str) -> bool {
+    word.split(|c: char| !(c.is_ascii_alphanumeric() || "-_+/=".contains(c)))
+        .any(|run| {
+            run.len() >= KEY_RUN_MIN_CHARS
+                && run.chars().any(|c| c.is_ascii_alphabetic())
+                && run.chars().any(|c| c.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
@@ -883,6 +1156,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use fluxbee_ai_sdk::{AiSdkError, FunctionModelTurnRequest, FunctionModelTurnResponse};
+    use std::future::{ready, Ready};
     use std::sync::Mutex;
 
     /// What the model was sent, turn by turn, and what it answers: its text, an error, or nothing
@@ -942,6 +1216,11 @@ mod tests {
         }
     }
 
+    /// A session with no turns yet, read at once.
+    fn no_turns() -> Ready<Result<ImmediateConversationMemory, String>> {
+        ready(Ok(ImmediateConversationMemory::default()))
+    }
+
     const TOKEN: &str = "fbct_9f2c4e7a1b3d5f60718293a4b5c6d7e8f9a0b1c2";
     const PAGE_KEY: &str = "4b1d9e0c7a5f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d";
     const VAULT_VALUE: &str = "vault-value-q7Rk2mXz";
@@ -990,6 +1269,7 @@ mod tests {
               "unanswered_hives": [ { "hive": "worker1", "reason": "TIMEOUT",
                                       "detail": VAULT_VALUE } ] },
             { "runtime": "wf.gate0236a", "version": "0.0.2", "error_code": "PURGE_STOPPED",
+              "detail": format!("the purge stopped at 0.0.1; password: {PASSWORD}"),
               "retryable": false }
         ]);
         s1_payload["pages_left_up"] = json!({
@@ -1057,6 +1337,7 @@ mod tests {
             "action": "executor_execute_plan",
             "message": "Execution stopped at step 's2'",
             "payload": { "status": "failed", "events": events, "summary": summary },
+            "error_code": "EXECUTION_FAILED",
             "verification_verdict": {
                 "verified_success": false, "eligible_for_cookbook": false,
                 "reason": "execution report is not verified successful: summary.status=failed"
@@ -1084,20 +1365,22 @@ mod tests {
     /// step's answer, and no token, link, vault value, key or password of the answers or of the
     /// steps' args reaches it, though every one of them sits in the run: in fields no view keeps
     /// (`token`, `url`, `value`, `secret_ref`, a page's `key`, the args), and in the texts a view
-    /// keeps cut (`warning`, `error_detail`, `wf_node.error`, a hive's `detail`). What the operator
-    /// is told is there: each step's status, code, detail cut, the versions left with their codes
-    /// and whether asking again may remove them, the hive not read, the page left up by its id and
-    /// expiry, the warning, the counts, and the step that did not run. Its text becomes the run's
-    /// message.
+    /// keeps cut (`warning`, `error_detail`, a version's `detail`, `wf_node.error`, a hive's
+    /// `detail`). What the operator is told is there: each step's status, code, detail cut, the
+    /// versions left with their codes and whether asking again may remove them, the hive not
+    /// read, the page left up by its id and expiry, the warning, the counts, and the step that did
+    /// not run. Its text becomes the run's message, and its tokens count in the answer's
+    /// `token_usage` with the plan compile's.
     #[tokio::test]
     async fn the_explanation_turn_gets_each_steps_answer_and_no_secret() {
         let model = RecordingModel::new(Answer::Text(
             "The workflow is deleted; two of its versions stayed.",
         ));
         let mut output = run_output();
+        output["token_usage"] = json!({ "plan_compile": 1000, "total": 1000, "budget": 60000 });
         explain_run(
             Ok(&model),
-            None,
+            no_turns(),
             &plan_steps(),
             &mut output,
             EXPLANATION_TURN_TIMEOUT,
@@ -1131,8 +1414,10 @@ mod tests {
             "2026-11-13T00:00:00Z",
             "its purge did not remove 2 versions",
             "nothing was removed",
+            "not read; [removed]",
             "removed.file.communications",
             "\\\"not_run\\\"",
+            "EXECUTION_FAILED",
             "Execution stopped at step 's2'",
             "[link removed]",
         ] {
@@ -1149,6 +1434,11 @@ mod tests {
         assert_eq!(output["explanation"]["source"], json!("model"));
         assert_eq!(output["explanation"]["model_calls"], json!(1));
         assert_eq!(output["explanation"]["tokens_used"], json!(321));
+        assert_eq!(
+            output["token_usage"],
+            json!({ "plan_compile": 1000, "execution_report": 321, "total": 1321,
+                    "budget": 60000 })
+        );
         let steps = output["explanation"]["steps"].to_string();
         for secret in secrets() {
             assert!(
@@ -1178,7 +1468,8 @@ mod tests {
             s1["packages_left"],
             json!([
                 { "runtime": "wf.gate0236a", "version": "0.0.1",
-                  "error_code": "RUNTIME_USAGE_UNKNOWN", "retryable": true,
+                  "error_code": "RUNTIME_USAGE_UNKNOWN", "detail": "not read; [removed]",
+                  "retryable": true,
                   "unanswered_hives": [ { "hive": "worker1", "reason": "TIMEOUT" } ] },
                 { "runtime": "wf.gate0236a", "version": "0.0.2",
                   "error_code": "PURGE_STOPPED", "retryable": false }
@@ -1205,8 +1496,11 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("[link removed]"), "{warning}");
-        assert!(warning.contains("Bearer [removed]"), "{warning}");
-        assert!(warning.contains("[removed]"), "{warning}");
+        assert!(
+            warning.contains("Authorization: Bearer [removed]"),
+            "{warning}"
+        );
+        assert!(warning.ends_with("[removed]"), "{warning}");
 
         let s2 = &views[1];
         assert_eq!(s2["status"], json!("failed"));
@@ -1251,7 +1545,7 @@ mod tests {
             let mut output = run_output();
             explain_run(
                 Ok(&model),
-                None,
+                no_turns(),
                 &plan_steps(),
                 &mut output,
                 EXPLANATION_TURN_TIMEOUT,
@@ -1260,12 +1554,13 @@ mod tests {
             assert_eq!(model.requests.lock().unwrap().len(), 1);
             assert_eq!(output["explanation"]["source"], json!("fallback"));
             assert_eq!(output["explanation"]["model_calls"], json!(1));
+            assert_eq!(output.get("token_usage"), None, "no tokens to count");
             let error = output["explanation"]["error"].as_str().unwrap();
             assert!(error.contains(why), "{error}");
             let message = output["message"].as_str().unwrap();
             assert!(message.starts_with("Execution stopped at step 's2'\n- s1 wf_rules_delete (hive motherbee, workflow_name gate0236a): done"), "{message}");
             for line in [
-                "versions left: wf.gate0236a 0.0.1 (RUNTIME_USAGE_UNKNOWN, retryable), wf.gate0236a 0.0.2 (PURGE_STOPPED)",
+                "versions left: wf.gate0236a 0.0.1 (RUNTIME_USAGE_UNKNOWN, retryable, hives not read: worker1 (TIMEOUT)), wf.gate0236a 0.0.2 (PURGE_STOPPED)",
                 "pages left up: 1 (pub:7d1f0b6e-2c4a-4e8b-9a3d-5f6e7a8b9c0d until 2026-11-13T00:00:00Z)",
                 "- s2 remove_runtime_version (hive motherbee, runtime wf.gate0236a, runtime_version 0.0.1): failed, RUNTIME_USAGE_UNKNOWN: cannot tell whether runtime",
                 "hives not read: worker1 (TIMEOUT); asking again may pass",
@@ -1285,7 +1580,7 @@ mod tests {
         let mut output = run_output();
         explain_run(
             Err("AI provider not configured.".to_string()),
-            None,
+            no_turns(),
             &plan_steps(),
             &mut output,
             EXPLANATION_TURN_TIMEOUT,
@@ -1299,6 +1594,36 @@ mod tests {
             .starts_with("Execution stopped at step 's2'\n- s1 wf_rules_delete"));
     }
 
+    /// When the session's turns cannot be read, no turn runs: it would answer with none of them,
+    /// not knowing the operator's language. The chat keeps the fixed line, with no model call.
+    #[tokio::test]
+    async fn a_session_whose_turns_cannot_be_read_gets_the_fixed_line_with_no_call() {
+        let model = RecordingModel::new(Answer::Text("The run, in English."));
+        let mut output = run_output();
+        explain_run(
+            Ok(&model),
+            ready(Err::<ImmediateConversationMemory, String>(
+                "messages table: not found".to_string(),
+            )),
+            &plan_steps(),
+            &mut output,
+            EXPLANATION_TURN_TIMEOUT,
+        )
+        .await;
+        assert!(model.requests.lock().unwrap().is_empty(), "no model call");
+        assert_eq!(output["explanation"]["source"], json!("fallback"));
+        assert_eq!(output["explanation"]["model_calls"], json!(0));
+        let error = output["explanation"]["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("the session's turns could not be read: messages table"),
+            "{error}"
+        );
+        assert!(output["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Execution stopped at step 's2'\n- s1 wf_rules_delete"));
+    }
+
     /// A model that answers no text is a failed turn too.
     #[tokio::test]
     async fn a_turn_with_no_text_falls_back() {
@@ -1306,6 +1631,214 @@ mod tests {
         let turn =
             explanation_turn(&model, None, "report".to_string(), EXPLANATION_TURN_TIMEOUT).await;
         assert_eq!(turn, Err("the model gave no text".to_string()));
+    }
+
+    /// When SY.admin's executor fails before its report (`EXECUTOR_UNAVAILABLE`: a step's model
+    /// run that failed, a reference that did not resolve), its answer carries no step, and the
+    /// steps before the one it failed at ran. Each is `not_reported`, never `not_run`: the turn
+    /// and the fallback say its outcome is in SY.admin's command log, and the turn gets the code.
+    #[tokio::test]
+    async fn an_executor_that_failed_before_its_report_leaves_each_step_not_reported() {
+        let mut output = json!({
+            "status": "error", "action": "executor_execute_plan", "payload": null,
+            "error_code": "EXECUTOR_UNAVAILABLE",
+            "error_detail": "executor model run failed: provider answered 529 overloaded",
+            "message": "Executor plan failed: executor model run failed: provider answered 529 \
+                        overloaded"
+        });
+        let views = step_views(&output, &plan_steps());
+        assert_eq!(
+            views
+                .iter()
+                .map(|view| view["status"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("not_reported"); 3]
+        );
+        assert_eq!(
+            run_view(&output, &fixed_line(&output))["error_code"],
+            json!("EXECUTOR_UNAVAILABLE")
+        );
+
+        explain_run(
+            Err("AI provider not configured.".to_string()),
+            no_turns(),
+            &plan_steps(),
+            &mut output,
+            EXPLANATION_TURN_TIMEOUT,
+        )
+        .await;
+        let message = output["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("Executor plan failed: executor model run failed"),
+            "{message}"
+        );
+        assert!(!message.contains("did not run"), "{message}");
+        assert_eq!(
+            message
+                .matches("its outcome is in SY.admin's command log")
+                .count(),
+            3,
+            "{message}"
+        );
+    }
+
+    /// An installation update's step is told as Archi followed it after the run, not as SY.admin
+    /// answered it while its hives moved (`open`, worker1 pending): done after 42 s, no hive
+    /// pending. An update Archi did not follow keeps its answer's.
+    #[test]
+    fn an_installation_update_is_told_as_archi_followed_it() {
+        let answered = json!({
+            "status": "partial", "action": "update_installation",
+            "payload": {
+                "update": { "id": "upd-1731160000000", "state": "open",
+                            "pending": ["worker1 (core in_flight, config pending)"], "held": [] },
+                "pending": ["worker1 (core in_flight, config pending)"],
+                "opening": "opened", "elapsed_ms": 4100,
+                "message": "update upd-1731160000000 is open: not every hive is on the target yet"
+            }
+        });
+        let mut output = json!({
+            "status": "ok", "message": "Execution completed successfully",
+            "payload": {
+                "events": [ { "step_id": "s1", "step_action": "update_installation",
+                              "status": "done", "tool_name": "update_installation",
+                              "result_preview": answered } ],
+                "summary": { "status": "done", "total_steps": 1, "completed_steps": 1,
+                             "final_message": "Execution completed successfully" }
+            }
+        });
+        let plan = vec![json!({ "id": "s1", "action": "update_installation",
+                                "args": { "reason": "release 0.1.137" } })];
+        let answered_view = &step_views(&output, &plan)[0];
+        assert_eq!(
+            answered_view["update"],
+            json!({ "id": "upd-1731160000000", "state": "open" })
+        );
+        assert_eq!(
+            answered_view["pending"],
+            json!(["worker1 (core in_flight, config pending)"])
+        );
+
+        output["installation_updates"] = json!({ "upd-1731160000000": {
+            "update": { "id": "upd-1731160000000", "state": "done", "superseded_by": null,
+                        "pending": [], "held": [],
+                        "hives": { "worker1": { "core": { "state": "on_target" } } } },
+            "followed_s": 42 } });
+        let views = step_views(&output, &plan);
+        let followed = &views[0];
+        assert_eq!(followed["status"], json!("done"));
+        assert_eq!(
+            followed["update"],
+            json!({ "id": "upd-1731160000000", "state": "done", "followed_s": 42 })
+        );
+        assert_eq!(followed["pending"], json!([]));
+        assert_eq!(followed["held"], json!([]));
+        let text = fallback_text("Execution completed successfully", &views);
+        assert!(
+            text.contains("installation update upd-1731160000000: done"),
+            "{text}"
+        );
+    }
+
+    /// A vault value is any JSON: `vault_get` answers it as `value`, a number or an object of
+    /// numbers and flags as well as a text, and no count of it reaches the turn (FINDINGS A-124);
+    /// the answer's other numbers do.
+    #[tokio::test]
+    async fn no_number_or_flag_of_a_vault_value_reaches_the_turn() {
+        for value in [
+            json!(482193),
+            json!({ "pin": 4821, "enabled": true, "codes": [11, 12] }),
+        ] {
+            let mut output = json!({
+                "status": "ok", "message": "Execution completed successfully",
+                "payload": {
+                    "events": [ { "step_id": "s1", "step_action": "vault_get", "status": "done",
+                        "tool_name": "vault_get",
+                        "tool_args_preview": { "hive": "motherbee", "key": "door_pin" },
+                        "result_preview": { "status": "ok", "action": "vault_get",
+                            "payload": { "status": "ok", "key": "door_pin", "version": 3,
+                                         "access_count": 2,
+                                         "metadata": { "tenant_id": "tnt:x",
+                                                       "created_at": 1_794_500_000_i64 },
+                                         "value": value } } } ],
+                    "summary": { "status": "done", "total_steps": 1, "completed_steps": 1,
+                                 "final_message": "Execution completed successfully" }
+                }
+            });
+            let views = step_views(&output, &[]);
+            let counts = views[0]["counts"].as_object().expect("its counts");
+            assert_eq!(counts.get("version"), Some(&json!(3)), "{counts:?}");
+            assert!(
+                counts.keys().all(|key| !key.starts_with("value")),
+                "{counts:?}"
+            );
+
+            let model = RecordingModel::new(Answer::Text("The value was read."));
+            explain_run(
+                Ok(&model),
+                no_turns(),
+                &[],
+                &mut output,
+                EXPLANATION_TURN_TIMEOUT,
+            )
+            .await;
+            let sent = model.sent();
+            let steps = output["explanation"]["steps"].to_string();
+            for secret in ["482193", "4821", "value.enabled", "value.codes"] {
+                assert!(!sent.contains(secret), "{secret} reached the model: {sent}");
+                assert!(
+                    !steps.contains(secret),
+                    "{secret} kept in the steps: {steps}"
+                );
+            }
+        }
+    }
+
+    /// What says why a version stayed or a page may stay up reaches the turn and the fallback: a
+    /// `DIST_UNREADABLE`'s detail, a page ledger that could not be read (`count` null, with its
+    /// error, and /artifacts lists the pages), and an entry SY.admin cut as "<n> more", never as
+    /// "()".
+    #[test]
+    fn what_says_why_a_version_or_a_page_stayed_is_kept() {
+        let detail = "dist/runtimes/wf.gate0237a cannot be listed: Permission denied (os error 13)";
+        let ledger = "the page ledger could not be read: database is locked";
+        let payload = json!({
+            "status": "ok",
+            "packages_left": [
+                { "runtime": "wf.gate0237a", "error_code": "DIST_UNREADABLE", "retryable": false,
+                  "detail": detail },
+                { "truncated_items": 3 }
+            ],
+            "pages_left_up": { "count": null, "error": ledger }
+        });
+        let output = json!({ "message": "Execution completed successfully", "payload": {
+            "events": [ { "step_id": "s1", "step_action": "wf_rules_delete", "status": "done",
+                          "tool_name": "wf_rules_delete",
+                          "result_preview": { "status": "ok", "payload": payload } } ],
+            "summary": { "status": "done", "total_steps": 1, "completed_steps": 1 } } });
+        let views = step_views(&output, &[]);
+        assert_eq!(
+            views[0]["packages_left"],
+            json!([
+                { "runtime": "wf.gate0237a", "error_code": "DIST_UNREADABLE",
+                  "detail": detail, "retryable": false },
+                { "truncated_items": 3 }
+            ])
+        );
+        assert_eq!(
+            views[0]["pages_left_up"],
+            json!({ "count": null, "error": ledger })
+        );
+        let text = fallback_text("Execution completed successfully", &views);
+        for part in [
+            format!("versions left: wf.gate0237a (DIST_UNREADABLE, {detail}), 3 more"),
+            format!(
+                "pages left up: not counted ({ledger}); /artifacts lists the pages that are up"
+            ),
+        ] {
+            assert!(text.contains(&part), "{part} missing: {text}");
+        }
+        assert!(!text.contains("()"), "{text}");
     }
 
     /// An add_hive that was accepted and whose join failed: the step failed with the join's code
@@ -1362,5 +1895,55 @@ mod tests {
             "pub:7d1f0b6e-2c4a-4e8b-9a3d-5f6e7a8b9c0d"
         );
         assert_eq!(cut("abcdef", 4), "abc…");
+    }
+
+    /// A credential's value goes however it is written (`name: value`, `name = value`, pretty
+    /// JSON, after an authorization's scheme), and a key whatever its alphabet (a JWT, base64 with
+    /// `/`, a key quoted in a JSON detail); a channel id goes, in a text and in a name; a version,
+    /// a path and an English word stay.
+    #[test]
+    fn scrub_takes_out_a_credentials_value_and_a_key_written_any_way() {
+        assert_eq!(
+            scrub(&format!("password: {PASSWORD} ok")),
+            "password: [removed] ok"
+        );
+        assert_eq!(
+            scrub(&format!("password = {PASSWORD} ok")),
+            "password = [removed] ok"
+        );
+        assert_eq!(
+            clean(
+                &detail_of(&json!({ "code": "X", "password": PASSWORD })).unwrap(),
+                DETAIL_MAX_CHARS
+            ),
+            "{ \"code\": \"X\", \"password\": [removed] }"
+        );
+        assert_eq!(
+            scrub("Authorization: Basic dXNlcjpwYXNzd29yZA== sent"),
+            "Authorization: Basic [removed] sent"
+        );
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.\
+                   dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        assert_eq!(scrub(&format!("signed {jwt}")), "signed [removed]");
+        assert_eq!(
+            scrub("key dGhpcyBpcyBhIHNlY3JldCBr/ZXkgZm9yIHRlc3RzIDEy+OTQ= stays"),
+            "key [removed] stays"
+        );
+        let detail = detail_of(&json!({ "outcome": { "key": PAGE_KEY } })).unwrap();
+        let cleaned = clean(&detail, DETAIL_MAX_CHARS);
+        assert!(!cleaned.contains(PAGE_KEY), "{cleaned}");
+        assert!(cleaned.contains("\"key\": [removed]"), "{cleaned}");
+
+        let channel = "ich:7d1f0b6e-2c4a-4e8b-9a3d-5f6e7a8b9c0d";
+        assert_eq!(
+            scrub(&format!("edge did not open URL '{channel}': refused")),
+            "edge did not open URL [removed] refused"
+        );
+        assert_eq!(clean_name(channel), "[removed]");
+        assert_eq!(scrub("which: one"), "which: one");
+        assert_eq!(
+            scrub("dist/runtimes/wf.gate0237a/0.1.137 cannot be listed"),
+            "dist/runtimes/wf.gate0237a/0.1.137 cannot be listed"
+        );
     }
 }

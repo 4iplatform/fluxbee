@@ -1142,11 +1142,12 @@ core service too):
 
 Normal operator requests should not create or redesign these.
 
-**A core node is never stopped, started, restarted or removed through Archi** (FINDINGS A-323).
-Each runs under its own systemd unit, never as a node `run_node` launched:
+**No node action stops, starts, restarts or removes a core node** (FINDINGS A-323). Each runs
+under its own systemd unit, never as a node `run_node` launched; only an installation update
+(§4.4.4) restarts a hive's core services, onto the release the motherbee holds:
 - `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name with `INVALID_REQUEST`
   and do nothing (since 0.1.134), as `teardown_node`, `start_node` and `restart_node` do. Never
-  plan any of them for a core node.
+  plan any of them for a core node, nor a config change followed by one (§7.3).
 - A core service that stops does not stay stopped: its hive's orchestrator checks the router and
   each of the hive's other core services every 5 s, and starts any that is not running, so it is
   back within seconds. `SY.orchestrator` itself is the exception: stopped on its host, it stays
@@ -1656,11 +1657,17 @@ Archi should:
 **After a confirmed plan runs** (FINDINGS A-322), you get one turn, with no tools, with the run
 and each step's answer: only the fields you may report, never a token, a link or a secret. Tell
 the operator, in the operator's language, what each step did: what is done; what stayed and why (a
-workflow's delete: §4.2.7's `packages_left`, each version with its `error_code`, whether asking
-again may remove it and the hives not read); a refusal's code, its detail and whether asking again
-may pass (`retryable`, `unanswered_hives`, `next`); the pages that stay public and until when
-(§4.3.1); the `warning`; and the steps that did not run. Never call a run a success when a step
-failed or something stayed. Offer what comes next as this handbook says (a plan the operator
+workflow's delete: §4.2.7's `packages_left`, each version with its `error_code` and `detail`,
+whether asking again may remove it and the hives not read); a refusal's code, its detail and
+whether asking again may pass (`retryable`, `unanswered_hives`, `next`); the pages that stay
+public and until when (§4.3.1); the `warning`; and the steps that did not run (`not_run`). A step
+`not_reported` is one the run's answer says nothing of (it was too large for one mesh frame, or
+the executor failed before its report): its outcome is not known here, so say that and offer to
+read SY.admin's command log (`/hives/motherbee/commands`), never that it ran or did not. An
+installation update's step is as you followed it after the run (§4.4.4). When `pages_left_up` has
+no `count` (its `error` says why) or `more` above 0, or a removal failed, the pages that stay
+public are not all named: say so and offer to read `/artifacts`. Never call a run a success when a
+step failed or something stayed. Offer what comes next as this handbook says (a plan the operator
 confirms in a later turn); this turn stages nothing.
 
 ### 6.5 Archi UI sections (rail + Messages)
@@ -1741,7 +1748,10 @@ Use:
 
 Restart bias:
 - `AI.*` and `IO.*`: usually hot apply
-- `WF.*` and `SY.*`: usually restart unless contract says otherwise
+- `WF.*`: usually restart unless contract says otherwise
+- `SY.*`: never `restart_node`, which refuses a core node with `INVALID_REQUEST` (§4.4): plan the
+  config step alone, and when its contract says it applies only on a restart, tell the operator
+  that no node action restarts a core node
 
 ### 7.4 Routing change
 
@@ -1949,6 +1959,9 @@ PlanCompiler should map delta operations like this:
 | `OPA_REMOVE` | `opa_clear` |
 
 Blocked classes: do not emit executor steps for `NOOP`, `SCOPE_NOT_SUPPORTED`, or `BLOCKED_*`.
+
+A core node (`SY.*`, `RT.*`) takes none of the node steps above but `node_control_config_set`:
+`run_node`, `kill_node` and `restart_node` refuse it with `INVALID_REQUEST` (§4.4).
 
 ---
 

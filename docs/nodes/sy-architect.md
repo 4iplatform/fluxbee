@@ -87,7 +87,8 @@ Then `handle_chat_message` looks at each message in this order:
    compiler prepared, sent with labels `{"origin": "plan_compiler_confirmed"}`); once such a plan
    ran, the chat says what each step did ([What the chat says after a confirmed
    plan](#what-the-chat-says-after-a-confirmed-plan)). `CANCEL` or `ABORT` drops it; a dropped
-   plan answers "Plan discarded." (since 0.1.137; before, "Programmer plan discarded.").
+   plan answers "Plan discarded." in mode `chat`, as a dropped SCMD does (since 0.1.137; before,
+   "Programmer plan discarded." in mode `executor`, which the UI drew as a run marked "done").
 2. While something waits for confirmation, other messages get `status: "blocked"`.
 3. `SCMD: <curl-like command>`: an operator command, run at once (see SCMD).
 4. A pasted JSON `executor_plan`: validated and run at once.
@@ -292,40 +293,61 @@ that answered ok with versions left read as a full success.
 - **The turn**: one call of Archi's model, with no tool, its prompt and handbook as in the chat,
   the session's summary and recent turns, and a message Archi writes: what to report (what each
   step did, what is done, what stayed and why, a refusal's code, its detail and whether asking
-  again may pass, the pages left up and until when, the warning, the steps that did not run), in
-  the operator's language and as the handbook says, then the run and each step as JSON. Its text
-  becomes the run's `message`: the chat shows it under the plan's head, in place of the fixed
-  line, and the next turns read it as Archi's own words. One model call per plan run, recorded
-  with the stage `execution_report`, and bounded at 90 s (`EXPLANATION_TURN_TIMEOUT`).
+  again may pass, the pages left up and until when, the warning, the steps that did not run, and
+  what each step's status and the followed update mean), in the operator's language and as the
+  handbook says, then the run and each step as JSON. Its text becomes the run's `message`: the
+  chat shows it under the plan's head, in place of the fixed line, and the next turns read it as
+  Archi's own words. One model call per plan run, recorded with the stage `execution_report`,
+  and bounded at 90 s (`EXPLANATION_TURN_TIMEOUT`).
+- **Its cost**: Archi's prompt and handbook (about 40,000 tokens), the session's turns and the
+  report, and a short answer. The turn sends no tools, and Anthropic caches a prompt as tools,
+  then system, then messages, so it never reads what a chat turn cached: its prompt is billed in
+  full, as a cache write, unless another such turn ran within the cache's lifetime.
 - **What the turn is given**: an allowlist, never a step's answer copied (FINDINGS A-124). Of the
-  run, its status, its steps done of all, the step it stopped at, whether Archi verified it and its
-  line (`run_view`). Of each step, in the plan's order (`step_views`): its `id`, `action`,
-  `status` (`done`, `failed`, `not_run`, or `not_reported` when the run's answer was too large for
-  one mesh frame), what it acted on (only the args `hive`, `hive_id`, `target`, `node_name`,
-  `runtime`, `runtime_version`, `version` and `workflow_name`), its answer's `status`, and its
-  `error_code` and `error_detail`, cut to 300 characters, for a step that failed or was refused:
-  its answer's, else those of the event that failed it (a step that could not be dispatched, an
-  `add_hive` whose join failed). Of its answer's payload: `retryable`; `unanswered_hives`, each
-  `{hive, reason, next}`; `next`; `warning`, cut to 400 characters; `packages_left`, each
-  `{runtime, version, error_code, retryable, unanswered_hives}`; `pages_left_up` as `count`,
-  `more` and each page's `publication_id` and expiry, nothing else of a page; `wf_node` as
-  `{node_name, action, status}`; `pending` and `held` as hive names; `update` as `{id, state}`;
-  and its counts, the numbers, flags and list lengths of plain field names down to three levels,
-  no text and no field whose name reads as a secret's. The help the executor's model read on the
-  way (`help_lookup`) is none of a step's, and an `add_hive`'s join, followed with `get_hive`,
-  counts only for its status and failure. Each text kept (a detail, a warning, a reason, `next`,
-  the run's line) has its links (`://`, `/public/`, `/e/`), a credential named with its value
-  (`token=`, `"api_key":`...), the word after `Bearer` and any run of 32 or more letters and
-  digits taken out (`scrub`); a name keeps a long id, never a link or a credential. So
+  run, its status, its steps done of all, the step it stopped at, its answer's code
+  (`EXECUTION_FAILED`, `EXECUTOR_UNAVAILABLE`...), whether Archi verified it and its line
+  (`run_view`). Of each step, in the plan's order (`step_views`): its `id`, `action`, `status`
+  (`done`, `failed`, `not_run`, or `not_reported` when the run's answer says nothing of its
+  steps: too large for one mesh frame, or an executor that failed before its report, its earlier
+  steps possibly run, each one's outcome in SY.admin's command log), what it acted on (only the
+  args `hive`, `hive_id`, `target`, `node_name`, `runtime`, `runtime_version`, `version` and
+  `workflow_name`), its answer's `status`, and its `error_code` and `error_detail`, cut to 300
+  characters, for a step that failed or was refused: its answer's, else those of the event that
+  failed it (a step that could not be dispatched, an `add_hive` whose join failed). Of its
+  answer's payload: `retryable`; `unanswered_hives`, each `{hive, reason, next}`; `next`;
+  `warning`, cut to 400 characters; `packages_left`, each `{runtime, version, error_code, detail,
+  retryable, unanswered_hives}`, a `PURGE_STOPPED`'s without its detail; `pages_left_up` as
+  `count`, its `error` when SY.admin could not count them, `more` and each page's
+  `publication_id` and expiry, nothing else of a page; `wf_node` as `{node_name, action,
+  status}`; `pending` and `held` as hive names; `update` as `{id, state}`, or for an update Archi
+  followed after the run (`follow_installation_updates`) as it found it: `{id, state,
+  superseded_by, followed_s}`, with that view's `pending` and `held`; and its counts, the
+  numbers, flags and list lengths of plain field names down to three levels, no text, no field
+  whose name reads as a secret's and nothing under a field named `value` (a vault value is any
+  JSON). The help the executor's model read on the way (`help_lookup`) is none of a step's, and
+  an `add_hive`'s join, followed with `get_hive`, counts only for its status and failure. So
   `publish_cloud_endpoint`'s token, a page's link or key, a vault value, an API key, a password
-  or a secret ref never reaches the turn.
-- **When the turn fails** (no AI runtime, the provider's error, no answer within 90 s, no text),
-  the message is the fixed line as Archi had it (SY.admin's, or that the plan ran but is not done,
-  with its reason) and one line per step under it, with its code, its detail and what it left
-  (`fallback_text`), with no model.
+  or a secret ref is in none of the fields the turn gets.
+- **The texts it keeps** (a detail, a warning, a reason, `next`, a page ledger's error, the run's
+  line) are cut and, as a backstop, scrubbed word by word (`scrub`): a link (`://`, `/public/`,
+  `/e/`) becomes `[link removed]`; a channel id (`ich:<uuid>`), a credential written with its value
+  (`token=abc`, `"api_key":"k"`) and a word holding 32 or more of a key's characters in a row
+  (letters, digits, `-`, `_`, `+`, `/`, `=`, with a letter and a digit: a key, a JWT's part, a
+  UUID) become `[removed]`; and the value after a credential's name and its joint (`password:
+  x`, `"token": "x"`, `password = x`) or after `Bearer` (after `Authorization:`, the word after its
+  scheme) becomes `[removed]`. A detail that is not a text is read as pretty JSON, so each of its
+  values is a word. A short secret written any other way reads as a plain word: the allowlist is
+  what keeps one out. A name keeps a long id, never a link, a channel id or a credential.
+- **When there is no turn, or it fails** (no AI runtime, the session's turns cannot be read, the
+  provider's error, no answer within 90 s, no text), the message is the fixed line as Archi had
+  it (SY.admin's, or that the plan ran but is not done, with its reason) and one line per step
+  under it, with its code, its detail and what it left: the versions with why, the pages left up,
+  or that they were not counted and `/artifacts` lists them, the update's state (`fallback_text`),
+  with no model.
 - **The answer** carries `explanation`: its `source` (`model` or `fallback`), its `model_calls` (1,
-  or 0 without an AI runtime), the `steps` the turn was given, and its `tokens_used` or why it
-  gave nothing (`error`).
+  or 0 when no turn ran), the `steps` the turn was given, and its `tokens_used` or why it gave
+  nothing (`error`). The turn's tokens are counted in the answer's `token_usage` too, as
+  `execution_report` and in its `total`, which the executor card's chip shows.
 - The pipeline's `CONFIRM 2` and a plan pasted in the chat or sent to `POST /api/executor/plan`
   keep their own answers, with no such turn.
 

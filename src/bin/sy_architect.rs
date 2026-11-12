@@ -10405,13 +10405,7 @@ async fn handle_chat_message(
                 .remove(&resolved_session_id);
             if plan_compile_plan_cancel.is_some() {
                 // plan_compile_pending was present; discard it
-                ChatResponse {
-                    status: "ok".to_string(),
-                    mode: "executor".to_string(),
-                    output: json!({ "message": "Plan discarded." }),
-                    session_id: Some(resolved_session_id.clone()),
-                    session_title: Some(session.title.clone()),
-                }
+                plan_discarded_response(&resolved_session_id, &session.title)
             } else {
                 match clear_pending_action(state, &resolved_session_id).await {
                     Some(pending) => {
@@ -11154,9 +11148,10 @@ async fn handle_ai_chat(
 /// one turn, with no tool, its prompt and handbook as in the chat, the session's summary and
 /// recent turns, and each step's answer as `execution_report::step_views` keeps it, never a secret
 /// (FINDINGS A-124); it tells the operator what each step did, and its text becomes the run's
-/// `message`. Without an AI runtime, or when that turn fails, the message keeps the executor's
-/// fixed line with each step's code and detail under it. One model call per plan run, recorded
-/// with the stage `execution_report`; `output.explanation` says which it was.
+/// `message`. Without an AI runtime, when the session's turns cannot be read, or when that turn
+/// fails, the message keeps the executor's fixed line with each step's code and detail under it.
+/// One model call per plan run, recorded with the stage `execution_report` and counted in the
+/// answer's `token_usage`; `output.explanation` says which it was.
 async fn explain_executed_plan(
     state: &ArchitectState,
     session: &ChatSessionRecord,
@@ -11174,23 +11169,15 @@ async fn explain_executed_plan(
         }
         None => Err(architect_ai_unavailable_reason(state)),
     };
-    let memory = match &built {
-        Ok(_) => match build_session_immediate_memory(state, session).await {
-            Ok(memory) => Some(memory),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    session_id = %session.session_id,
-                    "sy.architect: the run's explanation goes without the session's turns"
-                );
-                None
-            }
-        },
-        Err(_) => None,
-    };
     let model = match &built {
         Ok(model) => Ok(model.as_ref()),
         Err(why) => Err(why.clone()),
+    };
+    // The session's summary and recent turns, read only for a turn that runs.
+    let memory = async {
+        build_session_immediate_memory(state, session)
+            .await
+            .map_err(|err| err.to_string())
     };
     execution_report::explain_run(
         model,
@@ -11200,6 +11187,19 @@ async fn explain_executed_plan(
         execution_report::EXPLANATION_TURN_TIMEOUT,
     )
     .await;
+}
+
+/// The answer to `CANCEL` while a plan the plan compiler staged waits: the plan is dropped, and
+/// the chat says so as Archi's own words, as it does for a dropped SCMD, never as an executor run
+/// (whose card read "done").
+fn plan_discarded_response(session_id: &str, session_title: &str) -> ChatResponse {
+    ChatResponse {
+        status: "ok".to_string(),
+        mode: "chat".to_string(),
+        output: json!({ "message": "Plan discarded." }),
+        session_id: Some(session_id.to_string()),
+        session_title: Some(session_title.to_string()),
+    }
 }
 
 async fn handle_impersonation_chat(
@@ -33953,6 +33953,27 @@ mod tests {
         .expect("its note");
         assert_eq!(line.role, ImmediateRole::System);
         assert_eq!(line.kind, ImmediateInteractionKind::ToolError);
+    }
+
+    /// FINDINGS A-322's review: a plan dropped with CANCEL answers in the chat's own words, as a
+    /// dropped SCMD does: the UI draws it as Archi's message, never as an executor run marked
+    /// "done", and the next turns read it as what Archi said.
+    #[test]
+    fn a_discarded_plan_answers_as_archis_own_words() {
+        let response = plan_discarded_response("sess_1", "Gate");
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.mode, "chat");
+        assert_eq!(response.output, json!({ "message": "Plan discarded." }));
+        let told = immediate_interaction_from_response(
+            ImmediateRole::Assistant,
+            &serde_json::to_value(&response).expect("the response as JSON"),
+            "Plan discarded.",
+            "chat",
+        )
+        .expect("its turn");
+        assert_eq!(told.role, ImmediateRole::Assistant);
+        assert_eq!(told.kind, ImmediateInteractionKind::Text);
+        assert_eq!(told.content, "Plan discarded.");
     }
 
     /// FINDINGS A-322: without an AI runtime a confirmed plan's run makes no model call, and its
