@@ -40,7 +40,8 @@ use gov_common::{
     },
     gov_identity_config_from_env, identity_error_code, identity_error_is_transient,
     identity_error_log_summary, identity_error_to_tool_payload, resolve_case_tenant,
-    GovIdentityConfig, CASE_TENANT_MISMATCH, CASE_TENANT_MISSING, TENANT_ROOT_NOT_REGISTRABLE,
+    GovIdentityConfig, CASE_TENANT_MISMATCH, CASE_TENANT_MISSING, CASE_TENANT_UNREADABLE,
+    TENANT_ROOT_NOT_REGISTRABLE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -357,6 +358,8 @@ struct GenericAiNode {
     register_retry: RegisterRetry,
     /// Where the tenant of a case comes from: the tenant SY.identity holds for its ILK.
     ilk_tenant: IlkTenantLookup,
+    /// How a registration reads the identity SHM again while it cannot be read (`SHM_READ_RETRY`).
+    shm_read_retry: ShmReadRetry,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`.
     /// `None` when `self_ilk_id` / hive suffix is missing (degraded boot).
     vault: Option<VaultClient>,
@@ -365,9 +368,24 @@ struct GenericAiNode {
     usage: UsageRecorder,
 }
 
-/// The tenant SY.identity holds for an ILK, `None` when it cannot be read. Production reads the
-/// identity SHM (`identity_shm_ilk_tenant`); tests stub it.
-type IlkTenantLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// What the identity SHM says of a case's ILK (`IlkTenantLookup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IlkTenantRead {
+    /// The region holds the ILK, charged to this tenant.
+    Tenant(String),
+    /// The region, as SY.identity wrote it, does not hold the ILK: SY.identity has no such ILK, or
+    /// holds it marked deleted. A final answer.
+    NotHeld,
+    /// The region says nothing of the ILK: it could not be read (SY.identity was writing all of it,
+    /// past the reader's 5 ms, or creating it again, or it is gone), or SY.identity had not written
+    /// it yet (`ilk_tenant_in_region`). Reading it again may pass (FINDINGS A-303). The reason, for
+    /// the log.
+    Unreadable(String),
+}
+
+/// The tenant SY.identity holds for an ILK. Production reads the identity SHM
+/// (`identity_shm_ilk_tenant`); tests stub it.
+type IlkTenantLookup = Arc<dyn Fn(&str) -> IlkTenantRead + Send + Sync>;
 
 /// Reads the identity SHM of this node's hive, which SY.identity writes before it answers the
 /// ILK_PROVISION that created the temporary ILK.
@@ -378,55 +396,180 @@ fn identity_shm_ilk_tenant(node_name: &str) -> IlkTenantLookup {
         .map(str::trim)
         .filter(|hive_id| !hive_id.is_empty())
         .map(ToString::to_string);
+    let writer_ilk = hive_id
+        .as_deref()
+        .map(|hive_id| fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.identity@{hive_id}")));
     Arc::new(move |ilk_id: &str| {
-        let hive_id = hive_id.as_deref()?;
+        let (Some(hive_id), Some(writer_ilk)) = (hive_id.as_deref(), writer_ilk.as_deref()) else {
+            return IlkTenantRead::Unreadable("the node's name names no hive".to_string());
+        };
         match fluxbee_sdk::identity::list_ilks_from_hive_id(hive_id) {
-            Ok(snapshot) => snapshot
-                .ilks
-                .into_iter()
-                .find(|ilk| ilk.ilk_id == ilk_id)
-                .map(|ilk| ilk.tenant_id),
-            Err(err) => {
-                tracing::warn!(
-                    ilk_id,
-                    error = %err,
-                    "identity SHM unreadable: the tenant of the case is unknown"
-                );
-                None
-            }
+            Ok(snapshot) => ilk_tenant_in_region(&snapshot.ilks, ilk_id, writer_ilk),
+            Err(err) => IlkTenantRead::Unreadable(err.to_string()),
         }
     })
 }
 
-/// The tenant of a case (`resolve_case_tenant`): the one its ILK has, checked against the tenant a
-/// handoff informed.
+/// What the identity SHM's ILKs say of `ilk_id`. `writer_ilk` is SY.identity's own system ILK on
+/// the hive, which SY.identity puts in its store before it first writes the region: a region
+/// without it was created again (SY.identity starting with other limits) and not written yet, so
+/// an ILK it lacks is unknown there, not absent (FINDINGS A-303).
+fn ilk_tenant_in_region(
+    ilks: &[fluxbee_sdk::IdentityIlkOption],
+    ilk_id: &str,
+    writer_ilk: &str,
+) -> IlkTenantRead {
+    if let Some(ilk) = ilks.iter().find(|ilk| ilk.ilk_id == ilk_id) {
+        return IlkTenantRead::Tenant(ilk.tenant_id.clone());
+    }
+    if ilks.iter().any(|ilk| ilk.ilk_id == writer_ilk) {
+        return IlkTenantRead::NotHeld;
+    }
+    IlkTenantRead::Unreadable(format!(
+        "the region does not hold SY.identity's own ILK ({} ILKs): created again, and not written yet",
+        ilks.len()
+    ))
+}
+
+/// How a registration reads the identity SHM again while it cannot be read, before it answers
+/// that the tenant of its case is unknown for now (FINDINGS A-303).
+#[derive(Debug, Clone, Copy)]
+struct ShmReadRetry {
+    /// The wait before each read again: one read per wait.
+    backoff: &'static [Duration],
+}
+
+/// Three reads again, after 50 ms, 200 ms and 500 ms: past a rebuild of the whole region, which
+/// holds a reader past its 5 ms while SY.identity writes it (at its start, and on a delete, restore
+/// or purge), and past its creation again at a start with other limits. A region that cannot be
+/// read costs 0.75 s and the reads, before the registration's own 8 s (`REGISTER_DEADLINE`): under
+/// the 10 s io.api waits for a handoff.
+const SHM_READ_RETRY: ShmReadRetry = ShmReadRetry {
+    backoff: &[
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+        Duration::from_millis(500),
+    ],
+};
+
+/// The tenant SY.identity holds for `ilk_id`, from the identity SHM, read again after each of
+/// `retry`'s waits while the region says nothing of it (`IlkTenantRead::Unreadable`): a read that
+/// failed is no answer about the case (FINDINGS A-303). Each failed read is logged; an answer the
+/// region gave is final.
+async fn read_ilk_tenant(
+    ilk_tenant: &IlkTenantLookup,
+    retry: ShmReadRetry,
+    ilk_id: &str,
+) -> IlkTenantRead {
+    let mut reads = 0usize;
+    loop {
+        let read = ilk_tenant(ilk_id);
+        reads += 1;
+        let IlkTenantRead::Unreadable(reason) = &read else {
+            if reads > 1 {
+                tracing::info!(
+                    ilk_id,
+                    reads,
+                    "identity SHM readable again: its answer for the case is taken"
+                );
+            }
+            return read;
+        };
+        let Some(wait) = retry.backoff.get(reads - 1).copied() else {
+            tracing::warn!(
+                ilk_id,
+                reads,
+                reason = %reason,
+                "identity SHM unreadable on every read: the tenant of the case is unknown for now, and the answer says a retry may pass"
+            );
+            return read;
+        };
+        tracing::warn!(
+            ilk_id,
+            read = reads,
+            retry_in_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            reason = %reason,
+            "identity SHM unreadable: reading it again"
+        );
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// The case's ILK, the message's `src_ilk`, when it has one.
+fn case_ilk(src_ilk: Option<&str>) -> Option<&str> {
+    src_ilk.map(str::trim).filter(|ilk_id| !ilk_id.is_empty())
+}
+
+/// The tenant of a case (`resolve_case_tenant`) from what the identity SHM said of its ILK (`None`:
+/// the case has no ILK), checked against the tenant a handoff informed. A region that said nothing
+/// is `CASE_TENANT_UNREADABLE`, a failure that may pass, never the final `CASE_TENANT_MISSING`.
+fn case_tenant_from_read(
+    read: Option<IlkTenantRead>,
+    informed_tenant: Option<&str>,
+) -> Result<String, &'static str> {
+    match read {
+        Some(IlkTenantRead::Unreadable(_)) => Err(CASE_TENANT_UNREADABLE),
+        Some(IlkTenantRead::Tenant(tenant)) => resolve_case_tenant(Some(&tenant), informed_tenant),
+        Some(IlkTenantRead::NotHeld) | None => resolve_case_tenant(None, informed_tenant),
+    }
+}
+
+/// The tenant of a case from one read of the identity SHM, for what goes on without it: the
+/// root-tenant check before a turn, and whom a turn's model calls are charged to. A read that
+/// failed is logged and gives no tenant here; a registration reads it again
+/// (`case_tenant_to_register`).
 fn case_tenant_of(
     ilk_tenant: &IlkTenantLookup,
     src_ilk: Option<&str>,
     informed_tenant: Option<&str>,
 ) -> Result<String, &'static str> {
-    let tenant = src_ilk
-        .map(str::trim)
-        .filter(|ilk_id| !ilk_id.is_empty())
-        .and_then(|ilk_id| ilk_tenant(ilk_id));
-    resolve_case_tenant(tenant.as_deref(), informed_tenant)
+    let read = case_ilk(src_ilk).map(|ilk_id| {
+        let read = ilk_tenant(ilk_id);
+        if let IlkTenantRead::Unreadable(reason) = &read {
+            tracing::warn!(
+                ilk_id,
+                reason = %reason,
+                "identity SHM unreadable on one read: the turn goes on without the tenant of the case (a registration reads it again)"
+            );
+        }
+        read
+    });
+    case_tenant_from_read(read, informed_tenant)
 }
 
-/// The tool's answer when the case has no tenant to register into (unknown, contradicted, or the
-/// root tenant): no ILK_REGISTER is sent and no tenant is created.
+/// The tenant a case registers into: as `case_tenant_of`, with the identity SHM read again while
+/// it says nothing of the case's ILK (`read_ilk_tenant`, FINDINGS A-303).
+async fn case_tenant_to_register(
+    ilk_tenant: &IlkTenantLookup,
+    retry: ShmReadRetry,
+    src_ilk: Option<&str>,
+    informed_tenant: Option<&str>,
+) -> Result<String, &'static str> {
+    let read = match case_ilk(src_ilk) {
+        Some(ilk_id) => Some(read_ilk_tenant(ilk_tenant, retry, ilk_id).await),
+        None => None,
+    };
+    case_tenant_from_read(read, informed_tenant)
+}
+
+/// The tool's answer when the case has no tenant to register into (none, contradicted, or the
+/// root tenant), or its tenant could not be read for now: no ILK_REGISTER is sent and no tenant is
+/// created. Only the last may pass (`retryable`, FINDINGS A-303).
 fn case_tenant_error_payload(error_code: &str) -> Value {
     let message = if error_code == CASE_TENANT_MISMATCH {
         "the tenant informed with the case is not the tenant of its ILK; nothing was registered"
     } else if error_code == TENANT_ROOT_NOT_REGISTRABLE {
         "the case belongs to the root tenant, where nobody registers; nothing was registered and the ILK stays temporary"
+    } else if error_code == CASE_TENANT_UNREADABLE {
+        "the tenant of the case could not be read right now (the identity SHM could not be read); nothing was registered, and the same registration again may pass"
     } else {
-        "the tenant of the case is unknown (its ILK's tenant could not be read); nothing was registered and no tenant was created"
+        "the tenant of the case is unknown (the identity registry does not hold its ILK, or no tenant for it); nothing was registered and no tenant was created"
     };
     json!({
         "status": "error",
         "error_code": error_code,
         "message": message,
-        "retryable": false
+        "retryable": identity_error_is_transient(error_code)
     })
 }
 
@@ -697,10 +840,12 @@ struct IlkRegisterTool {
     /// once the case registers.
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     ilk_tenant: IlkTenantLookup,
+    /// How the tenant of the case is read again while the identity SHM cannot be read.
+    shm_retry: ShmReadRetry,
     identity: GovIdentityConfig,
     bridge: Option<Arc<dyn IdentityCaller>>,
     retry: RegisterRetry,
-    /// Where the conversation's turn keeps the answer of the registration it sent
+    /// Where the conversation's turn keeps the answer of its registration attempt
     /// (`BehaviorContext`), one per turn; `None` for the handoff, which reads the answer itself.
     turn_answer: Option<RegisterAnswerSlot>,
 }
@@ -765,13 +910,14 @@ struct BehaviorContext {
     /// Whether a tool has run in this message's tool loop (`ToolRunWatch`): a failure after that
     /// is never answered as retryable, since sending the message again would run the tool again.
     tool_ran: AtomicBool,
-    /// The answer of the registration `ilk_register` sent in this message's tool loop, if it sent
-    /// one: the turn's result comes from its own attempt, and a later call in the turn gets it
-    /// again instead of sending another (FINDINGS A-216).
+    /// The answer of the registration `ilk_register` attempted in this message's tool loop, if it
+    /// attempted one: the `ILK_REGISTER` it sent, or the tenant of the case it could not read
+    /// (FINDINGS A-303). The turn's result comes from its own attempt, and a later call in the
+    /// turn gets it again instead of attempting another (FINDINGS A-216).
     register_answer: RegisterAnswerSlot,
 }
 
-/// Where a conversation's turn keeps the answer of its one `ILK_REGISTER`.
+/// Where a conversation's turn keeps the answer of its one registration attempt.
 type RegisterAnswerSlot = Arc<std::sync::Mutex<Option<Value>>>;
 
 impl BehaviorContext {
@@ -1534,6 +1680,7 @@ impl GenericAiNode {
             vouched_email: None,
             thread_state_store: self.thread_state_store.clone(),
             ilk_tenant: self.ilk_tenant.clone(),
+            shm_retry: self.shm_read_retry,
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
             retry: self.register_retry,
@@ -1759,18 +1906,23 @@ impl GenericAiNode {
             });
         // The tenant of the case is the one SY.identity holds for its ILK; the handoff's tenant_id
         // only has to agree with it. Without one, or when it is the root tenant (where nobody
-        // registers), nothing is registered and no tenant is created.
+        // registers), nothing is registered and no tenant is created. An identity SHM that cannot
+        // be read, after reading it again, answers IDENTITY_UNAVAILABLE: the handoff sent again
+        // may pass (FINDINGS A-303).
         let informed_tenant_id = handoff
             .tenant_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        let tenant_id = match case_tenant_of(
+        let tenant_id = match case_tenant_to_register(
             &self.ilk_tenant,
+            self.shm_read_retry,
             ctx.src_ilk.as_deref(),
             informed_tenant_id.as_deref(),
-        ) {
+        )
+        .await
+        {
             Ok(tenant_id) => tenant_id,
             Err(error_code) => {
                 // Without src_ilk there is no case at all: that is an invalid request.
@@ -1779,14 +1931,24 @@ impl GenericAiNode {
                 } else {
                     missing_src_ilk_payload()
                 };
-                tracing::warn!(
-                    node_name = %self.node_name,
-                    trace_id = %msg.routing.trace_id,
-                    src_ilk = ?ctx.src_ilk,
-                    informed_tenant_id = ?informed_tenant_id,
-                    error_code = error["error_code"].as_str().unwrap_or_default(),
-                    "frontdesk handoff: no tenant to register the case into (ilk NOT registered, no tenant created)"
-                );
+                if error_code == CASE_TENANT_UNREADABLE {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        trace_id = %msg.routing.trace_id,
+                        src_ilk = ?ctx.src_ilk,
+                        error_code,
+                        "frontdesk handoff: the tenant of the case could not be read for now (ilk NOT registered); sending the handoff again may pass"
+                    );
+                } else {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        trace_id = %msg.routing.trace_id,
+                        src_ilk = ?ctx.src_ilk,
+                        informed_tenant_id = ?informed_tenant_id,
+                        error_code = error["error_code"].as_str().unwrap_or_default(),
+                        "frontdesk handoff: no tenant to register the case into (ilk NOT registered, no tenant created)"
+                    );
+                }
                 let result =
                     build_frontdesk_result_from_register_response(&error, ctx.src_ilk.clone());
                 return build_frontdesk_result_reply(msg, result);
@@ -1865,6 +2027,7 @@ impl GenericAiNode {
             vouched_email,
             thread_state_store: self.thread_state_store.clone(),
             ilk_tenant: self.ilk_tenant.clone(),
+            shm_retry: self.shm_read_retry,
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
             retry: self.register_retry,
@@ -2653,7 +2816,9 @@ impl FunctionTool for IlkRegisterTool {
         // At most one ILK_REGISTER per turn, whatever the model does (the runner calls the tools
         // one after another): a later call gets the answer of the turn's registration again, and
         // nothing is sent. A call that sent nothing (a candidate without its name or email, a
-        // case without its ILK or tenant) leaves the turn its registration.
+        // case without its ILK or with no tenant to register into) leaves the turn its
+        // registration; one whose case's tenant could not be read for now (FINDINGS A-303) is
+        // the turn's attempt, as an ILK_REGISTER that failed for a reason that may pass.
         if let Some(sent) = self.turn_registration() {
             tracing::warn!(
                 op = "ilk_register",
@@ -2702,21 +2867,37 @@ impl IlkRegisterTool {
 
         // The tenant of the case, never one the person or the LLM gives, never a new one, and
         // never the root tenant.
-        let tenant_id = match case_tenant_of(
+        let tenant_id = match case_tenant_to_register(
             &self.ilk_tenant,
+            self.shm_retry,
             Some(src_ilk),
             self.informed_tenant_id.as_deref(),
-        ) {
+        )
+        .await
+        {
             Ok(tenant_id) => tenant_id,
             Err(error_code) => {
-                tracing::warn!(
-                    op = "ilk_register",
-                    src_ilk = %src_ilk,
-                    informed_tenant_id = ?self.informed_tenant_id,
-                    error_code,
-                    "no tenant to register the case into: ILK_REGISTER not sent, no tenant created"
-                );
-                return Ok(case_tenant_error_payload(error_code));
+                let answer = case_tenant_error_payload(error_code);
+                if error_code == CASE_TENANT_UNREADABLE {
+                    tracing::warn!(
+                        op = "ilk_register",
+                        src_ilk = %src_ilk,
+                        error_code,
+                        "the tenant of the case could not be read for now: ILK_REGISTER not sent; the same registration again may pass"
+                    );
+                    // The turn's attempt, as an ILK_REGISTER that failed for a reason that may
+                    // pass: the turn answers it, and a later call in the turn gets it again.
+                    self.keep_turn_answer(&answer);
+                } else {
+                    tracing::warn!(
+                        op = "ilk_register",
+                        src_ilk = %src_ilk,
+                        informed_tenant_id = ?self.informed_tenant_id,
+                        error_code,
+                        "no tenant to register the case into: ILK_REGISTER not sent, no tenant created"
+                    );
+                }
+                return Ok(answer);
             }
         };
 
@@ -2815,13 +2996,19 @@ impl IlkRegisterTool {
             }
         };
         // The turn's registration: a later call in the turn gets this answer again (`call`).
-        if let Some(Ok(mut slot)) = self.turn_answer.as_ref().map(|slot| slot.lock()) {
-            *slot = Some(answer.clone());
-        }
+        self.keep_turn_answer(&answer);
         Ok(answer)
     }
 
-    /// The answer of the registration this turn sent, if it sent one (`turn_answer`).
+    /// Keeps `answer` as the turn's registration attempt (`turn_answer`), if the tool runs in a
+    /// conversation's turn.
+    fn keep_turn_answer(&self, answer: &Value) {
+        if let Some(Ok(mut slot)) = self.turn_answer.as_ref().map(|slot| slot.lock()) {
+            *slot = Some(answer.clone());
+        }
+    }
+
+    /// The answer of the registration this turn attempted, if it attempted one (`turn_answer`).
     fn turn_registration(&self) -> Option<Value> {
         self.turn_answer.as_ref()?.lock().ok()?.clone()
     }
@@ -3105,6 +3292,7 @@ async fn run_unconfigured_bootstrap(
         gov_identity_bridge,
         register_retry: REGISTER_RETRY,
         ilk_tenant: identity_shm_ilk_tenant(&node_name),
+        shm_read_retry: SHM_READ_RETRY,
         vault,
         control_plane: Arc::new(RwLock::new(state)),
         usage,
@@ -4355,6 +4543,11 @@ mod tests {
         min_attempt: REGISTER_RETRY.min_attempt,
     };
 
+    /// `SHM_READ_RETRY`'s reads without its waits.
+    const NO_WAIT_SHM_RETRY: ShmReadRetry = ShmReadRetry {
+        backoff: &[Duration::ZERO; SHM_READ_RETRY.backoff.len()],
+    };
+
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
@@ -4367,6 +4560,7 @@ mod tests {
             gov_identity_bridge: None,
             register_retry: NO_WAIT_RETRY,
             ilk_tenant: test_ilk_tenant(),
+            shm_read_retry: NO_WAIT_SHM_RETRY,
             vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState::default())),
             usage: UsageRecorder::disabled(),
@@ -5556,13 +5750,120 @@ mod tests {
     const ROOT_ILK: &str = "ilk:66666666-6666-4666-8666-666666666666";
 
     /// The identity SHM of the tests: TEST_ILK is a temporary ILK of TEST_TENANT, and ROOT_ILK one
-    /// a root-tenant IO node provisioned.
+    /// a root-tenant IO node provisioned. It holds no other.
     fn test_ilk_tenant() -> IlkTenantLookup {
         Arc::new(|ilk_id: &str| match ilk_id {
-            TEST_ILK => Some(TEST_TENANT.to_string()),
-            ROOT_ILK => Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
-            _ => None,
+            TEST_ILK => IlkTenantRead::Tenant(TEST_TENANT.to_string()),
+            ROOT_ILK => IlkTenantRead::Tenant(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+            _ => IlkTenantRead::NotHeld,
         })
+    }
+
+    /// The tests' identity SHM, unreadable for its first `failures` reads (`usize::MAX`: never
+    /// readable), and the count of its reads.
+    fn flaky_ilk_tenant(failures: usize) -> (IlkTenantLookup, Arc<std::sync::atomic::AtomicUsize>) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        let shm = test_ilk_tenant();
+        let lookup: IlkTenantLookup = Arc::new(move |ilk_id: &str| {
+            if counted.fetch_add(1, Ordering::SeqCst) < failures {
+                IlkTenantRead::Unreadable("identity SHM seqlock read timeout".to_string())
+            } else {
+                shm(ilk_id)
+            }
+        });
+        (lookup, reads)
+    }
+
+    fn shm_reads(reads: &std::sync::atomic::AtomicUsize) -> usize {
+        reads.load(Ordering::SeqCst)
+    }
+
+    /// An ILK of the identity SHM as the SDK reads it.
+    fn region_ilk(ilk_id: &str, tenant_id: &str) -> fluxbee_sdk::IdentityIlkOption {
+        fluxbee_sdk::IdentityIlkOption {
+            ilk_id: ilk_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            display_name: None,
+            handler_node: None,
+            registration_status: "temporary".to_string(),
+            ilk_type: "human".to_string(),
+            role_hash: None,
+            skill_hashes: Vec::new(),
+            handbook_hashes: Vec::new(),
+            personality_hash: None,
+        }
+    }
+
+    /// FINDINGS A-303: a region SY.identity wrote holds its own system ILK, so an ILK it lacks is
+    /// absent; a region without SY.identity's own ILK was created again and not written yet (a
+    /// start with other limits), so an ILK it lacks is unknown there, never absent.
+    #[test]
+    fn an_identity_shm_not_written_yet_says_nothing_of_an_ilk() {
+        let writer = fluxbee_sdk::deterministic_system_ilk_id("SY.identity@motherbee");
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let written = [region_ilk(&writer, root), region_ilk(TEST_ILK, TEST_TENANT)];
+        assert_eq!(
+            ilk_tenant_in_region(&written, TEST_ILK, &writer),
+            IlkTenantRead::Tenant(TEST_TENANT.to_string())
+        );
+        assert_eq!(
+            ilk_tenant_in_region(&written, UNKNOWN_ILK, &writer),
+            IlkTenantRead::NotHeld
+        );
+
+        // Created again, empty, before SY.identity wrote it.
+        assert!(matches!(
+            ilk_tenant_in_region(&[], TEST_ILK, &writer),
+            IlkTenantRead::Unreadable(_)
+        ));
+        // Its first write failed, and a provision wrote one ILK into it since: that one reads, and
+        // the rest is unknown.
+        let provisioned_since = [region_ilk(TEST_ILK, TEST_TENANT)];
+        assert_eq!(
+            ilk_tenant_in_region(&provisioned_since, TEST_ILK, &writer),
+            IlkTenantRead::Tenant(TEST_TENANT.to_string())
+        );
+        assert!(matches!(
+            ilk_tenant_in_region(&provisioned_since, UNKNOWN_ILK, &writer),
+            IlkTenantRead::Unreadable(_)
+        ));
+    }
+
+    /// FINDINGS A-303: the registration reads the identity SHM again while it cannot be read, once
+    /// after each wait, and takes the first answer the region gives; an ILK the region does not
+    /// hold is an answer, read once.
+    #[tokio::test]
+    async fn the_identity_shm_is_read_again_while_it_cannot_be_read() {
+        let (lookup, reads) = flaky_ilk_tenant(2);
+        assert_eq!(
+            read_ilk_tenant(&lookup, NO_WAIT_SHM_RETRY, TEST_ILK).await,
+            IlkTenantRead::Tenant(TEST_TENANT.to_string())
+        );
+        assert_eq!(shm_reads(&reads), 3);
+
+        let (lookup, reads) = flaky_ilk_tenant(usize::MAX);
+        assert!(matches!(
+            read_ilk_tenant(&lookup, NO_WAIT_SHM_RETRY, TEST_ILK).await,
+            IlkTenantRead::Unreadable(_)
+        ));
+        assert_eq!(shm_reads(&reads), 1 + SHM_READ_RETRY.backoff.len());
+
+        let (lookup, reads) = flaky_ilk_tenant(0);
+        assert_eq!(
+            read_ilk_tenant(&lookup, NO_WAIT_SHM_RETRY, UNKNOWN_ILK).await,
+            IlkTenantRead::NotHeld
+        );
+        assert_eq!(shm_reads(&reads), 1);
+    }
+
+    /// The reads again end well before a handoff's IO node gives up: their waits and the
+    /// registration's deadline stay under io.api's 10 s.
+    #[test]
+    fn the_identity_shm_reads_again_fit_before_the_registration() {
+        let waits: Duration = SHM_READ_RETRY.backoff.iter().sum();
+        assert!(waits <= Duration::from_secs(1), "{waits:?}");
+        assert!(waits + REGISTER_DEADLINE < Duration::from_secs(10));
     }
 
     fn register_failure(error_code: &str) -> FrontdeskResultPayload {
@@ -5660,6 +5961,7 @@ mod tests {
             vouched_email: None,
             thread_state_store: None,
             ilk_tenant: test_ilk_tenant(),
+            shm_retry: NO_WAIT_SHM_RETRY,
             identity: GovIdentityConfig::default(),
             bridge: None,
             retry: NO_WAIT_RETRY,
@@ -5876,6 +6178,36 @@ mod tests {
         );
         assert_eq!(mismatch.result_code, "INVALID_REQUEST");
         assert_eq!(mismatch.error_code.as_deref(), Some(CASE_TENANT_MISMATCH));
+        for code in [
+            CASE_TENANT_MISSING,
+            CASE_TENANT_MISMATCH,
+            TENANT_ROOT_NOT_REGISTRABLE,
+        ] {
+            assert_eq!(
+                case_tenant_error_payload(code)["retryable"],
+                false,
+                "{code}"
+            );
+        }
+
+        // FINDINGS A-303: a tenant that could not be read is unknown for now, not missing: the
+        // answer that may pass, never tenant_unresolved.
+        let unreadable_payload = case_tenant_error_payload(CASE_TENANT_UNREADABLE);
+        assert_eq!(unreadable_payload["retryable"], true);
+        let unreadable = build_frontdesk_result_from_register_response(
+            &unreadable_payload,
+            Some(TEST_ILK.to_string()),
+        );
+        assert_eq!(unreadable.status, "error");
+        assert_eq!(unreadable.result_code, "IDENTITY_UNAVAILABLE");
+        assert_eq!(
+            unreadable.error_code.as_deref(),
+            Some(CASE_TENANT_UNREADABLE)
+        );
+        assert_eq!(
+            frontdesk_structured_response_payload(&unreadable, &producer_contract())["error_code"],
+            "identity_unavailable"
+        );
     }
 
     #[test]
@@ -6157,6 +6489,42 @@ mod tests {
         assert_eq!(reply["success"], false);
         assert_eq!(reply["error_code"], "tenant_unresolved");
         assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    /// FINDINGS A-303: a handoff whose case's tenant cannot be read, after reading the identity
+    /// SHM again, answers identity_unavailable, which the IO node may send again, never the final
+    /// tenant_unresolved; nothing is sent to SY.identity or stored. Sent again with the region
+    /// readable, it registers.
+    #[tokio::test]
+    async fn a_handoff_whose_identity_shm_cannot_be_read_answers_identity_unavailable() {
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Registered]);
+        let (mut node, state) = test_node_with_identity(&identity);
+        let (unreadable, reads) = flaky_ilk_tenant(usize::MAX);
+        node.ilk_tenant = unreadable;
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, Some(TEST_TENANT))).await;
+        assert_eq!(reply["success"], false);
+        assert_eq!(reply["error_code"], "identity_unavailable");
+        assert_eq!(shm_reads(&reads), 1 + NO_WAIT_SHM_RETRY.backoff.len());
+        assert_eq!(identity.calls(), 0);
+        assert!(state.0.lock().expect("thread state").is_empty());
+
+        node.ilk_tenant = test_ilk_tenant();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, Some(TEST_TENANT))).await;
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(identity.calls(), 1);
+    }
+
+    /// A read that fails and then passes is the case's own: the handoff goes on with its tenant.
+    #[tokio::test]
+    async fn a_handoff_reads_the_identity_shm_again_and_registers() {
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Registered]);
+        let (mut node, _state) = test_node_with_identity(&identity);
+        let (flaky, reads) = flaky_ilk_tenant(2);
+        node.ilk_tenant = flaky;
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(identity.calls(), 1);
+        assert!(shm_reads(&reads) >= 3);
     }
 
     #[tokio::test]
@@ -6928,6 +7296,58 @@ mod tests {
             kept_case(&state)["register_error"]["error_code"],
             "DB_NOT_READY"
         );
+    }
+
+    /// FINDINGS A-303: in a conversation, a case whose tenant cannot be read, after reading the
+    /// identity SHM again, is the turn's attempt that may pass: the tool sends nothing and answers
+    /// retryable, a later call in the turn gets that answer and reads nothing again, the turn
+    /// answers IDENTITY_UNAVAILABLE, and the case awaits the confirmation that retries it, which
+    /// registers once the region reads.
+    #[tokio::test]
+    async fn a_turn_whose_case_tenant_cannot_be_read_awaits_the_confirmation() {
+        let identity = ScriptedIdentity::new(&[IdentityAnswer::Registered]);
+        let (mut node, state) = test_node_with_identity(&identity);
+        let (unreadable, reads) = flaky_ilk_tenant(usize::MAX);
+        node.ilk_tenant = unreadable;
+        save_case(&state, awaiting_case());
+
+        let ctx = turn_ctx();
+        let out = register_in_turn(&node, &ctx).await;
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], CASE_TENANT_UNREADABLE);
+        assert_eq!(out["retryable"], true);
+        let turn_reads = shm_reads(&reads);
+        assert_eq!(turn_reads, 1 + NO_WAIT_SHM_RETRY.backoff.len());
+        let again = register_in_turn(&node, &ctx).await;
+        assert_eq!(again, out);
+        assert_eq!(shm_reads(&reads), turn_reads, "a later call reads nothing");
+        assert_eq!(identity.calls(), 0);
+
+        let result = node
+            .build_frontdesk_result_for_conversation(
+                &ctx,
+                "The registration could not be done right now.".to_string(),
+                None,
+            )
+            .await
+            .expect("result");
+        assert_eq!(result.status, "error");
+        assert_eq!(result.result_code, "IDENTITY_UNAVAILABLE");
+        assert_eq!(result.error_code.as_deref(), Some(CASE_TENANT_UNREADABLE));
+        let kept = kept_case(&state);
+        assert_eq!(kept["status"], "awaiting_confirmation");
+        assert_eq!(kept["register_error"]["error_code"], CASE_TENANT_UNREADABLE);
+
+        // A case closed on it, by a model that did not follow the prompt, is open again.
+        let mut closed: FrontdeskThreadState =
+            serde_json::from_value(closed_case(CASE_TENANT_UNREADABLE)).expect("case");
+        assert!(closed.reopen_failed_for_now());
+
+        // The person confirms again, the region reads: the next turn registers.
+        node.ilk_tenant = test_ilk_tenant();
+        let out = register_in_turn(&node, &turn_ctx()).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(identity.calls(), 1);
     }
 
     /// At most one ILK_REGISTER per turn, whatever the model does: a later `ilk_register` in the

@@ -148,9 +148,19 @@ Rules:
 - `frontdesk_handoff.tenant_id`, if present, is only compared with that tenant;
 - on the conversational path the only source is the ILK's tenant: the thread state is written by
   the LLM, so it is not a tenant source;
-- if the ILK's tenant cannot be read (the ILK is not in the SHM, or the SHM cannot be read), no
-  `ILK_REGISTER` is sent and nothing is created. The response is explicit: `status = "error"`,
-  `result_code = TENANT_UNRESOLVED`, `error_code = missing_tenant_id`;
+- if the SHM, as `SY.identity` wrote it, does not hold the ILK (or holds no tenant for it), the case
+  has no tenant: no `ILK_REGISTER` is sent and nothing is created. The response is explicit and
+  final: `status = "error"`, `result_code = TENANT_UNRESOLVED`, `error_code = missing_tenant_id`;
+- if the SHM cannot be read, or holds nothing `SY.identity` wrote yet (a region created again,
+  empty, when `SY.identity` starts with other limits: it lacks `SY.identity`'s own system ILK),
+  the frontdesk reads it again after 50 ms, 200 ms and 500 ms. Still unreadable, the tenant is
+  unknown for now, not missing: no `ILK_REGISTER` is sent, and the answer is one that may pass
+  (`IDENTITY_UNAVAILABLE`, `error_code = identity_shm_unreadable`, `retryable: true`; section 7.2;
+  A-303). Up to 0.1.138 it was the final `TENANT_UNRESOLVED`. The frontdesk asks `SY.identity`
+  nothing in place of the SHM;
+- a provision `SY.identity` answered although its write to the SHM failed (a full region) is not
+  told apart from an ILK it does not hold: it reads as `TENANT_UNRESOLVED` until `SY.identity`
+  writes the whole region again with it;
 - there are no other sources: the tool has no `tenant_id` or `identity_candidate.tenant_hint`, and
   neither `effective_config.tenant_id` nor `GOV_IDENTITY_TENANT_ID` exists;
 - a `pending`, `suspended` or deleted tenant does not receive registrations: `SY.identity` responds
@@ -369,6 +379,11 @@ A registration can fail for a reason that may pass: `SY.identity` did not answer
   holds it whatever the model does: a later call in the same turn gets the answer of the turn's
   registration and sends nothing (a call that sent nothing, such as a candidate without its name,
   does not count). A later confirmation is what retries.
+- **The tenant of the case, unknown for now** (A-303). A registration whose case's tenant cannot
+  be read from the identity SHM, after reading it again (section 4.3), sends nothing and fails the
+  same way: `retryable: true`, `error_code = identity_shm_unreadable`, the case open. In a
+  conversation it is the turn's attempt: the turn answers `IDENTITY_UNAVAILABLE`, and a later
+  `ilk_register` in the turn gets the same answer and reads nothing again.
 - **Final only when it cannot pass.** Any other error (`retryable: false`) closes the case as
   `completed_error`, and every later turn only repeats it.
 - **A case closed on a failure that may pass**, by an earlier version's prompt or by a model that
@@ -458,7 +473,7 @@ Closed `result_code` values:
 | `MISSING_REQUIRED_FIELDS` | `needs_input` | `display_name` and/or `email` are missing |
 | `IN_CONVERSATION` | `needs_input` | conversational turn with no registration (greeting, request for a piece of data) |
 | `INVALID_REQUEST` | `error` | invalid request: a handoff from a sender that is not an IO node, unsupported operation, invalid data, `tenant_mismatch`, `INVALID_*` from `SY.identity` |
-| `TENANT_UNRESOLVED` | `error` | there is no tenant for the case (`missing_tenant_id`, section 4.3); nothing was registered or created |
+| `TENANT_UNRESOLVED` | `error` | there is no tenant for the case: the identity SHM does not hold its ILK (`missing_tenant_id`, section 4.3); nothing was registered or created |
 | `TENANT_NOT_REGISTRABLE` | `error` | the case's tenant is the root tenant (`TENANT_ROOT_NOT_REGISTRABLE`, section 4.4); nothing was registered and the person stays `temporary` |
 | `REGISTER_FAILED` | `error` | `SY.identity` rejected the registration with a final verdict |
 | `IDENTITY_UNAVAILABLE` | `error` | a failure that may pass, the only retryable one: the tool already retried it and the case stays open (section 7.2); in the conversation, only the turn whose own attempt failed |
@@ -467,9 +482,9 @@ Closed `result_code` values:
 
 Registration failures (`ILK_REGISTER`):
 
-- `IDENTITY_UNAVAILABLE` only for transient failures, the only retryable ones: `SY.identity` did not respond (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) or responded `NOT_PRIMARY`, `DB_NOT_READY` or `DB_WRITE_FAILED` (section 7.2);
+- `IDENTITY_UNAVAILABLE` only for transient failures, the only retryable ones: `SY.identity` did not respond (`UNREACHABLE`, `TTL_EXCEEDED`, `TIMEOUT`, `IDENTITY_ERROR`) or responded `NOT_PRIMARY`, `DB_NOT_READY` or `DB_WRITE_FAILED` (section 7.2), or the identity SHM the case's tenant is read from could not be read (`identity_shm_unreadable`, section 4.3);
 - any other code `SY.identity` responds with is a final verdict, not retryable: `INVALID_*` -> `INVALID_REQUEST`; `TENANT_ROOT_NOT_REGISTRABLE` -> `TENANT_NOT_REGISTRABLE` (the same result as when the frontdesk sees it); the rest (`TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
-- `error_code` keeps the `SY.identity` code as is (or the tool's: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `tenant_mismatch`, and `TENANT_ROOT_NOT_REGISTRABLE`, the same code `SY.identity` uses).
+- `error_code` keeps the `SY.identity` code as is (or the tool's: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `identity_shm_unreadable`, `tenant_mismatch`, and `TENANT_ROOT_NOT_REGISTRABLE`, the same code `SY.identity` uses).
 
 `DUPLICATE_EMAIL` is left only for a vouched email that cannot be merged: the registration's ILK is not a
 temporary human ILK of the same tenant (for example an ILK that is already `complete` and wants someone else's email).
@@ -559,7 +574,9 @@ SY.storage). The lines, for either path: `received ILK_REGISTER response from id
 `ILK_REGISTER failed` (with its `attempts`); for the handoff, `frontdesk handoff REGISTERED
 (ILK_REGISTER complete)`, `frontdesk handoff register FAILED (ilk stays temporary)` (with
 `error_code` and the case's `case_status`) and `frontdesk handoff incomplete → needs_input (ilk
-NOT registered)`.
+NOT registered)`. The identity SHM's reads again (A-303): `identity SHM unreadable: reading it
+again` and `identity SHM unreadable on every read`, each with the `ilk_id` and the read's reason,
+and `identity SHM readable again`.
 
 The logs carry no personal data: from the registration they log `ilk_id`, `tenant_id`, the codes and
 which fields came in, never their values.

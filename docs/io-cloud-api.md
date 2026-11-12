@@ -420,10 +420,12 @@ anyone. Send only emails Cloud has verified.
   - `IDENTITY_UNAVAILABLE`: the identity registry did not answer; send it again (below).
   - On a frontdesk refusal, `success:false` with its code, and the identity stays temporary. The
     frontdesk's codes are lowercase. `identity_unavailable` (the identity registry did not answer
-    in time; the frontdesk keeps the case open): send it again (below). `missing_required_fields`
-    and `invalid_request`: fix the request. Any other (`tenant_unresolved`,
-    `tenant_not_registrable`, `register_failed`, `in_conversation`, `unknown`) is final: give the
-    operator the `request_id`.
+    in time, or (0.1.139) the frontdesk could not read it for the moment; the frontdesk keeps the
+    case open): send it again (below). `missing_required_fields` and `invalid_request`: fix the
+    request. Any other (`tenant_unresolved`, `tenant_not_registrable`, `register_failed`,
+    `in_conversation`, `unknown`) is final: give the operator the `request_id`.
+    `tenant_unresolved` says the registry does not hold the identity IO.cloud created for the
+    request.
 - **When the frontdesk gives no verdict**, the answer is one of these codes. When the frontdesk
   sent an error, the answer also names the person (`ilk_id`), and (0.1.137) `error_detail` starts
   with the frontdesk's own code when it gave one (`"ai_runtime_error: …"`).
@@ -1092,6 +1094,17 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.139 (not deployed yet)
+
+Built, not deployed yet: what this entry lists arrives with 0.1.139, and the sections above mark
+it "(0.1.139)".
+
+- **`register_human` answers `identity_unavailable` where it answered `tenant_unresolved`** when
+  the hive's frontdesk could not read its identity registry for the moment (FINDINGS A-303): send
+  the request again, as on any `identity_unavailable` (§5.2). The frontdesk reads the registry
+  again for up to about 0.75 s before it answers so. `tenant_unresolved` stays final, for an
+  identity the registry does not hold.
 
 ### 0.1.137
 

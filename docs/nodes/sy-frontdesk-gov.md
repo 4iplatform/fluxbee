@@ -166,7 +166,8 @@ The contract (`frontdesk_contract.rs`):
 
 - The sender must be an IO node (above), else `INVALID_REQUEST`.
 - `operation` must be `complete_registration`, else `INVALID_REQUEST`.
-- The case tenant is checked first (next section).
+- The case tenant is checked first, the identity SHM read again while it cannot be read (Case
+  tenant rules).
 - A field the handoff lacks is taken from the case's thread state, but an email taken that way
   stays a claim, since the thread state is the LLM's to write. The handoff's own `subject.email` is
   vouched, and the case keeps it apart until it registers, under `vouched_email:<src_ilk>` in the
@@ -199,7 +200,21 @@ SY.admin (`CLOUD_LOCAL_OPS` in `crates/fluxbee_sdk/src/cloud.rs`). IO.cloud:
 ## Case tenant rules
 
 The tenant of a case is the tenant SY.identity holds for the sender's ILK, read from the identity
-SHM (`identity_shm_ilk_tenant`). `case_tenant_of` passes it to `resolve_case_tenant`:
+SHM of the frontdesk's hive (`identity_shm_ilk_tenant`, a read of the region's ILKs). A read
+gives one of three answers (`IlkTenantRead`, `ilk_tenant_in_region`):
+
+- **the ILK's tenant**: the region holds the ILK;
+- **not held**: the region, as SY.identity wrote it, does not hold the ILK (SY.identity has no such
+  ILK, or holds it marked deleted). A region SY.identity wrote always holds SY.identity's own system
+  ILK (`deterministic_system_ilk_id("SY.identity@<hive>")`, seeded before its first write);
+- **unreadable**: the read failed (SY.identity was rewriting the whole region, which holds a reader
+  past its 5 ms seqlock wait, or creating it again, or it is gone), or the region does not hold
+  SY.identity's own ILK: created again empty, when SY.identity starts with other limits, and not
+  written yet ([shared memory](../reference/shared-memory.md) §7). It says nothing of the case.
+
+`case_tenant_from_read` passes the tenant to `resolve_case_tenant`; an unreadable read is
+`CASE_TENANT_UNREADABLE` (`"identity_shm_unreadable"`) before it, never the final
+`CASE_TENANT_MISSING` (FINDINGS A-303):
 
 ```rust
 let Some(ilk_tenant) = ilk_tenant.map(str::trim).filter(|tenant| looks_like_tenant_id(tenant))
@@ -212,16 +227,29 @@ if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
 }
 ```
 
+- **A registration reads it again** (`case_tenant_to_register`, `read_ilk_tenant`; the handoff
+  and `ilk_register` alike): while a read is unreadable, after 50 ms, 200 ms and 500 ms
+  (`SHM_READ_RETRY`), and takes the first answer the region gives. A region that stays unreadable
+  costs about 0.75 s, before the registration's 8 s. Then nothing is sent and the answer is one
+  that may pass: `retryable: true`, `IDENTITY_UNAVAILABLE` / `identity_unavailable` with
+  `error_code` `identity_shm_unreadable` (`identity_error_is_transient` counts it). A handoff sent
+  again, or the person's next confirmation, retries it; in a conversation it is the turn's attempt
+  (see ILK_REGISTER), and the case stays `awaiting_confirmation`.
 - **Root-tenant case: stop.** `root_tenant_case_result` answers before any LLM, identity call or
   state write: `TENANT_NOT_REGISTRABLE` / `TENANT_ROOT_NOT_REGISTRABLE`, "I cannot complete the
   registration through this channel: it does not belong to any organization." The ILK stays
-  temporary.
-- **Unknown or mismatched tenant.** The conversation goes on; `ilk_register` refuses without
+  temporary. It reads the region once: unreadable, the conversation goes on.
+- **No tenant, or a mismatched one.** The conversation goes on; `ilk_register` refuses without
   sending anything (`case_tenant_error_payload`). In a handoff the answer is immediate
-  (`TENANT_UNRESOLVED` or `INVALID_REQUEST`).
-- **Usage.** `usage_account` charges the case tenant with source `case`; when `case_tenant_of`
-  fails, `AiAccount::charge` charges the root tenant as `fallback_root`
-  (`crates/fluxbee_ai_sdk/src/usage.rs`).
+  (`TENANT_UNRESOLVED` or `INVALID_REQUEST`). Both are final.
+- **Usage.** `usage_account` charges the case tenant with source `case`, from one read; when
+  `case_tenant_of` fails (an unreadable read included), `AiAccount::charge` charges the root tenant
+  as `fallback_root` (`crates/fluxbee_ai_sdk/src/usage.rs`).
+- **Not told apart:** an ILK whose provision SY.identity answered although its write to the region
+  failed (`identity shm delta apply FAILED` in SY.identity's journal; a full region does it) reads
+  as not held, a final `TENANT_UNRESOLVED`, until SY.identity writes the whole region again with
+  it (a full region needs higher limits first). The region looks the same as for an ILK SY.identity
+  does not hold, and the frontdesk asks SY.identity nothing in its place (FINDINGS A-303).
 - The frontdesk never creates a tenant and takes none from the person, the LLM or its config
   (doc comment of `resolve_case_tenant`).
 
@@ -255,8 +283,11 @@ Registering again is safe: SY.identity replaces the identification of an ILK reg
 A conversational turn sends at most one `ILK_REGISTER`, whatever the model does
 (`IlkRegisterTool::call`): a later `ilk_register` in the same turn gets the answer of the turn's
 registration, kept in `BehaviorContext::register_answer`, and sends nothing, with a WARN `ilk_register
-called again in the same turn`. A call that sent nothing (no name or email, no ILK, no tenant) does
-not count.
+called again in the same turn`. A call that sent nothing (no name or email, no ILK, no tenant to
+register into) does not count. One whose case's tenant could not be read, after reading the identity
+SHM again (see Case tenant rules), counts as the turn's attempt that may pass, as a transient
+`ILK_REGISTER` failure does: the turn answers `IDENTITY_UNAVAILABLE`, and a later call in the turn
+reads nothing again.
 
 The email goes in exactly one of the two keys (`person_identification`, with the tool's
 `email_vouched`):
@@ -330,8 +361,13 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   `awaiting_confirmation`: the handoff sent again, or the person's next confirmation, retries it.
   A case closed as `completed_error` on such a failure (by an earlier version) is reopened when
   the person writes again.
-- **Identity SHM unreadable**: the case tenant is unknown, so registration answers that the tenant
-  is unresolved and usage goes to `fallback_root`; the conversation itself continues.
+- **Identity SHM unreadable** (since 0.1.139, FINDINGS A-303): a registration reads it again after
+  50 ms, 200 ms and 500 ms. Still unreadable, it sends nothing and answers `IDENTITY_UNAVAILABLE`
+  (`identity_shm_unreadable`, `retryable: true`), and the case stays open: the handoff sent again,
+  or the person's next confirmation, retries it. Up to 0.1.138 it answered the final
+  `TENANT_UNRESOLVED`. A region created again empty, before SY.identity writes it, reads the same.
+  The root-tenant check and the usage account read it once: the conversation goes on, and usage
+  goes to `fallback_root`.
 - **Handler errors**: each message runs once under the AI runtime
   (`crates/fluxbee_ai_sdk/src/runtime.rs`): up to 47 min per conversation turn, each model call
   bounded at 5 min, and 30 s per handoff or `system` request. When the handler fails or runs out
@@ -359,6 +395,13 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
 - `systemctl status sy-frontdesk-gov`; `journalctl -u sy-frontdesk-gov`. Lines to look for:
   `frontdesk-gov connected to router`, `AI token resolved from vault → Configured`,
   `frontdesk handoff REGISTERED (ILK_REGISTER complete)`.
+- The identity SHM (FINDINGS A-303), each with the `ilk_id`: WARN `identity SHM unreadable:
+  reading it again` (with `read`, `retry_in_ms` and the `reason`), INFO `identity SHM readable
+  again: its answer for the case is taken` (with `reads`), WARN `identity SHM unreadable on every
+  read: ...` (with the last `reason`; the answer that may pass follows: `frontdesk handoff: the
+  tenant of the case could not be read for now` or, from `ilk_register`, `the tenant of the case
+  could not be read for now: ILK_REGISTER not sent`), and WARN `identity SHM unreadable on one
+  read: the turn goes on ...` (the root-tenant check or the usage account).
 - Under load (since 0.1.136, FINDINGS A-257), WARN lines, each at once and then at most one every
   10 s with how many since: `ai runtime refused an LLM turn without running it` (every worker busy
   and the queue full; its sender gets `ai_runtime_busy`), `ai runtime dropped a message, neither

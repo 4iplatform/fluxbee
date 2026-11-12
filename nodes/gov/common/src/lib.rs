@@ -97,10 +97,11 @@ pub fn identity_error_code(err: &IdentityError) -> String {
 }
 
 /// Whether retrying the same identity request may succeed: SY.identity did not answer, or answered
-/// with a transient condition (not the primary, DB not ready, DB write failed). Every other code it
-/// answers with — TENANT_PENDING, TENANT_SUSPENDED, TENANT_DELETED, TENANT_ROOT_NOT_REGISTRABLE,
-/// ILK_DELETED, ILK_NOT_FOUND, SYSTEM_ILK_PROTECTED, DUPLICATE_*, INVALID_*,
-/// UNAUTHORIZED_REGISTRAR, ... — is a final verdict.
+/// with a transient condition (not the primary, DB not ready, DB write failed), or the identity
+/// SHM the case's tenant is read from could not be read (`CASE_TENANT_UNREADABLE`). Every other
+/// code it answers with — TENANT_PENDING, TENANT_SUSPENDED, TENANT_DELETED,
+/// TENANT_ROOT_NOT_REGISTRABLE, ILK_DELETED, ILK_NOT_FOUND, SYSTEM_ILK_PROTECTED, DUPLICATE_*,
+/// INVALID_*, UNAUTHORIZED_REGISTRAR, ... — is a final verdict.
 pub fn identity_error_is_transient(error_code: &str) -> bool {
     matches!(
         error_code,
@@ -111,6 +112,7 @@ pub fn identity_error_is_transient(error_code: &str) -> bool {
             | "NOT_PRIMARY"
             | "DB_NOT_READY"
             | "DB_WRITE_FAILED"
+            | CASE_TENANT_UNREADABLE
     )
 }
 
@@ -146,8 +148,15 @@ pub fn looks_like_tenant_id(raw: &str) -> bool {
     uuid::Uuid::parse_str(rest.trim()).is_ok()
 }
 
-/// The tenant of the case cannot be read: nothing is registered, and no tenant is created.
+/// The case has no tenant: the identity SHM, read whole, does not hold its ILK (SY.identity has no
+/// such ILK, or has it marked deleted), or holds no tenant id for it. Nothing is registered, and no
+/// tenant is created. A final verdict.
 pub const CASE_TENANT_MISSING: &str = "missing_tenant_id";
+/// The tenant of the case is unknown for now: the identity SHM could not be read, or SY.identity
+/// had not written it yet (a region created again, empty), on every read the frontdesk made
+/// (FINDINGS A-303). Nothing is registered, and sending the same request again may pass
+/// (`identity_error_is_transient`).
+pub const CASE_TENANT_UNREADABLE: &str = "identity_shm_unreadable";
 /// The tenant the producer informed is not the tenant of the case's ILK: nothing is registered.
 pub const CASE_TENANT_MISMATCH: &str = "tenant_mismatch";
 /// The case belongs to the root tenant, where nobody registers (operator decision 2026-10-02):
@@ -258,6 +267,20 @@ mod tests {
             let payload = identity_error_to_tool_payload(&err);
             assert_eq!(payload["error_code"], code);
             assert_eq!(payload["retryable"], true, "{code} is transient");
+        }
+    }
+
+    /// FINDINGS A-303: an identity SHM the frontdesk could not read says nothing of the case, so
+    /// it is a failure that may pass; an ILK the SHM does not hold, read whole, stays final.
+    #[test]
+    fn an_identity_shm_that_could_not_be_read_is_a_failure_that_may_pass() {
+        assert!(identity_error_is_transient(CASE_TENANT_UNREADABLE));
+        for code in [
+            CASE_TENANT_MISSING,
+            CASE_TENANT_MISMATCH,
+            TENANT_ROOT_NOT_REGISTRABLE,
+        ] {
+            assert!(!identity_error_is_transient(code), "{code} is final");
         }
     }
 

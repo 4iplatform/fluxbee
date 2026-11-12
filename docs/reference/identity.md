@@ -195,7 +195,11 @@ tenant moves no key.
 4. **SY.frontdesk.gov registers the person** with `ILK_REGISTER`
    (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs`):
    - The tenant is the case's: the one SY.identity holds for the ILK, read from the identity SHM
-     (`identity_shm_ilk_tenant`, `case_tenant_of`). The frontdesk never creates a tenant.
+     (`identity_shm_ilk_tenant`, `case_tenant_of`). The frontdesk never creates a tenant. A
+     registration reads the SHM again while it cannot be read, or holds nothing SY.identity wrote
+     yet, then answers `IDENTITY_UNAVAILABLE`, which may pass, never the final
+     `TENANT_UNRESOLVED` (since 0.1.139, FINDINGS A-303;
+     [sy-frontdesk-gov](../nodes/sy-frontdesk-gov.md#case-tenant-rules)).
    - Two methods. A structured `frontdesk_handoff` runs deterministically, with no model call. A
      person chatting is the conversational method, driven by the frontdesk's LLM.
    - A handoff is taken only from an IO node: the router-stamped `src_l2_name` must start with
@@ -709,7 +713,7 @@ converges to the union of the mesh.
 | SY.orchestrator | A node's tenant status before a launch (`tenant_gate`); a node's ILK by name. |
 | SY.cognition | An agent node's ILK and tenant (`agent_identity_of`). |
 | SY.storage | The tenant a usage record is charged to (`identity_tenant`, the motherbee's region). |
-| SY.frontdesk.gov | The tenant of a case (`identity_shm_ilk_tenant`). |
+| SY.frontdesk.gov | The tenant of a case (`identity_shm_ilk_tenant`), read again while the region cannot be read or lacks SY.identity's own ILK (FINDINGS A-303). |
 | SY.admin | A caller's ILK by name; channel owners (`list_ich_options_from_hive_config`). |
 | IO nodes | A sender's ILK before provisioning (`resolve_ilk_from_hive_id`). |
 | IO.cloud | Its fast `get_ilk` and `list_ilks` reads (`CLOUD_LOCAL_OPS` in `crates/fluxbee_sdk/src/cloud.rs`). |

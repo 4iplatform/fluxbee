@@ -37,7 +37,9 @@ registers them in SY.identity (`ILK_REGISTER`).
 - **Tenant:** the registration goes to the tenant of the case, the one SY.identity holds for the temporary ILK (the
   frontdesk reads it from the identity SHM). The `tenant_id` of a handoff only has to match. The
   frontdesk never creates tenants, and never takes one from the person or from the LLM; with no tenant it answers
-  `TENANT_UNRESOLVED` and registers nothing.
+  `TENANT_UNRESOLVED` and registers nothing. An identity SHM it cannot read, or that SY.identity has not written
+  yet, is no answer: a registration reads it again after 50 ms, 200 ms and 500 ms, and then answers
+  `IDENTITY_UNAVAILABLE` (`identity_shm_unreadable`, retryable), never `TENANT_UNRESOLVED` (FINDINGS A-303).
 - **Root tenant:** nobody registers there. If the case belongs to the root tenant, it answers
   `TENANT_NOT_REGISTRABLE` (`error_code` `TENANT_ROOT_NOT_REGISTRABLE`) without calling SY.identity
   or the LLM, and the person stays temporary. SY.identity rejects the same for any caller.
@@ -51,7 +53,8 @@ registers them in SY.identity (`ILK_REGISTER`).
   email takes from the thread state, goes in `identification.claimed_email`: SY.identity stores it but never
   merges on it, so the registration completes with the same answer whether or not the email is known.
 - **A failure that may pass** (SY.identity does not answer, is not the primary, or cannot write yet,
-  as while a deploy restarts it): `ilk_register` sends it again for a few seconds. If it still
+  as while a deploy restarts it, or the identity SHM cannot be read for the moment): `ilk_register`
+  sends it again for a few seconds, or reads the SHM again. If it still
   fails, the case stays `awaiting_confirmation`, so the person's next confirmation, or the handoff
   sent again, retries it. Any other failure is final (`completed_error`).
 - **Texts:** its fixed texts are English; in the conversation the model answers in the language the
