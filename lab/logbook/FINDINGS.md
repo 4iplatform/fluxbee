@@ -273,9 +273,28 @@ no change required
     A-330, A-331 and A-332, low; B-18, the lab's template. A-326 is A-278's, on `coa/a278`.
     **Pending:** the gate's `drift` read at +24 h (2026-11-13, about 11:00Z) for A-283. (The Cloud
     team's page, outside the repo, says A-243 and A-298 are live since its Version 4, 2026-11-12.)
-    **Next:** A-278 alone (built on `coa/a278`, `711cda24`, for 0.1.138); then A-191's one-time
-    cleanup on 8.x (its operator action run once on the system ILKs of hives removed before 0.1.133
-    and of the retired SY.policy, purging only those with no history).
+    **Next:** A-278 alone (built on `coa/a278`, `711cda24`, for 0.1.138); then A-191's leftover:
+    a purge of the system ILKs 0.1.133's gate retired stays the operator's explicit word.
+29. **0.1.138, A-278 alone (the Go SDK, the Rust SDK and the WF engine)** ✅ live and checked on 8.x
+    (2026-11-12): a WF reconciles all its pending timers: the SDKs say where the timers past a list
+    start, the WF reads every page of SY.timer's list, and when the list stops before its end a
+    timer past its time and past the last one listed is fired. On 8.x a WF restarted with 3,000
+    pending timers listed them all in 13 pages in 0.931 s, took none as missing and was never
+    `DEGRADED`, `HEALTHY` at 3.670 s, where on 0.1.137 it took 2,000 as missing, sent 2,030 again
+    and ran `DEGRADED` 72 polls, `HEALTHY` at 94.453 s. No model call. Not provoked on 8.x, so by
+    its tests: a list that stops before its end (the review's fire of a timer past its time and its
+    cancel, the 200-page bound, a page of no timer that gives a cursor, a cursor given again, an
+    SY.timer before 1.6), and the Go SDK's `List` and the Rust SDK's `list` and `list_page` (no
+    caller on 8.x).
+    **Found by its gate:** A-333 [WF], low (the reconcile of 3,000 pending timers takes 3.6 s on
+    worker1, and the receive loop starts after it); A-326's live data (a walk of any status, its
+    slowest page 7.204 s); A-302 seen live. **In its deploy's timeline:** A-334 (worker1's
+    Syncthing failed to delete some directories of its receive-only mirror), closed: a later pass
+    deleted them, nothing left.
+    **Pending:** the 0.1.137 gate's `drift` read at +24 h (2026-11-13, about 11:00Z) for A-283.
+    **Next:** A-191's leftover, the operator's call: 0.1.133's gate retired worker2's and the
+    removed gate workers' system ILKs (SY.policy's at SY.identity's start); a purge of them stays
+    the operator's explicit word (2026-11-11), asked.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -387,7 +406,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
-- A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone; built on `coa/a278` for 0.1.138, its own release after 0.1.137).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
 - A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
@@ -398,7 +416,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-299 🔵 A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it (low; the orchestrator).
 - A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator).
 - A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator).
-- A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic).
+- A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic; seen live by 0.1.138's gate).
 - A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk).
 - A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives, to decide).
 - A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin).
@@ -418,13 +436,14 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
 - A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
-- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order).
+- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-328 🔵 SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next` (low; SY.admin's next change).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
 - A-330 🔵 `list_hives` lists a registry directory whose name is not a hive id (low; the orchestrator).
 - A-331 🔵 `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT` (low; the orchestrator).
 - A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition).
+- A-333 🔵 A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it (low; the WF engine; found by 0.1.138's gate).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1503,6 +1522,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-334 [General/orchestrator] ✅ CLOSED (2026-11-12, read on 8.x: transient, nothing left; no fault) (found 2026-11-12 in 0.1.138's deploy timeline; seen on 8.x) — worker1's Syncthing fails to delete some runtime directories of its receive-only dist mirror
+
+- **Seen on 8.x (0.1.138's deploy and gate, 2026-11-12, `ops timeline`):** worker1's Syncthing
+  logged *"Failed to delete directory"* (INF) in the folder `fluxbee-dist-runtimes`, receive-only:
+  at 13:26:44Z, while the motherbee's package boot restarted its core services, for five runtime
+  version directories (io.api's, io.cloud's and io.blob's 0.1.137; wf.engine's and
+  io.linkedhelper's, their names cut off); at 13:32:09Z, after the forced delete of the workflow
+  gate0238, for `wf.gate0238` (two lines) and a version directory of it. The timeline cuts each
+  line before its reason.
+- **Read on 8.x (2026-11-12, about 14:25Z):** Syncthing's whole lines give the reason, *"directory
+  has been deleted on a remote device but is not empty; the contents are probably ignored on that
+  remote device, but not locally"*: content the folder ignores held each deletion up. A later pass
+  finished them: worker1's `dist/runtimes` holds what the motherbee's holds (io.api, io.cloud,
+  io.blob, wf.engine and io.linkedhelper on 0.1.138 only; no `wf.gate0238`), and the folder is
+  `idle` with `receiveOnlyTotalItems` 0, no errors and nothing needed. Nothing to fix; which
+  ignored content held them was not read.
+
+### A-333 [WF] 🔵 low (found 2026-11-12 by 0.1.138's gate; seen on 8.x; the receive loop after Recover read in the code, there before it; the reconcile's cost not read in the code) — A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it
+
+- **Seen on 8.x (0.1.138, gate0238, 2026-11-12 13:29–13:31Z):** after A-278, the reconcile of
+  `WF.gate0238@worker1`'s 3,000 pending timers (300 instances, 10 keys each) took 3.558 s from its
+  *"listed"* line to its *"complete"* line in worker1's journal, at a restart with the hive at
+  rest, and 4.372 s at the deploy's relaunch; the listing itself took 0.931 s (13 pages). On the
+  builder's Mac SY.timer listed 3,000 in 0.13 s and the WF's reconcile took 0.23 s more (A-278);
+  the gate's 1 s bound came from those numbers, and this was its one FAIL.
+- **Effect:** the receive loop starts after the reconcile (at T0w+4.967 s at that restart, T0w the
+  node's start in worker1's journal), so a restarted WF takes no message into it for about 5 s at
+  3,000 timers, likely 12 to 15 s at 10,000. That order is the engine's, before A-278 too:
+  `Recover`, the timers' reconcile its fourth step, runs before the receive loop
+  (`go/nodes/wf/wf-generic/node/recover.go` ~26, `Run` in `node.go`). On 0.1.137 the same restart
+  reached its receive loop at T0w+18.205 s and ran `DEGRADED` from T0+17.4 s to T0+93.5 s (A-278).
+- **Not read:** whether the cost is a store commit per instance (300 × about 12 ms) or per timer.
+- **Fix, later (the WF engine):** read the code; batch the store writes, or start the receive loop
+  before the reconcile ends.
+
 ### A-332 [General/cognition] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x; left by A-292's fix) — Cognition's model call on a person's turn that the agent then refuses completes
 
 - **Why:** cognition starts analyzing a person's turn as soon as its copy arrives. When the agent
@@ -1586,7 +1640,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   sends Archi's same tools with `tool_choice` `none` (a `tool_choice` change keeps the
   tools-and-system cache).
 
-### A-326 [General/SY.timer] 🔵 low (found 2026-11-12 by A-278's review; read in the code, its query plan checked with SQLite; there before it, more pages since A-278) — Each `TIMER_LIST` page reads every pending timer of the hive
+### A-326 [General/SY.timer] 🔵 low (found 2026-11-12 by A-278's review; read in the code, its query plan checked with SQLite; there before it, more pages since A-278; seen live by 0.1.138's gate) — Each `TIMER_LIST` page reads every pending timer of the hive
 
 - **Why:** SY.timer's `listTimers` (`go/sy-timer/persistence.go` ~281-323) asks
   `WHERE owner_l2_name=? AND status=?` (and the cursor) `ORDER BY fire_at_utc, uuid LIMIT limit+1`,
@@ -1608,6 +1662,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (SY.timer's own release):** that index, created at the start as the others are;
   then, a smaller gain, a page that reads only what its frame can hold (it reads `limit+1` rows,
   1001, where about 238 of a WF's timers fit).
+- **Seen live (0.1.138's gate, 2026-11-12, its clean-up at 13:31–13:32Z):** the walk of
+  `WF.gate0238@worker1`'s timers of any status (`status_filter=all`), 3,000, all pending: 13
+  pages in 8.79 s, its slowest page 7.204 s, where the pending pages of the same 3,000 timers took
+  0.14 to 0.21 s: a page of another status filter reads far more. SY.timer serves one request at
+  a time.
 
 ### A-325 [General/AI runners] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
 
@@ -2025,7 +2084,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (the frontdesk):** an unreadable SHM answers a retryable code, as SY.identity's own
   passing failures do since 0.1.125 (`identity_unavailable`).
 
-### A-302 [WF/wf-generic] 🔵 low (found 2026-11-11 by A-284's review fixes; read in the code) — Which wf.engine a WF node runs shows only in its unit's ExecStart
+### A-302 [WF/wf-generic] 🔵 low (found 2026-11-11 by A-284's review fixes; read in the code; seen live by 0.1.138's gate) — Which wf.engine a WF node runs shows only in its unit's ExecStart
 
 - **Why:** wf-generic's `NodeRuntime.VersionStr` is a fixed `"1.0"` that nothing reads
   (`go/nodes/wf/wf-generic/node/node.go:102`); `get_node_status`'s `runtime_version` and the
@@ -2036,6 +2095,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   relaunch lines do.
 - **Fix, later:** the WF node reports the engine version it runs, and `get_node_status` shows it
   next to the package's.
+- **Seen live (0.1.138's deploy, 2026-11-12):** the deploy relaunched `WF.gate0238@worker1` on
+  wf.engine 0.1.138: the gate's `pre` step read it in the WF unit's ExecStart at 13:29:35Z, after
+  1 s of waiting for the relaunch.
 
 ### A-301 [General/orchestrator] 🔵 low (found 2026-11-11 by A-277's review fixes; read in the code; there before it) — A fresh join under a removed hive's name reuses a surviving identity key
 
@@ -2671,7 +2733,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   written `%40` works; a broken escape in `list_nodes`' cursor answers `INVALID_CURSOR` as JSON
   (0.1.132: no JSON); a path in quotes works (0.1.132: `SCMD_EXECUTION_FAILED`).
 
-### A-278 [WF/Go SDK] 🔵 medium (found 2026-11-11 by A-266's builder and review; read in the code; there before it) — A WF with more than 1000 pending timers cannot reconcile them
+### A-278 [WF/Go SDK] ✅ VALIDATED ON 8.x (0.1.138, 2026-11-12; a WF restarted with 3,000 pending timers listed them all in 13 pages in 0.931 s, took none as missing and sent none again, never `DEGRADED`, `HEALTHY` at 3.670 s and its receive loop at 4.967 s, where on 0.1.137 it listed 1000, took 2,000 as missing, sent 2,030 again, ran `DEGRADED` 72 polls and was `HEALTHY` at 94.453 s, its receive loop at 18.205 s; its reconcile took 3.558 s, over the 1 s the builder's numbers gave: A-333; a list that stops before its end and the SDKs' `List`, `list` and `list_page` not provoked on 8.x: by their tests) (found 2026-11-11 by A-266's builder and review; read in the code; there before it) — A WF with more than 1000 pending timers cannot reconcile them
 
 - **Why:** the WF's reconcile (`go/nodes/wf/wf-generic/node/recover.go` ~286-299) lists its pending
   timers with `Limit: sdk.MaxTimerListLimit` (1000); the Go SDK's `List` (and the Rust SDK's) stops
@@ -2753,6 +2815,36 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     of `docs/nodes/sy-timer.md`);
     the README says scheduled or moved. `wholeList` moved to the tests; the older paging tests of
     both SDKs use the new helpers.
+- **Shipped in 0.1.138** (`5acf764b`, its review `38ecd878`, on daily). **Checked on 8.x (gate0238,
+  2026-11-12):** `WF.gate0238@worker1` (tenant pruebas), each conversation scheduling 10 timer
+  keys, 150 conversations and then 150 more at 5 a second (T0, a restart's answer on the
+  motherbee's clock; T0w, the node's start in worker1's journal).
+  - **On 0.1.137 (12:36–12:44Z):** at 1,500 pending timers a restart logged *"reconciliation may
+    be truncated"* once and took the 500 past the 1000th as missing (*"missing from SY.timer
+    (fire_at still future)"*); it sent them again and SY.timer answered `already_existed`;
+    `DEGRADED` 17 polls, `HEALTHY` at T0+25.069 s; the old reconcile 7.348 s. At 3,000: 2,000
+    missing, 2,030 sent again (2,000 taken after a resend, 1,970 of them after one); `DEGRADED` 72
+    polls, from T0+17.393 s to T0+93.452 s, `HEALTHY` at T0+94.453 s; the old reconcile 16.727 s,
+    the receive loop at T0w+18.205 s, the resends' drain 76.316 s. SY.timer's digest of the WF's
+    timers unchanged by each restart: nothing duplicated or replaced.
+  - **The deploy's relaunch (13:29Z):** the WF unit on wf.engine 0.1.138 (A-302); the relaunch
+    listed the 3,000 pending timers in 13 pages in 3.312 s and logged its reconcile complete once,
+    with none of the old engine's or a cut list's lines, the reconcile 4.372 s; `HEALTHY`; the
+    store (3,000 timers, 0 refused, 300 running) and SY.timer's digest as after the baseline.
+  - **A restart on 0.1.138, the hive at rest (13:30Z):** one listing line, 3,000 pending timers in
+    13 pages (SY.timer's walk 13), the node's own measure 0.931 s; the reconcile complete once;
+    none taken as missing, none sent again, no orphan cancelled; never `DEGRADED`; `HEALTHY` in
+    the node's own answer at T0+3.670 s, the receive loop at T0w+4.967 s; the store and SY.timer's
+    digest unchanged. The gate's one FAIL: the reconcile, its *"listed"* line to its *"complete"*
+    line in worker1's journal, 3.558 s against the 1 s the builder's Mac numbers set (A-333).
+  - **Not provoked on 8.x, so by its tests:** a list that stops before its end (the review's fire
+    of a timer past its time and its cancel, the 200-page bound, a page of no timer that gives a
+    cursor, a cursor given again, an SY.timer before 1.6): neither the relaunch nor the restart
+    logged a cut list's line. And the Go SDK's `List` and the Rust SDK's `list` and `list_page`:
+    no caller on 8.x (the WF takes `ListPage`; ai.generic's `TimerClient` asks only
+    `TIMER_NOW_IN`, and SY.admin's timer list route sends its own `TIMER_LIST`).
+  - **The clean-up:** with the workflow's forced delete, SY.timer's `timer_owner_purged` deleted
+    the WF's 3,000 timers, all pending; none left. No model call in the gate's window.
 
 ### A-277 [General/identity] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; a removed throwaway worker's reconnects refused *"not in the hive registry"*, 132 with its key deleted and 74 with its key pinned in place, none during its joins; with the key pinned sy-identity was not restarted and the 10 s recheck closed its sessions, the last 7.7 s after the answer; at the deploy no refusal, and worker1's replica in sync, its metrics equal and 2 sessions) (found 2026-11-11 by the review fixes of identity's 0.1.133 branch; read in the code) — A removed hive whose identity key could not be deleted keeps reading the identity store
 
@@ -4366,6 +4458,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   version and loads them.
 - **It shows at every motherbee restart,** since at least 2026-11-03, as a WARN on both sides.
   Nothing to change: the code already treats it as transient.
+- **SY.vault's WARN** reads *"vault request refused: the caller's ILK is not bound to the sending
+  node"*: the line it logs whenever it cannot bind a caller's ILK to the sending node, this
+  `IDENTITY_UNAVAILABLE` and a mismatch's `UNAUTHORIZED` alike, its `error` field saying which
+  (`src/bin/sy_vault.rs` ~448-463, `check_caller_binding` ~1886). Seen so at 0.1.138's deploy
+  (2026-11-12, about 13:26:56Z), where `ops timeline` cuts the line before its `error`.
 
 ### A-191 [General/identity] ✅ VALIDATED ON 8.x (0.1.133, its throwaway worker run on 0.1.134, 2026-11-11; SY.policy's retired at SY.identity's start; worker2's and six removed workers' retired by `retire_hive_ilks`, a removed worker's by `remove_hive`; none deleted) (found 2026-11-08 by 0.1.117's gate on 8.x; read there) — A removed hive's and a retired node's system ILKs stay registered
 

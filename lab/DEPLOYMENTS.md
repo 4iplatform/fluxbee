@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.137** | 2026-11-12 | `55fbdd85` | motherbee + spokes (core), the sweep's seven binaries, one branch per binary, with A-322 and A-323: SY.admin (A-243: an IO or WF node takes its own pages down, only its own; A-263: the update's background reads at once; A-273: a failed record of the Cloud's door tried once more; A-280: a failed publish answers within its budget, its clean-up after the answer; A-311's and A-314's help), the orchestrator (A-282: a check with no answer restarts a service only at a boot that found a replaced binary; A-283: Syncthing restarted after 5 min with no answer, at most once an hour, its unit with `TimeoutStopSec=30`; A-311: `get_hive` refuses an id that is not a hive id, and the registry's readers skip such a directory), SY.identity (A-277: a hive the registry does not list is refused), the WF (A-284: a count-only instance count), SY.cognition (A-292: a turn the agent refused leaves its communication), IO.cloud (A-293: a retryable frontdesk error answers `FRONTDESK_UNAVAILABLE`, a malformed registration is refused before anything is created), SY.architect (A-286 and A-287: an SCMD keeps `+` and decodes each segment once; A-298: a publish recreates no node; A-322: after a confirmed plan Archi's model tells what each step answered; A-323: no core node stopped through Archi) | ✅ live, checked on 8.x | snap `pre-sweep-0-1-137` (all 4 VMs) · `apt install fluxbee=0.1.136` + 0.1.136's `update_installation` (nothing one-way; the sweep's items come back, A-298's redeploy among them) |
+| **0.1.138** | 2026-11-12 | `38ecd878` | motherbee + spokes (core), A-278 alone (the Go SDK, the Rust SDK and the WF engine): a WF reconciles all its pending timers: the Go SDK's `ListPage` and the Rust SDK's `list` and `list_page` say where the timers past a list start, and the WF's reconcile reads every page of SY.timer's list (200 at the most), never taking a timer past the last one listed as missing; its review: when the list stops before its end, a timer past its time and past the last one listed is fired, and the one SY.timer may hold cancelled | ✅ live, checked on 8.x | snap `pre-a278-0-1-138` (all 4 VMs) · `apt install fluxbee=0.1.137` + 0.1.137's `update_installation` (nothing one-way; A-278 comes back) |
+| **0.1.137** | 2026-11-12 | `55fbdd85` | motherbee + spokes (core), the sweep's seven binaries, one branch per binary, with A-322 and A-323: SY.admin (A-243: an IO or WF node takes its own pages down, only its own; A-263: the update's background reads at once; A-273: a failed record of the Cloud's door tried once more; A-280: a failed publish answers within its budget, its clean-up after the answer; A-311's and A-314's help), the orchestrator (A-282: a check with no answer restarts a service only at a boot that found a replaced binary; A-283: Syncthing restarted after 5 min with no answer, at most once an hour, its unit with `TimeoutStopSec=30`; A-311: `get_hive` refuses an id that is not a hive id, and the registry's readers skip such a directory), SY.identity (A-277: a hive the registry does not list is refused), the WF (A-284: a count-only instance count), SY.cognition (A-292: a turn the agent refused leaves its communication), IO.cloud (A-293: a retryable frontdesk error answers `FRONTDESK_UNAVAILABLE`, a malformed registration is refused before anything is created), SY.architect (A-286 and A-287: an SCMD keeps `+` and decodes each segment once; A-298: a publish recreates no node; A-322: after a confirmed plan Archi's model tells what each step answered; A-323: no core node stopped through Archi) | ✅ replaced by 0.1.138 | snap `pre-sweep-0-1-137` (deleted 2026-11-12) · `apt install fluxbee=0.1.136` + 0.1.136's `update_installation` (nothing one-way; the sweep's items come back, A-298's redeploy among them) |
 | **0.1.136** | 2026-11-12 | `ba2addb2` | motherbee + spokes (core), the AI SDK alone: A-257 (the AI runtime reads every message while its 4 workers run LLM turns: a status, help or config request runs at once beside them on a direct lane of 64 places, and so does a handoff in the shape the frontdesk parses, on at most 8 of them and within 30 s; the turns start on the 4 workers in the order they came, with up to 128 waiting, and the next one is answered `ai_runtime_busy` at once, never run); its review's texts: an AI node answers status and help at once however busy only on ai.generic 0.1.136 or later, and ai.generic running its model for a handoff on the direct lane is a known limit | ✅ replaced by 0.1.137 | snap `pre-aisdk-0-1-136` (deleted 2026-11-12) · `apt install fluxbee=0.1.135` + 0.1.135's `update_installation` (nothing one-way; A-257 comes back) |
 | **0.1.135** | 2026-11-11 | `9a6ffb6d` | motherbee + spokes (core), the router alone: A-272 (split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one it came from, so no router sends a broadcast back to its peer, and over IRP a router that is not the gateway hands none back to the gateway), A-268 (two FIB builds at once are stored in the order they began, so a build that read before a change never undoes that change's rebuild); `ops.py health` checks `wandrops=0` from then on | ✅ replaced by 0.1.136 | snap `pre-router-0-1-135` (deleted 2026-11-12) · `apt install fluxbee=0.1.134` + 0.1.134's `update_installation` (nothing one-way; the WAN echoes come back, and now that `HEALTH_OK` checks `wandrops=0` the hives that drop them fail health: the motherbee whenever a node broadcasts over the WAN, a spoke when its own nodes do) |
 | **0.1.134** | 2026-11-11 | `8539bc64` | motherbee + spokes (core), the orchestrator alone, a hotfix: A-314 (a node unit systemd does not have reads as not running: on the hives' systemd 255 `systemctl is-active` exits 4 for it, which 0.1.133 read as no answer, so no node could be launched and a stopped node whose unit was gone could be neither started nor purged and read `UNKNOWN`); its review: `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name (`INVALID_REQUEST`) before anything is done, as `run_node` does | ✅ replaced by 0.1.135 | snap `pre-orch-0-1-134` (deleted 2026-11-11) · `apt install fluxbee=0.1.133` + 0.1.133's `update_installation` (that brings A-314 back); to 0.1.132 by apt (nothing one-way found) |
@@ -146,6 +147,102 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.138 — The SDKs and the WF alone: a WF reconciles all its pending timers, past the first 1000 (A-278)
+
+- **Date:** 2026-11-12 (ART) · **Previous version:** 0.1.137 · **Commit:** `38ecd878`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The Rust SDK
+  changed, so the build recompiled most binaries.
+- **Why:** A-278 (found 2026-11-11 by A-266's builder and review): a WF's reconcile listed at most
+  1000 of its pending timers, so each index timer past the 1000th looked missing from SY.timer: it
+  was marked refused and sent again, SY.timer answered `already_existed`, and the node ran
+  `DEGRADED` meanwhile, about a minute at 3,000 timers and five at 10,000, at every reconcile. The
+  SDKs are shared code, so it ships alone ([METHOD](logbook/METHOD.md) §9), after 0.1.137, as the
+  operator set it on 2026-11-11 (FINDINGS' board, item 24).
+- **What changed (the Go SDK, the Rust SDK and the WF engine; no SY.timer change):**
+  - **A-278 (`5acf764b`):** the Go SDK's `ListPage` is one `TIMER_LIST`, a page as SY.timer
+    answers it, with its `NextCursor`, and `ListFilter.Cursor` is where a list starts; the Rust
+    SDK's `list` hands back SY.timer's `next_cursor` when it stops at its limit with timers
+    following (it dropped it), and `list_page` is one page; both SDKs keep their signatures. The
+    WF's reconcile (`listTimers`, `node/recover.go`) reads every page, 1000 at the most a page
+    (about 210 to 240 of a WF's timers fit one), each from the cursor the page before gave, until
+    a page gives none; it stops before the end, logging why, at 200 pages, at a page of no timer
+    that gives a cursor, at a cursor given again, or at a page of 1000 that gives none (SY.timer
+    before 1.6). An index timer from the last one listed on is never taken as missing;
+    *"reconciliation may be truncated"* is gone, and the listing logs its pages and its time.
+  - **Its review (`38ecd878`):** when the list stops before its end, an index timer past its time
+    and past the last one listed is fired now and the one SY.timer may hold cancelled, since no
+    reconcile comes before the node's next start; the listing counts each timer once, and a
+    reconcile of a list cut short says so, not *"complete"*; the texts give the 2 s margin as
+    SY.timer's usual lateness and count the pages by the names' and keys' lengths. With it,
+    FINDINGS A-326 (low, SY.timer's own release): each `TIMER_LIST` page reads every pending timer
+    of the hive.
+- **Build and review:** `coa/a278`'s two commits, A-278 (`86765837`) and its review's fix
+  (`711cda24`, from three reviews: the paging, the SDKs' compatibility, operations), CI green on
+  `711cda24` at 09:06Z (4 jobs). Rebased onto daily `8204b6c3` (0.1.137's records) with the
+  subjects re-prefixed `[0.1.137]` (`5acf764b`, `38ecd878`); FINDINGS conflicted twice: A-278's
+  open-list line, whose shipped neighbours the records had removed (the branch's line kept alone),
+  and A-326's line and entry (placed between A-325's and A-327's, newest first). Daily
+  fast-forwarded to `38ecd878`, its CI green at 12:54:55Z (4 jobs); the branch and its worktree
+  deleted.
+- **The deploy:** build on fb-build 12:55:15–13:22:43Z (27.5 min: the Rust SDK changed, so most
+  binaries recompiled), publish in 12 s, `ops deploy 0.1.138` from about 13:23Z, after the gate's
+  mark, in 302 s (snapshots 33.5 s, the motherbee's apt 141.6 s, its admin on the version 54.7 s,
+  the spokes answering 9.5 s, the update's call 34.8 s, the hives on the target 15.0 s, health
+  5.9 s); snapshot `pre-a278-0-1-138`, `pre-sweep-0-1-137` dropped. On the target after the
+  update's call: the motherbee 4.4 s, egress1 34.9 s, ingress1 39.5 s, worker1 43.9 s; by their
+  own records the spokes restarted their services at +15.9–20.7 s (egress1), +22.5–28.9 s
+  (ingress1) and +32.7–34.3 s (worker1), were installed at +18.6 s, +25.9 s and +34.1 s, and
+  settled at +28.1 s, +36.4 s and +41.6 s. The update (`upd-1794490052037`) closed with every hive
+  on the target. Health clean. The web line read `route=no_answer upstream=unknown` right after
+  it, with io.web relaunching on the new SDK; the timeline has SY.admin's push of the web routes
+  failing, transport unreachable, at about 13:27:54Z, while ingress1's router and SY.edge restarted
+  (about 13:27:53–13:27:56Z); `acknowledged`, `ready` at 13:29Z.
+- **Checked on 8.x (the gate, gate0238, 12:36–13:32Z, its baseline on 0.1.137 before the deploy;
+  its tool `scratchpad/gate-tools/r138_gate.py`, git-ignored; 72 PASS, 6 SEE and 1 FAIL, the
+  reconcile's time against a bound set from the builder's Mac numbers: A-333):**
+  - **The baseline on 0.1.137 (12:36–12:44Z):** `WF.gate0238@worker1` (tenant pruebas),
+    conversations at 5 a second, each scheduling 10 timer keys (T0, the restart's answer on the
+    motherbee's clock; T0w, the node's start in worker1's journal). At 1,500 pending timers a
+    restart took the 500 past the 1000th as missing and sent them again (SY.timer answered
+    `already_existed`), `DEGRADED` until T0+24.1 s. At 3,000 (150 more conversations): 2,000
+    taken as missing, 2,030 sent again, `DEGRADED` 72 polls, from T0+17.4 s to T0+93.5 s,
+    `HEALTHY` at T0+94.5 s, the receive loop at T0w+18.2 s. SY.timer's digest of the WF's timers
+    unchanged by each restart.
+  - **The smoke (A-314's lesson, 13:28Z):** `run_node AI.gate0238s@worker1` ok in 3.0 s,
+    `RUNNING` (`DEGRADED`, no config) after 5.7 s, killed: 14.2 s in all (0.1.137's 10.8 s); the
+    stopped `AI.gate0233@worker1` and `AI.gate0237c@worker1` read `STOPPED`.
+  - **The deploy's relaunch (13:29Z):** every hive on 0.1.138 (hash `fcc08f177e9f`), health clean
+    since the deploy's start; the WF unit's ExecStart names wf.engine 0.1.138 (A-302); the
+    relaunch listed the 3,000 pending timers in 13 pages in 3.312 s and logged its reconcile
+    complete once, with no old engine's or cut list's line, the reconcile 4.372 s; `HEALTHY`; the
+    store (3,000 timers, 0 refused, 300 running) and SY.timer's digest as before the deploy.
+  - **A restart on 0.1.138, the hive at rest (13:30Z), beside the baseline at 3,000:** the listing
+    3,000 in 13 pages in 0.931 s (1000, truncated); none taken as missing, sent again or cancelled
+    (2,000 missing, 2,030 sent again); `DEGRADED` polls 0 (72); `HEALTHY` at T0+3.670 s
+    (94.453 s); the receive loop at T0w+4.967 s (18.205 s); the reconcile 3.558 s (16.727 s); the
+    store and SY.timer's digest unchanged. The one FAIL: the reconcile's 3.558 s against the
+    gate's 1 s bound: A-333.
+  - **Not provoked on 8.x, so by its tests:** a list that stops before its end (the review's fire
+    of a timer past its time and its cancel, the 200-page bound, a page of no timer that gives a
+    cursor, a cursor given again, an SY.timer before 1.6), and the Go SDK's `List` and the Rust
+    SDK's `list` and `list_page` (no caller on 8.x).
+  - **The cost:** no usage record in the gate's window (a WF's timers make no model call).
+  - **Found:** A-333 [WF], low: a WF's reconcile of 3,000 pending timers takes 3.6 s on worker1,
+    and its receive loop starts after it. A-326's live data: the clean-up's walk of the WF's
+    timers of any status took 13 pages in 8.79 s, its slowest page 7.204 s, where the pending
+    pages took 0.14 to 0.21 s. A-302 seen live: the gate read the WF's engine in its unit's
+    ExecStart. In the deploy's timeline, A-334: worker1's Syncthing failed to delete some
+    directories of its receive-only dist mirror; read on 8.x after the gate: a later pass deleted
+    them, the mirror matches the motherbee's (closed, no fault).
+- **PROD after the gate:** all four hives on 0.1.138; snapshot `pre-a278-0-1-138` on each VM. The
+  workflow `gate0238` deleted with force (its 3,000 timers purged in SY.timer; its WF node's ILK
+  purged with it, A-159's known behaviour) and its version gone on both hives; `AI.gate0238s`
+  purged (no history); `/root/gate0238` gone on worker1. Kept: the tenant pruebas, its people,
+  AI.pruebas, and the gate's 300 turns in SY.storage. Pending: the 0.1.137 gate's `drift` read at
+  +24 h (2026-11-13, about 11:00Z) for A-283.
+- **Rollback:** the snapshot `pre-a278-0-1-138` (all 4 VMs), or `apt install fluxbee=0.1.137` +
+  0.1.137's `update_installation`: nothing one-way; A-278 comes back.
 
 ## 0.1.137 — The sweep's binaries, one branch per binary, and Archi telling what a confirmed plan did
 
