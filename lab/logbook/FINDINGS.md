@@ -408,7 +408,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-319 🔵 The installation update's background reads are bounded in time, not in number (low; SY.admin; 0.1.137).
 - A-320 🔵 Only `add_hive`'s timed-out records ever close in Archi (low; SY.architect).
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
-- A-322 🟡 After CONFIRM the chat shows only "Execution completed successfully" or "Execution stopped at step 's1'": no step's answer (medium; SY.architect).
+- A-322 🟡 After CONFIRM the chat shows only "Execution completed successfully" or "Execution stopped at step 's1'": no step's answer (medium; decided 2026-11-12: Archi's model explains the step answers; SY.architect in 0.1.137, with A-323).
 - A-323 🔵 Archi plans `kill_node` for a core node and says nothing brings it back (low; Archi's texts).
 - A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
@@ -1548,6 +1548,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (SY.architect):** after an execution, give the model one turn with each step's answer
   (the executor's essentials already carry them), or render each step's code, detail and
   `packages_left`/`warning`/`pages_left_up` in the line.
+- **The operator's call (2026-11-12):** yes, in 0.1.137 with SY.architect: after an execution the
+  model gets one turn with each step's answer and tells the operator what happened, the fixed line
+  kept only when that turn fails. No secret ever reaches that turn (A-124): only the fields Archi's
+  handbook says to report. A-323's texts go with it.
 
 ### A-321 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder and review; read in the code; there before it) — Archi's plans and texts around `add_hive`
 
