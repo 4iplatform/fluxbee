@@ -164,8 +164,11 @@ const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
 const NODE_STATUS_SCHEMA_VERSION: &str = "1";
 const NODE_STATUS_FORWARD_TIMEOUT_SECS: u64 = 2;
 /// How long a node's own hive waits for its NODE_HELP_RESPONSE (`node_help_flow`). Only a node of
-/// NODE_HELP_RUNTIMES is asked, and one that does not answer in time is no error: a busy AI node
-/// may not (docs/agent-tools-v1.md §3.3).
+/// NODE_HELP_RUNTIMES is asked, and one that does not answer in time is no error
+/// (docs/agent-tools-v1.md §3.3). An AI node on ai.generic 0.1.136 or later answers at once however
+/// busy its conversations keep it (FINDINGS A-257), so its silence means it is stuck or
+/// restarting, or its 64 places for control requests were all taken; one pinned to an older
+/// ai.generic may still miss the deadline while its workers are busy (FINDINGS A-324).
 const NODE_HELP_PROBE_TIMEOUT_SECS: u64 = 3;
 /// The runtimes whose nodes answer NODE_HELP. A node runs its package's `runtime_base` when it has
 /// one, so a node of an ai.generic package is asked too; any other node is answered at once.
@@ -29054,8 +29057,10 @@ fn node_help_from_answer(
             };
             (None, Some(reason))
         }
-        // Neutral: only a node whose runtime answers NODE_HELP is asked, and a busy one can miss
-        // the deadline.
+        // Neutral: only a node whose runtime answers NODE_HELP is asked. One on ai.generic 0.1.136
+        // or later answers at once however busy (FINDINGS A-257), so its silence means it is stuck
+        // or restarting, or its control places were all taken; only one pinned to an older
+        // ai.generic can miss the deadline for being busy (FINDINGS A-324).
         Err(err) if err.is_timeout() => (
             None,
             Some(format!(
@@ -57650,7 +57655,9 @@ blob:
     }
 
     /// The node's answer to NODE_HELP: its cards when it says ok, else no help and why. Silence is
-    /// no error, and its reason says only that: a busy AI node can miss the deadline too.
+    /// no error, and its reason says only that: a node stuck or restarting does not answer, and an
+    /// AI node pinned to an ai.generic before 0.1.136 can miss the deadline while busy (FINDINGS
+    /// A-324).
     #[test]
     fn a_nodes_answer_to_node_help_is_its_cards_or_why_not() {
         let timeout = Duration::from_secs(NODE_HELP_PROBE_TIMEOUT_SECS);
