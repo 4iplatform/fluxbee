@@ -10,6 +10,8 @@ mod messages_db;
 mod pipeline_types;
 #[path = "sy_architect/reconciler.rs"]
 mod reconciler;
+#[path = "sy_architect/shown_once.rs"]
+mod shown_once;
 use failure_classifier::{
     classify_failure_deterministic, route_failure, FailureContext, FailureRoutingDecision,
 };
@@ -2412,6 +2414,7 @@ Blocked result:
 - Never use `node_control_config_set` to create a node.
 - Never include read-only discovery actions as executor steps unless the requested plan itself is read-only.
 - Step ids must be unique. Use `s1`, `s2`, `s3` in order.
+- A step of `publish_cloud_endpoint`, `externalize` or `vault_get` never carries `executor_fill`: its answer is a secret (a token, a vault value) shown once to the operator, and a step with fields to fill would give it to SY.admin's executor model. SY.architect refuses such a plan.
 - `metadata.target_hive` is the primary hive for this plan; per-step args carry more specific hives when needed.
 - If the task is blocked by a missing required value or ambiguous target, submit `status: "blocked"` instead of guessing.
 
@@ -10225,7 +10228,7 @@ async fn handle_chat_message(
 
     let trimmed_message = message.trim();
 
-    let response = if confirmation_requested(trimmed_message) {
+    let mut response = if confirmation_requested(trimmed_message) {
         if let Some(pipeline_run) =
             active_pipeline_at_stage(state, &resolved_session_id, &PipelineStage::Confirm1).await
         {
@@ -10659,6 +10662,9 @@ async fn handle_chat_message(
         }
     };
 
+    // A secret the answer brought (a token publish_cloud_endpoint minted, a vault value) is shown
+    // once, in this answer, and kept masked (FINDINGS A-124).
+    shown_once::show_once(&mut response.output);
     let new_title = update_title_from_message(&session.title, &message);
     if new_title != session.title {
         session.title = new_title;
@@ -10741,7 +10747,7 @@ async fn handle_executor_plan_request(
     };
 
     let context = admin_tool_context(state, Some(&resolved_session_id));
-    let response = match execute_executor_plan_with_context(
+    let mut response = match execute_executor_plan_with_context(
         &context,
         execution_id.clone(),
         plan,
@@ -10778,6 +10784,8 @@ async fn handle_executor_plan_request(
         }
     };
 
+    // Shown once in this answer, kept masked (FINDINGS A-124).
+    shown_once::show_once(&mut response.output);
     let plan_text = render_executor_plan_submission(&execution_id, &req.plan);
     if let Err(err) = persist_chat_exchange(state, &mut session, plan_text, &[], &response).await {
         tracing::warn!(error = %err, session_id = %resolved_session_id, "failed to persist executor plan exchange");
@@ -12128,12 +12136,15 @@ async fn handle_scmd(
     }
     let translated = translate_scmd(&state.hive_id, parsed)?;
     if is_mutating_admin_action(&translated.action) {
+        // The command as the operations table keeps it, and as an answer repeats it
+        // (`confirmed_command`): its body's secret fields redacted, as the chat's copy of it is
+        // (FINDINGS A-124's check: an add_hive's ssh_password stayed there in clear).
         execute_tracked_admin_translation(
             state,
             session_id,
             "scmd",
             translated,
-            format!("SCMD: {raw}"),
+            sanitize_user_message_for_persistence(&format!("SCMD: {raw}")),
             None,
         )
         .await
@@ -13432,6 +13443,10 @@ fn validate_architect_executor_plan_shape(plan: &Value) -> Result<Value, Archite
     if steps.is_empty() {
         return Err("executor plan execution.steps must not be empty".into());
     }
+    // A step that answers a secret goes with nothing for SY.admin's model to fill (FINDINGS A-124).
+    if let Some(refusal) = shown_once::refusal_of_a_plan_whose_secret_would_reach_a_model(plan) {
+        return Err(refusal.into());
+    }
     Ok(plan.clone())
 }
 
@@ -13613,6 +13628,10 @@ async fn plan_compiler_prevalidate(
     }
     if let Err(err) = validate_plan_help_lookups(plan, help_lookup_actions) {
         return Some(format!("help lookup validation failed: {err}"));
+    }
+    // FINDINGS A-124: told before the plan is staged, so the plan is written again without it.
+    if let Some(refusal) = shown_once::refusal_of_a_plan_whose_secret_would_reach_a_model(plan) {
+        return Some(refusal);
     }
 
     let admin_target = format!("SY.admin@{}", context.hive_id);
@@ -14760,6 +14779,11 @@ async fn execute_executor_plan_with_context(
     executor_options: Value,
     labels: Value,
 ) -> Result<Value, ArchitectError> {
+    // Every plan Archi runs, the pipeline's and a confirmed one's included: a step that answers a
+    // secret is never filled by SY.admin's model, which would get its answer (FINDINGS A-124).
+    if let Some(refusal) = shown_once::refusal_of_a_plan_whose_secret_would_reach_a_model(&plan) {
+        return Err(format!("executor plan validation failed: {refusal}").into());
+    }
     let admin_target = format!("SY.admin@{}", context.hive_id);
     let validate_output = execute_admin_action_with_context(
         context,
@@ -15654,6 +15678,24 @@ async fn resolve_chat_session(
     Ok((record.session_id.clone(), record))
 }
 
+/// The `content` and `metadata_json` of the messages row Archi keeps of an answer (FINDINGS A-124,
+/// since 0.1.139): the answer as `shown_once::kept` keeps it, every secret it carries masked (a
+/// token `publish_cloud_endpoint` minted, its copy in `shown_once`, a vault value, a step's secret
+/// args, and each one's text wherever another text repeats it), so neither the chat's history,
+/// nor what Archi's model reads of it on a later turn, nor a snapshot of Archi's directory holds
+/// one. The chat got the answer whole, once. The content is the kept answer's `message`, and the
+/// session's preview is made from it.
+fn kept_response_row(response: &ChatResponse) -> (String, String) {
+    let kept = shown_once::kept(&serde_json::to_value(response).unwrap_or(Value::Null));
+    let content = kept
+        .pointer("/output/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let metadata = json!({ "kind": "response", "response": kept }).to_string();
+    (content, metadata)
+}
+
 async fn persist_chat_exchange(
     state: &ArchitectState,
     session: &mut ChatSessionRecord,
@@ -15718,23 +15760,15 @@ async fn persist_chat_exchange(
     } else {
         "architect"
     };
+    let (content, metadata_json) = kept_response_row(response);
     let response_row = ChatMessageRecord {
         message_id: Uuid::new_v4().to_string(),
         session_id: session.session_id.clone(),
         role: response_role.to_string(),
-        content: response
-            .output
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        content,
         timestamp_ms: now_epoch_ms(),
         mode: response.mode.clone(),
-        metadata_json: json!({
-            "kind": "response",
-            "response": response,
-        })
-        .to_string(),
+        metadata_json,
         seq: session.message_count + 2,
     };
     append_message_record(&messages, &response_row).await?;
@@ -16637,8 +16671,26 @@ fn compact_scmd_title(raw: &str) -> String {
     }
 }
 
+/// What Archi keeps of what the operator sent: an SCMD with its body's secret fields redacted, and
+/// an executor plan pasted into the chat, or sent to `POST /api/executor/plan`
+/// (`render_executor_plan_submission`), as `shown_once::kept` keeps it, a step's secret args (a
+/// vault value, an SSH password or key) masked (FINDINGS A-124's check, since 0.1.139). Anything
+/// else as it came.
 fn sanitize_user_message_for_persistence(user_message: &str) -> String {
     let trimmed = user_message.trim();
+    if let Some(plan) = try_extract_executor_plan_json(trimmed) {
+        return serde_json::to_string_pretty(&shown_once::kept(&plan))
+            .unwrap_or_else(|_| user_message.to_string());
+    }
+    if let Some((head, plan)) = trimmed
+        .strip_prefix("EXECUTOR_PLAN ")
+        .and_then(|rest| rest.split_once('\n'))
+        .and_then(|(id, body)| Some((id, serde_json::from_str::<Value>(body).ok()?)))
+    {
+        let kept = serde_json::to_string_pretty(&shown_once::kept(&plan))
+            .unwrap_or_else(|_| "{}".to_string());
+        return format!("EXECUTOR_PLAN {head}\n{kept}");
+    }
     let Some(raw) = trimmed.strip_prefix("SCMD:") else {
         return user_message.to_string();
     };
@@ -16734,15 +16786,30 @@ fn redact_json_secret_fields(value: &Value) -> Value {
     }
 }
 
+/// Whether a field name names a secret whose value Archi never keeps nor logs. The same names as
+/// SY.admin's peer (`redaction_field_is_secret` in sy_admin.rs): since 0.1.139 also
+/// `authorization` and an SSH or private key (`ssh_key`, `private_key`, `*_private_key`), which an
+/// `add_hive`'s params kept in Archi's operations table in clear (FINDINGS A-124's check).
 fn key_looks_secret(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "api_key" | "apikey" | "token" | "access_token" | "client_secret" | "secret" | "password"
+        "api_key"
+            | "apikey"
+            | "token"
+            | "access_token"
+            | "client_secret"
+            | "secret"
+            | "password"
+            | "authorization"
+            | "ssh_key"
+            | "ssh_password"
+            | "private_key"
     ) || normalized.ends_with("_api_key")
         || normalized.ends_with("_token")
         || normalized.ends_with("_secret")
         || normalized.ends_with("_password")
+        || normalized.ends_with("_private_key")
 }
 
 fn session_filter(session_id: &str) -> String {
@@ -18275,6 +18342,36 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.92rem;
       color: var(--text);
     }}
+    .shown-once {{
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--warning);
+      background: var(--warning-soft);
+      border-radius: 12px;
+      padding: 10px 12px;
+    }}
+    .shown-once-title {{
+      font-size: 0.78rem;
+      font-weight: 800;
+      color: var(--warning);
+      letter-spacing: 0.03em;
+    }}
+    .shown-once-where {{
+      font-size: 0.80rem;
+      color: var(--muted);
+    }}
+    .shown-once-secret {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.84rem;
+      word-break: break-all;
+      user-select: all;
+      color: var(--text);
+    }}
+    .shown-once-note {{
+      font-size: 0.80rem;
+      line-height: 1.45;
+      color: var(--text);
+    }}
     .exec-token-chip {{
       font-size: 0.72rem;
       font-weight: 800;
@@ -19087,6 +19184,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
     let currentSessionId = null;
     let currentSessionMode = "operator";
     let currentSessionRevision = "";
+    // FINDINGS A-124: an answer that carries a secret shows it once, and the chat's history keeps it
+    // masked. While that answer is on screen the periodic reload of the history does not replace
+    // it; the operator's next message, or another chat, ends the hold.
+    let shownOnceHold = false;
     let sessionsCache = [];
     let pendingIndicator = null;
     let impersonationOptionsCache = [];
@@ -20461,7 +20562,45 @@ fn architect_index_html(state: &ArchitectState) -> String {
       bar.appendChild(cancelBtn);
       return bar;
     }}
+    // FINDINGS A-124: the secrets an answer brought (output.shown_once), each with where it came
+    // from: in the answer as it came, its value; from the history, the mask Archi keeps instead.
+    function renderShownOnce(kind, data, fromHistory) {{
+      const shown = data && data.output && data.output.shown_once;
+      const secrets = shown && Array.isArray(shown.secrets) ? shown.secrets : [];
+      if (!secrets.length) return;
+      const block = document.createElement("div");
+      block.className = "shown-once";
+      const title = document.createElement("div");
+      title.className = "shown-once-title";
+      title.textContent = fromHistory ? "Shown once (kept masked)" : "Shown once: copy it now";
+      block.appendChild(title);
+      for (const item of secrets) {{
+        const where = document.createElement("div");
+        where.className = "shown-once-where";
+        where.textContent = String(item.where || "") + " · " + String(item.field || "");
+        const secret = document.createElement("div");
+        secret.className = "shown-once-secret";
+        secret.textContent = String(item.secret == null ? "" : item.secret);
+        block.appendChild(where);
+        block.appendChild(secret);
+      }}
+      const note = document.createElement("div");
+      note.className = "shown-once-note";
+      note.textContent = String(shown.note || "");
+      block.appendChild(note);
+      appendMessage(kind, kind === "architect" ? "archi" : "System", block);
+      if (!fromHistory) {{
+        shownOnceHold = true;
+      }}
+    }}
     function renderResponsePayload(kind, data, options = {{}}) {{
+      renderResponseBody(kind, data, options);
+      // A stored message comes with fromHistory, or with allowInlineConfirm when it waits for a
+      // confirmation; an answer as it came, with neither.
+      const stored = !!(options && (options.fromHistory || options.allowInlineConfirm));
+      renderShownOnce(kind, data, stored);
+    }}
+    function renderResponseBody(kind, data, options = {{}}) {{
       const fromHistory = !!(options && options.fromHistory);
       if (!fromHistory) {{
         clearInlineConfirmBars();
@@ -20829,6 +20968,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       return String(count) + ":" + String(updated) + ":" + recoveryToken;
     }}
     function renderSession(detail, showWelcome = false, preserveComposer = false) {{
+      shownOnceHold = false;
       resetChatViewport(preserveComposer);
       const session = detail && detail.session ? detail.session : null;
       const recovery = detail && detail.pipeline_recovery ? detail.pipeline_recovery : null;
@@ -20884,7 +21024,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     async function refreshCurrentSession(options = {{}}) {{
       const force = !!(options && options.force);
-      if (!currentSessionId || sessionRefreshInFlight) {{
+      if (!currentSessionId || sessionRefreshInFlight || shownOnceHold) {{
         return;
       }}
       sessionRefreshInFlight = true;
@@ -20978,6 +21118,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     let submitInFlight = false;
     async function sendQuickControlMessage(message, pendingText = "Executing confirmation...") {{
       if (submitInFlight) return;
+      shownOnceHold = false;
       if (!currentSessionId) {{
         await createSession();
       }}
@@ -21022,6 +21163,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (submitInFlight || confirmationLockActive) return;
       const message = input.value.trim();
       if (!message && !pendingAttachments.length) return;
+      shownOnceHold = false;
       if (!currentSessionId) {{
         await createSession();
       }}
@@ -22546,7 +22688,15 @@ fn pipeline_run_with_state_update(
         if let (Some(current_obj), Some(update_obj)) = (current.as_object_mut(), update.as_object())
         {
             for (key, value) in update_obj {
-                current_obj.insert(key.clone(), value.clone());
+                // A run's report is SY.admin's executor answer, its steps' answers in it: kept as
+                // Archi keeps any answer, its secrets masked (FINDINGS A-124). The plan is kept as
+                // it is: CONFIRM 2 runs it.
+                let value = if key == "execution_report" {
+                    shown_once::kept(value)
+                } else {
+                    value.clone()
+                };
+                current_obj.insert(key.clone(), value);
             }
         }
         updated.state_json =
@@ -28300,6 +28450,235 @@ mod tests {
         );
         assert!(!settled.expect("an answer"));
         assert_eq!(record.status, "timeout_unknown");
+    }
+
+    /// The answer the chat gets of a confirmed plan whose step opened Fluxbee Cloud's door, as
+    /// `handle_chat_message` builds it: SY.admin's executor answer (each step's args and answer,
+    /// `result_preview`, with the minted token), Archi's words on it, and what is shown once.
+    fn cloud_door_answer(token: &str) -> ChatResponse {
+        let mut output = json!({
+            "status": "ok",
+            "action": "executor_execute_plan",
+            "message": "The door is open on SY.edge@ingress1 and IO.cloud trusts it.",
+            "explanation": { "source": "model", "model_calls": 1, "tokens_used": 61000 },
+            "token_usage": { "total": 61000 },
+            "payload": {
+                "events": [
+                    { "step_id": "s1", "step_action": "publish_cloud_endpoint", "status": "done",
+                      "tool_args_preview": { "edge_node": "SY.edge@ingress1" },
+                      "result_preview": { "status": "ok", "action": "externalize", "payload": {
+                          "url": "/e/ich:9", "ich": "ich:9", "owner_l2_name": "IO.cloud@motherbee",
+                          "edge_node": "SY.edge@ingress1", "token": token,
+                          "edge_applied": true } } }
+                ],
+                "summary": { "status": "done", "final_message": "Execution completed successfully" }
+            }
+        });
+        shown_once::show_once(&mut output);
+        ChatResponse {
+            status: "ok".to_string(),
+            mode: "executor".to_string(),
+            output,
+            session_id: Some("session-a124".to_string()),
+            session_title: Some("Cloud door".to_string()),
+        }
+    }
+
+    /// FINDINGS A-124, the operator's call (2026-11-12, "Mostrar una vez, no guardar"): the chat
+    /// gets a token `publish_cloud_endpoint` minted once, in the step's answer and shown apart
+    /// (`shown_once`), and the messages row Archi keeps of that answer has it masked, its copy in
+    /// `shown_once` too, where the whole answer was kept with the token. The rest is kept as it
+    /// came, and what a later turn reads of the row (its memory) holds no token either.
+    #[test]
+    fn a_token_is_shown_once_in_the_answer_and_kept_masked_in_the_history() {
+        let token = "8c1f0a2e9b7d4c3a8e6f1b2d3c4a5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d";
+        let answer = cloud_door_answer(token);
+        // The chat gets it: in the step's answer, and shown once with where it came from.
+        let live = serde_json::to_value(&answer).expect("answer");
+        assert_eq!(
+            live.pointer("/output/payload/events/0/result_preview/payload/token"),
+            Some(&json!(token))
+        );
+        assert_eq!(
+            live.pointer("/output/shown_once/secrets"),
+            Some(
+                &json!([{ "where": "step s1 (publish_cloud_endpoint)", "field": "token",
+                           "secret": token }])
+            )
+        );
+        // What Archi keeps: no token anywhere, both places masked, the rest as it came.
+        let (content, metadata) = kept_response_row(&answer);
+        assert!(!metadata.contains(token), "{metadata}");
+        assert!(!content.contains(token), "{content}");
+        assert_eq!(
+            content,
+            "The door is open on SY.edge@ingress1 and IO.cloud trusts it."
+        );
+        let kept: Value = serde_json::from_str(&metadata).expect("metadata");
+        let output = &kept["response"]["output"];
+        let result = &output["payload"]["events"][0]["result_preview"]["payload"];
+        assert_eq!(result["token"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(
+            output["shown_once"]["secrets"][0]["secret"],
+            json!(NODE_SECRET_REDACTION_TOKEN)
+        );
+        assert_eq!(
+            output["shown_once"]["note"],
+            json!(shown_once::SHOWN_ONCE_NOTE)
+        );
+        for (field, value) in [
+            ("url", json!("/e/ich:9")),
+            ("edge_node", json!("SY.edge@ingress1")),
+            ("edge_applied", json!(true)),
+        ] {
+            assert_eq!(result[field], value, "{field}");
+        }
+        assert_eq!(output["token_usage"]["total"], json!(61000));
+        assert_eq!(kept["response"]["mode"], json!("executor"));
+        // A later turn's memory reads the kept row: no token there.
+        let row = PersistedChatMessage {
+            message_id: "m2".to_string(),
+            session_id: "session-a124".to_string(),
+            role: "architect".to_string(),
+            content: content.clone(),
+            timestamp_ms: 1,
+            mode: "executor".to_string(),
+            metadata: kept.clone(),
+        };
+        let interaction = immediate_interaction_from_message(&row).expect("a turn");
+        assert!(
+            !interaction.content.contains(token),
+            "{}",
+            interaction.content
+        );
+    }
+
+    /// FINDINGS A-124: a pipeline run's report, kept in its run state (`pipeline_runs`), has its
+    /// steps' secrets masked as a chat answer does, where the whole executor answer was kept; its
+    /// plan is kept as it came, since CONFIRM 2 runs it.
+    #[test]
+    fn a_pipeline_runs_report_is_kept_masked_and_its_plan_as_it_came() {
+        let token = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let report = cloud_door_answer(token).output;
+        let plan = json!({ "kind": "executor_plan", "plan_version": "0.1", "execution": {
+            "steps": [{ "id": "s1", "action": "vault_put",
+                        "args": { "key": "k", "value": "plan-value-kept" } }] } });
+        let run = blocked_pipeline_fixture(PipelineStage::Execute);
+        let updated = pipeline_run_with_state_update(
+            &run,
+            PipelineStage::Completed,
+            Some(json!({ "execution_report": report, "executor_plan": plan.clone() })),
+            None,
+        )
+        .expect("update");
+        assert!(
+            !updated.state_json.contains(token),
+            "{}",
+            updated.state_json
+        );
+        let state = pipeline_state_from_run(&updated);
+        assert_eq!(
+            state.pointer("/execution_report/payload/events/0/result_preview/payload/token"),
+            Some(&json!(NODE_SECRET_REDACTION_TOKEN))
+        );
+        assert_eq!(state["executor_plan"], plan);
+    }
+
+    /// FINDINGS A-124's check of what Archi keeps of the operator's input: an executor plan pasted
+    /// into the chat, or sent to POST /api/executor/plan, is kept with its steps' secret args
+    /// masked (a vault value, an SSH password), as an SCMD's body already was; an add_hive's
+    /// `ssh_key` and an `authorization` read as secrets now, as in SY.admin's run log
+    /// (`redaction_field_is_secret`), where Archi kept them in clear.
+    #[test]
+    fn what_the_operator_sent_is_kept_with_its_secrets_masked() {
+        let plan = json!({ "kind": "executor_plan", "plan_version": "0.1", "execution": {
+            "steps": [{ "id": "s1", "action": "vault_put",
+                        "args": { "key": "slack-tokens", "value": "xoxb-pasted-value" } }] } });
+        let pasted = sanitize_user_message_for_persistence(&plan.to_string());
+        assert!(!pasted.contains("xoxb-pasted-value"), "{pasted}");
+        assert!(pasted.contains("slack-tokens"), "{pasted}");
+        let submitted = sanitize_user_message_for_persistence(&render_executor_plan_submission(
+            "exec-1", &plan,
+        ));
+        assert!(
+            submitted.starts_with("EXECUTOR_PLAN exec-1\n"),
+            "{submitted}"
+        );
+        assert!(!submitted.contains("xoxb-pasted-value"), "{submitted}");
+        let scmd = sanitize_user_message_for_persistence(
+            "SCMD: curl -X POST /hives -d '{\"hive_id\":\"w9\",\"address\":\"10.0.0.9\",\
+             \"ssh_user\":\"admin\",\"ssh_password\":\"pw-typed\",\"ssh_key\":\"-----BEGIN KEY-----\"}'",
+        );
+        for secret in ["pw-typed", "BEGIN KEY"] {
+            assert!(!scmd.contains(secret), "{scmd}");
+        }
+        assert!(scmd.contains("\"ssh_user\":\"admin\""), "{scmd}");
+        let redacted = redact_json_secret_fields(&json!({
+            "ssh_key": "k", "private_key": "k", "tls_private_key": "k", "Authorization": "Bearer x",
+            "ssh_user": "admin"
+        }));
+        for field in ["ssh_key", "private_key", "tls_private_key", "Authorization"] {
+            assert_eq!(
+                redacted[field],
+                json!(NODE_SECRET_REDACTION_TOKEN),
+                "{field}"
+            );
+        }
+        assert_eq!(redacted["ssh_user"], json!("admin"));
+        // Anything else as it came.
+        assert_eq!(
+            sanitize_user_message_for_persistence("hola Archi"),
+            "hola Archi"
+        );
+    }
+
+    /// FINDINGS A-124: a step that answers a secret (`publish_cloud_endpoint`, `externalize`,
+    /// `vault_get`) goes to SY.admin's executor with nothing for its model to fill, which it then
+    /// runs with no model (since 0.1.95): one with `executor_fill` would give the model the step's
+    /// answer, the token. A plan pasted or sent to Archi is refused at its precheck, and any plan
+    /// Archi runs (a confirmed one, the pipeline's) before anything reaches SY.admin.
+    #[tokio::test]
+    async fn a_plan_whose_secret_would_reach_a_model_is_refused_before_it_runs() {
+        let plan = json!({ "kind": "executor_plan", "plan_version": "0.1", "execution": { "steps": [
+            { "id": "s1", "action": "publish_cloud_endpoint",
+              "args": { "edge_node": "SY.edge@ingress1" },
+              "executor_fill": { "allowed": ["edge_node"] } }
+        ] } });
+        let err = validate_architect_executor_plan_shape(&plan).expect_err("refused");
+        assert!(
+            err.to_string().contains("step s1 (publish_cloud_endpoint)"),
+            "{err}"
+        );
+        let (state, mut router) = harness_state();
+        let context = admin_tool_context(&state, None);
+        let err = execute_executor_plan_with_context(
+            &context,
+            "exec-a124".to_string(),
+            plan.clone(),
+            json!({}),
+            json!({}),
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            err.to_string()
+                .starts_with("executor plan validation failed: step s1 (publish_cloud_endpoint)"),
+            "{err}"
+        );
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing reaches SY.admin"
+        );
+        // Its args written in full, with nothing to fill, it goes on.
+        let mut plain = plan;
+        plain["execution"]["steps"][0]
+            .as_object_mut()
+            .expect("step")
+            .remove("executor_fill");
+        assert!(validate_architect_executor_plan_shape(&plain).is_ok());
     }
 
     /// FINDINGS A-320: which entry of SY.admin's command log is a record's. The same action, sent by

@@ -7185,7 +7185,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
 - **Built in 0.1.92** (`maxAgentCallsPerTrigger`, go/nodes/wf/wf-generic/node), with its tests in
   catch_test.go. The heading said OPEN until 2026-11-02.
 
-### A-124 [Archi] 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
+### A-124 [Archi] 🟡 OPEN · built on `coa/architect-139` for 0.1.139 (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
 
 - **What happens:** `publish_cloud_endpoint` answers with the new bearer, once
   ([io-cloud-api](../../docs/io-cloud-api.md) §2 and §7). Through Archi, that answer goes further:
@@ -7213,6 +7213,50 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   once in the chat and stores it masked in its history (and so in the snapshots). The bug push's
   verification (2026-11-12) read the AI-provider half as closed: SY.admin runs the step with no model
   since 0.1.95, and A-322's report carries no token. In the bug push (item 30).
+- **Built on `coa/architect-139` for 0.1.139** (`src/bin/sy_architect/shown_once.rs`), for the three
+  answers that bring a secret once: `publish_cloud_endpoint`'s and `externalize`'s token (a fanout's
+  `verify_token`) and `vault_get`'s value. Every place Archi keeps an executor answer or its text
+  was checked:
+  - **Shown once:** the answer the chat gets (the chat's and `POST /api/executor/plan`'s) carries
+    the step's answer as it came, and apart `output.shown_once` (`{note, secrets: [{where, field,
+    secret}]}`, found outside the operator's own args and plan). The chat shows a *"Shown once:
+    copy it now"* block and keeps that answer on screen: its 5 s reload of the history (which
+    replaced every answer with its stored copy) waits until the operator writes again or opens
+    another chat.
+  - **The `messages` table** (`kept_response_row`): its `metadata_json` (the whole answer, every
+    `result_preview` in it) and its `content` (so the session's preview too) are kept as
+    `shown_once::kept` keeps an answer: every field whose name reads as a secret's
+    (`key_looks_secret`) and a vault-shaped `value` masked `***REDACTED***`, `shown_once`'s copy
+    among them, and each such value of 8 characters or more masked where a text repeats it (a
+    message, a summary). A field that holds nothing (a public channel's null token) stays.
+  - **`pipeline_runs`**: a run's `execution_report` is kept the same way; its `executor_plan` as it
+    came (CONFIRM 2 runs it).
+  - **Archi's memory** is made from those rows (and A-322's turn from its allowlist), so no later
+    turn is given the token.
+  - **The `operations` table**: its `params_json` was redacted already, but by a shorter list of
+    names than SY.admin's run log: `key_looks_secret` takes SY.admin's (`authorization`, `ssh_key`,
+    `private_key`, `*_private_key`), where an `add_hive`'s `ssh_key` stayed in clear. Its
+    `preview_command` (and the answer's `confirmed_command`) kept an SCMD as typed, an `add_hive`'s
+    `ssh_password` in clear: now as the chat's copy keeps it, its body's secrets redacted. Its
+    `error_summary` is SY.admin's code or detail, which carry no token.
+  - **The operator's own input:** an executor plan pasted in the chat, or sent to `POST
+    /api/executor/plan`, is kept with its steps' secret args masked, as an SCMD's body was.
+  - **No model:** a step of those three actions with `executor_fill` would go through SY.admin's
+    executor model, which gets its answer back: refused by the plan compiler's prevalidation, the
+    precheck of a pasted or sent plan, and before any plan runs (the pipeline's included). The
+    plan compiler's hard rules say so.
+  - Archi's log lines were redacted already (`admin_payload_for_log`); SY.admin's command log keeps
+    no answer.
+  - Tests (each fails without its fix): `a_token_is_shown_once_in_the_answer_and_kept_masked_in_the_history`,
+    `a_pipeline_runs_report_is_kept_masked_and_its_plan_as_it_came`,
+    `what_the_operator_sent_is_kept_with_its_secrets_masked`,
+    `a_plan_whose_secret_would_reach_a_model_is_refused_before_it_runs`; and `shown_once`'s own
+    three. The chat page's script was checked with `node --check`; the block and the hold only on
+    8.x.
+  - **Not on this branch:** the texts that send a publish *"never through Archi (FINDINGS A-124)"*:
+    SY.admin's help for `publish_cloud_endpoint` (`src/bin/sy_admin.rs`), sy-admin.md's row and
+    io-cloud-api.md §7, in the files SY.admin's and SY.edge's 0.1.139 branches change (A-317).
+    Through Archi is now as safe as the HTTP API; they change with the integration.
 
 ### A-123 ✅ VALIDATED ON 8.x (0.1.91, 2026-10-30) — A message on a running WF instance's thread drives it, whoever sends it
 

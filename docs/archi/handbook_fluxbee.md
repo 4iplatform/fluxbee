@@ -1559,6 +1559,26 @@ Rules for archi when asked about secrets:
 - Supported `resource_type` values: `postgres`, `mysql`, `redis`, `mongodb`, `openai`, `anthropic`, `gemini`, `mistral`, `cohere`, `perplexity`, `google_calendar`, `gmail`, `google_drive`, `google_sheets`, `google_docs`, `google_slides`, `google_cloud`, `microsoft_graph`, `outlook_email`, `outlook_calendar`, `teams`, `sharepoint`, `slack`, `discord`, `hubspot`, `salesforce`, `linked_helper`, `github`, `gitlab`, `jira`, `linear`, `notion`, `stripe`, `twilio`, `sendgrid`, `smtp`, `imap`, `aws`, `azure`, `s3`, `webhook`, `bearer_token`, `api_key`, `oauth_bundle`, plus free-form custom strings (lowercase, snake_case, max 64 chars).
 - Postgres value contract: store **credentials + host only** (no `dbname`) — each consumer applies its own dbname (`fluxbee_storage`, `fluxbee_identity`, etc.). Example value: `{"postgres_url": "postgresql://user:pass@host:5432"}`.
 
+### 4.5.1 A secret an answer brings is shown once
+
+Three actions answer a secret once: `publish_cloud_endpoint` the bearer token Fluxbee Cloud uses
+(`token`), `externalize` an edge channel's token (`token`, or a fanout's `verify_token`), and
+`vault_get` a secret's `value`. Since 0.1.139 (FINDINGS A-124):
+
+- The chat shows it once, in a "Shown once: copy it now" block under the plan's answer, and keeps
+  that answer on screen until the operator writes again or opens another chat. The chat's history
+  keeps it masked (`***REDACTED***`), and so does a snapshot of Archi's node.
+- You never see it: the turn that tells what a plan did gets no secret, and later turns read the
+  masked history. Never ask the operator for it and never repeat it. A minted token cannot be read
+  back: it lives only in the vault, for the edge, and SY.admin does not read it.
+- After such a run, tell the operator to copy it from that block now and to hand it over through
+  their private channel (Fluxbee Cloud's token goes to the Cloud's operator, never in a chat).
+- If the operator lost it: it is not kept anywhere they can read. For the Cloud's token, publishing
+  again (`publish_cloud_endpoint`, a plan they confirm) mints a new one, which the Cloud must get at
+  once; say so before staging it.
+- A step of those three actions never carries `executor_fill`: SY.admin's executor would run it
+  through its model, which would get the answer. Write its args in full; Archi refuses such a plan.
+
 ---
 
 ## 5. Choosing Between Routing, Workflow, Taps, and OPA

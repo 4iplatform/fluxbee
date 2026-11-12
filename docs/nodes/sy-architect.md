@@ -380,6 +380,47 @@ that answered ok with versions left read as a full success.
 - The pipeline's `CONFIRM 2` and a plan pasted in the chat or sent to `POST /api/executor/plan`
   keep their own answers, with no such turn.
 
+### A secret an answer brings: shown once, kept masked
+
+Since 0.1.139 (FINDINGS A-124, the operator's call of 2026-11-12: show it once, keep it masked).
+`publish_cloud_endpoint` answers the Cloud's bearer once (its `token`), `externalize` an edge
+channel's (`token`, or a fanout's `verify_token`) and `vault_get` a secret's `value`. Through Archi
+such an answer comes back in a step's `result_preview` (`src/bin/sy_architect/shown_once.rs`):
+
+- **The chat gets it once.** The answer the chat gets (`handle_chat_message`, `POST
+  /api/executor/plan`) carries the step's answer as it came and, apart, `output.shown_once`:
+  `{note, secrets}`, each secret as `{where, field, secret}` (`step s1 (publish_cloud_endpoint)`,
+  `token`, its value), found outside the operator's own input (a step's args, a plan). The chat
+  shows them in a "Shown once: copy it now" block under the answer, and keeps that answer on
+  screen: the periodic reload of the chat's history does not replace it until the operator sends
+  again or opens another chat (`shownOnceHold`).
+- **What Archi keeps is masked** (`shown_once::kept`): the chat's `messages` row of that answer
+  (`kept_response_row`: its `metadata_json` and its `content`, and so the session's preview), and
+  a pipeline run's `execution_report` in `pipeline_runs`, have every field whose name reads as a
+  secret's (`key_looks_secret`) and a vault-shaped object's `value` replaced by `***REDACTED***`
+  (one that holds nothing, a public channel's null token, stays), and each such value of 8
+  characters or more masked wherever a text repeats it. So the token is in no row, no snapshot of
+  Archi's directory, and nothing a later turn reads (its memory is made from the rows); the history
+  shows the block as "Shown once (kept masked)". A run's plan is kept as it came: `CONFIRM 2` runs
+  it.
+- **No model gets it.** SY.admin's executor runs a step with nothing to fill as the plan wrote it,
+  with no model (since 0.1.95); a step with `executor_fill` goes through its model, which gets the
+  step's answer back. A step of `publish_cloud_endpoint`, `externalize` or `vault_get` with
+  `executor_fill` is refused: by the plan compiler's prevalidation, by the precheck of a plan pasted
+  or sent to `POST /api/executor/plan`, and before any plan runs
+  (`refusal_of_a_plan_whose_secret_would_reach_a_model`, "executor plan validation failed: step s1
+  (publish_cloud_endpoint) answers a secret..."). The explanation turn (above) is given no secret.
+- **What the operator sent is kept masked too**: an executor plan pasted in the chat, or sent to
+  `POST /api/executor/plan`, with its steps' secret args masked (a vault value, an SSH password or
+  key), as an SCMD's body already was (`sanitize_user_message_for_persistence`); the command line
+  of an SCMD mutation in the `operations` table (`preview_command`, and `confirmed_command` in its
+  answer) too, where an `add_hive`'s `ssh_password` stayed in clear. Archi's secret names are
+  SY.admin's run log's (`redaction_field_is_secret`): `authorization`, `ssh_key`, `private_key`
+  and `*_private_key` too, so an `add_hive`'s `ssh_key` is no longer kept in clear in the
+  operation's `params_json`.
+- Archi's own log lines were redacted already (`admin_payload_for_log`), and SY.admin's command
+  log keeps no answer.
+
 ## Pipelines
 
 `fluxbee_start_pipeline` starts the design pipeline; `fluxbee_pipeline_action` resolves a blocked
