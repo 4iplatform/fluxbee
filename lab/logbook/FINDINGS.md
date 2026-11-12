@@ -230,6 +230,16 @@ no change required
     (A-272, A-268). A-314's leftover, SY.admin's help that offers `SY.admin@motherbee` as the
     `node_name` of `kill_node` and `remove_node_instance`, is built for SY.admin's 0.1.137
     (`coa/admin-136`, `b0bfce41`).
+26. **0.1.135, the router alone** ✅ live and checked on 8.x (2026-11-12): A-272 (split horizon: a
+    broadcast that came over the WAN never goes back to the peer it came from; 32 broadcasts from
+    each hive reached every receiver exactly once and no router logged a drop, where on 0.1.134 the
+    echoes gave 7 drop lines on the motherbee and 6 on each spoke) and A-268 (FIB builds stored in
+    the order they began; its race by its unit test, and A-265's check reached a new node on
+    worker1 from ingress1 0.05 to 0.15 s after its connect, 0.33 s on 0.1.132). The smoke after
+    A-314: a stopped node whose unit was gone was started (ok in 1.3 s, `RUNNING` at 11 s), and a
+    core node's kill was refused. Health clean on every hive with `wandrops=0`, which `ops.py
+    health` checks from now on.
+    **Next:** 0.1.136, the AI SDK alone (A-257, `coa/aisdk-135`).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -341,9 +351,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-257 🔵 The frontdesk's handoff waits behind its LLM turns (low; the AI SDK).
 - A-263 🔵 The installation update's follow reads one hive at a time (low; with A-250's gate).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
-- A-268 🔵 Two FIB builds at once can store the older one last (low; the router).
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
-- A-272 🔵 Every router sends a WAN broadcast back to the peer it came from (low; the router).
 - A-273 🔵 `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door open and its new token lost (low; decided 2026-11-11; SY.admin in 0.1.136).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
@@ -1873,7 +1881,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Why:** `RouterDispatcher`'s command channels are `mpsc::unbounded_channel`
   (`crates/fluxbee_sdk/src/rpc.rs` ~593), with only a WARN at a depth of 1,000 (~76, ~614). The AI
   runtime's old *queue of 128* was no real bound: what waited behind it piled up there. Since A-257
-  (0.1.135) the AI runtime drains it continuously; any other node that stops draining a command
+  (0.1.136) the AI runtime drains it continuously; any other node that stops draining a command
   channel grows without limit.
 - **Fix, later (the Rust SDK alone):** a bounded channel with a named refusal past its bound.
 - **The operator (2026-11-11):** after the sweep (the Rust SDK alone, with the next change there).
@@ -1885,7 +1893,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   runners propagate it with `?`, and the node process exits, cutting every other turn in flight.
   ai.generic offloads long text to `content_ref`, so the likely source is a large request context
   copied into a reply, or a large control answer.
-- **Since 0.1.135 (A-257's review):** no waiting turn starts after such an end.
+- **Since 0.1.136 (A-257's review):** no waiting turn starts after such an end.
 - **Fix, later (the AI SDK alone):** a write refused as too large fails that message alone, counted
   and logged, as an exhausted recoverable write does.
 - **The operator (2026-11-11):** after the sweep (the AI SDK alone, with the next change there).
@@ -1907,10 +1915,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`src/router/mod.rs` ~7774-7777), before the runtime refuses it; the `ai_runtime_busy` answer is
   not text/v1, so cognition keeps no Out turn (`src/bin/sy_cognition.rs` ~1157-1167).
 - **Effect:** the person's message stays unanswered in the communication, and appears twice in the
-  next package if the person sends it again. Since A-257 (0.1.135) a busy node refuses at once, so
+  next package if the person sends it again. Since A-257 (0.1.136) a busy node refuses at once, so
   this becomes the usual case under load (the old runtime ran such a turn, late).
 - **Fix, later (cognition):** an In turn whose `trace_id` the agent answered `ai_runtime_busy` is
-  dropped or marked unanswered; the busy answer's trace entry says `busy` since 0.1.135.
+  dropped or marked unanswered; the busy answer's trace entry says `busy` since 0.1.136.
 - **Built on `coa/cognition-136` (0.1.136).** From its review: cognition drops the refused turn even
   when the busy answer never reached the sender (the router copies the agent's send for cognition
   at entry, before routing, so a busy answer lost to `LINK_BUSY` still drops it); under io.slack
@@ -1926,7 +1934,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   ~3099-3112; `TextV1Payload::from_value`, `nodes/io/common/src/text_v1_blob.rs` ~383) as *"Error
   (invalid_text_payload) while processing the content or attachments."*, error payloads included
   (`ai_runtime_busy`, `ai_runtime_error`, `ai_runtime_timeout`).
-- **Effect:** the person reads that their content was invalid; since A-257 (0.1.135) a busy node
+- **Effect:** the person reads that their content was invalid; since A-257 (0.1.136) a busy node
   answers `ai_runtime_busy` at once, so under load this is the usual answer.
 - **Fix, with io.slack's revamp:** post the payload's `message`, with a send-again hint when
   `retryable` is true.
@@ -1934,7 +1942,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 ### A-290 [General/AI runners] 🔵 low (found 2026-11-11 by A-257's reviews; read in the code) — An AI node answers `HEALTHY` while its runtime refuses every turn
 
 - **Why:** `build_node_status_response_payload` (`crates/fluxbee_sdk/src/managed_control_plane.rs`
-  ~342-367) looks only at the config state; since A-257 (0.1.135) `NODE_STATUS_GET` is always
+  ~342-367) looks only at the config state; since A-257 (0.1.136) `NODE_STATUS_GET` is always
   answered at once, while the lanes' load (`turns_waiting`, `turns_refused`, `direct_dropped`,
   `busy_answers_dropped`) shows only in the journal's *"ai runtime metrics"* line.
 - **Effect:** neither `get_node_status` nor Archi, the operator's interface, sees a saturated node;
@@ -2355,7 +2363,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Cloud the new token at once. On a record that times out, the retry waits another 30 s, so the
   call can take about 2 minutes. Found by its review: A-316 and A-317.
 
-### A-272 [General/router] 🔵 low (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
+### A-272 [General/router] ✅ VALIDATED ON 8.x (0.1.135, 2026-11-12; 32 broadcasts from each hive reached every receiver exactly once and no router logged a drop, where 0.1.134 logged the echoes, 7 lines on the motherbee and 6 on each spoke) (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
 
 - **Seen:** the motherbee logged `foreign_source` drops of its own nodes' broadcasts coming back
   from ingress1 and worker1 (`src_l2_name` `IO.gate0232b@motherbee`, 0.1.131 and 0.1.132), and
@@ -2369,6 +2377,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   line filled with echoes (most of what A-195 counted), which hides a real drop.
 - **Fix:** split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one
   it came from (a spoke, with the hub its only peer, sends none).
+- **Checked on 8.x (0.1.135, against a baseline on 0.1.134 the same night):** a receiver
+  `IO.gate0235r` and a sender `IO.gate0235s` on each of the four hives, each sender sending a
+  broadcast (ttl 16, `meta.target` `IO.gate0235*`) every 15 s. On 0.1.134 (16 per hive) every
+  receiver got each broadcast once, and the routers dropped the echoes and logged them as *"router
+  dropped a WAN frame"* (`foreign_source`): 7 lines on the motherbee (`reject_count` 133 to 178;
+  `peer_hive` worker1 and egress1, its own sender's broadcasts coming back) and 6 on each spoke
+  (`peer_hive` motherbee, the spoke's own sender's coming back from the hub). On 0.1.135 (32 per
+  hive, from 2 min after the last router restart) every receiver got each broadcast exactly once
+  (none missed, none twice), and no hive logged a drop line. Since then `ops.py health` checks
+  `wandrops=0` (`HEALTH_OK`).
 
 ### A-271 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133 with 0.1.134's A-314 fix, run on 0.1.134, 2026-11-11; 20 self-restarts on worker1 and egress1 acted on no check; its reading of a unit systemd does not have as no answer was A-314, fixed in 0.1.134) (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — A check that decides an action takes "no answer" for "no"
 
@@ -2432,7 +2450,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Another sender (A-293's review, 2026-11-11):** IO.cloud logs the Cloud's `op` unescaped
   (`op = %op`) on its received and completed lines; a trusted sender, left for the router's fix.
 
-### A-268 [General/router] 🔵 low (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
+### A-268 [General/router] ✅ VALIDATED ON 8.x (0.1.135, 2026-11-12; its race by its unit test, no live trigger; A-265's check, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 
 - **Why:** `rebuild_fib` (`src/router/mod.rs`) reads the nodes, the siblings, the static routes, the
   LSA snapshot and the reachability, and stores its FIB at the end under the FIB's lock; nothing
@@ -2446,6 +2464,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** a generation per router, taken before the reads and compared under the FIB's lock, so
   only a newer build is stored; or a mutex taken first that serializes the builds, after checking
   that no caller holds their inputs.
+- **Checked on 8.x (0.1.135):** built as the first option, a generation per build (`625413a4`). Its
+  race has no live trigger; its unit test covers it
+  (`a_fib_build_that_read_before_an_lsa_never_undoes_the_lsas_own`). Through A-265's check, three
+  runs: a node connecting on worker1 was reached by name from ingress1, the first message delivered
+  0.05 s, 0.15 s and 0.14 s after its connect (0.1.132: 0.33 s); the messages sent before the
+  connect answered `NODE_NOT_FOUND` from ingress1's router, as expected.
 
 ### A-267 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133 with 0.1.134's A-314 fix, run on 0.1.134, 2026-11-11; 20 self-restarts of the orchestrator on worker1 and egress1: no service started, no false line) (found 2026-11-11 by 0.1.131's deploy timeline; seen on 8.x, read in the code) — The watchdog's last tick, during the orchestrator's own stop, reads a healthy service as down and tries to start it
 
@@ -2609,7 +2633,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Correction (A-257's builder, 2026-11-11):** the frontdesk's runner is
   `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (its `RuntimeConfig` at ~3121), not
   ai.generic's.
-- **Built for 0.1.135 (`coa/aisdk-135`, the AI SDK alone):** two lanes; a handoff runs beside the
+- **Built for 0.1.136 (`coa/aisdk-135`, the AI SDK alone):** two lanes; a handoff runs beside the
   workers only in the shape the frontdesk parses, within 30 s and on at most 8 of the direct lane's
   64 places. **For the frontdesk's own release:** an `AiNode` method by which the node says what it
   answers without its model (default system and admin only; the frontdesk's override is
@@ -2622,9 +2646,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Without it, a new field in the busy answer silently turns A-292 off with every test green. Also:
   `run_direct_message`'s comment (`runtime.rs` ~772 on `coa/aisdk-135`) and
   `docs/nodes/sy-frontdesk-gov.md` say IO.cloud takes any error answer to a handoff for
-  `FRONTDESK_REJECTED`, which is stale once 0.1.136 (A-293) ships: update both when 0.1.135 and
-  0.1.136 are merged, and ship the follow-up (answer `ai_runtime_busy` instead of dropping) only
-  after 0.1.136 runs on every motherbee.
+  `FRONTDESK_REJECTED`, which is stale once 0.1.137 (A-293) ships: update both when 0.1.136 and
+  0.1.137 are merged, and ship the follow-up (answer `ai_runtime_busy` instead of dropping) only
+  after 0.1.137 runs on every motherbee.
 
 ### A-256 [IO/io.cloud] 🔵 low (found 2026-11-10 by A-91's builder; read in the code) — io.cloud accepts `io.inbound_family` and ignores it
 
