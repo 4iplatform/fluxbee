@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -342,6 +342,11 @@ struct CognitionRuntimeState {
     refusals_total: u64,
     refused_turns_dropped_total: u64,
     refused_turns_not_analyzed_total: u64,
+    /// The person's turns the worker waited on for their agent's answer or refusal before it
+    /// analyzed them (`wait_for_the_agent`, FINDINGS A-332), and those of them whose wait ran its
+    /// whole grace with neither.
+    agent_waits_total: u64,
+    agent_waits_grace_over_total: u64,
     /// Records of a stream batch at or below the last seq taken for that stream and epoch.
     stream_repeats_skipped_total: u64,
     /// Communications loaded from the file after start, and the loads that failed: a turn whose
@@ -435,6 +440,10 @@ struct CognitionAppState {
     /// The turns its agents refused without running them (`Refusals`, FINDINGS A-292). Locked under
     /// `thread_states` and after `takes`, or alone; never before either.
     refusals: std::sync::Mutex<Refusals>,
+    /// The messages its agents answered or refused lately (`Answers`, FINDINGS A-332), and the
+    /// worker's wake when the intake takes more (`wait_for_the_agent`). Locked alone.
+    answers: std::sync::Mutex<Answers>,
+    agents_answered: Notify,
     vault: VaultClient,
     dispatcher: Arc<RouterDispatcher>,
     /// Agent node → its ILK and tenant, read from the identity shared memory.
@@ -465,7 +474,8 @@ struct CommunicationKey {
 /// A copy of a turn its router made for this cognition: the message, who holds its communication
 /// (`holder_of`, none for an agent without an ILK in the identity memory), whether a WF relayed it
 /// between people, its record's seq, whether the intake found its communication held it already
-/// (`turn_key`), and the clears taken before its intake (`CognitionAppState::clears`).
+/// (`turn_key`), the clears taken before its intake (`CognitionAppState::clears`), and when the
+/// intake took it, which the worker's wait for the agent counts from (`wait_for_the_agent`).
 #[derive(Debug)]
 struct CognitionTurn {
     message: Message,
@@ -474,6 +484,7 @@ struct CognitionTurn {
     seq: u64,
     duplicate: bool,
     clears: u64,
+    taken_at: time::Instant,
 }
 
 /// A communication as this cognition holds it and writes it to its file: online state, so an item
@@ -844,6 +855,8 @@ async fn main() -> Result<(), CognitionError> {
         unsaved: std::sync::Mutex::new(HashSet::new()),
         takes: std::sync::Mutex::new(Takes::default()),
         refusals: std::sync::Mutex::new(Refusals::default()),
+        answers: std::sync::Mutex::new(Answers::default()),
+        agents_answered: Notify::new(),
         vault: vault_client,
         dispatcher: Arc::clone(&dispatcher),
         agent_ilks: Mutex::new(HashMap::new()),
@@ -1006,12 +1019,14 @@ async fn run_turn_worker(mut rx: mpsc::Receiver<CognitionTurn>, app_state: Arc<C
 /// a turn and counts it. An agent's refusal of a turn it never ran (`is_busy_answer`, FINDINGS
 /// A-292) is no turn: it goes to its communication after the turns before it, which include the
 /// one it refused (its router copies a turn for its agent before the agent can answer it), and
-/// never to the worker.
+/// never to the worker. Each message an agent answered or refused is noted for the worker, which
+/// may be waiting for it (`Answers`, FINDINGS A-332).
 async fn take_stream_batch(
     app_state: &CognitionAppState,
     turn_tx: &mpsc::Sender<CognitionTurn>,
     msg: &Message,
 ) {
+    let taken_at = time::Instant::now();
     let from = msg.routing.src_l2_name.as_deref().unwrap_or("");
     if !is_stream_node_name(from) || stream_hive(from) != Some(app_state.hive_id.as_str()) {
         tracing::warn!(
@@ -1042,6 +1057,8 @@ async fn take_stream_batch(
     let mut turns = Vec::new();
     let mut recent: Vec<Intake> = Vec::new();
     let mut relays = Vec::new();
+    // The messages its agents answered or refused in this batch (A-332).
+    let mut answered: Vec<(CommunicationKey, String)> = Vec::new();
     // A clear runs in the main loop too, so none comes while this batch is taken.
     let clears = app_state.clears.load(Ordering::SeqCst);
     for record in batch.records {
@@ -1079,15 +1096,17 @@ async fn take_stream_batch(
         // In the batch's order, after the turn it refused; never to the worker.
         if refusal {
             refusals += 1;
-            recent.extend(
-                holder
-                    .as_ref()
-                    .and_then(|holder| refusal_of(&message, holder))
-                    .map(Intake::Refusal),
-            );
+            if let Some(refusal) = holder
+                .as_ref()
+                .and_then(|holder| refusal_of(&message, holder))
+            {
+                answered.push((refusal.key.clone(), refusal.request.clone()));
+                recent.push(Intake::Refusal(refusal));
+            }
             continue;
         }
         if let Some(holder) = holder.as_ref() {
+            answered.extend(answer_of(&message, holder));
             recent.extend(
                 intake_turn(app_state, &message, holder, record.seq, record.ts_ms)
                     .map(Intake::Turn),
@@ -1100,11 +1119,24 @@ async fn take_stream_batch(
             seq: record.seq,
             duplicate: false,
             clears,
+            taken_at,
         });
     }
     // The next message its router delivers to the agent carries these turns, whatever the
     // worker's backlog. A turn its communication held already is not analyzed again.
     let mut duplicates = take_recent_turns(app_state, recent).await;
+    // Once the refusals are held: the worker that wakes for one finds what it left (A-332).
+    if !answered.is_empty() {
+        let mut answers = app_state
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, request) in answered {
+            answers.record(taken_at, key, request);
+        }
+        drop(answers);
+        app_state.agents_answered.notify_waiters();
+    }
     // A relay joins the communication whose agent served its thread last, this batch's turns
     // included: a WF that sends one message to an agent and to a person puts both copies in one
     // batch, whichever it sends first, and the relay is that agent's turn once
@@ -1363,6 +1395,43 @@ fn refusal_of(answer: &Message, holder: &Holder) -> Option<Refusal> {
         request: refused_request(answer)?,
         trace_id: answer.routing.trace_id.clone(),
     })
+}
+
+/// The message an agent's answer answers (FINDINGS A-332), as its refusal names one
+/// (`refused_request`): the answer's cycle, and its trace before the agent's entry. The AI runtime
+/// writes that entry, the trace's last, as it sends (docs/message-trace-v1.md §5). None when the
+/// trace's last entry is not `agent_node`'s: an agent that writes none names no message.
+fn answered_request(answer: &Message, agent_node: &str) -> Option<String> {
+    message_trace::entries(answer.meta.context.as_ref())
+        .last()
+        .is_some_and(|entry| entry.from == agent_node)
+        .then(|| refused_request(answer))
+        .flatten()
+}
+
+/// An agent's answer to a message it got, as the intake notes it for the worker (`Answers`,
+/// FINDINGS A-332): the agent's communication and the message answered (`answered_request`). None
+/// for what the agent did not send, without a thread, or for an agent with no ILK in the identity
+/// memory (`holder_of`), whose turns the worker skips.
+fn answer_of(message: &Message, holder: &Holder) -> Option<(CommunicationKey, String)> {
+    let Holder::Agent { node, identity } = holder else {
+        return None;
+    };
+    if message.routing.src_l2_name.as_deref() != Some(node.as_str()) {
+        return None;
+    }
+    let thread_id = message
+        .meta
+        .thread_id
+        .clone()
+        .filter(|thread_id| !thread_id.trim().is_empty())?;
+    Some((
+        CommunicationKey {
+            thread_id,
+            agent_ilk: identity.ilk.clone(),
+        },
+        answered_request(message, node)?,
+    ))
 }
 
 /// Who wrote a turn the agent got (docs/cognition-hands-v1.md §6): its `meta.context.writer`, else
@@ -1669,6 +1738,64 @@ impl Refusals {
     fn dropped(&self, key: &CommunicationKey, request: &str) -> bool {
         self.of(key, request)
             .is_some_and(|refused| refused.relayed.is_none())
+    }
+}
+
+/// How long, from its intake, the worker waits for an agent's answer to a person's message the
+/// agent got before it analyzes that turn (`wait_for_the_agent`, FINDINGS A-332). A busy AI runtime
+/// refuses a turn at once (`ai_runtime_busy`, in 7 to 12 ms), and on 8.x cognition took the refusal
+/// 0.04 to 0.26 s after it (A-292's gate): 2 s is some eight times the slowest, with room for a slow
+/// write of the batch before it. The wait ends as soon as the agent answers or refuses, so it holds
+/// back a turn the agent took by at most this, only when the worker had nothing else to do: a turn
+/// that waited in the queue longer than this does not wait again.
+const COGNITION_REFUSAL_GRACE: Duration = Duration::from_secs(2);
+
+/// How many answers `Answers` keeps at most, the oldest out first: 2,048 answers a second over the
+/// grace. Past that, a wait for an answer that left runs out its grace, as with no answer.
+const COGNITION_ANSWERS_KEPT: usize = 4096;
+
+/// The messages its agents answered lately, their refusals included (FINDINGS A-332): each by the
+/// agent's communication and the message as the agent's copy of it names it (`request_of`), with
+/// when the intake took the answer. In memory only. The worker waits for the answer to a person's
+/// turn at most `COGNITION_REFUSAL_GRACE` from the turn's intake (`wait_for_the_agent`), and an
+/// answer comes after the message it answers, in its agent's router's stream, so one taken longer
+/// ago than that is never looked for again, and leaves.
+#[derive(Debug, Default)]
+struct Answers {
+    recent: VecDeque<Answer>,
+}
+
+/// An answer `Answers` keeps.
+#[derive(Debug)]
+struct Answer {
+    at: time::Instant,
+    key: CommunicationKey,
+    request: String,
+}
+
+impl Answers {
+    fn record(&mut self, at: time::Instant, key: CommunicationKey, request: String) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|answer| at.saturating_duration_since(answer.at) > COGNITION_REFUSAL_GRACE)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(Answer { at, key, request });
+        while self.recent.len() > COGNITION_ANSWERS_KEPT {
+            self.recent.pop_front();
+        }
+    }
+
+    /// Whether the agent of `key` answered or refused `request` (`request_of`).
+    fn holds(&self, key: &CommunicationKey, request: &str) -> bool {
+        !request.is_empty()
+            && self
+                .recent
+                .iter()
+                .rev()
+                .any(|answer| answer.key == *key && answer.request == request)
     }
 }
 
@@ -2485,9 +2612,68 @@ async fn write_back_worker_turn(
     (outcome, synced)
 }
 
+/// How the worker's wait for an agent's answer ended (`wait_for_the_agent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentWait {
+    /// No wait: the agent had answered or refused already, or the turn's grace was over.
+    NotNeeded,
+    /// The agent answered or refused within the grace.
+    Answered,
+    /// The grace ran out with neither.
+    GraceOver,
+}
+
+/// The worker's wait for the agent of `key` to answer or refuse `request`, a person's message it
+/// got (FINDINGS A-332), until `COGNITION_REFUSAL_GRACE` after the turn's intake (`taken_at`). A
+/// busy AI runtime refuses a turn at once, and a refusal the intake takes while the tagger answers
+/// leaves that call wasted (A-292 drops its result): so the analysis starts once the agent answered
+/// or refused, or once the grace is over, whichever comes first. The intake wakes it at each
+/// answer it takes (`agents_answered`). A refused turn is then left out as before
+/// (`Refusals`); one the agent took is analyzed. Never cancelling a call already made: its provider
+/// bills it whatever cognition does, and a call dropped is recorded `abandoned`, without tokens.
+async fn wait_for_the_agent(
+    app_state: &CognitionAppState,
+    key: &CommunicationKey,
+    request: &str,
+    taken_at: time::Instant,
+) -> AgentWait {
+    let until = taken_at + COGNITION_REFUSAL_GRACE;
+    let mut waited = false;
+    loop {
+        // Registered before the look, so an answer the intake takes right after it wakes the wait.
+        let mut answered = std::pin::pin!(app_state.agents_answered.notified());
+        answered.as_mut().enable();
+        if app_state
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .holds(key, request)
+        {
+            return if waited {
+                AgentWait::Answered
+            } else {
+                AgentWait::NotNeeded
+            };
+        }
+        if time::Instant::now() >= until {
+            return if waited {
+                AgentWait::GraceOver
+            } else {
+                AgentWait::NotNeeded
+            };
+        }
+        waited = true;
+        tokio::select! {
+            () = answered => {}
+            () = time::sleep_until(until) => {}
+        }
+    }
+}
+
 /// One turn of a communication (§6.2): the ILK of the agent that owns it, its state (from the file
 /// when it is not held), the tagger and the derivations, its file row and the agent's memory
-/// package.
+/// package. A person's message the agent got waits first for the agent's answer, a short grace at
+/// most (`wait_for_the_agent`, FINDINGS A-332).
 async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     let msg = turn.message;
     let Some(thread_id) = msg
@@ -2535,6 +2721,34 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     } else {
         request_of(&msg)
     };
+    let person = person_at_other_end(&msg, &agent_node, |ilk| {
+        message_writer::ilk_facts(&app_state.hive_id, ilk)
+    });
+    // A person's message the agent got, which the agent may still refuse, is analyzed once the
+    // agent answered or refused it, or once its grace is over (FINDINGS A-332): a refusal the
+    // intake takes while the tagger answers wastes that call. A turn no model reads waits for
+    // nothing.
+    if person && !request.is_empty() {
+        let started = time::Instant::now();
+        let waited = wait_for_the_agent(&app_state, &key, &request, turn.taken_at).await;
+        if waited != AgentWait::NotNeeded {
+            let mut state = app_state.runtime_state.lock().await;
+            state.agent_waits_total = state.agent_waits_total.saturating_add(1);
+            if waited == AgentWait::GraceOver {
+                state.agent_waits_grace_over_total =
+                    state.agent_waits_grace_over_total.saturating_add(1);
+            }
+            drop(state);
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                agent_ilk = %agent_ilk,
+                waited_ms = started.elapsed().as_millis() as u64,
+                ended = ?waited,
+                "sy.cognition waited for the agent's answer to a person's turn before analyzing it"
+            );
+        }
+    }
     // A turn its agent refused without running it is no turn of its communication: the intake
     // dropped it, and it is not analyzed. One a WF relayed to a person too is that relay again:
     // this copy came first, the relay's record was its duplicate, and this copy is analyzed as the
@@ -2567,9 +2781,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     // Only a turn with a person at its other end is analyzed (docs/cognition-hands-v1.md §6): a turn
     // between agents, or a WF's own text, stays among the communication's last turns, which the
     // intake took and wrote, and in `turns`.
-    if !person_at_other_end(&msg, &agent_node, |ilk| {
-        message_writer::ilk_facts(&app_state.hive_id, ilk)
-    }) {
+    if !person {
         app_state
             .runtime_state
             .lock()
@@ -4439,6 +4651,8 @@ fn build_status_payload(
         "refusals_total": runtime_state.refusals_total,
         "refused_turns_dropped_total": runtime_state.refused_turns_dropped_total,
         "refused_turns_not_analyzed_total": runtime_state.refused_turns_not_analyzed_total,
+        "agent_waits_total": runtime_state.agent_waits_total,
+        "agent_waits_grace_over_total": runtime_state.agent_waits_grace_over_total,
         "relay_turns_total": runtime_state.relay_turns_total,
         "duplicate_turns_skipped_total": runtime_state.duplicate_turns_skipped_total,
         "last_trace_id": runtime_state.last_trace_id,
@@ -4626,6 +4840,11 @@ fn build_cognition_config_get_payload(
         "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
         "intake_turns_total": runtime_state.intake_turns_total,
         "turns_not_analyzed_total": runtime_state.turns_not_analyzed_total,
+        "refusals_total": runtime_state.refusals_total,
+        "refused_turns_dropped_total": runtime_state.refused_turns_dropped_total,
+        "refused_turns_not_analyzed_total": runtime_state.refused_turns_not_analyzed_total,
+        "agent_waits_total": runtime_state.agent_waits_total,
+        "agent_waits_grace_over_total": runtime_state.agent_waits_grace_over_total,
         "store_loads_total": runtime_state.store_loads_total,
         "store_load_failures_total": runtime_state.store_load_failures_total,
         "conversations_taken_total": runtime_state.conversations_taken_total,
@@ -7838,6 +8057,8 @@ mod tests {
             unsaved: std::sync::Mutex::new(HashSet::new()),
             takes: std::sync::Mutex::new(Takes::default()),
             refusals: std::sync::Mutex::new(Refusals::default()),
+            answers: std::sync::Mutex::new(Answers::default()),
+            agents_answered: Notify::new(),
             vault: VaultClient::for_primary(
                 Arc::clone(&dispatcher),
                 VaultCallerOwned::new("ilk:cognition".to_string(), node_name),
@@ -10144,10 +10365,9 @@ mod tests {
 
     /// What the agent's AI runtime answers a turn it refuses without running it, since 0.1.136
     /// (`busy_reply` and `send_reply`, crates/fluxbee_ai_sdk/src/runtime.rs): the reply to the
-    /// request with the runtime's error, stamped as the agent's, and the agent's entry in the
-    /// trace, `busy`, as its SDK writes it; with the agent's name, as its router copies it.
+    /// request with the runtime's error, and the agent's entry in the trace, `busy` (`reply_to`).
     fn busy_answer_to(request: &Message) -> Message {
-        let mut answer = fluxbee_ai_sdk::build_reply_message_runtime_src(
+        reply_to(
             request,
             json!({
                 "type": "error",
@@ -10157,8 +10377,23 @@ mod tests {
                             later.",
                 "retryable": true
             }),
-        );
-        fluxbee_ai_sdk::set_reply_act(&mut answer, ["busy"]);
+            &["busy"],
+        )
+    }
+
+    /// What the agent's AI runtime answers a turn it ran: its text, and the agent's entry in the
+    /// trace with no act (`reply_to`).
+    fn answer_to(request: &Message, content: &str) -> Message {
+        reply_to(request, text(content), &[])
+    }
+
+    /// The agent's AI runtime's reply to `request` (`send_reply`,
+    /// crates/fluxbee_ai_sdk/src/runtime.rs): `payload`, stamped as the agent's, and the agent's
+    /// entry in the trace with `act`, as its SDK writes it; with the agent's name, as its router
+    /// copies it.
+    fn reply_to(request: &Message, payload: Value, act: &[&str]) -> Message {
+        let mut answer = fluxbee_ai_sdk::build_reply_message_runtime_src(request, payload);
+        fluxbee_ai_sdk::set_reply_act(&mut answer, act.iter().copied());
         answer.routing.src = Uuid::new_v4().to_string();
         answer.meta.src_ilk = Some(TEST_AGENT.to_string());
         message_writer::set_writer(
@@ -10992,5 +11227,361 @@ mod tests {
             log.note(start + COGNITION_REFUSAL_LOG_INTERVAL * 3),
             Some(1)
         );
+    }
+
+    // --- The worker waits for the agent's answer before a person's turn (FINDINGS A-332) ---
+
+    /// A cognition with no model, whose analysis stops at its first model call, which counts it;
+    /// and the queue its intake hands the turns to.
+    async fn waiting_cognition(
+        hive_id: &str,
+        dir: &Path,
+    ) -> (
+        Arc<CognitionAppState>,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+        mpsc::Sender<CognitionTurn>,
+        mpsc::Receiver<CognitionTurn>,
+    ) {
+        let (app_state, router) = test_app_state(hive_id, None, dir);
+        app_state.control_state.lock().await.ai_settings_error =
+            Some("no model in the tests".to_string());
+        let (turn_tx, turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        (app_state, router, turn_tx, turn_rx)
+    }
+
+    /// The intake takes `records`, a batch of `hive_id`'s stream, and acks it.
+    async fn take_batch(
+        app_state: &CognitionAppState,
+        router: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        turn_tx: &mpsc::Sender<CognitionTurn>,
+        hive_id: &str,
+        records: &[(u64, u64, &Message)],
+    ) {
+        take_stream_batch(app_state, turn_tx, &turns_batch(hive_id, records)).await;
+        let ack = next_outgoing(router).await;
+        assert_eq!(ack.meta.msg.as_deref(), Some(MSG_STREAM_ACK));
+    }
+
+    /// The bug (FINDINGS A-332): with nothing else to do, the worker took a person's turn as soon as
+    /// the intake did, and its tagger call was under way when the agent's refusal came, in the
+    /// stream's next batch 40 ms later (0.037 s on 8.x). A-292 dropped the call's result; the call
+    /// was made. The worker now waits for the agent's answer: the refusal ends the wait at once,
+    /// and no model is called. A refusal the intake took before the worker got to its turn ends no
+    /// wait: there is none.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_after_the_worker_took_its_turn_costs_no_model_call() {
+        let dir = TestDir::new();
+        let (app_state, mut router, turn_tx, mut turn_rx) =
+            waiting_cognition("cogwaitref", &dir.0).await;
+        let question = person_says("Is my invoice ready?");
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitref",
+            &[(1, TEST_TS, &question)],
+        )
+        .await;
+        let start = time::Instant::now();
+        let worker = tokio::spawn(handle_turn(
+            turn_rx.try_recv().expect("the person's turn"),
+            Arc::clone(&app_state),
+        ));
+        time::sleep(Duration::from_millis(40)).await;
+        let busy = busy_answer_to(&question);
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitref",
+            &[(2, TEST_TS + 40, &busy)],
+        )
+        .await;
+        worker.await.expect("the worker");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(40),
+            "the refusal ends the wait"
+        );
+        {
+            let state = app_state.runtime_state.lock().await;
+            assert_eq!(state.semantic_tagger_calls_total, 0, "no model call");
+            assert_eq!(state.refused_turns_not_analyzed_total, 1);
+            assert_eq!(
+                (state.agent_waits_total, state.agent_waits_grace_over_total),
+                (1, 0)
+            );
+        }
+
+        let again = person_says("Is my invoice ready?");
+        let busy = busy_answer_to(&again);
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitref",
+            &[(3, TEST_TS + 60_000, &again), (4, TEST_TS + 60_040, &busy)],
+        )
+        .await;
+        let start = time::Instant::now();
+        handle_turn(
+            turn_rx.try_recv().expect("the turn sent again"),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::ZERO, "no wait");
+        let state = app_state.runtime_state.lock().await;
+        assert_eq!(state.semantic_tagger_calls_total, 0);
+        assert_eq!(state.refused_turns_not_analyzed_total, 2);
+        assert_eq!(state.agent_waits_total, 1);
+        let status = build_status_payload(
+            &app_state.node_name,
+            &test_control_state(),
+            &state,
+            &test_runtime_paths(),
+            None,
+        );
+        assert_eq!(status["turns_consumer"]["agent_waits_total"], json!(1));
+        assert_eq!(
+            status["turns_consumer"]["agent_waits_grace_over_total"],
+            json!(0)
+        );
+        // Where SY.admin, and so Archi, reads them: CONFIG_GET (`node_control_config_get`).
+        let config = build_cognition_config_get_payload(
+            &app_state.node_name,
+            &test_control_state(),
+            &state,
+            &test_runtime_paths(),
+            None,
+        );
+        for (counter, value) in [
+            ("refusals_total", 2),
+            ("refused_turns_dropped_total", 2),
+            ("refused_turns_not_analyzed_total", 2),
+            ("agent_waits_total", 1),
+            ("agent_waits_grace_over_total", 0),
+        ] {
+            assert_eq!(config["runtime"][counter], json!(value), "{counter}");
+        }
+    }
+
+    /// A person's turn the agent took is analyzed all the same, as soon as the agent answers: here
+    /// 300 ms after it, well within the grace. The agent's answer waits for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_the_agent_took_is_analyzed_as_soon_as_it_answers() {
+        let dir = TestDir::new();
+        let (app_state, mut router, turn_tx, mut turn_rx) =
+            waiting_cognition("cogwaitans", &dir.0).await;
+        let question = person_says("Is my invoice ready?");
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitans",
+            &[(1, TEST_TS, &question)],
+        )
+        .await;
+        let start = time::Instant::now();
+        let worker = tokio::spawn(handle_turn(
+            turn_rx.try_recv().expect("the person's turn"),
+            Arc::clone(&app_state),
+        ));
+        time::sleep(Duration::from_millis(300)).await;
+        let answer = answer_to(&question, "Yes: it went out this morning.");
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitans",
+            &[(2, TEST_TS + 300, &answer)],
+        )
+        .await;
+        worker.await.expect("the worker");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(300),
+            "analyzed once the agent answered, not at the grace's end"
+        );
+        {
+            let state = app_state.runtime_state.lock().await;
+            assert_eq!(state.semantic_tagger_calls_total, 1, "the turn is analyzed");
+            assert_eq!(state.refused_turns_not_analyzed_total, 0);
+            assert_eq!(
+                (state.agent_waits_total, state.agent_waits_grace_over_total),
+                (1, 0)
+            );
+        }
+
+        let start = time::Instant::now();
+        handle_turn(
+            turn_rx.try_recv().expect("the agent's answer"),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the answer waits for nothing"
+        );
+        let state = app_state.runtime_state.lock().await;
+        assert_eq!(state.semantic_tagger_calls_total, 2);
+        assert_eq!(state.agent_waits_total, 1);
+    }
+
+    /// A person's turn the agent neither answers nor refuses within the grace is analyzed once the
+    /// grace is over; one that waited that long in the queue already does not wait again; and one
+    /// no model reads, with no person at its other end, waits for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_with_no_answer_is_analyzed_once_its_grace_is_over() {
+        let dir = TestDir::new();
+        let (app_state, mut router, turn_tx, mut turn_rx) =
+            waiting_cognition("cogwaitnone", &dir.0).await;
+        let question = person_says("Is my invoice ready?");
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitnone",
+            &[(1, TEST_TS, &question)],
+        )
+        .await;
+        let start = time::Instant::now();
+        handle_turn(
+            turn_rx.try_recv().expect("the person's turn"),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(start.elapsed(), COGNITION_REFUSAL_GRACE);
+        {
+            let state = app_state.runtime_state.lock().await;
+            assert_eq!(state.semantic_tagger_calls_total, 1, "the turn is analyzed");
+            assert_eq!(
+                (state.agent_waits_total, state.agent_waits_grace_over_total),
+                (1, 1)
+            );
+        }
+
+        let follow_up = person_says("And the receipt?");
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitnone",
+            &[(2, TEST_TS + 60_000, &follow_up)],
+        )
+        .await;
+        // Behind another turn's analysis for the whole grace.
+        time::sleep(COGNITION_REFUSAL_GRACE).await;
+        let start = time::Instant::now();
+        handle_turn(
+            turn_rx.try_recv().expect("the follow-up"),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::ZERO, "it waited in the queue");
+        {
+            let state = app_state.runtime_state.lock().await;
+            assert_eq!(state.semantic_tagger_calls_total, 2);
+            assert_eq!(state.agent_waits_total, 1);
+        }
+
+        let mut reminder = turn_copy(
+            "WF.sales@motherbee",
+            Some("ilk:person"),
+            text("Ana has not answered in 2 days: send a reminder"),
+        );
+        reminder.meta.context = Some(json!({"writer": {"name": "WF.sales@motherbee"}}));
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitnone",
+            &[(3, TEST_TS + 120_000, &reminder)],
+        )
+        .await;
+        let start = time::Instant::now();
+        handle_turn(
+            turn_rx.try_recv().expect("the WF's own text"),
+            Arc::clone(&app_state),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::ZERO, "no model reads it");
+        let state = app_state.runtime_state.lock().await;
+        assert_eq!(state.turns_not_analyzed_total, 1);
+        assert_eq!(state.agent_waits_total, 1);
+    }
+
+    /// An agent's answer names the message it answers by the agent's entry, the trace's last, as
+    /// its refusal does; the intake notes only what the agent sent, in its communication.
+    #[test]
+    fn an_answer_names_the_message_it_answers_by_the_agents_entry() {
+        let question = person_says("Is my invoice ready?");
+        let answer = answer_to(&question, "Yes.");
+        assert_eq!(
+            answered_request(&answer, TEST_AGENT_NODE),
+            Some(request_of(&question))
+        );
+        assert_eq!(answered_request(&answer, "AI.other@motherbee"), None);
+        let mut forwarded = answer.clone();
+        trace_of(&mut forwarded).push(json!({"t": "2026-10-30T12:00:01.000Z",
+            "from": "WF.sales@motherbee", "to": "IO.api@motherbee", "act": ["forward"]}));
+        assert_eq!(answered_request(&forwarded, TEST_AGENT_NODE), None);
+        let mut no_entry = answer.clone();
+        trace_of(&mut no_entry).pop();
+        assert_eq!(answered_request(&no_entry, TEST_AGENT_NODE), None);
+        let mut no_cycle = answer.clone();
+        no_cycle.routing.trace_id = String::new();
+        assert_eq!(answered_request(&no_cycle, TEST_AGENT_NODE), None);
+
+        let holder = Holder::Agent {
+            node: TEST_AGENT_NODE.to_string(),
+            identity: AgentIdentity {
+                ilk: TEST_AGENT.to_string(),
+                tenant: None,
+                seq: 0,
+                read_at: std::time::Instant::now(),
+            },
+        };
+        assert_eq!(
+            answer_of(&answer, &holder),
+            Some((key(TEST_THREAD), request_of(&question)))
+        );
+        assert_eq!(answer_of(&question, &holder), None, "what the agent got");
+        assert_eq!(answer_of(&answer, &Holder::NoAgent), None);
+        let mut no_thread = answer;
+        no_thread.meta.thread_id = None;
+        assert_eq!(answer_of(&no_thread, &holder), None);
+    }
+
+    /// The answers leave once no wait can look for them: a grace after a later one was taken; and
+    /// past `COGNITION_ANSWERS_KEPT`, the oldest first.
+    #[test]
+    fn the_answers_leave_once_no_wait_looks_for_them() {
+        let start = time::Instant::now();
+        let mut answers = Answers::default();
+        answers.record(start, key(TEST_THREAD), "first".to_string());
+        answers.record(
+            start + COGNITION_REFUSAL_GRACE,
+            key(TEST_THREAD),
+            "second".to_string(),
+        );
+        assert!(answers.holds(&key(TEST_THREAD), "first"), "a wait may look");
+        assert!(!answers.holds(&key("thread:other"), "first"));
+        assert!(!answers.holds(&key(TEST_THREAD), ""));
+        answers.record(
+            start + COGNITION_REFUSAL_GRACE + Duration::from_millis(1),
+            key(TEST_THREAD),
+            "third".to_string(),
+        );
+        assert!(!answers.holds(&key(TEST_THREAD), "first"), "no wait looks");
+        assert!(answers.holds(&key(TEST_THREAD), "second"));
+
+        let mut answers = Answers::default();
+        for n in 0..=COGNITION_ANSWERS_KEPT {
+            answers.record(start, key(TEST_THREAD), format!("answer {n}"));
+        }
+        assert_eq!(answers.recent.len(), COGNITION_ANSWERS_KEPT);
+        assert!(!answers.holds(&key(TEST_THREAD), "answer 0"));
+        assert!(answers.holds(&key(TEST_THREAD), "answer 1"));
     }
 }

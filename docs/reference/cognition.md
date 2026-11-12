@@ -175,6 +175,9 @@ stays in the last turns.
      its `dst_ilk` is. An ILK the identity does not know yet counts as a person's. Any other turn
      stops here: it stays among the last turns, which the intake wrote to the file, unanalyzed
      and unnumbered (`turns_not_analyzed_total`), with no model call.
+   - **The agent's answer first** (FINDINGS A-332, since 0.1.139): a person's message the agent
+     got waits until the agent answered or refused it, or 2 s after its intake, whichever comes
+     first (`wait_for_the_agent`, §3.4). A turn the agent refused stops here, with no model call.
    - **The state:** a communication this cognition does not hold is loaded from its file (§6),
      where the intake wrote its turn (`held_or_loaded`). If the file cannot be read, the turn is
      skipped (`store_load_failures_total`).
@@ -300,6 +303,26 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
     analyzes once, as that relay: the relay itself, or the agent's copy, as the relay
     (`relayed_of`, the tagger's `to` and the episode's counterpart from it), when the relay came
     after the copy and was its duplicate.
+  - **The worker waits for the agent first** (FINDINGS A-332, since 0.1.139,
+    `wait_for_the_agent`). A person's message the agent got (its `request_of`) is analyzed once
+    the agent answered or refused it, or `COGNITION_REFUSAL_GRACE` (2 s) after the intake took it,
+    whichever comes first.
+    - The intake notes each answer and each refusal by the agent's communication and the message
+      it answers (`Answers`; `answered_request`: the answer's trace before the agent's entry,
+      which must be its last), and wakes the worker.
+    - A refusal then costs no model call, where up to 0.1.138 the worker's tagger call was under
+      way when it came.
+    - A turn older than the grace when the worker takes it does not wait. The agent's own
+      answers, the relays and the turns with no person at their other end never wait.
+    - **Why a grace, and neither the agent's whole answer nor a cancel:** the AI runtime refuses
+      at once (7 to 12 ms), and on 8.x cognition took the refusal 0.04 to 0.26 s after it. Its
+      answer takes seconds, a minute with tools, or never comes: waiting for it would hold the
+      serial worker, and every other communication's turns with it. A call cancelled is billed by
+      its provider all the same, its input at least, and recorded `abandoned`, without tokens: the
+      cost would leave the accounts.
+    - The answers are in memory only, those of the last grace (an older one is never looked for),
+      4,096 at most (`COGNITION_ANSWERS_KEPT`). A refusal later than the grace finds the call made,
+      and its result is dropped as above.
   - The refusals are in memory only (`Refusals`), the last 4,096 (`COGNITION_REFUSALS_KEPT`): a
     refusal matters while its turn may wait in the worker's queue or in the copy the worker took
     for one turn, and the refusals of turns the full queue dropped count too. 4,096 cover a full
@@ -743,9 +766,11 @@ their reason. `CONFIG_SET` cannot change them.
   config file (`persist_cognition_config_state`). The saved values are read back at start.
 
 **`CONFIG_GET`** answers the config, the runtime counters and the contract
-(`build_cognition_config_get_payload`). **`STATUS`** and **`PING`** answer the state
-(`ready_semantic_ai` or `degraded_no_ai_provider`), the counters and the region's use
-(`build_status_payload`).
+(`build_cognition_config_get_payload`). Since 0.1.139 its `runtime` has the agents' refusals and
+the worker's waits for the agent too (§10), which only `STATUS` had: SY.admin, and so Archi,
+reaches a node's `CONFIG_GET` (`node_control_config_get`), not its `STATUS`. **`STATUS`** and
+**`PING`** answer the state (`ready_semantic_ai` or `degraded_no_ai_provider`), the counters and
+the region's use (`build_status_payload`).
 
 ---
 
@@ -796,7 +821,9 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
   people, §2), `duplicate_turns_skipped_total` (one message copied twice, §2), and the agents'
   refusals (§3.4): `refusals_total`, `refused_turns_dropped_total` (the turns they dropped) and
   `refused_turns_not_analyzed_total` (the refused turns the worker did not analyze, or whose
-  analysis it dropped);
+  analysis it dropped); and the worker's waits for the agent (§3.4): `agent_waits_total` (the
+  person's turns it waited on) and `agent_waits_grace_over_total` (those whose wait ran its whole
+  grace, with no answer nor refusal);
 - the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, provider errors,
   invalid outputs and other failures (§3.1);
 - the live state: the communications held, their contexts, reasons and co-occurrences, active

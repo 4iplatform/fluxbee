@@ -68,7 +68,8 @@ Two paths take each turn:
   at once, so the agent's next message carries the turn before it, whatever the worker's backlog.
   20 turns at most, and 48 KiB.
 - **The worker** takes the turns one at a time, with up to two model calls each (about 5 s a
-  turn), and derives the labels, memories and feelings, and the episodes that pass the gate. It
+  turn), and derives the labels, memories and feelings, and the episodes that pass the gate. A
+  person's message the agent got first waits for the agent's answer, 2 s at most (below). It
   loads a communication it does not hold
   from its file first; then it works on a copy, so the intake never waits for it, and writes the
   copy back merging the turns the intake took meanwhile, then to its file. Its communication stays
@@ -97,6 +98,17 @@ no turn:
   relay came after it and was its duplicate. When the refusal comes while it analyzes the turn, it
   drops what the turn derived and calls no model it has not called yet; a turn that is a relay
   again keeps it.
+- **The worker waits for the agent first** (FINDINGS A-332, since 0.1.139). It analyzes a
+  person's message the agent got once the agent answered or refused it, or 2 s after the intake
+  took it (`COGNITION_REFUSAL_GRACE`), whichever comes first (`wait_for_the_agent`).
+  - The intake wakes it at each answer and refusal it takes, each told apart by the message it
+    answers, as the refusal is.
+  - So a refusal costs no model call. Up to 0.1.138 the worker, with nothing else to do, started
+    the turn's tagger call at once. The refusal came in the stream's next batch, some 0.04 s later,
+    and only dropped the call's result.
+  - A turn that waited longer than that in the queue does not wait again. The agent's own answers,
+    the relays and the turns with no person at their other end never wait.
+  - A refusal that comes after the grace finds the call made, and drops its result as before.
 - **It remembers** the last 4,096 refusals (`COGNITION_REFUSALS_KEPT`), in memory only: a full
   turn queue's drain at about three refusals a second. Past that, a refused turn that still waits
   for the worker is analyzed, as before 0.1.137, and stays out of the last turns.
@@ -179,7 +191,9 @@ those are the installation's, in its installation file). It accepts `thresholds.
   (`ai_provider.settings`: `{from: installation_file, version, sha256}` or `{from: hive_yaml}`,
   with `error` when they cannot be used; `config.ai.settings` in `CONFIG_GET`), the turn counters
   (the agents' refusals among them: `refusals_total`, `refused_turns_dropped_total`,
-  `refused_turns_not_analyzed_total`), and the clears it took (`clears`). Through the admin:
+  `refused_turns_not_analyzed_total`; and the worker's waits for the agent, `agent_waits_total` and
+  `agent_waits_grace_over_total`, which `CONFIG_GET`'s `runtime` has too since 0.1.139), and the
+  clears it took (`clears`). Through the admin:
   `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
 
 ## Links

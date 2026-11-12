@@ -457,7 +457,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
 - A-330 🔵 `list_hives` lists a registry directory whose name is not a hive id (low; the orchestrator).
 - A-331 🔵 `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT` (low; the orchestrator).
-- A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition).
+- A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition; built on `coa/cognition-139` for 0.1.139).
 - A-333 🔵 A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it (low; the WF engine; found by 0.1.138's gate).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the fix to decide).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review).
@@ -1634,6 +1634,55 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   kept and analyzed every refused turn, so this is no regression.
 - **Fix, later (cognition):** start an In turn's analysis after the agent's answer or a short
   grace, or drop the call's result and cancel the call on the refusal.
+- **Built on `coa/cognition-139` (for 0.1.139): a short grace, which the agent's answer ends.**
+  The worker analyzes a person's message the agent got (its `request_of`) once the agent answered
+  or refused it, or 2 s after the intake took it (`COGNITION_REFUSAL_GRACE`), whichever comes
+  first (`wait_for_the_agent`, `src/bin/sy_cognition.rs`).
+  - The intake notes each answer and each refusal of an agent by its communication and the message
+    it answers, and wakes the worker (`Answers`, `agents_answered`). The message is found as the
+    refusal's is: the answer's trace before the agent's entry, which must be the trace's last
+    (`answered_request`).
+  - A refused turn is then left out as A-292 does, with no model call. One the agent took is
+    analyzed as soon as its answer comes, or at the grace's end.
+  - A turn older than the grace when the worker takes it, one that waited in the queue, does not
+    wait. The agent's own answers, the relays and the turns with no person at their other end
+    never wait.
+  - New counters, `agent_waits_total` and `agent_waits_grace_over_total`, in `STATUS`
+    (`turns_consumer`) and in `CONFIG_GET`'s `runtime`, with A-292's three
+    (`refusals_total`, `refused_turns_dropped_total`, `refused_turns_not_analyzed_total`), which
+    only `STATUS` had: SY.admin, and so Archi, reaches `CONFIG_GET` (`node_control_config_get`),
+    not `STATUS`.
+  - **Why the grace, of the three fixes:**
+    - **Cancelling the call on the refusal does not save it.** The request has reached the
+      provider, which bills its input at least, whatever the client does. The AI SDK records a
+      dropped call `abandoned`, without tokens (`CallGuard`), so the cost would leave Fluxbee's
+      accounts. It would also add a cancel path to the model call.
+    - **Waiting for the agent's whole answer holds the worker.** The agent answers in seconds
+      (4.3 s in A-292's gate), a minute with tools, or never (an answer lost to `LINK_BUSY`, an
+      agent that answers nothing). The worker is serial, so every other communication's turns
+      would wait behind it; setting a waiting turn aside would analyze a communication's turns out
+      of order.
+    - **The grace is bounded and covers the refusal.** A turn is analyzed at most 2 s late, and
+      only when the worker had nothing else to do: under load the queue's wait is longer, so the
+      worker's throughput does not change. It never loses a turn's analysis. The runtime refuses
+      in 7 to 12 ms (A-257's gate), and on 8.x cognition took the refusal 0.04 to 0.26 s after it
+      (A-292's gate), some eight times under the grace. The agent's answer ends it too, as the
+      push asked (*"as soon as the agent answers"*).
+  - **What it leaves:** a refusal later than 2 s (a batch the stream sends again, a slow intake)
+    finds the call made, and A-292 drops its result, as before. With an LLM agent, which answers
+    in seconds, and a worker with nothing else to do, a person's turn is analyzed 2 s later than
+    on 0.1.138; what it derives reaches the next message's package, which comes seconds later.
+  - **Tests:** `a_refusal_after_the_worker_took_its_turn_costs_no_model_call` (the bug: the
+    worker on the turn when the refusal comes 40 ms later; without the wait, one tagger call),
+    `a_turn_the_agent_took_is_analyzed_as_soon_as_it_answers` (an answer 300 ms later; without the
+    intake's note of the answers, analyzed at 2 s),
+    `a_turn_with_no_answer_is_analyzed_once_its_grace_is_over`,
+    `an_answer_names_the_message_it_answers_by_the_agents_entry` and
+    `the_answers_leave_once_no_wait_looks_for_them`, on paused time; A-292's tests pass as they
+    were, their busy answer built by the shared `reply_to`. Docs:
+    [sy-cognition.md](../../docs/nodes/sy-cognition.md),
+    [cognition.md](../../docs/reference/cognition.md) §3, §3.4, §8 and §10,
+    [cognition-hands-v1](../../docs/cognition-hands-v1.md) §6.
 
 ### A-331 [General/orchestrator] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x) — `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT`
 
