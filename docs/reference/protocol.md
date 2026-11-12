@@ -698,8 +698,9 @@ later one.
 
 1. A `pre_pending_rule` matches: its target. For commands that must never be taken for a reply.
 2. A request is pending on this `trace_id` and its `PendingMatcher` matches: the request completes.
-3. A request on this `trace_id` ended in the last 30 s and the message matches its matcher:
-   dropped as stale (`RECENT_STALE_TTL`, at most 1,024 kept).
+   A `NOT_TAKEN` on its `trace_id` ends it whatever its matcher (§10.4; since 0.1.143, planned).
+3. A request on this `trace_id` ended in the last 30 s and the message matches its matcher, or is
+   a `NOT_TAKEN`: dropped as stale (`RECENT_STALE_TTL`, at most 1,024 kept).
 4. The message has the exact shape of a reply this node has awaited before
    (`register_response_only`): dropped as orphaned. A shape that a `post_pending_rule` sends to a
    broadcast channel is exempt (a catch-all `Any` rule does not count), and `AnyMsgOfType` and `Any`
@@ -707,7 +708,39 @@ later one.
 5. A `post_pending_rule` matches: its target.
 6. Otherwise dropped and counted (`metric_route_unmatched`).
 
-A Rust command channel is unbounded (FINDINGS A-295). A Go command channel is a queue of two lanes
+A Rust command channel holds at most 1,024 messages or 8 MiB in each of its two lanes
+(`RPC_COMMAND_CHANNEL_CAPACITY`, `RPC_COMMAND_CHANNEL_MAX_BYTES`, the bytes counted as the frames
+came off the socket; since 0.1.143, planned; FINDINGS A-295). These are the Go SDK's numbers
+(A-329, since 0.1.141). Until 0.1.143 the Rust channels had no bound.
+
+- **The lanes.** One holds the channel's `system` messages, the other every other kind. Its
+  consumer gets the `system` ones first (`RpcCommandReceiver::recv`, `try_recv`), so they never wait
+  behind the others, and each lane keeps its order.
+- **A message that finds its lane full is refused.** The node never sees it, and
+  `command_refused(name)` counts it.
+- **The warning, `rpc command channel full`,** names the channel. It is written at the first
+  refusal. After that, at most one comes every 10 s with the count since the last: at the next
+  refusal once the 10 s have passed, or at their end when none comes, as the Go SDK's line. Each
+  names the last message refused, its lane and what the lane held.
+- **Its sender is told `NOT_TAKEN`**, reason `node_busy`, `retryable` true, as the Go SDK does. It
+  is a `system` message to its `routing.src`, on its `trace_id` and `meta.thread_id`, `ttl` 16, with
+  the payload
+  `{"ok": false, "error": "not_taken", "reason": "node_busy", "retryable": true, "detail": "..."}`.
+  The `detail` is the Go SDK's words (*"IO.x@worker1 holds 1024 non-system messages, as many as it
+  takes; send it again later"*).
+  - It goes for any message a node sent, named or not, from any node.
+  - It never goes for a notice: `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, a
+    `system` message without a name, or one with no router-stamped `src_l2_name`.
+  - It never goes for a reply: `*_RESPONSE`, `NOT_TAKEN` or `<msg>.error`, the Go SDK's
+    `IsNoticeOrReply`. So two nodes cannot bounce one.
+  - The Rust SDK also never answers a kind ending in `_response`, a broadcast, which named no one,
+    or a tap copy, whose sender sent it to another node (A-209).
+  - The receive loop queues the answer without waiting. When the link's outgoing queue is full or
+    the link is down, the answer is dropped and counted in the warning (`unsent`).
+- **The same message from the WF engine.** It answers `NOT_TAKEN` with its own reasons (§14.5 of the
+  WF spec). `node_busy` is the SDKs'.
+
+A Go command channel is a queue of two lanes
 (`go/fluxbee-go-sdk/command_queue.go`, since 0.1.141, FINDINGS A-329): `system` messages and every
 other kind, each at most 1,024 messages or 8 MiB (the router's bound for a node's link,
 `LINK_QUEUE_MAX_FRAMES` and `LINK_QUEUE_MAX_BYTES`); its consumer gets the oldest system message
@@ -739,13 +772,39 @@ empty `trace_id` (a new UUID) and `src`, and refuses a `trace_id` already pendin
 pending. `send_system_rpc` sends `ttl` 16 to the unicast `target`, with `action_class` from
 `classify_system_message`.
 
+A call its caller drops leaves nothing pending (since 0.1.143, planned; FINDINGS A-309). That is a
+call wrapped in an outer `timeout`, or the losing branch of a `select!`.
+
+- Its entry goes, and its `trace_id` is free again.
+- An answer that comes later is dropped as stale (step 3 of §10.2).
+- A message whose send had not gone out is never sent.
+- `metric_abandoned_requests` counts such calls.
+
+Before, such a call left its entry for the life of the process.
+
 ### 10.4 Timeouts and errors
 
 A zero timeout means 5 s (`default_rpc_timeout`; Go `SendWithMatcher`).
 `RpcError::Timeout {trace_id, target, request_msg, response_msg, timeout_ms}` means the outcome is
 unknown, not failed: the peer may have done the work (`RpcError::is_timeout`). Transport errors are
 `RpcError::Unreachable {reason, original_dst}` and `RpcError::TtlExceeded {original_dst,
-last_hop}`. Go returns `*RpcError` with `Kind` `RpcErrTimeout`, `RpcErrTerminalTransport`,
+last_hop}`.
+
+`RpcError::NotTaken {reason, detail, retryable}` means the destination answered `NOT_TAKEN` on the
+request's `trace_id`: it took the request nowhere, and nothing of it ran (since 0.1.143, planned;
+FINDINGS A-295).
+
+- `node_busy` comes from a node whose channel had no room (§10.2), a Rust or a Go node, and is
+  retryable: asking again later may pass.
+- A WF's own reasons say whether they are retryable (`unavailable` is, since 0.1.141). One without
+  `retryable`, from a node before 0.1.141, reads as `false`.
+- Every request ends so at once, whatever its matcher. Before, a system request got
+  `InvalidResponse`, an admin request waited for its timeout, and a `send_with_matcher` call whose
+  success matched any message got the `NOT_TAKEN` as its answer.
+- Its text is the Go SDK's `RpcErrNotTaken`'s: *"rpc not taken: NOT_TAKEN reason=node_busy
+  retryable=true: ..."*.
+
+Go returns `*RpcError` with `Kind` `RpcErrTimeout`, `RpcErrTerminalTransport`,
 `RpcErrInvalidResponse`, `RpcErrDisconnected`, `RpcErrInvalidRequest`, `RpcErrMessageTooLarge` or
 `RpcErrNotTaken` (the target answered `NOT_TAKEN`, with its `Reason` and `Retryable`, since
 0.1.141; its text *"rpc not taken: ... NOT_TAKEN reason=node_busy retryable=true: ..."*).
@@ -780,8 +839,9 @@ forever.
 | Reconnection | §2.5 | §2.5 |
 | A frame over 128 KiB | Refused before sending (`NodeError::MessageTooLarge`) | Refused before sending (`*MessageTooLargeError`); the connection stays up |
 | Inbound queue full (256) | Backpressure on the socket | Backpressure on the socket since 0.1.141 (FINDINGS A-329): the reader waits for room, and the frames wait in the router's queue for the link. Before, the frame was dropped, and the dispatcher failed every pending request on the error |
-| Command channels | Unbounded, warning at depth 1,000 (`RPC_COMMAND_DEPTH_WARN_THRESHOLD`) | Since 0.1.141 (FINDINGS A-329) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is answered `NOT_TAKEN` `node_busy` (§6.10), counted (`CommandChannelDrops`, `NotTakenSent`) and logged. Before, 64 messages, the rest dropped and counted |
-| A target's `NOT_TAKEN` to a request | `InvalidResponse` (system), a timeout (admin) | `RpcErrNotTaken`, with `Reason` and `Retryable` (since 0.1.141) |
+| Command channels | Since 0.1.143 (planned; FINDINGS A-295) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is refused, counted (`command_refused`), logged and answered `NOT_TAKEN` `node_busy`, retryable (§10.2), but a notice, a reply, a broadcast or a tap copy. Before, unbounded, with a warning at depth 1,000 | Since 0.1.141 (FINDINGS A-329) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is answered `NOT_TAKEN` `node_busy` (§6.10), counted (`CommandChannelDrops`, `NotTakenSent`) and logged. Before, 64 messages, the rest dropped and counted |
+| A `NOT_TAKEN` on a pending request | Ends it with `RpcError::NotTaken`, whatever its matcher (since 0.1.143, planned) | `RpcErrNotTaken`, with `Reason` and `Retryable` (since 0.1.141) |
+| A call its caller gives up | Dropped: its pending entry goes, and a late answer is stale (since 0.1.143, planned) | Its `ctx` done: the same (`SendWithMatcher`) |
 | `AnyMsgOfType` success matcher | Never registered as a reply shape | The same (`registerResponseOnly`) |
 | System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC`: 16 unless `Options.TTL` sets another; `BuildSystemRequest` alone turns 0 into 1. It also sets `meta.action` to the verb |
 | Admin request result | `AdminCommandResult` | The raw `Message` |

@@ -115,8 +115,12 @@ pub struct NodeSender {
     info: Arc<ConnectionInfo>,
 }
 
+/// A message as it came off the router's socket, with the length of its frame. The dispatcher's
+/// command channels count the bytes they hold by it (FINDINGS A-295).
+pub(crate) type Received = (Message, usize);
+
 pub(crate) struct NodeReceiver {
-    rx: mpsc::Receiver<Result<Message, NodeError>>,
+    rx: mpsc::Receiver<Result<Received, NodeError>>,
     info: Arc<ConnectionInfo>,
 }
 
@@ -133,7 +137,37 @@ impl NodeSender {
     /// sends it, its own name, and what `note` adds, the destination by name and the actions it
     /// took. A message that is not the solution's carries no trace. A writer it names by ILK alone
     /// gets its name from the identity memory of this node's hive (docs/cognition-hands-v1.md §5).
-    pub async fn send_traced(&self, mut msg: Message, note: TraceNote) -> Result<(), NodeError> {
+    pub async fn send_traced(&self, msg: Message, note: TraceNote) -> Result<(), NodeError> {
+        let data = self.frame(msg, note)?;
+        self.tx.send(data).await.map_err(|_| {
+            self.info.state.set_connected(false);
+            NodeError::Disconnected
+        })?;
+        Ok(())
+    }
+
+    /// Queues `msg` for the link as `send` sends it, without waiting. It is for the dispatcher's
+    /// receive loop, which never waits: its `NOT_TAKEN` to the sender of a message a full command
+    /// channel refused (FINDINGS A-295). Returns whether the message was queued. It is not queued
+    /// when the link's outgoing queue (256 frames) is full, when the link is down, or when `send`
+    /// would refuse it.
+    pub(crate) fn try_send_now(&self, msg: Message) -> bool {
+        let Ok(data) = self.frame(msg, TraceNote::default()) else {
+            return false;
+        };
+        match self.tx.try_send(data) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.info.state.set_connected(false);
+                false
+            }
+        }
+    }
+
+    /// `msg` as the frame `send_traced` sends. It carries this node's entry in its trace and the
+    /// writer's name, with its long text in a blob. A frame over the limit is refused.
+    fn frame(&self, mut msg: Message, note: TraceNote) -> Result<Vec<u8>, NodeError> {
         let full_name = self.full_name();
         message_trace::write_entry(&mut msg, &full_name, note);
         if let Some(hive) = message_writer::hive_of(&full_name) {
@@ -152,11 +186,7 @@ impl NodeSender {
                 max: MAX_FRAME_SIZE,
             });
         }
-        self.tx.send(data).await.map_err(|_| {
-            self.info.state.set_connected(false);
-            NodeError::Disconnected
-        })?;
-        Ok(())
+        Ok(data)
     }
 
     pub async fn close(self) -> Result<(), NodeError> {
@@ -199,21 +229,28 @@ impl NodeSender {
 
 impl NodeReceiver {
     pub(crate) fn new(
-        rx: mpsc::Receiver<Result<Message, NodeError>>,
+        rx: mpsc::Receiver<Result<Received, NodeError>>,
         info: Arc<ConnectionInfo>,
     ) -> Self {
         Self { rx, info }
     }
 
-    pub(crate) async fn recv(&mut self) -> Result<Message, NodeError> {
+    /// The next message, with its frame's length.
+    pub(crate) async fn recv_sized(&mut self) -> Result<Received, NodeError> {
         match self.rx.recv().await {
-            Some(Ok(msg)) => Ok(msg),
+            Some(Ok(received)) => Ok(received),
             Some(Err(err)) => Err(err),
             None => {
                 self.info.state.set_connected(false);
                 Err(NodeError::Disconnected)
             }
         }
+    }
+
+    /// The next message, without its frame's length: for the timer client's tests.
+    #[cfg(test)]
+    pub(crate) async fn recv(&mut self) -> Result<Message, NodeError> {
+        self.recv_sized().await.map(|(msg, _)| msg)
     }
 
     #[cfg(test)]

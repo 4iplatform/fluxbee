@@ -36,3 +36,5 @@ x509-parser = { version = "0.18", optional = true }
 [dev-dependencies]
 # The `mesh` tests run real handshakes.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Paused time (`start_paused`) for the command channels' refusal warnings (A-295).
+tokio = { version = "1.37", features = ["full", "test-util"] }

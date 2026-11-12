@@ -1267,6 +1267,22 @@ under its own systemd unit, never as a node `run_node` launched; only an install
   (`GET /hives/{hive}/nodes/{node_name}/status`) and the hive's drift alerts
   (`GET /hives/{hive}/drift-alerts`), and say what they show.
 
+**A node with no room for a message refuses it** (FINDINGS A-295; since 0.1.143, planned). This
+holds for every node built on the Rust SDK:
+- every SY node but `SY.timer`, `SY.wf-rules` and `SY.opa.rules`;
+- the routers' stream;
+- every AI node and every IO node.
+
+Each such node holds at most 1,024 waiting messages (or 8 MiB) in each of its queues, and its
+`system` messages wait in a queue of their own that goes first. Past that, the next message is not
+taken: nothing of it ran, its sender gets `NOT_TAKEN` with reason `node_busy` and
+`retryable: true`, and the node logs a warning, *rpc command channel full*, naming the queue. The
+nodes built on the Go SDK do the same since 0.1.141.
+- An answer that says *not taken* with `node_busy` names a node that was busy, not broken. Say
+  which node, and that asking again later may pass.
+- Never plan a restart, a kill or a config change for it.
+- When it keeps happening, read that node's status and say what it shows.
+
 ### 4.4.1 Node teardown semantics
 
 - `purge_instance=true` is a real tabula-rasa for orchestrator-owned node state: instance directory, timers, `node_ilk_map`, ILK, and dedicated vault secrets are removed. Routes, VPNs, and taps are not auto-deleted; teardown returns `routing_references` so the operator can clean those deliberately.

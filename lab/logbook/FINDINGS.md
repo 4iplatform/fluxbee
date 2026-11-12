@@ -488,8 +488,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
-- A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
-- A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
+- A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK; built on `coa/rustsdk-143`, for 0.1.143, planned).
+- A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK; built on `coa/rustsdk-143`, for 0.1.143, planned).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` ✅ 0.1.142, by its tests; SY.architect's use of it open, for its next release).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
@@ -3559,6 +3559,26 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   would leak again.
 - **Fix, later:** a drop guard that removes the entry and marks the trace stale, in a release of
   the Rust SDK of its own (METHOD §9), with the SDK's lows.
+- **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30).**
+  - **The guard.** `send_with_matcher` holds its entry through a `PendingGuard` from its insert to
+    the call's end. A caller that drops the call drops the guard, and the guard removes the entry
+    and notes the trace stale under one hold of the pending table. This covers an outer `timeout`
+    and the losing branch of a `select!`, while the call waits for its answer or for room to send.
+    - So the `trace_id` is free again, a late answer is dropped as stale and counted, never handed
+      to a command channel, and a message that had not gone out is never sent.
+    - `metric_abandoned_requests` counts such calls.
+    - Each entry carries its call's id, so a guard never removes a later call's entry under the same
+      `trace_id`.
+  - **The tables.** The pending and stale tables became `std::sync::Mutex`es, which no holder keeps
+    across a wait, so the guard's `Drop` can take them. When a holder takes both, it takes pending
+    first, and the timeout's removal and its stale note now run under that one hold too.
+  - **Its tests** (`rpc.rs`): a call its caller drops frees its trace_id; a late answer to a dropped
+    call is stale; a call dropped before its message went out never sends it. Each fails on the
+    code before it. A guard never removes a later call's entry.
+  - **Docs:** the SDK's README and `docs/reference/protocol.md` §10.3 and §11 (Go's `ctx` did the
+    same already).
+  - **Not reachable on 8.x today:** nothing drops a call since `84653ab5`, so no live gate provokes
+    it; it is checked by its tests.
 
 ### A-308 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; with worker1's orchestrator frozen and 4 `/versions` held, the Cloud's `list_nodes` answered 200 in 12.5 s naming worker1 `NODE_LIST_FAILED`, where 0.1.138 answered `TIMEOUT` at 30.0 s; egress1's and ingress1's own reads in 0.54 to 0.77 s) (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it; seen live by 0.1.133's gate) — Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer
 
@@ -4305,6 +4325,72 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   channel grows without limit.
 - **Fix, later (the Rust SDK alone):** a bounded channel with a named refusal past its bound.
 - **The operator (2026-11-11):** after the sweep (the Rust SDK alone, with the next change there).
+- **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30), as
+  A-329's call for the Go SDK says:** NOT_TAKEN, retryable, to the sender, and system messages
+  never wait behind user ones. The contract is the Go SDK's of `coa/gosdk-141` (`620f07e7`): reason
+  `node_busy`, its `detail`'s words, lanes of 1,024 messages or 8 MiB, a log line at most every 10 s,
+  the error's text.
+  - **The bound.** Each command channel has two lanes of 1,024 messages
+    (`RPC_COMMAND_CHANNEL_CAPACITY`, which replaces `RPC_COMMAND_DEPTH_WARN_THRESHOLD`) or 8 MiB of
+    their frames (`RPC_COMMAND_CHANNEL_MAX_BYTES`, counted as they came off the socket: the SDK's
+    reader hands each message on with its frame's length). One lane holds the `system` messages,
+    which `RpcCommandReceiver::recv` and `try_recv` hand over first; the other holds every other
+    kind. The recv loop hands a message to its lane with `try_send`, never waiting.
+  - **A refused message.** A message that finds its lane full never reaches the node. It is
+    counted (`command_refused(name)`). The node logs a warning, *rpc command channel full: messages
+    refused, never handed to the node*, at the first refusal. After that, at most one comes every
+    10 s per channel: at the next refusal once the 10 s have passed, or at their end, so a burst
+    gets its count even when nothing follows it (the Go SDK's rule). Each warning carries
+    `refused`, `told_not_taken`, `unsent`, `unanswered` and `refused_total`, and names the last
+    message refused, its lane and what the lane held.
+  - **The answer.** Its sender gets `NOT_TAKEN`, the WF engine's message: a `system` message to its
+    `routing.src`, on its `trace_id` and thread, with
+    `{"ok": false, "error": "not_taken", "reason": "node_busy", "retryable": true, "detail"}`, the
+    `detail` the Go SDK's words (*"IO.x@worker1 holds 1024 non-system messages, as many as it
+    takes; send it again later"*).
+    - It goes for any message a node sent, named or not.
+    - It never goes for a notice: no `src_l2_name`, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`,
+      `TTL_EXCEEDED`, or a `system` message without a name.
+    - It never goes for a reply: `*_RESPONSE`, `NOT_TAKEN`, `<msg>.error` (the Go SDK's
+      `IsNoticeOrReply`). So no two nodes bounce one.
+    - Beyond the Go SDK's rule, it never goes for a kind ending in `_response`, a broadcast or a
+      tap copy. The Go SDK answers a broadcast it refuses; it has no tap copies.
+    - The answer is queued with `try_send` (`NodeSender::try_send_now`). When the link's outgoing
+      queue of 256 is full, it is dropped and counted (`unsent`).
+  - **A request that gets `NOT_TAKEN`** on its `trace_id` ends at once with
+    `RpcError::NotTaken {reason, detail, retryable}`, whatever its matcher, its text the Go SDK's
+    (*"rpc not taken: NOT_TAKEN reason=node_busy retryable=true: ..."*). One that comes after its
+    request ended is stale.
+    - Before, a system request got `InvalidResponse`, and an admin request waited for its timeout.
+    - A `send_with_matcher` whose success matches any message got the `NOT_TAKEN` as its answer:
+      SY.edge's handler calls, `edge_reply_matcher`.
+  - **Its tests**, each failing on the code before it (`rpc.rs`):
+    - a full lane refuses the next message and tells its sender;
+    - system messages never wait behind other kinds;
+    - only a sender that may be answered is told;
+    - a NOT_TAKEN the link cannot take is dropped without waiting;
+    - a burst refused after a warning is warned when the interval ends (paused time);
+    - a lane holds at most its bytes;
+    - a request its destination did not take ends at once.
+  - **Docs:** the SDK's README, `docs/reference/protocol.md` §10.2, §10.4 and §11,
+    `docs/nodes/sy-edge.md` (the reply step), `docs/io-cloud-api.md` (§7 and §9), and Archi's
+    handbook §4.4.
+  - **Found on the way, not changed (each its own binary):**
+    - SY.edge answers a handler's NOT_TAKEN `502 HANDLER_ERROR`, a code other failures share
+      (`rpc_error_code`). A code of its own, retryable (`503 HANDLER_BUSY`), is SY.edge's next
+      change.
+    - ai.generic answers a `NOT_TAKEN` it gets with an `unknown_system_msg` `CONFIG_RESPONSE`, as
+      it answers any system message it does not know (A-325; the AI SDK's
+      `is_infrastructure_message` takes no `NOT_TAKEN` for a reply). That answer is a reply, which
+      the refusing node never answers: no loop, one wasted message.
+    - The WF engine drops a `NOT_TAKEN` for a message it sent, as any system message but its timers
+      (spec §14.2). The person a WF writes to through an IO node with no room loses that message,
+      as before, but the IO node now names it in its warning.
+    - io-sim (`nodes/io/io-sim`, test-grade, not in the package) declares an `incoming` channel
+      for its `system` messages and never reads it. Before 0.1.143 every system message sent to a
+      running io-sim waited there for good, a case of this item. Since then the 1,025th and later
+      are refused. Run by hand with its stdin held open, it is the live gate's node that never
+      drains its channel.
 
 ### A-294 [General/AI SDK] ✅ VALIDATED ON 8.x (0.1.142, 2026-11-13; a reply over the frame limit failed alone, the runtime went on: the same process, no restart, `replies_too_large` 1, the next message answered at once, where 0.1.141's process exited and its unit restarted it, back 7.1 s later) (found 2026-11-11 by A-257's builder and review; read in the code; there before it) — One answer over the frame limit stops the whole AI runtime
 

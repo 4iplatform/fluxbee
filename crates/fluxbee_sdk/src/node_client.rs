@@ -13,7 +13,7 @@ use crate::protocol::{
     build_hello, is_system_kind, Message, NodeAnnouncePayload, NodeHelloPayload, MSG_ANNOUNCE,
 };
 use crate::socket::connection::{read_frame, write_frame};
-use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
+use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender, Received};
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -73,7 +73,7 @@ pub(crate) async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeRece
 
 struct ConnectedParts {
     tx: mpsc::Sender<Vec<u8>>,
-    rx: mpsc::Receiver<Result<Message, NodeError>>,
+    rx: mpsc::Receiver<Result<Received, NodeError>>,
     info: Arc<ConnectionInfo>,
 }
 
@@ -91,7 +91,7 @@ async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError>
         Arc::clone(&state),
     ));
     let (app_tx, internal_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (internal_tx, app_rx) = mpsc::channel::<Result<Message, NodeError>>(256);
+    let (internal_tx, app_rx) = mpsc::channel::<Result<Received, NodeError>>(256);
     let shared_rx = Arc::new(Mutex::new(internal_rx));
 
     let (announce_tx, announce_rx) = oneshot::channel::<Result<NodeAnnouncePayload, NodeError>>();
@@ -143,7 +143,7 @@ async fn connection_manager_loop(
     info: Arc<ConnectionInfo>,
     state: Arc<ConnectionState>,
     app_tx_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-    app_rx_tx: mpsc::Sender<Result<Message, NodeError>>,
+    app_rx_tx: mpsc::Sender<Result<Received, NodeError>>,
     mut announce_tx: Option<oneshot::Sender<Result<NodeAnnouncePayload, NodeError>>>,
 ) {
     let mut backoff = Duration::from_millis(100);
@@ -292,14 +292,14 @@ async fn handshake(
 
 async fn rx_loop(
     mut socket: OwnedReadHalf,
-    tx: mpsc::Sender<Result<Message, NodeError>>,
+    tx: mpsc::Sender<Result<Received, NodeError>>,
     state: Arc<ConnectionState>,
 ) {
     loop {
         match read_frame(&mut socket).await {
             Ok(Some(bytes)) => match serde_json::from_slice::<Message>(&bytes) {
                 Ok(msg) => {
-                    if tx.send(Ok(msg)).await.is_err() {
+                    if tx.send(Ok((msg, bytes.len()))).await.is_err() {
                         state.set_connected(false);
                         break;
                     }
@@ -334,7 +334,7 @@ async fn tx_loop(
     mut socket: OwnedWriteHalf,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<ConnectionState>,
-    disconnect_tx: mpsc::Sender<Result<Message, NodeError>>,
+    disconnect_tx: mpsc::Sender<Result<Received, NodeError>>,
 ) {
     loop {
         let frame = {

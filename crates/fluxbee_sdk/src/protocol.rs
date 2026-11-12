@@ -624,6 +624,19 @@ pub const MSG_WAN_ACCEPT: &str = "WAN_ACCEPT";
 pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
+/// A node's answer to a message it took nowhere: a `system` message to the sender's `routing.src`,
+/// on the message's `trace_id` and `meta.thread_id`, with the payload
+/// `{"ok": false, "error": "not_taken", "reason": "...", "detail": "...", "retryable": ...}`.
+/// Nothing of the message ran. The WF engine sends it since 0.1.94 with its own reasons
+/// (docs/wf-orchestration-v1.md §5.4.6). The SDKs send it for a message their command channel has
+/// no room for, with reason [`NOT_TAKEN_REASON_NODE_BUSY`] and `retryable: true`: the Go SDK since
+/// 0.1.141 (FINDINGS A-329), the Rust SDK since 0.1.143 (planned; A-295). It is a reply: never
+/// answered.
+pub const MSG_NOT_TAKEN: &str = "NOT_TAKEN";
+/// `NOT_TAKEN`'s reason when the receiving node had no room for the message (its command channel's
+/// lane held as many messages or bytes as it takes): sending it again later may pass. The Go SDK's
+/// `NotTakenReasonNodeBusy`.
+pub const NOT_TAKEN_REASON_NODE_BUSY: &str = "node_busy";
 
 /// The primary hive — the single motherbee, home of the singleton SY.admin and SY.vault.
 /// Nodes on any other hive reach those services here, never at their own hive.

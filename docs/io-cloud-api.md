@@ -1122,6 +1122,7 @@ post '{"op":"list_cloud_actions"}'
 | **404** | the endpoint was never published, or the hive was reinstalled: publish again. Or the request named a host other than the hive's (§2), or the door moved to another edge, which closed the old one (0.1.139): the operator gives you the new URL |
 | **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log), or a publish whose door did not open (§7): the edge did not answer it, and from 10 minutes after it may serve only the new token; or the hive could not roll the vault back, or it was a move, and the edge restarted since. The operator publishes again |
 | **502** `HANDLER_UNREACHABLE` | IO.cloud is not running (restarting, for example), or the edge's hive cannot reach the motherbee: the request never reached IO.cloud |
+| **502** `HANDLER_ERROR` | among other causes, since 0.1.143 (planned): IO.cloud had 1,024 requests (or 8 MiB of them) waiting already and took this one nowhere. Nothing of it ran (IO.cloud's journal warns `rpc command channel full`): send it again after a pause |
 | **504** | IO.cloud is busy (§6) or does not answer, or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
 ---
@@ -1160,6 +1161,9 @@ post '{"op":"list_cloud_actions"}'
     systemd does not answer for the node: read it again.
   - `provision_node`, `start_node`, `stop_node` and `delete_node` name `SERVICE_FAILED`: nothing
     was done, so send the op again.
+- **IO.cloud takes at most 1,024 waiting requests, or 8 MiB of them** (FINDINGS A-295). Past that, the next is taken
+  nowhere at once, and the edge answers 502 `HANDLER_ERROR` (§7): nothing of it ran. It is far past
+  the serialized calls this contract asks for (§6), which wait their turn as before.
 
 ### 0.1.142
 

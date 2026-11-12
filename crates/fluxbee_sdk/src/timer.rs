@@ -594,7 +594,7 @@ pub struct TimerClient<'a> {
 #[cfg(test)]
 pub(crate) struct TimerTestHarness {
     outbound_rx: mpsc::Receiver<Vec<u8>>,
-    inbound_tx: mpsc::Sender<Result<Message, NodeError>>,
+    inbound_tx: mpsc::Sender<Result<crate::split::Received, NodeError>>,
 }
 
 impl<'a> TimerClient<'a> {
@@ -1245,8 +1245,9 @@ impl TimerTestHarness {
     }
 
     pub async fn send_message(&self, message: Message) -> Result<(), NodeError> {
+        let frame_len = serde_json::to_vec(&message).map_or(0, |frame| frame.len());
         self.inbound_tx
-            .send(Ok(message))
+            .send(Ok((message, frame_len)))
             .await
             .map_err(|_| NodeError::Disconnected)
     }

@@ -76,7 +76,7 @@ pub use rpc::{
     OperationalRouteProfile, OperationalRouteProfileBuilder, PendingMatcher, RouteMatch,
     RouteTarget, RouterDispatcher, RouterDispatcherTestHarness, RpcCommandReceiver, RpcError,
     RpcRequestLabels, SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
-    RPC_COMMAND_DEPTH_WARN_THRESHOLD,
+    RPC_COMMAND_CHANNEL_CAPACITY,
 };
 pub use split::NodeSender;
 pub use status::try_handle_default_node_status;

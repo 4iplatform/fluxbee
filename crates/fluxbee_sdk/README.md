@@ -124,6 +124,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     catch-all (`RouteMatch::Any`) in `post_pending_rule`, or it takes the answers to the node's own
     requests;
   - a message no rule matches is dropped and counted (`metric_route_unmatched`).
+- **A command channel holds at most 1,024 messages or 8 MiB in each of its two lanes**
+  (`RPC_COMMAND_CHANNEL_CAPACITY`, `RPC_COMMAND_CHANNEL_MAX_BYTES`, the bytes counted as the frames
+  came off the socket; since 0.1.143, planned; FINDINGS A-295). The Go SDK's channels take as many
+  since 0.1.141 (A-329). Until 0.1.143 the Rust channels had no bound, only a warning at a depth of
+  1,000.
+  - The lanes: the `system` messages (`meta.type`, in any case), and every other kind. `recv` and
+    `try_recv` hand over the `system` messages first, so they never wait behind the others, and
+    each lane keeps its order. `command_depth(name)` is what both lanes hold.
+  - A message that finds its lane full is refused. The node never sees it, `command_refused(name)`
+    counts it, and the node logs a warning, `rpc command channel full`, naming the channel.
+    - The first refusal gets its warning at once.
+    - After that, at most one warning every 10 s gives the count since the last one: at the next
+      refusal once the 10 s have passed, or at their end when no refusal comes. This is the Go
+      SDK's rule.
+    - Each warning names the last message refused, its lane and what the lane held.
+  - Its sender is told `NOT_TAKEN`, reason `node_busy`, `retryable: true`: nothing of the message
+    ran, and sending it again later may pass. The answer goes to `routing.src`, on the message's
+    `trace_id` and `meta.thread_id`, `ttl` 16, with the payload
+    `{"ok": false, "error": "not_taken", "reason": "node_busy", "retryable": true, "detail": "..."}`.
+    Its `detail` is the Go SDK's words: *"IO.x@worker1 holds 1024 non-system messages, as many as it
+    takes; send it again later"*.
+  - It goes for any message a node sent, named or not, except a notice (`HELLO`, `ANNOUNCE`,
+    `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, a `system` message without a name, anything without
+    a router-stamped `src_l2_name`) and a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`): the Go
+    SDK's `IsNoticeOrReply`. So two nodes cannot bounce a `NOT_TAKEN`. The Rust SDK also leaves a
+    kind ending in `_response`, a broadcast and a tap copy unanswered.
+  - The receive loop never waits for the answer. When the link's outgoing queue is full or the link
+    is down, the answer is dropped, and the warning counts it as `unsent`.
 - **`sender_snapshot()`** gives the `NodeSender`: `send`, `uuid`, `full_name`, `is_connected`,
   `wait_connected`.
 
@@ -182,8 +210,27 @@ response_msg, payload, timeout })`. It sends one `system` message and waits for 
 
 - **Transport errors are errors:** `UNREACHABLE` and `TTL_EXCEEDED` become `RpcError::Unreachable`
   and `RpcError::TtlExceeded`.
+- **A request its destination did not take** ends at once with `RpcError::NotTaken { reason,
+  detail, retryable }` (since 0.1.143, planned; FINDINGS A-295): the destination answered
+  `NOT_TAKEN` on its `trace_id`.
+  - `node_busy`, from a node whose channel was full (a Rust or a Go node), is `retryable`: nothing
+    ran, and asking again later may pass.
+  - A WF's own reasons say whether they are retryable (`unavailable` is, since 0.1.141). One
+    without `retryable`, from a node before 0.1.141, reads as `false`.
+  - This holds for every request, whatever its matcher (`send_with_matcher` too). Before, it was
+    `RpcError::InvalidResponse` for a system request, and an admin request waited for its timeout.
+  - Its text is the Go SDK's: *"rpc not taken: NOT_TAKEN reason=node_busy retryable=true: ..."*.
 - **No answer in time** is `RpcError::Timeout`. A zero timeout means 5 s.
 - **A link that is down** fails at once with `RpcError::Disconnected`.
+- **A call its caller drops leaves nothing behind** (since 0.1.143, planned; FINDINGS A-309). This
+  covers a call wrapped in an outer `timeout` or lost in a `select!`:
+  - its pending entry goes, so its `trace_id` is free again;
+  - an answer that comes later is dropped as stale and counted (`metric_stale_responses`), never
+    handed to the node as a command;
+  - a message that had not gone out yet is never sent;
+  - `metric_abandoned_requests` counts such calls.
+
+  Before, each such call left its entry for the life of the process.
 
 **The admin gateway** is `dispatcher.send_admin_rpc(AdminCommandRequest)`. It sends `ADMIN_COMMAND`
 to SY.admin over the mesh, from any hive, for the same actions as its HTTP API:
