@@ -2,10 +2,9 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.133** (2026-11-11). Read from the code, operation by operation; §10
-> lists what was also checked live on the PROD hive. §9 lists what changed for Cloud in each
-> release. PROD runs **0.1.132** until 0.1.133 is deployed: what 0.1.133 changes for Cloud arrives
-> with it, and the text marks it "(0.1.133)". The model behind it: `docs/ilk-tenant-model-v1.md`
+> Contract as of **fluxbee 0.1.134** (2026-11-11), and PROD runs **0.1.134**. Read from the code,
+> operation by operation; §10 lists what was also checked live on the PROD hive. §9 lists what
+> changed for Cloud in each release. The model behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
 > system, never a company).
 >
@@ -688,14 +687,16 @@ operator's work, through Archi.
 - when the operator makes another version current, the hive relaunches a running node on
   `current` on it within a minute of the version reaching the node's hive, and leaves a pinned
   node as it is;
-- a publish through Archi that makes the new version current does more today, to every node of
-  that runtime on the motherbee, yours included, running or stopped, pinned or not: it deletes the
-  node and launches it again under the same name, on `current`. The node comes back with a new
-  identity (a credential assigned to the old one no longer reaches it), without the credentials it
-  owned, with the runtime's default config unless the operator keeps its own, and with
-  `launched_by: "archi"`, so `start_node`, `stop_node` and `delete_node` answer `NODE_NOT_FOUND`.
-  That waits for the operator's decision; if it happens to a node of yours, give the operator its
-  name.
+- up to 0.1.136, a publish through Archi that makes the new version current does more, to every
+  node of that runtime on the motherbee, yours included, running or stopped, pinned or not: it
+  deletes the node and launches it again under the same name, on `current`. The node comes back
+  with a new identity (a credential assigned to the old one no longer reaches it), without the
+  credentials it owned, with the runtime's default config unless the operator keeps its own, and
+  with `launched_by: "archi"`, so `start_node`, `stop_node` and `delete_node` answer
+  `NODE_NOT_FOUND`. If it happens to a node of yours, give the operator its name. The operator
+  decided that it goes: from 0.1.137 (planned, built, not deployed yet) such a publish moves a
+  running node on `current` in place, as the point above says, with its identity, config and
+  `launched_by`, and leaves a pinned or stopped node as it is.
 
 #### `list_nodes`
 
@@ -925,7 +926,7 @@ to, for example. No op of this list reads them or takes them down.
   that published a page, or the operator, can take it down.
 - **Cloud can neither list them nor take them down.** Listing and taking down your tenant's pages
   through IO.cloud is planned with the Cloud track, not scheduled yet.
-- **Planned for 0.1.136, not built yet:** an `IO.*` or `WF.*` node can take down the pages it
+- **Planned for 0.1.137, not built yet:** an `IO.*` or `WF.*` node can take down the pages it
   published itself, as an agent can now. Cloud gets no op for pages with it.
 
 ---
@@ -1056,7 +1057,18 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.133 (not deployed yet: PROD runs 0.1.132)
+### 0.1.134
+
+- **While 0.1.133 ran, the node ops failed for a node with no unit** (2026-11-11, from 22:35Z to
+  23:32Z; FINDINGS A-314). The hive took a unit its systemd does not have, a new node's before its
+  first launch or a stopped node's once it is gone, for a systemd that did not answer:
+  `provision_node` of a new node, and `start_node`, `stop_node` and `delete_node` of a stopped one,
+  answered `SERVICE_FAILED` with nothing done, and sending them again answered the same;
+  `list_nodes` and `get_node_status` read such a stopped node `UNKNOWN`. 0.1.134 reads that unit as
+  a node that does not run: those ops go on as before 0.1.133, and a stopped node reads `STOPPED`
+  again. An op that got this `SERVICE_FAILED` in that window did nothing: send it again.
+
+### 0.1.133
 
 - **The door works as soon as the operator publishes it or moves it to another edge** (§7). Before,
   a first publish or a move left Cloud with 504s until IO.cloud restarted; a rotation on the same
@@ -1133,7 +1145,7 @@ post '{"op":"list_cloud_actions"}'
   until `stop_node`.
 - **A node on `current` follows it:** when the operator makes another version current, the hive
   restarts the node on it within a minute; a version named in `runtime_version` pins it. A publish
-  through Archi does more today (§5.4).
+  through Archi does more up to 0.1.136 (§5.4).
 
 ### 0.1.85
 
@@ -1239,6 +1251,11 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.133:** on PROD, 2026-11-11 at 23:20Z, from inside the hive (`lab/DEPLOYMENTS.md`, 0.1.133;
+FINDINGS A-255): the operator rotated Cloud's token on `SY.edge@ingress1` (§7). The publish
+answered ok with `edge_applied: true`; IO.cloud kept running and was not restarted; the previous
+token worked 10 more minutes.
 
 **0.1.82 to 0.1.90:** on PROD, through the public door (`lab/DEPLOYMENTS.md`; 0.1.90 in
 `lab/logbook/2026-10-29.md`):
