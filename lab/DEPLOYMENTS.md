@@ -287,7 +287,10 @@
   - **A-241 (its pass on 0.1.134):** worker1's staging before the deploy (22:34Z): `root:root` 750,
     no backlog over 24 h; planted an old blob name, a fresh one, an old put temporary and an old
     name that is no blob's. The pass runs one hour after each orchestrator start; worker1's last
-    start (on 0.1.134) was 23:48:30Z, so its pass was due at 00:48:30Z. **[A-241 RESULT PENDING]**
+    start (on 0.1.134) was 23:48:30Z, so its pass was due at 00:48:30Z. It ran at 00:48:30Z (*"blob staging cleaned: unfinished puts past their TTL deleted"*, `scanned=4
+    deleted=2 deleted_bytes=6 elapsed_ms=39`, with `blob_gc_enabled=false`): the old blob name and the
+    old put temporary went, the fresh blob name and the old name that is no blob's stayed. A restart of
+    the orchestrator postpones the pass by an hour.
   - **A-255 (live, the operator's call; the path that never had the bug):** a rotation on the edge
     IO.cloud already trusted: `publish_cloud_endpoint` on `SY.edge@ingress1` at 23:20:20Z answered
     ok in 1.9 s with `edge_applied: true`; `IO.cloud@motherbee` RUNNING HEALTHY before and after,

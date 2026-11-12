@@ -217,7 +217,7 @@ no change required
 25. **0.1.133, one branch per binary, and 0.1.134, the orchestrator's hotfix** ✅ 0.1.134 live, both
     checked on 8.x (2026-11-11): 0.1.133 shipped A-191 (system ILKs retired, never deleted) with
     A-232, A-240 (a status read writes nothing), A-241 (a worker cleans its own blob staging:
-    **[A-241 RESULT PENDING]**), A-255 (the edge applied to the running IO.cloud, built: a new
+    its first pass on 8.x deleted the 2 old put leftovers of 4 planted files), A-255 (the edge applied to the running IO.cloud, built: a new
     edge's apply by its tests, and on 8.x a rotation of the Cloud's token on the edge IO.cloud
     already trusted), A-258, A-259 and A-266 (SY.timer 1.6), A-260 and A-274 (the publication lock
     free while an edge hangs), A-267 and A-271 (a check with no answer acts on nothing), A-270,
@@ -381,6 +381,12 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-312 🔵 A version with build metadata (`1.2.0+b1`) breaks every node built on it and cannot be removed (low; the runtimes).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide).
 - A-315 🔵 SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes` (low; SY.admin and SY.architect; found by 0.1.133's gate).
+- A-316 🔵 An edge channel's bearer can be read back through `vault_assign` then `vault_get` (low; SY.admin or SY.vault).
+- A-317 🔵 SY.edge keeps one previous channel secret, in memory only (low; SY.edge; to decide).
+- A-318 🔵 A failed publish's clean-up after the answer can orphan IO.blob's copy if SY.admin stops (low; SY.admin; 0.1.137).
+- A-319 🔵 The installation update's background reads are bounded in time, not in number (low; SY.admin; 0.1.137).
+- A-320 🔵 Only `add_hive`'s timed-out records ever close in Archi (low; SY.architect).
+- A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1458,6 +1464,73 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-321 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder and review; read in the code; there before it) — Archi's plans and texts around `add_hive`
+
+- **Manifests:** Archi never checks a manifest's hive ids: a hive `a.b` is planned, and refused
+  `INVALID_HIVE_ID` only at execution, after the operator confirmed.
+- **The SCMD help:** its `add_hive` example (`handle_meta_scmd`, `src/bin/sy_architect.rs` ~12099) has
+  no `ssh_user`, so a copied example is refused `INVALID_REQUEST`; SY.admin's example has it.
+- **A closed record:** one closed on `NOT_FOUND` says *"hive 'X' no longer exists"*, where a
+  timed-out `add_hive`'s hive usually never existed.
+- **Fix, later (SY.architect):** check a manifest's hive ids when it is planned; the example's
+  `ssh_user`; *"the registry does not have hive 'X' (removed, or never created)"*.
+
+### A-320 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder; read in the code; there before it) — Only `add_hive`'s timed-out records ever close
+
+- **Why:** Archi's reconcile asks the registry only for an open `add_hive` record. Any other tracked
+  mutation that times out in Archi stays `timeout_unknown` in its chat, and an identical request
+  there answers `OPERATION_ALREADY_TRACKED` (`remove_hive` waits Archi's 30 s while the
+  orchestrator's removal can take longer).
+- **Effect:** the operator's retry in the same chat is refused; a new chat, or other parameters,
+  gets past it.
+- **Fix, later (SY.architect):** a reconcile for each tracked mutation that has a read to settle it.
+
+### A-319 [General/admin] 🔵 low (found 2026-11-11 by A-263's review; read in the code) — The installation update's background reads are bounded in time, not in number (0.1.137)
+
+- **Why:** since 0.1.137 every due hive is read at once. Past about 16 hives in flight the
+  motherbee's orchestrator queues the rest (16 forwarding places, 4 per target) while SY.admin's
+  per-read limit runs, and a queued read that times out outside a restart holds its hive 50 s.
+- **Effect:** none at 8.x's four hives; on a large installation the marks come late again.
+- **Fix, later:** cap the background reads below 16 (for example 8).
+
+### A-318 [General/admin] 🔵 low (found 2026-11-11 by A-280's review; read in the code) — A failed publish's clean-up runs after the answer, so a stop of SY.admin during IO.blob's release orphans the copy
+
+- **Why:** since 0.1.137 the row is removed under the lock, the answer goes out, and IO.blob's
+  release runs in a task of its own. If SY.admin stops during that release (up to 30 s, a deploy
+  say), IO.blob keeps a copy no ledger row names, and IO.blob has no collection of such orphans.
+  Before 0.1.137 the row stayed `curated` and the expiry sweep retired it. A release that fails
+  orphaned the copy before too.
+- **Fix, later:** the clean-up task removes the row (under the lock, only while still `curated`)
+  once IO.blob answered the release.
+
+### A-317 [General/edge] 🔵 low (found 2026-11-11 by A-273's builder; read in the code; there before it) — SY.edge keeps one previous channel secret, in memory only
+
+- **Why:** `apply_open_url` (`src/bin/sy_edge.rs` ~696-711) keeps only the replaced entry's current
+  secret as the previous one, for 10 minutes, in memory.
+- **Effect:** two rotations within 10 minutes drop the older token at once; a run that answers
+  `CONFIG_RECORD_FAILED` puts a token nobody holds in that slot (0.1.137's texts say so); moving the
+  Cloud's door to another edge leaves the old edge's door open with the old token in its memory
+  until that edge restarts, when its vault fetch fails and the old door refuses every token.
+- **Fix, later (to decide):** keep the older grace token when the current one was never used; close
+  the old edge's door when the door moves; or record `io.edge_node` before the externalize mints,
+  so a failed record rotates nothing.
+
+### A-316 [General/admin] 🔵 low (found 2026-11-11 by A-273's review; read in the code, not run; there before it) — An edge channel's bearer can be read back through `vault_assign` then `vault_get`
+
+- **Why:** `handle_externalize` stores `edge_channel_secret:<ich>` owned by the edge, in the root
+  tenant; `vault_assign` (`check_assigned_ilks`, `src/bin/sy_admin.rs` ~23229) admits any ILK that is
+  not a person's and is charged to the secret's tenant, SY.admin's own system ILK included;
+  `refuse_acme_account_access` (~22510) guards only the ACME account key; SY.vault's
+  `handle_assign` (`src/bin/sy_vault.rs` ~1092) asks only for a known admin caller; a `vault_get`
+  through SY.admin goes with SY.admin's ILK (~22387), and `authorize_read` admits an assigned ILK
+  (~1941).
+- **Effect:** the operator, or Archi with the operator's confirmation of a `vault_assign` step (the
+  A-62 table admits Archi to both), can read the Cloud's bearer or any edge channel's; through Archi
+  it reaches the AI provider (A-124). SY.admin's texts say it cannot be read back.
+- **Fix, later:** a guard like the ACME one on `edge_channel_secret:*` and `edge_fanout_verify:*`
+  for `vault_get` and `vault_assign`, or SY.vault refusing to assign an infrastructure secret
+  dedicated to one node.
+
 ### A-315 [Archi] 🔵 low (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
 
 - **Seen:** 0.1.133's gate read SY.admin's per-action HELP for the answers 0.1.133 added (A-285):
@@ -2274,6 +2347,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   still fails, the error says the previous token no longer works and running again hands a new one.
   The token goes out once, only with a success. In 0.1.136 (SY.admin).
 
+- **Built on `coa/admin-136` (0.1.137), with its review's fixes:** the record is tried once more
+  at once; when it fails again, 502 `CONFIG_RECORD_FAILED` says the door is open with a token nobody
+  received, that the previous token works for up to 10 minutes and stops sooner if the edge
+  restarts or the action runs again (SY.edge keeps one previous token: A-317), to fix the cause
+  first and run it again on the motherbee's HTTP API, never through Archi (A-124), and to give the
+  Cloud the new token at once. On a record that times out, the retry waits another 30 s, so the
+  call can take about 2 minutes. Found by its review: A-316 and A-317.
+
 ### A-272 [General/router] 🔵 low (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
 
 - **Seen:** the motherbee logged `foreign_source` drops of its own nodes' broadcasts coming back
@@ -2799,6 +2880,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   not built, and the Cloud's list and take-down with its track. Both say so again when 0.1.136
   ships.
 
+- **Built on `coa/admin-136` (0.1.137):** over the mesh an `IO.*` or `WF.*` node takes down a page
+  it published, as an `AI.*` node does, and only its own (the router-stamped caller, the page's
+  tenant, no node of an ingress or egress hive). IO.cloud@motherbee, an IO node, is admitted too: it
+  publishes none, every other page is refused, and neither action is Cloud-exposed. The builder
+  chose that over a special case that denies IO.cloud; the operator may want it denied. No SDK
+  helper yet: the Rust and Go SDKs' helpers to publish and take down a page come with their next
+  releases.
+
 ### A-242 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a node's and a tenant's purge with two pages up, each naming them; the spawn's rollback stays by design) (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
 
 - **remove_hive:** `remove_hive_flow` (`src/bin/sy_orchestrator.rs` ~21482 on c7402e88) leaves the pages
@@ -2831,7 +2920,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   factory reset's dry run lists its new step [8]. The spawn's rollback that purges an ILK stays as
   it is, by design (docs/control-path-hardening-v1.md §4: the node never ran).
 
-### A-241 [General/blob] ✅ VALIDATED ON 8.x (0.1.133, run on 0.1.134, 2026-11-11; **[A-241 RESULT PENDING]**) (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
+### A-241 [General/blob] ✅ VALIDATED ON 8.x (0.1.133, run on 0.1.134, 2026-11-11; worker1's first pass deleted the 2 old put leftovers of 4 planted files) (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
 
 - **Why:** since A-188 the blob GC runs only on the motherbee; a spoke's `staging/` leftovers were
   never cleaned before either, because its GC was off. A staging-only pass on spokes, which needs
@@ -2842,7 +2931,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (22:34Z): `root:root` 750, no backlog over 24 h; the gate planted an old blob name, a fresh one,
   an old put temporary and an old name that is no blob's. The pass runs one hour after each
   orchestrator start; worker1's last start was 23:48:30Z (on 0.1.134), so its pass was due at
-  00:48:30Z. **[A-241 RESULT PENDING]**
+  00:48:30Z. It ran at 00:48:30Z (*"blob staging cleaned: unfinished puts past their TTL deleted"*, `scanned=4
+  deleted=2 deleted_bytes=6 elapsed_ms=39`, with `blob_gc_enabled=false`): the old blob name and the
+  old put temporary went, the fresh blob name and the old name that is no blob's stayed. A restart of
+  the orchestrator postpones the pass by an hour.
 
 ### A-240 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; no `status_version` in the answer, 5 reads left the node's directory unchanged) (found 2026-11-10 by A-199's builder; read in the code) — A local get_node_status writes on every read
 
