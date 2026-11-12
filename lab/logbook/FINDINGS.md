@@ -395,6 +395,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-319 🔵 The installation update's background reads are bounded in time, not in number (low; SY.admin; 0.1.137).
 - A-320 🔵 Only `add_hive`'s timed-out records ever close in Archi (low; SY.architect).
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
+- A-322 🟡 After CONFIRM the chat shows only "Execution completed successfully" or "Execution stopped at step 's1'": no step's answer (medium; SY.architect).
+- A-323 🔵 Archi plans `kill_node` for a core node and says nothing brings it back (low; Archi's texts).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1471,6 +1473,35 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-323 [Archi] 🔵 low (found 2026-11-12 by the natural-language gate of Archi; seen on 8.x on 0.1.135) — Archi plans `kill_node` for a core node and says nothing brings it back
+
+- **Seen:** asked to stop SY.timer on the motherbee, Archi staged one `kill_node` of
+  `SY.timer@motherbee` (no force, no purge) and said neither the boot nor the periodic checks would
+  bring it back. Since 0.1.134 the orchestrator refuses an `SY.*` name with `INVALID_REQUEST` (A-314's
+  review), and the watchdog restarts a stopped core service within seconds. Archi did warn that the
+  motherbee might refuse it. The plan was canceled, not run.
+- **Fix:** SY.admin's help names the refusal from 0.1.137 (`coa/admin-136`, `b0bfce41`); Archi's
+  handbook should also say a core node is not stopped with `kill_node` and that the watchdog keeps the
+  core services running.
+
+### A-322 [Archi] 🟡 medium (found 2026-11-12 by the natural-language gate of Archi; seen on 8.x on 0.1.135; there before it) — After CONFIRM the chat shows only "Execution completed successfully" or "Execution stopped at step 's1'"
+
+- **Seen:** with worker1's orchestrator stopped, a plan Archi staged to remove an unused version ran
+  on CONFIRM, and the chat said only *"Execution stopped at step 's1'"*: not
+  `RUNTIME_USAGE_UNKNOWN`, nor which hive was not read, nor that it may be asked again. A workflow's
+  delete then answered ok with `packages_left` (0.0.1 `RUNTIME_USAGE_UNKNOWN`, 0.0.2
+  `PURGE_STOPPED`) and the chat said only *"Execution completed successfully"*, so the operator reads a
+  full success while two versions stayed. Asked *"¿Cómo quedó?"*, Archi explained both exactly as its
+  handbook says (from reads: the command log keeps only the code, so it found worker1 in the LSA).
+- **Why:** the executor's answer goes to the chat as one fixed line; the model gets no turn with the
+  step answers its handbook tells it to report (`packages_left` and its reasons, `warning`,
+  `pages_left_up`, a refusal's code, detail, `unanswered_hives` and `retryable`).
+- **Effect:** what A-281, A-242 and A-285 added for the operator is reachable through Archi only if
+  the operator asks; the fixed line can mislead. A canceled plan reads *"Programmer plan discarded"*.
+- **Fix, later (SY.architect):** after an execution, give the model one turn with each step's answer
+  (the executor's essentials already carry them), or render each step's code, detail and
+  `packages_left`/`warning`/`pages_left_up` in the line.
 
 ### A-321 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder and review; read in the code; there before it) — Archi's plans and texts around `add_hive`
 
