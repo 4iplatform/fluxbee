@@ -1600,6 +1600,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   join's answer says so.
 - **Fix, later (the orchestrator):** `add_hive` sees another hive's install on the box and refuses
   it with a code that says so.
+- **Built on `coa/orch-139` (for 0.1.139; `9aec2c5d`).** The cause, read in the code: a worker
+  join `restart`s the box's rt-gateway but only `start`s its sy-orchestrator, a no-op on one that
+  runs, so the box's orchestrator stayed `gate0237i`; and no join restarts the other services it
+  finds running. Each join (worker, egress, ingress) now reads the box once its sudo works and
+  before it copies anything (`refuse_box_running_another_hive`): `/etc/fluxbee/hive.yaml`'s
+  `hive_id` and `systemctl is-active` of the units `remove_hive`'s cleanup stops
+  (`BOX_INSTALL_UNITS`). A hive.yaml that names another hive id while one of them runs refuses the
+  join `BOX_RUNS_ANOTHER_HIVE`, not retryable, nothing installed, naming `box_hive_id`,
+  `running_units` and what to do: `remove_hive` of that hive first, while the box can be reached,
+  when the registry still lists it; otherwise `systemctl disable --now <units>` on the box, or a
+  fresh box. A box joined again under its own name, one whose units a removal's cleanup stopped
+  (its hive.yaml stays) and a fresh box join as before; a probe that fails is logged and the join
+  goes on. Test `a_join_refuses_a_box_that_runs_another_hives_install` (fails without the refusal),
+  with a source check that every flow probes after its sudo check and before its first copy.
+  Docs: sy-orchestrator.md, operations.md, Archi's handbook. One SSH round trip more per join.
 
 ### A-330 [General/orchestrator] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x, read in the code; left by the integration's fix) — `list_hives` lists a registry directory whose name is not a hive id
 
@@ -1612,6 +1627,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `INVALID_HIVE_ID`; the runtime-use read, `/versions` and the Cloud's `list_nodes` left it out.
 - **Effect:** the hive list shows an entry that is no hive, which every action on it refuses.
 - **Fix, later (the orchestrator):** `list_hives` takes `registry_directory_is_hive`.
+- **Built on `coa/orch-139` (for 0.1.139; `c7a733ac`).** `list_hives` (`list_hives_in`) leaves out
+  a directory whose name is not a hive id (`registry_directory_is_hive`, warned of once); an entry
+  being accepted, with no `info.yaml` yet, is still listed by its name, and this hive when the
+  registry has no entry for it. Test `list_hives_lists_no_registry_directory_that_is_not_a_hive`
+  (fails without it: `gate0237.bak`, `lost+found` and `worker 3` listed). Docs: sy-orchestrator.md.
 
 ### A-329 [General/Go SDK] 🔵 medium (found 2026-11-12 by 0.1.137's gate, on 0.1.136; seen on 8.x, read in the code; there before it) — The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender
 
@@ -1735,6 +1755,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   says which), and only one pinned to an older ai.generic may still miss the 3 s while its workers
   are busy. Its test, `node_help_says_a_busy_ai_node_answers_at_once_since_0_1_136`, fails without
   it. The orchestrator's three comments are the orchestrator branch's.
+- **The orchestrator's three comments built on `coa/orch-139` (for 0.1.139; `09081da6`):**
+  `NODE_HELP_PROBE_TIMEOUT_SECS`, `node_help_from_answer`'s timeout arm and its test's comment say
+  what the pages say: on ai.generic 0.1.136 or later a silence of 3 s means the node is stuck or
+  restarting or its 64 control places were all taken, and only a node pinned to an older ai.generic
+  may miss it for being busy. Comments only, no test. SY.admin's `node_help` note, the other half,
+  goes with SY.admin's branch.
 
 ### A-323 [Archi] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; asked to stop `SY.orchestrator@worker1`, Archi staged nothing, said a core node is not stopped through it and asked what the operator wants, in 7.3 s) (found 2026-11-12 by the natural-language gate of Archi; seen on 8.x on 0.1.135) — Archi plans `kill_node` for a core node and says nothing brings it back
 
@@ -2096,6 +2122,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   so the window is a version removed by hand or before 0.1.133.
 - **Fix, later:** keep every version of the runtime while such a config exists and its unit runs
   or gives no answer, and log it.
+- **Built on `coa/orch-139` (for 0.1.139; `d081d505`).** The retention pass
+  (`apply_runtime_retention_with_roots_and_protection`: the watchdog's verify and a runtime
+  `SYSTEM_UPDATE`) asks systemd, through the state's unit checks, for the unit of each node whose
+  `config.json` cannot be read or parsed (`persisted_runtime_keep_versions_with_root`). While that
+  unit runs or gives no answer, the runtime and version the node runs on are unknown, so "every
+  version of the runtime" is every version: the pass deletes nothing, names each such node
+  (`held_by_unreadable_configs`) and logs *"runtime retention removed no version"*, and the next
+  pass reads the configs again. One whose unit does not run is left out, as before (nothing
+  relaunches a node whose config cannot be read). Test
+  `runtime_retention_deletes_nothing_while_a_node_whose_config_cannot_be_read_may_run` (fails
+  without it: the version only that node pins is deleted). Docs: sy-orchestrator.md.
 
 ### A-309 [General/SDK] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; latent) — The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call
 
@@ -2124,6 +2161,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   SIGSTOPped, 4 `GET /versions` held 30.8 to 31.3 s each; the Cloud's `list_nodes` for `pruebas`,
   started while they held, answered `TIMEOUT` at 31.8 s. With only 4 runtime reads in flight it
   answered in 13.1 s, worker1 in `unreachable_hives` (`NODE_LIST_FAILED`, 10 s).
+- **Built on `coa/orch-139` (for 0.1.139; `0b07426b`), the first of the two fixes:**
+  `list_tenant_nodes` waits in a read target of its own (`ReadTarget::TenantNodes`, 4 places),
+  never behind `list_versions` (`ReadTarget::EveryHive`), as the runtime reads do since 0.1.133. A
+  `/versions` read keeps its own cost (the hives asked one after another, 45 s for each that does
+  not answer), now in places that only `/versions` reads share. Test
+  `fluxbee_clouds_node_list_never_waits_behind_versions` (fails without it: the tenant read waits
+  behind the 4 held `/versions`), and the lane-target tests name the new target. Docs:
+  sy-orchestrator.md.
 
 ### A-307 [WF/wf-rules] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it, longer since 0.1.133) — SY.wf-rules handles one request at a time, and a request queued behind another starts its 60 s late
 
@@ -2292,6 +2337,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `create_dir_all`, and refuses with `IO_ERROR` when it cannot; the recheck could also compare the
   session's key with the key file (`src/mesh_hmac.rs` is shared code).
 - **Gates:** never join a gate hive again under a name whose box may still run with a surviving key.
+- **Built on `coa/orch-139` (for 0.1.139; `ee7eece4`).** `accept_add_hive` deletes a surviving
+  `<hive>.key` for a fresh join (`resumed == false`, and never the motherbee's own name) before it
+  creates the entry's directory (`drop_surviving_identity_key`), and refuses `IO_ERROR` naming the
+  file, nothing written, when it cannot; the bootstrap then generates a new key. Left, not built
+  (SY.identity's and the shared `src/mesh_hmac.rs`): the recheck comparing a session's key with the
+  key file, so a session the old box opened before the accept stays open until sy-identity
+  restarts; the texts say to wait one recheck (10 s) after a removal whose key could not be
+  deleted. Test `a_fresh_join_reuses_no_surviving_identity_key` (fails without it), with a source
+  check of the accept's order. Docs: sy-orchestrator.md, sy-identity.md, identity.md, Archi's
+  handbook and SY.admin's `remove_hive` help, which no longer call it a known limit. **Found on the
+  way (read in the code; there before it; not numbered here):** a fresh join under a removed
+  hive's name onto a box that still runs that hive can take the socket-only path once the accept
+  lists the hive (the box's router comes back with its old leaf, A-48's leaf pinning parked),
+  which provisions no identity key or TLS leaf, and no join restarts a running sy-identity, which
+  loads its HMAC key only at start (`src/bin/sy_identity.rs` ~4570): the box's replica is refused
+  until its sy-identity restarts. That holds for every removal that deleted the key; this fix
+  makes a `delete_failed` removal behave the same, where the key it left let the box back in.
 
 ### A-300 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's SY.admin review; read in the code; there before it) — A node pinned to a version is not counted as its use between crash-loop restarts, and the version can be removed under it
 
@@ -2306,6 +2368,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** list a pinned node whose config has `relaunch_on_boot` and whose unit does not
   run (for example as lifecycle `RELAUNCH_DUE`), so it must be stopped before its version goes; or
   narrow the note to units that run or give no answer.
+- **Built on `coa/orch-139` (for 0.1.139; `8cb15b27`), the first fix:** the runtime's use
+  (`local_runtime_usage_summary`) lists `RELAUNCH_DUE` a node whose unit does not run that the 60 s
+  reconcile relaunches on the version its config pins (`pinned_node_relaunch_due`: a kind the
+  reconcile takes, no SY or RT name, `relaunch_on_boot`, a pinned `requested_runtime_version`), so
+  `remove_runtime_version` refuses that version (`RUNTIME_IN_USE`) until the node is stopped
+  (`kill_node` clears the flag) or moved. A node that follows `current` is not listed: its relaunch
+  resolves the manifest's current, which SY.admin never removes. SY.admin's texts, built here in
+  `sy_admin.rs` (the removal's help note and `RUNTIME_IN_USE`'s detail on `RELAUNCH_DUE`), with
+  sy-admin.md, operations.md, Archi's handbook and sy-orchestrator.md, say it. Tests
+  `a_pinned_node_the_reconcile_relaunches_is_listed_as_its_versions_use` and
+  `no_answer_for_a_nodes_unit_starts_stops_or_removes_nothing` (fail without it); SY.admin's
+  `runtime_in_use_names_each_node_with_its_hive_and_state` and
+  `the_help_says_what_a_runtime_versions_removal_answers` (fail with the old texts).
 
 ### A-299 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review fixes; read in the code; there before it) — A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it
 
@@ -2319,6 +2394,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `remove_hive`'s cleanup still stops its managed nodes when it reaches the box.
 - **Fix, later:** record the device id as soon as the link is made, or unlink by the device id the
   failure path reads, so `remove_hive` unlinks a failed join too.
+- **Built on `coa/orch-139` (for 0.1.139; `22252d9a`).** Every join flow records the device it
+  links (`record_join_syncthing_device`) just before `ensure_syncthing_peer_link_runtime`: the
+  worker's two paths and the ingress, and, de-diverged, the egress, which recorded it only after a
+  link that succeeded. `write_join_entry` keeps a recorded device id through a flow's write that
+  names none, so a retry's writes before its own link keep the device an earlier attempt linked.
+  `remove_hive` then unlinks a failed join's device by it; the peer reconcile leaves alone the
+  device of a hive not at rest, as before. Test
+  `a_join_that_fails_after_its_link_keeps_the_device_it_linked` (fails without it), with a source
+  check that every link has its record just before it. Docs: sy-orchestrator.md. Not covered: a
+  box reinstalled between two failed attempts of one join (a new device id) leaves the first
+  device unrecorded, for the orphan pass.
 
 ### A-298 [Archi] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; through Archi's panel API a publish that made 1.0.1 current moved the two running nodes on `current` in place, ILK, `launched_by` and config kept, and left a pinned and a stopped node alone; Archi sent only `publish_runtime_package`) (found 2026-11-11 by the io-cloud-api docs verification; read in the code; there before it) — Archi's runtime publish that makes a version current recreates every motherbee node of that runtime: new ILK, owned secrets purged, `launched_by: "archi"`
 
@@ -2407,6 +2493,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Archi's filtered reads, which report them as vendor deployments.
 - **Fix, later (the orchestrator):** the category reaches the enrichment, which appends only that
   category's snapshot row, or none (the drift alerts' synthetic rows went for the same class, U-4b).
+- **Built on `coa/orch-139` (for 0.1.139; `c815d641`).** The category reaches the enrichment
+  (`enrich_deployment_history_entries`, from `list_deployments` and `get_deployments`), which adds
+  only that category's snapshot row, none for a category that has no snapshot row; a read with no
+  category keeps the three. Test
+  `a_deployments_read_by_category_gets_only_that_categorys_snapshot_row` (fails without it). Docs:
+  sy-orchestrator.md describes the two reads, which no page did.
 
 ### A-295 [General/Rust SDK] 🔵 low (found 2026-11-11 by A-257's builder; read in the code; there before it) — The Rust SDK's command channels are unbounded
 
