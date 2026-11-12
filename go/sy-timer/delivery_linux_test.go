@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,20 +207,28 @@ func notTaken(t *testing.T, traceID, from string, retryable bool) fluxbeesdk.Mes
 // FINDINGS A-329: a fire its target answers NOT_TAKEN, retryable (its Go SDK's queue full), is sent
 // again while it is on time, as one whose target was not connected is; one not retryable is not.
 // Only the fire's target decides it, and a NOT_TAKEN is never answered. Before, a NOT_TAKEN got a
-// TIMER_UNKNOWN_VERB, and the fire was lost.
+// TIMER_UNKNOWN_VERB, and the fire was lost. The log says what happened to the fire: "sent again"
+// only for a fire queued to go again, never for one no longer on time (the review: a drop
+// one-shot's line said "sent again", the next one "lost").
 func TestAFireItsTargetAnsweredNotTakenIsSentAgain(t *testing.T) {
+	const resent = "fire of timer-1 not taken by WF.demo@motherbee (node_busy): sent again at "
 	for _, tc := range []struct {
 		name, policy, from string
 		retryable, retried bool
+		// logged is a line SY.timer's log must hold, and never what it must not.
+		logged, never string
 	}{
-		{name: "retryable", policy: "fire", from: "WF.demo@motherbee", retryable: true, retried: true},
-		{name: "retryable, inside its window", policy: "fire_if_within", from: "WF.demo@motherbee", retryable: true, retried: true},
-		{name: "retryable, a drop one-shot", policy: "drop", from: "WF.demo@motherbee", retryable: true},
-		{name: "not retryable", policy: "fire", from: "WF.demo@motherbee"},
-		{name: "from another node", policy: "fire", from: "WF.other@motherbee", retryable: true},
+		{name: "retryable", policy: "fire", from: "WF.demo@motherbee", retryable: true, retried: true, logged: resent},
+		{name: "retryable, inside its window", policy: "fire_if_within", from: "WF.demo@motherbee", retryable: true, retried: true, logged: resent},
+		{name: "retryable, a drop one-shot", policy: "drop", from: "WF.demo@motherbee", retryable: true,
+			logged: "fire of timer-1 lost: WF.demo@motherbee did not take it in 1 attempts (NOT_TAKEN node_busy)", never: "sent again"},
+		{name: "not retryable", policy: "fire", from: "WF.demo@motherbee",
+			logged: "fire of timer-1 not taken by WF.demo@motherbee (node_busy, not retryable): not sent again", never: "sent again at"},
+		{name: "from another node", policy: "fire", from: "WF.other@motherbee", retryable: true, never: "not taken by"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fastRetries(t)
+			logged := captureLog(t)
 			service, tx := newTestService(t)
 			service.scheduler = newTimerScheduler(service)
 			insertDueTimer(t, service, "timer-1", tc.policy)
@@ -232,6 +241,9 @@ func TestAFireItsTargetAnsweredNotTakenIsSentAgain(t *testing.T) {
 			}
 			if retried := queuedRetries(service.scheduler) == 1; retried != tc.retried {
 				t.Fatalf("retried=%v, want %v", retried, tc.retried)
+			}
+			if text := logged.String(); !strings.Contains(text, tc.logged) || (tc.never != "" && strings.Contains(text, tc.never)) {
+				t.Fatalf("want a line with %q and none with %q, got:\n%s", tc.logged, tc.never, text)
 			}
 			if !tc.retried {
 				return

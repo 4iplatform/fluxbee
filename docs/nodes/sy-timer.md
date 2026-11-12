@@ -163,7 +163,8 @@ Each attempt goes under a new trace id, and is kept 30 s for the router's answer
 that fails, sends the same fire again after 5, 10, 20 and 40 s, then each minute (`undelivered`,
 `retryLater`). So does the target's own `NOT_TAKEN` with that trace id, when it says `retryable`:
 the Go SDK of a target whose queue was full (`node_busy`, a WF's, since 0.1.141, FINDINGS A-329;
-`notTaken`, with a log line at each attempt). Only the fire's target, by the name its router
+`notTaken`, with a log line at each attempt queued; a fire no longer on time is lost,
+`timer_fire_lost`, never said to go again). Only the fire's target, by the name its router
 stamps, decides it; one not retryable is not sent again (`timer_fire_refused`). Before 0.1.141 a Go
 target dropped a fire its queue (64) could not hold, and SY.timer answered a `NOT_TAKEN`
 `TIMER_UNKNOWN_VERB`. The retries stop

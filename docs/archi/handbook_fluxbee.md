@@ -323,14 +323,19 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
   - `not_expected`: the instance took nothing, neither a transition nor the catch;
   - `unavailable`: the WF node cannot use its instance store, and takes no message until it can.
     Its status says why (§4.2.7).
-  - `node_busy` (since 0.1.141): the WF node holds as many messages as it takes, 1,024 waiting,
-    and its SDK answered before the engine saw the message. Whoever sent it gets it, IO node or
-    not. Sent again later, the message is taken; SY.timer sends a timer's fire again by itself.
+  - `node_busy` (since 0.1.141): the WF node holds all it can take now (1,024 messages or 8 MiB of
+    the message's kind, system or not), and its SDK answered before the engine saw the message.
+    Whoever sent it gets it, IO node or not, unless the message is a notice or a reply, which no one
+    answers. Sent again later, the message is taken; SY.timer sends a timer's fire again by itself.
 
   Another sender gets the engine's reasons only for a named request. A sender the definition does
   not name gets none of them. Each `NOT_TAKEN` says whether sending again may pass (`retryable`):
   only `unavailable` and `node_busy` do. A WF node reads its system messages (status, config, a
-  timer's fire) before the user messages it holds, so a busy WF still answers its status.
+  timer's fire, a cancel) before the user messages it holds, so a busy WF still answers its status.
+  The other side of it: under a backlog, a timer's fire or a cancel goes before user messages that
+  came before it. A person's reply that came in time, but that the node has not read yet, can lose
+  to the timeout, and a reply queued behind a cancel finds no instance (from a `start_from` node, it
+  starts a new one).
 - **A state** has `name`, `description`, `entry_actions`, `exit_actions` and `transitions`. A state
   named `failed` must be terminal: an action that fails ends the instance there.
 - **A transition:**
@@ -387,8 +392,15 @@ Common guards:
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
   - A text over about 62 KiB (`{"type": "text", "content": ...}`) goes as a blob, its `content`
-    replaced by a `content_ref` that the IO node or the agent reads in full (since 0.1.141, as an
-    agent's long answer does). Before, a WF's text over 128 KiB was never sent.
+    replaced by a `content_ref` (since 0.1.141, as an agent's long answer does). Before, a WF's
+    text over 128 KiB was never sent, and one of about 62 to 128 KiB went inline.
+    - On the WF's own hive the reader has the blob at once.
+    - On another hive the blob comes through Syncthing, about 10 s or more after the message. Today
+      the readers do not wait that long: ai.generic reads it at once, and io.slack and io.wapp wait
+      5 s. Such a text then fails at the reader, and io.slack does not post it.
+    - A WF that receives it sees only the `content_ref`, as with an agent's long answer. io.api,
+      io.web and io.linkedhelper do not read a `content_ref`.
+    - Whether to keep this as it is, or to change it, is the operator's call (FINDINGS A-264).
   - A message the WF writes to an agent or a WF carries the instance's person: the `src_ilk` and
     `ich` that the messages of the person's IO node share: the IO node the person wrote from. On a thread several people write on,
     it carries none. Its writer is the WF (below): the agent reads it as the WF's, not as the

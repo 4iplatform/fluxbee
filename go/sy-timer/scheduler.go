@@ -478,10 +478,12 @@ func (s *timerScheduler) undelivered(traceID, reason string) bool {
 // notTaken takes the NOT_TAKEN of the target of a fire sent in the last deliveryAnswerWindow
 // (FINDINGS A-329): the target's Go SDK did not queue the fire, its queue full (node_busy). A
 // retryable one is sent again as a fire whose target was not connected is (retryLater: after 5, 10,
-// 20 and 40 s, then each minute, while it is on time, and logged at each attempt); one that is not
-// retryable is not sent again. Only the fire's target, by the name its router stamps (from), decides
-// it: another node's NOT_TAKEN on the trace decides nothing, and the fire waits for its target's
-// answer. It reports whether traceID named a fire the NOT_TAKEN was taken for.
+// 20 and 40 s, then each minute, while it is on time; a fire no longer on time, a drop one-shot's
+// at once, is lost), and logged at each attempt: a plain line names the next attempt only when one
+// is queued. One that is not retryable is not sent again. Only the fire's target, by the name its
+// router stamps (from), decides it: another node's NOT_TAKEN on the trace decides nothing, and the
+// fire waits for its target's answer. It reports whether traceID named a fire the NOT_TAKEN was
+// taken for.
 func (s *timerScheduler) notTaken(traceID, from string, notice fluxbeesdk.NotTakenPayload) bool {
 	s.sentMu.Lock()
 	fire, ok := s.sent[traceID]
@@ -507,14 +509,17 @@ func (s *timerScheduler) notTaken(traceID, from string, notice fluxbeesdk.NotTak
 		log.Printf("fire of %s not taken by %s (%s, not retryable): not sent again", fire.row.UUID, from, notice.Reason)
 		return true
 	}
-	log.Printf("fire of %s not taken by %s (%s): sent again while it is on time", fire.row.UUID, from, notice.Reason)
-	s.retryLater(fire, reason)
+	// Said once retryLater decides: a fire no longer on time is lost, never "sent again" (the review).
+	if next, queued := s.retryLater(fire, reason); queued {
+		log.Printf("fire of %s not taken by %s (%s): sent again at %s", fire.row.UUID, from, notice.Reason, next.Format("15:04:05.000Z"))
+	}
 	return true
 }
 
 // retryLater queues a fire's next attempt, unless it would no longer be on time: then the fire is
-// lost.
-func (s *timerScheduler) retryLater(fire *fireAttempt, reason string) {
+// lost. It returns when the next attempt goes, and whether one was queued (false: the fire is lost,
+// and logged so).
+func (s *timerScheduler) retryLater(fire *fireAttempt, reason string) (time.Time, bool) {
 	next := time.Now().UTC().Add(deliveryRetryDelays[min(fire.attempt, len(deliveryRetryDelays))-1])
 	fields := map[string]any{
 		"timer_uuid":     fire.row.UUID,
@@ -525,12 +530,13 @@ func (s *timerScheduler) retryLater(fire *fireAttempt, reason string) {
 	if next.After(fire.deadline) {
 		logEvent("timer_fire_lost", fields)
 		log.Printf("fire of %s lost: %s did not take it in %d attempts (%s)", fire.row.UUID, fire.row.TargetL2Name, fire.attempt, reason)
-		return
+		return time.Time{}, false
 	}
 	fields["retry_at_utc_ms"] = next.UnixMilli()
 	logEvent("timer_fire_undelivered", fields)
 	fire.attempt++
 	s.pushRetry(fire, next.UnixMilli())
+	return next, true
 }
 
 // retryFire sends a fire again, unless its timer was canceled or purged since.

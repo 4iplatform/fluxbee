@@ -86,6 +86,19 @@ func readMessage(t *testing.T, from <-chan Message) Message {
 	}
 }
 
+// readFrame is the next frame the node sent, and fails the test when none comes in time: a test
+// whose fix is taken away fails at once instead of waiting for go test's own timeout.
+func readFrame(t *testing.T, tx <-chan []byte) []byte {
+	t.Helper()
+	select {
+	case frame := <-tx:
+		return frame
+	case <-time.After(2 * time.Second):
+		t.Fatalf("the node sent nothing")
+		return nil
+	}
+}
+
 // FINDINGS A-329: a message that does not fit a command channel is answered NOT_TAKEN, reason
 // node_busy, retryable, to its sender's uuid, on its trace and thread; the ones that fit are handed
 // over in the order they came. Before, the channel (64) dropped it and told no one.
@@ -104,7 +117,7 @@ func TestAMessageThatDoesNotFitIsAnsweredNotTaken(t *testing.T) {
 		rx <- receivedMessage{msg: userMessage("IO.gate@worker1", "io-uuid", "", fmt.Sprintf("trace-%d", i), fmt.Sprintf("thread-%d", i))}
 	}
 	for i := 4; i < 10; i++ {
-		answer := decodeTestFrame(t, <-tx)
+		answer := decodeTestFrame(t, readFrame(t, tx))
 		notice, ok := ParseNotTaken(answer)
 		if !ok || answer.Routing.Dst.Value() != "io-uuid" || answer.Routing.Src != "src-1" ||
 			answer.Routing.TraceID != fmt.Sprintf("trace-%d", i) || stringValue(answer.Meta.ThreadID) != fmt.Sprintf("thread-%d", i) ||
@@ -163,7 +176,7 @@ func TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered(t *testing.T) {
 	}
 
 	rx <- receivedMessage{msg: userMessage("IO.gate@worker1", "io-uuid", "", "persons-text", "thread-1")}
-	answer := decodeTestFrame(t, <-tx)
+	answer := decodeTestFrame(t, readFrame(t, tx))
 	if _, ok := ParseNotTaken(answer); !ok || answer.Routing.TraceID != "persons-text" {
 		t.Fatalf("a person's text that does not fit gets a NOT_TAKEN, got %+v", answer)
 	}
@@ -277,12 +290,14 @@ func (b *syncBuffer) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 
-func (b *syncBuffer) lines() []string {
+// lines are the lines the dispatcher wrote of what the queue of channel refused. Each test that
+// reads them takes a channel of its own: a line due from another test's dispatcher names its own.
+func (b *syncBuffer) lines(channel string) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var out []string
 	for _, line := range strings.Split(strings.TrimSpace(b.buf.String()), "\n") {
-		if strings.Contains(line, `fluxbee-go-sdk: command channel "logged"`) {
+		if strings.Contains(line, fmt.Sprintf("fluxbee-go-sdk: command channel %q", channel)) {
 			out = append(out, line)
 		}
 	}
@@ -313,8 +328,8 @@ func TestTheLogSaysWhatTheQueueRefusedWithoutFlooding(t *testing.T) {
 
 	rx <- receivedMessage{msg: userMessage("IO.gate@worker1", "io-uuid", "", "fits", "t")}
 	rx <- receivedMessage{msg: userMessage("IO.gate@worker1", "io-uuid", "", "first-refused", "t")}
-	waitFor(t, "the first line", func() bool { return len(logged.lines()) == 1 })
-	if line := logged.lines()[0]; !strings.Contains(line, `command channel "logged" full (0 system and 1 non-system messages waiting): 1 message(s) not taken`) ||
+	waitFor(t, "the first line", func() bool { return len(logged.lines("logged")) == 1 })
+	if line := logged.lines("logged")[0]; !strings.Contains(line, `command channel "logged" full (0 system and 1 non-system messages waiting): 1 message(s) not taken`) ||
 		!strings.Contains(line, "1 answered NOT_TAKEN node_busy") || !strings.Contains(line, "trace_id=first-refused") {
 		t.Fatalf("unexpected first line: %s", line)
 	}
@@ -324,18 +339,72 @@ func TestTheLogSaysWhatTheQueueRefusedWithoutFlooding(t *testing.T) {
 	rx <- receivedMessage{msg: systemMessage("SY.orchestrator@worker1", "orch-uuid", MSGNodeStatusGet, "fits-too")}
 	rx <- receivedMessage{msg: systemMessage("", "router-uuid", MSGUnreachable, "notice-refused")}
 	waitFor(t, "the refusals", func() bool { return dispatcher.NotTakenSent().Answered+dispatcher.NotTakenSent().Unanswered == 7 })
-	if lines := logged.lines(); len(lines) != 1 {
+	if lines := logged.lines("logged"); len(lines) != 1 {
 		t.Fatalf("one line per interval, got %d: %v", len(lines), lines)
 	}
-	waitFor(t, "the burst's line", func() bool { return len(logged.lines()) == 2 })
-	if line := logged.lines()[1]; !strings.Contains(line, "6 message(s) not taken") ||
+	waitFor(t, "the burst's line", func() bool { return len(logged.lines("logged")) == 2 })
+	if line := logged.lines("logged")[1]; !strings.Contains(line, "6 message(s) not taken") ||
 		!strings.Contains(line, "5 answered NOT_TAKEN node_busy, 1 not answered (a notice or a reply)") ||
 		!strings.Contains(line, "trace_id=notice-refused") {
 		t.Fatalf("unexpected burst line: %s", line)
 	}
 	time.Sleep(3 * refusalLogEvery)
-	if lines := logged.lines(); len(lines) != 2 {
+	if lines := logged.lines("logged"); len(lines) != 2 {
 		t.Fatalf("nothing more to say, got %d lines: %v", len(lines), lines)
+	}
+}
+
+// FINDINGS A-329 (the review): a NOT_TAKEN that cannot go, the node's own send queue full (or its
+// link down), is counted as such and named in the log; the refused message is counted all the
+// same, and the dispatcher never waits for room to answer it.
+func TestANotTakenThatCannotBeSentIsCountedAndLogged(t *testing.T) {
+	logged := &syncBuffer{}
+	log.SetOutput(logged)
+	defer log.SetOutput(os.Stderr)
+	every := refusalLogEvery
+	refusalLogEvery = 200 * time.Millisecond
+	defer func() { refusalLogEvery = every }()
+
+	profile, err := NewOperationalRouteProfile().
+		CommandChannel("unsent").
+		PostPendingRule(RouteAny{}, RouteCommand{Channel: "unsent"}).
+		Build()
+	if err != nil {
+		t.Fatalf("build profile: %v", err)
+	}
+	// Nothing reads the send queue, and it holds nothing: every Send finds it full.
+	state := &connectionState{connected: true}
+	tx := make(chan []byte)
+	rx := make(chan receivedMessage, 8)
+	sender := &NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: state}
+	receiver := &NodeReceiver{uuid: "src-1", fullName: "WF.demo@motherbee", rx: rx, state: state}
+	dispatcher := newRouterDispatcher(sender, receiver, profile)
+	go dispatcher.dispatchLoop()
+	defer func() { _ = dispatcher.Close() }()
+	setLaneBounds(t, dispatcher, "unsent", 1, commandLaneMaxBytes)
+
+	rx <- receivedMessage{msg: userMessage("IO.gate@worker1", "io-uuid", "", "fits", "t")}
+	for i := 0; i < 3; i++ {
+		rx <- receivedMessage{msg: userMessage("IO.gate@worker1", "io-uuid", "", fmt.Sprintf("refused-%d", i), "t")}
+	}
+	waitFor(t, "the refusals", func() bool { return dispatcher.NotTakenSent().SendFailed == 3 })
+	if sent := dispatcher.NotTakenSent(); sent != (NotTakenCounts{SendFailed: 3}) {
+		t.Fatalf("want 3 NOT_TAKEN that could not be sent, none answered, got %+v", sent)
+	}
+	if drops := dispatcher.CommandChannelDrops()["unsent"]; drops != 3 {
+		t.Fatalf("want 3 refusals counted, got %d", drops)
+	}
+	waitFor(t, "the burst's line", func() bool { return len(logged.lines("unsent")) == 2 })
+	lines := logged.lines("unsent")
+	if !strings.Contains(lines[0], "1 message(s) not taken") ||
+		!strings.Contains(lines[0], "0 answered NOT_TAKEN node_busy, 0 not answered (a notice or a reply), 1 whose NOT_TAKEN could not be sent") ||
+		!strings.Contains(lines[0], "trace_id=refused-0") {
+		t.Fatalf("unexpected first line: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], "2 message(s) not taken") ||
+		!strings.Contains(lines[1], "0 answered NOT_TAKEN node_busy, 0 not answered (a notice or a reply), 2 whose NOT_TAKEN could not be sent") ||
+		!strings.Contains(lines[1], "trace_id=refused-2") {
+		t.Fatalf("unexpected burst line: %s", lines[1])
 	}
 }
 
@@ -382,7 +451,7 @@ func TestARequestAnsweredNotTakenFailsWithItsReason(t *testing.T) {
 			defer func() { _ = dispatcher.Close() }()
 			done := make(chan error, 1)
 			go func() { done <- tc.send(dispatcher) }()
-			request := decodeTestFrame(t, <-tx)
+			request := decodeTestFrame(t, readFrame(t, tx))
 			request.Routing.Src = "caller-uuid"
 			request.Routing.SrcL2Name = stringPtr("SY.wf-rules@worker1")
 			answer, err := BuildNotTaken("target-uuid", request, NotTakenReasonNodeBusy, "WF.busy@worker1 holds 1024 system messages", true)

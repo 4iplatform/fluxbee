@@ -96,7 +96,9 @@ func TestATextOverTheLimitGoesAsABlob(t *testing.T) {
 }
 
 // FINDINGS A-264: a payload under the limit, one with a content_ref already, and one that is no
-// text/v1 text go byte for byte, and write nothing.
+// text/v1 text go byte for byte, and write nothing. So does a text/v1 payload over the limit whose
+// content is null or missing, as the Rust SDK sends it (the review: it went as an empty blob, its
+// content_ref of size 0).
 func TestAPayloadThatNeedsNoBlobGoesByteForByte(t *testing.T) {
 	root := t.TempDir()
 	big := strings.Repeat("x", 70*1024)
@@ -105,6 +107,8 @@ func TestAPayloadThatNeedsNoBlobGoesByteForByte(t *testing.T) {
 		"a text with a content_ref": json.RawMessage(`{"type":"text","content_ref":{"type":"blob_ref","blob_name":"content_0123456789abcdef.txt","size":1,"mime":"text/plain","filename_original":"content.txt","spool_day":"2026-11-12"},"pad":"` + big + `"}`),
 		"no text":                   json.RawMessage(`{"type":"admin","content":"` + big + `"}`),
 		"a content that is no text": json.RawMessage(`{"type":"text","content":{"x":"` + big + `"}}`),
+		"a content that is null":    json.RawMessage(`{"type":"text","content":null,"pad":"` + big + `"}`),
+		"no content":                json.RawMessage(`{"type":"text","pad":"` + big + `"}`),
 		"no object":                 json.RawMessage(`"` + big + `"`),
 	} {
 		out, ref, err := offloadText(root, payload)
@@ -216,7 +220,7 @@ func TestATextOverTheFrameIsSentAsABlob(t *testing.T) {
 		}
 		t.Fatalf("send: %v", err)
 	}
-	frame := <-tx
+	frame := readFrame(t, tx)
 	if len(frame) > 4096 {
 		t.Fatalf("the frame carries the ref, not the text: %d bytes", len(frame))
 	}

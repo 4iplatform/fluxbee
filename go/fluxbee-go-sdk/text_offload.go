@@ -69,8 +69,9 @@ type BlobRef struct {
 
 // offloadText returns payload, a text/v1 payload, with its content in a blob of root when its
 // inline form is over the limit; any other payload, one under the limit, one that has a content_ref
-// already, or one that is not a text/v1 payload with a text, comes back as it is (false). An error
-// says the text was over the limit and could not go as a blob: payload comes back as it is.
+// already, or one that is not a text/v1 payload with a text (its content missing, null or no
+// string), comes back as it is, with no ref. An error says the text was over the limit and could
+// not go as a blob: payload comes back as it is.
 func offloadText(root string, payload json.RawMessage) (json.RawMessage, *BlobRef, error) {
 	if len(payload)+TextOffloadOverheadBytes <= TextOffloadMaxMessageBytes {
 		return payload, nil, nil
@@ -86,11 +87,13 @@ func offloadText(root string, payload json.RawMessage) (json.RawMessage, *BlobRe
 	if ref, ok := fields["content_ref"]; ok && string(ref) != "null" {
 		return payload, nil, nil
 	}
-	var content string
-	if json.Unmarshal(fields["content"], &content) != nil {
+	// A null content is no text: the payload goes as it is, as the Rust SDK sends a text/v1 payload
+	// whose content is None (send_normalization.rs), never as an empty blob.
+	var content *string
+	if json.Unmarshal(fields["content"], &content) != nil || content == nil {
 		return payload, nil, nil
 	}
-	ref, err := putTextBlob(root, []byte(content))
+	ref, err := putTextBlob(root, []byte(*content))
 	if err != nil {
 		return payload, nil, err
 	}

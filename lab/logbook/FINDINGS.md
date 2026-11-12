@@ -472,7 +472,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141).
+- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141; the review: a text of about 62 to 128 KiB, inline before, now fails at a reader on another hive, the operator's call before it ships).
 - A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, with 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
@@ -2210,11 +2210,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     never for the backlog; each lane has its own bound, so a user burst never refuses a
     `NODE_STATUS_GET`, a `CONFIG_SET` or a `TIMER_FIRED`. The consumers' API is the same
     (`TakeCommandReceiver`).
+  - **The other side of it, a consequence of the call (the review):** under a backlog, a WF's
+    `TIMER_FIRED` or `WF_CANCEL_INSTANCE` (SY.admin's, a system request) goes before user messages
+    that came before it, where the channel of 64 kept arrival order. A person's reply received in
+    time but still queued can lose to the timeout's transition, and a reply queued behind a cancel
+    finds no instance (from a `start_from` node it starts a new one). With 1,024 user messages at
+    the measured 30 a second, a fire can overtake a reply that came up to about 34 s before it. Said
+    in the handbook, the WF spec (§14.5), SY.wf-rules' page, the quickstart and wf-generic's README.
   - **SY.timer sends again a fire its target answers `NOT_TAKEN` retryable** (`notTaken`,
     `go/sy-timer/scheduler.go`), as one whose target is down: after 5, 10, 20 and 40 s, then each
     minute, while it is on time (an hour, a `fire_if_within`'s window, a recurring timer's next
-    instance; a `drop` one-shot gets none), logged at each attempt (a plain line and
-    `timer_fire_undelivered`, then `timer_fire_lost` past its time). Only the fire's target decides
+    instance; a `drop` one-shot gets none), logged at each attempt (`timer_fire_undelivered`, and a
+    plain line *"fire of <uuid> not taken by <target> (node_busy): sent again at <time>"* only once
+    the attempt is queued; past its time `timer_fire_lost` and *"fire of <uuid> lost: ..."*, never a
+    line that says it goes again: the review). Only the fire's target decides
     it, by the name its router stamps; one not retryable is not sent again (`timer_fire_refused`).
     SY.timer answers no `NOT_TAKEN` and no `<msg>.error` now (`isInfrastructureMessage`; before, a
     `NOT_TAKEN` got `TIMER_UNKNOWN_VERB`).
@@ -2233,13 +2242,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered`, `TestTheQueueHandsOverItsSystemMessagesFirst`,
     `TestASystemMessageThatComesDuringABacklogGoesNext`, `TestALaneHoldsAtMostItsMessagesAndBytes`,
     `TestTheLogSaysWhatTheQueueRefusedWithoutFlooding`, `TestARequestAnsweredNotTakenFailsWithItsReason`,
-    `TestTheReaderWaitsForRoomInsteadOfDroppingAFrame` (the SDK);
-    `TestAFireItsTargetAnsweredNotTakenIsSentAgain`, `TestANotTakenOfAnotherNodeLeavesTheFireWaiting`,
+    `TestTheReaderWaitsForRoomInsteadOfDroppingAFrame`, and from the review
+    `TestANotTakenThatCannotBeSentIsCountedAndLogged` (a `NOT_TAKEN` the node's full send queue
+    could not take; the tests read every frame under a deadline, so a fix taken away fails in 2 s,
+    not at go test's 10 minutes) (the SDK);
+    `TestAFireItsTargetAnsweredNotTakenIsSentAgain` (with its log lines since the review),
+    `TestANotTakenOfAnotherNodeLeavesTheFireWaiting`,
     and `TestRouterNoticesAndRepliesGetNoAnswer`'s two new cases (SY.timer); the WF's
     `TestAScheduleSYTimerDoesNotTakeGoesAgainUntilItDoes` (SY.timer's queue full), and its
     `NOT_TAKEN` checks hold `retryable`.
-  - **Mixed versions (the deploy, a runtime pinned older):** a sender on the old Go SDK (a WF pinned
-    to an older wf-generic) never sends `NOT_TAKEN`, and drops one it gets as a system message; an
+  - **Mixed versions (the deploy only):** no Go node stays on the old SDK past the deploy. SY.timer,
+    SY.wf-rules and SY.opa.rules come from the package, and every WF node runs its package's base,
+    wf.engine's `current`, which it moves to within a minute of its files reaching its hive, pinned
+    or not (`docs/nodes/sy-orchestrator.md`, "A running node and a new runtime version"); the
+    orchestrator runs no WF node outside a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`). The
+    review's correction: an earlier text here named "a WF pinned to an older wf-generic", which
+    cannot be. In the deploy's window (the hives one after the other; on a hive, its WF nodes'
+    relaunch before or after its core's, A-302) a node on the old Go SDK never sends `NOT_TAKEN`,
+    holds 64 and drops the rest silently, and drops a `NOT_TAKEN` it gets as a system message; an
     old SY.timer answers a new WF's `NOT_TAKEN` for a fire `TIMER_UNKNOWN_VERB` and does not send it
     again (the fire lost, as before), which the new WF logs and drops (a reply, the request it would
     settle unknown). Rust senders: `send_system_rpc` ends as `InvalidResponse` at once, where it
@@ -5069,11 +5089,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (A-56): `staging/<prefix>/` written to an exclusive temporary file and renamed, then moved to
     `active/<prefix>/`, given to the owner of `active/` (the Syncthing user, so it reaches the other
     hives), 0640, every directory opened without following a link; a blob already in `active/` is
-    left in place. A reader reads it with the Rust SDK's `read_blob_with_retry` (the IO nodes'
-    `resolve_text_v1_for_outbound`, the AI SDK's model input). Unlike the Rust SDK, a payload under
-    the limit goes byte for byte (a `forward` stays byte-faithful) and one over it keeps its other
-    fields; only `content` becomes `content_ref`. When the blob cannot be written the payload goes
-    as it is, with a log line, as in Rust, and a frame over 128 KiB is then refused as before.
+    left in place. Who reads it, and how, is below (the review). Unlike the Rust SDK, a payload
+    under the limit goes byte for byte (a `forward` stays byte-faithful) and one over it keeps its
+    other fields; only `content` becomes `content_ref`. A payload whose `content` is null or no
+    string goes as it is, as in Rust (the review: a null one went as an empty blob, its ref of size
+    0). When the blob cannot be written the payload goes as it is, with a log line, as in Rust, and
+    a frame over 128 KiB is then refused as before.
   - **The WF nodes' access to the blob root:** a WF node runs as root, as every managed node (a
     transient `systemd-run` unit with no `User=` and no sandboxing, `src/bin/sy_orchestrator.rs`
     ~31671), so it writes `staging/` (root's) and gives a blob to the owner of `active/`, as the
@@ -5083,18 +5104,55 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     SY.wf-rules adds it).
   - **By its tests, each checked failing without its fix:** `TestATextOverTheFrameIsSentAsABlob`
     (a text of 220 KiB sent as a ref; before, `MessageTooLargeError`),
-    `TestATextOverTheLimitGoesAsABlob`, `TestAPayloadThatNeedsNoBlobGoesByteForByte`,
-    `TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt`, `TestTheSameTextTwiceIsOneBlob`,
-    `TestALinkInTheBlobTreeIsNeverFollowed` (on the Mac and in a Linux container, as root and as a
-    user).
+    `TestATextOverTheLimitGoesAsABlob`, `TestAPayloadThatNeedsNoBlobGoesByteForByte` (its null
+    `content` case since the review), `TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt`,
+    `TestTheSameTextTwiceIsOneBlob`, `TestALinkInTheBlobTreeIsNeverFollowed` (on the Mac and in a
+    Linux container, as root and as a user).
   - **What it does not cover, recorded:** a WF's large `meta.context` (its resolved `vars`) with a
     short text still takes the frame into A-253's window, and a payload that is not text is not
     offloaded (both as in the Rust SDK). A blob left in `staging/` by a crash between its write and
     its promote, or by a second copy of a blob already active, waits for the staging clean-up
     (24 h, A-241), as the Rust SDK's does.
-  - **Mixed versions:** every reader takes a `content_ref` already (the IO nodes and the AI SDK
-    read the ones the Rust SDK writes for an agent's long answer); a WF on an older wf-generic keeps
-    sending its long texts inline (refused over 128 KiB, as before).
+  - **The review (2026-11-12), read in the code: a text of about 62 to 128 KiB reaches fewer
+    readers than before.** Before 0.1.141 a WF's text in that band went inline and reached every
+    reader; now it goes as a `content_ref`, which only a reader whose hive holds the blob can read.
+    The blob reaches another hive through Syncthing (`fluxbee-blob`, `active/` only, the motherbee
+    and the workers; a worker to another through the motherbee), whose watcher scans a change 10 s
+    after it (`fsWatcherDelayS`, `src/bin/sy_orchestrator.rs` ~16404; renames held up to 60 s were
+    seen in A-19, and `promoteBlob` moves by rename), so the message comes first. The readers:
+    - ai.generic and SY.frontdesk.gov read a `content_ref` at once, with no wait
+      (`ModelInputOptions::default()`, `resolve_retry: None`,
+      `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ~810,
+      `crates/fluxbee_ai_sdk/src/text_payload.rs` ~34-43, 303-310): a blob on its way answers
+      `BlobNotFound`;
+    - io.slack and io.wapp read it with `resolve_text_v1_text_only_for_outbound`
+      (`read_blob_with_retry`, the default `ResolveRetryConfig`, `BLOB_RETRY_MAX_MS` 5 s), and
+      io.slack fails the whole post when it does not resolve (`nodes/io/io-slack/src/main.rs`
+      ~3183-3197); `resolve_text_v1_for_outbound` has no caller outside `nodes/io/common`;
+    - a WF reads no `content_ref` (no Go code resolves one): its guards and `$ref`s see the ref
+      only, as with an agent's long answer (wf-orchestration-v1 §4.3);
+    - io.api, io.web and io.linkedhelper read no `content_ref` at all.
+
+    So a WF on a worker writing such a text to an IO node on the motherbee (the gates run their WFs
+    on worker1, the IO.slack nodes run on the motherbee) or to an agent on another worker loses it,
+    where an engine before 0.1.141 delivered it; a reader on the WF's own hive reads it at once.
+    The same holds today for the Rust SDK's offload of an agent's long answer (blob-annex-spec
+    §6.5, §6.6), which the Go SDK joins. The gate measures the motherbee's wait for such a blob
+    (A5).
+  - **To decide (the operator), before 0.1.141 ships:** (a) keep the Rust SDK's threshold, as
+    built: the band fails across hives, as an agent's long answer does; (b) offload a WF's text only
+    past A-253's window (about 96 KiB) or only past the frame (128 KiB), so what reached a reader
+    before still does, until (c); (c) the blob reaches the reader's hive before the reader needs it:
+    the producer asks a sync and waits (the sync hint is SY.admin's alone today, blob-annex-spec
+    §6.6), or each reader waits longer (the AI SDK's model input, the IO common code: their own
+    releases).
+  - **Mixed versions (only during the deploy):** every WF node runs its package's base, wf.engine's
+    `current`, and moves to a new one within a minute of its files reaching its hive, pinned or not
+    (`docs/nodes/sy-orchestrator.md`, "A running node and a new runtime version"); the orchestrator
+    runs no WF node outside a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`). So a WF still on
+    the old engine, which keeps sending its long texts inline (refused over 128 KiB, as before),
+    exists only until its hive's relaunch. The readers are unchanged: what each does with a
+    `content_ref` is above.
 
 ### A-263 [General/admin] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; at its own deploy SY.admin marked each spoke settled 2.9 to 4.4 s after the spoke's own settle, the marks 9.7 s apart, the spokes' own settles 9.3 s; one read lost to a restart asked again at once) (found 2026-11-10 by A-250's builder; read in the code) — The installation update's follow reads one hive at a time
 

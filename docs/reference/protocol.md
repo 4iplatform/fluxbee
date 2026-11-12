@@ -596,7 +596,15 @@ Conversational text is `TextV1Payload` (`crates/fluxbee_sdk/src/payload.rs`):
   FINDINGS A-264), measured on the payload as it goes, with the same blob layout, promote and
   checks (staging, then `active/`, given to its owner, no link followed); unlike the Rust SDK it
   sends a payload under the limit byte for byte, and keeps a payload's other fields when its text
-  goes as a blob. Before 0.1.141 a WF's text over the frame was refused (`MessageTooLargeError`).
+  goes as a blob. Before 0.1.141 a WF's text over the frame was refused (`MessageTooLargeError`),
+  and one of about 62 to 128 KiB went inline.
+- **A reader on another hive** gets an offloaded text's blob through Syncthing, whose watcher scans
+  a change 10 s after it (`fsWatcherDelayS`), so the message comes first. Today ai.generic and
+  SY.frontdesk.gov read a `content_ref` at once (`ModelInputOptions::default()`, no
+  `resolve_retry`), io.slack and io.wapp wait 5 s (`resolve_text_v1_text_only_for_outbound`), and
+  a WF, io.api, io.web and io.linkedhelper read none: such a text fails at a reader on another hive.
+  That holds for an agent's long answer (the Rust SDK) and, since 0.1.141, for a WF's (the Go
+  SDK); whether a WF's text keeps the 62 KiB threshold is the operator's call (FINDINGS A-264).
 - Limits: 128 KiB per frame (§1.3); with either SDK, 64 KiB for an inline text payload. Other
   payloads are not offloaded: over the frame limit, `send` fails.
 
