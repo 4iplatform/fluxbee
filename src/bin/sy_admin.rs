@@ -6883,9 +6883,10 @@ async fn handle_publish_artifact(
         );
     }
 
+    // From here a failure leaves its `curated` row for the clean-up, which removes it once IO.blob
+    // answered the release (FINDINGS A-318): a stop of SY.admin before then leaves the row, which
+    // a take-down or the expiry sweep finishes, never a copy no row names.
     let Some(edge_limit) = time_left(deadline, PUBLISH_EDGE_TIMEOUT) else {
-        ledger.publications.remove(&publication_id);
-        let _ = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger);
         return fail(publication_guard, None, out_of_time("the edge's publish"));
     };
     let edge_result = send_system_request_with_meta(
@@ -6916,8 +6917,6 @@ async fn handle_publish_artifact(
     match edge_result {
         Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {}
         result => {
-            ledger.publications.remove(&publication_id);
-            let _ = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger);
             let detail = match result {
                 Ok(payload) => format!("edge rejected publication: {payload}"),
                 Err(err) => format!("edge unavailable while publishing: {err}"),
@@ -7004,8 +7003,9 @@ async fn handle_unpublish_artifact(
     // again to write each state, never across the edge's or IO.blob's call
     // (`take_down_publication`). Read under it, the row is never one of a publish under way, which
     // holds the lock from its row's `curated` to its `published`, or to its failure: a failed
-    // publish lets the lock go with its row removed, or none written, or `curated` when a write
-    // failed, for a take-down to finish (FINDINGS A-280).
+    // publish lets the lock go with its row `curated`, or none written (FINDINGS A-280), and its
+    // clean-up removes that row once IO.blob released its copy, unless a take-down moved it on
+    // first (A-318).
     let ledger = {
         let _publication_guard = ctx.publication_lock.lock().await;
         load_admin_publication_ledger(&ctx.publication_ledger_path)
@@ -7908,10 +7908,12 @@ async fn curate_publication_blob(
 ///
 /// Awaited under the lock, the clean-up held it up to 60 s past the publish's own steps, against
 /// every take-down's and every sweep step's read and write, and gave the answer past the publish's
-/// 110 s, after ai.generic stopped waiting at 120 s. The publish removes the row it wrote before
-/// it lets the lock go; a row it could not remove, or whose last write failed, stays `curated`,
-/// which a take-down or the expiry sweep finishes as any page stopped half-way. A publish that
-/// succeeds is unchanged.
+/// 110 s, after ai.generic stopped waiting at 120 s. The row the publish wrote stays `curated` when
+/// it lets the lock go, and the clean-up removes it once its steps went through (FINDINGS A-318):
+/// removed before the answer, as 0.1.137 did, a stop of SY.admin during IO.blob's release (up to
+/// 30 s, a deploy say) left a copy no row names, which nothing collects. A row the clean-up keeps
+/// (a step failed, or SY.admin stopped) a take-down or the expiry sweep finishes as any page
+/// stopped half-way. A publish that succeeds is unchanged.
 fn fail_publish(
     publication_guard: tokio::sync::MutexGuard<'_, ()>,
     ctx: &AdminContext,
@@ -7932,12 +7934,16 @@ fn fail_publish(
 
 /// The clean-up of a failed publish (`fail_publish`): the edge's unpublish when `edge_node` took
 /// the page, then IO.blob's release; a step that fails is one warning line, and the next goes on.
+/// Once both went through, the page's ledger row goes, if it is still the `curated` row the publish
+/// left (`drop_failed_publish_row`, FINDINGS A-318); a row a take-down moved on is its own.
 ///
 /// It ends with one info line, whatever each step did (FINDINGS A-280's review): the page, the
 /// edge's unpublish (`not_asked`, `ok` or `failed`), IO.blob's release (`ok` with its `released`
-/// and `ref_count`, or `failed`) and `elapsed_ms`, the clean-up's own time. Its steps log nothing
-/// when they go through, so this line is what shows in SY.admin's log that the clean-up ran,
-/// after the publish's answer, and how long it took.
+/// and `ref_count`, or `failed`), the ledger's row (`ledger_row`: `removed`; `kept`, a step failed
+/// and the row stays for a take-down or the sweep; `none`, the publish wrote none or a take-down
+/// moved it on; `failed`, the ledger could not be written) and `elapsed_ms`, the clean-up's own
+/// time. Its steps log nothing when they go through, so this line is what shows in SY.admin's log
+/// that the clean-up ran, after the publish's answer, and how long it took.
 async fn clean_up_failed_publish(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -7981,6 +7987,11 @@ async fn clean_up_failed_publish(
                 ("failed", unknown(), unknown())
             }
         };
+    let ledger_row = if edge_unpublish != "failed" && release == "ok" {
+        drop_failed_publish_row(ctx, publication_id).await
+    } else {
+        "kept"
+    };
     tracing::info!(
         publication_id = %publication_id,
         edge = %edge_node.unwrap_or("none"),
@@ -7988,9 +7999,49 @@ async fn clean_up_failed_publish(
         release = %release,
         released = %released,
         ref_count = %ref_count,
+        ledger_row = %ledger_row,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "a failed publish's clean-up ended"
     );
+}
+
+/// The ledger row a failed publish left, removed once its clean-up went through (FINDINGS A-318):
+/// under the publication lock, and only while it is still `curated`, the state the publish left
+/// it in; a take-down that came first (`edge_removed`, `unpublished`) or the expiry sweep owns a
+/// row it moved on. `removed`, `none` (no such row, or one moved on) or `failed` (the ledger could
+/// not be read or written: the row stays, for a take-down or the sweep).
+async fn drop_failed_publish_row(ctx: &AdminContext, publication_id: &str) -> &'static str {
+    let _publication_guard = ctx.publication_lock.lock().await;
+    let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            tracing::warn!(
+                publication_id = %publication_id,
+                error = %err,
+                "a failed publish's clean-up: the ledger could not be read; its row stays"
+            );
+            return "failed";
+        }
+    };
+    let curated = ledger
+        .publications
+        .get(publication_id)
+        .is_some_and(|record| record.status == "curated");
+    if !curated {
+        return "none";
+    }
+    ledger.publications.remove(publication_id);
+    match persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
+        Ok(()) => "removed",
+        Err(err) => {
+            tracing::warn!(
+                publication_id = %publication_id,
+                error = %err,
+                "a failed publish's clean-up: the ledger could not be written; its row stays"
+            );
+            "failed"
+        }
+    }
 }
 
 /// IO.blob's release of the copy it curated for `publication_id`: its ok answer, `{status,
@@ -41724,10 +41775,11 @@ mod tests {
     /// A failed publish answers within its 110 s budget and cleans up after its answer, with the
     /// publication lock let go (FINDINGS A-280). Here IO.blob takes 25 s to curate, the edge never
     /// answers its publish (75 s at most), and IO.blob never answers the release (30 s at most).
-    /// The answer, EDGE_PUBLISH_FAILED, comes 100 s after the publish began, and its row is gone;
-    /// the release goes after it, the lock free. Under the lock the release came first, and the
-    /// answer at 130 s, after ai.generic stopped waiting at 120 s, while every take-down and sweep
-    /// waited for the lock.
+    /// The answer, EDGE_PUBLISH_FAILED, comes 100 s after the publish began; the release goes after
+    /// it, the lock free, and the row stays `curated` while IO.blob does not answer it (FINDINGS
+    /// A-318: the clean-up removes it once IO.blob released the copy). Under the lock the release
+    /// came first, and the answer at 130 s, after ai.generic stopped waiting at 120 s, while every
+    /// take-down and sweep waited for the lock.
     #[tokio::test(start_paused = true)]
     async fn a_failed_publish_answers_within_its_budget_and_cleans_up_after() {
         let (mut ctx, mut harness) = opa_test_admin("a280-edge-silent");
@@ -41793,10 +41845,144 @@ mod tests {
             (Duration::from_secs(100)..Duration::from_secs(101)).contains(&answered_after),
             "answered {answered_after:?} after the publish began: the edge's limit, not later"
         );
-        assert!(!load_admin_publication_ledger(&ctx.publication_ledger_path)
-            .expect("the ledger")
+        assert_eq!(
+            load_admin_publication_ledger(&ctx.publication_ledger_path)
+                .expect("the ledger")
+                .publications[&publication_id]
+                .status,
+            "curated"
+        );
+    }
+
+    /// FINDINGS A-318: a failed publish's row stays `curated` until IO.blob answered the release
+    /// of its copy, and its clean-up removes it then, under the publication lock: had SY.admin
+    /// stopped during the release, the row would stay for a take-down or the expiry sweep, never a
+    /// copy no row names, as 0.1.137 left when it removed the row before its answer. A release that
+    /// fails keeps the row; a row a take-down moved on is the take-down's.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_s_row_goes_once_io_blob_released_its_copy() {
+        let (mut ctx, mut harness) = opa_test_admin("a318-row-after-release");
+        charge_publisher(&mut ctx, PAGE_PUBLISHER, PAGE_TENANT);
+        ctx.public_edge_node = Some(PAGE_EDGE.to_string());
+        land_blob(&ctx, &page_blob_ref());
+        let ledger_path = ctx.publication_ledger_path.clone();
+        let status_of = |publication_id: &str| {
+            load_admin_publication_ledger(&ledger_path)
+                .expect("the ledger")
+                .publications
+                .get(publication_id)
+                .map(|record| record.status.clone())
+        };
+        let wait = Duration::from_secs(5);
+        for released in [true, false] {
+            let publish = handle_publish_artifact(
+                &ctx,
+                &ctx.rpc,
+                json!({ "blob_ref": page_blob_ref() }),
+                Some(PAGE_PUBLISHER),
+            );
+            let drive = async {
+                let curate = harness
+                    .next_outgoing_within(wait)
+                    .await
+                    .expect("the curate");
+                harness
+                    .inject(reply_to(&curate, MSG_BLOB_CURATE_RESPONSE, page_curated()))
+                    .await
+                    .unwrap();
+                let edge = harness
+                    .next_outgoing_within(wait)
+                    .await
+                    .expect("the edge's publish");
+                assert_eq!(edge.meta.msg.as_deref(), Some(MSG_EDGE_PUBLISH_BLOB));
+                harness
+                    .inject(reply_to(
+                        &edge,
+                        MSG_EDGE_PUBLISH_BLOB_RESPONSE,
+                        json!({ "status": "error", "error_code": "EDGE_FULL" }),
+                    ))
+                    .await
+                    .unwrap();
+                curate.payload["publication_id"]
+                    .as_str()
+                    .expect("its id")
+                    .to_string()
+            };
+            let (answer, publication_id) = tokio::join!(publish, drive);
+            let answer = answer.expect("dispatch");
+            assert_eq!(answer.envelope["error_code"], json!("EDGE_PUBLISH_FAILED"));
+            // Answered: the row stays while IO.blob has not answered the release.
+            let release = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the release");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            assert_eq!(status_of(&publication_id).as_deref(), Some("curated"));
+            let reply = if released {
+                json!({
+                    "status": "ok",
+                    "publication_id": publication_id,
+                    "released": true,
+                    "file_deleted": true,
+                    "ref_count": 0,
+                })
+            } else {
+                json!({ "status": "error", "error_code": "BLOB_IO_ERROR" })
+            };
+            harness
+                .inject(reply_to(&release, MSG_BLOB_RELEASE_RESPONSE, reply))
+                .await
+                .unwrap();
+            // The clean-up ends a moment later, in its own task.
+            for _ in 0..50 {
+                if status_of(&publication_id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if released {
+                assert_eq!(status_of(&publication_id), None, "removed once released");
+            } else {
+                assert_eq!(
+                    status_of(&publication_id).as_deref(),
+                    Some("curated"),
+                    "kept for a take-down or the sweep"
+                );
+            }
+        }
+
+        // A row a take-down moved on is not removed; one still curated is.
+        let mut ledger =
+            load_admin_publication_ledger(&ctx.publication_ledger_path).expect("the ledger");
+        let kept = ledger
             .publications
-            .contains_key(&publication_id));
+            .values()
+            .next()
+            .expect("the row of the release that failed")
+            .clone();
+        let taken_down = AdminPublicationRecord {
+            publication_id: format!("pub:{}", Uuid::new_v4()),
+            status: "edge_removed".to_string(),
+            ..kept.clone()
+        };
+        ledger
+            .publications
+            .insert(taken_down.publication_id.clone(), taken_down.clone());
+        persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger).expect("written");
+        assert_eq!(
+            drop_failed_publish_row(&ctx, &taken_down.publication_id).await,
+            "none"
+        );
+        assert_eq!(
+            status_of(&taken_down.publication_id).as_deref(),
+            Some("edge_removed")
+        );
+        assert_eq!(
+            drop_failed_publish_row(&ctx, &kept.publication_id).await,
+            "removed"
+        );
+        assert_eq!(status_of(&kept.publication_id), None);
+        assert_eq!(drop_failed_publish_row(&ctx, "pub:none").await, "none");
     }
 
     /// A publish whose last ledger write fails after the edge took its page answers LEDGER_FAILED

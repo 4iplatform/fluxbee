@@ -1847,6 +1847,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   orphaned the copy before too.
 - **Fix, later:** the clean-up task removes the row (under the lock, only while still `curated`)
   once IO.blob answered the release.
+- **Built on `coa/admin-139` for 0.1.139:** from its `curated` row on, a failed publish lets the
+  lock go with the row as it is, and its clean-up removes it once its steps went through: the
+  edge's unpublish when it was asked, and IO.blob's ok to the release (`drop_failed_publish_row`,
+  under the publication lock, only while the row is still `curated`). A step that fails keeps the
+  row for a take-down or the expiry sweep, as before 0.1.137; a row a take-down moved on is the
+  take-down's. The clean-up's line says what became of the row (`ledger_row`: `removed`, `kept`,
+  `none`, `failed`). Its test, `a_failed_publish_s_row_goes_once_io_blob_released_its_copy`
+  (paused time: the row `curated` after the answer and while the release is unanswered, gone once
+  IO.blob released, kept when the release failed, a taken-down row left alone), fails without it;
+  `a_failed_publish_answers_within_its_budget_and_cleans_up_after` now finds the row `curated`.
+  sy-admin.md says it. Left as it was: a curate that failed writes no row, so a stop during its
+  release still leaves an orphan, as a release that fails always did.
 
 ### A-317 [General/edge] 🔵 low (found 2026-11-11 by A-273's builder; read in the code; there before it) — SY.edge keeps one previous channel secret, in memory only
 

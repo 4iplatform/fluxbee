@@ -1410,12 +1410,18 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   ledger write failed, each within its own 30 s, a failed step logged. It ends with one info line,
   `a failed publish's clean-up ended`, whatever its steps did: the `publication_id`, the `edge`
   and its `edge_unpublish` (`not_asked`, `ok` or `failed`), IO.blob's `release` (`ok` or
-  `failed`) with its `released` and `ref_count`, and `elapsed_ms`, the clean-up's own time
-  (FINDINGS A-280's review). Before, the clean-up ran under the lock and before the answer: up to
-  60 s more against every take-down and sweep, and an answer past ai.generic's 120 s. The failed
-  publish removes the row it wrote before it lets the lock go; a row it could not remove, or whose
-  last write failed, stays `curated`, which a take-down or the expiry sweep finishes. A publish
-  that succeeds is unchanged.
+  `failed`) with its `released` and `ref_count`, its `ledger_row` (below), and `elapsed_ms`, the
+  clean-up's own time (FINDINGS A-280's review). Before, the clean-up ran under the lock and
+  before the answer: up to 60 s more against every take-down and sweep, and an answer past
+  ai.generic's 120 s. The row the failed publish wrote stays `curated` when it lets the lock go,
+  and the clean-up removes it once its steps went through, under the publication lock and only
+  while it is still `curated` (`drop_failed_publish_row`, FINDINGS A-318, since 0.1.139):
+  `ledger_row` `removed`; `kept` when a step failed, the row left for a take-down or the expiry
+  sweep, which finish it as any page stopped half-way; `none` when the publish wrote no row or a
+  take-down moved it on first; `failed` when the ledger could not be written. In 0.1.137 the
+  publish removed its row before its answer, so a stop of SY.admin during IO.blob's release (up
+  to 30 s, a deploy say) left a copy no row names, which nothing collects. A publish that succeeds
+  is unchanged.
 - **A page outlives its publisher** (FINDINGS A-242). A purge of the node while its publish is
   under way neither waits for the publish nor stops it, and the page, once up, stays up until it
   expires or is taken down, as every page the node published before.
