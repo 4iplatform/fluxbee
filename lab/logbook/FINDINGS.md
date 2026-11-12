@@ -240,6 +240,20 @@ no change required
     core node's kill was refused. Health clean on every hive with `wandrops=0`, which `ops.py
     health` checks from now on.
     **Next:** 0.1.136, the AI SDK alone (A-257, `coa/aisdk-136`).
+27. **0.1.136, the AI SDK alone** ✅ live and checked on 8.x (2026-11-12): A-257 (the AI runtime
+    reads every message while its 4 workers run LLM turns: status, help, config and a well-formed
+    handoff run at once beside them, and the turn past the 128 waiting is answered
+    `ai_runtime_busy` at once, never run). With both nodes' workers held by an nft drop of their
+    HTTPS, AI.pruebas answered its status in 0.924 s and `CONFIG_GET` in 0.328 s and the frontdesk
+    a handoff in 6 ms, where on 0.1.135 the status was the orchestrator's inference at 2.449 s,
+    `CONFIG_GET` timed out at 25.168 s and the handoff got no answer; a turn past the queue
+    answered busy in 7 to 12 ms; the waiting turns drained within 0.165 s, with no restart. 2 model
+    calls.
+    **Found by its review:** A-324 and A-325, low; and the known limit written into A-257 (the
+    handoff rule applies to ai.generic too, until the frontdesk's `AiNode` override).
+    **Next:** 0.1.137, the sweep's binaries, one branch per binary (`coa/admin-136`,
+    `coa/orch-136`, `coa/architect-136`, `coa/identity-136`, `coa/wf-136`, `coa/cognition-136`,
+    `coa/iocloud-136`), integrated with their texts moved to 0.1.137.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -348,7 +362,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
 - A-243 🔵 Who can take a page down: each publisher its own (the operator, 2026-11-11; SY.admin in 0.1.136; the Cloud with its track).
-- A-257 🔵 The frontdesk's handoff waits behind its LLM turns (low; the AI SDK).
 - A-263 🔵 The installation update's follow reads one hive at a time (low; with A-250's gate).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
@@ -397,6 +410,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
 - A-322 🟡 After CONFIRM the chat shows only "Execution completed successfully" or "Execution stopped at step 's1'": no step's answer (medium; SY.architect).
 - A-323 🔵 Archi plans `kill_node` for a core node and says nothing brings it back (low; Archi's texts).
+- A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes).
+- A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1473,6 +1488,37 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-325 [General/AI runners] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
+
+- **Why:** SY.vault broadcasts `VAULT_SECRET_CHANGED`, a `system` message, at each change of a
+  secret, and one for each secret it announces at its start (`emit_bootstrap_secret_broadcasts`,
+  `src/bin/sy_vault.rs` ~714). The AI SDK hands it to the node, since it comes from a named sender
+  and is no notice or reply (`is_infrastructure_message`,
+  `crates/fluxbee_ai_sdk/src/control_plane.rs` ~114). ai.generic's control plane answers any such
+  message that is none of its verbs with a `CONFIG_RESPONSE` error `unknown_system_msg`
+  (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ~1361-1373; its test pins it for this
+  broadcast, ~12455-12460), and SY.vault's loop skips every message that is not a vault request
+  (`src/bin/sy_vault.rs` ~331-343). The frontdesk takes the broadcast and answers nothing.
+- **Effect:** one wasted message per AI node per vault change; nothing is refused or lost.
+- **Fix, later:** ai.generic leaves the broadcast unanswered, as the frontdesk does, or the AI SDK's
+  notice list takes it (ai.generic's test changes with it); with ai.generic's or the AI SDK's next
+  change.
+
+### A-324 [General/admin] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; since 0.1.136) — SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline
+
+- **Why:** since 0.1.136 (A-257) an AI node on ai.generic 0.1.136 or later answers `NODE_HELP` and
+  `NODE_STATUS_GET` at once however busy, and only one pinned to an older ai.generic may still miss
+  the 3 s. The review of `coa/aisdk-136` (`ba2addb2`) changed Archi's handbook and SY.admin's and
+  SY.orchestrator's pages, not the binaries' own texts: SY.admin's `node_help` note
+  (`src/bin/sy_admin.rs` ~17528, *"did not answer within 3 s (a busy node may not)"*), which Archi
+  reads, and three comments in the orchestrator (`src/bin/sy_orchestrator.rs` ~161-162,
+  ~28061-28062, ~55873-55874).
+- **Effect:** Archi reads that a busy node may not answer, where on ai.generic 0.1.136 or later a
+  silence of 3 s means the node is stuck or restarting, or its 64 places for control requests were
+  all taken. Nothing is refused or done by it.
+- **Fix, later:** each text says what the pages say (the release, and the older case); with
+  SY.admin's and the orchestrator's next text changes.
 
 ### A-323 [Archi] 🔵 low (found 2026-11-12 by the natural-language gate of Archi; seen on 8.x on 0.1.135) — Archi plans `kill_node` for a core node and says nothing brings it back
 
@@ -2651,7 +2697,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   and a summary, and 12 stray `TIMER_FIRED_RESPONSE` 10 *"timer_message_ignored"* lines and a
   summary.
 
-### A-257 [General/frontdesk] 🔵 low (found 2026-11-10 by A-223's triage and io.api's builder; read in the code) — The frontdesk's handoff waits behind its LLM turns
+### A-257 [General/frontdesk] ✅ VALIDATED ON 8.x (0.1.136, 2026-11-12; with the 4 workers of AI.pruebas and of the frontdesk held, a handoff answered in 4 to 6 ms, status and help in 0.866 to 0.924 s, `CONFIG_GET` in 0.328 to 0.377 s, and a turn past the 128 waiting `ai_runtime_busy` in 7 to 12 ms, where on 0.1.135 the handoff got no answer, the status was the orchestrator's inference at 2.374 to 2.449 s, help null at 3.356 s and `CONFIG_GET` a `TIMEOUT` at 25.158 to 25.168 s) (found 2026-11-10 by A-223's triage and io.api's builder; read in the code) — The frontdesk's handoff waits behind its LLM turns
 
 - **Why:** SY.frontdesk.gov runs the AI SDK's default pool of 4 workers
   (`RuntimeConfig::default()`, `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ~3121;
@@ -2665,22 +2711,46 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Correction (A-257's builder, 2026-11-11):** the frontdesk's runner is
   `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (its `RuntimeConfig` at ~3121), not
   ai.generic's.
-- **Built for 0.1.136 (`coa/aisdk-135`, the AI SDK alone):** two lanes; a handoff runs beside the
-  workers only in the shape the frontdesk parses, within 30 s and on at most 8 of the direct lane's
-  64 places. **For the frontdesk's own release:** an `AiNode` method by which the node says what it
-  answers without its model (default system and admin only; the frontdesk's override is
-  `parse_frontdesk_handoff` and its sender rule); then the SDK's copy of the handoff's shape, its
-  gov-common dev-dependency and `tests/frontdesk_handoff_contract.rs` go.
+- **Built for 0.1.136 (`coa/aisdk-135`, rebased as `coa/aisdk-136`; the AI SDK alone):** two
+  lanes; a handoff runs beside the workers only in the shape the frontdesk parses, within 30 s and
+  on at most 8 of the direct lane's 64 places. **For the frontdesk's own release:** an `AiNode`
+  method by which the node says what it answers without its model (default system and admin only;
+  the frontdesk's override is `parse_frontdesk_handoff` and its sender rule); then the SDK's copy
+  of the handoff's shape, its gov-common dev-dependency and `tests/frontdesk_handoff_contract.rs`
+  go.
 - **For the AI SDK's next change (A-292's review, 2026-11-11):** pin the busy answer's exact
   shape: export `ai_runtime_busy` and the `busy` act (or a recognizer) for cognition's
   `is_busy_answer`, or an SDK test that the busy reply's payload has exactly `type`, `code`,
   `message` and `retryable` and that the trace's last entry is the agent's with act `busy`.
   Without it, a new field in the busy answer silently turns A-292 off with every test green. Also:
-  `run_direct_message`'s comment (`runtime.rs` ~772 on `coa/aisdk-135`) and
+  `run_direct_message`'s comment (`crates/fluxbee_ai_sdk/src/runtime.rs` ~777-781) and
   `docs/nodes/sy-frontdesk-gov.md` say IO.cloud takes any error answer to a handoff for
-  `FRONTDESK_REJECTED`, which is stale once 0.1.137 (A-293) ships: update both when 0.1.136 and
-  0.1.137 are merged, and ship the follow-up (answer `ai_runtime_busy` instead of dropping) only
+  `FRONTDESK_REJECTED`, which is stale once 0.1.137 (A-293) ships: update both when 0.1.137 is
+  merged (0.1.136 is), and ship the follow-up (answer `ai_runtime_busy` instead of dropping) only
   after 0.1.137 runs on every motherbee.
+- **A known limit (the review of `coa/aisdk-136`, `ba2addb2`):** the handoff rule is the runtime's,
+  the same for every node on it, ai.generic too: ai.generic has no handoff path, so a well-formed
+  handoff from an IO node with a thread, sent to an agent by mistake (io.api's `frontdesk_target`
+  may name any node), runs its model on the direct lane, up to 8 at once beside the 4 workers, each
+  cut at 30 s. The AI SDK's README says so. The `AiNode` method planned above for the frontdesk's
+  own release closes it: by default a node answers only `system` and `admin` messages without its
+  model, which ai.generic keeps, and only the frontdesk's override adds its handoff.
+- **Checked on 8.x (0.1.136, the gate gate0236, against a baseline on 0.1.135 the same night):**
+  the 4 workers of `AI.pruebas@worker1` and of `SY.frontdesk.gov@motherbee` held by an nft drop of
+  each node's own HTTPS (each held turn 92-93 s, then the node's fixed provider-failure text), the
+  fillers user messages with no `thread_id`. On 0.1.135 AI.pruebas' status took 2.449 s
+  (`ORCHESTRATOR_INFERRED`), its help 3.356 s (null) and its `CONFIG_GET` 25.168 s (`504
+  TIMEOUT`); the frontdesk's status 2.374 s (inferred) and `CONFIG_GET` 25.158 s (`TIMEOUT`); a
+  handoff got no answer. On 0.1.136 (held 05:43:51-05:45:23Z), with 128 turns waiting at each:
+  AI.pruebas' status 0.924 s (`NODE_REPORTED`), help 0.920 s, `CONFIG_GET` 0.328 s and a
+  `CONFIG_SET` of its own config 0.091 s; the frontdesk's status 0.866 s and `CONFIG_GET` 0.377 s;
+  a well-formed handoff 6 ms and the handoff probe 4 ms. The turns past the 128 answered
+  `ai_runtime_busy` at once: AI.pruebas' 7 in 7-12 ms, `retryable` true, the trace's last act
+  `busy`, its journal naming the refusal 5 ms after the first send; the frontdesk's one in 7 ms.
+  The frontdesk took a malformed handoff (`subject.phone` a number) as a turn. Once the held
+  turns answered, the waiting ones drained within 0.135 s (AI.pruebas' 128 fillers) and 0.165 s
+  (the frontdesk's 127); `direct_dropped=0` on both, `busy_answers_dropped=0` on AI.pruebas, no
+  restart; 2 model calls in all.
 
 ### A-256 [IO/io.cloud] 🔵 low (found 2026-11-10 by A-91's builder; read in the code) — io.cloud accepts `io.inbound_family` and ignores it
 

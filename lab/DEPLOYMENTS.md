@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.135** | 2026-11-11 | `9a6ffb6d` | motherbee + spokes (core), the router alone: A-272 (split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one it came from, so no router sends a broadcast back to its peer, and over IRP a router that is not the gateway hands none back to the gateway), A-268 (two FIB builds at once are stored in the order they began, so a build that read before a change never undoes that change's rebuild); `ops.py health` checks `wandrops=0` from then on | ✅ live, checked on 8.x | snap `pre-router-0-1-135` (all 4 VMs) · `apt install fluxbee=0.1.134` + 0.1.134's `update_installation` (nothing one-way; the WAN echoes come back, and now that `HEALTH_OK` checks `wandrops=0` the hives that drop them fail health: the motherbee whenever a node broadcasts over the WAN, a spoke when its own nodes do) |
+| **0.1.136** | 2026-11-12 | `ba2addb2` | motherbee + spokes (core), the AI SDK alone: A-257 (the AI runtime reads every message while its 4 workers run LLM turns: a status, help or config request runs at once beside them on a direct lane of 64 places, and so does a handoff in the shape the frontdesk parses, on at most 8 of them and within 30 s; the turns start on the 4 workers in the order they came, with up to 128 waiting, and the next one is answered `ai_runtime_busy` at once, never run); its review's texts: an AI node answers status and help at once however busy only on ai.generic 0.1.136 or later, and ai.generic running its model for a handoff on the direct lane is a known limit | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-136` (all 4 VMs) · `apt install fluxbee=0.1.135` + 0.1.135's `update_installation` (nothing one-way; A-257 comes back) |
+| **0.1.135** | 2026-11-11 | `9a6ffb6d` | motherbee + spokes (core), the router alone: A-272 (split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one it came from, so no router sends a broadcast back to its peer, and over IRP a router that is not the gateway hands none back to the gateway), A-268 (two FIB builds at once are stored in the order they began, so a build that read before a change never undoes that change's rebuild); `ops.py health` checks `wandrops=0` from then on | ✅ replaced by 0.1.136 | snap `pre-router-0-1-135` (deleted 2026-11-12) · `apt install fluxbee=0.1.134` + 0.1.134's `update_installation` (nothing one-way; the WAN echoes come back, and now that `HEALTH_OK` checks `wandrops=0` the hives that drop them fail health: the motherbee whenever a node broadcasts over the WAN, a spoke when its own nodes do) |
 | **0.1.134** | 2026-11-11 | `8539bc64` | motherbee + spokes (core), the orchestrator alone, a hotfix: A-314 (a node unit systemd does not have reads as not running: on the hives' systemd 255 `systemctl is-active` exits 4 for it, which 0.1.133 read as no answer, so no node could be launched and a stopped node whose unit was gone could be neither started nor purged and read `UNKNOWN`); its review: `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name (`INVALID_REQUEST`) before anything is done, as `run_node` does | ✅ replaced by 0.1.135 | snap `pre-orch-0-1-134` (deleted 2026-11-11) · `apt install fluxbee=0.1.133` + 0.1.133's `update_installation` (that brings A-314 back); to 0.1.132 by apt (nothing one-way found) |
 | **0.1.133** | 2026-11-11 | `45c736e4` | motherbee + spokes (core), one branch per binary, the sweep's end: SY.identity and SY.admin (A-191: a system ILK is retired, never deleted, at SY.identity's start for an SY node its release no longer runs, and by `retire_hive_ilks` or `remove_hive` for a removed hive; A-232: SY.identity's listings refuse a cursor not theirs without repeating it), SY.admin (A-255: `publish_cloud_endpoint` applies the edge to the running IO.cloud; A-260 and A-274: the expiry sweep and a take-down call the edge and IO.blob outside the publication lock; A-281: no version removed while some hive's use of it was not read; A-285's texts), SY.timer 1.6 (A-258: its refusals logged, bounded; A-259: the heap holds the pending timers only; A-266: a page its `limit` cuts answers `next_cursor`), the orchestrator (A-240: a status read writes nothing, `status_version` gone from the answer; A-241: a worker cleans its own blob staging; A-267 and A-271: a check with no answer acts on nothing; A-281's use across the hives, `hives_without_runtimes`), SY.wf-rules (A-270: no delete without force of a WF node that is not `RUNNING`; A-281: a delete names the versions it left), SY.architect (A-279 with A-288: Archi's SCMD reads decode their query and keep it) | ✅ replaced by 0.1.134 (deployed 22:35Z, replaced 23:32Z; its gate found A-314) | snap `pre-sweep-0-1-133` (deleted 2026-11-11) · `apt install fluxbee=0.1.132` + 0.1.132's `update_installation` (nothing one-way found: the system ILKs 0.1.133 retired stay retired, harmless to 0.1.132) |
 | **0.1.132** | 2026-11-11 | `36135e52` | motherbee + spokes (core), the router alone: A-245 (a far router's `UNREACHABLE` or `TTL_EXCEEDED` reaches a sender on another spoke: the hub hands it on toward the spoke whose LSA lists the sender), A-195 (no WAN frame arrives before what names its sender: a new link's first frames are the LSA and the hub's reachability; the hub tells every spoke of a hive's changed nodes as its LSA comes; A-261, A-262 with it), A-265 (the hub rebuilds its FIB as it applies an LSA, and as a hive goes stale), A-246 (a broadcast answered once, by the router it entered), A-253 (a stream record too big for a batch named in the router's journal, its ids quoted, escaped and cut, at most 10 between two alarm lines), A-208 with A-247 (the several-routers mode, unsupported: no wedge, answers over the link a frame came from); `ops.py health` counts the router's lines only when the pattern opens the message | ✅ replaced by 0.1.133 | snap `pre-router-0-1-132` (deleted 2026-11-11) · `apt install fluxbee=0.1.131` + 0.1.131's `update_installation` (nothing one-way; the wire is the same) |
@@ -144,6 +145,124 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.136 — The AI SDK alone: status, config and the handoff beside the LLM turns, and a busy answer past the queue (A-257)
+
+- **Date:** 2026-11-12 (ART) · **Previous version:** 0.1.135 · **Commit:** `ba2addb2`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The AI SDK's
+  runtime runs in ai.generic and SY.frontdesk.gov.
+- **Why:** A-257 (found 2026-11-10 by A-223's triage and io.api's builder): with its 4 workers on
+  LLM turns the AI runtime read no message, so the frontdesk's handoff waited behind them past
+  io.api's 10 s, and a status, help or config request to any AI node on the runtime waited in the
+  same queue. The sweep's end, as the operator set it on 2026-11-11 (FINDINGS' board, item 24); the
+  AI SDK is shared code and ships alone ([METHOD](logbook/METHOD.md) §9). Built and reviewed for
+  the planned 0.1.135; 0.1.134 went to the orchestrator's hotfix (A-314) and 0.1.135 to the router,
+  so the AI SDK is 0.1.136.
+- **What changed (`crates/fluxbee_ai_sdk/`, with the texts that describe it):**
+  - **A-257 (`b694af08`):** the runtime's dispatch loop never waits for a worker. What the AI nodes
+    answer without their model (any `system` or `admin` message, which ai.generic and the frontdesk
+    take to their control plane, and a frontdesk handoff from an IO node) starts as it is read, on
+    a direct lane of up to 64 places (`direct_capacity`); one more is dropped, neither run nor
+    answered. Every other message is an LLM turn: it takes a free worker or waits in the order it
+    came, up to 128 (`queue_capacity`), at most 4 at once (`worker_pool_size`); the next one is
+    answered `ai_runtime_busy` (`retryable`: it never ran) and never run. A tap copy takes no
+    place. The metrics line counts `turns_queued`, `turns_waiting`, `turns_refused` and
+    `direct_dropped`, and a WARN line names a refusal. With a free worker every message runs as it
+    comes, as before.
+  - **Its review (`bb607205`):** a handoff runs on the direct lane only in the shape the frontdesk
+    parses (gov-common's `FrontdeskHandoffPayload`); one it cannot parse is a turn, since the
+    frontdesk calls its model for it. The direct lane has its own deadline, 30 s
+    (`direct_handler_timeout`), and its user messages, the handoffs and the busy answers, take at
+    most 8 of its 64 places (`direct_user_capacity`), system and admin messages any; a busy answer
+    with no place is not sent and is counted (`busy_answers_dropped`). After a fatal end (a reply
+    too large, a panic) no waiting turn starts. The busy answer's trace act is `busy`; the
+    refusals' and the router notices' WARN lines come once, then at most once every 10 s with how
+    many since. `tests/frontdesk_handoff_contract.rs` holds the runtime's copy of the handoff's
+    shape to gov-common's.
+  - **The review of `coa/aisdk-136` (`ba2addb2`, texts only):** Archi's handbook and SY.admin's and
+    SY.orchestrator's pages say an AI node answers status and help at once however busy only on
+    ai.generic 0.1.136 or later, and that one pinned to an older version may still miss the 3 s;
+    the AI nodes runbook and ai.generic's README say what an older version does; the AI SDK's
+    README writes down as a known limit that ai.generic runs its model for a well-formed handoff on
+    the direct lane (FINDINGS A-257); SY.admin gives the node's `CONFIG_RESPONSE` 25 s within its
+    action's 30 s, not 30.
+- **Build and review:** `coa/aisdk-135`'s two commits (`6320eeb1` A-257, `b4071412` its review),
+  built and reviewed for the planned 0.1.135, CI green at `b4071412`; rebased onto daily as
+  `coa/aisdk-136` (`539cd9fc`, `9403d7f3`) with no conflict and the same patch ids (the branch's
+  three docs hunks moved without overlapping daily). Its review: ship, nothing in the code wrong;
+  its fix `8c339ab2`, the texts. CI green on `9403d7f3` and `8c339ab2`. Rebased onto daily
+  `b1545b22` with the subjects re-prefixed to the live `[0.1.135]` (`b694af08`, `bb607205`,
+  `ba2addb2`); daily fast-forwarded to `ba2addb2`, its CI green.
+- **The deploy:** build on fb-build 04:10:46–04:32:48Z (22.0 min), publish in 15 s, `ops deploy
+  0.1.136` from 05:36:49Z in 313 s (snapshots 36.8 s, the motherbee's apt 159.1 s, its admin on
+  the version 48.8 s, the spokes answering 9.6 s, the update's call 25.0 s, the hives on the target
+  15.8 s, health 7.0 s); snapshot `pre-aisdk-0-1-136`, `pre-router-0-1-135` dropped. On the target
+  after the update's call: egress1 34.5 s, ingress1 34.5 s, worker1 38.9 s, the motherbee 4.7 s; by
+  their own records the spokes settled +25.3 s (egress1), +29.6 s (ingress1), +32.9 s (worker1).
+  Health clean (`wandrops=0` on every hive, in `HEALTH_OK` since 0.1.135). `AI.pruebas@worker1`
+  was relaunched on ai.generic 0.1.136 at 05:40:31Z, its *"ai runtime started"* line naming
+  `worker_pool_size=4 queue_capacity=128 direct_capacity=64 direct_user_capacity=8
+  direct_handler_timeout_ms=30000`; sy-frontdesk-gov restarted at 05:40:36Z and logged the same
+  line at 05:40:42Z.
+- **Checked on 8.x (the gate, gate0236, against a baseline on 0.1.135 the same night):**
+  - **The method:** the 4 workers of `AI.pruebas@worker1` and of `SY.frontdesk.gov@motherbee` held
+    by an nft drop of each node's own HTTPS (table `inet gate0236`, scoped to the unit's cgroup and
+    tcp 443), so each held model call hung in its connect and nothing reached the provider. The
+    drop held each turn 92–93 s, not the planned ~300 s: the provider client gave up after its
+    connect attempts (`provider_status` None), and the node answered its fixed provider-failure
+    text. The turns to AI.pruebas carried an agent's ILK (`AI.gate0233@worker1`'s) as `src_ilk`,
+    so cognition left them alone; the fillers were user messages with no `thread_id`, answered
+    `invalid_payload` once a worker frees, with no model call.
+  - **On 0.1.135 (05:34–05:36Z), the same hold:** AI.pruebas' status 2.449 s
+    `ORCHESTRATOR_INFERRED`, help 3.356 s null (the node did not answer within 3 s), `CONFIG_GET`
+    25.168 s `504 TIMEOUT`; the frontdesk's status 2.374 s inferred, `CONFIG_GET` 25.158 s
+    `TIMEOUT`; a handoff to the frontdesk got no answer. The held turns answered at 93.0–93.1 s. No
+    model call.
+  - **On 0.1.136, before the hold:** every hive on 0.1.136; the probes 0.26–0.58 s,
+    `NODE_REPORTED`. With the workers free (1 model call): a question to AI.pruebas answered in
+    1.50 s; 10 user messages without a thread answered `invalid_payload` in 3–14 ms; a handoff
+    (operation `gate0236_probe`) answered in 12 ms, `invalid_request` *"The requested operation is
+    not supported."*, act `[identity_not_assigned, invalid_request]`; `turns_queued` unchanged.
+    Status and help took 1.1 s in this step (0.5 s in the step before, 0.36 s in the one after the
+    hold): a transient.
+  - **Held and filled (no model call):** both nodes' 4 workers held from 05:43:51Z to 05:45:23Z
+    (92.4–92.7 s).
+    - AI.pruebas: 128 fillers waited, none answered during the hold; the 129th and 6 more, 0.5 s
+      apart, answered `ai_runtime_busy` at once (7–12 ms), `retryable` true, the trace's last act
+      `busy`, the text *"The AI runtime is busy: its 4 model workers are all taken and 128 more
+      messages ..."*. The journal: *"ai runtime refused an LLM turn"* (`refused=1 turns_refused=1`)
+      5 ms after the first send, then the burst's end (`refused=6 turns_refused=7`) with the next
+      metrics line (`turns_waiting=128 turns_queued=128 direct_dropped=0
+      busy_answers_dropped=0`).
+    - The frontdesk: a malformed handoff (`subject.phone` a number) waited as a turn and 127
+      fillers waited; the next one answered `ai_runtime_busy` at once (7 ms), and a well-formed
+      handoff answered at once (6 ms); its metrics `turns_waiting=128 turns_refused=1
+      direct_dropped=0`.
+    - With the queues full: AI.pruebas' status 0.924 s `NODE_REPORTED`, help 0.920 s (its
+      catalog), `CONFIG_GET` 0.328 s, a `CONFIG_SET` of its own config 0.091 s (ok, its version
+      unchanged); the frontdesk's status 0.866 s and `CONFIG_GET` 0.377 s; the handoff probe 4 ms.
+      Every busy answer and probe fell inside the span when all 4 holders ran (AI.pruebas 7 of 7
+      and 8 of 8, the frontdesk 2 of 2 and 6 of 6).
+    - The drain: once the held turns answered, AI.pruebas' 128 fillers answered `invalid_payload`
+      within 0.135 s and the frontdesk's 127 within 0.165 s; the malformed handoff answered
+      `invalid_payload`. Answers came up to 4 places (AI.pruebas) and 25 (the frontdesk) behind a
+      later filler's: the queue starts the turns in order on 4 workers, and the handlers take
+      different times (an observation, no fault).
+  - **After (1 model call):** the probes 0.30–0.38 s; the question again 1.33 s; the handoff 7 ms;
+    the metrics `turns_waiting=0`; `NRestarts` 0 on both units, no *"ai runtime stopped"* and no
+    restart; health clean (`wandrops=0`).
+  - **The cost:** 2 usage records, both on the gate's threads: AI.pruebas' 2 calls ok (one with the
+    workers free, one after), 0 abandoned; SY.frontdesk.gov none; SY.cognition no record; nothing
+    on other threads.
+  - **Found:** from the review of `coa/aisdk-136`, A-324 (SY.admin's `node_help` note and three
+    orchestrator comments still say a busy AI node may miss the deadline) and A-325 (ai.generic
+    answers each `VAULT_SECRET_CHANGED` broadcast with an error SY.vault drops), both low; the
+    handoff rule's known limit, written into A-257.
+- **PROD after the gate:** all four hives on 0.1.136; snapshot `pre-aisdk-0-1-136` on each VM. The
+  gate's units `g36q`, `g36h`, `g36f` and `g36a` stopped, no table `inet gate0236` left, and
+  `/root/gate0236` removed on worker1 and the motherbee.
+- **Rollback:** the snapshot `pre-aisdk-0-1-136` (all 4 VMs), or `apt install fluxbee=0.1.135` +
+  0.1.135's `update_installation`: nothing one-way; A-257 comes back.
 
 ## 0.1.135 — The router alone: no WAN broadcast sent back, and FIB builds stored in order (A-272, A-268)
 
