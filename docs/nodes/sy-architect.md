@@ -158,6 +158,29 @@ refused `INVALID_REQUEST` for that. `get_hive` refuses such an id since 0.1.137,
 `NOT_FOUND`; read as any other answer, the record would stay open for good. A join still running,
 or any other answer, leaves the record open.
 
+Any other recorded mutation that timed out is read in SY.admin's command log (FINDINGS A-320, since
+0.1.139; `logged_outcome_of_operation`), which keeps each command's outcome once SY.admin ends it,
+whether Archi still waited or not: `list_recent_commands` for the record's action on its hive since
+5 s before its dispatch, 200 a page, up to 5 pages. The record's entry is the one this Archi sent
+(`origin` `l2:SY.architect@<hive>`) for that hive, started no earlier than 5 s before the dispatch,
+whose params hold each plain value the record's do (a value either side keeps redacted, and params
+SY.admin cut, are not compared), the one that started nearest the dispatch when several could be
+(`command_log_entry_is_records`). Its `ok` closes the record as `succeeded_after_timeout` and its
+`error` as `failed`, the summary naming SY.admin's code and how long it took (the log keeps no
+detail), and the request goes on. With no entry yet the record stays open, and the request is
+refused `OPERATION_ALREADY_TRACKED` (*"timed out locally and has no outcome yet: it may still be
+running"*); with none 10 minutes after its dispatch, the whole log read, it closes as `failed`, its
+outcome unknown: SY.admin never ended it (a restart, or the request lost), so the state is read
+before asking again. A log that cannot be read leaves it open. The log keeps every recorded
+mutation SY.admin runs as a command (`action_in_command_log`): a hive's removal, a node's run,
+start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN rule, an
+ILK's or a tenant's change, a node's config, a message to a node, the storage, a WF instance's
+cancel. `update`, `sync_hint` and the OPA and wf-rules writes go another way in SY.admin and are not
+in it, so a timed-out one stays open in that chat, as before: Archi waits for each as long as
+SY.admin does, or longer. Before 0.1.139 only an `add_hive` was read, and a `remove_hive` that
+outlasted Archi's 30 s, or a node's purge SY.admin waits 180 s for, stayed open in its chat for
+good.
+
 **`fluxbee_system_get`** is the LLM's read tool. It builds an SCMD from `{method, path, body}`
 and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`), and it runs reads
 only (`system_get_may_run`, FINDINGS A-73): a GET whose action changes nothing, and the POSTs that

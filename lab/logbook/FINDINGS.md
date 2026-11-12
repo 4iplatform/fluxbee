@@ -1903,7 +1903,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (`an_open_add_hive_closes_on_a_hive_id_that_get_hive_refuses`).
   - Each test fails without its fix. sy-architect.md says all three.
 
-### A-320 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder; read in the code; there before it) — Only `add_hive`'s timed-out records ever close
+### A-320 [Archi] 🔵 low · built on `coa/architect-139` for 0.1.139 (found 2026-11-11 by A-311's Archi builder; read in the code; there before it) — Only `add_hive`'s timed-out records ever close
 
 - **Why:** Archi's reconcile asks the registry only for an open `add_hive` record. Any other tracked
   mutation that times out in Archi stays `timeout_unknown` in its chat, and an identical request
@@ -1912,6 +1912,35 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Effect:** the operator's retry in the same chat is refused; a new chat, or other parameters,
   gets past it.
 - **Fix, later (SY.architect):** a reconcile for each tracked mutation that has a read to settle it.
+- **Built on `coa/architect-139` for 0.1.139:** the read is SY.admin's command log, which keeps
+  each command's outcome once SY.admin ends it, whether Archi still waited or not.
+  - An identical request in the chat of a `timeout_unknown` record of any action the log keeps
+    (`action_in_command_log`: every tracked mutation SY.admin runs as a command, `remove_hive`,
+    the node actions, a runtime's publish and version removal, routes, VPNs, ILKs, tenants, a node's
+    config and messages, the storage, a WF instance's cancel) reads `list_recent_commands` for its
+    action on its hive since 5 s before its dispatch (200 a page, up to 5 pages). The entry this
+    Archi's command made (its origin `l2:SY.architect@<hive>`, its hive, started no earlier than
+    5 s before the dispatch, the record's plain params, redacted values and cut params not
+    compared; the nearest start of several) closes the record: `ok` as `succeeded_after_timeout`,
+    `error` as `failed` with SY.admin's code and its duration (the log keeps no detail), and the
+    request goes on.
+  - No entry yet: still open, refused `OPERATION_ALREADY_TRACKED` with *"timed out locally and has
+    no outcome yet"*. None 10 minutes after its dispatch with the whole log read: `failed`, its
+    outcome unknown (SY.admin never ended it: a restart, or the request lost). A log that cannot
+    be read leaves it open. `add_hive` keeps its registry read.
+  - Not in the log, so not read, as before: `update`, `sync_hint`, the OPA and the wf-rules writes
+    (Archi waits for each as long as SY.admin does, or longer).
+  - Tests: `an_open_mutation_closes_on_its_outcome_in_the_command_log` (through the mesh harness:
+    a `remove_hive` closed by its entry among others of another origin, another hive id and an
+    earlier start, the read's target and params; a node's purge refused on the log's second page,
+    its cursor; no entry yet; none past 10 minutes; a log refused) fails without the fix: nothing
+    is asked and the record stays open.
+    `a_command_log_entry_is_a_records_by_its_action_origin_hive_time_and_params` judges the
+    entries. A-311's test asks nothing of a record that is not open, an accepted `remove_hive` and
+    an `update`.
+  - Not changed: Archi's own wait (30 s for `remove_hive`, `kill_node` and
+    `remove_node_instance`, where SY.admin waits up to 180 s for a purge), so such a request still
+    answers `TIMEOUT_UNKNOWN` first; its outcome is read on the next identical request.
 
 ### A-319 [General/admin] 🔵 low (found 2026-11-11 by A-263's review; read in the code) — The installation update's background reads are bounded in time, not in number (0.1.137)
 

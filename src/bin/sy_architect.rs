@@ -12466,11 +12466,14 @@ async fn reconcile_timeout_unknown_operation(
     Ok(true)
 }
 
-/// Whether the hive settles an open record (`reconcile_timeout_unknown_operation`): when it does,
+/// Whether a read settles an open record (`reconcile_timeout_unknown_operation`): when it does,
 /// the record's final status, error summary and times are set in place, and the record is
 /// terminal, so an identical request goes on (`execute_tracked_admin_translation`). Only
-/// `timeout_unknown` and `accepted` are open, and only an `add_hive` is read
-/// (`add_hive_outcome_from_registry`). It saves nothing: the reconcile does.
+/// `timeout_unknown` and `accepted` are open. An `add_hive` is read in the motherbee's hive
+/// registry (`add_hive_outcome_from_registry`), its join running after SY.admin's answer; any
+/// other tracked mutation SY.admin's command log keeps (`action_in_command_log`) in that log, which
+/// has each command's outcome once SY.admin ends it, whether Archi still waited or not
+/// (`logged_outcome_of_operation`, FINDINGS A-320). It saves nothing: the reconcile does.
 async fn settle_open_operation(
     state: &ArchitectState,
     record: &mut ChatOperationRecord,
@@ -12484,7 +12487,14 @@ async fn settle_open_operation(
     if record.status != "timeout_unknown" && record.status != "accepted" {
         return Ok(false);
     }
-    let Some((status, error_summary)) = add_hive_outcome_from_registry(state, record).await? else {
+    let outcome = if record.action == "add_hive" {
+        add_hive_outcome_from_registry(state, record).await?
+    } else if action_in_command_log(&record.action) {
+        logged_outcome_of_operation(state, record).await?
+    } else {
+        None
+    };
+    let Some((status, error_summary)) = outcome else {
         return Ok(false);
     };
     record.status = status.to_string();
@@ -12597,6 +12607,220 @@ async fn add_hive_outcome_from_registry(
     // joining, pending, connected-but-not-done, or an unrecognised state: still
     // open. Leave the record alone and look again next time.
     Ok(None)
+}
+
+/// How long after its dispatch a tracked mutation SY.admin's command log has no outcome for may
+/// still be under way there (FINDINGS A-320): longer than SY.admin waits for any action an SCMD
+/// sends (180 s for a node's purge, `kill_node` and `remove_node_instance`), with room. Past it,
+/// SY.admin never ended the command (it restarted meanwhile, or the request was lost on the way),
+/// so the record closes, its outcome unknown.
+const OPEN_OPERATION_LOG_WAIT_MS: u64 = 10 * 60 * 1000;
+
+/// How long before Archi recorded a command as dispatched SY.admin's log may say it started: both
+/// read the motherbee's clock, and Archi records the dispatch before it sends.
+const COMMAND_LOG_START_SLACK_MS: u64 = 5_000;
+
+/// The entries of SY.admin's command log a reconcile reads, a page at a time
+/// (`list_recent_commands`, newest first, of the record's action since its dispatch).
+const COMMAND_LOG_PAGE_ROWS: u64 = 200;
+const COMMAND_LOG_MAX_PAGES: usize = 5;
+
+/// Whether SY.admin's command log keeps a tracked mutation of `action` (FINDINGS A-320): the ones
+/// SY.admin runs as commands (`handle_admin_command`), each with its outcome once it ends. Of the
+/// actions an SCMD records, `update`, `sync_hint` and the OPA and wf-rules writes go another way in
+/// SY.admin and are not in it, so a timed-out one stays open, as before: Archi waits for each of
+/// them as long as SY.admin does, or longer. `add_hive` is read in the hive registry instead.
+fn action_in_command_log(action: &str) -> bool {
+    is_mutating_admin_action(action)
+        && !matches!(action, "add_hive" | "update" | "sync_hint")
+        && !action.starts_with("opa_")
+        && !action.starts_with("wf_rules_")
+}
+
+/// The summary of an open record whose command SY.admin's log has no outcome for well after its
+/// dispatch (`OPEN_OPERATION_LOG_WAIT_MS`, FINDINGS A-320).
+const OPERATION_NEVER_LOGGED: &str =
+    "SY.admin's command log has no outcome for it 10 minutes after it was sent: SY.admin never \
+     ended it (a restart, or the request was lost), so whether it took effect is unknown; read \
+     the state before asking again";
+
+/// How an open record of a tracked mutation other than `add_hive` ends (`settle_open_operation`,
+/// FINDINGS A-320), read in SY.admin's command log (`list_recent_commands`): the entries of its
+/// action on its target hive since just before its dispatch, a page at a time, judged by
+/// `command_log_outcome`. Only `timeout_unknown` is read: an answer that came (`accepted`) is the
+/// one the log keeps. None while the log settles nothing, and when it cannot be read (the record
+/// stays open, as before). It changes and saves nothing.
+async fn logged_outcome_of_operation(
+    state: &ArchitectState,
+    record: &ChatOperationRecord,
+) -> Result<Option<(&'static str, String)>, ArchitectError> {
+    if record.status != "timeout_unknown" || record.dispatched_at_ms == 0 {
+        return Ok(None);
+    }
+    let since_ms = record
+        .dispatched_at_ms
+        .saturating_sub(COMMAND_LOG_START_SLACK_MS);
+    let mut entries = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..COMMAND_LOG_MAX_PAGES {
+        let mut params = json!({
+            "action": record.action,
+            "since_ms": since_ms,
+            "limit": COMMAND_LOG_PAGE_ROWS,
+        });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let output = execute_admin_translation(
+            state,
+            AdminTranslation {
+                admin_target: format!("SY.admin@{}", state.hive_id),
+                action: "list_recent_commands".to_string(),
+                target_hive: record.target_hive.clone(),
+                params,
+            },
+        )
+        .await?;
+        if output.get("status").and_then(Value::as_str) != Some("ok") {
+            return Ok(None);
+        }
+        let payload = output.get("payload");
+        entries.extend(
+            payload
+                .and_then(|payload| payload.get("commands"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        cursor = payload
+            .and_then(|payload| payload.get("next_cursor"))
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            complete = true;
+            break;
+        }
+    }
+    Ok(command_log_outcome(
+        record,
+        &entries,
+        &format!("l2:{}", state.node_name),
+        now_epoch_ms(),
+        complete,
+    ))
+}
+
+/// What became of an open record by SY.admin's command log (FINDINGS A-320): `entries` are the
+/// log's entries of its action since just before its dispatch, `complete` when every page was
+/// read. The entry its command made (`command_log_entry_is_records`, the one that started nearest
+/// its dispatch when several could be) gives the outcome: `ok` closes it `succeeded_after_timeout`,
+/// `error` `failed` with SY.admin's code (the log keeps no detail), another status as its answer
+/// would have. With no such entry it stays open until `OPEN_OPERATION_LOG_WAIT_MS` after its
+/// dispatch, and then, the whole log read, closes `failed`, its outcome unknown
+/// (`OPERATION_NEVER_LOGGED`). None while it stays open.
+fn command_log_outcome(
+    record: &ChatOperationRecord,
+    entries: &[Value],
+    origin: &str,
+    now_ms: u64,
+    complete: bool,
+) -> Option<(&'static str, String)> {
+    let started = |entry: &Value| {
+        let ended = entry.get("ts_ms").and_then(Value::as_u64)?;
+        let took = entry
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Some(ended.saturating_sub(took))
+    };
+    let entry = entries
+        .iter()
+        .filter(|entry| command_log_entry_is_records(record, entry, origin))
+        .min_by_key(|entry| {
+            started(entry)
+                .unwrap_or(0)
+                .abs_diff(record.dispatched_at_ms)
+        });
+    let Some(entry) = entry else {
+        let waited = now_ms.saturating_sub(record.dispatched_at_ms);
+        return (complete && waited > OPEN_OPERATION_LOG_WAIT_MS)
+            .then(|| ("failed", OPERATION_NEVER_LOGGED.to_string()));
+    };
+    let status = entry
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let took = entry
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .map(|ms| format!(" after {:.1} s", ms as f64 / 1000.0))
+        .unwrap_or_default();
+    if status.eq_ignore_ascii_case("ok") {
+        return Some(("succeeded_after_timeout", String::new()));
+    }
+    if status.eq_ignore_ascii_case("error") {
+        let code = entry
+            .get("error_code")
+            .and_then(Value::as_str)
+            .filter(|code| !code.trim().is_empty())
+            .unwrap_or("an error");
+        return Some((
+            "failed",
+            format!(
+                "SY.admin answered {code}{took} (its command log, which keeps the code, not the \
+                 detail)"
+            ),
+        ));
+    }
+    match operation_status_from_output(&json!({ "status": status })).as_str() {
+        "succeeded" => Some(("succeeded_after_timeout", String::new())),
+        "not_found" => Some(("not_found", format!("SY.admin answered not_found{took}"))),
+        _ => None,
+    }
+}
+
+/// Whether an entry of SY.admin's command log is the one an open record's command made (FINDINGS
+/// A-320): the same action, sent by this Archi (`origin`, `l2:SY.architect@<hive>`), for the
+/// record's hive (an entry with none is a hive-less command), started no earlier than just before
+/// the record's dispatch, and with the record's params: each of the record's that is a plain value
+/// (a string, a number, a flag) is the entry's too, unless either side keeps it redacted or
+/// SY.admin cut the entry's params (`_truncated`).
+fn command_log_entry_is_records(record: &ChatOperationRecord, entry: &Value, origin: &str) -> bool {
+    let text = |key: &str| entry.get(key).and_then(Value::as_str);
+    if text("action") != Some(record.action.as_str()) || text("origin") != Some(origin) {
+        return false;
+    }
+    if text("hive").is_some_and(|hive| hive != record.target_hive) {
+        return false;
+    }
+    let Some(ended) = entry.get("ts_ms").and_then(Value::as_u64) else {
+        return false;
+    };
+    let took = entry
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if ended.saturating_sub(took) + COMMAND_LOG_START_SLACK_MS < record.dispatched_at_ms {
+        return false;
+    }
+    let logged = entry.get("params").cloned().unwrap_or(Value::Null);
+    if logged.get("_truncated").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let sent: Value = serde_json::from_str(&record.params_json).unwrap_or(Value::Null);
+    let redacted = |value: &Value| value.as_str() == Some(NODE_SECRET_REDACTION_TOKEN);
+    sent.as_object().into_iter().flatten().all(|(key, value)| {
+        let plain = matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_));
+        if !plain || redacted(value) {
+            return true;
+        }
+        match logged.get(key) {
+            Some(logged) => logged == value || redacted(logged),
+            None => false,
+        }
+    })
 }
 
 fn operation_status_from_output(output: &Value) -> String {
@@ -12730,8 +12954,10 @@ fn operation_error_message(record: &ChatOperationRecord) -> String {
             "An equivalent operation is already running in this chat (operation {}). Wait for it to finish before retrying.",
             record.operation_id
         ),
+        // FINDINGS A-320: an identical request read SY.admin's command log (or, for add_hive, the
+        // hive registry) first, and it has no outcome for it yet.
         "timeout_unknown" => format!(
-            "An equivalent operation timed out locally but may still be running (operation {}). Inspect the result before retrying.",
+            "An equivalent operation timed out locally and has no outcome yet: it may still be running (operation {}). Ask again once it ends, or inspect the result first.",
             record.operation_id
         ),
         _ => format!(
@@ -27798,12 +28024,18 @@ mod tests {
                 }
             }
         }
-        // Only an open add_hive record asks the registry; any other record is left as it is.
+        // Only an open record is read: an add_hive in the registry, another in SY.admin's command
+        // log (FINDINGS A-320, `an_open_mutation_closes_on_its_outcome_in_the_command_log`), and
+        // that only once Archi's wait expired (an accepted answer is the one the log keeps). A
+        // record that is not open, an accepted remove_hive, and an action the log does not keep
+        // (update) ask nothing and are left as they are.
         for (action, status) in [
             ("add_hive", "dispatched"),
             ("add_hive", "failed"),
             ("add_hive", "succeeded_after_timeout"),
-            ("remove_hive", "timeout_unknown"),
+            ("remove_hive", "failed"),
+            ("remove_hive", "accepted"),
+            ("update", "timeout_unknown"),
         ] {
             let mut record = add_hive_record("a.b", status);
             record.action = action.to_string();
@@ -27836,6 +28068,374 @@ mod tests {
         // What the operator and the model read of it: the hive id is not one, add_hive refuses it.
         for text in ["hive_id is not a hive id", "add_hive refuses it"] {
             assert!(ADD_HIVE_ID_NOT_A_HIVE_ID.contains(text), "{text}");
+        }
+    }
+
+    /// An open record of a tracked mutation, sent `dispatched_ago_ms` ago, as
+    /// `execute_tracked_admin_translation` keeps it once Archi's wait expired.
+    fn timed_out_record(
+        action: &str,
+        params: Value,
+        dispatched_ago_ms: u64,
+    ) -> ChatOperationRecord {
+        let dispatched = now_epoch_ms() - dispatched_ago_ms;
+        ChatOperationRecord {
+            operation_id: "op-a320".to_string(),
+            session_id: "session-a320".to_string(),
+            scope_id: operation_scope_id("session-a320"),
+            origin: "scmd".to_string(),
+            action: action.to_string(),
+            target_hive: PRIMARY_HIVE_ID.to_string(),
+            params_json: serde_json::to_string(&redact_json_secret_fields(&normalize_json(
+                &params,
+            )))
+            .expect("params"),
+            params_hash: params_hash(&params),
+            preview_command: String::new(),
+            status: "timeout_unknown".to_string(),
+            created_at_ms: dispatched,
+            updated_at_ms: dispatched,
+            dispatched_at_ms: dispatched,
+            completed_at_ms: 0,
+            request_id: String::new(),
+            trace_id: String::new(),
+            error_summary: String::new(),
+        }
+    }
+
+    /// An entry of SY.admin's command log (`AdminCommandLogEntry`), started `started_after_ms`
+    /// after the record's dispatch.
+    fn command_log_entry(
+        record: &ChatOperationRecord,
+        origin: &str,
+        params: Value,
+        started_after_ms: i64,
+        took_ms: u64,
+        status: &str,
+        error_code: Option<&str>,
+    ) -> Value {
+        let started = (record.dispatched_at_ms as i64 + started_after_ms) as u64;
+        json!({ "ts_ms": started + took_ms, "action": record.action, "hive": record.target_hive,
+                "origin": origin, "params": params, "status": status,
+                "error_code": error_code, "http_status": 200, "duration_ms": took_ms })
+    }
+
+    /// FINDINGS A-320: an open record of a tracked mutation other than add_hive (a remove_hive that
+    /// outlasted Archi's 30 s, a node's purge SY.admin waits 180 s for) is settled by SY.admin's
+    /// command log, which keeps each command's outcome once SY.admin ends it: an identical request
+    /// reads the log's entries of its action on its hive since just before its dispatch, and the
+    /// one its command made closes it, `ok` as `succeeded_after_timeout` and `error` as `failed`
+    /// with SY.admin's code, so the request goes on, where only an add_hive was ever read and every
+    /// other one stayed `timeout_unknown`, each identical retry in that chat refused
+    /// `OPERATION_ALREADY_TRACKED`. With no entry yet it stays open; read across pages; with none
+    /// 10 minutes after its dispatch it closes, its outcome unknown.
+    #[tokio::test]
+    async fn an_open_mutation_closes_on_its_outcome_in_the_command_log() {
+        let archi = "l2:SY.architect@motherbee";
+        let page = |commands: Vec<Value>, next: Option<&str>| {
+            let count = commands.len();
+            json!({ "status": "ok", "action": "list_recent_commands",
+                    "payload": { "commands": commands, "count": count, "next_cursor": next },
+                    "error_code": null, "error_detail": null })
+        };
+        let (state, mut router) = harness_state();
+
+        // A remove_hive that ended 45 s after it was sent: its entry closes it, the others do not.
+        let params = json!({ "hive_id": "worker-9" });
+        let mut record = timed_out_record("remove_hive", params.clone(), 60_000);
+        let theirs = vec![
+            command_log_entry(
+                &record,
+                "l2:SY.wf-rules@worker1",
+                params.clone(),
+                100,
+                45_000,
+                "error",
+                Some("JOIN_IN_PROGRESS"),
+            ),
+            command_log_entry(
+                &record,
+                archi,
+                json!({ "hive_id": "worker-8" }),
+                100,
+                45_000,
+                "error",
+                Some("NOT_FOUND"),
+            ),
+            command_log_entry(
+                &record,
+                archi,
+                params.clone(),
+                -30_000,
+                1_000,
+                "error",
+                Some("NOT_FOUND"),
+            ),
+        ];
+        let mut answer = theirs.clone();
+        answer.push(command_log_entry(
+            &record,
+            archi,
+            params.clone(),
+            120,
+            45_000,
+            "ok",
+            None,
+        ));
+        let since = record.dispatched_at_ms - COMMAND_LOG_START_SLACK_MS;
+        let (settled, sent) = tokio::join!(
+            settle_open_operation(&state, &mut record),
+            answer_admin_command(&mut router, "list_recent_commands", page(answer, None)),
+        );
+        assert!(
+            settled.expect("the log's answer"),
+            "{}",
+            record.error_summary
+        );
+        assert_eq!(
+            sent.payload["target"],
+            json!("motherbee"),
+            "{}",
+            sent.payload
+        );
+        assert_eq!(
+            sent.payload["params"],
+            json!({ "action": "remove_hive", "since_ms": since, "limit": 200 })
+        );
+        assert_eq!(
+            (record.status.as_str(), record.error_summary.as_str()),
+            ("succeeded_after_timeout", "")
+        );
+        assert_eq!(record.completed_at_ms, record.updated_at_ms);
+        assert!(is_terminal_operation_status(&record.status));
+
+        // A node's purge SY.admin refused, on the second page: failed, with SY.admin's code.
+        let params = json!({ "node_name": "AI.gate@worker1" });
+        let mut record = timed_out_record("remove_node_instance", params.clone(), 200_000);
+        let ours = command_log_entry(
+            &record,
+            archi,
+            params.clone(),
+            40,
+            125_400,
+            "error",
+            Some("SERVICE_FAILED"),
+        );
+        let (settled, ..) = tokio::join!(settle_open_operation(&state, &mut record), async {
+            answer_admin_command(
+                &mut router,
+                "list_recent_commands",
+                page(theirs.clone(), Some("17")),
+            )
+            .await;
+            let second =
+                answer_admin_command(&mut router, "list_recent_commands", page(vec![ours], None))
+                    .await;
+            assert_eq!(
+                second.payload["params"]["cursor"],
+                json!("17"),
+                "{}",
+                second.payload
+            );
+        });
+        assert!(settled.expect("the log's answer"));
+        assert_eq!(record.status, "failed");
+        assert_eq!(
+            record.error_summary,
+            "SY.admin answered SERVICE_FAILED after 125.4 s (its command log, which keeps the \
+             code, not the detail)"
+        );
+
+        // No entry of it yet: it stays open, unchanged.
+        let mut record = timed_out_record(
+            "kill_node",
+            json!({ "node_name": "AI.gate@worker1", "force": false }),
+            40_000,
+        );
+        let (settled, ..) = tokio::join!(
+            settle_open_operation(&state, &mut record),
+            answer_admin_command(
+                &mut router,
+                "list_recent_commands",
+                page(theirs.clone(), None)
+            ),
+        );
+        assert!(!settled.expect("the log's answer"));
+        assert_eq!(
+            (record.status.as_str(), record.completed_at_ms),
+            ("timeout_unknown", 0)
+        );
+
+        // None 10 minutes after it was sent, the whole log read: closed, its outcome unknown.
+        let mut record = timed_out_record(
+            "kill_node",
+            json!({ "node_name": "AI.gate@worker1" }),
+            OPEN_OPERATION_LOG_WAIT_MS + 1_000,
+        );
+        let (settled, ..) = tokio::join!(
+            settle_open_operation(&state, &mut record),
+            answer_admin_command(&mut router, "list_recent_commands", page(vec![], None)),
+        );
+        assert!(settled.expect("the log's answer"));
+        assert_eq!(
+            (record.status.as_str(), record.error_summary.as_str()),
+            ("failed", OPERATION_NEVER_LOGGED)
+        );
+
+        // A log that cannot be read leaves it open.
+        let mut record = timed_out_record(
+            "kill_node",
+            json!({ "node_name": "AI.gate@worker1" }),
+            OPEN_OPERATION_LOG_WAIT_MS + 1_000,
+        );
+        let (settled, ..) = tokio::join!(
+            settle_open_operation(&state, &mut record),
+            answer_admin_command(
+                &mut router,
+                "list_recent_commands",
+                json!({
+                "status": "error", "action": "list_recent_commands", "payload": null,
+                "error_code": "INVALID_CURSOR", "error_detail": "x" })
+            ),
+        );
+        assert!(!settled.expect("an answer"));
+        assert_eq!(record.status, "timeout_unknown");
+    }
+
+    /// FINDINGS A-320: which entry of SY.admin's command log is a record's. The same action, sent by
+    /// this Archi, for its hive, started no earlier than just before its dispatch, with its params:
+    /// a value either side keeps redacted, and params SY.admin cut, are not compared; of two that
+    /// could be, the one that started nearest the dispatch. An entry whose status says nothing
+    /// final (accepted) settles nothing; with none, the record closes only past the wait and with
+    /// the whole log read.
+    #[test]
+    fn a_command_log_entry_is_a_records_by_its_action_origin_hive_time_and_params() {
+        let archi = "l2:SY.architect@motherbee";
+        let params = json!({ "node_name": "AI.x@motherbee", "ssh_password": "pw", "force": true });
+        let record = timed_out_record("kill_node", params, 60_000);
+        let logged = json!({ "node_name": "AI.x@motherbee", "ssh_password": NODE_SECRET_REDACTION_TOKEN,
+                             "force": true, "launched_by": "archi" });
+        let entry = |origin: &str, params: Value, started: i64| {
+            command_log_entry(&record, origin, params, started, 2_000, "ok", None)
+        };
+        assert!(command_log_entry_is_records(
+            &record,
+            &entry(archi, logged.clone(), 50),
+            archi
+        ));
+        assert!(command_log_entry_is_records(
+            &record,
+            &entry(archi, logged.clone(), -4_000),
+            archi
+        ));
+        assert!(command_log_entry_is_records(
+            &record,
+            &entry(
+                archi,
+                json!({ "_truncated": true, "bytes": 9000, "preview": "{" }),
+                50
+            ),
+            archi
+        ));
+        let mut other_hive = entry(archi, logged.clone(), 50);
+        other_hive["hive"] = json!("worker1");
+        let mut hive_less = entry(archi, logged.clone(), 50);
+        hive_less.as_object_mut().expect("entry").remove("hive");
+        assert!(command_log_entry_is_records(&record, &hive_less, archi));
+        let mut other_action = entry(archi, logged.clone(), 50);
+        other_action["action"] = json!("remove_node_instance");
+        for (why, other) in [
+            ("another origin", entry("http", logged.clone(), 50)),
+            (
+                "another node",
+                entry(
+                    archi,
+                    json!({ "node_name": "AI.y@motherbee", "force": true }),
+                    50,
+                ),
+            ),
+            (
+                "a param it lacks",
+                entry(archi, json!({ "node_name": "AI.x@motherbee" }), 50),
+            ),
+            ("started before", entry(archi, logged.clone(), -6_000)),
+            ("another hive", other_hive),
+            ("another action", other_action),
+        ] {
+            assert!(
+                !command_log_entry_is_records(&record, &other, archi),
+                "{why}"
+            );
+        }
+
+        // Of two that could be, the nearest; a status that is not final settles nothing.
+        let now = now_epoch_ms();
+        let near = command_log_entry(
+            &record,
+            archi,
+            logged.clone(),
+            10,
+            1_000,
+            "error",
+            Some("NODE_NOT_FOUND"),
+        );
+        let far = command_log_entry(&record, archi, logged.clone(), 30_000, 1_000, "ok", None);
+        assert_eq!(
+            command_log_outcome(&record, &[far.clone(), near], archi, now, true),
+            Some((
+                "failed",
+                "SY.admin answered NODE_NOT_FOUND after 1.0 s (its command log, which keeps the \
+                 code, not the detail)"
+                    .to_string()
+            ))
+        );
+        let accepted =
+            command_log_entry(&record, archi, logged.clone(), 10, 1_000, "accepted", None);
+        assert_eq!(
+            command_log_outcome(&record, &[accepted], archi, now, true),
+            None
+        );
+        let pending = command_log_entry(&record, archi, logged, 10, 1_000, "sync_pending", None);
+        assert_eq!(
+            command_log_outcome(&record, &[pending], archi, now, true),
+            Some(("succeeded_after_timeout", String::new()))
+        );
+        // None found: open within the wait, and past it with the log not read to its end.
+        let late = now + OPEN_OPERATION_LOG_WAIT_MS;
+        assert_eq!(
+            command_log_outcome(&record, std::slice::from_ref(&far), archi, now, true),
+            Some(("succeeded_after_timeout", String::new()))
+        );
+        assert_eq!(command_log_outcome(&record, &[], archi, now, true), None);
+        assert_eq!(command_log_outcome(&record, &[], archi, late, false), None);
+        assert_eq!(
+            command_log_outcome(&record, &[], archi, late, true),
+            Some(("failed", OPERATION_NEVER_LOGGED.to_string()))
+        );
+
+        // The actions the log keeps: every tracked mutation SY.admin runs as a command.
+        for action in [
+            "remove_hive",
+            "kill_node",
+            "remove_node_instance",
+            "run_node",
+            "remove_runtime_version",
+            "publish_runtime_package",
+            "delete_tenant",
+            "add_route",
+        ] {
+            assert!(action_in_command_log(action), "{action}");
+        }
+        for action in [
+            "add_hive",
+            "update",
+            "sync_hint",
+            "opa_compile_apply",
+            "wf_rules_delete",
+            "get_hive",
+            "list_nodes",
+        ] {
+            assert!(!action_in_command_log(action), "{action}");
         }
     }
 
