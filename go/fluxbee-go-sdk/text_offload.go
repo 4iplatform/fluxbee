@@ -17,30 +17,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The text/v1 offload (FINDINGS A-264): as it sends, the SDK puts the text of a text/v1 payload
-// whose inline form would be over textOffloadMaxMessageBytes, with textOffloadOverheadBytes for the
-// rest of the frame, in a blob of the hive's blob store, and sends the blob's ref in its place
-// (content_ref), as the Rust SDK does (crates/fluxbee_sdk/src/send_normalization.rs). The blob's
-// layout and its promote are the Rust SDK's (crates/fluxbee_sdk/src/blob): staging/<prefix>/<name>
-// written to an exclusive temporary file and renamed, then moved to active/<prefix>/<name>, given
-// to the owner of active/ (the Syncthing user, who copies it to the other hives), every directory
-// opened without following a link (FINDINGS A-56). A reader (an IO node, an agent) reads it with
-// the Rust SDK's read_blob_with_retry, which checks its size and the hash in its name. Before
-// 0.1.141 a WF's text over 128 KiB was never sent (MessageTooLargeError), and one between about 96
-// and 128 KiB reached its node but not the router stream's turns (FINDINGS A-253).
+// The text/v1 offload (FINDINGS A-264): a message whose frame is over the router's limit
+// (maxFrameSize, 128 KiB), which SendTraced refused before 0.1.141 (MessageTooLargeError), goes with
+// the text of its text/v1 payload in a blob of the hive's blob store and the blob's ref in its place
+// (content_ref), when that makes it fit. Only then: a message that fits a frame goes as it is, byte
+// for byte, its text inline.
 //
-// Unlike the Rust SDK, a payload under the limit goes byte for byte, and one over it keeps its
-// other fields: only content becomes content_ref. When the blob cannot be written, the payload
-// goes as it is, with a log line, as in Rust.
+// Why the frame, and not the Rust SDK's threshold (crates/fluxbee_sdk/src/send_normalization.rs: a
+// payload over 64 KiB with 2 KiB for the rest of the frame, a text of about 62 KiB): the operator's
+// call of 2026-11-12, option (b). A reader on another hive gets the blob through Syncthing, whose
+// watcher scans a change 10 s after it, so the message comes first, and no reader waits that long
+// today (ai.generic reads a content_ref at once, io.slack and io.wapp wait 5 s, and a WF, io.api,
+// io.web and io.linkedhelper read none). With the Rust SDK's threshold a WF's text of about 62 to
+// 128 KiB, which went inline before 0.1.141 and reached every reader, would fail at a reader on
+// another hive. Past the frame, what fit inline before still goes inline, and only a text that could
+// not be sent at all goes as a blob. A text of about 95 to 128 KiB still reaches its node but not the
+// router stream's turns (FINDINGS A-253), as before. Getting the blob to the reader's hive in time is
+// a topic of its own.
+//
+// The blob's layout and its promote are the Rust SDK's (crates/fluxbee_sdk/src/blob):
+// staging/<prefix>/<name> written to an exclusive temporary file and renamed, then moved to
+// active/<prefix>/<name>, given to the owner of active/ (the Syncthing user, who copies it to the
+// other hives), every directory opened without following a link (FINDINGS A-56). A reader (an IO
+// node, an agent) reads it with the Rust SDK's read_blob_with_retry, which checks its size and the
+// hash in its name. Unlike the Rust SDK, the payload keeps its other fields: only content becomes
+// content_ref. A message over the frame with the ref too (a large meta.context) writes no blob and
+// is refused, with a log line, as is one whose blob cannot be written.
 
 const (
-	// TextOffloadMaxMessageBytes is the most an inline text/v1 payload, with
-	// TextOffloadOverheadBytes, may take before its text goes as a blob: the Rust SDK's
-	// TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES.
-	TextOffloadMaxMessageBytes = 64 * 1024
-	// TextOffloadOverheadBytes is what the rest of the frame is counted as: the Rust SDK's
-	// TEXT_V1_DEFAULT_OVERHEAD_BYTES.
-	TextOffloadOverheadBytes = 2048
 	// DefaultBlobRoot is the hive's blob store, the Rust SDK's default.
 	DefaultBlobRoot = "/var/lib/fluxbee/blob"
 
@@ -67,61 +71,88 @@ type BlobRef struct {
 	SpoolDay         string `json:"spool_day"`
 }
 
-// offloadText returns payload, a text/v1 payload, with its content in a blob of root when its
-// inline form is over the limit; any other payload, one under the limit, one that has a content_ref
-// already, or one that is not a text/v1 payload with a text (its content missing, null or no
-// string), comes back as it is, with no ref. An error says the text was over the limit and could
-// not go as a blob: payload comes back as it is.
-func offloadText(root string, payload json.RawMessage) (json.RawMessage, *BlobRef, error) {
-	if len(payload)+TextOffloadOverheadBytes <= TextOffloadMaxMessageBytes {
-		return payload, nil, nil
-	}
+// textBlob is the text of a text/v1 payload on its way to a blob: the payload that carries the blob's
+// ref in place of the text, the ref, and the text.
+type textBlob struct {
+	payload json.RawMessage
+	ref     BlobRef
+	text    []byte
+}
+
+// planTextBlob is what sending the text of payload as a blob, written at now, would send, and true,
+// when payload is a text/v1 payload with a text: its content a string, and no content_ref. Any other
+// payload is false: one that is no object or no text/v1 payload, one with a content_ref, or one whose
+// content is missing, null or no string (a null content is no text: the Rust SDK sends a text/v1
+// payload whose content is None as it is, never as an empty blob). Nothing is written.
+func planTextBlob(payload json.RawMessage, now time.Time) (textBlob, bool, error) {
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(payload, &fields) != nil {
-		return payload, nil, nil
+		return textBlob{}, false, nil
 	}
 	var kind string
 	if json.Unmarshal(fields["type"], &kind) != nil || kind != "text" {
-		return payload, nil, nil
+		return textBlob{}, false, nil
 	}
 	if ref, ok := fields["content_ref"]; ok && string(ref) != "null" {
-		return payload, nil, nil
+		return textBlob{}, false, nil
 	}
-	// A null content is no text: the payload goes as it is, as the Rust SDK sends a text/v1 payload
-	// whose content is None (send_normalization.rs), never as an empty blob.
 	var content *string
 	if json.Unmarshal(fields["content"], &content) != nil || content == nil {
-		return payload, nil, nil
+		return textBlob{}, false, nil
 	}
-	ref, err := putTextBlob(root, []byte(*content))
-	if err != nil {
-		return payload, nil, err
-	}
+	text := []byte(*content)
+	ref := textBlobRef(text, now)
 	raw, err := json.Marshal(ref)
 	if err != nil {
-		return payload, nil, err
+		return textBlob{}, false, err
 	}
 	delete(fields, "content")
 	fields["content_ref"] = raw
 	out, err := marshalNoEscape(fields)
 	if err != nil {
-		return payload, nil, err
+		return textBlob{}, false, err
 	}
-	return out, &ref, nil
+	return textBlob{payload: out, ref: ref, text: text}, true, nil
 }
 
-// offloadMessageText is offloadText on msg's payload, as SendTraced sends it, with its log lines.
-func offloadMessageText(msg *Message) {
-	payload, ref, err := offloadText(textOffloadBlobRoot, msg.Payload)
-	switch {
-	case err != nil:
-		log.Printf("fluxbee-go-sdk: text/v1 offload failed, the payload goes as it is: %v (msg_type=%q msg=%q trace_id=%s)",
+// offloadTextOverTheFrame is SendTraced's offload, for msg, whose frame, data, is over the limit. When
+// msg's payload is a text/v1 payload with a text (planTextBlob) and the frame with the blob's ref in
+// place of the text fits, the text is written as a blob of root, msg's payload becomes the one with
+// the ref, and its frame comes back. Otherwise msg stays as it is, data comes back and nothing is
+// written: a payload that is no such text, a frame over the limit with the ref too, or a blob that
+// cannot be written. The last two get a log line.
+func offloadTextOverTheFrame(root string, msg *Message, data []byte) []byte {
+	failed := func(err error) []byte {
+		log.Printf("fluxbee-go-sdk: text/v1 offload failed, the message stays over the limit: %v (msg_type=%q msg=%q trace_id=%s)",
 			err, msg.Meta.MsgType, stringValue(msg.Meta.Msg), msg.Routing.TraceID)
-	case ref != nil:
-		log.Printf("fluxbee-go-sdk: text/v1 content of %d bytes sent as blob %s (msg_type=%q msg=%q trace_id=%s)",
-			ref.Size, ref.BlobName, msg.Meta.MsgType, stringValue(msg.Meta.Msg), msg.Routing.TraceID)
-		msg.Payload = payload
+		return data
 	}
+	blob, ok, err := planTextBlob(msg.Payload, time.Now())
+	if err != nil {
+		return failed(err)
+	}
+	if !ok {
+		return data
+	}
+	offloaded := *msg
+	offloaded.Payload = blob.payload
+	frame, err := MarshalMessage(offloaded)
+	if err != nil {
+		return failed(err)
+	}
+	if len(frame) > maxFrameSize {
+		// Nothing is written for a message that is refused all the same.
+		log.Printf("fluxbee-go-sdk: text/v1 content of %d bytes not sent as a blob: with its ref the frame is still %d bytes, over the limit (msg_type=%q msg=%q trace_id=%s)",
+			len(blob.text), len(frame), msg.Meta.MsgType, stringValue(msg.Meta.Msg), msg.Routing.TraceID)
+		return data
+	}
+	if err := putTextBlob(root, blob.ref, blob.text); err != nil {
+		return failed(err)
+	}
+	log.Printf("fluxbee-go-sdk: text/v1 content of %d bytes sent as blob %s, its frame over the limit inline (msg_type=%q msg=%q trace_id=%s)",
+		blob.ref.Size, blob.ref.BlobName, msg.Meta.MsgType, stringValue(msg.Meta.Msg), msg.Routing.TraceID)
+	msg.Payload = blob.payload
+	return frame
 }
 
 // marshalNoEscape is value's JSON without HTML escaping, as a frame carries it.
@@ -135,30 +166,35 @@ func marshalNoEscape(value any) (json.RawMessage, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// putTextBlob writes data, a text, as a blob of root (content.txt, text/plain unless its bytes are
-// active markup), staged and promoted as the Rust SDK's put_bytes and promote do.
-func putTextBlob(root string, data []byte) (BlobRef, error) {
+// textBlobRef is the ref of data, a text, as a blob written at now: content_<hash>.txt, content.txt,
+// text/plain unless its bytes are active markup, of now's UTC day.
+func textBlobRef(data []byte, now time.Time) BlobRef {
 	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
 	mime := textBlobMime
 	if active := sniffActiveContent(data); active != "" {
 		mime = active
 	}
-	ref := BlobRef{
+	return BlobRef{
 		Type:             "blob_ref",
 		BlobName:         "content_" + hash[:blobHashLen] + ".txt",
 		Size:             uint64(len(data)),
 		Mime:             mime,
 		FilenameOriginal: textBlobFilename,
-		SpoolDay:         time.Now().UTC().Format("2006-01-02"),
+		SpoolDay:         now.UTC().Format("2006-01-02"),
 	}
+}
+
+// putTextBlob writes data, a text, as the blob ref names in root (textBlobRef), staged and promoted
+// as the Rust SDK's put_bytes and promote do.
+func putTextBlob(root string, ref BlobRef, data []byte) error {
 	if err := writeStagedBlob(root, ref.BlobName, data); err != nil {
-		return BlobRef{}, fmt.Errorf("write staging file: %w", err)
+		return fmt.Errorf("write staging file: %w", err)
 	}
 	if err := promoteBlob(root, ref.BlobName); err != nil {
-		return BlobRef{}, fmt.Errorf("promote staging->active: %w", err)
+		return fmt.Errorf("promote staging->active: %w", err)
 	}
-	return ref, nil
+	return nil
 }
 
 // blobPrefix is the directory of a blob under staging/ and active/: the first two hex digits of

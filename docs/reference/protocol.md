@@ -47,7 +47,7 @@ uses the same framing: node to router, router to sibling router, hive to hive.
 | Who has the big frame | What happens | Code |
 | --- | --- | --- |
 | A Rust node sending | `NodeSender::send` refuses it with `NodeError::MessageTooLarge` and logs `FRAME_TOO_LARGE`; nothing is queued. A `text` payload is offloaded to a blob before this check (§8). | `split.rs` |
-| A Go node sending | `NodeSender.Send` refuses it with `*MessageTooLargeError` and logs `FRAME_TOO_LARGE`; nothing is queued and the connection stays up. | `client.go` |
+| A Go node sending | `NodeSender.Send` refuses it with `*MessageTooLargeError` and logs `FRAME_TOO_LARGE`; nothing is queued and the connection stays up. Since 0.1.141, when the payload is `text`, its text goes as a blob instead if that makes the frame fit: only a message over the limit is offloaded (§8). | `client.go` |
 | The router, reading from a node | The read fails; the router logs `FRAME_TOO_LARGE — node sent oversized frame; disconnecting`, ends the connection and unregisters the node. | `handle_node` |
 | The router, handing a link a sender's frame it enlarged on the way (the sender's name, the action class, a resolve's trace entry; an agent's memory package is trimmed to fit) | Not queued: the sender is answered `UNREACHABLE` `FRAME_TOO_LARGE` over the link the message came in on, a broadcast once, with at most one warning every 30 s (since 0.1.124, FINDINGS A-202). SY.admin, SY.identity, SY.vault and SY.orchestrator keep their replies 1 KiB under the frame for these additions (A-198). | `frame_over_limit` |
 | The router, writing one of its own frames (an LSA, a HELLO) | The frame is skipped and counted, with at most one warning per link every 30 s; the link stays up. | `write_link_frames` |
@@ -590,26 +590,31 @@ Conversational text is `TextV1Payload` (`crates/fluxbee_sdk/src/payload.rs`):
   as files (`blob.sync` in `config/hive.yaml`, tool `syncthing`), so the file may arrive after the
   message: read it with `BlobToolkit::read_blob_with_retry`, which waits for a missing blob (5 s
   with the default `ResolveRetryConfig`) and checks the size and the hash in the name.
-- **Automatic offload.** `NodeSender::send` normalizes every payload whose `type` is
+- **The Rust SDK's automatic offload.** `NodeSender::send` normalizes every payload whose `type` is
   `text` (`crates/fluxbee_sdk/src/send_normalization.rs`): when the inline payload, serialized, plus
   2,048 bytes (`TEXT_V1_DEFAULT_OVERHEAD_BYTES`) exceeds 64 KiB
   (`TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES`), the text becomes a blob (`content.txt`, `text/plain`)
-  referenced by `content_ref`. If that fails, the payload goes unchanged, with a warning. The Go
-  SDK does the same since 0.1.141 (`NodeSender.SendTraced`, `go/fluxbee-go-sdk/text_offload.go`,
-  FINDINGS A-264), measured on the payload as it goes, with the same blob layout, promote and
-  checks (staging, then `active/`, given to its owner, no link followed); unlike the Rust SDK it
-  sends a payload under the limit byte for byte, and keeps a payload's other fields when its text
-  goes as a blob. Before 0.1.141 a WF's text over the frame was refused (`MessageTooLargeError`),
-  and one of about 62 to 128 KiB went inline.
+  referenced by `content_ref`. If that fails, the payload goes unchanged, with a warning.
+- **The Go SDK offloads only past the frame** (since 0.1.141, `NodeSender.SendTraced`,
+  `go/fluxbee-go-sdk/text_offload.go`, FINDINGS A-264): a message whose frame is over 128 KiB goes
+  with its `text` payload's text as a blob and `content_ref` in its place, when that makes it fit,
+  with the same blob layout, promote and checks (staging, then `active/`, given to its owner, no
+  link followed). A message that fits a frame goes byte for byte, its text inline however long.
+  The payload keeps its other fields. A message over the frame with the ref too (a large
+  `meta.context`) writes no blob, and is refused as before, as is one whose blob cannot be written.
+  Before 0.1.141 a WF's text over the frame was refused (`MessageTooLargeError`). The threshold is
+  the operator's call of 2026-11-12, option (b), for the readers below: what went inline before
+  still does.
 - **A reader on another hive** gets an offloaded text's blob through Syncthing, whose watcher scans
   a change 10 s after it (`fsWatcherDelayS`), so the message comes first. Today ai.generic and
   SY.frontdesk.gov read a `content_ref` at once (`ModelInputOptions::default()`, no
   `resolve_retry`), io.slack and io.wapp wait 5 s (`resolve_text_v1_text_only_for_outbound`), and
   a WF, io.api, io.web and io.linkedhelper read none: such a text fails at a reader on another hive.
-  That holds for an agent's long answer (the Rust SDK) and, since 0.1.141, for a WF's (the Go
-  SDK); whether a WF's text keeps the 62 KiB threshold is the operator's call (FINDINGS A-264).
-- Limits: 128 KiB per frame (§1.3); with either SDK, 64 KiB for an inline text payload. Other
-  payloads are not offloaded: over the frame limit, `send` fails.
+  That holds for an agent's long answer (the Rust SDK, over about 62 KiB) and, since 0.1.141, for a
+  WF's text over the frame (the Go SDK), which could not be sent at all before. Getting the blob to
+  the reader's hive in time is a topic of its own (FINDINGS A-264).
+- Limits: 128 KiB per frame (§1.3); with the Rust SDK, 64 KiB for an inline text payload, and with
+  the Go SDK the frame. Other payloads are not offloaded: over the frame limit, `send` fails.
 
 ---
 
@@ -770,7 +775,7 @@ UNREACHABLE, and a node that answers every message bounces it forever.
 | `AnyMsgOfType` success matcher | Never registered as a reply shape | The same (`registerResponseOnly`) |
 | System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC`: 16 unless `Options.TTL` sets another; `BuildSystemRequest` alone turns 0 into 1. It also sets `meta.action` to the verb |
 | Admin request result | `AdminCommandResult` | The raw `Message` |
-| text/v1 blob offload | Automatic (§8) | Automatic since 0.1.141 (§8, FINDINGS A-264); before, none |
+| text/v1 blob offload | Automatic, a text over about 62 KiB (§8) | Since 0.1.141 only past the frame, 128 KiB (§8, FINDINGS A-264); before, none |
 | `compute_thread_id`, `stream::append`, vault client | Yes | No |
 | `meta.via_tap` | In `Meta` | Not in `Meta` |
 | `ECHO`, `ECHO_REPLY`, `TIME_SYNC` | Gone (FINDINGS A-218) | `MSGEcho` and `MSGEchoReply` gone since 0.1.130; `TIME_SYNC` never there |

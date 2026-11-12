@@ -472,7 +472,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141; the review: a text of about 62 to 128 KiB, inline before, now fails at a reader on another hive, the operator's call before it ships).
+- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141 with the operator's call (b) of 2026-11-12: a WF's text goes as a blob only past the frame, so what fit inline before still goes inline).
 - A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, with 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
@@ -5089,22 +5089,26 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   check the WF nodes' access to the blob root). A Go SDK release, alone.
 - **The operator (2026-11-11):** after the sweep (the Go SDK alone, with the next change there).
 - **Built on `coa/gosdk-141` (the Go SDK alone, planned 0.1.141, with A-329):**
-  - **A WF's text over about 62 KiB goes as a blob, as the Rust SDK sends it.**
-    `NodeSender.SendTraced` (`go/fluxbee-go-sdk/text_offload.go`) puts the text of a text/v1
-    payload whose inline form, with 2,048 bytes for the rest of the frame, is over 64 KiB (the
-    Rust SDK's `TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES` and `TEXT_V1_DEFAULT_OVERHEAD_BYTES`) in a blob,
+  - **A WF's text goes as a blob only when its message is over the frame (128 KiB),** the
+    operator's call below; built first at the Rust SDK's threshold (a payload over 64 KiB with
+    2,048 bytes for the rest of the frame, a text of about 62 KiB). `NodeSender.SendTraced`
+    (`go/fluxbee-go-sdk/text_offload.go`, `offloadTextOverTheFrame`) measures the frame as it goes,
+    with its trace entry and its writer's name. Over 128 KiB, where it refused the message before
+    (`MessageTooLargeError`), the text of a text/v1 payload goes in a blob,
     `content_<the first 16 hex digits of its SHA-256>.txt`, `text/plain` (`text/html` or
     `image/svg+xml` when its first bytes are such a document, the Rust SDK's sniff), of the UTC
-    day, and sends `content_ref` in its place. The blob layout and its promote are the Rust SDK's
-    (A-56): `staging/<prefix>/` written to an exclusive temporary file and renamed, then moved to
-    `active/<prefix>/`, given to the owner of `active/` (the Syncthing user, so it reaches the other
-    hives), 0640, every directory opened without following a link; a blob already in `active/` is
-    left in place. Who reads it, and how, is below (the review). Unlike the Rust SDK, a payload
-    under the limit goes byte for byte (a `forward` stays byte-faithful) and one over it keeps its
-    other fields; only `content` becomes `content_ref`. A payload whose `content` is null or no
-    string goes as it is, as in Rust (the review: a null one went as an empty blob, its ref of size
-    0). When the blob cannot be written the payload goes as it is, with a log line, as in Rust, and
-    a frame over 128 KiB is then refused as before.
+    day, and `content_ref` in its place, when that makes the frame fit. A message that fits a frame
+    goes as it is, byte for byte (a `forward` stays byte-faithful), its text inline however long.
+    The blob layout and its promote are the Rust SDK's (A-56): `staging/<prefix>/` written to an
+    exclusive temporary file and renamed, then moved to `active/<prefix>/`, given to the owner of
+    `active/` (the Syncthing user, so it reaches the other hives), 0640, every directory opened
+    without following a link; a blob already in `active/` is left in place. Who reads it, and how,
+    is below (the review). Unlike the Rust SDK, the payload keeps its other fields; only `content`
+    becomes `content_ref`. A payload whose `content` is null or no string goes as it is, as in Rust
+    (the review: a null one went as an empty blob, its ref of size 0). A message over the frame
+    with the ref too (a large `meta.context`) writes no blob, none that no message names for
+    Syncthing to copy to every hive (as built first, it wrote one), and is refused as before, with a
+    log line; so is a message whose blob cannot be written.
   - **The WF nodes' access to the blob root:** a WF node runs as root, as every managed node (a
     transient `systemd-run` unit with no `User=` and no sandboxing, `src/bin/sy_orchestrator.rs`
     ~31671), so it writes `staging/` (root's) and gives a blob to the owner of `active/`, as the
@@ -5112,20 +5116,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (`DefaultBlobRoot`). The Go SDK takes `golang.org/x/sys` v0.23.0 for the descriptor-relative
     calls (the version SY.opa.rules builds with; SY.timer and the WF build with v0.42.0 already,
     SY.wf-rules adds it).
-  - **By its tests, each checked failing without its fix:** `TestATextOverTheFrameIsSentAsABlob`
-    (a text of 220 KiB sent as a ref; before, `MessageTooLargeError`),
-    `TestATextOverTheLimitGoesAsABlob`, `TestAPayloadThatNeedsNoBlobGoesByteForByte` (its null
-    `content` case since the review), `TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt`,
-    `TestTheSameTextTwiceIsOneBlob`, `TestALinkInTheBlobTreeIsNeverFollowed` (on the Mac and in a
-    Linux container, as root and as a user).
-  - **What it does not cover, recorded:** a WF's large `meta.context` (its resolved `vars`) with a
-    short text still takes the frame into A-253's window, and a payload that is not text is not
+  - **By its tests, each checked failing without its fix:** `TestATextThatFitsTheFrameGoesInline`
+    (a frame of exactly 128 KiB, its text of about 127 KiB, goes byte for byte and writes nothing,
+    and one byte more goes as a blob; it fails at the first build's threshold),
+    `TestATextOverTheFrameGoesAsABlob` (a text of 205 KiB sent as a ref, the other fields as they
+    came; before, `MessageTooLargeError`), `TestAMessageOverTheFrameWithNoTextIsRefusedAsBefore`
+    (its null `content` case since the review), `TestAMessageOverTheFrameWithItsRefTooWritesNoBlob`
+    (it fails when the blob is written before the frame is measured, as built first),
+    `TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt`, `TestTheSameTextTwiceIsOneBlob`,
+    `TestALinkInTheBlobTreeIsNeverFollowed` (on the Mac and in a Linux container, as root and as a
+    user).
+  - **What it does not cover, recorded:** a WF's text of about 95 to 128 KiB still reaches its node
+    but not `turns` or cognition (A-253's window), as before 0.1.141: the call keeps it inline, so
+    that it reaches every reader. A WF's large `meta.context` (its resolved `vars`) with a short
+    text still takes the frame into the same window, and a payload that is not text is not
     offloaded (both as in the Rust SDK). A blob left in `staging/` by a crash between its write and
     its promote, or by a second copy of a blob already active, waits for the staging clean-up
     (24 h, A-241), as the Rust SDK's does.
-  - **The review (2026-11-12), read in the code: a text of about 62 to 128 KiB reaches fewer
-    readers than before.** Before 0.1.141 a WF's text in that band went inline and reached every
-    reader; now it goes as a `content_ref`, which only a reader whose hive holds the blob can read.
+  - **The review (2026-11-12) of the first build, read in the code: a text of about 62 to 128 KiB
+    reached fewer readers than before.** Before 0.1.141 a WF's text in that band went inline and
+    reached every reader; built first, it went as a `content_ref`, which only a reader whose hive
+    holds the blob can read.
     The blob reaches another hive through Syncthing (`fluxbee-blob`, `active/` only, the motherbee
     and the workers; a worker to another through the motherbee), whose watcher scans a change 10 s
     after it (`fsWatcherDelayS`, `src/bin/sy_orchestrator.rs` ~16404; renames held up to 60 s were
@@ -5144,18 +5155,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     - io.api, io.web and io.linkedhelper read no `content_ref` at all.
 
     So a WF on a worker writing such a text to an IO node on the motherbee (the gates run their WFs
-    on worker1, the IO.slack nodes run on the motherbee) or to an agent on another worker loses it,
-    where an engine before 0.1.141 delivered it; a reader on the WF's own hive reads it at once.
-    The same holds today for the Rust SDK's offload of an agent's long answer (blob-annex-spec
-    §6.5, §6.6), which the Go SDK joins. The gate measures the motherbee's wait for such a blob
-    (A5).
-  - **To decide (the operator), before 0.1.141 ships:** (a) keep the Rust SDK's threshold, as
-    built: the band fails across hives, as an agent's long answer does; (b) offload a WF's text only
-    past A-253's window (about 96 KiB) or only past the frame (128 KiB), so what reached a reader
-    before still does, until (c); (c) the blob reaches the reader's hive before the reader needs it:
-    the producer asks a sync and waits (the sync hint is SY.admin's alone today, blob-annex-spec
-    §6.6), or each reader waits longer (the AI SDK's model input, the IO common code: their own
-    releases).
+    on worker1, the IO.slack nodes run on the motherbee) or to an agent on another worker would
+    lose it, where an engine before 0.1.141 delivered it; a reader on the WF's own hive reads it at
+    once. The same holds today for the Rust SDK's offload of an agent's long answer
+    (blob-annex-spec §6.5, §6.6), and, since the call, for a WF's text over the frame, which no
+    reader got before. The gate measures the motherbee's wait for such a blob (A5).
+  - **The operator's call (2026-11-12): (b), only past the frame (128 KiB).** The choices were
+    (a) keep the Rust SDK's threshold, the band failing across hives as an agent's long answer
+    does; (b) offload a WF's text only past A-253's window (about 96 KiB) or only past the frame,
+    so that what reached a reader before still does; (c) the blob reaches the reader's hive before
+    the reader needs it: the producer asks a sync and waits (the sync hint is SY.admin's alone
+    today, blob-annex-spec §6.6), or each reader waits longer (the AI SDK's model input, the IO
+    common code: their own releases). Built on `coa/gosdk-141` (above): what fit inline before
+    still goes inline, and only a message over the frame, refused before, goes with its text as a
+    blob. (c) stays a topic of its own.
   - **Mixed versions (only during the deploy):** every WF node runs its package's base, wf.engine's
     `current`, and moves to a new one within a minute of its files reaching its hive, pinned or not
     (`docs/nodes/sy-orchestrator.md`, "A running node and a new runtime version"); the orchestrator

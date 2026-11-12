@@ -391,16 +391,19 @@ Common guards:
   - `target` is a node name written in the definition, never a `SY.*` or `RT.*` node. To choose
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
-  - A text over about 62 KiB (`{"type": "text", "content": ...}`) goes as a blob, its `content`
-    replaced by a `content_ref` (since 0.1.141, as an agent's long answer does). Before, a WF's
-    text over 128 KiB was never sent, and one of about 62 to 128 KiB went inline.
+  - A text (`{"type": "text", "content": ...}`) goes inline, however long, while its message fits
+    one frame (128 KiB). Only a message over the frame goes with its text as a blob, its `content`
+    replaced by a `content_ref` (since 0.1.141; before, it was never sent). An agent's long answer
+    goes as a blob from about 62 KiB; a WF's waits for the frame, by the operator's call of
+    2026-11-12 (FINDINGS A-264), so that what reached every reader before still does.
     - On the WF's own hive the reader has the blob at once.
     - On another hive the blob comes through Syncthing, about 10 s or more after the message. Today
       the readers do not wait that long: ai.generic reads it at once, and io.slack and io.wapp wait
       5 s. Such a text then fails at the reader, and io.slack does not post it.
     - A WF that receives it sees only the `content_ref`, as with an agent's long answer. io.api,
       io.web and io.linkedhelper do not read a `content_ref`.
-    - Whether to keep this as it is, or to change it, is the operator's call (FINDINGS A-264).
+    - A text of about 95 to 128 KiB reaches its reader, but not the conversation's turns or
+      cognition (FINDINGS A-253).
   - A message the WF writes to an agent or a WF carries the instance's person: the `src_ilk` and
     `ich` that the messages of the person's IO node share: the IO node the person wrote from. On a thread several people write on,
     it carries none. Its writer is the WF (below): the agent reads it as the WF's, not as the

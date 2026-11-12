@@ -162,8 +162,9 @@ This is the single place for the track. The cases are worked here one at a time.
   - The payload and context are re-encoded through Go maps: keys reordered, numbers through
     float64, `<`, `>` and `&` escaped (HTML grows).
   - A frame over 128 KiB fails, because the Go SDK never moves long text to a blob. (Since 0.1.141
-    it does, as the Rust SDK: a text over about 62 KiB goes as a `content_ref`, which a reader on
-    another hive may not find yet, Syncthing being slower than the message: FINDINGS A-264.)
+    it does, only past the frame: a message over 128 KiB goes with its text as a `content_ref`,
+    which a reader on another hive may not find yet, Syncthing being slower than the message; a
+    text that fits a frame goes inline as before, the operator's call: FINDINGS A-264.)
 
 ### 4.2 The conversation and the person (FINDINGS A-116)
 

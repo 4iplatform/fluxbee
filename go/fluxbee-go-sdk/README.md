@@ -99,8 +99,7 @@ The v1 stable surface is:
   - `MSGNotTaken`, `NotTakenPayload`, `NotTakenReasonNodeBusy`
   - `BuildNotTaken`, `ParseNotTaken`
   - `IsNoticeOrReply`, `IsReplyName`: the messages no one answers
-- the text/v1 offload (below): `BlobRef`, `TextOffloadMaxMessageBytes`,
-  `TextOffloadOverheadBytes`, `DefaultBlobRoot`
+- the text/v1 offload (below): `BlobRef`, `DefaultBlobRoot`
 - node control-plane helpers:
   - `CONFIG_GET`
   - `CONFIG_SET`
@@ -149,27 +148,34 @@ The connection's reader waits for room in the receiver's queue (256) instead of 
 the router's queue for the link, which answers `LINK_BUSY` past its bound
 ([protocol](../../docs/reference/protocol.md) §6.10, §10.2, §11).
 
-## A long text goes as a blob
+## A text over the frame goes as a blob
 
-`NodeSender.Send` (and `SendTraced`) puts the text of a text/v1 payload (`{"type": "text",
-"content": ...}`) whose inline form, with 2 KiB for the rest of the frame, is over 64 KiB in a blob
-of the hive's blob store (`/var/lib/fluxbee/blob`), and sends its ref in its place, `content_ref`
-(`BlobRef`), as the Rust SDK does (since 0.1.141, FINDINGS A-264). The blob is `content_<the first
-16 hex digits of its SHA-256>.txt`, `text/plain` (`text/html` or `image/svg+xml` when its first
-bytes are such a document, so it is served sandboxed), written to `staging/<prefix>/` and moved to
-`active/<prefix>/` with the Rust SDK's layout and checks (no link under the blob root followed; the
-blob given to the owner of `active/`, whom Syncthing runs as, so it reaches the other hives). A
-payload under the limit goes byte for byte; one over it keeps its other fields; one whose `content`
-is null or no string goes as it is. When the blob cannot be written, the payload goes as it is,
-with a log line, and a frame over 128 KiB is then refused (`MessageTooLargeError`). The node writes
-the blob itself: a WF runs as root, as every managed node.
+`NodeSender.Send` (and `SendTraced`) sends a message whose frame is over 128 KiB, which it refused
+before (`MessageTooLargeError`), with the text of its text/v1 payload (`{"type": "text", "content":
+...}`) in a blob of the hive's blob store (`/var/lib/fluxbee/blob`) and the blob's ref in its place,
+`content_ref` (`BlobRef`), when that makes it fit (since 0.1.141, FINDINGS A-264). A message that
+fits a frame goes as it is, byte for byte, its text inline however long.
 
-A reader on the sender's hive reads the blob at once. One on another hive gets it through
-Syncthing, about 10 s or more after the message, and today no reader waits that long: ai.generic
-reads a `content_ref` at once, io.slack and io.wapp wait 5 s (`read_blob_with_retry`), and a WF,
-io.api, io.web and io.linkedhelper read none. Before 0.1.141 a text of about 62 to 128 KiB went
-inline and reached every reader; whether to keep the threshold is the operator's call (FINDINGS
-A-264, [protocol](../../docs/reference/protocol.md) §8).
+That is the operator's call of 2026-11-12, option (b): the Rust SDK sends a text over about 62 KiB
+as a blob, the Go SDK only past the frame. A reader on another hive gets a blob through Syncthing,
+about 10 s or more after the message, and today no reader waits that long: ai.generic reads a
+`content_ref` at once, io.slack and io.wapp wait 5 s (`read_blob_with_retry`), and a WF, io.api,
+io.web and io.linkedhelper read none. So what fit inline before 0.1.141 still goes inline and
+reaches every reader, and only a text that could not be sent at all goes as a blob: a reader on the
+sender's hive reads it at once, and one on another hive may not find it yet. Getting the blob to
+the reader's hive in time is a topic of its own. A text of about 95 to 128 KiB still reaches its
+node but not the router stream's turns (FINDINGS A-253), as before
+([protocol](../../docs/reference/protocol.md) §8).
+
+The blob is `content_<the first 16 hex digits of its SHA-256>.txt`, `text/plain` (`text/html` or
+`image/svg+xml` when its first bytes are such a document, so it is served sandboxed), written to
+`staging/<prefix>/` and moved to `active/<prefix>/` with the Rust SDK's layout and checks (no link
+under the blob root followed; the blob given to the owner of `active/`, whom Syncthing runs as, so
+it reaches the other hives). The payload keeps its other fields; one whose `content` is null or no
+string, or that has a `content_ref` already, is not offloaded. A message over the frame with the
+ref too (a large `meta.context`) is refused, and no blob is written for it; so is one whose blob
+cannot be written, with a log line. The node writes the blob itself: a WF runs as root, as every
+managed node.
 
 ## SY.timer client patterns
 

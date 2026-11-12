@@ -27,6 +27,64 @@ func textPayload(t *testing.T, content string, extra map[string]any) json.RawMes
 	return raw
 }
 
+// textMessage is a WF's user message to an IO node, its payload a text/v1 payload of content with
+// extra fields.
+func textMessage(t *testing.T, content string, extra map[string]any) Message {
+	t.Helper()
+	return Message{
+		Routing: Routing{Src: "wf-uuid", Dst: UnicastDestination("IO.slack.demo@motherbee"), TTL: 16, TraceID: "trace-text"},
+		Meta:    Meta{MsgType: "user", Msg: stringPtr("REPORT")},
+		Payload: textPayload(t, content, extra),
+	}
+}
+
+// sendText sends msg as a WF's sender does, its blobs written to root: the frame it queued, or why it
+// queued none.
+func sendText(t *testing.T, root string, msg Message) ([]byte, error) {
+	t.Helper()
+	saved := textOffloadBlobRoot
+	textOffloadBlobRoot = root
+	defer func() { textOffloadBlobRoot = saved }()
+	tx := make(chan []byte, 1)
+	sender := &NodeSender{uuid: "wf-uuid", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}}
+	if err := sender.Send(msg); err != nil {
+		if len(tx) != 0 {
+			t.Fatalf("a message refused with %v was queued", err)
+		}
+		return nil, err
+	}
+	return readFrame(t, tx), nil
+}
+
+// sentFields is the payload of frame, field by field.
+func sentFields(t *testing.T, frame []byte) map[string]json.RawMessage {
+	t.Helper()
+	var sent Message
+	if err := json.Unmarshal(frame, &sent); err != nil {
+		t.Fatalf("decode the frame: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(sent.Payload, &fields); err != nil {
+		t.Fatalf("decode the payload: %v", err)
+	}
+	return fields
+}
+
+// sentRef is the content_ref of frame's payload, a text/v1 payload whose text went as a blob, which
+// carries no content.
+func sentRef(t *testing.T, frame []byte) BlobRef {
+	t.Helper()
+	fields := sentFields(t, frame)
+	if _, ok := fields["content"]; ok {
+		t.Fatalf("content and content_ref are exclusive: %s", frame)
+	}
+	var ref BlobRef
+	if err := json.Unmarshal(fields["content_ref"], &ref); err != nil || ref.BlobName == "" {
+		t.Fatalf("want a content_ref: %s (%v)", fields["content_ref"], err)
+	}
+	return ref
+}
+
 // readBlob reads root's active blob ref names, and checks it is the blob ref says, as the Rust SDK's
 // read_blob does: its size, and the hash in its name.
 func readBlob(t *testing.T, root string, ref BlobRef) []byte {
@@ -47,41 +105,86 @@ func readBlob(t *testing.T, root string, ref BlobRef) []byte {
 	return data
 }
 
-// FINDINGS A-264: a text/v1 payload whose inline form is over 64 KiB, with 2 KiB for the rest of the
-// frame, goes as a blob: its content becomes content_ref, a blob content_<hash>.txt, text/plain,
-// of the UTC day, in active/<prefix>/ of the blob root, nothing left in staging/; its other fields go
-// as they came.
-func TestATextOverTheLimitGoesAsABlob(t *testing.T) {
-	root := t.TempDir()
-	content := strings.Repeat("A long answer. ", 5000)
-	payload := textPayload(t, content, map[string]any{"menu": map[string]any{"options": []string{"yes", "no"}}})
+// nothingWritten fails t when anything was written under root.
+func nothingWritten(t *testing.T, root string) {
+	t.Helper()
+	if entries, _ := os.ReadDir(root); len(entries) != 0 {
+		t.Fatalf("nothing is written: %v", entries)
+	}
+}
 
-	out, ref, err := offloadText(root, payload)
-	if err != nil || ref == nil {
-		t.Fatalf("want the text as a blob, got %v %v", ref, err)
+// FINDINGS A-264, the operator's call (b): a message that fits the frame goes as it is, byte for
+// byte, its text inline however long, and writes nothing: what went inline before 0.1.141 still
+// does, and reaches a reader on any hive. Built first at the Rust SDK's threshold (about 62 KiB),
+// such a text went as a blob, which a reader on another hive may not find yet. One byte over the
+// frame, the text goes as a blob.
+func TestATextThatFitsTheFrameGoesInline(t *testing.T) {
+	root := t.TempDir()
+	empty, err := sendText(t, root, textMessage(t, "", nil))
+	if err != nil {
+		t.Fatalf("send: %v", err)
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(out, &fields); err != nil {
-		t.Fatalf("decode: %v", err)
+	fill := maxFrameSize - len(empty)
+	msg := textMessage(t, strings.Repeat("y", fill), nil)
+	frame, err := sendText(t, root, msg)
+	if err != nil || len(frame) != maxFrameSize {
+		t.Fatalf("a text whose frame is the limit goes inline: a frame of %d bytes, %v", len(frame), err)
 	}
-	if _, ok := fields["content"]; ok {
-		t.Fatalf("content and content_ref are exclusive: %s", out)
+	var sent Message
+	if err := json.Unmarshal(frame, &sent); err != nil || !bytes.Equal(sent.Payload, msg.Payload) {
+		t.Fatalf("the payload goes byte for byte (%v)", err)
 	}
-	var got BlobRef
-	if err := json.Unmarshal(fields["content_ref"], &got); err != nil || got != *ref {
-		t.Fatalf("content_ref: %s (%v)", fields["content_ref"], err)
+	nothingWritten(t, root)
+
+	frame, err = sendText(t, root, textMessage(t, strings.Repeat("y", fill+1), nil))
+	if err != nil {
+		t.Fatalf("one byte over the frame: %v", err)
+	}
+	if ref := sentRef(t, frame); ref.Size != uint64(fill+1) {
+		t.Fatalf("one byte over the frame goes as a blob of the text: %+v", ref)
+	}
+}
+
+// FINDINGS A-264: a WF's text whose message is over the frame goes as a blob: its content becomes
+// content_ref, a blob content_<hash>.txt, text/plain, of the UTC day, in active/<prefix>/ of the
+// blob root, nothing left in staging/; the payload's other fields go as they came. Before 0.1.141
+// such a message was refused (MessageTooLargeError), and the text was never sent.
+func TestATextOverTheFrameGoesAsABlob(t *testing.T) {
+	root := t.TempDir()
+	content := strings.Repeat("a report line\n", 15000)
+	msg := textMessage(t, content, map[string]any{"menu": map[string]any{"options": []string{"yes", "no"}}})
+	if len(msg.Payload) <= maxFrameSize {
+		t.Fatalf("the text must be over the frame: %d bytes", len(msg.Payload))
+	}
+	before := time.Now().UTC().Format("2006-01-02")
+	frame, err := sendText(t, root, msg)
+	if err != nil {
+		var tooLarge *MessageTooLargeError
+		if errors.As(err, &tooLarge) {
+			t.Fatalf("a text over the frame was refused instead of sent as a blob: %v", err)
+		}
+		t.Fatalf("send: %v", err)
+	}
+	if len(frame) > 4096 {
+		t.Fatalf("the frame carries the ref, not the text: %d bytes", len(frame))
+	}
+	got := sentRef(t, frame)
+	day := before
+	if after := time.Now().UTC().Format("2006-01-02"); got.SpoolDay == after {
+		day = after // the send crossed midnight, UTC
 	}
 	sum := sha256.Sum256([]byte(content))
 	want := BlobRef{
 		Type: "blob_ref", BlobName: "content_" + hex.EncodeToString(sum[:])[:16] + ".txt", Size: uint64(len(content)),
-		Mime: "text/plain", FilenameOriginal: "content.txt", SpoolDay: time.Now().UTC().Format("2006-01-02"),
+		Mime: "text/plain", FilenameOriginal: "content.txt", SpoolDay: day,
 	}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
+	fields := sentFields(t, frame)
 	if string(fields["type"]) != `"text"` || string(fields["attachments"]) != `[]` ||
 		string(fields["menu"]) != `{"options":["yes","no"]}` {
-		t.Fatalf("the other fields go as they came: %s", out)
+		t.Fatalf("the other fields go as they came: %s", frame)
 	}
 	if data := readBlob(t, root, got); string(data) != content {
 		t.Fatalf("the blob holds another text")
@@ -90,20 +193,16 @@ func TestATextOverTheLimitGoesAsABlob(t *testing.T) {
 	if err != nil || len(staged) != 0 {
 		t.Fatalf("nothing is left in staging: %v %v", staged, err)
 	}
-	if len(out) > 1024 {
-		t.Fatalf("the payload is a ref now, %d bytes", len(out))
-	}
 }
 
-// FINDINGS A-264: a payload under the limit, one with a content_ref already, and one that is no
-// text/v1 text go byte for byte, and write nothing. So does a text/v1 payload over the limit whose
-// content is null or missing, as the Rust SDK sends it (the review: it went as an empty blob, its
-// content_ref of size 0).
-func TestAPayloadThatNeedsNoBlobGoesByteForByte(t *testing.T) {
+// FINDINGS A-264: a message over the frame whose payload is no text/v1 text is refused as before
+// (MessageTooLargeError), and writes nothing: one with a content_ref already, one that is no text/v1
+// payload, one whose content is no string, null (the review: it went as an empty blob, its
+// content_ref of size 0) or missing, and one that is no object.
+func TestAMessageOverTheFrameWithNoTextIsRefusedAsBefore(t *testing.T) {
 	root := t.TempDir()
-	big := strings.Repeat("x", 70*1024)
+	big := strings.Repeat("x", maxFrameSize)
 	for name, payload := range map[string]json.RawMessage{
-		"a text under the limit":    textPayload(t, strings.Repeat("y", TextOffloadMaxMessageBytes-TextOffloadOverheadBytes-100), nil),
 		"a text with a content_ref": json.RawMessage(`{"type":"text","content_ref":{"type":"blob_ref","blob_name":"content_0123456789abcdef.txt","size":1,"mime":"text/plain","filename_original":"content.txt","spool_day":"2026-11-12"},"pad":"` + big + `"}`),
 		"no text":                   json.RawMessage(`{"type":"admin","content":"` + big + `"}`),
 		"a content that is no text": json.RawMessage(`{"type":"text","content":{"x":"` + big + `"}}`),
@@ -111,14 +210,33 @@ func TestAPayloadThatNeedsNoBlobGoesByteForByte(t *testing.T) {
 		"no content":                json.RawMessage(`{"type":"text","pad":"` + big + `"}`),
 		"no object":                 json.RawMessage(`"` + big + `"`),
 	} {
-		out, ref, err := offloadText(root, payload)
-		if err != nil || ref != nil || !bytes.Equal(out, payload) {
-			t.Fatalf("%s: want it as it came, got %v %v", name, ref, err)
+		if _, ok, err := planTextBlob(payload, time.Now()); ok || err != nil {
+			t.Fatalf("%s: planned as a blob (%v)", name, err)
+		}
+		msg := textMessage(t, "", nil)
+		msg.Payload = payload
+		_, err := sendText(t, root, msg)
+		var tooLarge *MessageTooLargeError
+		if !errors.As(err, &tooLarge) {
+			t.Fatalf("%s: want it refused as before, got %v", name, err)
 		}
 	}
-	if entries, _ := os.ReadDir(root); len(entries) != 0 {
-		t.Fatalf("nothing is written: %v", entries)
+	nothingWritten(t, root)
+}
+
+// FINDINGS A-264: a message still over the frame with its text's ref in place of the text (its
+// meta.context, a WF's resolved vars, over it) is refused as before, and writes no blob: none that no
+// message names, which Syncthing would copy to every hive all the same.
+func TestAMessageOverTheFrameWithItsRefTooWritesNoBlob(t *testing.T) {
+	root := t.TempDir()
+	msg := textMessage(t, strings.Repeat("z", maxFrameSize), nil)
+	msg.Meta.Context = json.RawMessage(`{"vars":{"report":"` + strings.Repeat("v", maxFrameSize) + `"}}`)
+	_, err := sendText(t, root, msg)
+	var tooLarge *MessageTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("want it refused as before, got %v", err)
 	}
+	nothingWritten(t, root)
 }
 
 // FINDINGS A-264: a text whose first bytes are an HTML or SVG document is labeled as such, so it is
@@ -131,7 +249,7 @@ func TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt(t *testing.T) {
 		"<?xml version=\"1.0\"?>\n<svg></svg>":     "image/svg+xml",
 		"  <SVG width=\"1\">":                      "image/svg+xml",
 		"{\"note\": \"<script>x</script>\"}":       "",
-		" <html>":                                  "",
+		"\u00a0<html>":                             "",
 		string([]byte{0xA0}) + "<html>":            "text/html",
 	} {
 		if got := sniffActiveContent([]byte(text)); got != want {
@@ -139,10 +257,12 @@ func TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	content := "<!doctype html>" + strings.Repeat("<p>page</p>", 7000)
-	_, ref, err := offloadText(root, textPayload(t, content, nil))
-	if err != nil || ref == nil || ref.Mime != "text/html" {
-		t.Fatalf("an HTML text goes as text/html: %+v %v", ref, err)
+	frame, err := sendText(t, root, textMessage(t, "<!doctype html>"+strings.Repeat("<p>page</p>", 12000), nil))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if ref := sentRef(t, frame); ref.Mime != "text/html" {
+		t.Fatalf("an HTML text goes as text/html: %+v", ref)
 	}
 }
 
@@ -150,19 +270,23 @@ func TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt(t *testing.T) {
 // finds it in place and leaves it, never replacing a blob a reader or Syncthing may be reading.
 func TestTheSameTextTwiceIsOneBlob(t *testing.T) {
 	root := t.TempDir()
-	payload := textPayload(t, strings.Repeat("same ", 20000), nil)
-	_, first, err := offloadText(root, payload)
+	msg := textMessage(t, strings.Repeat("same ", 30000), nil)
+	frame, err := sendText(t, root, msg)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
+	first := sentRef(t, frame)
 	path := filepath.Join(root, "active", blobPrefix(first.BlobName), first.BlobName)
 	before, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	_, second, err := offloadText(root, payload)
-	if err != nil || second == nil || *second != *first {
-		t.Fatalf("second: %+v %v", second, err)
+	frame, err = sendText(t, root, msg)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if second := sentRef(t, frame); second != first {
+		t.Fatalf("second: %+v, first: %+v", second, first)
 	}
 	entries, err := os.ReadDir(filepath.Join(root, "active", blobPrefix(first.BlobName)))
 	if err != nil || len(entries) != 1 {
@@ -174,7 +298,7 @@ func TestTheSameTextTwiceIsOneBlob(t *testing.T) {
 }
 
 // FINDINGS A-264, A-56: the offload never writes through a link planted in the blob tree; it fails,
-// and the payload goes as it came.
+// and the message is refused as before.
 func TestALinkInTheBlobTreeIsNeverFollowed(t *testing.T) {
 	for _, planted := range []string{"staging", "active"} {
 		t.Run(planted, func(t *testing.T) {
@@ -183,60 +307,14 @@ func TestALinkInTheBlobTreeIsNeverFollowed(t *testing.T) {
 			if err := os.Symlink(elsewhere, filepath.Join(root, planted)); err != nil {
 				t.Fatalf("plant: %v", err)
 			}
-			payload := textPayload(t, strings.Repeat("z", 70*1024), nil)
-			out, ref, err := offloadText(root, payload)
-			if err == nil || ref != nil || !bytes.Equal(out, payload) {
-				t.Fatalf("want a failure and the payload as it came, got %v %v", ref, err)
+			_, err := sendText(t, root, textMessage(t, strings.Repeat("z", maxFrameSize), nil))
+			var tooLarge *MessageTooLargeError
+			if !errors.As(err, &tooLarge) {
+				t.Fatalf("want the message refused as before, got %v", err)
 			}
 			if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
 				t.Fatalf("wrote through the link: %v", entries)
 			}
 		})
-	}
-}
-
-// FINDINGS A-264: SendTraced sends a WF's text over the frame as a blob. Before, it refused it with
-// MessageTooLargeError, and the text was never sent.
-func TestATextOverTheFrameIsSentAsABlob(t *testing.T) {
-	root := t.TempDir()
-	saved := textOffloadBlobRoot
-	textOffloadBlobRoot = root
-	defer func() { textOffloadBlobRoot = saved }()
-	tx := make(chan []byte, 1)
-	sender := &NodeSender{uuid: "wf-uuid", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}}
-	content := strings.Repeat("a report line\n", 15000)
-	msg := Message{
-		Routing: Routing{Src: "wf-uuid", Dst: UnicastDestination("IO.slack.demo@motherbee"), TTL: 16, TraceID: "trace-big-text"},
-		Meta:    Meta{MsgType: "user", Msg: stringPtr("REPORT")},
-		Payload: textPayload(t, content, nil),
-	}
-	if len(msg.Payload) <= maxFrameSize {
-		t.Fatalf("the text must be over the frame: %d bytes", len(msg.Payload))
-	}
-	if err := sender.Send(msg); err != nil {
-		var tooLarge *MessageTooLargeError
-		if errors.As(err, &tooLarge) {
-			t.Fatalf("a text over the frame was refused instead of sent as a blob: %v", err)
-		}
-		t.Fatalf("send: %v", err)
-	}
-	frame := readFrame(t, tx)
-	if len(frame) > 4096 {
-		t.Fatalf("the frame carries the ref, not the text: %d bytes", len(frame))
-	}
-	var sent Message
-	if err := json.Unmarshal(frame, &sent); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	var payload struct {
-		Type       string   `json:"type"`
-		Content    *string  `json:"content"`
-		ContentRef *BlobRef `json:"content_ref"`
-	}
-	if err := json.Unmarshal(sent.Payload, &payload); err != nil || payload.Type != "text" || payload.Content != nil || payload.ContentRef == nil {
-		t.Fatalf("want a content_ref: %s (%v)", sent.Payload, err)
-	}
-	if data := readBlob(t, root, *payload.ContentRef); string(data) != content {
-		t.Fatalf("the blob holds another text")
 	}
 }

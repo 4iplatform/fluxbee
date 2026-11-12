@@ -363,10 +363,12 @@ pushes them in acknowledged batches to their sinks.
     0.1.132 they were only counted.
   - **Who sends one:** a frame may be up to 128 KiB, so such a turn reaches its node but neither
     `turns` nor cognition. The Rust SDK normally sends a text over about 62 KiB as a blob, and so
-    do the IO nodes and, since 0.1.141, the Go SDK (FINDINGS A-264), so their turns stay under it.
-    A WF's large `meta.context` (its resolved `vars`) can still reach it with a short text, and so
-    can a payload that is not text, a text whose blob could not be written (it goes inline, with a
-    log line), and a raw client. SY.timer cannot: its messages are system ones, never copied.
+    do the IO nodes, so their turns stay under it. A WF's text of about 95 to 128 KiB reaches it:
+    the Go SDK sends a text as a blob only when the frame is over 128 KiB (since 0.1.141, the
+    operator's call, FINDINGS A-264), so that a text that fits a frame reaches a reader on any hive.
+    So can a WF's large `meta.context` (its resolved `vars`) with a short text, a payload that is not
+    text, a text whose blob could not be written (it goes inline, with a log line), and a raw client.
+    SY.timer cannot: its messages are system ones, never copied.
 - **Never blocking:** the router only hands a record to a bounded queue (4096 turns, 1024 node
   appends, 16 MiB in total) and never waits. If the stream directory cannot be used, records are
   kept in memory only (`router stream cannot use its directory`).
