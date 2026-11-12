@@ -498,7 +498,14 @@ request that names another role, or none for a hive recorded as an ingress or an
 refused with `HIVE_EXISTS` before anything is written (`add_hive_role_refusal`): its `role` and
 `message` name the recorded role, and `remove_hive` comes first. A join records the role when it
 accepts the hive, before it links the box into that role's folders, and a failed attempt keeps
-those links (the peer reconcile leaves the device of a hive that is not connected as it is).
+those links (the peer reconcile leaves the device of a hive that is not connected as it is). It
+records the device it links in the entry (`syncthing_device_id`) just before the link
+(`record_join_syncthing_device`, FINDINGS A-299, since 0.1.139), and the flows' later writes keep
+it (`write_join_entry`), so `remove_hive` unlinks the box of a join that failed after its link
+(`DIST_SYNC_TIMEOUT`, an SSH control, its last write) or whose link failed half-way. Before, only
+a join's last write, on success, recorded it, and such a box kept the motherbee's folders,
+`fluxbee-dist-runtimes` included (`syncthing_peer_cleanup: skipped_no_peer_device_id`), until the
+peer reconcile's orphan pass, which waits for every hive to be connected.
 Before, a retry rewrote the role: a worker's attempt linked into `fluxbee-dist-runtimes`, with
 nodes running there, retried as an egress, read as a hive that runs no managed node, which the
 runtimes' use across the hives does not ask ([managed nodes](#managed-nodes)), so a version those

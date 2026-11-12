@@ -24462,19 +24462,76 @@ fn write_hive_info(
 /// record (`join`: phase, join_id, started_at_ms…) carries over, so it survives every rewrite until
 /// the join's tail ends it (`run_background_join`). A flow that dropped it left an entry the boot
 /// sweep could not tell was mid-join, and a caller waiting for `join.phase: done` waited forever.
+///
+/// A recorded `syncthing_device_id` carries over too, unless the flow's fields name one: the
+/// device a join linked into the motherbee's folders (`record_join_syncthing_device`, FINDINGS
+/// A-299), which `remove_hive` unlinks by it, stays recorded through a later attempt's writes that
+/// have not reached the link.
 fn write_join_entry(
     root: &Path,
     hive_id: &str,
     info: &serde_json::Value,
 ) -> Result<(), OrchestratorError> {
     let mut entry = info.clone();
-    if let Some(join) = read_hive_info(root, hive_id)
-        .ok()
+    let current = read_hive_info(root, hive_id).ok();
+    if let Some(join) = current
+        .as_ref()
         .and_then(|current| current.get("join").cloned())
     {
         entry["join"] = join;
     }
+    if recorded_syncthing_device_id(&entry).is_none() {
+        if let Some(device_id) = current.as_ref().and_then(recorded_syncthing_device_id) {
+            entry["syncthing_device_id"] = serde_json::Value::String(device_id);
+        }
+    }
     write_hive_info(root, hive_id, &entry)
+}
+
+/// FINDINGS A-299: records in `hive_id`'s entry the Syncthing device its join is about to link
+/// into the motherbee's folders (`ensure_syncthing_peer_link_runtime`), before the link. The flows
+/// wrote it only with their last write, on success, so a join that failed after the link
+/// (`DIST_SYNC_TIMEOUT`, `SSH_HARDEN_FAILED`, `SSH_KEY_FAILED`, `SERVICE_FAILED`, an `IO_ERROR` on
+/// that write), or whose link failed half-way, left the device a member of the motherbee's
+/// folders, `fluxbee-dist-runtimes` included, with no id `remove_hive` could unlink it by
+/// (`skipped_no_peer_device_id`); only the peer reconcile's orphan pass removed it, once every hive
+/// was connected. The peer reconcile leaves alone the device of a hive that is not at rest, as it
+/// did. Best effort, as the join's phase records: an entry that cannot be read or written is
+/// logged, and the join goes on.
+fn record_join_syncthing_device(root: &Path, hive_id: &str, device_id: &str) {
+    if !valid_syncthing_device_id(device_id) {
+        return;
+    }
+    let mut info = match read_hive_info(root, hive_id) {
+        Ok(info) if info.is_object() => info,
+        Ok(_) => {
+            tracing::warn!(
+                hive_id = hive_id,
+                "the join's entry is no object; the device it links is not recorded before the link"
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                hive_id = hive_id,
+                error = %err,
+                "the join's entry cannot be read; the device it links is not recorded before the link"
+            );
+            return;
+        }
+    };
+    if recorded_syncthing_device_id(&info).as_deref() == Some(device_id) {
+        return;
+    }
+    info["syncthing_device_id"] = serde_json::Value::String(device_id.to_string());
+    if let Err(err) = write_hive_info(root, hive_id, &info) {
+        tracing::warn!(
+            hive_id = hive_id,
+            device_id = device_id,
+            error = %err,
+            "could not record the device the join links; remove_hive cannot unlink it if the join fails"
+        );
+    }
 }
 
 fn runtime_manifest_entry_from_value(
@@ -34901,6 +34958,7 @@ async fn add_hive_flow(
                             "finalize": finalize,
                         });
                     };
+                    record_join_syncthing_device(&root, hive_id, &peer_device_id);
                     if let Err(err) = ensure_syncthing_peer_link_runtime(
                         &desired_sync,
                         &desired_blob,
@@ -35693,6 +35751,7 @@ async fn add_hive_flow(
                 "finalize": finalize,
             });
         };
+        record_join_syncthing_device(&root, hive_id, &peer_device_id);
         if let Err(err) = ensure_syncthing_peer_link_runtime(
             &desired_sync,
             &desired_blob,
@@ -36314,6 +36373,7 @@ async fn add_egress_hive_flow(
                     Ok(finalize) => {
                         match syncthing_device_id_from_finalize_payload(&finalize) {
                             Some(device_id) => {
+                                record_join_syncthing_device(&root, hive_id, &device_id);
                                 if let Err(err) = ensure_syncthing_peer_link_runtime(
                                     &desired_sync,
                                     &desired_blob,
@@ -37175,6 +37235,7 @@ async fn add_ingress_hive_flow(
             )
         }
     };
+    record_join_syncthing_device(&root, hive_id, &ingress_syncthing_device_id);
     if let Err(err) = ensure_syncthing_peer_link_runtime(
         &desired_sync,
         &desired_blob,
@@ -40667,6 +40728,120 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-299: a join records the Syncthing device it links before the link, and the
+    /// flows' later writes keep it, so a join that fails after the link (`DIST_SYNC_TIMEOUT`, an
+    /// SSH control, its last write) leaves in its entry the id `remove_hive` unlinks the box by,
+    /// where it read none (`skipped_no_peer_device_id`) and the box kept the motherbee's folders.
+    /// A retry's writes before its own link keep it too; the success write records the device it
+    /// linked.
+    #[test]
+    fn a_join_that_fails_after_its_link_keeps_the_device_it_linked() {
+        let root = std::env::temp_dir().join(format!("fluxbee-join-device-{}", Uuid::new_v4()));
+        let hive_id = "worker7";
+        let device = "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH";
+        let other = "IIIIIII-JJJJJJJ-KKKKKKK-LLLLLLL-MMMMMMM-NNNNNNN-OOOOOOO-PPPPPPP";
+        fs::create_dir_all(root.join(hive_id)).expect("hive dir");
+        let accept = || {
+            update_join_state_in(&root, hive_id, "joining", "accepted", |info| {
+                info["hive_id"] = serde_json::json!(hive_id);
+                info["role"] = serde_json::json!("worker");
+            });
+            update_join_state_in(&root, hive_id, "joining", "running", |_| {});
+        };
+        let pending =
+            serde_json::json!({ "hive_id": hive_id, "status": "pending", "role": "worker" });
+        let read = || read_hive_info(&root, hive_id).expect("info");
+
+        // The SSH path writes its entry before the finalize, then records the device the
+        // finalize named before it links it; a later step fails, and the tail records that.
+        accept();
+        write_join_entry(&root, hive_id, &pending).expect("pending entry");
+        assert_eq!(recorded_syncthing_device_id(&read()), None);
+        record_join_syncthing_device(&root, hive_id, device);
+        update_join_state_in(&root, hive_id, "failed", "done", |info| {
+            info["join"]["error_code"] = serde_json::json!("DIST_SYNC_TIMEOUT");
+        });
+        let info = read();
+        assert_eq!(
+            recorded_syncthing_device_id(&info).as_deref(),
+            Some(device),
+            "{info}"
+        );
+        assert_eq!(info["status"], "failed");
+        assert_eq!(info["join"]["phase"], "done");
+        assert_eq!(info["role"], "worker");
+
+        // A retry: its writes before its own link keep the device the first attempt linked.
+        accept();
+        write_join_entry(&root, hive_id, &pending).expect("pending entry");
+        assert_eq!(
+            recorded_syncthing_device_id(&read()).as_deref(),
+            Some(device)
+        );
+        // Its finalize names another device (the box reinstalled): recorded before its link,
+        // and the success write records the device it linked.
+        record_join_syncthing_device(&root, hive_id, other);
+        assert_eq!(
+            recorded_syncthing_device_id(&read()).as_deref(),
+            Some(other)
+        );
+        write_join_entry(
+            &root,
+            hive_id,
+            &serde_json::json!({
+                "hive_id": hive_id,
+                "status": "connected",
+                "role": "worker",
+                "syncthing_device_id": other,
+            }),
+        )
+        .expect("connected entry");
+        let info = read();
+        assert_eq!(recorded_syncthing_device_id(&info).as_deref(), Some(other));
+        assert_eq!(
+            info["join"]["phase"], "running",
+            "the join record carries over"
+        );
+
+        // An id that is none is not recorded, and an entry that cannot be read is left alone.
+        record_join_syncthing_device(&root, hive_id, "not-a-device");
+        assert_eq!(
+            recorded_syncthing_device_id(&read()).as_deref(),
+            Some(other)
+        );
+        record_join_syncthing_device(&root, "worker8", device);
+        assert!(!root.join("worker8").exists());
+        let _ = fs::remove_dir_all(&root);
+
+        // Every join flow records each device before it links it.
+        let src = include_str!("sy_orchestrator.rs");
+        for (flow, next) in [
+            ("async fn add_hive_flow(", "async fn add_egress_hive_flow("),
+            (
+                "async fn add_egress_hive_flow(",
+                "async fn add_ingress_hive_flow(",
+            ),
+            (
+                "async fn add_ingress_hive_flow(",
+                "fn ssh_bootstrap_error_payload(",
+            ),
+        ] {
+            let start = src.find(flow).unwrap_or_else(|| panic!("{flow}"));
+            let end = start + src[start..].find(next).unwrap_or_else(|| panic!("{next}"));
+            let body = &src[start..end];
+            let links: Vec<&str> = body.split("ensure_syncthing_peer_link_runtime(").collect();
+            assert!(links.len() > 1, "{flow} links a device");
+            for before in &links[..links.len() - 1] {
+                let since_last_link = before.rsplit("record_join_syncthing_device(").next();
+                assert!(
+                    before.contains("record_join_syncthing_device(&root, hive_id, &")
+                        && since_last_link.is_some_and(|tail| !tail.contains(".await")),
+                    "{flow}: a link with no record of its device just before it"
+                );
+            }
+        }
     }
 
     /// `accept_add_hive` refuses another role under the topology lock, after the status checks
