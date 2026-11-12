@@ -60,6 +60,9 @@ type WfRulesMetadata struct {
 type WfRulesError struct {
 	Code   string
 	Detail string
+	// Retryable says that asking again, nothing changed first, may pass: the answer carries
+	// retryable true (a change refused BUSY, FINDINGS A-307).
+	Retryable bool
 }
 
 func (e WfRulesError) Error() string {

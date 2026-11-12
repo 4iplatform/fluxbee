@@ -14405,6 +14405,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // rolled back names no target.
         | "INSTALLATION_UPDATE_RUNNING"
         | "MOTHERBEE_ROLLED_BACK"
+        // SY.wf-rules, one request at a time: a change whose turn came with less than 20 s of
+        // SY.admin's wait left, refused at once with nothing changed and payload.retryable true
+        // (FINDINGS A-307, WF_RULES_BUSY_NOTE).
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
@@ -18491,6 +18494,11 @@ const WF_DELETE_KILL_ERROR_NOTE: &str = "Any other ORCHESTRATOR_ERROR may come f
 /// (`highestPublishedVersion`, the delete's DIST_UNREADABLE).
 const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the versions of wf.<workflow_name> last, once its WF node and its state are gone: each version its hive's dist lists and each its slots named, one remove_runtime_version at a time, the current last, each waited for up to 35 s (SY.admin reads every hive's use first) within what is left of the request's 60 s, and stops at the first that fails: a refusal (RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281; RUNTIME_IN_USE while a node runs it; UNAUTHORIZED, since 0.1.139, while another hive holds a WF.<workflow_name>: FINDINGS A-304) or no answer in time (TIMEOUT: SY.admin may still remove it). Since 0.1.133 the delete answers ok all the same: payload.packages_left names each version not removed, {runtime, version, error_code, detail, retryable, unanswered_hives}, the one it stopped at with its failure and each after it PURGE_STOPPED ([] when every version it knew of went; one entry with no version, DIST_UNREADABLE, when its hive's dist could not be listed and none was removed); retryable says whether asking again, nothing changed first, may remove it (false for RUNTIME_IN_USE: stop or move the node first; false for UNAUTHORIZED; false for a RUNTIME_USAGE_UNKNOWN that SY.admin says is not, a hive not read being a join that ended or the motherbee's own nodes unread, and for each PURGE_STOPPED after it, whose read meets the same), and unanswered_hives, when SY.admin named any, the hives it did not read. payload.warning says the workflow is deleted and what removes them. Say so; never that the delete failed, and never ask it again: it answers WORKFLOW_NOT_FOUND. The versions left block nothing, those refused UNAUTHORIZED aside: a workflow created again under that name numbers its versions above every version the dist holds, and its deploy's purge removes them. A version refused UNAUTHORIZED is also the package of the WF.<workflow_name> its detail names, on another hive (a name deployed on two hives before 0.1.139, say): it stays until that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is refused the same way; say which hive uses the name, and never offer to remove it. To remove the others sooner, remove_runtime_version each once every hive answers, in packages_left's order, the runtime's current last: one refused RUNTIME_CURRENT_CONFLICT goes after the others. DIST_UNREADABLE is the exception: until its hive's dist/runtimes/wf.<workflow_name> can be listed again, a compile of the name that names no version is refused (WFRULES_ERROR, nothing staged), so that folder is fixed first, and the versions to remove are those GET /hives/motherbee/runtimes/wf.<workflow_name> lists, not packages_left.";
 
+/// What a change of a workflow says of SY.wf-rules' turns (FINDINGS A-307): it takes one request at
+/// a time, and refuses a change whose turn comes too late (`turnRule` in go/sy-wf-rules/node/turn.go;
+/// SY.admin's wait is `wf_rules_request_timeout`).
+const WF_RULES_BUSY_NOTE: &str = "409 BUSY, with payload.retryable true: the hive's SY.wf-rules takes one request at a time, in the order they came, and this change's turn came with less than 20 s left of SY.admin's 75 s wait for it, the requests before it having taken the rest (FINDINGS A-307, since 0.1.139): it was refused at once, and nothing was changed (no version staged, published, applied or deleted). error_detail says how long it waited. Ask again; a check and the reads are never refused so.";
+
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
 const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
@@ -18996,6 +19004,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
             WF_RULES_DEFINITION_NOTE,
+            WF_RULES_BUSY_NOTE,
         ],
         "wf_rules_compile" => vec![
             "workflow_name and definition are required.",
@@ -19003,6 +19012,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
             WF_RULES_DEFINITION_NOTE,
+            WF_RULES_BUSY_NOTE,
         ],
         "wf_rules_check" => vec![
             "workflow_name and definition are required.",
@@ -19017,6 +19027,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "workflow_name is required.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is only needed for first deploy when auto_spawn=true; existing-node rollout preserves the managed tenant_id.",
+            WF_RULES_BUSY_NOTE,
         ],
         "wf_rules_delete" => vec![
             "workflow_name is required.",
@@ -19028,6 +19039,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             WF_DELETE_VERSIONS_LEFT_NOTE,
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of its WF node, wf_node.node_name.",
+            WF_RULES_BUSY_NOTE,
         ],
         "wf_rules_get_workflow" | "wf_rules_get_status" | "wf_rules_list_workflows" => vec![
             "These are direct query operations against SY.wf-rules.",
@@ -37804,6 +37816,90 @@ mod tests {
             ));
         }
         assert_eq!(envelopes[0], envelopes[1]);
+    }
+
+    /// SY.wf-rules takes one request at a time and refuses a change whose turn came with less than
+    /// 20 s of SY.admin's wait left, BUSY and retryable, nothing changed (FINDINGS A-307): SY.admin
+    /// answers it 409 BUSY with SY.wf-rules' payload, its retryable kept, from a CONFIG_SET
+    /// operation and from the delete's command alike. Every change's help names it (where none
+    /// did); a check's and the reads' do not, since SY.wf-rules never refuses those so.
+    #[tokio::test]
+    async fn a_wf_rules_change_refused_busy_answers_409_and_its_help_names_it() {
+        for action in [
+            "wf_rules_compile_apply",
+            "wf_rules_compile",
+            "wf_rules_apply",
+            "wf_rules_rollback",
+            "wf_rules_delete",
+        ] {
+            assert!(
+                admin_action_request_notes(action).contains(&WF_RULES_BUSY_NOTE),
+                "{action}"
+            );
+        }
+        for action in [
+            "wf_rules_check",
+            "wf_rules_get_workflow",
+            "wf_rules_get_status",
+            "wf_rules_list_workflows",
+        ] {
+            assert!(
+                !admin_action_request_notes(action).contains(&WF_RULES_BUSY_NOTE),
+                "{action}"
+            );
+        }
+        let (ctx, mut harness) = opa_test_admin("wf-rules-busy");
+        let detail = "SY.wf-rules@worker1 takes one request at a time, and this change's turn came 56s after it arrived, with 19s left of SY.admin's 1m15s wait for it, less than the 20s a change is given: it was refused at once, and nothing was changed. Ask again";
+        for action in [WfRulesAction::CompileApply, WfRulesAction::Delete] {
+            let run =
+                handle_wf_rules_http(&ctx, &ctx.rpc, wf_rules_check_request(), action, "operator");
+            let wf_rules = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("the request");
+                let answer = if sent.meta.msg.as_deref() == Some("CONFIG_SET") {
+                    reply_to(
+                        &sent,
+                        "CONFIG_RESPONSE",
+                        json!({
+                            "ok": false,
+                            "node_name": "SY.wf-rules@worker1",
+                            "state": "error",
+                            "schema_version": 1,
+                            "config_version": 0,
+                            "error": { "code": "BUSY", "detail": detail },
+                            "retryable": true,
+                        }),
+                    )
+                } else {
+                    assert_eq!(sent.meta.action.as_deref(), Some("delete_workflow"));
+                    let mut reply = reply_to(
+                        &sent,
+                        "",
+                        json!({
+                            "status": "error",
+                            "error_code": "BUSY",
+                            "error_detail": detail,
+                            "retryable": true,
+                        }),
+                    );
+                    reply.meta.msg_type = "command_response".to_string();
+                    reply.meta.msg = None;
+                    reply.meta.action = Some("delete_workflow".to_string());
+                    reply
+                };
+                harness.inject(answer).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(run, wf_rules);
+            let (status, body) = result.expect("answered");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(status, 409, "{body}");
+            assert_eq!(body["status"], json!("error"), "{body}");
+            assert_eq!(body["error_code"], json!("BUSY"), "{body}");
+            assert_eq!(body["error_detail"], json!(detail), "{body}");
+            assert_eq!(body["payload"]["retryable"], json!(true), "{body}");
+        }
     }
 
     /// Only the answer that echoes the check's id counts: one without it, or with another's, ran

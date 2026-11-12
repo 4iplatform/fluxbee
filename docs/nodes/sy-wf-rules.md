@@ -181,6 +181,20 @@ a delete's reads of the node take up to 22 s (`get_node_config` and `get_node_st
 each, the count 2 s) and its kill up to 25 s (`nodeDeleteTimeout`), and its purge has the rest:
 a removal it cuts there is named `TIMEOUT` in `packages_left`.
 
+SY.wf-rules takes its requests one at a time, in the order they came, and a request's 60 s start
+at its turn. Each request is taken as it arrives, with when it came (`takeRequests`,
+`node/turn.go`), so a change knows how long it waited behind the requests before it: a change
+(a compile, an apply, a rollback, a `compile_apply`, a delete, as a `CONFIG_SET` operation or a
+command) whose turn comes with less than 20 s left of SY.admin's 75 s wait for it is refused at
+once, nothing changed, with `BUSY` and `retryable: true` (in a `CONFIG_RESPONSE`, `error.code`; in
+a command's answer, `error_code`), its detail saying how long it waited; SY.admin answers it `409`
+(FINDINGS A-307, since 0.1.139). A check, a query, `CONFIG_GET` and `NODE_STATUS_GET` are never
+refused so. Before, a change queued behind another that held its 60 s (a purge waits up to 35 s a
+removal while a hive is not read) could end past SY.admin's 75 s, which answered `TIMEOUT` for a
+change that may still have completed. A change that starts keeps its 60 s from its turn: bounded
+by its arrival instead, one that ran out mid-flight would still send its next step (the Go SDK
+sends a request whose context has expired) and answer a failure for a step SY.admin then made.
+
 ### Delete
 
 `DeleteWorkflow` (`node/delete.go`):
@@ -303,6 +317,9 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
 | `command` `compile_workflow`, `apply_workflow`, `rollback_workflow` | as the operations above | `SY.admin@motherbee` only |
 | `query` `get_workflow`, `list_workflows`, `get_status` | see above | `SY.admin@motherbee` only |
 | `NODE_STATUS_GET` (`SYSTEM`) | answered `HEALTHY` | anyone the router lets through |
+
+They are served one at a time, in the order they came; a change whose turn comes with less than
+20 s of SY.admin's wait left is refused `BUSY` (see Apply and rollback, FINDINGS A-307).
 
 The origin check is `fromAdmin`: the router-stamped sender must be `SY.admin@motherbee`
 (`PrimaryAdminNode` in `go/fluxbee-go-sdk/protocol.go`); otherwise the answer is
@@ -459,6 +476,10 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
   logs what it left.
 - A compile that cannot read this hive's dist or its runtimes manifest stages nothing
   (`WFRULES_ERROR`): the next version, above what they hold, is unknown.
+- A change whose turn comes with less than 20 s of SY.admin's 75 s wait left is refused at once,
+  `BUSY` with `retryable: true` (SY.admin 409), nothing changed: ask again (see Apply and
+  rollback, FINDINGS A-307). Its log line: `<operation> refused BUSY (trace_id=...): its turn
+  came <waited> after it arrived`.
 
 ## Health
 

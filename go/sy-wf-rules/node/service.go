@@ -34,6 +34,8 @@ type Service struct {
 	nodes      nodeClient
 	wfNodes    wfNodeClient
 	clock      ClockFunc
+	// turns is when a change's turn comes too late, refused BUSY (FINDINGS A-307).
+	turns turnRule
 }
 
 func NewService(
@@ -59,6 +61,7 @@ func NewService(
 		nodes:      newNodeClient(dispatcher, cfg.HiveID),
 		wfNodes:    newWFNodeClient(dispatcher),
 		clock:      clock,
+		turns:      defaultTurnRule,
 	}
 }
 
@@ -143,33 +146,44 @@ func (s *Service) Run() error {
 	return s.RunWithContext(context.Background())
 }
 
+// RunWithContext serves the requests one at a time, in the order they came: each is taken as it
+// arrives (takeRequests), so a change knows how long it waited for its turn, and one that waited too
+// long is refused BUSY (FINDINGS A-307).
 func (s *Service) RunWithContext(ctx context.Context) error {
 	if s.incoming == nil {
 		return fmt.Errorf("incoming channel is required")
 	}
+	turns := make(chan request, requestBacklog)
+	go s.takeRequests(ctx, turns)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case msg, ok := <-s.incoming:
+		case req, ok := <-turns:
 			if !ok {
 				return nil
 			}
-			s.handleMessage(msg)
+			s.handleTurn(req.msg, time.Since(req.arrivedAt))
 		}
 	}
 }
 
+// handleMessage serves msg as a request whose turn came as it arrived.
 func (s *Service) handleMessage(msg fluxbeesdk.Message) {
+	s.handleTurn(msg, 0)
+}
+
+// handleTurn serves msg, whose turn came waited after it arrived.
+func (s *Service) handleTurn(msg fluxbeesdk.Message, waited time.Duration) {
 	switch msg.Meta.MsgType {
 	case fluxbeesdk.SYSTEMKind:
-		s.handleSystemMessage(msg)
+		s.handleSystemMessage(msg, waited)
 	case "command":
 		if !fromAdmin(msg) {
 			s.sendCommandResponse(msg, stringValue(msg.Meta.Action), notFromAdmin(msg))
 			return
 		}
-		s.handleCommand(msg)
+		s.handleCommand(msg, waited)
 	case "query":
 		if !fromAdmin(msg) {
 			s.sendQueryResponse(msg, stringValue(msg.Meta.Action), notFromAdmin(msg))

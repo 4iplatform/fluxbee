@@ -974,6 +974,13 @@ person: when its provider gave no answer, the error carries the operator's text 
 - **A deploy whose node does not run the definition is refused,** `WF_NODE_NOT_DEPLOYED`: its
   `wf_node` says why (a spawn or a restart that failed, a tenant that does not exist). The
   definition is current anyway: fix the cause, and deploy again.
+- **A change refused `409 BUSY` changed nothing** (FINDINGS A-307, since 0.1.139): a hive's
+  SY.wf-rules takes one request at a time, and refuses at once a change (`wf_rules_compile_apply`,
+  `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback`, `wf_rules_delete`) whose turn came
+  with less than 20 s left of SY.admin's 75 s wait for it, another request having run before it.
+  `payload.retryable` is `true`: nothing changed, so the same request may go again as it was (in
+  a plan, the step staged again for the operator's confirmation). Say so; never report it as a
+  failed deploy or delete. A check and the reads are never refused so.
 - **An update** starts from the deployed definition: read it with `GET
   /hives/{hive}/wf-rules?workflow_name=<name>` (`wf_rules_get_workflow`: its definition, version and
   hash), change only what the operator asked, and check it. Never rebuild it from memory. The

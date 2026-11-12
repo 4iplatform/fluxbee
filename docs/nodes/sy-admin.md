@@ -770,6 +770,17 @@ publishes and stores nothing, so the staged and the current definitions stay as 
 }
 ```
 
+### A change refused BUSY
+
+SY.wf-rules takes one request at a time, in the order they came. A change of a workflow
+(`wf_rules_compile_apply`, `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback`,
+`wf_rules_delete`) whose turn comes with less than 20 s left of SY.admin's 75 s wait for it
+(`wf_rules_request_timeout`) is refused at once, nothing changed: `409 BUSY`, SY.wf-rules' payload
+kept, its `retryable: true` included, and `error_detail` saying how long it waited (FINDINGS
+A-307, since 0.1.139; `WF_RULES_BUSY_NOTE`). Ask again. `wf_rules_check` and the reads are never
+refused so. Before, such a change ran behind the requests before it, and SY.admin could answer
+`TIMEOUT` while it went on.
+
 ### Operating instances
 
 Three actions on a WF node, each the engine's own verb sent to the node and its answer as it is

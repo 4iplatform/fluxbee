@@ -164,6 +164,13 @@ query:
   list_workflows     → return all managed workflow names with status
 ```
 
+The messages are served one at a time, in the order they came, each taken as it arrives with when
+it came. A change (`compile`, `apply`, `rollback`, `compile_apply`, `delete_workflow`, as an
+operation or a command) whose turn comes with less than 20 s left of SY.admin's 75 s wait for it
+is refused at once, `BUSY` with `retryable: true`, nothing changed (FINDINGS A-307, since 0.1.139;
+`node/turn.go`); a `check` and the queries never are. A change that runs keeps its 60 s from its
+turn.
+
 ### 5.3 Operations (via CONFIG_SET or command)
 
 **`compile`** — Validate the workflow definition JSON, compile all CEL guards, write to staged. Do NOT apply. Returns validation result (pass/fail with details).
@@ -711,6 +718,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | `UNSUPPORTED_OPERATION` | Unknown operation string. |
 | `UNSUPPORTED_APPLY_MODE` | A CONFIG_SET whose `apply_mode` is not `replace`. |
 | `UNAUTHORIZED` | The request did not come from `SY.admin@motherbee`. |
+| `BUSY` | A change whose turn came with less than 20 s left of SY.admin's 75 s wait for it, the requests before it having taken the rest: refused at once, nothing changed, with `retryable: true` beside the error; SY.admin answers it 409 (§5.2, FINDINGS A-307, since 0.1.139). |
 | `WFRULES_ERROR` | Any other failure, with its detail: a store error, a `list_workflows` that failed, an answer too large to send. |
 
 A failed restart of the WF node is not an error code: the apply answers with its `wf_node` as `action: "restart_failed"` and the error. A failed kill (a forced delete) is `ORCHESTRATOR_ERROR`, with SY.admin's detail.

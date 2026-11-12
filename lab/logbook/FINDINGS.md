@@ -436,7 +436,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives, to decide).
 - A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin).
 - A-306 🔵 A version's removal holds the manifest lock through its read of every hive's use; a publish waits with no bound (low; SY.admin).
-- A-307 🔵 SY.wf-rules handles one request at a time; a queued request starts its 60 s late (low; SY.wf-rules; to decide).
+- A-307 🔵 SY.wf-rules handles one request at a time; a queued request starts its 60 s late (low; SY.wf-rules; the operator's call (a), 2026-11-12; built on `coa/wf-139` for 0.1.139).
 - A-308 🔵 Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer (low; the orchestrator; seen live by 0.1.133's gate).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-310 🔵 Runtime retention skips a node config it cannot read, and can delete a version only that node pins (low; the orchestrator).
@@ -2653,6 +2653,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-12):** (a): a change whose turn comes with less than about 20 s
   left is refused at once, nothing changed, with a retryable `BUSY` (SY.admin's 409; its help and
   Archi's handbook name it). In the bug push (item 30).
+- **Built on `coa/wf-139` (for 0.1.139), SY.wf-rules and SY.admin's texts:**
+  - **SY.wf-rules (`node/turn.go`, `node/service.go`, `node/dispatch.go`):** a goroutine takes each
+    message as it arrives, with when it came (`time.Now`, monotonic), into a queue of 64 where the
+    requests wait for their turn in order (`takeRequests`); the loop still serves one at a time. A
+    change, a compile (a `CONFIG_SET` with no operation is one), an apply, a rollback, a
+    `compile_apply` or a delete, as an operation or a command, whose turn comes with less than
+    20 s left of SY.admin's 75 s wait (`wf_rules_request_timeout`'s default; SY.wf-rules cannot
+    read `JSR_ADMIN_WF_RULES_TIMEOUT_SECS`), counted from its arrival, is refused at once, before
+    its first step: `BUSY`, `retryable: true` beside the error (`WfRulesError.Retryable`), the
+    detail saying how long it waited and how much was left; the log says *"<operation> refused
+    BUSY (trace_id=...): its turn came <waited> after it arrived"*. A check, the queries,
+    `CONFIG_GET` and `NODE_STATUS_GET` are never refused so. "Left" is read as SY.admin's wait,
+    whose 75 s the entry's effect names: a change refused waited more than 55 s. A change that
+    runs keeps its 60 s from its turn, as the entry's reasoning asks: bounded by its arrival, one
+    that ran out mid-flight would still send its next step. Its residue: a change whose turn
+    comes with 20 to 75 s left and then takes most of its 60 s can still end past SY.admin's
+    wait, as before; and a wait is counted from when SY.wf-rules took the message, so time spent
+    before it (the process stopped, or 64 requests already waiting) is not counted.
+  - **SY.admin (`src/bin/sy_admin.rs`):** `BUSY` already mapped to 409 (a runtime lifecycle code of
+    before); its comment names SY.wf-rules' refusal, and `WF_RULES_BUSY_NOTE` is in the help of
+    `wf_rules_compile_apply`, `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback` and
+    `wf_rules_delete` (not the check's nor the reads'). SY.admin passes SY.wf-rules' payload, its
+    `retryable` included.
+  - **Tests:** `TestAChangeWhoseTurnComesLateIsRefusedBusy` (each of the nine changes at 55.001 s,
+    nothing changed in the store, the dist or the publishes) and
+    `TestTheLoopCountsATurnFromTheRequestsArrival` (the loop itself, the rule shortened to 2 s and
+    1 s: a deploy that came while another ran for 1.2 s is refused, and runs when asked again), each
+    failing without the fix (the second also without the arrival's stamp: counted from the turn,
+    the deploy ran); `TestAChangeWithItsTurnInTimeRunsAndAReadAlways` (55 s runs; six reads at 80 s
+    answered); SY.admin's `a_wf_rules_change_refused_busy_answers_409_and_its_help_names_it` (the
+    help of each change names it, which fails without the note; the 409 with the payload's
+    `retryable` kept, from a `CONFIG_SET` and from the delete's command, held before too).
+    Docs: [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md),
+    [sy-wf-rules-spec](../../docs/sy-wf-rules-spec.md) §5.2 and §12,
+    [sy-admin.md](../../docs/nodes/sy-admin.md) and Archi's handbook §4.2.7.
 
 ### A-306 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it) — A version's removal holds the manifest lock through its read of every hive's use, and a publish waits on it with no bound
 
@@ -2880,7 +2915,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (fails before: no `extensions`) and `TestEngineOfReadsTheRuntimeVersionItsBinaryIsIn`. Docs: the
   WF's README, [spec-systemnode-wf-v1_1](../../docs/spec-systemnode-wf-v1_1.md)'s handlers,
   [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md), [sy-orchestrator.md](../../docs/nodes/sy-orchestrator.md),
-  [operations.md](../../docs/reference/operations.md) and Archi's handbook §4.2.
+  [operations.md](../../docs/reference/operations.md) and Archi's handbook §4.2.7.
 
 ### A-301 [General/orchestrator] 🔵 low (found 2026-11-11 by A-277's review fixes; read in the code; there before it) — A fresh join under a removed hive's name reuses a surviving identity key
 

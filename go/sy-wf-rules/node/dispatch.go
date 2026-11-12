@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-func (s *Service) handleSystemMessage(msg fluxbeesdk.Message) {
+func (s *Service) handleSystemMessage(msg fluxbeesdk.Message, waited time.Duration) {
 	switch stringValue(msg.Meta.Msg) {
 	case fluxbeesdk.MSGNodeStatusGet:
 		s.handleNodeStatusGet(msg)
@@ -29,13 +30,21 @@ func (s *Service) handleSystemMessage(msg fluxbeesdk.Message) {
 		if stringValue(msg.Meta.Msg) == fluxbeesdk.MSGConfigGet {
 			s.handleNodeConfigGet(msg)
 		} else {
-			s.handleNodeConfigSet(msg)
+			s.handleNodeConfigSet(msg, waited)
 		}
 	}
 }
 
-func (s *Service) handleCommand(msg fluxbeesdk.Message) {
+// handleCommand serves a command whose turn came waited after it arrived: a change whose turn came
+// too late is refused BUSY, nothing changed (lateChange, FINDINGS A-307).
+func (s *Service) handleCommand(msg fluxbeesdk.Message, waited time.Duration) {
 	action := strings.ToLower(stringValue(msg.Meta.Action))
+	if changingCommands[action] {
+		if busy := s.lateChange(msg, action, waited); busy != nil {
+			s.sendCommandResponse(msg, action, commandErrorPayload(busy))
+			return
+		}
+	}
 	switch action {
 	case "compile_workflow":
 		req, err := decodeCompileRequest(msg.Payload)
@@ -278,7 +287,10 @@ func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
 	s.sendNodeConfigResponse(msg, response)
 }
 
-func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
+// handleNodeConfigSet serves a CONFIG_SET whose turn came waited after it arrived: an operation that
+// changes a workflow whose turn came too late is refused BUSY, nothing changed (lateChange, FINDINGS
+// A-307); a check never is.
+func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message, waited time.Duration) {
 	reqMsg, err := fluxbeesdk.ParseNodeConfigRequest(&msg)
 	if err != nil || reqMsg == nil || reqMsg.Set == nil {
 		s.sendNodeConfigResponse(msg, map[string]any{
@@ -318,7 +330,14 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		})
 		return
 	}
-	switch operation := configOperation(configMap); operation {
+	operation := configOperation(configMap)
+	if changingOperations[operation] {
+		if busy := s.lateChange(msg, operation, waited); busy != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, busy))
+			return
+		}
+	}
+	switch operation {
 	case "check":
 		// A read (CheckWorkflow): it stages nothing and takes no version. Every answer to it carries
 		// its operation and check_id (sendNodeConfigResponse).
@@ -605,7 +624,7 @@ func configErrorPayload(nodeName string, schemaVersion uint32, configVersion uin
 		code = wfErr.Code
 		detail = wfErr.Detail
 	}
-	return map[string]any{
+	payload := map[string]any{
 		"ok":             false,
 		"node_name":      nodeName,
 		"state":          "error",
@@ -616,6 +635,10 @@ func configErrorPayload(nodeName string, schemaVersion uint32, configVersion uin
 			"detail": detail,
 		},
 	}
+	if wfErr.Retryable {
+		payload["retryable"] = true
+	}
+	return payload
 }
 
 func commandErrorPayload(err error) map[string]any {
@@ -626,11 +649,15 @@ func commandErrorPayload(err error) map[string]any {
 		code = wfErr.Code
 		detail = wfErr.Detail
 	}
-	return map[string]any{
+	payload := map[string]any{
 		"status":       "error",
 		"error_code":   code,
 		"error_detail": detail,
 	}
+	if wfErr.Retryable {
+		payload["retryable"] = true
+	}
+	return payload
 }
 
 func asWfRulesError(err error, out *WfRulesError) bool {
