@@ -509,7 +509,7 @@ kinds of node send it:
 
 - **The Go SDK, for a message its command channel cannot hold** (since 0.1.141, planned; FINDINGS
   A-329; §10.2): `reason` `node_busy`, `retryable` true, `detail` naming the node and the lane
-  (*"WF.x@worker1 holds 1024 non-system messages, as many as it takes; send it again later"*).
+  (*"WF.x@worker1 holds 1024 non-system messages, all it can take now; send it again later"*).
   Every message gets one but a notice or a reply (`IsNoticeOrReply`, §10.5): a person's text, a
   `user` message without a name, gets one.
 - **The WF engine, for a message its workflow takes nowhere**

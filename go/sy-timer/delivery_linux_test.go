@@ -195,7 +195,7 @@ func notTaken(t *testing.T, traceID, from string, retryable bool) fluxbeesdk.Mes
 	t.Helper()
 	fire := fluxbeesdk.Message{Routing: fluxbeesdk.Routing{Src: "timer-node-uuid", TraceID: traceID}}
 	msg, err := fluxbeesdk.BuildNotTaken("wf-node-uuid", fire, fluxbeesdk.NotTakenReasonNodeBusy,
-		"WF.demo@motherbee holds 1024 system messages, as many as it takes; send it again later", retryable)
+		"WF.demo@motherbee holds 1024 system messages, all it can take now; send it again later", retryable)
 	if err != nil {
 		t.Fatalf("build NOT_TAKEN: %v", err)
 	}

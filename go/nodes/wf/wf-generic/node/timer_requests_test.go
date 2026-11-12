@@ -182,7 +182,7 @@ func unreachable(traceID, reason string) sdk.Message {
 func notTakenBy(sender, traceID string) sdk.Message {
 	request := sdk.Message{Routing: sdk.Routing{Src: "wf-uuid", TraceID: traceID}}
 	msg, _ := sdk.BuildNotTaken("sender-uuid", request, sdk.NotTakenReasonNodeBusy,
-		sender+" holds 1024 system messages, as many as it takes; send it again later", true)
+		sender+" holds 1024 system messages, all it can take now; send it again later", true)
 	return from(sender, msg)
 }
 

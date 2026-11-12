@@ -78,7 +78,7 @@ func (d *RouterDispatcher) refuseCommand(queue *commandQueue, msg Message) {
 	depths := queue.depths()
 	outcome := refusalUnanswered
 	if !IsNoticeOrReply(&msg) && strings.TrimSpace(msg.Routing.Src) != "" {
-		detail := fmt.Sprintf("%s holds %d %s messages, as many as it takes; send it again later",
+		detail := fmt.Sprintf("%s holds %d %s messages, all it can take now; send it again later",
 			d.sender.FullName(), depths[lane], laneNames[lane])
 		answer, err := BuildNotTaken(d.sender.UUID(), msg, NotTakenReasonNodeBusy, detail, true)
 		if err == nil {
