@@ -8970,8 +8970,9 @@ fn cloud_edge_record_failed(
 ///
 /// A write a try of which got no answer may have been written all the same, and only then does the
 /// detail say so (`cloud_edge_maybe_written`, A-317's review). The action runs again once the cause
-/// is fixed, on the motherbee's HTTP API, never through Archi (FINDINGS A-124), since a run that
-/// works hands out a token.
+/// is fixed, on the motherbee's HTTP API or through Archi, which since 0.1.139 shows the token a run
+/// that works hands out once and keeps it masked (FINDINGS A-124), where before it was to run on the
+/// HTTP API alone.
 fn cloud_edge_record_failed_detail(
     cloud_node: &str,
     edge_node: &str,
@@ -8996,9 +8997,9 @@ fn cloud_edge_record_failed_detail(
         "{what} failed twice, the last time{failure}. Nothing else was done, since the record \
          comes before the token (FINDINGS A-317): no token was minted, no door was opened or \
          closed, and {cloud_node} was not asked, so a token the Cloud holds works as \
-         before.{written} Fix the cause above, then run publish_cloud_endpoint again on the \
-         motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi \
-         (FINDINGS A-124)."
+         before.{written} Fix the cause above, then run publish_cloud_endpoint again, on the \
+         motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which \
+         shows the token once and keeps it masked (FINDINGS A-124)."
     )
 }
 
@@ -18554,7 +18555,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "IO.cloud trusts that edge at once (FINDINGS A-255): once the door is open, SY.admin applies the edge it recorded to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
             "A door moved to another edge (IO.cloud's config named another SY.edge) closes the old one (FINDINGS A-317, since 0.1.139): once the new door is open and the running IO.cloud trusts the new edge (payload.edge_applied true), SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel, tried once more at once, so the previous token stops at once: a move keeps no 10 minutes. When IO.cloud did not take the new edge, or SY.admin could not tell (edge_applied false), the old door is left open, not asked to close: IO.cloud may still trust the old edge, and that door is then the Cloud's only way in. payload.previous_edge_node names that edge and payload.previous_edge_closed says whether its door closed; false comes with payload.warning, which says why and how to close it (unexternalize, POST /channels/unexternalize): once that edge answers, or, for a door left open, once IO.cloud trusts the new edge and the Cloud has the new URL and token. Give the Cloud the new URL, on the new edge's host, and the new token at once.",
-            "A read or a write of the record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. When a try of the write got no answer, it may have been written all the same, and only then does the detail say so: get_node_config of IO.cloud shows what its config names, which IO.cloud reads when it starts. On a move, a config that names the new edge is put back to the old one with set_node_config first: IO.cloud would otherwise trust, from its next start, an edge with no door, and a run again would take that edge for the door's place and close no old door. So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124). Up to 0.1.138 the record came after the token, and this answer left the door open with a token no one received.",
+            "A read or a write of the record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. When a try of the write got no answer, it may have been written all the same, and only then does the detail say so: get_node_config of IO.cloud shows what its config names, which IO.cloud reads when it starts. On a move, a config that names the new edge is put back to the old one with set_node_config first: IO.cloud would otherwise trust, from its next start, an edge with no door, and a run again would take that edge for the door's place and close no old door. So fix the cause the detail names first, then run publish_cloud_endpoint again, on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token once and keeps it masked (FINDINGS A-124, since 0.1.139). Up to 0.1.138 the record came after the token, and this answer left the door open with a token no one received.",
             "A door that does not open (the externalize's error: the vault or the edge refused, or the edge did not answer) puts the record back as it was before the run, tried once more at once, and the error's detail says so, or that IO.cloud's config still names the edge, which IO.cloud reads when it starts (FINDINGS A-317, since 0.1.139). When the edge refused the open or did not answer it, the vault already holds the token this run minted, for that edge, which no one received, and the detail says so: the token the Cloud holds works at most until the edge the door was on restarts, as a deploy does, so run publish_cloud_endpoint again, on an edge that answers, and give the Cloud its token at once. A token goes out once, only in an ok answer, never in an error or a log line.",
         ],
         "publish_artifact" => vec![
@@ -19082,7 +19083,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             WF_INSTANCE_ERRORS_NOTE,
         ],
         "get_runtime" => vec![
-            "The hive and the runtime come from the /hives/{hive}/runtimes/{runtime} path. Read on the motherbee, payload.usage_global_visible is the runtime's use across the hives, as remove_runtime_version reads it (FINDINGS A-281): running_nodes, each node of every hive on the runtime whose unit may run, with its hive and lifecycle (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN, its hive's systemd did not answer); skipped_hives, each hive whose nodes were not counted, {hive_id, reason, message}; hives_without_runtimes, each ingress and each egress, {hive_id, role}; and in_use. Read on a worker, it is that worker's own use.",
+            "The hive and the runtime come from the /hives/{hive}/runtimes/{runtime} path. Read on the motherbee, payload.usage_global_visible is the runtime's use across the hives, as remove_runtime_version reads it (FINDINGS A-281): running_nodes, each node of every hive on the runtime whose unit may run, or that its orchestrator relaunches on it within a minute, with its hive and lifecycle (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN, its hive's systemd did not answer; RELAUNCH_DUE, since 0.1.139, a node pinned to a version of it whose unit does not run, failed or between two restarts, and whose config keeps relaunch_on_boot: FINDINGS A-300), counted in running_count; skipped_hives, each hive whose nodes were not counted, {hive_id, reason} and its message when the hive's answer had one; hives_without_runtimes, each ingress and each egress, {hive_id, role}; and in_use. When the motherbee cannot read its own nodes or its hive registry, usage_global_visible is {scope, status: \"error\", message} instead, with none of those fields: the use across the hives is unknown, never none. Read on a worker, it is that worker's own use.",
             HIVES_WITHOUT_RUNTIMES_NOTE,
             "in_use is true while a node is listed, false only once every hive asked was counted, and null (unknown) while none is listed and a hive is in skipped_hives: never read null as not in use.",
         ],
@@ -30671,9 +30672,22 @@ mod tests {
 
     /// FINDINGS A-315: the help of get_runtime and remove_runtime_version names
     /// hives_without_runtimes, the ingress and egress hives a runtime's use lists apart, neither
-    /// counted nor skipped (A-281, since 0.1.133); only a test named it before.
+    /// counted nor skipped (A-281, since 0.1.133); only a test named it before. get_runtime's own
+    /// note says what the branches built beside it for 0.1.139 say (the integration): a node due
+    /// for a relaunch is listed RELAUNCH_DUE (A-300), a skipped hive's message comes only when its
+    /// answer had one, and the motherbee that cannot read its own nodes or its registry answers the
+    /// error shape instead, as Archi's handbook says since A-315's review.
     #[test]
     fn the_runtime_help_names_the_hives_without_runtimes() {
+        let notes = admin_action_request_notes("get_runtime").join(" ");
+        for words in [
+            "RELAUNCH_DUE, since 0.1.139",
+            "{hive_id, reason} and its message when the hive's answer had one",
+            "usage_global_visible is {scope, status: \"error\", message} instead",
+        ] {
+            assert!(notes.contains(words), "{words}: {notes}");
+        }
+        assert!(!notes.contains("{hive_id, reason, message}"), "{notes}");
         for action in ["get_runtime", "remove_runtime_version"] {
             let notes = admin_action_request_notes(action).join(" ");
             assert!(
@@ -38758,7 +38772,8 @@ mod tests {
     fn every_action_the_executor_runs_names_what_its_path_names() {
         // Apart on purpose: get_admin_action_help takes its action as `action_name` (its schema's
         // override); list_recent_commands' hive only filters, and the executor reads every hive's;
-        // publish_cloud_endpoint's token waits for Archi's chapter (FINDINGS A-124).
+        // publish_cloud_endpoint's handler takes no hive, its path's hive unread (apart since
+        // A-172 while its token waited for Archi's chapter, FINDINGS A-124, built in 0.1.139).
         let apart = [
             "get_admin_action_help",
             "list_recent_commands",
@@ -44696,9 +44711,9 @@ mod tests {
             );
             assert!(
                 detail.ends_with(
-                    "Fix the cause above, then run publish_cloud_endpoint again on the motherbee's \
-                     HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi \
-                     (FINDINGS A-124)."
+                    "Fix the cause above, then run publish_cloud_endpoint again, on the motherbee's \
+                     HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows \
+                     the token once and keeps it masked (FINDINGS A-124)."
                 ),
                 "{detail}"
             );
@@ -45170,10 +45185,11 @@ mod tests {
     /// 2026-11-12): the record comes before the token, so 502 CONFIG_RECORD_FAILED follows the
     /// record's read and its two writes and nothing else: no token minted into the vault, no door
     /// opened or closed, IO.cloud not asked. Its detail says so: a token the Cloud holds works as
-    /// before, and the run goes again on the motherbee's HTTP API once the cause is fixed, never
-    /// through Archi (A-124). Up to 0.1.138 the token was minted and the door opened with it before
-    /// the record, and this answer left a token no one received in the edge's current place. The
-    /// log lines and the command log say what failed.
+    /// before, and the run goes again once the cause is fixed, on the motherbee's HTTP API or
+    /// through Archi, which since 0.1.139 shows the token once and keeps it masked (A-124; 0.1.139's
+    /// integration: it said never through Archi). Up to 0.1.138 the token was minted and the door
+    /// opened with it before the record, and this answer left a token no one received in the edge's
+    /// current place. The log lines and the command log say what failed.
     #[tokio::test]
     async fn a_record_that_fails_twice_rotates_nothing() {
         let captured = LogCapture::start();
@@ -45209,8 +45225,9 @@ mod tests {
                 "no token was minted, no door was opened or closed, and {CLOUD_NODE} was not \
                  asked, so a token the Cloud holds works as before"
             ),
-            "Fix the cause above, then run publish_cloud_endpoint again on the motherbee's HTTP \
-             API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124)"
+            "Fix the cause above, then run publish_cloud_endpoint again, on the motherbee's HTTP \
+             API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token \
+             once and keeps it masked (FINDINGS A-124)"
                 .to_string(),
         ] {
             assert!(detail.contains(&what), "{what}: {detail}");
@@ -45220,6 +45237,7 @@ mod tests {
             "this call minted",
             "10 minutes",
             "leaves no token",
+            "never through Archi",
         ] {
             assert!(!detail.contains(gone), "{gone}: {detail}");
         }
@@ -45805,11 +45823,13 @@ mod tests {
     /// the edge's one previous token for up to 10 minutes, in its memory only, a restart of the edge
     /// or another run ending it sooner; a move closes the old door, so the previous token stops at
     /// once; CONFIG_RECORD_FAILED mints nothing, and the run goes again on the motherbee's HTTP
-    /// API, never through Archi (A-124); a door that does not open puts the record back. Before, the
-    /// help said CONFIG_RECORD_FAILED left the door open with a token no one received. Since
-    /// A-317's review: the old door closes only once IO.cloud trusts the new edge, and is left open
-    /// otherwise; a write may have landed only when a try got no answer, and on a move the old edge
-    /// goes back first; a door that does not open after the vault took the token says so.
+    /// API or through Archi, which since 0.1.139 shows the token once and keeps it masked (A-124;
+    /// 0.1.139's integration: it said never through Archi); a door that does not open puts the
+    /// record back. Before, the help said CONFIG_RECORD_FAILED left the door open with a token no
+    /// one received. Since A-317's review: the old door closes only once IO.cloud trusts the new
+    /// edge, and is left open otherwise; a write may have landed only when a try got no answer, and
+    /// on a move the old edge goes back first; a door that does not open after the vault took the
+    /// token says so.
     #[test]
     fn the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it() {
         let notes = admin_action_request_notes("publish_cloud_endpoint");
@@ -45824,7 +45844,7 @@ mod tests {
             "One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before.",
             "When a try of the write got no answer, it may have been written all the same, and only then does the detail say so",
             "On a move, a config that names the new edge is put back to the old one with set_node_config first",
-            "So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124).",
+            "So fix the cause the detail names first, then run publish_cloud_endpoint again, on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token once and keeps it masked (FINDINGS A-124, since 0.1.139).",
             "puts the record back as it was before the run, tried once more at once",
             "When the edge refused the open or did not answer it, the vault already holds the token this run minted, for that edge, which no one received, and the detail says so: the token the Cloud holds works at most until the edge the door was on restarts, as a deploy does",
             "A token goes out once, only in an ok answer, never in an error or a log line.",
@@ -45838,6 +45858,7 @@ mod tests {
             "leaves no token anyone holds",
             "once the new door is open and applied",
             "A write that got no answer may have been written all the same",
+            "never through Archi",
         ] {
             assert!(!says(promise), "{promise}: {notes:#?}");
         }
@@ -45846,7 +45867,7 @@ mod tests {
             .expect("an action of the catalog");
         let doc = build_admin_action_doc(spec).to_string();
         assert!(doc.contains(
-            "(POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124)"
+            "(POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token once and keeps it masked (FINDINGS A-124, since 0.1.139)"
         ));
         assert!(doc.contains(
             "The SY.edge L2 name to publish on, SY.edge@<hive> (e.g. SY.edge@ingress1); any other name is refused (INVALID_REQUEST) before anything is read or recorded (FINDINGS A-317, since 0.1.139)."

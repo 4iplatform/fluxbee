@@ -1062,7 +1062,9 @@ Until IO.cloud takes the edge, it drops every Cloud request through it (a 504 fo
   A-317): the record comes first, IO.cloud's config read and the edge written in it, each tried
   once more at once (0.1.137), so no token was minted and no door opened or closed: the token Cloud
   holds works as before. Fix the cause the answer's detail names (the motherbee's orchestrator not
-  answering, say), then run the publish again on the motherbee's HTTP API, never through Archi.
+  answering, say), then run the publish again, on the motherbee's HTTP API or through Archi, which
+  since 0.1.139 shows the token once and keeps it masked (FINDINGS A-124; before, never through
+  Archi).
   When a try of the write got no answer, it may have been written all the same, and only then
   does the detail say so (A-317's review): `GET /hives/motherbee/nodes/IO.cloud@motherbee/config`
   shows the edge IO.cloud's config names, which IO.cloud reads only when it starts. On a move, a

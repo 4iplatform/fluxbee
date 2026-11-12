@@ -561,7 +561,9 @@ A delete that removed the node and the workflow is done even when some versions 
 answers ok, `payload.packages_left` names each version left in the motherbee's dist with why
 (and `retryable`, whether asking again may remove it), and `payload.warning` says so.
 `remove_runtime_version` removes them once every hive answers, and a later deploy of the same name
-purges them too ([SY.wf-rules](nodes/sy-wf-rules.md#delete)). One entry with no version,
+purges them too ([SY.wf-rules](nodes/sy-wf-rules.md#delete)); not those refused `UNAUTHORIZED`
+(since 0.1.139: another hive holds a `WF.<workflow>`), which stay until that hive's workflow is
+deleted, a deploy of the name here refused meanwhile. One entry with no version,
 `DIST_UNREADABLE`, says the hive's `dist/runtimes/wf.<workflow>` could not be listed: fix it
 first, since until then a compile of the name that names no version is refused.
 

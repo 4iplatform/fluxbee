@@ -20,10 +20,12 @@ const (
 	// them answered (FINDINGS A-281): those 30 s and adminRPCTimeout for the rest (its checks of the
 	// manifest, its write, the mesh both ways), 35 s in all, so SY.admin's own answer, a refusal
 	// naming the hives it could not read included, comes before this wait ends. It can come later:
-	// SY.admin first waits for its manifest's lock, which another removal holds across its own read
-	// of the use and a publish across its install, and a JSR_ADMIN_ORCH_TIMEOUT_SECS above 30 s waits
-	// longer. Such an answer is a TIMEOUT here (packages_left), which says SY.admin may still remove
-	// the version. With 5 s, before 0.1.133, a read that took longer was answered as a timeout.
+	// since 0.1.139 SY.admin reads the use with no lock held, then waits up to 60 s for its
+	// manifest's lock, which a publish holds across its install and another removal across its
+	// write, and reads the use again under it when the runtime changed meanwhile (FINDINGS A-306);
+	// and a JSR_ADMIN_ORCH_TIMEOUT_SECS above 30 s waits longer. Such an answer is a TIMEOUT here
+	// (packages_left), which says SY.admin may still remove the version. With 5 s, before 0.1.133, a
+	// read that took longer was answered as a timeout.
 	runtimeRemovalTimeout       = 30*time.Second + adminRPCTimeout
 	adminCommandMsg             = "ADMIN_COMMAND"
 	adminCommandResponseMsg     = "ADMIN_COMMAND_RESPONSE"

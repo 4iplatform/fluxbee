@@ -1940,7 +1940,8 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
   `get_runtime`'s answer (`GET /hives/motherbee/runtimes/<runtime>`), beside the motherbee's own
   `usage`: `payload.usage_global_visible` (FINDINGS A-281, A-315). Its fields:
   - `running_nodes`: each node of any hive on that runtime (on the version asked, when one is)
-    whose unit may run, with its `hive` and `lifecycle`; `running_count` counts them.
+    whose unit may run, or that the orchestrator relaunches on it within a minute (`RELAUNCH_DUE`,
+    since 0.1.139, FINDINGS A-300), with its `hive` and `lifecycle`; `running_count` counts them.
   - `skipped_hives`: each hive whose nodes were not read, `{hive_id, reason}` and its `message`
     when the hive's answer had one: its use is unknown, never none.
   - `hives_without_runtimes`: each ingress and each egress, `{hive_id, role}`, by the role the hive

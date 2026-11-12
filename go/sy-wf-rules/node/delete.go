@@ -126,6 +126,13 @@ func packagesLeftWarning(workflowName string, left []PackageLeft) string {
 	if len(left) == 1 {
 		what = fmt.Sprintf("its purge did not remove %s %s from the motherbee's dist (packages_left: %s)", runtimeName, stopped.Version, stopped.ErrorCode)
 	}
+	if stopped.ErrorCode == "UNAUTHORIZED" {
+		// SY.admin refuses this hive's publish and removal of the package while another hive holds
+		// a WF.<workflow> (FINDINGS A-304, since 0.1.139), so a later deploy here purges nothing, as
+		// it does after any other refusal: the versions are that hive's package too, and stay until
+		// its workflow is deleted (SY.admin's WF_DELETE_VERSIONS_LEFT_NOTE says the same).
+		return fmt.Sprintf("workflow %s is deleted, but %s. Another hive holds a WF.%s (packages_left's detail names it), and %s is its package too: the versions stay until that hive's workflow is deleted, and meanwhile a deploy of %s on this hive is refused the same way.", workflowName, what, workflowName, runtimeName, workflowName)
+	}
 	return fmt.Sprintf("workflow %s is deleted, but %s. remove_runtime_version removes each version once every hive answers and no node runs it, and a later deploy of %s purges them too.", workflowName, what, workflowName)
 }
 

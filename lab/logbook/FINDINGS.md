@@ -1540,8 +1540,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 
 ### A-337 [General/admin] 🔵 low (found 2026-11-12 by A-124's review; read in the code, not run; there before it) — SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included
 
-- **Why:** `executor_validate_plan` (`src/bin/sy_admin.rs` ~9515) runs
-  `semantic_review_executor_plan` (~3112) whenever SY.admin's executor has an AI: one model call
+- **Why:** `executor_validate_plan` (`src/bin/sy_admin.rs` ~10376) runs
+  `semantic_review_executor_plan` (~3127) whenever SY.admin's executor has an AI: one model call
   per step (stage `executor_review`, charged to the root tenant), whose prompt holds the step as
   written (`serde_json::to_string_pretty(step)`), its args included. Archi sends every plan it runs
   there first (`execute_executor_plan_with_context`), and its plan compiler's prevalidation does
@@ -2381,7 +2381,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   without it. SY.admin's help (`vault_get`, `vault_assign`), sy-admin.md, sy-vault.md and Archi's
   handbook (§4.5) say it.
 
-### A-315 [Archi] 🔵 low · Archi's handbook part built on `coa/architect-139` for 0.1.139 (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
+### A-315 [Archi] 🔵 low · both parts built for 0.1.139: SY.admin's help on `coa/admin-139`, Archi's handbook on `coa/architect-139` (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
 
 - **Seen:** 0.1.133's gate read SY.admin's per-action HELP for the answers 0.1.133 added (A-285):
   each it looked for is named, but `hives_without_runtimes` is named nowhere in SY.admin's help
@@ -2415,6 +2415,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `get_runtime` and `remove_runtime_version` is the other part, in SY.admin's binary, not on this
   branch. Archi reads the handbook from `/etc/fluxbee/handbook_fluxbee.md`, which the package
   installs.
+- **At 0.1.139's integration (`coa/sweep-139`):** the two parts, and A-300 on `coa/orch-139`, were
+  built apart. `get_runtime`'s own note in SY.admin's help said a skipped hive's `message` is always
+  there and named neither the error shape nor `RELAUNCH_DUE`, which A-300 adds to `running_nodes`;
+  the handbook's `running_nodes` named only a unit that may run. Both now say what the orchestrator
+  answers: `RELAUNCH_DUE` (a node pinned to a version whose unit does not run and that its
+  orchestrator relaunches within a minute), a skipped hive's `{hive_id, reason}` and its `message`
+  when its answer had one, and `{scope, status: "error", message}` when the motherbee cannot read
+  its own nodes or its registry. `the_runtime_help_names_the_hives_without_runtimes` checks the
+  note, and fails without it.
 
 ### A-314 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.134, 2026-11-11; a new node launched and killed in 9.8 s, the stopped nodes with no unit read `STOPPED`, a core node's kill refused `INVALID_REQUEST`) (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
 
@@ -2750,6 +2759,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   of 2026-11-12: it said false). Left: the comment over `runtimeRemovalTimeout`
   in `go/sy-wf-rules/node/admin.go` still says a removal holds the lock across its read (SY.wf-rules'
   branch, a comment only).
+- **At 0.1.139's integration (`coa/sweep-139`):** that comment says what SY.admin does since this
+  item: the use read with no lock held, the lock waited for up to 60 s, held by a publish across its
+  install and by another removal across its write, and the use read again under it when the runtime
+  changed meanwhile.
 
 ### A-305 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code) — `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass
 
@@ -2830,6 +2843,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`WF_DELETE_VERSIONS_LEFT_NOTE`), sy-wf-rules.md and Archi's handbook say so, and that such
   versions are never offered for removal. Left: SY.wf-rules' own `warning` on a delete still says
   a later deploy of the name purges the versions left, after an `UNAUTHORIZED` too (its branch).
+- **At 0.1.139's integration (`coa/sweep-139`):** SY.wf-rules' branch was built beside this one, so
+  the integration fixes that warning (`packagesLeftWarning`, `go/sy-wf-rules/node/delete.go`): a
+  purge that stopped at `UNAUTHORIZED` says that another hive holds a `WF.<workflow>` (its detail
+  names it), whose package the versions are too, that they stay until that hive's workflow is
+  deleted, and that a deploy of the name on this hive is refused meanwhile, as SY.admin's help says;
+  no `remove_runtime_version` and no later deploy offered. Its test,
+  `TestADeleteWhosePurgeIsRefusedUnauthorizedSaysItsVersionsStay`, fails without it.
+  sy-wf-rules.md, the SY.wf-rules spec's delete and the WF quickstart say so (sy-wf-rules.md said
+  SY.admin refuses both "whatever the warning says"; the other two named no such exception).
 
 ### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
 
@@ -7777,6 +7799,15 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     SY.admin's help for `publish_cloud_endpoint` (`src/bin/sy_admin.rs`), sy-admin.md's row and
     io-cloud-api.md §7, in the files SY.admin's and SY.edge's 0.1.139 branches change (A-317).
     Through Archi is now as safe as the HTTP API; they change with the integration.
+  - **At 0.1.139's integration (`coa/sweep-139`):** those texts now send the run again on the
+    motherbee's HTTP API or through Archi, which shows the token once and keeps it masked:
+    `CONFIG_RECORD_FAILED`'s detail (`cloud_edge_record_failed_detail`) and SY.admin's help for
+    `publish_cloud_endpoint`, with their tests (`a_record_that_fails_twice_rotates_nothing`,
+    `a_record_write_without_an_answer_may_have_been_written` and
+    `the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it`), sy-admin.md's row and
+    io-cloud-api.md §7. `every_action_the_executor_runs_names_what_its_path_names` keeps
+    `publish_cloud_endpoint` apart for the reason left: its handler takes no hive, its path's hive
+    unread.
 
 ### A-123 ✅ VALIDATED ON 8.x (0.1.91, 2026-10-30) — A message on a running WF instance's thread drives it, whoever sends it
 

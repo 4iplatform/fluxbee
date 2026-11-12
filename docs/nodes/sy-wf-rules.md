@@ -283,9 +283,10 @@ is not counted.
   /hives/motherbee/runtimes/wf.<workflow>` lists them. With any left, `warning` says the workflow
   is deleted, how many versions of `wf.<workflow>` stayed in the motherbee's dist and where the
   purge stopped, and that `remove_runtime_version` removes each once every hive answers and no
-  node runs it, and a later deploy of the same name purges them too (not after `UNAUTHORIZED`:
-  while the other hive holds its `WF.<workflow>`, SY.admin refuses both, whatever the warning
-  says); with `DIST_UNREADABLE`, that
+  node runs it, and a later deploy of the same name purges them too; after `UNAUTHORIZED` it says
+  instead that they stay until the other hive's workflow is deleted, and that a deploy of the name
+  here is refused meanwhile, since SY.admin refuses both while that hive holds its
+  `WF.<workflow>` (FINDINGS A-304, since 0.1.139); with `DIST_UNREADABLE`, that
   this hive's `dist/runtimes/wf.<workflow>` must be fixed first, since until it can be listed a
   compile of the name that names no version is refused too. To remove them by hand, go in
   `packages_left`'s order, which puts the runtime's current last as far as this hive's copy of

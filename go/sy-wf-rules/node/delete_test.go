@@ -485,6 +485,51 @@ func TestADeleteWhosePurgeTimesOutIsDoneAndNamesThePackagesLeft(t *testing.T) {
 	}
 }
 
+// While another hive holds a WF.<workflow>, SY.admin refuses this hive's removal of the package's
+// versions, and its deploy of the name, UNAUTHORIZED (FINDINGS A-304, since 0.1.139): the delete is
+// done, packages_left names the refusal, not retryable, and each version after it, and the warning
+// says that the versions stay until that hive's workflow is deleted and that a deploy of the name
+// here is refused meanwhile, as SY.admin's help of wf_rules_delete does. It said, as after any
+// other refusal, that remove_runtime_version or a later deploy of the name removes them (0.1.139's
+// integration: SY.admin's half and SY.wf-rules' warning were built apart).
+func TestADeleteWhosePurgeIsRefusedUnauthorizedSaysItsVersionsStay(t *testing.T) {
+	svc := newTestService(t)
+	for range 2 {
+		applyWorkflowForDelete(t, svc)
+	}
+	admin := svc.admin.(*fakeAdminClient)
+	admin.removedVersions = nil
+	const refusal = "SY.wf-rules@motherbee may not change wf.invoice: wf.invoice is also the package of WF.invoice@worker1, whose config that hive holds, connected or not: only that hive's SY.wf-rules may change it, until its workflow is deleted there"
+	admin.removeErr = map[string]error{"0.0.1": &adminActionError{Status: "error", Code: "UNAUTHORIZED", Message: refusal, Payload: map[string]any{
+		"status":       "error",
+		"action":       "remove_runtime_version",
+		"error_code":   "UNAUTHORIZED",
+		"error_detail": refusal,
+		"payload":      nil,
+	}}}
+	killed := false
+	svc.nodes = &fakeNodeClient{getNodeConfigFunc: deployedWFNodeConfig, killNodeFunc: purgingKill(t, &killed)}
+
+	result, err := svc.DeleteWorkflow(DeleteWorkflowRequest{WorkflowName: "invoice", Force: true})
+	if err != nil || !result.Deleted || result.WFNode.Action != "deleted" || !killed || svc.store.WorkflowExists("invoice") {
+		t.Fatalf("the delete is done: result %#v, err %v, killed %v", result, err, killed)
+	}
+	if len(result.PackagesLeft) != 2 {
+		t.Fatalf("packages_left = %+v", result.PackagesLeft)
+	}
+	refused := PackageLeft{Runtime: "wf.invoice", Version: "0.0.1", ErrorCode: "UNAUTHORIZED", Detail: refusal}
+	if !reflect.DeepEqual(result.PackagesLeft[0], refused) {
+		t.Fatalf("the version refused:\n got %+v\nwant %+v", result.PackagesLeft[0], refused)
+	}
+	if left := result.PackagesLeft[1]; left.Version != "0.0.2" || left.ErrorCode != "PURGE_STOPPED" {
+		t.Fatalf("after it: %+v", left)
+	}
+	const warning = "workflow invoice is deleted, but its purge did not remove 2 versions of wf.invoice from the motherbee's dist (packages_left): it stopped at 0.0.1, UNAUTHORIZED. Another hive holds a WF.invoice (packages_left's detail names it), and wf.invoice is its package too: the versions stay until that hive's workflow is deleted, and meanwhile a deploy of invoice on this hive is refused the same way."
+	if result.Warning != warning {
+		t.Fatalf("warning:\n got %q\nwant %q", result.Warning, warning)
+	}
+}
+
 // A purge that cannot list the workflow's versions removes none and says so: the delete is done,
 // and packages_left names the runtime with no version, DIST_UNREADABLE, and why, which asking again
 // does not change. Its warning says to fix this hive's dist first: until then a compile of the name
