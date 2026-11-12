@@ -1957,6 +1957,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `INVALID_REQUEST`. A version segment is also the one place where Archi (keeps `+`) and SY.admin's
   route (reads `+` as a space) disagree; both readings are refused today.
 - **Fix, later:** refuse build metadata in `validate_semver`, or take `+` in both tokens.
+- **Built on `coa/admin-139` for 0.1.139:** the package check SY.admin's publish and
+  `fluxbee-publish` share (`validate_package`, its `validate_semver` in `src/runtime_package.rs`)
+  refuses build metadata, in the package.json's `version` and in `fluxbee-publish --version`
+  alike, before anything is installed: SY.admin answers `400 INVALID_REQUEST` with *"... carries
+  build metadata ('+'), which a runtime version may not: use MAJOR.MINOR.PATCH, with an optional
+  -prerelease such as 1.2.0-b1"*. A pre-release stays a version. SY.admin's publish maps its
+  install's errors in one place (`publish_runtime_package_error_code`). Its tests:
+  `a_version_with_build_metadata_is_refused_and_a_prerelease_is_not` (the library) and
+  `a_package_version_with_build_metadata_is_refused_before_it_is_installed` (SY.admin), each
+  failing without it. SY.admin's help (`publish_runtime_package`), sy-admin.md (A runtime
+  package's publish), operations.md and Archi's handbook (§7.2) say it. Not covered:
+  `scripts/publish-runtime.sh` (the .deb's seed and the `publish-*-runtime.sh` scripts) checks no
+  version's form; it is given the release's own versions.
 
 ### A-311 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; `GET /hives/a.b` 400 `INVALID_HIVE_ID` with the rule in 0.895 s and the registry unchanged; through Archi `..%2Fx` refused the same, and a timed-out `add_hive` closed on it, never `OPERATION_ALREADY_TRACKED`; a planted `gate0237.bak` no hive to the runtime-use read, `/versions` and the Cloud's `list_nodes`, though `list_hives` lists it, A-330) (found 2026-11-11 by A-287's review; read in the code; there before it, widened by 0.1.137) — `get_hive` reads any file named `info.yaml` its hive id leads to
 

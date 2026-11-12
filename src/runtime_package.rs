@@ -95,11 +95,16 @@ fn runtime_name_regex() -> Regex {
     Regex::new(r"^[a-z][a-z0-9]*(\.[a-z0-9]+)*$").expect("valid runtime name regex")
 }
 
+/// A version a runtime package may carry: `MAJOR.MINOR.PATCH`, with an optional pre-release
+/// (`1.2.0-rc.1`) and never build metadata (`1.2.0+b1`, FINDINGS A-312). Every reader of a
+/// version after its publish takes only letters, digits, `.`, `_` and `-`: SY.admin's
+/// `remove_runtime_version` (`valid_runtime_token`) and the orchestrator's launch, stamp and read
+/// of a node's runtime (`valid_token`). A version with `+` was published, then could neither run
+/// a node of a config-only or workflow package on it (`BASE_RUNTIME_NOT_AVAILABLE`) nor be removed
+/// (`INVALID_REQUEST`), and an HTTP path reads `+` as a space where Archi keeps it.
 fn semver_regex() -> Regex {
-    Regex::new(
-        r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
-    )
-    .expect("valid semver regex")
+    Regex::new(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$")
+        .expect("valid semver regex")
 }
 
 fn parse_package_type(raw: &str) -> Result<PackageType, String> {
@@ -134,6 +139,13 @@ fn validate_runtime_name(field: &str, value: &str) -> Result<(), String> {
 fn validate_semver(field: &str, value: &str) -> Result<(), String> {
     if semver_regex().is_match(value) {
         return Ok(());
+    }
+    if value.contains('+') {
+        return Err(format!(
+            "package.json invalid: {field}='{value}' carries build metadata ('+'), which a runtime \
+             version may not: use MAJOR.MINOR.PATCH, with an optional -prerelease such as \
+             1.2.0-b1"
+        ));
     }
     Err(format!(
         "package.json invalid: {field}='{value}' is not valid semver"
@@ -1140,5 +1152,55 @@ mod tests {
 
         let _ = fs::remove_dir_all(package_dir);
         let _ = fs::remove_dir_all(dist_root);
+    }
+
+    /// FINDINGS A-312: a version with build metadata (`+`) is refused by the package check SY.admin
+    /// and `fluxbee-publish` share, in the package.json and as the CLI's version override alike,
+    /// before anything is installed: past the publish no reader takes `+`, so such a version could
+    /// run no node and could not be removed. A pre-release stays a version.
+    #[test]
+    fn a_version_with_build_metadata_is_refused_and_a_prerelease_is_not() {
+        let package_dir = test_temp_dir("build-metadata");
+        let write_version = |version: &str| {
+            write_file(
+                &package_dir.join("package.json"),
+                &format!(
+                    "{{\n  \"name\": \"ai.gate\",\n  \"version\": \"{version}\",\n  \"type\": \"full_runtime\"\n}}"
+                ),
+            );
+        };
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho ok\n");
+        make_executable(&start_sh);
+
+        for version in ["1.2.0+b1", "0.2.0-rc.1+build.7", "1.0.0+"] {
+            write_version(version);
+            let err = validate_package(&package_dir, None).expect_err(version);
+            assert!(err.starts_with("package.json invalid: version="), "{err}");
+            assert!(err.contains("build metadata"), "{err}");
+        }
+
+        write_version("1.2.0");
+        let err = validate_package(&package_dir, Some("1.2.0+b1")).expect_err("the override");
+        assert!(
+            err.starts_with("package.json invalid: version override="),
+            "{err}"
+        );
+        assert!(err.contains("build metadata"), "{err}");
+
+        for version in ["1.2.0-b1", "0.2.0-rc.1", "1.2.0"] {
+            write_version(version);
+            let validated = validate_package(&package_dir, None).expect(version);
+            assert_eq!(validated.effective_version, version);
+        }
+        let validated = validate_package(&package_dir, Some("1.2.1-b2")).expect("the override");
+        assert_eq!(validated.effective_version, "1.2.1-b2");
+
+        // Not semver at all keeps its own words.
+        write_version("v1");
+        let err = validate_package(&package_dir, None).expect_err("v1");
+        assert!(err.contains("is not valid semver"), "{err}");
+
+        let _ = fs::remove_dir_all(package_dir);
     }
 }

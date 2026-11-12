@@ -583,6 +583,20 @@ Archi, and over the mesh only Archi may ask for it (`mesh_access`).
 
 SY.timer describes itself with `timer_help` (`TIMER_HELP`) and may answer `NODE_HELP` later.
 
+## A runtime package's publish
+
+`publish_runtime_package` (`POST /admin/runtime-packages/publish`,
+`handle_publish_runtime_package`) installs a package into the motherbee's dist and runtimes
+manifest, from an `inline_package` or a `bundle_upload`; each hive's mirror brings it.
+
+- **The version.** The package's check is the one `fluxbee-publish` runs (`validate_package` in
+  `src/runtime_package.rs`): its `package.json`'s `version` is `MAJOR.MINOR.PATCH`, with an
+  optional `-prerelease` (`1.2.0-rc.1`). A version with build metadata (`1.2.0+b1`) is refused
+  with `400 INVALID_REQUEST` before anything is installed (FINDINGS A-312, since 0.1.139): no
+  reader of a version after its publish takes a `+` (`remove_runtime_version`'s
+  `valid_runtime_token`, the orchestrator's launch and reads), so such a version ran no node of a
+  config-only or workflow package on it (`BASE_RUNTIME_NOT_AVAILABLE`) and could not be removed.
+
 ## A runtime version's removal
 
 `remove_runtime_version` (`DELETE /hives/motherbee/runtimes/{runtime}/versions/{version}`,

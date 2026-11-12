@@ -17665,6 +17665,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "publish_runtime_package" => vec![
             "Motherbee-only operation.",
             "Supported source kinds: inline_package and bundle_upload.",
+            "The package.json's version is MAJOR.MINOR.PATCH, with an optional -prerelease (1.2.0-rc.1). A version with build metadata (1.2.0+b1) is refused with 400 INVALID_REQUEST before anything is installed (FINDINGS A-312, since 0.1.139): no reader of a version after its publish takes a '+', so such a version could run no node and could not be removed. Write 1.2.0-b1 instead.",
             "bundle_upload resolves blob_path relative to the configured blob root in hive.yaml.",
             "Publishing mutates dist/manifest but does not spawn nodes.",
             "Optional sync_to runs sync_hint(channel=dist) after publish; optional update_to runs update(category=runtime) scoped to the new runtime/version.",
@@ -19873,6 +19874,33 @@ async fn run_publish_runtime_package_follow_up(
     ))
 }
 
+/// The code a failed publish answers, by what its install said: a package the check refuses (its
+/// package.json, its layout, a version with build metadata: FINDINGS A-312) is the request's
+/// fault, `INVALID_REQUEST`.
+fn publish_runtime_package_error_code(err: &str) -> &'static str {
+    if err.contains("bundle blob not found") {
+        "BLOB_NOT_FOUND"
+    } else if err.contains("invalid zip") {
+        "INVALID_ZIP"
+    } else if err.contains("single root directory")
+        || err.contains("package.json at the root directory")
+    {
+        "INVALID_PACKAGE_LAYOUT"
+    } else if err.contains("install conflict:") || err.contains("different contents") {
+        "VERSION_CONFLICT"
+    } else if err.contains("already exists") {
+        "VERSION_MISMATCH"
+    } else if err.contains("package.json invalid")
+        || err.contains("package validation failed")
+        || err.contains("inline package")
+        || err.contains("bundle_upload")
+    {
+        "INVALID_REQUEST"
+    } else {
+        "SERVICE_FAILED"
+    }
+}
+
 async fn handle_publish_runtime_package(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -20055,27 +20083,7 @@ async fn handle_publish_runtime_package(
             ))
         }
         Err(err) => {
-            let error_code = if err.contains("bundle blob not found") {
-                "BLOB_NOT_FOUND"
-            } else if err.contains("invalid zip") {
-                "INVALID_ZIP"
-            } else if err.contains("single root directory")
-                || err.contains("package.json at the root directory")
-            {
-                "INVALID_PACKAGE_LAYOUT"
-            } else if err.contains("install conflict:") || err.contains("different contents") {
-                "VERSION_CONFLICT"
-            } else if err.contains("already exists") {
-                "VERSION_MISMATCH"
-            } else if err.contains("package.json invalid")
-                || err.contains("package validation failed")
-                || err.contains("inline package")
-                || err.contains("bundle_upload")
-            {
-                "INVALID_REQUEST"
-            } else {
-                "SERVICE_FAILED"
-            };
+            let error_code = publish_runtime_package_error_code(&err);
             Ok((
                 error_code_to_http_status(error_code),
                 serde_json::json!({
@@ -33283,6 +33291,59 @@ mod tests {
         )
         .expect_err("changed contents must conflict");
         assert!(err.contains("different contents"), "err={err}");
+
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    /// FINDINGS A-312: a package whose version carries build metadata (`0.2.0+b1`) is refused before
+    /// anything is installed, `400 INVALID_REQUEST` with why, and the manifest gains no such
+    /// version: past the publish no reader takes `+`, so it could neither run a node nor be removed
+    /// (`remove_runtime_version` refuses the `+` as an invalid runtime_version).
+    #[test]
+    fn a_package_version_with_build_metadata_is_refused_before_it_is_installed() {
+        let staging_root = test_temp_dir("sy-admin-inline-build-metadata-stage");
+        let dist_root = test_temp_dir("sy-admin-inline-build-metadata-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+        let before = fs::read_to_string(&manifest_path).expect("the manifest");
+
+        let err = publish_runtime_package_inline(
+            &BTreeMap::from([
+                (
+                    "package.json".to_string(),
+                    "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.2.0+b1\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}".to_string(),
+                ),
+                (
+                    "config/default-config.json".to_string(),
+                    "{\n  \"tenant_id\": \"tnt:demo\"\n}".to_string(),
+                ),
+            ]),
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+            true,
+        )
+        .expect_err("build metadata is refused");
+        assert!(err.contains("build metadata"), "err={err}");
+        assert_eq!(publish_runtime_package_error_code(&err), "INVALID_REQUEST");
+        assert_eq!(error_code_to_http_status("INVALID_REQUEST"), 400);
+        assert!(!runtimes_root.join("ai.support.demo").exists());
+        assert_eq!(
+            fs::read_to_string(&manifest_path).expect("the manifest"),
+            before
+        );
+        assert!(!valid_runtime_token("0.2.0+b1"));
 
         let _ = fs::remove_dir_all(staging_root);
         let _ = fs::remove_dir_all(dist_root);

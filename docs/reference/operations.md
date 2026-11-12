@@ -398,7 +398,12 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   `publish-ia-runtime.sh` also hands it ai.generic's `tools.json`, the catalog of
   `docs/reference/agent-tools.json` (or `--catalog <path>`) with the version in it.
   `fluxbee-publish <package dir> [--deploy <hive>]` (`src/bin/fluxbee-publish.rs`) publishes a
-  package directory and always sets it current.
+  package directory and always sets it current. A package's `version` (and `fluxbee-publish
+  --version`) is `MAJOR.MINOR.PATCH`, with an optional `-prerelease` (`1.2.0-rc.1`): build
+  metadata (`1.2.0+b1`) is refused before anything is installed, by the check `fluxbee-publish`
+  and SY.admin's publish share (`validate_package` in `src/runtime_package.rs`; FINDINGS A-312,
+  since 0.1.139). No reader of a version after its publish takes a `+`: such a version ran no
+  node and could not be removed.
 - Over HTTP: `POST /admin/runtime-packages/publish` (`publish_runtime_package`, motherbee only)
   with an `inline_package` or `bundle_upload` source; optional `sync_to[]` and `update_to[]`
   follow-ups.
