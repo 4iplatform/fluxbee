@@ -13,7 +13,7 @@ pub const UUID_MODE_ENV: &str = "JSR_TIMER_EXAMPLE_UUID_MODE";
 
 pub fn init_logging() {
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    let _ = tracing_subscriber::fmt()
+    let _ = fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .try_init();
 }

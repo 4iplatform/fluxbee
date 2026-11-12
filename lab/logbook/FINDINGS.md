@@ -374,6 +374,15 @@ no change required
     answered `BUSY` (A-307), still moved its slots before a refused publish, and waited 5 s for a
     publish. Every hive runs 0.1.139 since the deploy's update closed (22:34 ART on 2026-11-12), so
     the hold is lifted.
+    A-305, A-306, A-316, A-318, A-319, A-324, A-328; the orchestrator: A-296, A-299, A-300, A-301,
+    A-308, A-310, A-330, A-331; Archi: A-124, A-315, A-320, A-321; SY.frontdesk.gov: A-303;
+    SY.cognition: A-332; SY.edge: A-317; SY.timer: A-326; the WF engine and SY.wf-rules: A-302,
+    A-307, A-333); then the router alone (A-269); the Go SDK alone (A-329 with SY.timer's resend,
+    A-264); the AI SDK alone (A-294, A-290, A-325, `tool_choice` for A-327); the Rust SDK alone
+    (A-295, A-309, A-285's `cloud.rs` text; A-269 (b), the operator's call: each record one line in
+    every Rust binary). Lab: B-18 (the template). Out of it, by decision or as
+    large topics: A-159/A-275/A-276 (deletion), A-137/A-227 (cognition), A-142 (with io.web), A-168,
+    the parked security items, A-289, A-199 step 2, A-250 (b), A-210 (after 2026-11-22).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -483,7 +492,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, with 0.1.143).
+- A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only; the operator's call (b), 2026-11-12: each record one line in every Rust binary, built on `coa/rustsdk-143`, for 0.1.143, planned).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
@@ -5423,6 +5432,58 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     list; health clean.
   - **Still open:** the operator's call (b) (the Rust SDK's logging, every Rust binary,
     IO.cloud's `op` among them) ships with 0.1.143.
+- **The operator's call (2026-11-12): (b).** The Rust SDK's `logging` keeps each record one line,
+  its control characters escaped and the record cut at 16 KiB, in one place for every Rust binary,
+  IO.cloud's `op` among them, with the Rust SDK's release. The router's own part (the HELLO's name,
+  its accept loops' errors) ships on `coa/router-140` (0.1.140, planned).
+- **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30):**
+  - **The writer.** `fluxbee_sdk::logging::fmt()` writes through `OneLine`, a `MakeWriter`. The fmt
+    layer asks it for a writer for each record (`RecordWriter`), which takes the whole record,
+    however many writes it takes, and writes it once, as one line, when the layer drops it at the
+    record's end; no flush writes part of it. `one_line` escapes every control character but the
+    final newline (`char::is_control`: C0, DEL and C1) as Rust's `Debug` shows it (`\n`, `\r`,
+    `\t`, `\0`, `\u{1b}`), and cuts a record past 16 KiB (`RECORD_MAX_BYTES`, its newline
+    included, a third of journald's default `LineMax`) after a whole character or escape, its line
+    ending `... (cut: N bytes)`, N the bytes it had. A record with neither is written as the
+    formatter made it, byte for byte, so every line seen today keeps its shape. On a terminal,
+    where the lines carry colour (A-31), the colour codes (`ESC [` ... `m`) stay and no other
+    escape does.
+  - **Every Rust binary.** Each starts its subscriber with `logging::fmt()`: the router, every SY
+    node in Rust, the diagnostic binaries, and the IO, AI, gov and test nodes. SY.edge, whose
+    filter reloads live and which built its own `fmt::layer()`, takes `logging::layer()`, the same
+    output as a layer; `logging::ansi()` is no longer public, so no binary builds a layer of its
+    own that skips the writer. The examples (`examples/`) built theirs with
+    `tracing_subscriber::fmt()`, with colour even into a pipe, and take `logging::fmt()` now too.
+    The only `tracing_subscriber::fmt()` left are four tests' captures (the router's stream,
+    SY.admin, ai.generic and SY.frontdesk.gov).
+  - **What it covers.** IO.cloud's `op`, with no change of IO.cloud's: it reaches 8.x with
+    IO.cloud's runtime of 0.1.143, which carries this SDK. In rt-gateway's journal the other
+    fields a node writes that the router's lines print as they come (a message's `meta.type` and
+    `trace_id`, a claimed `routing.src`, the WAN link's errors; `coa/router-140`'s text of this
+    entry) stay inside their record's line from 0.1.143, and no record is longer than 16 KiB.
+  - **Its tests** (`crates/fluxbee_sdk/src/logging.rs`):
+    `a_field_with_a_newline_and_a_forged_warn_stays_one_escaped_line` (IO.cloud's received line,
+    its `op` a newline and the router stream's loss alarm at WARN, through what `fmt()` builds;
+    with the record written as it came it is two lines, the second the forged alarm with
+    `expired: 99999`), the message and a span's field, SY.edge's layered setup, a record past
+    16 KiB, every control character, the colour codes, the cut after a whole piece, the 16 KiB
+    boundary and a record written in pieces. 10 of the 12 fail with the record written as it came;
+    the other two pin what stays (a record with no control character, a writer that got nothing).
+  - **Docs:** the SDK's README, `docs/reference/operations.md` (the journal's row) and
+    `docs/nodes/rt-gateway.md` (what `lab/ops.py health` counts).
+  - **Not covered:** the Go nodes (SY.timer, SY.wf-rules, SY.opa.rules, the WF engine) print
+    through Go's `log`, their fields as they come (`log.Printf("... (trace_id=%s): %v", ...)` in
+    SY.wf-rules' `dispatch.go`, a message's `trace_id`), and it escapes nothing. The same there
+    would be a change of the Go SDK's of its own; not decided.
+- **Found while building (b) (2026-11-12; read in the code, not tried), pending:**
+  `lab/ops.py health`'s `usagerej` is the one count whose pattern is not anchored. It takes any
+  line of SY.storage's journal that holds *usage records refused, mismatched or unverified*
+  anywhere, and sums every `refused=`, `mismatched=` and `unverified=` after it; no newline is
+  needed. SY.storage prints the `trace_id` of every message the router delivers to it as its sender
+  wrote it (*"sy.storage received router message"*, `trace_id = %`), so a trace_id with those words
+  and `refused=99999` fails the check. **Fix, later (`ops.py`'s next change):** anchor it as the
+  router's patterns are, the words opening the line's message after its time, `WARN` and target.
+  `docs/nodes/rt-gateway.md` says so meanwhile.
 
 ### A-268 [General/router] ✅ BUILT (0.1.135, 2026-11-11; its race by its unit test, no live trigger; A-265's check unchanged on 8.x, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 

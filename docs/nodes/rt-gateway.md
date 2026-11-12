@@ -413,7 +413,12 @@ came from (A-272, under [WAN between hives](#wan-between-hives)). A router older
 echoes again, and the hives that drop its echoes fail the check: after a rollback to 0.1.134, the
 motherbee whenever a node broadcasts over the WAN (each spoke sends back to the hub every
 broadcast the hub sent it, the motherbee's nodes' and the other spokes'), and a spoke when its own
-nodes do. A journal that cannot be read is reported, never counted as zero.
+nodes do. A journal that cannot be read is reported, never counted as zero. Each of the router's
+patterns must open the line's message (after its time, level and target), and from 0.1.143
+(planned) no field a node wrote can open a line: every record the router and SY.storage write is
+one line, its control characters escaped (the Rust SDK's `logging`, FINDINGS A-269), so a newline in
+a field shows as `\n` inside its record's line. `usagerej`'s pattern is not anchored yet: it counts
+SY.storage's line wherever its words show (A-269).
 
 ## Failure behavior
 

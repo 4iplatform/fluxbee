@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn init_logging() {
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    let _ = tracing_subscriber::fmt()
+    let _ = fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .try_init();
 }

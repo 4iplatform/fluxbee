@@ -1124,7 +1124,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /acme/status` | the edge's certificate: ACME's configuration, the names, the open conditions ([Certificates](#certificates-acme)) |
 | `GET /web/status` | the web door: the declared host, the certificate's names, the edge's answer to the web routes with its way to io.web, io.web ([The web door](#the-web-door)) |
 | `GET /config/storage/metrics` | SY.storage's inbox |
-| `systemctl --failed`, `journalctl -u <unit>` | per host |
+| `systemctl --failed`, `journalctl -u <unit>` | per host. A Rust binary writes each record as one line of at most 16 KiB (the Rust SDK's `logging`; since 0.1.143, planned; FINDINGS A-269): its control characters escaped as Rust's `Debug` shows them (`\n`, `\u{1b}`), so a field with a newline stays inside its record's line, and a longer record cut, its line ending `... (cut: N bytes)`. The Go nodes (SY.timer, SY.wf-rules, SY.opa.rules, the WF engine) print through Go's `log`, which escapes nothing |
 
 `lab/ops.py health [--since HH:MM]` runs on every host and passes only when all of `failed`,
 `denials`, `srcdrops`, `streamlost`, `usagelost`, `usagerej` and `wandrops` are 0 (`wandrops`

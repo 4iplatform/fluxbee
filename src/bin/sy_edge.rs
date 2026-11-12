@@ -206,9 +206,11 @@ async fn main() -> Result<(), SyEdgeError> {
         .unwrap_or_else(|| "info,sy_edge=debug,fluxbee_sdk=info".to_string());
     let env_filter = EnvFilter::try_new(&initial_log).unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    // The SDK's output as a layer: each record one line, colour only on a terminal (FINDINGS A-31,
+    // A-269).
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer().with_ansi(fluxbee_sdk::logging::ansi()))
+        .with(fluxbee_sdk::logging::layer())
         .init();
     // Current level string (EnvFilter can't be read back) + a boxed reloader for node_config.
     let current_log = Arc::new(std::sync::Mutex::new(initial_log));
