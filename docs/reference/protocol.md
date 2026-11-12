@@ -88,7 +88,11 @@ The payloads are `NodeHelloPayload {uuid, name, version}` and
 `NodeAnnouncePayload {uuid, name, status, vpn_id, router_name}` (`protocol.rs`, built by
 `build_hello` and `build_announce`; the same types in `protocol.go`).
 
-`handle_node` checks, in this order. A failure closes the connection without an ANNOUNCE.
+`handle_node` checks, in this order. A failure closes the connection without an ANNOUNCE, and the
+router logs `node connection error` with the failure's error quoted, escaped and cut at 128 bytes
+(`log_connection_error`; since 0.1.140, A-269's review: a frame that does not parse is named by what
+its sender wrote, serde's unknown variant for one, and until then a newline in it opened a line of
+the sender's choosing in the router's journal).
 
 1. The frame is a system message with `msg` `HELLO` (error `expected HELLO`).
 2. `routing.src` and `payload.uuid` parse as UUIDs and are equal (`uuid mismatch`).
@@ -96,11 +100,12 @@ The payloads are `NodeHelloPayload {uuid, name, version}` and
    local part and a hive on each side of one `@`, each of ASCII letters, digits, `.`, `-` and
    `_`, at most 256 bytes in all, the name field of the router's node table (`is_l2_node_name`,
    `NODE_NAME_MAX_BYTES`). Any other name is refused before the router logs or registers it, with
-   the warning `HELLO rejected: the node name is not an L2 name`, which shows the name quoted,
-   escaped and cut at 128 bytes, and the node's UUID and process id (A-269, since 0.1.140; until
-   then the router took any name, and its lines printed it as it came, newlines included). A name
-   starting with `RT.` is accepted only from the router's own process, checked by the socket's
-   peer PID (`rt_name_allowed`).
+   the warning `HELLO rejected: the node name is not an L2 name`, which shows the name as the
+   router judged it (its `@<hive>` added) quoted, escaped and cut at 128 bytes with its full
+   length, and the node's UUID and process id (A-269, since 0.1.140; until then the router took
+   any name, and its lines printed it as it came, newlines included). A name starting with `RT.`
+   is accepted only from the router's own process, checked by the socket's peer PID
+   (`rt_name_allowed`).
 4. One live connection per UUID (`claim_node_uuid`). If another connection holds the UUID, the
    router waits up to 1 s (`DUPLICATE_HELLO_GRACE`) for it to go, then refuses the new one and logs
    `HELLO rejected: this node UUID already has a live connection`. The old connection keeps its

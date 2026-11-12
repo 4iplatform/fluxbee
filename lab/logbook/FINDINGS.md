@@ -468,7 +468,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
-- A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only; built on `coa/router-140` for 0.1.140, the other fields a node writes left to decide).
+- A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only; built on `coa/router-140` for 0.1.140 with its review's fixes, a failed connection's error line escaped on both local sockets; the other fields a node writes left to decide).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
@@ -4807,9 +4807,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   hive on each side of one `@`, each of ASCII letters, digits, `.`, `-` and `_`, at most 256 bytes
   in all (`NODE_NAME_MAX_BYTES`, the name field of the router's node table, which until then
   refused a longer name only after two lines had printed it). Any other name gets no ANNOUNCE and
-  its connection closes, with one warning, *"HELLO rejected: the node name is not an L2 name"*,
-  that shows the name quoted, escaped and cut at 128 bytes (the stream's `shown_field`), the
-  node's UUID and its process id. The HELLO's *"hello received"* line names the UUID once
+  its connection closes, with two warnings: *"HELLO rejected: the node name is not an L2 name"*,
+  that shows the name as the router judged it, its `@<hive>` added, quoted, escaped and cut at
+  128 bytes with its full length (the stream's `shown_field`), the node's UUID and its process
+  id; and the accept loop's *"node connection error"*, which names the rule and no part of the
+  name, as after any refused HELLO. The HELLO's *"hello received"* line names the UUID once
   `routing.src` parsed as it, no longer the string the node wrote. Every name a node runs under
   today fits: the orchestrator launches a node only under these characters with a hive id
   (`normalize_node_name_for_target`), and the system nodes', the router's, its stream's and the
@@ -4823,19 +4825,47 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   shape, `ops.py health`'s pattern matching each (*loading config snapshot*, *vpn assigned*,
   *node registered*, each `expired: 99999`). Docs: protocol.md §2.2, rt-gateway.md,
   routing-and-policy.md §2, architecture.md §3.1 and Archi's handbook §2.2.
+- **Its review (2026-11-12; read in the code), fixed on the same branch:**
+  - **The HELLO's own frame was a way in.** The frame is parsed before the name is checked, serde
+    names an unknown variant as its sender wrote it (`meta.action_class`, any enum of `Message`),
+    and the accept loop printed the error as it came (*"node connection error: {err}"*), so a
+    newline there still opened the stream's loss alarm. The sibling routers' socket admits the
+    same peers (the router's own user) and printed its error so too (*"peer connection error"*).
+    Both accept loops now end a failed connection with `log_connection_error`, its error quoted,
+    escaped and cut at 128 bytes (`shown_field`). Tests:
+    `a_hello_frame_that_does_not_parse_forges_no_line_on_either_local_socket` (with the old print,
+    two forged alarm lines, one per socket; none now) and the pin
+    `both_accept_loops_log_a_failed_connection_escaped`.
+  - The refusal shows the name as the router judged it, its `@<hive>` added: a name of 250 bytes
+    without `@` is refused for the 260 it has with the hive, and its line now says 260 (it said
+    250). The refusal's error says *"ASCII letters"*, as the rule is (it said *"letters"*), and
+    so do rt-gateway.md and routing-and-policy.md.
+  - The tests' journal could lose a line: a capture set as the thread's default, while it was
+    the only subscriber registered, let another test's thread that reached a callsite first cache
+    it as unwanted for every thread (tracing-core's `has_just_one`), so a parallel run could fail
+    the refusal's count or pass a "no such line" check with nothing captured. The router's tests,
+    the stream's among them, now capture through one global subscriber that writes to the
+    capturing thread's journal (`src/router/test_journal.rs`, the frontdesk's pattern);
+    `a_line_whose_callsite_another_thread_reached_first_is_kept` fails with the old capture (3 of
+    3 runs alone).
 - **Found while building it (2026-11-12; read in the code):** the name was one door of several. The
   router prints other fields a node writes with `%`, as they come: a message's `meta.type` on
   *"message received"* (every message from a local node, at INFO) and *"router received
   broadcast"*, its `routing.trace_id` on about twenty lines, a claimed `routing.src` on the
   `srcdrops` line itself; and journald splits a line longer than its `LineMax` (48K by default),
-  so a long field can open an entry of its own too. The reach is the name's (local nodes only), and
-  every local node runs as root, the router's own user, which can already write an entry that
-  `journalctl -u rt-gateway` shows through the journal's own protocol (a root sender's
-  `OBJECT_SYSTEMD_UNIT`, by systemd's `add_matches_for_unit`; not tried here): what is left is a
-  line's hygiene, not a hole. **To decide (the operator):** (a) rt-gateway's log writer keeps each
-  record one line, its control characters escaped and the record cut at 16 KiB, in one place for
-  every line, the router alone; (b) the same in the Rust SDK's `logging`, for every Rust binary,
-  IO.cloud's `op` among them, with the Rust SDK's release; (c) leave it. Proposed: (b).
+  so a long field can open an entry of its own too. The WAN link prints its errors as they come
+  too (its review, 2026-11-12): *"wan connection error"* a peer's HELLO that does not parse, and
+  *"wan uplink error"* a hub's `WAN_REJECT` reason and message; their sender is another hive's
+  router, authenticated under `wan.mtls: required` (the value unless a hive sets another), any
+  peer that reaches the port under `permissive` or `disabled`. Elsewhere the reach is the name's,
+  the local nodes, and every local node runs as root, the router's own user, which can already
+  write an entry that `journalctl -u rt-gateway` shows through the journal's own protocol (a root
+  sender's `OBJECT_SYSTEMD_UNIT`, by systemd's `add_matches_for_unit`; not tried here): what is
+  left is a line's hygiene, not a hole. **To decide (the operator):** (a) rt-gateway's log
+  writer keeps each record one line, its control characters escaped and the record cut at 16 KiB,
+  in one place for every line, the router alone; (b) the same in the Rust SDK's `logging`, for
+  every Rust binary, IO.cloud's `op` among them, with the Rust SDK's release; (c) leave it.
+  Proposed: (b).
 - **IO.cloud's `op`** stays for IO.cloud's next change, or (b) above: the router's release goes
   alone (METHOD §9).
 

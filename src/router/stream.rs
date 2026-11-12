@@ -2070,29 +2070,15 @@ mod tests {
         assert!(!line.contains("refused"));
     }
 
-    /// What `log` writes to the router's journal while it runs, as plain text.
+    /// What `log` writes to the router's journal while it runs, as plain text (the router's test
+    /// journal, which loses no line to another test's thread).
     fn journal_of(log: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Journal(Arc<StdMutex<Vec<u8>>>);
-        impl Write for Journal {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().expect("the journal").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
+        let journal = crate::router::test_journal::TestJournal::default();
+        {
+            let _capture = journal.capture();
+            log();
         }
-        let journal = Journal::default();
-        let writer = journal.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, log);
-        let text = journal.0.lock().expect("the journal").clone();
-        String::from_utf8(text).expect("text")
+        journal.text()
     }
 
     /// A-253: the records too big for a batch are handed to their sender to name, at most

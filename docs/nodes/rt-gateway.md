@@ -67,13 +67,19 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   big-endian length plus JSON, at most 128 KiB (`MAX_FRAME_SIZE` in
   `crates/fluxbee_sdk/src/socket/connection.rs`). The first frame must be a `HELLO` whose
   `payload.uuid` equals `routing.src`. Its name, with `@<hive>` added when it has none, must be
-  an L2 name: letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes
+  an L2 name: ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes
   (`is_l2_node_name`); any other is refused before a line prints it or a table takes it, with
-  `HELLO rejected: the node name is not an L2 name` showing the name quoted, escaped and cut at
-  128 bytes, the node's UUID and the process id (A-269, since 0.1.140). `RT.*` names are accepted
-  only from the router's own process (`rt_name_allowed`, by the peer's PID). The router's own
-  name, from `JSR_ROUTER_NAME` or `wan.gateway_name`, must be an L2 name too: its stream connects
-  under it with `.stream` added (`RT.gateway.stream@<hive>`).
+  `HELLO rejected: the node name is not an L2 name` showing the name as judged (its `@<hive>`
+  added) quoted, escaped and cut at 128 bytes with its full length, the node's UUID and the
+  process id (A-269, since 0.1.140). `RT.*` names are accepted only from the router's own process
+  (`rt_name_allowed`, by the peer's PID). The router's own name, from `JSR_ROUTER_NAME` or
+  `wan.gateway_name`, must be an L2 name too: its stream connects under it with `.stream` added
+  (`RT.gateway.stream@<hive>`). A connection that fails ends with the warning `node connection
+  error`, its error quoted, escaped and cut at 128 bytes (`log_connection_error`), a refused
+  HELLO's after the refusal's own; one on the IRP socket ends with `peer connection error` the
+  same way. A frame that does not parse is named by what its sender wrote (serde's unknown
+  variant), so until 0.1.140 a newline in it opened a line of the sender's choosing (A-269's
+  review).
 - **IRP socket** `irp-<uuid hex>.sock` in the same directory, mode 0600: the link between
   routers of the same hive, which only the unsupported several-routers mode uses. Every 5 s a
   router looks in `/dev/shm` for live regions of other routers of its hive and the one with the

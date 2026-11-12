@@ -1,6 +1,8 @@
 mod link;
 pub mod stream;
 pub mod system_policy;
+#[cfg(test)]
+mod test_journal;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -411,7 +413,7 @@ impl Router {
                     )
                     .await
                     {
-                        tracing::warn!("peer connection error: {err}");
+                        log_connection_error("peer", &err);
                     }
                 });
             }
@@ -592,7 +594,7 @@ impl Router {
                 )
                 .await
                 {
-                    tracing::warn!("node connection error: {err}");
+                    log_connection_error("node", &err);
                 }
             });
         }
@@ -661,11 +663,11 @@ async fn handle_node(
 
     let node_name = normalize_name(&payload.name, hive_id);
     // Before any line prints the name: until 0.1.140 a name with a newline wrote a line of its
-    // sender's choosing into the router's journal (A-269). The refused name is shown quoted,
-    // escaped and cut.
+    // sender's choosing into the router's journal (A-269). The refused name is shown as it was
+    // judged, its `@<hive>` added, quoted, escaped and cut, its full length after the quotes.
     if !is_l2_node_name(&node_name) {
         tracing::warn!(
-            name = %stream::shown_field(&payload.name),
+            name = %stream::shown_field(&node_name),
             uuid = %node_uuid,
             peer_pid = ?peer_pid,
             "HELLO rejected: the node name is not an L2 name"
@@ -674,8 +676,8 @@ async fn handle_node(
         return Err(RouterError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "the node name is not an L2 name: letters, digits, '.', '-' and '_' on each side \
-                 of one '@', at most {NODE_NAME_MAX_BYTES} bytes"
+                "the node name is not an L2 name: ASCII letters, digits, '.', '-' and '_' on each \
+                 side of one '@', at most {NODE_NAME_MAX_BYTES} bytes"
             ),
         )));
     }
@@ -5869,6 +5871,19 @@ fn local_peer_admitted(stream: &UnixStream, own_uid: u32) -> bool {
     false
 }
 
+/// The line a connection on one of this router's sockets ends with when its handler failed,
+/// `link` naming the socket (`node`, `peer`): the error quoted, escaped and cut as the stream names
+/// a record (`stream::shown_field`). A frame that does not parse is named by what its sender wrote
+/// (serde's unknown variant, `meta.action_class` say), so until 0.1.140 a newline in it opened a
+/// line of the sender's choosing in the router's journal, the HELLO's own frame included (A-269's
+/// review).
+fn log_connection_error(link: &str, err: &RouterError) {
+    tracing::warn!(
+        error = %stream::shown_field(&err.to_string()),
+        "{link} connection error"
+    );
+}
+
 struct NodeHandle {
     name: String,
     vpn_id: u32,
@@ -8166,6 +8181,7 @@ async fn read_memory_snapshot_for_delivery(
 #[cfg(test)]
 mod tests {
     use super::link::{LINK_QUEUE_MAX_FRAMES, LINK_QUEUE_SENDERS_BYTES, LINK_QUEUE_SENDERS_FRAMES};
+    use super::test_journal::TestJournal;
     use super::*;
     use crate::shm::{
         IdentityHeaderSnapshot, IdentitySnapshot, IlkAliasEntry, IlkEntry,
@@ -12293,96 +12309,199 @@ mod tests {
         assert!(!body.contains("%payload.name"));
     }
 
-    /// What the router logs on this thread while the guard lives, as plain text with no time. A
-    /// `#[tokio::test]` runs its spawned tasks on its own thread, so a connection's lines are in it.
-    #[derive(Clone, Default)]
-    struct TestJournal(Arc<std::sync::Mutex<Vec<u8>>>);
+    /// The stream's loss alarm as a forged line would open it in the router's journal: the shape
+    /// `lab/ops.py health` sums.
+    const FORGED_ALARM: &str = concat!(
+        "2026-11-12T00:00:00.000000Z  WARN json_router::router::stream: ",
+        "router stream lost records in the last 30 s: expired: 99999"
+    );
 
-    impl io::Write for TestJournal {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("the journal").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl TestJournal {
-        fn capture(&self) -> tracing::subscriber::DefaultGuard {
-            let writer = self.clone();
-            tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(move || writer.clone())
-                    .with_ansi(false)
-                    .without_time()
-                    .finish(),
-            )
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().expect("the journal").clone()).expect("text")
-        }
+    /// How many lines of `text` `lab/ops.py health` counts as the stream's loss alarm: its pattern
+    /// (`HEALTH_SCRIPT`) opens the line.
+    fn alarm_lines(text: &str) -> usize {
+        let alarm =
+            regex::Regex::new(r"^[^ ]+ +WARN [^ ]+: router stream lost records in the last")
+                .expect("pattern");
+        text.lines().filter(|line| alarm.is_match(line)).count()
     }
 
     /// A-269: a HELLO whose name is no L2 name is refused before any line prints the name, and the
-    /// line that refuses it shows the name quoted and escaped. Before, the router registered it, and
-    /// its *"loading config snapshot"* line wrote the name's newline as it is: the line after it
-    /// was the stream's loss alarm, of the shape `lab/ops.py health` sums.
+    /// line that refuses it shows the name as the router judged it, its `@<hive>` added, quoted,
+    /// escaped and cut at its judged length. Before, the router registered it, and its *"loading
+    /// config snapshot"* line wrote the name's newline as it is: the line after it was the stream's
+    /// loss alarm, of the shape `lab/ops.py health` sums. A name of 250 bytes without `@` is
+    /// refused for the 260 it has with the hive, and its line says 260 (A-269's review: it said
+    /// 250).
     #[tokio::test]
     async fn a_hello_whose_name_is_not_an_l2_name_is_refused_before_a_line_prints_it() {
         let journal = TestJournal::default();
         let _capture = journal.capture();
         let shm = TestShm::new("rt-l2name");
         let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
-        let forged = concat!(
-            "2026-11-12T00:00:00.000000Z  WARN json_router::router::stream: ",
-            "router stream lost records in the last 30 s: expired: 99999"
-        );
-        let name = format!("AI.evil\n{forged}");
-        let uuid = Uuid::new_v4();
-        let (refused, connection) = hello(&shm, &nodes, uuid, &name).await;
-        assert!(refused.is_none(), "no ANNOUNCE");
-        let ended = time::timeout(Duration::from_secs(5), connection)
-            .await
-            .expect("the refused connection ends")
-            .expect("join");
-        assert!(ended.is_err());
-        assert_eq!(holder_name(&nodes, uuid).await, None, "nothing registered");
-        let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
-        assert!(
-            snapshot
-                .nodes
-                .iter()
-                .all(|node| node.uuid != *uuid.as_bytes()),
-            "and nothing in the node table"
-        );
+        let name = format!("AI.evil\n{FORGED_ALARM}");
+        let judged = format!("{name}@motherbee");
+        let short = format!("AI.{}", "x".repeat(250 - "AI.".len()));
+        let mut refused_uuids = Vec::new();
+        for sent in [name.as_str(), short.as_str()] {
+            let uuid = Uuid::new_v4();
+            let (refused, connection) = hello(&shm, &nodes, uuid, sent).await;
+            assert!(refused.is_none(), "no ANNOUNCE");
+            let err = time::timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("the refused connection ends")
+                .expect("join")
+                .expect_err("refused");
+            // What the accept loop logs after the refusal: the rule, no part of the name.
+            assert_eq!(
+                err.to_string(),
+                "io error: the node name is not an L2 name: ASCII letters, digits, '.', '-' and \
+                 '_' on each side of one '@', at most 256 bytes"
+            );
+            assert_eq!(holder_name(&nodes, uuid).await, None, "nothing registered");
+            let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
+            assert!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .all(|node| node.uuid != *uuid.as_bytes()),
+                "and nothing in the node table"
+            );
+            refused_uuids.push(uuid);
+        }
 
         let text = journal.text();
-        // `lab/ops.py health`'s pattern for the alarm (`HEALTH_SCRIPT`): it opens the line.
-        let alarm =
-            regex::Regex::new(r"^[^ ]+ +WARN [^ ]+: router stream lost records in the last")
-                .expect("pattern");
-        assert!(
-            !text.lines().any(|line| alarm.is_match(line)),
-            "no forged alarm line: {text}"
-        );
+        assert_eq!(alarm_lines(&text), 0, "no forged alarm line: {text}");
         let refusals: Vec<&str> = text
             .lines()
             .filter(|line| line.contains("HELLO rejected: the node name is not an L2 name"))
             .collect();
-        assert_eq!(refusals.len(), 1, "{text}");
-        // Quoted, its newline escaped, cut at 128 bytes with its length after the quotes.
+        assert_eq!(refusals.len(), 2, "{text}");
+        let refusal_of = |uuid: Uuid| {
+            refusals
+                .iter()
+                .find(|line| line.contains(&format!("uuid={uuid}")))
+                .unwrap_or_else(|| panic!("the refusal of {uuid}: {text}"))
+        };
+        let forged = refusal_of(refused_uuids[0]);
+        // Quoted, its newline escaped, cut at 128 bytes with its judged length after the quotes.
         assert!(
-            refusals[0].contains(r#"name="AI.evil\n2026-11-12T00:00:00.000000Z  WARN "#),
+            forged.contains(r#"name="AI.evil\n2026-11-12T00:00:00.000000Z  WARN "#),
             "{text}"
         );
         assert!(
-            refusals[0].contains(&format!("name={}", stream::shown_field(&name))),
+            forged.contains(&format!("name={}", stream::shown_field(&judged))),
             "{text}"
         );
-        assert!(name.len() > 128 && refusals[0].contains(&format!("... ({} bytes)", name.len())));
+        assert!(judged.len() > 128 && forged.contains(&format!("... ({} bytes)", judged.len())));
+        assert_eq!(short.len(), 250);
+        assert!(
+            refusal_of(refused_uuids[1]).contains("... (260 bytes)"),
+            "the name as judged, with its hive: {text}"
+        );
         assert!(!text.contains("loading config snapshot"), "{text}");
+    }
+
+    /// A-269's review: a HELLO frame that does not parse ends its connection with one line on
+    /// either local socket, its error quoted, escaped and cut. serde names an unknown variant as
+    /// its sender wrote it, and until then both accept loops printed the error as it came, so a
+    /// newline in `meta.action_class` opened the stream's loss alarm in the router's journal. The
+    /// two sockets admit the same peers, the router's own user (`local_peer_admitted`).
+    #[tokio::test]
+    async fn a_hello_frame_that_does_not_parse_forges_no_line_on_either_local_socket() {
+        let journal = TestJournal::default();
+        let _capture = journal.capture();
+        let shm = TestShm::new("rt-badframe");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let class = format!("x\n{FORGED_ALARM}");
+        let frame = |src: Uuid| {
+            serde_json::to_vec(&serde_json::json!({
+                "routing": {"src": src.to_string(), "dst": null, "ttl": 1, "trace_id": "t"},
+                "meta": {"type": SYSTEM_KIND, "msg": MSG_HELLO, "action_class": class},
+                "payload": {"uuid": src.to_string(), "name": "AI.probe", "version": "1"},
+            }))
+            .expect("frame")
+        };
+        let mut errors = Vec::new();
+        for link in ["node", "peer"] {
+            let (mut client, server) = UnixStream::pair().expect("socket pair");
+            let connection = if link == "node" {
+                spawn_node_connection(server, &shm, &nodes)
+            } else {
+                spawn_sibling_link(server, &shm, &peers)
+            };
+            write_frame(&mut client, &frame(Uuid::new_v4()))
+                .await
+                .expect("hello");
+            let err = time::timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("the connection ends")
+                .expect("join")
+                .expect_err("a frame that does not parse");
+            assert!(matches!(err, RouterError::Json(_)), "{err}");
+            assert!(
+                err.to_string().contains(&class),
+                "serde names the variant as written: {err}"
+            );
+            // As its accept loop does (`both_accept_loops_log_a_failed_connection_escaped`).
+            log_connection_error(link, &err);
+            errors.push((link, err));
+        }
+        assert!(nodes.lock().await.is_empty() && peers.lock().await.is_empty());
+
+        let text = journal.text();
+        assert_eq!(alarm_lines(&text), 0, "no forged alarm line: {text}");
+        for (link, err) in &errors {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains(&format!("{link} connection error")))
+                .collect();
+            assert_eq!(lines.len(), 1, "{text}");
+            assert!(
+                lines[0].contains(
+                    r#"error="json error: unknown variant `x\n2026-11-12T00:00:00.000000Z  WARN "#
+                ),
+                "quoted, its newline escaped: {text}"
+            );
+            let shown = err.to_string();
+            assert!(shown.len() > 128, "{shown}");
+            assert!(
+                lines[0].contains(&format!("error={}", stream::shown_field(&shown)))
+                    && lines[0].ends_with(&format!("... ({} bytes)", shown.len())),
+                "cut at 128 bytes, its length after the quotes: {text}"
+            );
+        }
+    }
+
+    /// Pins A-269's review: both accept loops of `Router::run` end a failed connection with
+    /// `log_connection_error`, which shows its error quoted, escaped and cut, and neither prints an
+    /// error as it came.
+    #[test]
+    fn both_accept_loops_log_a_failed_connection_escaped() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("    pub async fn run(&self)")
+            .expect("Router::run");
+        let end = start
+            + src[start..]
+                .find("\n    }\n}\n")
+                .expect("end of Router::run");
+        let body = &src[start..end];
+        for (serve, logged) in [
+            (
+                "handle_peer_incoming(",
+                "log_connection_error(\"peer\", &err);",
+            ),
+            ("handle_node(", "log_connection_error(\"node\", &err);"),
+        ] {
+            let served = body.find(serve).expect(serve);
+            assert!(
+                body[served..].contains(logged),
+                "{serve} ends with {logged}"
+            );
+        }
+        assert_eq!(body.matches("log_connection_error(").count(), 2);
+        assert!(!body.contains("connection error: {err}"));
     }
 
     /// A-269: the bound is the node table's. A name of 256 bytes registers, there and in the
@@ -12450,19 +12569,17 @@ mod tests {
         link.write_all(&[0u8; 10]).await.expect("part of the body");
     }
 
-    /// A-203, the link between sibling routers, the side that accepts it: a link that ends in a
-    /// read error is cleaned up like one that ends in EOF. Before, its entry stayed, and while it
-    /// stayed no link with that router could be set up again.
-    #[tokio::test]
-    async fn an_accepted_sibling_link_that_ends_in_a_read_error_is_cleaned_up() {
-        let shm = TestShm::new("rt-irpacc");
-        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
-        let sibling = Uuid::new_v4();
-        let (mut client, server) = UnixStream::pair().expect("socket pair");
-        let link = tokio::spawn(handle_peer_incoming(
+    /// `handle_peer_incoming` on `server`, the side that accepts a sibling's link, for a motherbee
+    /// router with no nodes, config or policy.
+    fn spawn_sibling_link(
+        server: UnixStream,
+        shm: &TestShm,
+        peers: &Arc<Mutex<HashMap<Uuid, PeerHandle>>>,
+    ) -> tokio::task::JoinHandle<Result<(), RouterError>> {
+        tokio::spawn(handle_peer_incoming(
             server,
             Uuid::new_v4(),
-            Arc::clone(&peers),
+            Arc::clone(peers),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
@@ -12481,7 +12598,19 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             stream::StreamHandle::detached(),
             false,
-        ));
+        ))
+    }
+
+    /// A-203, the link between sibling routers, the side that accepts it: a link that ends in a
+    /// read error is cleaned up like one that ends in EOF. Before, its entry stayed, and while it
+    /// stayed no link with that router could be set up again.
+    #[tokio::test]
+    async fn an_accepted_sibling_link_that_ends_in_a_read_error_is_cleaned_up() {
+        let shm = TestShm::new("rt-irpacc");
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sibling = Uuid::new_v4();
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let link = spawn_sibling_link(server, &shm, &peers);
         write_frame(&mut client, &router_hello_frame(sibling))
             .await
             .expect("hello");
