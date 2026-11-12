@@ -296,6 +296,21 @@ no change required
     workers"*): the 61 retired system ILKs of removed hives purged, each first read free of history;
     SY.policy's 2 stay retired (A-191).
 
+30. **The bug push (the operator, 2026-11-12: *"cerraría con un empujón más, resolviendo todo lo que
+    tiene que ver con nodos SY. RT. WF. AI ... y al menos resolver los más graves"*; IO only where a
+    test needs it; then the IO family, applied to io.slack to close it).** From the state review of
+    2026-11-12 (66 open items, a top 10 verified in the code). The operator's calls of the day:
+    A-329, A-304, A-307, A-124, A-313 (left as it is) and A-317 (recorded in each entry). Releases,
+    one per binary group, the SDKs each alone: 0.1.139 the binaries (SY.admin: A-312, A-297, A-304,
+    A-305, A-306, A-316, A-318, A-319, A-324, A-328; the orchestrator: A-296, A-299, A-300, A-301,
+    A-308, A-310, A-330, A-331; Archi: A-124, A-315, A-320, A-321; SY.frontdesk.gov: A-303;
+    SY.cognition: A-332; SY.edge: A-317; SY.timer: A-326; the WF engine and SY.wf-rules: A-302,
+    A-307, A-333); then the router alone (A-269); the Go SDK alone (A-329 with SY.timer's resend,
+    A-264); the AI SDK alone (A-294, A-290, A-325, `tool_choice` for A-327); the Rust SDK alone
+    (A-295, A-309, A-285's `cloud.rs` text). Lab: B-18 (the template). Out of it, by decision or as
+    large topics: A-159/A-275/A-276 (deletion), A-137/A-227 (cognition), A-142 (with io.web), A-168,
+    the parked security items, A-289, A-199 step 2, A-250 (b), A-210 (after 2026-11-22).
+
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
 1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
@@ -1615,6 +1630,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, to decide (the Go SDK, alone):** backpressure instead of a drop, so the router's per-link
   queue answers `LINK_BUSY` (A-222), or `NOT_TAKEN` to the sender; system messages must not wait
   behind user ones.
+- **The operator's call (2026-11-12):** *"Avisar al que mandó"*: the Go SDK answers `NOT_TAKEN`
+  (retryable) to the sender for each message that does not fit, its buffer grows, and SY.timer sends
+  again a fire it gets `NOT_TAKEN` for; system messages never wait behind user ones. The Go SDK's
+  own release (SY.timer's resend with it), in the bug push of item 30.
 
 ### A-328 [General/admin] 🔵 low (found 2026-11-12 by A-322's review; read in the code) — SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next`
 
@@ -1818,6 +1837,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (to decide):** keep the older grace token when the current one was never used; close
   the old edge's door when the door moves; or record `io.edge_node` before the externalize mints,
   so a failed record rotates nothing.
+- **The operator's call (2026-11-12):** the rotation mechanism complete, in the right order:
+  `io.edge_node` recorded before the externalize mints, so a failed record rotates nothing; and the
+  old edge's door closed when the door moves to another edge. No grace-token extension: *"no pongas
+  cosas raras para resolver el problema de que el cloud pierda el token que ya tenía aprobado,
+  porque eso es mecanismo distinto"*. A topic of its own for the Cloud track, to review: how Fluxbee
+  Cloud gets a new token when it was already registered. In the bug push (item 30).
 
 ### A-316 [General/admin] 🔵 low (found 2026-11-11 by A-273's review; read in the code, not run; there before it) — An edge channel's bearer can be read back through `vault_assign` then `vault_get`
 
@@ -1914,6 +1939,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (to decide):** the Syncthing watch and the peer reconcile run in a task or loop of
   their own, as `run_syncthing_options_switch_loop` already does; a structural change to the
   watchdog.
+- **The operator's call (2026-11-12):** left as it is. *"este es un tema general, podría pasar
+  con cualquier nodo del sistema, acá lo que hay que hacer es reintentar y log, lo que sí no puede
+  pasar es tomar acciones globales sobre lo que ocurra, solo acciones sobre el nodo o herramienta que
+  tenga problemas. no sirve watchdog de watchdog"*; if Syncthing failing stopped Fluxbee, a talk. It
+  does not: the running services go on, and only the restart of another core service that fails
+  meanwhile waits up to about 35 s instead of 5 s, while Syncthing cannot come up. The principle, for
+  every node and tool: on a failure, retry and log, act only on the one that fails, never globally.
 
 ### A-312 [General/runtimes] 🔵 low (found 2026-11-11 by A-287's review; read in the code; there before it) — A version with build metadata (`1.2.0+b1`) is published, then breaks every node built on it and cannot be removed
 
@@ -2027,6 +2059,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   refused at once, nothing changed, with a retryable `BUSY` (SY.admin maps it to 409; its help and
   Archi's handbook would name it); or (b) the requests run at the same time, with a lock per
   workflow.
+- **The operator's call (2026-11-12):** (a): a change whose turn comes with less than about 20 s
+  left is refused at once, nothing changed, with a retryable `BUSY` (SY.admin's 409; its help and
+  Archi's handbook name it). In the bug push (item 30).
 
 ### A-306 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it) — A version's removal holds the manifest lock through its read of every hive's use, and a publish waits on it with no bound
 
@@ -2073,6 +2108,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   published; the shared current would still move between hives; (c) SY.wf-rules refuses a
   compile while the dist holds another hive's versions of `wf.<x>`, naming them; (d) a docs rule
   only. The review recommends (a), with this item.
+- **The operator's call (2026-11-12):** (a): SY.admin refuses a publish or a removal of `wf.<x>`
+  while another hive holds a `WF.<x>` config, connected or not. In the bug push (item 30).
 
 ### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
 
@@ -6785,6 +6822,10 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   receives `publish_cloud_endpoint`'s token, and Archi still stores whole executor responses,
   `result_preview` included, in its `messages` table. A-322's new turn takes an allowlist of each
   step's fields, never a step's answer copied, so the token does not reach that turn.
+- **The operator's call (2026-11-12):** *"Mostrar una vez, no guardar"*: Archi shows the token
+  once in the chat and stores it masked in its history (and so in the snapshots). The bug push's
+  verification (2026-11-12) read the AI-provider half as closed: SY.admin runs the step with no model
+  since 0.1.95, and A-322's report carries no token. In the bug push (item 30).
 
 ### A-123 ✅ VALIDATED ON 8.x (0.1.91, 2026-10-30) — A message on a running WF instance's thread drives it, whoever sends it
 
