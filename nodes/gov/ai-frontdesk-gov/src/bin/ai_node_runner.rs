@@ -3301,7 +3301,6 @@ async fn run_unconfigured_bootstrap(
     let gov_identity_bridge: Option<Arc<dyn IdentityCaller>> =
         Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
     let usage = UsageRecorder::start(dispatcher.clone());
-    let runtime_load = RuntimeLoad::new();
     let ai_node = GenericAiNode {
         node_name: node_name.clone(),
         self_ilk_id: self_ilk_id.clone(),
@@ -3316,14 +3315,14 @@ async fn run_unconfigured_bootstrap(
         vault,
         control_plane: Arc::new(RwLock::new(state)),
         usage,
-        runtime_load: runtime_load.clone(),
+        runtime_load: RuntimeLoad::new(),
     };
     // Now that the dispatcher/vault exist, resolve the AI token from SY.vault, waiting for a vault
     // that does not answer yet (up to VAULT_BOOT_WAIT, FINDINGS A-141), and flip to Configured
     // when present (autonomous SY.* pattern, cf. build_architect_ai_runtime). No token => stay
     // Unconfigured (degraded — the deterministic handoff still works).
     ai_node.boot_self_configure().await;
-    let runtime = NodeRuntime::new(dispatcher, ai_node).with_load(runtime_load);
+    let runtime = node_runtime(dispatcher, ai_node);
     // Its replies carry its own ILK (docs/router-stream-v1.md §6.2); a SY unit has no
     // FLUXBEE_NODE_ILK_ID, so the default would leave them without one.
     runtime
@@ -3333,6 +3332,17 @@ async fn run_unconfigured_bootstrap(
         })
         .await?;
     Ok(())
+}
+
+/// The node on its AI runtime, which counts its load into the node's own `runtime_load`, the one
+/// its `NODE_STATUS_GET` answer reads (FINDINGS A-290): the runner builds its runtime this way
+/// alone, so the node and its runtime never hold two loads.
+fn node_runtime(
+    dispatcher: Arc<RouterDispatcher>,
+    node: GenericAiNode,
+) -> NodeRuntime<GenericAiNode> {
+    let load = node.runtime_load.clone();
+    NodeRuntime::new(dispatcher, node).with_load(load)
 }
 
 #[derive(Debug, Default)]
@@ -4647,6 +4657,44 @@ mod tests {
         assert_eq!(configured["health_state"], json!("HEALTHY"));
         assert_eq!(configured["lifecycle_state"], json!("CONFIGURED"));
         assert!(configured.get("last_error").is_none());
+    }
+
+    /// A-290: the runner puts the frontdesk on its runtime with one load (`node_runtime`): once
+    /// the runtime runs, its status, asked through that runtime, carries the runtime's own load,
+    /// the bounds it was started with included. A runtime given no load, or another one, leaves
+    /// the status without it.
+    #[tokio::test]
+    async fn the_status_reads_the_load_of_the_runtime_the_node_runs_on() {
+        let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.frontdesk.gov@motherbee",
+            build_frontdesk_gov_rpc_profile().expect("rpc profile"),
+        );
+        let config = RuntimeConfig {
+            worker_pool_size: 3,
+            queue_capacity: 7,
+            self_ilk_id: None,
+            ..RuntimeConfig::default()
+        };
+        let running = tokio::spawn(node_runtime(dispatcher, test_node()).run_with_config(config));
+        harness
+            .inject(sample_request())
+            .await
+            .expect("the status request");
+        let answer = harness
+            .next_outgoing_within(Duration::from_secs(10))
+            .await
+            .expect("the status");
+        running.abort();
+        assert_eq!(
+            answer.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+        let load = &answer.payload["extensions"]["ai_runtime"];
+        assert_eq!(load["state"], json!("serving"), "{}", answer.payload);
+        assert_eq!(load["model_workers"], json!(3));
+        assert_eq!(load["queue_capacity"], json!(7));
+        // The status request itself runs on the direct lane.
+        assert_eq!(load["direct_running"], json!(1));
     }
 
     /// A-290: the status reports the AI runtime's load once the runtime runs, as

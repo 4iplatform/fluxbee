@@ -258,7 +258,8 @@ turns may still wait. `extensions.ai_runtime` also has `model_workers_busy` of `
 more than 4 workers serve. A node on an older `ai.generic` (`runtime.resolved_version` before
 0.1.142) reports none of this: its saturation is in its log only. An agent whose answer is larger
 than a message may carry (128 KiB) answers `ai_runtime_reply_too_large` instead (`retryable`
-false: the message ran) and goes on with the others; before 0.1.142 that stopped the node.
+false: the message ran), or nothing when the request's own context is what is too large (nor to a
+`system` or `admin` request), and goes on with the others; before 0.1.142 that stopped the node.
 
 ### 4.1.1 Agent tools
 
@@ -1795,21 +1796,21 @@ Archi should:
 - use `fluxbee_start_pipeline` for broad desired-state design
 - not mutate directly
 
-**After a confirmed plan runs** (FINDINGS A-322), you get one turn in which you call no tool, with
-the run and each step's answer: only the fields you may report, never a token, a link or a secret.
-Tell the operator, in the operator's language, what each step did: what is done; what stayed and why
-(a workflow's delete: §4.2.7's `packages_left`, each version with its `error_code` and `detail`,
-whether asking again may remove it and the hives not read); a refusal's code, its detail and whether
-asking again may pass (`retryable`, `unanswered_hives`, `next`); the pages that stay public and
-until when (§4.3.1); the `warning`; and the steps that did not run (`not_run`). A step
-`not_reported` is one the run's answer says nothing of (it was too large for one mesh frame, or the
-executor failed before its report): its outcome is not known here, so say that and offer to read
-SY.admin's command log (`/hives/motherbee/commands`), never that it ran or did not. An installation
-update's step is as you followed it after the run (§4.4.4). When `pages_left_up` has no `count` (its
-`error` says why) or `more` above 0, or a removal failed, the pages that stay public are not all
-named: say so and offer to read `/artifacts`. Never call a run a success when a step failed or
-something stayed. Offer what comes next as this handbook says (a plan the operator confirms in a
-later turn); this turn stages nothing.
+**After a confirmed plan runs** (FINDINGS A-322), you get one turn, with no tools, with the run
+and each step's answer: only the fields you may report, never a token, a link or a secret. Tell
+the operator, in the operator's language, what each step did: what is done; what stayed and why (a
+workflow's delete: §4.2.7's `packages_left`, each version with its `error_code` and `detail`,
+whether asking again may remove it and the hives not read); a refusal's code, its detail and
+whether asking again may pass (`retryable`, `unanswered_hives`, `next`); the pages that stay
+public and until when (§4.3.1); the `warning`; and the steps that did not run (`not_run`). A step
+`not_reported` is one the run's answer says nothing of (it was too large for one mesh frame, or
+the executor failed before its report): its outcome is not known here, so say that and offer to
+read SY.admin's command log (`/hives/motherbee/commands`), never that it ran or did not. An
+installation update's step is as you followed it after the run (§4.4.4). When `pages_left_up` has
+no `count` (its `error` says why) or `more` above 0, or a removal failed, the pages that stay
+public are not all named: say so and offer to read `/artifacts`. Never call a run a success when a
+step failed or something stayed. Offer what comes next as this handbook says (a plan the operator
+confirms in a later turn); this turn stages nothing.
 
 ### 6.5 Archi UI sections (rail + Messages)
 

@@ -221,8 +221,8 @@ let answer = result.final_assistant_text;
     did, so it reads their prompt cache. Anthropic caches tools, then system, then messages, and
     keeps the cached tools and system prompt across a change of `tool_choice`: the same tools and
     system prompt under `None` read what a turn under `Auto` cached, where a turn without the
-    tools writes its prompt to the cache again. Archi's explanation turn after a `CONFIRM` runs so
-    (docs/nodes/sy-architect.md).
+    tools writes its prompt to the cache again. No node sends `None` yet: Archi's explanation turn
+    after a `CONFIRM` is to, in SY.architect's first release after this one (FINDINGS A-327).
   - The runner runs no tool under `None`: a turn that returns a call anyway (the provider did not
     hold the model to it) ends the run with an error, and the call is never made.
   - The choices that force a call (Anthropic's `any` and `tool`, OpenAI's `required`) are not

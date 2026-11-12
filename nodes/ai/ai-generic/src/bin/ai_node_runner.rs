@@ -5698,7 +5698,6 @@ async fn run_managed_node(
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let usage = UsageRecorder::start(dispatcher.clone());
     let installation_file = installation_file_of_hive(Path::new(&node_config_dir));
-    let runtime_load = RuntimeLoad::new();
     let ai_node = GenericAiNode {
         node_name,
         self_ilk_id,
@@ -5714,7 +5713,7 @@ async fn run_managed_node(
         cognitive_definition: cognitive_definition.clone(),
         runtime_version,
         router: Some(dispatcher.clone()),
-        runtime_load: runtime_load.clone(),
+        runtime_load: RuntimeLoad::new(),
     };
     spawn_cognitive_definition_poll(
         ai_node.node_name.clone(),
@@ -5722,9 +5721,20 @@ async fn run_managed_node(
         cognitive_definition_config,
         cognitive_definition,
     );
-    let runtime = NodeRuntime::new(dispatcher, ai_node).with_load(runtime_load);
+    let runtime = node_runtime(dispatcher, ai_node);
     runtime.run_with_config(RuntimeConfig::default()).await?;
     Ok(())
+}
+
+/// The node on its AI runtime, which counts its load into the node's own `runtime_load`, the one
+/// its `NODE_STATUS_GET` answer reads (FINDINGS A-290): the runner builds its runtime this way
+/// alone, so the node and its runtime never hold two loads.
+fn node_runtime(
+    dispatcher: Arc<RouterDispatcher>,
+    node: GenericAiNode,
+) -> NodeRuntime<GenericAiNode> {
+    let load = node.runtime_load.clone();
+    NodeRuntime::new(dispatcher, node).with_load(load)
 }
 
 #[derive(Debug, Default)]
@@ -12524,6 +12534,44 @@ mod tests {
             node.control_plane.read().await.current_state,
             NodeLifecycleState::Unconfigured
         );
+    }
+
+    /// A-290: the runner puts the node on its runtime with one load (`node_runtime`): once the
+    /// runtime runs, the node's status, asked through that runtime, carries the runtime's own load,
+    /// the bounds it was started with included. A runtime given no load, or another one, leaves
+    /// the status without it.
+    #[tokio::test]
+    async fn the_status_reads_the_load_of_the_runtime_the_node_runs_on() {
+        let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.generic@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let config = RuntimeConfig {
+            worker_pool_size: 3,
+            queue_capacity: 7,
+            self_ilk_id: None,
+            ..RuntimeConfig::default()
+        };
+        let running = tokio::spawn(node_runtime(dispatcher, test_node()).run_with_config(config));
+        harness
+            .inject(sample_request())
+            .await
+            .expect("the status request");
+        let answer = harness
+            .next_outgoing_within(Duration::from_secs(10))
+            .await
+            .expect("the status");
+        running.abort();
+        assert_eq!(
+            answer.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+        let load = &answer.payload["extensions"]["ai_runtime"];
+        assert_eq!(load["state"], json!("serving"), "{}", answer.payload);
+        assert_eq!(load["model_workers"], json!(3));
+        assert_eq!(load["queue_capacity"], json!(7));
+        // The status request itself runs on the direct lane.
+        assert_eq!(load["direct_running"], json!(1));
     }
 
     /// A-290: the status reports the AI runtime's load once the runtime runs, as

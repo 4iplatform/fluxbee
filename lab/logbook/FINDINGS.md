@@ -489,7 +489,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
 - A-325 🟡 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; its Go sibling ✅ 0.1.141; ai.generic's and SY.frontdesk.gov's part with 0.1.142).
-- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect; both built on `coa/aisdk-142`, planned 0.1.142).
+- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect; the AI SDK's part built on `coa/aisdk-142`, planned 0.1.142; SY.architect's for its first release after it, its code in that branch's A-327 commit).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
@@ -2365,24 +2365,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** the AI SDK gains `tool_choice` (`none`), in a release of its own; then the turn
   sends Archi's same tools with `tool_choice` `none` (a `tool_choice` change keeps the
   tools-and-system cache).
-- **Built on `coa/aisdk-142` (planned 0.1.142, the AI SDK with SY.architect, A-294, A-290 and
-  A-325):** the AI SDK's `ToolChoice` (`Auto`, the default, and `None`), on
+- **Built on `coa/aisdk-142` (planned 0.1.142, the AI SDK alone, with A-294, A-290 and A-325),
+  the AI SDK's part:** its `ToolChoice` (`Auto`, the default, and `None`), on
   `FunctionCallingConfig` and each `FunctionModelTurnRequest`: under `None` Anthropic gets
   `tool_choice: {"type": "none"}` and OpenAI `tool_choice: "none"`; `Auto` sends nothing, so every
   other call's request is as before; a turn without tools sends none. The runner runs no tool under
   `None`: a turn that returns a call anyway ends the run with an error. Forced choices (`any`,
   `tool`, `required`) are left out: Claude Opus 5.5 and Sonnet 5.5 refuse them. The cache rule,
   checked against Anthropic's prompt-caching invalidation table: a `tool_choice` change keeps the
-  tools and system caches and invalidates only the messages'. SY.architect's explanation turn is
-  shown the chat's tools (`architect_chat_tools`, the chat's own registry, by their definitions
-  alone: `ShownTool`, which does nothing if called) under `ToolChoice::None`, so its prompt starts
-  with the tools and system prompt the chat's turn cached; its request now says the turn *calls no
-  tool*. Tests: the SDK's `every_turn_goes_with_the_runs_tool_choice`,
-  `a_run_whose_tool_choice_is_none_runs_no_tool`,
+  tools and system caches and invalidates only the messages'. Tests:
+  `every_turn_goes_with_the_runs_tool_choice`, `a_run_whose_tool_choice_is_none_runs_no_tool`,
   `an_anthropic_turn_under_tool_choice_none_starts_as_the_turns_before_it`,
-  `an_openai_turn_under_tool_choice_none_sends_none`; Archi's
+  `an_openai_turn_under_tool_choice_none_sends_none`. No node sends `None` in 0.1.142, so it is
+  checked by its tests alone.
+- **SY.architect's part, built on the same branch and taken out of it by its review** (the AI SDK
+  goes alone: board item 30 and the fix above), **for SY.architect's first release after
+  0.1.142; its code is in the branch's A-327 commit:** the explanation turn shown the chat's tools
+  (`architect_chat_tools`, the chat's own registry, by their definitions alone: `ShownTool`, which
+  does nothing if called) under `ToolChoice::None`, so its prompt starts with the tools and system
+  prompt the chat's turn cached; its request saying the turn *calls no tool*; Archi's tests
   `the_explanation_turn_gets_each_steps_answer_and_no_secret` (the chat's tools, under `None`) and
-  `a_turn_that_calls_a_shown_tool_runs_nothing_and_falls_back`. To check on 8.x: the
+  `a_turn_that_calls_a_shown_tool_runs_nothing_and_falls_back`; docs/nodes/sy-architect.md and
+  the handbook's §6.4. From the review, for that release: the turn's `token_usage` grows by the
+  tools' tokens (the AI SDK's `tokens_used` counts cache reads), while its cost falls from a cache
+  write of about 40,000 tokens to a cache read; and the cache lives 5 minutes from its last use,
+  the chat's last model call, with the executor's run before the explanation's call, so its gate
+  confirms within about 3 min of the chat's answer. To check on 8.x then: the
   `execution_report` usage record's `cache_read` about the 40,000 tokens it wrote before.
 
 ### A-326 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.timer 1.7's first start built the four list indexes and dropped the two old ones, in 876 ms on worker1; the walks' page medians through SY.admin 0.090 to 0.106 s against 0.106 to 0.129 s on 0.1.138, a schedule's round trip 23 ms against 53 ms (medians); the 16 MiB cache: worker1's sy-timer 24,028 kB resident against 19,764 kB; the clean's purge of 4,430 timers 1,194 ms) (found 2026-11-12 by A-278's review; read in the code, its query plan checked with SQLite; there before it, more pages since A-278; seen live by 0.1.138's gate) — Each `TIMER_LIST` page reads every pending timer of the hive
@@ -2640,7 +2648,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   none of its verbs goes to the `default` arm; `isInfrastructureMessage` does not name it), one per
   hive's SY.timer at each change and per secret at SY.vault's start, which SY.vault drops. Low;
   with SY.timer's next change (it leaves the broadcast unanswered, as the AI nodes and wf-generic
-  do).
+  do). Not on board item 30: SY.timer's 0.1.139 (`coa/timer-139`) was built before it was found.
+  It takes an A-number of its own when this branch is integrated, unless that release takes it
+  first.
 
 ### A-324 [General/admin] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.admin's help of `node_help`, read on 8.x, carries the new note: an AI node on ai.generic 0.1.136 or later answers at once however busy; the orchestrator's three are comments) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; since 0.1.136) — SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline
 
@@ -4325,7 +4335,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `a_load_whose_runtime_does_not_run_adds_nothing` (runtime.rs),
   `the_status_reads_the_saturated_runtime_it_was_given` (tests/runtime_lanes.rs, through
   `with_load`), and each runner's `node_status_reports_the_ai_runtimes_load`; each failing when
-  the status leaves the load out.
+  the status leaves the load out. From its review: each runner puts the node on its runtime in one
+  place, `node_runtime`, which hands the runtime the node's own load, and each runner's
+  `the_status_reads_the_load_of_the_runtime_the_node_runs_on` runs that runtime on the dispatcher's
+  test harness and asks its status through it (the load there, with the bounds the runtime was
+  started with), failing when the runtime is given no load or another one.
 
 ### A-289 [General/router] 🔵 low (found 2026-11-11 by the router's 0.1.134 builder and review; read in the code; there before it; several routers a hive, not supported) — A broadcast from a router that is not the gateway needs ttl 4 to cross the WAN
 

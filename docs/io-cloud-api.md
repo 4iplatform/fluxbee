@@ -759,10 +759,12 @@ You see a node's state, not how the hive runs it: no process, unit or host paths
 - `lifecycle_state`: `RUNNING`, `STARTING`, `STOPPED` or `FAILED`, from the hive itself, for every
   node; `UNKNOWN` while the hive cannot tell (its systemd did not answer for the node), never a
   `STOPPED` it did not see (0.1.133). Read it again.
-- `health_state`: what the node reports about itself. IO nodes are not all at the same stage, and
-  an older one may answer `UNKNOWN`. An AI node reads `DEGRADED` while it turns messages away for
-  load (its workers all busy and its queue full), and `HEALTHY` again 30 s after the last (since
-  0.1.142; before, it read `HEALTHY`).
+- `health_state`: in this list, the hive's own reading of the node, not the node's answer:
+  `HEALTHY` while it runs with its config in place, `ERROR` when that config is missing or invalid,
+  `UNKNOWN` when it is not running. `get_node_status` asks the IO node itself (`health_source`); IO
+  nodes are not all at the same stage, and an older one may answer `UNKNOWN`. An AI node of your
+  tenant reads here as the hive reads it: the load it reports since 0.1.142 (`DEGRADED` while it
+  turns messages away) reaches only the operator's own status read, never this API.
 - `identity.ilk_id` is what `list_tokens` shows in `assigned_ilks`.
 - `relaunch_on_boot: false` means it was stopped and stays stopped until `start_node`.
 - A hive whose nodes are missing from `nodes` is listed in `unreachable_hives`, never left out in
