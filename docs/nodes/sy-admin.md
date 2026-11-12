@@ -659,14 +659,17 @@ not read. Otherwise, with nothing removed:
 
 - **`409 RUNTIME_IN_USE`** while a node is listed, whatever else was not counted. The detail names
   each node, the first 20 of them, with its hive and lifecycle: `RUNNING`, `STARTING` (its unit
-  runs and the router does not see it yet) or `UNKNOWN` (systemd did not answer whether its unit
+  runs and the router does not see it yet), `UNKNOWN` (systemd did not answer whether its unit
   runs; it is listed until systemd answers that it does not: [SY.orchestrator](sy-orchestrator.md),
-  FINDINGS A-271). Before 0.1.133 it said "still running" of each.
-  `payload.usage_global_visible.running_nodes` lists them all, and `payload.unanswered_hives` the
-  hives not counted besides. Stop each node that runs on the version, or move it to another, then
-  ask again. A node whose unit does not run is not listed: stopped, failed, or between two restarts
-  of a crash loop. One relaunched later (`relaunch_on_boot`) fails to start once its version is
-  gone, so stop it (`kill_node`) or move it first.
+  FINDINGS A-271) or `RELAUNCH_DUE` (its unit does not run, failed or between two restarts of a
+  crash loop, and the orchestrator relaunches it on this version within a minute,
+  `relaunch_on_boot`: FINDINGS A-300, since 0.1.139). Before 0.1.133 it said "still running" of
+  each. `payload.usage_global_visible.running_nodes` lists them all, and `payload.unanswered_hives`
+  the hives not counted besides. Stop each node that runs on the version (`kill_node`, which also
+  clears `relaunch_on_boot`), or move it to another, then ask again. A node stopped through
+  `kill_node` is not listed, nor one that follows `current`, which a relaunch puts on the current
+  version; before 0.1.139 a pinned node due for a relaunch was not listed either, and failed to
+  start once its version was gone.
 - **`409 RUNTIME_USAGE_UNKNOWN`** when the use could not be read on every hive (FINDINGS A-281,
   since 0.1.133). `payload.unanswered_hives` names each hive not read, `{hive, reason, detail}`,
   the detail names them with their reasons, and `payload.retryable` says whether asking again,

@@ -306,7 +306,14 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   (`runtime_usage_lifecycle`). So SY.admin's `remove_runtime_version` refuses that version
   (`RUNTIME_IN_USE`) until systemctl answers that the unit does not run. Before, each of them read
   no answer as "not running": a remove stopped and purged a node that might run, and the usage
-  left out a node on its way up and any node systemctl gave no answer for.
+  left out a node on its way up and any node systemctl gave no answer for. Since 0.1.139 it also
+  lists, `RELAUNCH_DUE`, a node whose unit does not run (failed, or between two restarts of a
+  crash loop) that the 60 s reconcile relaunches on the version its config pins
+  (`pinned_node_relaunch_due`: `relaunch_on_boot` set, a pinned version, not following `current`,
+  no core or router name; FINDINGS A-300). It was left out, so the version could be removed with a
+  200 and the relaunch then failed (*"unable to resolve runtime version"*). A node stopped through
+  `kill_node` (which clears `relaunch_on_boot`), and one that follows `current`, relaunched on the
+  manifest's current, which SY.admin never removes, are not listed.
 - **A runtime's use across the hives** (FINDINGS A-281, since 0.1.133). A `get_runtime`
   (`GET_RUNTIME`) answers, beside its hive's `usage`, `usage_global_visible`: on a spoke its own
   usage again; on the motherbee its nodes and those of the other hives of its registry, all asked

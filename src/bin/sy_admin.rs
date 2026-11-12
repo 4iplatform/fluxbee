@@ -17875,7 +17875,7 @@ const NODE_UNIT_UNANSWERED_NOTE: &str = "502 SERVICE_FAILED with retryable: true
 const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and the router sees the node), STARTING (its unit runs and the router does not see it yet), STOPPED, FAILED or UNKNOWN. UNKNOWN: the hive's systemd gave no full answer for the node's unit, whether it runs or, when it does not run, whether it failed (FINDINGS A-271, since 0.1.133): read it again, and never take it for STOPPED. A managed node whose unit does not run and that has no config or state left reads UNKNOWN too, every time.";
 
 /// What `remove_runtime_version` refuses, nothing removed.
-const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. A node whose unit does not run is not listed (stopped, failed, or between two restarts of a crash loop): one relaunched later (relaunch_on_boot) fails to start once its version is gone, so stop it (kill_node) or move it first.";
+const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. Since 0.1.139 a node pinned to the version whose unit does not run (failed, or between two restarts of a crash loop) and that the orchestrator relaunches on it within a minute (relaunch_on_boot) is listed too, as RELAUNCH_DUE (FINDINGS A-300): stop it (kill_node, which clears relaunch_on_boot) or move it first. A node stopped through kill_node is not listed, nor one that follows current.";
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
 /// What `vault_get` and `vault_assign` say of the secrets only an edge reads (FINDINGS A-316).
@@ -19798,7 +19798,8 @@ fn registry_hive_info(registry: &HiveRegistry, hive: &str) -> Option<serde_json:
 /// (`global_visible_runtime_usage_summary` in src/bin/sy_orchestrator.rs) lists in `running_nodes`
 /// the nodes of every hive pinned to the version whose unit may run, each with its `hive` and
 /// `lifecycle` (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN,
-/// systemd did not answer for its unit: FINDINGS A-271), and in `skipped_hives` the hives whose
+/// systemd did not answer for its unit: FINDINGS A-271; RELAUNCH_DUE, its unit does not run and the
+/// orchestrator relaunches it on the version: FINDINGS A-300), and in `skipped_hives` the hives whose
 /// nodes it did not count. Only a read that counted every hive that may run a node on a runtime,
 /// and lists no node, lets the version go.
 #[derive(Debug)]
@@ -20079,8 +20080,9 @@ fn runtime_version_removable(
 }
 
 /// `RUNTIME_IN_USE`'s detail: each node listed (the first `RUNTIME_IN_USE_NODES_NAMED`) with its
-/// hive and lifecycle, what STARTING and UNKNOWN mean when one is listed, what to do, and the hives
-/// whose nodes were not counted. Before 0.1.133 it said only "still running" (FINDINGS A-285).
+/// hive and lifecycle, what STARTING, UNKNOWN and RELAUNCH_DUE (FINDINGS A-300, since 0.1.139)
+/// mean when one is listed, what to do, and the hives whose nodes were not counted. Before 0.1.133
+/// it said only "still running" (FINDINGS A-285).
 fn runtime_in_use_detail(
     runtime: &str,
     runtime_version: &str,
@@ -20129,6 +20131,12 @@ fn runtime_in_use_detail(
         detail.push_str(
             " UNKNOWN: its hive's systemd did not answer whether its unit runs, so it is listed \
              until systemd answers that it does not.",
+        );
+    }
+    if listed("RELAUNCH_DUE") {
+        detail.push_str(
+            " RELAUNCH_DUE: its unit does not run now, and the orchestrator relaunches it on this \
+             version within a minute (relaunch_on_boot): kill_node stops it for good.",
         );
     }
     detail.push_str(
@@ -39016,6 +39024,25 @@ mod tests {
         );
         assert!(!detail.contains("still running"));
 
+        // FINDINGS A-300: a pinned node the orchestrator relaunches, its unit down for now.
+        let usage = global_usage(
+            json!([running_node("WF.billing@worker1", "RELAUNCH_DUE")]),
+            json!([]),
+        );
+        let (_, body) = removal_decided_on(runtime_read_with_usage(usage))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            body["error_detail"],
+            json!(
+                "runtime 'ai.generic' version '0.3.1' is in use by 1 node: WF.billing@worker1 \
+                 (worker1, RELAUNCH_DUE). RELAUNCH_DUE: its unit does not run now, and the \
+                 orchestrator relaunches it on this version within a minute (relaunch_on_boot): \
+                 kill_node stops it for good. Stop each node that runs on this version, or move \
+                 it to another, then ask again."
+            )
+        );
+
         // One RUNNING node: no word on the states it does not have.
         let usage = global_usage(
             json!([running_node("AI.sales@worker1", "RUNNING")]),
@@ -39157,8 +39184,14 @@ mod tests {
         }
         assert!(!RUNTIME_REMOVAL_UNKNOWN_NOTE.contains("one at a time"));
         assert!(!RUNTIME_REMOVAL_UNKNOWN_NOTE.contains("payload.retryable is true"));
+        for words in [
+            "listed too, as RELAUNCH_DUE (FINDINGS A-300)",
+            "A node stopped through kill_node is not listed, nor one that follows current.",
+        ] {
+            assert!(RUNTIME_REMOVAL_IN_USE_NOTE.contains(words), "{words}");
+        }
         assert!(
-            RUNTIME_REMOVAL_IN_USE_NOTE.contains("A node whose unit does not run is not listed")
+            !RUNTIME_REMOVAL_IN_USE_NOTE.contains("A node whose unit does not run is not listed")
         );
         assert!(!admin_action_request_notes("reset_base_runtime")
             .join(" ")

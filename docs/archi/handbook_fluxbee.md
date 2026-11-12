@@ -1830,11 +1830,12 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
 - The package's own version is never removed (`RUNTIME_PACKAGE_VERSION`): it is the way back.
 - `remove_runtime_version` also refuses, removing nothing:
   - `RUNTIME_IN_USE` while a node runs on the version. Its detail names each node with its hive
-    and state: `RUNNING`, `STARTING` (its unit runs and the router does not see it yet) or
-    `UNKNOWN` (its hive's systemd did not answer; it stays listed until systemd answers). Tell the
-    operator which nodes, and that each must be stopped or moved to another version first. A node
-    whose unit does not run (stopped, failed, between two restarts) is not listed: relaunched
-    later, it fails to start once its version is gone.
+    and state: `RUNNING`, `STARTING` (its unit runs and the router does not see it yet),
+    `UNKNOWN` (its hive's systemd did not answer; it stays listed until systemd answers) or
+    `RELAUNCH_DUE` (its unit does not run, crashed or failed, and the orchestrator relaunches it on
+    this version within a minute). Tell the operator which nodes, and that each must be stopped
+    (`kill_node`) or moved to another version first. A node stopped with `kill_node` is not
+    listed.
   - `RUNTIME_USAGE_UNKNOWN` when some hive's nodes could not be read: `payload.unanswered_hives`
     names each hive and why. A worker that gave no answer within 10 s (`TIMEOUT`: its orchestrator
     stuck or restarting), one down or stale (`UNREACHABLE`), or one that could not read its nodes

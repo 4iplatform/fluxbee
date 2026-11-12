@@ -432,10 +432,11 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   workflow's first deploy) is counted by its nodes:
   - `running_nodes`: each node pinned to the version whose unit may run, on the motherbee and on
     each hive that answered, with its `hive` and `lifecycle` (`RUNNING`; `STARTING`, its unit runs
-    and the router does not see it yet; `UNKNOWN`, systemd did not answer for its unit). A node
-    whose unit does not run (stopped, failed, between two restarts of a crash loop) is not
-    listed: one relaunched later fails to start once its version is gone, so stop it
-    (`kill_node`) or move it first;
+    and the router does not see it yet; `UNKNOWN`, systemd did not answer for its unit), and,
+    since 0.1.139, each one whose unit does not run (failed, between two restarts of a crash loop)
+    that the orchestrator relaunches on that version within a minute (`RELAUNCH_DUE`: its config
+    keeps `relaunch_on_boot`; FINDINGS A-300): stop it (`kill_node`) or move it first. A node
+    stopped with `kill_node` is not listed, nor one that follows `current`;
   - `skipped_hives`: each hive whose use is unknown, with its `reason` and the `message` that came
     with it: `TIMEOUT` (no answer within 10 s: its orchestrator stopped or restarting while the
     LSA still shows it), `UNREACHABLE` (the request never reached it: down, or stale in the LSA),

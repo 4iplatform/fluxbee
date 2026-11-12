@@ -21498,23 +21498,46 @@ async fn local_runtime_snapshot(
 /// systemctl's answer for its unit (FINDINGS A-271): a unit that runs is RUNNING when the router
 /// sees the node and STARTING before it does (one starting, crash-looping or reconnecting, or any
 /// while this hive's LSA entry is stale); a unit systemctl gives no answer for is UNKNOWN, whatever
-/// the router sees. SY.admin's `remove_runtime_version` refuses a version while a node is listed,
-/// so neither a node the router does not see yet nor a check with no answer reads as "not in use";
-/// asked again, systemctl answers. Only a unit that runs asks the router.
+/// the router sees. A unit that does not run is RELAUNCH_DUE when the reconcile relaunches the node
+/// on the version its config pins (`relaunch_due`, `pinned_node_relaunch_due`; FINDINGS A-300):
+/// between two restarts of a crash loop, or failed, it is relaunched within 60 s. SY.admin's
+/// `remove_runtime_version` refuses a version while a node is listed, so neither a node the router
+/// does not see yet, nor a check with no answer, nor a pinned node about to be relaunched reads as
+/// "not in use"; asked again, systemctl answers. Only a unit that runs asks the router.
 fn runtime_usage_lifecycle(
     unit: ServiceActivity,
+    relaunch_due: bool,
     visible_in_router: impl FnOnce() -> bool,
 ) -> Option<&'static str> {
     match unit {
         ServiceActivity::Active if visible_in_router() => Some("RUNNING"),
         ServiceActivity::Active => Some("STARTING"),
         ServiceActivity::Unknown => Some("UNKNOWN"),
+        ServiceActivity::Inactive if relaunch_due => Some("RELAUNCH_DUE"),
         ServiceActivity::Inactive => None,
     }
 }
 
-/// This hive's nodes on `runtime` (pinned to `version_filter` when given) whose unit may run
-/// (`runtime_usage_lifecycle`), read from their configs: the runtime's `usage`. An error, never a
+/// Whether the reconcile relaunches `node_name`, whose managed config is `config`, on the version
+/// that config pins whenever its unit does not run (FINDINGS A-300): a node the reconcile takes
+/// (`persisted_custom_nodes`: its kind known, no core or router name), whose config has
+/// `relaunch_on_boot` and names its runtime and version, and that does not follow `current`
+/// (`PersistedManagedNode::follows_current`), since one that does is relaunched on the manifest's
+/// current, which SY.admin never removes. A stop through `kill_node` clears `relaunch_on_boot`.
+fn pinned_node_relaunch_due(node_name: &str, config: &serde_json::Value) -> bool {
+    let kind = node_kind_from_name(node_name);
+    if kind == "UNKNOWN" || !managed_reconcile_candidate_allowed(node_name) {
+        return false;
+    }
+    matches!(
+        persisted_managed_node_from_config_value(node_name, &kind, PathBuf::new(), config, true),
+        Ok(Some(node)) if !node.follows_current()
+    )
+}
+
+/// This hive's nodes on `runtime` (pinned to `version_filter` when given) whose unit may run, or
+/// that the reconcile relaunches on their pinned version (`runtime_usage_lifecycle`), read from
+/// their configs: the runtime's `usage`. An error, never a
 /// hive with no node, when the nodes' tree cannot be walked, and when a node's `config.json`
 /// cannot be read or parsed while its unit runs or systemctl gives no answer for it: which runtime
 /// that node runs on is then unknown, and the error names the node (FINDINGS A-281, the review;
@@ -21607,11 +21630,11 @@ fn local_runtime_usage_summary_with_root(
             }
 
             let unit = unit_from_node_name(&node_name);
-            let Some(lifecycle) =
-                runtime_usage_lifecycle((state.unit_checks.activity)(&unit), || {
-                    local_inventory_has_node(state, &node_name)
-                })
-            else {
+            let Some(lifecycle) = runtime_usage_lifecycle(
+                (state.unit_checks.activity)(&unit),
+                pinned_node_relaunch_due(&node_name, &config),
+                || local_inventory_has_node(state, &node_name),
+            ) else {
                 continue;
             };
 
@@ -56971,6 +56994,96 @@ blob:
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// FINDINGS A-300: a node pinned to a version whose unit does not run, between two restarts of
+    /// a crash loop or failed, and whose config has `relaunch_on_boot`, is relaunched by the 60 s
+    /// reconcile on that version. It was not listed, so a removal of the version answered 200 and
+    /// the relaunch failed (*"unable to resolve runtime version"*). It is listed `RELAUNCH_DUE`,
+    /// and SY.admin refuses the removal until it is stopped (`kill_node` clears the flag) or moved.
+    /// A node that follows `current` (relaunched on the manifest's current, which is never
+    /// removed), one stopped through `kill_node`, one whose config predates
+    /// `requested_runtime_version` (it follows `current`) and a core node's config are not listed.
+    #[test]
+    fn a_pinned_node_the_reconcile_relaunches_is_listed_as_its_versions_use() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-usage-relaunch-{}",
+            Uuid::new_v4().simple()
+        ));
+        let write = |kind: &str, node_name: &str, system: serde_json::Value| {
+            let dir = root.join(kind).join(node_name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("config.json"),
+                serde_json::json!({ "_system": system }).to_string(),
+            )
+            .unwrap();
+        };
+        let system = |relaunch: bool, requested: Option<&str>| {
+            let mut system = serde_json::json!({
+                "runtime": "wf.pinned.test",
+                "runtime_version": "0.0.1",
+                "relaunch_on_boot": relaunch,
+                "tenant_id": "tnt:test",
+            });
+            if let Some(requested) = requested {
+                system["requested_runtime_version"] = serde_json::json!(requested);
+            }
+            system
+        };
+        write(
+            "WF",
+            "WF.crashing.test@worker1",
+            system(true, Some("0.0.1")),
+        );
+        write(
+            "WF",
+            "WF.current.test@worker1",
+            system(true, Some("current")),
+        );
+        write(
+            "WF",
+            "WF.stopped.test@worker1",
+            system(false, Some("0.0.1")),
+        );
+        write("WF", "WF.legacy.test@worker1", system(true, None));
+        write("SY", "SY.timer@worker1", system(true, Some("0.0.1")));
+
+        let mut worker = usage_test_worker("worker1");
+        worker.unit_checks.activity = |_: &str| ServiceActivity::Inactive;
+        let answer =
+            local_runtime_usage_answer_with_root(&worker, &root, "wf.pinned.test", Some("0.0.1"));
+        assert_eq!(answer["status"], "ok", "{answer}");
+        assert_eq!(answer["usage"]["in_use"], true, "{answer}");
+        assert_eq!(
+            answer["usage"]["running_nodes"],
+            serde_json::json!([{
+                "node_name": "WF.crashing.test@worker1",
+                "hive": "worker1",
+                "runtime": "wf.pinned.test",
+                "runtime_version": "0.0.1",
+                "lifecycle": "RELAUNCH_DUE",
+            }]),
+            "{answer}"
+        );
+        // Another version is not this node's use.
+        let other =
+            local_runtime_usage_answer_with_root(&worker, &root, "wf.pinned.test", Some("0.0.2"));
+        assert_eq!(other["usage"]["running_count"], 0, "{other}");
+
+        // Its unit runs: as before, whatever the flag.
+        worker.unit_checks.activity = |_: &str| ServiceActivity::Active;
+        let running =
+            local_runtime_usage_answer_with_root(&worker, &root, "wf.pinned.test", Some("0.0.1"));
+        assert_eq!(running["usage"]["running_count"], 5, "{running}");
+        assert!(
+            running["usage"]["running_nodes"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().all(|node| node["lifecycle"] == "STARTING")),
+            "{running}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// FINDINGS A-281, the review: a node whose config.json cannot be read or parsed, while its
     /// unit runs or systemctl gives no answer for it, runs on a runtime nobody can name. The
     /// hive's read of its nodes then fails, naming it: a worker answers `USAGE_UNREADABLE`, and on
@@ -63954,16 +64067,35 @@ blob:
         assert_eq!(remove_instance_refusal(Inactive, false), None);
 
         // A runtime's usage lists every node whose unit may run: one the router does not see yet
-        // too, and one systemctl gives no answer for whatever the router sees.
-        assert_eq!(runtime_usage_lifecycle(Active, || true), Some("RUNNING"));
-        assert_eq!(runtime_usage_lifecycle(Active, || false), Some("STARTING"));
+        // too, and one systemctl gives no answer for whatever the router sees; and a node whose
+        // unit does not run that the reconcile relaunches on its pinned version (FINDINGS A-300).
+        for relaunch_due in [false, true] {
+            assert_eq!(
+                runtime_usage_lifecycle(Active, relaunch_due, || true),
+                Some("RUNNING")
+            );
+            assert_eq!(
+                runtime_usage_lifecycle(Active, relaunch_due, || false),
+                Some("STARTING")
+            );
+            assert_eq!(
+                runtime_usage_lifecycle(Unknown, relaunch_due, || panic!(
+                    "the router is not asked"
+                )),
+                Some("UNKNOWN")
+            );
+        }
         assert_eq!(
-            runtime_usage_lifecycle(Unknown, || panic!("the router is not asked")),
-            Some("UNKNOWN")
+            runtime_usage_lifecycle(Inactive, false, || panic!(
+                "not asked for a unit that is down"
+            )),
+            None
         );
         assert_eq!(
-            runtime_usage_lifecycle(Inactive, || panic!("not asked for a unit that is down")),
-            None
+            runtime_usage_lifecycle(Inactive, true, || panic!(
+                "not asked for a unit that is down"
+            )),
+            Some("RELAUNCH_DUE")
         );
 
         // A managed node with nothing on disk and nothing seen is gone only when systemctl answers
