@@ -1558,6 +1558,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   not given to the model.
 - **Today:** a secret is stored over SY.admin's HTTP API (`POST /hives/<hive>/vault/secrets`), not
   in a plan. Archi's handbook (§4.5.1) tells Archi to say so before it stages one.
+
 ### A-335 [General/orchestrator] 🔵 low (found 2026-11-12 by A-301's builder on `coa/orch-139`, numbered by its review; read in the code; there before it) — A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names
 
 - **Why:** a box the removal's cleanup did not reach (`remote_cleanup` other than `socket_ok`)
