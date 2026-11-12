@@ -1058,7 +1058,8 @@ ingress and io.web's on the motherbee say why.
 | `systemctl --failed`, `journalctl -u <unit>` | per host |
 
 `lab/ops.py health [--since HH:MM]` runs on every host and passes only when all of `failed`,
-`denials`, `srcdrops`, `streamlost`, `usagelost` and `usagerej` are 0 (what each counts:
+`denials`, `srcdrops`, `streamlost`, `usagelost` and `usagerej` are 0; it prints `wandrops` too,
+which it does not check until every hive runs 0.1.135 (what each counts:
 [rt-gateway](../nodes/rt-gateway.md#what-it-logs-that-labopspy-health-counts)). Two lines from
 SY.admin follow:
 

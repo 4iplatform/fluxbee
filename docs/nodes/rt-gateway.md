@@ -389,9 +389,12 @@ every hive and reports, per hive (`HEALTH_SCRIPT`):
 | `streamlost` | the sum of the counts on `router stream lost records` lines | `src/router/stream.rs` |
 | `usagelost` | the sum on `router stream lost usage records` lines | `src/router/stream.rs` |
 | `usagerej` | SY.storage's `usage records refused, mismatched or unverified` | `src/bin/sy_storage.rs` |
+| `wandrops` | lines with `router dropped a WAN frame`: a WAN frame whose sender the peer that sent it does not vouch for (`foreign_source`, [routing-and-policy.md](../reference/routing-and-policy.md) §2). Lines, not frames: a router logs a drop only when it logged none in the last 30 s, and each line's `reject_count` is its count since it started | the WAN source check in `handle_wan_message` |
 
-A hive is healthy only when all six are 0. A journal that cannot be read is reported, never
-counted as zero.
+A hive is healthy only when the first six are 0. `wandrops` is printed and kept out of the check
+(`HEALTH_OK`) until every hive runs 0.1.135: until then most of its lines are a WAN broadcast
+echoed back to the peer it came from (A-272, under [WAN between hives](#wan-between-hives)). A
+journal that cannot be read is reported, never counted as zero.
 
 ## Failure behavior
 
