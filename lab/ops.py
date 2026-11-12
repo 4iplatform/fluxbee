@@ -227,10 +227,11 @@ def cmd_opa_status(a):
 # router's patterns must open the line's message (after its time, level and target): a node name, a
 # trace_id or a thread_id that another line quotes is never counted (the review of A-253).
 # `wandrops` counts the router's foreign_source lines (WAN frames whose sender the peer does not
-# vouch for; at most one line every 30 s a router, each with its cumulative count). Until every hive
-# runs 0.1.135 most of them are a WAN broadcast echoed back to its peer (A-272), so the field is
-# printed and kept out of the check; it joins `HEALTH_OK` once 0.1.135 runs everywhere.
-HEALTH_OK = "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0"
+# vouch for; at most one line every 30 s a router, each with its cumulative count). Since 0.1.135,
+# which every hive runs, no router sends a WAN broadcast back to the peer it came from (A-272), so
+# a line is a real drop and the field is checked like the others. An older router echoes again, and
+# the hives that drop its echoes fail the check (every hive after a rollback to 0.1.134).
+HEALTH_OK = "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0 wandrops=0"
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then
   echo "journal unreadable: $(printf '%%s' "$log" | head -1)"; exit 1
@@ -271,8 +272,7 @@ def health(since):
     ok = True
     for hive in hives():
         print("%-10s %s" % (hive, rows.get(hive, "no answer")))
-        checked = " ".join(f for f in rows.get(hive, "").split() if not f.startswith("wandrops="))
-        ok = ok and checked == HEALTH_OK
+        ok = ok and rows.get(hive, "") == HEALTH_OK
     certificate_ok = certificate_health()
     web_health()
     return certificate_ok and ok
