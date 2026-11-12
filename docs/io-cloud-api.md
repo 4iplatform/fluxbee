@@ -926,8 +926,8 @@ to, for example. No op of this list reads them or takes them down.
   that published a page, or the operator, can take it down.
 - **Cloud can neither list them nor take them down.** Listing and taking down your tenant's pages
   through IO.cloud is planned with the Cloud track, not scheduled yet.
-- **Planned for 0.1.137, not built yet:** an `IO.*` or `WF.*` node can take down the pages it
-  published itself, as an agent can now. Cloud gets no op for pages with it.
+- **Planned for 0.1.137, built, not deployed yet:** an `IO.*` or `WF.*` node can take down the
+  pages it published itself, as an agent can now. Cloud gets no op for pages with it.
 
 ---
 
@@ -1059,11 +1059,12 @@ post '{"op":"list_cloud_actions"}'
 
 ### 0.1.134
 
-- **While 0.1.133 ran, the node ops failed for a node with no unit** (2026-11-11, from 22:35Z to
-  23:32Z; FINDINGS A-314). The hive took a unit its systemd does not have, a new node's before its
-  first launch or a stopped node's once it is gone, for a systemd that did not answer:
-  `provision_node` of a new node, and `start_node`, `stop_node` and `delete_node` of a stopped one,
-  answered `SERVICE_FAILED` with nothing done, and sending them again answered the same;
+- **While 0.1.133 ran, the node ops failed for a node with no unit** (2026-11-11, from 22:35Z, when
+  0.1.133's deploy began, to 23:32Z, when 0.1.134's ended; FINDINGS A-314). The hive took a unit
+  its systemd does not have, a new node's before its first launch or a stopped node's once it is
+  gone, for a systemd that did not answer: `provision_node` of a new node, and `start_node`,
+  `stop_node` and `delete_node` of a stopped one, answered `SERVICE_FAILED` with nothing done, and
+  sending them again answered the same;
   `list_nodes` and `get_node_status` read such a stopped node `UNKNOWN`. 0.1.134 reads that unit as
   a node that does not run: those ops go on as before 0.1.133, and a stopped node reads `STOPPED`
   again. An op that got this `SERVICE_FAILED` in that window did nothing: send it again.
@@ -1252,10 +1253,16 @@ post '{"op":"list_cloud_actions"}'
 
 ## 10. Checked live
 
+**0.1.134:** on PROD, 2026-11-11 at 23:33Z, from inside the hive (`lab/DEPLOYMENTS.md`, 0.1.134;
+FINDINGS A-314): a new node was launched and stopped, and the stopped nodes with no unit read
+`STOPPED`.
+
 **0.1.133:** on PROD, 2026-11-11 at 23:20Z, from inside the hive (`lab/DEPLOYMENTS.md`, 0.1.133;
-FINDINGS A-255): the operator rotated Cloud's token on `SY.edge@ingress1` (§7). The publish
-answered ok with `edge_applied: true`; IO.cloud kept running and was not restarted; the previous
-token worked 10 more minutes.
+FINDINGS A-255): the operator rotated Cloud's token on `SY.edge@ingress1`, the edge IO.cloud
+already trusted (§7). The publish answered ok with `edge_applied: true`; IO.cloud kept running and
+was not restarted; the previous token worked 10 more minutes. A rotation on the same edge never
+needed a restart; what 0.1.133 fixed, a first publish or a move to another edge (§9), was not run
+live: its tests cover it.
 
 **0.1.82 to 0.1.90:** on PROD, through the public door (`lab/DEPLOYMENTS.md`; 0.1.90 in
 `lab/logbook/2026-10-29.md`):

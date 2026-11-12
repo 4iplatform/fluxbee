@@ -228,8 +228,8 @@ def cmd_opa_status(a):
 # trace_id or a thread_id that another line quotes is never counted (the review of A-253).
 # `wandrops` counts the router's foreign_source lines (WAN frames whose sender the peer does not
 # vouch for; at most one line every 30 s a router, each with its cumulative count). Until every hive
-# runs 0.1.134 most of them are a WAN broadcast echoed back to its peer (A-272), so the field is
-# printed and kept out of the check; it joins `HEALTH_OK` once 0.1.134 runs everywhere.
+# runs 0.1.135 most of them are a WAN broadcast echoed back to its peer (A-272), so the field is
+# printed and kept out of the check; it joins `HEALTH_OK` once 0.1.135 runs everywhere.
 HEALTH_OK = "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0"
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then
