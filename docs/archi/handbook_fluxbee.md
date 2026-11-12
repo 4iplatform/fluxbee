@@ -93,6 +93,11 @@ Examples:
 - `IO.api.support@motherbee`
 - `SY.admin@motherbee`
 
+A node name holds only ASCII letters, digits, `.`, `-` and `_` on each side of its one `@`, at
+most 256 bytes in all. The orchestrator refuses other characters at launch (`invalid node_name`),
+and the router refuses any other name, a longer one too, when the node connects: such a node never
+comes up.
+
 #### Runtime names
 
 Runtime/package names are **lowercase** and do **not** include `@hive`.

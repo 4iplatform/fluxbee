@@ -79,6 +79,9 @@ wrote it, never as the sender wrote it.
 
 - **From a local node.**
   - The first frame must be a system `HELLO` whose `payload.uuid` equals `routing.src`.
+  - Its name, with `@<hive>` added when it has none, must be an L2 name: letters, digits, `.`,
+    `-` and `_` on each side of one `@`, at most 256 bytes (`is_l2_node_name`); any other is
+    refused before a line prints it (A-269, since 0.1.140).
   - An `RT.*` name is accepted only from the router's own process (peer PID, `rt_name_allowed`).
   - One live connection per UUID: a HELLO for a UUID that is still connected waits up to 1 s
     (`DUPLICATE_HELLO_GRACE`) and is then refused (`claim_node_uuid`).

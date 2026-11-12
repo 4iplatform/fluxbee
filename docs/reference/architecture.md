@@ -208,7 +208,11 @@ After the boot it runs these jobs:
 A node name is `<PREFIX>.<name>@<hive>`, for example `IO.slack.support@worker1`. A node may
 register without `@<hive>`: the SDK appends the `hive_id` from `hive.yaml` (`normalize_name` in
 `crates/fluxbee_sdk/src/node_client.rs`), and so does the router (`normalize_name` in
-`src/router/mod.rs`). The prefix is the node's kind; some kinds get special treatment in code:
+`src/router/mod.rs`). Both sides of the `@` are ASCII letters, digits, `.`, `-` and `_`, at most
+256 bytes in all: the router refuses any other name at `HELLO` (`is_l2_node_name`, A-269, since
+0.1.140), and the orchestrator launches a node only under a name of these characters, its hive a
+hive id (`normalize_node_name_for_target`). The prefix is the node's kind; some kinds get special
+treatment in code:
 
 | Prefix | What | Rules in code |
 | --- | --- | --- |

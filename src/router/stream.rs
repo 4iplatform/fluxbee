@@ -712,8 +712,8 @@ const NAMED_FIELD_MAX_BYTES: usize = 128;
 /// `text` as the line naming a record shows it: quoted and escaped as `Debug` does, so a newline or
 /// a quote in it can end neither the line, to start a forged one, nor the field. One longer than
 /// `NAMED_FIELD_MAX_BYTES` is cut at the last char boundary within them, its full length after the
-/// quotes.
-fn shown_field(text: &str) -> String {
+/// quotes. The router's line refusing a HELLO shows the name it refused so too (A-269).
+pub(super) fn shown_field(text: &str) -> String {
     if text.len() <= NAMED_FIELD_MAX_BYTES {
         return format!("{text:?}");
     }

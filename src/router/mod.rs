@@ -644,7 +644,6 @@ async fn handle_node(
             "expected HELLO",
         )));
     }
-    tracing::info!(src = %msg.routing.src, "hello received");
     let payload: NodeHelloPayload = serde_json::from_value(msg.payload)?;
     let src_uuid = Uuid::parse_str(&msg.routing.src)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid routing.src"))?;
@@ -656,8 +655,30 @@ async fn handle_node(
             "uuid mismatch",
         )));
     }
+    // Logged once `routing.src` parsed as the node's UUID: until then it is any string the node
+    // wrote (A-269).
+    tracing::info!(src = %src_uuid, "hello received");
 
     let node_name = normalize_name(&payload.name, hive_id);
+    // Before any line prints the name: until 0.1.140 a name with a newline wrote a line of its
+    // sender's choosing into the router's journal (A-269). The refused name is shown quoted,
+    // escaped and cut.
+    if !is_l2_node_name(&node_name) {
+        tracing::warn!(
+            name = %stream::shown_field(&payload.name),
+            uuid = %node_uuid,
+            peer_pid = ?peer_pid,
+            "HELLO rejected: the node name is not an L2 name"
+        );
+        writer_task.abort();
+        return Err(RouterError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the node name is not an L2 name: letters, digits, '.', '-' and '_' on each side \
+                 of one '@', at most {NODE_NAME_MAX_BYTES} bytes"
+            ),
+        )));
+    }
     if !rt_name_allowed(&node_name, peer_pid, std::process::id()) {
         tracing::warn!(
             node = %node_name,
@@ -4983,6 +5004,32 @@ where
             break;
         }
     }
+}
+
+/// The longest node name a HELLO may give, its `@<hive>` included: the name field of the router's
+/// node table (`NodeEntry.name` in `src/shm/mod.rs`), which refused a longer one only after the
+/// router had logged it (A-269).
+const NODE_NAME_MAX_BYTES: usize = 256;
+
+/// Whether `name`, as `normalize_name` gave it, is a node name the router registers (A-269): a
+/// local part and a hive on each side of one `@`, each of ASCII letters, digits, `.`, `-` and `_`,
+/// at most `NODE_NAME_MAX_BYTES` in all. The names the orchestrator launches a node with are of
+/// these characters (`normalize_node_name_for_target`, with a hive id of `[A-Za-z0-9_-]`, at most
+/// 64), and so are the system nodes' and the router's own; a longer one never registered, the
+/// node table refusing it. Until 0.1.140 the router took any name, and several of its lines print
+/// the name as it is: a name with a newline wrote a line of its sender's choosing into the router's
+/// journal.
+fn is_l2_node_name(name: &str) -> bool {
+    let part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    };
+    name.len() <= NODE_NAME_MAX_BYTES
+        && name
+            .split_once('@')
+            .is_some_and(|(local, hive)| part(local) && part(hive))
 }
 
 /// `RT.` names are the router's own (operator, 2026-10-16, D12 of docs/router-stream-v1.md): a
@@ -12160,6 +12207,221 @@ mod tests {
                 .all(|node| node.uuid != *uuid.as_bytes()),
             "and its SHM slot is freed"
         );
+    }
+
+    /// A-269: the names the router registers. Every name a node runs under today is one, the
+    /// longest the node table holds among them; a character outside the set, a second `@`, an
+    /// empty side or one byte more is not.
+    #[test]
+    fn the_router_registers_only_l2_node_names_of_at_most_256_bytes() {
+        let longest = format!("AI.{}@worker1", "x".repeat(256 - "AI.@worker1".len()));
+        assert_eq!(longest.len(), NODE_NAME_MAX_BYTES);
+        for name in [
+            "SY.admin@motherbee",
+            "SY.frontdesk.gov@worker1",
+            "SY.wf-rules@motherbee",
+            "SY.config.routes@motherbee",
+            "RT.gateway@motherbee",
+            "RT.gateway.stream@worker1",
+            "AI.pruebas@worker1",
+            "AI.soporte.l1@prod",
+            "IO.slack.T0123ABC@motherbee",
+            "WF.identity.negative.idneg-1731400000000@motherbee",
+            "SY.timer@gate0237j",
+            "WF.under_score@hive_1",
+            longest.as_str(),
+        ] {
+            assert!(is_l2_node_name(name), "{name:?} is an L2 name");
+        }
+        let one_byte_more = format!("AI.{}@worker1", "x".repeat(257 - "AI.@worker1".len()));
+        for name in [
+            "AI.evil\nforged@motherbee",
+            "AI.evil\r@motherbee",
+            "AI.evil\t@motherbee",
+            "AI.evil\0@motherbee",
+            "AI.e vil@motherbee",
+            "AI.\"evil\"@motherbee",
+            "AI.evil/x@motherbee",
+            "AI.evil:x@motherbee",
+            "AI.evil@*",
+            "AI.ñandú@motherbee",
+            "AI.x@a@b",
+            "@motherbee",
+            "AI.x@",
+            "AI.x",
+            "",
+            one_byte_more.as_str(),
+        ] {
+            assert!(!is_l2_node_name(name), "{name:?} is no L2 name");
+        }
+    }
+
+    /// Pins A-269's place in `handle_node`: the name is checked as soon as the router gave it its
+    /// hive, before any line prints it and before the `RT.` check, the link, the VPN and the
+    /// registration take it.
+    #[test]
+    fn handle_node_checks_the_name_before_anything_takes_it() {
+        let src = include_str!("mod.rs");
+        let start = src.find("async fn handle_node(").expect("handle_node");
+        let end = start + src[start..].find("\n}\n").expect("end of handle_node");
+        let body = &src[start..end];
+        let normalized = body
+            .find("let node_name = normalize_name(&payload.name, hive_id);")
+            .expect("the name");
+        let check = body
+            .find("if !is_l2_node_name(&node_name)")
+            .expect("the check");
+        assert!(normalized < check);
+        for taker in [
+            "%node_name",
+            "rt_name_allowed(&node_name",
+            "tx.set_peer(node_name",
+            "assign_vpn(&node_name",
+            "claim_node_uuid(&nodes",
+        ] {
+            let at = body.find(taker).unwrap_or_else(|| panic!("{taker}"));
+            assert!(check < at, "the name is checked before {taker}");
+        }
+        // Nor its `routing.src` before it parsed as the node's UUID, nor its name as written.
+        let uuid_check = body
+            .find("if node_uuid != src_uuid")
+            .expect("the UUID check");
+        let hello_line = body
+            .find("tracing::info!(src = %src_uuid, \"hello received\");")
+            .expect("the HELLO's line names the parsed UUID");
+        assert!(uuid_check < hello_line && hello_line < check);
+        assert!(!body.contains("%payload.name"));
+    }
+
+    /// What the router logs on this thread while the guard lives, as plain text with no time. A
+    /// `#[tokio::test]` runs its spawned tasks on its own thread, so a connection's lines are in it.
+    #[derive(Clone, Default)]
+    struct TestJournal(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for TestJournal {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("the journal").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TestJournal {
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .without_time()
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("the journal").clone()).expect("text")
+        }
+    }
+
+    /// A-269: a HELLO whose name is no L2 name is refused before any line prints the name, and the
+    /// line that refuses it shows the name quoted and escaped. Before, the router registered it, and
+    /// its *"loading config snapshot"* line wrote the name's newline as it is: the line after it
+    /// was the stream's loss alarm, of the shape `lab/ops.py health` sums.
+    #[tokio::test]
+    async fn a_hello_whose_name_is_not_an_l2_name_is_refused_before_a_line_prints_it() {
+        let journal = TestJournal::default();
+        let _capture = journal.capture();
+        let shm = TestShm::new("rt-l2name");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let forged = concat!(
+            "2026-11-12T00:00:00.000000Z  WARN json_router::router::stream: ",
+            "router stream lost records in the last 30 s: expired: 99999"
+        );
+        let name = format!("AI.evil\n{forged}");
+        let uuid = Uuid::new_v4();
+        let (refused, connection) = hello(&shm, &nodes, uuid, &name).await;
+        assert!(refused.is_none(), "no ANNOUNCE");
+        let ended = time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("the refused connection ends")
+            .expect("join");
+        assert!(ended.is_err());
+        assert_eq!(holder_name(&nodes, uuid).await, None, "nothing registered");
+        let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .all(|node| node.uuid != *uuid.as_bytes()),
+            "and nothing in the node table"
+        );
+
+        let text = journal.text();
+        // `lab/ops.py health`'s pattern for the alarm (`HEALTH_SCRIPT`): it opens the line.
+        let alarm =
+            regex::Regex::new(r"^[^ ]+ +WARN [^ ]+: router stream lost records in the last")
+                .expect("pattern");
+        assert!(
+            !text.lines().any(|line| alarm.is_match(line)),
+            "no forged alarm line: {text}"
+        );
+        let refusals: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("HELLO rejected: the node name is not an L2 name"))
+            .collect();
+        assert_eq!(refusals.len(), 1, "{text}");
+        // Quoted, its newline escaped, cut at 128 bytes with its length after the quotes.
+        assert!(
+            refusals[0].contains(r#"name="AI.evil\n2026-11-12T00:00:00.000000Z  WARN "#),
+            "{text}"
+        );
+        assert!(
+            refusals[0].contains(&format!("name={}", stream::shown_field(&name))),
+            "{text}"
+        );
+        assert!(name.len() > 128 && refusals[0].contains(&format!("... ({} bytes)", name.len())));
+        assert!(!text.contains("loading config snapshot"), "{text}");
+    }
+
+    /// A-269: the bound is the node table's. A name of 256 bytes registers, there and in the
+    /// router's table, under its full name; one byte more, or a name that is no L2 name once the
+    /// router gave it its hive, is refused with no ANNOUNCE and nothing registered.
+    #[tokio::test]
+    async fn a_name_of_256_bytes_registers_and_no_other_than_an_l2_name_does() {
+        let shm = TestShm::new("rt-l2max");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let longest = format!("AI.{}@motherbee", "x".repeat(256 - "AI.@motherbee".len()));
+        let uuid = Uuid::new_v4();
+        let (client, _connection) = hello(&shm, &nodes, uuid, &longest).await;
+        assert!(client.is_some(), "a name of 256 bytes is announced");
+        assert_eq!(
+            holder_name(&nodes, uuid).await.as_deref(),
+            Some(longest.as_str())
+        );
+        let snapshot = shm.writer.lock().await.read_snapshot().expect("snapshot");
+        let entry = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.uuid == *uuid.as_bytes())
+            .expect("in the node table");
+        assert_eq!(&entry.name[..entry.name_len as usize], longest.as_bytes());
+
+        let one_byte_more = format!("AI.{}@motherbee", "x".repeat(257 - "AI.@motherbee".len()));
+        for name in [one_byte_more.as_str(), "", "AI.x@", "AI.x@a@b", "AI.x y"] {
+            let uuid = Uuid::new_v4();
+            let (refused, connection) = hello(&shm, &nodes, uuid, name).await;
+            assert!(refused.is_none(), "{name:?} gets no ANNOUNCE");
+            let ended = time::timeout(Duration::from_secs(5), connection)
+                .await
+                .expect("the refused connection ends")
+                .expect("join");
+            assert!(ended.is_err(), "{name:?}");
+            assert_eq!(holder_name(&nodes, uuid).await, None, "{name:?}");
+        }
+        assert_eq!(nodes.lock().await.len(), 1, "only the longest registered");
+        drop(client);
     }
 
     /// The HELLO a sibling router `router` opens an IRP link with.

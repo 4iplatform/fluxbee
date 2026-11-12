@@ -66,8 +66,14 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   the router's own (root in production) is refused (`local_peer_admitted`). Frames are a 4-byte
   big-endian length plus JSON, at most 128 KiB (`MAX_FRAME_SIZE` in
   `crates/fluxbee_sdk/src/socket/connection.rs`). The first frame must be a `HELLO` whose
-  `payload.uuid` equals `routing.src`. `RT.*` names are accepted only from the router's own
-  process (`rt_name_allowed`, by the peer's PID).
+  `payload.uuid` equals `routing.src`. Its name, with `@<hive>` added when it has none, must be
+  an L2 name: letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes
+  (`is_l2_node_name`); any other is refused before a line prints it or a table takes it, with
+  `HELLO rejected: the node name is not an L2 name` showing the name quoted, escaped and cut at
+  128 bytes, the node's UUID and the process id (A-269, since 0.1.140). `RT.*` names are accepted
+  only from the router's own process (`rt_name_allowed`, by the peer's PID). The router's own
+  name, from `JSR_ROUTER_NAME` or `wan.gateway_name`, must be an L2 name too: its stream connects
+  under it with `.stream` added (`RT.gateway.stream@<hive>`).
 - **IRP socket** `irp-<uuid hex>.sock` in the same directory, mode 0600: the link between
   routers of the same hive, which only the unsupported several-routers mode uses. Every 5 s a
   router looks in `/dev/shm` for live regions of other routers of its hive and the one with the
