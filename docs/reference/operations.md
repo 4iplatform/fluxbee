@@ -496,13 +496,17 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   lists the workflow.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on
   `dist/runtimes-manifest.lock` from its read of the manifest to its write: SY.admin's
-  `publish_runtime_package`, `remove_runtime_version` (across its read of the version's use, up to
-  30 s) and `reset_base_runtime`, `fluxbee-publish`, `publish-runtime.sh` (and every
+  `publish_runtime_package`, `remove_runtime_version` (which reads the version's use before it,
+  and again under it only when its runtime changed meanwhile, since 0.1.139: FINDINGS A-306; it
+  held the lock across that read, up to 30 s) and `reset_base_runtime`, `fluxbee-publish`,
+  `publish-runtime.sh` (and every
   `publish-*-runtime.sh` on it), and the seed for its whole run: its restore of the snapshot, and
   each base runtime's read of `current` with the publish that read decides, whose
   `publish-runtime.sh` takes the lock on the seed's own descriptor (`FLUXBEE_MANIFEST_LOCK_FD`; a
   descriptor of any other file is refused). A writer waits for another up to 60 s, then fails
-  with the manifest untouched; before, a hand publish and an admin write that read the manifest
+  with the manifest untouched (SY.admin's publish with `409 RUNTIME_MANIFEST_BUSY`, its removal
+  `RUNTIME_REMOVE_FAILED`, its reset `RUNTIME_RESET_FAILED`, each with `payload.retryable: true`
+  since 0.1.139, FINDINGS A-305, A-306); before, a hand publish and an admin write that read the manifest
   at the same moment lost one of the two writes. The lock file sits in the dist root, beside the
   `runtimes` folder and never inside it, since Syncthing shares that folder with the workers; it
   stays (removing it would let a writer lock a new one beside one still held). The package does

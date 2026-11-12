@@ -64,11 +64,12 @@ use json_router::mesh_reply::{self, PageAsk, REPLY_TOO_LARGE};
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, lock_runtime_manifest, runtime_manifest_lock_held_too_long,
     runtime_manifest_write_v2_gate_enabled_from_env, write_runtime_manifest_file_atomic,
-    RuntimeManifest, RuntimeManifestEntry, RuntimeManifestLock, RUNTIME_MANIFEST_LOCK_WAIT,
+    RuntimeManifest, RuntimeManifestEntry, RuntimeManifestLock, RUNTIME_MANIFEST_LOCK_HELD,
+    RUNTIME_MANIFEST_LOCK_WAIT,
 };
 use json_router::runtime_package::{
     install_validated_package_with_options, validate_package, PackageMetadata,
-    DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
+    DIST_RUNTIME_ROOT_DIR,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RouterRegionReader,
@@ -364,6 +365,10 @@ struct AdminContext {
     /// can overlap. Each also holds the manifest's file lock from its read to its write
     /// (`lock_runtime_manifest`, FINDINGS A-171), as the writers outside SY.admin do.
     runtime_manifest_lock: Arc<Mutex<()>>,
+    /// The motherbee's `dist/runtimes` (`DIST_RUNTIME_ROOT_DIR`): its manifest, `manifest.json`
+    /// (`runtime_manifest_path`), and each version's directory, which the manifest's writers read
+    /// and write; a test's own directory in the tests.
+    runtimes_root: PathBuf,
     /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
     command_log_lock: Arc<std::sync::Mutex<()>>,
     /// The public edge's certificate (docs/acme-edge-certificates-v1.md §6, §7).
@@ -776,6 +781,7 @@ async fn main() -> Result<(), AdminError> {
         publication_ledger_path: state_dir.join("sy-admin/publications.json"),
         publication_lock: Arc::new(Mutex::new(())),
         runtime_manifest_lock: Arc::new(Mutex::new(())),
+        runtimes_root: PathBuf::from(DIST_RUNTIME_ROOT_DIR),
         command_log_lock: Arc::new(std::sync::Mutex::new(())),
         acme: acme_service,
         web: web_routes,
@@ -13586,6 +13592,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_USAGE_UNKNOWN"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
+        // publish_runtime_package: another writer held the runtimes manifest's lock past 60 s;
+        // nothing was published, ask again (FINDINGS A-306).
+        | "RUNTIME_MANIFEST_BUSY"
         // A name another tenant holds: a vault key (one namespace for the hive), a tenant name or
         // domain.
         | "KEY_TAKEN"
@@ -17791,6 +17800,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The package.json's version is MAJOR.MINOR.PATCH, with an optional -prerelease (1.2.0-rc.1). A version with build metadata (1.2.0+b1) is refused with 400 INVALID_REQUEST before anything is installed (FINDINGS A-312, since 0.1.139): no reader of a version after its publish takes a '+', so such a version could run no node and could not be removed. Write 1.2.0-b1 instead.",
             "bundle_upload resolves blob_path relative to the configured blob root in hive.yaml.",
             "Publishing mutates dist/manifest but does not spawn nodes.",
+            "It waits for the runtimes manifest's locks (SY.admin's own and the file's) up to 60 s each: past that it answers 409 RUNTIME_MANIFEST_BUSY with payload.retryable: true and publishes nothing (FINDINGS A-306, since 0.1.139); ask again once the other change of the runtimes (a publish, a removal, a reset) is done. A publish with sync_to or update_to holds SY.admin's lock through its follow-ups.",
             "Optional sync_to runs sync_hint(channel=dist) after publish; optional update_to runs update(category=runtime) scoped to the new runtime/version.",
         ],
         "add_hive" => vec![
@@ -18269,6 +18279,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             RUNTIME_REMOVAL_IN_USE_NOTE,
             RUNTIME_REMOVAL_UNKNOWN_NOTE,
             HIVES_WITHOUT_RUNTIMES_NOTE,
+            "The use is read before the removal takes the runtimes manifest's locks, so no publish waits behind that read; under the locks the manifest is checked again, and the use read again only when the runtime changed meanwhile (FINDINGS A-306, since 0.1.139).",
             "502 SERVICE_FAILED when the manifest it wrote cannot be read back: the version was removed, and get_runtime shows the runtime as it is now.",
             "SY.wf-rules removes its workflows' old versions with it, each removal waited for up to 35 s (SY.admin reads every hive's use first) and a deploy's or a rollback's whole purge within 15 s: a deploy or a rollback whose removal is refused, or not answered in time, goes on, logs what it left (purge left wf.<workflow> <version>: <code>: <detail>), and the next one tries those versions again.",
             WF_DELETE_VERSIONS_LEFT_NOTE,
@@ -18932,8 +18943,30 @@ fn sanitize_runtime_suffix(value: &str) -> String {
         .collect()
 }
 
-fn load_local_runtime_manifest() -> Result<Option<RuntimeManifest>, String> {
-    load_runtime_manifest_from_paths(&[PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)])
+/// The motherbee's runtimes manifest, `manifest.json` in its `dist/runtimes`.
+fn runtime_manifest_path(ctx: &AdminContext) -> PathBuf {
+    ctx.runtimes_root.join("manifest.json")
+}
+
+fn load_local_runtime_manifest(ctx: &AdminContext) -> Result<Option<RuntimeManifest>, String> {
+    load_runtime_manifest_from_paths(&[runtime_manifest_path(ctx)])
+}
+
+/// SY.admin's own lock of the runtimes manifest (`runtime_manifest_lock`), waited for at most
+/// `RUNTIME_MANIFEST_LOCK_WAIT`, as the manifest's file lock is (FINDINGS A-306): a publish waited
+/// on it with no bound, behind a removal that held it through its read of every hive's use. Past
+/// the wait, an error that `runtime_manifest_lock_held_too_long` reads as another writer's hold.
+async fn take_runtime_manifest_lock(
+    ctx: &AdminContext,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    tokio::time::timeout(RUNTIME_MANIFEST_LOCK_WAIT, ctx.runtime_manifest_lock.lock())
+        .await
+        .map_err(|_| {
+            format!(
+                "{RUNTIME_MANIFEST_LOCK_HELD} SY.admin's own lock of the runtimes manifest for {}s (a publish, a removal or a reset of a runtime ran meanwhile)",
+                RUNTIME_MANIFEST_LOCK_WAIT.as_secs()
+            )
+        })
 }
 
 /// The answer of a writer of the runtimes manifest that could not take its lock, with nothing
@@ -18960,15 +18993,15 @@ fn manifest_lock_refusal(action: &str, code: &str, err: &str) -> (u16, String) {
 /// manifest holds from its read to its write, the ones outside SY.admin included (a hand publish,
 /// the .deb's seed): taken off the async workers, since another writer may hold it a while. None
 /// when there is no manifest, which then has nothing to read or write.
-async fn lock_local_runtime_manifest() -> Result<Option<RuntimeManifestLock>, String> {
-    if !Path::new(DIST_RUNTIME_MANIFEST_PATH).exists() {
+async fn lock_local_runtime_manifest(
+    ctx: &AdminContext,
+) -> Result<Option<RuntimeManifestLock>, String> {
+    let manifest_path = runtime_manifest_path(ctx);
+    if !manifest_path.exists() {
         return Ok(None);
     }
-    tokio::task::spawn_blocking(|| {
-        lock_runtime_manifest(
-            Path::new(DIST_RUNTIME_MANIFEST_PATH),
-            RUNTIME_MANIFEST_LOCK_WAIT,
-        )
+    tokio::task::spawn_blocking(move || {
+        lock_runtime_manifest(&manifest_path, RUNTIME_MANIFEST_LOCK_WAIT)
     })
     .await
     .map_err(|err| format!("runtime manifest lock: {err}"))?
@@ -19327,10 +19360,11 @@ fn reset_base_runtime_in_manifest_local(
 }
 
 fn quarantine_runtime_version_dir_local(
+    runtimes_root: &Path,
     runtime: &str,
     runtime_version: &str,
 ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    let runtime_dir = Path::new(DIST_RUNTIME_ROOT_DIR).join(runtime);
+    let runtime_dir = runtimes_root.join(runtime);
     let version_dir = runtime_dir.join(runtime_version);
     if !version_dir.exists() {
         return Ok(None);
@@ -19366,6 +19400,7 @@ fn restore_quarantined_runtime_version_dir_local(
 }
 
 fn finalize_quarantined_runtime_version_dir_local(
+    runtimes_root: &Path,
     runtime: &str,
     quarantine: &Path,
 ) -> Result<bool, String> {
@@ -19376,7 +19411,7 @@ fn finalize_quarantined_runtime_version_dir_local(
             err
         )
     })?;
-    let runtime_dir = Path::new(DIST_RUNTIME_ROOT_DIR).join(runtime);
+    let runtime_dir = runtimes_root.join(runtime);
     let runtime_dir_empty = runtime_dir
         .read_dir()
         .map(|mut read| read.next().is_none())
@@ -20028,9 +20063,13 @@ async fn run_publish_runtime_package_follow_up(
 
 /// The code a failed publish answers, by what its install said: a package the check refuses (its
 /// package.json, its layout, a version with build metadata: FINDINGS A-312) is the request's
-/// fault, `INVALID_REQUEST`.
+/// fault, `INVALID_REQUEST`; the manifest's lock, SY.admin's own or the file's, that another writer
+/// held past the 60 s is `RUNTIME_MANIFEST_BUSY` (FINDINGS A-306), where the file's was
+/// `SERVICE_FAILED`.
 fn publish_runtime_package_error_code(err: &str) -> &'static str {
-    if err.contains("bundle blob not found") {
+    if runtime_manifest_lock_held_too_long(err) {
+        "RUNTIME_MANIFEST_BUSY"
+    } else if err.contains("bundle blob not found") {
         "BLOB_NOT_FOUND"
     } else if err.contains("invalid zip") {
         "INVALID_ZIP"
@@ -20072,7 +20111,11 @@ async fn handle_publish_runtime_package(
         ));
     }
 
-    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
+    // Bounded (FINDINGS A-306): a publish waited with no bound while another writer held the lock.
+    let _manifest_guard = match take_runtime_manifest_lock(ctx).await {
+        Ok(guard) => guard,
+        Err(err) => return Ok(publish_runtime_package_failure(&err)),
+    };
     let req: PublishRuntimePackageRequest = match serde_json::from_value(payload) {
         Ok(req) => req,
         Err(err) => {
@@ -20090,7 +20133,7 @@ async fn handle_publish_runtime_package(
         }
     };
 
-    let manifest_path = PathBuf::from(DIST_RUNTIME_MANIFEST_PATH);
+    let manifest_path = runtime_manifest_path(ctx);
     if !manifest_path.exists() {
         return Ok((
             409,
@@ -20148,7 +20191,7 @@ async fn handle_publish_runtime_package(
         PublishRuntimePackageSource::InlinePackage { files } => publish_runtime_package_inline(
             files,
             &staging_root,
-            Path::new(DIST_RUNTIME_ROOT_DIR),
+            &ctx.runtimes_root,
             &manifest_path,
             set_current,
         ),
@@ -20156,7 +20199,7 @@ async fn handle_publish_runtime_package(
             &ctx.blob_root,
             blob_path,
             &staging_root,
-            Path::new(DIST_RUNTIME_ROOT_DIR),
+            &ctx.runtimes_root,
             &manifest_path,
             set_current,
         ),
@@ -20234,20 +20277,178 @@ async fn handle_publish_runtime_package(
                 .to_string(),
             ))
         }
-        Err(err) => {
-            let error_code = publish_runtime_package_error_code(&err);
-            Ok((
-                error_code_to_http_status(error_code),
-                serde_json::json!({
-                    "status": "error",
-                    "action": "publish_runtime_package",
-                    "payload": serde_json::Value::Null,
-                    "error_code": error_code,
-                    "error_detail": err,
-                })
-                .to_string(),
-            ))
-        }
+        Err(err) => Ok(publish_runtime_package_failure(&err)),
+    }
+}
+
+/// A publish that failed, answered by what its install said (`publish_runtime_package_error_code`).
+/// `RUNTIME_MANIFEST_BUSY` says `payload.retryable: true` (FINDINGS A-306): nothing was published,
+/// and asking again once the other writer is done may pass.
+fn publish_runtime_package_failure(err: &str) -> (u16, String) {
+    let error_code = publish_runtime_package_error_code(err);
+    let payload = if error_code == "RUNTIME_MANIFEST_BUSY" {
+        serde_json::json!({ "retryable": true })
+    } else {
+        serde_json::Value::Null
+    };
+    (
+        error_code_to_http_status(error_code),
+        serde_json::json!({
+            "status": "error",
+            "action": "publish_runtime_package",
+            "payload": payload,
+            "error_code": error_code,
+            "error_detail": err,
+        })
+        .to_string(),
+    )
+}
+
+/// What the manifest says of one removal, which `remove_runtime_version` reads twice (FINDINGS
+/// A-306): without a lock, before it reads the version's use, and again under the locks, before it
+/// writes. The runtime's key as the manifest spells it, and its entry as written: the use is read
+/// again only when either changed in between.
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeRemovalView {
+    runtime_key: String,
+    entry: serde_json::Value,
+}
+
+/// `remove_runtime_version`'s checks of the manifest, in their order, each with its refusal: the
+/// runtime and its entry (`MANIFEST_INVALID`, `RUNTIME_NOT_FOUND`), the current version
+/// (`RUNTIME_CURRENT_CONFLICT`), the package's own (`RUNTIME_PACKAGE_VERSION`, FINDINGS A-122), the
+/// version itself (`RUNTIME_VERSION_NOT_FOUND`) and the packages built on the runtime
+/// (`RUNTIME_HAS_DEPENDENTS`), all before the version's use is read, which waits on every hive and
+/// would refuse, while a hive does not answer, a removal that can never pass.
+fn runtime_removal_view(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    runtime_version: &str,
+) -> Result<RuntimeRemovalView, (u16, String)> {
+    let refusal = |status: u16, code: &str, detail: String, payload: serde_json::Value| {
+        (
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": payload,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+    let runtime_map = runtime_manifest_entry_map_local(manifest)
+        .map_err(|err| refusal(409, "MANIFEST_INVALID", err, serde_json::Value::Null))?;
+    let not_found = || {
+        refusal(
+            404,
+            "RUNTIME_NOT_FOUND",
+            format!("runtime '{}' not found", runtime),
+            serde_json::Value::Null,
+        )
+    };
+    let runtime_key = resolve_runtime_key_local(&runtime_map, runtime).map_err(|_| not_found())?;
+    let Some(entry) = runtime_map.get(&runtime_key) else {
+        return Err(not_found());
+    };
+
+    let current = entry.current.as_deref().map(str::trim).unwrap_or("");
+    let current_conflict = |version: &str| {
+        refusal(
+            409,
+            "RUNTIME_CURRENT_CONFLICT",
+            format!(
+                "cannot delete current version '{}' for runtime '{}'",
+                version, runtime
+            ),
+            serde_json::Value::Null,
+        )
+    };
+    if runtime_version == "current" {
+        return Err(current_conflict(current));
+    }
+    if !current.is_empty()
+        && current == runtime_version
+        && !can_remove_current_runtime_version_local(entry, runtime_version)
+    {
+        return Err(current_conflict(current));
+    }
+
+    // The version the installed package brought stays: it is the way back (`reset_base_runtime`),
+    // its files are the package's, and the next package replaces it (FINDINGS A-122).
+    if is_package_version_local(entry, runtime_version) {
+        return Err(refusal(
+            409,
+            "RUNTIME_PACKAGE_VERSION",
+            format!(
+                "version '{}' is the one the installed package brought for runtime '{}' (its package_version): it stays, as the way back with reset_base_runtime, and the next package replaces it",
+                runtime_version, runtime
+            ),
+            serde_json::Value::Null,
+        ));
+    }
+
+    let version_exists = runtime_versions_from_manifest_entry_local(entry)
+        .iter()
+        .any(|value| value == runtime_version);
+    if !version_exists {
+        return Err(refusal(
+            404,
+            "RUNTIME_VERSION_NOT_FOUND",
+            format!(
+                "version '{}' not available for runtime '{}'",
+                runtime_version, runtime
+            ),
+            serde_json::Value::Null,
+        ));
+    }
+
+    // The manifest alone decides this one: it goes before the read of the version's use.
+    let dependents = runtime_dependents_summary_local(manifest, &runtime_key)
+        .map_err(|err| refusal(409, "MANIFEST_INVALID", err, serde_json::Value::Null))?;
+    if !dependents.is_empty() {
+        return Err(refusal(
+            409,
+            "RUNTIME_HAS_DEPENDENTS",
+            format!(
+                "runtime '{}' has published dependents; remove dependent runtimes first",
+                runtime
+            ),
+            serde_json::json!({ "dependents": dependents }),
+        ));
+    }
+    let entry = manifest
+        .runtimes
+        .get(&runtime_key)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(RuntimeRemovalView { runtime_key, entry })
+}
+
+/// The manifest for a removal's checks, or its refusal (`RUNTIME_MANIFEST_MISSING`,
+/// `MANIFEST_INVALID`).
+fn runtime_manifest_for_removal(ctx: &AdminContext) -> Result<RuntimeManifest, (u16, String)> {
+    let refusal = |code: &str, detail: String| {
+        (
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+    match load_local_runtime_manifest(ctx) {
+        Ok(Some(manifest)) => Ok(manifest),
+        Ok(None) => Err(refusal(
+            "RUNTIME_MANIFEST_MISSING",
+            "runtime manifest not found".to_string(),
+        )),
+        Err(err) => Err(refusal("MANIFEST_INVALID", err)),
     }
 }
 
@@ -20272,7 +20473,6 @@ async fn handle_remove_runtime_version(
         ));
     }
 
-    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
     let runtime = payload
         .get("runtime")
         .and_then(|value| value.as_str())
@@ -20309,6 +20509,38 @@ async fn handle_remove_runtime_version(
             .to_string(),
         ));
     }
+
+    // The version's use is read with no lock held (FINDINGS A-306): read under the manifest's locks
+    // (up to SY.admin's 30 s while a hive does not answer), it held every publish, SY.wf-rules'
+    // deploys among them, and a publish waited with no bound. The manifest is checked first, then
+    // again under the locks before the write, and the use read again only when the runtime's entry
+    // changed meanwhile.
+    let seen = match runtime_manifest_for_removal(ctx)
+        .and_then(|manifest| runtime_removal_view(&manifest, runtime, runtime_version))
+    {
+        Ok(view) => view,
+        Err(refusal) => return Ok(refusal),
+    };
+    // Removed only once every hive's nodes were read and none runs on the version (FINDINGS A-281).
+    let mut usage_global = match runtime_version_removable(
+        runtime,
+        runtime_version,
+        read_runtime_version_use(ctx, client, &seen.runtime_key, runtime_version).await,
+    ) {
+        Ok(usage) => usage,
+        Err(refusal) => return Ok(refusal),
+    };
+
+    let _manifest_guard = match take_runtime_manifest_lock(ctx).await {
+        Ok(guard) => guard,
+        Err(err) => {
+            return Ok(manifest_lock_refusal(
+                "remove_runtime_version",
+                "RUNTIME_REMOVE_FAILED",
+                &err,
+            ))
+        }
+    };
     if let Some(hold_ms) = payload
         .get("test_hold_ms")
         .and_then(|value| value.as_u64())
@@ -20324,7 +20556,7 @@ async fn handle_remove_runtime_version(
     }
 
     // Held from the read to the write, and the write back after a failed removal (FINDINGS A-171).
-    let _manifest_file_lock = match lock_local_runtime_manifest().await {
+    let _manifest_file_lock = match lock_local_runtime_manifest(ctx).await {
         Ok(lock) => lock,
         Err(err) => {
             return Ok(manifest_lock_refusal(
@@ -20334,7 +20566,7 @@ async fn handle_remove_runtime_version(
             ));
         }
     };
-    let manifest = match load_local_runtime_manifest() {
+    let manifest = match load_local_runtime_manifest(ctx) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
             return Ok((
@@ -20363,176 +20595,28 @@ async fn handle_remove_runtime_version(
             ));
         }
     };
-
-    let runtime_map = match runtime_manifest_entry_map_local(&manifest) {
-        Ok(map) => map,
-        Err(err) => {
-            return Ok((
-                409,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "MANIFEST_INVALID",
-                    "error_detail": err,
-                })
-                .to_string(),
-            ));
-        }
-    };
-    let runtime_key = match resolve_runtime_key_local(&runtime_map, runtime) {
-        Ok(value) => value,
-        Err(_) => {
-            return Ok((
-                404,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "RUNTIME_NOT_FOUND",
-                    "error_detail": format!("runtime '{}' not found", runtime),
-                })
-                .to_string(),
-            ));
-        }
-    };
-    let Some(entry) = runtime_map.get(&runtime_key) else {
-        return Ok((
-            404,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": serde_json::Value::Null,
-                "error_code": "RUNTIME_NOT_FOUND",
-                "error_detail": format!("runtime '{}' not found", runtime),
-            })
-            .to_string(),
-        ));
-    };
-
-    let current = entry.current.as_deref().map(str::trim).unwrap_or("");
-    if runtime_version == "current" {
-        return Ok((
-            409,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": serde_json::Value::Null,
-                "error_code": "RUNTIME_CURRENT_CONFLICT",
-                "error_detail": format!(
-                    "cannot delete current version '{}' for runtime '{}'",
-                    current, runtime
-                ),
-            })
-            .to_string(),
-        ));
-    }
-    if !current.is_empty()
-        && current == runtime_version
-        && !can_remove_current_runtime_version_local(entry, runtime_version)
-    {
-        return Ok((
-            409,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": serde_json::Value::Null,
-                "error_code": "RUNTIME_CURRENT_CONFLICT",
-                "error_detail": format!(
-                    "cannot delete current version '{}' for runtime '{}'",
-                    current, runtime
-                ),
-            })
-            .to_string(),
-        ));
-    }
-
-    // The version the installed package brought stays: it is the way back (`reset_base_runtime`),
-    // its files are the package's, and the next package replaces it (FINDINGS A-122).
-    if is_package_version_local(entry, runtime_version) {
-        return Ok((
-            409,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": serde_json::Value::Null,
-                "error_code": "RUNTIME_PACKAGE_VERSION",
-                "error_detail": format!(
-                    "version '{}' is the one the installed package brought for runtime '{}' (its package_version): it stays, as the way back with reset_base_runtime, and the next package replaces it",
-                    runtime_version, runtime
-                ),
-            })
-            .to_string(),
-        ));
-    }
-
-    let version_exists = runtime_versions_from_manifest_entry_local(entry)
-        .iter()
-        .any(|value| value == runtime_version);
-    if !version_exists {
-        return Ok((
-            404,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": serde_json::Value::Null,
-                "error_code": "RUNTIME_VERSION_NOT_FOUND",
-                "error_detail": format!(
-                    "version '{}' not available for runtime '{}'",
-                    runtime_version, runtime
-                ),
-            })
-            .to_string(),
-        ));
-    }
-
-    // The manifest alone decides this one: it goes before the read of the version's use, which
-    // waits on every hive (up to 30 s, under the manifest's lock) and would refuse, while a hive
-    // does not answer, a removal that can never pass.
-    let dependents = match runtime_dependents_summary_local(&manifest, &runtime_key) {
-        Ok(value) => value,
-        Err(err) => {
-            return Ok((
-                409,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "MANIFEST_INVALID",
-                    "error_detail": err,
-                })
-                .to_string(),
-            ));
-        }
-    };
-    if !dependents.is_empty() {
-        return Ok((
-            409,
-            serde_json::json!({
-                "status": "error",
-                "action": "remove_runtime_version",
-                "payload": {
-                    "dependents": dependents,
-                },
-                "error_code": "RUNTIME_HAS_DEPENDENTS",
-                "error_detail": format!(
-                    "runtime '{}' has published dependents; remove dependent runtimes first",
-                    runtime
-                ),
-            })
-            .to_string(),
-        ));
-    }
-
-    // Removed only once every hive's nodes were read and none runs on the version (FINDINGS A-281).
-    let usage_global = match runtime_version_removable(
-        runtime,
-        runtime_version,
-        read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,
-    ) {
-        Ok(usage) => usage,
+    let now = match runtime_removal_view(&manifest, runtime, runtime_version) {
+        Ok(view) => view,
         Err(refusal) => return Ok(refusal),
     };
+    if now != seen {
+        // The runtime changed while its use was read (a publish of it, say): the use is read again,
+        // under the locks, as every removal read it before 0.1.139.
+        tracing::info!(
+            runtime = %now.runtime_key,
+            runtime_version = runtime_version,
+            "runtime removal: the runtime changed while its use was read; read again under the lock"
+        );
+        usage_global = match runtime_version_removable(
+            runtime,
+            runtime_version,
+            read_runtime_version_use(ctx, client, &now.runtime_key, runtime_version).await,
+        ) {
+            Ok(usage) => usage,
+            Err(refusal) => return Ok(refusal),
+        };
+    }
+    let runtime_key = now.runtime_key;
 
     let updated_manifest = match remove_runtime_version_from_manifest_local(
         &manifest,
@@ -20571,7 +20655,11 @@ async fn handle_remove_runtime_version(
         }
     };
 
-    let quarantined = match quarantine_runtime_version_dir_local(&runtime_key, runtime_version) {
+    let quarantined = match quarantine_runtime_version_dir_local(
+        &ctx.runtimes_root,
+        &runtime_key,
+        runtime_version,
+    ) {
         Ok(value) => value,
         Err(err) => {
             return Ok((
@@ -20588,7 +20676,8 @@ async fn handle_remove_runtime_version(
         }
     };
 
-    let manifest_path = Path::new(DIST_RUNTIME_MANIFEST_PATH);
+    let manifest_path = runtime_manifest_path(ctx);
+    let manifest_path = manifest_path.as_path();
     let write_v2_gate_enabled = runtime_manifest_write_v2_gate_enabled_from_env();
     if let Err(err) =
         write_runtime_manifest_file_atomic(manifest_path, &updated_manifest, write_v2_gate_enabled)
@@ -20610,7 +20699,11 @@ async fn handle_remove_runtime_version(
     }
 
     let removed_runtime_dir = if let Some((original, quarantine)) = quarantined.as_ref() {
-        match finalize_quarantined_runtime_version_dir_local(runtime, quarantine) {
+        match finalize_quarantined_runtime_version_dir_local(
+            &ctx.runtimes_root,
+            runtime,
+            quarantine,
+        ) {
             Ok(removed_runtime_dir) => removed_runtime_dir,
             Err(err) => {
                 let rollback_manifest = write_runtime_manifest_file_atomic(
@@ -20675,7 +20768,8 @@ async fn handle_remove_runtime_version(
                     .unwrap_or(serde_json::Value::Null),
                 "manifest_version": manifest_version,
                 "manifest_hash": manifest_hash,
-                "removed_path": Path::new(DIST_RUNTIME_ROOT_DIR)
+                "removed_path": ctx
+                    .runtimes_root
                     .join(&runtime_key)
                     .join(runtime_version)
                     .display()
@@ -20732,13 +20826,16 @@ async fn handle_reset_base_runtime(
         );
     }
 
-    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
+    let _manifest_guard = match take_runtime_manifest_lock(ctx).await {
+        Ok(guard) => guard,
+        Err(err) => return Ok(manifest_lock_refusal(action, "RUNTIME_RESET_FAILED", &err)),
+    };
     // Held from the read to the write (FINDINGS A-171).
-    let _manifest_file_lock = match lock_local_runtime_manifest().await {
+    let _manifest_file_lock = match lock_local_runtime_manifest(ctx).await {
         Ok(lock) => lock,
         Err(err) => return Ok(manifest_lock_refusal(action, "RUNTIME_RESET_FAILED", &err)),
     };
-    let manifest = match load_local_runtime_manifest() {
+    let manifest = match load_local_runtime_manifest(ctx) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
             return refuse(
@@ -20751,14 +20848,13 @@ async fn handle_reset_base_runtime(
     };
     let reset =
         match reset_base_runtime_in_manifest_local(&manifest, runtime, |runtime, version| {
-            base_runtime_version_ready(
-                &Path::new(DIST_RUNTIME_ROOT_DIR).join(runtime).join(version),
-            )
+            base_runtime_version_ready(&ctx.runtimes_root.join(runtime).join(version))
         }) {
             Ok(reset) => reset,
             Err((status, code, detail)) => return refuse(status, code, detail),
         };
-    let manifest_path = Path::new(DIST_RUNTIME_MANIFEST_PATH);
+    let manifest_path = runtime_manifest_path(ctx);
+    let manifest_path = manifest_path.as_path();
     if let Some(updated) = reset.updated.as_ref() {
         if let Err(err) = write_runtime_manifest_file_atomic(
             manifest_path,
@@ -30555,6 +30651,7 @@ mod tests {
             publication_ledger_path: state_dir.join("sy-admin/publications.json"),
             publication_lock: Arc::new(Mutex::new(())),
             runtime_manifest_lock: Arc::new(Mutex::new(())),
+            runtimes_root: root.join("dist").join("runtimes"),
             command_log_lock: Arc::new(std::sync::Mutex::new(())),
             acme: acme::tests::inert_service(&state_dir),
             web: Arc::new(WebRoutes::new(
@@ -35334,6 +35431,11 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&body).expect("JSON");
         assert_eq!(body["payload"]["retryable"], json!(false), "{body}");
+        // Only the lock's own words, at the start: a request's text that quotes them is no hold.
+        assert!(!runtime_manifest_lock_held_too_long(
+            "package.json invalid: version='runtime manifest lock: another writer held' is not \
+             valid semver"
+        ));
         let _ = fs::remove_dir_all(dist);
     }
 
@@ -37697,6 +37799,221 @@ mod tests {
         assert!(!is_package_version_local(&entries["wf.router"], "0.0.4"));
     }
 
+    /// A runtimes manifest of `runtimes` in the test's own dist, with a directory for each version
+    /// it lists.
+    fn seed_runtimes(ctx: &AdminContext, runtimes: Value) {
+        fs::create_dir_all(&ctx.runtimes_root).expect("the dist");
+        for (runtime, entry) in runtimes.as_object().into_iter().flatten() {
+            for version in entry["available"].as_array().into_iter().flatten() {
+                let dir = ctx
+                    .runtimes_root
+                    .join(runtime)
+                    .join(version.as_str().expect("a version"));
+                fs::create_dir_all(&dir).expect("its directory");
+                fs::write(dir.join("package.json"), "{}").expect("a file of it");
+            }
+        }
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1_710_000_000_000,
+            updated_at: None,
+            runtimes,
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&runtime_manifest_path(ctx), &manifest, false)
+            .expect("the manifest");
+    }
+
+    /// The motherbee orchestrator's answer to a read of a version's use: every hive counted, no
+    /// node on it.
+    fn unused_everywhere() -> Value {
+        json!({
+            "status": "ok",
+            "usage_global_visible": {
+                "scope": "group_visible_control_plane",
+                "in_use": false,
+                "running_count": 0,
+                "running_nodes": [],
+                "skipped_hives": [],
+                "hives_without_runtimes": [],
+            },
+        })
+    }
+
+    /// The orchestrator's answer to `request`, an admin request SY.admin sent it.
+    async fn answer_orchestrator(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        request: &Message,
+        answer: Value,
+    ) {
+        let mut reply = reply_to(request, "", answer);
+        reply.meta.msg_type = "admin".to_string();
+        reply.meta.msg = None;
+        harness.inject(reply).await.unwrap();
+    }
+
+    /// FINDINGS A-306: a version's removal reads its use on every hive with no lock held, then takes
+    /// the manifest's locks, checks the manifest again and writes. Before, it held SY.admin's lock
+    /// and the file lock through the read (up to 30 s while a hive does not answer), and every
+    /// publish, SY.wf-rules' deploys among them, waited behind it.
+    #[tokio::test]
+    async fn a_removal_reads_the_versions_use_with_no_lock_held() {
+        let (ctx, mut harness) = opa_test_admin("a306-read-unlocked");
+        seed_runtimes(
+            &ctx,
+            json!({ "ai.gate": { "available": ["0.9.0", "1.0.0"], "current": "1.0.0", "type": "full_runtime" } }),
+        );
+        let removal = handle_remove_runtime_version(
+            &ctx,
+            &ctx.rpc,
+            json!({ "runtime": "ai.gate", "runtime_version": "0.9.0" }),
+            None,
+        );
+        let read = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the read of its use");
+            assert_eq!(sent.meta.action.as_deref(), Some("get_runtime"));
+            assert_eq!(sent.payload["runtime_version"], json!("0.9.0"));
+            assert!(
+                ctx.runtime_manifest_lock.try_lock().is_ok(),
+                "SY.admin's lock of the manifest is free while the use is read"
+            );
+            drop(
+                lock_runtime_manifest(&runtime_manifest_path(&ctx), Duration::ZERO)
+                    .expect("the manifest's file lock is free while the use is read"),
+            );
+            answer_orchestrator(&mut harness, &sent, unused_everywhere()).await;
+        };
+        let (answer, ()) = tokio::join!(removal, read);
+        let (status, body) = answer.expect("answered");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["payload"]["removed_version"], json!("0.9.0"));
+        let manifest = load_local_runtime_manifest(&ctx)
+            .expect("read")
+            .expect("there");
+        assert_eq!(manifest.runtimes["ai.gate"]["available"], json!(["1.0.0"]));
+        assert!(!ctx.runtimes_root.join("ai.gate").join("0.9.0").exists());
+        // The runtime did not change meanwhile: its use was read once.
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+    }
+
+    /// FINDINGS A-306: when the runtime changed while its use was read (another version of it
+    /// published meanwhile), the removal reads the use again under the locks before it writes, and
+    /// writes on the manifest as it is then: the version published meanwhile stays.
+    #[tokio::test]
+    async fn a_removal_reads_the_use_again_when_its_runtime_changed_meanwhile() {
+        let (ctx, mut harness) = opa_test_admin("a306-read-again");
+        seed_runtimes(
+            &ctx,
+            json!({ "ai.gate": { "available": ["0.9.0", "1.0.0"], "current": "1.0.0", "type": "full_runtime" } }),
+        );
+        let removal = handle_remove_runtime_version(
+            &ctx,
+            &ctx.rpc,
+            json!({ "runtime": "ai.gate", "runtime_version": "0.9.0" }),
+            None,
+        );
+        let reads = async {
+            let first = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the first read");
+            // Meanwhile 1.1.0 is published.
+            seed_runtimes(
+                &ctx,
+                json!({ "ai.gate": { "available": ["0.9.0", "1.0.0", "1.1.0"], "current": "1.1.0", "type": "full_runtime" } }),
+            );
+            answer_orchestrator(&mut harness, &first, unused_everywhere()).await;
+            let second = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the read again");
+            assert_eq!(second.meta.action.as_deref(), Some("get_runtime"));
+            assert!(
+                ctx.runtime_manifest_lock.try_lock().is_err(),
+                "read again under SY.admin's lock"
+            );
+            answer_orchestrator(&mut harness, &second, unused_everywhere()).await;
+        };
+        let (answer, ()) = tokio::join!(removal, reads);
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+        let manifest = load_local_runtime_manifest(&ctx)
+            .expect("read")
+            .expect("there");
+        assert_eq!(
+            manifest.runtimes["ai.gate"]["available"],
+            json!(["1.0.0", "1.1.0"])
+        );
+        assert_eq!(manifest.runtimes["ai.gate"]["current"], json!("1.1.0"));
+    }
+
+    /// FINDINGS A-306: a publish waits for SY.admin's lock of the runtimes manifest 60 s at most, then
+    /// answers `409 RUNTIME_MANIFEST_BUSY`, `payload.retryable: true`, with nothing published,
+    /// where it waited with no bound; a reset waiting as long answers `RUNTIME_RESET_FAILED`,
+    /// retryable. The manifest's file lock held past its own 60 s reads as busy too, where a
+    /// publish answered `SERVICE_FAILED`.
+    #[tokio::test(start_paused = true)]
+    async fn a_publish_waits_for_the_manifest_lock_a_bounded_time() {
+        let (ctx, _harness) = opa_test_admin("a306-publish-bounded");
+        seed_runtimes(&ctx, json!({}));
+        let other_writer = ctx.runtime_manifest_lock.lock().await;
+        let started = tokio::time::Instant::now();
+        let publish = handle_publish_runtime_package(
+            &ctx,
+            &ctx.rpc,
+            json!({
+                "source": {
+                    "kind": "inline_package",
+                    "files": {
+                        "package.json": "{\"name\": \"ai.support.demo\", \"version\": \"0.1.0\", \"type\": \"config_only\", \"runtime_base\": \"ai.generic\"}",
+                    },
+                },
+            }),
+        );
+        let (status, body) = tokio::time::timeout(Duration::from_secs(120), publish)
+            .await
+            .expect("answered within its bound")
+            .expect("answered");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("RUNTIME_MANIFEST_BUSY"));
+        assert_eq!(body["payload"]["retryable"], json!(true));
+        assert!(started.elapsed() >= RUNTIME_MANIFEST_LOCK_WAIT);
+        assert!(!ctx.runtimes_root.join("ai.support.demo").exists());
+
+        let reset = handle_reset_base_runtime(&ctx, json!({ "runtime": "ai.generic" }), None);
+        let (status, body) = tokio::time::timeout(Duration::from_secs(120), reset)
+            .await
+            .expect("answered within its bound")
+            .expect("answered");
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("RUNTIME_RESET_FAILED"));
+        assert_eq!(body["payload"]["retryable"], json!(true));
+        drop(other_writer);
+
+        let file_lock_held = "runtime manifest lock: another writer held '/var/lib/fluxbee/dist/runtimes-manifest.lock' for 60s";
+        assert_eq!(
+            publish_runtime_package_error_code(file_lock_held),
+            "RUNTIME_MANIFEST_BUSY"
+        );
+        // As the package install gives it.
+        assert_eq!(
+            publish_runtime_package_error_code(&format!(
+                "manifest update failed: {file_lock_held}"
+            )),
+            "RUNTIME_MANIFEST_BUSY"
+        );
+        assert_eq!(error_code_to_http_status("RUNTIME_MANIFEST_BUSY"), 409);
+    }
+
     /// FINDINGS A-171: SY.admin's writers of the runtimes manifest hold its file lock from their read
     /// to their write, as the writers outside SY.admin do: remove_runtime_version (its write back
     /// after a failed removal included) and reset_base_runtime take it before they read the
@@ -37715,16 +38032,19 @@ mod tests {
             let start = source.find(handler).expect("the handler");
             let body = &source[start..start + source[start..].find("\n}\n").expect("its end")];
             let lock = body
-                .find("lock_local_runtime_manifest().await")
+                .find("lock_local_runtime_manifest(ctx).await")
                 .expect("the file lock");
+            // The read the write is built on, the last before it: since 0.1.139 a removal also
+            // reads the manifest before its locks, to check it while it reads the version's use,
+            // and writes nothing from that read (FINDINGS A-306).
             let read = body
-                .find("load_local_runtime_manifest()")
+                .rfind("load_local_runtime_manifest(ctx)")
                 .expect("the read");
             let last_write = body
                 .rfind("write_runtime_manifest_file_atomic(")
                 .expect("the write");
             assert!(lock < read && read < last_write, "{handler}");
-            assert_eq!(body.matches("lock_local_runtime_manifest()").count(), 1);
+            assert_eq!(body.matches("lock_local_runtime_manifest(").count(), 1);
 
             // Its binding: a statement of the body itself, four spaces in, never one of a block
             // that ends before the write, whose value is the lock.
@@ -38399,16 +38719,30 @@ mod tests {
         let handler = "async fn handle_remove_runtime_version(";
         let start = source.find(handler).expect("the handler");
         let body = &source[start..start + source[start..].find("\n}\n").expect("its end")];
+        // Each read of the use is decided on by runtime_version_removable: the first with no lock
+        // held, and again under the locks only when the runtime changed meanwhile (FINDINGS A-306).
         let read =
             "runtime_version_removable(\n        runtime,\n        runtime_version,\n        \
-                    read_runtime_version_use(ctx, client, &runtime_key, runtime_version).await,";
+                    read_runtime_version_use(ctx, client, &seen.runtime_key, runtime_version).await,";
+        let read_again = "runtime_version_removable(\n            runtime,\n            \
+                          runtime_version,\n            read_runtime_version_use(ctx, client, \
+                          &now.runtime_key, runtime_version).await,";
         assert!(body.contains(read));
+        assert!(body.contains(read_again));
+        assert_eq!(body.matches("read_runtime_version_use(").count(), 2);
         assert!(!body.contains("in_use"), "{handler}");
         assert!(!body.contains("running_nodes"), "{handler}");
-        let dependents = body
-            .find("runtime_dependents_summary_local(&manifest, &runtime_key)")
-            .expect("the dependents' check");
-        assert!(dependents < body.find(read).expect("the read"));
+        // The manifest's checks, the dependents' among them, come before the read: they are
+        // runtime_removal_view's, which the handler runs first.
+        let checks = body
+            .find("runtime_removal_view(&manifest, runtime, runtime_version)")
+            .expect("the manifest's checks");
+        assert!(checks < body.find(read).expect("the read"));
+        let view_start = source
+            .find("fn runtime_removal_view(")
+            .expect("the checks' function");
+        let view = &source[view_start..view_start + source[view_start..].find("\n}\n").unwrap()];
+        assert!(view.contains("runtime_dependents_summary_local(manifest, &runtime_key)"));
     }
 
     /// The help says what a runtime version's removal answers (FINDINGS A-281): RUNTIME_IN_USE

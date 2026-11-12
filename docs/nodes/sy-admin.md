@@ -608,6 +608,14 @@ manifest, from an `inline_package` or a `bundle_upload`; each hive's mirror brin
   reader of a version after its publish takes a `+` (`remove_runtime_version`'s
   `valid_runtime_token`, the orchestrator's launch and reads), so such a version ran no node of a
   config-only or workflow package on it (`BASE_RUNTIME_NOT_AVAILABLE`) and could not be removed.
+- **The manifest's lock.** A publish waits for SY.admin's lock of the manifest
+  (`take_runtime_manifest_lock`) and for its file lock up to 60 s each
+  (`RUNTIME_MANIFEST_LOCK_WAIT`); past either it answers `409 RUNTIME_MANIFEST_BUSY` with
+  `payload.retryable: true`, nothing published (FINDINGS A-306, since 0.1.139): ask again once the
+  other writer is done. Before, it waited for SY.admin's lock with no bound, behind a removal that
+  held it through its read of every hive's use, and a file lock held too long answered
+  `SERVICE_FAILED`. A publish with follow-ups (`sync_to`, `update_to`) holds SY.admin's lock
+  through them.
 
 ## A runtime version's removal
 
@@ -619,7 +627,13 @@ use on every hive from the motherbee's orchestrator (`get_runtime` with the vers
 pinned to the version whose unit may run, each with its `hive` and `lifecycle`, and
 `skipped_hives`, the hives whose nodes the orchestrator did not count
 ([SY.orchestrator](sy-orchestrator.md)). Only a read that counted every hive that may run a node on
-a runtime, and lists no node, lets the version go (`runtime_version_removable`). An ingress or an
+a runtime, and lists no node, lets the version go (`runtime_version_removable`). The manifest's
+checks come first and the read of the use after them, with no lock held (FINDINGS A-306, since
+0.1.139); then the removal takes SY.admin's lock and the file lock, checks the manifest again
+(`runtime_removal_view`) and, only when the runtime's entry changed meanwhile (a publish of it,
+say), reads the use again under the locks before it writes. Before, it held both locks through
+the read, up to 30 s while a hive did not answer, and every publish, SY.wf-rules' deploys among
+them, waited behind it. An ingress or an
 egress, by the role its registry entry records whatever the state of its join
 (`registered_hive`), receives no runtime: the orchestrator links only the workers into
 `fluxbee-dist-runtimes`. The motherbee's orchestrator asks neither and lists them apart
@@ -1846,13 +1860,16 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
   from its read of the manifest to its write (`lock_runtime_manifest`, FINDINGS A-171), the flock
   every writer outside SY.admin takes too
   (`fluxbee-publish`, `scripts/publish-runtime.sh`, the .deb's seed): `remove_runtime_version`
-  and `reset_base_runtime` before they read it (`lock_local_runtime_manifest`, across the 30 s read
-  of the version's use for a removal), `publish_runtime_package` in the shared install. A writer
-  waits for another up to 60 s (`RUNTIME_MANIFEST_LOCK_WAIT`): past that a removal answers
-  `RUNTIME_REMOVE_FAILED`, a reset `RUNTIME_RESET_FAILED` and a publish `SERVICE_FAILED`, with the
-  manifest untouched. The removal's and the reset's say `payload.retryable: true` (FINDINGS
-  A-305, since 0.1.139): asked again once the other writer is done, they may pass; a lock whose
-  file cannot be opened says false (`manifest_lock_refusal`).
+  and `reset_base_runtime` before they read it (`lock_local_runtime_manifest`),
+  `publish_runtime_package` in the shared install. A removal reads the version's use before it
+  takes either lock, and reads it again under them only when the runtime changed meanwhile
+  (FINDINGS A-306, since 0.1.139; [A runtime version's removal](#a-runtime-versions-removal)).
+  A writer waits for another up to 60 s (`RUNTIME_MANIFEST_LOCK_WAIT`), for SY.admin's lock as for
+  the file's (`take_runtime_manifest_lock`, since 0.1.139: it waited with no bound): past that a
+  removal answers `RUNTIME_REMOVE_FAILED`, a reset `RUNTIME_RESET_FAILED` and a publish
+  `RUNTIME_MANIFEST_BUSY` (`SERVICE_FAILED` before 0.1.139), with the manifest untouched. Each
+  says `payload.retryable: true` (FINDINGS A-305, A-306): asked again once the other writer is
+  done, it may pass; a lock whose file cannot be opened says false (`manifest_lock_refusal`).
 
 ## Failure behavior
 

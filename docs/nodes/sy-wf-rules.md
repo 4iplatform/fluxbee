@@ -142,8 +142,10 @@ compile and its apply leaves the staged and the current definitions as they were
    that may run it, up to 30 s (`JSR_ADMIN_ORCH_TIMEOUT_SECS`), and refuses it otherwise
    (`RUNTIME_USAGE_UNKNOWN`, FINDINGS A-281), so each removal waits up to 35 s for SY.admin's
    answer (`runtimeRemovalTimeout`; 5 s before). An answer that comes later is a `TIMEOUT`
-   (SY.admin may still remove the version): SY.admin first waits for its manifest's lock, which
-   another removal holds across its own read of the use, and a publish across its install. The
+   (SY.admin may still remove the version): SY.admin reads the use before it takes its manifest's
+   lock, then waits for that lock, which a publish holds across its install and another removal
+   for its write, or for a read again when its runtime changed meanwhile (FINDINGS A-306, since
+   0.1.139; before, a removal held it across its own read of the use). The
    purge stops at the first removal refused or not answered: what refused it holds for the next.
    Here, between the publish and the node's step, the whole purge is bounded by 15 s
    (`deployPurgeBudget`, `purgeAfterPublish`), so the node's step keeps 40 s at least, as before

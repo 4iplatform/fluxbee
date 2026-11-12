@@ -111,8 +111,12 @@ pub fn load_runtime_manifest_from_paths(
 }
 
 /// How long a writer of a runtimes manifest waits for its lock (`lock_runtime_manifest`): above
-/// the longest hold, SY.admin's `remove_runtime_version`, whose read of the version's use (30 s)
-/// comes between its read of the manifest and its write.
+/// the longest hold, SY.admin's `remove_runtime_version` whose runtime changed while it read the
+/// version's use, which reads it again (30 s) between its read of the manifest under the lock and
+/// its write. Since 0.1.139 a removal reads the use first with no lock held, so most removals hold
+/// it for their write alone (FINDINGS A-306). SY.admin's writers wait as long for its own lock of
+/// the manifest, which a publish holds through its follow-ups too (`sync_to`, `update_to`): one
+/// waiting past it answers `RUNTIME_MANIFEST_BUSY`, retryable.
 pub const RUNTIME_MANIFEST_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// The name of the runtimes manifest's lock file, in the dist root (`runtime_manifest_lock_path`).
@@ -141,14 +145,19 @@ pub struct RuntimeManifestLock {
     _file: fs::File,
 }
 
-/// How `lock_runtime_manifest`'s error begins when another writer held the lock past the wait.
-const RUNTIME_MANIFEST_LOCK_HELD: &str = "runtime manifest lock: another writer held";
+/// How `lock_runtime_manifest`'s error begins when another writer held the lock past the wait, and
+/// SY.admin's when its own lock of the manifest was held past it (FINDINGS A-306).
+pub const RUNTIME_MANIFEST_LOCK_HELD: &str = "runtime manifest lock: another writer held";
 
-/// Whether `err`, an error of `lock_runtime_manifest`, says another writer held the lock past the
-/// wait (FINDINGS A-305): nothing was read or written, and asking again once that writer is done
-/// may pass. Any other error of the lock (its file cannot be opened or locked) is the dist's to fix.
+/// Whether `err`, an error of `lock_runtime_manifest` as it comes or as the package install gives
+/// it (after its `manifest update failed: `), says another writer held the lock past the wait
+/// (FINDINGS A-305): nothing was read or written, and asking again once that writer is done may
+/// pass. Any other error of the lock (its file cannot be opened or locked) is the dist's to fix.
+/// Only those words where the lock puts them count: a request's text that quotes them is no hold.
 pub fn runtime_manifest_lock_held_too_long(err: &str) -> bool {
-    err.contains(RUNTIME_MANIFEST_LOCK_HELD)
+    err.strip_prefix("manifest update failed: ")
+        .unwrap_or(err)
+        .starts_with(RUNTIME_MANIFEST_LOCK_HELD)
 }
 
 /// Takes the lock of the runtimes manifest at `manifest_path` (`runtime_manifest_lock_path`),

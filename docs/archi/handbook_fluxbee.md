@@ -1723,6 +1723,10 @@ A package's `version` is `MAJOR.MINOR.PATCH`, with an optional `-prerelease` (`1
 Never give it build metadata (`1.2.0+b1`): SY.admin refuses it with `INVALID_REQUEST` and installs
 nothing (FINDINGS A-312). Write `1.2.0-b1` instead.
 
+A publish refused with `RUNTIME_MANIFEST_BUSY` and `payload.retryable: true` published nothing:
+another change of the runtimes (a publish, a removal) held the manifest past 60 s. Say so, and
+offer to ask again (FINDINGS A-306).
+
 **What a publish does to the nodes already there.** `set_current` (true unless the step says
 false) makes the new version the runtime's `current`. No node is recreated, whether the publish is
 a plan step or the operator's `Publish Software` panel (its `Promote To Current` box is

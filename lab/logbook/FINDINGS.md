@@ -2138,6 +2138,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** read the use before taking the locks, then check the manifest again under them
   and read again only if it changed; or a bounded wait for the publish that answers a retryable
   code.
+- **Built on `coa/admin-139` for 0.1.139, both halves:** a removal checks the manifest and reads the
+  version's use with no lock held, then takes SY.admin's lock and the file lock, checks the
+  manifest again (`runtime_removal_view`) and reads the use again, under the locks, only when the
+  runtime's entry changed meanwhile; and SY.admin's own lock is waited for at most 60 s
+  (`take_runtime_manifest_lock`, as the file lock is): a publish past it answers
+  `409 RUNTIME_MANIFEST_BUSY` with `payload.retryable: true` (a new code; the file lock held past
+  its 60 s answers it too, where it was `SERVICE_FAILED`), a removal `RUNTIME_REMOVE_FAILED` and a
+  reset `RUNTIME_RESET_FAILED`, both retryable (A-305). The manifest's writers read and write the
+  dist SY.admin's context names (`runtimes_root`, `DIST_RUNTIME_ROOT_DIR` on the motherbee), so the
+  tests run a removal and a publish on a dist of their own. `test_hold_ms` holds the lock as
+  before, now after the read of the use. Its tests: `a_removal_reads_the_versions_use_with_no_lock_held`,
+  `a_removal_reads_the_use_again_when_its_runtime_changed_meanwhile` and
+  `a_publish_waits_for_the_manifest_lock_a_bounded_time`, each failing without it; A-171's
+  structural test reads the locked read the write is built on. SY.admin's help
+  (`publish_runtime_package`, `remove_runtime_version`), sy-admin.md, sy-wf-rules.md,
+  operations.md and Archi's handbook (§7.2) say it. Left: the comment over `runtimeRemovalTimeout`
+  in `go/sy-wf-rules/node/admin.go` still says a removal holds the lock across its read (SY.wf-rules'
+  branch, a comment only).
 
 ### A-305 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code) — `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass
 
