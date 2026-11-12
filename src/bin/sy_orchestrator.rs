@@ -1549,9 +1549,10 @@ fn system_response_msg(msg: &str) -> Option<String> {
 const WORKER_CONCURRENT_READS_MAX: usize = 16;
 
 /// FINDINGS A-199, the review of step 1: the most reads one worker runs at once that wait on the
-/// same target (`ReadTarget`: one other hive, every hive for a fan-out, or every hive for a
-/// runtime's use). A hive that does not answer, asked again and again, then holds this many of
-/// the forwarding reads' places for each target it delays, and no local read's.
+/// same target (`ReadTarget`: one other hive, every hive for `/versions`, every hive for a
+/// runtime's use, or every hive for a tenant's nodes). A hive that does not answer, asked again
+/// and again, then holds this many of the forwarding reads' places for each target it delays, and
+/// no local read's.
 const WORKER_READS_PER_TARGET_MAX: usize = 4;
 
 /// The lane a worker runs a request in (FINDINGS A-199, step 1).
@@ -1573,16 +1574,23 @@ enum ReadTarget {
     Local,
     /// Another hive's orchestrator, which the flow forwards the read to.
     Hive(String),
-    /// Every other hive at once (`list_versions`, `list_tenant_nodes`).
+    /// Every other hive, for `/versions` (`list_versions`), which asks the hives one after
+    /// another, 45 s for each that does not answer.
     EveryHive,
     /// Every other hive at once for a runtime's use: the motherbee's `get_runtime` of its own
     /// hive, which asks each worker for its nodes on the runtime, up to
     /// `RUNTIME_USAGE_HIVE_TIMEOUT` for one that does not answer (FINDINGS A-281, the review).
-    /// Apart from `EveryHive`, so it never waits behind `list_versions`, which asks the hives one
-    /// after another, 45 s for each that does not answer, while SY.admin's `remove_runtime_version`
-    /// waits 30 s for this read; and Fluxbee Cloud's `list_tenant_nodes` (20 s) never waits behind
-    /// it.
+    /// Apart from `EveryHive`, so it never waits behind `list_versions`, while SY.admin's
+    /// `remove_runtime_version` waits 30 s for this read; and Fluxbee Cloud's `list_tenant_nodes`
+    /// (20 s) never waits behind it.
     RuntimeUse,
+    /// Every other hive at once for a tenant's nodes: Fluxbee Cloud's `list_nodes`
+    /// (`list_tenant_nodes`), which asks each connected hive with 10 s to answer and which the
+    /// Cloud waits 20 s for. Apart from `EveryHive` (FINDINGS A-308): while a worker's orchestrator
+    /// did not answer, 4 `/versions` reads held that target's places 30 s and more, and a Cloud
+    /// `list_nodes` asked meanwhile waited for one past the Cloud's 20 s (`TIMEOUT` at 31.8 s on
+    /// 8.x, 0.1.134).
+    TenantNodes,
 }
 
 /// The lane of one of SY.admin's commands (FINDINGS A-199). The reads are the ones read in the code
@@ -1636,7 +1644,9 @@ fn system_request_lane(
 /// of its own (`ReadTarget::RuntimeUse`), so reads asked again while a hive does not answer hold
 /// its 4 places and forwarding places, never this hive's local reads' nor the places of
 /// `list_versions` and `list_tenant_nodes`. A spoke's asks no other hive, and neither does a read
-/// of the hive's own nodes alone (`usage_only`, `runtime_read_usage_only`).
+/// of the hive's own nodes alone (`usage_only`, `runtime_read_usage_only`). Fluxbee Cloud's
+/// `list_tenant_nodes` waits in a target of its own too (`ReadTarget::TenantNodes`, FINDINGS
+/// A-308), never behind `list_versions` (`ReadTarget::EveryHive`).
 fn read_target(
     action: &str,
     payload: &serde_json::Value,
@@ -1657,7 +1667,8 @@ fn read_target(
         "get_node_config" | "get_node_state" | "get_node_status" => {
             node_request_target_hive(payload, local_hive)
         }
-        "list_versions" | "list_tenant_nodes" => return ReadTarget::EveryHive,
+        "list_versions" => return ReadTarget::EveryHive,
+        "list_tenant_nodes" => return ReadTarget::TenantNodes,
         _ => return ReadTarget::Local,
     };
     if hive == local_hive {
@@ -21797,8 +21808,8 @@ async fn global_visible_runtime_usage_summary_with_roots(
 /// up to this long while a worker does not answer: a fifth read asked meanwhile waits up to 10 s
 /// for one, and a ninth up to 20 s, which with its own 10 s reaches SY.admin's 30 s. Each also
 /// takes one of the 16 forwarding places (`WorkerLanes`), which the reads of other targets (4
-/// each: a hive that does not answer, `list_versions`) fill only while at least 4 of those targets
-/// wait at once. A worker answers from its nodes' configs, with one `systemctl is-active` for each
+/// each: a hive that does not answer, `list_versions`, `list_tenant_nodes`) fill only while at
+/// least 4 of those targets wait at once. A worker answers from its nodes' configs, with one `systemctl is-active` for each
 /// node on the runtime: well under a second, a few on a loaded 2-vCPU spoke. Before, each hive was
 /// asked after the one before, with the forward's 45 s (`system_forward_timeout`), past SY.admin's
 /// whole wait for a single hive that did not answer. `list_tenant_nodes` waits as long for each
@@ -57328,8 +57339,9 @@ blob:
     /// hive for its nodes, up to RUNTIME_USAGE_HIVE_TIMEOUT for one that does not answer, so it
     /// waits on every hive, in a target of its own (`ReadTarget::RuntimeUse`): asked again and
     /// again while a hive does not answer, it holds its own places, never a local read's nor those
-    /// of list_versions and list_tenant_nodes (`EveryHive`). A spoke's, and a read of the hive's
-    /// own nodes alone (the request a worker gets from that fan-out), ask no other hive.
+    /// of list_versions (`EveryHive`) and list_tenant_nodes (`TenantNodes`, FINDINGS A-308). A
+    /// spoke's, and a read of the hive's own nodes alone (the request a worker gets from that
+    /// fan-out), ask no other hive.
     #[test]
     fn the_motherbees_runtime_read_waits_on_every_hive() {
         let runtime_use = RequestLane::Read(ReadTarget::RuntimeUse);
@@ -57392,10 +57404,13 @@ blob:
             admin_request_lane("list_runtimes", &serde_json::json!({}), "motherbee", true),
             local
         );
-        for action in ["list_versions", "list_tenant_nodes"] {
+        for (action, target) in [
+            ("list_versions", ReadTarget::EveryHive),
+            ("list_tenant_nodes", ReadTarget::TenantNodes),
+        ] {
             assert_eq!(
                 admin_request_lane(action, &serde_json::json!({}), "motherbee", true),
-                RequestLane::Read(ReadTarget::EveryHive),
+                RequestLane::Read(target),
                 "{action}"
             );
         }
@@ -58479,6 +58494,82 @@ blob:
         }
     }
 
+    /// FINDINGS A-308: Fluxbee Cloud's list_nodes (list_tenant_nodes, which the Cloud waits 20 s
+    /// for) waits in places of its own (`ReadTarget::TenantNodes`). On 8.x (0.1.134), with
+    /// worker1's orchestrator stopped, 4 `/versions` held list_versions's places 30.8 to 31.3 s
+    /// (it asks the hives one after another, 45 s for each that does not answer), and the Cloud's
+    /// list_nodes asked meanwhile answered TIMEOUT at 31.8 s. With those 4 places held, a tenant's
+    /// nodes read now starts at once; with 4 tenant reads held, a `/versions` read starts too. One
+    /// more of a kind waits for its own kind.
+    #[tokio::test]
+    async fn fluxbee_clouds_node_list_never_waits_behind_versions() {
+        let versions =
+            admin_request_lane("list_versions", &serde_json::json!({}), "motherbee", true);
+        let tenant_nodes = admin_request_lane(
+            "list_tenant_nodes",
+            &serde_json::json!({ "tenant_id": "tnt:test" }),
+            "motherbee",
+            true,
+        );
+
+        // list_versions holds its places, and one more waits.
+        let lanes = WorkerLanes::start("test", WORKER_CONCURRENT_READS_MAX);
+        let log = LaneLog::default();
+        let mut gates = Vec::new();
+        for read in 0..WORKER_READS_PER_TARGET_MAX {
+            gates.push(run_gated(
+                &lanes,
+                &log,
+                &versions,
+                &format!("versions-{read}"),
+            ));
+        }
+        wait_for_lane_starts(&log, WORKER_READS_PER_TARGET_MAX).await;
+        gates.push(run_gated(&lanes, &log, &versions, "versions-waiting"));
+        run_gated(&lanes, &log, &tenant_nodes, "tenant-nodes")
+            .send(())
+            .expect("the tenant's nodes read waits for its gate");
+        wait_for_lane_entry(&log, "tenant-nodes end").await;
+        assert!(
+            !lane_logged(&log, "versions-waiting start"),
+            "{:?}",
+            lane_started(&log)
+        );
+        gates.remove(0).send(()).expect("a versions read's gate");
+        wait_for_lane_entry(&log, "versions-waiting start").await;
+        for gate in gates.drain(..) {
+            let _ = gate.send(());
+        }
+
+        // The tenant reads hold theirs, and one more waits.
+        let lanes = WorkerLanes::start("test", WORKER_CONCURRENT_READS_MAX);
+        let log = LaneLog::default();
+        for read in 0..WORKER_READS_PER_TARGET_MAX {
+            gates.push(run_gated(
+                &lanes,
+                &log,
+                &tenant_nodes,
+                &format!("tenant-{read}"),
+            ));
+        }
+        wait_for_lane_starts(&log, WORKER_READS_PER_TARGET_MAX).await;
+        gates.push(run_gated(&lanes, &log, &tenant_nodes, "tenant-waiting"));
+        run_gated(&lanes, &log, &versions, "versions")
+            .send(())
+            .expect("the versions read waits for its gate");
+        wait_for_lane_entry(&log, "versions end").await;
+        assert!(
+            !lane_logged(&log, "tenant-waiting start"),
+            "{:?}",
+            lane_started(&log)
+        );
+        gates.remove(0).send(()).expect("a tenant read's gate");
+        wait_for_lane_entry(&log, "tenant-waiting start").await;
+        for gate in gates {
+            let _ = gate.send(());
+        }
+    }
+
     /// Forwarded reads hold only their own places: with every forwarding place held, a read of
     /// this hive alone still runs to its end.
     #[tokio::test]
@@ -58568,7 +58659,7 @@ blob:
             (
                 "list_tenant_nodes",
                 serde_json::json!({}),
-                RequestLane::Read(ReadTarget::EveryHive),
+                RequestLane::Read(ReadTarget::TenantNodes),
             ),
             (
                 "hive_status",

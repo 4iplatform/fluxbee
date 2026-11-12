@@ -1277,11 +1277,15 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 - **A read** runs in a task of its own. A read of this hive alone takes one of 16 places per
   worker (`WORKER_CONCURRENT_READS_MAX`); a read that waits on another hive takes one of its
   target's 4 places (`WORKER_READS_PER_TARGET_MAX`), then one of 16 others. Its target is that
-  hive; every hive for list_versions and list_tenant_nodes; and, since 0.1.133, every hive in a
-  target of its own for the motherbee's get_runtime of its own hive, which asks every hive for its
-  nodes on the runtime ([A runtime's use across the hives](#managed-nodes), FINDINGS A-281), so it
-  never waits behind list_versions, which asks the hives one after another, 45 s for each that
-  does not answer, while SY.admin's remove_runtime_version waits 30 s for it. A hive that does not
+  hive; every hive for list_versions; since 0.1.133, every hive in a target of its own for the
+  motherbee's get_runtime of its own hive, which asks every hive for its nodes on the runtime
+  ([A runtime's use across the hives](#managed-nodes), FINDINGS A-281), so it never waits behind
+  list_versions, which asks the hives one after another, 45 s for each that does not answer,
+  while SY.admin's remove_runtime_version waits 30 s for it; and, since 0.1.139, every hive in a
+  target of its own for list_tenant_nodes, Fluxbee Cloud's `list_nodes`, which the Cloud waits
+  20 s for (FINDINGS A-308): with worker1's orchestrator stopped on 8.x, 4 `/versions` held the
+  places they shared 30.8 to 31.3 s, and a `list_nodes` asked meanwhile answered `TIMEOUT` at
+  31.8 s. A hive that does not
   answer, asked again and again, then holds 4 forwarding places for each target it delays and no
   local read's (the review of step 1). One more read of a kind waits for one of its kind to end.
   Each read's target is the hive its flow forwards it to, found with the function the flow uses
