@@ -1644,6 +1644,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Effect:** for a run whose answer was cut, A-322's explanation turn (0.1.137) cannot say whether
   asking again may pass.
 - **Fix, later:** the essentials keep those three fields, bounded; with SY.admin's next change.
+- **Built on `coa/admin-139` for 0.1.139:** `executor_result_essentials` keeps a step's
+  `retryable`, its `unanswered_hives` (each hive's `hive`, `reason` and `next`,
+  `unanswered_hive_essentials`, which `packages_left_essentials` uses too, the hives that fit in
+  1 KiB, the rest counted) and its `next` (256 bytes), which Archi's report reads
+  (`payload_view` in `src/bin/sy_architect/execution_report.rs`). Its test,
+  `an_executor_answer_without_its_outputs_keeps_a_refusals_retryable_and_hives`, fails without it.
+  sy-admin.md's executor section says it.
 
 ### A-327 [Archi] 🔵 low (found 2026-11-12 by A-322's review; read in the code; since 0.1.137) — Archi's explanation turn after a CONFIRM never reads the prompt cache
 

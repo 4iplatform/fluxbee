@@ -1304,7 +1304,10 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
      `nothing_to_do`, a removal's `pages_left_up` cut to 1 KiB, a workflow delete's
      `packages_left` in 1 KiB, each version's `runtime`, `version`, `error_code` and `retryable`,
      the first one's `detail` cut to 256 bytes and each hive not read with its `reason` and `next`
-     (`packages_left_essentials`), and of an installation update its `id`, `state`, `held`,
+     (`packages_left_essentials`), a refusal's `retryable`, its `unanswered_hives` in 1 KiB, each
+     hive with its `reason` and `next` (`unanswered_hive_essentials`), and its `next` cut to 256
+     bytes (FINDINGS A-328, since 0.1.139: Archi's report of a run says from them whether asking
+     again may pass), and of an installation update its `id`, `state`, `held`,
      `stale_target` and `superseded_by`, never its hives: Archi reads an update whose answer was
      cut again; `executor_result_essentials`). Its run id, time and summary line go. If the
      answer still does not fit, each step keeps only its last event (`collapse_executor_events`).

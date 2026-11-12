@@ -4229,9 +4229,11 @@ fn drop_executor_previews(envelope: &mut serde_json::Value) {
 /// installation update holds, a removal's `pages_left_up` (its count and more whole, the pages
 /// that fit; FINDINGS A-242), a hive's removal its `system_ilks_retired` (FINDINGS A-191: when its
 /// count is null, Archi runs retire_hive_ilks), a workflow delete's `packages_left`
-/// (`packages_left_essentials`), and of the update its `id`, `state`, `held`, `stale_target` and
-/// `superseded_by`, never its hives: Archi reads an update whose answer was cut again), each cut
-/// short.
+/// (`packages_left_essentials`), a refusal's `retryable`, `unanswered_hives`
+/// (`unanswered_hive_essentials`) and `next` (FINDINGS A-328: Archi's report of a run says from
+/// them whether asking again may pass), and of the update its `id`, `state`, `held`,
+/// `stale_target` and `superseded_by`, never its hives: Archi reads an update whose answer was cut
+/// again), each cut short.
 fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value {
     let mut kept = serde_json::Map::new();
     for key in ["status", "error_code"] {
@@ -4255,10 +4257,27 @@ fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value 
                 ("nothing_to_do", 16),
                 ("pages_left_up", 1024),
                 ("system_ilks_retired", 1024),
+                // Whether asking again may pass, and what ends a refusal (FINDINGS A-328).
+                ("retryable", 8),
+                ("next", 256),
             ] {
                 if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
                     fields.insert(key.to_string(), mesh_reply::bounded_value(value, max_bytes));
                 }
+            }
+            if let Some(hives) = payload
+                .get("unanswered_hives")
+                .and_then(serde_json::Value::as_array)
+            {
+                fields.insert(
+                    "unanswered_hives".to_string(),
+                    mesh_reply::bounded_value(
+                        &serde_json::Value::Array(
+                            hives.iter().map(unanswered_hive_essentials).collect(),
+                        ),
+                        UNANSWERED_HIVES_KEPT_BYTES,
+                    ),
+                );
             }
             if let Some(left) = payload
                 .get("packages_left")
@@ -4289,6 +4308,23 @@ fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value 
 
 /// The most a step keeps of a workflow delete's `packages_left` once outputs are dropped.
 const PACKAGES_LEFT_KEPT_BYTES: usize = 1024;
+
+/// The most a step keeps of a refusal's `unanswered_hives` once outputs are dropped (FINDINGS
+/// A-328): the hives that fit, the rest counted.
+const UNANSWERED_HIVES_KEPT_BYTES: usize = 1024;
+
+/// What a step keeps of a hive SY.admin did not read (an entry of `unanswered_hives`): its `hive`,
+/// its `reason` and, for a join not done, what ends it (`next`), each cut short; never its
+/// `detail`, which the step's error text says.
+fn unanswered_hive_essentials(hive: &serde_json::Value) -> serde_json::Value {
+    let mut view = serde_json::Map::new();
+    for (key, max_bytes) in [("hive", 128), ("reason", 64), ("next", 128)] {
+        if let Some(field) = hive.get(key).filter(|field| !field.is_null()) {
+            view.insert(key.to_string(), mesh_reply::bounded_value(field, max_bytes));
+        }
+    }
+    serde_json::Value::Object(view)
+}
 
 /// What a step keeps of a workflow delete's `packages_left` once outputs are dropped (FINDINGS
 /// A-281, the integration's review): each version left, in order, with its `runtime`, `version`
@@ -4334,15 +4370,7 @@ fn packages_left_essentials(left: &[serde_json::Value]) -> serde_json::Value {
                 .get("unanswered_hives")
                 .and_then(serde_json::Value::as_array)
             {
-                let hives = hives
-                    .iter()
-                    .map(|hive| {
-                        serde_json::Value::Object(pick(
-                            hive,
-                            &[("hive", 128), ("reason", 64), ("next", 128)],
-                        ))
-                    })
-                    .collect();
+                let hives = hives.iter().map(unanswered_hive_essentials).collect();
                 view.insert(
                     "unanswered_hives".to_string(),
                     serde_json::Value::Array(hives),
@@ -29533,6 +29561,74 @@ mod tests {
         );
         assert!(mesh_reply::serialized_len(left_up) <= 1_024);
         assert!(kept["payload"].get("noise").is_none());
+    }
+
+    /// FINDINGS A-328: with its outputs dropped, a refused step keeps what says whether asking
+    /// again may pass: its `retryable`, the hives SY.admin did not read (each one's hive, reason
+    /// and, for a join not done, what ends it) and the payload's `next`, each cut short, the hives
+    /// that fit in 1 KiB. Before, the cut kept none of them, so for a run whose answer was cut
+    /// Archi's report (A-322) could not say whether asking again may pass.
+    #[test]
+    fn an_executor_answer_without_its_outputs_keeps_a_refusals_retryable_and_hives() {
+        let preview = json!({
+            "status": "error",
+            "action": "remove_runtime_version",
+            "error_code": "RUNTIME_USAGE_UNKNOWN",
+            "payload": {
+                "usage_global_visible": {
+                    "running_nodes": [],
+                    "skipped_hives": [{ "hive_id": "worker1", "reason": "TIMEOUT", "message": "x".repeat(4_000) }],
+                },
+                "unanswered_hives": [
+                    { "hive": "worker1", "reason": "TIMEOUT", "detail": "no answer within 10 s; ".repeat(100) },
+                    {
+                        "hive": "joining1",
+                        "reason": "UNREACHABLE",
+                        "detail": "down",
+                        "status": "joining",
+                        "join_phase": "dist_sync",
+                        "next": UNFINISHED_JOIN_NEXT,
+                    },
+                ],
+                "retryable": true,
+                "next": "ask again once worker1 answers",
+            },
+        });
+        let kept = executor_result_essentials(&preview);
+        assert_eq!(kept["error_code"], json!("RUNTIME_USAGE_UNKNOWN"));
+        assert_eq!(kept["payload"]["retryable"], json!(true));
+        assert_eq!(
+            kept["payload"]["unanswered_hives"],
+            json!([
+                { "hive": "worker1", "reason": "TIMEOUT" },
+                { "hive": "joining1", "reason": "UNREACHABLE", "next": UNFINISHED_JOIN_NEXT },
+            ])
+        );
+        assert_eq!(
+            kept["payload"]["next"],
+            json!("ask again once worker1 answers")
+        );
+        assert!(kept["payload"].get("usage_global_visible").is_none());
+        assert!(mesh_reply::serialized_len(&kept) < 1_024);
+
+        // A refusal that says asking again does not pass keeps that too, and many hives are cut
+        // to the ones that fit, the rest counted.
+        let hives: Vec<Value> = (0..60)
+            .map(|n| json!({ "hive": format!("worker{n}"), "reason": "UNREACHABLE", "detail": "down" }))
+            .collect();
+        let preview = json!({
+            "status": "error",
+            "error_code": "RUNTIME_USAGE_UNKNOWN",
+            "payload": { "unanswered_hives": hives, "retryable": false },
+        });
+        let kept = executor_result_essentials(&preview);
+        assert_eq!(kept["payload"]["retryable"], json!(false));
+        let listed = &kept["payload"]["unanswered_hives"];
+        assert!(mesh_reply::serialized_len(listed) <= UNANSWERED_HIVES_KEPT_BYTES);
+        assert_eq!(
+            listed[0],
+            json!({ "hive": "worker0", "reason": "UNREACHABLE" })
+        );
     }
 
     /// With its outputs dropped, a workflow delete's step keeps the versions its purge left
