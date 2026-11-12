@@ -140,15 +140,15 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "list_tenants", "category": "relay",
           "summary": "Every tenant but the genesis one, deleted ones included (deleted_at_ms set, so you can restore them): tenant_id, name, domain, status, settings, sponsor_tenant_id, ilk_count, people_count, node_count. No envelope tenant_id." },
         { "op": "list_nodes", "category": "relay",
-          "summary": "The nodes charged to YOUR tenant (the envelope tenant_id) on every hive: node_name, hive, runtime {name, version}, lifecycle_state (RUNNING, STARTING, STOPPED, FAILED), health_state, identity {ilk_id, tenant_id} (the ilk_id is what list_tokens shows in assigned_ilks), launched_by (cloud for yours) and relaunch_on_boot (false once stopped). A hive that does not answer is listed in unreachable_hives. Health is what each node reports: an older IO node may answer UNKNOWN." },
+          "summary": "The nodes charged to YOUR tenant (the envelope tenant_id) on every hive: node_name, hive, runtime {name, version}, lifecycle_state (RUNNING, STARTING, STOPPED, FAILED, or UNKNOWN while the hive cannot tell: its systemd did not answer for the node, so read it again; never a STOPPED the hive did not see), health_state, identity {ilk_id, tenant_id} (the ilk_id is what list_tokens shows in assigned_ilks), launched_by (cloud for yours) and relaunch_on_boot (false once stopped). A hive that does not answer is listed in unreachable_hives. Health is what each node reports: an older IO node may answer UNKNOWN." },
         { "op": "get_node_status", "category": "relay",
-          "summary": "The status of one node of YOUR tenant: the envelope tenant_id + params.node_name (IO.*@hive). A node of another tenant answers NODE_NOT_FOUND." },
+          "summary": "The status of one node of YOUR tenant: the envelope tenant_id + params.node_name (IO.*@hive). The same view as list_nodes, its lifecycle_state included (UNKNOWN while the hive cannot tell: read it again). A node of another tenant answers NODE_NOT_FOUND." },
         { "op": "start_node", "category": "relay",
-          "summary": "Start one IO node YOU launched (provision_node) in YOUR tenant: the envelope tenant_id + params.node_name. Any other node answers NODE_NOT_FOUND. Refused with TENANT_NOT_ACTIVE while the tenant is pending or suspended. Already running answers state already_running." },
+          "summary": "Start one IO node YOU launched (provision_node) in YOUR tenant: the envelope tenant_id + params.node_name. Any other node answers NODE_NOT_FOUND. Refused with TENANT_NOT_ACTIVE while the tenant is pending or suspended. Already running answers state already_running. SERVICE_FAILED: the hive's systemd did not answer and nothing was started; send it again." },
         { "op": "stop_node", "category": "relay",
-          "summary": "Stop one IO node YOU launched in YOUR tenant: the envelope tenant_id + params.node_name. It stays stopped, kept with its config and identity, until start_node. Any other node answers NODE_NOT_FOUND." },
+          "summary": "Stop one IO node YOU launched in YOUR tenant: the envelope tenant_id + params.node_name. It stays stopped, kept with its config and identity, until start_node. Any other node answers NODE_NOT_FOUND. SERVICE_FAILED: the hive's systemd did not answer and nothing was stopped; send it again." },
         { "op": "delete_node", "category": "relay",
-          "summary": "Delete one IO node YOU launched in YOUR tenant: the envelope tenant_id + params.node_name. It stops, and its timers, the credentials it owns and its identity go; credentials only assigned to it stay (they are the tenant's), and the name is free again. Final. Any other node answers NODE_NOT_FOUND." },
+          "summary": "Delete one IO node YOU launched in YOUR tenant: the envelope tenant_id + params.node_name. It stops, and its timers, the credentials it owns and its identity go; credentials only assigned to it stay (they are the tenant's), and the name is free again. Final. Any other node answers NODE_NOT_FOUND. SERVICE_FAILED: the hive's systemd did not answer and nothing was removed; send it again." },
         { "op": "put_token", "category": "relay",
           "summary": "Store a credential for YOUR tenant (the envelope tenant_id, who pays for its use) + params.key ([a-z0-9:_-], one namespace for the whole hive: a key another tenant holds answers KEY_TAKEN) + params.value + params.resource_type. Who uses it: one IO.* node that owns it (params.owner_node), the nodes it is assigned to (params.nodes: node names or ILK ids, each charged to your tenant), or, with neither, every node of your tenant (a general credential). Storing the same value again changes nothing: change the nodes with assign_token. Infrastructure keys are refused." },
         { "op": "assign_token", "category": "relay",
@@ -158,7 +158,7 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "delete_token", "category": "relay",
           "summary": "Delete one credential of YOUR tenant. Needs the envelope tenant_id + params.key. A key that does not exist or belongs to another tenant answers KEY_NOT_FOUND; infrastructure keys are refused." },
         { "op": "provision_node", "category": "relay",
-          "summary": "Spawn an IO.* node in YOUR tenant. Needs the envelope tenant_id + params.node_name (IO.*) + params.runtime. A tenant that is not active (pending, suspended) starts no node: TENANT_NOT_ACTIVE. NOT idempotent." },
+          "summary": "Spawn an IO.* node in YOUR tenant. Needs the envelope tenant_id + params.node_name (IO.*) + params.runtime. A tenant that is not active (pending, suspended) starts no node: TENANT_NOT_ACTIVE. SERVICE_FAILED: the hive's systemd did not answer and nothing was launched, nothing of the node stays; send it again. NOT idempotent." },
         { "op": "register_human", "category": "local",
           "summary": "Register a person's Fluxbee Cloud account, charged to YOUR tenant (the envelope tenant_id). params = a frontdesk_handoff {type:'frontdesk_handoff', schema_version:1, operation:'complete_registration', subject:{display_name,email,phone?,company_name?,attributes?}}. One email is one account: an email that already has one answers existing:true with its ilk_id and tenant, and nothing is created (charging it elsewhere is set_ilk_tenant). Otherwise IO.cloud provisions the person and hands it to SY.frontdesk.gov; returns the frontdesk verdict + ilk_id." },
         { "op": "set_ilk_tenant", "category": "relay",
@@ -285,6 +285,37 @@ mod tests {
             assert!(
                 !is_cloud_local_op(relay_op),
                 "relay op {relay_op} must not be local"
+            );
+        }
+    }
+
+    /// The node ops' summaries name what their answers can say since 0.1.133 (FINDINGS A-285;
+    /// docs/io-cloud-api.md §5.4): a lifecycle_state UNKNOWN while the hive cannot tell, and
+    /// SERVICE_FAILED, nothing done, for the ops that start, stop or remove a node.
+    #[test]
+    fn the_node_ops_name_unknown_and_service_failed() {
+        let catalog = cloud_action_catalog();
+        let summary = |op: &str| -> String {
+            catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["op"] == op)
+                .and_then(|entry| entry["summary"].as_str())
+                .unwrap_or_else(|| panic!("catalog has no {op}"))
+                .to_string()
+        };
+        for op in ["list_nodes", "get_node_status"] {
+            assert!(
+                summary(op).contains("UNKNOWN while the hive cannot tell"),
+                "{op} names the lifecycle_state UNKNOWN"
+            );
+        }
+        for op in ["provision_node", "start_node", "stop_node", "delete_node"] {
+            let summary = summary(op);
+            assert!(
+                summary.contains("SERVICE_FAILED") && summary.contains("send it again"),
+                "{op} names SERVICE_FAILED and what to do"
             );
         }
     }

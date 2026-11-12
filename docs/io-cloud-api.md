@@ -1152,6 +1152,15 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
+### 0.1.143 (planned)
+
+- **`list_cloud_actions` describes the answers §5.4 lists since 0.1.133** (FINDINGS A-285). The
+  ops themselves did not change:
+  - `list_nodes` and `get_node_status` name the state `UNKNOWN`, which the hive gives while its
+    systemd does not answer for the node: read it again.
+  - `provision_node`, `start_node`, `stop_node` and `delete_node` name `SERVICE_FAILED`: nothing
+    was done, so send the op again.
+
 ### 0.1.142
 
 - **Nothing to change on your side.** §5.4 now says what `list_nodes`' `health_state` is: the hive's

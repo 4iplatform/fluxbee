@@ -4539,7 +4539,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   through Archi's SCMD, a usage read whose `from` has the offset `+01:00` reached SY.storage and
   answered ok, 5 records, the same as with `%2B01:00`.
 
-### A-285 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.admin's help names each new answer the gate looked for, all missing on 0.1.132, but not `hives_without_runtimes`, A-315) · the Cloud catalog's text (`cloud.rs`) with the Rust SDK's next change (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
+### A-285 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.admin's help names each new answer the gate looked for, all missing on 0.1.132, but not `hives_without_runtimes`, A-315) · the Cloud catalog's text (`cloud.rs`) built on `coa/rustsdk-143`, for 0.1.143 (planned) (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
 
 - **`delete_workflow` (A-270):** a WF node that is not RUNNING, or whose instances cannot be
   counted, now needs `force` or a start first, and a config read with no answer is
@@ -4561,6 +4561,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `INVENTORY_UNAVAILABLE` (`teardown_node`), and `RUNTIME_USAGE_UNKNOWN`, `NO_USAGE` and
   `USAGE_UNREADABLE` (`remove_runtime_version`), each missing on 0.1.132. Named neither there nor in
   Archi's handbook: `hives_without_runtimes` (A-315).
+- **`cloud.rs` built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item
+  30):** the catalog that `list_cloud_actions` returns says what §5.4 of `docs/io-cloud-api.md`
+  says since 0.1.133.
+  - `list_nodes` lists the fifth state, `UNKNOWN` while the hive cannot tell (read it again), never
+    a `STOPPED` it did not see. `get_node_status` gives the same view.
+  - `provision_node`, `start_node`, `stop_node` and `delete_node` name `SERVICE_FAILED`: the hive's
+    systemd did not answer, nothing was done, so send it again. The answer Cloud gets carries no
+    retry flag (IO.cloud passes the code and the text), so the summaries say what to do.
+  - Its test (`the_node_ops_name_unknown_and_service_failed`) fails on the text before it.
+  - `docs/io-cloud-api.md` §9 has its line for 0.1.143.
+  - It reaches Cloud with IO.cloud's runtime of 0.1.143, which carries this SDK.
+  - **Found on the way, not changed:** the catalog names no paging for `list_nodes` and
+    `list_tenants` (`params.limit`, `params.cursor`, `next_cursor`), which the contract has
+    (§4.4, §5.1, §5.4). It is a text of the same kind, for the SDK's next change.
 
 ### A-284 [WF/wf-generic] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; a WF node with 1000 running instances counted 1000 in 0.50 to 1.04 s, where 0.1.136's count failed `INTERNAL_ERROR` past the frame; a delete without force `INSTANCES_ACTIVE`; Archi named 1000; across the deploy every answer one of the five kinds allowed) (found 2026-11-11 by A-270's review; read in the code) — The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame
 
