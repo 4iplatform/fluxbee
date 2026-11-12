@@ -21797,6 +21797,13 @@ const RUNTIME_USAGE_HIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The hives of the motherbee's registry other than `local_hive`, in name order, each with the
 /// spoke role its entry records (`registered_spoke_role`). An error when the registry cannot be
 /// listed; the orchestrator creates its directory at every start (`ensure_dirs`).
+///
+/// A directory whose name is not a hive id (`valid_hive_id`: a copy left there, `worker1.bak`,
+/// say, or `lost+found`) is no hive: no join files one under such a name, and no hive can be
+/// asked by it. It is left out, as the peer reconcile's reader leaves it out
+/// (`read_registry_snapshot`), and warned of once while the orchestrator runs (FINDINGS A-311).
+/// Listed, it was asked as a hive the LSA never shows, and its `UNREACHABLE` in `skipped_hives`
+/// refused every `remove_runtime_version` (FINDINGS A-281) for as long as the directory stayed.
 fn registry_hives_with_roles(
     root: &Path,
     local_hive: &str,
@@ -21805,8 +21812,32 @@ fn registry_hives_with_roles(
         .entries()?
         .iter()
         .filter(|entry| entry.name() != local_hive)
+        .filter(|entry| {
+            let is_hive_id = valid_hive_id(entry.name());
+            if !is_hive_id && registry_name_not_a_hive_id_first_seen(entry.name()) {
+                tracing::warn!(
+                    registry = %root.display(),
+                    directory = ?entry.name(),
+                    "a directory of the hive registry whose name is not a hive id is no hive: a \
+                     runtime's use across the hives leaves it out (warned once)"
+                );
+            }
+            is_hive_id
+        })
         .map(|entry| (entry.name().to_string(), registered_spoke_role(entry)))
         .collect())
+}
+
+/// True the first time this process meets `name`, a directory of the hive registry whose name is
+/// not a hive id (`registry_hives_with_roles`): each such name is warned of once while the
+/// orchestrator runs, not at every read of a runtime's use.
+fn registry_name_not_a_hive_id_first_seen(name: &str) -> bool {
+    static WARNED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_string())
 }
 
 /// The spoke role the motherbee's registry records for a hive (`role` in its `info.yaml`),
@@ -56091,6 +56122,72 @@ blob:
         );
         fs::remove_dir_all(&root).unwrap();
         assert!(registry_hives_with_roles(&root, "motherbee").is_err());
+    }
+
+    /// FINDINGS A-311, at the rebase on 0.1.133: a directory of the registry whose name is not a
+    /// hive id is no hive, and the motherbee's read of a runtime's use leaves it out, as the peer
+    /// reconcile's reader does (`read_registry_snapshot`). Asked as a hive, it was skipped at every
+    /// read (the LSA never shows it), so `in_use` stayed unknown and SY.admin refused every
+    /// `remove_runtime_version` while the directory was there. Each such name is warned of once.
+    #[tokio::test]
+    async fn a_registry_directory_whose_name_is_not_a_hive_id_is_never_asked() {
+        let scratch = std::env::temp_dir().join(format!(
+            "fluxbee-usage-not-a-hive-{}",
+            Uuid::new_v4().simple()
+        ));
+        let nodes_root = scratch.join("nodes");
+        let registry_root = scratch.join("hives");
+        let done = "status: connected\njoin:\n  phase: done\n";
+        let too_long = "w".repeat(65);
+        for (dir, info) in [
+            (
+                "egress1",
+                Some(format!("hive_id: egress1\nrole: egress\n{done}")),
+            ),
+            // A copy of a worker's entry left beside it.
+            (
+                "worker1.bak",
+                Some(format!("hive_id: worker1\nrole: worker\n{done}")),
+            ),
+            ("lost+found", None),
+            (
+                "worker 2",
+                Some(format!("hive_id: worker 2\nrole: worker\n{done}")),
+            ),
+            (too_long.as_str(), None),
+        ] {
+            fs::create_dir_all(registry_root.join(dir)).unwrap();
+            if let Some(info) = info {
+                fs::write(registry_root.join(dir).join("info.yaml"), info).unwrap();
+            }
+        }
+
+        let hives =
+            registry_hives_with_roles(&registry_root, "motherbee").expect("the registry is listed");
+        assert_eq!(hives, [("egress1".to_string(), Some(HiveRole::Egress))]);
+
+        let motherbee = sample_orchestrator_state_for_tests();
+        let usage = global_visible_runtime_usage_summary_with_roots(
+            &motherbee,
+            &nodes_root,
+            &registry_root,
+            "ai.generic",
+            Some("0.3.1"),
+        )
+        .await;
+        assert!(usage.get("status").is_none(), "{usage}");
+        assert_eq!(usage["skipped_hives"], serde_json::json!([]), "{usage}");
+        assert_eq!(usage["in_use"], false, "{usage}");
+
+        // Warned of once while the orchestrator runs: the reads above met every such name.
+        for name in ["worker1.bak", "lost+found", "worker 2", too_long.as_str()] {
+            assert!(!registry_name_not_a_hive_id_first_seen(name), "{name}");
+        }
+        let fresh = format!("fresh.{}", Uuid::new_v4().simple());
+        assert!(registry_name_not_a_hive_id_first_seen(&fresh));
+        assert!(!registry_name_not_a_hive_id_first_seen(&fresh));
+
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     /// FINDINGS A-281, as 8.x answered on 0.1.132: an ingress and an egress answer GET_RUNTIME

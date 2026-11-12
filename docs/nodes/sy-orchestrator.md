@@ -609,7 +609,11 @@ refusals of a hive id use: `hive_id must be a hive id: 1 to 64 letters, digits, 
 `list_hives` lists a directory whose name is not a hive id by its name alone, as it lists one
 without an `info.yaml`. The inventory leaves out a hive of the LSA with such a name, and a
 deployment's or a drift alert's `present` and `hive_present` are false for one
-(`registry_has_hive`), with no path touched.
+(`registry_has_hive`), with no path touched. The motherbee's read of a runtime's use across the
+hives (`registry_hives_with_roles`, FINDINGS A-281) skips a directory whose name is not a hive id
+too, as the peer reconcile's reader does (`read_registry_snapshot`), and warns of each such name
+once while the orchestrator runs (since 0.1.137): asked as a hive, which the LSA never shows, it
+was skipped at every read, and SY.admin refused every `remove_runtime_version` while it was there.
 
 ## Updates
 
