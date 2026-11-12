@@ -8514,6 +8514,22 @@ async fn advance_publication(
 /// guarantees the value is born strong and lives only in the vault. Passing your own is the
 /// "explicit opt-out" documented in `handle_externalize`, and this action deliberately does not
 /// offer it.
+///
+/// # The order of a run (FINDINGS A-317)
+///
+/// 1. The record: IO.cloud's config read, then the edge written in it (`record_cloud_edge`). A
+///    record that fails is the error answer, before anything is minted: no token, no door opened
+///    or closed, IO.cloud not asked, so the token the Cloud holds works as before.
+/// 2. The door: the externalize mints the token, stores it in the vault for the edge and opens the
+///    URL there. A door that does not open puts the record back as it was
+///    (`put_back_cloud_edge_record`), and the answer is the externalize's error.
+/// 3. The apply: the edge given to the running IO.cloud (`apply_cloud_edge`, FINDINGS A-255).
+/// 4. The old door: when the record named another edge, the door moved, and that edge's door is
+///    closed (`close_moved_cloud_door`); one that does not close is named in the answer.
+///
+/// A rotation on the same edge keeps the edge's one previous token for up to 10 minutes (SY.edge's
+/// grace, in its memory); a move closes the old door at once. Nothing extends that grace, by the
+/// operator's call (2026-11-12).
 async fn handle_publish_cloud_endpoint(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -8544,6 +8560,14 @@ async fn handle_publish_cloud_endpoint(
             &format!("cloud_node must be IO.cloud (IO.cloud@<hive>), not '{cloud_node}'"),
         ));
     }
+    // An edge's name, before anything is read or recorded (FINDINGS A-317): the record comes first,
+    // and IO.cloud's config would otherwise name an edge that does not exist.
+    if !is_cloud_door_edge(&edge_node) {
+        return Ok(internal_invalid_request(
+            "publish_cloud_endpoint",
+            &format!("edge_node must be an edge, SY.edge@<hive>, not '{edge_node}'"),
+        ));
+    }
 
     // The operator names the NODE; we resolve the ICH.
     let ich = match (ctx.channel_options)(&ctx.config_dir) {
@@ -8559,6 +8583,11 @@ async fn handle_publish_cloud_endpoint(
         }
     };
 
+    // One run at a time (FINDINGS A-317): a run reads the edge the record names before it writes
+    // its own, and closes that edge's door once its own is open. Two at once would read the same
+    // edge, and the door the first one opened would stay open behind the second.
+    let _one_run = CLOUD_DOOR_RUNS.lock().await;
+
     tracing::info!(
         cloud_node = %cloud_node,
         edge_node = %edge_node,
@@ -8566,10 +8595,17 @@ async fn handle_publish_cloud_endpoint(
         "publish_cloud_endpoint: opening Fluxbee Cloud's public door"
     );
 
+    // The record first, before the externalize mints anything (FINDINGS A-317): a record that
+    // fails rotates nothing. Its read gives the edge the door is on now.
+    let record = match record_cloud_edge(ctx, client, &cloud_node, &edge_node).await {
+        Ok(record) => record,
+        Err(failed) => return Ok(failed),
+    };
+
     // Reuses the real path (mint -> store in the vault -> send only the secret_ref to the edge).
     // `caller_l2_name: None` is the trusted internal path of the operator's HTTP server, which
     // authorize_channel_command already accounts for.
-    let externalize = handle_externalize(
+    let externalize = match handle_externalize(
         ctx,
         client,
         serde_json::json!({
@@ -8581,24 +8617,55 @@ async fn handle_publish_cloud_endpoint(
         }),
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(opened) if opened.envelope.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            opened
+        }
+        // The door did not open: the record goes back to what it named before this run (FINDINGS
+        // A-317), so that IO.cloud, which reads it when it starts, trusts the edge whose door is
+        // open, and the next run finds the door where it is.
+        not_opened => {
+            let put_back =
+                put_back_cloud_edge_record(ctx, client, &cloud_node, &edge_node, &record).await;
+            return not_opened.map(|failed| {
+                with_cloud_edge_put_back(failed, &cloud_node, &edge_node, &record, &put_back)
+            });
+        }
+    };
 
-    // The edge IO.cloud is to trust, only once the externalize succeeded: there is nothing to trust
-    // otherwise. It is recorded in IO.cloud's managed config and applied to the running IO.cloud
-    // (`record_and_apply_cloud_edge`, FINDINGS A-255), and the answer says whether it took it.
-    let externalized_ok = externalize.envelope.get("status").and_then(|v| v.as_str()) == Some("ok");
-    if !externalized_ok {
-        return Ok(externalize);
-    }
-    match record_and_apply_cloud_edge(ctx, client, &cloud_node, &edge_node).await {
-        Ok(applied) => Ok(cloud_endpoint_answer(
-            externalize,
-            &cloud_node,
-            &edge_node,
-            &applied,
-        )),
-        Err(failed) => Ok(failed),
-    }
+    // The edge IO.cloud is to trust, applied to the running IO.cloud once its door is open
+    // (`apply_cloud_edge`, FINDINGS A-255); the answer says whether it took it.
+    let applied = apply_cloud_edge(client, &cloud_node, &edge_node).await;
+    log_cloud_edge_apply(&cloud_node, &edge_node, &applied);
+
+    // The door moved to another edge: the old edge's door is closed (FINDINGS A-317).
+    let moved = match record.moved_from(&edge_node) {
+        Some(from) => Some(MovedCloudDoor {
+            closed: close_moved_cloud_door(client, &ich, from).await,
+            ich: ich.clone(),
+            from: from.to_string(),
+        }),
+        None => None,
+    };
+    Ok(cloud_endpoint_answer(
+        externalize,
+        &cloud_node,
+        &edge_node,
+        &applied,
+        moved.as_ref(),
+    ))
+}
+
+/// One `publish_cloud_endpoint` at a time (FINDINGS A-317): a run holds it from the record to the
+/// old door's close.
+static CLOUD_DOOR_RUNS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether `edge` names an edge, `SY.edge@<hive>`: the only node `publish_cloud_endpoint` records in
+/// IO.cloud's config and opens the door on, and the only one whose door it closes (FINDINGS A-317).
+fn is_cloud_door_edge(edge: &str) -> bool {
+    edge.split_once('@')
+        .is_some_and(|(name, hive)| name == "SY.edge" && is_valid_hive_id(hive))
 }
 
 /// Whether `node` is IO.cloud, `IO.cloud@<hive>`: the one node whose door `publish_cloud_endpoint`
@@ -8669,38 +8736,117 @@ impl CloudEdgeTry {
     }
 }
 
-/// Records the edge in IO.cloud's managed config, then applies it to the running IO.cloud
-/// (FINDINGS A-255).
+/// What IO.cloud's config said before a run recorded its edge (FINDINGS A-317): its `io`, as the
+/// record read it. From it a run learns the edge the door is on, whose door it closes once the door
+/// moved, and what it writes back when its own door did not open.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CloudEdgeRecord {
+    /// The config's `io` before the record; none when it had none, or one that is not an object.
+    previous_io: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl CloudEdgeRecord {
+    /// The edge the config named before the record (`io.edge_node`); none when it named none.
+    fn previous_edge(&self) -> Option<&str> {
+        self.previous_io
+            .as_ref()
+            .and_then(|io| io.get("edge_node"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|edge| !edge.is_empty())
+    }
+
+    /// The `io` the record writes: the one it read with `edge_node`, nothing else in it changed.
+    fn io_with_edge(&self, edge_node: &str) -> serde_json::Value {
+        let mut io = self.previous_io.clone().unwrap_or_default();
+        io.insert("edge_node".to_string(), serde_json::json!(edge_node));
+        serde_json::Value::Object(io)
+    }
+
+    /// The `io` that puts the record back: the one it read, or an empty one when it had none, which
+    /// IO.cloud takes as trusting no edge.
+    fn io_before(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.previous_io.clone().unwrap_or_default())
+    }
+
+    /// The edge the door moves from when a run publishes it on `edge_node`: the one the config named,
+    /// when that is another edge; none on a first publish and on a rotation on the same edge.
+    fn moved_from(&self, edge_node: &str) -> Option<&str> {
+        self.previous_edge()
+            .filter(|previous| *previous != edge_node && is_cloud_door_edge(previous))
+    }
+}
+
+/// The step of the record that failed twice (FINDINGS A-317): the read of IO.cloud's config, or the
+/// write of the edge in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudEdgeRecordStep {
+    Read,
+    Write,
+}
+
+/// The record, first in a run (FINDINGS A-317): IO.cloud's config read (`get_node_config`), then the
+/// edge written in it (`set_node_config` of its `io` with `edge_node`, the rest as read), which the
+/// orchestrator writes to IO.cloud's `config.json` and nothing more. IO.cloud reads that file when it
+/// starts; once the door is open, the apply gives the edge to the running IO.cloud
+/// (`apply_cloud_edge`, FINDINGS A-255). The answer is what the config said before.
 ///
-/// The record is `set_node_config` of `io.edge_node`, which the orchestrator writes to IO.cloud's
-/// `config.json` and nothing more; IO.cloud reads that file when it starts. Alone, it left a running
-/// IO.cloud dropping every Cloud request through a new edge (a 504 for Cloud) until its restart: on
-/// a fresh install's first publish, and whenever the door moved to another edge. So the record is
-/// applied at once (`apply_cloud_edge`).
-///
-/// A record that fails is tried once more at once (FINDINGS A-273): the externalize before it has
-/// minted a new token and the edge holds it, and that token goes out only in an ok answer. A record
-/// that fails again is the error answer, which carries no token (`cloud_edge_record_failed_detail`
-/// says what is left), and nothing is applied.
-async fn record_and_apply_cloud_edge(
+/// A read or a write that fails is tried once more at once (FINDINGS A-273). One that fails again is
+/// the error answer, 502 `CONFIG_RECORD_FAILED` (`cloud_edge_record_failed_detail`), before the
+/// externalize mints a token: nothing is rotated, no door opened or closed, IO.cloud not asked.
+async fn record_cloud_edge(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     cloud_node: &str,
     edge_node: &str,
-) -> Result<CloudEdgeApply, InternalAdminDispatchResult> {
-    let record = || {
+) -> Result<CloudEdgeRecord, InternalAdminDispatchResult> {
+    let read = || {
+        handle_admin_command(
+            ctx,
+            client,
+            "get_node_config",
+            serde_json::json!({ "node_name": cloud_node }),
+            Some(ctx.hive_id.clone()),
+        )
+    };
+    let mut found = cloud_edge_record_read(&read().await);
+    if let Err(first) = &found {
+        tracing::warn!(
+            cloud_node = %cloud_node,
+            edge_node = %edge_node,
+            reason = %first,
+            "publish_cloud_endpoint: reading IO.cloud's config failed: tried once more"
+        );
+        found = cloud_edge_record_read(&read().await);
+    }
+    let record = match found {
+        Ok(record) => record,
+        Err(failure) => {
+            tracing::warn!(
+                cloud_node = %cloud_node,
+                edge_node = %edge_node,
+                reason = %failure,
+                "publish_cloud_endpoint: reading IO.cloud's config failed twice: nothing is minted"
+            );
+            return Err(cloud_edge_record_failed(
+                cloud_node,
+                edge_node,
+                CloudEdgeRecordStep::Read,
+                &failure,
+            ));
+        }
+    };
+    let config = serde_json::json!({ "io": record.io_with_edge(edge_node) });
+    let write = || {
         handle_admin_command(
             ctx,
             client,
             "set_node_config",
-            serde_json::json!({
-                "node_name": cloud_node,
-                "config": { "io": { "edge_node": edge_node } },
-            }),
+            serde_json::json!({ "node_name": cloud_node, "config": config.clone() }),
             Some(ctx.hive_id.clone()),
         )
     };
-    let mut failure = cloud_edge_record_failure(&record().await);
+    let mut failure = cloud_edge_record_failure(&write().await);
     if let Some(first) = &failure {
         tracing::warn!(
             cloud_node = %cloud_node,
@@ -8709,29 +8855,319 @@ async fn record_and_apply_cloud_edge(
             "publish_cloud_endpoint: recording edge_node in IO.cloud's config failed: tried once \
              more"
         );
-        failure = cloud_edge_record_failure(&record().await);
+        failure = cloud_edge_record_failure(&write().await);
     }
     if let Some(failure) = failure {
         tracing::warn!(
             cloud_node = %cloud_node,
             edge_node = %edge_node,
             reason = %failure,
-            "publish_cloud_endpoint: recording edge_node in IO.cloud's config failed twice: the \
-             token this call minted is not handed out"
+            "publish_cloud_endpoint: recording edge_node in IO.cloud's config failed twice: \
+             nothing is minted"
         );
-        return Err(internal_service_error(
-            "publish_cloud_endpoint",
-            "CONFIG_RECORD_FAILED",
-            &cloud_edge_record_failed_detail(cloud_node, edge_node, &failure),
+        return Err(cloud_edge_record_failed(
+            cloud_node,
+            edge_node,
+            CloudEdgeRecordStep::Write,
+            &failure,
         ));
     }
     tracing::info!(
         cloud_node = %cloud_node,
         edge_node = %edge_node,
+        previous_edge = record.previous_edge().unwrap_or("none"),
         "publish_cloud_endpoint: edge_node recorded in IO.cloud's config"
     );
-    let applied = apply_cloud_edge(client, cloud_node, edge_node).await;
-    match &applied {
+    Ok(record)
+}
+
+/// What the record's read of IO.cloud's config (`get_node_config`) found, its `io` (FINDINGS
+/// A-317); or why not, as `CONFIG_RECORD_FAILED`'s detail says it right after "the last time".
+fn cloud_edge_record_read(
+    read: &Result<(u16, String), AdminError>,
+) -> Result<CloudEdgeRecord, String> {
+    let body = match read {
+        Ok((status, body)) if *status < 400 => body,
+        Ok((status, body)) => return Err(format!(" (HTTP {status}): {body}")),
+        Err(err) => return Err(format!(": {err}")),
+    };
+    let config = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|answer| answer.pointer("/payload/config").cloned());
+    match config {
+        Some(serde_json::Value::Object(config)) => Ok(CloudEdgeRecord {
+            previous_io: config
+                .get("io")
+                .and_then(serde_json::Value::as_object)
+                .cloned(),
+        }),
+        _ => Err(format!(": its answer carries no config: {body}")),
+    }
+}
+
+/// Why a write of the record failed, as `CONFIG_RECORD_FAILED`'s detail says it right after "the
+/// last time"; none when the orchestrator took it. Its put-back is read the same way.
+fn cloud_edge_record_failure(record: &Result<(u16, String), AdminError>) -> Option<String> {
+    match record {
+        Ok((status, _)) if *status < 400 => None,
+        Ok((status, body)) => Some(format!(" (HTTP {status}): {body}")),
+        Err(err) => Some(format!(": {err}")),
+    }
+}
+
+/// `CONFIG_RECORD_FAILED`, the record's read or write having failed twice (FINDINGS A-273, A-317).
+fn cloud_edge_record_failed(
+    cloud_node: &str,
+    edge_node: &str,
+    step: CloudEdgeRecordStep,
+    failure: &str,
+) -> InternalAdminDispatchResult {
+    internal_service_error(
+        "publish_cloud_endpoint",
+        "CONFIG_RECORD_FAILED",
+        &cloud_edge_record_failed_detail(cloud_node, edge_node, step, failure),
+    )
+}
+
+/// `CONFIG_RECORD_FAILED`'s detail once the record's read or write failed twice (FINDINGS A-273),
+/// `failure` the second time's (`cloud_edge_record_read`, `cloud_edge_record_failure`). The record
+/// comes first in a run (FINDINGS A-317), so nothing else was done: the externalize minted no token,
+/// no door was opened or closed, and IO.cloud was not asked; a token the Cloud holds works as before.
+/// Up to 0.1.138 the record came after the externalize, and this answer left the door open with a
+/// token no one received.
+///
+/// A write that got no answer may have been written all the same: IO.cloud's config then names the
+/// edge, which IO.cloud reads only when it starts, and `get_node_config` shows it. The action runs
+/// again once the cause is fixed, on the motherbee's HTTP API, never through Archi (FINDINGS A-124),
+/// since a run that works hands out a token.
+fn cloud_edge_record_failed_detail(
+    cloud_node: &str,
+    edge_node: &str,
+    step: CloudEdgeRecordStep,
+    failure: &str,
+) -> String {
+    let (what, unanswered) = match step {
+        CloudEdgeRecordStep::Read => (format!("reading {cloud_node} config"), String::new()),
+        CloudEdgeRecordStep::Write => (
+            format!("recording edge_node {edge_node} into {cloud_node} config"),
+            format!(
+                " A try that got no answer may have been written all the same: {cloud_node} \
+                 config then names {edge_node}, which {cloud_node} reads only when it starts \
+                 (get_node_config shows it)."
+            ),
+        ),
+    };
+    format!(
+        "{what} failed twice, the last time{failure}. Nothing else was done, since the record \
+         comes before the token (FINDINGS A-317): no token was minted, no door was opened or \
+         closed, and {cloud_node} was not asked, so a token the Cloud holds works as \
+         before.{unanswered} Fix the cause above, then run publish_cloud_endpoint again on the \
+         motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi \
+         (FINDINGS A-124)."
+    )
+}
+
+/// What became of the record of a run whose door did not open (FINDINGS A-317).
+#[derive(Debug, Clone, PartialEq)]
+enum CloudEdgePutBack {
+    /// The config named that edge before the run (a rotation on the same edge): nothing changed.
+    Unchanged,
+    /// The config's `io` is the one it had before the run again.
+    PutBack,
+    /// Putting it back failed twice, why the last time: the config still names the run's edge.
+    Failed(String),
+}
+
+/// Puts the record of a run whose door did not open back to what IO.cloud's config said before the
+/// run (FINDINGS A-317): `set_node_config` of the `io` the record read, tried once more at once.
+/// Nothing when the config named that edge already. Without it, IO.cloud would trust, from its next
+/// start, an edge whose door did not open, and the next run would read that edge as the door's.
+async fn put_back_cloud_edge_record(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    cloud_node: &str,
+    edge_node: &str,
+    record: &CloudEdgeRecord,
+) -> CloudEdgePutBack {
+    if record.previous_edge() == Some(edge_node) {
+        return CloudEdgePutBack::Unchanged;
+    }
+    let config = serde_json::json!({ "io": record.io_before() });
+    let write = || {
+        handle_admin_command(
+            ctx,
+            client,
+            "set_node_config",
+            serde_json::json!({ "node_name": cloud_node, "config": config.clone() }),
+            Some(ctx.hive_id.clone()),
+        )
+    };
+    let mut failure = cloud_edge_record_failure(&write().await);
+    if let Some(first) = &failure {
+        tracing::warn!(
+            cloud_node = %cloud_node,
+            edge_node = %edge_node,
+            reason = %first,
+            "publish_cloud_endpoint: the door did not open, and putting IO.cloud's config back \
+             failed: tried once more"
+        );
+        failure = cloud_edge_record_failure(&write().await);
+    }
+    match failure {
+        None => {
+            tracing::info!(
+                cloud_node = %cloud_node,
+                edge_node = %edge_node,
+                previous_edge = record.previous_edge().unwrap_or("none"),
+                "publish_cloud_endpoint: the door did not open; IO.cloud's config is put back"
+            );
+            CloudEdgePutBack::PutBack
+        }
+        Some(why) => {
+            tracing::warn!(
+                cloud_node = %cloud_node,
+                edge_node = %edge_node,
+                reason = %why,
+                "publish_cloud_endpoint: the door did not open, and putting IO.cloud's config back \
+                 failed twice: it names the edge whose door did not open"
+            );
+            CloudEdgePutBack::Failed(why)
+        }
+    }
+}
+
+/// The externalize's error answer, its detail followed by what became of the record (FINDINGS
+/// A-317): put back, or still naming the run's edge, and what that does; as it is when the config
+/// named that edge already.
+fn with_cloud_edge_put_back(
+    mut failed: InternalAdminDispatchResult,
+    cloud_node: &str,
+    edge_node: &str,
+    record: &CloudEdgeRecord,
+    put_back: &CloudEdgePutBack,
+) -> InternalAdminDispatchResult {
+    let before = record.previous_edge().unwrap_or("no edge");
+    let said = match put_back {
+        CloudEdgePutBack::Unchanged => return failed,
+        CloudEdgePutBack::PutBack => format!(
+            "{cloud_node} config names {before} again: this run recorded {edge_node} in it before \
+             the door, and put it back (FINDINGS A-317)."
+        ),
+        CloudEdgePutBack::Failed(why) => format!(
+            "{cloud_node} config still names {edge_node}, which this run recorded in it before the \
+             door (FINDINGS A-317): putting back {before} failed twice, the last time{why}. \
+             {cloud_node} reads it when it starts, and from then on drops every Cloud request \
+             through another edge: fix the cause, then run publish_cloud_endpoint again, or put \
+             io.edge_node back with set_node_config."
+        ),
+    };
+    let detail = failed
+        .envelope
+        .get("error_detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let detail = if detail.is_empty() {
+        said
+    } else {
+        format!("{detail}. {said}")
+    };
+    failed.envelope["error_detail"] = serde_json::json!(detail);
+    failed
+}
+
+/// IO.cloud's door on the edge it moved from (FINDINGS A-317): its channel, that edge, and whether
+/// it closed (`close_moved_cloud_door`).
+#[derive(Debug, Clone, PartialEq)]
+struct MovedCloudDoor {
+    ich: String,
+    from: String,
+    /// `Ok(closed)` once that edge answered the close ok, `closed` false when it held no such door;
+    /// else why not, the last time.
+    closed: Result<bool, String>,
+}
+
+/// How long SY.admin waits for an edge to answer one close of the door (FINDINGS A-317), as
+/// `unexternalize` does.
+const CLOUD_DOOR_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Closes IO.cloud's door on the edge it moved from (FINDINGS A-317): `EDGE_CLOSE_URL` of its channel
+/// on `from`, as `unexternalize` sends it, tried once more at once when it does not close. The vault
+/// keeps the channel's token for the new edge since this run's externalize; the old door holds the
+/// previous token in that edge's memory, and nothing else ends it before that edge restarts.
+async fn close_moved_cloud_door(
+    client: &RouterDispatcher,
+    ich: &str,
+    from: &str,
+) -> Result<bool, String> {
+    let close = || {
+        send_system_request_with_meta(
+            client,
+            from,
+            MSG_EDGE_CLOSE_URL,
+            MSG_EDGE_CLOSE_URL_RESPONSE,
+            serde_json::json!({ "ich": ich }),
+            16,
+            None,
+            None,
+            Some(from.to_string()),
+            None,
+            None,
+            CLOUD_DOOR_CLOSE_TIMEOUT,
+        )
+    };
+    let mut closed = cloud_door_close_outcome(close().await);
+    if let Err(first) = &closed {
+        tracing::warn!(
+            edge = %from,
+            ich = %ich,
+            reason = %first,
+            "publish_cloud_endpoint: the door on the edge it moved from did not close: tried once \
+             more"
+        );
+        closed = cloud_door_close_outcome(close().await);
+    }
+    match &closed {
+        Ok(existed) => tracing::info!(
+            edge = %from,
+            ich = %ich,
+            closed = existed,
+            "publish_cloud_endpoint: the door on the edge it moved from is closed"
+        ),
+        Err(why) => tracing::warn!(
+            edge = %from,
+            ich = %ich,
+            reason = %why,
+            "publish_cloud_endpoint: the door on the edge it moved from did not close twice: the \
+             answer names it"
+        ),
+    }
+    closed
+}
+
+/// What an edge's answer to the close says (FINDINGS A-317): `Ok(closed)` on `ok`, `closed` false
+/// when it held no such door; else why not.
+fn cloud_door_close_outcome(answer: Result<serde_json::Value, AdminError>) -> Result<bool, String> {
+    match answer {
+        Ok(payload) if payload.get("status").and_then(serde_json::Value::as_str) == Some("ok") => {
+            Ok(payload
+                .get("closed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false))
+        }
+        Ok(payload) => Err(format!(
+            "it refused the close: {}",
+            payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason given")
+        )),
+        Err(err) => Err(format!("it did not answer the close: {err}")),
+    }
+}
+
+/// The log line of what the apply did to the running IO.cloud (FINDINGS A-255).
+fn log_cloud_edge_apply(cloud_node: &str, edge_node: &str, applied: &CloudEdgeApply) {
+    match applied {
         CloudEdgeApply::AlreadyTrusted => tracing::info!(
             cloud_node = %cloud_node,
             edge_node = %edge_node,
@@ -8764,51 +9200,6 @@ async fn record_and_apply_cloud_edge(
              meanwhile and may have replaced the record"
         ),
     }
-    Ok(applied)
-}
-
-/// Why the record failed, as `CONFIG_RECORD_FAILED`'s detail says it right after "the last time";
-/// none when the orchestrator took it.
-fn cloud_edge_record_failure(record: &Result<(u16, String), AdminError>) -> Option<String> {
-    match record {
-        Ok((status, _)) if *status < 400 => None,
-        Ok((status, body)) => Some(format!(" (HTTP {status}): {body}")),
-        Err(err) => Some(format!(": {err}")),
-    }
-}
-
-/// `CONFIG_RECORD_FAILED`'s detail once the record failed twice (FINDINGS A-273), `failure` the
-/// second time's (`cloud_edge_record_failure`). What is left, as the code leaves it:
-/// - the door is open on `edge_node` with the token the externalize minted: the vault holds it for
-///   the edge (`edge_channel_secret:<ich>`, dedicated to SY.edge's ILK, which SY.admin cannot read
-///   back), and the edge took it; nothing closes the door;
-/// - that token is in no answer (A-124: a token through Archi reaches the AI provider), and in no
-///   log line;
-/// - a token the edge held for that channel before is the edge's grace secret, accepted for up to
-///   10 minutes from the open (SY.edge's `SHARED_SECRET_GRACE_MS`), in its memory only: a restart
-///   of the edge ends it sooner, and so does another run of the action, whose open puts this
-///   call's token, which no one holds, in its place (SY.edge's `apply_open_url` keeps one previous
-///   secret, the one it replaces);
-/// - nothing is applied to the running IO.cloud: it trusts what it trusted before (no edge, on a
-///   first publish).
-///
-/// So the action runs again only once the cause the detail names is fixed, on the motherbee's
-/// HTTP API, never through Archi (A-124), and the Cloud gets the new token at once (FINDINGS
-/// A-273's review): that run ends the grace at once, and one that fails at the record again
-/// leaves the door with no token anyone holds.
-fn cloud_edge_record_failed_detail(cloud_node: &str, edge_node: &str, failure: &str) -> String {
-    format!(
-        "the door is open on {edge_node} with the token this call minted, but recording \
-         edge_node into {cloud_node} config failed twice, the last time{failure}. That token is \
-         not handed out, and it cannot be read back: the vault keeps it for the edge alone. A \
-         previous token on {edge_node} works for up to 10 minutes from this call, and stops \
-         sooner if the edge restarts or publish_cloud_endpoint runs again: the edge keeps one \
-         previous token, and another run puts this call's token in its place. So fix the cause \
-         above first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST \
-         /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124), and give the \
-         Cloud the new token at once: a run that answers CONFIG_RECORD_FAILED again leaves no \
-         token anyone holds."
-    )
 }
 
 /// Applies `edge_node` to the running `cloud_node` (FINDINGS A-255): a `CONFIG_GET` gives its live
@@ -9075,12 +9466,16 @@ fn cloud_edge_set_outcome(
 /// The answer of `publish_cloud_endpoint`: the externalize's, which carries the token, and whether
 /// the running IO.cloud took the edge (FINDINGS A-255): `edge_applied`, and when it did not, or
 /// SY.admin could not tell, a `warning` that says so (`cloud_edge_warning`), never a plain success.
-/// The publish worked and its token is shown only here, so the answer stays `ok`.
+/// When the door moved from another edge (FINDINGS A-317), `previous_edge_node` names that edge and
+/// `previous_edge_closed` says whether its door closed; one that did not close is in the `warning`
+/// too (`moved_cloud_door_warning`). The publish worked and its token is shown only here, so the
+/// answer stays `ok`.
 fn cloud_endpoint_answer(
     mut externalize: InternalAdminDispatchResult,
     cloud_node: &str,
     edge_node: &str,
     applied: &CloudEdgeApply,
+    moved: Option<&MovedCloudDoor>,
 ) -> InternalAdminDispatchResult {
     let Some(payload) = externalize
         .envelope
@@ -9089,15 +9484,50 @@ fn cloud_endpoint_answer(
     else {
         return externalize;
     };
-    let warning = cloud_edge_warning(cloud_node, edge_node, applied);
+    let apply_warning = cloud_edge_warning(cloud_node, edge_node, applied);
     payload.insert(
         "edge_applied".to_string(),
-        serde_json::json!(warning.is_none()),
+        serde_json::json!(apply_warning.is_none()),
     );
-    if let Some(warning) = warning {
-        payload.insert("warning".to_string(), serde_json::json!(warning));
+    if let Some(moved) = moved {
+        payload.insert(
+            "previous_edge_node".to_string(),
+            serde_json::json!(moved.from),
+        );
+        payload.insert(
+            "previous_edge_closed".to_string(),
+            serde_json::json!(moved.closed.is_ok()),
+        );
+    }
+    let warnings: Vec<String> = apply_warning
+        .into_iter()
+        .chain(moved.and_then(|moved| moved_cloud_door_warning(cloud_node, edge_node, moved)))
+        .collect();
+    if !warnings.is_empty() {
+        payload.insert("warning".to_string(), serde_json::json!(warnings.join(" ")));
     }
     externalize
+}
+
+/// The warning of a door moved to another edge whose old door did not close (FINDINGS A-317): which
+/// edge, why, what that door does meanwhile and how the operator closes it; none once it closed.
+fn moved_cloud_door_warning(
+    cloud_node: &str,
+    edge_node: &str,
+    moved: &MovedCloudDoor,
+) -> Option<String> {
+    let Err(why) = &moved.closed else {
+        return None;
+    };
+    let MovedCloudDoor { ich, from, .. } = moved;
+    Some(format!(
+        "The door on {from}, the edge it moved from, did not close, asked twice: {why}. While \
+         {from} runs, it still takes the previous token and forwards what it takes to \
+         {cloud_node}, which drops it once it trusts {edge_node}; once {from} restarts, it refuses \
+         every token, the vault keeping the channel's token for {edge_node}. Close it once {from} \
+         answers: unexternalize (POST /channels/unexternalize) with {{\"ich\":\"{ich}\",\
+         \"edge_node\":\"{from}\"}}. A hive removed has no door left to close."
+    ))
 }
 
 /// The warning of a publish whose edge the running IO.cloud did not take, or not for sure
@@ -16412,7 +16842,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "edge_node",
                 "string",
-                "Required. The SY.edge L2 name to publish on (e.g. SY.edge@ingress1).",
+                "Required. The SY.edge L2 name to publish on, SY.edge@<hive> (e.g. SY.edge@ingress1); any other name is refused (INVALID_REQUEST) before anything is read or recorded (FINDINGS A-317, since 0.1.139).",
             ),
             admin_action_body_field(
                 "cloud_node",
@@ -17944,10 +18374,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The compact view gives each action its name, description and read_only, and is what the mesh and the executor answer. One action's schema and example are its help: get_admin_action_help (GET /admin/actions/{action}).",
         ],
         "publish_cloud_endpoint" => vec![
-            "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
-            "IO.cloud trusts that edge at once (FINDINGS A-255): SY.admin records it in IO.cloud's config (set_node_config of io.edge_node), then applies it to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
+            "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again on the same edge, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
+            "A run goes in this order (FINDINGS A-317, since 0.1.139): the record first, IO.cloud's config read (get_node_config) and edge_node written in it (set_node_config of its io with io.edge_node, the rest of it as read); then the door, the token minted and the URL opened on the edge; then the edge applied to the running IO.cloud; last, when the door moved from another edge, that edge's door closed. One run at a time: another waits for it.",
+            "IO.cloud trusts that edge at once (FINDINGS A-255): once the door is open, SY.admin applies the edge it recorded to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
-            "A record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED, with no token: the door is open on the edge with the token this call minted, which is handed to no one and cannot be read back; nothing is applied to IO.cloud. A previous token on that edge works for up to 10 minutes from this call, and stops sooner if the edge restarts or publish_cloud_endpoint runs again: the edge keeps one previous token, and another run puts this call's token in its place. So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124), and give the Cloud the new token at once: a run that answers CONFIG_RECORD_FAILED again leaves no token anyone holds. A token goes out once, only in an ok answer, never in an error or a log line.",
+            "A door moved to another edge (IO.cloud's config named another SY.edge) closes the old one (FINDINGS A-317, since 0.1.139): once the new door is open and applied, SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel, tried once more at once, so the previous token stops at once: a move keeps no 10 minutes. payload.previous_edge_node names that edge and payload.previous_edge_closed says whether its door closed; false comes with payload.warning, which says how to close it (unexternalize, POST /channels/unexternalize, once that edge answers). Give the Cloud the new URL, on the new edge's host, and the new token at once.",
+            "A read or a write of the record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. A write that got no answer may have been written all the same, as the detail says: get_node_config of IO.cloud shows what its config names. So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124). Up to 0.1.138 the record came after the token, and this answer left the door open with a token no one received.",
+            "A door that does not open (the externalize's error: the vault or the edge refused, or the edge did not answer) puts the record back as it was before the run, tried once more at once, and the error's detail says so, or that IO.cloud's config still names the edge, which IO.cloud reads when it starts (FINDINGS A-317, since 0.1.139). A token goes out once, only in an ok answer, never in an error or a log line.",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
@@ -42970,18 +43403,58 @@ mod tests {
 
     const CLOUD_NODE: &str = "IO.cloud@motherbee";
     const CLOUD_EDGE: &str = "SY.edge@ingress1";
+    /// The edge a door moves from (FINDINGS A-317).
+    const OLD_CLOUD_EDGE: &str = "SY.edge@ingress2";
+
+    /// The orchestrator's answer to the record's read, `get_node_config` of IO.cloud, its config
+    /// with `io` (none when `io` is null), as SY.admin relays it.
+    async fn answer_cloud_edge_read(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        io: Value,
+    ) {
+        let mut config = json!({
+            "_system": { "managed_by": "SY.orchestrator", "config_version": 3 },
+            "node_name": CLOUD_NODE,
+        });
+        if !io.is_null() {
+            config["io"] = io;
+        }
+        let answer = json!({
+            "status": "ok",
+            "node_name": CLOUD_NODE,
+            "config_version": 3,
+            "config": config,
+        });
+        answer_cloud_edge_read_with(harness, answer).await;
+    }
+
+    /// The orchestrator's `answer` to the record's read, `get_node_config` of IO.cloud.
+    async fn answer_cloud_edge_read_with(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        answer: Value,
+    ) {
+        let sent = answer_admin_relay(harness, "get_node_config", answer).await;
+        assert_eq!(sent.payload["node_name"], json!(CLOUD_NODE));
+    }
+
+    /// The orchestrator's answer to a write of IO.cloud's config, `set_node_config` with `io`: the
+    /// record, or its put-back (FINDINGS A-317).
+    async fn answer_cloud_edge_write(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        io: Value,
+        answer: Value,
+    ) {
+        let sent = answer_admin_relay(harness, "set_node_config", answer).await;
+        assert_eq!(sent.payload["node_name"], json!(CLOUD_NODE));
+        assert_eq!(sent.payload["config"], json!({ "io": io }));
+    }
 
     /// The orchestrator's answer to the record, `set_node_config` of `io.edge_node` on IO.cloud.
     async fn answer_cloud_edge_record(
         harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
         answer: Value,
     ) {
-        let sent = answer_admin_relay(harness, "set_node_config", answer).await;
-        assert_eq!(sent.payload["node_name"], json!(CLOUD_NODE));
-        assert_eq!(
-            sent.payload["config"],
-            json!({ "io": { "edge_node": CLOUD_EDGE } })
-        );
+        answer_cloud_edge_write(harness, json!({ "edge_node": CLOUD_EDGE }), answer).await;
     }
 
     /// IO.cloud's answer, `answer_msg` with `answer`, to the next message SY.admin sends, which is
@@ -43098,8 +43571,13 @@ mod tests {
     /// SY.admin could not tell: the answer stays `ok` with the token, which is shown only there,
     /// says `edge_applied: false`, and asks for no restart.
     fn cloud_edge_warning_of(applied: &CloudEdgeApply) -> String {
-        let answer =
-            cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, applied);
+        let answer = cloud_endpoint_answer(
+            cloud_externalize_answer(),
+            CLOUD_NODE,
+            CLOUD_EDGE,
+            applied,
+            None,
+        );
         assert_eq!(answer.http_status, 200);
         assert_eq!(answer.envelope["status"], json!("ok"));
         let payload = &answer.envelope["payload"];
@@ -43112,16 +43590,16 @@ mod tests {
 
     /// FINDINGS A-255: the edge `publish_cloud_endpoint` records reaches the running IO.cloud. On a
     /// fresh install IO.cloud trusts no edge: after the record (`set_node_config`, which only writes
-    /// its config.json), SY.admin reads its live config and config_version (a CONFIG_GET, not `ok`
+    /// its config.json) and the door's open, SY.admin reads its live config and config_version (a
+    /// CONFIG_GET, not `ok`
     /// while it trusts no edge, with no config in use) and sends a CONFIG_SET of that config with the
     /// edge, at that config_version + 1, which IO.cloud applies at once. Nothing followed the record
     /// before, and IO.cloud dropped every Cloud request until its restart.
     #[tokio::test]
     async fn the_published_edge_is_applied_to_the_running_io_cloud() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-applied");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43155,15 +43633,19 @@ mod tests {
             );
         };
         let (applied, ()) = tokio::join!(apply, drive);
-        let applied = applied.expect("recorded");
         assert_eq!(applied, CloudEdgeApply::Applied(4));
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
 
-        let answer =
-            cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, &applied);
+        let answer = cloud_endpoint_answer(
+            cloud_externalize_answer(),
+            CLOUD_NODE,
+            CLOUD_EDGE,
+            &applied,
+            None,
+        );
         assert_eq!(answer.http_status, 200);
         assert_eq!(answer.envelope["status"], json!("ok"));
         let payload = &answer.envelope["payload"];
@@ -43279,9 +43761,8 @@ mod tests {
     #[tokio::test]
     async fn a_rotation_on_the_same_edge_sends_io_cloud_no_config_set() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-rotation");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43291,7 +43772,6 @@ mod tests {
             .await;
         };
         let (applied, ()) = tokio::join!(apply, drive);
-        let applied = applied.expect("recorded");
         assert_eq!(applied, CloudEdgeApply::AlreadyTrusted);
         assert!(
             harness
@@ -43300,8 +43780,13 @@ mod tests {
                 .is_none(),
             "no CONFIG_SET"
         );
-        let answer =
-            cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, &applied);
+        let answer = cloud_endpoint_answer(
+            cloud_externalize_answer(),
+            CLOUD_NODE,
+            CLOUD_EDGE,
+            &applied,
+            None,
+        );
         assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
         assert!(answer.envelope["payload"].get("warning").is_none());
     }
@@ -43315,9 +43800,8 @@ mod tests {
     #[tokio::test]
     async fn an_edge_io_cloud_refuses_is_recorded_and_not_applied() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-refused");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43334,7 +43818,6 @@ mod tests {
             .await;
         };
         let (unwritten, ()) = tokio::join!(apply, drive);
-        let unwritten = unwritten.expect("recorded");
         let CloudEdgeApply::NotApplied(why) = &unwritten else {
             panic!("{unwritten:?}");
         };
@@ -43350,9 +43833,8 @@ mod tests {
             "not tried again"
         );
 
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43366,7 +43848,6 @@ mod tests {
             .await;
         };
         let (unread, ()) = tokio::join!(apply, drive);
-        let unread = unread.expect("recorded");
         let CloudEdgeApply::NotApplied(why) = &unread else {
             panic!("{unread:?}");
         };
@@ -43408,9 +43889,8 @@ mod tests {
     #[tokio::test]
     async fn a_config_get_without_an_answer_leaves_the_edge_unchecked() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-unchecked");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43420,7 +43900,6 @@ mod tests {
             .await;
         };
         let (applied, ()) = tokio::join!(apply, drive);
-        let applied = applied.expect("recorded");
         let CloudEdgeApply::Unchecked(why) = &applied else {
             panic!("{applied:?}");
         };
@@ -43454,9 +43933,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_io_cloud_that_does_not_answer_in_time_leaves_the_edge_unchecked() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-busy");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             let get = harness
                 .next_outgoing_within(Duration::from_secs(5))
                 .await
@@ -43464,7 +43942,6 @@ mod tests {
             assert_eq!(get.meta.msg.as_deref(), Some("CONFIG_GET"));
         };
         let (busy, ()) = tokio::join!(apply, drive);
-        let busy = busy.expect("recorded");
         let CloudEdgeApply::Unchecked(why) = &busy else {
             panic!("{busy:?}");
         };
@@ -43474,9 +43951,8 @@ mod tests {
             .await
             .is_none());
 
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43491,7 +43967,6 @@ mod tests {
             assert_eq!(set.meta.msg.as_deref(), Some("CONFIG_SET"));
         };
         let (late, ()) = tokio::join!(apply, drive);
-        let late = late.expect("recorded");
         let CloudEdgeApply::Unchecked(why) = &late else {
             panic!("{late:?}");
         };
@@ -43517,10 +43992,9 @@ mod tests {
     #[tokio::test]
     async fn a_stale_config_set_is_tried_again_on_the_config_read_again() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-stale-again");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let ours = json!({ "io": { "edge_node": CLOUD_EDGE, "inbound_family": "user" } });
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43557,7 +44031,7 @@ mod tests {
             assert_eq!(again.payload["config"], ours);
         };
         let (applied, ()) = tokio::join!(apply, drive);
-        assert_eq!(applied.expect("recorded"), CloudEdgeApply::Applied(9));
+        assert_eq!(applied, CloudEdgeApply::Applied(9));
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
@@ -43578,9 +44052,8 @@ mod tests {
                 json!({ "reason": "NODE_NOT_FOUND", "original_dst": CLOUD_NODE }),
             ),
         ] {
-            let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+            let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
             let drive = async {
-                answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
                 answer_cloud_config(
                     &mut harness,
                     "CONFIG_GET",
@@ -43598,14 +44071,18 @@ mod tests {
                 .await;
             };
             let (applied, ()) = tokio::join!(apply, drive);
-            let applied = applied.expect("recorded");
             assert_eq!(applied, CloudEdgeApply::AlreadyTrusted, "{answer_msg}");
             assert!(harness
                 .next_outgoing_within(Duration::from_millis(200))
                 .await
                 .is_none());
-            let answer =
-                cloud_endpoint_answer(cloud_externalize_answer(), CLOUD_NODE, CLOUD_EDGE, &applied);
+            let answer = cloud_endpoint_answer(
+                cloud_externalize_answer(),
+                CLOUD_NODE,
+                CLOUD_EDGE,
+                &applied,
+                None,
+            );
             assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
         }
     }
@@ -43618,9 +44095,8 @@ mod tests {
     #[tokio::test]
     async fn a_config_set_stale_on_both_tries_does_not_say_the_record_holds_the_edge() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-superseded");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let apply = apply_cloud_edge(&ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43651,7 +44127,6 @@ mod tests {
             .await;
         };
         let (applied, ()) = tokio::join!(apply, drive);
-        let applied = applied.expect("recorded");
         let CloudEdgeApply::Superseded(why) = &applied else {
             panic!("{applied:?}");
         };
@@ -43755,23 +44230,29 @@ mod tests {
     }
 
     /// A record the orchestrator refuses twice is the error answer (FINDINGS A-255): it is tried
-    /// once more at once (A-273), nothing is applied, and IO.cloud is not asked.
+    /// once more at once (A-273), and nothing follows it, since the record comes before the token
+    /// (FINDINGS A-317): its read and its writes are all SY.admin sent. A read that fails twice is
+    /// the same answer, and nothing is written.
     #[tokio::test]
-    async fn an_edge_whose_record_fails_is_not_applied() {
+    async fn a_record_that_fails_twice_is_config_record_failed_and_nothing_follows() {
         let (ctx, mut harness) = opa_test_admin("cloud-edge-record-fails");
-        let apply = record_and_apply_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let record = record_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
         let drive = async {
+            answer_cloud_edge_read(&mut harness, Value::Null).await;
             answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
             answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
         };
-        let (failed, ()) = tokio::join!(apply, drive);
+        let (failed, ()) = tokio::join!(record, drive);
         let failed = failed.expect_err("the record failed");
         assert_eq!(failed.http_status, 502);
         assert_eq!(failed.envelope["error_code"], json!("CONFIG_RECORD_FAILED"));
         let detail = failed.envelope["error_detail"].as_str().unwrap_or_default();
         assert!(
-            detail.contains("config failed twice, the last time (HTTP ")
-                && detail.contains("NODE_CONFIG_NOT_FOUND"),
+            detail.starts_with(&format!(
+                "recording edge_node {CLOUD_EDGE} into {CLOUD_NODE} config failed twice, the last \
+                 time (HTTP "
+            )) && detail.contains("NODE_CONFIG_NOT_FOUND")
+                && detail.contains("A try that got no answer may have been written all the same"),
             "{detail}"
         );
         assert!(
@@ -43779,13 +44260,40 @@ mod tests {
                 .next_outgoing_within(Duration::from_millis(200))
                 .await
                 .is_none(),
-            "IO.cloud is not asked"
+            "nothing follows the record"
+        );
+
+        let record = record_cloud_edge(&ctx, &ctx.rpc, CLOUD_NODE, CLOUD_EDGE);
+        let drive = async {
+            answer_cloud_edge_read_with(&mut harness, cloud_edge_record_refused()).await;
+            answer_cloud_edge_read_with(&mut harness, cloud_edge_record_refused()).await;
+        };
+        let (failed, ()) = tokio::join!(record, drive);
+        let failed = failed.expect_err("the read failed");
+        assert_eq!(failed.http_status, 502);
+        assert_eq!(failed.envelope["error_code"], json!("CONFIG_RECORD_FAILED"));
+        let detail = failed.envelope["error_detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.starts_with(&format!(
+                "reading {CLOUD_NODE} config failed twice, the last time (HTTP "
+            )) && detail.contains("NODE_CONFIG_NOT_FOUND")
+                && !detail.contains("A try that got no answer"),
+            "{detail}"
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing is written"
         );
     }
 
     /// CONFIG_RECORD_FAILED's detail names the second failure right after "the last time":
     /// ": <why>" for an error and " (HTTP <status>): <body>" for a refusal (FINDINGS A-255's
-    /// review, A-273).
+    /// review, A-273), the read's as the write's (FINDINGS A-317). The read takes IO.cloud's `io`
+    /// from the config SY.admin relays, none when that config has none; an answer that carries no
+    /// config is a failure.
     #[test]
     fn the_record_s_failure_reads_right_after_the_last_time() {
         let failure =
@@ -43799,22 +44307,137 @@ mod tests {
             failure(Err("timeout".into())),
             Some(": timeout".to_string())
         );
-        let detail = cloud_edge_record_failed_detail(CLOUD_NODE, CLOUD_EDGE, ": timeout");
-        assert!(
-            detail.contains(&format!(
-                "recording edge_node into {CLOUD_NODE} config failed twice, the last time: \
-                 timeout. "
-            )),
-            "{detail}"
+
+        let read = |read: Result<(u16, String), AdminError>| cloud_edge_record_read(&read);
+        let relayed = |config: Value| {
+            json!({
+                "status": "ok",
+                "action": "get_node_config",
+                "payload": { "status": "ok", "node_name": CLOUD_NODE, "config": config },
+            })
+            .to_string()
+        };
+        assert_eq!(
+            read(Ok((404, "no config.json".to_string()))),
+            Err(" (HTTP 404): no config.json".to_string())
         );
+        assert_eq!(read(Err("timeout".into())), Err(": timeout".to_string()));
+        let io = json!({ "edge_node": OLD_CLOUD_EDGE, "inbound_family": "user" });
+        assert_eq!(
+            read(Ok((200, relayed(json!({ "io": io, "_system": {} }))))),
+            Ok(CloudEdgeRecord {
+                previous_io: io.as_object().cloned()
+            })
+        );
+        for config in [
+            json!({ "_system": {} }),
+            json!({ "io": "SY.edge@ingress2" }),
+        ] {
+            assert_eq!(
+                read(Ok((200, relayed(config.clone())))),
+                Ok(CloudEdgeRecord::default()),
+                "{config}"
+            );
+        }
+        for body in [
+            json!({ "status": "ok", "payload": { "status": "ok" } }).to_string(),
+            relayed(json!("io")),
+            "not JSON".to_string(),
+        ] {
+            let why = read(Ok((200, body.clone()))).expect_err("no config");
+            assert!(
+                why.starts_with(": its answer carries no config: "),
+                "{body}: {why}"
+            );
+        }
+
+        for (step, what) in [
+            (
+                CloudEdgeRecordStep::Read,
+                format!("reading {CLOUD_NODE} config"),
+            ),
+            (
+                CloudEdgeRecordStep::Write,
+                format!("recording edge_node {CLOUD_EDGE} into {CLOUD_NODE} config"),
+            ),
+        ] {
+            let detail = cloud_edge_record_failed_detail(CLOUD_NODE, CLOUD_EDGE, step, ": timeout");
+            assert!(
+                detail.starts_with(&format!("{what} failed twice, the last time: timeout. ")),
+                "{detail}"
+            );
+        }
     }
 
-    /// publish_cloud_endpoint end to end (FINDINGS A-255's review): IO.cloud's channel from
-    /// identity's shared memory, the token minted into the vault for the edge, the edge opening the
-    /// URL with only the token's reference, the record, then IO.cloud's CONFIG_GET and CONFIG_SET.
-    /// The answer carries the token the vault got, once, and `edge_applied: true`.
+    /// What the record read says (FINDINGS A-317): the edge the door is on, the `io` the record
+    /// writes (the one read with the edge, nothing else in it changed), the `io` that puts it back,
+    /// and the edge the door moves from, which is only another edge's name. Before, the record wrote
+    /// `io` with the edge alone, and nothing read where the door was.
+    #[test]
+    fn the_record_writes_only_the_edge_and_knows_where_the_door_was() {
+        let record = |io: Value| CloudEdgeRecord {
+            previous_io: io.as_object().cloned(),
+        };
+
+        let fresh = CloudEdgeRecord::default();
+        assert_eq!(fresh.previous_edge(), None);
+        assert_eq!(
+            fresh.io_with_edge(CLOUD_EDGE),
+            json!({ "edge_node": CLOUD_EDGE })
+        );
+        assert_eq!(fresh.io_before(), json!({}));
+        assert_eq!(fresh.moved_from(CLOUD_EDGE), None);
+
+        let same = record(json!({ "edge_node": CLOUD_EDGE, "inbound_family": "user" }));
+        assert_eq!(same.previous_edge(), Some(CLOUD_EDGE));
+        assert_eq!(
+            same.io_with_edge(CLOUD_EDGE),
+            json!({ "edge_node": CLOUD_EDGE, "inbound_family": "user" })
+        );
+        assert_eq!(same.moved_from(CLOUD_EDGE), None);
+
+        let moved = record(json!({ "edge_node": OLD_CLOUD_EDGE, "inbound_family": "user" }));
+        assert_eq!(moved.previous_edge(), Some(OLD_CLOUD_EDGE));
+        assert_eq!(moved.moved_from(CLOUD_EDGE), Some(OLD_CLOUD_EDGE));
+        assert_eq!(
+            moved.io_with_edge(CLOUD_EDGE),
+            json!({ "edge_node": CLOUD_EDGE, "inbound_family": "user" })
+        );
+        assert_eq!(
+            moved.io_before(),
+            json!({ "edge_node": OLD_CLOUD_EDGE, "inbound_family": "user" })
+        );
+        assert_eq!(
+            record(json!({ "edge_node": format!(" {OLD_CLOUD_EDGE} ") })).moved_from(CLOUD_EDGE),
+            Some(OLD_CLOUD_EDGE)
+        );
+
+        // A name that is no edge's is no door to close; the put-back writes it as it was.
+        for odd in [
+            "",
+            "IO.cloud@motherbee",
+            "SY.edge",
+            "SY.edge@",
+            "SY.edges@ingress2",
+            "SY.edge@ingress 2",
+        ] {
+            let odd_record = record(json!({ "edge_node": odd }));
+            assert_eq!(odd_record.moved_from(CLOUD_EDGE), None, "{odd}");
+            assert_eq!(odd_record.io_before(), json!({ "edge_node": odd }), "{odd}");
+        }
+        for edge in [CLOUD_EDGE, OLD_CLOUD_EDGE, "SY.edge@egress_1"] {
+            assert!(is_cloud_door_edge(edge), "{edge}");
+        }
+    }
+
+    /// publish_cloud_endpoint end to end, in its order (FINDINGS A-255's review, A-317): IO.cloud's
+    /// channel from identity's shared memory; the record, IO.cloud's config read (a fresh install's,
+    /// with no edge) and the edge written in it; only then the token minted into the vault for the
+    /// edge and the edge opening the URL with only the token's reference; then IO.cloud's CONFIG_GET
+    /// and CONFIG_SET. The answer carries the token the vault got, once, and `edge_applied: true`,
+    /// and no door moved. Up to 0.1.138 the token was minted first and the record came after.
     #[tokio::test]
-    async fn publish_cloud_endpoint_opens_the_door_records_and_applies_the_edge() {
+    async fn publish_cloud_endpoint_records_the_edge_then_opens_the_door_then_applies_it() {
         let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-publish");
         ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
         let publish =
@@ -43822,6 +44445,8 @@ mod tests {
         let drive = async {
             let wait = Duration::from_secs(5);
             let secret_ref = format!("edge_channel_secret:{CLOUD_ICH}");
+            answer_cloud_edge_read(&mut harness, Value::Null).await;
+            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             let put = harness
                 .next_outgoing_within(wait)
                 .await
@@ -43863,7 +44488,6 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -43900,6 +44524,9 @@ mod tests {
         assert_eq!(payload["edge_node"], json!(CLOUD_EDGE));
         assert_eq!(payload["edge_applied"], json!(true));
         assert!(payload.get("warning").is_none(), "{shown}");
+        for moved in ["previous_edge_node", "previous_edge_closed"] {
+            assert!(payload.get(moved).is_none(), "{moved}: {shown}");
+        }
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
@@ -44054,9 +44681,8 @@ mod tests {
     }
 
     /// A record that fails is tried once more at once (FINDINGS A-273): the orchestrator refuses
-    /// the first and takes the second, and the publish goes on to IO.cloud and answers ok with the
-    /// token this call minted, once. Before, the first refusal was the error answer, and that
-    /// token went to no one.
+    /// the first write and takes the second, and the publish goes on to the door and IO.cloud and
+    /// answers ok with the token this call minted, once.
     #[tokio::test]
     async fn a_record_that_fails_once_is_tried_again() {
         let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-record-again");
@@ -44064,9 +44690,10 @@ mod tests {
         let publish =
             handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
         let drive = async {
-            let token = open_cloud_door(&mut harness).await;
+            answer_cloud_edge_read(&mut harness, Value::Null).await;
             answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
             answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+            let token = open_cloud_door(&mut harness).await;
             answer_cloud_config(
                 &mut harness,
                 "CONFIG_GET",
@@ -44099,16 +44726,16 @@ mod tests {
             .is_none());
     }
 
-    /// A record that fails twice is the error answer (FINDINGS A-273): 502 CONFIG_RECORD_FAILED
-    /// with no token in it, the token this call minted handed to no one, and its detail says what
-    /// is left: the door open on the edge with that token, a previous token on that edge working
-    /// for up to 10 minutes and less once the action runs again, which puts this call's token in
-    /// the edge's one place for a previous token (A-273's review), and so the cause fixed first,
-    /// the run again on the motherbee's HTTP API, never through Archi (A-124), and the new token
-    /// to the Cloud at once. IO.cloud is not asked. Neither a log line, at any level, nor the
-    /// command log carries the token.
+    /// A record that fails twice rotates nothing (FINDINGS A-317, the operator's call of
+    /// 2026-11-12): the record comes before the token, so 502 CONFIG_RECORD_FAILED follows the
+    /// record's read and its two writes and nothing else: no token minted into the vault, no door
+    /// opened or closed, IO.cloud not asked. Its detail says so: a token the Cloud holds works as
+    /// before, and the run goes again on the motherbee's HTTP API once the cause is fixed, never
+    /// through Archi (A-124). Up to 0.1.138 the token was minted and the door opened with it before
+    /// the record, and this answer left a token no one received in the edge's current place. The
+    /// log lines and the command log say what failed.
     #[tokio::test]
-    async fn a_record_that_fails_twice_hands_no_token_and_says_what_is_left() {
+    async fn a_record_that_fails_twice_rotates_nothing() {
         let captured = LogCapture::start();
         let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-record-fails-twice");
         ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
@@ -44121,101 +44748,480 @@ mod tests {
             AdminOrigin::Mesh("SY.architect@motherbee"),
         );
         let drive = async {
-            let token = open_cloud_door(&mut harness).await;
+            answer_cloud_edge_read(&mut harness, json!({ "edge_node": CLOUD_EDGE })).await;
             answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
             answer_cloud_edge_record(&mut harness, cloud_edge_record_refused()).await;
-            token
         };
-        let (answer, token) = tokio::join!(publish, drive);
+        let (answer, ()) = tokio::join!(publish, drive);
         let answer = answer.expect("dispatch");
         let text = answer.envelope.to_string();
-        assert!(!text.contains(&token), "the error carries the minted token");
         assert_eq!(answer.http_status, 502, "{text}");
         assert_eq!(answer.envelope["error_code"], json!("CONFIG_RECORD_FAILED"));
+        assert!(answer.envelope["payload"].is_null(), "{text}");
         let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
         for what in [
-            format!("the door is open on {CLOUD_EDGE} with the token this call minted"),
-            format!("recording edge_node into {CLOUD_NODE} config failed twice"),
+            format!("recording edge_node {CLOUD_EDGE} into {CLOUD_NODE} config failed twice"),
             "the last time (HTTP ".to_string(),
             "NODE_CONFIG_NOT_FOUND".to_string(),
-            "That token is not handed out".to_string(),
-            format!("A previous token on {CLOUD_EDGE} works for up to 10 minutes from this call"),
-            "stops sooner if the edge restarts or publish_cloud_endpoint runs again".to_string(),
-            "the edge keeps one previous token, and another run puts this call's token in its \
-             place"
+            "Nothing else was done, since the record comes before the token (FINDINGS A-317)"
                 .to_string(),
-            "So fix the cause above first, then run publish_cloud_endpoint again on the \
-             motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi \
-             (FINDINGS A-124), and give the Cloud the new token at once"
-                .to_string(),
-            "a run that answers CONFIG_RECORD_FAILED again leaves no token anyone holds"
+            format!(
+                "no token was minted, no door was opened or closed, and {CLOUD_NODE} was not \
+                 asked, so a token the Cloud holds works as before"
+            ),
+            "Fix the cause above, then run publish_cloud_endpoint again on the motherbee's HTTP \
+             API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124)"
                 .to_string(),
         ] {
             assert!(detail.contains(&what), "{what}: {detail}");
         }
-        assert!(
-            !detail.contains("keeps working only for the 10 minutes"),
-            "the grace a run takes away: {detail}"
-        );
+        for gone in [
+            "the door is open",
+            "this call minted",
+            "10 minutes",
+            "leaves no token",
+        ] {
+            assert!(!detail.contains(gone), "{gone}: {detail}");
+        }
         assert!(
             harness
                 .next_outgoing_within(Duration::from_millis(200))
                 .await
                 .is_none(),
-            "IO.cloud is not asked"
+            "no token into the vault, no door, IO.cloud not asked"
         );
 
         let logs = captured.text();
-        assert!(
-            !logs.contains(&token),
-            "a log line carries the minted token"
-        );
         for line in [
             "recording edge_node in IO.cloud's config failed: tried once more",
-            "recording edge_node in IO.cloud's config failed twice",
+            "recording edge_node in IO.cloud's config failed twice: nothing is minted",
         ] {
             assert!(logs.contains(line), "{line}");
         }
+        assert!(!logs.contains("opened URL"), "no door was opened");
         let command_log =
             fs::read_to_string(admin_command_log_path(&ctx.state_dir)).expect("the command log");
-        assert!(
-            !command_log.contains(&token),
-            "the command log carries the minted token"
+        let actions: Vec<String> = command_log
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("JSON")["action"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "get_node_config",
+                "set_node_config",
+                "set_node_config",
+                "publish_cloud_endpoint"
+            ],
+            "{command_log}"
         );
         let entry: Value =
             serde_json::from_str(command_log.lines().last().expect("an entry")).expect("JSON");
-        assert_eq!(entry["action"], "publish_cloud_endpoint");
         assert_eq!(entry["error_code"], "CONFIG_RECORD_FAILED");
     }
 
-    /// publish_cloud_endpoint's help, which Archi reads, says what a run does to the token before
-    /// it (FINDINGS A-273's review): the edge keeps one previous token, for up to 10 minutes and in
-    /// its memory only, so a restart of the edge or another run ends it sooner. After
-    /// CONFIG_RECORD_FAILED: the cause fixed first, the run again on the motherbee's HTTP API,
-    /// never through Archi (A-124), and the new token to the Cloud at once. Before, the help
-    /// promised that token its 10 minutes and said to run again, which ends them.
+    /// The edge is named before anything is read or recorded (FINDINGS A-317): the record comes
+    /// first, and IO.cloud's config would otherwise name a node that is no edge. A name that is not
+    /// `SY.edge@<hive>` is refused INVALID_REQUEST, and nothing is sent.
+    #[tokio::test(start_paused = true)]
+    async fn publish_cloud_endpoint_refuses_an_edge_node_that_is_no_edge() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-no-edge");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        for edge in [
+            "IO.cloud@motherbee",
+            "SY.admin@motherbee",
+            "SY.edges@ingress1",
+            "sy.edge@ingress1",
+            "SY.edge",
+            "SY.edge@",
+            "SY.edge@ingress 1",
+        ] {
+            let answer =
+                handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": edge }))
+                    .await
+                    .expect("dispatch");
+            assert_eq!(answer.http_status, 400, "{edge}");
+            assert_eq!(answer.envelope["error_code"], json!("INVALID_REQUEST"));
+            let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+            assert_eq!(
+                detail,
+                format!("edge_node must be an edge, SY.edge@<hive>, not '{edge}'"),
+                "{edge}"
+            );
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing read, recorded or opened"
+        );
+    }
+
+    /// The old edge's answer, `answer_msg` with `answer`, to the close of IO.cloud's door on it
+    /// (FINDINGS A-317): `EDGE_CLOSE_URL` of IO.cloud's channel, to that edge.
+    async fn answer_old_door_close(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        answer_msg: &str,
+        answer: Value,
+    ) {
+        let close = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the old door's close");
+        assert_eq!(close.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(close.meta.msg.as_deref(), Some(MSG_EDGE_CLOSE_URL));
+        assert_eq!(dst_of(&close), json!(OLD_CLOUD_EDGE));
+        assert_eq!(close.payload, json!({ "ich": CLOUD_ICH }));
+        harness
+            .inject(reply_to(&close, answer_msg, answer))
+            .await
+            .unwrap();
+    }
+
+    /// A move from `OLD_CLOUD_EDGE`, up to the old door's close: the record read with the old edge
+    /// and the inbound family, written with the new edge and the family kept, the door opened on
+    /// the new edge, and IO.cloud, which trusted the old edge, taking the new one. The token.
+    async fn move_cloud_door(harness: &mut fluxbee_sdk::RouterDispatcherTestHarness) -> String {
+        let was = json!({ "edge_node": OLD_CLOUD_EDGE, "inbound_family": "user" });
+        let now = json!({ "edge_node": CLOUD_EDGE, "inbound_family": "user" });
+        answer_cloud_edge_read(harness, was.clone()).await;
+        answer_cloud_edge_write(harness, now.clone(), cloud_edge_recorded()).await;
+        let token = open_cloud_door(harness).await;
+        answer_cloud_config(
+            harness,
+            "CONFIG_GET",
+            "CONFIG_RESPONSE",
+            cloud_config_get(3, json!({ "io": was })),
+        )
+        .await;
+        let set = answer_cloud_config(
+            harness,
+            "CONFIG_SET",
+            "CONFIG_RESPONSE",
+            cloud_config_taken(4, json!({ "io": now })),
+        )
+        .await;
+        assert_eq!(set.payload["config"], json!({ "io": now }));
+        token
+    }
+
+    /// A door moved to another edge closes the old one (FINDINGS A-317, the operator's call of
+    /// 2026-11-12): IO.cloud's config named another edge, so once the new door is open and IO.cloud
+    /// took the new edge, SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel. The
+    /// answer is ok with the token, names the old edge and says its door closed, with no warning.
+    /// Up to 0.1.138 nothing closed it: the old edge kept the old token in its memory until it
+    /// restarted.
+    #[tokio::test]
+    async fn a_door_moved_to_another_edge_closes_the_old_one() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-moved");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let publish =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let drive = async {
+            let token = move_cloud_door(&mut harness).await;
+            answer_old_door_close(
+                &mut harness,
+                MSG_EDGE_CLOSE_URL_RESPONSE,
+                json!({ "status": "ok", "ich": CLOUD_ICH, "closed": true }),
+            )
+            .await;
+            token
+        };
+        let (answer, token) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        let payload = &answer.envelope["payload"];
+        assert!(payload["token"] == json!(token), "{shown}");
+        assert_eq!(payload["edge_node"], json!(CLOUD_EDGE));
+        assert_eq!(payload["edge_applied"], json!(true));
+        assert_eq!(payload["previous_edge_node"], json!(OLD_CLOUD_EDGE));
+        assert_eq!(payload["previous_edge_closed"], json!(true));
+        assert!(payload.get("warning").is_none(), "{shown}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// An old door that does not close is asked once more, and then named (FINDINGS A-317): the
+    /// publish worked, so the answer stays ok with the token, says the old door did not close and,
+    /// in the warning, why, what that door does meanwhile and how the operator closes it. One that
+    /// closes on the second ask, or that the old edge no longer holds, is closed.
+    #[tokio::test]
+    async fn an_old_door_that_does_not_close_is_asked_twice_and_named() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-moved-not-closed");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let publish =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let unreachable = json!({ "reason": "NODE_NOT_FOUND", "original_dst": OLD_CLOUD_EDGE });
+        let drive = async {
+            let token = move_cloud_door(&mut harness).await;
+            answer_old_door_close(&mut harness, MSG_UNREACHABLE, unreachable.clone()).await;
+            answer_old_door_close(&mut harness, MSG_UNREACHABLE, unreachable.clone()).await;
+            token
+        };
+        let (answer, token) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        assert_eq!(answer.envelope["status"], json!("ok"), "{shown}");
+        let payload = &answer.envelope["payload"];
+        assert!(payload["token"] == json!(token), "{shown}");
+        assert_eq!(payload["edge_applied"], json!(true));
+        assert_eq!(payload["previous_edge_node"], json!(OLD_CLOUD_EDGE));
+        assert_eq!(payload["previous_edge_closed"], json!(false));
+        let warning = payload["warning"].as_str().expect("a warning");
+        for what in [
+            format!(
+                "The door on {OLD_CLOUD_EDGE}, the edge it moved from, did not close, asked twice"
+            ),
+            "NODE_NOT_FOUND".to_string(),
+            format!("it still takes the previous token and forwards what it takes to {CLOUD_NODE}"),
+            format!("which drops it once it trusts {CLOUD_EDGE}"),
+            format!("once {OLD_CLOUD_EDGE} restarts, it refuses every token"),
+            format!(
+                "unexternalize (POST /channels/unexternalize) with \
+                 {{\"ich\":\"{CLOUD_ICH}\",\"edge_node\":\"{OLD_CLOUD_EDGE}\"}}"
+            ),
+            "A hive removed has no door left to close.".to_string(),
+        ] {
+            assert!(warning.contains(&what), "{what}: {warning}");
+        }
+        assert!(!warning.contains(&token), "the warning carries no token");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        for (first, closed) in [
+            (
+                (
+                    MSG_EDGE_CLOSE_URL_RESPONSE,
+                    json!({ "status": "error", "error": "registry lock poisoned" }),
+                ),
+                true,
+            ),
+            ((MSG_UNREACHABLE, unreachable.clone()), false),
+        ] {
+            let close = close_moved_cloud_door(&ctx.rpc, CLOUD_ICH, OLD_CLOUD_EDGE);
+            let drive = async {
+                answer_old_door_close(&mut harness, first.0, first.1.clone()).await;
+                answer_old_door_close(
+                    &mut harness,
+                    MSG_EDGE_CLOSE_URL_RESPONSE,
+                    json!({ "status": "ok", "ich": CLOUD_ICH, "closed": closed }),
+                )
+                .await;
+            };
+            let (outcome, ()) = tokio::join!(close, drive);
+            assert_eq!(outcome, Ok(closed), "{first:?}");
+        }
+        assert_eq!(
+            cloud_door_close_outcome(Ok(json!({ "status": "error", "error": "busy" }))),
+            Err("it refused the close: busy".to_string())
+        );
+    }
+
+    /// The vault's and the edge's answers to a door that does not open: the token minted into the
+    /// vault for the edge, then the edge's refusal of the open. The token the vault got.
+    async fn refuse_cloud_door(harness: &mut fluxbee_sdk::RouterDispatcherTestHarness) -> String {
+        let wait = Duration::from_secs(5);
+        let put = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the token into the vault");
+        assert_eq!(put.meta.msg.as_deref(), Some(MSG_VAULT_PUT));
+        let token = put.payload["value"]["secret"]
+            .as_str()
+            .expect("the minted token")
+            .to_string();
+        harness
+            .inject(reply_to(
+                &put,
+                MSG_VAULT_PUT_RESPONSE,
+                json!({ "status": "ok", "key": format!("edge_channel_secret:{CLOUD_ICH}") }),
+            ))
+            .await
+            .unwrap();
+        let open = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the edge's open");
+        assert_eq!(open.meta.msg.as_deref(), Some(MSG_EDGE_OPEN_URL));
+        harness
+            .inject(reply_to(
+                &open,
+                MSG_EDGE_OPEN_URL_RESPONSE,
+                json!({ "status": "error", "error": "the edge refused it" }),
+            ))
+            .await
+            .unwrap();
+        token
+    }
+
+    /// A door that does not open puts the record back (FINDINGS A-317): the record came first and
+    /// named the new edge, so SY.admin writes back the `io` IO.cloud's config had before the run,
+    /// and the externalize's error says so; IO.cloud is not asked and no door is closed. On a
+    /// rotation on the same edge nothing is written back; one that cannot be written back is named.
+    #[tokio::test]
+    async fn a_door_that_does_not_open_puts_the_record_back() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-not-opened");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let old = json!({ "edge_node": OLD_CLOUD_EDGE });
+        let same = json!({ "edge_node": CLOUD_EDGE });
+        for (was, put_back, says) in [
+            (
+                old.clone(),
+                Some((old.clone(), cloud_edge_recorded())),
+                format!(
+                    "{CLOUD_NODE} config names {OLD_CLOUD_EDGE} again: this run recorded \
+                     {CLOUD_EDGE} in it before the door, and put it back (FINDINGS A-317)."
+                ),
+            ),
+            (
+                Value::Null,
+                Some((json!({}), cloud_edge_recorded())),
+                format!("{CLOUD_NODE} config names no edge again"),
+            ),
+            (same.clone(), None, String::new()),
+            (
+                old.clone(),
+                Some((old.clone(), cloud_edge_record_refused())),
+                format!(
+                    "{CLOUD_NODE} config still names {CLOUD_EDGE}, which this run recorded in it \
+                     before the door (FINDINGS A-317): putting back {OLD_CLOUD_EDGE} failed twice, \
+                     the last time (HTTP "
+                ),
+            ),
+        ] {
+            let publish =
+                handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+            let drive = async {
+                answer_cloud_edge_read(&mut harness, was.clone()).await;
+                answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+                let token = refuse_cloud_door(&mut harness).await;
+                if let Some((io, answer)) = &put_back {
+                    answer_cloud_edge_write(&mut harness, io.clone(), answer.clone()).await;
+                    if answer["status"] == json!("error") {
+                        answer_cloud_edge_write(&mut harness, io.clone(), answer.clone()).await;
+                    }
+                }
+                token
+            };
+            let (answer, token) = tokio::join!(publish, drive);
+            let answer = answer.expect("dispatch");
+            let text = answer.envelope.to_string();
+            assert!(!text.contains(&token), "the error carries the minted token");
+            assert_eq!(answer.http_status, 400, "{was}: {text}");
+            assert_eq!(answer.envelope["error_code"], json!("INVALID_REQUEST"));
+            let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.starts_with(&format!(
+                    "edge did not open URL '{CLOUD_ICH}': the edge refused it"
+                )),
+                "{was}: {detail}"
+            );
+            if says.is_empty() {
+                assert!(!detail.contains("config"), "{was}: {detail}");
+            } else {
+                assert!(detail.contains(&says), "{was}: {says}: {detail}");
+            }
+            assert!(
+                harness
+                    .next_outgoing_within(Duration::from_millis(200))
+                    .await
+                    .is_none(),
+                "{was}: IO.cloud not asked, no door closed"
+            );
+        }
+    }
+
+    /// One publish at a time (FINDINGS A-317): a run reads the edge the record names before it
+    /// writes its own and closes that edge's door once its own is open, so a second run starts only
+    /// once the first answered. Here two rotations on the same edge are asked at once, and the
+    /// second's read follows the first's last message.
+    #[tokio::test]
+    async fn one_publish_runs_at_a_time() {
+        let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-one-at-a-time");
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        let first =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let second =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let drive = async {
+            for _ in 0..2 {
+                answer_cloud_edge_read(&mut harness, json!({ "edge_node": CLOUD_EDGE })).await;
+                answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+                open_cloud_door(&mut harness).await;
+                answer_cloud_config(
+                    &mut harness,
+                    "CONFIG_GET",
+                    "CONFIG_RESPONSE",
+                    cloud_config_get(3, json!({ "io": { "edge_node": CLOUD_EDGE } })),
+                )
+                .await;
+            }
+        };
+        let (first, second, ()) = tokio::join!(first, second, drive);
+        for answer in [first, second] {
+            let answer = answer.expect("dispatch");
+            assert_eq!(answer.http_status, 200);
+            assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// publish_cloud_endpoint's help, which Archi reads, says what a run does (FINDINGS A-273's
+    /// review, A-317): its order, the record before the token; a rotation on the same edge keeps
+    /// the edge's one previous token for up to 10 minutes, in its memory only, a restart of the edge
+    /// or another run ending it sooner; a move closes the old door, so the previous token stops at
+    /// once; CONFIG_RECORD_FAILED mints nothing, and the run goes again on the motherbee's HTTP
+    /// API, never through Archi (A-124); a door that does not open puts the record back. Before, the
+    /// help said CONFIG_RECORD_FAILED left the door open with a token no one received.
     #[test]
     fn the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it() {
         let notes = admin_action_request_notes("publish_cloud_endpoint");
         let says = |words: &str| notes.iter().any(|note| note.contains(words));
         for words in [
-            "Run again, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
-            "A previous token on that edge works for up to 10 minutes from this call, and stops sooner if the edge restarts or publish_cloud_endpoint runs again: the edge keeps one previous token, and another run puts this call's token in its place.",
-            "So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124), and give the Cloud the new token at once: a run that answers CONFIG_RECORD_FAILED again leaves no token anyone holds.",
+            "Run again on the same edge, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
+            "A run goes in this order (FINDINGS A-317, since 0.1.139): the record first, IO.cloud's config read (get_node_config) and edge_node written in it",
+            "then the door, the token minted and the URL opened on the edge; then the edge applied to the running IO.cloud; last, when the door moved from another edge, that edge's door closed. One run at a time: another waits for it.",
+            "SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel, tried once more at once, so the previous token stops at once: a move keeps no 10 minutes.",
+            "payload.previous_edge_node names that edge and payload.previous_edge_closed says whether its door closed; false comes with payload.warning, which says how to close it (unexternalize, POST /channels/unexternalize, once that edge answers).",
+            "One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before.",
+            "So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124).",
+            "puts the record back as it was before the run, tried once more at once",
+            "A token goes out once, only in an ok answer, never in an error or a log line.",
         ] {
             assert!(says(words), "{words}: {notes:#?}");
         }
         for promise in [
             "the previous one works 10 more minutes",
             "keeps working only for the 10 minutes",
+            "the door is open on the edge with the token this call minted",
+            "leaves no token anyone holds",
         ] {
             assert!(!says(promise), "{promise}: {notes:#?}");
         }
         // In the help itself, GET /admin/actions/publish_cloud_endpoint, and on the route it names.
         let spec = resolve_internal_action_spec("publish_cloud_endpoint")
             .expect("an action of the catalog");
-        assert!(build_admin_action_doc(spec).to_string().contains(
+        let doc = build_admin_action_doc(spec).to_string();
+        assert!(doc.contains(
             "(POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124)"
+        ));
+        assert!(doc.contains(
+            "The SY.edge L2 name to publish on, SY.edge@<hive> (e.g. SY.edge@ingress1); any other name is refused (INVALID_REQUEST) before anything is read or recorded (FINDINGS A-317, since 0.1.139)."
         ));
         assert_eq!(
             admin_methods_allowed_for_path("/hives/motherbee/cloud/endpoint"),

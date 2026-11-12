@@ -218,7 +218,13 @@ framed. A response the edge cannot build (an invalid header value, say) is a
 - **shared-secret**: the request needs `Authorization: Bearer <token>`, compared in constant time
   (`bearer_matches`, `constant_time_eq`). An empty stored secret never matches. After a rotation
   the previous token stays valid for 10 minutes (`SHARED_SECRET_GRACE_MS`, set in
-  `apply_open_url`, kept in RAM only).
+  `apply_open_url`, kept in RAM only). The edge keeps one previous token, the current one an open
+  replaces: a second rotation within the 10 minutes drops the first token at once, and a restart
+  ends the grace. Nothing extends it (FINDINGS A-317, the operator's call of 2026-11-12). A door
+  that moves to another edge keeps no grace on the old one: since 0.1.139 SY.admin's
+  `publish_cloud_endpoint` sends the old edge `EDGE_CLOSE_URL` once the new door is open (A-317),
+  so the previous token stops at once. The vault keeps the channel's new token for the new edge,
+  and an old door left open would refuse every token once its edge restarts.
 
 Where the token comes from (`handle_externalize` in `src/bin/sy_admin.rs`): SY.admin mints one
 (`mint_entry_token`, two UUIDv4 in hex) unless the caller sent `secret`, stores it in SY.vault as

@@ -444,7 +444,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide).
 - A-315 🔵 SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes` (low; SY.admin and SY.architect; found by 0.1.133's gate).
 - A-316 🔵 An edge channel's bearer can be read back through `vault_assign` then `vault_get` (low; SY.admin or SY.vault).
-- A-317 🔵 SY.edge keeps one previous channel secret, in memory only (low; SY.edge; to decide).
+- A-317 🔵 SY.edge keeps one previous channel secret, in memory only (low; decided 2026-11-12: the rotation complete and in order, no grace extension; built on `coa/edge-139` for 0.1.139, in SY.admin alone).
 - A-318 🔵 A failed publish's clean-up after the answer can orphan IO.blob's copy if SY.admin stops (low; SY.admin; 0.1.137).
 - A-319 🔵 The installation update's background reads are bounded in time, not in number (low; SY.admin; 0.1.137).
 - A-320 🔵 Only `add_hive`'s timed-out records ever close in Archi (low; SY.architect).
@@ -2111,6 +2111,45 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   cosas raras para resolver el problema de que el cloud pierda el token que ya tenía aprobado,
   porque eso es mecanismo distinto"*. A topic of its own for the Cloud track, to review: how Fluxbee
   Cloud gets a new token when it was already registered. In the bug push (item 30).
+- **Built on `coa/edge-139` (0.1.139), in SY.admin alone.** SY.edge is unchanged: its one previous
+  token, 10 minutes in its memory, stays as it is by the operator's call, and its `EDGE_CLOSE_URL`
+  closes the old door. `publish_cloud_endpoint` (`src/bin/sy_admin.rs`) now runs in this order:
+  - **The record first** (`record_cloud_edge`): IO.cloud's config read (`get_node_config`), then
+    the edge written in it (`set_node_config` of its `io` with `edge_node`, the rest of `io` as
+    read, where the record wrote `io` with the edge alone), each tried once more at once, before
+    the externalize mints the token. A read or a write that fails twice answers 502
+    `CONFIG_RECORD_FAILED` with nothing else done: no token minted, no door opened or closed,
+    IO.cloud not asked, so a token the Cloud holds works as before. Its detail says so, and that a
+    write that got no answer may have been written all the same.
+  - **A door that does not open** (the externalize's error) puts the record back as it was read
+    (`put_back_cloud_edge_record`, tried once more at once; nothing on a rotation on the same
+    edge), and the error's detail says so, or that IO.cloud's config still names the edge.
+  - **The apply** to the running IO.cloud, as before (A-255).
+  - **The old door closed on a move** (`close_moved_cloud_door`): when the config named another
+    `SY.edge@<hive>`, SY.admin sends that edge `EDGE_CLOSE_URL` of IO.cloud's channel, tried once
+    more at once. The answer adds `previous_edge_node` and `previous_edge_closed`; one that did not
+    close is in its `warning`, with the `unexternalize` that closes it once that edge answers.
+  - `edge_node` must be `SY.edge@<hive>`, refused `INVALID_REQUEST` before anything is read or
+    recorded, since the record comes first; one run at a time (a lock: two runs at once would read
+    the same old edge, and the door the first opened would stay open behind the second).
+  - Texts: SY.admin's help for `publish_cloud_endpoint` (its order, a move, the record's failure, a
+    door that does not open, `edge_node`); docs/io-cloud-api.md §2, §7 and §9 0.1.139;
+    docs/nodes/sy-admin.md's route row; docs/nodes/sy-edge.md's grace note.
+  - Tests: the publish end to end in its new order; a record that fails twice rotates nothing (the
+    read, two writes and nothing else, its log lines and command log); the record's read or write
+    failing twice; a move that closes the old door; an old door that does not close (asked twice,
+    named in the warning; closed on a second ask); a door that does not open (put back on a move and
+    on a first publish, nothing on a rotation, a put-back that fails named); an `edge_node` that is
+    no edge; one run at a time; what the record reads and writes. Each fails on a mutant without its
+    part of the fix (the old order, no close, no put-back, no edge check, no lock, the edge alone in
+    `io`, no second close).
+  - **Left as they were, not in the operator's call (to decide):** a door whose open fails after
+    the vault took the new token (the edge refused `EDGE_OPEN_URL` or did not answer it): the
+    vault's `edge_channel_secret:<ich>` holds the new token, for the new edge, and no one received
+    it; the old edge keeps the token it holds in memory until it restarts, then reads the new token
+    (a rotation on the same edge) or none (a move): 401 for the Cloud. And a record write that got
+    no answer but was written: a run again then reads the new edge as the door's, and does not close
+    the old door, which IO.cloud no longer trusts.
 
 ### A-316 [General/admin] 🔵 low (found 2026-11-11 by A-273's review; read in the code, not run; there before it) — An edge channel's bearer can be read back through `vault_assign` then `vault_get`
 
