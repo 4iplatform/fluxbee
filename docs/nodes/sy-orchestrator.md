@@ -1189,9 +1189,12 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 - **The answer:** `{status: "ok", node_name, help, reason}`. `help` is the node's
   `NODE_HELP_RESPONSE`, or null with the reason: what runs the node does not answer `NODE_HELP`, it
   is not connected, it did not answer within 3 s, or it answered with an error. None of these is
-  an error, and a silence says only that. A busy AI node still answers at once: its control
-  requests never wait behind its conversations (FINDINGS A-257). One that misses the 3 s is stuck
-  or restarting, or its 64 places for control requests were all taken (its journal says which).
+  an error, and a silence says only that. A busy AI node on `ai.generic` 0.1.136 or later still
+  answers at once: its control requests never wait behind its conversations (FINDINGS A-257). One
+  that misses the 3 s is stuck or restarting, or its 64 places for control requests were all taken
+  (its journal says which). One on an older version (a node pinned to one) may still miss it while
+  its workers are busy, and the 2 s of a status read too: its requests wait behind the turns that
+  came before them.
 
 ## Config
 

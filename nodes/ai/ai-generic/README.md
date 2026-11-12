@@ -320,12 +320,14 @@ reads nothing of the hive's ([hive-config-update-v1](../../../docs/hive-config-u
     409, 429 or 5xx, after the wait the provider names);
   - a message has 47 min: up to 8 model turns of the tool loop, one plain call after them, and
     2 min for its tools;
-  - 4 workers run the turns in the order they came, and up to 128 wait for one; the next is
-    refused without running and answered `ai_runtime_busy` (`retryable: true`), its trace entry
-    `busy`. A `system` or `admin` message (status, config, help) runs at once beside the workers,
-    never behind a turn, up to 64 at once and each within 30 s, so a config change applies to the
-    turns still waiting (FINDINGS A-257; the two lanes of
-    [the AI SDK's runtime](../../../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)).
+  - since 0.1.136, 4 workers run the turns in the order they came, and up to 128 wait for one;
+    the next is refused without running and answered `ai_runtime_busy` (`retryable: true`), its
+    trace entry `busy`. A `system` or `admin` message (status, config, help) runs at once beside
+    the workers, never behind a turn, up to 64 at once and each within 30 s, so a config change
+    applies to the turns still waiting (FINDINGS A-257; the two lanes of
+    [the AI SDK's runtime](../../../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)). A node
+    on an older version (one pinned to it keeps it) runs every message, those too, on its 4
+    workers in the order they came, with no bound and no `ai_runtime_busy`.
 - **A message runs once.** When its handler fails or runs out of time, the sender gets an
   `ai_runtime_error` or `ai_runtime_timeout` error and the message is not run again: it may already
   have called the model or a tool such as `publish_html_page`.

@@ -538,8 +538,8 @@ registered case ends saved as `completed` and is never deleted by the model.
     call, each bounded by `MODEL_CALL_TIMEOUT`, and 2 min for its tools. Beside them, 64 places
     for what runs without the model (`DEFAULT_DIRECT_CAPACITY`), 8 of them at most for its `user`
     messages (`DEFAULT_DIRECT_USER_CAPACITY`), and 30 s for each (`DEFAULT_DIRECT_HANDLER_TIMEOUT`).
-  - **Two lanes** (FINDINGS A-257). The runtime reads each message as it comes, however busy its
-    workers are, and places it:
+  - **Two lanes** (since 0.1.136, FINDINGS A-257). The runtime reads each message as it comes,
+    however busy its workers are, and places it:
     - **What runs without the model** (`runs_without_model`) starts at once on the direct lane,
       beside the workers:
       - any `system` or `admin` message, which ai.generic and the frontdesk take to their control
@@ -552,12 +552,20 @@ registered case ends saved as `completed` and is never deleted by the model.
         the wrong type) is a conversation's turn at the frontdesk, which calls the model, so it is
         an LLM turn here (`tests/frontdesk_handoff_contract.rs` holds the runtime's copy to
         gov-common's).
+    - **A known limit:** that rule is the runtime's, the same for every node on it. ai.generic,
+      which has no handoff path, runs its model for a handoff with a thread, on the direct lane:
+      up to 8 at once beside the 4 workers, each cut at 30 s (`ai_runtime_timeout`, maybe after
+      billed model calls). No IO node sends an agent a handoff unless it is set to (io.api's
+      `frontdesk_target` may name any node). FINDINGS A-257 plans an `AiNode` method by which each
+      node says what it answers without its model: by default only `system` and `admin`
+      messages, which ai.generic keeps.
     - Up to `direct_capacity` run at once, each within `direct_handler_timeout` (30 s: no sender
-      waits longer; SY.admin waits 30 s for a `CONFIG_SET`). A `system` or `admin` message may
-      take any of those places; the `user` ones, the handoffs and the `ai_runtime_busy` answers,
-      at most `direct_user_capacity`, so a burst of handoffs held by a slow SY.identity never takes
-      the places of the status and config requests, and SY.identity gets the registrations of at
-      most 8 handoffs at once (4 before, when they ran on the workers).
+      waits longer; SY.admin waits 25 s for a node's `CONFIG_RESPONSE`, within its action's 30 s).
+      A `system` or `admin` message may take any of those places; the `user` ones, the handoffs
+      and the `ai_runtime_busy` answers, at most `direct_user_capacity`, so a burst of handoffs
+      held by a slow SY.identity never takes the places of the status and config requests, and
+      SY.identity gets the registrations of at most 8 handoffs at once (4 before, when they ran
+      on the workers).
     - A message that finds every place it may take taken is dropped, neither run nor answered, as
       a `system` request whose handler fails: its caller's own timeout reports it. A handoff is
       dropped too rather than answered with an error: io.api reports `frontdesk_unavailable`

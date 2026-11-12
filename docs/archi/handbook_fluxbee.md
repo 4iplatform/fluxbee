@@ -231,10 +231,13 @@ have its own identity), its input and output, and its errors.
   before any AI agent runs. On a running AI node, `/hives/{hive}/nodes/{node_name}/help`
   (`node_help`) answers the same cards in `help.tools`. Any other node (only `ai.generic` describes
   itself) answers `help: null` at once, with the reason, and so does a stopped AI node. A running
-  AI node answers at once however busy its conversations keep it (FINDINGS A-257), so `help: null`
-  after 3 s from one means it did not answer at all: it is stuck or restarting, or its 64 places
-  for control requests were all taken; its journal says which. The same catalog is
-  `docs/reference/agent-tools.md`, generated from the code with each runtime version.
+  AI node on `ai.generic` 0.1.136 or later answers at once however busy its conversations keep it
+  (FINDINGS A-257), so `help: null` after 3 s from one means it did not answer at all: it is stuck
+  or restarting, or its 64 places for control requests were all taken; its journal says which.
+  One on an older version (a node pinned to one; `get_node_status` names it in
+  `runtime.resolved_version`) may only be busy: the request waits behind the conversation turns
+  that came before it, past the 3 s. The same catalog is `docs/reference/agent-tools.md`,
+  generated from the code with each runtime version.
 - **Read it before you design a role, a skill or a handbook,** and design against it. Never write
   one that promises a tool the catalog does not list.
 - **Roles stay reusable:** a role says what the agent does, never through which channel or tool, so

@@ -59,9 +59,10 @@ pub const DEFAULT_DIRECT_USER_CAPACITY: usize = 8;
 const _: () = assert!(DEFAULT_DIRECT_USER_CAPACITY < DEFAULT_DIRECT_CAPACITY);
 
 /// How long a message that runs without the model may run by default, in place of the 47 min of an
-/// LLM turn (`DEFAULT_HANDLER_TIMEOUT`): no sender of one waits longer (SY.admin waits 30 s for a
-/// `CONFIG_SET`, IO.cloud 20 s and io.api 10 s for a handoff, which registers within 8 s), so none
-/// holds its place longer than its sender waits for it.
+/// LLM turn (`DEFAULT_HANDLER_TIMEOUT`). No sender of one waits longer for its answer: SY.admin
+/// waits 25 s for a node's `CONFIG_RESPONSE`, within the 30 s of its action; IO.cloud 20 s and
+/// io.api 10 s for a handoff, which registers within 8 s. So the deadline never cuts a message
+/// whose sender still waits for it, and one that reaches it has no sender left waiting.
 pub const DEFAULT_DIRECT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The channel that hands what the reader takes to the dispatch loop. The loop never waits for a
@@ -415,7 +416,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
 
 /// Whether the runtime runs `msg` as soon as it reads it, beside the model workers, rather than as
 /// an LLM turn that waits for one (FINDINGS A-257). It is a message the AI nodes on this runtime
-/// (ai.generic, SY.frontdesk.gov) answer without their model:
+/// (ai.generic, SY.frontdesk.gov) answer without their model, the handoff the frontdesk alone:
 ///
 /// - **Control traffic** (`is_control_traffic`): any `system` or `admin` message, in any case.
 ///   Both nodes take it to their control plane, never to the model (`is_control_plane` in each):
@@ -426,6 +427,12 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
 ///   as one, whose payload parses as one. SY.frontdesk.gov runs it in code
 ///   (`handle_frontdesk_handoff`: an `ILK_REGISTER` to SY.identity, every attempt within 8 s) while
 ///   the IO node waits for the answer, 10 s for io.api and 20 s for IO.cloud.
+///   - A known limit: the rule is the runtime's, the same for every node on it. ai.generic, which
+///     has no handoff path, runs its model for a handoff with a thread, on the direct lane, at
+///     most `direct_user_capacity` at once and each cut at `direct_handler_timeout`. No IO node
+///     sends an agent one unless it is set to (io.api's `frontdesk_target` may name any node).
+///     FINDINGS A-257 plans an `AiNode` method by which each node says what it answers without its
+///     model, ai.generic only its control traffic.
 ///
 /// Anything else may need the model and waits for a worker: a conversation's turn, a WF's message,
 /// and the few `user` messages a node answers in code that the runtime cannot tell apart (the
@@ -2069,8 +2076,8 @@ mod tests {
         ] {
             assert!(config.check().is_err(), "{config:?}");
         }
-        // Above every sender's wait (SY.admin's 30 s for a CONFIG_SET, IO.cloud's 20 s for a
-        // handoff), far below an LLM turn's.
+        // Above every sender's wait (SY.admin's 25 s for a node's CONFIG_RESPONSE, IO.cloud's 20 s
+        // for a handoff), far below an LLM turn's.
         assert_eq!(DEFAULT_DIRECT_HANDLER_TIMEOUT, Duration::from_secs(30));
     }
 

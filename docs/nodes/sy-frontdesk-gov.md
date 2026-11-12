@@ -343,7 +343,7 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   answered `ai_runtime_busy` (`retryable: true`). A handoff runs as it comes beside them, never
   behind a turn, and so does every `system` or `admin` request (`NODE_STATUS_GET`, `CONFIG_GET`,
   `CONFIG_SET`, `VAULT_SECRET_CHANGED`): io.api has its answer within the registration's 8 s
-  (FINDINGS A-257; `runs_without_model`,
+  (since 0.1.136, FINDINGS A-257; `runs_without_model`,
   [the AI SDK](../../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)).
   - Only a handoff the node parses runs that way: a message marked `frontdesk_handoff` whose
     payload does not parse (a field of the wrong type) is a conversation's turn, as below, and
@@ -359,12 +359,12 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
 - `systemctl status sy-frontdesk-gov`; `journalctl -u sy-frontdesk-gov`. Lines to look for:
   `frontdesk-gov connected to router`, `AI token resolved from vault → Configured`,
   `frontdesk handoff REGISTERED (ILK_REGISTER complete)`.
-- Under load (FINDINGS A-257), WARN lines, each at once and then at most one every 10 s with how
-  many since: `ai runtime refused an LLM turn without running it` (every worker busy and the queue
-  full; its sender gets `ai_runtime_busy`), `ai runtime dropped a message, neither run nor
-  answered` (a handoff or a request past its places), and `ai runtime sent no ai_runtime_busy
-  answer to a refused LLM turn`. The `ai runtime metrics` line, every 30 s, counts them
-  (`turns_refused`, `direct_dropped`, `busy_answers_dropped`) beside `turns_waiting`.
+- Under load (since 0.1.136, FINDINGS A-257), WARN lines, each at once and then at most one every
+  10 s with how many since: `ai runtime refused an LLM turn without running it` (every worker busy
+  and the queue full; its sender gets `ai_runtime_busy`), `ai runtime dropped a message, neither
+  run nor answered` (a handoff or a request past its places), and `ai runtime sent no
+  ai_runtime_busy answer to a refused LLM turn`. The `ai runtime metrics` line, every 30 s, counts
+  them (`turns_refused`, `direct_dropped`, `busy_answers_dropped`) beside `turns_waiting`.
 - `NODE_STATUS_GET` says whether the conversation runs: `HEALTHY`, or `DEGRADED` with
   `missing_secret` or `invalid_ai_config` in `last_error`. Handoffs work in every state. `CONFIG_GET`
   (through SY.admin's `node_control_config_get`) shows the same state and reason.
