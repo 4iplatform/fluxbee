@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.134** (2026-11-11), and PROD runs **0.1.134**. Read from the code,
+> Contract as of **fluxbee 0.1.136** (2026-11-12), and PROD runs **0.1.136**. Read from the code,
 > operation by operation; §10 lists what was also checked live on the PROD hive. §9 lists what
 > changed for Cloud in each release. The model behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
@@ -1056,6 +1056,16 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.136
+
+- **`register_human` no longer waits behind the frontdesk's conversations** (FINDINGS A-257). The
+  hive's frontdesk takes the handoff at once, however many conversations it is answering, where it
+  waited its turn behind them: past IO.cloud's 20 s that answered `FRONTDESK_UNAVAILABLE`, and the
+  person could still be registered afterwards. Up to 8 handoffs run at once; one that finds no
+  place is dropped unanswered, and IO.cloud answers `FRONTDESK_UNAVAILABLE` at its 20 s. A handoff
+  whose `subject` has a field of another type (a number for `phone`, say) is still a conversation
+  to the frontdesk, and waits its turn.
 
 ### 0.1.134
 

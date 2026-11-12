@@ -152,12 +152,12 @@
 - **Scope:** motherbee and the three spokes, through the installation's update. The AI SDK's
   runtime runs in ai.generic and SY.frontdesk.gov.
 - **Why:** A-257 (found 2026-11-10 by A-223's triage and io.api's builder): with its 4 workers on
-  LLM turns the AI runtime read no message, so the frontdesk's handoff waited behind them past
-  io.api's 10 s, and a status, help or config request to any AI node on the runtime waited in the
-  same queue. The sweep's end, as the operator set it on 2026-11-11 (FINDINGS' board, item 24); the
-  AI SDK is shared code and ships alone ([METHOD](logbook/METHOD.md) §9). Built and reviewed for
-  the planned 0.1.135; 0.1.134 went to the orchestrator's hotfix (A-314) and 0.1.135 to the router,
-  so the AI SDK is 0.1.136.
+  LLM turns the AI runtime's dispatch loop took no message from its queue, so the frontdesk's
+  handoff waited behind them past io.api's 10 s, and a status, help or config request to any AI
+  node on the runtime waited in the same queue. The sweep's end, as the operator set it on
+  2026-11-11 (FINDINGS' board, item 24); the AI SDK is shared code and ships alone
+  ([METHOD](logbook/METHOD.md) §9). Built and reviewed for the planned 0.1.135; 0.1.134 went to
+  the orchestrator's hotfix (A-314) and 0.1.135 to the router, so the AI SDK is 0.1.136.
 - **What changed (`crates/fluxbee_ai_sdk/`, with the texts that describe it):**
   - **A-257 (`b694af08`):** the runtime's dispatch loop never waits for a worker. What the AI nodes
     answer without their model (any `system` or `admin` message, which ai.generic and the frontdesk
