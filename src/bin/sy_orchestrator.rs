@@ -608,12 +608,15 @@ struct DriftAlertEntry {
     remote_hash_after: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct RuntimeRetentionStats {
     removed_runtime_dirs: u64,
     removed_version_dirs: u64,
     protected_runtime_dirs: u64,
     protected_version_dirs: u64,
+    /// The nodes whose config.json could not be read while they may run: the pass removed nothing
+    /// for them (FINDINGS A-310), each named with why.
+    held_by_unreadable_configs: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -7384,6 +7387,7 @@ async fn apply_system_update_local(
                 &runtimes_root(),
                 &node_files_root(),
                 &protected_keep_versions,
+                state.unit_checks.activity,
             )?;
             if retention.protected_runtime_dirs > 0 || retention.protected_version_dirs > 0 {
                 tracing::info!(
@@ -24558,14 +24562,32 @@ async fn protected_runtime_keep_versions(
     keep_map
 }
 
+/// The runtime versions the managed nodes' configs under `nodes_root` name, which the retention
+/// keeps (`apply_runtime_retention_with_roots_and_protection`).
+#[derive(Debug, Default)]
+struct PersistedRuntimeKeep {
+    /// Each runtime's versions some node's config names.
+    versions: HashMap<String, HashSet<String>>,
+    /// Each node whose config.json cannot be read or parsed while its unit runs or systemctl gives
+    /// no answer for it, with why: the runtime and version it runs on are unknown (FINDINGS A-310).
+    unreadable: Vec<String>,
+}
+
+/// The versions the managed nodes under `nodes_root` keep (`PersistedRuntimeKeep`). A node whose
+/// config cannot be read is named in `unreadable` while its unit may run (`unit_activity` answers
+/// it runs, or gives no answer), as the runtime's use names it (`local_runtime_usage_summary`,
+/// FINDINGS A-281); one whose unit does not run is left out, as before, since nothing relaunches a
+/// node whose config cannot be read (`persisted_custom_nodes`).
 fn persisted_runtime_keep_versions_with_root(
     nodes_root: &Path,
-) -> Result<HashMap<String, HashSet<String>>, OrchestratorError> {
+    unit_activity: fn(&str) -> ServiceActivity,
+) -> Result<PersistedRuntimeKeep, OrchestratorError> {
+    let mut keep = PersistedRuntimeKeep::default();
     if !nodes_root.exists() {
-        return Ok(HashMap::new());
+        return Ok(keep);
     }
 
-    let mut keep_map: HashMap<String, HashSet<String>> = HashMap::new();
+    let keep_map = &mut keep.versions;
     for kind_entry in fs::read_dir(nodes_root)? {
         let kind_entry = kind_entry?;
         if !kind_entry.file_type()?.is_dir() {
@@ -24584,11 +24606,23 @@ fn persisted_runtime_keep_versions_with_root(
             let config = match load_node_effective_config(&config_path) {
                 Ok(value) => value,
                 Err(err) => {
-                    tracing::warn!(
-                        path = %config_path.display(),
-                        error = %err,
-                        "runtime retention skipping unreadable persisted node config"
-                    );
+                    let node_name = node_entry.file_name().to_string_lossy().to_string();
+                    let unit_state = match unit_activity(&unit_from_node_name(&node_name)) {
+                        ServiceActivity::Inactive => {
+                            tracing::warn!(
+                                path = %config_path.display(),
+                                error = %err,
+                                "runtime retention skipping unreadable persisted node config; its unit does not run"
+                            );
+                            continue;
+                        }
+                        ServiceActivity::Active => "its unit runs",
+                        ServiceActivity::Unknown => "systemctl gives no answer for its unit",
+                    };
+                    keep.unreadable.push(format!(
+                        "the config.json of {node_name} cannot be read ({err}) while {unit_state}, \
+                         so the runtime and version it runs on are unknown"
+                    ));
                     continue;
                 }
             };
@@ -24627,7 +24661,8 @@ fn persisted_runtime_keep_versions_with_root(
         }
     }
 
-    Ok(keep_map)
+    keep.unreadable.sort();
+    Ok(keep)
 }
 
 fn verify_runtime_current_artifacts(
@@ -24828,14 +24863,34 @@ fn verify_runtime_current_artifacts_with_root(
     verify_runtime_artifacts_for_scope(manifest, runtimes_root, None, None)
 }
 
+/// Deletes from `runtimes_root` each runtime version that the manifest does not list, no managed
+/// node's config under `nodes_root` names and no recent update protects, and each runtime
+/// directory left with none. While a node whose config cannot be read may run (its unit runs or
+/// `unit_activity` gives no answer), the runtime and version it runs on are unknown, so the pass
+/// deletes nothing, names each such node in `held_by_unreadable_configs` and logs them (FINDINGS
+/// A-310): it skipped that node and could delete the version only it pinned, under it. The next
+/// pass (the watchdog's verify, or a runtime `SYSTEM_UPDATE`) reads the configs again.
 fn apply_runtime_retention_with_roots_and_protection(
     manifest: &RuntimeManifest,
     runtimes_root: &Path,
     nodes_root: &Path,
     protected_keep_versions: &HashMap<String, HashSet<String>>,
+    unit_activity: fn(&str) -> ServiceActivity,
 ) -> Result<RuntimeRetentionStats, OrchestratorError> {
     let mut keep_map = runtime_keep_versions(manifest)?;
-    for (runtime, versions) in persisted_runtime_keep_versions_with_root(nodes_root)? {
+    let persisted = persisted_runtime_keep_versions_with_root(nodes_root, unit_activity)?;
+    if !persisted.unreadable.is_empty() {
+        tracing::warn!(
+            nodes = %persisted.unreadable.join("; "),
+            "runtime retention removed no version: a node whose config cannot be read may run, so \
+             the runtime and version it runs on are unknown; fix its config or stop the node"
+        );
+        return Ok(RuntimeRetentionStats {
+            held_by_unreadable_configs: persisted.unreadable,
+            ..RuntimeRetentionStats::default()
+        });
+    }
+    for (runtime, versions) in persisted.versions {
         keep_map.entry(runtime).or_default().extend(versions);
     }
     let root = runtimes_root.to_path_buf();
@@ -25246,6 +25301,7 @@ async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), Orch
             &runtimes_root(),
             &node_files_root(),
             &protected_keep_versions,
+            state.unit_checks.activity,
         ) {
             Ok(value) => value,
             Err(err) => {
@@ -25262,7 +25318,9 @@ async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), Orch
                 "watchdog verify: runtime retention kept protected versions during convergence window"
             );
         }
-        tracing::info!("watchdog verify: runtime retention applied (software updates use SYSTEM_UPDATE per hive)");
+        if retention.held_by_unreadable_configs.is_empty() {
+            tracing::info!("watchdog verify: runtime retention applied (software updates use SYSTEM_UPDATE per hive)");
+        }
     }
     Ok(())
 }
@@ -55122,6 +55180,7 @@ blob:
             &runtimes_root,
             &nodes_root,
             &HashMap::new(),
+            |_| ServiceActivity::Active,
         )
         .expect("retention should succeed");
 
@@ -55170,6 +55229,7 @@ blob:
             &runtimes_root,
             &nodes_root,
             &protected_keep,
+            |_| ServiceActivity::Active,
         )
         .expect("retention with protection should succeed");
 
@@ -55184,6 +55244,92 @@ blob:
         assert_eq!(stats.protected_runtime_dirs, 1);
         assert_eq!(stats.protected_version_dirs, 1);
         assert_eq!(stats.removed_version_dirs, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-310: runtime retention skipped a node whose config.json it could not read, so a
+    /// version only that node pinned, and the manifest no longer listed (removed by hand, or before
+    /// 0.1.133), was deleted under the running node. While such a node may run (its unit runs, or
+    /// systemctl gives no answer for it) the runtime and version it runs on are unknown, so the
+    /// pass deletes nothing and names the node; once its unit does not run, nothing relaunches it
+    /// and the pass runs as before.
+    #[test]
+    fn runtime_retention_deletes_nothing_while_a_node_whose_config_cannot_be_read_may_run() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-retention-unreadable-{}",
+            Uuid::new_v4().simple()
+        ));
+        let runtimes_root = root.join("runtimes");
+        let nodes_root = root.join("nodes");
+        // Only the broken node pins ai.pinned.test 0.3.1; nothing names ai.old.test.
+        let pinned = runtimes_root.join("ai.pinned.test").join("0.3.1");
+        let old = runtimes_root.join("ai.old.test").join("1.0.0");
+        let broken = nodes_root.join("AI").join("AI.broken@worker1");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-11-12T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        let plant = || {
+            for dir in [&pinned, &old, &broken] {
+                fs::create_dir_all(dir).expect("dir");
+            }
+            fs::write(broken.join("config.json"), "{\"_system\": {\"runtime\": ")
+                .expect("a config that does not parse");
+        };
+
+        let checks: [(fn(&str) -> ServiceActivity, &str); 2] = [
+            (|_: &str| ServiceActivity::Active, "its unit runs"),
+            (
+                |_: &str| ServiceActivity::Unknown,
+                "systemctl gives no answer for its unit",
+            ),
+        ];
+        for (activity, unit_state) in checks {
+            plant();
+            let stats = apply_runtime_retention_with_roots_and_protection(
+                &manifest,
+                &runtimes_root,
+                &nodes_root,
+                &HashMap::new(),
+                activity,
+            )
+            .expect("retention");
+            assert!(pinned.exists(), "the version the node may run on stays");
+            assert!(
+                old.exists(),
+                "nothing is deleted while the node's runtime is unknown"
+            );
+            assert_eq!(stats.removed_runtime_dirs, 0);
+            assert_eq!(stats.removed_version_dirs, 0);
+            assert_eq!(stats.held_by_unreadable_configs.len(), 1, "{stats:?}");
+            let held = &stats.held_by_unreadable_configs[0];
+            assert!(
+                held.starts_with("the config.json of AI.broken@worker1 cannot be read (")
+                    && held.ends_with(&format!(
+                        ") while {unit_state}, so the runtime and version it runs on are unknown"
+                    )),
+                "{held}"
+            );
+        }
+
+        // Its unit does not run: nothing relaunches a node whose config cannot be read, and the
+        // pass deletes what nothing names, as before.
+        plant();
+        let stats = apply_runtime_retention_with_roots_and_protection(
+            &manifest,
+            &runtimes_root,
+            &nodes_root,
+            &HashMap::new(),
+            |_| ServiceActivity::Inactive,
+        )
+        .expect("retention");
+        assert!(!pinned.exists() && !old.exists());
+        assert_eq!(stats.removed_runtime_dirs, 2);
+        assert!(stats.held_by_unreadable_configs.is_empty(), "{stats:?}");
 
         let _ = fs::remove_dir_all(&root);
     }

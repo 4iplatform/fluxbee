@@ -647,7 +647,15 @@ SY.admin late, which drops it; a read past those 4 waits for a place, and none o
 another hive's read or a local one.
 
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
-  applies retention.
+  applies retention, as the watchdog's runtime verify does every 5 minutes
+  (`apply_runtime_retention_with_roots_and_protection`): it deletes from `dist/runtimes` each
+  version that the manifest does not list, that no managed node's `config.json` names and that no
+  runtime update of the last 10 minutes protects, and a runtime left with none goes whole. While
+  a node whose `config.json` cannot be read or parsed may run (its unit runs, or systemd gives no
+  answer for it), the runtime and version it runs on are unknown: the pass deletes nothing and
+  logs that node, *"runtime retention removed no version"* (FINDINGS A-310, since 0.1.139; before,
+  it skipped the node and could delete a version only that node pinned, under it). One whose unit
+  does not run is left out, since nothing relaunches a node whose config cannot be read.
 - **config** (stage 3c): the installation file, its version and the sha256 of its bytes. No binary
   step: once the hive's copy is that version, it restarts only its readers whose engine changed
   ([The installation file](#the-installation-file)). The same message with a `write`, on the
