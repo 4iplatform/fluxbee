@@ -2149,7 +2149,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     it; the old edge keeps the token it holds in memory until it restarts, then reads the new token
     (a rotation on the same edge) or none (a move): 401 for the Cloud. And a record write that got
     no answer but was written: a run again then reads the new edge as the door's, and does not close
-    the old door, which IO.cloud no longer trusts.
+    the old door, which IO.cloud no longer trusts. Since the review below, both are told to the
+    operator in the answer; whether to roll the vault's key back (`vault_rollback`) on a door that
+    did not open stays the operator's call. Also not told: a vault put that got no answer but
+    landed (the detail then starts `failed to store channel token in vault`), the same residual.
+- **Its review (`coa/edge-139`, for 0.1.139):**
+  - **The old door closes only once IO.cloud trusts the new edge** (`settle_moved_cloud_door`):
+    the apply `Applied` or `AlreadyTrusted`. When IO.cloud did not take it (`NotApplied`,
+    `Superseded`) or SY.admin could not tell (`Unchecked`), the running IO.cloud may still trust
+    the old edge, whose door is then the Cloud's only way in, so the old door is left open, not
+    asked to close: `previous_edge_closed: false`, and a `warning` that says so and to close it
+    with `unexternalize` once IO.cloud trusts the new edge and the Cloud has the new URL and token.
+    The build closed it whatever the apply did, which cut the Cloud off until IO.cloud took the new
+    edge, against its own help ("once the new door is open and applied"). The branch's reading of
+    the operator's call ("in the right order") and of the operator's principle of 2026-11-12
+    (A-313: act only on what fails), **for the operator to confirm**; the other way is to keep the
+    close whatever the apply did and say so in the help.
+  - **A door that does not open says what it left in the vault** (`unreceived_cloud_token`): when
+    the edge refused the open or did not answer it, the error's detail adds that the vault already
+    holds the token this run minted, for that edge, which no one received; that the token the Cloud
+    holds works at most until the edge the door was on restarts, as a deploy does; and to publish
+    again on an edge that answers. The build said only that the config was put back, which read as
+    a full undo.
+  - **`CONFIG_RECORD_FAILED` says a write may have landed only when a try got no answer**
+    (`cloud_edge_write_unanswered`: HTTP 504, or no answer at all), the first try's or the last's,
+    where the build said it on every failed write, two refusals included; on a move it adds to put
+    `io.edge_node` back to the old edge first, since IO.cloud would trust, from its next start, an
+    edge with no door, and a run again would close no old door (`cloud_edge_maybe_written`).
+  - The one-run lock is SY.admin's context's (`cloud_door_lock`), like `publication_lock` and
+    `runtime_manifest_lock`, where it was a static that every test's admin shared.
+  - Tests: a move IO.cloud did not take (refused, then not answered) leaves the old door open and
+    sends no close; a door that does not open, after the vault took the token (the edge refused,
+    or not reached) or not (the vault refused); a write that got no answer on the first or the last
+    try, or both, and two refusals that say nothing of it. Each fails on a mutant without its part
+    (the close whatever the apply did; no vault sentence; the sentence on every failure; the last
+    try alone; no way back on a move; no lock).
+  - Left for the release's records: board item 30 lists `SY.edge: A-317` among 0.1.139's binaries,
+    where the fix is in SY.admin alone.
 
 ### A-316 [General/admin] 🔵 low (found 2026-11-11 by A-273's review; read in the code, not run; there before it) — An edge channel's bearer can be read back through `vault_assign` then `vault_get`
 

@@ -1052,20 +1052,34 @@ Until IO.cloud takes the edge, it drops every Cloud request through it (a 504 fo
   Meanwhile the old door still takes the previous token and forwards to IO.cloud, which drops what
   comes from an edge it does not trust; once that edge restarts, it refuses every token. Up to
   0.1.138 nothing closed it.
+- **A move IO.cloud did not take** (`edge_applied: false`, the cases above) leaves the old door
+  open, not asked to close (0.1.139, A-317's review): IO.cloud may still trust the old edge, and
+  that door, with the previous token, is then Cloud's only way in, until the old edge restarts.
+  `previous_edge_closed: false`, and the `warning` says so: once IO.cloud trusts the new edge (its
+  `node_control_config_get` names it as `io.edge_node`) and Cloud has the new URL and token, close
+  the old door with the `unexternalize` above.
 - **A publish that answers `CONFIG_RECORD_FAILED`** (502) did nothing else (0.1.139, FINDINGS
   A-317): the record comes first, IO.cloud's config read and the edge written in it, each tried
   once more at once (0.1.137), so no token was minted and no door opened or closed: the token Cloud
   holds works as before. Fix the cause the answer's detail names (the motherbee's orchestrator not
-  answering, say), then run the publish again on the motherbee's HTTP API, never through Archi. A
-  write that got no answer may have been written all the same, as the detail says:
-  `GET /hives/motherbee/nodes/IO.cloud@motherbee/config` shows the edge IO.cloud's config names,
-  which IO.cloud reads only when it starts. Up to 0.1.138 the token was minted first, and this
-  answer left the door open with a new token nobody received.
+  answering, say), then run the publish again on the motherbee's HTTP API, never through Archi.
+  When a try of the write got no answer, it may have been written all the same, and only then
+  does the detail say so (A-317's review): `GET /hives/motherbee/nodes/IO.cloud@motherbee/config`
+  shows the edge IO.cloud's config names, which IO.cloud reads only when it starts. On a move, a
+  config that names the new edge goes back to the old one first (`set_node_config` of
+  `io.edge_node`, as the detail says): from its next start IO.cloud would trust an edge with no
+  door, and a publish again would take that edge for the door's place and close no old door. Up to
+  0.1.138 the token was minted first, and this answer left the door open with a new token nobody
+  received.
 - **A publish whose door does not open** (the externalize's error: the vault or the edge refused,
   or the edge did not answer) puts IO.cloud's config back as it was before the publish, tried once
   more at once, and the error's detail says so (0.1.139). One it cannot put back is named there:
   IO.cloud's config then still names the edge whose door did not open, which IO.cloud reads when it
-  starts.
+  starts. When the edge refused the open or did not answer it, the vault already took the token
+  the publish minted, for that edge, and nobody received it; the detail says so (A-317's review).
+  The token Cloud holds then works at most until the edge the door was on restarts, as a deploy
+  does: that edge then loads the new token, or none it may use after a move. So publish again, on
+  an edge that answers, and give Cloud the new token at once.
 - **Check:** `curl 'http://127.0.0.1:8080/channels/externalized?edge_node=SY.edge@ingress1'` lists a
   row owned by `IO.cloud@motherbee`.
 - **IO.cloud's own state** (FINDINGS A-91): while it trusts no edge, it drops every Cloud request,
@@ -1087,7 +1101,7 @@ post '{"op":"list_cloud_actions"}'
 | Cloud sees | likely cause on the hive |
 |---|---|
 | **404** | the endpoint was never published, or the hive was reinstalled: publish again. Or the request named a host other than the hive's (§2), or the door moved to another edge, which closed the old one (0.1.139): the operator gives you the new URL |
-| **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log) |
+| **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log), or a publish whose door did not open left a new token in the vault and the edge restarted since (§7): the operator publishes again |
 | **502** `HANDLER_UNREACHABLE` | IO.cloud is not running (restarting, for example), or the edge's hive cannot reach the motherbee: the request never reached IO.cloud |
 | **504** | IO.cloud is busy (§6) or does not answer, or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
@@ -1134,10 +1148,12 @@ it "(0.1.139)".
   the hive records the edge in IO.cloud's config before it mints the token, so a
   `CONFIG_RECORD_FAILED` leaves the token you hold working. Up to 0.1.138 that answer left a new
   token nobody received on the edge, and yours stopped within 10 minutes.
-- **A door moved to another edge closes the old one at once** (§7): your previous token stops
-  then, with no 10 minutes, and the old URL answers 404; the operator gives you the new URL and
-  token at once. Up to 0.1.138 the old door stayed open with the old token until its edge
-  restarted, and IO.cloud dropped what came through it (a 504 for you).
+- **A door moved to another edge closes the old one at once** (§7), once IO.cloud trusts the new
+  edge: your previous token stops then, with no 10 minutes, and the old URL answers 404; the
+  operator gives you the new URL and token at once. Up to 0.1.138 the old door stayed open with
+  the old token until its edge restarted, and IO.cloud dropped what came through it (a 504 for
+  you). While IO.cloud has not taken the new edge, the old door stays open, since it may still be
+  your only way in.
 - **A rotation on the same edge is as before** (§2): the previous token works up to 10 minutes, and
   an edge restart or another rotation within them ends it. Nothing extends it.
 

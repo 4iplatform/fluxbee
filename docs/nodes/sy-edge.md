@@ -222,9 +222,11 @@ framed. A response the edge cannot build (an invalid header value, say) is a
   replaces: a second rotation within the 10 minutes drops the first token at once, and a restart
   ends the grace. Nothing extends it (FINDINGS A-317, the operator's call of 2026-11-12). A door
   that moves to another edge keeps no grace on the old one: since 0.1.139 SY.admin's
-  `publish_cloud_endpoint` sends the old edge `EDGE_CLOSE_URL` once the new door is open (A-317),
-  so the previous token stops at once. The vault keeps the channel's new token for the new edge,
-  and an old door left open would refuse every token once its edge restarts.
+  `publish_cloud_endpoint` sends the old edge `EDGE_CLOSE_URL` once the new door is open and
+  IO.cloud trusts the new edge (A-317), so the previous token stops at once. Until IO.cloud trusts
+  it, the old door is left open, since it may be the Cloud's only way in. The vault keeps the
+  channel's new token for the new edge, and an old door left open refuses every token once its
+  edge restarts.
 
 Where the token comes from (`handle_externalize` in `src/bin/sy_admin.rs`): SY.admin mints one
 (`mint_entry_token`, two UUIDv4 in hex) unless the caller sent `secret`, stores it in SY.vault as
