@@ -2301,7 +2301,7 @@ fn registry_hives(
 ) -> Result<(Vec<String>, Vec<Value>), String> {
     // No registry directory at all: no hive was ever added (the orchestrator creates it with the
     // first), so the motherbee alone. Any other error is a registry that cannot be read.
-    let entries = match registry.entries() {
+    let entries = match super::registry_hive_entries(registry) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(err) => {
@@ -2311,24 +2311,8 @@ fn registry_hives(
             ))
         }
     };
-    let mut hives = vec![admin_hive.to_string()];
-    for entry in &entries {
-        if entry.field("status") != Some("connected") {
-            continue;
-        }
-        if let Some(hive) = entry
-            .field("hive_id")
-            .map(str::trim)
-            .filter(|hive| !hive.is_empty())
-        {
-            if !hives.iter().any(|known| known == hive) {
-                hives.push(hive.to_string());
-            }
-        }
-    }
-    hives.sort();
     Ok((
-        hives,
+        super::connected_hives_of(admin_hive, &entries),
         skipped_hives(super::installation_skipped_hives(registry, false, None)),
     ))
 }

@@ -518,10 +518,12 @@ mesh. Cloud posts `{op, tenant_id, params}` to `https://<public host>/e/<ich>` w
 SY.edge checks the token and forwards the request to IO.cloud. IO.cloud accepts traffic only from the
 SY.edge it trusts (`config.io.edge_node`), answers the identity reads in `CLOUD_LOCAL_OPS` itself,
 and relays the operations in `CLOUD_OP_ACTIONS` (`crates/fluxbee_sdk/src/cloud.rs`) to SY.admin as
-`ADMIN_COMMAND`s. SY.admin admits from IO.cloud only those actions (the A-62 table,
-`authorize_mesh_caller`) and checks what each carries again (`enforce_cloud_relay_content`). The
-admin action `publish_cloud_endpoint` opens the door. The
-contract for Cloud developers is [io-cloud-api.md](../io-cloud-api.md).
+`ADMIN_COMMAND`s. SY.admin admits from IO.cloud those actions and checks what each carries again
+(`enforce_cloud_relay_content`). Beside them, its A-62 table (`authorize_mesh_caller`) admits
+from IO.cloud only what any IO node may ask on its own behalf: `externalize`, `unexternalize` and
+`list_externalized` of its own channel, `publish_artifact`, and, since 0.1.137 (FINDINGS A-243),
+`unpublish_artifact` of its own pages. The admin action `publish_cloud_endpoint` opens the door.
+The contract for Cloud developers is [io-cloud-api.md](../io-cloud-api.md).
 
 ## 7. The control plane
 

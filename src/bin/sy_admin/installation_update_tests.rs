@@ -3831,3 +3831,44 @@ fn an_egress_switch_waits_only_for_a_task_that_acts_on_its_worker() {
     );
     assert!(updates.acting_on("worker2").is_none());
 }
+
+/// FINDINGS A-311, the 0.1.137 integration's review: the update reaches the hives the registry
+/// calls connected under their own names, as a policy's rollout does (`connected_hives_with`). A
+/// copy of a removed worker's entry, under a name that is not a hive id or under another hive's, is
+/// no hive to update, and a `lost+found` is no join to finish: neither `add_hive` nor `remove_hive`
+/// takes its name.
+#[test]
+fn the_update_reaches_only_the_registry_s_own_hives() {
+    let root = temp_state("installation-update-registry-hives");
+    for (dir, info) in [
+        (
+            "worker1",
+            "hive_id: worker1\nrole: worker\nstatus: connected\n",
+        ),
+        (
+            "worker5",
+            "hive_id: worker5\nrole: worker\nstatus: failed\n",
+        ),
+        (
+            "worker2.bak",
+            "hive_id: worker2\nrole: worker\nstatus: connected\n",
+        ),
+        (
+            "worker3-old",
+            "hive_id: worker3\nrole: worker\nstatus: connected\n",
+        ),
+    ] {
+        fs::create_dir_all(root.join(dir)).expect("entry");
+        fs::write(root.join(dir).join("info.yaml"), info).expect("info.yaml");
+    }
+    fs::create_dir_all(root.join("lost+found")).expect("lost+found");
+    let (hives, skipped) =
+        registry_hives("motherbee", &fluxbee_sdk::mesh::HiveRegistry::new(&root)).expect("read");
+    assert_eq!(hives, vec!["motherbee", "worker1"]);
+    let named: Vec<&str> = skipped
+        .iter()
+        .map(|hive| hive["hive"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(named, vec!["worker5"]);
+    let _ = fs::remove_dir_all(&root);
+}

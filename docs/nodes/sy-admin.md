@@ -1768,6 +1768,19 @@ motherbee plus every registry entry whose `info.yaml` says `status: connected`
 (`opa_rollout_hives`, `expected_hive_sets`). The A-62 table reads a mesh caller's hive role from
 the same entries (`caller_hive_role`).
 
+Every read of the registry's entries reads them as the orchestrator does (FINDINGS A-311, since
+0.1.137):
+
+- A directory whose name is not a hive id (a `lost+found`, a `worker1.bak` left there) is no
+  hive, and is warned of once while SY.admin runs (`registry_hive_entries`). No join files one
+  under such a name, and `add_hive` and `remove_hive` refuse it (`INVALID_HIVE_ID`). Read as a
+  hive, `set_installation_ai` named it in `skipped` as a join to finish or remove.
+- A connected entry stands for a hive only under its own name: its `hive_id` is the directory's
+  name, as the strict reading requires (`connected_registry_hive`). Read by the `hive_id` it
+  records, a copy of a removed hive's entry kept that hive pending in every policy rollout and in
+  the installation's changes and update, and a copy of a removed ingress's made the public edge
+  ambiguous (`resolve_public_edge_node`: two connected ingress hives).
+
 ## State on disk
 
 - `/var/lib/fluxbee/state/sy-admin/command-log/`: the audit log.

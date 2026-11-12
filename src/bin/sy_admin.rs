@@ -34,7 +34,7 @@ use fluxbee_ai_sdk::{
     UsageWork,
 };
 use fluxbee_sdk::blob::{safe_fs, BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
-use fluxbee_sdk::mesh::{is_valid_hive_id, HiveRegistry, HiveRole};
+use fluxbee_sdk::mesh::{is_valid_hive_id, HiveEntry, HiveRegistry, HiveRole};
 use fluxbee_sdk::protocol::{
     is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
     VaultSecretChangedPayload, VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
@@ -6111,14 +6111,13 @@ fn caller_hive_role(admin_hive: &str, registry: &HiveRegistry, hive: &str) -> Op
     registry.role(hive).map(CallerHive::from)
 }
 
-/// Each entry of the hive registry with the role the A-62 table gives its nodes
-/// (`caller_hive_role`), in name order.
+/// Each hive of the registry (`registry_hive_entries`) with the role the A-62 table gives its
+/// nodes (`caller_hive_role`), in name order.
 fn registry_caller_roles(
     admin_hive: &str,
     registry: &HiveRegistry,
 ) -> Vec<(String, Option<CallerHive>)> {
-    registry
-        .entries()
+    registry_hive_entries(registry)
         .unwrap_or_default()
         .iter()
         .map(|entry| {
@@ -7464,6 +7463,62 @@ fn hive_registry_for(state_dir: &Path) -> HiveRegistry {
     HiveRegistry::new(state_dir.parent().unwrap_or(state_dir).join("hives"))
 }
 
+/// The entries of the hive registry that are hives, in name order: each directory whose name is a
+/// hive id (`is_valid_hive_id`, 1 to 64 of `[A-Za-z0-9_-]`). The error is the registry's own
+/// directory missing or unreadable (`HiveRegistry::entries`). Every reader of the registry's
+/// entries here reads them through this.
+///
+/// A directory with another name (a copy left there, `worker1.bak`, say, or `lost+found`) is no
+/// hive: no join files one under such a name, and the orchestrator refuses it in `add_hive`,
+/// `remove_hive` and `get_hive` (`INVALID_HIVE_ID`, FINDINGS A-311). It is left out, as the
+/// orchestrator's readers leave it out, and warned of once while SY.admin runs. Read as a hive, a
+/// `lost+found` was named in `set_installation_ai`'s `skipped` as a join to finish or remove,
+/// which neither action takes.
+fn registry_hive_entries(registry: &HiveRegistry) -> std::io::Result<Vec<HiveEntry>> {
+    Ok(registry
+        .entries()?
+        .into_iter()
+        .filter(|entry| {
+            let is_hive_id = is_valid_hive_id(entry.name());
+            if !is_hive_id && registry_name_not_a_hive_id_first_seen(entry.name()) {
+                tracing::warn!(
+                    registry = %registry.root().display(),
+                    directory = ?entry.name(),
+                    "a directory of the hive registry whose name is not a hive id is no hive: \
+                     SY.admin's reads of the registry leave it out (warned once)"
+                );
+            }
+            is_hive_id
+        })
+        .collect())
+}
+
+/// True the first time this process meets `name`, a directory of the hive registry whose name is
+/// not a hive id (`registry_hive_entries`): each such name is warned of once while SY.admin runs,
+/// not at every read of the registry.
+fn registry_name_not_a_hive_id_first_seen(name: &str) -> bool {
+    static WARNED: LazyLock<std::sync::Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_string())
+}
+
+/// The hive an entry of the registry stands for when its `info.yaml` says `status: connected`,
+/// whatever its join says: the entry's own name, and only when the `hive_id` the entry records is
+/// that name, as the strict reading requires (`HiveEntry::role`). A copy of another hive's entry
+/// under another name stands for no hive: read by the `hive_id` it records, a copy of a removed
+/// hive's entry kept that hive in every policy rollout as pending, and a copy of a removed
+/// ingress's made `resolve_public_edge_node` find two connected ingress hives.
+fn connected_registry_hive(entry: &HiveEntry) -> Option<&str> {
+    let names_itself = entry.field("hive_id").map(str::trim) == Some(entry.name());
+    if entry.field("status") == Some("connected") && names_itself {
+        Some(entry.name())
+    } else {
+        None
+    }
+}
+
 /// Every hive a global write must reach: the motherbee plus each joined hive the registry calls
 /// `connected`, reachable right now or not. The LSA only says who is reachable now; a hive cut off
 /// keeps enforcing its last policy, so it has to show up as pending, not drop out of the report.
@@ -7471,22 +7526,22 @@ fn opa_rollout_hives(ctx: &AdminContext) -> Vec<String> {
     connected_hives_with(&ctx.hive_id, &hive_registry(ctx))
 }
 
-/// `self_hive` and every hive whose registry entry says `status: connected`, by the `hive_id` it
-/// records, whatever its join says.
+/// `self_hive` and every hive whose registry entry says `status: connected`, whatever its join
+/// says (`connected_registry_hive`), in name order; `self_hive` alone when the registry cannot be
+/// read.
 fn connected_hives_with(self_hive: &str, registry: &HiveRegistry) -> Vec<String> {
+    connected_hives_of(
+        self_hive,
+        &registry_hive_entries(registry).unwrap_or_default(),
+    )
+}
+
+/// `self_hive` and each hive of `entries` that `connected_registry_hive` names, in name order.
+fn connected_hives_of(self_hive: &str, entries: &[HiveEntry]) -> Vec<String> {
     let mut hives = vec![self_hive.to_string()];
-    for entry in registry.entries().unwrap_or_default() {
-        if entry.field("status") != Some("connected") {
-            continue;
-        }
-        if let Some(hive) = entry
-            .field("hive_id")
-            .map(str::trim)
-            .filter(|hive| !hive.is_empty())
-        {
-            if !hives.iter().any(|known| known == hive) {
-                hives.push(hive.to_string());
-            }
+    for hive in entries.iter().filter_map(connected_registry_hive) {
+        if !hives.iter().any(|known| known == hive) {
+            hives.push(hive.to_string());
         }
     }
     hives.sort();
@@ -7497,7 +7552,8 @@ fn resolve_public_edge_node(ctx: &AdminContext) -> Result<String, String> {
     resolve_public_edge_node_from(ctx.public_edge_node.as_deref(), &hive_registry(ctx))
 }
 
-/// `admin.public_edge_node`, else the one connected ingress in the hives registry.
+/// `admin.public_edge_node`, else the one connected ingress in the hives registry
+/// (`connected_registry_hive`).
 fn resolve_public_edge_node_from(
     configured: Option<&str>,
     registry: &HiveRegistry,
@@ -7506,18 +7562,17 @@ fn resolve_public_edge_node_from(
         return validate_public_edge_node(edge).map(str::to_string);
     }
     let mut candidates = Vec::new();
-    let entries = registry.entries().map_err(|err| {
+    let entries = registry_hive_entries(registry).map_err(|err| {
         format!(
             "cannot inspect ingress inventory '{}': {err}",
             registry.root().display()
         )
     })?;
-    for entry in entries {
-        if entry.field("role") != Some("ingress") || entry.field("status") != Some("connected") {
+    for entry in &entries {
+        if entry.field("role") != Some("ingress") {
             continue;
         }
-        let hive_id = entry.field("hive_id").unwrap_or_default().trim();
-        if !hive_id.is_empty() {
+        if let Some(hive_id) = connected_registry_hive(entry) {
             candidates.push(format!("SY.edge@{hive_id}"));
         }
     }
@@ -17632,6 +17687,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages a node of the hive published and the pages its edge serves (edge_node on the hive). The hive's cleanup stops its edge (FINDINGS A-236), so those are served no more once it ran, and taking one down releases only its copy (edge_skipped).",
             "Once the hive is removed, SY.admin retires its system ILKs (retire_hive_ilks, FINDINGS A-191) and the ok answer names the result in payload.system_ilks_retired: SY.identity's {count, ilk_ids, already_retired}. A retire that fails leaves the removal ok: system_ilks_retired is {count: null, error_code, error_detail} and payload.warning says so. Then run retire_hive_ilks for the hive; never remove it again, it is gone (NOT_FOUND).",
+            "payload.identity_key_cleanup says what became of the hive's identity key on the motherbee. delete_failed leaves it there, and a join under that name keeps a key it finds: a box the cleanup did not reach (payload.remote_cleanup other than socket_ok) may still run with it, and the new join's accept would let it read and write the identity store again (FINDINGS A-277, a known limit). Add a hive under that name only once the key is gone: the orchestrator deletes it at its next start, or the operator deletes /var/lib/fluxbee/identity/keys/<hive>.key on the motherbee.",
         ],
         "retire_hive_ilks" => vec![
             "Motherbee-only operation. For HTTP usage the hive id is in the path; over the mesh and in a plan, hive_id names the removed hive.",
@@ -23956,43 +24012,34 @@ fn nodes_left_without_an_engine(
         .collect()
 }
 
-/// A-11's hives: the motherbee and each connected worker, where the runtimes, and so the AI nodes,
-/// run (an ingress or an egress receives no runtime).
+/// A-11's hives: the motherbee and each connected worker (`connected_registry_hive`), where the
+/// runtimes, and so the AI nodes, run (an ingress or an egress receives no runtime).
 fn installation_node_check_hives(self_hive: &str, registry: &HiveRegistry) -> Vec<String> {
-    let mut hives = vec![self_hive.to_string()];
-    for entry in registry.entries().unwrap_or_default() {
-        let worker = entry
-            .field("role")
-            .is_some_and(|role| role.trim().eq_ignore_ascii_case("worker"));
-        if entry.field("status") != Some("connected") || !worker {
-            continue;
-        }
-        if let Some(hive) = entry
-            .field("hive_id")
-            .map(str::trim)
-            .filter(|hive| !hive.is_empty())
-        {
-            if !hives.iter().any(|known| known == hive) {
-                hives.push(hive.to_string());
-            }
-        }
-    }
-    hives.sort();
-    hives
+    let workers: Vec<HiveEntry> = registry_hive_entries(registry)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .field("role")
+                .is_some_and(|role| role.trim().eq_ignore_ascii_case("worker"))
+        })
+        .collect();
+    connected_hives_of(self_hive, &workers)
 }
 
 /// The hives the registry holds that a change of the installation does not reach (stage 3c's
 /// review, F4): a join that did not finish (joining, failed, interrupted) leaves an entry whose
 /// status is not `connected`, though its join may have copied the file and started SY.cognition.
 /// Each is named with its status, its join's phase, and what finishes it; `workers_only` keeps the
-/// workers, the hives A-11 would read. In name order.
+/// workers, the hives A-11 would read. In name order. A directory whose name is not a hive id is
+/// no hive (`registry_hive_entries`), and neither `add_hive` nor `remove_hive` takes its name.
 fn installation_skipped_hives(
     registry: &HiveRegistry,
     workers_only: bool,
     version: Option<(u64, &str)>,
 ) -> Vec<serde_json::Value> {
     let mut skipped = Vec::new();
-    for entry in registry.entries().unwrap_or_default() {
+    for entry in registry_hive_entries(registry).unwrap_or_default() {
         if entry.field("status") == Some("connected") {
             continue;
         }
@@ -39235,6 +39282,101 @@ mod tests {
             connected_hives_with("motherbee", &registry),
             vec!["egress1", "ingress1", "motherbee", "worker1"]
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-311, the 0.1.137 integration's review: SY.admin reads the hive registry as the
+    /// orchestrator does. A directory whose name is not a hive id (a `lost+found`, a `worker2.bak`
+    /// left there) is no hive, and a connected entry stands for a hive only under its own name.
+    /// Read by the `hive_id` it records, a copy of a removed worker's entry kept that worker in
+    /// every policy rollout and in A-11's node check, a copy of a removed ingress's made the public
+    /// edge ambiguous, and `set_installation_ai` named a `lost+found` as a join to finish or
+    /// remove, which neither `add_hive` nor `remove_hive` takes.
+    #[test]
+    fn a_registry_directory_that_is_not_a_hive_is_read_as_no_hive() {
+        let root = test_temp_dir("registry-not-a-hive");
+        for (dir, info) in [
+            (
+                "worker1",
+                "hive_id: worker1\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "ingress1",
+                "hive_id: ingress1\nrole: ingress\nstatus: connected\n",
+            ),
+            (
+                "worker5",
+                "hive_id: worker5\nrole: worker\nstatus: failed\n",
+            ),
+            // Copies of removed hives' entries, under a name that is not a hive id...
+            (
+                "worker2.bak",
+                "hive_id: worker2\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "ingress2.bak",
+                "hive_id: ingress2\nrole: ingress\nstatus: connected\n",
+            ),
+            // ...and under one that is.
+            (
+                "worker3-old",
+                "hive_id: worker3\nrole: worker\nstatus: connected\n",
+            ),
+            (
+                "ingress3-old",
+                "hive_id: ingress3\nrole: ingress\nstatus: connected\n",
+            ),
+            (
+                "worker 4",
+                "hive_id: worker 4\nrole: worker\nstatus: failed\n",
+            ),
+        ] {
+            write_registry_entry(&root, dir, info);
+        }
+        fs::create_dir_all(root.join("lost+found")).unwrap();
+        let registry = HiveRegistry::new(&root);
+
+        assert_eq!(
+            connected_hives_with("motherbee", &registry),
+            vec!["ingress1", "motherbee", "worker1"]
+        );
+        assert_eq!(
+            installation_node_check_hives("motherbee", &registry),
+            vec!["motherbee", "worker1"]
+        );
+        assert_eq!(
+            resolve_public_edge_node_from(None, &registry),
+            Ok("SY.edge@ingress1".to_string())
+        );
+        let named = |workers_only: bool| -> Vec<String> {
+            installation_skipped_hives(&registry, workers_only, None)
+                .iter()
+                .map(|hive| hive["hive"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert_eq!(named(false), vec!["worker5"]);
+        assert_eq!(named(true), vec!["worker5"]);
+        let logged: Vec<String> = registry_caller_roles(PRIMARY_HIVE_ID, &registry)
+            .into_iter()
+            .map(|(hive, _)| hive)
+            .collect();
+        assert_eq!(
+            logged,
+            vec![
+                "ingress1",
+                "ingress3-old",
+                "worker1",
+                "worker3-old",
+                "worker5"
+            ]
+        );
+        // Each name that is not a hive id was warned of once while SY.admin runs.
+        for name in ["worker2.bak", "ingress2.bak", "worker 4", "lost+found"] {
+            assert!(!registry_name_not_a_hive_id_first_seen(name), "{name}");
+        }
+        let fresh = format!("fresh.{}", Uuid::new_v4().simple());
+        assert!(registry_name_not_a_hive_id_first_seen(&fresh));
+        assert!(!registry_name_not_a_hive_id_first_seen(&fresh));
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -569,8 +569,12 @@ registered case ends saved as `completed` and is never deleted by the model.
     - A message that finds every place it may take taken is dropped, neither run nor answered, as
       a `system` request whose handler fails: its caller's own timeout reports it. A handoff is
       dropped too rather than answered with an error: io.api reports `frontdesk_unavailable`
-      either way, and IO.cloud takes any error answer for the frontdesk's refusal
-      (`FRONTDESK_REJECTED`), its timeout for `FRONTDESK_UNAVAILABLE`.
+      either way, and an IO.cloud before 0.1.137 takes any error answer for the frontdesk's
+      refusal (`FRONTDESK_REJECTED`), its timeout for `FRONTDESK_UNAVAILABLE`. From 0.1.137
+      IO.cloud answers `FRONTDESK_UNAVAILABLE` for an error marked `retryable` (FINDINGS A-293),
+      so once every motherbee runs it, an `ai_runtime_busy` answer to a dropped handoff would
+      reach Fluxbee Cloud as that code at once, not after IO.cloud's 20 s. Whether it gets one is
+      left to the AI SDK's next change (FINDINGS A-257).
     - **Everything else is an LLM turn:** a conversation's turn, a WF's message. It takes one of
       the `worker_pool_size` workers, in the order turns came, as before; up to `queue_capacity`
       wait for one. One more is refused and never run: it is answered at once with

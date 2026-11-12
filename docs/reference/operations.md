@@ -440,7 +440,9 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
     stop the node), or the error a worker before 0.1.133 answered, which reads its mirror first
     (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet, `RUNTIME_MANIFEST_MISSING`
     without one). A worker, and a hive whose registry entry gives no role (a join being accepted,
-    an entry that does not parse), are asked;
+    an entry that does not parse), are asked. A directory of the registry whose name is not a hive
+    id (a `lost+found`, a `worker1.bak` left there) is no hive: it is neither asked nor listed
+    (FINDINGS A-311, since 0.1.137);
   - `hives_without_runtimes`: each ingress and egress, by the role the hive registry records,
     whatever the state of its join; an entry keeps its role until the hive is removed
     ([add_hive](#join-a-hive-add_hive)). The runtimes never reach them (`fluxbee-dist-runtimes`

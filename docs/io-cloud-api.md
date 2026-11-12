@@ -372,7 +372,8 @@ handed out (§5.3, §5.4). The pages its nodes published stay up until they expi
 | `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity; strings, `.attributes` an object |
 
 A required field missing or empty, or a field of another type, is refused with `INVALID_REQUEST`
-before anything is created; `error_detail` names the field (0.1.137).
+before anything is created; `error_detail` names the field (0.1.137 for `display_name` and the
+types of `phone`, `company_name` and `attributes`, which went on to the frontdesk before).
 
 **One email is one account, in the whole hive.** The person is charged to the tenant at the root;
 their email (the account's `cloud` channel) belongs to no tenant.
@@ -425,11 +426,11 @@ anyone. Send only emails Cloud has verified.
     operator the `request_id`.
 - **When the frontdesk gives no verdict**, the answer is one of these codes. When the frontdesk
   sent an error, the answer also names the person (`ilk_id`), and (0.1.137) `error_detail` starts
-  with the frontdesk's own code when it gave one (`"ai_runtime_busy: …"`).
+  with the frontdesk's own code when it gave one (`"ai_runtime_error: …"`).
 
   | `error_code` | what happened | what Cloud does |
   |---|---|---|
-  | `FRONTDESK_UNAVAILABLE` | the frontdesk could not be reached (at once), did not answer within 20 s (§6), or (0.1.137) answered with an error that says sending the request again may pass (it was busy) | send it again after a few seconds, a few times at most (below) |
+  | `FRONTDESK_UNAVAILABLE` | the frontdesk could not be reached (at once), did not answer within 20 s (§6), or (0.1.137) answered with an error that says sending the request again may pass. Today's frontdesk sends no such error for a registration: it runs up to 8 at once and drops one that finds no place unanswered, which is the 20 s wait | send it again after a few seconds, a few times at most (below) |
   | `FRONTDESK_REJECTED` | the frontdesk answered with an error that does not say so: it failed on this registration, and may have done part of it | do not resend it in a loop: read the person (`get_ilk` by email: its `registration_status`) and give the operator the `request_id` |
   | `INVALID_FRONTDESK_RESPONSE` | the frontdesk answered something that is neither its verdict nor an error: a fault on the hive's side | as `FRONTDESK_REJECTED` |
 
@@ -1030,9 +1031,15 @@ Until IO.cloud takes the edge, it drops every Cloud request through it (a 504 fo
 - **Rotate:** run it again on the same edge. A new token is minted; the previous one works 10 more
   minutes, or until the edge restarts within them (§2). IO.cloud already trusts that edge: nothing
   in it changes.
-- **A publish that answers `CONFIG_RECORD_FAILED`** opened the door and minted a new token it does
-  not hand over: the previous token works 10 more minutes (none after a first publish). Run the
-  publish again, and give Cloud the token it answers.
+- **A publish that answers `CONFIG_RECORD_FAILED`** (502) opened the door and minted a new token
+  it does not hand over: the edge holds it, and nobody can read it back. Before that answer the
+  record is tried once more at once (0.1.137). The previous token works for up to 10 minutes from
+  the call (none after a first publish), and stops sooner if the edge restarts or the publish runs
+  again: the edge keeps one previous token, and another run puts the token nobody holds in its
+  place. So fix the cause the answer's detail names first (the motherbee's orchestrator not
+  answering, say); then run the publish again on the motherbee's HTTP API, never through Archi, and
+  give Cloud the token it answers at once. A run that answers `CONFIG_RECORD_FAILED` again leaves
+  no token anyone holds: Cloud gets 401 until a publish succeeds.
 - **Check:** `curl 'http://127.0.0.1:8080/channels/externalized?edge_node=SY.edge@ingress1'` lists a
   row owned by `IO.cloud@motherbee`.
 - **IO.cloud's own state** (FINDINGS A-91): while it trusts no edge, it drops every Cloud request,
@@ -1086,14 +1093,18 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.137
+### 0.1.137 (not deployed yet)
 
-- **`register_human`: a frontdesk error that says sending the request again may pass** (the
-  frontdesk was busy) answers `FRONTDESK_UNAVAILABLE`, as a frontdesk that does not answer in time
-  does: send the request again, a few times at most. It answered `FRONTDESK_REJECTED`, which stays
-  for an error that does not say so. Both, `INVALID_FRONTDESK_RESPONSE` and the frontdesk's own
-  codes are listed with what to do (§5.2), and `error_detail` starts with the frontdesk's own code
-  when it gave one.
+Built, not deployed yet: what this entry lists arrives with 0.1.137, and the sections above mark
+it "(0.1.137)".
+
+- **`register_human`: a frontdesk error that says sending the request again may pass** answers
+  `FRONTDESK_UNAVAILABLE`, as a frontdesk that does not answer in time does: send the request
+  again, a few times at most. It answered `FRONTDESK_REJECTED`, which stays for an error that does
+  not say so. Today's frontdesk sends no such error for a registration (a busy one drops it, which
+  is the 20 s wait); this is ready for one that does. Both, `INVALID_FRONTDESK_RESPONSE` and the
+  frontdesk's own codes are listed with what to do (§5.2), and `error_detail` starts with the
+  frontdesk's own code when it gave one.
 - **`register_human` refuses a `subject` without a `display_name`, or with a field of another
   type**, with `INVALID_REQUEST` naming the field, before anything is created: `display_name` is a
   string with the person's name, `phone` and `company_name` are strings, `attributes` an object
@@ -1102,6 +1113,10 @@ post '{"op":"list_cloud_actions"}'
   for a conversation, not a registration.
 - **IO.cloud logs the `request_id` of each request**, next to its trace, so the operator finds the
   trace from the `request_id` you report (§4.2).
+- **A publish of the door tries its record once more** before it answers `CONFIG_RECORD_FAILED`,
+  so a passing failure no longer costs the operator a run (§7). A publish that answers it still
+  hands over no token, and the token you hold stops within 10 minutes: the operator fixes the
+  cause, publishes again and gives you the new token.
 
 ### 0.1.136
 

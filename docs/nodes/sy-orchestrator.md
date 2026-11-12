@@ -338,6 +338,10 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   - **`in_use`**: true while a node is listed, false only once every hive asked was counted, and
     `null` (unknown) while none is listed and a hive is in `skipped_hives`.
 
+  A directory of the registry whose name is not a hive id (a `lost+found`, a `worker1.bak` left
+  there) is no hive: it is neither asked nor in any of these lists (`registry_directory_is_hive`,
+  FINDINGS A-311, since 0.1.137; [Reading the registry](#hives-add_hive-and-remove_hive)).
+
   **A hive's own nodes alone.** A `get_runtime` with `usage_only: true` answers
   `{status: "ok", hive_id, usage}`: the hive's nodes on the runtime, read from their configs
   whatever its runtime manifest lists (`local_runtime_usage_answer`), and `USAGE_UNREADABLE` when
@@ -610,10 +614,14 @@ refusals of a hive id use: `hive_id must be a hive id: 1 to 64 letters, digits, 
 without an `info.yaml`. The inventory leaves out a hive of the LSA with such a name, and a
 deployment's or a drift alert's `present` and `hive_present` are false for one
 (`registry_has_hive`), with no path touched. The motherbee's read of a runtime's use across the
-hives (`registry_hives_with_roles`, FINDINGS A-281) skips a directory whose name is not a hive id
-too, as the peer reconcile's reader does (`read_registry_snapshot`), and warns of each such name
-once while the orchestrator runs (since 0.1.137): asked as a hive, which the LSA never shows, it
-was skipped at every read, and SY.admin refused every `remove_runtime_version` while it was there.
+hives (`registry_hives_with_roles`, FINDINGS A-281) and its list of the hives for Fluxbee Cloud's
+`list_tenant_nodes` and for `/versions` (`list_managed_hive_ids`) skip a directory whose name is
+not a hive id too, as the peer reconcile's reader does (`read_registry_snapshot`), and warn of
+each such name once while the orchestrator runs (`registry_directory_is_hive`, since 0.1.137):
+asked as a hive, which the LSA never shows, it was skipped at every read, and SY.admin refused
+every `remove_runtime_version` while it was there; `list_tenant_nodes` named it in
+`unreachable_hives` on every call, `HIVE_NOT_CONNECTED` with its join status unknown. SY.admin
+reads the registry the same way (`registry_hive_entries`).
 
 ## Updates
 

@@ -20710,22 +20710,7 @@ async fn list_tenant_nodes_flow(
     };
     // Every connected hive at once, each bounded: Fluxbee Cloud waits 20 s for the whole answer.
     const PER_HIVE: Duration = Duration::from_secs(10);
-    let root = hives_root();
-    let mut unreachable = Vec::new();
-    let mut hives: Vec<String> = Vec::new();
-    for hive_id in list_managed_hive_ids() {
-        if hive_id == state.hive_id {
-            continue;
-        }
-        match hive_status(&root, &hive_id) {
-            Some(status) if status == "connected" => hives.push(hive_id),
-            status => unreachable.push(serde_json::json!({
-                "hive_id": hive_id,
-                "error_code": "HIVE_NOT_CONNECTED",
-                "message": format!("its join status is {}", status.as_deref().unwrap_or("unknown")),
-            })),
-        }
-    }
+    let (hives, mut unreachable) = tenant_node_hives(&hives_root(), &state.hive_id);
     let answers = futures::future::join_all(hives.iter().map(|hive_id| {
         forward_system_action_to_hive_with_timeout(
             state,
@@ -20793,6 +20778,29 @@ async fn list_tenant_nodes_flow(
             "unreachable_hives": unreachable,
         }),
     )
+}
+
+/// The hives of the registry under `root` that `list_tenant_nodes` asks for the tenant's nodes, the
+/// connected ones other than `local_hive`, and an `unreachable_hives` entry for each other hive,
+/// `HIVE_NOT_CONNECTED` with its join status. A directory whose name is not a hive id is in neither
+/// (`list_managed_hive_ids`).
+fn tenant_node_hives(root: &Path, local_hive: &str) -> (Vec<String>, Vec<serde_json::Value>) {
+    let mut hives = Vec::new();
+    let mut unreachable = Vec::new();
+    for hive_id in list_managed_hive_ids(root) {
+        if hive_id == local_hive {
+            continue;
+        }
+        match hive_status(root, &hive_id) {
+            Some(status) if status == "connected" => hives.push(hive_id),
+            status => unreachable.push(serde_json::json!({
+                "hive_id": hive_id,
+                "error_code": "HIVE_NOT_CONNECTED",
+                "message": format!("its join status is {}", status.as_deref().unwrap_or("unknown")),
+            })),
+        }
+    }
+    (hives, unreachable)
 }
 
 fn remote_router_name(entry: &RemoteHiveEntry) -> String {
@@ -21798,12 +21806,9 @@ const RUNTIME_USAGE_HIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// spoke role its entry records (`registered_spoke_role`). An error when the registry cannot be
 /// listed; the orchestrator creates its directory at every start (`ensure_dirs`).
 ///
-/// A directory whose name is not a hive id (`valid_hive_id`: a copy left there, `worker1.bak`,
-/// say, or `lost+found`) is no hive: no join files one under such a name, and no hive can be
-/// asked by it. It is left out, as the peer reconcile's reader leaves it out
-/// (`read_registry_snapshot`), and warned of once while the orchestrator runs (FINDINGS A-311).
-/// Listed, it was asked as a hive the LSA never shows, and its `UNREACHABLE` in `skipped_hives`
-/// refused every `remove_runtime_version` (FINDINGS A-281) for as long as the directory stayed.
+/// A directory whose name is not a hive id (`registry_directory_is_hive`) is left out. Listed, it
+/// was asked as a hive the LSA never shows, and its `UNREACHABLE` in `skipped_hives` refused every
+/// `remove_runtime_version` (FINDINGS A-281) for as long as the directory stayed.
 fn registry_hives_with_roles(
     root: &Path,
     local_hive: &str,
@@ -21812,25 +21817,34 @@ fn registry_hives_with_roles(
         .entries()?
         .iter()
         .filter(|entry| entry.name() != local_hive)
-        .filter(|entry| {
-            let is_hive_id = valid_hive_id(entry.name());
-            if !is_hive_id && registry_name_not_a_hive_id_first_seen(entry.name()) {
-                tracing::warn!(
-                    registry = %root.display(),
-                    directory = ?entry.name(),
-                    "a directory of the hive registry whose name is not a hive id is no hive: a \
-                     runtime's use across the hives leaves it out (warned once)"
-                );
-            }
-            is_hive_id
-        })
+        .filter(|entry| registry_directory_is_hive(root, entry.name()))
         .map(|entry| (entry.name().to_string(), registered_spoke_role(entry)))
         .collect())
 }
 
+/// Whether `name`, a directory of the hive registry under `root`, is a hive: its name is a hive id
+/// (`valid_hive_id`). A directory with another name (a copy left there, `worker1.bak`, say, or
+/// `lost+found`) is no hive: no join files one under such a name, no hive can be asked by it, and
+/// `add_hive`, `remove_hive` and `get_hive` refuse it (`INVALID_HIVE_ID`, FINDINGS A-311). The
+/// motherbee's readers of its hives leave it out (`registry_hives_with_roles`,
+/// `list_managed_hive_ids`), as the peer reconcile's reader does (`read_registry_snapshot`), and
+/// it is warned of once while the orchestrator runs.
+fn registry_directory_is_hive(root: &Path, name: &str) -> bool {
+    let is_hive_id = valid_hive_id(name);
+    if !is_hive_id && registry_name_not_a_hive_id_first_seen(name) {
+        tracing::warn!(
+            registry = %root.display(),
+            directory = ?name,
+            "a directory of the hive registry whose name is not a hive id is no hive: the \
+             motherbee's reads of its hives leave it out (warned once)"
+        );
+    }
+    is_hive_id
+}
+
 /// True the first time this process meets `name`, a directory of the hive registry whose name is
-/// not a hive id (`registry_hives_with_roles`): each such name is warned of once while the
-/// orchestrator runs, not at every read of a runtime's use.
+/// not a hive id (`registry_directory_is_hive`): each such name is warned of once while the
+/// orchestrator runs, not at every read of the registry.
 fn registry_name_not_a_hive_id_first_seen(name: &str) -> bool {
     static WARNED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
     WARNED
@@ -22116,15 +22130,15 @@ async fn list_versions_flow(
     let motherbee = state.hive_id.clone();
     let mut order = vec![motherbee.clone()];
     let root = hives_root();
-    for hive_id in list_managed_hive_ids() {
+    for hive_id in list_managed_hive_ids(&root) {
         if hive_id == motherbee {
             continue;
         }
-        // Only hives that actually joined. `list_managed_hive_ids` filters on `is_dir` alone, so
-        // a hive whose join failed leaves a directory behind forever — and fanning out to it
-        // yields `unknown`, which pins the FLEET verdict at `unknown` permanently and makes
-        // /versions useless as an instrument. Same `status == "connected"` gate that the
-        // public-edge selection applies.
+        // Only hives that actually joined. `list_managed_hive_ids` lists every directory whose
+        // name is a hive id, so a hive whose join failed leaves a directory behind forever — and
+        // fanning out to it yields `unknown`, which pins the FLEET verdict at `unknown`
+        // permanently and makes /versions useless as an instrument. Same `status == "connected"`
+        // gate that the public-edge selection applies.
         if hive_status(&root, &hive_id).as_deref() != Some("connected") {
             continue;
         }
@@ -33281,9 +33295,12 @@ tail -n {lines} /var/log/syslog 2>/dev/null | grep -E '{service_raw}|sy_orchestr
     }
 }
 
-fn list_managed_hive_ids() -> Vec<String> {
+/// The hives of the registry under `root`, in name order, whatever their join says: each directory
+/// whose name is a hive id (`registry_directory_is_hive`). Empty when the registry cannot be read.
+/// A directory with another name is no hive: listed, Fluxbee Cloud's `list_nodes` named a
+/// `lost+found` or a `worker1.bak` as a hive it could not reach, on every call.
+fn list_managed_hive_ids(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let root = hives_root();
     let read = match fs::read_dir(root) {
         Ok(read) => read,
         Err(_) => return out,
@@ -33293,7 +33310,7 @@ fn list_managed_hive_ids() -> Vec<String> {
             continue;
         }
         let hive_id = entry.file_name().to_string_lossy().to_string();
-        if !hive_id.is_empty() {
+        if registry_directory_is_hive(root, &hive_id) {
             out.push(hive_id);
         }
     }
@@ -56188,6 +56205,60 @@ blob:
         assert!(!registry_name_not_a_hive_id_first_seen(&fresh));
 
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// FINDINGS A-311, the 0.1.137 integration's review: Fluxbee Cloud's `list_nodes` asks each
+    /// connected hive of the registry and names every other one in `unreachable_hives`. A directory
+    /// whose name is not a hive id is no hive, so it is in neither list; listed, a `lost+found` or a
+    /// `worker1.bak` read as a hive whose join status is unknown (`HIVE_NOT_CONNECTED`) on every
+    /// call, since `hive_status` refuses its name. `/versions` reads the same list.
+    #[test]
+    fn list_nodes_names_no_registry_directory_that_is_not_a_hive() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-tenant-nodes-not-a-hive-{}",
+            Uuid::new_v4().simple()
+        ));
+        let done = "status: connected\njoin:\n  phase: done\n";
+        for (dir, info) in [
+            (
+                "worker1",
+                Some(format!("hive_id: worker1\nrole: worker\n{done}")),
+            ),
+            (
+                "worker2",
+                Some("hive_id: worker2\nrole: worker\nstatus: failed\n".to_string()),
+            ),
+            // A copy of worker1's entry left beside it.
+            (
+                "worker1.bak",
+                Some(format!("hive_id: worker1\nrole: worker\n{done}")),
+            ),
+            ("lost+found", None),
+            (
+                "worker 3",
+                Some(format!("hive_id: worker 3\nrole: worker\n{done}")),
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            if let Some(info) = info {
+                fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+            }
+        }
+        fs::write(root.join("stray-file"), "not a hive").unwrap();
+
+        assert_eq!(list_managed_hive_ids(&root), ["worker1", "worker2"]);
+        let (asked, unreachable) = tenant_node_hives(&root, "motherbee");
+        assert_eq!(asked, ["worker1"]);
+        assert_eq!(
+            unreachable,
+            [serde_json::json!({
+                "hive_id": "worker2",
+                "error_code": "HIVE_NOT_CONNECTED",
+                "message": "its join status is failed",
+            })]
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// FINDINGS A-281, as 8.x answered on 0.1.132: an ingress and an egress answer GET_RUNTIME

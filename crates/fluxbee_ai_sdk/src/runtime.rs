@@ -777,8 +777,11 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
     /// Runs `msg`, which runs without the model, on the direct lane under its own deadline
     /// (`direct_handler_timeout`), or drops it when every place it may take is taken: nothing runs
     /// or answers it, and its sender's own timeout reports it. A handoff is dropped too rather than
-    /// answered: IO.cloud takes any error answer to it for the frontdesk's refusal
-    /// (`FRONTDESK_REJECTED`), and its timeout for the frontdesk being unavailable.
+    /// answered: an IO.cloud before 0.1.137 takes any error answer to it for the frontdesk's
+    /// refusal (`FRONTDESK_REJECTED`), and its timeout for the frontdesk being unavailable. From
+    /// 0.1.137 IO.cloud answers `FRONTDESK_UNAVAILABLE` for an error marked `retryable` (FINDINGS
+    /// A-293), so once every motherbee runs it, an `ai_runtime_busy` answer here would reach
+    /// Fluxbee Cloud as that code at once; that change is the AI SDK's next (FINDINGS A-257).
     fn run_direct_message(&mut self, place: DirectPlace, msg: Message) {
         if self.has_direct_place(place) {
             let task = process_one(
