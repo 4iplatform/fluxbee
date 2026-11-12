@@ -9656,6 +9656,12 @@ router reviews.
   timings measure the template, not the join.
 - **To do:** refresh the template (`lab/template-prep.sh`), so that a clone does not start with a
   backlog of package upgrades.
+- **Fixed in the lab's tool (2026-11-12), the template untouched:** the upgrade is Proxmox's
+  cloud-init default (`ciupgrade`, unset on the template 9000; 8.x runs Proxmox 9.2.2, which has the
+  option since 8.1). `lab/pve.py create` now sets `ciupgrade=0` on its clones (`--ciupgrade 1` asks
+  for the upgrade), so a gate's throwaway worker boots without it and only the gate's own clones
+  change (the template may serve others). To check at the next join of a fresh clone (0.1.139's
+  gate): its time back near 0.1.118's 127 s.
 
 ---
 
