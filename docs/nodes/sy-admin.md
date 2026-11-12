@@ -293,7 +293,7 @@ caller and the action; a command with no stamped caller is refused too.
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
 | `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
-| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication), and `unpublish_artifact` of its own publications only (FINDINGS A-243, since 0.1.136, where only `AI.*@H` might) | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
+| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication), and `unpublish_artifact` of its own publications only (FINDINGS A-243, since 0.1.137, where only `AI.*@H` might) | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
 
 - **The table lives next to the catalog.** `mesh_access`, right after `INTERNAL_ACTION_REGISTRY`,
   gives every action of the catalog and every mesh command off it its row. An action it does not
@@ -419,7 +419,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `cognition_clear` | `SY.cognition@<hive>` | `COGNITION_CLEAR` → `COGNITION_CLEAR_RESPONSE` (`handle_cognition_clear`) |
 | `node_control_config_get/set`, `send_node_message` | the node; a bare name is a node of the path's hive, and a name of another hive is refused (`node_name_on_hive`, FINDINGS A-127) | `CONFIG_GET`, `CONFIG_SET`; the message as given, with no answer awaited |
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
-| `publish_cloud_endpoint` | `SY.vault@motherbee` and the edge (its externalize, the token's mint), then `SY.orchestrator@motherbee` (the record), then `IO.cloud@motherbee` | `VAULT_*`, `EDGE_OPEN_URL`; `set_node_config` of `io.edge_node` (`msg_type: admin`); then `CONFIG_GET` and, unless IO.cloud trusts that edge already, a `CONFIG_SET` of its live config with the edge at its `config_version` + 1; a `CONFIG_SET` refused as stale or not answered is tried once more on the config read again; 30 s in all (`record_and_apply_cloud_edge`, FINDINGS A-255). The answer says `edge_applied`; `false` comes with a `warning` that says why: the edge recorded but not applied yet, SY.admin unable to check what IO.cloud trusts, or another config that reached IO.cloud meanwhile and may have replaced the record. A record that fails is tried once more at once; one that fails again answers `502 CONFIG_RECORD_FAILED` with no token (FINDINGS A-273, since 0.1.136): the door is open on the edge with the token this call minted, which goes to no one and cannot be read back (the vault keeps it for SY.edge's ILK alone); a previous token on that edge keeps working only for the 10 minutes the rotation leaves it (SY.edge's grace, in its memory: a restart of the edge ends it sooner); nothing is applied to IO.cloud; running `publish_cloud_endpoint` again records the edge and hands a new token. A token goes out once, only in an ok answer, and in no error or log line. A `cloud_node` that is not IO.cloud is refused before anything is opened |
+| `publish_cloud_endpoint` | `SY.vault@motherbee` and the edge (its externalize, the token's mint), then `SY.orchestrator@motherbee` (the record), then `IO.cloud@motherbee` | `VAULT_*`, `EDGE_OPEN_URL`; `set_node_config` of `io.edge_node` (`msg_type: admin`); then `CONFIG_GET` and, unless IO.cloud trusts that edge already, a `CONFIG_SET` of its live config with the edge at its `config_version` + 1; a `CONFIG_SET` refused as stale or not answered is tried once more on the config read again; 30 s in all (`record_and_apply_cloud_edge`, FINDINGS A-255). The answer says `edge_applied`; `false` comes with a `warning` that says why: the edge recorded but not applied yet, SY.admin unable to check what IO.cloud trusts, or another config that reached IO.cloud meanwhile and may have replaced the record. A record that fails is tried once more at once; one that fails again answers `502 CONFIG_RECORD_FAILED` with no token (FINDINGS A-273, since 0.1.137): the door is open on the edge with the token this call minted, which goes to no one and cannot be read back (the vault keeps it for SY.edge's ILK alone); a previous token on that edge keeps working only for the 10 minutes the rotation leaves it (SY.edge's grace, in its memory: a restart of the edge ends it sooner); nothing is applied to IO.cloud; running `publish_cloud_endpoint` again records the edge and hands a new token. A token goes out once, only in an ok answer, and in no error or log line. A `cloud_node` that is not IO.cloud is refused before anything is opened |
 | `publish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT`, `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` |
 | `unpublish_artifact` | the publication's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
 | `list_published_artifacts` | answered by SY.admin from its publication ledger | |
@@ -1123,7 +1123,7 @@ time comes, in a task of its own, and sleeps until the next one is due:
 - **one read of a hive at a time, everywhere, and every hive at once:** the explicit run, the
   follow, the re-read and the automatic step share each hive's read, so at most one
   `GET_VERSIONS` of a hive is outstanding, and the hives' reads go beside each other: the
-  background task reads every hive at once, each read under its own bound, since 0.1.136
+  background task reads every hive at once, each read under its own bound, since 0.1.137
   (FINDINGS A-263). Before, it read one hive at a time, so a read that a spoke's self-restart lost
   held up the reads of the hives after it for its whole bound, and an explicit run's pass waited
   behind them. The motherbee's orchestrator forwards a spoke's read within its own bound (45 s,
@@ -1370,7 +1370,7 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   its answer: the wait for the blob, the publication lock, the curate (30 s at most) and the
   edge's publish (75 s at most) each get what is left. A step with nothing left answers
   `TIMEOUT`. A publish that fails once it asked for the curate answers at once and lets the
-  publication lock go (`fail_publish`, FINDINGS A-280, since 0.1.136); its clean-up runs after
+  publication lock go (`fail_publish`, FINDINGS A-280, since 0.1.137); its clean-up runs after
   the answer, in a task of its own: IO.blob's release of what it may have curated (`BLOB_RELEASE`),
   after the edge's unpublish (`EDGE_UNPUBLISH_BLOB`) when the edge took the page and the last
   ledger write failed, each within its own 30 s, a failed step logged. Before, the clean-up ran
@@ -1386,7 +1386,7 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/public/<key>` link: 64 lowercase hex characters, as `mint_public_capability` makes it. A
   `publication_id` is read in the form the ledger keeps, lowercase and hyphenated, whatever form
   of the UUID it comes in (`canonical_publication_id`). Over the mesh each publisher takes its own
-  pages down: an `AI.*`, `IO.*` or `WF.*` node may ask (A-62; FINDINGS A-243, since 0.1.136, where
+  pages down: an `AI.*`, `IO.*` or `WF.*` node may ask (A-62; FINDINGS A-243, since 0.1.137, where
   only an `AI.*` node might), and only for its own publication: the record's publisher must be its
   exact router-stamped name, and the record's tenant the one identity's shared memory charges
   that name to now (`resolve_artifact_publisher`, the read publish makes), else

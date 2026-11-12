@@ -59,7 +59,7 @@ types a registered person's email is merged into that person.
 | `SY.wf-rules@H` | node actions; package actions; `sync_hint` (detailed below) |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` (new, below) |
 | `IO.*@H` | externalize, unexternalize and list for its own channels (checked in the handler, as today) |
-| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact`, and `unpublish_artifact` of its own publications (checked in the handler; for `AI.*` only until FINDINGS A-243, 0.1.136) |
+| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact`, and `unpublish_artifact` of its own publications (checked in the handler; for `AI.*` only until FINDINGS A-243, 0.1.137) |
 
 **The `SY.wf-rules@H` row in detail:**
 

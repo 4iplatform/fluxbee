@@ -1956,7 +1956,7 @@ fn spoke_as(hive: &str, role: &str, worker1: Value) -> Value {
 /// orchestrator in its few seconds off the router and is never answered, while ingress1 and
 /// worker1 settle. The background task reads every hive at once, each read bounded as before, so
 /// ingress1 and worker1 are read, marked settled and given their config within the bound of
-/// egress1's lost read, beside it. Until 0.1.136 it read one hive at a time, and they waited that
+/// egress1's lost read, beside it. Until 0.1.137 it read one hive at a time, and they waited that
 /// whole bound behind it. As before, egress1's lost read is asked again at once (FINDINGS A-250), a
 /// hive is read once at a time, the update closes, and its results come in the hives' order.
 #[tokio::test]
@@ -1989,7 +1989,7 @@ async fn the_follow_reads_every_hive_at_once() {
         &updates,
         &dyn_mesh,
         "http",
-        Some("deploy 0.1.136"),
+        Some("deploy 0.1.137"),
         &[],
         &motherbee,
         &target_of(&motherbee),
@@ -3683,7 +3683,7 @@ async fn a_task_of_a_closed_update_sends_nothing_more() {
 /// A slow read of one hive holds up no other hive (FINDINGS A-263): the background task's re-read
 /// of worker1 goes beside worker2's, which has not answered, and an explicit run's pass on worker1
 /// is never left to a read of another hive. At a run's open every hive not read yet gets such a
-/// re-read; until 0.1.136 they were read one at a time, each queued behind the read under way.
+/// re-read; until 0.1.137 they were read one at a time, each queued behind the read under way.
 #[tokio::test]
 async fn a_slow_read_of_one_hive_holds_up_no_pass_on_another() {
     // worker2's read answers once the test lets it, every other one at once; a config update

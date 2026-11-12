@@ -651,7 +651,7 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     forwards each within its own 45 s (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`) and runs one
     SY.admin gave up to that bound; until 0.1.127 it ran them one at a time, each queued behind
     the one before (FINDINGS A-199), and the background task read one hive at a time to match.
-    Since 0.1.136 (FINDINGS A-263) it reads every hive at once, as the explicit run does: one
+    Since 0.1.137 (FINDINGS A-263) it reads every hive at once, as the explicit run does: one
     read at a time meant that a read a spoke's self-restart lost held up the reads of the hives
     after it for its whole bound, so their marks came one after the other, and an explicit run's
     pass waited behind them. A read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`),

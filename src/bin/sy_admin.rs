@@ -5924,7 +5924,7 @@ enum MeshAccess {
     OwnChannel,
     /// `AI.*@H`, `IO.*@H` and `WF.*@H`, the producers (`authorize_artifact_publisher` in the
     /// handlers): each publishes, and takes down only its own publications
-    /// (`handle_unpublish_artifact`; FINDINGS A-243, since 0.1.136, where only `AI.*` might).
+    /// (`handle_unpublish_artifact`; FINDINGS A-243, since 0.1.137, where only `AI.*` might).
     Publisher,
     /// Nobody, Archi included: the operator's alone, on loopback or as a step of a plan Archi
     /// stages and the operator confirms (the executor is no mesh caller).
@@ -6953,7 +6953,7 @@ async fn handle_unpublish_artifact(
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let action = "unpublish_artifact";
     // Producer path (mesh, caller_l2_name = Some): the A-62 table lets an AI.*, IO.* or WF.* node
-    // ask, the producers that publish (`MeshAccess::Publisher`; FINDINGS A-243, since 0.1.136,
+    // ask, the producers that publish (`MeshAccess::Publisher`; FINDINGS A-243, since 0.1.137,
     // where only AI.* might; Archi, which it admits to every action, is no producer and is refused
     // here), and only for its own publication: the exact router-stamped name that published it,
     // charged to the tenant it published in, checked below. Operator path
@@ -17442,7 +17442,7 @@ const HIVE_ID_RULE: &str = "hive_id must be a hive id: 1 to 64 letters, digits, 
 
 /// What `add_hive`, `remove_hive` and `get_hive` answer for a hive id that is not one (FINDINGS
 /// A-311): the orchestrator refuses it before any path is built. Its message is `HIVE_ID_RULE`.
-const INVALID_HIVE_ID_NOTE: &str = "A hive_id that is not a hive id (1 to 64 letters, digits, '_' or '-': no '/', '.' or space) answers 400 INVALID_HIVE_ID with the message \"hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'\", and nothing is read or changed (FINDINGS A-311, since 0.1.136).";
+const INVALID_HIVE_ID_NOTE: &str = "A hive_id that is not a hive id (1 to 64 letters, digits, '_' or '-': no '/', '.' or space) answers 400 INVALID_HIVE_ID with the message \"hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'\", and nothing is read or changed (FINDINGS A-311, since 0.1.137).";
 
 /// What every removal says of the public pages it leaves up (`pages_left_up`, FINDINGS A-242).
 const PAGES_LEFT_UP_NOTE: &str = "No removal is refused for public pages (FINDINGS A-242): a page outlives its publisher, its tenant and its hive, and stays up until its expires_at (24 h after its publish by default, 30 days at most, never renewed; the edge then serves it no more and SY.admin's sweep retires it) or until it is taken down. The ok answer names the pages it leaves up in payload.pages_left_up: {count, pages: [{publication_id, expires_at (epoch seconds), status, filename_original, publisher_l2_name, tenant_id, edge_node}], more}, soonest to expire first, at most 20 of them in 8 KiB (more counts the rest), never a link's key. A ledger SY.admin cannot read gives {count: null, error}, and refuses nothing. GET /artifacts lists every page that is up; POST /artifacts/unpublish takes one down by its publication_id.";
@@ -17494,12 +17494,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again, it mints a new token; the previous one works 10 more minutes.",
             "IO.cloud trusts that edge at once (FINDINGS A-255): SY.admin records it in IO.cloud's config (set_node_config of io.edge_node), then applies it to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
-            "A record that fails is tried once more at once (FINDINGS A-273, since 0.1.136). One that fails again answers 502 CONFIG_RECORD_FAILED, with no token: the door is open on the edge with the token this call minted, which is handed to no one and cannot be read back; a previous token on that edge keeps working only for the 10 minutes the rotation leaves it (sooner if the edge restarts); nothing is applied to IO.cloud. Run publish_cloud_endpoint again: it records the edge and hands a new token. A token goes out once, only in an ok answer, never in an error or a log line.",
+            "A record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED, with no token: the door is open on the edge with the token this call minted, which is handed to no one and cannot be read back; a previous token on that edge keeps working only for the 10 minutes the rotation leaves it (sooner if the edge restarts); nothing is applied to IO.cloud. Run publish_cloud_endpoint again: it records the edge and hands a new token. A token goes out once, only in an ok answer, never in an error or a log line.",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
             "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node on a worker or the motherbee (A-62: a node of an ingress or egress hive asks SY.admin for nothing). The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
-            "Each producer takes its own pages down (FINDINGS A-243, since 0.1.136): over the mesh an AI.*, IO.* or WF.* node calls unpublish_artifact for a page it published, and only for one. Any page also ends at its expiry or by the operator's unpublish_artifact (POST /artifacts/unpublish, or a plan Archi stages and the operator confirms).",
+            "Each producer takes its own pages down (FINDINGS A-243, since 0.1.137): over the mesh an AI.*, IO.* or WF.* node calls unpublish_artifact for a page it published, and only for one. Any page also ends at its expiry or by the operator's unpublish_artifact (POST /artifacts/unpublish, or a plan Archi stages and the operator confirms).",
             "Call RouterDispatcher::send_admin_rpc with target=None. Do not send tenant_id, publisher_l2_name, path, public key, sha256, raw headers or CSP.",
             "blob_ref must already identify promoted active content available to IO.blob; bytes never travel in ADMIN_COMMAND.",
             "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
@@ -17521,7 +17521,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "unpublish_artifact" => vec![
             "The operator takes down any page, whoever published it: POST /artifacts/unpublish on loopback, or a step of an executor plan, which Archi stages with fluxbee_plan_compiler and SY.admin runs only after the operator confirms it (A-120).",
-            "Over the mesh the producers may ask (A-62): an AI.*, IO.* or WF.* node (FINDINGS A-243, since 0.1.136; AI.* only before), with RouterDispatcher::send_admin_rpc and target=None, and only for a page it published: the same router-stamped L2 name, charged by identity to the tenant the page was published in, else 403 UNAUTHORIZED. A node of an ingress or egress hive asks SY.admin for nothing. Archi takes a page down through the executor, never with an ADMIN_COMMAND of its own.",
+            "Over the mesh the producers may ask (A-62): an AI.*, IO.* or WF.* node (FINDINGS A-243, since 0.1.137; AI.* only before), with RouterDispatcher::send_admin_rpc and target=None, and only for a page it published: the same router-stamped L2 name, charged by identity to the tenant the page was published in, else 403 UNAUTHORIZED. A node of an ingress or egress hive asks SY.admin for nothing. Archi takes a page down through the executor, never with an ADMIN_COMMAND of its own.",
             "Name the page by exactly one of publication_id (pub:<uuid>, returned by publish_artifact) or key, the last segment of its link: of https://<host>/public/<key>, only <key>. It takes no hive: the publication names its edge.",
             "list_published_artifacts (GET /artifacts) lists the pages that are up, each with its publication_id.",
             "A publication that does not exist answers 404 NOT_FOUND.",
@@ -42688,7 +42688,7 @@ mod tests {
             .is_none());
     }
 
-    /// Each publisher takes its own pages down over the mesh (FINDINGS A-243, since 0.1.136): an
+    /// Each publisher takes its own pages down over the mesh (FINDINGS A-243, since 0.1.137): an
     /// IO.* and a WF.* node as an AI.* node does, through the A-62 table and the handler's checks
     /// (the page's publisher, and the tenant identity charges it to). Each is refused 403
     /// UNAUTHORIZED for another node's page, by its id or its link's key, and so is IO.cloud, an IO

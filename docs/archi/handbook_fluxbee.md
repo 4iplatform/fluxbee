@@ -1050,7 +1050,7 @@ The ownership and call path are fixed:
 4. To revoke the link before it expires, the same producer calls `unpublish_artifact` on its own
    publication, with the returned `publication_id` or the key of the link (`/public/<key>`). Each
    publisher takes its own pages down, an `AI.*`, `IO.*` or `WF.*` node alike, and only its own
-   (FINDINGS A-243, since 0.1.136; before, only `AI.*` might). Any page also ends at its expiry or
+   (FINDINGS A-243, since 0.1.137; before, only `AI.*` might). Any page also ends at its expiry or
    by the operator.
 
 **Taking a page down is the operator's,** whoever published it (FINDINGS A-120):

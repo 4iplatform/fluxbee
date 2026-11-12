@@ -148,7 +148,7 @@ exposure model is in [docs/host-posture-and-exposure-spec-v1.md](../host-posture
 Checks before anything starts: `INVALID_HIVE_ID`, `INVALID_ADDRESS`, `MISSING_WAN_LISTEN` (the
 motherbee needs `wan.listen`), `JOIN_IN_PROGRESS`, `HIVE_EXISTS`. A hive id that is not one
 answers `400 INVALID_HIVE_ID` with the message `hive_id must be a hive id: 1 to 64 letters,
-digits, '_' or '-'`, and nothing is read or changed; since 0.1.136 `DELETE /hives/{hive}` and
+digits, '_' or '-'`, and nothing is read or changed; since 0.1.137 `DELETE /hives/{hive}` and
 `GET /hives/{hive}` refuse it the same way (FINDINGS A-311), and `GET /hives/{hive}` of a hive the
 registry does not have answers `404 NOT_FOUND`. The old `ssh_access` field is
 refused: SSH exists only inside the join (`reject_removed_add_hive_fields`). So is a password join

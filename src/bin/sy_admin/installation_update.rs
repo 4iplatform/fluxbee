@@ -1863,7 +1863,7 @@ impl Updates {
 
     /// One read of `hive`'s `/versions`, at most one outstanding for the hive, everywhere; the
     /// hives' reads go at once, each beside the others, whoever reads them (the background task
-    /// since 0.1.136, FINDINGS A-263: it read one hive at a time, so a read a spoke's self-restart
+    /// since 0.1.137, FINDINGS A-263: it read one hive at a time, so a read a spoke's self-restart
     /// lost held up the reads of the hives after it for its whole bound). The motherbee's
     /// orchestrator forwards a spoke's read within its own bound, each read apart since 0.1.127
     /// (FINDINGS A-199), and runs one SY.admin gave up to that bound:
