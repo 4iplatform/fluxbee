@@ -7849,36 +7849,74 @@ fn fail_publish(
 
 /// The clean-up of a failed publish (`fail_publish`): the edge's unpublish when `edge_node` took
 /// the page, then IO.blob's release; a step that fails is one warning line, and the next goes on.
+///
+/// It ends with one info line, whatever each step did (FINDINGS A-280's review): the page, the
+/// edge's unpublish (`not_asked`, `ok` or `failed`), IO.blob's release (`ok` with its `released`
+/// and `ref_count`, or `failed`) and `elapsed_ms`, the clean-up's own time. Its steps log nothing
+/// when they go through, so this line is what shows in SY.admin's log that the clean-up ran,
+/// after the publish's answer, and how long it took.
 async fn clean_up_failed_publish(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     publication_id: &str,
     edge_node: Option<&str>,
 ) {
-    if let Some(edge_node) = edge_node {
-        if let Err(err) = unpublish_edge_blob(client, edge_node, publication_id).await {
-            tracing::warn!(
-                publication_id = %publication_id,
-                edge = %edge_node,
-                error = %err,
-                "a failed publish's clean-up: the edge did not unpublish the page"
-            );
-        }
-    }
-    if let Err(err) = release_curated_blob(client, ctx, publication_id).await {
-        tracing::warn!(
-            publication_id = %publication_id,
-            error = %err,
-            "a failed publish's clean-up: IO.blob did not release what it may have curated"
-        );
-    }
+    let started = tokio::time::Instant::now();
+    let edge_unpublish = match edge_node {
+        None => "not_asked",
+        Some(edge_node) => match unpublish_edge_blob(client, edge_node, publication_id).await {
+            Ok(()) => "ok",
+            Err(err) => {
+                tracing::warn!(
+                    publication_id = %publication_id,
+                    edge = %edge_node,
+                    error = %err,
+                    "a failed publish's clean-up: the edge did not unpublish the page"
+                );
+                "failed"
+            }
+        },
+    };
+    let unknown = || "unknown".to_string();
+    let (release, released, ref_count) =
+        match release_curated_blob(client, ctx, publication_id).await {
+            Ok(answer) => (
+                "ok",
+                answer
+                    .get("released")
+                    .map_or_else(unknown, ToString::to_string),
+                answer
+                    .get("ref_count")
+                    .map_or_else(unknown, ToString::to_string),
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    publication_id = %publication_id,
+                    error = %err,
+                    "a failed publish's clean-up: IO.blob did not release what it may have curated"
+                );
+                ("failed", unknown(), unknown())
+            }
+        };
+    tracing::info!(
+        publication_id = %publication_id,
+        edge = %edge_node.unwrap_or("none"),
+        edge_unpublish = %edge_unpublish,
+        release = %release,
+        released = %released,
+        ref_count = %ref_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "a failed publish's clean-up ended"
+    );
 }
 
+/// IO.blob's release of the copy it curated for `publication_id`: its ok answer, `{status,
+/// publication_id, released, file_deleted, ref_count}`, else why not.
 async fn release_curated_blob(
     client: &RouterDispatcher,
     ctx: &AdminContext,
     publication_id: &str,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     let target = format!("IO.blob@{}", ctx.hive_id);
     let payload = send_system_request_with_meta(
         client,
@@ -7897,7 +7935,7 @@ async fn release_curated_blob(
     .await
     .map_err(|err| err.to_string())?;
     if payload.get("status").and_then(|value| value.as_str()) == Some("ok") {
-        Ok(())
+        Ok(payload)
     } else {
         Err(format!("IO.blob release rejected: {payload}"))
     }
@@ -41248,6 +41286,118 @@ mod tests {
         fs::remove_dir_all(&ledger_path).expect("the directory in the ledger's place");
     }
 
+    /// A failed publish's clean-up ends with one info line, whatever its steps did (FINDINGS
+    /// A-280's review): the page, the edge's unpublish (not asked, ok or failed), IO.blob's release
+    /// with its released and ref_count, and how long the clean-up took. Its steps log nothing when
+    /// they go through, so before it SY.admin's log never showed that a clean-up ran, nor when or
+    /// for how long. Here the edge took one page and answers its unpublish in 1 s, and IO.blob its
+    /// release 1 s later; another page's edge is not asked, and IO.blob cannot be reached.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_s_clean_up_ends_with_a_line_that_says_what_it_did() {
+        let captured = LogCapture::start();
+        let (ctx, mut harness) = opa_test_admin("a280-clean-up-line");
+        let wait = Duration::from_secs(5);
+        let taken = format!("pub:{}", Uuid::new_v4());
+        let clean_up = clean_up_failed_publish(&ctx, &ctx.rpc, &taken, Some(PAGE_EDGE));
+        let drive = async {
+            let unpublish = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the edge's unpublish");
+            assert_eq!(unpublish.meta.msg.as_deref(), Some(MSG_EDGE_UNPUBLISH_BLOB));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            harness
+                .inject(reply_to(
+                    &unpublish,
+                    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+                    json!({ "status": "ok", "removed": true }),
+                ))
+                .await
+                .unwrap();
+            let release = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the release");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            harness
+                .inject(reply_to(
+                    &release,
+                    MSG_BLOB_RELEASE_RESPONSE,
+                    json!({
+                        "status": "ok",
+                        "publication_id": taken,
+                        "released": true,
+                        "file_deleted": true,
+                        "ref_count": 0,
+                    }),
+                ))
+                .await
+                .unwrap();
+        };
+        tokio::join!(clean_up, drive);
+        let curated = format!("pub:{}", Uuid::new_v4());
+        let clean_up = clean_up_failed_publish(&ctx, &ctx.rpc, &curated, None);
+        let drive = async {
+            let release = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the release");
+            assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+            harness
+                .inject(reply_to(
+                    &release,
+                    MSG_UNREACHABLE,
+                    json!({ "reason": "NODE_NOT_FOUND" }),
+                ))
+                .await
+                .unwrap();
+        };
+        tokio::join!(clean_up, drive);
+
+        let logs = captured.text();
+        let line_of = |publication_id: &str| {
+            let lines: Vec<&str> = logs
+                .lines()
+                .filter(|line| line.contains("a failed publish's clean-up ended"))
+                .filter(|line| line.contains(&format!("publication_id={publication_id} ")))
+                .collect();
+            assert_eq!(lines.len(), 1, "one line for {publication_id}: {logs}");
+            lines[0].trim_end().to_string()
+        };
+        let taken_line = line_of(&taken);
+        assert!(taken_line.contains(" INFO "), "{taken_line}");
+        for field in [
+            format!(" edge={PAGE_EDGE} "),
+            " edge_unpublish=ok ".to_string(),
+            " release=ok ".to_string(),
+            " released=true ".to_string(),
+            " ref_count=0 ".to_string(),
+        ] {
+            assert!(taken_line.contains(&field), "{field}: {taken_line}");
+        }
+        assert!(
+            taken_line.ends_with(" elapsed_ms=2000"),
+            "the clean-up's own 2 s: {taken_line}"
+        );
+        let curated_line = line_of(&curated);
+        assert!(curated_line.contains(" INFO "), "{curated_line}");
+        for field in [
+            " edge=none ",
+            " edge_unpublish=not_asked ",
+            " release=failed ",
+            " released=unknown ",
+            " ref_count=unknown ",
+            " elapsed_ms=",
+        ] {
+            assert!(curated_line.contains(field), "{field}: {curated_line}");
+        }
+        assert!(
+            logs.contains("IO.blob did not release what it may have curated"),
+            "the failed release keeps its warning"
+        );
+    }
+
     // --- publish_cloud_endpoint: the edge applied to the running IO.cloud (FINDINGS A-255) -----
 
     const CLOUD_NODE: &str = "IO.cloud@motherbee";
@@ -42278,6 +42428,63 @@ mod tests {
         text.replace(token, "<the minted token>")
     }
 
+    /// Every line this thread logs, at every level, while it lives (`text` reads them). A second
+    /// dispatcher stays registered meanwhile, so that tracing asks each event's own thread whether
+    /// it wants the event: with one alone, a callsite another test's thread reaches first is
+    /// cached as unwanted for every thread (tracing-core's `has_just_one`), and this thread's
+    /// lines would be lost.
+    struct LogCapture {
+        lines: Arc<std::sync::Mutex<Vec<u8>>>,
+        _logs: tracing::subscriber::DefaultGuard,
+        _other: tracing::Dispatch,
+    }
+
+    impl LogCapture {
+        fn start() -> Self {
+            #[derive(Clone)]
+            struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Captured {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Captured(Arc::clone(&lines));
+            let logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            );
+            tracing::callsite::rebuild_interest_cache();
+            Self {
+                lines,
+                _logs: logs,
+                _other: other,
+            }
+        }
+
+        /// What this thread logged so far, line by line.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(
+                &self
+                    .lines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+            .to_string()
+        }
+    }
+
     /// A record that fails is tried once more at once (FINDINGS A-273): the orchestrator refuses
     /// the first and takes the second, and the publish goes on to IO.cloud and answers ok with the
     /// token this call minted, once. Before, the first refusal was the error answer, and that
@@ -42334,36 +42541,7 @@ mod tests {
     /// command log carries the token.
     #[tokio::test]
     async fn a_record_that_fails_twice_hands_no_token_and_says_what_is_left() {
-        #[derive(Clone)]
-        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        // Every line this thread logs, at every level. A second dispatcher stays registered
-        // meanwhile, so that tracing asks each event's own thread whether it wants the event: with
-        // one alone, a callsite another test's thread reaches first is cached as unwanted for
-        // every thread (tracing-core's `has_just_one`), and this thread's lines would be lost.
-        let _other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let captured = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let writer = captured.clone();
-        let _logs = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish(),
-        );
-        tracing::callsite::rebuild_interest_cache();
-
+        let captured = LogCapture::start();
         let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-record-fails-twice");
         ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
         let publish = dispatch_internal_admin_command(
@@ -42419,13 +42597,7 @@ mod tests {
             "IO.cloud is not asked"
         );
 
-        let logs = String::from_utf8_lossy(
-            &captured
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-        .to_string();
+        let logs = captured.text();
         assert!(
             !logs.contains(&token),
             "a log line carries the minted token"

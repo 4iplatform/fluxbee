@@ -1373,11 +1373,15 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   publication lock go (`fail_publish`, FINDINGS A-280, since 0.1.137); its clean-up runs after
   the answer, in a task of its own: IO.blob's release of what it may have curated (`BLOB_RELEASE`),
   after the edge's unpublish (`EDGE_UNPUBLISH_BLOB`) when the edge took the page and the last
-  ledger write failed, each within its own 30 s, a failed step logged. Before, the clean-up ran
-  under the lock and before the answer: up to 60 s more against every take-down and sweep, and
-  an answer past ai.generic's 120 s. The failed publish removes the row it wrote before it lets
-  the lock go; a row it could not remove, or whose last write failed, stays `curated`, which a
-  take-down or the expiry sweep finishes. A publish that succeeds is unchanged.
+  ledger write failed, each within its own 30 s, a failed step logged. It ends with one info line,
+  `a failed publish's clean-up ended`, whatever its steps did: the `publication_id`, the `edge`
+  and its `edge_unpublish` (`not_asked`, `ok` or `failed`), IO.blob's `release` (`ok` or
+  `failed`) with its `released` and `ref_count`, and `elapsed_ms`, the clean-up's own time
+  (FINDINGS A-280's review). Before, the clean-up ran under the lock and before the answer: up to
+  60 s more against every take-down and sweep, and an answer past ai.generic's 120 s. The failed
+  publish removes the row it wrote before it lets the lock go; a row it could not remove, or whose
+  last write failed, stays `curated`, which a take-down or the expiry sweep finishes. A publish
+  that succeeds is unchanged.
 - **A page outlives its publisher** (FINDINGS A-242). A purge of the node while its publish is
   under way neither waits for the publish nor stops it, and the page, once up, stays up until it
   expires or is taken down, as every page the node published before.
