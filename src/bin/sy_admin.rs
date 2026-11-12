@@ -17861,7 +17861,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The hive comes from the /hives/{hive} path in HTTP; the node_name path segment is a fully-qualified node name, for example AI.sales@worker1. Takes no body.",
             "It travels as get_node_status does: SY.admin asks the motherbee's SY.orchestrator, which sends NODE_HELP to the orchestrator of the node's hive, which asks the node. Only a node that ai.generic runs (its package's base runtime included) is asked, and it has 3 s to answer; any other node, a core node included, is answered at once.",
             "Always 200 for a node that exists: payload {status: \"ok\", node_name, help, reason}. help is the node's NODE_HELP_RESPONSE, {status: \"ok\", node_name, runtime, runtime_version, tools: [card, ...]}, and reason is null.",
-            "help is null, and reason says why, when the node's runtime does not answer NODE_HELP (today only ai.generic does), when it is not connected, when it did not answer within 3 s (a busy node may not), or when it answers with an error. None of these is an error of the action.",
+            "help is null, and reason says why, when the node's runtime does not answer NODE_HELP (today only ai.generic does), when it is not connected, when it did not answer within 3 s, or when it answers with an error. None of these is an error of the action.",
+            "An AI node on ai.generic 0.1.136 or later answers at once however busy its conversations keep it (FINDINGS A-257): one that does not answer within 3 s is stuck or restarting, or its 64 places for control requests were all taken (its journal says which). Only one pinned to an older ai.generic may still miss the 3 s while its workers are busy: its NODE_HELP waits behind the turns that came before it (FINDINGS A-324).",
             "Each card: {name, summary, when_to_use, limits: [...], present_when, input: <JSON schema>, output: <JSON schema>, errors: [{code, meaning}]}. present_when says when the tool is there, for example only when the message names its interlocutor, or only for a node with its own identity.",
             "Every AI agent (ai.generic) loads the same base tools. Read their catalog first with get_runtime on ai.generic (GET /hives/motherbee/runtimes/ai.generic), whose tool_catalog has the same cards and needs no running node; node_help gives them from a running AI node. docs/reference/agent-tools.md is the same catalog, generated from the code with each runtime version. Read it before designing a role or a skill, and never write one that promises a tool the catalog does not list.",
             "A node that does not exist answers 404 NODE_NOT_FOUND, as get_node_status does; 500 NODE_HELP_FAILED when the node's hive does not answer. SY.timer describes itself with timer_help.",
@@ -29666,6 +29667,26 @@ mod tests {
                 "{action}"
             );
         }
+    }
+
+    /// FINDINGS A-324: node_help's note says what a silence of 3 s means since 0.1.136 (A-257), as
+    /// sy-admin.md and Archi's handbook do: an AI node on ai.generic 0.1.136 or later answers at
+    /// once however busy, and only one pinned to an older version may miss the 3 s while its
+    /// workers are busy. It said that a busy node may not answer.
+    #[test]
+    fn node_help_says_a_busy_ai_node_answers_at_once_since_0_1_136() {
+        let notes = admin_action_request_notes("node_help").join(" ");
+        assert!(!notes.contains("a busy node may not"), "{notes}");
+        assert!(
+            notes
+                .contains("An AI node on ai.generic 0.1.136 or later answers at once however busy"),
+            "{notes}"
+        );
+        assert!(notes.contains("stuck or restarting"), "{notes}");
+        assert!(
+            notes.contains("Only one pinned to an older ai.generic may still miss the 3 s"),
+            "{notes}"
+        );
     }
 
     /// With its outputs dropped, a workflow delete's step keeps the versions its purge left

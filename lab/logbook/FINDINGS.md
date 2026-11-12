@@ -1723,6 +1723,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   all taken. Nothing is refused or done by it.
 - **Fix, later:** each text says what the pages say (the release, and the older case); with
   SY.admin's and the orchestrator's next text changes.
+- **SY.admin's part built on `coa/admin-139` for 0.1.139:** `node_help`'s note says what the pages
+  say: an AI node on ai.generic 0.1.136 or later answers at once however busy, so a silence of 3 s
+  means it is stuck or restarting or its 64 places for control requests were taken (its journal
+  says which), and only one pinned to an older ai.generic may still miss the 3 s while its workers
+  are busy. Its test, `node_help_says_a_busy_ai_node_answers_at_once_since_0_1_136`, fails without
+  it. The orchestrator's three comments are the orchestrator branch's.
 
 ### A-323 [Archi] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; asked to stop `SY.orchestrator@worker1`, Archi staged nothing, said a core node is not stopped through it and asked what the operator wants, in 7.3 s) (found 2026-11-12 by the natural-language gate of Archi; seen on 8.x on 0.1.135) — Archi plans `kill_node` for a core node and says nothing brings it back
 
