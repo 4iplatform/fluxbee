@@ -292,9 +292,9 @@ no change required
     Syncthing failed to delete some directories of its receive-only mirror), closed: a later pass
     deleted them, nothing left.
     **Pending:** the 0.1.137 gate's `drift` read at +24 h (2026-11-13, about 11:00Z) for A-283.
-    **Next:** A-191's leftover, the operator's call: 0.1.133's gate retired worker2's and the
-    removed gate workers' system ILKs (SY.policy's at SY.identity's start); a purge of them stays
-    the operator's explicit word (2026-11-11), asked.
+    **Then:** A-191's leftover, the operator's call of 2026-11-12 (*"Purge the 61 from removed
+    workers"*): the 61 retired system ILKs of removed hives purged, each first read free of history;
+    SY.policy's 2 stay retired (A-191).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -4491,6 +4491,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   deleted, and 35 s later all 6 were still retired. Joined again under the same name (131 s; the
   gate's first try failed `SSH_AUTH_FAILED` until it re-ran its prep, the gate's slip) the 6 were
   active again; removed again (4.4 s), retired.
+- **The purge (the operator's call, 2026-11-12, asked with the 63 retired system ILKs counted on
+  8.x: 54 of nine removed gate workers, worker2's 7, SY.policy's 2):** *"Purge the 61 from removed
+  workers"*, only those with no history. `purge_ilk` does not read history, so each one was read
+  first, over the whole record: no usage record among the 1,289 since 2026-09-01 (by node name,
+  node ILK or counterpart), no turn in SY.storage naming it (from, to or writer), and no
+  communication in SY.cognition's on worker1 or the motherbee; all 61 read free. Purged
+  15:20–15:23Z, 61 of 61 ok: worker2's 7, and 6 each of `gate0217`, `gate0218`, `gate0219`,
+  `gate0221`, `gate0227`, `gate0231`, `gate0233`, `gate0237i` and `gate0237j`. After it the
+  motherbee's identity and worker1's replica both list 19 system ILKs, only SY.policy's 2 marked
+  (`retired: node`), which stay retired; none of a removed hive is left. The tool:
+  `scratchpad/a191_purge.py` (the session's, outside the repo), dry run unless `--apply`.
 
 ### A-190 [General/join] ✅ VALIDATED ON 8.x (0.1.118, 2026-11-08; found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
 
