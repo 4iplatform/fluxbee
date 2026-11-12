@@ -55,7 +55,7 @@ types a registered person's email is merged into that person.
 | --- | --- |
 | any caller on an ingress or egress hive | nothing (checked before every row below) |
 | `SY.architect@motherbee` | everything (the operator's agent), but what is closed to the mesh: since A-160, `cognition_clear`, since A-122, `reset_base_runtime`, since stage 3c of [hive-config-update-v1](hive-config-update-v1.md), `set_installation_ai`, and since its stage 4, `update_installation`, which Archi stages in a plan the operator confirms; their reads, `get_installation` and `get_installation_update`, are Archi's |
-| `IO.cloud@motherbee` | the Cloud-exposed actions; externalize, unexternalize and list for its own channel |
+| `IO.cloud@motherbee` | the Cloud-exposed actions; externalize, unexternalize and list for its own channel; as an IO node, `publish_artifact`, and `unpublish_artifact` of its own publications (it publishes none) |
 | `SY.wf-rules@H` | node actions; package actions; `sync_hint` (detailed below) |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` (new, below) |
 | `IO.*@H` | externalize, unexternalize and list for its own channels (checked in the handler, as today) |

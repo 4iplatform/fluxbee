@@ -293,7 +293,7 @@ caller and the action; a command with no stamped caller is refused too.
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
 | `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
-| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication), and `unpublish_artifact` of its own publications only (FINDINGS A-243, since 0.1.137, where only `AI.*@H` might) | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
+| `AI.*@H`, `IO.*@H` (IO.cloud included), `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication), and `unpublish_artifact` of its own publications only (FINDINGS A-243, since 0.1.137, where only `AI.*@H` might) | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
 
 - **The table lives next to the catalog.** `mesh_access`, right after `INTERNAL_ACTION_REGISTRY`,
   gives every action of the catalog and every mesh command off it its row. An action it does not
