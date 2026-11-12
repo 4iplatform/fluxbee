@@ -398,10 +398,12 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   A-278; until 0.1.137 it read 1000, and took the ones of its index past them as missing), 200 pages
   at the most; when the list stops before its end, the timers past the last one listed are never
   taken as missing: one past its time is fired now, and one ahead of it is left as it is until the
-  node's next start (the log says so). When SY.timer does not answer, or the timer index cannot be
-  read, it starts `DEGRADED` and reconciles later. When the store does not open, or fails
-  during recovery, the
-  engine does not run and the node stays up (FINDINGS A-217): `DEGRADED` with `store_unavailable`,
+  node's next start (the log says so). It reads its index once, and makes what it writes of it in
+  one commit before each fire it gives and at its end (FINDINGS A-333; until 0.1.138 it read each
+  row twice and made each write a commit of its own: 3.6 s for 3,000 timers on a hive). When
+  SY.timer does not answer, or the timer index cannot be read, or those writes cannot be made, it
+  starts `DEGRADED` and reconciles later. When the store does not open, or fails during recovery,
+  the engine does not run and the node stays up (FINDINGS A-217): `DEGRADED` with `store_unavailable`,
   or `FAILED_CONFIG` `invalid_config` when the `db_path` itself cannot hold the store
   (`storeFailure`; `dbPathProblem` and `pathFault` in `node/store.go`, a read-only file system
   being the disk's fault); it refuses every event (`NOT_TAKEN`

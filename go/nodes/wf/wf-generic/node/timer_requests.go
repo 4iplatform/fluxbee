@@ -279,28 +279,46 @@ func (rt *NodeRuntime) clearRefusal(ctx context.Context, row TimerRow) {
 		log.Printf("wf: timer %s taken by SY.timer, and its refusal could not be cleared: %v", ref, err)
 		return
 	}
-	log.Printf("wf: timer %s taken by SY.timer, sent again %d time(s) after %s", ref, row.Resends, row.Refusal)
+	log.Print(timerTakenLine(row))
+}
+
+// timerTakenLine is the log line of a refusal of row cleared, SY.timer having taken its timer.
+func timerTakenLine(row TimerRow) string {
+	return fmt.Sprintf("wf: timer %s taken by SY.timer, sent again %d time(s) after %s", timerRef{row.InstanceID, row.TimerKey}, row.Resends, row.Refusal)
 }
 
 // timerHeld settles timer ref, which SY.timer holds pending at heldAtMS: it answered a schedule
 // already_existed with that time (it keeps one pending timer per client_ref), or the reconcile's
-// TIMER_LIST lists it. The timer is taken, its refusal cleared, unless SY.timer holds it later than
-// the index's time, past a fire's tolerance: a move SY.timer did not take (its TIMER_RESCHEDULE
-// refused or lost, and the TIMER_SCHEDULE that went again answered already_existed at the old time),
-// or a schedule of a key it held already. SY.timer would fire it late, and the stale-fire rule
-// (takeTimerFired) rescues only a timer it holds earlier. The timer is moved to its time, a
-// TIMER_RESCHEDULE followed as any request, its refusal, if it has one, kept until SY.timer takes
-// it; one less than 60 s from its time, SY.timer's floor, is marked, and the node fires it itself at
-// its time (FINDINGS A-254's review).
+// TIMER_LIST lists it (the reconcile settles the row it read itself, the same way). The timer is
+// taken, its refusal cleared, unless SY.timer holds it later than the index's time, past a fire's
+// tolerance (heldLate), which moveHeldTimer settles.
 func (rt *NodeRuntime) timerHeld(ctx context.Context, ref timerRef, heldAtMS int64) {
 	row, ok := rt.timerRow(ctx, ref, "held by SY.timer")
 	if !ok {
 		return
 	}
-	if heldAtMS <= row.FireAtMS+timerFireTolerance.Milliseconds() || rt.ActCtx.Timer == nil {
+	if !rt.heldLate(row, heldAtMS) {
 		rt.clearRefusal(ctx, row)
 		return
 	}
+	rt.moveHeldTimer(ctx, row, heldAtMS)
+}
+
+// heldLate reports whether SY.timer holds the timer of row at heldAtMS, later than the index's time,
+// past a fire's tolerance: a move SY.timer did not take (its TIMER_RESCHEDULE refused or lost, and
+// the TIMER_SCHEDULE that went again answered already_existed at the old time), or a schedule of a
+// key it held already. SY.timer would fire it late, and the stale-fire rule (takeTimerFired) rescues
+// only a timer it holds earlier.
+func (rt *NodeRuntime) heldLate(row TimerRow, heldAtMS int64) bool {
+	return heldAtMS > row.FireAtMS+timerFireTolerance.Milliseconds() && rt.ActCtx.Timer != nil
+}
+
+// moveHeldTimer moves the timer of row, which SY.timer holds at heldAtMS, later than its time
+// (heldLate), to its time: a TIMER_RESCHEDULE followed as any request, its refusal, if it has one,
+// kept until SY.timer takes it; one less than 60 s from its time, SY.timer's floor, is marked, and
+// the node fires it itself at its time (FINDINGS A-254's review).
+func (rt *NodeRuntime) moveHeldTimer(ctx context.Context, row TimerRow, heldAtMS int64) {
+	ref := timerRef{row.InstanceID, row.TimerKey}
 	why := fmt.Sprintf("%s holds it at %s, later than its time, %s", timerAuthority(rt.NodeName), msTime(heldAtMS), msTime(row.FireAtMS))
 	now := nowMS(rt.ActCtx.Clock)
 	if row.FireAtMS-now < minTimerDuration.Milliseconds() {

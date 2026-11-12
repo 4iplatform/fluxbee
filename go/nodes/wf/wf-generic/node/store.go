@@ -152,13 +152,7 @@ func OpenStore(path string) (*Store, error) {
 			return nil, fmt.Errorf("create wf db dir for %q: %w", path, err)
 		}
 	}
-	// A pragma belongs to one connection and database/sql opens several: in the DSN,
-	// modernc.org/sqlite applies them to each connection it opens. Set once with db.Exec they
-	// reached one connection only, and the others failed at once with SQLITE_BUSY instead of
-	// waiting (as in sy-timer). synchronous stays SQLite's default, FULL, as in sy-timer: a commit is
-	// on disk when it returns, so at least once holds across a host crash too.
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", storeDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open wf db %q: %w", path, err)
 	}
@@ -167,6 +161,15 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+// storeDSN is how the store at path is opened. A pragma belongs to one connection and database/sql
+// opens several: in the DSN, modernc.org/sqlite applies them to each connection it opens. Set once
+// with db.Exec they reached one connection only, and the others failed at once with SQLITE_BUSY
+// instead of waiting (as in sy-timer). synchronous stays SQLite's default, FULL, as in sy-timer: a
+// commit is on disk when it returns, so at least once holds across a host crash too.
+func storeDSN(path string) string {
+	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 }
 
 // Close closes the underlying database.
@@ -1052,13 +1055,73 @@ WHERE instance_id = ? AND timer_key = ?;`, scheduledAtMS, fireAtMS, instanceID, 
 	return err
 }
 
+// The writes to one row of the timer index that a reconcile also makes in one commit
+// (WriteTimerIndex): RefuseTimer's, TimerTaken's and DeleteTimer's.
+const (
+	refuseTimerSQL = `
+UPDATE wf_instance_timers SET refusal = ?, resend_at_ms = ?
+WHERE instance_id = ? AND timer_key = ?;`
+	timerTakenSQL = `
+UPDATE wf_instance_timers SET refusal = '', resends = 0, resend_at_ms = 0
+WHERE instance_id = ? AND timer_key = ?;`
+	deleteTimerSQL = `
+DELETE FROM wf_instance_timers WHERE instance_id = ? AND timer_key = ?;`
+)
+
 // RefuseTimer records why SY.timer did not take the last request about a timer of the index, and
 // when the timer goes again (FINDINGS A-254). A timer no longer in the index is left alone.
 func (s *Store) RefuseTimer(ctx context.Context, instanceID, timerKey, refusal string, resendAtMS int64) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE wf_instance_timers SET refusal = ?, resend_at_ms = ?
-WHERE instance_id = ? AND timer_key = ?;`, refusal, resendAtMS, instanceID, timerKey)
+	_, err := s.db.ExecContext(ctx, refuseTimerSQL, refusal, resendAtMS, instanceID, timerKey)
 	return err
+}
+
+// timerIndexWrite is a write to one row of the timer index, as WriteTimerIndex commits it with
+// others: a refusal (refuse, with refusal and resendAtMS, RefuseTimer's), a refusal cleared (taken,
+// TimerTaken's) or the row dropped (drop, DeleteTimer's).
+type timerIndexWrite struct {
+	op                   timerIndexOp
+	instanceID, timerKey string
+	refusal              string
+	resendAtMS           int64
+}
+
+type timerIndexOp int
+
+const (
+	timerIndexRefuse timerIndexOp = iota
+	timerIndexTaken
+	timerIndexDrop
+)
+
+// WriteTimerIndex makes writes, in their order, in one transaction: all of them or none (FINDINGS
+// A-333). Each write on its own is a commit of its own, which waits for the disk (synchronous FULL):
+// a reconcile that marked 2,000 timers SY.timer did not have, one commit each, took 16.7 s on a
+// hive.
+func (s *Store) WriteTimerIndex(ctx context.Context, writes []timerIndexWrite) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, write := range writes {
+		switch write.op {
+		case timerIndexRefuse:
+			_, err = tx.ExecContext(ctx, refuseTimerSQL, write.refusal, write.resendAtMS, write.instanceID, write.timerKey)
+		case timerIndexTaken:
+			_, err = tx.ExecContext(ctx, timerTakenSQL, write.instanceID, write.timerKey)
+		case timerIndexDrop:
+			_, err = tx.ExecContext(ctx, deleteTimerSQL, write.instanceID, write.timerKey)
+		default:
+			err = fmt.Errorf("no such write to the timer index: %d", write.op)
+		}
+		if err != nil {
+			return fmt.Errorf("timer %s/%s: %w", write.instanceID, write.timerKey, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // TimerSentAgain records that a refused timer was sent again, its resends-th time, and when it goes
@@ -1072,9 +1135,7 @@ WHERE instance_id = ? AND timer_key = ?;`, resends, resendAtMS, instanceID, time
 
 // TimerTaken clears the refusal of a timer SY.timer took.
 func (s *Store) TimerTaken(ctx context.Context, instanceID, timerKey string) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE wf_instance_timers SET refusal = '', resends = 0, resend_at_ms = 0
-WHERE instance_id = ? AND timer_key = ?;`, instanceID, timerKey)
+	_, err := s.db.ExecContext(ctx, timerTakenSQL, instanceID, timerKey)
 	return err
 }
 
@@ -1108,9 +1169,7 @@ ORDER BY resend_at_ms, instance_id, timer_key LIMIT 1;`)
 
 // DeleteTimer removes a timer entry from the local index.
 func (s *Store) DeleteTimer(ctx context.Context, instanceID, timerKey string) error {
-	_, err := s.db.ExecContext(ctx, `
-DELETE FROM wf_instance_timers WHERE instance_id = ? AND timer_key = ?;`,
-		instanceID, timerKey)
+	_, err := s.db.ExecContext(ctx, deleteTimerSQL, instanceID, timerKey)
 	return err
 }
 

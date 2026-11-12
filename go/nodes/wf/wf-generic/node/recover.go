@@ -436,13 +436,21 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 }
 
 // reconcileTimers reconciles the timer index with listing, what SY.timer had pending for this node
-// when it was asked, at askedAtMS. It goes through the index in the order the timers fire, and reads
-// each row again before it acts: a fire it gives an instance may cancel or move a later timer.
+// when it was asked, at askedAtMS. It reads the index once and goes through it in the order the
+// timers fire. A row of an instance it gave a fire to is read again before it acts on it: the fire's
+// transition may have cancelled or moved that later timer, or scheduled it again. Any other row is
+// as the index was read: nothing else writes the index meanwhile, the reconcile running on the
+// receive loop's goroutine (Recover before the loop), but the GC, which drops only the rows of an
+// instance that ended days before, read as one that no longer runs. Read again each, two reads a
+// timer, 3,000 timers took 3.6 s on a hive (FINDINGS A-333). What it writes of the rows it passed (a
+// refusal cleared, a timer SY.timer lacks marked, a row of an instance that no longer runs dropped)
+// goes in one commit, made before each fire it gives an instance, whose transition may read or
+// change the instance's rows, and at its end (indexWrites).
 //
 //   - pending, fire_at ahead: nothing to do, but a refusal the index keeps of it is cleared: SY.timer
 //     has it (FINDINGS A-254). SY.timer holding it later than the index's time (a move it did not
 //     take) would fire it late: it is moved to its time, or, less than 60 s from it, fired by the
-//     node itself then (timerHeld, A-254's review);
+//     node itself then (moveHeldTimer, A-254's review);
 //   - pending, fire_at past, SY.timer's or the index's (SY.timer holding it later): the instance takes
 //     a fire now (as SY.timer's would, through the journal), in the order of the index, and the
 //     pending one is cancelled unless the fire scheduled the key again (firePastTimer);
@@ -469,9 +477,10 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 // An error says the timers are not reconciled, and the node stays DEGRADED until a later reconcile
 // is (timersPending), since a fire dropped while it could not take one has no other way back (SY.timer
 // sends a fire once, FINDINGS A-217): the index could not be read, and nothing changed (every timer
-// of SY.timer would have read as an orphan), or a row could not be read again, and stays as it was
-// while the others are reconciled. A listing that stopped before its end is no error: what it lists
-// is reconciled, its listTimers' log says why it stopped, and the node's next start lists the rest.
+// of SY.timer would have read as an orphan); a row could not be read again, and stays as it was
+// while the others are reconciled; or a commit of its writes failed, and the rows it held stay as
+// they were (A-333). A listing that stopped before its end is no error: what it lists is
+// reconciled, its listTimers' log says why it stopped, and the node's next start lists the rest.
 func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing, opts RecoverOptions, askedAtMS int64) error {
 	actx := rt.ActCtx
 	expectedTimers, err := rt.Store.ListAllExpectedTimers(ctx)
@@ -490,21 +499,33 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 	now := actx.Clock().UnixMilli()
 	var unread error
 	unlisted := 0
+	// fired are the running instances the reconcile gave a fire to, whose rows further on are read
+	// again; writes, what it writes of the rows it passed, committed before each such fire.
+	fired := map[string]bool{}
+	writes := &indexWrites{}
+	beforeFire := func(row TimerRow) {
+		writes.commit(ctx, rt.Store)
+		fired[row.InstanceID] = true
+	}
 	for _, listed := range expectedTimers {
 		ref := timerClientRef(listed.InstanceID, listed.TimerKey)
 		syTimer, existsInSY := syView[ref]
 		delete(syView, ref)
-		row, current, err := rt.Store.GetTimerForInstance(ctx, listed.InstanceID, listed.TimerKey)
-		if err != nil {
-			log.Printf("recover: reread timer %s/%s: %v", listed.InstanceID, listed.TimerKey, err)
-			if unread == nil {
-				unread = fmt.Errorf("read timer %s/%s of the index again: %w", listed.InstanceID, listed.TimerKey, err)
+		row := listed
+		if fired[listed.InstanceID] {
+			again, current, err := rt.Store.GetTimerForInstance(ctx, listed.InstanceID, listed.TimerKey)
+			if err != nil {
+				log.Printf("recover: reread timer %s/%s: %v", listed.InstanceID, listed.TimerKey, err)
+				if unread == nil {
+					unread = fmt.Errorf("read timer %s/%s of the index again: %w", listed.InstanceID, listed.TimerKey, err)
+				}
+				continue
 			}
-			continue
-		}
-		if !current || row.FireAtMS != listed.FireAtMS {
-			// An earlier fire's transition cancelled it or scheduled it again.
-			continue
+			if !current || again.FireAtMS != listed.FireAtMS {
+				// An earlier fire's transition cancelled it or scheduled it again.
+				continue
+			}
+			row = again
 		}
 		if row.ScheduledAtMS > askedAtMS {
 			continue
@@ -515,10 +536,15 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 		case existsInSY && syTimer.FireAtUTCMS > now && row.FireAtMS > now:
 			// Pending, fire_at ahead: SY.timer has it. A refusal of it is settled (FINDINGS A-254),
 			// unless SY.timer holds it later than its time, a move it did not take: it goes to its
-			// time (timerHeld, A-254's review). The timer of an instance that no longer runs is left
-			// alone: its fire is dropped as an orphan's, and a mark of it goes on the loop's tick.
-			if running {
-				rt.timerHeld(ctx, timerRef{row.InstanceID, row.TimerKey}, syTimer.FireAtUTCMS)
+			// time (moveHeldTimer, A-254's review). The timer of an instance that no longer runs is
+			// left alone: its fire is dropped as an orphan's, and a mark of it goes on the loop's
+			// tick.
+			switch {
+			case !running:
+			case rt.heldLate(row, syTimer.FireAtUTCMS):
+				rt.moveHeldTimer(ctx, row, syTimer.FireAtUTCMS)
+			case row.Refusal != "":
+				writes.add(timerIndexWrite{op: timerIndexTaken, instanceID: row.InstanceID, timerKey: row.TimerKey}, timerTakenLine(row))
 			}
 
 		case existsInSY:
@@ -526,6 +552,7 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 			// (a move to an earlier time it did not take), whose fire would come late.
 			if running {
 				log.Printf("recover: timer %s/%s past fire_at, injecting synthetic TIMER_FIRED", row.InstanceID, row.TimerKey)
+				beforeFire(row)
 			}
 			rt.firePastTimer(ctx, inst, running, row, syTimer.UUID)
 
@@ -536,6 +563,7 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 			// one SY.timer may hold is cancelled (FINDINGS A-278's review).
 			log.Printf("recover: timer %s/%s past fire_at, and past the last timer %s listed, its list stopped before its end: injecting synthetic TIMER_FIRED, and cancelling the one it may hold",
 				row.InstanceID, row.TimerKey, timerAuthority(rt.NodeName))
+			beforeFire(row)
 			rt.firePastTimer(ctx, inst, running, row, "")
 
 		case running && !listing.covers(row.FireAtMS):
@@ -550,18 +578,20 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 			// say) would wait forever.
 			if running {
 				log.Printf("recover: expected timer %s/%s past fire_at but missing from SY.timer — fired while down; injecting synthetic TIMER_FIRED", row.InstanceID, row.TimerKey)
+				beforeFire(row)
 				rt.fireMissedTimer(ctx, inst, row, "")
 			} else {
-				_ = rt.Store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
+				writes.add(timerIndexWrite{op: timerIndexDrop, instanceID: row.InstanceID, timerKey: row.TimerKey}, "")
 			}
 
 		case running:
-			rt.timerMissing(ctx, row, now)
+			rt.timerMissing(row, now, writes)
 
 		default:
-			_ = rt.Store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
+			writes.add(timerIndexWrite{op: timerIndexDrop, instanceID: row.InstanceID, timerKey: row.TimerKey}, "")
 		}
 	}
+	writes.commit(ctx, rt.Store)
 	if unlisted > 0 {
 		last := "it listed none"
 		if listing.throughMS != math.MinInt64 {
@@ -584,6 +614,9 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, listing timerListing
 	}
 	if unread != nil {
 		return unread
+	}
+	if writes.failed != nil {
+		return writes.failed
 	}
 	if listing.complete {
 		log.Printf("recover: timer reconciliation complete")
@@ -622,16 +655,54 @@ func (rt *NodeRuntime) firePastTimer(ctx context.Context, inst *WFInstance, runn
 // followed as any other, and one less than 60 s from its time is fired by the node itself then
 // (sendRefusedTimersAgain). The reconcile sent each at once, past SY.timer's 64 messages and the
 // node's 64 answers after a long outage, and the answers the SDK dropped read as refusals 30 s later
-// (FINDINGS A-254's review).
-func (rt *NodeRuntime) timerMissing(ctx context.Context, row TimerRow, nowMS int64) {
+// (FINDINGS A-254's review). The mark goes with the reconcile's other writes (writes, FINDINGS A-333).
+func (rt *NodeRuntime) timerMissing(row TimerRow, nowMS int64, writes *indexWrites) {
 	ref := timerRef{row.InstanceID, row.TimerKey}
-	why := "TIMER_LIST: " + timerAuthority(rt.NodeName) + " does not have it"
-	if err := rt.Store.RefuseTimer(ctx, row.InstanceID, row.TimerKey, why, nowMS); err != nil {
-		log.Printf("recover: expected timer %s missing from SY.timer, and it could not be marked to go again: %v", ref, err)
+	writes.add(timerIndexWrite{op: timerIndexRefuse, instanceID: row.InstanceID, timerKey: row.TimerKey,
+		refusal: "TIMER_LIST: " + timerAuthority(rt.NodeName) + " does not have it", resendAtMS: nowMS},
+		fmt.Sprintf("recover: expected timer %s missing from SY.timer (fire_at still future): it goes again from the loop", ref))
+	rt.ActCtx.Requests.noteRefused()
+}
+
+// indexWrites are what a reconcile writes of the rows of the timer index it passed (a refusal
+// cleared, a timer SY.timer lacks marked to go again, a row of an instance that no longer runs
+// dropped), each with the line that logs it once it is made. They are made together, in one commit
+// (WriteTimerIndex), before each fire the reconcile gives an instance, whose transition may read or
+// change the instance's rows, and at its end (FINDINGS A-333): one commit each, they took about 8 ms
+// apiece on a hive's disk, and 2,000 of them most of a reconcile's 16.7 s.
+type indexWrites struct {
+	writes []timerIndexWrite
+	logs   []string
+	// failed is the first commit that failed: the reconcile says its timers are not reconciled, and
+	// the node reconciles them again (timersPending).
+	failed error
+}
+
+// add keeps write, and logLine ("" for none) to log once it is made.
+func (w *indexWrites) add(write timerIndexWrite, logLine string) {
+	w.writes = append(w.writes, write)
+	w.logs = append(w.logs, logLine)
+}
+
+// commit makes the writes added since the last commit, all of them or none, and logs each once
+// made; a failure is logged and kept (failed).
+func (w *indexWrites) commit(ctx context.Context, store *Store) {
+	if len(w.writes) == 0 {
 		return
 	}
-	rt.ActCtx.Requests.noteRefused()
-	log.Printf("recover: expected timer %s missing from SY.timer (fire_at still future): it goes again from the loop", ref)
+	if err := store.WriteTimerIndex(ctx, w.writes); err != nil {
+		log.Printf("recover: %d write(s) to the timer index not made, those timers stay as they were: %v", len(w.writes), err)
+		if w.failed == nil {
+			w.failed = fmt.Errorf("write %d row(s) of the timer index: %w", len(w.writes), err)
+		}
+	} else {
+		for _, line := range w.logs {
+			if line != "" {
+				log.Print(line)
+			}
+		}
+	}
+	w.writes, w.logs = w.writes[:0], w.logs[:0]
 }
 
 // scheduleAgain schedules again, at its fire_at (SY.timer's minimum ahead at least), a timer SY.timer

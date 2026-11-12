@@ -458,7 +458,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-330 🔵 `list_hives` lists a registry directory whose name is not a hive id (low; the orchestrator).
 - A-331 🔵 `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT` (low; the orchestrator).
 - A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition; built on `coa/cognition-139` for 0.1.139: a 2 s grace the agent's answer ends, the first of the entry's two fixes, the branch's choice for the operator to confirm).
-- A-333 🔵 A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it (low; the WF engine; found by 0.1.138's gate).
+- A-333 🔵 A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it (low; the WF engine; found by 0.1.138's gate; built on `coa/wf-139` for 0.1.139).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the fix to decide).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
@@ -1618,6 +1618,47 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Not read:** whether the cost is a store commit per instance (300 × about 12 ms) or per timer.
 - **Fix, later (the WF engine):** read the code; batch the store writes, or start the receive loop
   before the reconcile ends.
+- **Built on `coa/wf-139` (for 0.1.139).** **Where the time went, measured on the Mac** (a store
+  file of 300 instances and 3,000 timers, as gate0238's, SY.timer a fake): neither commits per
+  instance nor writes, at rest. The reconcile read each row of the index twice, again before it
+  acted on it and again to settle a timer SY.timer holds (`timerHeld`), each read a statement
+  outside a transaction, so a read transaction of its own: 6,001 transactions for 3,000 timers
+  held, 0.286 s, two thirds of its CPU in the `fcntl` locks of the WAL's shared memory
+  (`walTryBeginRead`); worker1's 3.558 s is the same work 12.5 times slower. Each write was a commit
+  of its own, which waits for the disk (`synchronous` FULL): with every timer refused in the index
+  and held, 9,001 transactions, 1.244 s; with SY.timer holding none (each marked to go again),
+  6,001, 1.104 s; on worker1 the 0.1.137 baseline's 2,000 such marks took most of its 16.727 s.
+  - **The fix (`node/recover.go`, `node/store.go`, `node/timer_requests.go`):** the reconcile reads
+    the index once, and reads a row again only when it gave that row's instance a fire before it,
+    whose transition may have cancelled, moved or scheduled the timer again: nothing else writes
+    the index meanwhile (the reconcile runs on the receive loop's goroutine, `Recover` before the
+    loop; the GC drops only the rows of instances that ended days before, read as not running). A
+    timer SY.timer holds is settled on the row as read (`heldLate`, `moveHeldTimer`, split from
+    `timerHeld`). What it writes of the rows it passed (a refusal cleared, a timer SY.timer lacks
+    marked, a row of an instance that no longer runs dropped) is kept with its log line and made in
+    one transaction (`indexWrites`, `Store.WriteTimerIndex`) before each fire it gives an
+    instance, whose transition may read or change the instance's rows, and at its end. A commit
+    that fails leaves its rows as they were, is logged (*"N write(s) to the timer index not made,
+    those timers stay as they were"*), and the reconcile says the timers are not reconciled: the
+    node runs `DEGRADED` (`timers_not_reconciled`) and the loop reconciles again every 30 s, where
+    a mark that failed was only logged and its timer went again only at the node's next start.
+    The same store after it: 1 transaction, 9.4 ms (held); 2, 74.6 ms (held and refused); 2,
+    86.7 ms (none held). A start with 3,000 held timers, its own work: the instances loaded in
+    16 ms, drained in 13 ms, the reconcile 13 ms; the rest is SY.timer's listing.
+  - **The receive loop stays after the reconcile:** a fire the reconcile gives reaches its
+    instance before any message the loop takes, in the order the timers fire, and only the loop's
+    goroutine touches the registry and the timer requests. With the reconcile's cost gone, a
+    restart's time to its loop is SY.timer's listing (A-326: 0.931 s for 13 pages on worker1 at
+    rest).
+  - **Tests** (`node/reconcile_cost_test.go`; `node/store_count_test.go` opens the store through a
+    driver that counts its transactions): `TestAReconcileReadsTheIndexOnceAndWritesItInOneCommit`
+    (1, 2 and 2 transactions for the three cases, where the reconcile before made 6,001, 9,001 and
+    6,001), `TestAReconcileWhoseWritesFailIsNotDone` (the reconcile before was complete) and
+    `TestAReconcileMakesItsWritesBeforeAFire` (marks made only at the reconcile's end land on a
+    deadline the fire scheduled again: it fails without the commit before a fire);
+    `TestRecoveryFiresLostTimersInTheOrderTheyFire` fails without the read again after a fire.
+    Docs: the WF's README, [spec-systemnode-wf-v1_1](../../docs/spec-systemnode-wf-v1_1.md)
+    §11.4 and [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md).
 
 ### A-332 [General/cognition] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x; left by A-292's fix) — Cognition's model call on a person's turn that the agent then refuses completes
 

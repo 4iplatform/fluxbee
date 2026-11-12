@@ -82,19 +82,24 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   index at that time: a fire of a timer it cancelled is dropped, and so is one of a timer it moved
   (a `TIMER_CANCEL` or a `TIMER_RESCHEDULE` goes fire-and-forget), which is scheduled again at its
   `fire_at`. A fired timer's index row goes with it, so a restart does not fire it again. A
-  restart fires the timers it missed in the order they fire, reading each row again first. It
-  reads every page of its pending timers in SY.timer, each from the `next_cursor` the page before
-  gave (FINDINGS A-278; until 0.1.137 it read 1000, and took the ones of its index past them as
-  missing, sent again while the node ran `DEGRADED`), 200 pages at the most; when the list stops
-  before its end (that bound, or an answer it cannot go on from), the log says why, and the timers
-  past the last one listed are never taken as missing: one past its time is fired now, and the one
-  SY.timer may hold cancelled; one ahead of it is left as it is until the node's next start, the
-  next reconcile (the node is not `DEGRADED` for it), the log the only sign. If
-  SY.timer does not answer at start, or the timer index (or a row of it) cannot be read, the node
-  starts `DEGRADED` (`timers_not_reconciled`) and reconciles its timers on a later try, every 30 s;
-  a timer SY.timer never got is scheduled again then, from the loop, 32 a second at most, and one
-  scheduled, or moved, after the list was asked is left alone. A timer fires from 60 s to 366 days
-  ahead, SY.timer's floor and ceiling (a definition that asks more does not load).
+  restart fires the timers it missed in the order they fire. It reads the index once, and again
+  only a row of an instance it gave a fire to, and makes what it writes of the rows it passed (a
+  mark cleared, a timer SY.timer lacks marked) in one commit, before each fire and at its end
+  (FINDINGS A-333; until 0.1.138 it read each row twice and wrote each in a commit of its own:
+  3,000 timers took 3.6 s on a hive before the receive loop started). It reads every page of its
+  pending timers in SY.timer, each from the `next_cursor` the page before gave (FINDINGS A-278;
+  until 0.1.137 it read 1000, and took the ones of its index past them as missing, sent again
+  while the node ran `DEGRADED`), 200 pages at the most; when the list stops before its end (that
+  bound, or an answer it cannot go on from), the log says why, and the timers past the last one
+  listed are never taken as missing: one past its time is fired now, and the one SY.timer may hold
+  cancelled; one ahead of it is left as it is until the node's next start, the next reconcile (the
+  node is not `DEGRADED` for it), the log the only sign. If SY.timer does not answer at start, or
+  the timer index (or a row of it) cannot be read, or what the reconcile writes of it cannot be
+  written, the node starts `DEGRADED` (`timers_not_reconciled`) and reconciles its timers on a
+  later try, every 30 s; a timer SY.timer never got is scheduled again then, from the loop, 32 a
+  second at most, and one scheduled, or moved, after the list was asked is left alone. A timer
+  fires from 60 s to 366 days ahead, SY.timer's floor and ceiling (a definition that asks more does
+  not load).
 - **A timer SY.timer does not take goes again** (FINDINGS A-254). A `schedule_timer` or a
   `reschedule_timer` records the timer in the index first (a `cancel_timer` drops it first, whatever
   becomes of its cancel, a fire of it then dropped as stale), then sends its request without waiting,
