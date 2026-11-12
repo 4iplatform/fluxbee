@@ -271,8 +271,8 @@ no change required
     **Found by A-322's review:** A-327 and A-328, low; A-124 unchanged. **Found by its gate:** A-329
     [General/Go SDK], medium (on 0.1.136: the Go SDK dropped 344 of a burst of 1000 messages);
     A-330, A-331 and A-332, low; B-18, the lab's template. A-326 is A-278's, on `coa/a278`.
-    **Pending:** the gate's `drift` read at +24 h (2026-11-13, about 11:00Z) for A-283; telling the
-    Cloud team, whose page is outside the repo, that A-243 and A-298 are live.
+    **Pending:** the gate's `drift` read at +24 h (2026-11-13, about 11:00Z) for A-283. (The Cloud
+    team's page, outside the repo, says A-243 and A-298 are live since its Version 4, 2026-11-12.)
     **Next:** A-278 alone (built on `coa/a278`, `711cda24`, for 0.1.138); then A-191's one-time
     cleanup on 8.x (its operator action run once on the system ILKs of hives removed before 0.1.133
     and of the retired SY.policy, purging only those with no history).
@@ -2128,8 +2128,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   passes, `current` still 1.0.1. The panel's label: *"Promote To Current: running nodes on current,
   and those of packages built on it, move to it in place, keeping their config"*.
 - **Docs at 0.1.137:** `docs/io-cloud-api.md` §5.4 and §9's 0.1.137 entry say the redeploy is gone,
-  with these records. The Cloud team's page, outside the repo, gave the redeploy as today's
-  behaviour (the Docs line above): telling the Cloud team is pending, with A-243's.
+  with these records. The Cloud team's page, outside the repo, says so since its Version 4
+  (2026-11-12), with A-243's.
 
 ### A-297 [General/admin] 🔵 low (found 2026-11-11 by A-288's review; read in the code) — SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee
 
@@ -3464,8 +3464,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   take-down unchanged, ok. `unpublish_artifact`'s help names A-243, `IO.*` and `WF.*`. The gate's
   first run stopped on its own tool (it read the router's node list, which has no ILK; fixed).
   `docs/io-cloud-api.md` §5.7 and §9 say it as live from 0.1.137, with these records. The Cloud
-  team's page, outside the repo, was to say so too (above): telling the Cloud team is pending, with
-  A-298's.
+  team's page, outside the repo, says so since its Version 4 (2026-11-12), with A-298's.
 
 ### A-242 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a node's and a tenant's purge with two pages up, each naming them; the spawn's rollback stays by design) (found 2026-11-10 by A-233's builder; read in the code) — remove_hive leaves its nodes' pages up; a spawn's rollback purges an ILK without SY.admin
 

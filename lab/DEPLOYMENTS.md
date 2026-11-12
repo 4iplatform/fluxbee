@@ -333,8 +333,8 @@
   `wf.gate0237w`, `wf.gate0237u` and `wf.gate0237a` gone on both hives; VM 104 destroyed. One
   person stays in the tenant pruebas (A-293's registration). Health clean since 09:44Z,
   `wandrops=0`. Pending: the gate's `drift` read at +24 h (2026-11-13, about 11:00Z), A-283's check
-  that no hive opened a Syncthing drift row outside the gate's steps; telling the Cloud team, whose
-  page is outside the repo, that A-243 and A-298 are live.
+  that no hive opened a Syncthing drift row outside the gate's steps. The Cloud team's page (outside
+  the repo) says 0.1.137 is live since its Version 4 (2026-11-12).
 - **Rollback:** the snapshot `pre-sweep-0-1-137` (all 4 VMs), or `apt install fluxbee=0.1.136` +
   0.1.136's `update_installation`: nothing one-way; the sweep's items come back, A-298's redeploy
   among them.
