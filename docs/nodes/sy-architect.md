@@ -126,7 +126,7 @@ inside its segment (one route prefix, never two segments), and the vault key of
 digits after it goes as it came, as in the query: no node name holds a `%`, so the node's hive
 refuses it (`invalid node_name`). A `+` stays a `+`, as in the query, where SY.admin's routes read
 one in a path segment as a space; no node, runtime, hive or vault key name holds either. Before
-0.1.136 each segment went as it came, but the vault key's: a node name written `%40` matched no
+0.1.137 each segment went as it came, but the vault key's: a node name written `%40` matched no
 node through Archi, and worked over SY.admin's route.
 
 An SCMD typed by the operator runs immediately; a mutating action is recorded in the
@@ -145,9 +145,11 @@ request first reads an open `add_hive` in the motherbee's hive registry, `get_hi
 as `succeeded_after_timeout`, one `failed` or `interrupted` as `failed` with its join's error, and
 `NOT_FOUND` as `failed` (the hive no longer exists). `INVALID_HIVE_ID` closes it as `failed` too:
 the hive id is not one, and `add_hive` refuses it, so the request goes on and gets `add_hive`'s
-own `INVALID_HIVE_ID` (FINDINGS A-311). `get_hive` refuses such an id since 0.1.136, where it
-answered `NOT_FOUND`; read as any other answer, the record would stay open for good. A join still
-running, or any other answer, leaves the record open.
+own refusal (FINDINGS A-311). That refusal is `INVALID_HIVE_ID` once the request's other fields
+are valid, since `add_hive` checks its SSH fields and its role first: one without `ssh_user` is
+refused `INVALID_REQUEST` for that. `get_hive` refuses such an id since 0.1.137, where it answered
+`NOT_FOUND`; read as any other answer, the record would stay open for good. A join still running,
+or any other answer, leaves the record open.
 
 **`fluxbee_system_get`** is the LLM's read tool. It builds an SCMD from `{method, path, body}`
 and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`), and it runs reads
@@ -172,7 +174,7 @@ percent-decoded once, where the query is read (`scmd_query_params`, FINDINGS A-2
 own HTTP routes decode theirs (`parse_query`): a cursor written with `%3A`, or an owner with `%40`,
 reaches SY.admin as it does written raw; an escape that is none goes as it came, and a `+` stays a
 `+` (`percent_decode`, FINDINGS A-286), so `?from=2026-11-01T00:00:00+01:00` is that time. Before
-0.1.136 a `+` read as a space, and SY.storage refused that `from` as no RFC 3339 time. Archi's own
+0.1.137 a `+` read as a space, and SY.storage refused that `from` as no RFC 3339 time. Archi's own
 HTTP API (`/api/...`) reads a `+` in its query as a space (`query_param`). The path's description
 tells the model to follow `next_cursor`, and on `REPLY_TOO_LARGE` to ask again with
 `error_detail.suggested_limit` ([SY.admin](sy-admin.md#pages));
@@ -435,7 +437,7 @@ skills, handbooks and a personality.
     `.zip` that was uploaded (its `config/default-config.json`, or its `config_template`): no read
     shows a published version's template (`get_runtime` carries none, and SY.admin removes the
     uploaded bundle once it is installed).
-  - **Up to 0.1.135** a publish with `set_current` then took every node of that runtime on the
+  - **Up to 0.1.136** a publish with `set_current` then took every node of that runtime on the
     motherbee, by runtime name, running or stopped, pinned or not, and ran `kill_node` with `force`
     and `purge_instance` and then `run_node` on `current` (`redeploy_runtime_nodes_with_current`):
     each came back with a new ILK, without the secrets it owned, running even if it had been

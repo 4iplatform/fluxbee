@@ -10817,7 +10817,7 @@ const PUBLISH_NEXT_NOT_CURRENT: &str = "This publish did not move current: no no
 /// payload names the version it installed, even when a follow-up of `sync_to` or `update_to`
 /// failed (its status is then an error, and the version is installed, current with
 /// `set_current`). Up to
-/// 0.1.135 a publish that made its version current then killed every motherbee node of that
+/// 0.1.136 a publish that made its version current then killed every motherbee node of that
 /// runtime with its instance purged and ran it again on `current`: a new ILK, its owned secrets
 /// gone, `launched_by: "archi"` (FINDINGS A-298).
 async fn handle_package_publish_request(
@@ -12372,6 +12372,22 @@ async fn reconcile_timeout_unknown_operation(
     state: &ArchitectState,
     record: &mut ChatOperationRecord,
 ) -> Result<bool, ArchitectError> {
+    if !settle_open_operation(state, record).await? {
+        return Ok(false);
+    }
+    save_operation(state, record).await?;
+    Ok(true)
+}
+
+/// Whether the hive settles an open record (`reconcile_timeout_unknown_operation`): when it does,
+/// the record's final status, error summary and times are set in place, and the record is
+/// terminal, so an identical request goes on (`execute_tracked_admin_translation`). Only
+/// `timeout_unknown` and `accepted` are open, and only an `add_hive` is read
+/// (`add_hive_outcome_from_registry`). It saves nothing: the reconcile does.
+async fn settle_open_operation(
+    state: &ArchitectState,
+    record: &mut ChatOperationRecord,
+) -> Result<bool, ArchitectError> {
     // Two non-terminal states resolve the same way — by asking the hive what actually
     // happened. `timeout_unknown`: the reply expired, outcome genuinely unknown.
     // `accepted` (PB-7): add_hive now returns immediately and joins in the background, so the
@@ -12388,7 +12404,6 @@ async fn reconcile_timeout_unknown_operation(
     record.error_summary = error_summary;
     record.updated_at_ms = now_epoch_ms();
     record.completed_at_ms = record.updated_at_ms;
-    save_operation(state, record).await?;
     Ok(true)
 }
 
@@ -12397,10 +12412,10 @@ const ADD_HIVE_ID_NOT_A_HIVE_ID: &str =
     "hive_id is not a hive id (1 to 64 letters, digits, '_' or '-'), and add_hive refuses it: \
      no hive was added";
 
-/// How an open `add_hive` record ends (`reconcile_timeout_unknown_operation`), read in the
-/// motherbee's hive registry: SY.admin's `get_hive` for the record's hive id. Its final status and
-/// error summary; None while the answer settles nothing (a join still running, an answer of
-/// another kind) and for a record of another action. It saves nothing: the reconcile does.
+/// How an open `add_hive` record ends (`settle_open_operation`), read in the motherbee's hive
+/// registry: SY.admin's `get_hive` for the record's hive id. Its final status and error summary;
+/// None while the answer settles nothing (a join still running, an answer of another kind) and
+/// for a record of another action. It changes and saves nothing.
 async fn add_hive_outcome_from_registry(
     state: &ArchitectState,
     record: &ChatOperationRecord,
@@ -12439,10 +12454,11 @@ async fn add_hive_outcome_from_registry(
         )));
     }
     // A hive id that is not one (FINDINGS A-311): `add_hive` refuses it, so no hive was added,
-    // and since 0.1.136 `get_hive` refuses it too (INVALID_HIVE_ID), where it answered NOT_FOUND.
+    // and since 0.1.137 `get_hive` refuses it too (INVALID_HIVE_ID), where it answered NOT_FOUND.
     // Read as an answer of another kind, the record would stay open for good, and every
-    // identical retry would be OPERATION_ALREADY_TRACKED instead of add_hive's own
-    // INVALID_HIVE_ID.
+    // identical retry would be OPERATION_ALREADY_TRACKED instead of add_hive's own refusal:
+    // INVALID_HIVE_ID once the request's other fields are valid, since add_hive checks its SSH
+    // fields and its role first (one without ssh_user is refused INVALID_REQUEST for that).
     if error_code.is_some_and(|v| v.eq_ignore_ascii_case("INVALID_HIVE_ID")) {
         return Ok(Some(("failed", ADD_HIVE_ID_NOT_A_HIVE_ID.to_string())));
     }
@@ -27491,12 +27507,15 @@ mod tests {
     }
 
     /// FINDINGS A-311: an open `add_hive` record (`timeout_unknown`, or `accepted` while its join
-    /// runs) closes as failed when `get_hive` refuses its hive id (INVALID_HIVE_ID, since 0.1.136,
+    /// runs) closes as failed when `get_hive` refuses its hive id (INVALID_HIVE_ID, since 0.1.137,
     /// where such an id answered NOT_FOUND), as it closes when the registry does not have the hive:
     /// the hive id is not one, and add_hive refuses it. Read as an answer of another kind, the
     /// record would stay open for good, and every identical retry would be
-    /// OPERATION_ALREADY_TRACKED instead of add_hive's own INVALID_HIVE_ID. The other answers
-    /// settle the record as before.
+    /// OPERATION_ALREADY_TRACKED instead of add_hive's own refusal (INVALID_HIVE_ID once the
+    /// request's other fields are valid). The other answers settle the record as before. A record
+    /// that closes gets its status, its summary and its times, and is terminal, so an identical
+    /// retry goes on (`execute_tracked_admin_translation`); one that stays open is not changed; a
+    /// record that is not open, or of another action, asks nothing.
     #[tokio::test]
     async fn an_open_add_hive_closes_on_a_hive_id_that_get_hive_refuses() {
         // SY.admin's answers to `get_hive`, as its router delivers them: the orchestrator's answer
@@ -27560,37 +27579,108 @@ mod tests {
                 None,
             ),
         ];
+        let add_hive_record = |hive_id: &str, status: &str| ChatOperationRecord {
+            operation_id: "op-a311".to_string(),
+            session_id: "session-a311".to_string(),
+            scope_id: operation_scope_id("session-a311"),
+            origin: "scmd".to_string(),
+            action: "add_hive".to_string(),
+            target_hive: PRIMARY_HIVE_ID.to_string(),
+            params_json: json!({ "address": "10.0.0.9", "hive_id": hive_id }).to_string(),
+            params_hash: String::new(),
+            preview_command: String::new(),
+            status: status.to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            dispatched_at_ms: 1,
+            completed_at_ms: 0,
+            request_id: String::new(),
+            trace_id: String::new(),
+            error_summary: String::new(),
+        };
         let (state, mut router) = harness_state();
         for (hive_id, answer, outcome) in cases {
-            let record = ChatOperationRecord {
-                operation_id: "op-a311".to_string(),
-                session_id: "session-a311".to_string(),
-                scope_id: operation_scope_id("session-a311"),
-                origin: "scmd".to_string(),
-                action: "add_hive".to_string(),
-                target_hive: PRIMARY_HIVE_ID.to_string(),
-                params_json: json!({ "address": "10.0.0.9", "hive_id": hive_id }).to_string(),
-                params_hash: String::new(),
-                preview_command: String::new(),
-                status: "timeout_unknown".to_string(),
-                created_at_ms: 1,
-                updated_at_ms: 1,
-                dispatched_at_ms: 1,
-                completed_at_ms: 0,
-                request_id: String::new(),
-                trace_id: String::new(),
-                error_summary: String::new(),
-            };
-            let (read, sent) = tokio::join!(
-                add_hive_outcome_from_registry(&state, &record),
-                answer_admin_command(&mut router, "get_hive", answer.clone()),
+            for open in ["timeout_unknown", "accepted"] {
+                let mut record = add_hive_record(hive_id, open);
+                let (settled, sent) = tokio::join!(
+                    settle_open_operation(&state, &mut record),
+                    answer_admin_command(&mut router, "get_hive", answer.clone()),
+                );
+                assert_eq!(
+                    sent.payload["params"],
+                    json!({ "hive_id": hive_id }),
+                    "{answer}"
+                );
+                let settled = settled.expect("the registry's answer");
+                match &outcome {
+                    Some((status, summary)) => {
+                        assert!(settled, "{open}: {answer}");
+                        assert_eq!(
+                            (record.status.as_str(), record.error_summary.as_str()),
+                            (*status, summary.as_str()),
+                            "{open}: {answer}"
+                        );
+                        assert!(record.updated_at_ms > 1, "{open}: {answer}");
+                        assert_eq!(
+                            record.completed_at_ms, record.updated_at_ms,
+                            "{open}: {answer}"
+                        );
+                        // Terminal: an identical retry is sent on, not OPERATION_ALREADY_TRACKED.
+                        assert!(
+                            is_terminal_operation_status(&record.status),
+                            "{open}: {answer}"
+                        );
+                    }
+                    None => {
+                        assert!(!settled, "{open}: {answer}");
+                        assert_eq!(
+                            (
+                                record.status.as_str(),
+                                record.error_summary.as_str(),
+                                record.updated_at_ms,
+                                record.completed_at_ms
+                            ),
+                            (open, "", 1, 0),
+                            "{open}: {answer}"
+                        );
+                    }
+                }
+            }
+        }
+        // Only an open add_hive record asks the registry; any other record is left as it is.
+        for (action, status) in [
+            ("add_hive", "dispatched"),
+            ("add_hive", "failed"),
+            ("add_hive", "succeeded_after_timeout"),
+            ("remove_hive", "timeout_unknown"),
+        ] {
+            let mut record = add_hive_record("a.b", status);
+            record.action = action.to_string();
+            let settled = tokio::time::timeout(
+                Duration::from_secs(2),
+                settle_open_operation(&state, &mut record),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{action} {status}: it asked the registry"))
+            .expect("nothing to read");
+            assert!(!settled, "{action} {status}");
+            assert!(
+                router
+                    .next_outgoing_within(Duration::from_millis(200))
+                    .await
+                    .is_none(),
+                "{action} {status}"
             );
             assert_eq!(
-                sent.payload["params"],
-                json!({ "hive_id": hive_id }),
-                "{answer}"
+                (
+                    record.status.as_str(),
+                    record.error_summary.as_str(),
+                    record.updated_at_ms,
+                    record.completed_at_ms
+                ),
+                (status, "", 1, 0),
+                "{action} {status}"
             );
-            assert_eq!(read.expect("the registry's answer"), outcome, "{answer}");
         }
         // What the operator and the model read of it: the hive id is not one, add_hive refuses it.
         for text in ["hive_id is not a hive id", "add_hive refuses it"] {
@@ -30608,7 +30698,7 @@ mod tests {
 
     /// FINDINGS A-298: Archi's publish recreates no node. With `set_current`, its default, it sends
     /// SY.admin's `publish_runtime_package` and nothing after it: no `list_nodes`, no `kill_node`,
-    /// no `run_node`, where up to 0.1.135 every motherbee node of the runtime was killed with its
+    /// no `run_node`, where up to 0.1.136 every motherbee node of the runtime was killed with its
     /// instance purged (its ILK and the secrets it owned gone) and run again on `current`. Its
     /// answer says what follows instead: the hive moves the running nodes that follow `current`
     /// within a minute, in place, and the running nodes of the packages built on the runtime with

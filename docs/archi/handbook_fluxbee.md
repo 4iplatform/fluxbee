@@ -1688,7 +1688,7 @@ a plan step or the operator's `Publish Software` panel (its `Promote To Current`
   in the `.zip` the operator uploaded (ask for it) or in the plan's `inline_package`. No read
   shows a published version's template. Never recreate the node for it (`kill_node` with
   `purge_instance`, then `run_node`): that removes its ILK and the secrets it owns.
-- Up to 0.1.135 the `Publish Software` panel recreated every motherbee node of the runtime on
+- Up to 0.1.136 the `Publish Software` panel recreated every motherbee node of the runtime on
   such a publish: a new ILK, its owned secrets gone, `launched_by: "archi"`. It no longer does.
 
 ### 7.3 Update node config
