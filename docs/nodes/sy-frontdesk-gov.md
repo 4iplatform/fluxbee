@@ -338,7 +338,7 @@ There is nothing to configure. `handle_control_plane` answers:
 
 | Request | Reply |
 | --- | --- |
-| `NODE_STATUS_GET` | the SDK's managed answer (`build_node_status_response_payload`): `health_state` `HEALTHY` when `CONFIGURED`, `DEGRADED` (never `ERROR`) when `UNCONFIGURED` or `FAILED_CONFIG`, with `lifecycle_state` and the reason in `last_error`: `missing_secret` (no key) or `invalid_ai_config` (`ai` settings it cannot use: the installation file, or the hive.yaml `ai` section while the hive holds none) |
+| `NODE_STATUS_GET` | the SDK's managed answer (`build_node_status_response_payload`): `health_state` `HEALTHY` when `CONFIGURED`, `DEGRADED` (never `ERROR`) when `UNCONFIGURED` or `FAILED_CONFIG`, with `lifecycle_state` and the reason in `last_error`: `missing_secret` (no key) or `invalid_ai_config` (`ai` settings it cannot use: the installation file, or the hive.yaml `ai` section while the hive holds none). Then its AI runtime's load (since 0.1.142, FINDINGS A-290): `extensions.ai_runtime`, and `DEGRADED` with `last_error` `ai_runtime_saturated` while the runtime turned work away in the last 30 s (see Health) |
 | `CONFIG_GET` | `state`, `config_source: "baked"`, `api_key_source`, the provider and model; `error` is the same reason as `last_error` |
 | `CONFIG_SET` | refuses every field under `config` (`config_not_accepted`), the prompt (`behavior`) and `runtime` included; an empty `config` re-reads the key from the vault. Nothing is persisted |
 | `PING`, `STATUS` | `PONG`, `STATUS_RESPONSE` |
@@ -404,6 +404,11 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
     and a burst of them never stops a status or config request. Past its places a message is
     dropped unanswered, and its sender's own timeout reports it: io.api's
     `frontdesk_unavailable` after 10 s, IO.cloud's `FRONTDESK_UNAVAILABLE` after 20 s.
+- **An answer over the frame limit** (128 KiB) fails its message alone (since 0.1.142, FINDINGS
+  A-294): it is not sent, and the node goes on. A conversation's or a handoff's sender gets the
+  error `ai_runtime_reply_too_large` (`retryable: false`) in its place, unless that does not fit
+  either (the request's context, which a reply carries, is what is too large); a `system` request
+  gets nothing. Before, it stopped the node's process.
 
 ## Health
 
@@ -422,10 +427,19 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   and the queue full; its sender gets `ai_runtime_busy`), `ai runtime dropped a message, neither
   run nor answered` (a handoff or a request past its places), and `ai runtime sent no
   ai_runtime_busy answer to a refused LLM turn`. The `ai runtime metrics` line, every 30 s, counts
-  them (`turns_refused`, `direct_dropped`, `busy_answers_dropped`) beside `turns_waiting`.
+  them (`turns_refused`, `direct_dropped`, `busy_answers_dropped`) beside `turns_waiting`,
+  `turns_running` and `direct_running`, and `replies_too_large`.
 - `NODE_STATUS_GET` says whether the conversation runs: `HEALTHY`, or `DEGRADED` with
   `missing_secret` or `invalid_ai_config` in `last_error`. Handoffs work in every state. `CONFIG_GET`
   (through SY.admin's `node_control_config_get`) shows the same state and reason.
+- Since 0.1.142 (FINDINGS A-290) it also says whether the AI runtime keeps up:
+  `extensions.ai_runtime` has its `state` (`serving`, or `saturated` while it turned work away in
+  the last 30 s: a turn refused `ai_runtime_busy`, a handoff or a request dropped past its places,
+  a busy answer not sent), `last_turned_away_ms_ago`, the workers busy of 4, the turns waiting of
+  128, the direct lane's tasks of 64, and the counts since it started. While `saturated`, a
+  `CONFIGURED` frontdesk reports `DEGRADED` with `last_error` `ai_runtime_saturated`, and `HEALTHY`
+  again 30 s after the last one; one without its key keeps `missing_secret`. Before 0.1.142 a
+  saturated frontdesk read `HEALTHY`.
 
 ## Links
 

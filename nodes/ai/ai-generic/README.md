@@ -22,7 +22,8 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   - an invalid one: **FAILED_CONFIG**, until a valid `CONFIG_SET` arrives.
 - **Until it is CONFIGURED**, it answers every `user` message with a `node_not_configured` error and
   reports `DEGRADED` to `NODE_STATUS_GET`, with its `lifecycle_state` and, for a rejected
-  `config.json`, the reason in `last_error`. CONFIGURED reports `HEALTHY`.
+  `config.json`, the reason in `last_error`. CONFIGURED reports `HEALTHY`, unless its AI runtime
+  turned work away in the last 30 s (`NODE_STATUS_GET`, below).
 - **A `user` message needs `meta.thread_id`.** Without it the node answers an `invalid_payload`
   error.
 - **Without `FLUXBEE_NODE_ILK_ID`** the node has no SY.vault client: it cannot read its key, and it
@@ -49,13 +50,13 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   its reason. An answer to one would go to the router's own UUID, and the two would bounce it
   forever (FINDINGS A-112). SY.timer and wf-generic leave the same ones unanswered (FINDINGS
   A-218).
-- **A tap copy is neither handled nor answered,** whatever its kind: the AI SDK's runtime takes no
 - **SY.vault's `VAULT_SECRET_CHANGED` broadcast is not answered either** (since 0.1.142, FINDINGS
   A-325; the AI SDK's `is_vault_secret_changed`): it is an event, which SY.vault takes no answer
   to, and the node asks SY.vault for its key at each model call, so it has nothing to refresh. Its
   line is at debug. Before, the node answered each one, at every change of a secret and once per
   secret at SY.vault's start, with an `unknown_system_msg` error that SY.vault dropped. Any other
   `system` message from a node that is no control verb is still answered `unknown_system_msg`.
+- **A tap copy is neither handled nor answered,** whatever its kind: the AI SDK's runtime takes no
   message with `meta.via_tap` to the node (FINDINGS A-248). The node used as a tap's target runs
   no model and no control verb for another node's message, and sends nothing to its sender. The
   journal shows the copies as `tap_copies_ignored` in the `ai runtime metrics` line (every 30 s);
@@ -69,6 +70,20 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   - `ai_model`: the model in effect, `{name, source}`, where `source` is `behavior.model` or
     `hive` (with an `error` when the hive has no model for the node's provider);
   - the state of the agent definition (`definition_state`, `definition`, `active_prompt_chars`).
+- **`NODE_STATUS_GET`** returns the SDK's managed answer for the config state (above), then its AI
+  runtime's load (since 0.1.142, FINDINGS A-290; the AI SDK's `RuntimeLoad`):
+  - `extensions.ai_runtime`: `state`, `serving` or `saturated`; `window_s` (30);
+    `last_turned_away_ms_ago`; `model_workers` (4) and `model_workers_busy`; `turns_waiting` and
+    `queue_capacity` (128); `direct_capacity` (64) and `direct_running`; and since the node
+    started `turns_refused`, `direct_dropped`, `busy_answers_dropped` and `replies_too_large`.
+  - `saturated` means it turned work away in the last 30 s: a turn refused `ai_runtime_busy` (its 4
+    workers busy and 128 more waiting), a control request dropped with its 64 places taken, or a
+    busy answer not sent. A CONFIGURED node then reports `DEGRADED`, with `last_error`
+    `ai_runtime_saturated` and a message that says when, the bounds and the counts; 30 s after the
+    last one it reports `HEALTHY` again, though turns may still wait. A node `DEGRADED` by its
+    config keeps its config's `last_error`.
+  - Since 0.1.136 the node answers its status at once however busy, so before 0.1.142 a saturated
+    node read `HEALTHY`, its saturation only in its journal (FINDINGS A-290).
 - **`NODE_HELP`** returns the runtime's tool catalog: `{status: "ok", node_name, runtime,
   runtime_version, tools}`, the cards of [Tools](#tools). `runtime_version` is the one the
   orchestrator launched it at (`_system.runtime_version` of its `config.json`), `null` for a node
@@ -337,6 +352,17 @@ reads nothing of the hive's ([hive-config-update-v1](../../../docs/hive-config-u
 - **A message runs once.** When its handler fails or runs out of time, the sender gets an
   `ai_runtime_error` or `ai_runtime_timeout` error and the message is not run again: it may already
   have called the model or a tool such as `publish_html_page`.
+- **An answer over the frame limit fails its message alone** (since 0.1.142, FINDINGS A-294): a
+  reply the SDK's sender refuses as larger than 128 KiB (a request whose `meta.context`, which the
+  reply carries, is that large; a control answer that large) is not sent, and the node goes on with
+  every other message. The sender of a conversation's or a WF's message gets the same reply with an
+  error in place of its payload, `ai_runtime_reply_too_large` (`retryable: false`), named
+  `<msg>.error`; a control request gets nothing, and its sender reports its own timeout. When the
+  error does not fit either (the context is what is too large), nothing reaches the sender. The
+  journal's WARN `ai runtime could not send a reply` names it, and `replies_too_large` counts it in
+  the `ai runtime metrics` line and in the status. Before, such a reply stopped the node's process,
+  and every message in flight with it. Long text never gets there: the node offloads it to a
+  `content_ref`.
 
 ## Tools
 

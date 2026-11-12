@@ -482,9 +482,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
-- A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners).
+- A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners; built on `coa/aisdk-142`, planned 0.1.142).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
-- A-294 🔵 One answer over the frame limit stops the whole AI runtime (low; the AI SDK).
+- A-294 🔵 One answer over the frame limit stops the whole AI runtime (low; the AI SDK; built on `coa/aisdk-142`, planned 0.1.142).
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
@@ -4193,6 +4193,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (the AI SDK alone):** a write refused as too large fails that message alone, counted
   and logged, as an exhausted recoverable write does.
 - **The operator (2026-11-11):** after the sweep (the AI SDK alone, with the next change there).
+- **Built on `coa/aisdk-142` (planned 0.1.142, the AI SDK alone, with A-290, A-325 and A-327's
+  `tool_choice`):** `send_reply` settles a reply the sender refuses as too large within its
+  message (`send_reply_too_large`), as the WF engine, SY.wf-rules, SY.timer and SY.admin treat an
+  answer too large to send: the runtime goes on. The requester of a conversation's or a WF's
+  message gets the same reply with an error in place of its payload, `ai_runtime_reply_too_large`
+  (`retryable: false`: the message ran), named `<msg>.error`, without the evaluation of the answer
+  that did not go, its trace entry adding `reply_too_large`; a reply to a `system` or `admin`
+  request gets nothing, as for a handler that fails; an error that does not fit either (the
+  request's context is what is too large) sends nothing. Each counts in `replies_too_large` (the
+  metrics line and A-290's load) and a bounded WARN names it (*"ai runtime could not send a reply:
+  it is larger than a message may carry"*). A handler that panics still stops the runtime. Tests:
+  `an_answer_too_large_fails_its_message_alone`,
+  `a_control_answer_too_large_fails_alone_with_nothing_in_its_place`,
+  `a_context_too_large_for_any_answer_fails_its_message_alone` (runtime.rs) and
+  `an_answer_over_the_frame_limit_fails_that_message_alone` (tests/runtime_lanes.rs, through the
+  SDK's own sender), each failing with the old settle (the runtime stopped).
 
 ### A-293 [IO/io.cloud] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; through IO.cloud's public door a `phone` that is a number and a missing `display_name` refused `INVALID_REQUEST` naming the field, nothing created; a registration ok in 1.42 s and again `existing` in 0.50 s; with the frontdesk down `FRONTDESK_UNAVAILABLE` in 0.79 s, as before 0.1.137; a retryable frontdesk error, its own case, not provoked (no frontdesk sends one): by its tests; the `request_id` on 9 of 9 request lines) (found 2026-11-11 by A-257's review fixes; read in the code) — io.cloud answers `FRONTDESK_REJECTED` to a retryable frontdesk error
 
@@ -4291,6 +4307,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   runners put it in `NODE_STATUS_GET`'s `extensions`, which the orchestrator passes on, and report
   `DEGRADED` while turns were refused in the last interval.
 - **The operator (2026-11-11):** after the sweep (the AI SDK, then the runners alone, with the next change there).
+- **Built on `coa/aisdk-142` (planned 0.1.142, the AI SDK with both runners, A-294, A-325 and
+  A-327's `tool_choice`):** the AI SDK's `RuntimeLoad`, a handle a node keeps and hands its runtime
+  (`NodeRuntime::with_load`), and `RuntimeLoad::add_to_status` on the managed answer: its
+  `extensions.ai_runtime` (`state` `serving` or `saturated`, `window_s`,
+  `last_turned_away_ms_ago`, `model_workers` and `model_workers_busy`, `turns_waiting` and
+  `queue_capacity`, `direct_capacity` and `direct_running`, and since the start `turns_refused`,
+  `direct_dropped`, `busy_answers_dropped`, `replies_too_large`). `saturated` while the runtime
+  turned work away in its last window, the metrics interval (30 s): a turn refused, a message
+  dropped from the direct lane, a busy answer not sent; then a `HEALTHY` node reads `DEGRADED`
+  with `last_error` `ai_runtime_saturated` (its message says when, the bounds and the counts), as
+  io.web reports its port, and `HEALTHY` again 30 s after the last one; a node `DEGRADED` by its
+  config keeps its config's `last_error`. The metrics line gains `turns_running` and
+  `direct_running`. ai.generic and SY.frontdesk.gov answer `NODE_STATUS_GET` with it
+  (`node_status_payload`). Tests: `a_saturated_runtime_reads_degraded_until_its_window_passes`,
+  `a_message_dropped_from_the_direct_lane_saturates_the_load`,
+  `a_load_whose_runtime_does_not_run_adds_nothing` (runtime.rs),
+  `the_status_reads_the_saturated_runtime_it_was_given` (tests/runtime_lanes.rs, through
+  `with_load`), and each runner's `node_status_reports_the_ai_runtimes_load`; each failing when
+  the status leaves the load out.
 
 ### A-289 [General/router] 🔵 low (found 2026-11-11 by the router's 0.1.134 builder and review; read in the code; there before it; several routers a hive, not supported) — A broadcast from a router that is not the gateway needs ttl 4 to cross the WAN
 

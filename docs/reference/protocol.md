@@ -46,7 +46,7 @@ uses the same framing: node to router, router to sibling router, hive to hive.
 
 | Who has the big frame | What happens | Code |
 | --- | --- | --- |
-| A Rust node sending | `NodeSender::send` refuses it with `NodeError::MessageTooLarge` and logs `FRAME_TOO_LARGE`; nothing is queued. A `text` payload is offloaded to a blob before this check (§8). | `split.rs` |
+| A Rust node sending | `NodeSender::send` refuses it with `NodeError::MessageTooLarge` and logs `FRAME_TOO_LARGE`; nothing is queued. A `text` payload is offloaded to a blob before this check (§8). The AI runtime (ai.generic, SY.frontdesk.gov) fails that message alone: its sender gets the error `ai_runtime_reply_too_large` in its place, a `system` or `admin` request nothing (since 0.1.142, FINDINGS A-294; before, the node's process stopped). | `split.rs` |
 | A Go node sending | `NodeSender.Send` refuses it with `*MessageTooLargeError` and logs `FRAME_TOO_LARGE`; nothing is queued and the connection stays up. Since 0.1.141, when the payload is `text`, its text goes as a blob instead if that makes the frame fit: only a message over the limit is offloaded (§8). | `client.go` |
 | The router, reading from a node | The read fails; the router logs `FRAME_TOO_LARGE — node sent oversized frame; disconnecting`, ends the connection and unregisters the node. | `handle_node` |
 | The router, handing a link a sender's frame it enlarged on the way (the sender's name, the action class, a resolve's trace entry; an agent's memory package is trimmed to fit) | Not queued: the sender is answered `UNREACHABLE` `FRAME_TOO_LARGE` over the link the message came in on, a broadcast once, with at most one warning every 30 s (since 0.1.124, FINDINGS A-202). SY.admin, SY.identity, SY.vault and SY.orchestrator keep their replies 1 KiB under the frame for these additions (A-198). | `frame_over_limit` |
@@ -363,6 +363,10 @@ the payload of the answer. It is a protected verb (§7).
 - Go: `BuildDefaultNodeStatusResponse`, and `BuildManagedNodeStatusResponse`, which takes the
   health from the config state (`CONFIGURED` is `HEALTHY`, anything else `DEGRADED`) and adds
   `last_error` (`go/fluxbee-go-sdk/status.go`).
+- The AI nodes (ai.generic, SY.frontdesk.gov) add their AI runtime's load to the managed answer
+  (since 0.1.142, FINDINGS A-290; `RuntimeLoad::add_to_status`, `crates/fluxbee_ai_sdk`):
+  `extensions.ai_runtime`, and `DEGRADED` with `last_error` `ai_runtime_saturated` while the
+  runtime turned work away in its last 30 s. io.web adds `extensions.web` the same way.
 
 `NODE_HELP` (`MSG_NODE_HELP`, `crates/fluxbee_sdk/src/protocol.rs`) asks a node to describe itself
 ([agent-tools-v1](../agent-tools-v1.md) §3.3). It travels as `NODE_STATUS_GET` does: SY.admin's

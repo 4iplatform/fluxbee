@@ -16,8 +16,9 @@ use fluxbee_ai_sdk::{
     FunctionCallingRunner, FunctionRunInput, FunctionTool, FunctionToolDefinition,
     FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
     Message, ModelInputOptions, ModelSettings, NodeRuntime, ProviderError, ProviderErrorKind,
-    ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool, ThreadStatePutTool,
-    ThreadStateStore, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS, PROVIDER_FAILURE_TEXT,
+    ResolvedModelInput, RuntimeConfig, RuntimeLoad, RuntimeLoadSnapshot, TenantSource,
+    ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore, ToolRunWatch, UsageRecorder,
+    MSG_PING, MSG_STATUS, PROVIDER_FAILURE_TEXT,
 };
 use fluxbee_sdk::managed_control_plane::{
     build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
@@ -365,6 +366,8 @@ struct GenericAiNode {
     control_plane: Arc<RwLock<ControlPlaneState>>,
     /// Where each model call's usage record goes (docs/router-stream-v1.md §7.2).
     usage: UsageRecorder,
+    /// Its AI runtime's load, which its `NODE_STATUS_GET` answer reports (FINDINGS A-290).
+    runtime_load: RuntimeLoad,
 }
 
 /// What the identity SHM says of a case's ILK (`IlkTenantLookup`).
@@ -2783,10 +2786,15 @@ impl GenericAiNode {
 
     /// The SDK's managed answer: HEALTHY when CONFIGURED; DEGRADED, never ERROR, when the
     /// conversation is off (no key, or a bad hive.yaml `ai` section), with the reason in
-    /// `last_error`. The deterministic handoff works either way.
+    /// `last_error`. The deterministic handoff works either way. Its AI runtime's load follows
+    /// (`node_status_payload`).
     async fn build_node_status_get_response(&self) -> Value {
         let state = self.control_plane.read().await;
-        build_node_status_response_payload(state.current_state, state.last_error.as_ref())
+        node_status_payload(
+            state.current_state,
+            state.last_error.as_ref(),
+            self.runtime_load.snapshot(),
+        )
     }
 }
 
@@ -3293,6 +3301,7 @@ async fn run_unconfigured_bootstrap(
     let gov_identity_bridge: Option<Arc<dyn IdentityCaller>> =
         Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())));
     let usage = UsageRecorder::start(dispatcher.clone());
+    let runtime_load = RuntimeLoad::new();
     let ai_node = GenericAiNode {
         node_name: node_name.clone(),
         self_ilk_id: self_ilk_id.clone(),
@@ -3307,13 +3316,14 @@ async fn run_unconfigured_bootstrap(
         vault,
         control_plane: Arc::new(RwLock::new(state)),
         usage,
+        runtime_load: runtime_load.clone(),
     };
     // Now that the dispatcher/vault exist, resolve the AI token from SY.vault, waiting for a vault
     // that does not answer yet (up to VAULT_BOOT_WAIT, FINDINGS A-141), and flip to Configured
     // when present (autonomous SY.* pattern, cf. build_architect_ai_runtime). No token => stay
     // Unconfigured (degraded — the deterministic handoff still works).
     ai_node.boot_self_configure().await;
-    let runtime = NodeRuntime::new(dispatcher, ai_node);
+    let runtime = NodeRuntime::new(dispatcher, ai_node).with_load(runtime_load);
     // Its replies carry its own ILK (docs/router-stream-v1.md §6.2); a SY unit has no
     // FLUXBEE_NODE_ILK_ID, so the default would leave them without one.
     runtime
@@ -3691,6 +3701,23 @@ fn build_control_plane_response(msg: &Message, response_msg: &str, payload: Valu
     let mut response = build_reply_message_runtime_src(msg, payload);
     response.meta.msg = Some(response_msg.to_string());
     response
+}
+
+/// `NODE_STATUS_GET`'s answer: the SDK's managed answer for the config state, then the AI
+/// runtime's load, when the runtime runs (FINDINGS A-290): `extensions.ai_runtime`, and `DEGRADED`
+/// with `last_error` `ai_runtime_saturated` while the runtime turned work away in its last window
+/// (`RuntimeLoadSnapshot::add_to_status`): a turn refused `ai_runtime_busy`, or a handoff or a
+/// control request dropped with every place of its direct lane taken.
+fn node_status_payload(
+    state: NodeLifecycleState,
+    last_error: Option<&ControlPlaneErrorInfo>,
+    load: Option<RuntimeLoadSnapshot>,
+) -> Value {
+    let mut payload = build_node_status_response_payload(state, last_error);
+    if let Some(load) = load {
+        load.add_to_status(&mut payload);
+    }
+    payload
 }
 
 fn redact_secrets(value: &Value) -> Value {
@@ -4570,6 +4597,7 @@ mod tests {
             vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState::default())),
             usage: UsageRecorder::disabled(),
+            runtime_load: RuntimeLoad::new(),
         }
     }
 
@@ -4619,6 +4647,58 @@ mod tests {
         assert_eq!(configured["health_state"], json!("HEALTHY"));
         assert_eq!(configured["lifecycle_state"], json!("CONFIGURED"));
         assert!(configured.get("last_error").is_none());
+    }
+
+    /// A-290: the status reports the AI runtime's load once the runtime runs, as
+    /// `extensions.ai_runtime`; while it turned work away in its last window (a handoff dropped
+    /// here), a CONFIGURED frontdesk reads DEGRADED with `last_error` `ai_runtime_saturated`, and
+    /// one without its key keeps `missing_secret`. Before the runtime runs, the managed answer
+    /// alone.
+    #[test]
+    fn node_status_reports_the_ai_runtimes_load() {
+        let saturated = RuntimeLoadSnapshot {
+            state: fluxbee_ai_sdk::RuntimeLoadState::Saturated,
+            window_s: 30,
+            last_turned_away_ms_ago: Some(800),
+            model_workers: 4,
+            model_workers_busy: 0,
+            turns_waiting: 0,
+            queue_capacity: 128,
+            direct_capacity: 64,
+            direct_running: 8,
+            turns_refused: 0,
+            direct_dropped: 3,
+            busy_answers_dropped: 0,
+            replies_too_large: 0,
+        };
+        let busy = node_status_payload(
+            NodeLifecycleState::Configured,
+            None,
+            Some(saturated.clone()),
+        );
+        assert_eq!(busy["health_state"], json!("DEGRADED"));
+        assert_eq!(busy["last_error"]["code"], json!("ai_runtime_saturated"));
+        assert_eq!(busy["extensions"]["ai_runtime"]["direct_dropped"], json!(3));
+
+        let no_key = node_status_payload(
+            NodeLifecycleState::Unconfigured,
+            Some(&ControlPlaneErrorInfo {
+                code: "missing_secret".to_string(),
+                message: "no AI key in SY.vault".to_string(),
+            }),
+            Some(saturated),
+        );
+        assert_eq!(no_key["health_state"], json!("DEGRADED"));
+        assert_eq!(no_key["last_error"]["code"], json!("missing_secret"));
+        assert_eq!(
+            no_key["extensions"]["ai_runtime"]["state"],
+            json!("saturated")
+        );
+
+        assert_eq!(
+            node_status_payload(NodeLifecycleState::Configured, None, None),
+            build_node_status_response_payload(NodeLifecycleState::Configured, None)
+        );
     }
 
     /// The vault's answer to `request`, on the request's trace.

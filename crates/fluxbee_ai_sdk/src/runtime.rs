@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -9,7 +9,7 @@ use fluxbee_sdk::message_writer::{self, Writer};
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{is_solution_kind, is_system_kind};
 use fluxbee_sdk::{NodeSender, RouterDispatcher, RpcCommandReceiver, RpcError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
@@ -21,9 +21,21 @@ use crate::errors::AiSdkError;
 use crate::errors::Result;
 use crate::function_calling::DEFAULT_MAX_TURNS;
 use crate::llm::MODEL_CALL_TIMEOUT;
-use crate::message::{build_reply_message_runtime_src, set_reply_act, take_reply_act, Message};
+use crate::message::{
+    apply_error_reply_msg_suffix, build_reply_message_runtime_src, set_reply_act, take_reply_act,
+    Message,
+};
 use crate::node_trait::AiNode;
 use crate::refusal_log::RefusalLog;
+
+/// The code of the error that goes in place of a reply over the frame limit (FINDINGS A-294,
+/// `reply_too_large_stand_in`), and the word its trace entry adds.
+pub const AI_RUNTIME_REPLY_TOO_LARGE: &str = "ai_runtime_reply_too_large";
+const REPLY_TOO_LARGE_ACT: &str = "reply_too_large";
+
+/// The `last_error.code` of a node whose AI runtime turned work away within its last window
+/// (FINDINGS A-290, `RuntimeLoadSnapshot::add_to_status`).
+pub const AI_RUNTIME_SATURATED: &str = "ai_runtime_saturated";
 
 /// Command channel the AI runtime drains. Binary callers must declare a
 /// matching `command_channel` + `post_pending_rule` in the dispatcher
@@ -101,6 +113,8 @@ pub struct RuntimeConfig {
     pub direct_user_capacity: usize,
     /// Retries of the write of a reply, the only step the runtime retries.
     pub write_retry: RetryPolicy,
+    /// How often the `ai runtime metrics` line is logged, and how long the runtime's load reads
+    /// `saturated` after it last turned work away (`RuntimeLoad`, FINDINGS A-290).
     pub metrics_log_interval: Duration,
     /// The agent's own ILK, stamped as the sender of its replies (docs/router-stream-v1.md §6.2:
     /// cognition reads who says what). None leaves a reply without `src_ilk`, never the human's.
@@ -166,6 +180,146 @@ impl Default for RetryPolicy {
 pub struct NodeRuntime<N: AiNode> {
     dispatcher: Arc<RouterDispatcher>,
     node: N,
+    /// What the runtime counts, which a node reads for its status (`with_load`).
+    load: RuntimeLoad,
+}
+
+/// The AI runtime's load, read-only, for the node's own status (FINDINGS A-290): its lanes' places
+/// and what they turned away. A node makes one, keeps a clone and hands it to its runtime
+/// (`NodeRuntime::with_load`); the runtime counts into it while it runs. Since A-257 (0.1.136) a
+/// node answers `NODE_STATUS_GET` at once however busy, so its status no longer times out when its
+/// workers are taken: `add_to_status` is how a saturated runtime reaches it.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeLoad {
+    metrics: Arc<RuntimeMetrics>,
+}
+
+impl RuntimeLoad {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The load now, or None until the runtime this handle was given to runs.
+    pub fn snapshot(&self) -> Option<RuntimeLoadSnapshot> {
+        self.metrics.load_snapshot(Instant::now())
+    }
+
+    /// `RuntimeLoadSnapshot::add_to_status` with the load now; nothing until the runtime runs.
+    pub fn add_to_status(&self, payload: &mut Value) {
+        if let Some(load) = self.snapshot() {
+            load.add_to_status(payload);
+        }
+    }
+}
+
+/// What the AI runtime's load says of its node (FINDINGS A-290).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLoadState {
+    /// The runtime turned no work away in its last window.
+    Serving,
+    /// The runtime turned work away in its last window: an LLM turn refused `ai_runtime_busy`
+    /// (every model worker busy and the queue for them full), a message dropped from its direct
+    /// lane, or a refused turn's busy answer not sent.
+    Saturated,
+}
+
+/// The AI runtime's load at one moment (`RuntimeLoad::snapshot`), as a node reports it in its
+/// status: `extensions.ai_runtime` of its `NODE_STATUS_GET` answer. The counts of what was turned
+/// away are the runtime's since it started, as in its `ai runtime metrics` line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLoadSnapshot {
+    pub state: RuntimeLoadState,
+    /// How long the runtime stays `saturated` after it last turned work away, in seconds: its
+    /// `metrics_log_interval` (30 s by default).
+    pub window_s: u64,
+    /// How long ago the runtime last turned work away, in milliseconds; None if it never did.
+    pub last_turned_away_ms_ago: Option<u64>,
+    /// The model workers (`worker_pool_size`), and how many run an LLM turn now.
+    pub model_workers: usize,
+    pub model_workers_busy: u64,
+    /// The LLM turns waiting for a worker now, of at most `queue_capacity`.
+    pub turns_waiting: u64,
+    pub queue_capacity: usize,
+    /// The direct lane's places (`direct_capacity`), and how many run now.
+    pub direct_capacity: usize,
+    pub direct_running: u64,
+    pub turns_refused: u64,
+    pub direct_dropped: u64,
+    pub busy_answers_dropped: u64,
+    /// Replies over the frame limit, each of which failed its message alone (FINDINGS A-294).
+    pub replies_too_large: u64,
+}
+
+impl RuntimeLoadSnapshot {
+    /// Puts the load in `payload`, a `NODE_STATUS_GET` answer (the managed answer of fluxbee-sdk's
+    /// `build_node_status_response_payload`): as `extensions.ai_runtime`, beside any other
+    /// extension; and while it is `saturated`, a `HEALTHY` node reads `DEGRADED`, with
+    /// `last_error` `{code: "ai_runtime_saturated", message}`, as io.web reports its port. A node
+    /// already `DEGRADED` by its config keeps its config's `last_error`. The orchestrator's
+    /// `get_node_status` passes `health_state`, `last_error` and `extensions` on.
+    pub fn add_to_status(&self, payload: &mut Value) {
+        let Some(fields) = payload.as_object_mut() else {
+            return;
+        };
+        if self.state == RuntimeLoadState::Saturated
+            && fields.get("health_state").and_then(Value::as_str) == Some("HEALTHY")
+        {
+            fields.insert("health_state".to_string(), json!("DEGRADED"));
+            fields.insert(
+                "last_error".to_string(),
+                json!({"code": AI_RUNTIME_SATURATED, "message": self.saturation_message()}),
+            );
+        }
+        let extensions = fields
+            .entry("extensions".to_string())
+            .or_insert_with(|| json!({}));
+        if !extensions.is_object() {
+            *extensions = json!({});
+        }
+        extensions["ai_runtime"] = serde_json::to_value(self).unwrap_or_default();
+    }
+
+    /// What `last_error.message` says of a saturated runtime.
+    fn saturation_message(&self) -> String {
+        let ago_s = self.last_turned_away_ms_ago.unwrap_or_default() as f64 / 1000.0;
+        format!(
+            "The AI runtime turned work away {ago_s:.1} s ago: an LLM turn refused \
+             ai_runtime_busy (its {} model workers busy and its queue of {} full), a message \
+             dropped from its direct lane ({} places), or a busy answer not sent. It reports \
+             DEGRADED until {} s pass without one. Now {} workers are busy and {} turns wait. \
+             Since it started: {} turns refused, {} messages dropped, {} busy answers not sent.",
+            self.model_workers,
+            self.queue_capacity,
+            self.direct_capacity,
+            self.window_s,
+            self.model_workers_busy,
+            self.turns_waiting,
+            self.turns_refused,
+            self.direct_dropped,
+            self.busy_answers_dropped
+        )
+    }
+}
+
+/// The bounds a runtime runs on, which its load is read against.
+#[derive(Debug, Clone, Copy)]
+struct LoadBounds {
+    model_workers: usize,
+    queue_capacity: usize,
+    direct_capacity: usize,
+    window: Duration,
+}
+
+impl LoadBounds {
+    fn of(config: &RuntimeConfig) -> Self {
+        Self {
+            model_workers: config.worker_pool_size,
+            queue_capacity: config.queue_capacity,
+            direct_capacity: config.direct_capacity,
+            window: config.metrics_log_interval,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +344,10 @@ struct RuntimeMetrics {
     turns_queued: AtomicU64,
     /// LLM turns waiting for a worker now.
     turns_waiting: AtomicU64,
+    /// LLM turns running now, one on each busy worker (FINDINGS A-290).
+    turns_running: AtomicU64,
+    /// Tasks the direct lane runs now: messages that run without the model and busy answers.
+    direct_running: AtomicU64,
     /// LLM turns refused and never run: every worker busy and the queue full. Each is answered
     /// `ai_runtime_busy`, unless its answer counts in `busy_answers_dropped`.
     turns_refused: AtomicU64,
@@ -198,11 +356,17 @@ struct RuntimeMetrics {
     /// Refused turns whose answer `ai_runtime_busy` was not sent: every place of the direct lane
     /// for its `user` messages was taken.
     busy_answers_dropped: AtomicU64,
+    /// Replies over the frame limit (FINDINGS A-294): each failed its message alone.
+    replies_too_large: AtomicU64,
     /// When the journal names what the lanes turned away (`RefusalLogs`).
     refusal_logs: Mutex<RefusalLogs>,
+    /// The bounds the runtime runs on, set as it starts: its load is read against them
+    /// (`load_snapshot`).
+    bounds: Mutex<Option<LoadBounds>>,
 }
 
-/// What the lanes turn away, by kind (FINDINGS A-257).
+/// What the lanes turn away, by kind (FINDINGS A-257), and the replies too large to send
+/// (FINDINGS A-294).
 #[derive(Debug, Clone, Copy)]
 enum Refusal {
     /// An LLM turn refused (`turns_refused`).
@@ -211,16 +375,28 @@ enum Refusal {
     Dropped,
     /// A refused turn's answer `ai_runtime_busy` not sent (`busy_answers_dropped`).
     BusyAnswer,
+    /// A reply over the frame limit, not sent (`replies_too_large`). It turns no work away: the
+    /// message ran.
+    ReplyTooLarge,
+}
+
+impl Refusal {
+    /// Whether the runtime turned work away, which makes its load `saturated` (FINDINGS A-290).
+    fn turns_work_away(self) -> bool {
+        !matches!(self, Refusal::ReplyTooLarge)
+    }
 }
 
 /// One `RefusalLog` for each kind of refusal: the dispatch loop names a refusal as it turns it
 /// away, when its line is due, and the metrics loop names the end of a burst, which no later
-/// refusal would name.
+/// refusal would name. It also keeps when the lanes last turned work away (FINDINGS A-290).
 #[derive(Debug, Default)]
 struct RefusalLogs {
     turns: RefusalLog,
     dropped: RefusalLog,
     busy_answers: RefusalLog,
+    replies_too_large: RefusalLog,
+    last_turned_away: Option<Instant>,
 }
 
 impl RefusalLogs {
@@ -229,6 +405,7 @@ impl RefusalLogs {
             Refusal::Turn => &mut self.turns,
             Refusal::Dropped => &mut self.dropped,
             Refusal::BusyAnswer => &mut self.busy_answers,
+            Refusal::ReplyTooLarge => &mut self.replies_too_large,
         }
     }
 }
@@ -250,19 +427,59 @@ struct RuntimeMetricsSnapshot {
     tap_copies_ignored: u64,
     turns_queued: u64,
     turns_waiting: u64,
+    turns_running: u64,
+    direct_running: u64,
     turns_refused: u64,
     direct_dropped: u64,
     busy_answers_dropped: u64,
+    replies_too_large: u64,
 }
 
 impl RuntimeMetrics {
-    /// Counts one refusal of `kind` in its log: when its line is due, how many to name in it.
+    /// Counts one refusal of `kind` in its log: when its line is due, how many to name in it. One
+    /// that turns work away is the lanes' last (FINDINGS A-290).
     fn note_refusal(&self, kind: Refusal) -> Option<u64> {
-        self.refusal_logs
+        let now = Instant::now();
+        let mut logs = self
+            .refusal_logs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .of(kind)
-            .note(Instant::now())
+            .unwrap_or_else(PoisonError::into_inner);
+        if kind.turns_work_away() {
+            logs.last_turned_away = Some(now);
+        }
+        logs.of(kind).note(now)
+    }
+
+    /// The load at `now` (FINDINGS A-290): None until the runtime runs.
+    fn load_snapshot(&self, now: Instant) -> Option<RuntimeLoadSnapshot> {
+        let bounds = (*self.bounds.lock().unwrap_or_else(PoisonError::into_inner))?;
+        let last_turned_away = self
+            .refusal_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_turned_away;
+        let ago = last_turned_away.map(|at| now.saturating_duration_since(at));
+        let state = if ago.is_some_and(|ago| ago < bounds.window) {
+            RuntimeLoadState::Saturated
+        } else {
+            RuntimeLoadState::Serving
+        };
+        let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        Some(RuntimeLoadSnapshot {
+            state,
+            window_s: bounds.window.as_secs(),
+            last_turned_away_ms_ago: ago.map(|ago| ago.as_millis() as u64),
+            model_workers: bounds.model_workers,
+            model_workers_busy: count(&self.turns_running),
+            turns_waiting: count(&self.turns_waiting),
+            queue_capacity: bounds.queue_capacity,
+            direct_capacity: bounds.direct_capacity,
+            direct_running: count(&self.direct_running),
+            turns_refused: count(&self.turns_refused),
+            direct_dropped: count(&self.direct_dropped),
+            busy_answers_dropped: count(&self.busy_answers_dropped),
+            replies_too_large: count(&self.replies_too_large),
+        })
     }
 
     /// Names, for each kind, what the lanes turned away after its last line, once that line is
@@ -273,9 +490,14 @@ impl RuntimeMetrics {
             let mut logs = self
                 .refusal_logs
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            [Refusal::Turn, Refusal::Dropped, Refusal::BusyAnswer]
-                .map(|kind| (kind, logs.of(kind).flush(now)))
+                .unwrap_or_else(PoisonError::into_inner);
+            [
+                Refusal::Turn,
+                Refusal::Dropped,
+                Refusal::BusyAnswer,
+                Refusal::ReplyTooLarge,
+            ]
+            .map(|kind| (kind, logs.of(kind).flush(now)))
         };
         for (kind, count) in flushed {
             let Some(count) = count else {
@@ -300,6 +522,12 @@ impl RuntimeMetrics {
                     "ai runtime sent no ai_runtime_busy answer to more refused LLM turns since its \
                      last line: every place of the direct lane for user messages was taken"
                 ),
+                Refusal::ReplyTooLarge => tracing::warn!(
+                    replies = count,
+                    replies_too_large = self.replies_too_large.load(Ordering::Relaxed),
+                    "ai runtime could not send more replies since its last line, each larger than \
+                     a message may carry; each failed its message alone"
+                ),
             }
         }
     }
@@ -321,16 +549,30 @@ impl RuntimeMetrics {
             tap_copies_ignored: self.tap_copies_ignored.load(Ordering::Relaxed),
             turns_queued: self.turns_queued.load(Ordering::Relaxed),
             turns_waiting: self.turns_waiting.load(Ordering::Relaxed),
+            turns_running: self.turns_running.load(Ordering::Relaxed),
+            direct_running: self.direct_running.load(Ordering::Relaxed),
             turns_refused: self.turns_refused.load(Ordering::Relaxed),
             direct_dropped: self.direct_dropped.load(Ordering::Relaxed),
             busy_answers_dropped: self.busy_answers_dropped.load(Ordering::Relaxed),
+            replies_too_large: self.replies_too_large.load(Ordering::Relaxed),
         }
     }
 }
 
 impl<N: AiNode + 'static> NodeRuntime<N> {
     pub fn new(dispatcher: Arc<RouterDispatcher>, node: N) -> Self {
-        Self { dispatcher, node }
+        Self {
+            dispatcher,
+            node,
+            load: RuntimeLoad::default(),
+        }
+    }
+
+    /// Counts the runtime's load into `load`, a handle the node keeps for its status (FINDINGS
+    /// A-290): `RuntimeLoad::add_to_status` in its `NODE_STATUS_GET` answer.
+    pub fn with_load(mut self, load: RuntimeLoad) -> Self {
+        self.load = load;
+        self
     }
 
     pub async fn run_forever(self) -> Result<()> {
@@ -363,7 +605,7 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             .map_err(map_rpc_err)?;
         let writer = self.dispatcher.sender_snapshot();
         let (tx, mut rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
-        let metrics = Arc::new(RuntimeMetrics::default());
+        let metrics = self.load.metrics.clone();
 
         let read_timeout = config.read_timeout;
         let dispatcher_for_reader = self.dispatcher.clone();
@@ -404,9 +646,12 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             tap_copies_ignored = final_metrics.tap_copies_ignored,
             turns_queued = final_metrics.turns_queued,
             turns_waiting = final_metrics.turns_waiting,
+            turns_running = final_metrics.turns_running,
+            direct_running = final_metrics.direct_running,
             turns_refused = final_metrics.turns_refused,
             direct_dropped = final_metrics.direct_dropped,
             busy_answers_dropped = final_metrics.busy_answers_dropped,
+            replies_too_large = final_metrics.replies_too_large,
             "ai runtime stopped"
         );
 
@@ -629,6 +874,10 @@ struct Lanes<N, W> {
 
 impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
     fn new(node: Arc<N>, writer: W, config: RuntimeConfig, metrics: Arc<RuntimeMetrics>) -> Self {
+        *metrics
+            .bounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(LoadBounds::of(&config));
         Self {
             node,
             writer,
@@ -670,10 +919,10 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             );
             self.waiting.push_back(msg);
             self.metrics.turns_queued.fetch_add(1, Ordering::Relaxed);
-            self.note_waiting();
         } else {
             self.refuse_turn(msg);
         }
+        self.note_load();
         Ok(())
     }
 
@@ -705,7 +954,8 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
     /// `recoverable_exhausted` and the runtime goes on, and the worker a turn gives back takes the
     /// next waiting turn; any other error, or a task that panicked, stops the runtime, and no
     /// waiting turn starts, since it would be cut off as the runtime stops, after it may have
-    /// called its model.
+    /// called its model. A reply over the frame limit is no such error: `send_reply` settles it
+    /// within its message (FINDINGS A-294).
     fn settle(&mut self, (lane, ended): (Lane, TaskEnd)) -> Result<()> {
         match ended {
             Ok(Ok(())) => {}
@@ -725,6 +975,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
         if lane == Lane::Worker {
             self.start_waiting_turns();
         }
+        self.note_load();
         Ok(())
     }
 
@@ -746,13 +997,20 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
             };
             self.start_turn(msg);
         }
-        self.note_waiting();
     }
 
-    fn note_waiting(&self) {
-        self.metrics
-            .turns_waiting
-            .store(self.waiting.len() as u64, Ordering::Relaxed);
+    /// The lanes' load now, for the metrics line and the node's status (FINDINGS A-290): the turns
+    /// waiting, the turns running and what runs on the direct lane.
+    fn note_load(&self) {
+        let store = |counter: &AtomicU64, value: usize| {
+            counter.store(value as u64, Ordering::Relaxed);
+        };
+        store(&self.metrics.turns_waiting, self.waiting.len());
+        store(&self.metrics.turns_running, self.workers.len());
+        store(
+            &self.metrics.direct_running,
+            self.direct_control.len() + self.direct_user.len(),
+        );
     }
 
     /// Whether the direct lane has a place a task of `place` may take: any free one for a `system`
@@ -875,7 +1133,7 @@ impl<N: AiNode + 'static, W: ReplyWriter> Lanes<N, W> {
                 "ai runtime stopped with LLM turns waiting for a worker; they are not run"
             );
             self.waiting.clear();
-            self.note_waiting();
+            self.note_load();
         }
         while let Some(ended) = self.join_next().await {
             self.settle(ended)?;
@@ -1007,7 +1265,8 @@ async fn process_one<N: AiNode, W: ReplyWriter>(
 }
 
 /// Sends an answer to `requester`, the name the router stamped on the request: stamped as this
-/// node's (`stamp_reply`), with the node's entry in the cycle's trace.
+/// node's (`stamp_reply`), with the node's entry in the cycle's trace. A reply over the frame limit
+/// fails its message alone (`send_reply_too_large`).
 async fn send_reply<W: ReplyWriter>(
     writer: W,
     requester: Option<String>,
@@ -1022,13 +1281,39 @@ async fn send_reply<W: ReplyWriter>(
         config.self_ilk_id.as_deref(),
     );
     let note = reply_trace_note(requester.as_deref(), &mut response);
-    // Sending a reply again is safe: a send that timed out or was refused never queued it (the
-    // SDK's send is a cancel-safe channel send), so a reply cannot go out twice.
+    match write_reply(&writer, &response, &note, &config, &metrics).await {
+        Err(AiSdkError::Node(NodeError::MessageTooLarge { size, max })) => {
+            send_reply_too_large(
+                &writer,
+                requester.as_deref(),
+                &response,
+                note,
+                (size, max),
+                &config,
+                &metrics,
+            )
+            .await
+        }
+        written => written,
+    }
+}
+
+/// Writes one reply, retried by `write_retry`, and counts it in `responses_sent` once it went.
+/// Sending a reply again is safe: a send that timed out or was refused never queued it (the SDK's
+/// send is a cancel-safe channel send), so a reply cannot go out twice. A reply over the frame
+/// limit is refused before it is queued, `NodeError::MessageTooLarge`, and never retried.
+async fn write_reply<W: ReplyWriter>(
+    writer: &W,
+    reply: &Message,
+    note: &TraceNote,
+    config: &RuntimeConfig,
+    metrics: &Arc<RuntimeMetrics>,
+) -> Result<()> {
     execute_with_retry(
         || async {
             timeout(
                 config.write_timeout,
-                writer.send_traced(response.clone(), note.clone()),
+                writer.send_traced(reply.clone(), note.clone()),
             )
             .await
             .map_err(|_| AiSdkError::Timeout("router write timeout".to_string()))?
@@ -1041,6 +1326,116 @@ async fn send_reply<W: ReplyWriter>(
     .await?;
     metrics.responses_sent.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// What became of the error that goes in place of a reply too large to send (FINDINGS A-294).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandIn {
+    /// It went to the requester.
+    Sent,
+    /// None goes for the reply to a `system` or `admin` request (`reply_too_large_stand_in`).
+    NotForControl,
+    /// It was over the frame limit too, with this size: the request's context, which a reply
+    /// carries, is what made the reply too large. Nothing reached the requester.
+    TooLarge(usize),
+    /// Its write failed after its retries (`recoverable_exhausted`).
+    Failed,
+}
+
+impl StandIn {
+    fn describe(self) -> String {
+        match self {
+            StandIn::Sent => format!("sent: an error {AI_RUNTIME_REPLY_TOO_LARGE}"),
+            StandIn::NotForControl => {
+                "none: a control request's sender reports its own timeout".to_string()
+            }
+            StandIn::TooLarge(size) => format!(
+                "not sent: its error answer was {size} bytes too, the request's context it carries \
+                 being too large; nothing reached the sender"
+            ),
+            StandIn::Failed => "not sent: its write failed".to_string(),
+        }
+    }
+}
+
+/// A reply over the frame limit fails its message alone (FINDINGS A-294), as the other nodes treat
+/// an answer too large to send (the WF engine, SY.wf-rules, SY.timer, SY.admin's
+/// `REPLY_TOO_LARGE`): it counts in `replies_too_large`, its requester gets the error
+/// `reply_too_large_stand_in` makes in its place, and the runtime goes on with every other
+/// message, as after a write that failed after its retries. Before, the error stopped the
+/// runtime, and the node's process with it, cutting every turn in flight. A WARN names it, at once
+/// and then at most one every 10 s with how many since (`replies`).
+async fn send_reply_too_large<W: ReplyWriter>(
+    writer: &W,
+    requester: Option<&str>,
+    reply: &Message,
+    mut note: TraceNote,
+    (size, max): (usize, usize),
+    config: &RuntimeConfig,
+    metrics: &Arc<RuntimeMetrics>,
+) -> Result<()> {
+    let total = metrics.replies_too_large.fetch_add(1, Ordering::Relaxed) + 1;
+    let (stand_in, failed) = match reply_too_large_stand_in(reply, size, max) {
+        None => (StandIn::NotForControl, None),
+        Some(stand_in) => {
+            // Its trace entry says what the node did, and that its answer did not go.
+            note.act.push(REPLY_TOO_LARGE_ACT.to_string());
+            match write_reply(writer, &stand_in, &note, config, metrics).await {
+                Ok(()) => (StandIn::Sent, None),
+                Err(AiSdkError::Node(NodeError::MessageTooLarge { size, .. })) => {
+                    (StandIn::TooLarge(size), None)
+                }
+                Err(err) => (StandIn::Failed, Some(err)),
+            }
+        }
+    };
+    if let Some(replies) = metrics.note_refusal(Refusal::ReplyTooLarge) {
+        tracing::warn!(
+            trace_id = %reply.routing.trace_id,
+            msg_type = %reply.meta.msg_type,
+            msg = ?reply.meta.msg,
+            requester = ?requester,
+            size,
+            max,
+            stand_in = %stand_in.describe(),
+            replies,
+            replies_too_large = total,
+            "ai runtime could not send a reply: it is larger than a message may carry; that \
+             message alone failed, and the runtime goes on"
+        );
+    }
+    match failed {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The error that goes in place of `reply`, a reply over the frame limit (FINDINGS A-294): the
+/// same reply, to the same requester, under the same trace and thread, with an error payload in
+/// place of its own (`ai_runtime_reply_too_large`, not `retryable`: the message ran, and may have
+/// done its work), the error's `.error` suffix on its name, and without the evaluation of an answer
+/// that did not go. None for the reply to a `system` or `admin` request: its sender waits for its
+/// verb's own answer and reports its own timeout, as for a handler that fails (`error_reply`).
+fn reply_too_large_stand_in(reply: &Message, size: usize, max: usize) -> Option<Message> {
+    if is_control_traffic(reply) {
+        return None;
+    }
+    let mut stand_in = reply.clone();
+    stand_in.payload = json!({
+        "type": "error",
+        "code": AI_RUNTIME_REPLY_TOO_LARGE,
+        "message": format!(
+            "The AI runtime could not send its answer to this message: it was {size} bytes, more \
+             than the {max} a message may carry. The message ran and may have done its work; it \
+             is not run again."
+        ),
+        "retryable": false
+    });
+    apply_error_reply_msg_suffix(&mut stand_in.meta, &stand_in.payload);
+    if let Some(Value::Object(context)) = stand_in.meta.context.as_mut() {
+        context.remove("evaluation");
+    }
+    Some(stand_in)
 }
 
 /// What the runtime stamps on an answer as it sends it: this node as its sender, its ILK when the
@@ -1268,9 +1663,12 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
             tap_copies_ignored = snapshot.tap_copies_ignored,
             turns_queued = snapshot.turns_queued,
             turns_waiting = snapshot.turns_waiting,
+            turns_running = snapshot.turns_running,
+            direct_running = snapshot.direct_running,
             turns_refused = snapshot.turns_refused,
             direct_dropped = snapshot.direct_dropped,
             busy_answers_dropped = snapshot.busy_answers_dropped,
+            replies_too_large = snapshot.replies_too_large,
             "ai runtime metrics"
         );
     }
@@ -1544,12 +1942,28 @@ mod tests {
 
     // FINDINGS A-257: the lanes.
 
-    /// The answers the runtime sends, handed to the test. The answer to the message named in
-    /// `too_large` is refused as a frame too large, an error that stops the runtime.
+    /// The largest frame the tests' writer takes: as the SDK's `send_traced` refuses one over
+    /// `MAX_FRAME_SIZE` (128 KiB), it refuses a reply that serializes to more, before it goes.
+    const TEST_FRAME_MAX: usize = 4_096;
+
+    /// The answers the runtime sends, handed to the test, with the trace note each went with. A
+    /// reply over `max_frame` is refused as the SDK refuses a frame too large
+    /// (`NodeError::MessageTooLarge`), and nothing goes.
     #[derive(Clone)]
     struct TestWriter {
         sent: mpsc::UnboundedSender<Message>,
-        too_large: Option<&'static str>,
+        notes: Arc<Mutex<Vec<(String, TraceNote)>>>,
+        max_frame: usize,
+    }
+
+    impl TestWriter {
+        fn new(sent: mpsc::UnboundedSender<Message>) -> Self {
+            Self {
+                sent,
+                notes: Arc::default(),
+                max_frame: TEST_FRAME_MAX,
+            }
+        }
     }
 
     #[async_trait]
@@ -1565,14 +1979,19 @@ mod tests {
         async fn send_traced(
             &self,
             msg: Message,
-            _note: TraceNote,
+            note: TraceNote,
         ) -> std::result::Result<(), NodeError> {
-            if self.too_large == Some(msg.routing.trace_id.as_str()) {
+            let size = serde_json::to_vec(&msg)?.len();
+            if size > self.max_frame {
                 return Err(NodeError::MessageTooLarge {
-                    size: 200_000,
-                    max: 131_072,
+                    size,
+                    max: self.max_frame,
                 });
             }
+            self.notes
+                .lock()
+                .unwrap()
+                .push((msg.routing.trace_id.clone(), note));
             let _ = self.sent.send(msg);
             Ok(())
         }
@@ -1581,7 +2000,9 @@ mod tests {
     /// A node as the frontdesk is to its runtime: an LLM turn holds its worker until the test lets
     /// one go (the earliest first), and a status request or a handoff is answered at once, unless
     /// its trace id starts with `held`: that one holds its place until the test lets it go
-    /// (`let_held_go`). It notes the order its handler starts each message in, by trace id.
+    /// (`let_held_go`). An answer to a message whose trace id starts with `big` is larger than a
+    /// frame (`TEST_FRAME_MAX`), and a turn whose trace id starts with `panic` panics. It notes the
+    /// order its handler starts each message in, by trace id.
     struct GatedNode {
         started: std::sync::Mutex<Vec<String>>,
         turns: tokio::sync::Semaphore,
@@ -1610,11 +2031,17 @@ mod tests {
                 .unwrap()
                 .push(msg.routing.trace_id.clone());
             let held = msg.routing.trace_id.starts_with("held");
+            let big = msg.routing.trace_id.starts_with("big");
             if is_system_kind(&msg.meta.msg_type) {
                 if held {
                     self.held.acquire().await.unwrap().forget();
                 }
-                let mut answer = build_reply_message_runtime_src(&msg, json!({"status": "ok"}));
+                let status = if big {
+                    json!({"status": "ok", "catalog": "x".repeat(TEST_FRAME_MAX)})
+                } else {
+                    json!({"status": "ok"})
+                };
+                let mut answer = build_reply_message_runtime_src(&msg, status);
                 answer.meta.msg = Some("NODE_STATUS_GET_RESPONSE".to_string());
                 return Ok(Some(answer));
             }
@@ -1628,10 +2055,23 @@ mod tests {
                 )));
             }
             self.turns.acquire().await.unwrap().forget();
-            Ok(Some(build_reply_message_runtime_src(
-                &msg,
-                json!({"type": "text", "content": msg.routing.trace_id}),
-            )))
+            assert!(
+                !msg.routing.trace_id.starts_with("panic"),
+                "a handler that panics"
+            );
+            let content = if big {
+                "x".repeat(TEST_FRAME_MAX)
+            } else {
+                msg.routing.trace_id.clone()
+            };
+            let mut answer =
+                build_reply_message_runtime_src(&msg, json!({"type": "text", "content": content}));
+            // A WF's menu answer, as `set_reply_evaluation` gives it, and what the node did.
+            set_reply_act(&mut answer, ["answered"]);
+            let mut context = answer.meta.context.take().unwrap_or_else(|| json!({}));
+            context["evaluation"] = json!({"reply": "done", "option": "handover", "params": {}});
+            answer.meta.context = Some(context);
+            Ok(Some(answer))
         }
     }
 
@@ -1640,6 +2080,9 @@ mod tests {
         metrics: Arc<RuntimeMetrics>,
         to_runtime: mpsc::Sender<Message>,
         answers: mpsc::UnboundedReceiver<Message>,
+        notes: Arc<Mutex<Vec<(String, TraceNote)>>>,
+        /// How the dispatch loop ended, once it did.
+        ended: JoinHandle<Result<()>>,
     }
 
     impl Harness {
@@ -1649,12 +2092,10 @@ mod tests {
             let metrics = Arc::new(RuntimeMetrics::default());
             let (sent, answers) = mpsc::unbounded_channel();
             let (to_runtime, mut rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
-            let writer = TestWriter {
-                sent,
-                too_large: None,
-            };
+            let writer = TestWriter::new(sent);
+            let notes = writer.notes.clone();
             let mut lanes = Lanes::new(node.clone(), writer, config, metrics.clone());
-            tokio::spawn(async move {
+            let ended = tokio::spawn(async move {
                 let mut reader = tokio::spawn(std::future::pending::<Result<()>>());
                 dispatch(&mut lanes, &mut rx, &mut reader).await
             });
@@ -1663,7 +2104,43 @@ mod tests {
                 metrics,
                 to_runtime,
                 answers,
+                notes,
+                ended,
             }
+        }
+
+        /// The load the node reads for its status (FINDINGS A-290).
+        fn load(&self) -> RuntimeLoad {
+            RuntimeLoad {
+                metrics: self.metrics.clone(),
+            }
+        }
+
+        /// The load once `settled` holds of it: a task that sent its answer is settled by the
+        /// dispatch loop just after.
+        async fn load_until(
+            &self,
+            settled: impl Fn(&RuntimeLoadSnapshot) -> bool,
+        ) -> RuntimeLoadSnapshot {
+            for _ in 0..100 {
+                let load = self.load().snapshot().expect("the runtime runs");
+                if settled(&load) {
+                    return load;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the load never settled: {:?}", self.load().snapshot());
+        }
+
+        /// The note the answer under `trace_id` went with.
+        fn note_of(&self, trace_id: &str) -> TraceNote {
+            self.notes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id == trace_id)
+                .map(|(_, note)| note.clone())
+                .expect("an answer went under that trace")
         }
 
         async fn send(&self, msg: Message) {
@@ -1997,37 +2474,37 @@ mod tests {
     }
 
     /// The review of A-257: a task that ends with an error that stops the runtime starts no
-    /// waiting turn, which the stop would cut off after it may have called its model.
+    /// waiting turn, which the stop would cut off after it may have called its model. Since A-294 a
+    /// reply too large to send is no such error: a handler that panics is.
     #[tokio::test]
     async fn a_task_that_stops_the_runtime_starts_no_waiting_turn() {
         let node = Arc::new(GatedNode::new());
         let (sent, _answers) = mpsc::unbounded_channel();
-        let writer = TestWriter {
-            sent,
-            too_large: Some("turn-1"),
-        };
         let config = RuntimeConfig {
             worker_pool_size: 1,
             ..RuntimeConfig::default()
         };
-        let mut lanes = Lanes::new(node.clone(), writer, config, Arc::default());
-        lanes.take(turn("turn-1")).unwrap();
+        let mut lanes = Lanes::new(node.clone(), TestWriter::new(sent), config, Arc::default());
+        lanes.take(turn("panic-1")).unwrap();
         lanes.take(turn("turn-2")).unwrap();
         assert_eq!(lanes.waiting.len(), 1);
 
-        // turn-1's answer is too large to send.
+        // panic-1's handler panics.
         node.turns.add_permits(1);
         let ended = timeout(Duration::from_secs(5), lanes.join_next())
             .await
-            .expect("turn-1 ends")
+            .expect("panic-1 ends")
             .expect("a task ended");
-        assert!(matches!(
-            lanes.settle(ended),
-            Err(AiSdkError::Node(NodeError::MessageTooLarge { .. }))
-        ));
+        let Err(AiSdkError::Protocol(reason)) = lanes.settle(ended) else {
+            panic!("a handler that panicked stops the runtime");
+        };
+        assert!(
+            reason.starts_with("model worker task join error"),
+            "{reason}"
+        );
         assert!(lanes.workers.is_empty(), "turn-2 never started");
         assert_eq!(lanes.waiting.len(), 1);
-        assert_eq!(node.started(), ["turn-1"]);
+        assert_eq!(node.started(), ["panic-1"]);
 
         // A task that did not end on its own (it panicked, or it was cut off) names its lane.
         let task = tokio::spawn(std::future::pending::<Result<()>>());
@@ -2050,6 +2527,304 @@ mod tests {
         assert_eq!(busy.payload["code"], json!("ai_runtime_busy"));
         let note = reply_trace_note(Some("IO.slack.main@motherbee"), &mut busy);
         assert_eq!(note.act, ["busy"]);
+    }
+
+    // FINDINGS A-294: a reply over the frame limit fails its message alone.
+
+    /// A WF's message asking the agent (`meta.msg` `ask`), whose answer is larger than a frame.
+    fn big_turn(id: &str) -> Message {
+        let mut msg = turn(id);
+        msg.meta.msg = Some("ask".to_string());
+        msg
+    }
+
+    /// An answer over the frame limit no longer stops the runtime: its sender gets the error that
+    /// goes in its place, to it, under its trace and thread, named as an error (`ask.error`), with
+    /// no evaluation of the answer that did not go, and its trace entry says so; the turn that
+    /// waited starts and is answered, and the runtime goes on. It turns no work away.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_too_large_fails_its_message_alone() {
+        let mut runtime = Harness::start(RuntimeConfig {
+            worker_pool_size: 1,
+            ..RuntimeConfig::default()
+        });
+        runtime.send(big_turn("big-1")).await;
+        runtime.send(turn("turn-2")).await;
+        assert_eq!(runtime.started(1).await, ["big-1"]);
+
+        runtime.let_turns_go(1);
+        let stand_in = runtime.answer().await;
+        assert_eq!(stand_in.routing.trace_id, "big-1");
+        assert_eq!(stand_in.payload["type"], json!("error"));
+        assert_eq!(stand_in.payload["code"], json!(AI_RUNTIME_REPLY_TOO_LARGE));
+        assert_eq!(stand_in.payload["retryable"], json!(false));
+        let message = stand_in.payload["message"].as_str().unwrap();
+        assert!(message.contains("more than the 4096"), "{message}");
+        assert!(matches!(
+            stand_in.routing.dst,
+            Destination::Unicast(ref dst) if dst == "IO.slack.main@motherbee"
+        ));
+        assert_eq!(stand_in.meta.thread_id.as_deref(), Some("thread-big-1"));
+        assert_eq!(stand_in.meta.msg.as_deref(), Some("ask.error"));
+        assert_eq!(stand_in.routing.src, "uuid-of-the-frontdesk");
+        let context = stand_in.meta.context.clone().unwrap_or_default();
+        assert_eq!(context.get("evaluation"), None, "{context}");
+        assert_eq!(
+            runtime.note_of("big-1").act,
+            ["answered", "handover", REPLY_TOO_LARGE_ACT]
+        );
+
+        // The runtime goes on: the turn that waited starts, and is answered.
+        runtime.let_turns_go(1);
+        let next = runtime.answer().await;
+        assert_eq!(next.routing.trace_id, "turn-2");
+        assert_eq!(next.payload["content"], json!("turn-2"));
+        assert!(!runtime.ended.is_finished(), "the runtime runs");
+        let metrics = runtime.metrics.snapshot();
+        assert_eq!(metrics.replies_too_large, 1);
+        assert_eq!(
+            metrics.responses_sent, 2,
+            "the error in its place, and turn-2's"
+        );
+        assert_eq!(metrics.fatal_errors, 0);
+        let load = runtime.load().snapshot().expect("the runtime runs");
+        assert_eq!(load.replies_too_large, 1);
+        assert_eq!(load.state, RuntimeLoadState::Serving, "no work turned away");
+    }
+
+    /// The answer to a `system` request over the frame limit gets nothing in its place: its sender
+    /// waits for its verb's own answer and reports its own timeout. The runtime goes on.
+    #[tokio::test(start_paused = true)]
+    async fn a_control_answer_too_large_fails_alone_with_nothing_in_its_place() {
+        let mut runtime = Harness::start(RuntimeConfig::default());
+        runtime.send(status_request("big-status")).await;
+        runtime.no_answer().await;
+        assert_eq!(runtime.metrics.snapshot().replies_too_large, 1);
+
+        runtime.send(status_request("status")).await;
+        let answer = runtime.answer().await;
+        assert_eq!(answer.routing.trace_id, "status");
+        assert_eq!(answer.meta.msg.as_deref(), Some("NODE_STATUS_GET_RESPONSE"));
+        assert!(!runtime.ended.is_finished(), "the runtime runs");
+    }
+
+    /// A reply is too large because of the request's context, which it carries: the error in its
+    /// place is too large as well, and nothing reaches the sender. The message alone failed, and
+    /// the runtime goes on.
+    #[tokio::test(start_paused = true)]
+    async fn a_context_too_large_for_any_answer_fails_its_message_alone() {
+        let mut runtime = Harness::start(RuntimeConfig::default());
+        let mut msg = turn("wide-1");
+        msg.meta.context = Some(json!({"io": {"channel": "y".repeat(TEST_FRAME_MAX)}}));
+        runtime.send(msg).await;
+        runtime.let_turns_go(1);
+        runtime.no_answer().await;
+        assert_eq!(runtime.metrics.snapshot().replies_too_large, 1);
+        assert_eq!(runtime.metrics.snapshot().responses_sent, 0);
+
+        runtime.send(turn("turn-2")).await;
+        runtime.let_turns_go(1);
+        assert_eq!(runtime.answer().await.routing.trace_id, "turn-2");
+        assert!(!runtime.ended.is_finished(), "the runtime runs");
+    }
+
+    #[test]
+    fn the_error_in_place_of_a_reply_too_large_is_for_the_conversations_messages() {
+        let mut reply =
+            build_reply_message_runtime_src(&status_request("status"), json!({"status": "ok"}));
+        assert!(reply_too_large_stand_in(&reply, 200_000, 131_072).is_none());
+        reply.meta.msg_type = "admin".to_string();
+        assert!(reply_too_large_stand_in(&reply, 200_000, 131_072).is_none());
+
+        let reply = build_reply_message_runtime_src(
+            &turn("turn"),
+            json!({"type": "text", "content": "a long answer"}),
+        );
+        let stand_in = reply_too_large_stand_in(&reply, 200_000, 131_072).expect("a turn's");
+        assert_eq!(stand_in.payload["code"], json!(AI_RUNTIME_REPLY_TOO_LARGE));
+        assert_eq!(
+            stand_in.payload["message"],
+            json!(
+                "The AI runtime could not send its answer to this message: it was 200000 bytes, \
+                 more than the 131072 a message may carry. The message ran and may have done its \
+                 work; it is not run again."
+            )
+        );
+        // A message without a name keeps none.
+        assert_eq!(stand_in.meta.msg, None);
+    }
+
+    // FINDINGS A-290: the AI runtime's load, for the node's status.
+
+    fn healthy_status() -> Value {
+        json!({
+            "status": "ok",
+            "health_state": "HEALTHY",
+            "lifecycle_state": "CONFIGURED",
+            "extensions": {"other": {"kept": true}}
+        })
+    }
+
+    /// The load reads `saturated` from the moment the runtime turns a turn away until its window
+    /// (the metrics interval, 30 s) passes without another, and a `HEALTHY` node's status reads
+    /// `DEGRADED` meanwhile, with `last_error` `ai_runtime_saturated` and the load in
+    /// `extensions.ai_runtime`. A node `DEGRADED` by its config keeps its config's `last_error`.
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_runtime_reads_degraded_until_its_window_passes() {
+        let mut runtime = Harness::start(RuntimeConfig {
+            worker_pool_size: 1,
+            queue_capacity: 1,
+            ..RuntimeConfig::default()
+        });
+        let load = runtime.load();
+        let serving = load.snapshot().expect("the runtime runs");
+        assert_eq!(
+            serving,
+            RuntimeLoadSnapshot {
+                state: RuntimeLoadState::Serving,
+                window_s: 30,
+                last_turned_away_ms_ago: None,
+                model_workers: 1,
+                model_workers_busy: 0,
+                turns_waiting: 0,
+                queue_capacity: 1,
+                direct_capacity: DEFAULT_DIRECT_CAPACITY,
+                direct_running: 0,
+                turns_refused: 0,
+                direct_dropped: 0,
+                busy_answers_dropped: 0,
+                replies_too_large: 0,
+            }
+        );
+        let mut status = healthy_status();
+        load.add_to_status(&mut status);
+        assert_eq!(status["health_state"], json!("HEALTHY"));
+        assert_eq!(status.get("last_error"), None);
+        assert_eq!(
+            status["extensions"]["ai_runtime"]["state"],
+            json!("serving")
+        );
+
+        for id in ["turn-1", "turn-2", "turn-3"] {
+            runtime.send(turn(id)).await;
+        }
+        assert_eq!(
+            runtime.answer().await.payload["code"],
+            json!("ai_runtime_busy")
+        );
+        let saturated = load.snapshot().expect("the runtime runs");
+        assert_eq!(saturated.state, RuntimeLoadState::Saturated);
+        assert_eq!(saturated.model_workers_busy, 1);
+        assert_eq!(saturated.turns_waiting, 1);
+        assert_eq!(saturated.turns_refused, 1);
+        assert!(saturated
+            .last_turned_away_ms_ago
+            .is_some_and(|ms| ms < 1_000));
+
+        let mut status = healthy_status();
+        load.add_to_status(&mut status);
+        assert_eq!(status["health_state"], json!("DEGRADED"));
+        assert_eq!(status["last_error"]["code"], json!(AI_RUNTIME_SATURATED));
+        let why = status["last_error"]["message"].as_str().unwrap();
+        assert!(
+            why.contains("its 1 model workers busy and its queue of 1 full"),
+            "{why}"
+        );
+        assert!(why.contains("until 30 s pass without one"), "{why}");
+        assert_eq!(status["extensions"]["other"], json!({"kept": true}));
+        let ai_runtime = &status["extensions"]["ai_runtime"];
+        assert_eq!(ai_runtime["state"], json!("saturated"));
+        assert_eq!(ai_runtime["turns_refused"], json!(1));
+        assert_eq!(ai_runtime["model_workers_busy"], json!(1));
+        assert_eq!(ai_runtime["window_s"], json!(30));
+
+        let mut failed = json!({
+            "status": "ok", "health_state": "DEGRADED", "lifecycle_state": "FAILED_CONFIG",
+            "last_error": {"code": "invalid_config", "message": "unknown field"}
+        });
+        load.add_to_status(&mut failed);
+        assert_eq!(failed["health_state"], json!("DEGRADED"));
+        assert_eq!(failed["last_error"]["code"], json!("invalid_config"));
+        assert_eq!(
+            failed["extensions"]["ai_runtime"]["state"],
+            json!("saturated")
+        );
+
+        // Within the window it stays saturated; past it, with the turns still running, it serves.
+        sleep(Duration::from_secs(29)).await;
+        assert_eq!(load.snapshot().unwrap().state, RuntimeLoadState::Saturated);
+        sleep(Duration::from_secs(1)).await;
+        let calm = load.snapshot().unwrap();
+        assert_eq!(calm.state, RuntimeLoadState::Serving);
+        assert_eq!(calm.model_workers_busy, 1);
+        assert_eq!(calm.turns_waiting, 1);
+        assert!(
+            calm.last_turned_away_ms_ago
+                .is_some_and(|ms| (30_000..31_000).contains(&ms)),
+            "{calm:?}"
+        );
+        let mut status = healthy_status();
+        load.add_to_status(&mut status);
+        assert_eq!(status["health_state"], json!("HEALTHY"));
+        assert_eq!(status.get("last_error"), None);
+
+        runtime.let_turns_go(2);
+        assert_eq!(runtime.answer().await.routing.trace_id, "turn-1");
+        assert_eq!(runtime.answer().await.routing.trace_id, "turn-2");
+        let drained = runtime
+            .load_until(|load| load.model_workers_busy == 0)
+            .await;
+        assert_eq!(drained.turns_waiting, 0);
+    }
+
+    /// A message dropped from the direct lane is work turned away too.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_dropped_from_the_direct_lane_saturates_the_load() {
+        let mut runtime = Harness::start(RuntimeConfig {
+            direct_capacity: 1,
+            direct_user_capacity: 1,
+            ..RuntimeConfig::default()
+        });
+        runtime.send(status_request("held")).await;
+        assert_eq!(runtime.started(1).await, ["held"]);
+        assert_eq!(runtime.load().snapshot().unwrap().direct_running, 1);
+        runtime.send(handoff("dropped")).await;
+        runtime.no_answer().await;
+        let load = runtime.load().snapshot().unwrap();
+        assert_eq!(load.state, RuntimeLoadState::Saturated);
+        assert_eq!(load.direct_dropped, 1);
+        runtime.let_held_go(1);
+        assert_eq!(runtime.answer().await.routing.trace_id, "held");
+        runtime.load_until(|load| load.direct_running == 0).await;
+    }
+
+    /// Before its runtime runs, a load has nothing to say, and a status stays as it was.
+    #[test]
+    fn a_load_whose_runtime_does_not_run_adds_nothing() {
+        let load = RuntimeLoad::new();
+        assert_eq!(load.snapshot(), None);
+        let mut status = healthy_status();
+        load.add_to_status(&mut status);
+        assert_eq!(status, healthy_status());
+        // A payload that is no object is left alone.
+        let mut odd = json!("HEALTHY");
+        RuntimeLoadSnapshot {
+            state: RuntimeLoadState::Saturated,
+            window_s: 30,
+            last_turned_away_ms_ago: Some(1),
+            model_workers: 4,
+            model_workers_busy: 4,
+            turns_waiting: 128,
+            queue_capacity: 128,
+            direct_capacity: 64,
+            direct_running: 0,
+            turns_refused: 1,
+            direct_dropped: 0,
+            busy_answers_dropped: 0,
+            replies_too_large: 0,
+        }
+        .add_to_status(&mut odd);
+        assert_eq!(odd, json!("HEALTHY"));
     }
 
     #[test]

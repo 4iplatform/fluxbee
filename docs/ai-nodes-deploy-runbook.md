@@ -167,8 +167,14 @@ EOF
     behind a turn, up to 64 at once and each within 30 s (FINDINGS A-257;
     [the AI SDK's runtime](../crates/fluxbee_ai_sdk/README.md#writing-an-ai-node)). So a busy
     agent still answers `get_node_status` and `node_help` at once, and a config change applies to
-    the turns still waiting. Its saturation shows in the node's journal only (`turns_refused` in
-    the `ai runtime metrics` line); its status still reads `HEALTHY`.
+    the turns still waiting.
+  - since 0.1.142 its status shows its saturation (FINDINGS A-290): `get_node_status` has
+    `extensions.ai_runtime` (`state`, `serving` or `saturated`, the workers busy, the turns
+    waiting, and what it turned away since it started), and a node that turned work away in the
+    last 30 s (a turn refused `ai_runtime_busy`, a request dropped past its 64 places) reads
+    `DEGRADED` with `last_error` `ai_runtime_saturated`, `HEALTHY` again 30 s after the last one.
+    On 0.1.136 to 0.1.141 the status read `HEALTHY`, the saturation only in the journal
+    (`turns_refused` in the `ai runtime metrics` line).
   - a node on an older version of `ai.generic` (one pinned to it keeps it: section 6, step 3) runs
     every message on its 4 workers in the order they came, with no bound and no
     `ai_runtime_busy`. While they are busy its status, config and help requests wait behind its
@@ -178,6 +184,10 @@ EOF
 - **A message runs once.** When it fails or runs out of time, the sender gets an `ai_runtime_error` or
   `ai_runtime_timeout` error and the message is not run again: it may already have called the model
   or a tool such as `publish_html_page`.
+- **An answer over the frame limit (128 KiB) fails its message alone** (since 0.1.142, FINDINGS
+  A-294): the sender gets `ai_runtime_reply_too_large` in its place (nothing, for a control
+  request, or when the request's own context is what is too large), and the node goes on. Before,
+  it stopped the node's process and every message in flight; systemd started it again.
 
 ---
 

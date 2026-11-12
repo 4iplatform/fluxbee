@@ -1,7 +1,9 @@
 //! The AI runtime's lanes through `NodeRuntime::run_with_config`, with a router of the test's own on
 //! a Unix socket (FINDINGS A-257): with every worker on an LLM turn, a status request and a
 //! frontdesk handoff are answered at once, and a turn past the queue is answered `ai_runtime_busy`
-//! while the ones that wait keep their order.
+//! while the ones that wait keep their order. Through the SDK's own sender: an answer over the
+//! frame limit fails its message alone (FINDINGS A-294), and the node's status reads the load of
+//! the runtime it was given (`NodeRuntime::with_load`, FINDINGS A-290).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_reply_message_runtime_src, AiNode, Message, NodeRuntime, Result, RuntimeConfig,
-    AI_RUNTIME_CHANNEL,
+    RuntimeLoad, AI_RUNTIME_CHANNEL, AI_RUNTIME_REPLY_TOO_LARGE, AI_RUNTIME_SATURATED,
+};
+use fluxbee_sdk::managed_control_plane::{
+    build_node_status_response_payload, ManagedNodeLifecycleState,
 };
 use fluxbee_sdk::protocol::{
     build_announce, Destination, Meta, NodeAnnouncePayload, NodeHelloPayload, Routing,
@@ -31,11 +36,14 @@ use tokio::time::{sleep, timeout};
 const WAIT: Duration = Duration::from_secs(10);
 
 /// What the frontdesk is to its runtime: an LLM turn holds its worker until the test lets one go
-/// (the earliest first), and a status request or a handoff is answered at once, in code. It notes
-/// the order its handler starts each message in, by trace id.
+/// (the earliest first), and a status request or a handoff is answered at once, in code: its
+/// status as the runners answer it, the managed answer with its runtime's load. A turn whose trace
+/// id starts with `big` is answered with 200,000 bytes, more than a frame carries. It notes the
+/// order its handler starts each message in, by trace id.
 struct Frontdesk {
     started: Mutex<Vec<String>>,
     turns: Semaphore,
+    load: RuntimeLoad,
 }
 
 #[derive(Clone)]
@@ -50,7 +58,10 @@ impl AiNode for Node {
             .unwrap()
             .push(msg.routing.trace_id.clone());
         if msg.meta.msg_type == "system" {
-            let mut answer = build_reply_message_runtime_src(&msg, json!({"status": "ok"}));
+            let mut status =
+                build_node_status_response_payload(ManagedNodeLifecycleState::Configured, None);
+            self.0.load.add_to_status(&mut status);
+            let mut answer = build_reply_message_runtime_src(&msg, status);
             answer.meta.msg = Some("NODE_STATUS_GET_RESPONSE".to_string());
             return Ok(Some(answer));
         }
@@ -61,9 +72,14 @@ impl AiNode for Node {
             )));
         }
         self.0.turns.acquire().await.unwrap().forget();
+        let content = if msg.routing.trace_id.starts_with("big") {
+            "x".repeat(200_000)
+        } else {
+            msg.routing.trace_id.clone()
+        };
         Ok(Some(build_reply_message_runtime_src(
             &msg,
-            json!({"type": "text", "content": msg.routing.trace_id}),
+            json!({"type": "text", "content": content}),
         )))
     }
 }
@@ -95,9 +111,11 @@ impl Router {
         let socket = dir.join("router.sock");
         let listener = UnixListener::bind(&socket).unwrap();
 
+        let load = RuntimeLoad::new();
         let node = Arc::new(Frontdesk {
             started: Mutex::new(Vec::new()),
             turns: Semaphore::new(0),
+            load: load.clone(),
         });
         let node_config = NodeConfig {
             name: "SY.frontdesk.gov@motherbee".to_string(),
@@ -122,6 +140,7 @@ impl Router {
             .await
             .expect("the node connects");
             NodeRuntime::new(dispatcher, runtime_node)
+                .with_load(load)
                 .run_with_config(config)
                 .await
         });
@@ -320,4 +339,77 @@ async fn a_turn_past_the_queue_is_answered_busy_and_the_waiting_ones_keep_their_
         ["turn-1", "turn-2", "turn-3"],
         "the turn answered busy never ran"
     );
+}
+
+/// FINDINGS A-294: an answer over the frame limit, refused by the SDK's sender before it goes,
+/// fails its message alone: its sender gets the error that goes in its place, and the turn that
+/// waited behind it runs and is answered. Before, the refusal stopped the runtime, and the node's
+/// process with it.
+#[tokio::test]
+async fn an_answer_over_the_frame_limit_fails_that_message_alone() {
+    let mut router = Router::start(RuntimeConfig {
+        worker_pool_size: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    router.send(turn("big-1")).await;
+    router.send(turn("turn-2")).await;
+    router.let_turns_go(2);
+
+    let stand_in = router.answer().await;
+    assert_eq!(stand_in.routing.trace_id, "big-1");
+    assert_eq!(stand_in.payload["type"], json!("error"));
+    assert_eq!(stand_in.payload["code"], json!(AI_RUNTIME_REPLY_TOO_LARGE));
+    assert_eq!(stand_in.payload["retryable"], json!(false));
+    assert_eq!(stand_in.meta.thread_id.as_deref(), Some("thread-big-1"));
+
+    let next = router.answer().await;
+    assert_eq!(next.routing.trace_id, "turn-2");
+    assert_eq!(next.payload["content"], json!("turn-2"));
+    assert_eq!(router.started(2).await, ["big-1", "turn-2"]);
+}
+
+/// FINDINGS A-290: a node's status reads the load of the runtime it gave its handle to: with its
+/// one worker busy and no queue, a turn is refused, and the status the node answers at once says
+/// `DEGRADED`, why, and the load.
+#[tokio::test]
+async fn the_status_reads_the_saturated_runtime_it_was_given() {
+    let mut router = Router::start(RuntimeConfig {
+        worker_pool_size: 1,
+        queue_capacity: 0,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    router.send(status_request("status-before")).await;
+    let before = router.answer().await;
+    assert_eq!(before.payload["health_state"], json!("HEALTHY"));
+    assert_eq!(
+        before.payload["extensions"]["ai_runtime"]["state"],
+        json!("serving")
+    );
+
+    router.send(turn("turn-1")).await;
+    assert_eq!(router.started(2).await, ["status-before", "turn-1"]);
+    router.send(turn("turn-2")).await;
+    assert_eq!(
+        router.answer().await.payload["code"],
+        json!("ai_runtime_busy")
+    );
+
+    router.send(status_request("status")).await;
+    let status = router.answer().await;
+    assert_eq!(status.routing.trace_id, "status");
+    assert_eq!(status.payload["health_state"], json!("DEGRADED"));
+    assert_eq!(
+        status.payload["last_error"]["code"],
+        json!(AI_RUNTIME_SATURATED)
+    );
+    let load = &status.payload["extensions"]["ai_runtime"];
+    assert_eq!(load["state"], json!("saturated"));
+    assert_eq!(load["model_workers"], json!(1));
+    assert_eq!(load["model_workers_busy"], json!(1));
+    assert_eq!(load["turns_refused"], json!(1));
+
+    router.let_turns_go(1);
+    assert_eq!(router.answer().await.routing.trace_id, "turn-1");
 }

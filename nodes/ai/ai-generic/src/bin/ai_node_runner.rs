@@ -20,9 +20,10 @@ use fluxbee_ai_sdk::{
     FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput,
     FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, LanceDbThreadStateStore, LlmClient,
     LlmRequest, MenuContract, Message, MessageContract, ModelInputOptions, ModelSettings,
-    NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateDeleteTool,
-    ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard,
-    ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
+    NodeRuntime, ResolvedModelInput, RuntimeConfig, RuntimeLoad, RuntimeLoadSnapshot, TenantSource,
+    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
+    ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
+    MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -301,6 +302,8 @@ struct GenericAiNode {
     /// The node's connection to its router, for the tools that ask another node of the mesh:
     /// `get_current_time` asks SY.timer of the node's hive. `None` only in a unit test.
     router: Option<Arc<RouterDispatcher>>,
+    /// Its AI runtime's load, which its `NODE_STATUS_GET` answer reports (FINDINGS A-290).
+    runtime_load: RuntimeLoad,
 }
 
 /// The files one message's tools make, for its reply (FINDINGS A-98, A-99). A file generator keeps
@@ -1880,10 +1883,14 @@ impl GenericAiNode {
 
     /// A node that is not CONFIGURED refuses every completion, so it is not healthy: the SDK's
     /// managed answer reports DEGRADED with its `lifecycle_state`, and `last_error` for a rejected
-    /// config.
+    /// config. Its AI runtime's load follows (`node_status_payload`).
     async fn build_node_status_get_response(&self) -> Value {
         let state = self.control_plane.read().await;
-        build_node_status_response_payload(state.current_state, state.last_error.as_ref())
+        node_status_payload(
+            state.current_state,
+            state.last_error.as_ref(),
+            self.runtime_load.snapshot(),
+        )
     }
 
     /// `NODE_HELP` (docs/agent-tools-v1.md §3.3): the node describes itself with its runtime's
@@ -5691,6 +5698,7 @@ async fn run_managed_node(
     let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
     let usage = UsageRecorder::start(dispatcher.clone());
     let installation_file = installation_file_of_hive(Path::new(&node_config_dir));
+    let runtime_load = RuntimeLoad::new();
     let ai_node = GenericAiNode {
         node_name,
         self_ilk_id,
@@ -5706,6 +5714,7 @@ async fn run_managed_node(
         cognitive_definition: cognitive_definition.clone(),
         runtime_version,
         router: Some(dispatcher.clone()),
+        runtime_load: runtime_load.clone(),
     };
     spawn_cognitive_definition_poll(
         ai_node.node_name.clone(),
@@ -5713,7 +5722,7 @@ async fn run_managed_node(
         cognitive_definition_config,
         cognitive_definition,
     );
-    let runtime = NodeRuntime::new(dispatcher, ai_node);
+    let runtime = NodeRuntime::new(dispatcher, ai_node).with_load(runtime_load);
     runtime.run_with_config(RuntimeConfig::default()).await?;
     Ok(())
 }
@@ -6086,6 +6095,23 @@ fn build_control_plane_response(msg: &Message, response_msg: &str, payload: Valu
     let mut response = build_reply_message_runtime_src(msg, payload);
     response.meta.msg = Some(response_msg.to_string());
     response
+}
+
+/// `NODE_STATUS_GET`'s answer: the SDK's managed answer for the config state, then the AI
+/// runtime's load, when the runtime runs (FINDINGS A-290): `extensions.ai_runtime`, and `DEGRADED`
+/// with `last_error` `ai_runtime_saturated` while the runtime turned work away in its last window
+/// (`RuntimeLoadSnapshot::add_to_status`). Since 0.1.136 the node answers at once however busy, so
+/// a saturated node no longer shows by a status that times out.
+fn node_status_payload(
+    state: NodeLifecycleState,
+    last_error: Option<&ControlPlaneErrorInfo>,
+    load: Option<RuntimeLoadSnapshot>,
+) -> Value {
+    let mut payload = build_node_status_response_payload(state, last_error);
+    if let Some(load) = load {
+        load.add_to_status(&mut payload);
+    }
+    payload
 }
 
 fn redact_secrets(value: &Value) -> Value {
@@ -7772,6 +7798,7 @@ mod tests {
             )),
             runtime_version: Some("0.1.86".to_string()),
             router: None,
+            runtime_load: RuntimeLoad::new(),
         }
     }
 
@@ -12496,6 +12523,79 @@ mod tests {
         assert_eq!(
             node.control_plane.read().await.current_state,
             NodeLifecycleState::Unconfigured
+        );
+    }
+
+    /// A-290: the status reports the AI runtime's load once the runtime runs, as
+    /// `extensions.ai_runtime`; while it turned work away in its last window, a CONFIGURED node
+    /// reads DEGRADED with `last_error` `ai_runtime_saturated`, and a node DEGRADED by its config
+    /// keeps its config's reason. Before the runtime runs, the status is the managed answer alone.
+    #[test]
+    fn node_status_reports_the_ai_runtimes_load() {
+        let saturated = RuntimeLoadSnapshot {
+            state: fluxbee_ai_sdk::RuntimeLoadState::Saturated,
+            window_s: 30,
+            last_turned_away_ms_ago: Some(2_500),
+            model_workers: 4,
+            model_workers_busy: 4,
+            turns_waiting: 128,
+            queue_capacity: 128,
+            direct_capacity: 64,
+            direct_running: 1,
+            turns_refused: 7,
+            direct_dropped: 0,
+            busy_answers_dropped: 0,
+            replies_too_large: 0,
+        };
+        let busy = node_status_payload(
+            NodeLifecycleState::Configured,
+            None,
+            Some(saturated.clone()),
+        );
+        assert_eq!(busy["health_state"], json!("DEGRADED"));
+        assert_eq!(busy["lifecycle_state"], json!("CONFIGURED"));
+        assert_eq!(busy["last_error"]["code"], json!("ai_runtime_saturated"));
+        let why = busy["last_error"]["message"].as_str().unwrap();
+        assert!(why.contains("turned work away 2.5 s ago"), "{why}");
+        assert_eq!(
+            busy["extensions"]["ai_runtime"]["state"],
+            json!("saturated")
+        );
+        assert_eq!(busy["extensions"]["ai_runtime"]["turns_refused"], json!(7));
+
+        let calm = RuntimeLoadSnapshot {
+            state: fluxbee_ai_sdk::RuntimeLoadState::Serving,
+            last_turned_away_ms_ago: Some(45_000),
+            ..saturated.clone()
+        };
+        let healthy = node_status_payload(NodeLifecycleState::Configured, None, Some(calm));
+        assert_eq!(healthy["health_state"], json!("HEALTHY"));
+        assert!(healthy.get("last_error").is_none());
+        assert_eq!(
+            healthy["extensions"]["ai_runtime"]["state"],
+            json!("serving")
+        );
+
+        let config_error = ControlPlaneErrorInfo {
+            code: "invalid_config".to_string(),
+            message: "unknown field `instructions`".to_string(),
+        };
+        let failed = node_status_payload(
+            NodeLifecycleState::FailedConfig,
+            Some(&config_error),
+            Some(saturated),
+        );
+        assert_eq!(failed["health_state"], json!("DEGRADED"));
+        assert_eq!(failed["last_error"]["code"], json!("invalid_config"));
+        assert_eq!(
+            failed["extensions"]["ai_runtime"]["state"],
+            json!("saturated")
+        );
+
+        let before = node_status_payload(NodeLifecycleState::Configured, None, None);
+        assert_eq!(
+            before,
+            build_node_status_response_payload(NodeLifecycleState::Configured, None)
         );
     }
 

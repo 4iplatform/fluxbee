@@ -58,7 +58,7 @@ pub const AI_ERROR_MSG_SUFFIX: &str = ".error";
 /// with missing data. With the suffix a WF can event_match `<msg>.error` (or the bare marker) to route
 /// AI failures to a failed state. Callers that correlate by thread_id (io.api/io.slack) are unaffected;
 /// error detection there still uses payload.type.
-fn apply_error_reply_msg_suffix(meta: &mut Meta, payload: &Value) {
+pub(crate) fn apply_error_reply_msg_suffix(meta: &mut Meta, payload: &Value) {
     if payload.get("type").and_then(Value::as_str) != Some("error") {
         return;
     }

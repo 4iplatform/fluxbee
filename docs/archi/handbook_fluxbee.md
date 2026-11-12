@@ -244,6 +244,22 @@ agent with a menu gets the error payload instead, with its code, and the same te
 catch sends it to the person (§4.2.4, atom 6). A program that asks under a response envelope gets
 the same payload.
 
+**An agent that cannot keep up** (since 0.1.142, FINDINGS A-290). An AI node runs 4 conversation
+turns at once and lets 128 more wait; the next is refused at once, `ai_runtime_busy`
+(`retryable`: the person may send it again). Its status
+(`GET /hives/{hive}/nodes/{node_name}/status`) says so: `extensions.ai_runtime.state` is
+`saturated` while it turned work away in the last 30 s (`window_s`), and the node then reads
+`DEGRADED` with `last_error.code` `ai_runtime_saturated`,
+whose message says when and how much; 30 s after the last refusal it reads `HEALTHY` again, though
+turns may still wait. `extensions.ai_runtime` also has `model_workers_busy` of `model_workers`,
+`turns_waiting` of `queue_capacity`, and since the node started `turns_refused` and
+`direct_dropped`. Tell the operator the agent is overloaded, not broken: its provider may be slow
+(workers busy for minutes; its log says `AI runtime request failed` when calls fail) or its traffic
+more than 4 workers serve. A node on an older `ai.generic` (`runtime.resolved_version` before
+0.1.142) reports none of this: its saturation is in its log only. An agent whose answer is larger
+than a message may carry (128 KiB) answers `ai_runtime_reply_too_large` instead (`retryable`
+false: the message ran) and goes on with the others; before 0.1.142 that stopped the node.
+
 ### 4.1.1 Agent tools
 
 What an AI agent can do beyond answering is its **tools**: the functions its model calls while it

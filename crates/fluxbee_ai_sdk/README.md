@@ -552,7 +552,9 @@ registered case ends saved as `completed` and is never deleted by the model.
   `tap_copies_ignored`, in the runtime's periodic `ai runtime metrics` line (every 30 s by
   default), which shows at info. A copy is another node's message, which a router sends a tap's
   target to be observed: it keeps the original sender, so an answer would go to that sender.
-- **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`.
+- **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`;
+  `.with_load(load)` before `run_with_config` hands it a `RuntimeLoad` the node keeps for its
+  status (below).
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:
     `.command_channel(AI_RUNTIME_CHANNEL).post_pending_rule(RouteMatch::Any, RouteTarget::Command(AI_RUNTIME_CHANNEL))`.
@@ -612,18 +614,53 @@ registered case ends saved as `completed` and is never deleted by the model.
     - A config change runs on the direct lane, so it applies to the turns still waiting for a
       worker; a turn that has started keeps the config it read.
     - Each one turned away counts in the `ai runtime metrics` line (`turns_refused`,
-      `direct_dropped`, `busy_answers_dropped`, beside `turns_queued` and `turns_waiting`). A WARN
-      line names it at once (`ai runtime refused an LLM turn without running it`, `ai runtime
-      dropped a message, neither run nor answered`, `ai runtime sent no ai_runtime_busy answer to a
-      refused LLM turn`), then at most one every 10 s with how many since (`refused`, `dropped`);
-      the metrics loop names the end of a burst that no later one would.
+      `direct_dropped`, `busy_answers_dropped`, beside `turns_queued`, `turns_waiting`,
+      `turns_running` and `direct_running`). A WARN line names it at once (`ai runtime refused an
+      LLM turn without running it`, `ai runtime dropped a message, neither run nor answered`, `ai
+      runtime sent no ai_runtime_busy answer to a refused LLM turn`), then at most one every 10 s
+      with how many since (`refused`, `dropped`); the metrics loop names the end of a burst that
+      no later one would.
+  - **The load, for the node's status** (since 0.1.142, FINDINGS A-290): a node makes a
+    `RuntimeLoad`, keeps a clone and hands it to its runtime (`NodeRuntime::with_load`); its
+    `NODE_STATUS_GET` answer calls `load.add_to_status(&mut payload)` on fluxbee-sdk's managed
+    answer (`build_node_status_response_payload`). Since A-257 a node answers its status at once
+    however busy, so a jammed node no longer shows by a status that times out; this is how it
+    shows.
+    - `extensions.ai_runtime`, a `RuntimeLoadSnapshot`: `state` (`serving`, or `saturated` while
+      the runtime turned work away in its last window: an LLM turn refused `ai_runtime_busy`, a
+      message dropped from the direct lane, a busy answer not sent), `window_s` (the
+      `metrics_log_interval`, 30 s by default), `last_turned_away_ms_ago`, `model_workers` and
+      `model_workers_busy`, `turns_waiting` and `queue_capacity`, `direct_capacity` and
+      `direct_running`, and since the runtime started `turns_refused`, `direct_dropped`,
+      `busy_answers_dropped` and `replies_too_large`.
+    - While it is `saturated`, a `HEALTHY` node reads `DEGRADED`, with `last_error`
+      `{code: "ai_runtime_saturated", message}` (the message says when it last turned work away,
+      the bounds, and the counts), as io.web reports its port; `window_s` after the last refusal
+      it reads `HEALTHY` again, whatever still waits. A node `DEGRADED` by its config keeps its
+      config's `last_error`. The orchestrator's `get_node_status` passes `health_state`,
+      `last_error` and `extensions` on.
+    - `RuntimeLoad::snapshot()` is `None` until the runtime runs, and `add_to_status` then adds
+      nothing.
   - A handler runs once. When it returns an error or runs out of time (its lane's) it may already
     have called a model (billed) or a tool that acts, so the runtime never runs it again: a
     conversational message or a handoff gets an error reply (`ai_runtime_error` or
     `ai_runtime_timeout`, `retryable: false`); a `system` or `admin` request gets none, and its
     caller's own timeout reports it.
-  - A task that ends with an error the runtime does not go on after (a reply too large to send, a
-    handler that panicked) stops it, and no waiting turn starts then.
+  - **A reply over the frame limit fails its message alone** (since 0.1.142, FINDINGS A-294), as
+    the WF engine, SY.wf-rules, SY.timer and SY.admin treat an answer too large to send: the SDK's
+    sender refuses a frame over 128 KiB before it goes (`NodeError::MessageTooLarge`), and the
+    runtime goes on with every other message. Its requester gets the same reply with an error in
+    place of its payload, `ai_runtime_reply_too_large` (`retryable: false`: the message ran and may
+    have done its work), named `<msg>.error`, without the evaluation of the answer that did not go,
+    and its trace entry adds `reply_too_large`. A reply to a `system` or `admin` request gets
+    nothing in its place: its sender reports its own timeout. When the error is too large as well
+    (the request's `meta.context`, which a reply carries, is what is too large), nothing reaches
+    the requester. Each counts in `replies_too_large`, and a WARN names it (`ai runtime could not
+    send a reply: it is larger than a message may carry`), at once and then at most one every 10 s
+    with how many since. Before, the error stopped the runtime and the node's process with it,
+    cutting every turn in flight.
+  - A task that ends with an error the runtime does not go on after (a handler that panicked)
+    stops it, and no waiting turn starts then.
   - Only the write of a reply is retried (`RuntimeConfig::write_retry`): a send that timed out or
     was refused never queued it, so a reply cannot go out twice.
 - **A reply goes from the agent to whoever spoke:**
