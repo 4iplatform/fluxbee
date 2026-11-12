@@ -17630,6 +17630,10 @@ const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. A node whose unit does not run is not listed (stopped, failed, or between two restarts of a crash loop): one relaunched later (relaunch_on_boot) fails to start once its version is gone, so stop it (kill_node) or move it first.";
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
+/// What a runtime's use says of the ingress and egress hives (FINDINGS A-315): listed apart, neither
+/// counted nor skipped (FINDINGS A-281, since 0.1.133).
+const HIVES_WITHOUT_RUNTIMES_NOTE: &str = "usage_global_visible.hives_without_runtimes lists each ingress and each egress, {hive_id, role}, by the role the hive registry records whatever the state of its join (since 0.1.133). The runtimes never reach them (fluxbee-dist-runtimes goes to the workers only), so no managed node runs there: they are not asked, neither counted nor in skipped_hives, and one that is down holds no removal up. A hive listed there is no hive whose use is unknown.";
+
 /// A workflow delete's ORCHESTRATOR_ERROR that does not come from the WF node's config read: the
 /// node's kill (`DeleteWorkflow` in go/sy-wf-rules/node/delete.go), which SY.wf-rules waits for
 /// 25 s (`nodeDeleteTimeout`) while SY.admin gives kill_node 180 s.
@@ -18197,11 +18201,17 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The answer is the engine's WF_CANCEL_INSTANCE_RESPONSE as it is: payload {ok: true, instance_id, status: \"cancelled\"}. An instance already ended answers 409 INSTANCE_ALREADY_TERMINATED; one the node does not have, 404 INSTANCE_NOT_FOUND.",
             WF_INSTANCE_ERRORS_NOTE,
         ],
+        "get_runtime" => vec![
+            "The hive and the runtime come from the /hives/{hive}/runtimes/{runtime} path. Read on the motherbee, payload.usage_global_visible is the runtime's use across the hives, as remove_runtime_version reads it (FINDINGS A-281): running_nodes, each node of every hive on the runtime whose unit may run, with its hive and lifecycle (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN, its hive's systemd did not answer); skipped_hives, each hive whose nodes were not counted, {hive_id, reason, message}; hives_without_runtimes, each ingress and each egress, {hive_id, role}; and in_use. Read on a worker, it is that worker's own use.",
+            HIVES_WITHOUT_RUNTIMES_NOTE,
+            "in_use is true while a node is listed, false only once every hive asked was counted, and null (unknown) while none is listed and a hive is in skipped_hives: never read null as not in use.",
+        ],
         "remove_runtime_version" => vec![
             "Motherbee-only (409 NOT_PRIMARY elsewhere): it removes the version from the motherbee's dist and runtimes manifest, and each hive's mirror deletes it when it syncs. In HTTP runtime and runtime_version come from the path; the executor step's args are hive, runtime and runtime_version.",
             "Refused, with nothing removed: 400 INVALID_REQUEST for a missing or invalid runtime or runtime_version; 409 RUNTIME_CURRENT_CONFLICT for the runtime's current version while other versions remain; 409 RUNTIME_PACKAGE_VERSION for the version the installed package brought (the way back with reset_base_runtime); 404 RUNTIME_NOT_FOUND or RUNTIME_VERSION_NOT_FOUND; 409 RUNTIME_HAS_DEPENDENTS while packages are built on the runtime, before the version's use is read; 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_REMOVE_FAILED (the manifest's lock not taken within 60 s, or a step of the removal failed: what it changed is put back). A RUNTIME_REMOVE_FAILED whose lock another writer held past the 60 s says payload.retryable: true (FINDINGS A-305, since 0.1.139): ask again once that writer is done; one whose lock file cannot be opened says false.",
             RUNTIME_REMOVAL_IN_USE_NOTE,
             RUNTIME_REMOVAL_UNKNOWN_NOTE,
+            HIVES_WITHOUT_RUNTIMES_NOTE,
             "502 SERVICE_FAILED when the manifest it wrote cannot be read back: the version was removed, and get_runtime shows the runtime as it is now.",
             "SY.wf-rules removes its workflows' old versions with it, each removal waited for up to 35 s (SY.admin reads every hive's use first) and a deploy's or a rollback's whole purge within 15 s: a deploy or a rollback whose removal is refused, or not answered in time, goes on, logs what it left (purge left wf.<workflow> <version>: <code>: <detail>), and the next one tries those versions again.",
             WF_DELETE_VERSIONS_LEFT_NOTE,
@@ -29629,6 +29639,33 @@ mod tests {
             listed[0],
             json!({ "hive": "worker0", "reason": "UNREACHABLE" })
         );
+    }
+
+    /// FINDINGS A-315: the help of get_runtime and remove_runtime_version names
+    /// hives_without_runtimes, the ingress and egress hives a runtime's use lists apart, neither
+    /// counted nor skipped (A-281, since 0.1.133); only a test named it before.
+    #[test]
+    fn the_runtime_help_names_the_hives_without_runtimes() {
+        for action in ["get_runtime", "remove_runtime_version"] {
+            let notes = admin_action_request_notes(action).join(" ");
+            assert!(
+                notes.contains("hives_without_runtimes"),
+                "{action}: {notes}"
+            );
+            assert!(
+                notes.contains("each ingress and each egress, {hive_id, role}"),
+                "{action}: {notes}"
+            );
+            let doc = build_admin_action_doc(
+                resolve_internal_action_spec(action).expect("an action of the catalog"),
+            );
+            assert!(
+                doc["request_contract"]["notes"]
+                    .to_string()
+                    .contains("hives_without_runtimes"),
+                "{action}"
+            );
+        }
     }
 
     /// With its outputs dropped, a workflow delete's step keeps the versions its purge left

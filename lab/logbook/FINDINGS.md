@@ -1880,6 +1880,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the egress listed apart, neither counted nor skipped. Nothing is refused or removed by it.
 - **Fix, later:** SY.admin's help for `get_runtime` and `remove_runtime_version`, and Archi's
   handbook, name the field and what it means.
+- **SY.admin's part built on `coa/admin-139` for 0.1.139:** `get_runtime` has notes of its own
+  (its `usage_global_visible`: `running_nodes`, `skipped_hives`, `hives_without_runtimes` and
+  `in_use`, null never read as not in use), and both its help and `remove_runtime_version`'s name
+  `hives_without_runtimes` (`HIVES_WITHOUT_RUNTIMES_NOTE`): each ingress and egress, `{hive_id,
+  role}`, by the role the registry records, neither asked, counted nor skipped, and never holding
+  a removal up. Its test, `the_runtime_help_names_the_hives_without_runtimes`, fails without it.
+  Archi's handbook is the architect branch's.
 
 ### A-314 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.134, 2026-11-11; a new node launched and killed in 9.8 s, the stopped nodes with no unit read `STOPPED`, a core node's kill refused `INVALID_REQUEST`) (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
 
