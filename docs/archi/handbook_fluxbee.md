@@ -171,6 +171,15 @@ needs no such answer: next to it, a password only feeds `sudo`. A join re-run af
 late finds the worker running and touches no SSH: its answer says so, and `harden_ssh` is not
 applied.
 
+**A box that still runs another hive** (FINDINGS A-331, since 0.1.139). Before it installs
+anything, a join reads the box: when its `/etc/fluxbee/hive.yaml` names another hive id and one of
+its Fluxbee services runs, the join fails `BOX_RUNS_ANOTHER_HIVE`, nothing installed. The hive's
+record (`GET /hives/<hive>`) has it in `join.error_code`, and `join.result` names `box_hive_id`
+and `running_units`. Tell the operator what the message says to do: when that other hive is still
+a hive of the motherbee, remove it first (`remove_hive`, with the box reachable, so its cleanup
+stops that install); otherwise the operator stops those services on the box, or uses a fresh box.
+Then the join is asked again. A box joined again under its own name joins as before.
+
 ---
 
 ## 4. Node Family Guidance

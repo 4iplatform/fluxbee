@@ -586,6 +586,21 @@ to an `ssh_key` the password only feeds `sudo`. A socket-only re-run touches no 
 `harden_ssh`; when its request carries a password, its `warnings` say so
 (`socket_only_join_ssh_warnings`).
 
+Each join reads the box once its sudo works, before it installs anything
+(`refuse_box_running_another_hive`, FINDINGS A-331, since 0.1.139): `/etc/fluxbee/hive.yaml`'s
+`hive_id` and `systemctl is-active` of each Fluxbee unit, the core services and Syncthing that
+`remove_hive`'s cleanup stops (`BOX_INSTALL_UNITS`, `box_install_probe_command`). A box whose
+hive.yaml names another hive id while one of those units runs is refused `BOX_RUNS_ANOTHER_HIVE`
+(`box_runs_another_hive_refusal`, not retryable), with `box_hive_id`, `running_units` and what to
+do in its message: `remove_hive` of that hive first, while the box can be reached, when the
+registry still lists it; otherwise stop those units on the box (`systemctl disable --now ...`) or
+use a fresh box. A worker join restarts the box's router but only starts its orchestrator, a no-op
+on one that runs, and no join restarts the other services it finds running: on 8.x (0.1.137) a box
+whose removal did not reach it, joined again as another hive, failed `WORKER_ORCHESTRATOR_TIMEOUT`
+after 191 s, its router up under the new name and its orchestrator not. A box joined again under
+its own name, one whose units a removal stopped and a fresh box join as before; a read of the box
+that fails is logged and the join goes on, as before the check.
+
 A successful join answers `warnings`. A join that logged in with `ssh_password` (its key-first
 probe failed and the password seeded the motherbee key) with `harden_ssh: false` says there that
 password logins stay enabled on the box, and how to close them (`add_hive_ssh_warnings`, FINDINGS

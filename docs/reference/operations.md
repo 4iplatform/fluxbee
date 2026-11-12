@@ -176,7 +176,18 @@ What a worker join does (`add_hive_flow`):
 1. Issues the hive's certificate from the motherbee's mesh CA (`issue_hive_tls`).
 2. Gets SSH access with the motherbee key `/var/lib/fluxbee/ssh/motherbee.key` (installing it
    with the given password or key) and waits for the host to settle, up to 900 s
-   (`wait_for_host_to_settle`; `HOST_NOT_SETTLED` is retryable).
+   (`wait_for_host_to_settle`; `HOST_NOT_SETTLED` is retryable). Once its sudo works, it reads
+   what the box runs (`refuse_box_running_another_hive`, FINDINGS A-331, since 0.1.139): a box
+   whose `/etc/fluxbee/hive.yaml` names another hive id while one of its Fluxbee units runs (the
+   core services and Syncthing, those `remove_hive`'s cleanup stops) is refused
+   `BOX_RUNS_ANOTHER_HIVE`, nothing installed, its record naming `box_hive_id`, `running_units`
+   and what to do: `remove_hive` of that hive first while the box can be reached, when this
+   motherbee still has it; otherwise stop those units on the box (`systemctl disable --now ...`),
+   or use a fresh box. A join does not restart every service it finds running, so that install
+   went on under the other name: a worker's join failed `WORKER_ORCHESTRATOR_TIMEOUT` after
+   minutes, its router up under the new name and its orchestrator not. A box joined again under
+   its own name, or whose units a removal stopped, joins as before; a read of the box that fails
+   is logged and the join goes on.
 3. Copies the role's core binaries and `manifest.json` from the motherbee's
    `/var/lib/fluxbee/dist/core/` (`sync_core_to_worker`), the vendored Syncthing
    (`sync_vendor_to_worker`) and the installation file (`sync_installation_to_worker`, mode 0644,

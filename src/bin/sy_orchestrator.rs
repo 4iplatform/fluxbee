@@ -23986,6 +23986,182 @@ fn invalid_hive_id_answer() -> serde_json::Value {
     })
 }
 
+/// The units of a Fluxbee install on a box: the core services and Syncthing, which
+/// `remove_hive`'s cleanup stops and disables (`remove_hive_cleanup_script`). One of them running
+/// under another hive id is that hive's install still running there (FINDINGS A-331).
+const BOX_INSTALL_UNITS: &[&str] = &[
+    "rt-gateway",
+    "sy-config-routes",
+    "sy-opa-rules",
+    "sy-identity",
+    "sy-vault",
+    "sy-cognition",
+    "sy-timer",
+    "sy-wf-rules",
+    "sy-orchestrator",
+    "sy-admin",
+    "sy-architect",
+    "sy-storage",
+    "sy-frontdesk-gov",
+    "sy-edge",
+    "fluxbee-syncthing",
+];
+
+/// The markers around a box's hive.yaml in `box_install_probe_command`'s output.
+const BOX_HIVE_YAML_BEGIN: &str = "@@fluxbee-box-hive-yaml-begin@@";
+const BOX_HIVE_YAML_END: &str = "@@fluxbee-box-hive-yaml-end@@";
+
+/// What a box a join reaches over SSH already holds of a Fluxbee install (FINDINGS A-331).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct BoxInstall {
+    /// The hive id its `/etc/fluxbee/hive.yaml` names, when it has one that parses and names one.
+    hive_id: Option<String>,
+    /// The units of `BOX_INSTALL_UNITS` that run there (systemd answers active, activating or
+    /// reloading), in that order.
+    running_units: Vec<String>,
+}
+
+/// The command a join runs on the box (as root, through the bootstrap's sudo) before it installs
+/// anything: the box's `/etc/fluxbee/hive.yaml` between two markers, when there is one, then
+/// `unit <name> <state>` for each of `BOX_INSTALL_UNITS`, as `systemctl is-active` answers it.
+/// Built from constants only (no caller input).
+fn box_install_probe_command() -> String {
+    sudo_bash_wrap(&format!(
+        "if [ -f /etc/fluxbee/hive.yaml ]; then echo '{BOX_HIVE_YAML_BEGIN}'; \
+         cat /etc/fluxbee/hive.yaml; echo; echo '{BOX_HIVE_YAML_END}'; fi; \
+         for u in {units}; do echo \"unit $u $(systemctl is-active \"$u\" 2>/dev/null)\"; done; true",
+        units = BOX_INSTALL_UNITS.join(" "),
+    ))
+}
+
+/// `box_install_probe_command`'s output read: the hive id the box's hive.yaml names, and the
+/// units that run. A hive.yaml that does not parse, or names no hive id, names none.
+fn box_install_from_probe(output: &str) -> BoxInstall {
+    let (yaml, units) = match (
+        output.find(BOX_HIVE_YAML_BEGIN),
+        output.find(BOX_HIVE_YAML_END),
+    ) {
+        (Some(begin), Some(end)) if begin < end => (
+            Some(&output[begin + BOX_HIVE_YAML_BEGIN.len()..end]),
+            &output[end + BOX_HIVE_YAML_END.len()..],
+        ),
+        _ => (None, output),
+    };
+    let hive_id = yaml
+        .and_then(|yaml| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok())
+        .and_then(|hive| {
+            hive.get("hive_id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|hive_id| !hive_id.is_empty());
+    let running_units = units
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("unit"), Some(unit), Some("active" | "activating" | "reloading"))
+                    if BOX_INSTALL_UNITS.contains(&unit) =>
+                {
+                    Some(unit.to_string())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    BoxInstall {
+        hive_id,
+        running_units,
+    }
+}
+
+/// FINDINGS A-331: the refusal of a join of `hive_id` onto a box at `address` that runs another
+/// hive's install: its hive.yaml names another hive id and one of its Fluxbee units runs. A worker
+/// join restarts the box's router but only starts its orchestrator, a no-op on one that runs, and
+/// no join restarts the box's other services, so they went on under the other name: on 8.x (0.1.137)
+/// a box removed with its cleanup not reached, joined again as another hive, failed
+/// `WORKER_ORCHESTRATOR_TIMEOUT` after 191 s, its router up under the new name and its
+/// orchestrator not. `registered` says whether this motherbee's registry still lists a hive id,
+/// which picks what the operator does: remove that hive first, its cleanup reaching the box, or stop
+/// the install on the box. A box whose hive.yaml names this hive (a box joined again under its own
+/// name) or whose units do not run (a removal's cleanup stopped them) is no refusal.
+fn box_runs_another_hive_refusal(
+    hive_id: &str,
+    address: &str,
+    install: &BoxInstall,
+    registered: impl Fn(&str) -> bool,
+) -> Option<serde_json::Value> {
+    let other = install.hive_id.as_deref()?;
+    if other == hive_id || install.running_units.is_empty() {
+        return None;
+    }
+    let what_to_do = if registered(other) {
+        format!(
+            "'{other}' is a hive of this motherbee: remove it first (remove_hive) while the box \
+             can be reached, so its cleanup stops that install, then ask again"
+        )
+    } else {
+        format!(
+            "stop that install on the box (systemctl disable --now {}), or use a fresh box, then \
+             ask again",
+            install.running_units.join(" ")
+        )
+    };
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "BOX_RUNS_ANOTHER_HIVE",
+        "retryable": false,
+        "hive_id": hive_id,
+        "address": address,
+        "box_hive_id": other,
+        "running_units": install.running_units,
+        "message": format!(
+            "the box at {address} runs hive '{other}' (its /etc/fluxbee/hive.yaml), and these of \
+             its units run: {}. A box joins under another hive id only once that install is \
+             stopped: a join does not restart every service it finds running, so they would go \
+             on as '{other}'. Nothing was installed: {what_to_do}.",
+            install.running_units.join(", ")
+        ),
+    }))
+}
+
+/// A join's look at the box before it installs anything (FINDINGS A-331): the refusal when the box
+/// runs another hive's install (`box_runs_another_hive_refusal`). A probe that fails is logged and
+/// the join goes on as it did before the check: its next steps go over the same SSH.
+fn refuse_box_running_another_hive(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Option<serde_json::Value> {
+    match ssh_with_key_output(address, key_path, &box_install_probe_command(), user) {
+        Ok(output) => {
+            let install = box_install_from_probe(&output);
+            if let Some(other) = install.hive_id.as_deref().filter(|other| *other != hive_id) {
+                tracing::info!(
+                    hive_id = hive_id,
+                    address = address,
+                    box_hive_id = other,
+                    running_units = ?install.running_units,
+                    "the box a join reaches was another hive"
+                );
+            }
+            box_runs_another_hive_refusal(hive_id, address, &install, |other| {
+                registry_has_hive(&hives_root(), other)
+            })
+        }
+        Err(err) => {
+            tracing::warn!(
+                hive_id = hive_id,
+                address = address,
+                error = %err,
+                "could not read what the box runs before the join installs; the join goes on"
+            );
+            None
+        }
+    }
+}
+
 /// The removed hive's mesh credentials (FINDINGS A-48): its WAN TLS leaf and its identity HMAC
 /// key, so the box can neither dial the WAN nor open :9100 again. The cleanup's first step.
 const REMOVE_HIVE_CREDENTIALS_SCRIPT: &str =
@@ -35194,6 +35370,11 @@ async fn add_hive_flow(
             "message": format!("key access verification failed after bootstrap seed: {err}"),
         });
     }
+    if let Some(refusal) =
+        refuse_box_running_another_hive(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return refusal;
+    }
 
     let core_manifest = match load_core_manifest() {
         Ok(manifest) => manifest,
@@ -36092,6 +36273,11 @@ async fn add_egress_hive_flow(
             format!("key access verification failed: {err}"),
         );
     }
+    if let Some(refusal) =
+        refuse_box_running_another_hive(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return refusal;
+    }
 
     // FINDINGS A-1: the egress' interfaces and addresses are the operator's, so the join reads
     // them before it installs anything: `edge_ip` is the address lan_iface carries, never a
@@ -36852,6 +37038,11 @@ async fn add_ingress_hive_flow(
             "SSH_KEY_FAILED",
             format!("key access verification failed: {err}"),
         );
+    }
+    if let Some(refusal) =
+        refuse_box_running_another_hive(hive_id, address, &key_path, creds.user.as_str())
+    {
+        return refusal;
     }
 
     // The ingress' SY nodes are this release's (`release_settings`), as the worker's.
@@ -49657,6 +49848,149 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
             .find("systemctl stop 'fluxbee-node-*'")
             .expect("managed nodes stopped");
         assert!(nodes_stop < script.find("rm -rf /var/lib/fluxbee/nodes/*").unwrap());
+    }
+
+    /// FINDINGS A-331: a join reads the box before it installs anything. On 8.x (0.1.137) a box
+    /// removed with its cleanup not reached, so its install kept running as `gate0237i`, was
+    /// joined as `gate0237j`: its router came up under the new name, its orchestrator did not, and
+    /// the join failed `WORKER_ORCHESTRATOR_TIMEOUT` after 191 s with nothing saying why. A box
+    /// whose hive.yaml names another hive and whose Fluxbee units run is refused
+    /// `BOX_RUNS_ANOTHER_HIVE`, naming that hive, the units and what to do; a box joined again
+    /// under its own name, one whose units a removal stopped, and a fresh box join as before.
+    #[test]
+    fn a_join_refuses_a_box_that_runs_another_hives_install() {
+        let probe = |yaml: Option<&str>, units: &[(&str, &str)]| {
+            let mut output = String::new();
+            if let Some(yaml) = yaml {
+                output.push_str(&format!(
+                    "{BOX_HIVE_YAML_BEGIN}\n{yaml}\n\n{BOX_HIVE_YAML_END}\n"
+                ));
+            }
+            for (unit, state) in units {
+                output.push_str(&format!("unit {unit} {state}\n"));
+            }
+            output
+        };
+        let gate_i = "hive_id: \"gate0237i\"\nrole: worker\nwan:\n  gateway_name: RT.gateway\n";
+        let units = [
+            ("rt-gateway", "active"),
+            ("sy-config-routes", "inactive"),
+            ("sy-orchestrator", "activating"),
+            ("sy-identity", "failed"),
+            ("sy-timer", "reloading"),
+            ("fluxbee-syncthing", "deactivating"),
+            // Not one of the install's units: never counted.
+            ("sshd", "active"),
+        ];
+        let install = box_install_from_probe(&probe(Some(gate_i), &units));
+        assert_eq!(
+            install,
+            BoxInstall {
+                hive_id: Some("gate0237i".to_string()),
+                running_units: ["rt-gateway", "sy-orchestrator", "sy-timer"]
+                    .map(str::to_string)
+                    .to_vec(),
+            }
+        );
+
+        let refusal = box_runs_another_hive_refusal("gate0237j", "192.0.2.14", &install, |_| false)
+            .expect("refused");
+        assert_eq!(refusal["status"], "error");
+        assert_eq!(refusal["error_code"], "BOX_RUNS_ANOTHER_HIVE");
+        assert_eq!(refusal["retryable"], false);
+        assert_eq!(refusal["hive_id"], "gate0237j");
+        assert_eq!(refusal["box_hive_id"], "gate0237i");
+        assert_eq!(
+            refusal["running_units"],
+            serde_json::json!(["rt-gateway", "sy-orchestrator", "sy-timer"])
+        );
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "the box at 192.0.2.14 runs hive 'gate0237i' (its /etc/fluxbee/hive.yaml), and \
+                 these of its units run: rt-gateway, sy-orchestrator, sy-timer."
+            ) && message.contains(
+                "stop that install on the box (systemctl disable --now rt-gateway sy-orchestrator \
+                 sy-timer), or use a fresh box"
+            ),
+            "{message}"
+        );
+        // That hive is still in the registry: remove it first, its cleanup reaching the box.
+        let registered =
+            box_runs_another_hive_refusal("gate0237j", "192.0.2.14", &install, |hive| {
+                hive == "gate0237i"
+            })
+            .expect("refused");
+        let message = registered["message"].as_str().unwrap_or_default();
+        assert!(
+            message
+                .contains("'gate0237i' is a hive of this motherbee: remove it first (remove_hive)"),
+            "{message}"
+        );
+
+        // No refusal: the box joined again under its own name, its units stopped by a removal, a
+        // fresh box, a hive.yaml that does not parse or names no hive.
+        assert_eq!(
+            box_runs_another_hive_refusal("gate0237i", "192.0.2.14", &install, |_| true),
+            None
+        );
+        for output in [
+            probe(
+                Some(gate_i),
+                &[("rt-gateway", "inactive"), ("sy-orchestrator", "failed")],
+            ),
+            probe(None, &[("rt-gateway", "inactive")]),
+            probe(Some("hive_id: [unclosed"), &[("rt-gateway", "active")]),
+            probe(Some("role: worker"), &[("rt-gateway", "active")]),
+            String::new(),
+        ] {
+            let install = box_install_from_probe(&output);
+            assert_eq!(
+                box_runs_another_hive_refusal("gate0237j", "192.0.2.14", &install, |_| true),
+                None,
+                "{output}"
+            );
+        }
+        // A hive.yaml line that reads like a unit's is not one.
+        let tricky = box_install_from_probe(&probe(
+            Some("hive_id: worker5\nnotes: |\n  unit rt-gateway active"),
+            &[("rt-gateway", "inactive")],
+        ));
+        assert_eq!(tricky.hive_id.as_deref(), Some("worker5"));
+        assert!(tricky.running_units.is_empty(), "{tricky:?}");
+
+        // The probe asks for every unit the removal's cleanup stops, and only those.
+        let command = box_install_probe_command();
+        assert!(command.starts_with("sudo -n bash -lc '"), "{command}");
+        assert!(command.contains(&format!("for u in {}; do", BOX_INSTALL_UNITS.join(" "))));
+        assert!(remove_hive_cleanup_script()
+            .starts_with(&format!("for s in {}; do", BOX_INSTALL_UNITS.join(" "))));
+
+        // Every join flow reads the box after its sudo works and before it copies anything there.
+        let src = include_str!("sy_orchestrator.rs");
+        for (flow, next) in [
+            ("async fn add_hive_flow(", "async fn add_egress_hive_flow("),
+            (
+                "async fn add_egress_hive_flow(",
+                "async fn add_ingress_hive_flow(",
+            ),
+            (
+                "async fn add_ingress_hive_flow(",
+                "fn ssh_bootstrap_error_payload(",
+            ),
+        ] {
+            let start = src.find(flow).unwrap_or_else(|| panic!("{flow}"));
+            let end = start + src[start..].find(next).unwrap_or_else(|| panic!("{next}"));
+            let body = &src[start..end];
+            let at = |needle: &str| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("{flow}: {needle}"))
+            };
+            let sudo = at("\"sudo -n /bin/bash -lc 'exit 0'\"");
+            let probe = at("refuse_box_running_another_hive(hive_id, address, &key_path,");
+            let copy = at("sync_core_to_worker(");
+            assert!(sudo < probe && probe < copy, "{flow}");
+        }
     }
 
     /// FINDINGS A-48: the removed box loses its mesh credentials before anything else.
