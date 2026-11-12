@@ -472,7 +472,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
+- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141).
 - A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, with 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
@@ -5058,6 +5058,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** the Go SDK gets the Rust SDK's `text/v1` offload (the blob layout and its promote;
   check the WF nodes' access to the blob root). A Go SDK release, alone.
 - **The operator (2026-11-11):** after the sweep (the Go SDK alone, with the next change there).
+- **Built on `coa/gosdk-141` (the Go SDK alone, planned 0.1.141, with A-329):**
+  - **A WF's text over about 62 KiB goes as a blob, as the Rust SDK sends it.**
+    `NodeSender.SendTraced` (`go/fluxbee-go-sdk/text_offload.go`) puts the text of a text/v1
+    payload whose inline form, with 2,048 bytes for the rest of the frame, is over 64 KiB (the
+    Rust SDK's `TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES` and `TEXT_V1_DEFAULT_OVERHEAD_BYTES`) in a blob,
+    `content_<the first 16 hex digits of its SHA-256>.txt`, `text/plain` (`text/html` or
+    `image/svg+xml` when its first bytes are such a document, the Rust SDK's sniff), of the UTC
+    day, and sends `content_ref` in its place. The blob layout and its promote are the Rust SDK's
+    (A-56): `staging/<prefix>/` written to an exclusive temporary file and renamed, then moved to
+    `active/<prefix>/`, given to the owner of `active/` (the Syncthing user, so it reaches the other
+    hives), 0640, every directory opened without following a link; a blob already in `active/` is
+    left in place. A reader reads it with the Rust SDK's `read_blob_with_retry` (the IO nodes'
+    `resolve_text_v1_for_outbound`, the AI SDK's model input). Unlike the Rust SDK, a payload under
+    the limit goes byte for byte (a `forward` stays byte-faithful) and one over it keeps its other
+    fields; only `content` becomes `content_ref`. When the blob cannot be written the payload goes
+    as it is, with a log line, as in Rust, and a frame over 128 KiB is then refused as before.
+  - **The WF nodes' access to the blob root:** a WF node runs as root, as every managed node (a
+    transient `systemd-run` unit with no `User=` and no sandboxing, `src/bin/sy_orchestrator.rs`
+    ~31671), so it writes `staging/` (root's) and gives a blob to the owner of `active/`, as the
+    Rust nodes do; the root is the hive's `/var/lib/fluxbee/blob`, the Rust offload's fixed default
+    (`DefaultBlobRoot`). The Go SDK takes `golang.org/x/sys` v0.23.0 for the descriptor-relative
+    calls (the version SY.opa.rules builds with; SY.timer and the WF build with v0.42.0 already,
+    SY.wf-rules adds it).
+  - **By its tests, each checked failing without its fix:** `TestATextOverTheFrameIsSentAsABlob`
+    (a text of 220 KiB sent as a ref; before, `MessageTooLargeError`),
+    `TestATextOverTheLimitGoesAsABlob`, `TestAPayloadThatNeedsNoBlobGoesByteForByte`,
+    `TestActiveMarkupIsLabeledAsTheRustSDKLabelsIt`, `TestTheSameTextTwiceIsOneBlob`,
+    `TestALinkInTheBlobTreeIsNeverFollowed` (on the Mac and in a Linux container, as root and as a
+    user).
+  - **What it does not cover, recorded:** a WF's large `meta.context` (its resolved `vars`) with a
+    short text still takes the frame into A-253's window, and a payload that is not text is not
+    offloaded (both as in the Rust SDK). A blob left in `staging/` by a crash between its write and
+    its promote, or by a second copy of a blob already active, waits for the staging clean-up
+    (24 h, A-241), as the Rust SDK's does.
+  - **Mixed versions:** every reader takes a `content_ref` already (the IO nodes and the AI SDK
+    read the ones the Rust SDK writes for an agent's long answer); a WF on an older wf-generic keeps
+    sending its long texts inline (refused over 128 KiB, as before).
 
 ### A-263 [General/admin] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; at its own deploy SY.admin marked each spoke settled 2.9 to 4.4 s after the spoke's own settle, the marks 9.7 s apart, the spokes' own settles 9.3 s; one read lost to a restart asked again at once) (found 2026-11-10 by A-250's builder; read in the code) — The installation update's follow reads one hive at a time
 

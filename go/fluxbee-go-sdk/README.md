@@ -99,6 +99,8 @@ The v1 stable surface is:
   - `MSGNotTaken`, `NotTakenPayload`, `NotTakenReasonNodeBusy`
   - `BuildNotTaken`, `ParseNotTaken`
   - `IsNoticeOrReply`, `IsReplyName`: the messages no one answers
+- the text/v1 offload (below): `BlobRef`, `TextOffloadMaxMessageBytes`,
+  `TextOffloadOverheadBytes`, `DefaultBlobRoot`
 - node control-plane helpers:
   - `CONFIG_GET`
   - `CONFIG_SET`
@@ -146,6 +148,21 @@ The connection's reader waits for room in the receiver's queue (256) instead of 
 (since 0.1.141): the dispatcher never waits, so the wait is short, and meanwhile the frames wait in
 the router's queue for the link, which answers `LINK_BUSY` past its bound
 ([protocol](../../docs/reference/protocol.md) §6.10, §10.2, §11).
+
+## A long text goes as a blob
+
+`NodeSender.Send` (and `SendTraced`) puts the text of a text/v1 payload (`{"type": "text",
+"content": ...}`) whose inline form, with 2 KiB for the rest of the frame, is over 64 KiB in a blob
+of the hive's blob store (`/var/lib/fluxbee/blob`), and sends its ref in its place, `content_ref`
+(`BlobRef`), as the Rust SDK does (since 0.1.141, FINDINGS A-264). The blob is `content_<the first
+16 hex digits of its SHA-256>.txt`, `text/plain` (`text/html` or `image/svg+xml` when its first
+bytes are such a document, so it is served sandboxed), written to `staging/<prefix>/` and moved to
+`active/<prefix>/` with the Rust SDK's layout and checks (no link under the blob root followed; the
+blob given to the owner of `active/`, whom Syncthing runs as, so it reaches the other hives). A
+reader reads it with the Rust SDK's `read_blob_with_retry`. A payload under the limit goes byte for
+byte; one over it keeps its other fields. When the blob cannot be written, the payload goes as it
+is, with a log line, and a frame over 128 KiB is then refused (`MessageTooLargeError`). The node
+writes the blob itself: a WF runs as root, as every managed node.
 
 ## SY.timer client patterns
 

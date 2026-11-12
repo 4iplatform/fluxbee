@@ -386,6 +386,9 @@ Common guards:
   - `target` is a node name written in the definition, never a `SY.*` or `RT.*` node. To choose
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
+  - A text over about 62 KiB (`{"type": "text", "content": ...}`) goes as a blob, its `content`
+    replaced by a `content_ref` that the IO node or the agent reads in full (since 0.1.141, as an
+    agent's long answer does). Before, a WF's text over 128 KiB was never sent.
   - A message the WF writes to an agent or a WF carries the instance's person: the `src_ilk` and
     `ich` that the messages of the person's IO node share: the IO node the person wrote from. On a thread several people write on,
     it carries none. Its writer is the WF (below): the agent reads it as the WF's, not as the

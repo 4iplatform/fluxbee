@@ -264,11 +264,11 @@ the motherbee and the workers, where they read them, and no longer on the ingres
     128 KiB reaches its node but neither `turns` nor cognition. The Rust SDK normally sends a text
     over about 62 KiB as a blob (`crates/fluxbee_sdk/src/send_normalization.rs`; it sends the text
     inline only when the blob cannot be written), and the IO nodes the same
-    (`nodes/io/common/src/text_v1_blob.rs`), so their turns stay under it. What can reach it: a
-    WF's text, since the Go SDK has no blob offload (`go/fluxbee-go-sdk/client.go`), and a WF's
-    large `meta.context` (its resolved `vars`) even with a short text; a payload that is not text;
-    and a raw client. SY.timer cannot: its messages are system ones, which the router never copies.
-    The later fix is the Go SDK's text offload (FINDINGS A-264).
+    (`nodes/io/common/src/text_v1_blob.rs`), and since 0.1.141 the Go SDK, a WF's
+    (`go/fluxbee-go-sdk/text_offload.go`, FINDINGS A-264), so their turns stay under it. What can
+    reach it: a WF's large `meta.context` (its resolved `vars`) even with a short text; a payload
+    that is not text; a text whose blob could not be written, which goes inline; and a raw client.
+    SY.timer cannot: its messages are system ones, which the router never copies.
   - NATS took up to 1 MB.
 - **Counted once:** a skipped record is counted when the sink's cursor passes it, which happens
   right away ahead of a batch; one met after the first record of a batch ends that batch and is

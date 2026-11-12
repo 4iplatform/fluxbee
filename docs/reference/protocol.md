@@ -587,13 +587,17 @@ Conversational text is `TextV1Payload` (`crates/fluxbee_sdk/src/payload.rs`):
   as files (`blob.sync` in `config/hive.yaml`, tool `syncthing`), so the file may arrive after the
   message: read it with `BlobToolkit::read_blob_with_retry`, which waits for a missing blob (5 s
   with the default `ResolveRetryConfig`) and checks the size and the hash in the name.
-- **Automatic offload, Rust only.** `NodeSender::send` normalizes every payload whose `type` is
+- **Automatic offload.** `NodeSender::send` normalizes every payload whose `type` is
   `text` (`crates/fluxbee_sdk/src/send_normalization.rs`): when the inline payload, serialized, plus
   2,048 bytes (`TEXT_V1_DEFAULT_OVERHEAD_BYTES`) exceeds 64 KiB
   (`TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES`), the text becomes a blob (`content.txt`, `text/plain`)
   referenced by `content_ref`. If that fails, the payload goes unchanged, with a warning. The Go
-  SDK does not do this.
-- Limits: 128 KiB per frame (§1.3); with the Rust SDK, 64 KiB for an inline text payload. Other
+  SDK does the same since 0.1.141 (`NodeSender.SendTraced`, `go/fluxbee-go-sdk/text_offload.go`,
+  FINDINGS A-264), measured on the payload as it goes, with the same blob layout, promote and
+  checks (staging, then `active/`, given to its owner, no link followed); unlike the Rust SDK it
+  sends a payload under the limit byte for byte, and keeps a payload's other fields when its text
+  goes as a blob. Before 0.1.141 a WF's text over the frame was refused (`MessageTooLargeError`).
+- Limits: 128 KiB per frame (§1.3); with either SDK, 64 KiB for an inline text payload. Other
   payloads are not offloaded: over the frame limit, `send` fails.
 
 ---
@@ -755,7 +759,7 @@ UNREACHABLE, and a node that answers every message bounces it forever.
 | `AnyMsgOfType` success matcher | Never registered as a reply shape | The same (`registerResponseOnly`) |
 | System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC`: 16 unless `Options.TTL` sets another; `BuildSystemRequest` alone turns 0 into 1. It also sets `meta.action` to the verb |
 | Admin request result | `AdminCommandResult` | The raw `Message` |
-| text/v1 blob offload | Automatic (§8) | None |
+| text/v1 blob offload | Automatic (§8) | Automatic since 0.1.141 (§8, FINDINGS A-264); before, none |
 | `compute_thread_id`, `stream::append`, vault client | Yes | No |
 | `meta.via_tap` | In `Meta` | Not in `Meta` |
 | `ECHO`, `ECHO_REPLY`, `TIME_SYNC` | Gone (FINDINGS A-218) | `MSGEcho` and `MSGEchoReply` gone since 0.1.130; `TIME_SYNC` never there |

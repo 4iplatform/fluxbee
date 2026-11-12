@@ -205,10 +205,13 @@ func (s *NodeSender) Send(msg Message) error {
 // (docs/message-trace-v1.md): when it sends it, its own name, and what note adds, the destination
 // by name and the actions it took. A message that is not the solution's carries no trace. A writer
 // it names by ILK alone gets its name from the identity memory of this node's hive
-// (docs/cognition-hands-v1.md §5). A message whose frame is over the limit is refused with
-// *MessageTooLargeError before it is queued: queued, it would make the writer drop the connection.
-// A full queue fails with "sender queue full".
+// (docs/cognition-hands-v1.md §5). The text of a text/v1 payload over about 62 KiB goes as a blob,
+// its content_ref in its place, as the Rust SDK sends it (text_offload.go, FINDINGS A-264). A
+// message whose frame is over the limit is refused with *MessageTooLargeError before it is queued:
+// queued, it would make the writer drop the connection. A full queue fails with "sender queue
+// full".
 func (s *NodeSender) SendTraced(msg Message, note TraceNote) error {
+	offloadMessageText(&msg)
 	WriteTraceEntry(&msg, s.FullName(), note)
 	if hive := hiveOf(s.FullName()); hive != "" {
 		fillWriterName(&msg, func(ilk string) (IlkFacts, bool) { return IlkFactsOf(hive, ilk) })
