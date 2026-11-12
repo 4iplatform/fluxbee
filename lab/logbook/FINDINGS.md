@@ -230,7 +230,7 @@ no change required
     (A-272, A-268). A-314's leftover, SY.admin's help that offers `SY.admin@motherbee` as the
     `node_name` of `kill_node` and `remove_node_instance`, is built for SY.admin's 0.1.137
     (`coa/admin-136`, `b0bfce41`).
-26. **0.1.135, the router alone** ✅ live and checked on 8.x (2026-11-12): A-272 (split horizon: a
+26. **0.1.135, the router alone** ✅ live and checked on 8.x (2026-11-11): A-272 (split horizon: a
     broadcast that came over the WAN never goes back to the peer it came from; 32 broadcasts from
     each hive reached every receiver exactly once and no router logged a drop, where on 0.1.134 the
     echoes gave 7 drop lines on the motherbee and 6 on each spoke) and A-268 (FIB builds stored in
@@ -2363,7 +2363,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Cloud the new token at once. On a record that times out, the retry waits another 30 s, so the
   call can take about 2 minutes. Found by its review: A-316 and A-317.
 
-### A-272 [General/router] ✅ VALIDATED ON 8.x (0.1.135, 2026-11-12; 32 broadcasts from each hive reached every receiver exactly once and no router logged a drop, where 0.1.134 logged the echoes, 7 lines on the motherbee and 6 on each spoke) (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
+### A-272 [General/router] ✅ VALIDATED ON 8.x (0.1.135, 2026-11-11; 32 broadcasts from each hive reached every receiver exactly once and no router logged a drop, where 0.1.134 logged the echoes, 7 lines on the motherbee and 6 on each spoke) (found 2026-11-11 by 0.1.132's gate; seen on 8.x, read in the code; there before it) — Every router sends a WAN broadcast back to the peer it came from
 
 - **Seen:** the motherbee logged `foreign_source` drops of its own nodes' broadcasts coming back
   from ingress1 and worker1 (`src_l2_name` `IO.gate0232b@motherbee`, 0.1.131 and 0.1.132), and
@@ -2450,7 +2450,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Another sender (A-293's review, 2026-11-11):** IO.cloud logs the Cloud's `op` unescaped
   (`op = %op`) on its received and completed lines; a trusted sender, left for the router's fix.
 
-### A-268 [General/router] ✅ BUILT (0.1.135, 2026-11-12; its race by its unit test, no live trigger; A-265's check unchanged on 8.x, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
+### A-268 [General/router] ✅ BUILT (0.1.135, 2026-11-11; its race by its unit test, no live trigger; A-265's check unchanged on 8.x, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 
 - **Why:** `rebuild_fib` (`src/router/mod.rs`) reads the nodes, the siblings, the static routes, the
   LSA snapshot and the reachability, and stores its FIB at the end under the FIB's lock; nothing
