@@ -305,6 +305,12 @@ rules. What they do:
   certificate's key reaches its TLS handling (`src/bin/sy_edge.rs`, [SY.edge](sy-edge.md)).
 - SY.admin and SY.cognition re-resolve their AI key (`handle_vault_secret_changed_admin` in
   `src/bin/sy_admin.rs`; the handler in `src/bin/sy_cognition.rs`).
+- The AI nodes answer nothing (the AI SDK's `is_vault_secret_changed`): SY.frontdesk.gov re-resolves
+  its AI key, and ai.generic, which asks SY.vault for its key at each model call, leaves it alone
+  (since 0.1.142, FINDINGS A-325; before, ai.generic answered each one, the bootstrap's included,
+  with an `unknown_system_msg` error that SY.vault drops).
+- SY.timer answers each one with a `TIMER_UNKNOWN_VERB` error, which SY.vault drops too (A-325's
+  sibling, recorded there; SY.timer's next change).
 
 ## Model D': no secrets in node config
 

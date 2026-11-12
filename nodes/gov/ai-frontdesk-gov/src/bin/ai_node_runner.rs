@@ -10,22 +10,21 @@ use fluxbee_ai_sdk::{
     ai_settings_at, build_model_user_content_parts, build_reply_message_runtime_src,
     build_text_response, control_request, create_function_calling_model, create_llm_client,
     extract_response_envelope, extract_text, installation_file_path, is_infrastructure_message,
-    note_infrastructure_message, resolve_model_input_from_payload_with_options, set_reply_act,
-    AiAccount, AiNode, AiProvider, AiSdkError, AiSettings, AiSettingsSource, ControlRequest,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
-    LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime, ProviderError,
-    ProviderErrorKind, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool,
-    ThreadStatePutTool, ThreadStateStore, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
-    PROVIDER_FAILURE_TEXT,
+    is_vault_secret_changed, note_infrastructure_message,
+    resolve_model_input_from_payload_with_options, set_reply_act, AiAccount, AiNode, AiProvider,
+    AiSdkError, AiSettings, AiSettingsSource, ControlRequest, FunctionCallingConfig,
+    FunctionCallingRunner, FunctionRunInput, FunctionTool, FunctionToolDefinition,
+    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
+    Message, ModelInputOptions, ModelSettings, NodeRuntime, ProviderError, ProviderErrorKind,
+    ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool, ThreadStatePutTool,
+    ThreadStateStore, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS, PROVIDER_FAILURE_TEXT,
 };
 use fluxbee_sdk::managed_control_plane::{
     build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
 };
 use fluxbee_sdk::protocol::{
     Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_CONFIG_GET,
-    MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     managed_node_name, IdentityError, NodeConfig, NodeUuidMode, OperationalRouteProfile,
@@ -3686,11 +3685,6 @@ const CONTROL_VERBS: [&str; 5] = [
 fn is_control_plane(msg: &Message) -> bool {
     msg.meta.msg_type.eq_ignore_ascii_case("system")
         || msg.meta.msg_type.eq_ignore_ascii_case("admin")
-}
-
-fn is_vault_secret_changed(msg: &Message) -> bool {
-    msg.meta.msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
-        && msg.meta.msg.as_deref() == Some(MSG_VAULT_SECRET_CHANGED)
 }
 
 fn build_control_plane_response(msg: &Message, response_msg: &str, payload: Value) -> Message {

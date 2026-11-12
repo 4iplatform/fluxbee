@@ -6,7 +6,8 @@ use std::sync::{Mutex, PoisonError};
 
 use fluxbee_sdk::protocol::{
     is_system_kind, MSG_ANNOUNCE, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_HELLO, MSG_NODE_HELP,
-    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, PRIMARY_HIVE_ID,
+    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, MSG_WITHDRAW,
+    PRIMARY_HIVE_ID,
 };
 use serde_json::Value;
 use tokio::time::Instant;
@@ -124,6 +125,17 @@ pub fn is_infrastructure_message(msg: &Message) -> bool {
         "" | MSG_HELLO | MSG_ANNOUNCE | MSG_WITHDRAW | MSG_UNREACHABLE | MSG_TTL_EXCEEDED => true,
         name => name.ends_with("_RESPONSE"),
     }
+}
+
+/// Whether `msg` is SY.vault's `VAULT_SECRET_CHANGED`, a `system` message so named: the broadcast
+/// of a secret's change, sent to every node at each change and, at SY.vault's start, once for each
+/// secret it holds (FINDINGS A-325). It is an event, not a request, and SY.vault takes no answer
+/// to it: its loop skips whatever is not a vault request. An AI node never answers it:
+/// SY.frontdesk.gov reads its AI key again on it, and ai.generic, which asks SY.vault for its key
+/// at each model call, leaves it alone. ai.generic used to answer each one with an
+/// `unknown_system_msg` error, which SY.vault dropped.
+pub fn is_vault_secret_changed(msg: &Message) -> bool {
+    is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_VAULT_SECRET_CHANGED)
 }
 
 /// The journal's line for `msg`, a notice or a reply that reached the control plane of the AI node
@@ -388,6 +400,39 @@ mod tests {
                 "{msg} from {sender}"
             );
         }
+    }
+
+    /// FINDINGS A-325: SY.vault's broadcast of a secret's change, in any case of its kind, from
+    /// whoever names it; nothing else.
+    #[test]
+    fn the_vault_broadcast_is_told_apart() {
+        for kind in ["system", "SYSTEM"] {
+            assert!(is_vault_secret_changed(&request(
+                kind,
+                MSG_VAULT_SECRET_CHANGED,
+                Some("SY.vault@motherbee")
+            )));
+        }
+        assert!(is_vault_secret_changed(&request(
+            "system",
+            MSG_VAULT_SECRET_CHANGED,
+            None
+        )));
+        assert!(!is_vault_secret_changed(&request(
+            "user",
+            MSG_VAULT_SECRET_CHANGED,
+            Some("SY.vault@motherbee")
+        )));
+        assert!(!is_vault_secret_changed(&request(
+            "system",
+            "vault_secret_changed",
+            Some("SY.vault@motherbee")
+        )));
+        assert!(!is_vault_secret_changed(&request(
+            "system",
+            MSG_CONFIG_SET,
+            Some("SY.admin@motherbee")
+        )));
     }
 
     /// The review of A-257: a burst of undelivered answers (a client that sent 200 turns and left)

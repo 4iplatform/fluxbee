@@ -12,17 +12,17 @@ use fluxbee_ai_sdk::{
     ai_settings_at, build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, build_text_response,
     control_request, create_function_calling_model, create_llm_client, extract_text,
-    installation_file_path, is_infrastructure_message, note_infrastructure_message,
-    resolve_message_contract, resolve_model_input_from_payload_with_options, set_reply_evaluation,
-    AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiSdkError,
-    AiSettings, AiSettingsSource, AiUserArtifact, ContractAnswer, ControlRequest,
-    FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem,
-    FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider, FunctionToolRegistry,
-    HiveAiConfig, LanceDbThreadStateStore, LlmClient, LlmRequest, MenuContract, Message,
-    MessageContract, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput,
-    RuntimeConfig, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool,
-    ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch,
-    UsageRecorder, MSG_PING, MSG_STATUS,
+    installation_file_path, is_infrastructure_message, is_vault_secret_changed,
+    note_infrastructure_message, resolve_message_contract,
+    resolve_model_input_from_payload_with_options, set_reply_evaluation, AgentTool, AiAccount,
+    AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiSdkError, AiSettings, AiSettingsSource,
+    AiUserArtifact, ContractAnswer, ControlRequest, FunctionCallingConfig, FunctionCallingModel,
+    FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput,
+    FunctionToolProvider, FunctionToolRegistry, HiveAiConfig, LanceDbThreadStateStore, LlmClient,
+    LlmRequest, MenuContract, Message, MessageContract, ModelInputOptions, ModelSettings,
+    NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateDeleteTool,
+    ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard,
+    ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -1322,6 +1322,19 @@ impl GenericAiNode {
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
         if is_infrastructure_message(&msg) {
             note_infrastructure_message(&self.node_name, &msg);
+            return Ok(None);
+        }
+        // SY.vault's broadcast of a secret's change is an event, not a request: ai.generic asks
+        // SY.vault for its key at each model call, so it has nothing to refresh, and it answers
+        // nothing, as SY.frontdesk.gov does (FINDINGS A-325). It used to answer each one
+        // `unknown_system_msg`, which SY.vault dropped.
+        if is_vault_secret_changed(&msg) {
+            tracing::debug!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "VAULT_SECRET_CHANGED: an event, not a request; not answered"
+            );
             return Ok(None);
         }
         let Some(command) = msg.meta.msg.as_deref() else {
@@ -12392,7 +12405,8 @@ mod tests {
     /// A node, an `admin` message, a verb in another case and the orchestrator of another hive are
     /// refused: a WARN, an `unauthorized` answer under the verb's own response, and nothing
     /// changes. A system message from a node that is no control verb is answered as before; one the
-    /// router made gets no answer (A-112).
+    /// router made gets no answer (A-112), nor does SY.vault's `VAULT_SECRET_CHANGED` broadcast
+    /// (A-325).
     #[tokio::test]
     async fn the_control_plane_refuses_every_other_caller() {
         let node = test_node();
@@ -12454,8 +12468,8 @@ mod tests {
 
         // Not a control verb, from a node: answered as before.
         let mut unknown = sample_request();
-        unknown.routing.src_l2_name = Some("SY.vault@motherbee".to_string());
-        unknown.meta.msg = Some("VAULT_SECRET_CHANGED".to_string());
+        unknown.routing.src_l2_name = Some("SY.wf-rules@motherbee".to_string());
+        unknown.meta.msg = Some("WF_RULES_RELOAD".to_string());
         let answer = control_answer(&node, unknown.clone()).await;
         assert_eq!(answer.payload["error"]["code"], json!("unknown_system_msg"));
         // The same without a sender's name is the router's: no answer.
@@ -12465,6 +12479,24 @@ mod tests {
             .await
             .expect("control plane")
             .is_none());
+
+        // A-325: SY.vault's broadcast of a secret's change is an event: no answer, through the
+        // node's own entry too, and nothing changes.
+        let mut vault = sample_request();
+        vault.routing.src_l2_name = Some("SY.vault@motherbee".to_string());
+        vault.routing.dst = Destination::Broadcast;
+        vault.meta.msg = Some("VAULT_SECRET_CHANGED".to_string());
+        vault.payload = json!({"op": "put", "resource_type": "openai", "tenant_id": "tnt:pruebas"});
+        assert!(node
+            .handle_control_plane(vault.clone())
+            .await
+            .expect("control plane")
+            .is_none());
+        assert!(node.on_message(vault).await.expect("on_message").is_none());
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
+        );
     }
 
     // --- agent-tools-v1 §6.2.1: read_blob ---

@@ -18,7 +18,7 @@ pub mod usage;
 
 pub use agent::Agent;
 pub use control_plane::{
-    control_caller_authorized, control_request, is_infrastructure_message,
+    control_caller_authorized, control_request, is_infrastructure_message, is_vault_secret_changed,
     note_infrastructure_message, ControlRequest, MSG_PING, MSG_STATUS,
 };
 pub use errors::{AiSdkError, ProviderError, ProviderErrorKind, Result, PROVIDER_FAILURE_TEXT};

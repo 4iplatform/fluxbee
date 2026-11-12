@@ -541,6 +541,11 @@ registered case ends saved as `completed` and is never deleted by the model.
   the rate messages come (`ai_runtime_busy`, below) may get as many back. An answer to the
   router's notice would go to the router's own UUID, and the two would bounce it forever (FINDINGS
   A-112). SY.timer and the WF engine leave the same ones unanswered (FINDINGS A-218).
+- **Nor SY.vault's broadcast of a secret's change:** `is_vault_secret_changed(&msg)`
+  (`VAULT_SECRET_CHANGED`, a `system` message) is an event, which SY.vault takes no answer to. The
+  frontdesk reads its key again on it; ai.generic, which asks SY.vault for its key at each model
+  call, leaves it alone (since 0.1.142, FINDINGS A-325: it used to answer each one
+  `unknown_system_msg`).
 - **A tap copy never reaches it:** the runtime takes no message with `meta.via_tap` to
   `on_message` and answers none (`ignored_tap_copy`, FINDINGS A-248), whatever its kind; nor does
   a copy take a worker or a place in the queue (below). Each copy is a debug line and counts in

@@ -50,6 +50,12 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   forever (FINDINGS A-112). SY.timer and wf-generic leave the same ones unanswered (FINDINGS
   A-218).
 - **A tap copy is neither handled nor answered,** whatever its kind: the AI SDK's runtime takes no
+- **SY.vault's `VAULT_SECRET_CHANGED` broadcast is not answered either** (since 0.1.142, FINDINGS
+  A-325; the AI SDK's `is_vault_secret_changed`): it is an event, which SY.vault takes no answer
+  to, and the node asks SY.vault for its key at each model call, so it has nothing to refresh. Its
+  line is at debug. Before, the node answered each one, at every change of a secret and once per
+  secret at SY.vault's start, with an `unknown_system_msg` error that SY.vault dropped. Any other
+  `system` message from a node that is no control verb is still answered `unknown_system_msg`.
   message with `meta.via_tap` to the node (FINDINGS A-248). The node used as a tap's target runs
   no model and no control verb for another node's message, and sends nothing to its sender. The
   journal shows the copies as `tap_copies_ignored` in the `ai runtime metrics` line (every 30 s);

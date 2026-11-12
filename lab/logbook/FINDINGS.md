@@ -2625,6 +2625,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `VAULT_SECRET_CHANGED` from a mesh client `TIMER_UNKNOWN_VERB` in 0.01 s and logged a refusal; on
   0.1.141 it gave no answer within 5 s and logged one `timer_message_ignored`, no refusal, while an
   unknown verb from the same client was still answered `TIMER_UNKNOWN_VERB` within 1 s.
+- **Built on `coa/aisdk-142` (planned 0.1.142, with A-294, A-290 and A-327's `tool_choice`):** the
+  first: the AI SDK's `is_vault_secret_changed` (the frontdesk's own check, moved there), and
+  ai.generic's control plane leaves the broadcast unanswered, a debug line, as the frontdesk does
+  (its key is read from SY.vault at each model call, so it has nothing to refresh); any other
+  `system` message from a node that is no control verb is still answered `unknown_system_msg`.
+  The notice list (`is_infrastructure_message`) is unchanged: SY.timer's and wf-generic's are the
+  same rule, name by name (A-218). Test: ai.generic's
+  `the_control_plane_refuses_every_other_caller` (no answer, through `on_message` too), failing on
+  the old answer; the SDK's `the_vault_broadcast_is_told_apart`.
+- **Its sibling, found by this build (read in the code, not fixed here):** SY.timer answers each
+  `VAULT_SECRET_CHANGED` broadcast with a `TIMER_RESPONSE` error `TIMER_UNKNOWN_VERB`
+  (`handleMessage`, `go/sy-timer/main.go` ~286-340: a `system` message from a named sender that is
+  none of its verbs goes to the `default` arm; `isInfrastructureMessage` does not name it), one per
+  hive's SY.timer at each change and per secret at SY.vault's start, which SY.vault drops. Low;
+  with SY.timer's next change (it leaves the broadcast unanswered, as the AI nodes and wf-generic
+  do).
 
 ### A-324 [General/admin] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.admin's help of `node_help`, read on 8.x, carries the new note: an AI node on ai.generic 0.1.136 or later answers at once however busy; the orchestrator's three are comments) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; since 0.1.136) — SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline
 
