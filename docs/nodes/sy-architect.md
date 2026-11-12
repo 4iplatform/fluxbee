@@ -118,7 +118,9 @@ the method and path to one admin action, sent as `ADMIN_COMMAND` to `SY.admin@<h
 `GET /hives/{hive}/vault/secrets` → `vault_list`, `POST /hives/{hive}/nodes` → `run_node`,
 `DELETE /hives/{hive}/nodes/{name}` → `kill_node`). Two paths stay inside Archi:
 `GET /architect/control/config-get` and `POST /architect/control/config-set`
-(`handle_local_architect_scmd`). `SCMD: help` lists the forms.
+(`handle_local_architect_scmd`). `SCMD: help` lists the forms; its `add_hive` example names the
+fields SY.admin requires, `hive_id`, `address` and `ssh_user` (FINDINGS A-321, since 0.1.139: it
+had no `ssh_user`, so a copied example was refused `INVALID_REQUEST`).
 
 Each segment of the path is percent-decoded once, after the path is split, as SY.admin's HTTP
 routes decode theirs (`scmd_path_parts`, FINDINGS A-287), and Archi's own two paths are matched
@@ -146,7 +148,9 @@ action with the same parameters in the same chat is refused `OPERATION_ALREADY_T
 request first reads an open `add_hive` in the motherbee's hive registry, `get_hive` for its hive
 (`reconcile_timeout_unknown_operation`): a hive `connected` with its join `done` closes the record
 as `succeeded_after_timeout`, one `failed` or `interrupted` as `failed` with its join's error, and
-`NOT_FOUND` as `failed` (the hive no longer exists). `INVALID_HIVE_ID` closes it as `failed` too:
+`NOT_FOUND` as `failed`, its summary saying the registry does not have the hive (removed, or never
+created; FINDINGS A-321, since 0.1.139, where it said the hive no longer exists, of one a timed-out
+`add_hive` usually never created). `INVALID_HIVE_ID` closes it as `failed` too:
 the hive id is not one, and `add_hive` refuses it, so the request goes on and gets `add_hive`'s
 own refusal (FINDINGS A-311). That refusal is `INVALID_HIVE_ID` once the request's other fields
 are valid, since `add_hive` checks its SSH fields and its role first: one without `ssh_user` is
@@ -370,7 +374,12 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   declares a `WF.*` node (SY.wf-rules creates it) or a core node (`SY.*`, `RT.*`), a runtime name
   outside the naming rule (lowercase letters and digits in dot-separated parts), a workflow name
   SY.wf-rules rejects, or a route SY.config.routes would not take as declared (action FORWARD
-  with a `next_hop_hive`, or DROP, case-sensitive; one route per prefix on a hive).
+  with a `next_hop_hive`, or DROP, case-sensitive; one route per prefix on a hive). So is a hive id
+  SY.admin would refuse (`refuse_manifest_hive_id`, FINDINGS A-321, since 0.1.139): each hive the
+  manifest names, a hive its topology adds, a VPN rule's, a node's, a route's and its next hop's,
+  and a workflow's, must be 1 to 64 letters, digits, `_` or `-` as written (no `.`, `/` or space).
+  Before, a hive `a.b` went on into the plan and was refused `INVALID_HIVE_ID` only at execution,
+  once the operator had confirmed it.
   - Validation is strict when a manifest is saved and before a run reconciles. Reading one is not:
     `get_manifest_current` returns a manifest saved before a rule changed with its
     `validation_error`, so the designer can fix it, and a run made from it is blocked.

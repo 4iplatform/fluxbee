@@ -1878,7 +1878,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `a_run_without_an_ai_runtime_keeps_the_fixed_line_with_each_step`,
   `a_discarded_plan_answers_as_archis_own_words`).
 
-### A-321 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder and review; read in the code; there before it) — Archi's plans and texts around `add_hive`
+### A-321 [Archi] 🔵 low · built on `coa/architect-139` for 0.1.139 (found 2026-11-11 by A-311's Archi builder and review; read in the code; there before it) — Archi's plans and texts around `add_hive`
 
 - **Manifests:** Archi never checks a manifest's hive ids: a hive `a.b` is planned, and refused
   `INVALID_HIVE_ID` only at execution, after the operator confirmed.
@@ -1888,6 +1888,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   timed-out `add_hive`'s hive usually never existed.
 - **Fix, later (SY.architect):** check a manifest's hive ids when it is planned; the example's
   `ssh_user`; *"the registry does not have hive 'X' (removed, or never created)"*.
+- **Built on `coa/architect-139` for 0.1.139:** the three, by their tests.
+  - `validate_manifest_v2` refuses a hive id SY.admin would refuse (`refuse_manifest_hive_id`,
+    `is_valid_hive_id`: 1 to 64 letters, digits, `_` or `-`, as written) in each place a manifest
+    names one: a hive its topology adds, a VPN rule's, a node's, a route's and its next hop's, a
+    workflow's. The error names the field and the id, so the designer's next round fixes it
+    (`a_manifest_hive_id_that_is_not_one_is_refused_when_planned`: `a.b`, ` worker1`,
+    `worker/1` and `../x` in each place, and `worker-1` passes).
+  - `SCMD: help`'s `add_hive` example carries `ssh_user`
+    (`the_scmd_help_examples_translate_and_add_hive_names_its_required_fields`: every SCMD example
+    of the help translates, and the `add_hive` one names `hive_id`, `address` and `ssh_user`).
+  - An open `add_hive` record closed on `NOT_FOUND` says *"the registry does not have hive 'X'
+    (removed, or never created); the operation cannot be resolved"*
+    (`an_open_add_hive_closes_on_a_hive_id_that_get_hive_refuses`).
+  - Each test fails without its fix. sy-architect.md says all three.
 
 ### A-320 [Archi] 🔵 low (found 2026-11-11 by A-311's Archi builder; read in the code; there before it) — Only `add_hive`'s timed-out records ever close
 

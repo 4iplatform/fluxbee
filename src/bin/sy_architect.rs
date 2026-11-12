@@ -12183,7 +12183,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X GET /config/storage"
             ],
             "mutation_examples": [
-                "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\"}'",
+                "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\",\"ssh_user\":\"administrator\"}'",
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.sales@motherbee\",\"runtime\":\"ai.generic\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
@@ -12499,6 +12499,16 @@ const ADD_HIVE_ID_NOT_A_HIVE_ID: &str =
     "hive_id is not a hive id (1 to 64 letters, digits, '_' or '-'), and add_hive refuses it: \
      no hive was added";
 
+/// The error summary of an open `add_hive` record whose hive the registry does not have (FINDINGS
+/// A-321): the hive was removed since, or, as for most `add_hive` that timed out, the join never
+/// created it. It said "hive 'X' no longer exists" of a hive that usually never existed.
+fn add_hive_not_in_registry(hive_id: &str) -> String {
+    format!(
+        "the registry does not have hive '{hive_id}' (removed, or never created); the operation \
+         cannot be resolved"
+    )
+}
+
 /// How an open `add_hive` record ends (`settle_open_operation`), read in the motherbee's hive
 /// registry: SY.admin's `get_hive` for the record's hive id. Its final status and error summary;
 /// None while the answer settles nothing (a join still running, an answer of another kind) and
@@ -12526,8 +12536,8 @@ async fn add_hive_outcome_from_registry(
     )
     .await?;
     let error_code = output.get("error_code").and_then(Value::as_str);
-    // The hive is GONE (removed, or the join never created it). Nothing will ever
-    // resolve this record, and leaving it open blocks every identical retry with
+    // The registry does not have the hive (removed, or the join never created it). Nothing will
+    // ever resolve this record, and leaving it open blocks every identical retry with
     // OPERATION_ALREADY_TRACKED forever. Close it as failed.
     if output
         .get("status")
@@ -12535,10 +12545,7 @@ async fn add_hive_outcome_from_registry(
         .is_some_and(|v| v.eq_ignore_ascii_case("not_found"))
         || error_code.is_some_and(|v| v.eq_ignore_ascii_case("NOT_FOUND"))
     {
-        return Ok(Some((
-            "failed",
-            format!("hive '{hive_id}' no longer exists; the operation cannot be resolved"),
-        )));
+        return Ok(Some(("failed", add_hive_not_in_registry(hive_id))));
     }
     // A hive id that is not one (FINDINGS A-311): `add_hive` refuses it, so no hive was added,
     // and since 0.1.137 `get_hive` refuses it too (INVALID_HIVE_ID), where it answered NOT_FOUND.
@@ -21639,6 +21646,20 @@ async fn deployed_workflows_of_untenanted(
     deployed
 }
 
+/// A hive id a manifest names (FINDINGS A-321), as SY.admin and the orchestrator take one: 1 to 64
+/// letters, digits, '_' or '-' (`is_valid_hive_id`), as written. A hive's topology, a node's,
+/// route's (and its next hop), VPN rule's and workflow's hive are checked when the manifest is
+/// planned, where an id such as `a.b` went on into the plan and was refused `INVALID_HIVE_ID` only
+/// at execution, once the operator had confirmed it.
+fn refuse_manifest_hive_id(field: &str, hive: &str) -> Result<(), String> {
+    if fluxbee_sdk::mesh::is_valid_hive_id(hive) {
+        return Ok(());
+    }
+    Err(format!(
+        "{field} '{hive}' is not a hive id: 1 to 64 letters, digits, '_' or '-' (no '.', '/' or space); SY.admin refuses it (INVALID_HIVE_ID)"
+    ))
+}
+
 fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
     if manifest.manifest_version.trim().is_empty() {
         return Err("manifest_version must not be empty".to_string());
@@ -21675,6 +21696,10 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                         "desired_state.topology.hives[{idx}].hive_id must not be empty"
                     ));
                 }
+                refuse_manifest_hive_id(
+                    &format!("desired_state.topology.hives[{idx}].hive_id"),
+                    &hive.hive_id,
+                )?;
                 if !is_valid_ownership_label(&hive.ownership) {
                     return Err(format!(
                         "desired_state.topology.hives[{idx}].ownership must be one of solution/system/external"
@@ -21697,6 +21722,10 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                         "desired_state.topology.vpns[{idx}] requires non-empty hive and pattern"
                     ));
                 }
+                refuse_manifest_hive_id(
+                    &format!("desired_state.topology.vpns[{idx}].hive"),
+                    &vpn.hive,
+                )?;
                 if vpn.pattern.len() > pipeline_types::VPN_PATTERN_MAX_BYTES {
                     return Err(format!(
                         "desired_state.topology.vpns[{idx}].pattern is longer than {} bytes",
@@ -21761,6 +21790,7 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                     "desired_state.nodes[{idx}] requires non-empty node_name, hive, and runtime"
                 ));
             }
+            refuse_manifest_hive_id(&format!("desired_state.nodes[{idx}].hive"), &node.hive)?;
             if node.node_name.starts_with("WF.") {
                 return Err(format!("desired_state.nodes[{idx}] is a WF node: SY.wf-rules creates and runs WF.<workflow_name>@<hive> from desired_state.wf_deployments; declare the workflow there, not its node"));
             }
@@ -21794,6 +21824,7 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                     "desired_state.routing[{idx}] requires non-empty hive, prefix, and action"
                 ));
             }
+            refuse_manifest_hive_id(&format!("desired_state.routing[{idx}].hive"), &route.hive)?;
             // As SY.config.routes takes a route (add_route, case-sensitive).
             if !pipeline_types::ROUTE_ACTIONS.contains(&route.action.as_str()) {
                 return Err(format!(
@@ -21823,6 +21854,16 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                     pipeline_types::ROUTE_NEXT_HOP_MAX_BYTES
                 ));
             }
+            if let Some(next_hop_hive) = route
+                .next_hop_hive
+                .as_deref()
+                .filter(|hive| !hive.trim().is_empty())
+            {
+                refuse_manifest_hive_id(
+                    &format!("desired_state.routing[{idx}].next_hop_hive"),
+                    next_hop_hive,
+                )?;
+            }
             if !declared.insert(route.identity_key()) {
                 return Err(format!(
                     "desired_state.routing[{idx}] repeats the prefix '{}' on hive '{}' (one route per prefix)",
@@ -21846,6 +21887,10 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                     "desired_state.wf_deployments[{idx}] requires non-empty hive and workflow_name"
                 ));
             }
+            refuse_manifest_hive_id(
+                &format!("desired_state.wf_deployments[{idx}].hive"),
+                &wf.hive,
+            )?;
             if !pipeline_types::valid_workflow_name(&wf.workflow_name) {
                 return Err(format!(
                     "desired_state.wf_deployments[{idx}].workflow_name '{}' is not one SY.wf-rules accepts: lowercase letters and digits, in parts joined by dots, the first starting with a letter, no hyphens (its runtime is wf.<workflow_name>)",
@@ -27646,12 +27691,15 @@ mod tests {
                 refused("INVALID_HIVE_ID", not_a_hive_id),
                 closed("failed", ADD_HIVE_ID_NOT_A_HIVE_ID),
             ),
+            // FINDINGS A-321: the registry does not have it, removed or never created, where it
+            // said the hive "no longer exists" of one a timed-out add_hive usually never created.
             (
                 "worker-9",
                 refused("NOT_FOUND", "No such file or directory (os error 2)"),
                 closed(
                     "failed",
-                    "hive 'worker-9' no longer exists; the operation cannot be resolved",
+                    "the registry does not have hive 'worker-9' (removed, or never created); the \
+                     operation cannot be resolved",
                 ),
             ),
             (
@@ -28243,6 +28291,122 @@ mod tests {
         .expect("manifest parses");
         let err = validate_manifest_v2(&manifest).expect_err("runtime is required");
         assert!(err.contains("requires non-empty node_name, hive, and runtime"));
+    }
+
+    /// FINDINGS A-321: a manifest's hive ids are checked when it is planned, as SY.admin takes one
+    /// (1 to 64 letters, digits, '_' or '-', as written): each place a manifest names a hive, with
+    /// `a.b`, ` worker1` or `worker/1`, is refused naming the field, where the plan carried it and
+    /// SY.admin refused it `INVALID_HIVE_ID` only once the operator had confirmed it. The same
+    /// manifest with `worker-1` passes.
+    #[test]
+    fn a_manifest_hive_id_that_is_not_one_is_refused_when_planned() {
+        let manifest_with = |hive: &str| -> Vec<(&'static str, Value)> {
+            vec![
+                (
+                    "desired_state.topology.hives[0].hive_id",
+                    json!({ "topology": { "hives": [
+                        { "hive_id": hive, "role": "worker", "ownership": "solution" }
+                    ] } }),
+                ),
+                (
+                    "desired_state.topology.vpns[0].hive",
+                    json!({ "topology": { "vpns": [
+                        { "hive": hive, "pattern": "AI.", "vpn_id": 7, "ownership": "solution" }
+                    ] } }),
+                ),
+                (
+                    "desired_state.nodes[0].hive",
+                    json!({ "nodes": [
+                        { "node_name": "AI.demo", "hive": hive, "runtime": "ai.generic" }
+                    ] }),
+                ),
+                (
+                    "desired_state.routing[0].hive",
+                    json!({ "routing": [
+                        { "hive": hive, "prefix": "AI.", "action": "DROP" }
+                    ] }),
+                ),
+                (
+                    "desired_state.routing[0].next_hop_hive",
+                    json!({ "routing": [
+                        { "hive": "motherbee", "prefix": "AI.", "action": "FORWARD",
+                          "next_hop_hive": hive }
+                    ] }),
+                ),
+                (
+                    "desired_state.wf_deployments[0].hive",
+                    json!({ "wf_deployments": [
+                        { "hive": hive, "workflow_name": "invoice", "definition": {} }
+                    ] }),
+                ),
+            ]
+        };
+        let manifest = |desired: Value| -> SolutionManifestV2 {
+            serde_json::from_value(json!({
+                "manifest_version": "2.0",
+                "solution": { "name": "demo" },
+                "desired_state": desired,
+                "advisory": {}
+            }))
+            .expect("manifest parses")
+        };
+        for bad in ["a.b", " worker1", "worker/1", "../x"] {
+            for (field, desired) in manifest_with(bad) {
+                let err = validate_manifest_v2(&manifest(desired))
+                    .expect_err(&format!("{field} '{bad}' must be refused"));
+                assert!(
+                    err.contains(&format!("{field} '{bad}' is not a hive id")),
+                    "{field}: {err}"
+                );
+                assert!(err.contains("INVALID_HIVE_ID"), "{field}: {err}");
+            }
+        }
+        for (field, desired) in manifest_with("worker-1") {
+            assert_eq!(validate_manifest_v2(&manifest(desired)), Ok(()), "{field}");
+        }
+    }
+
+    /// FINDINGS A-321: `SCMD: help` gives an `add_hive` example SY.admin takes, with the fields it
+    /// requires (`admin_action_body_required_fields` in sy_admin.rs: hive_id, address and
+    /// ssh_user), where its example had no `ssh_user` and, copied, was refused `INVALID_REQUEST`.
+    /// Every SCMD example of the help translates to an admin action.
+    #[test]
+    fn the_scmd_help_examples_translate_and_add_hive_names_its_required_fields() {
+        let help = handle_meta_scmd("help").expect("the help");
+        let examples = ["examples", "mutation_examples"]
+            .iter()
+            .flat_map(|list| {
+                help["payload"][*list]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|example| example.as_str().map(str::to_string))
+            .filter_map(|example| {
+                example
+                    .strip_prefix("SCMD:")
+                    .map(|raw| raw.trim().to_string())
+            })
+            .collect::<Vec<_>>();
+        assert!(examples.len() > 10, "{examples:?}");
+        let mut add_hive = 0;
+        for raw in &examples {
+            let parsed = parse_scmd(raw).unwrap_or_else(|err| panic!("{raw}: {err}"));
+            let translated = translate_scmd(PRIMARY_HIVE_ID, parsed)
+                .unwrap_or_else(|err| panic!("{raw}: {err}"));
+            if translated.action == "add_hive" {
+                add_hive += 1;
+                for field in ["hive_id", "address", "ssh_user"] {
+                    assert!(
+                        translated.params[field]
+                            .as_str()
+                            .is_some_and(|value| !value.trim().is_empty()),
+                        "{raw}: {field}"
+                    );
+                }
+            }
+        }
+        assert_eq!(add_hive, 1, "{examples:?}");
     }
 
     fn manifest_with_opa(opa: Value) -> SolutionManifestV2 {
