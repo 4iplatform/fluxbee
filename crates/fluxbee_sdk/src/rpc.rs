@@ -170,12 +170,32 @@ pub enum RpcError {
     ///   0.1.143, the Go SDK's since 0.1.141), and is `retryable`: asking again later may pass.
     /// - A WF's own reasons say whether they are retryable (`unavailable` is, since 0.1.141). One
     ///   without `retryable`, from a node before 0.1.141, reads as `false`.
-    #[error("rpc not taken: NOT_TAKEN reason={reason} retryable={retryable}: {detail}")]
+    /// - It names its request as `Timeout` does: its `trace_id`, `target` and `request_msg`.
+    /// - Its text is the Go SDK's `RpcErrNotTaken` text, which calls the request's `msg` its verb:
+    ///   *"rpc not taken: trace_id=… target=… verb=…: NOT_TAKEN reason=node_busy retryable=true:
+    ///   …"*, without the last `": …"` when the detail is empty.
+    #[error(
+        "rpc not taken: trace_id={trace_id} target={target} verb={request_msg}: NOT_TAKEN reason={reason} retryable={retryable}{}",
+        detail_suffix(.detail)
+    )]
     NotTaken {
+        trace_id: String,
+        target: String,
+        request_msg: String,
         reason: String,
         detail: String,
         retryable: bool,
     },
+}
+
+/// `": <detail>"` at the end of `RpcError::NotTaken`'s text, or nothing for an empty detail, as
+/// the Go SDK writes it.
+fn detail_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    }
 }
 
 impl RpcError {
@@ -541,6 +561,10 @@ struct PendingEntry {
     /// (`PendingGuard`).
     id: u64,
     matcher: PendingMatcher,
+    /// Its request's destination and `msg`, from its labels, which a `NOT_TAKEN`'s error names
+    /// (`not_taken_error`).
+    target: String,
+    request_msg: String,
     response_tx: oneshot::Sender<Result<Message, RpcError>>,
 }
 
@@ -914,8 +938,15 @@ impl CommandChannel {
     /// never waits for a consumer. The lane takes its bytes before the message goes, so its
     /// consumer never gives back bytes the lane did not take. A lane that holds nothing takes any
     /// one message: a frame is at most 128 KiB.
+    ///
+    /// A lane whose consumer dropped its receiver takes nothing and refuses nothing: no one will
+    /// read it again, so a sender told `NOT_TAKEN` (retryable) could never pass. The bytes of the
+    /// messages it held then stay in the lane's count, which nothing reads once the lane is closed.
     fn enqueue(&self, msg: Message, frame_len: usize) -> Enqueued {
         let lane = self.lane(Lane::of(&msg));
+        if lane.queue.is_closed() {
+            return Enqueued::NoConsumer;
+        }
         let held = lane.bytes.fetch_add(frame_len, Ordering::AcqRel);
         if held > 0 && held + frame_len > RPC_COMMAND_CHANNEL_MAX_BYTES {
             lane.bytes.fetch_sub(frame_len, Ordering::AcqRel);
@@ -1346,6 +1377,11 @@ impl RouterDispatcher {
                 self.note_stale(trace_id, entry.matcher.clone());
                 let _ = entry.response_tx.send(Err(err));
             }
+            DispatchAction::CompleteNotTaken(entry, msg) => {
+                let err = not_taken_error(&trace_id, &entry, &msg);
+                self.note_stale(trace_id, entry.matcher.clone());
+                let _ = entry.response_tx.send(Err(err));
+            }
             DispatchAction::CompleteInvalidResponse(entry, msg) => {
                 let err = RpcError::InvalidResponse(format!(
                     "unexpected response shape msg_type={} msg={:?}",
@@ -1400,14 +1436,14 @@ impl RouterDispatcher {
         {
             let mut pending = lock(&self.pending);
             if let Some(entry_ref) = pending.get(trace_id) {
-                let outcome = if is_not_taken(&msg) {
-                    MatchOutcome::TerminalTransportError
-                } else {
-                    entry_ref
-                        .matcher
-                        .classify(msg.meta.msg_type.as_str(), msg.meta.msg.as_deref())
-                };
-                match outcome {
+                if is_not_taken(&msg) {
+                    let entry = pending.remove(trace_id).expect("entry present");
+                    return DispatchAction::CompleteNotTaken(entry, msg);
+                }
+                match entry_ref
+                    .matcher
+                    .classify(msg.meta.msg_type.as_str(), msg.meta.msg.as_deref())
+                {
                     MatchOutcome::Success => {
                         let entry = pending.remove(trace_id).expect("entry present");
                         return DispatchAction::CompleteSuccess(entry, msg);
@@ -1516,15 +1552,17 @@ impl RouterDispatcher {
     /// Handles `msg`, a message its command channel had no room for (FINDINGS A-295): it never
     /// reaches the node. Its sender, when it may be answered (`may_answer_not_taken`), is told
     /// `NOT_TAKEN` (`node_busy`, retryable). The answer is queued without waiting, since the recv loop
-    /// never waits: an answer the link cannot take now is dropped and counted.
+    /// never waits: an answer the link cannot take now, its outgoing queue full or the link down,
+    /// is dropped and counted.
     fn refuse(&self, channel: &CommandChannel, msg: Message) {
         let answer = if !may_answer_not_taken(&msg) {
             Answer::Never
         } else {
             let lane = Lane::of(&msg);
-            // The Go SDK's words (A-329), so a sender reads the same from either.
+            // The Go SDK's words (A-329), so a sender reads the same from either: "all it can take
+            // now", since a lane also refuses at its bytes with fewer than 1,024 messages waiting.
             let detail = format!(
-                "{} holds {} {} messages, as many as it takes; send it again later",
+                "{} holds {} {} messages, all it can take now; send it again later",
                 self.sender.full_name(),
                 channel.lane(lane).depth(),
                 lane.as_str()
@@ -1642,7 +1680,7 @@ impl RouterDispatcher {
         let (tx, rx) = oneshot::channel();
         // From here until the call ends on a path of its own, a caller that drops the call drops
         // `waiter`, which removes the entry (A-309).
-        let waiter = self.register_waiter(&trace_id, &matcher, tx)?;
+        let waiter = self.register_waiter(&trace_id, &matcher, &labels, tx)?;
         if let Err(err) = self.sender.send(outgoing).await {
             waiter.withdraw();
             // AF-P2a: normalize disconnect to a single `RpcError` variant so
@@ -1676,12 +1714,14 @@ impl RouterDispatcher {
         }
     }
 
-    /// Records a request's waiter under `trace_id`, and the guard that removes it if the call is
-    /// dropped (`PendingGuard`). Refused while another request holds that `trace_id`.
+    /// Records a request's waiter under `trace_id`, with what its `labels` name, and the guard that
+    /// removes it if the call is dropped (`PendingGuard`). Refused while another request holds that
+    /// `trace_id`.
     fn register_waiter(
         &self,
         trace_id: &str,
         matcher: &PendingMatcher,
+        labels: &RpcRequestLabels,
         response_tx: oneshot::Sender<Result<Message, RpcError>>,
     ) -> Result<PendingGuard<'_>, RpcError> {
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -1696,6 +1736,8 @@ impl RouterDispatcher {
             PendingEntry {
                 id,
                 matcher: matcher.clone(),
+                target: labels.target.clone(),
+                request_msg: labels.request_msg.clone(),
                 response_tx,
             },
         );
@@ -1845,6 +1887,8 @@ enum DispatchAction {
     RouteByProfile(Message, RouteTarget),
     CompleteSuccess(PendingEntry, Message),
     CompleteTransportError(PendingEntry, Message),
+    /// The request's destination answered `NOT_TAKEN` (FINDINGS A-295), whatever its matcher.
+    CompleteNotTaken(PendingEntry, Message),
     CompleteInvalidResponse(PendingEntry, Message),
     Stale(Message),
     UnknownResponse(Message),
@@ -1885,28 +1929,35 @@ fn transport_error_from_message(msg: &Message) -> RpcError {
                 last_hop: payload.last_hop,
             }
         }
-        // Read field by field: a field of another type loses only itself.
-        Some(MSG_NOT_TAKEN) => {
-            let text = |field: &str| {
-                msg.payload
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            RpcError::NotTaken {
-                reason: text("reason"),
-                detail: text("detail"),
-                retryable: msg
-                    .payload
-                    .get("retryable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            }
-        }
         other => {
             RpcError::InvalidResponse(format!("expected transport error message, got {other:?}"))
         }
+    }
+}
+
+/// The error of the request `entry`, on `trace_id`, that its destination answered `NOT_TAKEN`
+/// (`msg`, FINDINGS A-295): the request as its labels name it, and what the `NOT_TAKEN` says, read
+/// field by field, so a field of another type loses only itself. One without `retryable` reads as
+/// `false`.
+fn not_taken_error(trace_id: &str, entry: &PendingEntry, msg: &Message) -> RpcError {
+    let text = |field: &str| {
+        msg.payload
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    RpcError::NotTaken {
+        trace_id: trace_id.to_string(),
+        target: entry.target.clone(),
+        request_msg: entry.request_msg.clone(),
+        reason: text("reason"),
+        detail: text("detail"),
+        retryable: msg
+            .payload
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -2032,6 +2083,16 @@ impl RouterDispatcherTestHarness {
         full_name: &str,
         profile: OperationalRouteProfile,
     ) -> (Arc<RouterDispatcher>, Self) {
+        let (client, harness, _link) = Self::with_link(uuid, full_name, profile);
+        (client, harness)
+    }
+
+    /// `new_with_uuid`, with the state of the dispatcher's link, which a test can take down.
+    fn with_link(
+        uuid: &str,
+        full_name: &str,
+        profile: OperationalRouteProfile,
+    ) -> (Arc<RouterDispatcher>, Self, Arc<ConnectionState>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let state = Arc::new(ConnectionState::new_connected());
@@ -2040,7 +2101,7 @@ impl RouterDispatcherTestHarness {
             full_name.to_string(),
             7,
             "router-test".to_string(),
-            state,
+            Arc::clone(&state),
         ));
         let sender = NodeSender::new(outbound_tx, Arc::clone(&info));
         let receiver = NodeReceiver::new(inbound_rx, info);
@@ -2052,6 +2113,7 @@ impl RouterDispatcherTestHarness {
                 inbound_tx,
                 sender_uuid: uuid.to_string(),
             },
+            state,
         )
     }
 
@@ -3518,7 +3580,7 @@ mod tests {
         assert_eq!(
             answer.payload["detail"],
             json!(format!(
-                "IO.test@hive holds {held} {lane} messages, as many as it takes; send it again later"
+                "IO.test@hive holds {held} {lane} messages, all it can take now; send it again later"
             ))
         );
     }
@@ -3797,6 +3859,95 @@ mod tests {
             .is_none());
     }
 
+    /// A NOT_TAKEN for a refusal while the link is down is never queued, since the reconnect would
+    /// drop it (`drain_tx_queue`): the warning counts it as not sent, never as told. Before, it was
+    /// queued and counted as told.
+    #[tokio::test]
+    async fn a_not_taken_while_the_link_is_down_is_counted_unsent() {
+        let (client, mut harness, link) =
+            RouterDispatcherTestHarness::with_link("test-uuid", "IO.test@hive", incoming_profile());
+        fill_lane(&client, &harness, "user", "IO.web@hive", None).await;
+        link.set_connected(false);
+        for trace in ["over-0", "over-1"] {
+            harness
+                .inject(from_node("IO.web@hive", trace, "user", None))
+                .await
+                .unwrap();
+        }
+        let channel = client.command.get("incoming").unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while channel.refused() < 2 {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both refused");
+        // The first refusal was warned at once; the second waits in the log for the next warning.
+        {
+            let log = lock(&channel.refusals);
+            assert_eq!((log.refused, log.told, log.unsent), (1, 0, 1));
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "nothing queued for a link that is down"
+        );
+    }
+
+    /// A channel whose consumer dropped its receiver refuses nothing, so no sender is told a
+    /// NOT_TAKEN that no retry could pass: its messages go unread, as before the bound. Before, the
+    /// bytes the dropped receiver held stayed counted, and the next large message was refused and
+    /// its sender told `node_busy`, retryable.
+    #[tokio::test]
+    async fn a_channel_whose_consumer_is_gone_refuses_nothing() {
+        // io-sim's profile: the system messages go to "incoming", no rule takes any other kind.
+        let profile = OperationalRouteProfile::builder()
+            .command_channel("incoming")
+            .post_pending_rule(
+                RouteMatch::any_msg_type(SYSTEM_KIND),
+                RouteTarget::Command("incoming"),
+            )
+            .build()
+            .expect("io-sim's profile");
+        let (client, mut harness) = RouterDispatcherTestHarness::new("IO.test@hive", profile);
+        let big = |trace: &str| {
+            let mut msg = from_node("SY.x@hive", trace, SYSTEM_KIND, Some("BIG"));
+            msg.payload = json!({"text": "x".repeat(100_000)});
+            msg
+        };
+        let frame_len = serde_json::to_vec(&big("big-0000")).unwrap().len();
+        let fit = RPC_COMMAND_CHANNEL_MAX_BYTES / frame_len;
+        for i in 0..fit {
+            harness.inject(big(&format!("big-{i:04}"))).await.unwrap();
+        }
+        wait_for_depth(&client, fit).await;
+        drop(client.take_command_receiver("incoming").await.unwrap());
+
+        harness.inject(big("big-after")).await.unwrap();
+        // No rule takes a user message: once it is counted, the one before it was handled.
+        harness
+            .inject(from_node("IO.web@hive", "barrier", "user", None))
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while client.metric_route_unmatched() < 1 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both handled");
+        assert_eq!(client.command_refused("incoming"), Some(0));
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "no NOT_TAKEN"
+        );
+    }
+
     /// The refusals of a burst within 10 s of a warning get their own warning at the end of the
     /// 10 s, even when nothing follows them.
     #[tokio::test(start_paused = true)]
@@ -3898,7 +4049,8 @@ mod tests {
     /// A request its destination did not take ends at once with `RpcError::NotTaken`, whatever its
     /// matcher: a system request (before: `InvalidResponse`), an admin request (before: it waited
     /// for its timeout) and a call whose success matches any message (before: the NOT_TAKEN was its
-    /// answer). A NOT_TAKEN after the request ended is stale.
+    /// answer). Its text names the request as the Go SDK's does. A NOT_TAKEN after the request
+    /// ended is stale.
     #[tokio::test]
     async fn a_request_its_destination_did_not_take_ends_at_once() {
         let (client, mut harness) =
@@ -3928,8 +4080,17 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            matches!(&err, RpcError::NotTaken { reason, detail, retryable: true } if reason == "node_busy" && detail == "full"),
+            matches!(&err, RpcError::NotTaken { reason, detail, retryable: true, .. } if reason == "node_busy" && detail == "full"),
             "got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "rpc not taken: trace_id={} target=SY.target@hive verb=REQ: NOT_TAKEN \
+                 reason=node_busy retryable=true: full",
+                request.routing.trace_id
+            ),
+            "it names the request, as the Go SDK's text"
         );
 
         let c = Arc::clone(&client);
@@ -3945,10 +4106,9 @@ mod tests {
             .await
         });
         let request = harness.next_outgoing().await.unwrap();
-        harness
-            .inject(not_taken_answer(&request, None))
-            .await
-            .unwrap();
+        let mut answer = not_taken_answer(&request, None);
+        answer.payload.as_object_mut().unwrap().remove("detail");
+        harness.inject(answer).await.unwrap();
         let err = time::timeout(Duration::from_secs(1), admin)
             .await
             .expect("ends at the NOT_TAKEN")
@@ -3965,6 +4125,15 @@ mod tests {
             "a NOT_TAKEN without retryable reads false: {err:?}"
         );
         assert!(!err.is_timeout());
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "rpc not taken: trace_id={} target=SY.admin@motherbee verb=ADMIN_COMMAND: \
+                 NOT_TAKEN reason=node_busy retryable=false",
+                request.routing.trace_id
+            ),
+            "no detail, no last colon"
+        );
 
         let c = Arc::clone(&client);
         let any = tokio::spawn(async move {
@@ -4169,8 +4338,9 @@ mod tests {
     async fn a_guard_never_removes_a_later_calls_entry() {
         let (client, _harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let (tx, _rx) = oneshot::channel();
+        let labels = RpcRequestLabels::new("SY.target@hive", "REQ", "RESP");
         let later = client
-            .register_waiter("trace-shared", &plain_matcher(), tx)
+            .register_waiter("trace-shared", &plain_matcher(), &labels, tx)
             .unwrap();
         let later_id = later.id;
         drop(PendingGuard {

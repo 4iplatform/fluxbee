@@ -150,8 +150,13 @@ impl NodeSender {
     /// receive loop, which never waits: its `NOT_TAKEN` to the sender of a message a full command
     /// channel refused (FINDINGS A-295). Returns whether the message was queued. It is not queued
     /// when the link's outgoing queue (256 frames) is full, when the link is down, or when `send`
-    /// would refuse it.
+    /// would refuse it. While the link is down a queued frame would be dropped at the reconnect
+    /// (`drain_tx_queue`, docs/reference/protocol.md §2.5), so it is not queued at all, and its
+    /// caller counts it as not sent.
     pub(crate) fn try_send_now(&self, msg: Message) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
         let Ok(data) = self.frame(msg, TraceNote::default()) else {
             return false;
         };

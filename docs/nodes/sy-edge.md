@@ -208,8 +208,10 @@ framed. A response the edge cannot build (an invalid header value, say) is a
    `UNREACHABLE`/`TTL_EXCEEDED`: `502 HANDLER_UNREACHABLE`. Timeout: `504 HANDLER_TIMEOUT`
    (`rpc_error_to_http_status`, `rpc_error_code`). A handler with no room for the request
    answers `NOT_TAKEN` (`node_busy`; since 0.1.143, planned; FINDINGS A-295). The wait ends at once,
-   and the edge answers `502 HANDLER_ERROR`, a code other failures share. Before, a `NOT_TAKEN`
-   from a handler matched as its reply. Each code answers a fixed message
+   and the edge answers `502 HANDLER_ERROR`, a code other failures share. An edge before 0.1.143
+   takes a `NOT_TAKEN` for the handler's reply and answers `200` with its payload, the handler's
+   name in its `detail`: during a deploy, while the handler runs 0.1.143 and the edge does not yet.
+   Each code answers a fixed message
    (`rpc_error_message`, A-88); the error's text, with its trace, target and message family, is
    logged with the channel and the peer, and never sent.
 

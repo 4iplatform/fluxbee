@@ -143,15 +143,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ran, and sending it again later may pass. The answer goes to `routing.src`, on the message's
     `trace_id` and `meta.thread_id`, `ttl` 16, with the payload
     `{"ok": false, "error": "not_taken", "reason": "node_busy", "retryable": true, "detail": "..."}`.
-    Its `detail` is the Go SDK's words: *"IO.x@worker1 holds 1024 non-system messages, as many as it
-    takes; send it again later"*.
+    Its `detail` is the Go SDK's words: *"IO.x@worker1 holds 1024 non-system messages, all it can
+    take now; send it again later"*. A lane full by its bytes names fewer messages.
   - It goes for any message a node sent, named or not, except a notice (`HELLO`, `ANNOUNCE`,
     `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, a `system` message without a name, anything without
     a router-stamped `src_l2_name`) and a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`): the Go
     SDK's `IsNoticeOrReply`. So two nodes cannot bounce a `NOT_TAKEN`. The Rust SDK also leaves a
     kind ending in `_response`, a broadcast and a tap copy unanswered.
   - The receive loop never waits for the answer. When the link's outgoing queue is full or the link
-    is down, the answer is dropped, and the warning counts it as `unsent`.
+    is down, the answer is dropped, and the warning counts it as `unsent`. While the link is down it
+    is not queued at all, since the reconnect would drop it
+    ([the protocol reference](../../docs/reference/protocol.md) §2.5).
+  - A channel whose consumer dropped its receiver refuses nothing: no one reads it again, so its
+    messages are dropped unread, as before the bound, and no sender is told `NOT_TAKEN`, which no
+    retry could pass.
 - **`sender_snapshot()`** gives the `NodeSender`: `send`, `uuid`, `full_name`, `is_connected`,
   `wait_connected`.
 
@@ -210,16 +215,19 @@ response_msg, payload, timeout })`. It sends one `system` message and waits for 
 
 - **Transport errors are errors:** `UNREACHABLE` and `TTL_EXCEEDED` become `RpcError::Unreachable`
   and `RpcError::TtlExceeded`.
-- **A request its destination did not take** ends at once with `RpcError::NotTaken { reason,
-  detail, retryable }` (since 0.1.143, planned; FINDINGS A-295): the destination answered
-  `NOT_TAKEN` on its `trace_id`.
+- **A request its destination did not take** ends at once with `RpcError::NotTaken { trace_id,
+  target, request_msg, reason, detail, retryable }` (since 0.1.143, planned; FINDINGS A-295): the
+  destination answered `NOT_TAKEN` on its `trace_id`.
   - `node_busy`, from a node whose channel was full (a Rust or a Go node), is `retryable`: nothing
     ran, and asking again later may pass.
   - A WF's own reasons say whether they are retryable (`unavailable` is, since 0.1.141). One
     without `retryable`, from a node before 0.1.141, reads as `false`.
   - This holds for every request, whatever its matcher (`send_with_matcher` too). Before, it was
     `RpcError::InvalidResponse` for a system request, and an admin request waited for its timeout.
-  - Its text is the Go SDK's: *"rpc not taken: NOT_TAKEN reason=node_busy retryable=true: ..."*.
+  - It names its request as `RpcError::Timeout` does, and its text is the Go SDK's
+    `RpcErrNotTaken` text, which calls `request_msg` the verb: *"rpc not taken: trace_id=...
+    target=IO.x@worker1 verb=ILK_PROVISION: NOT_TAKEN reason=node_busy retryable=true: ..."*, the
+    last `": ..."` only when the `NOT_TAKEN` has a detail.
 - **No answer in time** is `RpcError::Timeout`. A zero timeout means 5 s.
 - **A link that is down** fails at once with `RpcError::Disconnected`.
 - **A call its caller drops leaves nothing behind** (since 0.1.143, planned; FINDINGS A-309). This

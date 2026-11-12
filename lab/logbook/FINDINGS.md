@@ -493,6 +493,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` ✅ 0.1.142, by its tests; SY.architect's use of it open, for its next release).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
+- A-336 🔵 The orchestrator reads SY.admin's `NOT_TAKEN` as an unknown outcome, and a spoke orchestrator's as unreachable (low; the orchestrator's next change after 0.1.143; found by the review of `coa/rustsdk-143`).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
@@ -1919,6 +1920,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   not given to the model.
 - **Today:** a secret is stored over SY.admin's HTTP API (`POST /hives/<hive>/vault/secrets`), not
   in a plan. Archi's handbook (§4.5.1) tells Archi to say so before it stages one.
+
+### A-336 [General/orchestrator] 🔵 low (found 2026-11-12 by the review of `coa/rustsdk-143`; read in the code; from 0.1.143, planned) — The orchestrator reads SY.admin's `NOT_TAKEN` as an unknown outcome, and a spoke orchestrator's as unreachable
+
+- **Why:** since 0.1.143 (planned; A-295) a Rust node whose command channel has no room answers
+  `NOT_TAKEN` `node_busy`, retryable, and the requester's call ends with `RpcError::NotTaken`:
+  nothing of the request ran. The orchestrator's readings of a failed call do not know it:
+  - `teardown_node_call_failure` (`src/bin/sy_orchestrator.rs` ~31129) takes every `RpcError` but
+    `InvalidRequest`, `Json`, `Unreachable` and `TtlExceeded` for `TeardownNodeCall::NoAnswer`
+    (*"SY.admin may still have run it"*), where `NotDelivered` means nothing ran;
+  - the runtime-usage fan-out (`group_runtime_usage`, ~21944) names any failure but a timeout
+    `UNREACHABLE` (*"the request never reached it"*) in `skipped_hives`.
+- **Effect:** a teardown whose `teardown_node` a busy SY.admin refused reports an unknown outcome,
+  where nothing ran and sending it again may pass; a spoke whose orchestrator was busy is skipped as
+  unreachable. Nothing wrong is done: an unknown outcome is the careful reading. It needs SY.admin or
+  a spoke's orchestrator with 1,024 messages (or 8 MiB) waiting in a lane.
+- **Fix, later (the orchestrator's next change, after 0.1.143):** `RpcError::NotTaken { .. }` reads
+  as `TeardownNodeCall::NotDelivered`, and the fan-out names a reason of its own (`BUSY`,
+  retryable) in `skipped_hives`. `RpcError::NotTaken` exists from 0.1.143, so not in 0.1.139.
 
 ### A-335 [General/orchestrator] 🔵 low (found 2026-11-12 by A-301's builder on `coa/orch-139`, numbered by its review; read in the code; there before it) — A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names
 
@@ -4327,9 +4346,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator (2026-11-11):** after the sweep (the Rust SDK alone, with the next change there).
 - **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30), as
   A-329's call for the Go SDK says:** NOT_TAKEN, retryable, to the sender, and system messages
-  never wait behind user ones. The contract is the Go SDK's of `coa/gosdk-141` (`620f07e7`): reason
-  `node_busy`, its `detail`'s words, lanes of 1,024 messages or 8 MiB, a log line at most every 10 s,
-  the error's text.
+  never wait behind user ones. The contract is the Go SDK's of `coa/gosdk-141` (`620f07e7`, the
+  `detail`'s words as `6d35cf2a` changed them): reason `node_busy`, its `detail`'s words, lanes of
+  1,024 messages or 8 MiB, a log line at most every 10 s, the error's text.
   - **The bound.** Each command channel has two lanes of 1,024 messages
     (`RPC_COMMAND_CHANNEL_CAPACITY`, which replaces `RPC_COMMAND_DEPTH_WARN_THRESHOLD`) or 8 MiB of
     their frames (`RPC_COMMAND_CHANNEL_MAX_BYTES`, counted as they came off the socket: the SDK's
@@ -4346,8 +4365,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **The answer.** Its sender gets `NOT_TAKEN`, the WF engine's message: a `system` message to its
     `routing.src`, on its `trace_id` and thread, with
     `{"ok": false, "error": "not_taken", "reason": "node_busy", "retryable": true, "detail"}`, the
-    `detail` the Go SDK's words (*"IO.x@worker1 holds 1024 non-system messages, as many as it
-    takes; send it again later"*).
+    `detail` the Go SDK's words (*"IO.x@worker1 holds 1024 non-system messages, all it can take
+    now; send it again later"*). A lane full by its bytes names fewer messages (the Go SDK's words
+    said *"as many as it takes"* until `6d35cf2a`, which this follows).
     - It goes for any message a node sent, named or not.
     - It never goes for a notice: no `src_l2_name`, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`,
       `TTL_EXCEEDED`, or a `system` message without a name.
@@ -4356,11 +4376,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     - Beyond the Go SDK's rule, it never goes for a kind ending in `_response`, a broadcast or a
       tap copy. The Go SDK answers a broadcast it refuses; it has no tap copies.
     - The answer is queued with `try_send` (`NodeSender::try_send_now`). When the link's outgoing
-      queue of 256 is full, it is dropped and counted (`unsent`).
+      queue of 256 is full, it is dropped and counted (`unsent`). While the link is down it is not
+      queued at all and counted the same: the reconnect would drop it (`drain_tx_queue`, protocol
+      §2.5).
+  - **A channel whose consumer dropped its receiver** refuses nothing and tells no one: its
+    messages are dropped unread, as before the bound (*"no consumer attached"*), since a sender told
+    `NOT_TAKEN` retryable could never pass. The bytes the dropped receiver held stay counted, and
+    nothing reads them once the lane is closed.
   - **A request that gets `NOT_TAKEN`** on its `trace_id` ends at once with
-    `RpcError::NotTaken {reason, detail, retryable}`, whatever its matcher, its text the Go SDK's
-    (*"rpc not taken: NOT_TAKEN reason=node_busy retryable=true: ..."*). One that comes after its
-    request ended is stale.
+    `RpcError::NotTaken {trace_id, target, request_msg, reason, detail, retryable}`, whatever its
+    matcher. It names its request as `Timeout` does, and its text is the Go SDK's `RpcErrNotTaken`
+    text, which calls `request_msg` the verb (*"rpc not taken: trace_id=... target=... verb=...:
+    NOT_TAKEN reason=node_busy retryable=true: ..."*, the last `": ..."` only with a detail). One
+    that comes after its request ended is stale.
     - Before, a system request got `InvalidResponse`, and an admin request waited for its timeout.
     - A `send_with_matcher` whose success matches any message got the `NOT_TAKEN` as its answer:
       SY.edge's handler calls, `edge_reply_matcher`.
@@ -4371,21 +4399,44 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     - a NOT_TAKEN the link cannot take is dropped without waiting;
     - a burst refused after a warning is warned when the interval ends (paused time);
     - a lane holds at most its bytes;
-    - a request its destination did not take ends at once.
+    - a request its destination did not take ends at once, its error naming the request;
+    - a NOT_TAKEN while the link is down is counted unsent;
+    - a channel whose consumer is gone refuses nothing.
   - **Docs:** the SDK's README, `docs/reference/protocol.md` §10.2, §10.4 and §11,
     `docs/nodes/sy-edge.md` (the reply step), `docs/io-cloud-api.md` (§7 and §9), and Archi's
     handbook §4.4.
+  - **Its review (2026-11-12):** the `detail`'s words brought to the Go SDK's last ones; the error
+    names its request; a `NOT_TAKEN` is not queued while the link is down; a channel whose consumer
+    is gone refuses nothing. It found A-339 (the AI SDK) and A-336 (the orchestrator).
+  - **Mixed versions** (during 0.1.143's deploy, and while a runtime stays pinned below it):
+    - A node on an older Rust SDK never refuses (its channels stay unbounded) and never sends
+      `node_busy`.
+    - A requester on an older Rust SDK that gets `node_busy` ends a system request with
+      `InvalidResponse`; an admin request waits for its timeout (the `NOT_TAKEN` goes where its
+      profile sends any system message); a `send_with_matcher` whose success matches any message
+      takes the `NOT_TAKEN` as its answer.
+    - An SY.edge before 0.1.143 is such a caller: in front of a handler on 0.1.143 it answers `200`
+      with the `NOT_TAKEN`'s payload as its body, the handler's name in its `detail`, which A-88
+      keeps off the internet otherwise. Accepted: it needs 1,024 waiting requests in that window.
+    - ai.generic and SY.frontdesk.gov answer each `NOT_TAKEN` they get with an `unknown_system_msg`
+      `CONFIG_RESPONSE` until A-339: one wasted message, no loop.
+    - The Go nodes take it since 0.1.141 (A-329): their requests end with `RpcErrNotTaken`,
+      SY.timer sends again a fire refused retryable, a WF logs any other.
+    - A requester on 0.1.143 that gets the WF engine's own `NOT_TAKEN` (`no_thread`,
+      `invalid_input`, `unavailable`...) gets `RpcError::NotTaken` where it got `InvalidResponse`:
+      only the error's type changes.
   - **Found on the way, not changed (each its own binary):**
     - SY.edge answers a handler's NOT_TAKEN `502 HANDLER_ERROR`, a code other failures share
       (`rpc_error_code`). A code of its own, retryable (`503 HANDLER_BUSY`), is SY.edge's next
       change.
     - ai.generic answers a `NOT_TAKEN` it gets with an `unknown_system_msg` `CONFIG_RESPONSE`, as
-      it answers any system message it does not know (A-325; the AI SDK's
-      `is_infrastructure_message` takes no `NOT_TAKEN` for a reply). That answer is a reply, which
-      the refusing node never answers: no loop, one wasted message.
-    - The WF engine drops a `NOT_TAKEN` for a message it sent, as any system message but its timers
-      (spec §14.2). The person a WF writes to through an IO node with no room loses that message,
-      as before, but the IO node now names it in its warning.
+      it answers any system message it does not know: A-339, the AI SDK's.
+    - The orchestrator reads SY.admin's `NOT_TAKEN` as an unknown outcome, and a spoke
+      orchestrator's as unreachable: A-336, the orchestrator's.
+    - The WF engine logs a `NOT_TAKEN` for a message it sent (`takeNotTaken`, since 0.1.141,
+      A-329; before, it dropped it as any system message but its timers) and does not send that
+      message again. The person a WF writes to through an IO node with no room loses that message,
+      as before, but the IO node names it in its warning and the WF in its log.
     - io-sim (`nodes/io/io-sim`, test-grade, not in the package) declares an `incoming` channel
       for its `system` messages and never reads it. Before 0.1.143 every system message sent to a
       running io-sim waited there for good, a case of this item. Since then the 1,025th and later
