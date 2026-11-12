@@ -170,16 +170,21 @@ SY.admin cut, are not compared), the one that started nearest the dispatch when 
 detail), and the request goes on. With no entry yet the record stays open, and the request is
 refused `OPERATION_ALREADY_TRACKED` (*"timed out locally and has no outcome yet: it may still be
 running"*); with none 10 minutes after its dispatch, the whole log read, it closes as `failed`, its
-outcome unknown: SY.admin never ended it (a restart, or the request lost), so the state is read
-before asking again. A log that cannot be read leaves it open. The log keeps every recorded
-mutation SY.admin runs as a command (`action_in_command_log`): a hive's removal, a node's run,
-start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN rule, an
-ILK's or a tenant's change, a node's config, a message to a node, the storage, a WF instance's
-cancel. `update`, `sync_hint` and the OPA and wf-rules writes go another way in SY.admin and are not
-in it, so a timed-out one stays open in that chat, as before: Archi waits for each as long as
-SY.admin does, or longer. Before 0.1.139 only an `add_hive` was read, and a `remove_hive` that
-outlasted Archi's 30 s, or a node's purge SY.admin waits 180 s for, stayed open in its chat for
-good.
+outcome unknown: SY.admin never ended it (a restart, or the request lost), or its entry rotated
+out, so the state is read before asking again. The log keeps about the last 400 commands SY.admin
+ran, reads included (its active file and 3 rotations of 100 entries; `list_recent_commands`'
+help), so on a busy installation, or for a record left open before the upgrade, the entry may be
+gone, and the summary says both. A log that cannot be read leaves it open. The log keeps every
+recorded mutation SY.admin runs as a command (`action_in_command_log`): a hive's removal, a
+node's run, start, restart, kill or removal, a runtime's publish or version removal, a route, a VPN
+rule, an ILK's or a tenant's change, a node's config, a message to a node, the storage, a WF
+instance's cancel. `update`, `sync_hint` and the OPA and wf-rules writes go another way in SY.admin
+and are not in it, so a timed-out one stays open in that chat, as before: Archi waits for each as
+long as SY.admin does, or longer. An identical request there is refused with a text that says so
+(`operation_error_message`, `open_operation_is_read`): the record cannot be settled in that chat;
+read the state, and repeat it in a new chat. Before 0.1.139 only an `add_hive` was read, and a
+`remove_hive` that outlasted Archi's 30 s, or a node's purge SY.admin waits 180 s for, stayed open
+in its chat for good.
 
 **`fluxbee_system_get`** is the LLM's read tool. It builds an SCMD from `{method, path, body}`
 and runs it through the same `translate_scmd` (`ArchitectSystemGetTool::call`), and it runs reads
@@ -393,23 +398,36 @@ such an answer comes back in a step's `result_preview` (`src/bin/sy_architect/sh
   `token`, its value), found outside the operator's own input (a step's args, a plan). The chat
   shows them in a "Shown once: copy it now" block under the answer, and keeps that answer on
   screen: the periodic reload of the chat's history does not replace it until the operator sends
-  again or opens another chat (`shownOnceHold`).
+  again or opens another chat (`shownOnceHold`). The reload starts nothing while a message is in
+  flight, and one already under way when the answer came checks the hold after its last read,
+  right before it redraws (`loadSession`'s `unlessHeld`).
 - **What Archi keeps is masked** (`shown_once::kept`): the chat's `messages` row of that answer
   (`kept_response_row`: its `metadata_json` and its `content`, and so the session's preview), and
-  a pipeline run's `execution_report` in `pipeline_runs`, have every field whose name reads as a
-  secret's (`key_looks_secret`) and a vault-shaped object's `value` replaced by `***REDACTED***`
-  (one that holds nothing, a public channel's null token, stays), and each such value of 8
-  characters or more masked wherever a text repeats it. So the token is in no row, no snapshot of
-  Archi's directory, and nothing a later turn reads (its memory is made from the rows); the history
-  shows the block as "Shown once (kept masked)". A run's plan is kept as it came: `CONFIRM 2` runs
-  it.
+  a pipeline run's `execution_report` in `pipeline_runs` (each way a run's state is updated
+  merges through `pipeline_run_with_state_update`, CONFIRM 2's `advance_pipeline_run` included),
+  have every field whose name reads as a secret's (`key_looks_secret`) and a vault-shaped
+  object's `value` replaced by `***REDACTED***` (one that holds nothing, a public channel's null
+  token, stays), and each such value of 8 characters or more masked wherever a text repeats it.
+  So the token is in no row, no snapshot of Archi's directory, and nothing a later turn reads (its
+  memory is made from the rows); the history shows the block as "Shown once (kept masked)". A
+  run's plan is kept as it came: `CONFIRM 2` runs it.
 - **No model gets it.** SY.admin's executor runs a step with nothing to fill as the plan wrote it,
-  with no model (since 0.1.95); a step with `executor_fill` goes through its model, which gets the
-  step's answer back. A step of `publish_cloud_endpoint`, `externalize` or `vault_get` with
-  `executor_fill` is refused: by the plan compiler's prevalidation, by the precheck of a plan pasted
-  or sent to `POST /api/executor/plan`, and before any plan runs
+  with no model (since 0.1.95); a step with `executor_fill` goes through its model, whose prompt
+  holds the step with its `$steps.<id>...` references resolved, and which gets the step's answer
+  back. So a step of `publish_cloud_endpoint`, `externalize` or `vault_get` with `executor_fill`
+  is refused, and so is a step with `executor_fill` whose args take such a step's answer (a
+  `vault_put` of `$steps.s1.payload.token`, say): by the plan compiler's prevalidation, by the
+  precheck of a plan pasted or sent to `POST /api/executor/plan`, and before any plan runs
   (`refusal_of_a_plan_whose_secret_would_reach_a_model`, "executor plan validation failed: step s1
-  (publish_cloud_endpoint) answers a secret..."). The explanation turn (above) is given no secret.
+  (publish_cloud_endpoint) answers a secret..." or "step s2 (vault_put) takes the answer of step s1
+  (publish_cloud_endpoint)..."). The explanation turn (above) is given no secret.
+- **What the operator writes into a plan reaches a model.** SY.admin's plan review
+  (`executor_validate_plan`, which Archi sends every plan to before it runs) gives its model each
+  step as written, args included, when SY.admin's executor has an AI: one call per step, stage
+  `executor_review`. A secret the operator writes into a step's args (a `vault_put`'s value, an
+  `add_hive`'s SSH password) reaches the hive's AI provider there (FINDINGS A-337, SY.admin's to
+  fix). A secret an answer brings does not: the review runs before any step, on the references as
+  written.
 - **What the operator sent is kept masked too**: an executor plan pasted in the chat, or sent to
   `POST /api/executor/plan`, with its steps' secret args masked (a vault value, an SSH password or
   key), as an SCMD's body already was (`sanitize_user_message_for_persistence`); the command line
@@ -418,8 +436,12 @@ such an answer comes back in a step's `result_preview` (`src/bin/sy_architect/sh
   SY.admin's run log's (`redaction_field_is_secret`): `authorization`, `ssh_key`, `private_key`
   and `*_private_key` too, so an `add_hive`'s `ssh_key` is no longer kept in clear in the
   operation's `params_json`.
-- Archi's own log lines were redacted already (`admin_payload_for_log`), and SY.admin's command
-  log keeps no answer.
+- **Archi's log** (`journalctl -u sy-architect`): each admin action Archi sends, and its answer, is
+  logged at info level with its secrets masked as Archi keeps an answer (`admin_params_for_log`,
+  `admin_payload_for_log`, through `shown_once::kept`): a `vault_get`'s value whatever it holds, a
+  `vault_put` step's. Before the review only fields named as secrets were, so a vault value that is
+  a plain text, or whose fields are not named so (a postgres URL), went to the journal in clear.
+  SY.admin's command log keeps no answer.
 
 ## Pipelines
 
@@ -442,8 +464,10 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   SY.admin would refuse (`refuse_manifest_hive_id`, FINDINGS A-321, since 0.1.139): each hive the
   manifest names, a hive its topology adds, a VPN rule's, a node's, a route's and its next hop's,
   and a workflow's, must be 1 to 64 letters, digits, `_` or `-` as written (no `.`, `/` or space).
-  Before, a hive `a.b` went on into the plan and was refused `INVALID_HIVE_ID` only at execution,
-  once the operator had confirmed it.
+  The error names the field and the id, and says no hive has such an id. Before, a hive `a.b` went
+  on into the plan and failed only at execution, once the operator had confirmed it (`add_hive`
+  refused it `INVALID_HIVE_ID`; a node, a route, a VPN rule or a workflow on it failed its own
+  way).
   - Validation is strict when a manifest is saved and before a run reconciles. Reading one is not:
     `get_manifest_current` returns a manifest saved before a rule changed with its
     `validation_error`, so the designer can fix it, and a run made from it is blocked.

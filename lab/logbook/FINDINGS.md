@@ -460,6 +460,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition).
 - A-333 🔵 A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it (low; the WF engine; found by 0.1.138's gate).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the fix to decide).
+- A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1537,6 +1538,26 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-337 [General/admin] 🔵 low (found 2026-11-12 by A-124's review; read in the code, not run; there before it) — SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included
+
+- **Why:** `executor_validate_plan` (`src/bin/sy_admin.rs` ~9515) runs
+  `semantic_review_executor_plan` (~3112) whenever SY.admin's executor has an AI: one model call
+  per step (stage `executor_review`, charged to the root tenant), whose prompt holds the step as
+  written (`serde_json::to_string_pretty(step)`), its args included. Archi sends every plan it runs
+  there first (`execute_executor_plan_with_context`), and its plan compiler's prevalidation does
+  too.
+- **Effect:** a secret the operator writes into a plan's args (a `vault_put`'s or a
+  `vault_rotate`'s `value`, an `add_hive`'s `ssh_password` or `ssh_key`) reaches the hive's AI
+  provider before the plan runs, though Archi keeps it masked in its history and its log since
+  0.1.139 (A-124). A secret an answer brings does not: the review runs before any step, on
+  `$steps.<id>...` references as written. SY.admin's HTTP routes take no plan and no model.
+  Archi's own model sees what the operator types into the chat, a secret included, as before.
+- **Fix, later (SY.admin):** the review's prompt carries the step's args with their secrets masked
+  (`redact_executor_log_value`: names that read as secrets, and a vault-shaped `value`), since it
+  checks that a field is there and its shape, not its value; or a step whose args hold a secret is
+  not given to the model.
+- **Today:** a secret is stored over SY.admin's HTTP API (`POST /hives/<hive>/vault/secrets`), not
+  in a plan. Archi's handbook (§4.5.1) tells Archi to say so before it stages one.
 ### A-335 [General/orchestrator] 🔵 low (found 2026-11-12 by A-301's builder on `coa/orch-139`, numbered by its review; read in the code; there before it) — A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names
 
 - **Why:** a box the removal's cleanup did not reach (`remote_cleanup` other than `socket_ok`)
@@ -1880,8 +1901,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 
 ### A-321 [Archi] 🔵 low · built on `coa/architect-139` for 0.1.139 (found 2026-11-11 by A-311's Archi builder and review; read in the code; there before it) — Archi's plans and texts around `add_hive`
 
-- **Manifests:** Archi never checks a manifest's hive ids: a hive `a.b` is planned, and refused
-  `INVALID_HIVE_ID` only at execution, after the operator confirmed.
+- **Manifests:** Archi never checks a manifest's hive ids: a hive `a.b` is planned, and fails only
+  at execution, after the operator confirmed (`add_hive` refuses it `INVALID_HIVE_ID`; a node, a
+  route, a VPN rule or a workflow on it fails its own way).
 - **The SCMD help:** its `add_hive` example (`handle_meta_scmd`, `src/bin/sy_architect.rs` ~12099) has
   no `ssh_user`, so a copied example is refused `INVALID_REQUEST`; SY.admin's example has it.
 - **A closed record:** one closed on `NOT_FOUND` says *"hive 'X' no longer exists"*, where a
@@ -1894,7 +1916,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     names one: a hive its topology adds, a VPN rule's, a node's, a route's and its next hop's, a
     workflow's. The error names the field and the id, so the designer's next round fixes it
     (`a_manifest_hive_id_that_is_not_one_is_refused_when_planned`: `a.b`, ` worker1`,
-    `worker/1` and `../x` in each place, and `worker-1` passes).
+    `worker/1` and `../x` in each place, and `worker-1` passes). It says no hive has such an id,
+    and names no code (the review: it said SY.admin refuses it `INVALID_HIVE_ID`, which only
+    `add_hive`, `remove_hive`, `get_hive` and the joins answer).
   - `SCMD: help`'s `add_hive` example carries `ssh_user`
     (`the_scmd_help_examples_translate_and_add_hive_names_its_required_fields`: every SCMD example
     of the help translates, and the `add_hive` one names `hive_id`, `address` and `ssh_user`).
@@ -1926,10 +1950,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     request goes on.
   - No entry yet: still open, refused `OPERATION_ALREADY_TRACKED` with *"timed out locally and has
     no outcome yet"*. None 10 minutes after its dispatch with the whole log read: `failed`, its
-    outcome unknown (SY.admin never ended it: a restart, or the request lost). A log that cannot
+    outcome unknown: SY.admin never ended it (a restart, or the request lost), or its entry rotated
+    out (the review: the log keeps about the last 400 commands, reads included, 100 a file in the
+    active one and 3 rotations, so on a busy installation, or for a record left open before the
+    upgrade, the entry may be gone; the summary said SY.admin never ended it). A log that cannot
     be read leaves it open. `add_hive` keeps its registry read.
   - Not in the log, so not read, as before: `update`, `sync_hint`, the OPA and the wf-rules writes
-    (Archi waits for each as long as SY.admin does, or longer).
+    (Archi waits for each as long as SY.admin does, or longer). An identical request in the chat of
+    such an open record is refused saying it cannot be settled there: read the state, and repeat
+    it in a new chat (`open_operation_is_read`; the review: it said to ask again once it ends,
+    which that chat refuses for good).
   - Tests: `an_open_mutation_closes_on_its_outcome_in_the_command_log` (through the mesh harness:
     a `remove_hive` closed by its entry among others of another origin, another hive id and an
     earlier start, the read's target and params; a node's purge refused on the log's second page,
@@ -1937,7 +1967,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     is asked and the record stays open.
     `a_command_log_entry_is_a_records_by_its_action_origin_hive_time_and_params` judges the
     entries. A-311's test asks nothing of a record that is not open, an accepted `remove_hive` and
-    an `update`.
+    an `update`. The review's `an_open_records_texts_say_what_is_known_and_the_way_out` checks the
+    two texts above, and fails without them.
   - Not changed: Archi's own wait (30 s for `remove_hive`, `kill_node` and
     `remove_node_instance`, where SY.admin waits up to 180 s for a purge), so such a request still
     answers `TIMEOUT_UNKNOWN` first; its outcome is read on the next identical request.
@@ -2059,13 +2090,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Archi's handbook part, built on `coa/architect-139` for 0.1.139 (docs only):** §7.7 says where a
   runtime's use across the hives is (`get_runtime`'s `payload.usage_global_visible`, the read
   `remove_runtime_version` decides on) and names each field: `running_nodes` (and
-  `running_count`), `skipped_hives` (`{hive_id, reason, message}`, a use unknown, never none),
-  `hives_without_runtimes` (`{hive_id, role}`: each ingress and egress by the role the registry
-  records, whatever its join; not asked, neither counted nor skipped, never a hive not read, and
-  one that is down holds no removal up) and `in_use` (true, false, or null while a hive was
-  skipped). SY.admin's help for `get_runtime` and `remove_runtime_version` is the other part, in
-  SY.admin's binary, not on this branch. Archi reads the handbook from
-  `/etc/fluxbee/handbook_fluxbee.md`, which the package installs.
+  `running_count`), `skipped_hives` (`{hive_id, reason}` and a `message` when there is one, a use
+  unknown, never none), `hives_without_runtimes` (`{hive_id, role}`: each ingress and egress by
+  the role the registry records, whatever its join; not asked, neither counted nor skipped, never
+  a hive not read, and one that is down holds no removal up) and `in_use` (true, false, or null
+  while a hive was skipped), and the shape `{scope, status: "error", message}` when the motherbee
+  cannot read its own nodes or its hive registry, a use unknown too (the review: it named a
+  skipped hive's `message` as always there, and not that shape). SY.admin's help for
+  `get_runtime` and `remove_runtime_version` is the other part, in SY.admin's binary, not on this
+  branch. Archi reads the handbook from `/etc/fluxbee/handbook_fluxbee.md`, which the package
+  installs.
 
 ### A-314 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.134, 2026-11-11; a new node launched and killed in 9.8 s, the stopped nodes with no unit read `STOPPED`, a core node's kill refused `INVALID_REQUEST`) (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
 
@@ -7222,7 +7256,9 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     secret}]}`, found outside the operator's own args and plan). The chat shows a *"Shown once:
     copy it now"* block and keeps that answer on screen: its 5 s reload of the history (which
     replaced every answer with its stored copy) waits until the operator writes again or opens
-    another chat.
+    another chat; it starts nothing while a message is in flight, and a reload already under way
+    when the answer came checks the hold after its last read, right before it redraws (the
+    review: it checked only on entry, so such a reload could redraw over the answer).
   - **The `messages` table** (`kept_response_row`): its `metadata_json` (the whole answer, every
     `result_preview` in it) and its `content` (so the session's preview too) are kept as
     `shown_once::kept` keeps an answer: every field whose name reads as a secret's
@@ -7230,7 +7266,9 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     among them, and each such value of 8 characters or more masked where a text repeats it (a
     message, a summary). A field that holds nothing (a public channel's null token) stays.
   - **`pipeline_runs`**: a run's `execution_report` is kept the same way; its `executor_plan` as it
-    came (CONFIRM 2 runs it).
+    came (CONFIRM 2 runs it). Every update of a run's state merges through
+    `pipeline_run_with_state_update` (the review: CONFIRM 2 writes each report through
+    `advance_pipeline_run`, whose own merge kept it whole; `advance_active_pipeline_run` now).
   - **Archi's memory** is made from those rows (and A-322's turn from its allowlist), so no later
     turn is given the token.
   - **The `operations` table**: its `params_json` was redacted already, but by a shorter list of
@@ -7242,17 +7280,26 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - **The operator's own input:** an executor plan pasted in the chat, or sent to `POST
     /api/executor/plan`, is kept with its steps' secret args masked, as an SCMD's body was.
   - **No model:** a step of those three actions with `executor_fill` would go through SY.admin's
-    executor model, which gets its answer back: refused by the plan compiler's prevalidation, the
-    precheck of a pasted or sent plan, and before any plan runs (the pipeline's included). The
-    plan compiler's hard rules say so.
-  - Archi's log lines were redacted already (`admin_payload_for_log`); SY.admin's command log keeps
-    no answer.
+    executor model, which gets its answer back; so would a step with `executor_fill` whose args
+    take such a step's answer (`$steps.<id>...`), since SY.admin resolves a reference before it
+    chooses between its model and a direct dispatch (the review). Both refused by the plan
+    compiler's prevalidation, the precheck of a pasted or sent plan, and before any plan runs (the
+    pipeline's included). The plan compiler's hard rules say so. Not covered, and not Archi's: a
+    secret the operator writes into a plan's args reaches SY.admin's plan review model (A-337).
+  - **Archi's log** (`admin_params_for_log`, `admin_payload_for_log`): each admin action and its
+    answer go to the journal at info level masked as `shown_once::kept` keeps an answer (the
+    review: by name alone, a `vault_get`'s or a `vault_put` step's value that is a plain text, or
+    whose fields are not named as secrets, such as a postgres URL, went there in clear).
+    SY.admin's command log keeps no answer.
   - Tests (each fails without its fix): `a_token_is_shown_once_in_the_answer_and_kept_masked_in_the_history`,
-    `a_pipeline_runs_report_is_kept_masked_and_its_plan_as_it_came`,
+    `a_pipeline_runs_report_is_kept_masked_and_its_plan_as_it_came` (since the review through the
+    way CONFIRM 2 advances a run too),
     `what_the_operator_sent_is_kept_with_its_secrets_masked`,
-    `a_plan_whose_secret_would_reach_a_model_is_refused_before_it_runs`; and `shown_once`'s own
-    three. The chat page's script was checked with `node --check`; the block and the hold only on
-    8.x.
+    `a_plan_whose_secret_would_reach_a_model_is_refused_before_it_runs` (a step that takes a secret
+    step's answer too), and the review's `archis_log_keeps_no_vault_value_whatever_it_holds` and
+    `the_chat_keeps_an_answer_shown_once_through_a_reload_under_way` (the page's script as served);
+    and `shown_once`'s own four. The chat page's scripts were checked with `node --check`; the
+    block and the hold only on 8.x.
   - **Not on this branch:** the texts that send a publish *"never through Archi (FINDINGS A-124)"*:
     SY.admin's help for `publish_cloud_endpoint` (`src/bin/sy_admin.rs`), sy-admin.md's row and
     io-cloud-api.md §7, in the files SY.admin's and SY.edge's 0.1.139 branches change (A-317).

@@ -14,8 +14,9 @@
 //! - what Archi keeps of an answer (`kept`) has every field whose name reads as a secret's
 //!   (`super::key_looks_secret`) and a vault-shaped object's `value` masked, and the value of each
 //!   masked wherever a text repeats it;
-//! - a plan step of an action that answers a secret goes to SY.admin's executor with nothing for
-//!   its model to fill (`steps_whose_answer_would_reach_a_model`), so no model gets its answer.
+//! - a plan step of an action that answers a secret, and a step that takes such a step's answer
+//!   (`$steps.<id>...`), go to SY.admin's executor with nothing for its model to fill
+//!   (`steps_that_would_give_a_model_a_secret`), so no model gets the answer.
 
 use fluxbee_sdk::NODE_SECRET_REDACTION_TOKEN;
 use serde_json::{json, Map, Value};
@@ -204,40 +205,108 @@ pub fn show_once(output: &mut Value) {
     }
 }
 
-/// The steps of `plan` whose answer would reach a model (FINDINGS A-124): a step of an action that
-/// answers a secret (`ACTIONS_ANSWERING_A_SECRET`) with fields for SY.admin's executor model to
-/// fill (`executor_fill.allowed`). SY.admin runs a step with nothing to fill as the plan wrote it,
-/// with no model (since 0.1.95); one with fields to fill goes through the model, which gets the
-/// step's answer back. Each as `<id> (<action>)`.
-pub fn steps_whose_answer_would_reach_a_model(plan: &Value) -> Vec<String> {
-    plan.pointer("/execution/steps")
+/// The ids of the steps a step's args take the answer of: each text that is a reference
+/// `$steps.<id>.<path>`, as SY.admin's executor resolves one (`resolve_executor_value_refs`: the
+/// whole text, trimmed, its first segment the step's id), at any depth.
+fn steps_taken(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(id) = text
+                .trim()
+                .strip_prefix("$steps.")
+                .and_then(|path| path.split('.').next())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if !out.iter().any(|known| known == id) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| steps_taken(item, out)),
+        Value::Object(fields) => fields.values().for_each(|field| steps_taken(field, out)),
+        _ => {}
+    }
+}
+
+/// The steps of `plan` whose `executor_fill` would give SY.admin's executor model a secret an
+/// answer brought (FINDINGS A-124). SY.admin runs a step with nothing to fill as the plan wrote
+/// it, with no model (since 0.1.95); a step with fields to fill (`executor_fill.allowed`) goes
+/// through the model, whose prompt holds the step with its references resolved, and which gets
+/// the step's answer back. So two kinds are refused:
+/// - a step of an action that answers a secret (`ACTIONS_ANSWERING_A_SECRET`) with fields to
+///   fill: `step <id> (<action>) answers a secret`;
+/// - a step with fields to fill whose args take the answer of such a step (`$steps.<id>...`,
+///   which SY.admin resolves before it chooses between the model and a direct dispatch):
+///   `step <id> (<action>) takes the answer of step <id> (<action>)`.
+pub fn steps_that_would_give_a_model_a_secret(plan: &Value) -> Vec<String> {
+    let steps = plan
+        .pointer("/execution/steps")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|step| {
-            let action = step.get("action").and_then(Value::as_str)?.trim();
-            let fills = step
-                .pointer("/executor_fill/allowed")
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let action_of = |step: &Value| {
+        step.get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let id_of = |step: &Value| {
+        step.get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("?")
+            .to_string()
+    };
+    // The steps whose answer is a secret, by id.
+    let answering = steps
+        .iter()
+        .filter(|step| ACTIONS_ANSWERING_A_SECRET.contains(&action_of(step).as_str()))
+        .map(|step| (id_of(step), action_of(step)))
+        .collect::<Vec<_>>();
+    steps
+        .iter()
+        .filter(|step| {
+            step.pointer("/executor_fill/allowed")
                 .and_then(Value::as_array)
-                .is_some_and(|allowed| !allowed.is_empty());
-            (fills && ACTIONS_ANSWERING_A_SECRET.contains(&action)).then(|| {
-                let id = step.get("id").and_then(Value::as_str).unwrap_or("?");
-                format!("{id} ({action})")
+                .is_some_and(|allowed| !allowed.is_empty())
+        })
+        .filter_map(|step| {
+            let (id, action) = (id_of(step), action_of(step));
+            if ACTIONS_ANSWERING_A_SECRET.contains(&action.as_str()) {
+                return Some(format!("step {id} ({action}) answers a secret"));
+            }
+            let mut taken = Vec::new();
+            if let Some(args) = step.get("args") {
+                steps_taken(args, &mut taken);
+            }
+            let sources = answering
+                .iter()
+                .filter(|(source, _)| taken.contains(source))
+                .map(|(source, source_action)| format!("step {source} ({source_action})"))
+                .collect::<Vec<_>>();
+            (!sources.is_empty()).then(|| {
+                format!(
+                    "step {id} ({action}) takes the answer of {}",
+                    sources.join(" and ")
+                )
             })
         })
         .collect()
 }
 
-/// The refusal of a plan whose steps' answers would reach a model
-/// (`steps_whose_answer_would_reach_a_model`), or None.
+/// The refusal of a plan whose `executor_fill` would give a model a secret an answer brought
+/// (`steps_that_would_give_a_model_a_secret`), or None.
 pub fn refusal_of_a_plan_whose_secret_would_reach_a_model(plan: &Value) -> Option<String> {
-    let steps = steps_whose_answer_would_reach_a_model(plan);
+    let steps = steps_that_would_give_a_model_a_secret(plan);
     (!steps.is_empty()).then(|| {
         format!(
-            "step {} answers a secret (a token or a vault value), and its executor_fill would make \
-             SY.admin's executor run it through its model, which gets the answer: write the \
-             step's args in full, with no executor_fill (FINDINGS A-124)",
-            steps.join(", ")
+            "{}: a step with executor_fill runs through SY.admin's executor model, which gets the \
+             step's answer and its args with every $steps reference resolved, so the model would \
+             get a secret (a token or a vault value); write those steps' args in full, with no \
+             executor_fill (FINDINGS A-124)",
+            steps.join("; ")
         )
     })
 }
@@ -431,6 +500,71 @@ mod tests {
         assert_eq!(
             refusal_of_a_plan_whose_secret_would_reach_a_model(&json!({})),
             None
+        );
+    }
+
+    /// The review of FINDINGS A-124: SY.admin resolves a step's `$steps.<id>...` references before
+    /// it chooses between its model and a direct dispatch, so a later step with `executor_fill`
+    /// that takes a secret step's answer hands the model that answer, resolved in its prompt. Such
+    /// a step is refused too, at any depth of its args; with nothing to fill it goes as written.
+    #[test]
+    fn a_step_that_takes_a_secret_steps_answer_has_nothing_for_a_model_to_fill() {
+        let plan = |reference: Value, fill: Value| {
+            json!({ "kind": "executor_plan", "plan_version": "0.1", "execution": { "steps": [
+                { "id": "s1", "action": "publish_cloud_endpoint",
+                  "args": { "edge_node": "SY.edge@ingress1" } },
+                { "id": "s2", "action": "vault_put",
+                  "args": { "key": "cloud-copy", "value": reference,
+                            "metadata": { "resource_type": "bearer_token" } },
+                  "executor_fill": fill }
+            ] } })
+        };
+        let fill = json!({ "allowed": ["metadata"] });
+        for reference in [
+            json!("$steps.s1.payload.token"),
+            json!(" $steps.s1 "),
+            json!({ "bearer": "$steps.s1.payload" }),
+            json!(["x", "$steps. s1 .payload.token"]),
+        ] {
+            let refusal = refusal_of_a_plan_whose_secret_would_reach_a_model(&plan(
+                reference.clone(),
+                fill.clone(),
+            ))
+            .unwrap_or_else(|| panic!("{reference} refused"));
+            assert!(
+                refusal.starts_with(
+                    "step s2 (vault_put) takes the answer of step s1 (publish_cloud_endpoint): "
+                ),
+                "{refusal}"
+            );
+            assert!(refusal.contains("no executor_fill"), "{refusal}");
+            // Nothing to fill: SY.admin dispatches it as written, its reference resolved, with
+            // no model.
+            assert_eq!(
+                refusal_of_a_plan_whose_secret_would_reach_a_model(&plan(reference, Value::Null)),
+                None
+            );
+        }
+        // A reference to a step whose answer is no secret, and a text that only names one, pass.
+        for reference in [
+            json!("$steps.s3.payload.url"),
+            json!("see $steps.s1.payload.token"),
+        ] {
+            assert_eq!(
+                refusal_of_a_plan_whose_secret_would_reach_a_model(&plan(reference, fill.clone())),
+                None
+            );
+        }
+        // Both kinds in one plan: each named.
+        let mut both = plan(json!("$steps.s1.payload.token"), fill);
+        both["execution"]["steps"][0]["executor_fill"] = json!({ "allowed": ["edge_node"] });
+        assert_eq!(
+            steps_that_would_give_a_model_a_secret(&both),
+            vec![
+                "step s1 (publish_cloud_endpoint) answers a secret".to_string(),
+                "step s2 (vault_put) takes the answer of step s1 (publish_cloud_endpoint)"
+                    .to_string(),
+            ]
         );
     }
 }

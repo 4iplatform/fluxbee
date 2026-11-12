@@ -2414,7 +2414,7 @@ Blocked result:
 - Never use `node_control_config_set` to create a node.
 - Never include read-only discovery actions as executor steps unless the requested plan itself is read-only.
 - Step ids must be unique. Use `s1`, `s2`, `s3` in order.
-- A step of `publish_cloud_endpoint`, `externalize` or `vault_get` never carries `executor_fill`: its answer is a secret (a token, a vault value) shown once to the operator, and a step with fields to fill would give it to SY.admin's executor model. SY.architect refuses such a plan.
+- A step of `publish_cloud_endpoint`, `externalize` or `vault_get` never carries `executor_fill`: its answer is a secret (a token, a vault value) shown once to the operator, and a step with fields to fill would give it to SY.admin's executor model. Nor does a step whose args take such a step's answer (`$steps.<id>...`): SY.admin resolves the reference into the prompt of a step with fields to fill. SY.architect refuses such a plan.
 - `metadata.target_hive` is the primary hive for this plan; per-step args carry more specific hives when needed.
 - If the task is blocked by a missing required value or ambiguous target, submit `status: "blocked"` instead of guessing.
 
@@ -12498,12 +12498,12 @@ async fn settle_open_operation(
     if record.status != "timeout_unknown" && record.status != "accepted" {
         return Ok(false);
     }
-    let outcome = if record.action == "add_hive" {
-        add_hive_outcome_from_registry(state, record).await?
-    } else if action_in_command_log(&record.action) {
-        logged_outcome_of_operation(state, record).await?
-    } else {
+    let outcome = if !open_operation_is_read(&record.action) {
         None
+    } else if record.action == "add_hive" {
+        add_hive_outcome_from_registry(state, record).await?
+    } else {
+        logged_outcome_of_operation(state, record).await?
     };
     let Some((status, error_summary)) = outcome else {
         return Ok(false);
@@ -12622,9 +12622,11 @@ async fn add_hive_outcome_from_registry(
 
 /// How long after its dispatch a tracked mutation SY.admin's command log has no outcome for may
 /// still be under way there (FINDINGS A-320): longer than SY.admin waits for any action an SCMD
-/// sends (180 s for a node's purge, `kill_node` and `remove_node_instance`), with room. Past it,
-/// SY.admin never ended the command (it restarted meanwhile, or the request was lost on the way),
-/// so the record closes, its outcome unknown.
+/// sends (180 s for a node's purge, `kill_node` and `remove_node_instance`), with room. Past it the
+/// record closes, its outcome unknown: SY.admin never ended the command (it restarted meanwhile, or
+/// the request was lost on the way), or its entry is no longer in the log, which keeps about the
+/// last 400 commands SY.admin ran, reads included (SY.admin's active file and its 3 rotations, 100
+/// entries each, `ADMIN_COMMAND_LOG_ROTATE_ENTRIES`), and drops the oldest.
 const OPEN_OPERATION_LOG_WAIT_MS: u64 = 10 * 60 * 1000;
 
 /// How long before Archi recorded a command as dispatched SY.admin's log may say it started: both
@@ -12648,12 +12650,24 @@ fn action_in_command_log(action: &str) -> bool {
         && !action.starts_with("wf_rules_")
 }
 
+/// Whether a read can settle an open record of `action` (`settle_open_operation`): an `add_hive`'s
+/// in the hive registry, any other in SY.admin's command log (`action_in_command_log`). Asking
+/// again in the chat of an open record of any other action is refused for good, so its refusal
+/// says so (`operation_error_message`).
+fn open_operation_is_read(action: &str) -> bool {
+    action == "add_hive" || action_in_command_log(action)
+}
+
 /// The summary of an open record whose command SY.admin's log has no outcome for well after its
-/// dispatch (`OPEN_OPERATION_LOG_WAIT_MS`, FINDINGS A-320).
+/// dispatch (`OPEN_OPERATION_LOG_WAIT_MS`, FINDINGS A-320). It says what is known: the log has no
+/// entry for it, whether SY.admin never ended it or its entry rotated out (the review: the log
+/// keeps about 400 commands, reads included, so on a busy installation, or for a record left open
+/// before the upgrade, it may be gone).
 const OPERATION_NEVER_LOGGED: &str =
-    "SY.admin's command log has no outcome for it 10 minutes after it was sent: SY.admin never \
-     ended it (a restart, or the request was lost), so whether it took effect is unknown; read \
-     the state before asking again";
+    "SY.admin's command log has no entry for it 10 minutes after it was sent: SY.admin never \
+     ended it (a restart, or the request was lost), or its entry rotated out (the log keeps about \
+     the last 400 commands), so whether it took effect is unknown; read the state before asking \
+     again";
 
 /// How an open record of a tracked mutation other than `add_hive` ends (`settle_open_operation`,
 /// FINDINGS A-320), read in SY.admin's command log (`list_recent_commands`): the entries of its
@@ -12730,7 +12744,7 @@ async fn logged_outcome_of_operation(
 /// `error` `failed` with SY.admin's code (the log keeps no detail), another status as its answer
 /// would have. With no such entry it stays open until `OPEN_OPERATION_LOG_WAIT_MS` after its
 /// dispatch, and then, the whole log read, closes `failed`, its outcome unknown
-/// (`OPERATION_NEVER_LOGGED`). None while it stays open.
+/// (`OPERATION_NEVER_LOGGED`: never ended, or rotated out of the log). None while it stays open.
 fn command_log_outcome(
     record: &ChatOperationRecord,
     entries: &[Value],
@@ -12967,9 +12981,15 @@ fn operation_error_message(record: &ChatOperationRecord) -> String {
         ),
         // FINDINGS A-320: an identical request read SY.admin's command log (or, for add_hive, the
         // hive registry) first, and it has no outcome for it yet.
-        "timeout_unknown" => format!(
+        "timeout_unknown" if open_operation_is_read(&record.action) => format!(
             "An equivalent operation timed out locally and has no outcome yet: it may still be running (operation {}). Ask again once it ends, or inspect the result first.",
             record.operation_id
+        ),
+        // The review of A-320: nothing Archi reads ends such a record, so asking again in this
+        // chat is refused for good; a new chat is the way to repeat it.
+        "timeout_unknown" => format!(
+            "An equivalent operation timed out locally and cannot be settled in this chat: SY.admin's command log does not keep {}, so Archi has nothing to read its outcome from (operation {}). It may still be running: read the state, and to repeat it, use a new chat.",
+            record.action, record.operation_id
         ),
         _ => format!(
             "An equivalent operation is already tracked in this chat (operation {}).",
@@ -16706,11 +16726,15 @@ fn sanitize_user_message_for_persistence(user_message: &str) -> String {
     }
 }
 
-/// What Archi's log keeps of an admin action's params: its secrets redacted, and of a plan the
-/// executor validates or runs, the link's key an `unpublish_artifact` step names only as its SHA-256
-/// (`key_sha256_for_log`), as SY.admin's own logs keep it.
+/// What Archi's log keeps of an admin action's params: its secrets masked as Archi keeps an answer
+/// (`shown_once::kept`: a field named as a secret, a vault-shaped object's `value`, such as a
+/// `vault_put` step's, and each such value where a text repeats it), and of a plan the executor
+/// validates or runs, the link's key an `unpublish_artifact` step names only as its SHA-256
+/// (`key_sha256_for_log`), as SY.admin's own logs keep it. By name alone (before the review of
+/// FINDINGS A-124), a vault value that is a plain text, or whose fields are not named as secrets
+/// (a postgres URL), went to the journal in clear.
 fn admin_params_for_log(action: &str, params: &Value) -> Value {
-    let mut logged = redact_json_secret_fields(params);
+    let mut logged = shown_once::kept(params);
     let steps = match action {
         "executor_validate_plan" => "/execution/steps",
         "executor_execute_plan" => "/plan/execution/steps",
@@ -16728,10 +16752,11 @@ fn admin_params_for_log(action: &str, params: &Value) -> Value {
     logged
 }
 
-/// What Archi's log keeps of an admin action's answer: its secrets redacted, and the link's key an
+/// What Archi's log keeps of an admin action's answer: its secrets masked as Archi keeps an answer
+/// (`shown_once::kept`: a `vault_get`'s `value` whatever it holds, a token), and the link's key an
 /// executor's event repeats from an `unpublish_artifact` step only as its SHA-256.
 fn admin_payload_for_log(action: &str, payload: &Value) -> Value {
-    let mut logged = redact_json_secret_fields(payload);
+    let mut logged = shown_once::kept(payload);
     if action == "executor_execute_plan" {
         if let Some(events) = logged.get_mut("events").and_then(Value::as_array_mut) {
             for event in events {
@@ -21004,7 +21029,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         renderPipelineRecoveryPrompt(recovery);
       }}
     }}
-    async function loadSession(sessionId, existingDetail, showWelcome = false, preserveComposer = false) {{
+    async function loadSession(sessionId, existingDetail, showWelcome = false, preserveComposer = false, unlessHeld = false) {{
       currentSessionId = sessionId;
       renderHistory();
       localStorage.setItem(currentSessionStorageKey, sessionId);
@@ -21020,11 +21045,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
         throw new Error("session load failed");
       }}
       const detail = await res.json();
+      // FINDINGS A-124's review: a reload the refresh loop started keeps what came while it read,
+      // checked after its last await and right before it redraws: an answer shown once (its
+      // hold), or a submit whose answer is still to come.
+      if (unlessHeld && (shownOnceHold || submitInFlight)) {{
+        return;
+      }}
       renderSession(detail, showWelcome, preserveComposer);
     }}
     async function refreshCurrentSession(options = {{}}) {{
       const force = !!(options && options.force);
-      if (!currentSessionId || sessionRefreshInFlight || shownOnceHold) {{
+      if (!currentSessionId || sessionRefreshInFlight || shownOnceHold || submitInFlight) {{
         return;
       }}
       sessionRefreshInFlight = true;
@@ -21047,7 +21078,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
             )
           : sessionRevision({{ session: detail || null }});
         if (force || nextRevision !== currentSessionRevision) {{
-          await loadSession(currentSessionId, null, false, true);
+          if (shownOnceHold || submitInFlight) {{
+            return;
+          }}
+          await loadSession(currentSessionId, null, false, true, true);
           await refreshSessionList(currentSessionId);
         }}
       }} catch (_err) {{
@@ -22017,14 +22051,15 @@ async fn deployed_workflows_of_untenanted(
 /// A hive id a manifest names (FINDINGS A-321), as SY.admin and the orchestrator take one: 1 to 64
 /// letters, digits, '_' or '-' (`is_valid_hive_id`), as written. A hive's topology, a node's,
 /// route's (and its next hop), VPN rule's and workflow's hive are checked when the manifest is
-/// planned, where an id such as `a.b` went on into the plan and was refused `INVALID_HIVE_ID` only
-/// at execution, once the operator had confirmed it.
+/// planned, where an id such as `a.b` went on into the plan and failed only at execution, once the
+/// operator had confirmed it (`add_hive` refused it `INVALID_HIVE_ID`; a node, a route, a VPN rule
+/// or a workflow on it failed in its own way). The error names no code: no hive has such an id.
 fn refuse_manifest_hive_id(field: &str, hive: &str) -> Result<(), String> {
     if fluxbee_sdk::mesh::is_valid_hive_id(hive) {
         return Ok(());
     }
     Err(format!(
-        "{field} '{hive}' is not a hive id: 1 to 64 letters, digits, '_' or '-' (no '.', '/' or space); SY.admin refuses it (INVALID_HIVE_ID)"
+        "{field} '{hive}' is not a hive id: 1 to 64 letters, digits, '_' or '-' (no '.', '/' or space); no hive has such an id"
     ))
 }
 
@@ -22662,6 +22697,9 @@ async fn load_pipeline_run_with_context(
     )
 }
 
+/// `record` moved to `new_stage`, with `state_update`'s fields merged into its state: the one merge
+/// of a run's state, `advance_pipeline_run`'s (`advance_active_pipeline_run`) and
+/// `advance_pipeline_run_with_context`'s.
 fn pipeline_run_with_state_update(
     record: &PipelineRunRecord,
     new_stage: PipelineStage,
@@ -23022,32 +23060,28 @@ async fn advance_pipeline_run(
         refill.insert(run_id.to_string(), loaded);
         guard = refill;
     }
-    let run = guard.get_mut(run_id).ok_or_else(|| -> ArchitectError {
-        format!("pipeline run {run_id} not found after reload").into()
-    })?;
-    run.current_stage = new_stage.clone();
-    run.status = pipeline_run_status_for_stage(&new_stage);
-    run.updated_at_ms = now_epoch_ms();
-    if run.status == PipelineRunStatus::Interrupted {
-        run.interrupted_at_ms.get_or_insert(run.updated_at_ms);
-    } else {
-        run.interrupted_at_ms = None;
-    }
-    if let Some(update) = state_update {
-        if let Ok(mut current) = serde_json::from_str::<serde_json::Value>(&run.state_json) {
-            if let (Some(c), Some(u)) = (current.as_object_mut(), update.as_object()) {
-                for (k, v) in u {
-                    c.insert(k.clone(), v.clone());
-                }
-            }
-            run.state_json =
-                serde_json::to_string(&current).unwrap_or_else(|_| run.state_json.clone());
-        }
-    }
-    let updated = run.clone();
+    let updated = advance_active_pipeline_run(&mut guard, run_id, new_stage, state_update)?;
     drop(guard);
     save_pipeline_run(state, &updated).await?;
     Ok(())
+}
+
+/// The run `run_id` of Archi's active runs moved to `new_stage`, `state_update` merged into its
+/// state, in place, and the record as it is now, for `advance_pipeline_run` to save. The merge is
+/// `pipeline_run_with_state_update`'s, the one every update of a run's state goes through, so a
+/// run's `execution_report` is kept masked whichever way it is written (FINDINGS A-124's review:
+/// CONFIRM 2 writes every report through here, and this merge kept it whole).
+fn advance_active_pipeline_run(
+    runs: &mut HashMap<String, PipelineRunRecord>,
+    run_id: &str,
+    new_stage: PipelineStage,
+    state_update: Option<Value>,
+) -> Result<PipelineRunRecord, ArchitectError> {
+    let run = runs.get_mut(run_id).ok_or_else(|| -> ArchitectError {
+        format!("pipeline run {run_id} not found after reload").into()
+    })?;
+    *run = pipeline_run_with_state_update(run, new_stage, state_update, None)?;
+    Ok(run.clone())
 }
 
 fn pipeline_run_status_for_stage(stage: &PipelineStage) -> PipelineRunStatus {
@@ -28555,7 +28589,9 @@ mod tests {
 
     /// FINDINGS A-124: a pipeline run's report, kept in its run state (`pipeline_runs`), has its
     /// steps' secrets masked as a chat answer does, where the whole executor answer was kept; its
-    /// plan is kept as it came, since CONFIRM 2 runs it.
+    /// plan is kept as it came, since CONFIRM 2 runs it. The review: CONFIRM 2 writes every report
+    /// through `advance_pipeline_run`, whose own merge kept it whole; both ways of advancing a run
+    /// now merge alike (`advance_active_pipeline_run`, `pipeline_run_with_state_update`).
     #[test]
     fn a_pipeline_runs_report_is_kept_masked_and_its_plan_as_it_came() {
         let token = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
@@ -28564,24 +28600,115 @@ mod tests {
             "steps": [{ "id": "s1", "action": "vault_put",
                         "args": { "key": "k", "value": "plan-value-kept" } }] } });
         let run = blocked_pipeline_fixture(PipelineStage::Execute);
-        let updated = pipeline_run_with_state_update(
-            &run,
+        let update = || {
+            Some(json!({
+                "execution_report": report.clone(),
+                "executor_plan": plan.clone(),
+                "verification_verdict": { "verified_success": true },
+            }))
+        };
+        let check = |updated: &PipelineRunRecord, stage: PipelineStage| {
+            assert!(
+                !updated.state_json.contains(token),
+                "{}",
+                updated.state_json
+            );
+            assert_eq!(updated.current_stage, stage);
+            let state = pipeline_state_from_run(updated);
+            assert_eq!(
+                state.pointer("/execution_report/payload/events/0/result_preview/payload/token"),
+                Some(&json!(NODE_SECRET_REDACTION_TOKEN))
+            );
+            assert_eq!(
+                state.pointer("/execution_report/payload/events/0/result_preview/payload/url"),
+                Some(&json!("/e/ich:9"))
+            );
+            assert_eq!(state["executor_plan"], plan);
+            // The run's earlier state stays beside the update.
+            assert_eq!(state["blocked_reason"], json!("test blocker"));
+        };
+        // The way CONFIRM 2 advances a run (`advance_pipeline_run`): the active run, in place.
+        let mut active = HashMap::from([(run.pipeline_run_id.clone(), run.clone())]);
+        for stage in [
+            PipelineStage::Blocked,
+            PipelineStage::Verify,
+            PipelineStage::Failed,
             PipelineStage::Completed,
-            Some(json!({ "execution_report": report, "executor_plan": plan.clone() })),
-            None,
-        )
-        .expect("update");
+        ] {
+            let updated =
+                advance_active_pipeline_run(&mut active, "pipe-test", stage.clone(), update())
+                    .expect("advanced");
+            check(&updated, stage);
+            // Kept so in Archi's active runs, which save_pipeline_run writes as they are.
+            assert_eq!(active["pipe-test"].state_json, updated.state_json);
+            assert_eq!(active["pipe-test"].current_stage, updated.current_stage);
+        }
         assert!(
-            !updated.state_json.contains(token),
-            "{}",
-            updated.state_json
+            advance_active_pipeline_run(&mut active, "other", PipelineStage::Verify, None).is_err()
         );
-        let state = pipeline_state_from_run(&updated);
-        assert_eq!(
-            state.pointer("/execution_report/payload/events/0/result_preview/payload/token"),
-            Some(&json!(NODE_SECRET_REDACTION_TOKEN))
+        // The way a tool context advances one (`advance_pipeline_run_with_context`).
+        let updated =
+            pipeline_run_with_state_update(&run, PipelineStage::Completed, update(), None)
+                .expect("update");
+        check(&updated, PipelineStage::Completed);
+    }
+
+    /// The review of FINDINGS A-124: the chat page keeps an answer shown once on screen through a
+    /// reload of the history its refresh loop had started already. The loop's check of the hold
+    /// ran only on entry, so a tick that read the session's new revision while the answer came
+    /// redrew the chat from the masked history after the answer had rendered, and the secret
+    /// shown once was lost. Now the loop starts nothing while a submit is in flight, checks again
+    /// after its read of the revision, and its reload (`loadSession`'s `unlessHeld`) checks the
+    /// hold and the submit after its last await, right before it redraws.
+    #[tokio::test]
+    async fn the_chat_keeps_an_answer_shown_once_through_a_reload_under_way() {
+        let (state, _router) = harness_state();
+        let page = architect_index_html(&state);
+        let function = |name: &str| -> String {
+            let start = page
+                .find(&format!("async function {name}("))
+                .unwrap_or_else(|| panic!("{name}"));
+            let rest = &page[start + 1..];
+            let end = ["\n    async function ", "\n    function "]
+                .iter()
+                .filter_map(|next| rest.find(next))
+                .min()
+                .unwrap_or(rest.len());
+            page[start..start + 1 + end].to_string()
+        };
+        let load = function("loadSession");
+        let held = load
+            .find("if (unlessHeld && (shownOnceHold || submitInFlight)) {")
+            .expect("loadSession checks the hold");
+        let last_await = load.rfind("await ").expect("an await");
+        let redraw = load
+            .rfind("renderSession(detail, showWelcome, preserveComposer);")
+            .expect("its redraw");
+        assert!(last_await < held && held < redraw, "{load}");
+        assert!(!load[held..redraw].contains("await "), "{load}");
+        let refresh = function("refreshCurrentSession");
+        assert!(
+            refresh.contains(
+                "if (!currentSessionId || sessionRefreshInFlight || shownOnceHold || submitInFlight) {"
+            ),
+            "{refresh}"
         );
-        assert_eq!(state["executor_plan"], plan);
+        assert_eq!(refresh.matches("loadSession(").count(), 1, "{refresh}");
+        assert!(
+            refresh.contains("loadSession(currentSessionId, null, false, true, true);"),
+            "{refresh}"
+        );
+        assert!(!refresh.contains("renderSession("), "{refresh}");
+        // The hold starts with an answer as it came, and the operator's next message ends it.
+        assert!(page.contains("function renderShownOnce(kind, data, fromHistory) {"));
+        for sender in [
+            "async function submit()",
+            "async function sendQuickControlMessage(",
+        ] {
+            let start = page.find(sender).expect(sender);
+            let head = page[start..].chars().take(400).collect::<String>();
+            assert!(head.contains("shownOnceHold = false;"), "{sender}: {head}");
+        }
     }
 
     /// FINDINGS A-124's check of what Archi keeps of the operator's input: an executor plan pasted
@@ -28635,8 +28762,9 @@ mod tests {
     /// FINDINGS A-124: a step that answers a secret (`publish_cloud_endpoint`, `externalize`,
     /// `vault_get`) goes to SY.admin's executor with nothing for its model to fill, which it then
     /// runs with no model (since 0.1.95): one with `executor_fill` would give the model the step's
-    /// answer, the token. A plan pasted or sent to Archi is refused at its precheck, and any plan
-    /// Archi runs (a confirmed one, the pipeline's) before anything reaches SY.admin.
+    /// answer, the token. So does a step that takes such a step's answer (`$steps.s1...`, the
+    /// review). A plan pasted or sent to Archi is refused at its precheck, and any plan Archi runs
+    /// (a confirmed one, the pipeline's) before anything reaches SY.admin.
     #[tokio::test]
     async fn a_plan_whose_secret_would_reach_a_model_is_refused_before_it_runs() {
         let plan = json!({ "kind": "executor_plan", "plan_version": "0.1", "execution": { "steps": [
@@ -28675,6 +28803,51 @@ mod tests {
         // Its args written in full, with nothing to fill, it goes on.
         let mut plain = plan;
         plain["execution"]["steps"][0]
+            .as_object_mut()
+            .expect("step")
+            .remove("executor_fill");
+        assert!(validate_architect_executor_plan_shape(&plain).is_ok());
+
+        // The review: a later step with executor_fill that takes the secret step's answer, which
+        // SY.admin resolves into that step's prompt, is refused the same way, before anything
+        // reaches SY.admin.
+        let copy = json!({ "kind": "executor_plan", "plan_version": "0.1", "execution": { "steps": [
+            { "id": "s1", "action": "vault_get", "args": { "key": "gate-shown" } },
+            { "id": "s2", "action": "vault_put",
+              "args": { "key": "gate-copy", "value": "$steps.s1.payload.value",
+                        "metadata": { "resource_type": "gate" } },
+              "executor_fill": { "allowed": ["metadata"] } }
+        ] } });
+        let err = validate_architect_executor_plan_shape(&copy).expect_err("refused");
+        assert!(
+            err.to_string()
+                .starts_with("step s2 (vault_put) takes the answer of step s1 (vault_get)"),
+            "{err}"
+        );
+        let err = execute_executor_plan_with_context(
+            &context,
+            "exec-a124-copy".to_string(),
+            copy.clone(),
+            json!({}),
+            json!({}),
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            err.to_string().starts_with(
+                "executor plan validation failed: step s2 (vault_put) takes the answer of step s1"
+            ),
+            "{err}"
+        );
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing reaches SY.admin"
+        );
+        let mut plain = copy;
+        plain["execution"]["steps"][1]
             .as_object_mut()
             .expect("step")
             .remove("executor_fill");
@@ -28815,6 +28988,46 @@ mod tests {
             "list_nodes",
         ] {
             assert!(!action_in_command_log(action), "{action}");
+        }
+    }
+
+    /// The review of FINDINGS A-320: what an open record's texts say. Closed with no entry in
+    /// SY.admin's command log, the summary says what is known, never that SY.admin never ended it:
+    /// the log keeps about 400 commands, reads included, so the entry may have rotated out. An
+    /// identical request refused while a record is open says to ask again only where a read can
+    /// end it; for an action no read ends (`update`, `sync_hint`, the OPA and wf-rules writes) it
+    /// says the record cannot be settled in that chat, and that a new chat repeats it, where it
+    /// advised asking again, which is refused for good there.
+    #[test]
+    fn an_open_records_texts_say_what_is_known_and_the_way_out() {
+        assert!(
+            OPERATION_NEVER_LOGGED.contains("never ended it")
+                && OPERATION_NEVER_LOGGED.contains("rotated out")
+                && OPERATION_NEVER_LOGGED.contains("about the last 400 commands"),
+            "{OPERATION_NEVER_LOGGED}"
+        );
+        for action in ["add_hive", "remove_hive", "kill_node", "add_route"] {
+            assert!(open_operation_is_read(action), "{action}");
+            let text = operation_error_message(&timed_out_record(action, json!({}), 40_000));
+            assert!(text.contains("has no outcome yet"), "{action}: {text}");
+            assert!(text.contains("Ask again once it ends"), "{action}: {text}");
+        }
+        for action in [
+            "update",
+            "sync_hint",
+            "opa_compile_apply",
+            "wf_rules_delete",
+        ] {
+            assert!(!open_operation_is_read(action), "{action}");
+            let text = operation_error_message(&timed_out_record(action, json!({}), 40_000));
+            assert!(
+                text.contains("cannot be settled in this chat")
+                    && text.contains(&format!("does not keep {action}"))
+                    && text.contains("use a new chat")
+                    && text.contains("(operation op-a320)"),
+                "{action}: {text}"
+            );
+            assert!(!text.contains("Ask again once it ends"), "{action}: {text}");
         }
     }
 
@@ -29275,8 +29488,9 @@ mod tests {
     /// FINDINGS A-321: a manifest's hive ids are checked when it is planned, as SY.admin takes one
     /// (1 to 64 letters, digits, '_' or '-', as written): each place a manifest names a hive, with
     /// `a.b`, ` worker1` or `worker/1`, is refused naming the field, where the plan carried it and
-    /// SY.admin refused it `INVALID_HIVE_ID` only once the operator had confirmed it. The same
-    /// manifest with `worker-1` passes.
+    /// it failed only once the operator had confirmed it. The error names no code (the review:
+    /// only `add_hive` answers `INVALID_HIVE_ID`; a node, a route or a workflow on such a hive
+    /// fails its own way). The same manifest with `worker-1` passes.
     #[test]
     fn a_manifest_hive_id_that_is_not_one_is_refused_when_planned() {
         let manifest_with = |hive: &str| -> Vec<(&'static str, Value)> {
@@ -29337,7 +29551,8 @@ mod tests {
                     err.contains(&format!("{field} '{bad}' is not a hive id")),
                     "{field}: {err}"
                 );
-                assert!(err.contains("INVALID_HIVE_ID"), "{field}: {err}");
+                assert!(err.ends_with("; no hive has such an id"), "{field}: {err}");
+                assert!(!err.contains("INVALID_HIVE_ID"), "{field}: {err}");
             }
         }
         for (field, desired) in manifest_with("worker-1") {
@@ -36425,5 +36640,55 @@ mod tests {
             admin_params_for_log("executor_validate_plan", &other),
             other
         );
+    }
+
+    /// The review of FINDINGS A-124: Archi logs each admin action it sends and its answer at info
+    /// level. A vault value is masked there whatever it holds, as in what Archi keeps
+    /// (`shown_once::kept`): a `vault_get`'s answer, an executor's event that repeats it, and a
+    /// `vault_put` step's args, where the redaction by name alone wrote to the journal a value that
+    /// is a plain text or whose fields are not named as secrets (the handbook's postgres contract).
+    #[test]
+    fn archis_log_keeps_no_vault_value_whatever_it_holds() {
+        let url = "postgresql://fluxbee:s3cret-pass@10.0.0.5:5432";
+        let plain = "a-plain-text-vault-value-0123";
+        for (value, secret) in [(json!({ "postgres_url": url }), url), (json!(plain), plain)] {
+            let answer = json!({ "status": "ok", "key": "pg-shared", "value": value,
+                                 "metadata": { "resource_type": "postgres" }, "version": 3 });
+            let logged = admin_payload_for_log("vault_get", &answer);
+            assert_eq!(logged["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+            assert_eq!(logged["key"], json!("pg-shared"));
+            assert_eq!(logged["version"], json!(3));
+            let run = admin_payload_for_log(
+                "executor_execute_plan",
+                &json!({ "events": [{ "step_id": "s1", "step_action": "vault_get",
+                    "tool_args_preview": { "key": "pg-shared" },
+                    "result_preview": { "status": "ok", "payload": answer.clone() } }],
+                    "summary": { "final_message": format!("read {secret} for pg-shared") } }),
+            );
+            let plan = json!({ "execution": { "steps": [{ "id": "s1", "action": "vault_put",
+                "args": { "key": "pg-shared", "value": value.clone(),
+                          "metadata": { "resource_type": "postgres" } } }] } });
+            let validate = admin_params_for_log("executor_validate_plan", &plan);
+            let execute = admin_params_for_log(
+                "executor_execute_plan",
+                &json!({ "execution_id": "e1", "plan": plan }),
+            );
+            for logged in [&logged, &run, &validate, &execute] {
+                let text = logged.to_string();
+                assert!(!text.contains("s3cret-pass"), "{text}");
+                assert!(!text.contains(secret), "{text}");
+                assert!(text.contains("pg-shared"), "{text}");
+            }
+            assert_eq!(
+                run.pointer("/summary/final_message"),
+                Some(&json!(format!(
+                    "read {NODE_SECRET_REDACTION_TOKEN} for pg-shared"
+                )))
+            );
+            assert_eq!(
+                validate.pointer("/execution/steps/0/args/metadata/resource_type"),
+                Some(&json!("postgres"))
+            );
+        }
     }
 }

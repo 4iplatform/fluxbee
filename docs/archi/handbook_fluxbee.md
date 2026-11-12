@@ -1577,7 +1577,13 @@ Three actions answer a secret once: `publish_cloud_endpoint` the bearer token Fl
   again (`publish_cloud_endpoint`, a plan they confirm) mints a new one, which the Cloud must get at
   once; say so before staging it.
 - A step of those three actions never carries `executor_fill`: SY.admin's executor would run it
-  through its model, which would get the answer. Write its args in full; Archi refuses such a plan.
+  through its model, which would get the answer. Nor does a step that takes one of their answers
+  (`$steps.<id>...`, a `vault_put` that stores a copy, say): SY.admin resolves the reference into
+  the prompt of a step with fields to fill. Write their args in full; Archi refuses such a plan.
+- What the operator writes into a plan is another matter: SY.admin's plan review, which reads every
+  plan before it runs, gives its model each step as written, args included (FINDINGS A-337). A
+  secret the operator asks you to store (a `vault_put`'s value, an SSH password) reaches the hive's
+  AI provider there, as it reached you if they typed it in the chat. Say so before staging it.
 
 ---
 
@@ -1916,8 +1922,8 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
   `usage`: `payload.usage_global_visible` (FINDINGS A-281, A-315). Its fields:
   - `running_nodes`: each node of any hive on that runtime (on the version asked, when one is)
     whose unit may run, with its `hive` and `lifecycle`; `running_count` counts them.
-  - `skipped_hives`: each hive whose nodes were not read, `{hive_id, reason, message}`: its use is
-    unknown, never none.
+  - `skipped_hives`: each hive whose nodes were not read, `{hive_id, reason}` and its `message`
+    when the hive's answer had one: its use is unknown, never none.
   - `hives_without_runtimes`: each ingress and each egress, `{hive_id, role}`, by the role the hive
     registry records, whatever the state of its join. The runtimes never reach them, so no managed
     node runs there: they are not asked, they are neither counted nor skipped, and one that is
@@ -1925,6 +1931,9 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
     the operator asks, as a hive that runs no runtime.
   - `in_use`: true while a node is listed, false only once every hive asked was counted, and null
     (unknown) while none is listed and a hive is in `skipped_hives`.
+  - When the motherbee cannot read its own nodes or its hive registry, `usage_global_visible` is
+    `{scope, status: "error", message}` instead, with none of these fields: the use across the
+    hives is unknown, never none; the message says what could not be read.
 
 ---
 
