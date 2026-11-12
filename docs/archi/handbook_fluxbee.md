@@ -172,13 +172,25 @@ late finds the worker running and touches no SSH: its answer says so, and `harde
 applied.
 
 **A box that still runs another hive** (FINDINGS A-331, since 0.1.139). Before it installs
-anything, a join reads the box: when its `/etc/fluxbee/hive.yaml` names another hive id and one of
-its Fluxbee services runs, the join fails `BOX_RUNS_ANOTHER_HIVE`, nothing installed. The hive's
-record (`GET /hives/<hive>`) has it in `join.error_code`, and `join.result` names `box_hive_id`
-and `running_units`. Tell the operator what the message says to do: when that other hive is still
-a hive of the motherbee, remove it first (`remove_hive`, with the box reachable, so its cleanup
-stops that install); otherwise the operator stops those services on the box, or uses a fresh box.
-Then the join is asked again. A box joined again under its own name joins as before.
+anything, a join reads the box: when its `/etc/fluxbee/hive.yaml` names another hive id and
+something of that install is still there (one of its Fluxbee services runs, a managed node's unit
+runs, or a managed node's directory of another hive is left), the join fails
+`BOX_RUNS_ANOTHER_HIVE`, nothing installed. The hive's record (`GET /hives/<hive>`) has it in
+`join.error_code`, and `join.result` names `box_hive_id`, `box_role`, `running_units`,
+`running_node_units` and `left_node_dirs`. The message starts with *"check the address"*: a typo
+may have reached a box in use. Ask the operator to check the address first, and stage nothing that
+stops or removes that box until the operator confirms it is the one meant:
+- **It is a motherbee** (the message says so: this motherbee's own hive id, or role `motherbee`):
+  the address is wrong. Nothing there is ever stopped; ask for the right address.
+- **It is a hive of this motherbee** (`join.result.box_hive_status`, `box_hive_address`): most
+  likely a wrong address too, above all when that hive is `connected`. Only when the operator
+  confirms that box is meant for the new hive, stage `remove_hive` of that hive (with the box
+  reachable, so its cleanup stops that install), then the join again.
+- **Any other box**: only to reuse it, the operator stops that install on the box first, as the
+  message lists (its core units, its managed nodes' units, their directories), or uses a fresh
+  box; then the join is asked again.
+
+A box joined again under its own name joins as before.
 
 ---
 
@@ -1480,11 +1492,25 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
 - **Also after `remove_hive`**, read `identity_key_cleanup` in its answer. `delete_failed` means the
   removed hive's identity key is still on the motherbee, and a box the removal's cleanup did not
   reach (`remote_cleanup` other than `socket_ok`) may still run with that key. Tell the operator.
-  A new `add_hive` under that name deletes that key before it writes anything, so that box is
-  never let back in (FINDINGS A-301, since 0.1.139); when it cannot delete it, the join is refused
-  `IO_ERROR` naming the file, nothing written: the operator deletes
-  `/var/lib/fluxbee/identity/keys/<hive>.key` on the motherbee (the orchestrator also deletes it at
-  its next start), then the join is asked again.
+  A new `add_hive` under that name deletes that key before it writes anything, so that box no
+  longer reads or writes the identity store with it (FINDINGS A-301, since 0.1.139); when it
+  cannot delete it, the join is refused `IO_ERROR` naming the file, nothing written: the operator
+  deletes `/var/lib/fluxbee/identity/keys/<hive>.key` on the motherbee (the orchestrator also
+  deletes it at its next start), then the join is asked again.
+- **A box `remove_hive` did not reach** (`remote_cleanup` other than `socket_ok`), whatever
+  `identity_key_cleanup` says, keeps its install and its mesh certificate. The router admits that
+  certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48),
+  and a join that finds that box's `SY.orchestrator` online takes it over the socket, even when
+  the join's address names another box, with no identity key and no new certificate (FINDINGS
+  A-335).
+  Tell the operator, and do not stage `add_hive` under that name until the operator has stopped
+  that box's install or confirms the box is gone.
+- **`syncthing_peer_cleanup: kept_for_other_hive`** in a `remove_hive` answer (since 0.1.139,
+  FINDINGS A-299): the removed hive's Syncthing device stays linked, because another hive's entry,
+  named in `syncthing_peer_kept_for`, records the same device (the same box joined again under
+  another name). Unlinked, it would cut that hive off. Tell the operator; the device goes with the
+  last entry that records it. `kept_registry_unread`: the registry could not be read whole, and the
+  motherbee removes the device later, once nothing records it.
 - **A hive removed before this was built** (worker2, the throwaway gate workers before 0.1.133):
   its system ILKs are still active. On the operator's word, stage one `retire_hive_ilks` step per
   hive. Running it again is safe: it answers `count` 0.

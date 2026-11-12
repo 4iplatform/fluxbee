@@ -17874,9 +17874,16 @@ const NODE_UNIT_UNANSWERED_NOTE: &str = "502 SERVICE_FAILED with retryable: true
 /// What the node reads say of a node's lifecycle (FINDINGS A-271).
 const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and the router sees the node), STARTING (its unit runs and the router does not see it yet), STOPPED, FAILED or UNKNOWN. UNKNOWN: the hive's systemd gave no full answer for the node's unit, whether it runs or, when it does not run, whether it failed (FINDINGS A-271, since 0.1.133): read it again, and never take it for STOPPED. A managed node whose unit does not run and that has no config or state left reads UNKNOWN too, every time.";
 
+/// What `remove_hive` says of the removed hive's identity key (FINDINGS A-301, since 0.1.139).
+const REMOVE_HIVE_IDENTITY_KEY_NOTE: &str = "payload.identity_key_cleanup says what became of the hive's identity key on the motherbee. delete_failed leaves it there, while a box the cleanup did not reach (payload.remote_cleanup other than socket_ok) may still run with it. Since 0.1.139 a new add_hive under that name deletes the key before it writes anything, so that box no longer reads or writes the identity store with it (FINDINGS A-301), and is refused 500 IO_ERROR, nothing written, when it cannot delete it: then the operator deletes /var/lib/fluxbee/identity/keys/<hive>.key on the motherbee (the orchestrator also deletes it at its next start) and asks again. Before 0.1.139 the join kept the key it found, and the new join's accept let that box read and write the identity store again (FINDINGS A-277).";
+
+/// What a box `remove_hive` did not reach keeps (FINDINGS A-335, the review of A-301): A-301 closes
+/// the identity store to it, not the mesh.
+const REMOVE_HIVE_BOX_NOT_REACHED_NOTE: &str = "When payload.remote_cleanup is not socket_ok, the box was not reached and keeps its install and its mesh certificate, whatever identity_key_cleanup says: stop that install on the box, or make sure the box is gone, before adding a hive under its name. The router admits that certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48), and a join that finds that box's SY.orchestrator online takes it over the socket, even when the join's address names another box, with no identity key and no new certificate (FINDINGS A-335).";
+
 /// What `remove_runtime_version` refuses, nothing removed.
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. Since 0.1.139 a node pinned to the version whose unit does not run (failed, or between two restarts of a crash loop) and that the orchestrator relaunches on it within a minute (relaunch_on_boot) is listed too, as RELAUNCH_DUE (FINDINGS A-300): stop it (kill_node, which clears relaunch_on_boot) or move it first. A node stopped through kill_node is not listed, nor one that follows current.";
-const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
+const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs, gives systemd no answer or, since 0.1.139, is on its way up or down in systemd, as a crash loop's unit is between two restarts (FINDINGS A-310), which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
 /// What `vault_get` and `vault_assign` say of the secrets only an edge reads (FINDINGS A-316).
 const EDGE_ONLY_SECRETS_NOTE: &str = "A secret only an edge reads is never read back nor assigned through the admin API: vault_get and vault_assign of an endpoint's bearer (edge_channel_secret:<ich>, the Cloud's door among them), the edge's TLS key (edge_tls*) or a fanout's verify token (edge_fanout_verify:<ich>) answer 403 RESERVED_KEY before anything reaches SY.vault (FINDINGS A-316, since 0.1.139). Their metadata stays readable (vault_get_metadata). A lost bearer is replaced by publishing the endpoint again, never read.";
@@ -18009,7 +18016,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages a node of the hive published and the pages its edge serves (edge_node on the hive). The hive's cleanup stops its edge (FINDINGS A-236), so those are served no more once it ran, and taking one down releases only its copy (edge_skipped).",
             "Once the hive is removed, SY.admin retires its system ILKs (retire_hive_ilks, FINDINGS A-191) and the ok answer names the result in payload.system_ilks_retired: SY.identity's {count, ilk_ids, already_retired}. A retire that fails leaves the removal ok: system_ilks_retired is {count: null, error_code, error_detail} and payload.warning says so. Then run retire_hive_ilks for the hive; never remove it again, it is gone (NOT_FOUND).",
-            "payload.identity_key_cleanup says what became of the hive's identity key on the motherbee. delete_failed leaves it there, while a box the cleanup did not reach (payload.remote_cleanup other than socket_ok) may still run with it. Since 0.1.139 a new add_hive under that name deletes the key before it writes anything, so that box is never let back in (FINDINGS A-301), and is refused 500 IO_ERROR, nothing written, when it cannot delete it: then the operator deletes /var/lib/fluxbee/identity/keys/<hive>.key on the motherbee (the orchestrator also deletes it at its next start) and asks again. Before 0.1.139 the join kept the key it found, and the new join's accept let that box read and write the identity store again (FINDINGS A-277).",
+            REMOVE_HIVE_IDENTITY_KEY_NOTE,
+            REMOVE_HIVE_BOX_NOT_REACHED_NOTE,
         ],
         "retire_hive_ilks" => vec![
             "Motherbee-only operation. For HTTP usage the hive id is in the path; over the mesh and in a plan, hive_id names the removed hive.",
@@ -39190,6 +39198,13 @@ mod tests {
         ] {
             assert!(RUNTIME_REMOVAL_IN_USE_NOTE.contains(words), "{words}");
         }
+        // FINDINGS A-310, the review: a node whose config cannot be read while systemd restarts
+        // its unit leaves a worker's use unknown too.
+        assert!(RUNTIME_REMOVAL_UNKNOWN_NOTE.contains(
+            "the config.json of a node whose unit runs, gives systemd no answer or, since 0.1.139, \
+             is on its way up or down in systemd, as a crash loop's unit is between two restarts \
+             (FINDINGS A-310)"
+        ));
         assert!(
             !RUNTIME_REMOVAL_IN_USE_NOTE.contains("A node whose unit does not run is not listed")
         );
@@ -39234,6 +39249,30 @@ mod tests {
         assert!(admin_action_request_notes("wf_rules_delete")
             .join(" ")
             .contains("packages_left"));
+    }
+
+    /// FINDINGS A-335, the review of A-301: remove_hive's help keeps its caution about a box the
+    /// removal did not reach. A-301 closes the identity store to that box, not the mesh: its
+    /// certificate is admitted again once a hive of its name is listed (A-48: leaf pinning not
+    /// built), and a join that finds its orchestrator online takes it over the socket, whatever
+    /// address it names. The first 0.1.139 text said such a box was "never let back in" and
+    /// dropped the caution.
+    #[test]
+    fn remove_hives_help_keeps_the_caution_about_a_box_it_did_not_reach() {
+        let notes = admin_action_request_notes("remove_hive").join(" ");
+        for words in [
+            "When payload.remote_cleanup is not socket_ok, the box was not reached and keeps its \
+             install and its mesh certificate, whatever identity_key_cleanup says: stop that \
+             install on the box, or make sure the box is gone, before adding a hive under its name.",
+            "(leaf pinning is not built, FINDINGS A-48)",
+            "takes it over the socket, even when the join's address names another box",
+            "(FINDINGS A-335)",
+            "deletes the key before it writes anything, so that box no longer reads or writes the \
+             identity store with it (FINDINGS A-301)",
+        ] {
+            assert!(notes.contains(words), "{words}");
+        }
+        assert!(!notes.contains("never let back in"), "{notes}");
     }
 
     /// FINDINGS A-285: the help Archi and the operator read says what 0.1.133 answers. A node

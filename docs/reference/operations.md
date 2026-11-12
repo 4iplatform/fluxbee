@@ -178,16 +178,31 @@ What a worker join does (`add_hive_flow`):
    with the given password or key) and waits for the host to settle, up to 900 s
    (`wait_for_host_to_settle`; `HOST_NOT_SETTLED` is retryable). Once its sudo works, it reads
    what the box runs (`refuse_box_running_another_hive`, FINDINGS A-331, since 0.1.139): a box
-   whose `/etc/fluxbee/hive.yaml` names another hive id while one of its Fluxbee units runs (the
-   core services and Syncthing, those `remove_hive`'s cleanup stops) is refused
-   `BOX_RUNS_ANOTHER_HIVE`, nothing installed, its record naming `box_hive_id`, `running_units`
-   and what to do: `remove_hive` of that hive first while the box can be reached, when this
-   motherbee still has it; otherwise stop those units on the box (`systemctl disable --now ...`),
-   or use a fresh box. A join does not restart every service it finds running, so that install
-   went on under the other name: a worker's join failed `WORKER_ORCHESTRATOR_TIMEOUT` after
-   minutes, its router up under the new name and its orchestrator not. A box joined again under
-   its own name, or whose units a removal stopped, joins as before; a read of the box that fails
-   is logged and the join goes on.
+   whose `/etc/fluxbee/hive.yaml` names another hive id while something of that install is still
+   there is refused `BOX_RUNS_ANOTHER_HIVE`, nothing installed. That is one of its Fluxbee units
+   running (the core services and Syncthing, those `remove_hive`'s cleanup stops), a managed
+   node's unit running (`fluxbee-node-*`, which systemd restarts on its own), or a managed node's
+   directory named for another hive (`/var/lib/fluxbee/nodes/<KIND>/<node>@<hive>`, which the
+   next hive's reconcile would relaunch under that name). Its record names `box_hive_id`,
+   `box_role`, `running_units`, `running_node_units`, `left_node_dirs` and what to do, and its
+   message always starts with *"check the address"*, since a typo may have reached a box that is
+   in use:
+   - a box whose hive.yaml names this motherbee's own hive id, or the role `motherbee`, is a
+     motherbee (this one, or another installation's): nothing there is to be stopped, and the join
+     is asked again with the right address;
+   - a box that runs a hive of this motherbee is named with that hive's `box_hive_status` and
+     `box_hive_address`; only to reuse that box, `remove_hive` that hive first, while the box can
+     be reached, so its cleanup stops the install;
+   - any other box: only to reuse it, stop that install on it first as `remove_hive`'s cleanup
+     does, as root: `systemctl disable --now <the running units>; systemctl stop
+     'fluxbee-node-*'; rm -rf /var/lib/fluxbee/nodes/* /var/lib/fluxbee/state/nodes/*`; or use a
+     fresh box.
+
+   A join does not restart every service it finds running, so that install went on under the
+   other name: a worker's join failed `WORKER_ORCHESTRATOR_TIMEOUT` after minutes, its router up
+   under the new name and its orchestrator not. A box joined again under its own name, or whose
+   install a removal's cleanup stopped, joins as before; a read of the box that fails is logged
+   and the join goes on.
 3. Copies the role's core binaries and `manifest.json` from the motherbee's
    `/var/lib/fluxbee/dist/core/` (`sync_core_to_worker`), the vendored Syncthing
    (`sync_vendor_to_worker`) and the installation file (`sync_installation_to_worker`, mode 0644,
@@ -279,9 +294,15 @@ its next boot. An egress or ingress the cleanup did not reach keeps them, and th
 `warning` says what to remove from its console. The motherbee then unpairs Syncthing (the hive
 leaves every `fluxbee-dist*` folder and both blob folders, whatever the blob's flags), deletes
 `hives/<id>/` and the hive's identity key under `/var/lib/fluxbee/identity/keys/`
-(`identity_key_cleanup` in the answer). When the spoke did not answer, the motherbee restarts its
-`sy-identity` to close any session the removed hive still holds (`identity_restart`). The
-motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
+(`identity_key_cleanup` in the answer). Since 0.1.139 it keeps the Syncthing device when another
+hive's entry records it too (a box joined again under another name, its Syncthing home kept), so
+that hive stays linked: `syncthing_peer_cleanup` is `kept_for_other_hive`, naming them in
+`syncthing_peer_kept_for` (FINDINGS A-299's review); `kept_registry_unread` when the registry
+could not be read whole. When the spoke did not answer, the motherbee restarts its
+`sy-identity` to close any session the removed hive still holds (`identity_restart`). A box the
+cleanup did not reach keeps its install and its mesh certificate, which the router admits again
+once a hive of that name is listed: stop its install, or make sure it is gone, before adding a
+hive under its name (FINDINGS A-335). The motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
 the identity key of every hive with no `hives/<id>/`. Public pages never refuse the removal
 (FINDINGS A-242): the ok answer names in `pages_left_up` the pages a node of the hive published
 and the pages its edge serves, which stay up until they expire. The cleanup stops the hive's edge
@@ -452,9 +473,11 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
     with it: `TIMEOUT` (no answer within 10 s: its orchestrator stopped or restarting while the
     LSA still shows it), `UNREACHABLE` (the request never reached it: down, or stale in the LSA),
     `USAGE_UNREADABLE` (its own read of its nodes failed: its nodes' folder could not be read, or
-    a node's `config.json` cannot be read or parsed while its unit runs or systemd gives no
-    answer for it, so that node's runtime is unknown; the `message` names it: fix its config or
-    stop the node), or the error a worker before 0.1.133 answered, which reads its mirror first
+    a node's `config.json` cannot be read or parsed while its unit runs, systemd gives no answer
+    for it or, since 0.1.139, systemd has it on its way up or down, as a crash loop's unit is
+    between two restarts (FINDINGS A-310's review), so that node's runtime is unknown; the
+    `message` names it: fix its config or stop the node), or the error a worker before 0.1.133
+    answered, which reads its mirror first
     (`RUNTIME_NOT_FOUND` while its mirror does not list the runtime yet, `RUNTIME_MANIFEST_MISSING`
     without one). A worker, and a hive whose registry entry gives no role (a join being accepted,
     an entry that does not parse), are asked. A directory of the registry whose name is not a hive

@@ -353,11 +353,13 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   `{status: "ok", hive_id, usage}`: the hive's nodes on the runtime, read from their configs
   whatever its runtime manifest lists (`local_runtime_usage_answer`), and `USAGE_UNREADABLE` when
   that read fails, its `message` saying why: the nodes' tree cannot be walked, or a node's
-  `config.json` cannot be read or parsed while its unit runs or systemctl gives no answer for it,
-  so the runtime that node runs on is unknown, and the message names it
-  (`local_runtime_usage_summary`). Before A-281's review such a node counted as one on no runtime,
-  so a worker answered ok without it; one whose unit does not run is left out, as any node whose
-  unit does not run is. The whole read's `usage` fails alike, and on the motherbee so does the
+  `config.json` cannot be read or parsed while its unit may run (it runs, systemctl gives no answer
+  for it, or, since 0.1.139, systemd has it on its way up or down, as a crash loop's unit is between
+  two restarts: `unreadable_config_unit_state`, FINDINGS A-310's review), so the runtime that node
+  runs on is unknown, and the message names it (`local_runtime_usage_summary`). Before A-281's
+  review such a node counted as one on no runtime, so a worker answered ok without it; one whose
+  unit systemd has at rest (`inactive`, `failed`) is left out. The whole read's `usage` fails
+  alike, and on the motherbee so does the
   whole `usage_global_visible`. A forward carries the field to the target hive; the motherbee,
   asked so, answers its own nodes and asks no other hive. A node's use is its config, so a worker
   whose copy of `dist/runtimes` lags the motherbee's (10-60 s after a workflow's first deploy) is
@@ -374,9 +376,9 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   its own ([Messages](#messages): `read_target`, `ReadTarget::RuntimeUse`) with 4 places, each
   held up to 10 s while a worker does not answer: a fifth such read asked meanwhile waits up to
   10 s for a place and a ninth up to 20 s, which with its own 10 s reaches SY.admin's 30 s, and
-  the refusal then names the motherbee (`TIMEOUT`). It also takes one of the 16 forwarding places,
-  which the other targets' reads, 4 each, fill only while at least 4 of those targets wait at once
-  (hives that do not answer, `list_versions`, `list_tenant_nodes`). It never waits behind
+  the refusal then names the motherbee (`TIMEOUT`). Since 0.1.139 it takes no forwarding place,
+  as no fan-out does (FINDINGS A-308, the review), so the reads forwarded to hives, answering or
+  not, never delay it. It never waits behind
   `list_versions`, which asks the hives one after another, 45 s for each that does not answer;
   Fluxbee Cloud's `list_tenant_nodes` never waits behind it; and the reads asked again while a
   hive does not answer never hold a local read's place. Each hive's ask ends by the forward's own
@@ -505,7 +507,13 @@ it (`write_join_entry`), so `remove_hive` unlinks the box of a join that failed 
 (`DIST_SYNC_TIMEOUT`, an SSH control, its last write) or whose link failed half-way. Before, only
 a join's last write, on success, recorded it, and such a box kept the motherbee's folders,
 `fluxbee-dist-runtimes` included (`syncthing_peer_cleanup: skipped_no_peer_device_id`), until the
-peer reconcile's orphan pass, which waits for every hive to be connected.
+peer reconcile's orphan pass, which waits for every hive to be connected. Since a failed attempt's
+entry keeps its device, two entries can record one: the same box, its units stopped by hand,
+joined under another name with its Syncthing home kept. `remove_hive` then keeps a device another
+hive's entry records (`removed_hive_peer_device`, A-299's review): `syncthing_peer_cleanup:
+kept_for_other_hive`, those hives named in `syncthing_peer_kept_for`, where unlinking it would cut
+them off, and the peer reconcile adds no membership back. A registry it cannot read whole keeps the
+device too (`kept_registry_unread`), for the orphan pass.
 Before, a retry rewrote the role: a worker's attempt linked into `fluxbee-dist-runtimes`, with
 nodes running there, retried as an egress, read as a hive that runs no managed node, which the
 runtimes' use across the hives does not ask ([managed nodes](#managed-nodes)), so a version those
@@ -588,18 +596,37 @@ to an `ssh_key` the password only feeds `sudo`. A socket-only re-run touches no 
 
 Each join reads the box once its sudo works, before it installs anything
 (`refuse_box_running_another_hive`, FINDINGS A-331, since 0.1.139): `/etc/fluxbee/hive.yaml`'s
-`hive_id` and `systemctl is-active` of each Fluxbee unit, the core services and Syncthing that
-`remove_hive`'s cleanup stops (`BOX_INSTALL_UNITS`, `box_install_probe_command`). A box whose
-hive.yaml names another hive id while one of those units runs is refused `BOX_RUNS_ANOTHER_HIVE`
-(`box_runs_another_hive_refusal`, not retryable), with `box_hive_id`, `running_units` and what to
-do in its message: `remove_hive` of that hive first, while the box can be reached, when the
-registry still lists it; otherwise stop those units on the box (`systemctl disable --now ...`) or
-use a fresh box. A worker join restarts the box's router but only starts its orchestrator, a no-op
-on one that runs, and no join restarts the other services it finds running: on 8.x (0.1.137) a box
-whose removal did not reach it, joined again as another hive, failed `WORKER_ORCHESTRATOR_TIMEOUT`
-after 191 s, its router up under the new name and its orchestrator not. A box joined again under
-its own name, one whose units a removal stopped and a fresh box join as before; a read of the box
-that fails is logged and the join goes on, as before the check.
+`hive_id` and `role`, `systemctl is-active` of each Fluxbee unit, the core services and Syncthing
+that `remove_hive`'s cleanup stops (`BOX_INSTALL_UNITS`), the managed nodes' units systemd has
+(`systemctl list-units 'fluxbee-node-*'`) and their directories under `/var/lib/fluxbee/nodes/`
+(`box_install_probe_command`, 200 of each at most). A box whose hive.yaml names another hive id
+while one of those units runs, a managed node's unit runs or a managed node's directory named for
+another hive is left is refused `BOX_RUNS_ANOTHER_HIVE` (`box_runs_another_hive_refusal`, not
+retryable), with `box_hive_id`, `box_role`, `running_units`, `running_node_units`,
+`left_node_dirs` and what to do in its message, which starts with *"check the address"* (the
+review of A-331: a typo may reach a box in use, and the first remedies told the operator to
+remove a connected worker, or to stop the motherbee's own core):
+
+- a box whose hive.yaml names this motherbee's hive id, or the role `motherbee`, is a motherbee,
+  this one or another installation's: no step that stops anything is offered;
+- a box that runs a hive of this registry is named with that hive's status and recorded address
+  (`box_hive_status`, `box_hive_address`), and `remove_hive` of that hive, while the box can be
+  reached, is offered only to reuse that box;
+- any other box is offered the steps `remove_hive`'s cleanup takes, as root (`systemctl disable
+  --now <the running units>; systemctl stop 'fluxbee-node-*'; rm -rf /var/lib/fluxbee/nodes/*
+  /var/lib/fluxbee/state/nodes/*`), or a fresh box. Stopping the core units alone, the first
+  remedy, left the old hive's managed nodes: their units run on (`Restart=always`), and the next
+  hive's reconcile relaunches each directory's node under its old `@<hive>` name
+  (`persisted_custom_nodes` takes any directory whose config asks for it).
+
+A worker join restarts the box's router but only starts its orchestrator, a no-op on one that
+runs, and no join restarts the other services it finds running: on 8.x (0.1.137) a box whose
+removal did not reach it, joined again as another hive, failed `WORKER_ORCHESTRATOR_TIMEOUT` after
+191 s, its router up under the new name and its orchestrator not. A box joined again under its own
+name, one whose install a removal's cleanup stopped and a fresh box join as before; a node
+directory named for the hive that joins is no refusal, nor a core node's (`nodes/SY/`, which no
+reconcile relaunches); a read of the box that fails is logged and the join goes on, as before the
+check.
 
 A successful join answers `warnings`. A join that logged in with `ssh_password` (its key-first
 probe failed and the password seeded the motherbee key) with `harden_ssh: false` says there that
@@ -634,6 +661,13 @@ delete_failed`) before its accept writes anything, and is refused `IO_ERROR` nam
 nothing written, when it cannot (`drop_surviving_identity_key`, FINDINGS A-301, since 0.1.139); its
 bootstrap then generates the hive's key (`ensure_local_identity_key`). Before, the join reused the
 key it found, and the removed box, if it still ran, was let back onto :9100 from the accept on.
+What that does not close (FINDINGS A-335): a box the removal did not reach keeps its install and
+its mesh certificate, which the router admits again once the accept lists the hive (leaf pinning,
+A-48, is not built), and the join's socket-first path takes any `SY.orchestrator@<hive>` it sees
+online within 3 s, whatever `address` names. That box is then the hive again, with no identity key
+and no new certificate, and its sy-identity, which loads its key only at its start, is refused at
+:9100. Such a box's install is stopped, or the box is gone, before a hive is added under its name;
+`remove_hive`'s help and Archi's handbook say so.
 
 **Reading the registry.** `get_hive` (`get_hive_flow`) answers one hive's `info.yaml` as `hive`,
 and `NOT_FOUND` for a hive the registry does not have. A hive id that is not one, 1 to 64
@@ -685,11 +719,16 @@ another hive's read or a local one.
   (`apply_runtime_retention_with_roots_and_protection`): it deletes from `dist/runtimes` each
   version that the manifest does not list, that no managed node's `config.json` names and that no
   runtime update of the last 10 minutes protects, and a runtime left with none goes whole. While
-  a node whose `config.json` cannot be read or parsed may run (its unit runs, or systemd gives no
-  answer for it), the runtime and version it runs on are unknown: the pass deletes nothing and
-  logs that node, *"runtime retention removed no version"* (FINDINGS A-310, since 0.1.139; before,
-  it skipped the node and could delete a version only that node pinned, under it). One whose unit
-  does not run is left out, since nothing relaunches a node whose config cannot be read.
+  a node whose `config.json` cannot be read or parsed may run (its unit runs, systemd gives no
+  answer for it, or systemd has it on its way up or down), the runtime and version it runs on are
+  unknown: the pass deletes nothing and logs that node, *"runtime retention removed no version"*
+  (FINDINGS A-310, since 0.1.139; before, it skipped the node and could delete a version only that
+  node pinned, under it). The reconcile relaunches no node whose config it cannot read, but systemd
+  restarts a node's unit on its own (`Restart=always`, on the version its `ExecStart` names), and a
+  crash loop's unit between two restarts reads not running (`is-active` exits 3 for its
+  `activating`, `auto-restart`), so the pass asks systemd for the unit's `ActiveState`
+  (`UnitChecks::at_rest`, A-310's review). Only a unit systemd has at rest (`inactive`, `failed`,
+  or none at all) is left out.
 - **config** (stage 3c): the installation file, its version and the sha256 of its bytes. No binary
   step: once the hive's copy is that version, it restarts only its readers whose engine changed
   ([The installation file](#the-installation-file)). The same message with a `write`, on the
@@ -1318,8 +1357,9 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
 
 - **A read** runs in a task of its own. A read of this hive alone takes one of 16 places per
   worker (`WORKER_CONCURRENT_READS_MAX`); a read that waits on another hive takes one of its
-  target's 4 places (`WORKER_READS_PER_TARGET_MAX`), then one of 16 others. Its target is that
-  hive; every hive for list_versions; since 0.1.133, every hive in a target of its own for the
+  target's 4 places (`WORKER_READS_PER_TARGET_MAX`), and a read forwarded to one hive then one of
+  16 forwarding places. Its target is that hive; every hive for list_versions; since 0.1.133,
+  every hive in a target of its own for the
   motherbee's get_runtime of its own hive, which asks every hive for its nodes on the runtime
   ([A runtime's use across the hives](#managed-nodes), FINDINGS A-281), so it never waits behind
   list_versions, which asks the hives one after another, 45 s for each that does not answer,
@@ -1327,9 +1367,15 @@ worker hands a message to one of two lanes once the checks above passed (`Worker
   target of its own for list_tenant_nodes, Fluxbee Cloud's `list_nodes`, which the Cloud waits
   20 s for (FINDINGS A-308): with worker1's orchestrator stopped on 8.x, 4 `/versions` held the
   places they shared 30.8 to 31.3 s, and a `list_nodes` asked meanwhile answered `TIMEOUT` at
-  31.8 s. A hive that does not
-  answer, asked again and again, then holds 4 forwarding places for each target it delays and no
-  local read's (the review of step 1). One more read of a kind waits for one of its kind to end.
+  31.8 s. Those three are the fan-outs (`ReadTarget::is_fan_out`), and since 0.1.139 a fan-out
+  takes no forwarding place (A-308, the review): one hive that does not answer delays its own
+  target and every fan-out, and with all four holding 4 reads each, the forwarding places would
+  all have been taken, and a read of a hive that answers would have waited up to 45 s. A hive
+  that does not answer, asked again and again, then holds 4 forwarding places, its own target's,
+  and no local read's (the review of step 1), and the fan-outs it delays hold 4 places each of
+  their own: 12 of the 16 forwarding places stay for the hives that answer. A worker runs at most
+  16 local reads, 16 forwarded reads and 12 fan-outs at once. One more read of a kind waits for
+  one of its kind to end.
   Each read's target is the hive its flow forwards it to, found with the function the flow uses
   (`read_target`). The reads are the ones read in the code to write and change nothing
   (`admin_request_lane`, `system_request_lane`): hive_status, get_storage, list_nodes,

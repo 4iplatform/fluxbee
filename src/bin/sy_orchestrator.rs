@@ -747,18 +747,47 @@ struct OrchestratorState {
 }
 
 /// What systemctl answers for a node's unit, its managed unit or its core one (FINDINGS A-271):
-/// whether it runs, and whether it failed.
+/// whether it runs, whether it failed, and whether systemd has it at rest.
 #[derive(Clone, Copy)]
 struct UnitChecks {
     activity: fn(&str) -> ServiceActivity,
     failed: fn(&str) -> CheckAnswer,
+    /// Whether systemd starts nothing of the unit on its own: its `ActiveState` is `inactive` or
+    /// `failed` (`systemd_unit_at_rest`, FINDINGS A-310, the review). A node's unit between two
+    /// restarts of a crash loop reads not running (`activity`: `is-active` exits 3 for its
+    /// `activating`, `auto-restart`), yet systemd runs it again on its own within `RestartSec`.
+    at_rest: fn(&str) -> CheckAnswer,
 }
 
 impl UnitChecks {
     const SYSTEMCTL: UnitChecks = UnitChecks {
         activity: systemd_activity,
         failed: systemd_unit_failed,
+        at_rest: systemd_unit_at_rest,
     };
+}
+
+/// Why the unit of a node whose config.json cannot be read may still run, as the runtime's use
+/// and the runtime retention name it, or None when it is at rest (FINDINGS A-281, A-310): the
+/// runtime and version such a node runs on are unknown while it may run. One whose unit runs, or
+/// that systemctl gives no answer for, may; and, since A-310's review, one systemd has on its way
+/// up or down, as a crash loop's unit between two restarts is: the reconcile relaunches nothing
+/// whose config it cannot read, but systemd restarts that unit on its own (`Restart=always`), on
+/// the version its `ExecStart` names. Only a unit systemd has at rest (`inactive`, `failed`, or
+/// none at all) is left out.
+fn unreadable_config_unit_state(checks: &UnitChecks, unit: &str) -> Option<&'static str> {
+    match (checks.activity)(unit) {
+        ServiceActivity::Active => Some("its unit runs"),
+        ServiceActivity::Unknown => Some("systemctl gives no answer for its unit"),
+        ServiceActivity::Inactive => match (checks.at_rest)(unit) {
+            CheckAnswer::Yes => None,
+            CheckAnswer::No => Some(
+                "systemd has its unit on its way up or down (a crash loop between two restarts, \
+                 say)",
+            ),
+            CheckAnswer::NoAnswer => Some("systemctl gives no answer for its unit"),
+        },
+    }
 }
 
 impl OrchestratorState {
@@ -1546,16 +1575,19 @@ fn system_response_msg(msg: &str) -> Option<String> {
 
 /// FINDINGS A-199, step 1: the most reads of each kind one worker runs at once (`WorkerLanes`),
 /// each on a thread of tokio's blocking pool (at most 512 threads): the reads of this hive alone,
-/// and apart the reads that wait on another hive's answer, which a forward to a hive that does not
-/// answer holds up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s). Past this many, a read waits
-/// for one of its kind to end, and never holds a request that changes something.
+/// and apart the reads forwarded to one other hive, which a forward to a hive that does not answer
+/// holds up to `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` (45 s). Past this many, a read waits for one
+/// of its kind to end, and never holds a request that changes something. The fan-outs, the reads
+/// that ask every other hive, hold places of their own and none of these
+/// (`ReadTarget::is_fan_out`, FINDINGS A-308, the review): a worker runs at most 16 local reads,
+/// 16 forwarded reads and 12 fan-outs (3 targets of 4) at once, 44 of the pool's threads.
 const WORKER_CONCURRENT_READS_MAX: usize = 16;
 
 /// FINDINGS A-199, the review of step 1: the most reads one worker runs at once that wait on the
 /// same target (`ReadTarget`: one other hive, every hive for `/versions`, every hive for a
 /// runtime's use, or every hive for a tenant's nodes). A hive that does not answer, asked again
-/// and again, then holds this many of the forwarding reads' places for each target it delays, and
-/// no local read's.
+/// and again, then holds this many forwarding places, its own target's, and no local read's; the
+/// 3 fan-outs it delays hold this many places each, of their own (FINDINGS A-308, the review).
 const WORKER_READS_PER_TARGET_MAX: usize = 4;
 
 /// The lane a worker runs a request in (FINDINGS A-199, step 1).
@@ -1594,6 +1626,21 @@ enum ReadTarget {
     /// `list_nodes` asked meanwhile waited for one past the Cloud's 20 s (`TIMEOUT` at 31.8 s on
     /// 8.x, 0.1.134).
     TenantNodes,
+}
+
+impl ReadTarget {
+    /// Whether a read waiting on this target asks every other hive (`EveryHive`, `RuntimeUse`,
+    /// `TenantNodes`): a fan-out holds only its target's places, never a forwarding place
+    /// (`WorkerLanes`, FINDINGS A-308, the review). One hive that does not answer delays its own
+    /// target and every fan-out: once `list_tenant_nodes` had a target of its own, those 4
+    /// targets of 4 reads each took all 16 forwarding places, and a read forwarded to a hive that
+    /// answers waited up to 45 s for one, where A-199 had it answered at once.
+    fn is_fan_out(&self) -> bool {
+        matches!(
+            self,
+            ReadTarget::EveryHive | ReadTarget::RuntimeUse | ReadTarget::TenantNodes
+        )
+    }
 }
 
 /// The lane of one of SY.admin's commands (FINDINGS A-199). The reads are the ones read in the code
@@ -1645,11 +1692,12 @@ fn system_request_lane(
 /// runtime (`usage_global_visible`, `group_runtime_usage`; FINDINGS A-281), up to
 /// `RUNTIME_USAGE_HIVE_TIMEOUT` for one that does not answer: it waits on every hive, in a target
 /// of its own (`ReadTarget::RuntimeUse`), so reads asked again while a hive does not answer hold
-/// its 4 places and forwarding places, never this hive's local reads' nor the places of
+/// its 4 places only, never this hive's local reads', a forwarding place, nor the places of
 /// `list_versions` and `list_tenant_nodes`. A spoke's asks no other hive, and neither does a read
 /// of the hive's own nodes alone (`usage_only`, `runtime_read_usage_only`). Fluxbee Cloud's
 /// `list_tenant_nodes` waits in a target of its own too (`ReadTarget::TenantNodes`, FINDINGS
-/// A-308), never behind `list_versions` (`ReadTarget::EveryHive`).
+/// A-308), never behind `list_versions` (`ReadTarget::EveryHive`). The three are fan-outs
+/// (`ReadTarget::is_fan_out`), which take no forwarding place (A-308, the review).
 fn read_target(
     action: &str,
     payload: &serde_json::Value,
@@ -1688,10 +1736,13 @@ type TargetPermits = HashMap<ReadTarget, Arc<tokio::sync::Semaphore>>;
 /// takes the next one at once, whatever runs:
 /// - a read runs once it holds a permit of its kind, so a slow or lost read (a forward to a hive
 ///   that does not answer waits 45 s) holds no other request. A read of this hive alone takes one
-///   of `local_reads`. A read that waits on another hive takes one of its target's
+///   of `local_reads`. A read forwarded to another hive takes one of its target's
 ///   (`WORKER_READS_PER_TARGET_MAX`), then one of `forwarding_reads`: a hive asked again and again
 ///   while it does not answer holds a few forwarding places, never a local read's (the review of
-///   step 1). A read runs on a thread of the blocking pool, never on the runtime's (`run`): its
+///   step 1). A fan-out, which asks every other hive (`ReadTarget::is_fan_out`), takes one of its
+///   target's places and nothing more (FINDINGS A-308, the review): the fan-outs one silent hive
+///   delays then leave the forwarding places to the reads of the hives that answer. A read runs
+///   on a thread of the blocking pool, never on the runtime's (`run`): its
 ///   blocking calls (systemctl, sha256sum, `ip route`, the LSA and file reads) can then never
 ///   take every thread the watchdog, the message loop and the ordered lane run on, as several
 ///   reads at once could on a 2-vCPU spoke;
@@ -1754,10 +1805,13 @@ impl WorkerLanes {
             RequestLane::Read(target) => {
                 let worker = self.worker;
                 let (target, reads) = match target {
-                    ReadTarget::Local => (None, Arc::clone(&self.local_reads)),
+                    ReadTarget::Local => (None, Some(Arc::clone(&self.local_reads))),
                     remote => {
                         let permits = self.target_permits(&remote);
-                        (Some((remote, permits)), Arc::clone(&self.forwarding_reads))
+                        // A fan-out holds its target's places alone (FINDINGS A-308, the review).
+                        let reads =
+                            (!remote.is_fan_out()).then(|| Arc::clone(&self.forwarding_reads));
+                        (Some((remote, permits)), reads)
                     }
                 };
                 let targets = Arc::clone(&self.targets);
@@ -1771,8 +1825,12 @@ impl WorkerLanes {
                         },
                         None => None,
                     };
-                    let Ok(permit) = reads.acquire_owned().await else {
-                        return;
+                    let permit = match reads {
+                        Some(reads) => match reads.acquire_owned().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => return,
+                        },
+                        None => None,
                     };
                     // Dropped with this task, as the runtime drops it when the orchestrator
                     // stops: the read then ends at its next turn, before it waits on a timer the
@@ -7422,7 +7480,7 @@ async fn apply_system_update_local(
                 &runtimes_root(),
                 &node_files_root(),
                 &protected_keep_versions,
-                state.unit_checks.activity,
+                &state.unit_checks,
             )?;
             if retention.protected_runtime_dirs > 0 || retention.protected_version_dirs > 0 {
                 tracing::info!(
@@ -21574,10 +21632,11 @@ fn pinned_node_relaunch_due(node_name: &str, config: &serde_json::Value) -> bool
 /// that the reconcile relaunches on their pinned version (`runtime_usage_lifecycle`), read from
 /// their configs: the runtime's `usage`. An error, never a
 /// hive with no node, when the nodes' tree cannot be walked, and when a node's `config.json`
-/// cannot be read or parsed while its unit runs or systemctl gives no answer for it: which runtime
-/// that node runs on is then unknown, and the error names the node (FINDINGS A-281, the review;
-/// such a node counted as one on no runtime). A node whose config cannot be read and whose unit
-/// does not run is left out, as any node whose unit does not run is.
+/// cannot be read or parsed while its unit may run (`unreadable_config_unit_state`: it runs,
+/// systemctl gives no answer for it, or, since A-310's review, systemd has it on its way up or
+/// down, as a crash loop's unit between two restarts is): which runtime that node runs on is then
+/// unknown, and the error names the node (FINDINGS A-281, the review; such a node counted as one on
+/// no runtime). A node whose config cannot be read and whose unit systemd has at rest is left out.
 fn local_runtime_usage_summary(
     state: &OrchestratorState,
     runtime: &str,
@@ -21626,10 +21685,9 @@ fn local_runtime_usage_summary_with_root(
                 Ok(value) => value,
                 Err(err) => {
                     let unit = unit_from_node_name(&node_name);
-                    let unit_state = match (state.unit_checks.activity)(&unit) {
-                        ServiceActivity::Inactive => continue,
-                        ServiceActivity::Active => "its unit runs",
-                        ServiceActivity::Unknown => "systemctl gives no answer for its unit",
+                    let Some(unit_state) = unreadable_config_unit_state(&state.unit_checks, &unit)
+                    else {
+                        continue;
                     };
                     unreadable.push(format!(
                         "the config.json of {node_name} cannot be read ({err}) while {unit_state}, \
@@ -21868,10 +21926,10 @@ async fn global_visible_runtime_usage_summary_with_roots(
 /// that hive (`TIMEOUT`) rather than the motherbee, provided the read got its lane place at once.
 /// The motherbee's runtime reads have 4 places of their own (`ReadTarget::RuntimeUse`), each held
 /// up to this long while a worker does not answer: a fifth read asked meanwhile waits up to 10 s
-/// for one, and a ninth up to 20 s, which with its own 10 s reaches SY.admin's 30 s. Each also
-/// takes one of the 16 forwarding places (`WorkerLanes`), which the reads of other targets (4
-/// each: a hive that does not answer, `list_versions`, `list_tenant_nodes`) fill only while at
-/// least 4 of those targets wait at once. A worker answers from its nodes' configs, with one `systemctl is-active` for each
+/// for one, and a ninth up to 20 s, which with its own 10 s reaches SY.admin's 30 s. Being a
+/// fan-out, it takes no forwarding place (`WorkerLanes`, FINDINGS A-308, the review), so no read
+/// forwarded to a hive, whether that hive answers or not, and no `list_versions` or
+/// `list_tenant_nodes` delays it. A worker answers from its nodes' configs, with one `systemctl is-active` for each
 /// node on the runtime: well under a second, a few on a loaded 2-vCPU spoke. Before, each hive was
 /// asked after the one before, with the forward's 45 s (`system_forward_timeout`), past SY.admin's
 /// whole wait for a single hive that did not answer. `list_tenant_nodes` waits as long for each
@@ -24011,31 +24069,85 @@ const BOX_INSTALL_UNITS: &[&str] = &[
 const BOX_HIVE_YAML_BEGIN: &str = "@@fluxbee-box-hive-yaml-begin@@";
 const BOX_HIVE_YAML_END: &str = "@@fluxbee-box-hive-yaml-end@@";
 
+/// The most managed nodes' units, and the most of their directories, a box's probe lists
+/// (`box_install_probe_command`).
+const BOX_PROBE_NODES_MAX: usize = 200;
+
+/// The most of them a `BOX_RUNS_ANOTHER_HIVE` message names, each (`box_refusal_names`); its
+/// answer lists them all.
+const BOX_REFUSAL_NODES_NAMED: usize = 5;
+
 /// What a box a join reaches over SSH already holds of a Fluxbee install (FINDINGS A-331).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct BoxInstall {
     /// The hive id its `/etc/fluxbee/hive.yaml` names, when it has one that parses and names one.
     hive_id: Option<String>,
+    /// The role that hive.yaml names, as written there.
+    role: Option<String>,
     /// The units of `BOX_INSTALL_UNITS` that run there (systemd answers active, activating or
     /// reloading), in that order.
     running_units: Vec<String>,
+    /// The managed nodes' units (`fluxbee-node-*`) that run there, in the same states (A-331, the
+    /// review): a node's unit is transient with `Restart=always`, so systemd starts it again on
+    /// its own, and one between two restarts of a crash loop is `activating`.
+    running_node_units: Vec<String>,
+    /// The nodes' directories there (`/var/lib/fluxbee/nodes/<KIND>/<node>`), by name (A-331, the
+    /// review). For a managed node's whose config asks for it, the reconcile of the hive that joins
+    /// next relaunches that node under the name it has (`persisted_custom_nodes`), whatever hive
+    /// the name ends with.
+    node_dirs: Vec<String>,
+}
+
+impl BoxInstall {
+    /// Its managed nodes' directories named for a hive other than `hive_id` (`<node>@<hive>`):
+    /// those the next hive's reconcile takes (`persisted_custom_nodes`: a node kind it knows, no
+    /// SY or RT name). The files a core node keeps under `nodes/SY/` are relaunched by no
+    /// reconcile.
+    fn node_dirs_of_another_hive(&self, hive_id: &str) -> Vec<String> {
+        self.node_dirs
+            .iter()
+            .filter(|name| {
+                node_kind_from_name(name) != "UNKNOWN"
+                    && managed_reconcile_candidate_allowed(name)
+                    && name
+                        .rsplit_once('@')
+                        .is_some_and(|(_, hive)| hive != hive_id)
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// The command a join runs on the box (as root, through the bootstrap's sudo) before it installs
-/// anything: the box's `/etc/fluxbee/hive.yaml` between two markers, when there is one, then
-/// `unit <name> <state>` for each of `BOX_INSTALL_UNITS`, as `systemctl is-active` answers it.
-/// Built from constants only (no caller input).
+/// anything: the box's `/etc/fluxbee/hive.yaml` between two markers, when there is one; then
+/// `unit <name> <state>` for each of `BOX_INSTALL_UNITS`, as `systemctl is-active` answers it;
+/// `node-unit <unit> <state>` for each managed node's unit systemd has, as `systemctl list-units`
+/// answers it; and `node-dir <name>` for each node's directory under `/var/lib/fluxbee/nodes/`, the
+/// first `BOX_PROBE_NODES_MAX` of each. Built from constants only (no caller input).
 fn box_install_probe_command() -> String {
     sudo_bash_wrap(&format!(
         "if [ -f /etc/fluxbee/hive.yaml ]; then echo '{BOX_HIVE_YAML_BEGIN}'; \
          cat /etc/fluxbee/hive.yaml; echo; echo '{BOX_HIVE_YAML_END}'; fi; \
-         for u in {units}; do echo \"unit $u $(systemctl is-active \"$u\" 2>/dev/null)\"; done; true",
+         for u in {units}; do echo \"unit $u $(systemctl is-active \"$u\" 2>/dev/null)\"; done; \
+         systemctl list-units --all --plain --no-legend --type=service 'fluxbee-node-*' \
+         2>/dev/null | head -n {max} | while read -r u l a rest; do echo \"node-unit $u $a\"; \
+         done; for d in /var/lib/fluxbee/nodes/*/*; do [ -d \"$d\" ] && echo \"node-dir \
+         ${{d##*/}}\"; done | head -n {max}; true",
         units = BOX_INSTALL_UNITS.join(" "),
+        max = BOX_PROBE_NODES_MAX,
     ))
 }
 
-/// `box_install_probe_command`'s output read: the hive id the box's hive.yaml names, and the
-/// units that run. A hive.yaml that does not parse, or names no hive id, names none.
+/// Whether systemd's state for a unit, as `systemctl is-active` or `list-units` answers it, is
+/// one that runs or that systemd is starting: `active`, `activating` (a crash loop between two
+/// restarts among them) or `reloading`.
+fn box_unit_state_runs(state: &str) -> bool {
+    matches!(state, "active" | "activating" | "reloading")
+}
+
+/// `box_install_probe_command`'s output read: the hive id and role the box's hive.yaml names, the
+/// units that run, the managed nodes' units that run and their directories. A hive.yaml that does
+/// not parse names neither; only the lines after it are read as units and directories.
 fn box_install_from_probe(output: &str) -> BoxInstall {
     let (yaml, units) = match (
         output.find(BOX_HIVE_YAML_BEGIN),
@@ -24047,92 +24159,226 @@ fn box_install_from_probe(output: &str) -> BoxInstall {
         ),
         _ => (None, output),
     };
-    let hive_id = yaml
-        .and_then(|yaml| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok())
-        .and_then(|hive| {
-            hive.get("hive_id")
-                .and_then(|value| value.as_str())
-                .map(|value| value.trim().to_string())
-        })
-        .filter(|hive_id| !hive_id.is_empty());
-    let running_units = units
-        .lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            match (words.next(), words.next(), words.next()) {
-                (Some("unit"), Some(unit), Some("active" | "activating" | "reloading"))
-                    if BOX_INSTALL_UNITS.contains(&unit) =>
-                {
-                    Some(unit.to_string())
-                }
-                _ => None,
+    let hive_yaml = yaml.and_then(|yaml| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok());
+    let field = |key: &str| {
+        hive_yaml
+            .as_ref()
+            .and_then(|hive| hive.get(key))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let mut install = BoxInstall {
+        hive_id: field("hive_id"),
+        role: field("role"),
+        ..BoxInstall::default()
+    };
+    for line in units.lines() {
+        let mut words = line.split_whitespace();
+        match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("unit"), Some(unit), Some(state), None)
+                if BOX_INSTALL_UNITS.contains(&unit) && box_unit_state_runs(state) =>
+            {
+                install.running_units.push(unit.to_string());
             }
-        })
-        .collect();
-    BoxInstall {
-        hive_id,
-        running_units,
+            (Some("node-unit"), Some(unit), Some(state), None)
+                if unit.starts_with("fluxbee-node-") && box_unit_state_runs(state) =>
+            {
+                let unit = unit.strip_suffix(".service").unwrap_or(unit);
+                install.running_node_units.push(unit.to_string());
+            }
+            (Some("node-dir"), Some(name), None, None) => install.node_dirs.push(name.to_string()),
+            _ => {}
+        }
+    }
+    install
+}
+
+/// What this motherbee's registry records of the hive a box's hive.yaml names (FINDINGS A-331,
+/// the review): its entry's status and address, each when it reads.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RegisteredBoxHive {
+    status: Option<String>,
+    address: Option<String>,
+}
+
+/// What the registry under `root` records of `hive_id`, when it has an entry for it
+/// (`registry_has_hive`).
+fn registered_box_hive(root: &Path, hive_id: &str) -> Option<RegisteredBoxHive> {
+    if !registry_has_hive(root, hive_id) {
+        return None;
+    }
+    let info = read_hive_info(root, hive_id).ok();
+    let field = |key: &str| {
+        info.as_ref()
+            .and_then(|info| info.get(key))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    Some(RegisteredBoxHive {
+        status: field("status"),
+        address: field("address"),
+    })
+}
+
+/// The first `BOX_REFUSAL_NODES_NAMED` of `names`, and how many more there are.
+fn box_refusal_names(names: &[String]) -> String {
+    let shown = names
+        .iter()
+        .take(BOX_REFUSAL_NODES_NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().saturating_sub(BOX_REFUSAL_NODES_NAMED) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
     }
 }
 
-/// FINDINGS A-331: the refusal of a join of `hive_id` onto a box at `address` that runs another
-/// hive's install: its hive.yaml names another hive id and one of its Fluxbee units runs. A worker
-/// join restarts the box's router but only starts its orchestrator, a no-op on one that runs, and
-/// no join restarts the box's other services, so they went on under the other name: on 8.x (0.1.137)
-/// a box removed with its cleanup not reached, joined again as another hive, failed
-/// `WORKER_ORCHESTRATOR_TIMEOUT` after 191 s, its router up under the new name and its
-/// orchestrator not. `registered` says whether this motherbee's registry still lists a hive id,
-/// which picks what the operator does: remove that hive first, its cleanup reaching the box, or stop
-/// the install on the box. A box whose hive.yaml names this hive (a box joined again under its own
-/// name) or whose units do not run (a removal's cleanup stopped them) is no refusal.
+/// FINDINGS A-331: the refusal of a join of `hive_id` onto a box at `address` that holds another
+/// hive's install: its hive.yaml names another hive id, and one of its Fluxbee units runs, one of
+/// its managed nodes' units runs, or the directory of a managed node named for another hive is
+/// left there. A worker join restarts the box's router but only starts its orchestrator, a no-op
+/// on one that runs, and no join restarts the box's other services, so they went on under the
+/// other name: on 8.x (0.1.137) a box removed with its cleanup not reached, joined again as
+/// another hive, failed `WORKER_ORCHESTRATOR_TIMEOUT` after 191 s, its router up under the new name
+/// and its orchestrator not. The review added the managed nodes: a box whose core units were
+/// stopped by hand still ran their units (`Restart=always`), and the next hive's reconcile
+/// relaunched each directory's node under its old `@<hive>` name.
+///
+/// Every message starts from the address, which a typo may have pointed at a hive that runs (the
+/// review): a box whose hive.yaml names `local_hive`, this motherbee's own hive id, or the role
+/// `motherbee` is a motherbee, this one or another installation's, and is offered no step that
+/// stops anything; one that runs a hive of this motherbee's registry (`registered` gives what the
+/// registry records of a hive id it lists) is named with that hive's status and recorded address,
+/// and `remove_hive` is offered only to reuse that box; any other box gets the steps
+/// `remove_hive`'s cleanup takes (`remove_hive_cleanup_script`), or a fresh box. A box whose
+/// hive.yaml names this hive (a box joined again under its own name), or whose install a removal's
+/// cleanup stopped (units stopped, node directories gone), is no refusal.
 fn box_runs_another_hive_refusal(
     hive_id: &str,
     address: &str,
+    local_hive: &str,
     install: &BoxInstall,
-    registered: impl Fn(&str) -> bool,
+    registered: impl Fn(&str) -> Option<RegisteredBoxHive>,
 ) -> Option<serde_json::Value> {
     let other = install.hive_id.as_deref()?;
-    if other == hive_id || install.running_units.is_empty() {
+    let left_node_dirs = install.node_dirs_of_another_hive(hive_id);
+    if other == hive_id
+        || (install.running_units.is_empty()
+            && install.running_node_units.is_empty()
+            && left_node_dirs.is_empty())
+    {
         return None;
     }
-    let what_to_do = if registered(other) {
+    let mut found = Vec::new();
+    if !install.running_units.is_empty() {
+        found.push(format!(
+            "these of its units run: {}",
+            install.running_units.join(", ")
+        ));
+    }
+    match install.running_node_units.len() {
+        0 => {}
+        1 => found.push(format!(
+            "the unit of 1 managed node runs ({})",
+            install.running_node_units[0]
+        )),
+        count => found.push(format!(
+            "the units of {count} managed nodes run ({})",
+            box_refusal_names(&install.running_node_units)
+        )),
+    }
+    match left_node_dirs.len() {
+        0 => {}
+        1 => found.push(format!(
+            "the directory of 1 managed node of another hive is left ({})",
+            left_node_dirs[0]
+        )),
+        count => found.push(format!(
+            "the directories of {count} managed nodes of another hive are left ({})",
+            box_refusal_names(&left_node_dirs)
+        )),
+    }
+    let found = found.join("; ");
+    let motherbee = other == local_hive
+        || HiveRole::from_role(install.role.as_deref()) == Some(HiveRole::Motherbee);
+    let registry = if motherbee { None } else { registered(other) };
+    let message = if motherbee {
+        let named = if other == local_hive {
+            format!("names this motherbee's own hive id, '{other}'")
+        } else {
+            format!("names hive '{other}' with role motherbee")
+        };
         format!(
-            "'{other}' is a hive of this motherbee: remove it first (remove_hive) while the box \
-             can be reached, so its cleanup stops that install, then ask again"
+            "check the address: the box at {address} is a motherbee, no box to join: its \
+             /etc/fluxbee/hive.yaml {named}, and {found}. It is this motherbee or another \
+             installation's. Nothing was installed, and nothing there is to be stopped: ask again \
+             with the address of the box meant for '{hive_id}'."
+        )
+    } else if let Some(entry) = &registry {
+        let status = entry.status.as_deref().unwrap_or("unknown");
+        let recorded = match entry.address.as_deref() {
+            Some(recorded) if recorded == address => "the address its entry records".to_string(),
+            Some(recorded) => format!("its entry records the address {recorded}"),
+            None => "its entry records no address".to_string(),
+        };
+        format!(
+            "check the address: the box at {address} is hive '{other}' of this motherbee (status \
+             {status}; {recorded}), and {found}. Nothing was installed. If that box is meant for \
+             '{hive_id}': remove '{other}' first (remove_hive) while the box can be reached, so \
+             its cleanup stops that install, then ask again."
         )
     } else {
+        let mut steps = Vec::new();
+        if !install.running_units.is_empty() {
+            steps.push(format!(
+                "systemctl disable --now {}",
+                install.running_units.join(" ")
+            ));
+        }
+        steps.push("systemctl stop 'fluxbee-node-*'".to_string());
+        steps.push("rm -rf /var/lib/fluxbee/nodes/* /var/lib/fluxbee/state/nodes/*".to_string());
         format!(
-            "stop that install on the box (systemctl disable --now {}), or use a fresh box, then \
-             ask again",
-            install.running_units.join(" ")
+            "check the address: the box at {address} runs hive '{other}' (its \
+             /etc/fluxbee/hive.yaml), no hive of this motherbee, and {found}. Nothing was \
+             installed: a join does not restart every service it finds running, and the next \
+             hive relaunches the nodes it finds, so they would go on as '{other}'. If that box \
+             is meant for '{hive_id}': stop that install on it first as remove_hive's cleanup \
+             does, as root ({}), or use a fresh box, then ask again.",
+            steps.join("; ")
         )
     };
-    Some(serde_json::json!({
+    let mut refusal = serde_json::json!({
         "status": "error",
         "error_code": "BOX_RUNS_ANOTHER_HIVE",
         "retryable": false,
         "hive_id": hive_id,
         "address": address,
         "box_hive_id": other,
+        "box_role": install.role,
         "running_units": install.running_units,
-        "message": format!(
-            "the box at {address} runs hive '{other}' (its /etc/fluxbee/hive.yaml), and these of \
-             its units run: {}. A box joins under another hive id only once that install is \
-             stopped: a join does not restart every service it finds running, so they would go \
-             on as '{other}'. Nothing was installed: {what_to_do}.",
-            install.running_units.join(", ")
-        ),
-    }))
+        "running_node_units": install.running_node_units,
+        "left_node_dirs": left_node_dirs,
+        "message": message,
+    });
+    if let Some(entry) = registry {
+        refusal["box_hive_status"] = serde_json::json!(entry.status);
+        refusal["box_hive_address"] = serde_json::json!(entry.address);
+    }
+    Some(refusal)
 }
 
 /// A join's look at the box before it installs anything (FINDINGS A-331): the refusal when the box
-/// runs another hive's install (`box_runs_another_hive_refusal`). A probe that fails is logged and
-/// the join goes on as it did before the check: its next steps go over the same SSH.
+/// runs another hive's install (`box_runs_another_hive_refusal`); `local_hive` is this motherbee's
+/// own hive id. A probe that fails is logged and the join goes on as it did before the check: its
+/// next steps go over the same SSH.
 fn refuse_box_running_another_hive(
     hive_id: &str,
     address: &str,
     key_path: &Path,
     user: &str,
+    local_hive: &str,
 ) -> Option<serde_json::Value> {
     match ssh_with_key_output(address, key_path, &box_install_probe_command(), user) {
         Ok(output) => {
@@ -24142,12 +24388,15 @@ fn refuse_box_running_another_hive(
                     hive_id = hive_id,
                     address = address,
                     box_hive_id = other,
+                    box_role = ?install.role,
                     running_units = ?install.running_units,
+                    running_node_units = install.running_node_units.len(),
+                    node_dirs = install.node_dirs.len(),
                     "the box a join reaches was another hive"
                 );
             }
-            box_runs_another_hive_refusal(hive_id, address, &install, |other| {
-                registry_has_hive(&hives_root(), other)
+            box_runs_another_hive_refusal(hive_id, address, local_hive, &install, |other| {
+                registered_box_hive(&hives_root(), other)
             })
         }
         Err(err) => {
@@ -24429,7 +24678,29 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
 
     let mut syncthing_peer_cleanup = "skipped_no_peer_device_id".to_string();
     let mut syncthing_peer_unlinked = false;
-    if let Some(peer_device_id) = syncthing_peer_device_id.as_deref() {
+    let mut syncthing_peer_kept_for = Vec::new();
+    let peer_device = removed_hive_peer_device(&root, hive_id, syncthing_peer_device_id.as_deref());
+    if let RemovedHivePeerDevice::KeptForOtherHives { device_id, hives } = &peer_device {
+        tracing::warn!(
+            hive_id = hive_id,
+            peer_device_id = %device_id,
+            hives = ?hives,
+            "remove_hive keeps the Syncthing device: other hives' entries record it too (A-299's review)"
+        );
+        syncthing_peer_cleanup = "kept_for_other_hive".to_string();
+        syncthing_peer_kept_for.clone_from(hives);
+    }
+    if let RemovedHivePeerDevice::KeptRegistryUnread(device_id) = &peer_device {
+        tracing::warn!(
+            hive_id = hive_id,
+            peer_device_id = %device_id,
+            "remove_hive keeps the Syncthing device: the registry could not be read whole, so \
+             whether another hive records it is unknown; the peer reconcile's orphan pass removes it"
+        );
+        syncthing_peer_cleanup = "kept_registry_unread".to_string();
+    }
+    if let RemovedHivePeerDevice::Unlink(peer_device_id) = &peer_device {
+        let peer_device_id = peer_device_id.as_str();
         let desired_blob = current_blob_runtime_config(state);
         let desired_dist = current_dist_runtime_config(state);
         let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -24531,6 +24802,9 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         "identity_key_cleanup": identity_key_cleanup,
         "identity_restart": identity_restart,
     });
+    if !syncthing_peer_kept_for.is_empty() {
+        response["syncthing_peer_kept_for"] = serde_json::json!(syncthing_peer_kept_for);
+    }
     if is_egress && !socket_cleanup_ok {
         tracing::warn!(
             hive_id = hive_id,
@@ -24561,6 +24835,61 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         ));
     }
     response
+}
+
+/// What `remove_hive` does with the Syncthing device the removed hive's entry records (FINDINGS
+/// A-299, the review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemovedHivePeerDevice {
+    /// The entry records none: nothing to unlink (`skipped_no_peer_device_id`).
+    NoDevice,
+    /// No other entry records it: it leaves every Fluxbee folder of the motherbee.
+    Unlink(String),
+    /// Other hives' entries record it too: the same box joined again under another name, its
+    /// Syncthing home kept, while the entry of an earlier attempt stayed. It stays: unlinked, it
+    /// would cut those hives off, and the peer reconcile adds no membership back.
+    KeptForOtherHives {
+        device_id: String,
+        hives: Vec<String>,
+    },
+    /// The registry could not be read whole, so whether another hive records it is unknown: it
+    /// stays, and the peer reconcile's orphan pass removes it once nothing records it.
+    KeptRegistryUnread(String),
+}
+
+/// What `remove_hive` of `hive_id` does with `device_id`, the device its entry under `root`
+/// records (`RemovedHivePeerDevice`). Since A-299 a join records the device before its link, and a
+/// failed attempt's entry keeps it (`write_join_entry`); before, a failed attempt recorded none,
+/// and its removal touched no other hive's device. A box whose units were stopped by hand can then
+/// join under another name (A-331 lets a stopped install through) with the same device, and the
+/// removal of the failed entry unlinked the device the connected hive syncs with (the review).
+fn removed_hive_peer_device(
+    root: &Path,
+    hive_id: &str,
+    device_id: Option<&str>,
+) -> RemovedHivePeerDevice {
+    let Some(device_id) = device_id else {
+        return RemovedHivePeerDevice::NoDevice;
+    };
+    let registry = read_registry_snapshot(root);
+    let hives: Vec<String> = registry
+        .hives
+        .iter()
+        .filter(|(other, hive)| {
+            other.as_str() != hive_id && hive.device_id.as_deref() == Some(device_id)
+        })
+        .map(|(other, _)| other.clone())
+        .collect();
+    if !hives.is_empty() {
+        return RemovedHivePeerDevice::KeptForOtherHives {
+            device_id: device_id.to_string(),
+            hives,
+        };
+    }
+    if !registry.complete {
+        return RemovedHivePeerDevice::KeptRegistryUnread(device_id.to_string());
+    }
+    RemovedHivePeerDevice::Unlink(device_id.to_string())
 }
 
 fn socket_cleanup_timeout(forward_result: &Result<serde_json::Value, OrchestratorError>) -> bool {
@@ -24859,19 +25188,24 @@ async fn protected_runtime_keep_versions(
 struct PersistedRuntimeKeep {
     /// Each runtime's versions some node's config names.
     versions: HashMap<String, HashSet<String>>,
-    /// Each node whose config.json cannot be read or parsed while its unit runs or systemctl gives
-    /// no answer for it, with why: the runtime and version it runs on are unknown (FINDINGS A-310).
+    /// Each node whose config.json cannot be read or parsed while its unit may run (it runs,
+    /// systemd has it on its way up or down, or systemctl gives no answer for it), with why: the
+    /// runtime and version it runs on are unknown (FINDINGS A-310).
     unreadable: Vec<String>,
 }
 
 /// The versions the managed nodes under `nodes_root` keep (`PersistedRuntimeKeep`). A node whose
-/// config cannot be read is named in `unreadable` while its unit may run (`unit_activity` answers
-/// it runs, or gives no answer), as the runtime's use names it (`local_runtime_usage_summary`,
-/// FINDINGS A-281); one whose unit does not run is left out, as before, since nothing relaunches a
-/// node whose config cannot be read (`persisted_custom_nodes`).
+/// config cannot be read is named in `unreadable` while its unit may run
+/// (`unreadable_config_unit_state`), as the runtime's use names it
+/// (`local_runtime_usage_summary`, FINDINGS A-281): its unit runs, systemctl gives no answer, or,
+/// since A-310's review, systemd has it on its way up or down, as a crash loop's unit between two
+/// restarts is. The reconcile relaunches no node whose config it cannot read
+/// (`persisted_custom_nodes`), but systemd restarts such a unit on its own (`Restart=always`), on
+/// the version its `ExecStart` names, and between two restarts it reads not running. One that
+/// systemd has at rest is left out, as before.
 fn persisted_runtime_keep_versions_with_root(
     nodes_root: &Path,
-    unit_activity: fn(&str) -> ServiceActivity,
+    unit_checks: &UnitChecks,
 ) -> Result<PersistedRuntimeKeep, OrchestratorError> {
     let mut keep = PersistedRuntimeKeep::default();
     if !nodes_root.exists() {
@@ -24898,17 +25232,14 @@ fn persisted_runtime_keep_versions_with_root(
                 Ok(value) => value,
                 Err(err) => {
                     let node_name = node_entry.file_name().to_string_lossy().to_string();
-                    let unit_state = match unit_activity(&unit_from_node_name(&node_name)) {
-                        ServiceActivity::Inactive => {
-                            tracing::warn!(
-                                path = %config_path.display(),
-                                error = %err,
-                                "runtime retention skipping unreadable persisted node config; its unit does not run"
-                            );
-                            continue;
-                        }
-                        ServiceActivity::Active => "its unit runs",
-                        ServiceActivity::Unknown => "systemctl gives no answer for its unit",
+                    let unit = unit_from_node_name(&node_name);
+                    let Some(unit_state) = unreadable_config_unit_state(unit_checks, &unit) else {
+                        tracing::warn!(
+                            path = %config_path.display(),
+                            error = %err,
+                            "runtime retention skipping unreadable persisted node config; systemd has its unit at rest"
+                        );
+                        continue;
                     };
                     keep.unreadable.push(format!(
                         "the config.json of {node_name} cannot be read ({err}) while {unit_state}, \
@@ -25156,8 +25487,9 @@ fn verify_runtime_current_artifacts_with_root(
 
 /// Deletes from `runtimes_root` each runtime version that the manifest does not list, no managed
 /// node's config under `nodes_root` names and no recent update protects, and each runtime
-/// directory left with none. While a node whose config cannot be read may run (its unit runs or
-/// `unit_activity` gives no answer), the runtime and version it runs on are unknown, so the pass
+/// directory left with none. While a node whose config cannot be read may run (its unit runs,
+/// systemd has it on its way up or down, or systemctl gives no answer: `unit_checks`,
+/// `unreadable_config_unit_state`), the runtime and version it runs on are unknown, so the pass
 /// deletes nothing, names each such node in `held_by_unreadable_configs` and logs them (FINDINGS
 /// A-310): it skipped that node and could delete the version only it pinned, under it. The next
 /// pass (the watchdog's verify, or a runtime `SYSTEM_UPDATE`) reads the configs again.
@@ -25166,10 +25498,10 @@ fn apply_runtime_retention_with_roots_and_protection(
     runtimes_root: &Path,
     nodes_root: &Path,
     protected_keep_versions: &HashMap<String, HashSet<String>>,
-    unit_activity: fn(&str) -> ServiceActivity,
+    unit_checks: &UnitChecks,
 ) -> Result<RuntimeRetentionStats, OrchestratorError> {
     let mut keep_map = runtime_keep_versions(manifest)?;
-    let persisted = persisted_runtime_keep_versions_with_root(nodes_root, unit_activity)?;
+    let persisted = persisted_runtime_keep_versions_with_root(nodes_root, unit_checks)?;
     if !persisted.unreadable.is_empty() {
         tracing::warn!(
             nodes = %persisted.unreadable.join("; "),
@@ -25592,7 +25924,7 @@ async fn runtime_verify_and_retain(state: &OrchestratorState) -> Result<(), Orch
             &runtimes_root(),
             &node_files_root(),
             &protected_keep_versions,
-            state.unit_checks.activity,
+            &state.unit_checks,
         ) {
             Ok(value) => value,
             Err(err) => {
@@ -35370,9 +35702,13 @@ async fn add_hive_flow(
             "message": format!("key access verification failed after bootstrap seed: {err}"),
         });
     }
-    if let Some(refusal) =
-        refuse_box_running_another_hive(hive_id, address, &key_path, creds.user.as_str())
-    {
+    if let Some(refusal) = refuse_box_running_another_hive(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &state.hive_id,
+    ) {
         return refusal;
     }
 
@@ -36273,9 +36609,13 @@ async fn add_egress_hive_flow(
             format!("key access verification failed: {err}"),
         );
     }
-    if let Some(refusal) =
-        refuse_box_running_another_hive(hive_id, address, &key_path, creds.user.as_str())
-    {
+    if let Some(refusal) = refuse_box_running_another_hive(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &state.hive_id,
+    ) {
         return refusal;
     }
 
@@ -37039,9 +37379,13 @@ async fn add_ingress_hive_flow(
             format!("key access verification failed: {err}"),
         );
     }
-    if let Some(refusal) =
-        refuse_box_running_another_hive(hive_id, address, &key_path, creds.user.as_str())
-    {
+    if let Some(refusal) = refuse_box_running_another_hive(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &state.hive_id,
+    ) {
         return refusal;
     }
 
@@ -38311,6 +38655,30 @@ fn systemd_unit_failed(unit: &str) -> CheckAnswer {
 fn unit_failed_answer(active_state: Option<String>) -> CheckAnswer {
     match active_state.as_deref() {
         Some("failed") => CheckAnswer::Yes,
+        Some(_) => CheckAnswer::No,
+        None => CheckAnswer::NoAnswer,
+    }
+}
+
+/// Whether systemd has `unit` at rest, by its `ActiveState` (`UnitChecks::at_rest`, FINDINGS
+/// A-310, the review): systemd starts nothing of it on its own. `systemctl show` answers
+/// `inactive` for a unit it does not have.
+fn systemd_unit_at_rest(unit: &str) -> CheckAnswer {
+    unit_at_rest_answer(systemctl_show_value(
+        Command::new("systemctl")
+            .arg("show")
+            .arg(unit)
+            .arg("--property=ActiveState")
+            .arg("--value")
+            .output(),
+    ))
+}
+
+/// `inactive` and `failed` are at rest; `activating` (a start, or a crash loop's `auto-restart`
+/// between two restarts), `deactivating`, `reloading`, `active` and any other state are not.
+fn unit_at_rest_answer(active_state: Option<String>) -> CheckAnswer {
+    match active_state.as_deref() {
+        Some("inactive" | "failed") => CheckAnswer::Yes,
         Some(_) => CheckAnswer::No,
         None => CheckAnswer::NoAnswer,
     }
@@ -41033,6 +41401,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// FINDINGS A-299, the review: a failed join's entry now keeps the device it linked, so two
+    /// entries can record one device: the same box, its units stopped by hand (A-331 lets a
+    /// stopped install through), joined again under another name with its Syncthing home kept.
+    /// `remove_hive` of the failed entry unlinked that device from every Fluxbee folder and cut
+    /// the connected hive off, which the peer reconcile never repairs. The device now stays while
+    /// another entry records it, or while the registry cannot be read whole; the answer says so.
+    #[test]
+    fn remove_hive_keeps_a_device_another_hives_entry_records() {
+        let root = std::env::temp_dir().join(format!("fluxbee-removed-device-{}", Uuid::new_v4()));
+        let entry = |hive: &str, body: &str| {
+            fs::create_dir_all(root.join(hive)).unwrap();
+            fs::write(root.join(hive).join("info.yaml"), body).unwrap();
+        };
+        let failed = "role: worker\nstatus: failed\njoin:\n  phase: done\n";
+        let connected = "role: worker\nstatus: connected\njoin:\n  phase: done\n";
+        entry(
+            "gate0239i",
+            &format!("hive_id: gate0239i\n{failed}syncthing_device_id: {ST_WORKER1}\n"),
+        );
+        entry(
+            "gate0239j",
+            &format!("hive_id: gate0239j\n{connected}syncthing_device_id: {ST_WORKER1}\n"),
+        );
+        entry(
+            "worker1",
+            &format!("hive_id: worker1\n{connected}syncthing_device_id: {ST_INGRESS1}\n"),
+        );
+        fs::create_dir_all(root.join("accepting1")).unwrap();
+
+        assert_eq!(
+            removed_hive_peer_device(&root, "gate0239i", Some(ST_WORKER1)),
+            RemovedHivePeerDevice::KeptForOtherHives {
+                device_id: ST_WORKER1.to_string(),
+                hives: vec!["gate0239j".to_string()],
+            }
+        );
+        assert_eq!(
+            removed_hive_peer_device(&root, "gate0239j", Some(ST_WORKER1)),
+            RemovedHivePeerDevice::KeptForOtherHives {
+                device_id: ST_WORKER1.to_string(),
+                hives: vec!["gate0239i".to_string()],
+            }
+        );
+        assert_eq!(
+            removed_hive_peer_device(&root, "worker1", Some(ST_INGRESS1)),
+            RemovedHivePeerDevice::Unlink(ST_INGRESS1.to_string())
+        );
+        assert_eq!(
+            removed_hive_peer_device(&root, "gate0239i", None),
+            RemovedHivePeerDevice::NoDevice
+        );
+
+        // An entry that cannot be read may record it: kept, for the orphan pass.
+        entry("garbled1", ": not yaml : [");
+        assert_eq!(
+            removed_hive_peer_device(&root, "worker1", Some(ST_INGRESS1)),
+            RemovedHivePeerDevice::KeptRegistryUnread(ST_INGRESS1.to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        // remove_hive decides by it, and unlinks only the device it lets go.
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("async fn remove_hive_flow(")
+            .expect("remove_hive_flow");
+        let end = start
+            + src[start..]
+                .find("\n/// What `remove_hive` does with the Syncthing device")
+                .expect("its end");
+        let body: String = src[start..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("remove_hive_flow: {needle}"))
+        };
+        let decide =
+            at("removed_hive_peer_device(&root,hive_id,syncthing_peer_device_id.as_deref())");
+        let unlink_arm = at("ifletRemovedHivePeerDevice::Unlink(peer_device_id)=&peer_device{");
+        let unlink = at("ensure_syncthing_peer_unlink_runtime(");
+        assert!(decide < unlink_arm && unlink_arm < unlink);
+        assert_eq!(
+            body.matches("ensure_syncthing_peer_unlink_runtime(")
+                .count(),
+            1
+        );
+        at("syncthing_peer_cleanup=\"kept_for_other_hive\".to_string();");
+        at("response[\"syncthing_peer_kept_for\"]=serde_json::json!(syncthing_peer_kept_for);");
     }
 
     /// `accept_add_hive` refuses another role under the topology lock, after the status checks
@@ -49850,27 +50309,43 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
         assert!(nodes_stop < script.find("rm -rf /var/lib/fluxbee/nodes/*").unwrap());
     }
 
+    /// A box probe's output (`box_install_probe_command`): `yaml` between the markers when given,
+    /// then a line for each core unit, managed node's unit and node directory.
+    fn box_probe_output(
+        yaml: Option<&str>,
+        units: &[(&str, &str)],
+        node_units: &[(&str, &str)],
+        node_dirs: &[&str],
+    ) -> String {
+        let mut output = String::new();
+        if let Some(yaml) = yaml {
+            output.push_str(&format!(
+                "{BOX_HIVE_YAML_BEGIN}\n{yaml}\n\n{BOX_HIVE_YAML_END}\n"
+            ));
+        }
+        for (unit, state) in units {
+            output.push_str(&format!("unit {unit} {state}\n"));
+        }
+        for (unit, state) in node_units {
+            output.push_str(&format!("node-unit {unit} {state}\n"));
+        }
+        for dir in node_dirs {
+            output.push_str(&format!("node-dir {dir}\n"));
+        }
+        output
+    }
+
     /// FINDINGS A-331: a join reads the box before it installs anything. On 8.x (0.1.137) a box
     /// removed with its cleanup not reached, so its install kept running as `gate0237i`, was
     /// joined as `gate0237j`: its router came up under the new name, its orchestrator did not, and
     /// the join failed `WORKER_ORCHESTRATOR_TIMEOUT` after 191 s with nothing saying why. A box
     /// whose hive.yaml names another hive and whose Fluxbee units run is refused
     /// `BOX_RUNS_ANOTHER_HIVE`, naming that hive, the units and what to do; a box joined again
-    /// under its own name, one whose units a removal stopped, and a fresh box join as before.
+    /// under its own name, one whose install a removal stopped, and a fresh box join as before.
     #[test]
     fn a_join_refuses_a_box_that_runs_another_hives_install() {
-        let probe = |yaml: Option<&str>, units: &[(&str, &str)]| {
-            let mut output = String::new();
-            if let Some(yaml) = yaml {
-                output.push_str(&format!(
-                    "{BOX_HIVE_YAML_BEGIN}\n{yaml}\n\n{BOX_HIVE_YAML_END}\n"
-                ));
-            }
-            for (unit, state) in units {
-                output.push_str(&format!("unit {unit} {state}\n"));
-            }
-            output
-        };
+        let probe =
+            |yaml: Option<&str>, units: &[(&str, &str)]| box_probe_output(yaml, units, &[], &[]);
         let gate_i = "hive_id: \"gate0237i\"\nrole: worker\nwan:\n  gateway_name: RT.gateway\n";
         let units = [
             ("rt-gateway", "active"),
@@ -49887,51 +50362,39 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
             install,
             BoxInstall {
                 hive_id: Some("gate0237i".to_string()),
+                role: Some("worker".to_string()),
                 running_units: ["rt-gateway", "sy-orchestrator", "sy-timer"]
                     .map(str::to_string)
                     .to_vec(),
+                ..BoxInstall::default()
             }
         );
 
-        let refusal = box_runs_another_hive_refusal("gate0237j", "192.0.2.14", &install, |_| false)
+        let refusal =
+            box_runs_another_hive_refusal("gate0237j", "192.0.2.14", "motherbee", &install, |_| {
+                None
+            })
             .expect("refused");
         assert_eq!(refusal["status"], "error");
         assert_eq!(refusal["error_code"], "BOX_RUNS_ANOTHER_HIVE");
         assert_eq!(refusal["retryable"], false);
         assert_eq!(refusal["hive_id"], "gate0237j");
         assert_eq!(refusal["box_hive_id"], "gate0237i");
+        assert_eq!(refusal["box_role"], "worker");
         assert_eq!(
             refusal["running_units"],
             serde_json::json!(["rt-gateway", "sy-orchestrator", "sy-timer"])
         );
-        let message = refusal["message"].as_str().unwrap_or_default();
-        assert!(
-            message.starts_with(
-                "the box at 192.0.2.14 runs hive 'gate0237i' (its /etc/fluxbee/hive.yaml), and \
-                 these of its units run: rt-gateway, sy-orchestrator, sy-timer."
-            ) && message.contains(
-                "stop that install on the box (systemctl disable --now rt-gateway sy-orchestrator \
-                 sy-timer), or use a fresh box"
-            ),
-            "{message}"
-        );
-        // That hive is still in the registry: remove it first, its cleanup reaching the box.
-        let registered =
-            box_runs_another_hive_refusal("gate0237j", "192.0.2.14", &install, |hive| {
-                hive == "gate0237i"
-            })
-            .expect("refused");
-        let message = registered["message"].as_str().unwrap_or_default();
-        assert!(
-            message
-                .contains("'gate0237i' is a hive of this motherbee: remove it first (remove_hive)"),
-            "{message}"
-        );
+        assert_eq!(refusal["running_node_units"], serde_json::json!([]));
+        assert_eq!(refusal["left_node_dirs"], serde_json::json!([]));
+        assert!(refusal.get("box_hive_status").is_none(), "{refusal}");
 
         // No refusal: the box joined again under its own name, its units stopped by a removal, a
         // fresh box, a hive.yaml that does not parse or names no hive.
         assert_eq!(
-            box_runs_another_hive_refusal("gate0237i", "192.0.2.14", &install, |_| true),
+            box_runs_another_hive_refusal("gate0237i", "192.0.2.14", "motherbee", &install, |_| {
+                Some(RegisteredBoxHive::default())
+            }),
             None
         );
         for output in [
@@ -49946,25 +50409,53 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
         ] {
             let install = box_install_from_probe(&output);
             assert_eq!(
-                box_runs_another_hive_refusal("gate0237j", "192.0.2.14", &install, |_| true),
+                box_runs_another_hive_refusal(
+                    "gate0237j",
+                    "192.0.2.14",
+                    "motherbee",
+                    &install,
+                    |_| Some(RegisteredBoxHive::default())
+                ),
                 None,
                 "{output}"
             );
         }
-        // A hive.yaml line that reads like a unit's is not one.
+        // A hive.yaml line that reads like a unit's or a node's is not one.
         let tricky = box_install_from_probe(&probe(
-            Some("hive_id: worker5\nnotes: |\n  unit rt-gateway active"),
+            Some(
+                "hive_id: worker5\nnotes: |\n  unit rt-gateway active\n  node-unit \
+                 fluxbee-node-AI.x-worker5.service active\n  node-dir AI.x@worker5",
+            ),
             &[("rt-gateway", "inactive")],
         ));
         assert_eq!(tricky.hive_id.as_deref(), Some("worker5"));
-        assert!(tricky.running_units.is_empty(), "{tricky:?}");
+        assert!(
+            tricky.running_units.is_empty()
+                && tricky.running_node_units.is_empty()
+                && tricky.node_dirs.is_empty(),
+            "{tricky:?}"
+        );
 
-        // The probe asks for every unit the removal's cleanup stops, and only those.
+        // The probe asks for every unit the removal's cleanup stops, and only those, then for the
+        // managed nodes' units and directories, which the cleanup stops and deletes.
         let command = box_install_probe_command();
         assert!(command.starts_with("sudo -n bash -lc '"), "{command}");
         assert!(command.contains(&format!("for u in {}; do", BOX_INSTALL_UNITS.join(" "))));
-        assert!(remove_hive_cleanup_script()
-            .starts_with(&format!("for s in {}; do", BOX_INSTALL_UNITS.join(" "))));
+        assert!(command.contains(
+            "systemctl list-units --all --plain --no-legend --type=service \
+             '\"'\"'fluxbee-node-*'\"'\"'"
+        ));
+        assert!(command.contains("for d in /var/lib/fluxbee/nodes/*/*; do"));
+        assert!(command.contains("echo \"node-dir ${d##*/}\""), "{command}");
+        let cleanup = remove_hive_cleanup_script();
+        assert!(cleanup.starts_with(&format!("for s in {}; do", BOX_INSTALL_UNITS.join(" "))));
+        for step in [
+            "systemctl stop 'fluxbee-node-*'",
+            "rm -rf /var/lib/fluxbee/nodes/*",
+            "rm -rf /var/lib/fluxbee/state/nodes/*",
+        ] {
+            assert!(cleanup.contains(step), "{step}");
+        }
 
         // Every join flow reads the box after its sudo works and before it copies anything there.
         let src = include_str!("sy_orchestrator.rs");
@@ -49987,10 +50478,280 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
                     .unwrap_or_else(|| panic!("{flow}: {needle}"))
             };
             let sudo = at("\"sudo -n /bin/bash -lc 'exit 0'\"");
-            let probe = at("refuse_box_running_another_hive(hive_id, address, &key_path,");
+            let probe = at("refuse_box_running_another_hive(");
             let copy = at("sync_core_to_worker(");
             assert!(sudo < probe && probe < copy, "{flow}");
+            let call: String = body[probe..]
+                .chars()
+                .take_while(|c| *c != ';' && *c != '{')
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert_eq!(
+                call,
+                "refuse_box_running_another_hive(hive_id,address,&key_path,creds.user.as_str(),\
+                 &state.hive_id,)",
+                "{flow}: the probe knows this motherbee's own hive id"
+            );
         }
+    }
+
+    /// FINDINGS A-331, the review: an add_hive whose address is wrong reaches a box that runs, and
+    /// the refusal must not tell the operator, or Archi, to stop it. A mistyped address that lands
+    /// on worker1, connected, said "'worker1' is a hive of this motherbee: remove it first", and
+    /// the motherbee's own address (its hive.yaml names the motherbee, which has no registry entry)
+    /// said to run `systemctl disable --now` on every core unit. Every refusal now starts with
+    /// "check the address": a motherbee, this one or another installation's, is offered no step
+    /// that stops anything; a hive of the registry is named with its status and recorded address,
+    /// and `remove_hive` is offered only to reuse that box; any other box gets the cleanup's steps.
+    #[test]
+    fn a_join_refusal_starts_from_the_address_and_never_stops_a_motherbee() {
+        let units = [
+            ("rt-gateway", "active"),
+            ("sy-orchestrator", "active"),
+            ("sy-admin", "active"),
+        ];
+        let probe =
+            |yaml: &str| box_install_from_probe(&box_probe_output(Some(yaml), &units, &[], &[]));
+
+        // This motherbee's own address, or another installation's motherbee.
+        for (yaml, named) in [
+            (
+                "hive_id: motherbee\nrole: motherbee\n",
+                "names this motherbee's own hive id, 'motherbee'",
+            ),
+            // A hive.yaml with no role, naming this motherbee: its id says enough.
+            (
+                "hive_id: motherbee\n",
+                "names this motherbee's own hive id, 'motherbee'",
+            ),
+            (
+                "hive_id: sandbox\nrole: Motherbee\n",
+                "names hive 'sandbox' with role motherbee",
+            ),
+        ] {
+            let install = probe(yaml);
+            let refusal = box_runs_another_hive_refusal(
+                "gate0239j",
+                "192.0.2.10",
+                "motherbee",
+                &install,
+                |_| Some(RegisteredBoxHive::default()),
+            )
+            .expect("refused");
+            let message = refusal["message"].as_str().unwrap_or_default();
+            assert!(
+                message.starts_with(&format!(
+                    "check the address: the box at 192.0.2.10 is a motherbee, no box to join: its \
+                     /etc/fluxbee/hive.yaml {named}, and these of its units run: rt-gateway, \
+                     sy-orchestrator, sy-admin. It is this motherbee or another installation's. \
+                     Nothing was installed, and nothing there is to be stopped"
+                )),
+                "{message}"
+            );
+            for never in ["systemctl", "remove_hive", "rm -rf"] {
+                assert!(!message.contains(never), "{never}: {message}");
+            }
+            assert!(refusal.get("box_hive_status").is_none(), "{refusal}");
+        }
+
+        // A hive of this motherbee, connected, at the address its entry records: a typo that
+        // landed on worker1 is told so first, and removing worker1 is only the step to reuse it.
+        let install = probe("hive_id: worker1\nrole: worker\n");
+        let worker1 = |hive: &str| {
+            (hive == "worker1").then(|| RegisteredBoxHive {
+                status: Some("connected".to_string()),
+                address: Some("192.0.2.21".to_string()),
+            })
+        };
+        let refusal = box_runs_another_hive_refusal(
+            "gate0239j",
+            "192.0.2.21",
+            "motherbee",
+            &install,
+            worker1,
+        )
+        .expect("refused");
+        assert_eq!(refusal["box_hive_status"], "connected");
+        assert_eq!(refusal["box_hive_address"], "192.0.2.21");
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            "check the address: the box at 192.0.2.21 is hive 'worker1' of this motherbee (status \
+             connected; the address its entry records), and these of its units run: rt-gateway, \
+             sy-orchestrator, sy-admin. Nothing was installed. If that box is meant for \
+             'gate0239j': remove 'worker1' first (remove_hive) while the box can be reached, so \
+             its cleanup stops that install, then ask again."
+        );
+        // Recorded at another address (a box reinstalled, say): the message names it.
+        let refusal = box_runs_another_hive_refusal(
+            "gate0239j",
+            "192.0.2.99",
+            "motherbee",
+            &install,
+            worker1,
+        )
+        .expect("refused");
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "check the address: the box at 192.0.2.99 is hive 'worker1' of this motherbee \
+                 (status connected; its entry records the address 192.0.2.21)"
+            ),
+            "{message}"
+        );
+
+        // No hive of this motherbee: another installation's worker, or a removed hive's box.
+        let refusal =
+            box_runs_another_hive_refusal("gate0239j", "192.0.2.14", "motherbee", &install, |_| {
+                None
+            })
+            .expect("refused");
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "check the address: the box at 192.0.2.14 runs hive 'worker1' (its \
+                 /etc/fluxbee/hive.yaml), no hive of this motherbee, and these of its units run: \
+                 rt-gateway, sy-orchestrator, sy-admin. Nothing was installed"
+            ) && message.ends_with(
+                "If that box is meant for 'gate0239j': stop that install on it first as \
+                 remove_hive's cleanup does, as root (systemctl disable --now rt-gateway \
+                 sy-orchestrator sy-admin; systemctl stop 'fluxbee-node-*'; rm -rf \
+                 /var/lib/fluxbee/nodes/* /var/lib/fluxbee/state/nodes/*), or use a fresh box, \
+                 then ask again."
+            ),
+            "{message}"
+        );
+        assert!(refusal.get("box_hive_status").is_none(), "{refusal}");
+    }
+
+    /// FINDINGS A-331, the review: the old remedy, `systemctl disable --now` of the core units,
+    /// left the old hive's managed nodes on the box: their units run on (`Restart=always`) and
+    /// their directories stay, so the next hive's reconcile relaunched each under its old
+    /// `@<hive>` name, and the probe, which read only the core units, let that join go on. A box
+    /// whose hive.yaml names another hive is refused while a managed node's unit runs there or a
+    /// managed node's directory named for another hive is left, even with every core unit
+    /// stopped; a directory named for the hive that joins, or a core node's, is no refusal.
+    #[test]
+    fn a_join_refuses_a_box_whose_managed_nodes_another_hive_left() {
+        let gate_i = "hive_id: gate0239i\nrole: worker\n";
+        let stopped = [("rt-gateway", "inactive"), ("sy-orchestrator", "inactive")];
+
+        // A node's unit between two restarts of a crash loop, and one that runs.
+        let install = box_install_from_probe(&box_probe_output(
+            Some(gate_i),
+            &stopped,
+            &[
+                ("fluxbee-node-AI.x-gate0239i.service", "activating"),
+                ("fluxbee-node-WF.y-gate0239i.service", "active"),
+                ("fluxbee-node-IO.z-gate0239i.service", "inactive"),
+                ("fluxbee-node-AI.w-gate0239i.service", "failed"),
+                ("sshd.service", "active"),
+            ],
+            &[],
+        ));
+        assert_eq!(
+            install.running_node_units,
+            ["fluxbee-node-AI.x-gate0239i", "fluxbee-node-WF.y-gate0239i"]
+        );
+        let refusal =
+            box_runs_another_hive_refusal("gate0239j", "192.0.2.14", "motherbee", &install, |_| {
+                None
+            })
+            .expect("refused");
+        assert_eq!(refusal["error_code"], "BOX_RUNS_ANOTHER_HIVE");
+        assert_eq!(refusal["running_units"], serde_json::json!([]));
+        assert_eq!(
+            refusal["running_node_units"],
+            serde_json::json!(["fluxbee-node-AI.x-gate0239i", "fluxbee-node-WF.y-gate0239i"])
+        );
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "no hive of this motherbee, and the units of 2 managed nodes run \
+                 (fluxbee-node-AI.x-gate0239i, fluxbee-node-WF.y-gate0239i)."
+            ) && message.contains(
+                "as root (systemctl stop 'fluxbee-node-*'; rm -rf /var/lib/fluxbee/nodes/* \
+                 /var/lib/fluxbee/state/nodes/*)"
+            ),
+            "{message}"
+        );
+
+        // Nothing runs, and the directories of another hive's managed nodes are left: the first
+        // five named, the rest counted. One named for the hive that joins, for no hive, a core
+        // node's (no reconcile relaunches it) or a name of no node kind is not.
+        let dirs: Vec<String> = (0..7).map(|node| format!("AI.n{node}@gate0239i")).collect();
+        let mut listed: Vec<&str> = dirs.iter().map(String::as_str).collect();
+        listed.extend([
+            "AI.mine@gate0239j",
+            "README",
+            "SY.timer@gate0239i",
+            "RT.gateway@gate0239i",
+            "notes@gate0239i",
+        ]);
+        let install =
+            box_install_from_probe(&box_probe_output(Some(gate_i), &stopped, &[], &listed));
+        let refusal =
+            box_runs_another_hive_refusal("gate0239j", "192.0.2.14", "motherbee", &install, |_| {
+                None
+            })
+            .expect("refused");
+        assert_eq!(refusal["left_node_dirs"], serde_json::json!(dirs));
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "the directories of 7 managed nodes of another hive are left (AI.n0@gate0239i, \
+                 AI.n1@gate0239i, AI.n2@gate0239i, AI.n3@gate0239i, AI.n4@gate0239i and 2 more)"
+            ),
+            "{message}"
+        );
+        let one = box_install_from_probe(&box_probe_output(
+            Some(gate_i),
+            &stopped,
+            &[("fluxbee-node-AI.n0-gate0239i.service", "active")],
+            &["AI.n0@gate0239i"],
+        ));
+        let refusal =
+            box_runs_another_hive_refusal("gate0239j", "192.0.2.14", "motherbee", &one, |_| None)
+                .expect("refused");
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "no hive of this motherbee, and the unit of 1 managed node runs \
+                 (fluxbee-node-AI.n0-gate0239i); the directory of 1 managed node of another hive \
+                 is left (AI.n0@gate0239i)."
+            ),
+            "{message}"
+        );
+        let mine = box_install_from_probe(&box_probe_output(
+            Some(gate_i),
+            &stopped,
+            &[],
+            &["AI.mine@gate0239j", "README", "SY.timer@gate0239i"],
+        ));
+        assert_eq!(
+            box_runs_another_hive_refusal("gate0239j", "192.0.2.14", "motherbee", &mine, |_| None),
+            None
+        );
+
+        // What remove_hive's cleanup leaves, or a box joined again under its own name: no refusal.
+        let cleaned = box_install_from_probe(&box_probe_output(
+            Some(gate_i),
+            &stopped,
+            &[("fluxbee-node-AI.x-gate0239i.service", "inactive")],
+            &[],
+        ));
+        assert_eq!(
+            box_runs_another_hive_refusal("gate0239j", "192.0.2.14", "motherbee", &cleaned, |_| {
+                None
+            }),
+            None
+        );
+        assert_eq!(
+            box_runs_another_hive_refusal("gate0239i", "192.0.2.14", "motherbee", &install, |_| {
+                None
+            }),
+            None
+        );
     }
 
     /// FINDINGS A-48: the removed box loses its mesh credentials before anything else.
@@ -55800,7 +56561,11 @@ blob:
             &runtimes_root,
             &nodes_root,
             &HashMap::new(),
-            |_| ServiceActivity::Active,
+            &UnitChecks {
+                activity: |_| ServiceActivity::Active,
+                failed: |_| CheckAnswer::No,
+                at_rest: |_| CheckAnswer::No,
+            },
         )
         .expect("retention should succeed");
 
@@ -55849,7 +56614,11 @@ blob:
             &runtimes_root,
             &nodes_root,
             &protected_keep,
-            |_| ServiceActivity::Active,
+            &UnitChecks {
+                activity: |_| ServiceActivity::Active,
+                failed: |_| CheckAnswer::No,
+                at_rest: |_| CheckAnswer::No,
+            },
         )
         .expect("retention with protection should succeed");
 
@@ -55872,8 +56641,11 @@ blob:
     /// version only that node pinned, and the manifest no longer listed (removed by hand, or before
     /// 0.1.133), was deleted under the running node. While such a node may run (its unit runs, or
     /// systemctl gives no answer for it) the runtime and version it runs on are unknown, so the
-    /// pass deletes nothing and names the node; once its unit does not run, nothing relaunches it
-    /// and the pass runs as before.
+    /// pass deletes nothing and names the node. The review: a crash loop's unit between two
+    /// restarts reads not running (`is-active` exits 3 for `activating`, `auto-restart`), most of
+    /// the time, yet systemd restarts it on its own (`Restart=always`) on the version its
+    /// `ExecStart` names; the pass then deleted that version. A unit systemd has on its way up or
+    /// down holds the pass too. Only once systemd has the unit at rest does the pass run as before.
     #[test]
     fn runtime_retention_deletes_nothing_while_a_node_whose_config_cannot_be_read_may_run() {
         let root = std::env::temp_dir().join(format!(
@@ -55900,22 +56672,40 @@ blob:
             fs::write(broken.join("config.json"), "{\"_system\": {\"runtime\": ")
                 .expect("a config that does not parse");
         };
+        let checks =
+            |activity: fn(&str) -> ServiceActivity, at_rest: fn(&str) -> CheckAnswer| UnitChecks {
+                activity,
+                failed: |_| CheckAnswer::No,
+                at_rest,
+            };
 
-        let checks: [(fn(&str) -> ServiceActivity, &str); 2] = [
-            (|_: &str| ServiceActivity::Active, "its unit runs"),
+        for (unit_checks, unit_state) in [
             (
-                |_: &str| ServiceActivity::Unknown,
+                checks(|_| ServiceActivity::Active, |_| CheckAnswer::No),
+                "its unit runs",
+            ),
+            (
+                checks(|_| ServiceActivity::Unknown, |_| CheckAnswer::NoAnswer),
                 "systemctl gives no answer for its unit",
             ),
-        ];
-        for (activity, unit_state) in checks {
+            // A crash loop between two restarts: not running, not at rest.
+            (
+                checks(|_| ServiceActivity::Inactive, |_| CheckAnswer::No),
+                "systemd has its unit on its way up or down (a crash loop between two restarts, \
+                 say)",
+            ),
+            (
+                checks(|_| ServiceActivity::Inactive, |_| CheckAnswer::NoAnswer),
+                "systemctl gives no answer for its unit",
+            ),
+        ] {
             plant();
             let stats = apply_runtime_retention_with_roots_and_protection(
                 &manifest,
                 &runtimes_root,
                 &nodes_root,
                 &HashMap::new(),
-                activity,
+                &unit_checks,
             )
             .expect("retention");
             assert!(pinned.exists(), "the version the node may run on stays");
@@ -55936,15 +56726,15 @@ blob:
             );
         }
 
-        // Its unit does not run: nothing relaunches a node whose config cannot be read, and the
-        // pass deletes what nothing names, as before.
+        // systemd has its unit at rest (stopped, failed, or gone): the reconcile relaunches no
+        // node whose config it cannot read, and the pass deletes what nothing names, as before.
         plant();
         let stats = apply_runtime_retention_with_roots_and_protection(
             &manifest,
             &runtimes_root,
             &nodes_root,
             &HashMap::new(),
-            |_| ServiceActivity::Inactive,
+            &checks(|_| ServiceActivity::Inactive, |_| CheckAnswer::Yes),
         )
         .expect("retention");
         assert!(!pinned.exists() && !old.exists());
@@ -55952,6 +56742,30 @@ blob:
         assert!(stats.held_by_unreadable_configs.is_empty(), "{stats:?}");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-310, the review: systemd's `ActiveState` says whether it starts anything of a
+    /// unit on its own. `inactive` (a unit it does not have reads so too) and `failed` are at rest;
+    /// `activating`, which a crash loop's unit is between two restarts (`auto-restart`), and every
+    /// other state are not; no answer is no answer.
+    #[test]
+    fn a_unit_is_at_rest_only_when_systemd_has_it_inactive_or_failed() {
+        for (state, answer) in [
+            ("inactive", CheckAnswer::Yes),
+            ("failed", CheckAnswer::Yes),
+            ("activating", CheckAnswer::No),
+            ("deactivating", CheckAnswer::No),
+            ("reloading", CheckAnswer::No),
+            ("active", CheckAnswer::No),
+            ("maintenance", CheckAnswer::No),
+        ] {
+            assert_eq!(
+                unit_at_rest_answer(Some(state.to_string())),
+                answer,
+                "{state}"
+            );
+        }
+        assert_eq!(unit_at_rest_answer(None), CheckAnswer::NoAnswer);
     }
 
     #[test]
@@ -56199,6 +57013,7 @@ blob:
             unit_checks: UnitChecks {
                 activity: |_| ServiceActivity::Inactive,
                 failed: |_| CheckAnswer::No,
+                at_rest: |_| CheckAnswer::Yes,
             },
             rpc: OnceLock::new(),
         }
@@ -56943,6 +57758,7 @@ blob:
         unanswered.unit_checks = UnitChecks {
             activity: |_| ServiceActivity::Unknown,
             failed: |_| CheckAnswer::NoAnswer,
+            at_rest: |_| CheckAnswer::NoAnswer,
         };
         let inventory = managed_node_inventory_with_root(&unanswered, &root)
             .expect("managed inventory must load");
@@ -56987,6 +57803,7 @@ blob:
         state.unit_checks = UnitChecks {
             activity: |_| ServiceActivity::Unknown,
             failed: |_| CheckAnswer::NoAnswer,
+            at_rest: |_| CheckAnswer::NoAnswer,
         };
         let unanswered = usage(&state);
         assert_eq!(unanswered["in_use"], true, "{unanswered}");
@@ -57000,6 +57817,7 @@ blob:
         state.unit_checks = UnitChecks {
             activity: |_| ServiceActivity::Active,
             failed: |_| CheckAnswer::No,
+            at_rest: |_| CheckAnswer::Yes,
         };
         let starting = usage(&state);
         assert_eq!(starting["in_use"], true, "{starting}");
@@ -57488,6 +58306,7 @@ blob:
         worker.unit_checks = UnitChecks {
             activity: |_| ServiceActivity::Active,
             failed: |_| CheckAnswer::No,
+            at_rest: |_| CheckAnswer::Yes,
         };
         worker
     }
@@ -57685,8 +58504,10 @@ blob:
     /// unit runs or systemctl gives no answer for it, runs on a runtime nobody can name. The
     /// hive's read of its nodes then fails, naming it: a worker answers `USAGE_UNREADABLE`, and on
     /// the motherbee the whole use is an error. It was left out as a node on no runtime, so a
-    /// worker answered ok without it and a removal took its version from under it. One whose unit
-    /// does not run is left out, as any node whose unit does not run is.
+    /// worker answered ok without it and a removal took its version from under it. Since A-310's
+    /// review, one whose unit systemd has on its way up or down (a crash loop between two
+    /// restarts, which `is-active` reads not running) counts as one that may run, as the runtime
+    /// retention counts it; one systemd has at rest is left out.
     #[tokio::test]
     async fn a_node_whose_config_cannot_be_read_while_it_may_run_leaves_the_use_unknown() {
         let root =
@@ -57736,7 +58557,8 @@ blob:
             );
         }
 
-        // Its unit does not run: it is left out, and the readable node counts.
+        // Its unit reads not running, between two restarts of a crash loop: systemd has it on its
+        // way up, so it may run.
         let mut worker = usage_test_worker("worker1");
         worker.unit_checks.activity = |unit: &str| {
             if unit.contains("broken") {
@@ -57745,6 +58567,20 @@ blob:
                 ServiceActivity::Active
             }
         };
+        worker.unit_checks.at_rest = |_: &str| CheckAnswer::No;
+        let answer = read(&worker);
+        assert_eq!(answer["error_code"], "USAGE_UNREADABLE", "{answer}");
+        let message = answer["message"].as_str().unwrap_or_default();
+        assert!(
+            message.ends_with(
+                ") while systemd has its unit on its way up or down (a crash loop between two \
+                 restarts, say), so the runtime it runs on is unknown"
+            ),
+            "{message}"
+        );
+
+        // systemd has its unit at rest: it is left out, and the readable node counts.
+        worker.unit_checks.at_rest = |_: &str| CheckAnswer::Yes;
         let answer = read(&worker);
         assert_eq!(answer["status"], "ok", "{answer}");
         assert_eq!(answer["usage"]["running_count"], 1, "{answer}");
@@ -59422,6 +60258,77 @@ blob:
         gates.remove(0).send(()).expect("a tenant read's gate");
         wait_for_lane_entry(&log, "tenant-waiting start").await;
         for gate in gates {
+            let _ = gate.send(());
+        }
+    }
+
+    /// FINDINGS A-308, the review: one hive that does not answer delays its own target and every
+    /// fan-out (`/versions`, the motherbee's runtime use, Fluxbee Cloud's tenant nodes), 4 reads
+    /// each. Once `list_tenant_nodes` had a target of its own, those 16 reads took all 16
+    /// forwarding places, and a read forwarded to a hive that answers waited up to 45 s, where
+    /// A-199's live check had it answered at once. A fan-out now holds only its target's places:
+    /// with the 16 held, the reads of 12 other hives start at once, a 13th waits for a forwarding
+    /// place, and a 5th read of each fan-out waits for its own kind.
+    #[tokio::test]
+    async fn a_silent_hive_and_the_fan_outs_it_delays_leave_room_for_other_hives() {
+        let lanes = WorkerLanes::start("test", WORKER_CONCURRENT_READS_MAX);
+        let log = LaneLog::default();
+        let delayed = [
+            ReadTarget::Hive("silentbee".to_string()),
+            ReadTarget::EveryHive,
+            ReadTarget::RuntimeUse,
+            ReadTarget::TenantNodes,
+        ];
+        let mut gates = Vec::new();
+        for (kind, target) in delayed.iter().enumerate() {
+            for read in 0..WORKER_READS_PER_TARGET_MAX {
+                gates.push(run_gated(
+                    &lanes,
+                    &log,
+                    &RequestLane::Read(target.clone()),
+                    &format!("delayed-{kind}-{read}"),
+                ));
+            }
+        }
+        let held = delayed.len() * WORKER_READS_PER_TARGET_MAX;
+        wait_for_lane_starts(&log, held).await;
+
+        // The forwarding places the silent hive leaves all go to the other hives' reads.
+        let others = WORKER_CONCURRENT_READS_MAX - WORKER_READS_PER_TARGET_MAX;
+        for hive in 0..others {
+            gates.push(run_gated(
+                &lanes,
+                &log,
+                &RequestLane::Read(ReadTarget::Hive(format!("otherbee{hive}"))),
+                &format!("other-{hive}"),
+            ));
+        }
+        wait_for_lane_starts(&log, held + others).await;
+
+        // One more of each kind waits: a forwarded read for a forwarding place, a fan-out for its
+        // own target's.
+        let mut waiting = vec![run_gated(
+            &lanes,
+            &log,
+            &RequestLane::Read(ReadTarget::Hive("latebee".to_string())),
+            "late-forward",
+        )];
+        for (kind, target) in delayed.iter().enumerate().skip(1) {
+            waiting.push(run_gated(
+                &lanes,
+                &log,
+                &RequestLane::Read(target.clone()),
+                &format!("late-fan-out-{kind}"),
+            ));
+        }
+        time::sleep(Duration::from_millis(50)).await;
+        let started = lane_started(&log);
+        assert_eq!(started.len(), held + others, "{started:?}");
+        assert!(
+            started.iter().all(|name| !name.starts_with("late-")),
+            "{started:?}"
+        );
+        for gate in gates.into_iter().chain(waiting) {
             let _ = gate.send(());
         }
     }
@@ -64782,6 +65689,7 @@ blob:
         unanswered.unit_checks = UnitChecks {
             activity: |_| ServiceActivity::Unknown,
             failed: |_| CheckAnswer::NoAnswer,
+            at_rest: |_| CheckAnswer::NoAnswer,
         };
         let core = serde_json::json!({ "node_name": "SY.timer@motherbee" });
         let ghost = serde_json::json!({ "node_name": "AI.ghost@motherbee" });

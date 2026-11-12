@@ -693,8 +693,9 @@ not read. Otherwise, with nothing removed:
     `RUNTIME_NOT_FOUND` while that copy does not list the runtime yet, `RUNTIME_MANIFEST_MISSING`
     without one; a 0.1.133 worker answers its nodes whatever its copy lists); or one that could
     not read its own nodes (`USAGE_UNREADABLE`: its nodes' folder, or the `config.json` of a node
-    whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its
-    config). A hive whose join the registry does not record as done also gets its `status`, its
+    whose unit runs, gives systemd no answer or, since 0.1.139, is on its way up or down in
+    systemd, as a crash loop's unit is between two restarts (FINDINGS A-310), which the detail
+    names: stop that node or fix its config). A hive whose join the registry does not record as done also gets its `status`, its
     `join_phase` and `next`: finish its join (`add_hive` again) or remove it (`remove_hive`). One
     whose join ended (its status `failed` or `interrupted`, or its record's phase `done`, as a
     failed join and the boot sweep of a cut one stamp it: `UnfinishedJoin::ended`) is read only
