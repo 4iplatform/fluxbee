@@ -275,6 +275,12 @@ const (
 	ScopeGlobal              = "global"
 )
 
+// MSGVaultSecretChanged is SY.vault's notice that a secret changed: a system message it broadcasts
+// to every node at each change, and at its start once for each secret it holds (the Rust SDK's
+// MSG_VAULT_SECRET_CHANGED, docs/nodes/sy-vault.md). SY.vault reads no answer to it, so a node
+// leaves it unanswered, whether it acts on it or not (SY.timer since 0.1.141, FINDINGS A-325).
+const MSGVaultSecretChanged = "VAULT_SECRET_CHANGED"
+
 // IsSystemKind reports whether a msg_type is the system kind, ignoring ASCII case, as the router
 // and the Rust SDK compare it (`is_system_kind`).
 func IsSystemKind(msgType string) bool {

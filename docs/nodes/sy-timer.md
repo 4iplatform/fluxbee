@@ -92,8 +92,9 @@ Rules enforced in `main.go`:
   (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line, bounded
   (`isInfrastructureMessage`; `timer_message_ignored`, Messages below).
   Nor does a notice or a reply from a node: `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a
-  name, any `*_RESPONSE`, a `NOT_TAKEN` or an agent's `<msg>.error`; wf-generic's rule, name by name,
-  and the AI nodes' but for the last two (FINDINGS A-218, A-329).
+  name, SY.vault's `VAULT_SECRET_CHANGED`, any `*_RESPONSE`, a `NOT_TAKEN` or an agent's
+  `<msg>.error`; wf-generic's rule, name by name, and the AI nodes' but for the vault's notice and
+  the last two (FINDINGS A-218, A-329, A-325).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
   `<kind>.<name>@<hive>`, with a dot before the `@` (`isCanonicalL2Name`).
 - **Target.** A node schedules for itself: a `target_l2_name` that names another node is
@@ -234,9 +235,12 @@ router made, `trace_id`; `ignoredLog`), bounded the same way in windows of its o
 | `NODE_STATUS_GET` | | answered `HEALTHY` (`BuildDefaultNodeStatusResponse`) |
 
 Any other verb gets `TIMER_UNKNOWN_VERB`; a notice or a reply gets no answer: one the router made,
-and from a node `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a name, any `*_RESPONSE`, a
-`NOT_TAKEN` or an agent's `<msg>.error` (`isInfrastructureMessage`, above; the last two since
-0.1.141, FINDINGS A-329). The router does not gate `TIMER_*` verbs: they are not in
+and from a node `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a name, SY.vault's
+`VAULT_SECRET_CHANGED`, any `*_RESPONSE`, a `NOT_TAKEN` or an agent's `<msg>.error`
+(`isInfrastructureMessage`, above; the last two since 0.1.141, FINDINGS A-329). The vault's notice,
+which SY.vault broadcasts to every node at each change of a secret and once for each secret at its
+start, since 0.1.141 too: before, each was answered `TIMER_UNKNOWN_VERB`, which SY.vault drops
+(FINDINGS A-325). SY.timer reads no secret. The router does not gate `TIMER_*` verbs: they are not in
 `PROTECTED_SYSTEM_ACTIONS` (`src/router/system_policy.rs`).
 
 Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_ABOVE_MAXIMUM`, `TIMER_LIMIT_EXCEEDED`,

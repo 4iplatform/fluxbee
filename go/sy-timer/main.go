@@ -375,12 +375,18 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 // isInfrastructureMessage reports whether msg gets no answer: the router made it (it carries no
 // routing.src_l2_name, which the router stamps on everything a node sends), or it is a notice or a
 // reply, not a request: HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED, a message without a
-// name, or a reply (fluxbeesdk.IsReplyName: any *_RESPONSE, a NOT_TAKEN, an agent's <msg>.error;
-// SY.timer awaits none). It is wf-generic's isNotice and neverAnswered, and the AI SDK's
-// is_infrastructure_message, name by name but for NOT_TAKEN and <msg>.error (FINDINGS A-218, A-329).
+// name, SY.vault's VAULT_SECRET_CHANGED, or a reply (fluxbeesdk.IsReplyName: any *_RESPONSE, a
+// NOT_TAKEN, an agent's <msg>.error; SY.timer awaits none). It is wf-generic's isNotice and
+// neverAnswered, and the AI SDK's is_infrastructure_message, name by name but for NOT_TAKEN and
+// <msg>.error (FINDINGS A-218, A-329) and VAULT_SECRET_CHANGED, which a WF leaves unanswered with
+// every system message that is none of its verbs, and ai.generic still answers (FINDINGS A-325).
 // An answer to the router's UNREACHABLE would go to the router's own UUID, which no node has: the
 // router would answer UNREACHABLE again, and the two would bounce it forever (a TIMER_FIRED for a
-// node not connected yet starts it). Before 0.1.141 a NOT_TAKEN was answered TIMER_UNKNOWN_VERB.
+// node not connected yet starts it). VAULT_SECRET_CHANGED is the notice SY.vault broadcasts to every
+// node at each change of a secret, and once for each secret at its start: SY.timer reads no secret,
+// and SY.vault reads no answer to it. Before 0.1.141 a NOT_TAKEN and a VAULT_SECRET_CHANGED were
+// answered TIMER_UNKNOWN_VERB: for the broadcast, one wasted message each change, which SY.vault
+// dropped (FINDINGS A-325).
 func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
 	if msg.SourceL2Name() == "" {
 		return true
@@ -392,7 +398,8 @@ func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
 		fluxbeesdk.MSGAnnounce,
 		fluxbeesdk.MSGWithdraw,
 		fluxbeesdk.MSGUnreachable,
-		fluxbeesdk.MSGTTLExceeded:
+		fluxbeesdk.MSGTTLExceeded,
+		fluxbeesdk.MSGVaultSecretChanged:
 		return true
 	}
 	return fluxbeesdk.IsReplyName(name)

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -186,6 +187,52 @@ func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
 				t.Fatalf("unexpected answer to an unknown verb: %+v", response)
 			}
 		})
+	}
+}
+
+// FINDINGS A-325: SY.vault's VAULT_SECRET_CHANGED, the notice it broadcasts to every node at each
+// change of a secret, and once for each secret at its start (meta.action bootstrap), gets no answer:
+// SY.timer reads no secret, and SY.vault reads no answer. It is logged as an ignored message, never
+// as a refused request. Before 0.1.141 each was answered TIMER_UNKNOWN_VERB, which SY.vault dropped.
+func TestTheVaultsSecretChangedBroadcastGetsNoAnswer(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	logged := captureLog(t)
+	// As SY.vault sends it (secret_changed_notices, src/bin/sy_vault.rs), with the router's stamp.
+	const change = `{"routing":{"src":"44444444-4444-4444-4444-444444444444","src_l2_name":"SY.vault@motherbee",` +
+		`"dst":"broadcast","ttl":16,"trace_id":"%s"},"meta":{"type":"system","msg":"VAULT_SECRET_CHANGED",` +
+		`"scope":"global"%s},"payload":{"op":"put","resource_type":"openai","tenant_id":"tnt:0d3c8e52",` +
+		`"general":true,"version":2,"key":"openai_api_key","hive_id":"motherbee","at_ms":1762958400000}}`
+	for _, tc := range []struct{ traceID, action string }{
+		{traceID: "trace-of-a-change"},
+		{traceID: "trace-of-the-start", action: `,"action":"bootstrap"`},
+	} {
+		var msg fluxbeesdk.Message
+		if err := json.Unmarshal([]byte(fmt.Sprintf(change, tc.traceID, tc.action)), &msg); err != nil {
+			t.Fatalf("decode the broadcast: %v", err)
+		}
+		if !msg.Routing.Dst.IsBroadcast() || stringValue(msg.Meta.Msg) != fluxbeesdk.MSGVaultSecretChanged {
+			t.Fatalf("not the vault's broadcast: %+v", msg)
+		}
+		if err := service.handleMessage(msg); err != nil {
+			t.Fatalf("handle: %v", err)
+		}
+	}
+	if len(tx) != 0 {
+		t.Fatalf("answered the vault's broadcast: %s", <-tx)
+	}
+	ignored := loggedEvents(t, logged, "timer_message_ignored")
+	if len(ignored) != 2 {
+		t.Fatalf("logged %d ignored messages, want the 2 broadcasts: %v", len(ignored), ignored)
+	}
+	for i, traceID := range []string{"trace-of-a-change", "trace-of-the-start"} {
+		want := map[string]any{"event": "timer_message_ignored", "msg": "VAULT_SECRET_CHANGED", "src_l2_name": "SY.vault@motherbee", "trace_id": traceID}
+		if fmt.Sprint(ignored[i]) != fmt.Sprint(want) {
+			t.Fatalf("broadcast %d logged %v, want %v", i, ignored[i], want)
+		}
+	}
+	if refused := loggedEvents(t, logged, "timer_request_refused"); len(refused) != 0 {
+		t.Fatalf("the vault's broadcast was logged as a refused request: %v", refused)
 	}
 }
 

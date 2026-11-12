@@ -476,8 +476,11 @@ assigned_ilks, general, version, key, hive_id, at_ms}` (`protocol.rs`). A consum
 also sends the notice to that edge as a unicast: the router lets only that unicast into the DMZ
 edge, never the broadcast (FINDINGS A-78). When SY.vault starts it broadcasts one for every
 secret with `meta.action` `bootstrap`: nothing changed, so a consumer whose reaction is costly (a
-restart) skips those. The Go SDK has no vault client. Details: [SY.vault](../nodes/sy-vault.md) and
-`docs/history/sy-vault-spec.md`.
+restart) skips those. The notice is never answered, whether the node acts on it or not: SY.vault
+reads no answer to it (SY.timer leaves it unanswered since 0.1.141; ai.generic still answers it
+with an error, FINDINGS A-325).
+The Go SDK has no vault client; it names the notice (`MSGVaultSecretChanged`, since 0.1.141).
+Details: [SY.vault](../nodes/sy-vault.md) and `docs/history/sy-vault-spec.md`.
 
 ### 6.8 Identity
 

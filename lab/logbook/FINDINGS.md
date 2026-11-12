@@ -483,7 +483,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
-- A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
+- A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change; its SY.timer sibling built on `coa/gosdk-141` for 0.1.141).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the operator's call of 2026-11-12, built on `coa/gosdk-141` for 0.1.141).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
@@ -2537,6 +2537,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** ai.generic leaves the broadcast unanswered, as the frontdesk does, or the AI SDK's
   notice list takes it (ai.generic's test changes with it); with ai.generic's or the AI SDK's next
   change.
+- **Its SY.timer sibling, built on `coa/gosdk-141` (the Go SDK's release, planned 0.1.141):** SY.timer
+  answered each broadcast `TIMER_UNKNOWN_VERB` the same way (`handleMessage`'s default arm,
+  `go/sy-timer/main.go`), and SY.vault dropped it. It now takes the broadcast as a notice
+  (`isInfrastructureMessage`, by the Go SDK's new `MSGVaultSecretChanged`): no answer, one
+  `timer_message_ignored` line bounded per sender, never a refusal's line; by
+  `TestTheVaultsSecretChangedBroadcastGetsNoAnswer` (a change's broadcast and a start's, in a
+  Linux container; it fails without the fix). The WF engine, SY.wf-rules and SY.opa.rules already
+  leave it unanswered (a system message that is none of their verbs). Left, read in the code: the
+  Go SDK's `NOT_TAKEN` `node_busy` (A-329) still answers it from a Go node whose system lane is
+  full, since `IsNoticeOrReply` does not name it.
 
 ### A-324 [General/admin] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.admin's help of `node_help`, read on 8.x, carries the new note: an AI node on ai.generic 0.1.136 or later answers at once however busy; the orchestrator's three are comments) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; since 0.1.136) — SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline
 
