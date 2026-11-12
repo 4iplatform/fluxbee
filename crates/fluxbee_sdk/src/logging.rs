@@ -13,6 +13,10 @@
 //!   one line of at most [`RECORD_MAX_BYTES`]: its control characters escaped as Rust's `Debug`
 //!   shows them (`\n`, `\r`, `\t`, `\0`, `\u{1b}`), a longer record cut. A record with neither
 //!   is written as the formatter made it.
+//! - **Two forms of an escape.** A record's message (and an error logged as `&dyn Error`) reaches
+//!   [`OneLine`] with its ESC, BEL, BS, FF and DEL already escaped in tracing-subscriber's own
+//!   form: `\x1b`, `\x07`, `\x08`, `\x0c`, `\x7f`. So the journal shows a message's ESC as `\x1b`
+//!   and a field's as `\u{1b}`: a search for one form misses the other.
 
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
@@ -81,8 +85,8 @@ pub struct OneLine<M> {
 }
 
 impl<M> OneLine<M> {
-    /// Each record goes to `out` as one line. `colour`: the formatter writes ANSI colour codes,
-    /// which then stay as they are; no other escape does.
+    /// Each record goes to `out` as one line. `colour`: the formatter writes ANSI colour codes;
+    /// every colour code then stays as it is, a field's too, and no other escape does.
     pub fn new(out: M, colour: bool) -> Self {
         Self { out, colour }
     }
@@ -144,9 +148,12 @@ impl<W: Write> Drop for RecordWriter<W> {
 /// [`RECORD_MAX_BYTES`].
 /// - Every control character in it (`char::is_control`: C0, DEL and C1) but its final newline is
 ///   escaped as Rust's `Debug` shows it: a newline or a NUL would end the journal's line there,
-///   and a carriage return or an escape would move a terminal's cursor.
-/// - With `colour`, its ANSI colour codes (`ESC [`, digits and `;`, `m`) stay as they are, the
-///   formatter's own that a terminal shows; no other escape does.
+///   and a carriage return or an escape would move a terminal's cursor. (A message's ESC, BEL,
+///   BS, FF and DEL come already escaped, by tracing-subscriber: see the module's doc.)
+/// - With `colour`, every ANSI colour code in it (`ESC [`, digits and `;`, `m`) stays as it is:
+///   the formatter's, and a field's too, which on the terminal can recolour or hide (`ESC [8m`)
+///   the rest of its line; nothing here tells them apart. A cursor's move, a line's erase and
+///   every other escape are escaped.
 /// - A longer record is cut at the end of a piece (a character, an escape or a colour code) and
 ///   ends with `... (cut: N bytes)`, N the bytes it had.
 ///
@@ -401,8 +408,8 @@ mod tests {
         assert_eq!(line("x\r\n", false), "x\\r\n");
     }
 
-    /// On a terminal the formatter's colour codes stay; no other escape does (a cursor's move, a
-    /// line's erase, a title's set), and in the journal none does.
+    /// On a terminal every colour code stays, the formatter's and a field's alike; no other escape
+    /// does (a cursor's move, a line's erase, a title's set), and in the journal none does.
     #[test]
     fn on_a_terminal_colour_codes_stay_and_no_other_escape_does() {
         let record = "\u{1b}[2m2026-11-12T03:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m x=1\u{1b}[1A\u{1b}[2K\u{1b}]0;t\u{7}\u{1b}[1;31mred\u{1b}[0m\u{1b}[\n";
@@ -411,6 +418,35 @@ mod tests {
             "\u{1b}[2m2026-11-12T03:00:00.000000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m x=1\\u{1b}[1A\\u{1b}[2K\\u{1b}]0;t\\u{7}\u{1b}[1;31mred\u{1b}[0m\\u{1b}[\n"
         );
         assert!(!line(record, false).contains('\u{1b}'));
+    }
+
+    /// What the docs say a reader finds, through what `fmt` builds: a message's ESC, BEL, BS, FF
+    /// and DEL in tracing-subscriber's form (`\x1b`), its newline and a field's control characters
+    /// in `Debug`'s (`\u{1b}`); on a terminal a field's colour code passes, its other escapes not.
+    #[test]
+    fn a_message_and_a_field_show_their_escapes_as_the_docs_say() {
+        for colour in [false, true] {
+            let journal = Journal::default();
+            let subscriber = fmt_to(journal.out(), colour).finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(
+                    f = %"x\u{1b}[8my\u{7}z\u{1b}[2K",
+                    "m \u{1b}[31m \u{7} \u{8} \u{c} \u{7f} \n end"
+                );
+            });
+            let text = journal.text();
+            assert_eq!(text.matches('\n').count(), 1, "{colour}: {text:?}");
+            assert!(
+                text.contains(r"m \x1b[31m \x07 \x08 \x0c \x7f \n end"),
+                "{colour}: {text:?}"
+            );
+            let field = if colour {
+                "x\u{1b}[8my\\u{7}z\\u{1b}[2K"
+            } else {
+                r"x\u{1b}[8my\u{7}z\u{1b}[2K"
+            };
+            assert!(text.contains(field), "{colour}: {text:?}");
+        }
     }
 
     /// The cut keeps whole pieces, as many as leave room for its marker: never part of an escape,

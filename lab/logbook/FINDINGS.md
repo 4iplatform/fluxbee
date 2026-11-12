@@ -5445,9 +5445,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `\t`, `\0`, `\u{1b}`), and cuts a record past 16 KiB (`RECORD_MAX_BYTES`, its newline
     included, a third of journald's default `LineMax`) after a whole character or escape, its line
     ending `... (cut: N bytes)`, N the bytes it had. A record with neither is written as the
-    formatter made it, byte for byte, so every line seen today keeps its shape. On a terminal,
-    where the lines carry colour (A-31), the colour codes (`ESC [` ... `m`) stay and no other
-    escape does.
+    formatter made it, byte for byte, so every line seen today keeps its shape. A record's message
+    comes to it with its ESC, BEL, BS, FF and DEL already escaped in tracing-subscriber's own form
+    (`\x1b`, `\x07`, `\x08`, `\x0c`, `\x7f`), so the journal shows a message's ESC as `\x1b` and a
+    field's as `\u{1b}` (the review, 2026-11-12; the docs name both forms). On a terminal,
+    where the lines carry colour (A-31), every colour code (`ESC [` ... `m`) stays, a field's too,
+    which can recolour or hide the rest of its line there (a binary run by hand; under systemd
+    every escape is escaped), and no other escape does.
   - **Every Rust binary.** Each starts its subscriber with `logging::fmt()`: the router, every SY
     node in Rust, the diagnostic binaries, and the IO, AI, gov and test nodes. SY.edge, whose
     filter reloads live and which built its own `fmt::layer()`, takes `logging::layer()`, the same
@@ -5467,8 +5471,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     with the record written as it came it is two lines, the second the forged alarm with
     `expired: 99999`), the message and a span's field, SY.edge's layered setup, a record past
     16 KiB, every control character, the colour codes, the cut after a whole piece, the 16 KiB
-    boundary and a record written in pieces. 10 of the 12 fail with the record written as it came;
-    the other two pin what stays (a record with no control character, a writer that got nothing).
+    boundary, a record written in pieces, and what the docs say a reader finds
+    (`a_message_and_a_field_show_their_escapes_as_the_docs_say`, the review's: a message's escapes
+    in tracing-subscriber's form and a field's in `Debug`'s, through `fmt()`, and on a terminal a
+    field's colour code kept, its other escapes not). 11 of the 13 fail with the record written as
+    it came; the other two pin what stays (a record with no control character, a writer that got
+    nothing).
   - **Docs:** the SDK's README, `docs/reference/operations.md` (the journal's row) and
     `docs/nodes/rt-gateway.md` (what `lab/ops.py health` counts).
   - **Not covered:** the Go nodes (SY.timer, SY.wf-rules, SY.opa.rules, the WF engine) print
