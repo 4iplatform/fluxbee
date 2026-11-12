@@ -214,6 +214,18 @@ no change required
     **0.1.133 deployed 2026-11-11, and its gate found A-314 (🔴, no node can be launched): 0.1.134 is
     the orchestrator's hotfix alone, so the router is 0.1.135, the AI SDK 0.1.136 and the sweep's
     binaries 0.1.137 (the cut-off above moves with them).**
+25. **0.1.133, one branch per binary, and 0.1.134, the orchestrator's hotfix** ✅ 0.1.134 live, both
+    checked on 8.x (2026-11-11): 0.1.133 shipped A-191 (system ILKs retired, never deleted) with
+    A-232, A-240 (a status read writes nothing), A-241 (a worker cleans its own blob staging:
+    **[A-241 RESULT PENDING]**), A-255 (the edge applied to the running IO.cloud, checked live with
+    a rotation of the Cloud's token), A-258, A-259 and A-266 (SY.timer 1.6), A-260 and A-274 (the
+    publication lock free while an edge hangs), A-267 and A-271 (a check with no answer acts on
+    nothing), A-270, A-279 with A-288 (Archi's SCMD reads), A-281 (no version removed while a hive's
+    use of it was not read) and A-285's texts. **Found by its gate:** A-314 (🔴, on the hives'
+    systemd 255 a node unit systemd does not have read as no answer: no node could be launched),
+    fixed forward the same evening by 0.1.134, the orchestrator alone, with its review's guard
+    (`kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name); A-315 [Archi], low;
+    A-308 seen live. **Next:** 0.1.135, the router alone (A-272, A-268).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -295,8 +307,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-149 🟡 The family has no written standard, and its nodes answer health and config each their
   own way.
 - A-114 🟡 No IO node writes first to a person; io.api delivers no answer at all.
-- A-255 🔴 A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its
-  restart.
 - A-256 🔵 io.cloud accepts `io.inbound_family` and ignores it (low; with A-149).
 - **io.slack:**
   - A-136 🟡 One interlocutor's conversation is split by where they write in Slack.
@@ -316,7 +326,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - A-175 🟡 A spoke's drift alerts stay on the spoke: with the system's log, later (the operator,
   2026-11-08; router-stream-v1 §8).
-- A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
 - The sweep's calls, decided by the operator on 2026-11-10: A-211 ✅ 0.1.124; A-212 to A-217 ✅
@@ -324,38 +333,24 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-240 🔵 A local get_node_status writes on every read (low).
-- A-241 🔵 A spoke's blob staging is never cleaned (low, to decide).
 - A-243 🔵 Who can take a page down: each publisher its own (the operator, 2026-11-11; SY.admin in 0.1.136; the Cloud with its track).
 - A-257 🔵 The frontdesk's handoff waits behind its LLM turns (low; the AI SDK).
-- A-258 🔵 SY.timer's refusals leave no line in its own log (low).
-- A-259 🔵 SY.timer's scheduler keeps a canceled or moved timer's entry until its old fire time (low).
-- A-260 🔵 The expiry sweep holds the publication lock while an edge or IO.blob does not answer (low).
 - A-263 🔵 The installation update's follow reads one hive at a time (low; with A-250's gate).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
-- A-266 🔵 `TIMER_LIST` says nothing of the timers its `limit` left out (low; SY.timer).
-- A-267 🔵 The watchdog's last tick during the orchestrator's own stop reads a healthy service as down (low).
 - A-268 🔵 Two FIB builds at once can store the older one last (low; the router).
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
-- A-270 🔵 `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances (low; SY.wf-rules; with A-240 in 0.1.133).
-- A-271 🔵 A check that decides an action takes "no answer" for "no": A-267's class, left in the orchestrator (low).
 - A-272 🔵 Every router sends a WAN broadcast back to the peer it came from (low; the router).
 - A-273 🔵 `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door open and its new token lost (low; decided 2026-11-11; SY.admin in 0.1.136).
-- A-274 🔵 A take-down holds the publication lock across its edge and IO.blob calls (low; SY.admin).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-277 🔵 A removed hive whose identity key could not be deleted keeps reading the identity store (low; decided 2026-11-11; SY.identity in 0.1.136).
 - A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
-- A-279 🔵 Archi's timer list passes its query undecoded (low; SY.architect; with A-266 in 0.1.133).
 - A-280 🔵 A publish holds the publication lock across its curate and the edge's publish (low; the small fix, SY.admin in 0.1.136).
-- A-281 🟡 `remove_runtime_version` removes a version whose usage it could not read (medium; SY.admin, the orchestrator and SY.wf-rules' delete; with A-271's class in 0.1.133).
 - A-282 🔵 A replaced binary is taken for current when `systemctl show` gives no answer (low; the orchestrator; built for 0.1.136; decided 2026-11-11: restart on no answer only with a replaced binary).
 - A-283 🔵 The Syncthing watchdog waits on an API that never answers, and never repairs it (low; decided 2026-11-11: a bounded restart, a refused API port included; the orchestrator in 0.1.136).
 - A-284 🔵 The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame (low; wf-generic and SY.wf-rules).
-- A-285 🔵 The texts Archi and Cloud read do not describe 0.1.133's new answers (low; SY.admin and SY.architect in 0.1.133; the SDK's catalog later).
 - A-286 🔵 Archi's SCMD reads take `+` for a space where SY.admin keeps it (low; SY.architect).
 - A-287 🔵 Archi's SCMD paths go to SY.admin undecoded: `AI.sales%40worker1` matches no node (low; SY.architect).
-- A-288 🔵 Archi's SCMD reads of deployments and drift alerts drop their query (low; SY.architect; with A-279 in 0.1.133).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
 - A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
@@ -375,13 +370,13 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin).
 - A-306 🔵 A version's removal holds the manifest lock through its read of every hive's use; a publish waits with no bound (low; SY.admin).
 - A-307 🔵 SY.wf-rules handles one request at a time; a queued request starts its 60 s late (low; SY.wf-rules; to decide).
-- A-308 🔵 Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer (low; the orchestrator).
+- A-308 🔵 Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer (low; the orchestrator; seen live by 0.1.133's gate).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-310 🔵 Runtime retention skips a node config it cannot read, and can delete a version only that node pins (low; the orchestrator).
 - A-311 🔵 `get_hive` reads any file named `info.yaml` its hive id leads to (low; widened by 0.1.136's A-287, so the orchestrator's fix ships with 0.1.136).
 - A-312 🔵 A version with build metadata (`1.2.0+b1`) breaks every node built on it and cannot be removed (low; the runtimes).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide).
-- A-314 🔴 A node unit systemd does not have reads as no answer: no node can be launched on 8.x (since 0.1.133; the orchestrator's hotfix, 0.1.134).
+- A-315 🔵 SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes` (low; SY.admin and SY.architect; found by 0.1.133's gate).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1459,7 +1454,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-314 [General/orchestrator] 🔴 (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
+### A-315 [Archi] 🔵 low (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
+
+- **Seen:** 0.1.133's gate read SY.admin's per-action HELP for the answers 0.1.133 added (A-285):
+  each is named, but `hives_without_runtimes` is named nowhere in SY.admin's help nor in Archi's
+  handbook (`docs/archi/handbook_fluxbee.md`). In `src/bin/sy_admin.rs` only a test names it;
+  `docs/nodes/sy-admin.md` and `docs/reference/operations.md` do.
+- **Why:** A-281 (0.1.133) lists every ingress and egress of a runtime's use across the hives
+  (`get_runtime`, and the read `remove_runtime_version` decides on) in `hives_without_runtimes`, by
+  the role the hive registry records, where they were in `skipped_hives`; A-285's texts named the
+  new codes, not this field.
+- **Effect:** Archi reading a runtime's use sees a field its texts do not explain: the ingress and
+  the egress listed apart, neither counted nor skipped. Nothing is refused or removed by it.
+- **Fix, later:** SY.admin's help for `get_runtime` and `remove_runtime_version`, and Archi's
+  handbook, name the field and what it means.
+
+### A-314 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.134, 2026-11-11; a new node launched and killed in 9.8 s, the stopped nodes with no unit read `STOPPED`, a core node's kill refused `INVALID_REQUEST`) (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
 
 - **Seen on 8.x (0.1.133, 2026-11-11 22:41Z):** a `run_node` of `AI.gate0233@worker1` answered
   `SERVICE_FAILED` *"systemctl did not answer whether the node's unit runs, asked again; the node
@@ -1498,6 +1508,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   warnings, as in 0.1.132 (only a broken install; none on 8.x). The releases planned after it move
   by one: the router 0.1.135, the AI SDK 0.1.136, the sweep's binaries 0.1.137 (their texts that
   say 0.1.136 change at their integration).
+- **Checked on 8.x (0.1.134, 23:33Z):** `run_node` of `AI.gate0233@worker1` ok and its kill (ILK
+  kept) ok, 9.8 s in all; the three gate0192 nodes and `AI.gate0233` read `STOPPED`; ai.generic's
+  use lists only `AI.pruebas@worker1`, skipped none, `hives_without_runtimes` egress1 and ingress1
+  (1.4 s); `kill_node` of `SY.gate0233@motherbee` answered `INVALID_REQUEST` (*"SY.* nodes are core
+  nodes: they run under their own unit and are never stopped, purged or removed as a managed
+  node"*). Before the deploy no node on the motherbee or worker1 had `relaunch_on_boot` true with
+  its unit gone, so 0.1.134's reconcile launched nothing unexpected.
 
 ### A-313 [General/orchestrator] 🔵 low (found 2026-11-11 by A-283's second review; read in the code; there before it; to decide) — A Syncthing that cannot come up holds the whole watchdog about 35 s a tick
 
@@ -1576,7 +1593,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** a drop guard that removes the entry and marks the trace stale, in a release of
   the Rust SDK of its own (METHOD §9), with the SDK's lows.
 
-### A-308 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it) — Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer
+### A-308 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; there before it; seen live by 0.1.133's gate) — Fluxbee Cloud's `list_nodes` can wait behind `/versions` while a worker does not answer
 
 - **Why:** `read_target` maps `list_versions` and `list_tenant_nodes` to the same
   `ReadTarget::EveryHive` (`src/bin/sy_orchestrator.rs` ~1495), 4 places; `list_versions_flow`
@@ -1586,6 +1603,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   past the Cloud's 20 s.
 - **Fix, later:** a target of its own for `list_tenant_nodes`, as 0.1.133 gives the runtime reads
   (`ReadTarget::RuntimeUse`), or `list_versions` asks every hive at once with a 10 s bound.
+- **Seen live (0.1.133's gate, 2026-11-11):** with worker1's orchestrator SIGSTOPped, 4 `GET
+  /versions` held 30.8 to 31.3 s each; the Cloud's `list_nodes` for `pruebas`, started while they
+  held, answered `TIMEOUT` at 31.8 s. With only 4 runtime reads in flight it answered in 13.1 s,
+  worker1 in `unreachable_hives` (`NODE_LIST_FAILED`, 10 s).
 
 ### A-307 [WF/wf-rules] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it, longer since 0.1.133) — SY.wf-rules handles one request at a time, and a request queued behind another starts its 60 s late
 
@@ -1858,7 +1879,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, if the mode is ever supported:** a router that is not the gateway hands no IRP copy toward
   the WAN.
 
-### A-288 [Archi] 🔵 low (found 2026-11-11 by A-279's review; read in the code; there before it) — Archi's SCMD reads of deployments and drift alerts drop their query
+### A-288 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; through Archi, the drift alerts' severity filter and the deployments' hive filter kept: 2 and 3 entries, 50 and 48 on 0.1.132) (found 2026-11-11 by A-279's review; read in the code; there before it) — Archi's SCMD reads of deployments and drift alerts drop their query
 
 - **Why:** the SCMD arms of `GET /deployments`, `/drift-alerts`, `/hives/{hive}/deployments` and
   `/hives/{hive}/drift-alerts` (`src/bin/sy_architect.rs` ~13578, ~13584, ~14093, ~14099 on A-279's
@@ -1873,6 +1894,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   it:** the SCMD of `DELETE /hives/{hive}/taps` read the tap's key from the body only, while SY.admin's
   route and its `delete_tap` example name it in the query, so the example reached SY.config.routes
   empty and was refused `NOT_FOUND`; it now reads the query when the body names none.
+- **Checked on 8.x (0.1.133, against 0.1.132):** through Archi, the drift alerts' severity filter
+  and the deployments' hive filter are kept: 2 and 3 entries, where 0.1.132 answered 50 and 48.
 
 ### A-287 [Archi] 🔵 low (found 2026-11-11 by A-279's builder; read in the code; there before it) — Archi's SCMD paths go to SY.admin undecoded: `AI.sales%40worker1` matches no node
 
@@ -1901,7 +1924,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   HTTP `query_param` keeps its reading.
 - **Built on `coa/architect-136` (0.1.136):** the SCMD reads keep `+`, as SY.admin does.
 
-### A-285 [Archi] 🔵 low (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
+### A-285 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.admin's help names each new answer, all missing on 0.1.132) · the Cloud catalog's text (`cloud.rs`) with the Rust SDK's next change (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
 
 - **`delete_workflow` (A-270):** a WF node that is not RUNNING, or whose instances cannot be
   counted, now needs `force` or a start first, and a config read with no answer is
@@ -1917,6 +1940,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   orchestrator lists since A-271.
 - **Fix:** SY.admin's and SY.architect's texts in 0.1.133 with A-281; `cloud.rs` with the SDK's
   next release.
+- **Checked on 8.x (0.1.133):** SY.admin's HELP names `retryable` (`kill_node`, `run_node`,
+  `start_node`, `remove_node_instance`), `UNKNOWN` (`get_node_status`), `RUNNING`,
+  `wf_rules_get_status` and `packages_left` (`wf_rules_delete`), 1000 (`timer_list`),
+  `INVENTORY_UNAVAILABLE` (`teardown_node`), and `RUNTIME_USAGE_UNKNOWN`, `NO_USAGE` and
+  `USAGE_UNREADABLE` (`remove_runtime_version`), each missing on 0.1.132. Named neither there nor in
+  Archi's handbook: `hives_without_runtimes` (A-315).
 
 ### A-284 [WF/wf-generic] 🔵 low (found 2026-11-11 by A-270's review; read in the code) — The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame
 
@@ -2007,7 +2036,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   upgrade replaced and, beside them, the listed ones with no answer; any other start, `systemctl
   restart sy-orchestrator` included, restarts none.
 
-### A-281 [General/admin] 🟡 medium (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — `remove_runtime_version` removes a version whose usage it could not read
+### A-281 [General/admin] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; with worker1 not read, a version's removal refused `RUNTIME_USAGE_UNKNOWN` naming it, nothing removed; the ingress and the egress in `hives_without_runtimes`; a workflow's delete ok naming its `packages_left`) (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — `remove_runtime_version` removes a version whose usage it could not read
 
 - **Why:** `handle_remove_runtime_version` (`src/bin/sy_admin.rs` ~19422-19470) refuses only when
   `usage_global_visible.running_nodes` is not empty, and `query_runtime_usage_global_visible`
@@ -2088,6 +2117,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `teardown_node` refuses 503 `INVENTORY_UNAVAILABLE`, nothing removed, for a node whose hive the
   LSA holds stale (or does not list) while the registry still lists it; before, it removed the
   node's secrets and purged its ILK.
+- **Checked on 8.x (0.1.133):** `get_runtime`'s use skipped egress1 and ingress1
+  `RUNTIME_MANIFEST_MISSING` on 0.1.132 (2.8 to 3.2 s); on 0.1.133 it skipped none and listed them
+  in `hives_without_runtimes` (1.1 to 1.5 s). With worker1's orchestrator stopped, the removal of
+  io.slack 0.1.14 (unused) was refused `RUNTIME_USAGE_UNKNOWN` naming worker1 `UNREACHABLE`,
+  retryable, in 1.5 s, nothing removed; SIGSTOPped, it named worker1 `TIMEOUT` (*"no answer within
+  10 s"*) in 12.8 s. In the lanes, worker1's orchestrator SIGSTOPped: 4 `GET /versions` held 30.8 to
+  31.3 s, a removal started 3 s after them answered in 11.2 s, `/hive/status` in 1.4 s, 4 runtime
+  reads in 11.2 to 11.9 s (the Cloud's `list_nodes` behind the `/versions`: A-308). Workflows
+  deleted right after their deploy answered ok with `packages_left` [] (2.7 and 3.2 s; the lagging
+  copy not reproduced live, its test covers it); with worker1's orchestrator stopped, two deletes
+  answered ok in about 3 s naming `packages_left` (0.0.1 `RUNTIME_USAGE_UNKNOWN`, 0.0.2
+  `PURGE_STOPPED`, both retryable) with the warning, one deployed again over its leftovers ran
+  0.0.3, and once worker1 answered the leftovers went (a current version first refused
+  `RUNTIME_CURRENT_CONFLICT`). `teardown_node` of `AI.gate0233@worker1` with worker1's orchestrator
+  and router stopped 43 s: 503 `INVENTORY_UNAVAILABLE`, nothing removed, its ILK kept. io.slack
+  0.1.14 removed with every hive up (3.1 s).
 
 ### A-280 [General/admin] 🔵 low (found 2026-11-11 by A-274's review; read in the code; there before it) — A publish holds the publication lock across its curate and the edge's publish, and on its failure paths across a clean-up its budget does not bound
 
@@ -2110,7 +2155,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-11):** the small fix: the failure path's clean-up inside the
   budget or outside the lock; a publish that succeeds is unchanged. In 0.1.136 (SY.admin).
 
-### A-279 [Archi] 🔵 low (found 2026-11-11 by A-266's review; read in the code; there before it) — Archi's timer list passes its query undecoded, so a cursor or an owner it encoded is refused
+### A-279 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; through Archi, a timer cursor written `%3A` and an owner `%40` page, where 0.1.132 refused them) (found 2026-11-11 by A-266's review; read in the code; there before it) — Archi's timer list passes its query undecoded, so a cursor or an owner it encoded is refused
 
 - **Why:** SY.architect's SCMD translation of `GET /hives/{hive}/timer/timers`
   (`src/bin/sy_architect.rs` ~14104-14130) copies `cursor`, `owner_l2_name` and `status_filter`
@@ -2126,6 +2171,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Found and fixed with it (A-279's builder):** `percent_decode_simple` sliced the text at byte
   offsets, so a `%` before a character of more than one byte (`%aé`) panicked the request's task
   (no answer; the process stays up), and `%+A` decoded to a newline.
+- **Checked on 8.x (0.1.133, against 0.1.132):** through Archi's SCMD reads, a timer cursor written
+  `%3A` or `%3a` pages (0.1.132: `TIMER_INVALID_PAYLOAD`), `%253A` is still refused, an owner
+  written `%40` works; a broken escape in `list_nodes`' cursor answers `INVALID_CURSOR` as JSON
+  (0.1.132: no JSON); a path in quotes works (0.1.132: `SCMD_EXECUTION_FAILED`).
 
 ### A-278 [WF/Go SDK] 🔵 medium (found 2026-11-11 by A-266's builder and review; read in the code; there before it) — A WF with more than 1000 pending timers cannot reconcile them
 
@@ -2193,7 +2242,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   deleting (A-159) takes it. **A conflict to settle there:** a node's purge (`kill_node` with
   `purge_instance`, then `teardown_node`) deletes the node's secrets and purges its ILK today.
 
-### A-274 [General/admin] 🔵 low (found 2026-11-11 by A-260's builder; read in the code; there before it) — A take-down holds the publication lock across its edge and IO.blob calls
+### A-274 [General/admin] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; with the edge stopped, take-downs not waiting on it answered in 1.4 s; of two take-downs of one page, one wrote and the other wrote nothing over it) (found 2026-11-11 by A-260's builder; read in the code; there before it) — A take-down holds the publication lock across its edge and IO.blob calls
 
 - **Why:** `take_down_publication` (`src/bin/sy_admin.rs` ~6919) is called with the publication
   ledger held (`&mut AdminPublicationLedger`) and awaits the edge's unpublish and IO.blob's release,
@@ -2203,6 +2252,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   60 s, and the factory reset takes its pages down one after another.
 - **Fix:** A-260's split: the calls outside the lock, the write under it only while the row is
   still at the state read.
+- **Checked on 8.x (0.1.133, with A-260):** with `SY.edge@ingress1` SIGSTOPped 48 s, two take-downs
+  waited on it (`EDGE_UNPUBLISH_FAILED` at 31 s) while take-downs of an unknown page answered
+  `NOT_FOUND` in 1.4 s, twice; after the edge went on, two take-downs of one page sent together: one
+  took it down (8.2 s), the other wrote nothing over it (7.9 s, *"another writer took the page down
+  meanwhile"*).
 
 ### A-273 [General/admin] 🔵 low (found 2026-11-11 by A-255's builder; read in the code; there before it) — `publish_cloud_endpoint` answers `CONFIG_RECORD_FAILED` with the door already open and its new token lost
 
@@ -2230,7 +2284,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one
   it came from (a spoke, with the hub its only peer, sends none).
 
-### A-271 [General/orchestrator] 🔵 low (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — A check that decides an action takes "no answer" for "no"
+### A-271 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; 20 self-restarts on worker1 and egress1 acted on no check; its reading of a unit systemd does not have as no answer was A-314, fixed in 0.1.134) (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — A check that decides an action takes "no answer" for "no"
 
 - **Why:** A-267 fixed this in `systemd_is_active` only (a killed or failed `systemctl is-active`
   read as "not running"). The same two-state reading is in other checks of
@@ -2251,8 +2305,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   deploy), or a systemctl, nft or curl that fails for another reason.
 - **Fix:** a tri-state per check (yes, no, no answer), where only "no" acts, as A-267 did; each
   caller says what "no answer" means to it.
+- **Checked on 8.x (0.1.133, with A-267, run on 0.1.134):** 20 self-restarts of `sy-orchestrator` on
+  worker1 and egress1, debug on: no unit restarted or started meanwhile, and no *"did not answer"*,
+  *"nft table missing"* or *"syncthing unhealthy"* line. Its reading of `systemctl is-active`'s exit
+  4 as no answer was A-314 on the hives' systemd 255: no node could be launched on 0.1.133, fixed
+  forward by 0.1.134.
 
-### A-270 [WF/SY.wf-rules] 🔵 low (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances
+### A-270 [WF/SY.wf-rules] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; a stopped WF node's delete without force refused `INSTANCES_UNKNOWN`, with force done) (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — `delete_workflow` without force takes a WF node that is not RUNNING for one with no instances
 
 - **Why:** `inspectWFNode` (`go/sy-wf-rules/node/status.go` ~137-146) returns no instance count
   when `get_node_status` answers any `lifecycle_state` but `RUNNING`, or fails with anything but a
@@ -2266,6 +2325,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** without force, a WF node whose config exists and that is not `RUNNING`, or whose status
   read failed, is answered `INSTANCES_UNKNOWN` (its state named, and "delete with force to remove it
   anyway").
+- **Checked on 8.x (0.1.133):** `WF.gate0233@worker1` deployed (5 s) and killed without purge
+  (`STOPPED`); `delete_workflow` without force answered `INSTANCES_UNKNOWN` (*"the wf node is
+  STOPPED, not RUNNING (delete with force to remove it anyway)"*); with force, ok.
 
 ### A-269 [General/router] 🔵 low (found 2026-11-11 by the review fixes of the router's A-253; read in the code) — The router takes any node name and logs it unescaped: a local node can write a line of its own into the router's journal
 
@@ -2299,7 +2361,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   only a newer build is stored; or a mutex taken first that serializes the builds, after checking
   that no caller holds their inputs.
 
-### A-267 [General/orchestrator] 🔵 low (found 2026-11-11 by 0.1.131's deploy timeline; seen on 8.x, read in the code) — The watchdog's last tick, during the orchestrator's own stop, reads a healthy service as down and tries to start it
+### A-267 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; 20 self-restarts of the orchestrator on worker1 and egress1: no service started, no false line) (found 2026-11-11 by 0.1.131's deploy timeline; seen on 8.x, read in the code) — The watchdog's last tick, during the orchestrator's own stop, reads a healthy service as down and tries to start it
 
 - **Seen:** worker1's old orchestrator logged *"service not active; attempting restart"* for
   `sy-opa-rules` at 06:27:42, the moment its own self-restart began, while sy-opa-rules had been
@@ -2312,8 +2374,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   if the stop does not kill that call first.
 - **Fix:** active only on exit 0, inactive only on systemctl's "inactive" exit (3); a killed or
   failed check is unknown and starts nothing.
+- **Checked on 8.x (0.1.133, with A-271, run on 0.1.134):** 20 self-restarts of `sy-orchestrator` at
+  staggered offsets, debug on, on worker1 (23:47 to 23:48Z) and egress1 (23:48 to 23:50Z): no unit
+  restarted or started meanwhile, and no *"service not active; attempting restart"* line. Stopped on
+  worker1, `sy-opa-rules` came back in 3.3 s and `fluxbee-syncthing` in 3.5 s, each with the
+  orchestrator's line.
 
-### A-266 [General/SY.timer] 🔵 low (found 2026-11-11 by 0.1.131's gate; seen on 8.x, read in the code) — `TIMER_LIST` says nothing of the timers its `limit` left out
+### A-266 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; `limit` 1 gave `next_cursor`; pages of 7 listed 355 rows, all distinct) (found 2026-11-11 by 0.1.131's gate; seen on 8.x, read in the code) — `TIMER_LIST` says nothing of the timers its `limit` left out
 
 - **Seen:** `GET /hives/motherbee/timer/timers?status_filter=all&limit=1` listed one of the
   motherbee's three timers and gave no `next_cursor`.
@@ -2325,6 +2392,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   SDK's `List`, the WF's reconcile included, stops at its own limit the same way.
 - **Fix:** read one row more than the limit and, when it is there, answer the cursor of the last
   row listed.
+- **Checked on 8.x (0.1.133):** `TIMER_LIST` with `limit` 1 answered `next_cursor`; pages of 7
+  listed 355 rows in 51 pages, 355 distinct; one page of 1000 was cut by the frame at 80 rows, with
+  `next_cursor`.
 
 ### A-265 [General/router] ✅ VALIDATED ON 8.x (0.1.132, 2026-11-11; a new node on worker1 reached by name from ingress1 0.33 s after its connect, 5.98 s on 0.1.131) (found 2026-11-11 by the review fixes of the router's A-195; read in the code) — The hub does not rebuild its FIB when it applies a spoke's LSA
 
@@ -2386,7 +2456,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** `refresh_lsa` stores a read only if its heartbeat is not older than the stored one's;
   `write_lsa_state` takes the writer's lock before it reads.
 
-### A-260 [General/admin] 🔵 low (found 2026-11-10 by A-242's builder; read in the code; there before it) — The expiry sweep holds the publication lock while an edge or IO.blob does not answer
+### A-260 [General/admin] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; with the edge stopped 48 s, the sweep deferred one retire and retired it at its next pass, and take-downs not waiting on the edge answered in 1.4 s) (found 2026-11-10 by A-242's builder; read in the code; there before it) — The expiry sweep holds the publication lock while an edge or IO.blob does not answer
 
 - **Why:** `retire_expired_publication` (`src/bin/sy_admin.rs` ~7731) holds `publication_lock`
   across `unpublish_edge_blob` (a 30 s bound) and `release_curated_blob`. A-242 removed only the
@@ -2396,8 +2466,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   110 s, and take-downs (Archi's, the factory reset's) queue.
 - **Fix:** the edge's and IO.blob's calls outside the lock (copy the record, call, then lock again,
   reload and check before writing each state), or a much shorter bound for the sweep's calls.
+- **Checked on 8.x (0.1.133, with A-274):** 5 pages published as `AI.gate0233@worker1` (13.5 to 16.3
+  s each); with `SY.edge@ingress1` SIGSTOPped 48 s, take-downs of an unknown page answered
+  `NOT_FOUND` in 1.4 s, twice, while two take-downs waited on the edge, and the expiry sweep
+  deferred one retire on the edge's timeout and retired it at its next pass. At the end all five
+  pages were expired or taken down, and released.
 
-### A-259 [General/SY.timer] 🔵 low (found 2026-11-10 by A-244's review; read in the code; there before it) — SY.timer's scheduler keeps a canceled, moved or purged timer's entry until its old fire time
+### A-259 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; canceled timers never fired, moved ones fired once, a canceled recurring one stopped) (found 2026-11-10 by A-244's review; read in the code; there before it) — SY.timer's scheduler keeps a canceled, moved or purged timer's entry until its old fire time
 
 - **Why:** nothing removes a heap entry: the only calls are `heap.Push` and `heap.Pop`
   (`go/sy-timer/scheduler.go` ~599, ~613). `TIMER_CANCEL` only signals the scheduler (`main.go`
@@ -2411,13 +2486,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   to a separate error line.
 - **Fix:** a map from a timer's uuid to its heap entry (`timerHeapEntry.index` is kept already) and
   `heap.Remove` on cancel, reschedule and purge.
+- **Checked on 8.x (0.1.133, against a regression):** two one-shots per hive scheduled 15 and 16 min
+  ahead before the deploy were loaded again at SY.timer's restart; the ones canceled after the
+  deploy never fired, the others fired once on time (the motherbee 22:49:17Z, 15 ms late; worker1
+  22:49:34Z, 497 ms late). On worker1, a timer moved earlier (6 to 2 min) and one moved later (2 to
+  4 min) fired once each, the canceled one never, and a recurring one fired 5 times and not in the
+  75 s after its cancel; no `timer_fire_dropped` line.
 
-### A-258 [General/SY.timer] 🔵 low (found 2026-11-10 by A-254's triage; read in the code) — SY.timer's refusals leave no line in its own log
+### A-258 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.timer 1.6: 12 refusals gave 10 lines and a summary, no cursor text) (found 2026-11-10 by A-254's triage; read in the code) — SY.timer's refusals leave no line in its own log
 
 - A request SY.timer refuses (`TIMER_BELOW_MINIMUM`, `TIMER_FORBIDDEN`, `TIMER_LIMIT_EXCEEDED`, …) is
   answered to its sender, and SY.timer's journal says nothing: the operator cannot see there who
   was refused and why. The operator's call on A-253 (2026-11-10): logs for everything.
 - **Fix:** one line per refusal (the verb, the code, the sender), bounded per sender.
+- **Checked on 8.x (0.1.133):** SY.timer 1.6 on the motherbee and worker1 (`TIMER_HELP`; its start
+  line `pending=2`, the replay's timers). Through SY.admin's routes, 12 bad cursors gave 10 refusal
+  lines and one summary (*"timer_request_refusals_not_logged"*), no cursor text in any line, on both
+  hives. From a throwaway client on worker1, 12 schedules below the minimum gave 10 refusal lines
+  and a summary, and 12 stray `TIMER_FIRED_RESPONSE` 10 *"timer_message_ignored"* lines and a
+  summary.
 
 ### A-257 [General/frontdesk] 🔵 low (found 2026-11-10 by A-223's triage and io.api's builder; read in the code) — The frontdesk's handoff waits behind its LLM turns
 
@@ -2461,7 +2548,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   each rotation bumps the file's `_system.config_version` while the live one stays; nothing compares
   the two today. Harmless while IO.cloud reads no other `io` field.
 
-### A-255 [IO/io.cloud] 🔴 (found 2026-11-10 by A-91's builder; confirmed in the code by its review; there before it) — A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its restart
+### A-255 [IO/io.cloud] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; a rotation on `SY.edge@ingress1` answered `edge_applied: true` in 1.9 s, IO.cloud not restarted) (found 2026-11-10 by A-91's builder; confirmed in the code by its review; there before it) — A running IO.cloud trusts the edge `publish_cloud_endpoint` records only after its restart
 
 - **Why:** `publish_cloud_endpoint` records the edge with `set_node_config`
   (`src/bin/sy_admin.rs`, `handle_publish_cloud_endpoint` ~7846-7856); the orchestrator's
@@ -2476,6 +2563,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config_version` + 1, or its restart), and the restart steps written in 0.1.131 come out.
 - **The operator's call (2026-11-11):** checked live in 0.1.133's gate: the new token goes to a
   0600 file whose path the operator gets, and the operator passes it to the Cloud team.
+- **Checked on 8.x (0.1.133, live, the operator's call):** `publish_cloud_endpoint` on
+  `SY.edge@ingress1` at 23:20:20Z answered ok in 1.9 s with `edge_applied: true`;
+  `IO.cloud@motherbee` RUNNING HEALTHY before and after, `io.edge_node` `SY.edge@ingress1`,
+  `config_version` 3 to 4, its unit's start and PID unchanged (no restart). The new token (64
+  characters) and url (43) went to a 0600 file, never printed; the operator was given its path. The
+  previous token worked 10 more minutes (until about 23:30Z).
 
 ### A-254 [WF] ✅ VALIDATED ON 8.x (0.1.131, 2026-11-11; a timer refused while SY.timer was down went again 6 s later and fired on time; fire_in 400d a COMPILE_ERROR) (found 2026-11-10 by the Go SDK's 0.1.130 builder; read in the code, not run) — A WF can lose a timer schedule without knowing it
 
@@ -2723,15 +2816,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   factory reset's dry run lists its new step [8]. The spawn's rollback that purges an ILK stays as
   it is, by design (docs/control-path-hardening-v1.md §4: the node never ran).
 
-### A-241 [General/blob] 🔵 low (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
+### A-241 [General/blob] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; **[A-241 RESULT PENDING]**) (found 2026-11-10 by stage 5's builder; read in the code) — A spoke's blob staging is never cleaned
 
 - **Why:** since A-188 the blob GC runs only on the motherbee; a spoke's `staging/` leftovers were
   never cleaned before either, because its GC was off. A staging-only pass on spokes, which needs
   no publication pins, would clean them.
 - **Fix, to decide:** whether spokes get a staging-only GC pass.
 - **The operator's call (2026-11-10, the sweep):** *"si"*: each worker cleans its own blob staging (always on, files older than 24 h, hourly, one log line).
+- **Checked on 8.x (0.1.133):** worker1's staging before the deploy (22:34Z): `root:root` 750, no
+  backlog over 24 h; the gate planted an old blob name, a fresh one, an old put temporary and an old
+  name that is no blob's. The pass runs one hour after each orchestrator start; worker1's last start
+  was 23:48:44Z (on 0.1.134), so its pass was due about 00:49Z. **[A-241 RESULT PENDING]**
 
-### A-240 [General/orchestrator] 🔵 low (found 2026-11-10 by A-199's builder; read in the code) — A local get_node_status writes on every read
+### A-240 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; no `status_version` in the answer, 5 reads left the node's directory unchanged) (found 2026-11-10 by A-199's builder; read in the code) — A local get_node_status writes on every read
 
 - **Why:** `get_node_status` / `NODE_STATUS_GET` for a node of this hive runs
   `advance_node_status_version` (`src/bin/sy_orchestrator.rs` ~25911), which writes the status
@@ -2740,6 +2837,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reason.
 - **Fix, later:** a status read that writes nothing (the version advanced where the status changes).
 - **The operator's call (2026-11-10, the sweep):** *"si, sacalo"*: `status_version` goes; a node's status becomes a plain read.
+- **Checked on 8.x (0.1.133):** `AI.pruebas@worker1`'s status has no `status_version`; 5 reads (1.2
+  to 3.2 s) left its directory unchanged. The `status_version` and `status_fingerprint` files older
+  releases wrote stay on disk, unused.
 
 ### A-239 [General/Go SDK] ✅ VALIDATED ON 8.x (0.1.130, 2026-11-10; TIMER_GET and TIMER_LIST byte for byte the same before and after) (found 2026-11-10 by A-220's builder; read in the code) — The Go SDK's TimerInfo drops SY.timer's canceled_reason
 
@@ -2817,13 +2917,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Superseded (0.1.131, A-242, the operator's call of 2026-11-10):** no removal is refused for pages
   or a publish in flight any more; each answer names the pages it leaves up.
 
-### A-232 [General/shared] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; SY.admin, the orchestrator and SY.timer; SY.identity's refusal waits, noted in A-242) (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
+### A-232 [General/shared] ✅ VALIDATED ON 8.x (SY.admin, the orchestrator and SY.timer in 0.1.127, 2026-11-10; SY.identity's ILK and tenant listings in 0.1.133, 2026-11-11) (found 2026-11-10 by A-212's builder; read in the code) — A page request's refusal repeats a bad `limit`
 
 - **Why:** `PageAsk::from_payload` (`src/mesh_reply.rs:194`, `:206`) answers a bad `limit`, or a
   cursor that is not a string, with the value in the error text. A link's key pasted there by
   mistake comes back in the answer, and into Archi's provider. A-212's own cursor refusal does not
   repeat it.
 - **Fix, later (shared code, with its next release):** the refusal names the field, not the value.
+- **Checked on 8.x (0.1.133):** SY.identity's ILK and tenant listings refuse a cursor not theirs
+  `INVALID_CURSOR` without repeating it; a real `next_cursor` pages (5 rows).
 
 ### A-231 [General/admin] ✅ VALIDATED ON 8.x (0.1.127, 2026-11-10; two rows dropped at SY.admin's start) (found 2026-11-10 by A-212's builder; read in the code) — SY.admin's publication ledger never drops a row
 
@@ -3579,7 +3681,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **It shows at every motherbee restart,** since at least 2026-11-03, as a WARN on both sides.
   Nothing to change: the code already treats it as transient.
 
-### A-191 [General/identity] 🟡 OBSERVED, low (found 2026-11-08 by 0.1.117's gate on 8.x; read there) — A removed hive's and a retired node's system ILKs stay registered
+### A-191 [General/identity] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.policy's retired at SY.identity's start; worker2's and six removed workers' retired by `retire_hive_ilks`, a removed worker's by `remove_hive`; none deleted) (found 2026-11-08 by 0.1.117's gate on 8.x; read there) — A removed hive's and a retired node's system ILKs stay registered
 
 - **Seen:**
   - after `remove_hive` of `gate0217`, its six `SY.*@gate0217` system ILKs stayed on the
@@ -3593,6 +3695,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reuses them. Data hygiene, next to A-159 (deleting an ILK that other data names); a release
   that drops a node from a role leaves its ILK too (A-181, stage 2).
 - **The operator's call (2026-11-10, the sweep):** old ILKs that made no history are deleted (*"si son ilk viejos, borralos cuando puedas"*); an ILK that made history is disabled, never deleted (*"los ilk son historia... podemos hacer disable pero no borrarlos sino rompe"*). So: `remove_hive` disables (marks, reversibly) the removed hive's system ILKs and never purges them; the throwaway gate workers' and worker2's are purged once; SY.policy's, which ran in PROD for months, are only disabled.
+- **Checked on 8.x (0.1.133):** before the deploy only SY.policy's ILKs on the motherbee and worker1
+  were outside 0.1.133's lists; SY.identity retired them at its start, one line each (the motherbee
+  22:39:00Z, worker1 22:39:44Z). `retire_hive_ilks` retired worker2's 7 and 6 each of `gate0217`,
+  `gate0218`, `gate0219`, `gate0221`, `gate0227` and `gate0231` (1.2 to 3.0 s each), none deleted
+  (since the operator's call of 2026-11-11 the system retires a system ILK and never deletes one; a
+  purge stays the operator's explicit word); a repeat answered count 0, `already_retired` 7 or 6;
+  worker1 and the motherbee were refused
+  `HIVE_NOT_REMOVED` (with what to do), a bad id `INVALID_REQUEST`, none echoing the id. The
+  throwaway worker `gate0233` (VM 104) joined in 148 s with its 6 system ILKs active; `remove_hive`
+  (14.1 s) answered `system_ilks_retired` 6 and `identity_key_cleanup` deleted, and 35 s later all 6
+  were still retired. Joined again under the same name (131 s; the gate's first try failed
+  `SSH_AUTH_FAILED` until it re-ran its prep, the gate's slip) the 6 were active again; removed
+  again (4.4 s), retired.
 
 ### A-190 [General/join] ✅ VALIDATED ON 8.x (0.1.118, 2026-11-08; found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
 

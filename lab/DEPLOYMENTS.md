@@ -21,7 +21,9 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.132** | 2026-11-11 | `36135e52` | motherbee + spokes (core), the router alone: A-245 (a far router's `UNREACHABLE` or `TTL_EXCEEDED` reaches a sender on another spoke: the hub hands it on toward the spoke whose LSA lists the sender), A-195 (no WAN frame arrives before what names its sender: a new link's first frames are the LSA and the hub's reachability; the hub tells every spoke of a hive's changed nodes as its LSA comes; A-261, A-262 with it), A-265 (the hub rebuilds its FIB as it applies an LSA, and as a hive goes stale), A-246 (a broadcast answered once, by the router it entered), A-253 (a stream record too big for a batch named in the router's journal, its ids quoted, escaped and cut, at most 10 between two alarm lines), A-208 with A-247 (the several-routers mode, unsupported: no wedge, answers over the link a frame came from); `ops.py health` counts the router's lines only when the pattern opens the message | ✅ live, checked on 8.x | snap `pre-router-0-1-132` (all 4 VMs) · `apt install fluxbee=0.1.131` + 0.1.131's `update_installation` (nothing one-way; the wire is the same) |
+| **0.1.134** | 2026-11-11 | `8539bc64` | motherbee + spokes (core), the orchestrator alone, a hotfix: A-314 (a node unit systemd does not have reads as not running: on the hives' systemd 255 `systemctl is-active` exits 4 for it, which 0.1.133 read as no answer, so no node could be launched and a stopped node whose unit was gone could be neither started nor purged and read `UNKNOWN`); its review: `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name (`INVALID_REQUEST`) before anything is done, as `run_node` does | ✅ live, checked on 8.x | snap `pre-orch-0-1-134` (all 4 VMs) · `apt install fluxbee=0.1.133` + 0.1.133's `update_installation` (that brings A-314 back); to 0.1.132 by apt (nothing one-way found) |
+| **0.1.133** | 2026-11-11 | `45c736e4` | motherbee + spokes (core), one branch per binary, the sweep's end: SY.identity and SY.admin (A-191: a system ILK is retired, never deleted, at SY.identity's start for an SY node its release no longer runs, and by `retire_hive_ilks` or `remove_hive` for a removed hive; A-232: SY.identity's listings refuse a cursor not theirs without repeating it), SY.admin (A-255: `publish_cloud_endpoint` applies the edge to the running IO.cloud; A-260 and A-274: the expiry sweep and a take-down call the edge and IO.blob outside the publication lock; A-281: no version removed while some hive's use of it was not read; A-285's texts), SY.timer 1.6 (A-258: its refusals logged, bounded; A-259: the heap holds the pending timers only; A-266: a page its `limit` cuts answers `next_cursor`), the orchestrator (A-240: a status read writes nothing, `status_version` gone from the answer; A-241: a worker cleans its own blob staging; A-267 and A-271: a check with no answer acts on nothing; A-281's use across the hives, `hives_without_runtimes`), SY.wf-rules (A-270: no delete without force of a WF node that is not `RUNNING`; A-281: a delete names the versions it left), SY.architect (A-279 with A-288: Archi's SCMD reads decode their query and keep it) | ✅ replaced by 0.1.134 (live 22:35Z–23:32Z; its gate found A-314) | snap `pre-sweep-0-1-133` (deleted 2026-11-11) · `apt install fluxbee=0.1.132` + 0.1.132's `update_installation` (nothing one-way found: the system ILKs 0.1.133 retired stay retired, harmless to 0.1.132) |
+| **0.1.132** | 2026-11-11 | `36135e52` | motherbee + spokes (core), the router alone: A-245 (a far router's `UNREACHABLE` or `TTL_EXCEEDED` reaches a sender on another spoke: the hub hands it on toward the spoke whose LSA lists the sender), A-195 (no WAN frame arrives before what names its sender: a new link's first frames are the LSA and the hub's reachability; the hub tells every spoke of a hive's changed nodes as its LSA comes; A-261, A-262 with it), A-265 (the hub rebuilds its FIB as it applies an LSA, and as a hive goes stale), A-246 (a broadcast answered once, by the router it entered), A-253 (a stream record too big for a batch named in the router's journal, its ids quoted, escaped and cut, at most 10 between two alarm lines), A-208 with A-247 (the several-routers mode, unsupported: no wedge, answers over the link a frame came from); `ops.py health` counts the router's lines only when the pattern opens the message | ✅ replaced by 0.1.133 | snap `pre-router-0-1-132` (deleted 2026-11-11) · `apt install fluxbee=0.1.131` + 0.1.131's `update_installation` (nothing one-way; the wire is the same) |
 | **0.1.131** | 2026-11-11 | `0f6b54f1` | motherbee + spokes (core), one branch per binary, from the sweep: SY.admin (A-242: no removal refused for published pages, each ok answer names them in `pages_left_up`; A-249 closed with it; A-251: SY.timer's refusals answered by their code; A-250 (a): a short read while a hive restarts, asked again at once), SY.timer 1.5 (A-238: a canceled timer aged by its cancel, schema 4; A-244: the lock map drops a timer's entry), IO (A-91: io.blob CONFIGURED on its defaults, io.cloud UNCONFIGURED `missing_edge_node` without an edge; A-226; A-223's spec), WF (A-254: a timer SY.timer does not take goes again until it does, the store at v7; the 366-day bound in wf.engine and SY.wf-rules), the orchestrator (A-252: a new spoke switches Syncthing's posture at its join's peer link) | ✅ replaced by 0.1.132 | snap `pre-sweep-0-1-131` (deleted 2026-11-11) · `apt install fluxbee=0.1.130` + 0.1.130's `update_installation` (the older SY.timer and wf.engine read schema 4 and store v7; A-233's and A-212's page refusals come back) |
 | **0.1.130** | 2026-11-10 | `8604debf` | motherbee + spokes (core), the Go SDK alone: A-228 (an RPC error for a router notice carries `reason`, `original_dst`, `last_hop`), A-239 (`TimerInfo.canceled_reason`; SY.timer serializes the SDK's `TimerInfo`), A-218's ECHO leftovers (`MSGEcho`/`MSGEchoReply` gone; SY.timer and wf-generic take the AI nodes' notice rule; SY.timer answers an ECHO `TIMER_UNKNOWN_VERB`) | ✅ replaced by 0.1.131 | snap `pre-gosdk-0-1-130` (deleted 2026-11-11) · `apt install fluxbee=0.1.129` + 0.1.129's `update_installation` (nothing one-way; the wire is the same) |
 | **0.1.129** | 2026-11-10 | `9b396e3e` | motherbee + spokes (core), the router alone: A-222 (a bounded queue per link, 1,024 frames or 8 MiB counted as heap, the senders' share 960 / 7 MiB; a message past it refused `LINK_BUSY` with an answer, the node never disconnected), A-209 (no router answers a tap copy; the router clears a `via_tap` a node sets), A-221 (an agent's turn goes to cognition only once its link took it) | ✅ replaced by 0.1.130 | snap `pre-router-0-1-129` (deleted 2026-11-10) · `apt install fluxbee=0.1.128` + 0.1.128's `update_installation` (nothing one-way) |
@@ -141,6 +143,199 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.134 — The orchestrator alone: a unit systemd does not have is not running (A-314)
+
+- **Date:** 2026-11-11 (ART) · **Previous version:** 0.1.133 · **Commit:** `8539bc64`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** 0.1.133's gate found A-314 (🔴) at 22:41Z: on the hives' systemd 255, `systemctl
+  is-active` exits 4 for a unit systemd does not have, which 0.1.133 read as no answer. No node
+  could be launched, a stopped node whose unit was gone could be neither started nor purged and
+  read `UNKNOWN`, and the reconcile launched no such node. The call, on the operator's standing
+  authority over 8.x: fix it forward as 0.1.134, the orchestrator alone, instead of rolling back.
+  The releases planned after it move by one: the router 0.1.135, the AI SDK 0.1.136, the sweep's
+  binaries 0.1.137.
+- **What changed (`src/bin/sy_orchestrator.rs` only):**
+  - **A-314 (`7964c265`):** `systemctl is-active`'s exit 4 (every unit it names not-found, since
+    systemd 253) reads as not running, as exit 3 does; exit 1 and a killed check stay no answer.
+  - **Its review (`8539bc64`):** with a missing unit read as not running, a `kill_node` with purge
+    or a `remove_node_instance` of an `SY.*` or `RT.*` name (a core node, whose `fluxbee-node-*`
+    unit never exists) would remove the running core node's state (SY.timer's `timers.db`,
+    SY.identity's config and secrets) and answer ok, as 0.1.132 did. Both now refuse such a name
+    (`INVALID_REQUEST`) before anything is done, as `run_node` does.
+- **Build and review:** `coa/orch-134`; a two-lens review (systemd's source at v252, v253, v255 and
+  v258; every caller of the check): ship. CI green on `8539bc64`; daily fast-forwarded to it.
+- **The deploy:** build 23:19:04–23:27:51Z (8.8 min), publish in 13 s, `ops deploy 0.1.134` at
+  23:28:25Z in 259 s (snapshots 33.5 s, the motherbee's apt 137.6 s, its admin on the version
+  32.5 s, the spokes answering 9.2 s, the update's call 22.2 s, the hives on the target 9.5 s,
+  health 5.4 s); snapshot `pre-orch-0-1-134`, `pre-sweep-0-1-133` dropped. On the target after the
+  update's call: egress1 26.1 s, ingress1 26.1 s, worker1 30.3 s, the motherbee 4.2 s; the spokes
+  settled by their own records +21.8 s (ingress1), +23.0 s (egress1), +25.7 s (worker1). Health
+  clean (`wandrops=1`: A-272's echo).
+- **Checked on 8.x (23:33Z):**
+  - A-314: `run_node` of `AI.gate0233@worker1` ok and its kill (ILK kept) ok, 9.8 s in all; the
+    three `AI.gate0192*@worker1` nodes and `AI.gate0233` read `STOPPED` (`UNKNOWN` on 0.1.133);
+    ai.generic's use lists only `AI.pruebas@worker1` (0.1.134), the stopped gate0192 nodes no
+    longer counted, skipped none, `hives_without_runtimes` egress1 (egress) and ingress1 (ingress),
+    read in 1.4 s.
+  - The review's guard: `kill_node` of `SY.gate0233@motherbee` answered `INVALID_REQUEST` *"SY.*
+    nodes are core nodes: they run under their own unit and are never stopped, purged or removed
+    as a managed node"*.
+  - Before the deploy no node on the motherbee or worker1 had `relaunch_on_boot` true with its unit
+    gone, so 0.1.134's reconcile launched nothing unexpected.
+  - 0.1.133's gate went on over 0.1.134 (its entry below): A-267's and A-271's self-restarts ran
+    at 23:47–23:50Z.
+- **PROD after the gate:** all four hives on 0.1.134; worker1 behind egress1; the throwaway worker
+  `gate0233` removed and VM 104 destroyed; snapshot `pre-orch-0-1-134` on each VM.
+- **Rollback:** the snapshot `pre-orch-0-1-134` (all 4 VMs), or `apt install fluxbee=0.1.133` +
+  0.1.133's `update_installation`, which brings A-314 back; to 0.1.132 by apt (nothing one-way
+  found: the system ILKs 0.1.133 retired stay retired, harmless to 0.1.132).
+
+## 0.1.133 — The sweep's end, one branch per binary
+
+- **Date:** 2026-11-11 (ART) · **Previous version:** 0.1.132 · **Commit:** `45c736e4`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the sweep's end (the operator, 2026-11-11; FINDINGS' board, item 24): the third batch's
+  items and what their builders and reviews brought in, one branch per binary, none of them shared
+  code ([METHOD](logbook/METHOD.md) §9). The operator's calls: A-240 and A-241 (2026-11-10, the
+  sweep); A-191, an ILK is history, so the system retires one and never deletes it; A-255 checked
+  live, its new token handed over by a file's path.
+- **What changed:**
+  - **SY.identity and SY.admin:** A-191, a system ILK is retired (the delete model's reversible
+    mark), never deleted on its own: SY.identity marks at its start the system ILKs of the SY
+    nodes its release no longer runs on its hive (SY.policy's); SY.admin's new `retire_hive_ilks`,
+    and `remove_hive` once the hive is gone (`system_ilks_retired`), mark a removed hive's through
+    SY.identity's `ILK_RETIRE_HIVE`; only the operator's explicit purge removes a retired one; the
+    primary drops every publish of a hive the registry no longer lists, so a removed hive cannot
+    undo its retirement (the review). A-232: SY.identity's ILK and tenant listings refuse a cursor
+    not theirs `INVALID_CURSOR`, naming what it takes, never the cursor.
+  - **SY.admin:** A-255, `publish_cloud_endpoint` applies the edge it records to the running
+    IO.cloud (a `CONFIG_SET` of its live config at its `config_version` + 1, tried once more when
+    stale or unanswered) and answers `edge_applied`, with a warning when IO.cloud did not take it;
+    the restart steps 0.1.131 wrote came out. A-260 and A-274: the expiry sweep and a take-down call
+    the edge and IO.blob outside the publication lock, and write each state only while the page's
+    row is still at the state they read. A-281: `remove_runtime_version` removes a version only once
+    every hive that may run it was read and no node runs on it (409 `RUNTIME_USAGE_UNKNOWN` naming
+    each hive and why; `RUNTIME_IN_USE` naming each node's hive and state), and `teardown_node`
+    waits (`INVENTORY_UNAVAILABLE`) for a node whose hive the LSA holds stale. A-285: the help says
+    what 0.1.133 answers (`SERVICE_FAILED` with `retryable`, `UNKNOWN`, `INSTANCES_UNKNOWN`, the
+    timer list's pages, the runtime use's codes).
+  - **SY.timer 1.6:** A-258, every refusal logged (the verb, the code, the sender), at most 10 a
+    minute per sender and then the count of the rest; A-259, the scheduler's heap holds the pending
+    timers only (a cancel or a purge takes a timer out at once, a reschedule moves it); A-266, a
+    page its `limit` cuts answers `next_cursor`.
+  - **The orchestrator:** A-240, a node's status is a plain read: `status_version` is gone from the
+    status answer and its files are no longer written (the `status_version` and
+    `status_fingerprint` files older releases wrote stay on disk, unused), and a local status read
+    runs in A-199's read lane. A-241, a worker cleans its own `blob/staging` every hour (unfinished
+    puts past 24 h, never `active/` or `public/`), with one line. A-267 and A-271, a check that
+    decides an action answers yes, no or nothing, and only a no acts (the units, the nft tables,
+    the default route, the Syncthing folders). A-281, the motherbee asks every worker at once for
+    its nodes on a runtime (`usage_only`, 10 s each) and no ingress or egress
+    (`hives_without_runtimes`), in read places of its own; Fluxbee Cloud's `list_nodes` never waits
+    behind them.
+  - **SY.wf-rules:** A-270, `delete_workflow` without force refuses a WF node that is not `RUNNING`,
+    or whose status read failed (`INSTANCES_UNKNOWN`); A-281, a delete whose purge SY.admin refuses
+    answers ok naming each version left in `packages_left`, a name deployed again numbers its
+    versions above them, and the factory reset counts them.
+  - **SY.architect:** A-279 and A-288, Archi's SCMD reads decode each query value once (a timer
+    cursor written `%3A`, an owner `%40`), take a path in quotes, and carry the deployments' and the
+    drift alerts' query; A-285's texts.
+- **Build and review:** one branch per binary, each with its review round and fixes; A-281's three
+  halves (`coa/admin-usage-133`, `coa/orch-usage-133`, `coa/wfrules-usage-133`) integrated on
+  `coa/a281-133`, whose review's five lows were fixed. CI green on the integrated head (`45c736e4`:
+  rust-tests, go-tests, admin-catalog-guard, posture-guards, router-dispatcher-guards). The builders
+  and reviews found A-273 to A-288 (A-274, A-279, A-281, A-285 and A-288 shipped in it), A-296,
+  A-297, A-299, A-300 and A-304 to A-310.
+- **The deploy:** build on fb-build 22:16:59–22:33:34Z (16.6 min), publish in 12 s, `ops deploy
+  0.1.133` at 22:35:09Z in 304 s (snapshots 31.5 s, the motherbee's apt 167.8 s, its admin on the
+  version 46.0 s, the spokes answering 8.1 s, the update's call 21.0 s, the hives on the target
+  16.7 s, health 5.3 s); snapshot `pre-sweep-0-1-133`, `pre-router-0-1-132` dropped. On the target
+  after the update's call: egress1 26.5 s, ingress1 30.7 s, worker1 36.4 s, the motherbee 4.2 s; by
+  their own records the spokes settled +19.8 s (egress1), +24.2 s (ingress1), +29.3 s (worker1).
+  Health clean (`wandrops=1` on the motherbee: a WAN echo, A-272). The mixed window (a 0.1.133
+  motherbee, 0.1.132 spokes) was not captured: the background watcher died when the snapshot froze
+  the motherbee's guest agent (the gate tool's slip, now caught).
+- **Checked on 8.x (the gate, against 0.1.132 where a baseline was taken):**
+  - **A-191:** before the deploy only SY.policy's ILKs on the motherbee and worker1 were outside
+    0.1.133's lists; SY.identity retired them at its start, one line each (22:39:00Z, 22:39:44Z).
+    `retire_hive_ilks` retired worker2's 7 and 6 each of `gate0217`, `gate0218`, `gate0219`,
+    `gate0221`, `gate0227` and `gate0231` (1.2–3.0 s each), never deleted; a repeat answered count
+    0 and `already_retired`; worker1 and the motherbee refused `HIVE_NOT_REMOVED`, a bad id
+    `INVALID_REQUEST`, none echoing the id. A throwaway worker `gate0233` (VM 104) joined in 148 s
+    with its 6 system ILKs active; `remove_hive` (14.1 s) answered `system_ilks_retired` 6, and 35 s
+    later all 6 were still retired; joined again under the same name (131 s, once the gate re-ran
+    its prep: its first try failed `SSH_AUTH_FAILED`, the gate's slip) the 6 were active again, and
+    removed again (4.4 s) they were retired.
+  - **A-232:** the ILK and tenant listings refuse a cursor not theirs `INVALID_CURSOR` without
+    repeating it; a real `next_cursor` pages (5 rows).
+  - **A-240:** `AI.pruebas@worker1`'s status has no `status_version`; 5 reads (1.2–3.2 s) left its
+    directory unchanged.
+  - **A-241:** worker1's staging before the deploy (22:34Z): `root:root` 750, no backlog over 24 h;
+    planted an old blob name, a fresh one, an old put temporary and an old name that is no blob's.
+    The pass runs one hour after each orchestrator start; worker1's last start (on 0.1.134) was
+    23:48:44Z, so its pass is due about 00:49Z. **[A-241 RESULT PENDING]**
+  - **A-255 (live, the operator's call):** `publish_cloud_endpoint` on `SY.edge@ingress1` at
+    23:20:20Z answered ok in 1.9 s with `edge_applied: true`; `IO.cloud@motherbee` RUNNING HEALTHY
+    before and after, `io.edge_node` `SY.edge@ingress1`, `config_version` 3 to 4, its unit's start
+    and PID unchanged (no restart). The new token went to a 0600 file, never printed, and the
+    operator was given its path; the previous token worked 10 more minutes.
+  - **A-258, A-259, A-266 (SY.timer 1.6 on the motherbee and worker1):** 12 bad cursors through
+    SY.admin's routes gave 10 refusal lines and one summary on each hive, no cursor text in any
+    line; from a throwaway client on worker1, 12 schedules below the minimum and 12 stray
+    `TIMER_FIRED_RESPONSE` gave 10 lines and a summary each. Two one-shots per hive scheduled before
+    the deploy were loaded again at SY.timer's restart: the ones canceled after it never fired, the
+    others fired once on time (15 ms and 497 ms late); on worker1 a timer moved earlier and one
+    moved later fired once each, a canceled one never, and a recurring one 5 times and none in the
+    75 s after its cancel. `TIMER_LIST` with `limit` 1 gave `next_cursor`; pages of 7 listed 355
+    rows in 51 pages, all distinct; a page of 1000 was cut by the frame at 80 rows with
+    `next_cursor`.
+  - **A-260 and A-274:** 5 pages published as `AI.gate0233@worker1` (13.5–16.3 s each);
+    `SY.edge@ingress1` SIGSTOPped 48 s: take-downs of an unknown page answered `NOT_FOUND` in 1.4 s,
+    twice, while two take-downs waited on the edge (`EDGE_UNPUBLISH_FAILED` at 31 s); two take-downs
+    of one page sent together after the edge went on: one took it down (8.2 s), the other wrote
+    nothing over it (7.9 s); the expiry sweep deferred one retire on the edge's timeout and retired
+    it at its next pass; all five pages expired or taken down, and released.
+  - **A-267 and A-271 (on 0.1.134):** 20 self-restarts of `sy-orchestrator` at staggered offsets,
+    debug on, on worker1 (23:47–23:48Z) and egress1 (23:48–23:50Z): no unit restarted or started
+    meanwhile, and no *"service not active; attempting restart"*, *"did not answer"*, *"nft table
+    missing"* or *"syncthing unhealthy"* line. Stopped on worker1, `sy-opa-rules` came back in 3.3 s
+    and `fluxbee-syncthing` in 3.5 s, each with the orchestrator's line. A-271's reading of no
+    answer is what made A-314 on systemd 255.
+  - **A-270:** `WF.gate0233@worker1` deployed (5 s) and killed without purge (`STOPPED`): its delete
+    without force answered `INSTANCES_UNKNOWN`, with force ok.
+  - **A-279 and A-288 (Archi's SCMD reads):** a timer cursor written `%3A` or `%3a` pages (0.1.132:
+    `TIMER_INVALID_PAYLOAD`), `%253A` is still refused, an owner written `%40` works; a broken
+    escape in `list_nodes`' cursor answers `INVALID_CURSOR` as JSON (0.1.132: no JSON); the drift
+    alerts' severity filter and the deployments' hive filter are kept (2 and 3 entries; 50 and 48 on
+    0.1.132); a path in quotes works (0.1.132: `SCMD_EXECUTION_FAILED`).
+  - **A-281:** `get_runtime`'s use skipped egress1 and ingress1 `RUNTIME_MANIFEST_MISSING` on
+    0.1.132 (2.8–3.2 s), and on 0.1.133 skipped none and listed them in `hives_without_runtimes`
+    (1.1–1.5 s). With worker1's orchestrator stopped, removing io.slack 0.1.14 (unused) was refused
+    `RUNTIME_USAGE_UNKNOWN` naming worker1 `UNREACHABLE`, retryable, in 1.5 s, nothing removed;
+    SIGSTOPped, `TIMEOUT` in 12.8 s. In the lanes, with it SIGSTOPped: 4 `GET /versions` held
+    30.8–31.3 s, a removal started 3 s after them answered in 11.2 s, `/hive/status` in 1.4 s, 4
+    runtime reads in 11.2–11.9 s. Workflows: deleted right after their deploy (2.7 and 3.2 s), ok
+    with `packages_left` []; with worker1's orchestrator stopped, two deletes ok in about 3 s naming
+    `packages_left` (`RUNTIME_USAGE_UNKNOWN`, `PURGE_STOPPED`, both retryable) with the warning, one
+    deployed again over its leftovers ran 0.0.3, and once worker1 answered the leftovers were
+    removed (a runtime's current version first refused `RUNTIME_CURRENT_CONFLICT`).
+    `teardown_node` of `AI.gate0233@worker1` with worker1's orchestrator and router stopped:
+    503 `INVENTORY_UNAVAILABLE`, nothing removed, its ILK kept. io.slack 0.1.14 removed with every
+    hive up (3.1 s).
+  - **A-285:** SY.admin's help names every new answer (`retryable`, `UNKNOWN`, `RUNNING`,
+    `wf_rules_get_status`, `packages_left`, 1000, `INVENTORY_UNAVAILABLE`,
+    `RUNTIME_USAGE_UNKNOWN`, `NO_USAGE`, `USAGE_UNREADABLE`), each missing on 0.1.132.
+  - **Found:** A-314 (🔴) at 22:41Z: `run_node` of `AI.gate0233@worker1` answered `SERVICE_FAILED`
+    and the stopped nodes with no unit read `UNKNOWN`, fixed forward by 0.1.134 (above); A-315
+    [Archi], low: SY.admin's help and Archi's handbook do not name `hives_without_runtimes`; A-308
+    seen live: the Cloud's `list_nodes`, started while the 4 `/versions` held, timed out at 31.8 s,
+    and with only 4 runtime reads in flight answered in 13.1 s with worker1 in `unreachable_hives`.
+- **PROD after the gate:** 0.1.133 ran from 22:35Z to 23:32Z, replaced by 0.1.134 (A-314), whose
+  deploy dropped the snapshot `pre-sweep-0-1-133`.
+- **Rollback:** now through 0.1.134's entry. To 0.1.132: `apt install fluxbee=0.1.132` + 0.1.132's
+  `update_installation` (nothing one-way found: the system ILKs 0.1.133 retired stay retired,
+  harmless to 0.1.132).
 
 ## 0.1.132 — The router alone: far answers, link-ups and named drops
 
