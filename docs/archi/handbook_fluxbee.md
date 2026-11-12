@@ -1891,6 +1891,20 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
     the manifest's lock past 60 s, and nothing was removed. Say so, and offer to ask again
     (FINDINGS A-305). With `retryable: false` (the lock's file cannot be opened) the operator
     fixes the motherbee's dist first.
+- A runtime's use across the hives, the read `remove_runtime_version` decides on, is in
+  `get_runtime`'s answer (`GET /hives/motherbee/runtimes/<runtime>`), beside the motherbee's own
+  `usage`: `payload.usage_global_visible` (FINDINGS A-281, A-315). Its fields:
+  - `running_nodes`: each node of any hive on that runtime (on the version asked, when one is)
+    whose unit may run, with its `hive` and `lifecycle`; `running_count` counts them.
+  - `skipped_hives`: each hive whose nodes were not read, `{hive_id, reason, message}`: its use is
+    unknown, never none.
+  - `hives_without_runtimes`: each ingress and each egress, `{hive_id, role}`, by the role the hive
+    registry records, whatever the state of its join. The runtimes never reach them, so no managed
+    node runs there: they are not asked, they are neither counted nor skipped, and one that is
+    down holds no removal up. Never report one as a hive not read or of unknown use; name it, if
+    the operator asks, as a hive that runs no runtime.
+  - `in_use`: true while a node is listed, false only once every hive asked was counted, and null
+    (unknown) while none is listed and a hive is in `skipped_hives`.
 
 ---
 

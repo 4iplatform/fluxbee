@@ -2035,7 +2035,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   without it. SY.admin's help (`vault_get`, `vault_assign`), sy-admin.md, sy-vault.md and Archi's
   handbook (§4.5) say it.
 
-### A-315 [Archi] 🔵 low (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
+### A-315 [Archi] 🔵 low · Archi's handbook part built on `coa/architect-139` for 0.1.139 (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
 
 - **Seen:** 0.1.133's gate read SY.admin's per-action HELP for the answers 0.1.133 added (A-285):
   each it looked for is named, but `hives_without_runtimes` is named nowhere in SY.admin's help
@@ -2056,6 +2056,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   role}`, by the role the registry records, neither asked, counted nor skipped, and never holding
   a removal up. Its test, `the_runtime_help_names_the_hives_without_runtimes`, fails without it.
   Archi's handbook is the architect branch's.
+- **Archi's handbook part, built on `coa/architect-139` for 0.1.139 (docs only):** §7.7 says where a
+  runtime's use across the hives is (`get_runtime`'s `payload.usage_global_visible`, the read
+  `remove_runtime_version` decides on) and names each field: `running_nodes` (and
+  `running_count`), `skipped_hives` (`{hive_id, reason, message}`, a use unknown, never none),
+  `hives_without_runtimes` (`{hive_id, role}`: each ingress and egress by the role the registry
+  records, whatever its join; not asked, neither counted nor skipped, never a hive not read, and
+  one that is down holds no removal up) and `in_use` (true, false, or null while a hive was
+  skipped). SY.admin's help for `get_runtime` and `remove_runtime_version` is the other part, in
+  SY.admin's binary, not on this branch. Archi reads the handbook from
+  `/etc/fluxbee/handbook_fluxbee.md`, which the package installs.
 
 ### A-314 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.134, 2026-11-11; a new node launched and killed in 9.8 s, the stopped nodes with no unit read `STOPPED`, a core node's kill refused `INVALID_REQUEST`) (found 2026-11-11 by 0.1.133's gate; seen on 8.x, read in the code; since 0.1.133) — A node unit systemd does not have reads as no answer: no node can be launched
 
