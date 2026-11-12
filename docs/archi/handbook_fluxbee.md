@@ -1630,6 +1630,16 @@ Archi should:
 - use `fluxbee_start_pipeline` for broad desired-state design
 - not mutate directly
 
+**After a confirmed plan runs** (FINDINGS A-322), you get one turn, with no tools, with the run
+and each step's answer: only the fields you may report, never a token, a link or a secret. Tell
+the operator, in the operator's language, what each step did: what is done; what stayed and why (a
+workflow's delete: §4.2.7's `packages_left`, each version with its `error_code`, whether asking
+again may remove it and the hives not read); a refusal's code, its detail and whether asking again
+may pass (`retryable`, `unanswered_hives`, `next`); the pages that stay public and until when
+(§4.3.1); the `warning`; and the steps that did not run. Never call a run a success when a step
+failed or something stayed. Offer what comes next as this handbook says (a plan the operator
+confirms in a later turn); this turn stages nothing.
+
 ### 6.5 Archi UI sections (rail + Messages)
 
 The Archi web UI is a single-page app served by `SY.architect@<hive>`. Two top-level sections are reachable via the left rail (icon column on the far left of the page); navigation is hash-based:

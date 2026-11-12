@@ -84,8 +84,10 @@ Each chat turn first takes a new version of the installation file, when there is
 Then `handle_chat_message` looks at each message in this order:
 
 1. `CONFIRM`: runs what is waiting for confirmation (a pipeline checkpoint, or a plan the plan
-   compiler prepared, sent with labels `{"origin": "plan_compiler_confirmed"}`). `CANCEL` or
-   `ABORT` drops it.
+   compiler prepared, sent with labels `{"origin": "plan_compiler_confirmed"}`); once such a plan
+   ran, the chat says what each step did ([What the chat says after a confirmed
+   plan](#what-the-chat-says-after-a-confirmed-plan)). `CANCEL` or `ABORT` drops it; a dropped
+   plan answers "Plan discarded." (since 0.1.137; before, "Programmer plan discarded.").
 2. While something waits for confirmation, other messages get `status: "blocked"`.
 3. `SCMD: <curl-like command>`: an operator command, run at once (see SCMD).
 4. A pasted JSON `executor_plan`: validated and run at once.
@@ -277,6 +279,55 @@ message name them); a hive in error, without an answer, `sync_pending` at its bo
 is, a stale target or a superseded update keep it unverified, the reason naming each hive with its
 `next`, as does an update still moving at the bound (`installation_updates_verdict`;
 [SY.admin, the installation's update](sy-admin.md#the-installations-update)).
+
+### What the chat says after a confirmed plan
+
+Since 0.1.137 (FINDINGS A-322), once a plan the plan compiler prepared ran on `CONFIRM`, and after
+its verdict, Archi's model gets one turn with each step's answer and tells the operator what
+happened (`explain_executed_plan`, `src/bin/sy_architect/execution_report.rs`). Before, the chat
+showed only SY.admin's fixed line, "Execution completed successfully" or "Execution stopped at
+step 's1'": a refusal's code and whether asking again may pass went unsaid, and a workflow's delete
+that answered ok with versions left read as a full success.
+
+- **The turn**: one call of Archi's model, with no tool, its prompt and handbook as in the chat,
+  the session's summary and recent turns, and a message Archi writes: what to report (what each
+  step did, what is done, what stayed and why, a refusal's code, its detail and whether asking
+  again may pass, the pages left up and until when, the warning, the steps that did not run), in
+  the operator's language and as the handbook says, then the run and each step as JSON. Its text
+  becomes the run's `message`: the chat shows it under the plan's head, in place of the fixed
+  line, and the next turns read it as Archi's own words. One model call per plan run, recorded
+  with the stage `execution_report`, and bounded at 90 s (`EXPLANATION_TURN_TIMEOUT`).
+- **What the turn is given**: an allowlist, never a step's answer copied (FINDINGS A-124). Of the
+  run, its status, its steps done of all, the step it stopped at, whether Archi verified it and its
+  line (`run_view`). Of each step, in the plan's order (`step_views`): its `id`, `action`,
+  `status` (`done`, `failed`, `not_run`, or `not_reported` when the run's answer was too large for
+  one mesh frame), what it acted on (only the args `hive`, `hive_id`, `target`, `node_name`,
+  `runtime`, `runtime_version`, `version` and `workflow_name`), its answer's `status`, and its
+  `error_code` and `error_detail`, cut to 300 characters, for a step that failed or was refused:
+  its answer's, else those of the event that failed it (a step that could not be dispatched, an
+  `add_hive` whose join failed). Of its answer's payload: `retryable`; `unanswered_hives`, each
+  `{hive, reason, next}`; `next`; `warning`, cut to 400 characters; `packages_left`, each
+  `{runtime, version, error_code, retryable, unanswered_hives}`; `pages_left_up` as `count`,
+  `more` and each page's `publication_id` and expiry, nothing else of a page; `wf_node` as
+  `{node_name, action, status}`; `pending` and `held` as hive names; `update` as `{id, state}`;
+  and its counts, the numbers, flags and list lengths of plain field names down to three levels,
+  no text and no field whose name reads as a secret's. The help the executor's model read on the
+  way (`help_lookup`) is none of a step's, and an `add_hive`'s join, followed with `get_hive`,
+  counts only for its status and failure. Each text kept (a detail, a warning, a reason, `next`,
+  the run's line) has its links (`://`, `/public/`, `/e/`), a credential named with its value
+  (`token=`, `"api_key":`...), the word after `Bearer` and any run of 32 or more letters and
+  digits taken out (`scrub`); a name keeps a long id, never a link or a credential. So
+  `publish_cloud_endpoint`'s token, a page's link or key, a vault value, an API key, a password
+  or a secret ref never reaches the turn.
+- **When the turn fails** (no AI runtime, the provider's error, no answer within 90 s, no text),
+  the message is the fixed line as Archi had it (SY.admin's, or that the plan ran but is not done,
+  with its reason) and one line per step under it, with its code, its detail and what it left
+  (`fallback_text`), with no model.
+- **The answer** carries `explanation`: its `source` (`model` or `fallback`), its `model_calls` (1,
+  or 0 without an AI runtime), the `steps` the turn was given, and its `tokens_used` or why it
+  gave nothing (`error`).
+- The pipeline's `CONFIRM 2` and a plan pasted in the chat or sent to `POST /api/executor/plan`
+  keep their own answers, with no such turn.
 
 ## Pipelines
 
@@ -490,7 +541,8 @@ skills, handbooks and a personality.
   provider, or an `ai` no reader can use, takes the AI down with the reason, as at start (stage
   3c's review, F1). Its own `config.ai.model` stays its node config.
 - **Limits**: every model call asks for up to 32,000 output tokens and may take 600 s
-  (`ARCHITECT_MODEL_CALL_TIMEOUT`); a pipeline task's budget is 1,000,000 tokens
+  (`ARCHITECT_MODEL_CALL_TIMEOUT`), but the turn that explains a confirmed plan's run, which the
+  chat waits for 90 s at most; a pipeline task's budget is 1,000,000 tokens
   (`TASK_AGENT_TOKEN_BUDGET`).
 - **Key**: from SY.vault, read as Archi, in the root tenant: the key Archi owns, else one assigned
   to it, else the tenant's general one (8.x holds `anthropic_architect`, Archi's own).
@@ -499,8 +551,9 @@ skills, handbooks and a personality.
   fields (`reject_architect_secret_fields`), and any key under `ai` but `model`.
 - **Usage records**: every model call is charged to the root tenant (`AiAccount::root`, source
   `root`) with work `{session_id, pipeline_run_id, solution_id, stage}` (`usage_account`). The
-  stage is `chat`, `designer`, `design_auditor`, `programmer`, `plan_compiler` or
-  `failure_classifier`. Records go to the router stream subject `storage.usage`.
+  stage is `chat`, `designer`, `design_auditor`, `programmer`, `plan_compiler`,
+  `failure_classifier` or `execution_report` (the turn that explains a confirmed plan's run, one
+  per run, since 0.1.137). Records go to the router stream subject `storage.usage`.
 
 ## The handbook
 

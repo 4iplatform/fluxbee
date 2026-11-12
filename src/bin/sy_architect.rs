@@ -1,5 +1,7 @@
 #[path = "sy_architect/artifact_loop.rs"]
 mod artifact_loop;
+#[path = "sy_architect/execution_report.rs"]
+mod execution_report;
 #[path = "sy_architect/failure_classifier.rs"]
 mod failure_classifier;
 #[path = "sy_architect/messages_db.rs"]
@@ -10242,6 +10244,13 @@ async fn handle_chat_message(
             if let Some(prog_pending) = plan_compile_plan {
                 let tool_ctx = admin_tool_context(state, Some(&resolved_session_id));
                 let execution_id = uuid::Uuid::new_v4().to_string();
+                // The plan's steps, for what the chat says of its run (FINDINGS A-322).
+                let plan_steps = prog_pending
+                    .plan
+                    .pointer("/execution/steps")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 match execute_executor_plan_with_context(
                     &tool_ctx,
                     execution_id,
@@ -10284,6 +10293,9 @@ async fn handle_chat_message(
                             "error"
                         };
                         output["verification_verdict"] = json!(verdict);
+                        // What each step did, in the model's words, or the fixed line with each
+                        // step's code when its turn fails (FINDINGS A-322).
+                        explain_executed_plan(state, &session, &plan_steps, &mut output).await;
                         ChatResponse {
                             status: status.to_string(),
                             mode: "executor".to_string(),
@@ -10396,7 +10408,7 @@ async fn handle_chat_message(
                 ChatResponse {
                     status: "ok".to_string(),
                     mode: "executor".to_string(),
-                    output: json!({ "message": "Programmer plan discarded." }),
+                    output: json!({ "message": "Plan discarded." }),
                     session_id: Some(resolved_session_id.clone()),
                     session_title: Some(session.title.clone()),
                 }
@@ -11138,6 +11150,58 @@ async fn handle_ai_chat(
     Ok(output)
 }
 
+/// What the chat says once a plan the operator confirmed ran (FINDINGS A-322): Archi's model gets
+/// one turn, with no tool, its prompt and handbook as in the chat, the session's summary and
+/// recent turns, and each step's answer as `execution_report::step_views` keeps it, never a secret
+/// (FINDINGS A-124); it tells the operator what each step did, and its text becomes the run's
+/// `message`. Without an AI runtime, or when that turn fails, the message keeps the executor's
+/// fixed line with each step's code and detail under it. One model call per plan run, recorded
+/// with the stage `execution_report`; `output.explanation` says which it was.
+async fn explain_executed_plan(
+    state: &ArchitectState,
+    session: &ChatSessionRecord,
+    plan_steps: &[Value],
+    output: &mut Value,
+) {
+    let runtime = state.ai_runtime.lock().await.clone();
+    let built: Result<Arc<dyn FunctionCallingModel>, String> = match runtime {
+        Some(runtime) => {
+            let account = admin_tool_context(state, Some(&session.session_id))
+                .usage_account(execution_report::EXPLANATION_STAGE, None)
+                .await
+                .with_thread(Some(session.thread_id.clone()));
+            Ok(runtime.function_model(Some(runtime.instructions.clone()), account))
+        }
+        None => Err(architect_ai_unavailable_reason(state)),
+    };
+    let memory = match &built {
+        Ok(_) => match build_session_immediate_memory(state, session).await {
+            Ok(memory) => Some(memory),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    session_id = %session.session_id,
+                    "sy.architect: the run's explanation goes without the session's turns"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let model = match &built {
+        Ok(model) => Ok(model.as_ref()),
+        Err(why) => Err(why.clone()),
+    };
+    execution_report::explain_run(
+        model,
+        memory,
+        plan_steps,
+        output,
+        execution_report::EXPLANATION_TURN_TIMEOUT,
+    )
+    .await;
+}
+
 async fn handle_impersonation_chat(
     state: &ArchitectState,
     session: &ChatSessionRecord,
@@ -11842,6 +11906,29 @@ fn immediate_interaction_from_response(
         }
 
         return None;
+    }
+
+    // What the model told the operator of a plan's run (FINDINGS A-322) is its own turn, whatever
+    // the run's status: the next turns read it as what Archi said.
+    if mode == "executor" {
+        if let Some(message) = output
+            .filter(|output| {
+                output
+                    .pointer("/explanation/source")
+                    .and_then(Value::as_str)
+                    == Some("model")
+            })
+            .and_then(|output| output.get("message"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return Some(ImmediateInteraction {
+                role: ImmediateRole::Assistant,
+                kind: ImmediateInteractionKind::Text,
+                content: message.to_string(),
+            });
+        }
     }
 
     if mode == "scmd" || mode == "acmd" {
@@ -17949,6 +18036,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--muted);
       margin-top: 2px;
     }}
+    .exec-explanation {{
+      white-space: pre-wrap;
+      line-height: 1.5;
+      font-size: 0.92rem;
+      color: var(--text);
+    }}
     .exec-token-chip {{
       font-size: 0.72rem;
       font-weight: 800;
@@ -19869,7 +19962,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const stepsText = (completedSteps != null && totalSteps != null)
         ? completedSteps + " / " + totalSteps + " steps"
         : (executionId ? executionId.slice(0, 8) : "");
-      const finalMessage = summary.final_message || (isError ? output.error || "" : "");
+      // FINDINGS A-322: a confirmed plan's run carries what Archi says it did (its model's words,
+      // or the fixed line with each step's code and detail): it is shown under the head, and the
+      // fixed line is no longer in the subtitle.
+      const explanation = output.explanation && typeof output.message === "string" ? output.message.trim() : "";
+      const finalMessage = explanation ? "" : (summary.final_message || (isError ? output.error || "" : ""));
       const failedStep = summary.failed_step_id
         ? " · failed at " + summary.failed_step_id + (summary.failed_step_action ? " (" + summary.failed_step_action + ")" : "")
         : "";
@@ -19893,6 +19990,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       headRight.appendChild(badge);
       head.appendChild(headRight);
       shell.appendChild(head);
+      if (explanation) {{
+        const explanationEl = document.createElement("div");
+        explanationEl.className = "exec-explanation";
+        explanationEl.textContent = explanation;
+        shell.appendChild(explanationEl);
+      }}
 
       // if validation/pre-execution error
       if (data.status !== "ok" && output.error) {{
@@ -33813,6 +33916,83 @@ mod tests {
         assert!(interaction
             .content
             .contains("Attachment: invoice.pdf (application/pdf, 182233 bytes)"));
+    }
+
+    /// FINDINGS A-322: what the model told the operator of a plan's run is Archi's own turn in the
+    /// memory of the next turns, a failed run's too; the fixed line of a run the model did not
+    /// explain stays a note, as before.
+    #[test]
+    fn a_runs_explanation_is_archis_own_turn_in_the_memory() {
+        let persisted = |source: &str, message: &str| PersistedChatMessage {
+            message_id: "msg_1".to_string(),
+            session_id: "sess_1".to_string(),
+            role: "system".to_string(),
+            content: message.to_string(),
+            timestamp_ms: 0,
+            mode: "executor".to_string(),
+            metadata: json!({ "kind": "response", "response": {
+                "status": "error", "mode": "executor",
+                "output": { "message": message, "explanation": { "source": source } }
+            } }),
+        };
+        let told = immediate_interaction_from_message(&persisted(
+            "model",
+            "worker1 did not answer, so nothing was removed; ask again once it does.",
+        ))
+        .expect("its turn");
+        assert_eq!(told.role, ImmediateRole::Assistant);
+        assert_eq!(told.kind, ImmediateInteractionKind::Text);
+        assert_eq!(
+            told.content,
+            "worker1 did not answer, so nothing was removed; ask again once it does."
+        );
+        let line = immediate_interaction_from_message(&persisted(
+            "fallback",
+            "Execution stopped at step 's1'\n- s1 remove_runtime_version: failed",
+        ))
+        .expect("its note");
+        assert_eq!(line.role, ImmediateRole::System);
+        assert_eq!(line.kind, ImmediateInteractionKind::ToolError);
+    }
+
+    /// FINDINGS A-322: without an AI runtime a confirmed plan's run makes no model call, and its
+    /// message is the executor's fixed line with each step's code and detail under it.
+    #[tokio::test]
+    async fn a_run_without_an_ai_runtime_keeps_the_fixed_line_with_each_step() {
+        let (state, _router) = harness_state();
+        let session = default_session_profile_with_id("sess-a322");
+        let plan_steps = vec![json!({ "id": "s1", "action": "remove_runtime_version",
+            "args": { "hive": "motherbee", "runtime": "wf.x", "runtime_version": "0.0.1" } })];
+        let mut output = json!({
+            "status": "error",
+            "message": "Execution stopped at step 's1'",
+            "payload": {
+                "events": [{ "step_id": "s1", "step_action": "remove_runtime_version",
+                    "status": "failed", "tool_name": "remove_runtime_version",
+                    "result_preview": { "status": "error",
+                        "error_code": "RUNTIME_USAGE_UNKNOWN",
+                        "error_detail": "the nodes of worker1 (TIMEOUT) were not read",
+                        "payload": { "retryable": true,
+                            "unanswered_hives": [{ "hive": "worker1", "reason": "TIMEOUT" }] } } }],
+                "summary": { "status": "failed", "failed_step_id": "s1",
+                    "final_message": "Execution stopped at step 's1'" }
+            }
+        });
+        explain_executed_plan(&state, &session, &plan_steps, &mut output).await;
+        assert_eq!(output["explanation"]["source"], json!("fallback"));
+        assert_eq!(output["explanation"]["model_calls"], json!(0));
+        assert!(output["explanation"]["error"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("AI provider not configured")));
+        assert_eq!(
+            output["message"],
+            json!(
+                "Execution stopped at step 's1'\n- s1 remove_runtime_version (hive motherbee, \
+                 runtime wf.x, runtime_version 0.0.1): failed, RUNTIME_USAGE_UNKNOWN: the nodes \
+                 of worker1 (TIMEOUT) were not read; hives not read: worker1 (TIMEOUT); asking \
+                 again may pass"
+            )
+        );
     }
 
     // ARCHI-ATTACH-11: mime validation
