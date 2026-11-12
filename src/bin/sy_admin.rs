@@ -15829,22 +15829,46 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "Inventory view: summary is GET /hives/{hive}/inventory/summary, hive is GET /hives/{hive}/status.",
             ),
         ],
+        // A core node, SY.admin@motherbee itself, is a node each of these reads or sends to.
         "get_node_status"
         | "node_help"
         | "get_node_state"
-        | "get_node_config"
-        | "kill_node"
-        | "remove_node_instance"
-        | "teardown_node"
         | "send_node_message"
         | "node_control_config_get"
-        | "node_control_config_set"
-        | "set_node_config" => vec![
+        | "node_control_config_set" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "node_name",
                 "string",
                 "Fully-qualified node name, for example SY.admin@motherbee.",
+            ),
+        ],
+        // The config.json of a node run_node launched, which SY.admin@motherbee has none of.
+        "get_node_config" | "set_node_config" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "Fully-qualified node name, for example AI.sales@motherbee.",
+            ),
+        ],
+        // The actions that stop, remove or tear down a node run_node launched refuse a core node's
+        // name: the orchestrator since 0.1.134, a purge having removed a running core node's state
+        // (FINDINGS A-314's review), and SY.admin's teardown always (`TeardownNodeRequest`).
+        "kill_node" | "remove_node_instance" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "Fully-qualified name of a node run_node launched, for example AI.sales@motherbee. An SY.* or RT.* name is a core node's, which runs under its own unit: it is refused with INVALID_REQUEST before anything is done (FINDINGS A-314, since 0.1.134).",
+            ),
+        ],
+        "teardown_node" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "Fully-qualified name of a node run_node launched, for example AI.sales@motherbee. An SY.* or RT.* name, a core node's, is refused with INVALID_REQUEST and nothing is removed.",
             ),
         ],
         "wf_list_instances" => vec![
@@ -44215,6 +44239,90 @@ mod tests {
         assert!(is_valid_hive_id("Worker_2-B"));
         for not_one in ["", "/srv/x", "..", "a.b", "worker 9", &"w".repeat(65)] {
             assert!(!is_valid_hive_id(not_one), "{not_one:?}");
+        }
+    }
+
+    /// The node_name the help offers as an example is a node each action takes (FINDINGS A-314's
+    /// review). kill_node, remove_node_instance and teardown_node name a node run_node launched,
+    /// AI.sales@motherbee as their curl examples do, and say that an SY.* or RT.* name is refused
+    /// with INVALID_REQUEST: the orchestrator refuses it in a kill or a removal since 0.1.134,
+    /// after a purge of a core node's name removed its state while it ran, and SY.admin in a
+    /// teardown. get_node_config and set_node_config name one too: SY.admin keeps no config.json.
+    /// The reads and the sends a core node answers keep SY.admin@motherbee. Before, all eleven
+    /// offered SY.admin@motherbee, in the help and in the executor's schema alike.
+    #[test]
+    fn the_node_name_example_is_a_node_the_action_takes() {
+        let spec = |action: &str| resolve_internal_action_spec(action).expect("an action");
+        let node_name = |action: &str| {
+            build_admin_action_doc(spec(action))["request_contract"]["path_params"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|param| param["name"] == "node_name")
+                .and_then(|param| param["description"].as_str())
+                .unwrap_or_else(|| panic!("{action}: no node_name in its help"))
+                .to_string()
+        };
+        for action in [
+            "kill_node",
+            "remove_node_instance",
+            "teardown_node",
+            "get_node_config",
+            "set_node_config",
+        ] {
+            // The executor's schema, which Archi's plans follow, says the same.
+            assert_eq!(
+                build_admin_executor_function_definition(spec(action)).parameters_json_schema
+                    ["properties"]["node_name"]["description"],
+                json!(node_name(action)),
+                "{action}"
+            );
+        }
+        for action in ["kill_node", "remove_node_instance", "teardown_node"] {
+            let text = node_name(action);
+            assert!(
+                text.contains("for example AI.sales@motherbee.")
+                    && text.contains("An SY.* or RT.* name")
+                    && text.contains("is refused with INVALID_REQUEST")
+                    && !text.contains("SY.admin@motherbee"),
+                "{action}: {text}"
+            );
+        }
+        for action in ["kill_node", "remove_node_instance"] {
+            assert!(
+                node_name(action).ends_with("(FINDINGS A-314, since 0.1.134)."),
+                "{action}"
+            );
+        }
+        for action in ["get_node_config", "set_node_config"] {
+            assert_eq!(
+                node_name(action),
+                "Fully-qualified node name, for example AI.sales@motherbee.",
+                "{action}"
+            );
+        }
+        for action in [
+            "get_node_status",
+            "node_help",
+            "get_node_state",
+            "send_node_message",
+            "node_control_config_get",
+            "node_control_config_set",
+        ] {
+            assert_eq!(
+                node_name(action),
+                "Fully-qualified node name, for example SY.admin@motherbee.",
+                "{action}"
+            );
+        }
+        assert_eq!(error_code_to_http_status("INVALID_REQUEST"), 400);
+        // SY.admin's own refusal in a teardown, as the text says.
+        for core in ["SY.timer@motherbee", "RT.gateway@worker1"] {
+            assert!(TeardownNodeRequest::from_params(&json!({
+                "node_name": core,
+                "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000",
+            }))
+            .is_err());
         }
     }
 
