@@ -606,12 +606,21 @@ fn package_left_view(item: &Value) -> Option<Value> {
     (!view.is_empty()).then_some(Value::Object(view))
 }
 
-/// A hive SY.admin did not read: its `hive`, `reason` and, for a join not done, `next`.
+/// A hive SY.admin did not read: its `hive`, `reason` and, for a join not done, `next`. The hives
+/// SY.admin left out of a list it cut to fit the mesh frame (its `{"truncated_items": n}`, FINDINGS
+/// A-328) are counted as `{"more": n}`, which `hive_list` says as "<n> more": the report dropped
+/// them, and with them that more hives went unread.
 fn unanswered_hive_view(item: &Value) -> Option<Value> {
     if let Some(hive) = name_of(item) {
         return Some(json!({ "hive": hive }));
     }
-    let hive = name_of(item.get("hive")?)?;
+    let Some(hive) = item.get("hive").and_then(name_of) else {
+        let more = item
+            .get("truncated_items")
+            .or_else(|| item.get("more"))
+            .and_then(Value::as_u64)?;
+        return (more > 0).then(|| json!({ "more": more }));
+    };
     let mut view = Map::new();
     view.insert("hive".into(), json!(hive));
     if let Some(reason) = item.get("reason").and_then(detail_of) {
@@ -1839,6 +1848,60 @@ mod tests {
             assert!(text.contains(&part), "{part} missing: {text}");
         }
         assert!(!text.contains("()"), "{text}");
+    }
+
+    /// FINDINGS A-328's review: a refusal whose `unanswered_hives` SY.admin cut to fit the mesh
+    /// frame keeps the count of the hives it left out (`{"truncated_items": n}`): the report says
+    /// "<n> more", in the turn as in the fallback, where it dropped the count and with it that
+    /// more hives went unread. A version left keeps its own the same way.
+    #[test]
+    fn the_hives_sy_admin_cut_from_a_refusal_are_counted() {
+        let answer = json!({
+            "status": "error", "action": "remove_runtime_version",
+            "error_code": "RUNTIME_USAGE_UNKNOWN",
+            "error_detail": "the nodes of worker1 (TIMEOUT) and 4 more hives were not read",
+            "payload": {
+                "retryable": true,
+                "unanswered_hives": [
+                    { "hive": "worker1", "reason": "TIMEOUT" },
+                    { "truncated_items": 4 }
+                ]
+            }
+        });
+        let delete = json!({
+            "status": "ok",
+            "packages_left": [
+                { "runtime": "wf.gate0239w", "version": "0.0.1",
+                  "error_code": "RUNTIME_USAGE_UNKNOWN", "retryable": true,
+                  "unanswered_hives": [ { "hive": "worker2", "reason": "TIMEOUT" },
+                                        { "truncated_items": 2 } ] }
+            ]
+        });
+        let output = json!({ "payload": { "events": [
+            { "step_id": "s1", "step_action": "remove_runtime_version", "status": "failed",
+              "tool_name": "remove_runtime_version", "error_code": "RUNTIME_USAGE_UNKNOWN",
+              "result_preview": answer },
+            { "step_id": "s2", "step_action": "wf_rules_delete", "status": "done",
+              "tool_name": "wf_rules_delete", "result_preview": { "status": "ok", "payload": delete } }
+        ], "summary": { "status": "failed", "total_steps": 2, "completed_steps": 1 } } });
+        let views = step_views(&output, &[]);
+        assert_eq!(
+            views[0]["unanswered_hives"],
+            json!([ { "hive": "worker1", "reason": "TIMEOUT" }, { "more": 4 } ])
+        );
+        assert_eq!(
+            views[1]["packages_left"][0]["unanswered_hives"],
+            json!([ { "hive": "worker2", "reason": "TIMEOUT" }, { "more": 2 } ])
+        );
+        let text = fallback_text("Execution failed", &views);
+        for part in [
+            "hives not read: worker1 (TIMEOUT), 4 more",
+            "hives not read: worker2 (TIMEOUT), 2 more",
+        ] {
+            assert!(text.contains(part), "{part} missing: {text}");
+        }
+        // A cut of nothing counts nothing.
+        assert_eq!(unanswered_hive_view(&json!({ "truncated_items": 0 })), None);
     }
 
     /// An add_hive that was accepted and whose join failed: the step failed with the join's code

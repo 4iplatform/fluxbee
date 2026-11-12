@@ -230,9 +230,13 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   did not remove, `{runtime, version, error_code, detail, retryable, unanswered_hives}`:
   - the one it stopped at, with SY.admin's code and detail: `RUNTIME_USAGE_UNKNOWN` while a hive
     that may run the version cannot be read (a worker down or restarting, a join under way;
-    FINDINGS A-281), or `RUNTIME_IN_USE` while a node runs it; or `TIMEOUT` when no answer came
-    in time (SY.admin may still remove it: `remove_runtime_version` then answers
-    `RUNTIME_VERSION_NOT_FOUND`), or `TRANSPORT_ERROR` when SY.admin was not reached;
+    FINDINGS A-281), or `RUNTIME_IN_USE` while a node runs it; `UNAUTHORIZED` since 0.1.139
+    while another hive holds a `WF.<workflow>` (FINDINGS A-304, a name deployed on two hives
+    before 0.1.139, say): the versions are that hive's as much as this one's, and stay until
+    its workflow is deleted there, while a deploy of the name on this hive is refused the same
+    way; or `TIMEOUT` when no answer came in time (SY.admin may still remove it:
+    `remove_runtime_version` then answers `RUNTIME_VERSION_NOT_FOUND`), or `TRANSPORT_ERROR`
+    when SY.admin was not reached;
   - each one it had still to remove, `PURGE_STOPPED`;
   - or, when its versions could not be listed, one entry with the runtime, no version
     (`version: ""`) and `DIST_UNREADABLE`: nothing was removed.
@@ -246,7 +250,8 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   `RUNTIME_USAGE_UNKNOWN` and `INVENTORY_UNAVAILABLE`; true for `TIMEOUT`, `TRANSPORT_ERROR` and
   `PURGE_STOPPED`, but a `PURGE_STOPPED` after a `RUNTIME_USAGE_UNKNOWN` that is not retryable is
   not either, since its removal reads the same hives (`purgeStoppedAt`); false for any other
-  refusal (`RUNTIME_IN_USE`: stop or move the node first) and for `DIST_UNREADABLE`.
+  refusal (`RUNTIME_IN_USE`: stop or move the node first; `UNAUTHORIZED`: the other hive's
+  workflow is deleted first) and for `DIST_UNREADABLE`.
   `unanswered_hives` is SY.admin's list of the hives whose nodes it could not read, each
   `{hive, reason, detail}`, when its refusal names any (`RUNTIME_USAGE_UNKNOWN`, and
   `RUNTIME_IN_USE` with a hive not read besides).
@@ -258,7 +263,9 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   /hives/motherbee/runtimes/wf.<workflow>` lists them. With any left, `warning` says the workflow
   is deleted, how many versions of `wf.<workflow>` stayed in the motherbee's dist and where the
   purge stopped, and that `remove_runtime_version` removes each once every hive answers and no
-  node runs it, and a later deploy of the same name purges them too; with `DIST_UNREADABLE`, that
+  node runs it, and a later deploy of the same name purges them too (not after `UNAUTHORIZED`:
+  while the other hive holds its `WF.<workflow>`, SY.admin refuses both, whatever the warning
+  says); with `DIST_UNREADABLE`, that
   this hive's `dist/runtimes/wf.<workflow>` must be fixed first, since until it can be listed a
   compile of the name that names no version is refused too. To remove them by hand, go in
   `packages_left`'s order, which puts the runtime's current last as far as this hive's copy of
@@ -320,14 +327,18 @@ In the other direction, SY.admin's A-62 table bounds what `SY.wf-rules@<hive>` m
 A workflow's package is one runtime for every hive, `wf.<workflow>`. Since 0.1.139 (FINDINGS
 A-304, the operator's call of 2026-11-12) SY.admin refuses this hive's publish and removal of it
 (`UNAUTHORIZED`, naming the node) while another hive holds a `WF.<workflow>`: one connected, or
-one the LSA last saw on a hive cut off, read from shared memory, or one whose config that hive's
+one the LSA last saw on a hive cut off that the hive registry still lists (a hive removed with
+`remove_hive` holds nothing up), read from shared memory, or one whose config that hive's
 orchestrator reads, its node stopped or not, asked at once of every other hive that may run one
 (3 s each). So a deploy of a name another hive uses fails at its publish
 (`PACKAGE_PUBLISH_FAILED`), and moves and purges nothing of that hive's; it passes once that
-hive's workflow is deleted. A hive that does not answer within the 3 s is judged by what the LSA
-last saw of it: a stopped `WF.<workflow>` on a hive down at that moment is not seen, and its
-versions stay all the same, since SY.admin removes a version only once every hive's use of it was
-read (FINDINGS A-281). Before 0.1.139 only a connected `WF.<workflow>` refused, so a deploy of
+hive's workflow is deleted. A delete's purge here is refused the same way, and leaves those
+versions (`UNAUTHORIZED` in `packages_left`, see [Delete](#delete)). A hive that does not answer
+within the 3 s is judged by what the LSA last saw of it, which the motherbee's router keeps in
+memory from its last start (a deploy restarts it): a stopped `WF.<workflow>` on a hive down at
+that moment is not seen, nor one, stopped or running, on a hive cut off since before that start;
+its versions stay all the same, since SY.admin removes a version only once every hive's use of it
+was read (FINDINGS A-281). Before 0.1.139 only a connected `WF.<workflow>` refused, so a deploy of
 the same name staged above that hive's versions (`highestPublishedVersion` counts every version
 of `wf.<workflow>` the dist holds) and its purge asked SY.admin to remove them, a stopped node not
 counted; before 0.1.133 such a deploy published `0.0.1`, which SY.admin refused

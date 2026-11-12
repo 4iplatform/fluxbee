@@ -70,8 +70,9 @@ types a registered person's email is merged into that person.
   - its name must be `wf.<x>` and never `wf.engine`, since every workflow runs the engine's code;
   - no `sync_to`, `update_to` or bundle upload;
   - refused while another hive holds a `WF.<x>` node, connected or not (since 0.1.139, FINDINGS
-    A-304): the connected nodes and what the LSA last saw of a hive cut off, from shared memory,
-    then each other hive's config of it, read through the motherbee's orchestrator.
+    A-304): the connected nodes and what the LSA last saw of a hive cut off that the hive
+    registry still lists, from shared memory, then each other hive's config of it, read through
+    the motherbee's orchestrator.
 - **`remove_runtime_version`:** under the same rule.
 - **`sync_hint`:** with target `motherbee` and the folder `fluxbee-dist-runtimes`, as a worker's
   deploy sends it.
@@ -270,11 +271,14 @@ These remain after the batch and are recorded, not fixed:
 - **On the motherbee, a local non-root user can call the loopback HTTP APIs** (SY.admin :8080,
   Archi :3000).
 - **A node name is not bound to its process** on its own hive. That waits for A-60.
-- **A workflow's next version can come from another hive** only when that hive's `WF.<x>` is
-  stopped and the hive cannot be read at that moment, or the node runs under another name. Since
-  0.1.139 (FINDINGS A-304) the check reads each other hive's config of `WF.<x>`, stopped nodes
-  included, and what the LSA last saw of a hive cut off; before, it read the live node lists alone.
-  A version of such a hive is still never removed while that hive is not read (A-281).
+- **A workflow's next version can come from another hive** only when that hive cannot be read at
+  that moment and its `WF.<x>` is stopped, or, stopped or running, that hive has been cut off
+  since before the motherbee's router last started (the LSA's last view lives in the router's
+  memory, and a deploy restarts it); or when the node runs under another name. Since 0.1.139
+  (FINDINGS A-304) the check reads each other hive's config of `WF.<x>`, stopped nodes included,
+  and what the LSA last saw of a hive cut off that the hive registry still lists; before, it read
+  the live node lists alone. A version of such a hive is still never removed while that hive is
+  not read (A-281).
 
 ---
 

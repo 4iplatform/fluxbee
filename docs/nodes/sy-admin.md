@@ -332,16 +332,23 @@ caller and the action; a command with no stamped caller is refused too.
     the package is the same on every hive. First the nodes connected now, read from shared
     memory, asking no one (`connected_nodes_from_shm`, `workflow_nodes_elsewhere`): the
     motherbee's own from the regions of its routers, every other hive's from the LSA, as the
-    router reaches them, and what the LSA last saw of each hive it holds stale, a hive cut off
-    (`last_seen_node_names`). Then the node's config on every other hive that may run one (the
-    motherbee and each worker whose join is done), each asked at once through the motherbee's
-    orchestrator (`get_node_config` of `WF.<x>@<hive>`, 3 s: `read_workflow_node_config`): a hive
-    that holds it refuses, its node stopped, failed or not connected. A hive that does not answer
-    within the 3 s is judged by what the LSA last saw of it, and a warning names it: nothing is
-    refused for one hive that fails, and a removal still waits for that hive's read of the
-    version's use (A-281). Before 0.1.139 only a connected `WF.<x>` refused. Regions that cannot
-    be read answer `503 INVENTORY_UNAVAILABLE`, to retry (its `payload.retryable` true since
-    0.1.139, FINDINGS A-305), never `UNAUTHORIZED`;
+    router reaches them, and what the LSA last saw of each hive it holds stale, a hive cut off,
+    while the hive registry still lists it (`last_seen_node_names`, `nodes_of_listed_hives`: the
+    router keeps a removed hive's last LSA until it restarts, and a hive gone for good holds
+    nothing up, as in a teardown). Then the node's config on every other hive that may run one
+    (the motherbee and each worker whose join is done), each asked at once through the
+    motherbee's orchestrator (`get_node_config` of `WF.<x>@<hive>`, 3 s:
+    `read_workflow_node_config`): a hive that holds it refuses, its node stopped, failed or not
+    connected. A hive that does not answer within the 3 s is judged by what the LSA last saw of
+    it, and a warning names it: nothing is refused for one hive that fails, and a removal still
+    waits for that hive's read of the version's use (A-281). What the LSA last saw lives in the
+    router's memory from its last start (a deploy restarts it), so a `WF.<x>` on a hive that does
+    not answer is not seen when it is stopped, nor, stopped or running, when that hive has been
+    cut off since before the router's start. Before 0.1.139 only a connected `WF.<x>` refused. A
+    workflow delete's purge meets the same refusal for each version it asks to remove, which
+    stays, `UNAUTHORIZED` in its `packages_left`, until the other hive's workflow is deleted.
+    Regions that cannot be read answer `503 INVENTORY_UNAVAILABLE`, to retry (its
+    `payload.retryable` true since 0.1.139, FINDINGS A-305), never `UNAUTHORIZED`;
   - `sync_hint` `{channel, folder_id, wait_for_idle, timeout_ms}`: only a scan of
     `fluxbee-dist-runtimes` (channel `dist`) on the motherbee, as a worker's deploy asks for one
     (`announceRuntimes`), with `timeout_ms` given and at most 5000. A longer wait would hold the
@@ -1176,8 +1183,10 @@ time comes, in a task of its own, and sleeps until the next one is due:
   (FINDINGS A-263), at most 8 at a time since 0.1.139 (`BACKGROUND_READS_AT_ONCE`, FINDINGS
   A-319): past about 16 in flight the motherbee's orchestrator queued the rest (16 forwarding
   places, 4 per target hive) while each read's bound ran. A look takes its place
-  (`background_place`) before it claims its hive and lets it go once its read ends, so a hive
-  waiting for a place is free for an explicit run; the explicit run's own reads, and the
+  (`background_claim`) before it claims its hive and lets it go once its read ends, so a hive
+  waiting for a place is free for an explicit run; while its look waits, no tick spawns another
+  look at that hive (`Updates::waiting`), where each tick past the hive's cadence queued one more,
+  each reading it again once the one before let it go; the explicit run's own reads, and the
   motherbee's, which its orchestrator answers itself, take none. Before 0.1.137 it read one hive at
   a time, so a read that a spoke's self-restart lost held up the reads of the hives after it for
   its whole bound, and an explicit run's pass waited behind them. The motherbee's orchestrator forwards a spoke's read within its own bound (45 s,
@@ -1878,7 +1887,9 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
   removal answers `RUNTIME_REMOVE_FAILED`, a reset `RUNTIME_RESET_FAILED` and a publish
   `RUNTIME_MANIFEST_BUSY` (`SERVICE_FAILED` before 0.1.139), with the manifest untouched. Each
   says `payload.retryable: true` (FINDINGS A-305, A-306): asked again once the other writer is
-  done, it may pass; a lock whose file cannot be opened says false (`manifest_lock_refusal`).
+  done, it may pass. A lock whose file cannot be opened or locked is the dist's to fix: a removal
+  or a reset answers its code with `payload.retryable: false` (`manifest_lock_refusal`), and a
+  publish `SERVICE_FAILED` with no payload (`publish_runtime_package_failure`).
 
 ## Failure behavior
 

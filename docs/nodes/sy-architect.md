@@ -314,7 +314,9 @@ that answered ok with versions left read as a full success.
   `workflow_name`), its answer's `status`, and its `error_code` and `error_detail`, cut to 300
   characters, for a step that failed or was refused: its answer's, else those of the event that
   failed it (a step that could not be dispatched, an `add_hive` whose join failed). Of its
-  answer's payload: `retryable`; `unanswered_hives`, each `{hive, reason, next}`; `next`;
+  answer's payload: `retryable`; `unanswered_hives`, each `{hive, reason, next}`, and `{more}`
+  counting the hives SY.admin cut from it to fit the mesh frame (since 0.1.139, FINDINGS A-328),
+  which the fallback says as "<n> more"; `next`;
   `warning`, cut to 400 characters; `packages_left`, each `{runtime, version, error_code, detail,
   retryable, unanswered_hives}`, a `PURGE_STOPPED`'s without its detail; `pages_left_up` as
   `count`, its `error` when SY.admin could not count them, `more` and each page's

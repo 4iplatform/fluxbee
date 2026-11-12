@@ -32612,9 +32612,11 @@ mod tests {
             }
             checked += 1;
         }
+        // Twelve since 0.1.139: the deployment and drift-alert reads' examples carry their query
+        // filters (FINDINGS A-297).
         assert_eq!(
-            checked, 8,
-            "the admin catalog has eight GET examples with a quoted path"
+            checked, 12,
+            "the admin catalog has twelve GET examples with a quoted path"
         );
     }
 

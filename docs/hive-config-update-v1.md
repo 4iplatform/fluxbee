@@ -658,10 +658,11 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     (`BACKGROUND_READS_AT_ONCE`): bounded in time only, past about 16 in flight its reads queued
     at the motherbee's orchestrator (16 forwarding places, 4 per target hive) while each one's
     bound ran, and a queued read that timed out held its hive 50 s. A look takes its place before
-    it claims its hive, and lets it go once its read ends; the explicit run's reads and the
-    motherbee's own take none. A read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`),
-    past that bound; one that timed out anyway keeps the hive unread for another 50 s, so a second
-    never runs beside it. The re-read (`recheck`) claims its hive only for its own read, so an
+    it claims its hive, and lets it go once its read ends; while it waits for its place, no tick
+    spawns another look at that hive; the explicit run's reads and the motherbee's own take none.
+    A read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), past that bound; one that
+    timed out anyway keeps the hive unread for another 50 s, so a second never runs beside it. The
+    re-read (`recheck`) claims its hive only for its own read, so an
     explicit run's pass on a hive waits only for the read of that hive under way (since 0.1.124
     the re-read took its turn among the background reads before it claimed its hive: woken at a
     run's open, the task re-read every hive not read yet, each holding its hive while queued

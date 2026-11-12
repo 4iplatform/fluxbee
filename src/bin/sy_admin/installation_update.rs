@@ -33,7 +33,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -1567,6 +1567,12 @@ pub(crate) struct Updates {
     quiet_until: Mutex<HashMap<String, u64>>,
     /// The background task's places for a hive's read, `BACKGROUND_READS_AT_ONCE` (FINDINGS A-319).
     background_reads: tokio::sync::Semaphore,
+    /// The hives a look of the background task waits for its place at, each with that look's mark
+    /// (`WaitingLook`, A-319's review): from the tick that spawned it until it tried to claim its
+    /// hive, which is busy from then on, or ended. A tick passes over such a hive as over a busy
+    /// one: a look holds no hive while it waits, and every tick past its cadence queued another.
+    waiting: Mutex<HashMap<String, u64>>,
+    next_waiting_mark: AtomicU64,
     /// One explicit run at a time.
     running: Mutex<Option<Running>>,
     /// The open update's target checked once after SY.admin's start; the registry's failure said.
@@ -1671,6 +1677,25 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// A look the background task spawned at a hive, marked waiting from the tick that spawned it
+/// (`Updates::waiting`, A-319's review). The look's own claim takes the mark off
+/// (`Updates::background_claim`); this takes it off when the look ends first, and never a later
+/// look's mark.
+pub(crate) struct WaitingLook {
+    updates: Arc<Updates>,
+    hive: String,
+    mark: u64,
+}
+
+impl Drop for WaitingLook {
+    fn drop(&mut self) {
+        let mut waiting = lock(&self.updates.waiting);
+        if waiting.get(&self.hive) == Some(&self.mark) {
+            waiting.remove(&self.hive);
+        }
+    }
+}
+
 /// The explicit run's mark, released when it answers.
 pub(crate) struct RunGuard<'a> {
     updates: &'a Updates,
@@ -1712,6 +1737,8 @@ impl Updates {
             reads: Mutex::new(HashMap::new()),
             quiet_until: Mutex::new(HashMap::new()),
             background_reads: tokio::sync::Semaphore::new(BACKGROUND_READS_AT_ONCE),
+            waiting: Mutex::new(HashMap::new()),
+            next_waiting_mark: AtomicU64::new(0),
             running: Mutex::new(None),
             resume_checked: AtomicBool::new(false),
             registry_said: AtomicBool::new(false),
@@ -1768,6 +1795,23 @@ impl Updates {
 
     fn is_busy(&self, hive: &str) -> bool {
         lock(&self.busy).contains_key(hive)
+    }
+
+    /// Whether a look of the background task waits for its place at `hive` (`WaitingLook`).
+    fn is_waiting(&self, hive: &str) -> bool {
+        lock(&self.waiting).contains_key(hive)
+    }
+
+    /// The mark of a look the background task spawns at `hive`, waiting until it claims the hive
+    /// (A-319's review).
+    fn mark_waiting(self: &Arc<Self>, hive: &str) -> WaitingLook {
+        let mark = self.next_waiting_mark.fetch_add(1, Ordering::SeqCst);
+        lock(&self.waiting).insert(hive.to_string(), mark);
+        WaitingLook {
+            updates: Arc::clone(self),
+            hive: hive.to_string(),
+            mark,
+        }
     }
 
     /// One explicit run at a time: the run's mark, or the one under way.
@@ -1896,7 +1940,7 @@ impl Updates {
     ///
     /// A read that is answered ends any hold: the hive answers.
     ///
-    /// The background task's looks take one of its places first (`background_place`, FINDINGS
+    /// The background task's looks take one of its places first (`background_claim`, FINDINGS
     /// A-319).
     pub(crate) async fn read_versions(
         &self,
@@ -1938,13 +1982,23 @@ impl Updates {
     }
 
     /// One of the background task's `BACKGROUND_READS_AT_ONCE` places for a hive's read (FINDINGS
-    /// A-319), held until it is dropped. A look takes it before it claims its hive and lets it go
-    /// once its read answered or gave up, before anything else it does: a look waiting for a place
-    /// holds no hive, so an explicit run's pass on a hive still waits only for that hive's read
-    /// under way (A-263), and a look never waits for a second place while it holds one. None only
-    /// when the places are closed, which nothing does.
-    pub(crate) async fn background_place(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        self.background_reads.acquire().await.ok()
+    /// A-319), held until it is dropped, then the hive (`claim`). A look takes its place before it
+    /// claims its hive and lets it go once its read answered or gave up, before anything else it
+    /// does: a look waiting for a place holds no hive, so an explicit run's pass on a hive still
+    /// waits only for that hive's read under way (A-263), and a look never waits for a second place
+    /// while it holds one. Its mark as waiting (`WaitingLook`) goes once it tried to claim the
+    /// hive, which is busy from then on, its own or another task's: no tick in between spawns
+    /// another look at it. None when another task holds the hive, or when the places are closed,
+    /// which nothing does.
+    pub(crate) async fn background_claim(
+        &self,
+        hive: &str,
+        id: &str,
+    ) -> Option<(tokio::sync::SemaphorePermit<'_>, Claim<'_>)> {
+        let place = self.background_reads.acquire().await.ok()?;
+        let claim = self.claim(hive, READING, id);
+        lock(&self.waiting).remove(hive);
+        Some((place, claim?))
     }
 
     /// Sets one hive's category in the update `id`, while it is the open one; logs an outcome on
@@ -3438,7 +3492,10 @@ pub(crate) async fn tick(
         if look == Look::Nothing {
             continue;
         }
-        if updates.is_busy(&hive) {
+        // A hive another task holds, or whose look waits for a place (A-319's review): a look that
+        // waits holds no hive, and each tick past its cadence queued one more look at it, each
+        // reading it again as soon as the one before let it go.
+        if updates.is_busy(&hive) || updates.is_waiting(&hive) {
             sooner(now.saturating_add(bounds.flight_check.as_millis() as u64));
             continue;
         }
@@ -3450,6 +3507,7 @@ pub(crate) async fn tick(
         let period = look.period(bounds);
         updates.look_again(&hive, period);
         sooner(now.saturating_add(period.as_millis() as u64));
+        let waiting = updates.mark_waiting(&hive);
         let (updates, mesh, id, target, bounds) = (
             Arc::clone(updates),
             Arc::clone(mesh),
@@ -3468,6 +3526,8 @@ pub(crate) async fn tick(
                 }
                 Look::Nothing => {}
             }
+            // Its mark, when it ended before it claimed its hive.
+            drop(waiting);
             updates.settle_state();
         });
     }
@@ -3576,10 +3636,7 @@ pub(crate) async fn follow(
     bounds: &Bounds,
 ) {
     // A place for its read, then the hive (FINDINGS A-319).
-    let Some(place) = updates.background_place().await else {
-        return;
-    };
-    let Some(claim) = updates.claim(hive, READING, id) else {
+    let Some((place, claim)) = updates.background_claim(hive, id).await else {
         return;
     };
     let Some(entry) = updates.entry(id, hive) else {
@@ -3871,10 +3928,7 @@ pub(crate) async fn automatic_step(
         return;
     }
     // A place for its read, then the hive (FINDINGS A-319).
-    let Some(place) = updates.background_place().await else {
-        return;
-    };
-    let Some(claim) = updates.claim(hive, READING, id) else {
+    let Some((place, claim)) = updates.background_claim(hive, id).await else {
         return;
     };
     let read = updates.read_versions(mesh, hive, bounds).await;
@@ -3998,10 +4052,7 @@ pub(crate) async fn recheck(
     // A place for its read, then the hive, then its read, beside the other hives' (FINDINGS A-263,
     // A-319): it holds the hive only once it has its place, so an explicit run's pass on this hive
     // waits only for this read.
-    let Some(place) = updates.background_place().await else {
-        return;
-    };
-    let Some(_claim) = updates.claim(hive, READING, id) else {
+    let Some((place, _claim)) = updates.background_claim(hive, id).await else {
         return;
     };
     let read_at = now_epoch_ms();

@@ -2178,6 +2178,62 @@ async fn the_background_reads_at_most_eight_hives_at_once() {
     const { assert!(BACKGROUND_READS_AT_ONCE < 16) };
 }
 
+/// A-319's review: a look waiting for one of the background task's places holds no hive, and the
+/// ticks meanwhile spawn no other look at that hive (`Updates::waiting`), so once a place frees the
+/// hive is read once. Every tick past its cadence queued one more look, and each read the hive
+/// again as soon as the one before let it go: five here, past 8 hives due on a large installation.
+#[tokio::test]
+async fn a_hive_whose_look_waits_for_a_place_gets_no_second_look() {
+    let bounds = quick();
+    let updates = Updates::load(&temp_state("installation-update-waiting-look"));
+    let mesh = FakeMesh::new(vec![motherbee_on_target(), worker_behind()]);
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let id = open_update(&updates, "http", &["motherbee", "worker1"]);
+    for category in [Category::Core, Category::Config] {
+        updates.record(
+            &id,
+            "motherbee",
+            category,
+            Standing::OnTarget,
+            None,
+            None,
+            None,
+        );
+    }
+    // Every place taken, as by eight long reads of other hives.
+    let places: Vec<_> = (0..BACKGROUND_READS_AT_ONCE)
+        .map(|_| updates.background_reads.try_acquire().expect("a place"))
+        .collect();
+    // Five ticks, each past worker1's cadence (`retry_check`, 10 ms) while its look waits.
+    for _ in 0..5 {
+        tick(&updates, &dyn_mesh, &bounds).await;
+        tokio::time::sleep(bounds.retry_check * 3).await;
+    }
+    assert!(updates.is_waiting("worker1"));
+    assert!(
+        !updates.is_busy("worker1"),
+        "a look that waits holds no hive"
+    );
+    assert!(mesh.read_bounds_of("worker1").is_empty());
+    drop(places);
+    // Its look reads it and lets it go; another look queued meanwhile would read it again at once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while mesh.read_bounds_of("worker1").is_empty() || updates.is_busy("worker1") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker1 was not read"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mesh.read_bounds_of("worker1").len(),
+        1,
+        "worker1 read once its look had a place"
+    );
+    assert!(!updates.is_waiting("worker1"));
+}
+
 /// F2 (b) and (c): each hive is looked at by where it stands (in flight every few seconds; one that
 /// did not answer, or was not read, through shared memory, read only once its orchestrator shows;
 /// one left as it is now and then), and an action on it makes the background task look at once.

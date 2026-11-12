@@ -395,8 +395,8 @@ type ConnectedNodes = Arc<dyn Fn(&str) -> Result<ConnectedNow, String> + Send + 
 /// read holds: this admin's own, and each other hive the LSA holds as fresh. The nodes of a hive
 /// the LSA holds as stale, or does not list, are not in it either way: whether they run is unknown.
 /// `last_seen` holds what the LSA last saw of each hive it holds as stale, a hive cut off
-/// (`last_seen_node_names`): not connected now, which only the workflow-package admission reads
-/// (FINDINGS A-304).
+/// (`last_seen_node_names`): not connected now, which only the workflow-package admission reads,
+/// for the hives the registry still lists (FINDINGS A-304, `nodes_of_listed_hives`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConnectedNow {
     nodes: Vec<String>,
@@ -6540,7 +6540,9 @@ fn connected_nodes_from_shm(admin_hive: &str) -> Result<ConnectedNow, String> {
 
 /// The nodes the LSA holds for each other hive it holds as stale but not deleted, a hive cut off,
 /// as it last saw them (FINDINGS A-304): the router keeps a hive's last LSA, flagged stale, until
-/// the hive is back. None is connected now, and each may still run.
+/// the hive is back or the router restarts. None is connected now, and each may still run. A hive
+/// removed with `remove_hive` keeps its last LSA there too, so a reader keeps only the hives the
+/// registry still lists (`nodes_of_listed_hives`).
 fn last_seen_node_names(admin_hive: &str, lsa: &LsaSnapshot, now: u64) -> Vec<String> {
     let cut_off = |index: u16| {
         let entry = lsa.hives.get(index as usize)?;
@@ -6565,6 +6567,21 @@ fn last_seen_node_names(admin_hive: &str, lsa: &LsaSnapshot, now: u64) -> Vec<St
     names.sort();
     names.dedup();
     names
+}
+
+/// The nodes of `names`, each `<name>@<hive>`, whose hive the hive registry still lists (FINDINGS
+/// A-304's review): what the LSA last saw of a hive cut off holds a workflow's package only then.
+/// The router keeps the last LSA of a hive removed with `remove_hive` until it restarts, and a
+/// hive gone for good holds nothing up, as in a teardown (`teardown_live_node_refusal`).
+fn nodes_of_listed_hives(names: &[String], registry: &HiveRegistry) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            name.rsplit_once('@')
+                .is_some_and(|(_, node_hive)| registry.lists(node_hive))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The nodes in the regions of this hive's routers, found as a router finds its peers'
@@ -6756,7 +6773,8 @@ enum WorkflowNodeHeld {
 /// The package is one runtime for every hive, so another hive's deploy would publish above its
 /// versions and its purge would ask for their removal. In order:
 /// 1. the nodes connected now, from shared memory (`workflow_nodes_elsewhere`), and what the LSA
-///    last saw of each hive it holds stale, a hive cut off (`ConnectedNow::last_seen`);
+///    last saw of each hive it holds stale, a hive cut off, while the hive registry still lists
+///    that hive (`ConnectedNow::last_seen`, `nodes_of_listed_hives`);
 /// 2. the node's config on every other hive that may run one (the motherbee and each worker
 ///    whose join is done), each asked at once through the motherbee's orchestrator
 ///    (`get_node_config`, `WF_PACKAGE_HOLDER_READ_TIMEOUT`): one that holds it refuses, whether
@@ -6765,7 +6783,10 @@ enum WorkflowNodeHeld {
 /// A hive that does not answer now is judged by what the LSA last saw of it, and logged: refusing
 /// whenever some hive cannot be read would stop every workflow's deploy on every hive while one
 /// hive is down (the operator's principle of 2026-11-12, A-313: act only on what fails). A
-/// removal of such a version still waits for that hive's read of its use (A-281).
+/// removal of such a version still waits for that hive's read of its use (A-281). What the LSA
+/// last saw lives in the motherbee's router's memory, from its last start (a deploy restarts it):
+/// so a `WF.<workflow>` is not seen on a hive that does not answer when it is stopped, nor,
+/// stopped or running, when that hive has been cut off since before the router's start.
 async fn admit_workflow_package(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -6782,13 +6803,18 @@ async fn admit_workflow_package(
         ))
     })?;
     workflow_nodes_elsewhere(&connected.nodes, workflow, hive).map_err(refuse)?;
-    workflow_nodes_elsewhere(&connected.last_seen, workflow, hive).map_err(|detail| {
+    let registry = hive_registry(ctx);
+    workflow_nodes_elsewhere(
+        &nodes_of_listed_hives(&connected.last_seen, &registry),
+        workflow,
+        hive,
+    )
+    .map_err(|detail| {
         refuse(format!(
             "{detail} (as the LSA last saw its hive, which is cut off now)"
         ))
     })?;
 
-    let registry = hive_registry(ctx);
     let mut hives: Vec<String> = registry_hive_entries(&registry)
         .unwrap_or_default()
         .into_iter()
@@ -17869,7 +17895,7 @@ const WF_DELETE_KILL_ERROR_NOTE: &str = "Any other ORCHESTRATOR_ERROR may come f
 /// again under the name numbers its versions (`nextWorkflowVersion` in
 /// go/sy-wf-rules/node/compile.go), which a hive's dist that cannot be listed refuses
 /// (`highestPublishedVersion`, the delete's DIST_UNREADABLE).
-const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the versions of wf.<workflow_name> last, once its WF node and its state are gone: each version its hive's dist lists and each its slots named, one remove_runtime_version at a time, the current last, each waited for up to 35 s (SY.admin reads every hive's use first) within what is left of the request's 60 s, and stops at the first that fails: a refusal (RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281; RUNTIME_IN_USE while a node runs it) or no answer in time (TIMEOUT: SY.admin may still remove it). Since 0.1.133 the delete answers ok all the same: payload.packages_left names each version not removed, {runtime, version, error_code, detail, retryable, unanswered_hives}, the one it stopped at with its failure and each after it PURGE_STOPPED ([] when every version it knew of went; one entry with no version, DIST_UNREADABLE, when its hive's dist could not be listed and none was removed); retryable says whether asking again, nothing changed first, may remove it (false for RUNTIME_IN_USE: stop or move the node first; false for a RUNTIME_USAGE_UNKNOWN that SY.admin says is not, a hive not read being a join that ended or the motherbee's own nodes unread, and for each PURGE_STOPPED after it, whose read meets the same), and unanswered_hives, when SY.admin named any, the hives it did not read. payload.warning says the workflow is deleted and what removes them. Say so; never that the delete failed, and never ask it again: it answers WORKFLOW_NOT_FOUND. The versions left block nothing: a workflow created again under that name numbers its versions above every version the dist holds, and its deploy's purge removes them. To remove them sooner, remove_runtime_version each once every hive answers, in packages_left's order, the runtime's current last: one refused RUNTIME_CURRENT_CONFLICT goes after the others. DIST_UNREADABLE is the exception: until its hive's dist/runtimes/wf.<workflow_name> can be listed again, a compile of the name that names no version is refused (WFRULES_ERROR, nothing staged), so that folder is fixed first, and the versions to remove are those GET /hives/motherbee/runtimes/wf.<workflow_name> lists, not packages_left.";
+const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the versions of wf.<workflow_name> last, once its WF node and its state are gone: each version its hive's dist lists and each its slots named, one remove_runtime_version at a time, the current last, each waited for up to 35 s (SY.admin reads every hive's use first) within what is left of the request's 60 s, and stops at the first that fails: a refusal (RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281; RUNTIME_IN_USE while a node runs it; UNAUTHORIZED, since 0.1.139, while another hive holds a WF.<workflow_name>: FINDINGS A-304) or no answer in time (TIMEOUT: SY.admin may still remove it). Since 0.1.133 the delete answers ok all the same: payload.packages_left names each version not removed, {runtime, version, error_code, detail, retryable, unanswered_hives}, the one it stopped at with its failure and each after it PURGE_STOPPED ([] when every version it knew of went; one entry with no version, DIST_UNREADABLE, when its hive's dist could not be listed and none was removed); retryable says whether asking again, nothing changed first, may remove it (false for RUNTIME_IN_USE: stop or move the node first; false for UNAUTHORIZED; false for a RUNTIME_USAGE_UNKNOWN that SY.admin says is not, a hive not read being a join that ended or the motherbee's own nodes unread, and for each PURGE_STOPPED after it, whose read meets the same), and unanswered_hives, when SY.admin named any, the hives it did not read. payload.warning says the workflow is deleted and what removes them. Say so; never that the delete failed, and never ask it again: it answers WORKFLOW_NOT_FOUND. The versions left block nothing, those refused UNAUTHORIZED aside: a workflow created again under that name numbers its versions above every version the dist holds, and its deploy's purge removes them. A version refused UNAUTHORIZED is also the package of the WF.<workflow_name> its detail names, on another hive (a name deployed on two hives before 0.1.139, say): it stays until that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is refused the same way; say which hive uses the name, and never offer to remove it. To remove the others sooner, remove_runtime_version each once every hive answers, in packages_left's order, the runtime's current last: one refused RUNTIME_CURRENT_CONFLICT goes after the others. DIST_UNREADABLE is the exception: until its hive's dist/runtimes/wf.<workflow_name> can be listed again, a compile of the name that names no version is refused (WFRULES_ERROR, nothing staged), so that folder is fixed first, and the versions to remove are those GET /hives/motherbee/runtimes/wf.<workflow_name> lists, not packages_left.";
 
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
@@ -35107,7 +35133,9 @@ mod tests {
     /// of a hive cut off. Only the connected nodes were read, so a stopped WF.invoice@motherbee,
     /// or one on a hive cut off, let worker1's deploy publish above its versions and purge them. A
     /// hive that does not answer is judged by what the LSA last saw of it: nothing is refused for
-    /// it alone.
+    /// it alone. What the LSA last saw of a hive the registry no longer lists (removed with
+    /// remove_hive, its last LSA kept by the router until it restarts) holds nothing up (A-304's
+    /// review): it refused every hive's deploy and delete of the name.
     #[tokio::test(start_paused = true)]
     async fn a_wf_rules_package_is_refused_while_another_hive_holds_its_wf_node() {
         let (mut ctx, mut harness) = mesh_test_admin("a304-wf-holders");
@@ -35198,13 +35226,48 @@ mod tests {
             admitted.envelope
         );
 
-        // A hive cut off whose last LSA showed WF.invoice: refused before anything is read.
+        // The last LSA of worker2, a hive the registry no longer lists (removed), showed
+        // WF.invoice: it holds nothing up, and the motherbee's read decides.
         ctx.connected_nodes = Arc::new(|_| {
             Ok(ConnectedNow {
                 last_seen: vec!["WF.invoice@worker2".to_string()],
                 ..connected_now(&["worker1"], &[])
             })
         });
+        for (action, params) in [
+            ("publish_runtime_package", publish.clone()),
+            ("remove_runtime_version", removal.clone()),
+        ] {
+            let ask = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                action,
+                Some("motherbee"),
+                params,
+                caller,
+            );
+            let none_there = json!({ "status": "error", "error_code": "NODE_CONFIG_NOT_FOUND" });
+            let (admitted, read) = tokio::join!(
+                ask,
+                answer_admin_relay(&mut harness, "get_node_config", none_there)
+            );
+            assert_eq!(read.payload["node_name"], json!("WF.invoice@motherbee"));
+            let admitted = admitted.expect("dispatch");
+            assert_ne!(
+                admitted.envelope["error_code"],
+                json!("UNAUTHORIZED"),
+                "{action}: {}",
+                admitted.envelope
+            );
+        }
+
+        // A hive cut off that the registry lists, whose last LSA showed WF.invoice: refused before
+        // anything is read.
+        write_registry_entry(
+            hive_registry(&ctx).root(),
+            "worker2",
+            "hive_id: worker2\nstatus: connected\nrole: worker\njoin:\n  phase: done\n",
+        );
         let refused = dispatch_internal_admin_command(
             &ctx,
             &ctx.rpc,
@@ -39117,6 +39180,12 @@ mod tests {
             "a compile of the name that names no version is refused (WFRULES_ERROR",
             "GET /hives/motherbee/runtimes/wf.<workflow_name> lists, not packages_left",
             "and for each PURGE_STOPPED after it",
+            // A-304's review: another hive's WF.<workflow_name> keeps them, and its deploy here.
+            "UNAUTHORIZED, since 0.1.139, while another hive holds a WF.<workflow_name>",
+            "false for UNAUTHORIZED",
+            "it stays until that hive's workflow is deleted, and meanwhile a deploy of the name on \
+             this hive is refused the same way",
+            "never offer to remove it",
         ] {
             assert!(WF_DELETE_VERSIONS_LEFT_NOTE.contains(words), "{words}");
         }

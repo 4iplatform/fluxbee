@@ -993,6 +993,12 @@ person: when its provider gave no answer, the error carries the operator's text 
     `remove_runtime_version` step each (hive `motherbee`) once every hive answers, in
     `packages_left`'s order, the runtime's current last (a step refused `RUNTIME_CURRENT_CONFLICT`
     goes after the others), in a plan the operator confirms.
+  - `UNAUTHORIZED` (since 0.1.139, `retryable` false) is the exception: another hive holds a
+    `WF.<workflow_name>`, the node its `detail` names (a name deployed on two hives before
+    0.1.139, say), and the version is that node's package too (FINDINGS A-304). It stays until
+    that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is refused
+    the same way (§7.5). Tell the operator which hive uses the name, and never offer to remove
+    those versions.
   - `DIST_UNREADABLE` is the exception: it names no version, and until the hive's
     `dist/runtimes/wf.<workflow_name>` can be listed again, a compile of the name that names no
     version is refused (`WFRULES_ERROR`, nothing staged), so the workflow cannot be deployed again.
@@ -1781,7 +1787,9 @@ Use:
 A workflow's name is one package for every hive (`wf.<name>`). While another hive holds a
 `WF.<name>` node, running or stopped, a deploy of that name on this hive fails: SY.admin refuses
 its package with `UNAUTHORIZED`, naming the other node (FINDINGS A-304). Tell the operator which
-hive uses the name, and offer another name, or the workflow's delete on that hive first.
+hive uses the name, and offer another name, or the workflow's delete on that hive first. A delete
+of the name on this hive meanwhile removes its workflow, node and state, and leaves the versions
+the other node uses (`packages_left`, each `UNAUTHORIZED`).
 
 Use this when the operator is describing:
 - branching

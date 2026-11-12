@@ -1651,6 +1651,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`payload_view` in `src/bin/sy_architect/execution_report.rs`). Its test,
   `an_executor_answer_without_its_outputs_keeps_a_refusals_retryable_and_hives`, fails without it.
   sy-admin.md's executor section says it.
+- **Its review (2026-11-12), on `coa/admin-139`:** Archi's report dropped the count of the hives
+  SY.admin cut (`{"truncated_items": n}`): `unanswered_hive_view` kept only an item with a `hive`.
+  It now keeps the count as `{"more": n}`, which the report's text says as "<n> more", for a
+  refusal's hives and for a version left's alike (`src/bin/sy_architect/execution_report.rs`, in
+  0.1.139 with SY.admin). Its test, `the_hives_sy_admin_cut_from_a_refusal_are_counted`, fails
+  without it.
 
 ### A-327 [Archi] 🔵 low (found 2026-11-12 by A-322's review; read in the code; since 0.1.137) — Archi's explanation turn after a CONFIRM never reads the prompt cache
 
@@ -1837,6 +1843,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `the_background_reads_at_most_eight_hives_at_once`, has twelve workers restart onto the target
   with each read taking 300 ms: 8 at once, the update closed; without it, 12. sy-admin.md and
   hive-config-update-v1 say it.
+- **Its review (2026-11-12), on `coa/admin-139`:** a look that waited for its place held no hive,
+  so the tick, which passed over busy hives only, spawned another look at that hive at each tick
+  past its cadence (3 s for a hive in flight), and each read the hive again as soon as the one
+  before let it go: on an installation with more than 8 hives due, more reads, off the cadence.
+  Now the tick marks each look it spawns as waiting (`Updates::waiting`, `WaitingLook`) until the
+  look tried to claim its hive (`background_claim`, which takes the place and then the hive), or
+  ended, and passes over a waiting hive as over a busy one. Its test,
+  `a_hive_whose_look_waits_for_a_place_gets_no_second_look` (every place taken, five ticks past
+  the hive's cadence, then the places freed: one read), fails without it (five reads).
 
 ### A-318 [General/admin] 🔵 low (found 2026-11-11 by A-280's review; read in the code) — A failed publish's clean-up runs after the answer, so a stop of SY.admin during IO.blob's release orphans the copy
 
@@ -2153,7 +2168,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `a_publish_waits_for_the_manifest_lock_a_bounded_time`, each failing without it; A-171's
   structural test reads the locked read the write is built on. SY.admin's help
   (`publish_runtime_package`, `remove_runtime_version`), sy-admin.md, sy-wf-rules.md,
-  operations.md and Archi's handbook (§7.2) say it. Left: the comment over `runtimeRemovalTimeout`
+  operations.md and Archi's handbook (§7.2) say it. A publish whose lock's file cannot be opened
+  or locked still answers `SERVICE_FAILED` with no payload, as sy-admin.md now says (its review
+  of 2026-11-12: it said false). Left: the comment over `runtimeRemovalTimeout`
   in `go/sy-wf-rules/node/admin.go` still says a removal holds the lock across its read (SY.wf-rules'
   branch, a comment only).
 
@@ -2215,12 +2232,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the LSA last saw of it and named in a warning, never refused for: refusing whenever a hive
   cannot be read would stop every workflow's deploy on every hive while one is down (this entry's
   own concern, and the operator's principle of 2026-11-12 in A-313). What stays open: a stopped
-  `WF.<x>` on a hive that cannot be read at that moment is not seen; its versions still stay,
-  since a removal reads every hive's use first (A-281). Its tests:
+  `WF.<x>` on a hive that cannot be read at that moment is not seen, nor one, stopped or running,
+  on a hive cut off since before the motherbee's router last started, since the LSA's last view
+  lives in the router's memory and a deploy restarts it; their versions still stay, since a
+  removal reads every hive's use first (A-281). Its tests:
   `a_wf_rules_package_is_refused_while_another_hive_holds_its_wf_node` (a config held, one that
   cannot be read, a motherbee that does not answer, a hive cut off) and the LSA's last view in
   `connected_nodes_come_from_the_routers_and_the_lsa`, each failing without it. sy-admin.md,
   sy-wf-rules.md, control-path-hardening-v1 and Archi's handbook (§7.5) say it.
+- **Its review (2026-11-12), on `coa/admin-139`:** (1) what the LSA last saw counts only for a hive
+  the registry still lists (`nodes_of_listed_hives`): the router keeps a removed hive's last LSA
+  until it restarts, so once a hive that ran `WF.<x>` was removed with `remove_hive`, every hive's
+  deploy and delete of the name was refused, naming a hive that no longer exists, where 0.1.138
+  admitted them; a hive gone for good holds nothing up, as in a teardown. The A-304 test now has
+  that removed hive admitted and a listed one refused, and fails without it. (2) The docs say what
+  the LSA's last view misses (above). (3) A workflow delete's purge meets the same refusal: each
+  version another hive's `WF.<x>` holds stays in `packages_left` as `UNAUTHORIZED`, retryable
+  false (SY.wf-rules' `removalFailure`), until that hive's workflow is deleted, and a deploy of the
+  name meanwhile is refused too; SY.admin's help of `wf_rules_delete`
+  (`WF_DELETE_VERSIONS_LEFT_NOTE`), sy-wf-rules.md and Archi's handbook say so, and that such
+  versions are never offered for removal. Left: SY.wf-rules' own `warning` on a delete still says
+  a later deploy of the name purges the versions left, after an `UNAUTHORIZED` too (its branch).
 
 ### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
 
@@ -2358,6 +2390,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the global two) and their examples carry a query. Its test,
   `an_empty_hive_filter_reads_every_hive`, drives the HTTP routes and fails without it (the
   motherbee's orchestrator was asked `get_deployments` for `/deployments?hive=`).
+- **Its review (2026-11-12), on `coa/admin-139`:** Archi's test that every quoted GET example of
+  SY.admin's catalog translates (`every_quoted_get_example_in_the_admin_catalog_translates`)
+  counted eight and failed with the four new examples, each of which translates: it counts twelve.
+  The gate judges the fix by the bodies: the command log never shows a read of `/versions`, and a
+  hive's log never showed 0.1.138's entries of hive `""`.
 
 ### A-296 [General/orchestrator] 🔵 low (found 2026-11-11 by A-288's review; read in the code; there before it) — A deployments read filtered by category also answers the local snapshot rows of every category
 
