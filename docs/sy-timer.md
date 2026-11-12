@@ -1,6 +1,6 @@
 # SY.timer — System Node
 
-**Status:** v1.6 implemented / aligned with current runtime
+**Status:** v1.7 implemented / aligned with current runtime
 **Date:** 2026-04-13; checked against the code on 2026-10-27; v1.2 on 2026-11-04, in 0.1.99: a fire saved
 before it goes and sent again while its target is down, caps, reads by the owner, a node's own
 target (FINDINGS A-115); v1.3 for the next release: `TIMER_LIST` in pages (FINDINGS A-151); v1.4 in
@@ -14,7 +14,9 @@ purged timer's entry leaving it at once, a fire whose read of its timer fails is
 gets a line in SY.timer's own log, with its verb, its code and its sender (and the database's error
 for a `TIMER_STORAGE_ERROR`), at most 10 a minute per sender, and so does a message that is no
 request (FINDINGS A-258); a `TIMER_LIST` page its `limit` cuts answers `next_cursor`, as one the
-frame cuts does (FINDINGS A-266)
+frame cuts does (FINDINGS A-266); v1.7 in 0.1.139: a `TIMER_LIST` page reads its timers from an
+index that holds them in the list's order, from its cursor's place on, and no further than the
+first one it cannot take: what it lists and one more, whatever the hive holds (FINDINGS A-326)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -129,7 +131,8 @@ Future nodes with direct interaction (for example `WF.*`, invocable capabilities
 │  ┌─────────────────────────────────────────────────┐  │
 │  │              SQLite (timers.db)                 │  │
 │  │  table: timers                                  │  │
-│  │  indexes: owner, fire_at_utc, status            │  │
+│  │  indexes: owner, fire_at_utc, status, and one   │  │
+│  │  per TIMER_LIST filter, in its order (§5.2)     │  │
 │  └─────────────────────────────────────────────────┘  │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
@@ -243,9 +246,16 @@ CREATE INDEX idx_timers_status ON timers(status);
 CREATE UNIQUE INDEX idx_timers_owner_clientref_pending
 ON timers(owner_l2_name, client_ref)
 WHERE client_ref IS NOT NULL AND status='pending';
+
+-- TIMER_LIST's, one per filter, in the list's order (since v1.7)
+CREATE INDEX idx_timers_list_owner_status ON timers(owner_l2_name, status, fire_at_utc, uuid);
+CREATE INDEX idx_timers_list_owner ON timers(owner_l2_name, fire_at_utc, uuid);
+CREATE INDEX idx_timers_list_status ON timers(status, fire_at_utc, uuid);
+CREATE INDEX idx_timers_list ON timers(fire_at_utc, uuid);
 ```
 
 **Notes:**
+- The four `idx_timers_list*` indexes (since v1.7, FINDINGS A-326) hold the timers in `TIMER_LIST`'s order, fire time then uuid, after what a page filters on: an owner and a status, an owner (`status_filter` `all`), a status (`SY.admin`'s list of the whole hive), or nothing (the whole hive, `all`). A page reads one of them from its cursor's place on (§7.6). They are created at every start when the table lacks them, as `idx_timers_owner`, `idx_timers_fire_at` and `idx_timers_status` are (`CREATE INDEX IF NOT EXISTS`, whatever `user_version` says), so the first start of v1.7 builds them over the table it finds, before it serves a request: on the builder's Mac 0.18 s for 15,000 timers, and 2.7 s for 200,000 (the hive's cap of 100,000 pending, and as many fired). They take room: the file went from 5.8 to 9.8 MB at 15,000 timers, and from 67 to 120 MB at 200,000. A timer's writes update them too: on the same Mac, with 18,000 timers in the table, an insert took 376 µs where it took 289 µs, and a fire's read and save 462 µs where 358 µs. An older `SY.timer` started on the table leaves them as they are (its lists read them too), so going back and forward again is safe. `idx_timers_owner` and `idx_timers_status` lead two of them and stay: an older `SY.timer`'s start would create them again.
 - `created_at_utc` is kept forever, even after reschedules. It serves traceability and `fire_if_within` decisions based on the age of the original timer.
 - `cron_tz` is persisted explicitly so that the next recurring fire can be recomputed without losing the source timezone.
 - `canceled_reason` is schema version 3 (`PRAGMA user_version`, since 0.1.127, FINDINGS A-220). `ensureTimerSchema` adds it to a table that lacks it, whatever `user_version` says: a `SY.timer` before it writes `user_version` 2 back over a table that has it, and reads and writes its rows by naming the other columns, so going back to it and forward again is safe.
@@ -357,7 +367,7 @@ Creates a one-shot timer. If it comes with a `client_ref` and an active timer of
 - At most 366 days ahead (`maxTimerDelay`). If it fails: error `TIMER_ABOVE_MAXIMUM`.
 - `target_l2_name` must be a canonical L2 name, `<kind>.<name>@<hive>` (`TIMER_INVALID_PAYLOAD`), and the requester's own unless the requester is a SY node (`TIMER_FORBIDDEN`, `checkTimerTarget`).
 - `payload` and `metadata` at most 32 KiB each (`TIMER_LIMIT_EXCEEDED`, `checkTimerData`).
-- A new timer is refused when its owner has 10,000 pending timers, or the hive 100,000 (`TIMER_LIMIT_EXCEEDED`, `checkPendingLimits`). A `client_ref` that names a pending timer of the requester is still answered with it.
+- A new timer is refused when its owner has 10,000 pending timers, or the hive 100,000 (`TIMER_LIMIT_EXCEEDED`, `checkPendingLimits`). A `client_ref` that names a pending timer of the requester is still answered with it. The owner's count reads only its own pending timers, in `idx_timers_list_owner_status` (§5.2; since v1.7, FINDINGS A-326): on the builder's Mac 1.8 ms with 100,000 pending timers in the hive, where before it read every one of them, 58 ms. The hive's count reads `idx_timers_status`'s pending entries, as before, about 10 ms at 100,000 there.
 - `client_ref`: at most 255 characters.
 - Fields the verb does not know, a `cron_spec` included, are ignored: a recurring timer is `TIMER_SCHEDULE_RECURRING`.
 
@@ -585,6 +595,8 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 - The page that lists the rest of the list has no `next_cursor`, even when it holds exactly `limit` timers.
 
 Before v1.6 only the frame's cut gave `next_cursor`: a page its `limit` cut, 100 timers without one, read as the whole list. A list in pages is no snapshot: a timer whose fire time moves between two pages (a recurring timer's fire, a `TIMER_RESCHEDULE`) takes its new place in the order, so it can come again on a later page, or not at all. A response has no `total`. The cursor is a place in the order, never a timer `SY.timer` looks up: the timer it names canceled or deleted since, the next page still starts right after its place, and a well-formed cursor `SY.timer` never gave lists the timers after the place it names.
+
+**What a page reads** (since v1.7, FINDINGS A-326). A page reads its timers from the index that holds its filters' timers in the list's order (§5.2), from its cursor's place on, and stops at the first timer it cannot take, past its `limit` or past its frame, which says more follow: it reads the timers it lists and one more, whatever the hive holds. On the builder's Mac (SQLite and the encoding, no router) a page took 1.5 to 2.7 ms (medians) whatever its filter, with 15,000 or 90,000 pending timers of other owners in the hive. Before v1.7 a page of an owner's timers in one status read every timer of the hive in that status, every owner's, and sorted them: 15 to 22 ms a page with 15,000 pending timers of other owners, 47 ms with 90,000 (medians); a page of `all` read and sorted every timer of the owner, its history included; `SY.admin`'s pages of the whole hive, every timer in the status, or the whole table; and a page read 1001 timers when its `limit` was 1000, where about 228 of a WF's fit its frame. `SY.timer` serves one request at a time, so each page held up the other nodes' requests that long.
 
 Both SDKs' `List` follow the pages up to their own limit, lowering it by what came, from the filter's `cursor` on (§14). Each SDK also says where the timers past its list start (FINDINGS A-278, 0.1.138): the Go SDK's `ListPage` lists one page, one `TIMER_LIST`, with its `NextCursor`, where Go's `List` returns the timers only; the Rust SDK's `list` hands back `next_cursor` when it stops at its limit with timers following (before, it dropped it), and its `list_page` lists one page. A caller that wants every timer asks again from that cursor until a page has none. So does a WF's reconcile: it reads every page of its pending timers ([spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md) §11.4). Until 0.1.137 it read 1000 at the most, and took the ones of its index past the 1000th as missing from `SY.timer`, though `SY.timer`'s answer said more followed. `SY.admin`'s `timer_list` answers one page, its `next_cursor` included, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
 
@@ -821,7 +833,7 @@ Returns a complete descriptor of the node's capabilities, meant for both human a
     "verb": "TIMER_HELP",
     "node_family": "SY",
     "node_kind": "SY.timer",
-    "version": "1.6",
+    "version": "1.7",
     "description": "System node providing persistent timers and authoritative time/timezone services.",
     "operations": [
       {
@@ -869,7 +881,7 @@ For **recurring timers**, `missed_policy` is stored but never applied:
 
 At node startup:
 
-1. Open `timers.db`. If it does not exist, create the schema.
+1. Open `timers.db`. If it does not exist, create the schema. Create the indexes the table lacks (§5.2): the first start of v1.7 builds the four `idx_timers_list*` over the table it finds (FINDINGS A-326).
 2. Delete the history older than 7 days, once (`gcHistoricalTimers`), in one transaction: first `UPDATE timers SET canceled_at_utc = now WHERE status='canceled' AND canceled_at_utc IS NULL` (a timer canceled before v1.5, or by v1.4 after a rollback, is dated at this start, §5.2), then `DELETE FROM timers WHERE (status='fired' AND COALESCE(last_fired_at_utc, created_at_utc) < now - 7 days) OR (status='canceled' AND canceled_at_utc < now - 7 days)`. Before v1.5 a canceled timer went by its last fire or its creation too (FINDINGS A-238). A GC that fails is logged, changes nothing, and the start goes on. Nothing deletes history again until the next start.
 3. `now = time.Now().UTC()`; `SELECT <timerColumns> FROM timers WHERE status='pending' ORDER BY fire_at_utc ASC` (`listPendingTimers`; every read and write of a timer names its columns, §5.2).
 4. For each timer:

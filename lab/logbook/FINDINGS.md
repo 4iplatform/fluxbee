@@ -451,7 +451,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
 - A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
-- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate).
+- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate; built on `coa/timer-139` for 0.1.139, SY.timer 1.7: an index for each filter, `all` included, and a page that reads no further than its frame).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-328 🔵 SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next` (low; SY.admin's next change).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
@@ -1858,6 +1858,70 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   pages in 8.79 s, its slowest page 7.204 s, where the pending pages of the same 3,000 timers took
   0.14 to 0.21 s: a page of another status filter reads far more. SY.timer serves one request at
   a time.
+- **Built on `coa/timer-139` (for 0.1.139, SY.timer 1.7):**
+  - **An index for each filter, in the list's order** (`ensureTimerSchema`):
+    `idx_timers_list_owner_status` on (owner_l2_name, status, fire_at_utc, uuid), the entry's;
+    `idx_timers_list_owner` on (owner_l2_name, fire_at_utc, uuid), for `status_filter` `all`, the
+    walk 0.1.138's gate timed; and `idx_timers_list_status` and `idx_timers_list`, for SY.admin's
+    pages of the whole hive in one status or in any, which read and sorted every timer of the status,
+    or the whole table, the same way. Created at every start, as the others are; the first start of
+    1.7 builds them over the table it finds (on the Mac 0.18 s for 15,000 timers, 2.7 s for 200,000:
+    the hive's cap of 100,000 pending and as many fired). They take room (the file 5.8 to 9.8 MB at
+    15,000 timers, 67 to 120 MB at 200,000) and slow a timer's writes on the Mac (an insert 289 to
+    376 µs, a fire's read and save 358 to 462 µs). `idx_timers_owner` and `idx_timers_status`, which
+    lead two of them, stay: an older SY.timer's start would create them again. An older SY.timer
+    started on the table leaves the new ones as they are, and its lists read them too.
+  - **The cursor a row value** (`timerListQuery`): `(fire_at_utc, uuid) > (?, ?)`, which SQLite
+    searches the index for, so a page starts at its place. With the old
+    `(fire_at_utc > ? OR (fire_at_utc = ? AND uuid > ?))` a page read its index from the start of
+    the owner's timers and filtered out those before its cursor.
+  - **A page that reads no further than its frame** (`takeTimerPage`; the frame's cut moves from
+    `respondTimerList` into the read): it reads the timers one at a time and stops at the first it
+    cannot take, past its limit or its frame, which says more follow: what it lists and one more,
+    about 229 of a WF's timers, where it read 1001. The pages, their cursors and their errors are
+    the same: a timer that cannot be answered is still `TIMER_INTERNAL`, the database's error
+    `TIMER_STORAGE_ERROR`.
+  - **The plans** (EXPLAIN QUERY PLAN with the parameters bound, modernc's SQLite): before, every
+    filter's page used a temp B-tree for its order (an owner's in a status on `idx_timers_status`,
+    an owner's in any on `idx_timers_owner`, the hive's on `idx_timers_status` or a scan of the
+    table); after, each searches its index, the cursor in the search, with nothing to sort. Every
+    other statement's plan is the same or better: the start's replay reads `idx_timers_list_status`
+    in order, with no sort; and the owner's pending count, which each new timer's cap check runs
+    (`checkPendingLimits`), and `TIMER_PURGE_OWNER`'s first delete read the owner's pending entries
+    in `idx_timers_list_owner_status` alone, where both searched `idx_timers_status` and read every
+    pending timer of the hive: on the Mac the count took 11.0 ms with 18,000 pending timers in the
+    hive and 58.3 ms with 100,000, and takes 0.48 ms and 1.75 ms. What stays: the hive's count in
+    the same check reads `idx_timers_status`'s pending entries, about 2 ms at 18,000 and 10 ms at
+    100,000 there, before and after.
+  - **Tests:** `TestATimerListPageReadsAnIndexInTheListsOrder` (each filter's plan, with and
+    without a cursor, on a new table and on SY.timer 1.4's after the start: without the indexes it
+    fails on `idx_timers_status` and a temp B-tree, and with the old cursor on a search with no
+    cursor in it) and `TestATimerListPageReadsNoTimerPastTheFirstItCannotTake` (with 1.6's read it
+    fails: *"the page of 85 timers read 1001, want 86"*). SY.timer's page tests pass unchanged
+    (`TestTimerListAnswersInPagesThatFitAFrame`, and every filter, scope and limit of
+    `TestATimerListPageItsLimitCutsSaysWhereTheNextOneStarts`), on Linux with the race detector.
+  - **Measured on the Mac** (the same walk on 1.6 and on 1.7: SQLite and the encoding, no router;
+    the median page of the best of 3 to 5 walks, limit 1000, about 250 of these timers a page):
+
+    | A page | 1.6 | 1.7 |
+    |---|---|---|
+    | An owner's 3,000 pending, 15,000 pending of other owners | 14.7 ms | 1.5 ms |
+    | The same owner's, `all` | 8.6 ms | 1.8 ms |
+    | An owner's 10,000 pending, 15,000 of other owners | 21.8 ms | 1.9 ms |
+    | An owner's 10,000 pending, 90,000 of other owners (the hive's cap) | 47.1 ms | 2.1 ms |
+    | An owner's 3,000 pending and 20,000 fired, `all` | 31.4 ms | 2.7 ms |
+    | The hive's pending (SY.admin), 100,000 | 64.5 ms | 2.5 ms |
+    | The hive's `all` (SY.admin), 100,000 | 48.4 ms | 2.5 ms |
+
+    The index alone, a page reading its 1001 timers and then cutting at the frame, took 5.1 ms in
+    the first row's case, where 1.7 takes 1.5 ms: the read that stops at the frame is most of the
+    rest. On a busy Mac (other builds running) the first row's case took 27 ms on 1.6 and 3 ms on
+    1.7, about the same ratio.
+  - **0.1.138's 7.204 s page is not this plan's cost:** the same walk on the Mac (`all`, an owner's
+    3,000) took 8.6 ms a page on 1.6, and the 12 other pages of that walk on 8.x took about 0.13 s
+    each through SY.admin. What held that one page up was not found: SY.timer logs no request's
+    time, and the router's and SY.admin's part of it was not measured. 0.1.139's gate times the
+    walk page by page on 0.1.138 and again on 0.1.139.
 
 ### A-325 [General/AI runners] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
 

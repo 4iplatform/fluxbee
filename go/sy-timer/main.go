@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version             = "1.6"
+	version             = "1.7"
 	defaultNodeBaseName = "SY.timer"
 	configDir           = "/etc/fluxbee"
 	routerSockDir       = "/var/run/fluxbee/routers"
@@ -791,49 +791,31 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	rows, more, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit, after)
-	if err != nil {
-		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_STORAGE_ERROR", err.Error())
-	}
 	// A page ends at the request's limit (FINDINGS A-266) or where the frame does (FINDINGS A-151):
-	// the timers past maxTimerListPageBytes go in the next page. Either way, while timers follow,
-	// next_cursor is the cursor of the last timer this page lists, where the next page starts; the
-	// page that lists the rest of the list has none.
-	items := make([]fluxbeesdk.TimerInfo, 0, len(rows))
-	pageBytes := 0
-	for i, row := range rows {
-		info, err := timerRowToInfo(row)
-		if err != nil {
-			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INTERNAL", err.Error())
-		}
-		encoded, err := json.Marshal(info)
-		if err != nil {
-			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INTERNAL", err.Error())
-		}
-		if i > 0 && pageBytes+len(encoded)+1 > maxTimerListPageBytes {
-			more = true
-			break
-		}
-		pageBytes += len(encoded) + 1
-		items = append(items, info)
+	// the timers past maxTimerListPageBytes go in the next page, and this one does not read them
+	// (FINDINGS A-326). Either way, while timers follow, next_cursor is the cursor of the last timer
+	// this page lists, where the next page starts; the page that lists the rest of the list has none.
+	timers, more, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit, maxTimerListPageBytes, after)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_LIST", errorCode(err, "TIMER_STORAGE_ERROR"), err.Error())
 	}
 	response := map[string]any{
 		"ok":            true,
 		"verb":          "TIMER_LIST",
 		"owner_l2_name": nullableJSONValue(ownerFilter),
-		"count":         len(items),
-		"timers":        items,
+		"count":         len(timers),
+		"timers":        timers,
 	}
 	if more {
 		// A page lists its first timer whatever its size, so a page with more after it lists one.
-		response["next_cursor"] = formatTimerListCursor(rows[len(items)-1])
+		response["next_cursor"] = formatTimerListCursor(timers[len(timers)-1])
 	}
 	return s.sendTimerResponse(incoming, response)
 }
 
-// formatTimerListCursor is the cursor after row: its fire time, in ms, and its uuid.
-func formatTimerListCursor(row timerRow) string {
-	return fmt.Sprintf("%d:%s", row.FireAtUTC, row.UUID)
+// formatTimerListCursor is the cursor after timer: its fire time, in ms, and its uuid.
+func formatTimerListCursor(timer fluxbeesdk.TimerInfo) string {
+	return fmt.Sprintf("%d:%s", timer.FireAtUTCMS, timer.UUID)
 }
 
 // parseTimerListCursor reads a cursor formatTimerListCursor wrote, nil for none.

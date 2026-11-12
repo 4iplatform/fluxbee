@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -80,7 +82,7 @@ func TestInsertGetAndListTimer(t *testing.T) {
 		t.Fatalf("unexpected timer row: %+v", got)
 	}
 
-	items, more, err := listTimers(ctx, db, "WF.demo@motherbee", "pending", 10, nil)
+	items, more, err := listTimers(ctx, db, "WF.demo@motherbee", "pending", 10, noFrameCut, nil)
 	if err != nil {
 		t.Fatalf("list timers: %v", err)
 	}
@@ -138,7 +140,7 @@ func TestListTimersSaysWhetherMoreFollow(t *testing.T) {
 			if tc.after >= 0 {
 				after = &timerListCursor{fireAtUTC: fireAt(tc.after), uuid: name(tc.after)}
 			}
-			rows, more, err := listTimers(ctx, db, owner, "pending", tc.limit, after)
+			rows, more, err := listTimers(ctx, db, owner, "pending", tc.limit, noFrameCut, after)
 			if err != nil {
 				t.Fatalf("list: %v", err)
 			}
@@ -148,6 +150,192 @@ func TestListTimersSaysWhetherMoreFollow(t *testing.T) {
 			for i, row := range rows {
 				if want := name(tc.after + 1 + i); row.UUID != want {
 					t.Fatalf("timer %d is %s, want %s: the list starts right after its cursor, in order", i, row.UUID, want)
+				}
+			}
+		})
+	}
+}
+
+// noFrameCut is a page's byte budget that no list of these tests reaches: their pages end at their
+// limit, or with the list (takeTimerPage).
+const noFrameCut = math.MaxInt
+
+// queryPlan is SQLite's plan for query with args bound (EXPLAIN QUERY PLAN), a line a step.
+func queryPlan(t *testing.T, db *sql.DB, query string, args ...any) []string {
+	t.Helper()
+	rows, err := db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	return plan
+}
+
+// planIndex finds the index a step of a plan reads.
+var planIndex = regexp.MustCompile(`USING (?:COVERING )?INDEX (\w+)`)
+
+// A TIMER_LIST page reads its timers from an index that holds them in the list's order, from its
+// cursor's place on, whatever its filters, and sorts nothing (FINDINGS A-326): it reads the timers it
+// lists and one more, whatever the hive holds. So on a new table, and on one an older SY.timer made,
+// to which the start adds the indexes. Before 1.7 a page of an owner's timers in one status searched
+// idx_timers_status and sorted every timer of the hive in that status, every owner's; a page of any
+// status sorted all of the owner's timers, or the whole table; and the cursor was a filter on what the
+// page read, not the place it started.
+func TestATimerListPageReadsAnIndexInTheListsOrder(t *testing.T) {
+	ofSYTimer14, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer ofSYTimer14.Close()
+	startAsSYTimer14(t, ofSYTimer14)
+	if err := ensureTimerSchema(ofSYTimer14); err != nil {
+		t.Fatalf("the start on SY.timer 1.4's table: %v", err)
+	}
+	after := &timerListCursor{fireAtUTC: 1775577600000, uuid: "timer-1"}
+	for _, table := range []struct {
+		name string
+		db   *sql.DB
+	}{{name: "a new table", db: openTestTimerDB(t)}, {name: "SY.timer 1.4's table", db: ofSYTimer14}} {
+		for _, tc := range []struct {
+			lists, owner, status, index string
+		}{
+			{lists: "an owner's pending timers", owner: "WF.demo@motherbee", status: "pending", index: "idx_timers_list_owner_status"},
+			{lists: "an owner's canceled timers", owner: "WF.demo@motherbee", status: "canceled", index: "idx_timers_list_owner_status"},
+			{lists: "an owner's timers of any status", owner: "WF.demo@motherbee", status: "all", index: "idx_timers_list_owner"},
+			{lists: "the hive's fired timers", status: "fired", index: "idx_timers_list_status"},
+			{lists: "the hive's timers of any status", status: "all", index: "idx_timers_list"},
+		} {
+			for _, cursor := range []*timerListCursor{nil, after} {
+				query, args := timerListQuery(tc.owner, tc.status, maxListLimit, cursor)
+				plan := queryPlan(t, table.db, query, args...)
+				page := fmt.Sprintf("%s, %s, cursor %v", table.name, tc.lists, cursor != nil)
+				if len(plan) != 1 || strings.Contains(plan[0], "TEMP B-TREE") {
+					t.Fatalf("%s: the page sorts what it reads: %q", page, plan)
+				}
+				if found := planIndex.FindStringSubmatch(plan[0]); found == nil || found[1] != tc.index {
+					t.Fatalf("%s: the page reads %q, want the index %s", page, plan[0], tc.index)
+				}
+				if cursor != nil && !strings.Contains(plan[0], "(fire_at_utc,uuid)>(?,?)") {
+					t.Fatalf("%s: the page reads its index from the start and filters out what is before its cursor: %q", page, plan[0])
+				}
+			}
+		}
+	}
+}
+
+// countedRows are a query's rows, and how many of them were read.
+type countedRows struct {
+	*sql.Rows
+	read int
+}
+
+func (r *countedRows) Next() bool {
+	if !r.Rows.Next() {
+		return false
+	}
+	r.read++
+	return true
+}
+
+// A TIMER_LIST page reads the timers it lists and the first one it cannot take, which says that more
+// follow, and no further (FINDINGS A-326): the timers past its frame or its limit stay unread. The
+// frame's cut is exact: the page's timers fit maxBytes encoded, and the next one would not. Before 1.7
+// a page read limit+1 timers, 1001 for a WF's reconcile, where about 228 of its timers fit the frame.
+func TestATimerListPageReadsNoTimerPastTheFirstItCannotTake(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	const owner = "WF.demo@motherbee"
+	const total = maxListLimit + 1
+	const frame = 96 * 1024 // maxTimerListPageBytes (main.go)
+	base := int64(1775577600000)
+	name := func(i int) string { return fmt.Sprintf("timer-%04d", i) }
+	insertPendingTimers(t, db, owner, "timer-%04d", total, base, 1, `{"note":"`+strings.Repeat("x", 900)+`"}`)
+	encodedSize := func(info fluxbeesdk.TimerInfo) int {
+		t.Helper()
+		encoded, err := json.Marshal(info)
+		if err != nil {
+			t.Fatalf("encode %s: %v", info.UUID, err)
+		}
+		return len(encoded) + 1
+	}
+
+	for _, tc := range []struct {
+		name  string
+		limit int
+		after int // the timer the page starts after, -1 for the start
+		ends  string
+	}{
+		{name: "the frame ends the page", limit: maxListLimit, after: -1, ends: "frame"},
+		{name: "the limit ends the page", limit: 10, after: -1, ends: "limit"},
+		{name: "the list ends the page", limit: 10, after: total - 6, ends: "list"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var after *timerListCursor
+			if tc.after >= 0 {
+				after = &timerListCursor{fireAtUTC: base + int64(tc.after), uuid: name(tc.after)}
+			}
+			query, args := timerListQuery(owner, "pending", tc.limit, after)
+			rows, err := db.QueryContext(ctx, query, args...)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			defer rows.Close()
+			counted := &countedRows{Rows: rows}
+			page, more, err := takeTimerPage(counted, tc.limit, frame)
+			if err != nil {
+				t.Fatalf("take a page: %v", err)
+			}
+			if want := tc.ends != "list"; more != want {
+				t.Fatalf("a page of %d timers says more %v, want %v", len(page), more, want)
+			}
+			for i, info := range page {
+				if want := name(tc.after + 1 + i); info.UUID != want {
+					t.Fatalf("timer %d is %s, want %s", i, info.UUID, want)
+				}
+			}
+			read := len(page)
+			if more {
+				read++
+			}
+			if counted.read != read {
+				t.Fatalf("the page of %d timers read %d, want %d: what it lists, and one more when more follow", len(page), counted.read, read)
+			}
+			pageBytes := 0
+			for _, info := range page {
+				pageBytes += encodedSize(info)
+			}
+			switch tc.ends {
+			case "frame":
+				next, err := getTimer(ctx, db, name(len(page)))
+				if err != nil {
+					t.Fatalf("get the timer past the page: %v", err)
+				}
+				nextInfo, err := timerRowToInfo(*next)
+				if err != nil {
+					t.Fatalf("the timer past the page: %v", err)
+				}
+				if len(page) >= tc.limit || pageBytes > frame || pageBytes+encodedSize(nextInfo) <= frame {
+					t.Fatalf("a page of %d timers, %d bytes, where the frame takes %d and the next timer %d more", len(page), pageBytes, frame, encodedSize(nextInfo))
+				}
+			case "limit":
+				if len(page) != tc.limit {
+					t.Fatalf("listed %d timers, want the limit, %d", len(page), tc.limit)
+				}
+			case "list":
+				if len(page) != total-1-tc.after {
+					t.Fatalf("listed %d timers, want the %d left", len(page), total-1-tc.after)
 				}
 			}
 		})
@@ -655,7 +843,7 @@ func TestGCHistoricalTimersAgesACanceledTimerByItsCancellation(t *testing.T) {
 	kept := func(when string, want ...string) {
 		t.Helper()
 		var uuids []string
-		rows, _, err := listTimers(ctx, db, "", "all", maxListLimit, nil)
+		rows, _, err := listTimers(ctx, db, "", "all", maxListLimit, noFrameCut, nil)
 		if err != nil {
 			t.Fatalf("%s: list: %v", when, err)
 		}

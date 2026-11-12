@@ -122,6 +122,14 @@ CREATE TABLE IF NOT EXISTS timers (
 		`CREATE INDEX IF NOT EXISTS idx_timers_owner ON timers(owner_l2_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at_utc) WHERE status='pending';`,
 		`CREATE INDEX IF NOT EXISTS idx_timers_status ON timers(status);`,
+		// A TIMER_LIST page reads one of these four, in the list's order (fire time, then uuid), from
+		// its cursor on: one owner's timers in one status, one owner's in any, the hive's in one, the
+		// hive's in any (timerListQuery, since 1.7, FINDINGS A-326). An older SY.timer started on the
+		// table leaves them as they are.
+		`CREATE INDEX IF NOT EXISTS idx_timers_list_owner_status ON timers(owner_l2_name, status, fire_at_utc, uuid);`,
+		`CREATE INDEX IF NOT EXISTS idx_timers_list_owner ON timers(owner_l2_name, fire_at_utc, uuid);`,
+		`CREATE INDEX IF NOT EXISTS idx_timers_list_status ON timers(status, fire_at_utc, uuid);`,
+		`CREATE INDEX IF NOT EXISTS idx_timers_list ON timers(fire_at_utc, uuid);`,
 	}
 	for _, stmt := range indexes {
 		if _, err := db.Exec(stmt); err != nil {
@@ -274,17 +282,39 @@ type timerListCursor struct {
 	uuid      string
 }
 
-// listTimers lists up to limit timers, an owner's or every owner's, in a status or all, by fire time
-// and then uuid, after a cursor when there is one, and says whether more follow the last one listed.
-// It reads one timer past the limit to know, and never lists that one. Before 1.6 it read the limit
-// only, and a list its limit cut read as the whole list (FINDINGS A-266).
-func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter string, limit int, after *timerListCursor) (listed []timerRow, more bool, err error) {
+// listTimers lists a TIMER_LIST page: the timers of an owner, or of every owner for "", in a status
+// or in any ("all", or ""), by fire time and then uuid, after a cursor when there is one, each as
+// TIMER_GET answers it (timerRowToInfo). The page ends at limit (defaultListLimit for none,
+// maxListLimit at most) or where its timers would take more than maxBytes encoded, the frame's share
+// (maxTimerListPageBytes, FINDINGS A-151), and says whether more follow its last timer
+// (takeTimerPage). An error that carries TIMER_INTERNAL is a timer that cannot be answered; any other
+// is the database's.
+func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter string, limit, maxBytes int, after *timerListCursor) (listed []fluxbeesdk.TimerInfo, more bool, err error) {
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
 	if limit > maxListLimit {
 		limit = maxListLimit
 	}
+	query, args := timerListQuery(ownerL2Name, statusFilter, limit, after)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	return takeTimerPage(rows, limit, maxBytes)
+}
+
+// timerListQuery is the query of a TIMER_LIST page of up to limit timers. It selects one timer past
+// the limit, never listed, to know whether more follow; before 1.6 it selected the limit only, and a
+// list its limit cut read as the whole list (FINDINGS A-266). Each filter has an index that holds its
+// timers in the list's order (idx_timers_list*, ensureTimerSchema), and the cursor is a row value,
+// which SQLite searches that index for: a page starts at its place in the index and reads on in
+// order, with nothing to sort. Before 1.7 a page of an owner's timers in one status searched
+// idx_timers_status, read every timer of the hive in that status, every owner's, and sorted them; a
+// page of any status read all of the owner's, or the whole table for the hive's; and the cursor was
+// a filter on what it read (FINDINGS A-326).
+func timerListQuery(ownerL2Name, statusFilter string, limit int, after *timerListCursor) (string, []any) {
 	var conditions []string
 	var args []any
 	if ownerL2Name != "" {
@@ -296,8 +326,8 @@ func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter strin
 		args = append(args, statusFilter)
 	}
 	if after != nil {
-		conditions = append(conditions, "(fire_at_utc > ? OR (fire_at_utc = ? AND uuid > ?))")
-		args = append(args, after.fireAtUTC, after.fireAtUTC, after.uuid)
+		conditions = append(conditions, "(fire_at_utc, uuid) > (?, ?)")
+		args = append(args, after.fireAtUTC, after.uuid)
 	}
 	query := `
 SELECT ` + timerColumns + `
@@ -306,20 +336,50 @@ FROM timers`
 		query += "\nWHERE " + strings.Join(conditions, " AND ")
 	}
 	query += "\nORDER BY fire_at_utc ASC, uuid ASC\nLIMIT ?"
-	args = append(args, limit+1)
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
+	return query, append(args, limit+1)
+}
+
+// timerQueryRows are the rows of a query of timers, read one at a time: a *sql.Rows.
+type timerQueryRows interface {
+	rowScanner
+	Next() bool
+	Err() error
+}
+
+// takeTimerPage reads a TIMER_LIST page from rows, one timer at a time: up to limit timers, and no
+// more than fit in maxBytes, encoded as the page lists them, its first whatever its size. The first
+// timer it cannot take says that more follow its last one, and it reads no further: a page reads the
+// timers it lists and one more, about 229 of a WF's timers where 228 fit a frame (FINDINGS A-326).
+// Before 1.7 a page read limit+1 timers, up to 1001, and dropped those past the frame.
+func takeTimerPage(rows timerQueryRows, limit, maxBytes int) (page []fluxbeesdk.TimerInfo, more bool, err error) {
+	page = []fluxbeesdk.TimerInfo{}
+	pageBytes := 0
+	for rows.Next() {
+		if len(page) == limit {
+			return page, true, nil
+		}
+		row, err := scanTimerRow(rows)
+		if err != nil {
+			return nil, false, err
+		}
+		info, err := timerRowToInfo(row)
+		if err != nil {
+			return nil, false, &timerError{code: "TIMER_INTERNAL", err: err}
+		}
+		encoded, err := json.Marshal(info)
+		if err != nil {
+			return nil, false, &timerError{code: "TIMER_INTERNAL", err: err}
+		}
+		if len(page) > 0 && pageBytes+len(encoded)+1 > maxBytes {
+			return page, true, nil
+		}
+		pageBytes += len(encoded) + 1
+		page = append(page, info)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
-	defer rows.Close()
-	listed, err = collectTimerRows(rows)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(listed) > limit {
-		return listed[:limit], true, nil
-	}
-	return listed, false, nil
+	return page, false, nil
 }
 
 func listPendingTimers(ctx context.Context, db *sql.DB) ([]timerRow, error) {

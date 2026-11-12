@@ -42,7 +42,9 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    with `busy_timeout(5000)` and WAL on every connection (`timerDSN`), and creates the `timers`
    table and its indexes (`ensureTimerSchema`, schema version 4: version 3 adds `canceled_reason`,
    FINDINGS A-220, and version 4 `canceled_at_utc`, FINDINGS A-238, to a table that lacks them,
-   whatever `user_version` says; `addTimerColumn`).
+   whatever `user_version` says; `addTimerColumn`). Among the indexes, the four `TIMER_LIST`
+   reads (`idx_timers_list*`, since 1.7, FINDINGS A-326): the first start of 1.7 builds them over
+   the table it finds, 0.18 s for 15,000 timers and 2.7 s for 200,000 on the builder's Mac.
 5. Deletes the fired timers whose last fire, and the canceled timers whose cancellation, is more
    than 7 days old (`gcHistoricalTimers`, `defaultHistoryRetention`). A canceled timer with no
    cancellation time, canceled before 1.5 or by a SY.timer before it, is dated first and kept 7 days
@@ -87,7 +89,9 @@ Rules enforced in `main.go`:
 - **Caps** (FINDINGS A-115). A one-shot fires at most 366 days ahead, scheduled or rescheduled
   (`maxTimerDelay`, `TIMER_ABOVE_MAXIMUM`). A `payload` and a `metadata` are at most 32 KiB each
   (`checkTimerData`), and a new timer is refused once its owner has 10,000 pending timers or the
-  hive 100,000 (`checkPendingLimits`): both `TIMER_LIMIT_EXCEEDED`.
+  hive 100,000 (`checkPendingLimits`): both `TIMER_LIMIT_EXCEEDED`. The owner's count reads only
+  its own pending timers, in `idx_timers_list_owner_status` (since 1.7, FINDINGS A-326); before,
+  each new timer's count read every pending timer of the hive.
 - **Cron.** Five fields (minute, hour, day of month, month, day of week), parsed with
   `robfig/cron`; `cron_tz` is an IANA zone and defaults to `UTC` (`scheduleRecurringFireAt`).
   A `cron_spec` that starts with `TZ=`, `CRON_TZ=` or `@` is `TIMER_INVALID_CRON` before the
@@ -196,7 +200,7 @@ router made, `trace_id`; `ignoredLog`), bounded the same way in windows of its o
 | `TIMER_SCHEDULE` | `fire_at_utc_ms` or `fire_in_ms` (exactly one), optional `target_l2_name`, `client_ref`, `payload`, `missed_policy`, `missed_within_ms`, `metadata` | any node; it becomes the owner, and the target unless it is a SY node |
 | `TIMER_SCHEDULE_RECURRING` | `cron_spec`, optional `cron_tz` and the same optional fields | any node; it becomes the owner, and the target unless it is a SY node |
 | `TIMER_GET` | `timer_uuid`, or `client_ref` (the caller's own pending timer) | the owner, and `SY.admin@motherbee` for any timer by `timer_uuid` (`TIMER_NOT_OWNER` otherwise) |
-| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page ends at `limit` or at one 128 KiB frame, whichever comes first, and while timers follow it answers `next_cursor`, its last timer's place, which given back as `cursor` lists the next; the page that lists the rest has none. The frame's cut since 1.3 (FINDINGS A-151), the limit's since 1.6 (FINDINGS A-266; `listTimers` reads one timer past the limit, never listed): before, a page its limit cut read as the whole list. Both SDKs' `List` follow the pages up to their own limit. Go's `ListPage` and Rust's `list_page` list one page with its `next_cursor`, Rust's `list` hands it back when it stops at its limit, and Go's `List` returns the timers only (FINDINGS A-278); a WF's reconcile reads every page of its pending timers |
+| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page ends at `limit` or at one 128 KiB frame, whichever comes first, and while timers follow it answers `next_cursor`, its last timer's place, which given back as `cursor` lists the next; the page that lists the rest has none. The frame's cut since 1.3 (FINDINGS A-151), the limit's since 1.6 (FINDINGS A-266; `listTimers` reads one timer past the limit, never listed): before, a page its limit cut read as the whole list. A page reads its timers from an index that holds them in the list's order, one per filter, from its cursor's place on, and stops at the first one it cannot take (`timerListQuery`, `takeTimerPage`; since 1.7, FINDINGS A-326): it reads what it lists and one more, whatever the hive holds. Before, a page of an owner's timers in one status sorted every timer of the hive in that status, and a page read 1001 timers where about 228 of a WF's fit its frame. Both SDKs' `List` follow the pages up to their own limit. Go's `ListPage` and Rust's `list_page` list one page with its `next_cursor`, Rust's `list` hands it back when it stops at its limit, and Go's `List` returns the timers only (FINDINGS A-278); a WF's reconcile reads every page of its pending timers |
 | `TIMER_CANCEL` | `timer_uuid` or `client_ref` | the owner only (`TIMER_NOT_OWNER`); a `client_ref` with no pending timer answers `ok` with `found: false`; a fired one-shot gives `TIMER_ALREADY_FIRED` |
 | `TIMER_RESCHEDULE` | `timer_uuid` or `client_ref`, and `new_fire_at_utc_ms` or `new_fire_in_ms` | the owner only; pending one-shots only (`TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_ALREADY_FIRED`) |
 | `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status, in one transaction: the pending ones first, whose uuids come back for the heap, then the history, counted without being read (`deleteTimersByOwner`) |
