@@ -238,7 +238,9 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   `retryable` says that `remove_runtime_version` asked again for that version, nothing changed
   first, may remove it: SY.admin's own word when its refusal gives one (`payload.retryable` of
   `RUNTIME_USAGE_UNKNOWN`: false while a hive not read is a join that ended and when the
-  motherbee could not read its own nodes or its registry, true otherwise); without it, true for
+  motherbee could not read its own nodes or its registry, true otherwise; since 0.1.139 also of
+  `INVENTORY_UNAVAILABLE`, true, and of a `RUNTIME_REMOVE_FAILED` whose manifest lock another
+  writer held past 60 s, true, FINDINGS A-305); without it, true for
   `RUNTIME_USAGE_UNKNOWN` and `INVENTORY_UNAVAILABLE`; true for `TIMEOUT`, `TRANSPORT_ERROR` and
   `PURGE_STOPPED`, but a `PURGE_STOPPED` after a `RUNTIME_USAGE_UNKNOWN` that is not retryable is
   not either, since its removal reads the same hives (`purgeStoppedAt`); false for any other

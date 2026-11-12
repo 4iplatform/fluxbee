@@ -331,7 +331,8 @@ caller and the action; a command with no stamped caller is refused too.
     the package is the same on every hive. SY.admin reads the connected nodes from shared memory,
     asking no one (`connected_nodes_from_shm`): the motherbee's own from the regions of its
     routers, every other hive's from the LSA, as the router reaches them. Regions that cannot be
-    read answer `503 INVENTORY_UNAVAILABLE`, to retry, never `UNAUTHORIZED`;
+    read answer `503 INVENTORY_UNAVAILABLE`, to retry (its `payload.retryable` true since
+    0.1.139, FINDINGS A-305), never `UNAUTHORIZED`;
   - `sync_hint` `{channel, folder_id, wait_for_idle, timeout_ms}`: only a scan of
     `fluxbee-dist-runtimes` (channel `dist`) on the motherbee, as a worker's deploy asks for one
     (`announceRuntimes`), with `timeout_ms` given and at most 5000. A longer wait would hold the
@@ -470,7 +471,8 @@ executor may ask for it too. In order:
    down then. Anyone else gets `409 NODE_STILL_CONNECTED` while the shared-memory regions list
    the node, or `503 INVENTORY_UNAVAILABLE` when they cannot be read, or when the node's hive,
    which the hive registry still lists, is stale in the LSA or not in it, and nothing is removed
-   (`teardown_live_node_refusal`). Otherwise a node redeployed onto the ILK of a teardown that
+   (`teardown_live_node_refusal`); its `payload.retryable` is true (FINDINGS A-305, since
+   0.1.139). Otherwise a node redeployed onto the ILK of a teardown that
    failed half-way could be purged alive. A node of a hive cut off is not connected, and may run:
    before 0.1.133 it read as gone, and its secrets and its ILK went while it ran. A hive the
    registry no longer lists holds nothing up. **The node's public pages refuse nothing** (FINDINGS
@@ -1824,7 +1826,9 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
   of the version's use for a removal), `publish_runtime_package` in the shared install. A writer
   waits for another up to 60 s (`RUNTIME_MANIFEST_LOCK_WAIT`): past that a removal answers
   `RUNTIME_REMOVE_FAILED`, a reset `RUNTIME_RESET_FAILED` and a publish `SERVICE_FAILED`, with the
-  manifest untouched.
+  manifest untouched. The removal's and the reset's say `payload.retryable: true` (FINDINGS
+  A-305, since 0.1.139): asked again once the other writer is done, they may pass; a lock whose
+  file cannot be opened says false (`manifest_lock_refusal`).
 
 ## Failure behavior
 

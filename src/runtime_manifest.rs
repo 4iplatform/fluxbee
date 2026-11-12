@@ -141,6 +141,16 @@ pub struct RuntimeManifestLock {
     _file: fs::File,
 }
 
+/// How `lock_runtime_manifest`'s error begins when another writer held the lock past the wait.
+const RUNTIME_MANIFEST_LOCK_HELD: &str = "runtime manifest lock: another writer held";
+
+/// Whether `err`, an error of `lock_runtime_manifest`, says another writer held the lock past the
+/// wait (FINDINGS A-305): nothing was read or written, and asking again once that writer is done
+/// may pass. Any other error of the lock (its file cannot be opened or locked) is the dist's to fix.
+pub fn runtime_manifest_lock_held_too_long(err: &str) -> bool {
+    err.contains(RUNTIME_MANIFEST_LOCK_HELD)
+}
+
 /// Takes the lock of the runtimes manifest at `manifest_path` (`runtime_manifest_lock_path`),
 /// waiting up to `wait` while another writer holds it; past that, an error that says so.
 pub fn lock_runtime_manifest(
@@ -178,7 +188,7 @@ pub fn lock_runtime_manifest(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "runtime manifest lock: another writer held '{}' for {}s",
+                "{RUNTIME_MANIFEST_LOCK_HELD} '{}' for {}s",
                 path.display(),
                 wait.as_secs()
             ));

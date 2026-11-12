@@ -2097,6 +2097,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   takes `INVENTORY_UNAVAILABLE` as retryable on its own (0.1.133), and Archi reads the help's
   "retry".
 - **Fix, later:** `payload.retryable: true` on both.
+- **Built on `coa/admin-139` for 0.1.139:** `INVENTORY_UNAVAILABLE` answers `payload.retryable:
+  true`, from the A-62 table's admission and from `teardown_node` alike; a runtimes manifest's
+  lock not taken answers its code (`RUNTIME_REMOVE_FAILED`, `RUNTIME_RESET_FAILED`) with
+  `payload.retryable`: true when another writer held the lock past the 60 s, false when the lock's
+  file cannot be opened or locked (`manifest_lock_refusal`, over the library's
+  `runtime_manifest_lock_held_too_long`). SY.wf-rules' purge already reads `payload.retryable`
+  (`removalFailure`), so no change there. Its test,
+  `an_inventory_or_a_lock_not_read_in_time_says_a_retry_may_pass`, holds the manifest's lock with
+  a second writer, and `the_http_teardown_waits_for_the_node_to_be_gone` checks the teardown's;
+  both fail without it. SY.admin's help (`remove_runtime_version`, `reset_base_runtime`, the
+  teardown note), sy-admin.md, sy-wf-rules.md and Archi's handbook (§7.7) say it. A publish's lock
+  not taken in time is A-306's.
 
 ### A-304 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.admin review fixes; read in the code; there before it) — A-62's workflow-package admission misses a WF node on a hive cut off from the LSA
 

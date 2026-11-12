@@ -1829,6 +1829,10 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
     for that `USAGE_READ_FAILED` and while a join that ended is not read. It is never "not in
     use": ask again once the hive answers. A hive gone for good is removed with `remove_hive`
     first. An ingress or an egress receives no runtime, so it never refuses a removal.
+  - `RUNTIME_REMOVE_FAILED` with `payload.retryable: true`: another change of the runtimes held
+    the manifest's lock past 60 s, and nothing was removed. Say so, and offer to ask again
+    (FINDINGS A-305). With `retryable: false` (the lock's file cannot be opened) the operator
+    fixes the motherbee's dist first.
 
 ---
 

@@ -62,7 +62,7 @@ use fluxbee_sdk::{
 use json_router::ai_settings;
 use json_router::mesh_reply::{self, PageAsk, REPLY_TOO_LARGE};
 use json_router::runtime_manifest::{
-    load_runtime_manifest_from_paths, lock_runtime_manifest,
+    load_runtime_manifest_from_paths, lock_runtime_manifest, runtime_manifest_lock_held_too_long,
     runtime_manifest_write_v2_gate_enabled_from_env, write_runtime_manifest_file_atomic,
     RuntimeManifest, RuntimeManifestEntry, RuntimeManifestLock, RUNTIME_MANIFEST_LOCK_WAIT,
 };
@@ -10125,14 +10125,16 @@ fn internal_not_found(action: &str, detail: &str) -> InternalAdminDispatchResult
 }
 
 /// The connected nodes a decision needs cannot be read from shared memory: worth a retry, and never
-/// a refusal of the caller.
+/// a refusal of the caller. The payload says so (`retryable: true`, FINDINGS A-305), as
+/// `RUNTIME_USAGE_UNKNOWN`'s does, where it was null and a caller that reads the payload took it
+/// for a final refusal.
 fn internal_inventory_unavailable(action: &str, detail: &str) -> InternalAdminDispatchResult {
     InternalAdminDispatchResult {
         http_status: 503,
         envelope: serde_json::json!({
             "status": "error",
             "action": action,
-            "payload": serde_json::Value::Null,
+            "payload": { "retryable": true },
             "error_code": "INVENTORY_UNAVAILABLE",
             "error_detail": detail,
         }),
@@ -17797,7 +17799,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "teardown_node" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP; over the mesh, from node_name. Body: {\"ilk_id\": \"ilk:<uuid>\"} (node_name from the path when the body has none; a bare name is a node of the path's hive).",
             "Callers: the operator's HTTP API, Archi and the executor, and SY.orchestrator@<hive> for a node of its own hive, which calls it when a node is purged (kill_node with purge_instance).",
-            "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, retry) when the connected nodes cannot be read from shared memory, or when the node's hive, which the hive registry still lists, is stale in the LSA or not in it, so its nodes cannot be read (since 0.1.133); nothing is removed. A hive the registry no longer lists does not hold it up.",
+            "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, payload.retryable: true since 0.1.139, FINDINGS A-305) when the connected nodes cannot be read from shared memory, or when the node's hive, which the hive registry still lists, is stale in the LSA or not in it, so its nodes cannot be read (since 0.1.133); nothing is removed. A hive the registry no longer lists does not hold it up.",
             PAGES_LEFT_UP_NOTE,
             "Steps, in order: SY.identity must hold the ILK as this node's (identification.node_name), else NODE_ILK_MISMATCH and nothing is removed; then every SY.vault secret dedicated to the ILK is deleted in its own tenant; then the ILK is marked (ILK_DELETE) and purged (ILK_PURGE). An ILK SY.identity does not hold is reported not_found: the operator's HTTP API and the executor still delete its leftover secrets, a mesh caller (the orchestrator, Archi) leaves them.",
             "The payload is the same on success and on failure: node_name, ilk_id, ilk_deleted, not_found, vault_secrets_purged {status, scanned, deleted, errors[{key, error_code, error_detail}]} and ilk_delete {status ok|error|skipped, error_code, error_detail}. A step that did not run says skipped. The ok answer adds pages_left_up, the node's pages (publisher_l2_name), to every caller but the node's own orchestrator: the purge that called it names them.",
@@ -18169,7 +18171,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "remove_runtime_version" => vec![
             "Motherbee-only (409 NOT_PRIMARY elsewhere): it removes the version from the motherbee's dist and runtimes manifest, and each hive's mirror deletes it when it syncs. In HTTP runtime and runtime_version come from the path; the executor step's args are hive, runtime and runtime_version.",
-            "Refused, with nothing removed: 400 INVALID_REQUEST for a missing or invalid runtime or runtime_version; 409 RUNTIME_CURRENT_CONFLICT for the runtime's current version while other versions remain; 409 RUNTIME_PACKAGE_VERSION for the version the installed package brought (the way back with reset_base_runtime); 404 RUNTIME_NOT_FOUND or RUNTIME_VERSION_NOT_FOUND; 409 RUNTIME_HAS_DEPENDENTS while packages are built on the runtime, before the version's use is read; 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_REMOVE_FAILED (the manifest's lock not taken within 60 s, or a step of the removal failed: what it changed is put back).",
+            "Refused, with nothing removed: 400 INVALID_REQUEST for a missing or invalid runtime or runtime_version; 409 RUNTIME_CURRENT_CONFLICT for the runtime's current version while other versions remain; 409 RUNTIME_PACKAGE_VERSION for the version the installed package brought (the way back with reset_base_runtime); 404 RUNTIME_NOT_FOUND or RUNTIME_VERSION_NOT_FOUND; 409 RUNTIME_HAS_DEPENDENTS while packages are built on the runtime, before the version's use is read; 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_REMOVE_FAILED (the manifest's lock not taken within 60 s, or a step of the removal failed: what it changed is put back). A RUNTIME_REMOVE_FAILED whose lock another writer held past the 60 s says payload.retryable: true (FINDINGS A-305, since 0.1.139): ask again once that writer is done; one whose lock file cannot be opened says false.",
             RUNTIME_REMOVAL_IN_USE_NOTE,
             RUNTIME_REMOVAL_UNKNOWN_NOTE,
             "502 SERVICE_FAILED when the manifest it wrote cannot be read back: the version was removed, and get_runtime shows the runtime as it is now.",
@@ -18182,7 +18184,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Motherbee-only (409 NOT_PRIMARY elsewhere): it writes the runtimes manifest, which the other hives receive through the dist folder. Takes no body: the runtime comes from the path in HTTP, and the executor step's args are hive and runtime.",
             "The answer: payload {runtime, previous_current, current, package_version, changed, manifest_version, manifest_hash}. changed is false, and nothing is written, when current already is the package's version.",
             "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove_runtime_version deletes it once every hive's nodes were read and none runs on it (RUNTIME_IN_USE, RUNTIME_USAGE_UNKNOWN otherwise), except on a base that packages are built on (wf.engine with deployed workflows, ai.generic with config-only packages), which refuses it with RUNTIME_HAS_DEPENDENTS; it then stays unused, and costs only its disk. The package's own version is never removed (RUNTIME_PACKAGE_VERSION).",
-            "400 INVALID_REQUEST for a missing or invalid runtime; 404 RUNTIME_NOT_FOUND for a runtime the manifest does not have, or names in two cases; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not on disk or cannot run (reinstall the package), or is on disk but not published (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_RESET_FAILED; 502 SERVICE_FAILED when the written manifest cannot be read back.",
+            "400 INVALID_REQUEST for a missing or invalid runtime; 404 RUNTIME_NOT_FOUND for a runtime the manifest does not have, or names in two cases; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not on disk or cannot run (reinstall the package), or is on disk but not published (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_RESET_FAILED (a RUNTIME_RESET_FAILED whose manifest lock another writer held past 60 s says payload.retryable: true, FINDINGS A-305: ask again once it is done); 502 SERVICE_FAILED when the written manifest cannot be read back.",
         ],
         "set_hive_egress" => vec![
             "Confirm with the operator first: from then on the worker's agents reach the internet through the egress, which becomes their dependency; a call in flight at the switch may fail once; and SSH reaches the box only from what the answer's ssh_reachable_from names (its connected subnets, its more specific routes, the hypervisor's console). Run it while the worker's agents are idle.",
@@ -18837,6 +18839,26 @@ fn sanitize_runtime_suffix(value: &str) -> String {
 
 fn load_local_runtime_manifest() -> Result<Option<RuntimeManifest>, String> {
     load_runtime_manifest_from_paths(&[PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)])
+}
+
+/// The answer of a writer of the runtimes manifest that could not take its lock, with nothing
+/// changed: 409 `code`, and `payload.retryable` (FINDINGS A-305), true when another writer held the
+/// lock past the wait (`runtime_manifest_lock_held_too_long`), so asking again once it is done may
+/// pass; false when the lock's file cannot be opened or locked, which the dist's owner fixes. The
+/// payload was null, and a caller that reads it (SY.wf-rules' purge, Archi) took the refusal for
+/// a final one.
+fn manifest_lock_refusal(action: &str, code: &str, err: &str) -> (u16, String) {
+    (
+        409,
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": { "retryable": runtime_manifest_lock_held_too_long(err) },
+            "error_code": code,
+            "error_detail": err,
+        })
+        .to_string(),
+    )
 }
 
 /// The motherbee's runtimes manifest's file lock (FINDINGS A-171), which every writer of the
@@ -20210,16 +20232,10 @@ async fn handle_remove_runtime_version(
     let _manifest_file_lock = match lock_local_runtime_manifest().await {
         Ok(lock) => lock,
         Err(err) => {
-            return Ok((
-                409,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "RUNTIME_REMOVE_FAILED",
-                    "error_detail": err,
-                })
-                .to_string(),
+            return Ok(manifest_lock_refusal(
+                "remove_runtime_version",
+                "RUNTIME_REMOVE_FAILED",
+                &err,
             ));
         }
     };
@@ -20625,7 +20641,7 @@ async fn handle_reset_base_runtime(
     // Held from the read to the write (FINDINGS A-171).
     let _manifest_file_lock = match lock_local_runtime_manifest().await {
         Ok(lock) => lock,
-        Err(err) => return refuse(409, "RUNTIME_RESET_FAILED", err),
+        Err(err) => return Ok(manifest_lock_refusal(action, "RUNTIME_RESET_FAILED", &err)),
     };
     let manifest = match load_local_runtime_manifest() {
         Ok(Some(manifest)) => manifest,
@@ -22831,6 +22847,11 @@ impl TeardownReport {
         });
         if let Some(pages) = self.pages_left_up.as_ref().filter(|_| error.is_none()) {
             payload["pages_left_up"] = pages.clone();
+        }
+        // The connected nodes could not be read: nothing was removed, and asking again once they
+        // can be may pass (FINDINGS A-305).
+        if matches!(&error, Some((_, "INVENTORY_UNAVAILABLE", _))) {
+            payload["retryable"] = serde_json::json!(true);
         }
         (
             http_status,
@@ -34943,6 +34964,49 @@ mod tests {
         let _ = fs::remove_dir_all(registry.root());
     }
 
+    /// FINDINGS A-305: `INVENTORY_UNAVAILABLE` and a runtimes manifest's lock that another writer
+    /// held past the wait say in their payload that asking again may pass (`retryable: true`), as
+    /// `RUNTIME_USAGE_UNKNOWN`'s does: the payload was null, and a caller that reads it took either
+    /// for a final refusal. A lock whose file cannot be opened is no retry's to fix.
+    #[test]
+    fn an_inventory_or_a_lock_not_read_in_time_says_a_retry_may_pass() {
+        let held = internal_inventory_unavailable(
+            "publish_runtime_package",
+            "whether WF.invoice runs on another hive cannot be read: no router region",
+        );
+        assert_eq!(held.http_status, 503);
+        assert_eq!(held.envelope["payload"], json!({ "retryable": true }));
+
+        // Another writer holds the manifest's lock past the wait.
+        let dist = test_temp_dir("a305-manifest-lock");
+        let manifest_path = dist.join("runtimes").join("manifest.json");
+        fs::create_dir_all(manifest_path.parent().expect("its folder")).expect("the folder");
+        let other_writer = lock_runtime_manifest(&manifest_path, Duration::ZERO).expect("held");
+        let err = lock_runtime_manifest(&manifest_path, Duration::from_millis(100))
+            .expect_err("another writer holds it");
+        for (action, code) in [
+            ("remove_runtime_version", "RUNTIME_REMOVE_FAILED"),
+            ("reset_base_runtime", "RUNTIME_RESET_FAILED"),
+        ] {
+            let (status, body) = manifest_lock_refusal(action, code, &err);
+            let body: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(status, 409, "{body}");
+            assert_eq!(body["action"], json!(action));
+            assert_eq!(body["error_code"], json!(code));
+            assert_eq!(body["payload"]["retryable"], json!(true), "{body}");
+            assert_eq!(body["error_detail"], json!(err));
+        }
+        drop(other_writer);
+        let (_, body) = manifest_lock_refusal(
+            "remove_runtime_version",
+            "RUNTIME_REMOVE_FAILED",
+            "runtime manifest lock: open '/var/lib/fluxbee/dist/runtimes-manifest.lock' failed: Permission denied (os error 13)",
+        );
+        let body: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(body["payload"]["retryable"], json!(false), "{body}");
+        let _ = fs::remove_dir_all(dist);
+    }
+
     /// Over HTTP: a connected node is refused before anything is sent, a box whose regions cannot
     /// be read waits, and a bare node name in the path is a node of the path's hive.
     #[tokio::test]
@@ -34960,6 +35024,8 @@ mod tests {
         assert_eq!(status, 503, "{body}");
         assert_eq!(body["error_code"], json!("INVENTORY_UNAVAILABLE"));
         assert_eq!(body["payload"]["node_name"], json!("WF.invoice@worker1"));
+        // FINDINGS A-305: a retry may pass, and the payload says so.
+        assert_eq!(body["payload"]["retryable"], json!(true));
 
         ctx.connected_nodes =
             Arc::new(|_| Ok(connected_now(&["worker1"], &["WF.invoice@worker1"])));
