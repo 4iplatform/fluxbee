@@ -312,19 +312,26 @@ In the other direction, SY.admin's A-62 table bounds what `SY.wf-rules@<hive>` m
 - `publish_runtime_package` of the inline package it builds (`type: workflow`,
   `runtime_base: wf.engine`, `name: wf.<workflow>`, never `wf.engine` itself) and
   `remove_runtime_version` of a `wf.<workflow>`, each with only the fields SY.wf-rules sends, and
-  both refused while a `WF.<workflow>` is connected on another hive, which SY.admin reads from
-  shared memory (`authorize_wf_rules_package`, `workflow_nodes_elsewhere`);
+  both refused while another hive holds a `WF.<workflow>`, connected or not
+  (`authorize_wf_rules_package`, `admit_workflow_package`; FINDINGS A-304, since 0.1.139);
 - `sync_hint` of `fluxbee-dist-runtimes` on the motherbee (`announceRuntimes`), with only its own
   fields and a `timeout_ms` of at most 5000.
 
-A workflow's package is one runtime for every hive, `wf.<workflow>`, and SY.admin sees another
-hive's `WF.<workflow>` only while it is connected: one that is stopped, or on a hive the LSA holds
-stale, is not seen (FINDINGS A-304). A deploy of the same name here then stages above that hive's
-versions too (`highestPublishedVersion` counts every version of `wf.<workflow>` the dist holds),
-and its purge, as a delete here, asks SY.admin to remove them: SY.admin removes only a version no
-node of any hive may run on (FINDINGS A-281), and a node whose unit does not run is not counted.
-Before 0.1.133 such a deploy published `0.0.1`, which SY.admin refused (`VERSION_CONFLICT`) while
-that hive still held its own `0.0.1`.
+A workflow's package is one runtime for every hive, `wf.<workflow>`. Since 0.1.139 (FINDINGS
+A-304, the operator's call of 2026-11-12) SY.admin refuses this hive's publish and removal of it
+(`UNAUTHORIZED`, naming the node) while another hive holds a `WF.<workflow>`: one connected, or
+one the LSA last saw on a hive cut off, read from shared memory, or one whose config that hive's
+orchestrator reads, its node stopped or not, asked at once of every other hive that may run one
+(3 s each). So a deploy of a name another hive uses fails at its publish
+(`PACKAGE_PUBLISH_FAILED`), and moves and purges nothing of that hive's; it passes once that
+hive's workflow is deleted. A hive that does not answer within the 3 s is judged by what the LSA
+last saw of it: a stopped `WF.<workflow>` on a hive down at that moment is not seen, and its
+versions stay all the same, since SY.admin removes a version only once every hive's use of it was
+read (FINDINGS A-281). Before 0.1.139 only a connected `WF.<workflow>` refused, so a deploy of
+the same name staged above that hive's versions (`highestPublishedVersion` counts every version
+of `wf.<workflow>` the dist holds) and its purge asked SY.admin to remove them, a stopped node not
+counted; before 0.1.133 such a deploy published `0.0.1`, which SY.admin refused
+(`VERSION_CONFLICT`) while that hive still held its own `0.0.1`.
 
 This is the standard path of A-68 (see `docs/wf-standard-path-v1.md`): SY.wf-rules acts on nodes
 only through SY.admin.

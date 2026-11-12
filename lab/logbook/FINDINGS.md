@@ -2204,6 +2204,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   only. The review recommends (a), with this item.
 - **The operator's call (2026-11-12):** (a): SY.admin refuses a publish or a removal of `wf.<x>`
   while another hive holds a `WF.<x>` config, connected or not. In the bug push (item 30).
+- **Built on `coa/admin-139` for 0.1.139, (a):** SY.wf-rules@H's publish or removal of `wf.<x>` is
+  refused `403 UNAUTHORIZED`, naming the node, while another hive holds a `WF.<x>`
+  (`admit_workflow_package`, now async in the A-62 dispatch): first the nodes connected now and
+  what the LSA last saw of each hive it holds stale (`ConnectedNow::last_seen`,
+  `last_seen_node_names`), read from shared memory; then `WF.<x>`'s config on every other hive
+  that may run one (the motherbee and each worker whose join is done), asked at once through the
+  motherbee's orchestrator (`get_node_config`, 3 s each, within SY.wf-rules' 5 s for a publish;
+  `NODE_CONFIG_READ_FAILED` counts as held). A hive that does not answer in time is judged by what
+  the LSA last saw of it and named in a warning, never refused for: refusing whenever a hive
+  cannot be read would stop every workflow's deploy on every hive while one is down (this entry's
+  own concern, and the operator's principle of 2026-11-12 in A-313). What stays open: a stopped
+  `WF.<x>` on a hive that cannot be read at that moment is not seen; its versions still stay,
+  since a removal reads every hive's use first (A-281). Its tests:
+  `a_wf_rules_package_is_refused_while_another_hive_holds_its_wf_node` (a config held, one that
+  cannot be read, a motherbee that does not answer, a hive cut off) and the LSA's last view in
+  `connected_nodes_come_from_the_routers_and_the_lsa`, each failing without it. sy-admin.md,
+  sy-wf-rules.md, control-path-hardening-v1 and Archi's handbook (§7.5) say it.
 
 ### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
 

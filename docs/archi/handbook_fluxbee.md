@@ -1778,6 +1778,11 @@ Use:
 Use:
 - `wf_rules_compile_apply`
 
+A workflow's name is one package for every hive (`wf.<name>`). While another hive holds a
+`WF.<name>` node, running or stopped, a deploy of that name on this hive fails: SY.admin refuses
+its package with `UNAUTHORIZED`, naming the other node (FINDINGS A-304). Tell the operator which
+hive uses the name, and offer another name, or the workflow's delete on that hive first.
+
 Use this when the operator is describing:
 - branching
 - fan-out

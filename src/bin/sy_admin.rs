@@ -394,10 +394,14 @@ type ConnectedNodes = Arc<dyn Fn(&str) -> Result<ConnectedNow, String> + Send + 
 /// The nodes connected now, `<name>@<hive>` (`connected_node_names`), and the hives whose nodes the
 /// read holds: this admin's own, and each other hive the LSA holds as fresh. The nodes of a hive
 /// the LSA holds as stale, or does not list, are not in it either way: whether they run is unknown.
+/// `last_seen` holds what the LSA last saw of each hive it holds as stale, a hive cut off
+/// (`last_seen_node_names`): not connected now, which only the workflow-package admission reads
+/// (FINDINGS A-304).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConnectedNow {
     nodes: Vec<String>,
     hives: Vec<String>,
+    last_seen: Vec<String>,
 }
 
 /// Reads the tenant of a node, `<name>@<hive>`, from identity's shared memory, given this hive's
@@ -6189,8 +6193,8 @@ fn node_of_family(name: &str, family: &str) -> bool {
 enum MeshAdmission {
     Admitted,
     /// SY.wf-rules@`hive` on the package `wf.<workflow>`. A package is one for every hive, so it
-    /// is admitted only while no `WF.<workflow>` is connected on another hive
-    /// (`workflow_nodes_elsewhere`).
+    /// is admitted only while no other hive holds a `WF.<workflow>`, connected or not
+    /// (`admit_workflow_package`, FINDINGS A-304).
     WorkflowPackage {
         workflow: String,
         hive: String,
@@ -6353,7 +6357,8 @@ fn authorize_wf_rules_node(
 ///   wait would hold the motherbee orchestrator's system worker, which takes one message at a
 ///   time).
 ///
-/// The first two also wait for the connected nodes (`MeshAdmission::WorkflowPackage`).
+/// The first two are then admitted only while no other hive holds a `WF.<x>`, connected or not
+/// (`MeshAdmission::WorkflowPackage`, `admit_workflow_package`).
 fn authorize_wf_rules_package(
     caller: &str,
     caller_hive: &str,
@@ -6529,7 +6534,37 @@ fn connected_nodes_from_shm(admin_hive: &str) -> Result<ConnectedNow, String> {
     Ok(ConnectedNow {
         nodes: connected_node_names(admin_hive, &local_nodes, &lsa, now),
         hives: connected_hive_names(admin_hive, &lsa, now),
+        last_seen: last_seen_node_names(admin_hive, &lsa, now),
     })
+}
+
+/// The nodes the LSA holds for each other hive it holds as stale but not deleted, a hive cut off,
+/// as it last saw them (FINDINGS A-304): the router keeps a hive's last LSA, flagged stale, until
+/// the hive is back. None is connected now, and each may still run.
+fn last_seen_node_names(admin_hive: &str, lsa: &LsaSnapshot, now: u64) -> Vec<String> {
+    let cut_off = |index: u16| {
+        let entry = lsa.hives.get(index as usize)?;
+        let hive = remote_hive_name(entry)?;
+        (hive != admin_hive
+            && entry.flags & (HIVE_FLAG_SELF | FLAG_DELETED) == 0
+            && remote_hive_is_stale(entry, now))
+        .then_some(hive)
+    };
+    let mut names: Vec<String> = lsa
+        .nodes
+        .iter()
+        .filter(|node| node.name_len > 0 && node.flags & FLAG_DELETED == 0)
+        .filter_map(|node| {
+            let hive = cut_off(node.hive_index)?;
+            Some(qualified_node_name(
+                &shm_node_name(&node.name, node.name_len),
+                &hive,
+            ))
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The nodes in the regions of this hive's routers, found as a router finds its peers'
@@ -6674,9 +6709,11 @@ enum MeshRefusal {
     InventoryUnavailable(String),
 }
 
-/// A-62 for one mesh command: the table, then the connected nodes it leaves to shared memory.
-fn admit_mesh_caller(
+/// A-62 for one mesh command: the table, then, for a workflow package, who else holds its
+/// workflow (`admit_workflow_package`).
+async fn admit_mesh_caller(
     ctx: &AdminContext,
+    client: &RouterDispatcher,
     caller: &str,
     action: &str,
     target: Option<&str>,
@@ -6692,17 +6729,142 @@ fn admit_mesh_caller(
     {
         MeshAdmission::Admitted => Ok(()),
         MeshAdmission::WorkflowPackage { workflow, hive } => {
-            let connected = (ctx.connected_nodes)(&ctx.hive_id).map_err(|detail| {
-                MeshRefusal::InventoryUnavailable(format!(
-                    "whether WF.{workflow} runs on another hive cannot be read: {detail}"
-                ))
-            })?;
-            workflow_nodes_elsewhere(&connected.nodes, &workflow, &hive).map_err(|detail| {
-                MeshRefusal::Unauthorized(format!(
-                    "{caller} may not change wf.{workflow}: {detail}"
-                ))
-            })
+            admit_workflow_package(ctx, client, caller, &workflow, &hive).await
         }
+    }
+}
+
+/// How long the workflow-package admission waits for each hive's answer on its `WF.<x>` (FINDINGS
+/// A-304): all at once, well within the 5 s SY.wf-rules gives a publish (`adminRPCTimeout` in
+/// go/sy-wf-rules/node/admin.go). A config is a file its hive's orchestrator reads, in well under a
+/// second.
+const WF_PACKAGE_HOLDER_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What one hive answered of its `WF.<x>` (`read_workflow_node_config`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkflowNodeHeld {
+    /// It holds the node's config (its orchestrator read it, or could not parse what it holds).
+    Held,
+    /// No such config there.
+    None,
+    /// Not read now (no answer in time, the hive cut off, another error): why.
+    Unread(String),
+}
+
+/// A-62 for SY.wf-rules@`hive` on the package `wf.<workflow>` (FINDINGS A-304, the operator's call of
+/// 2026-11-12, option (a)): refused while another hive holds a `WF.<workflow>`, connected or not.
+/// The package is one runtime for every hive, so another hive's deploy would publish above its
+/// versions and its purge would ask for their removal. In order:
+/// 1. the nodes connected now, from shared memory (`workflow_nodes_elsewhere`), and what the LSA
+///    last saw of each hive it holds stale, a hive cut off (`ConnectedNow::last_seen`);
+/// 2. the node's config on every other hive that may run one (the motherbee and each worker
+///    whose join is done), each asked at once through the motherbee's orchestrator
+///    (`get_node_config`, `WF_PACKAGE_HOLDER_READ_TIMEOUT`): one that holds it refuses, whether
+///    its node is stopped, failed or not connected.
+///
+/// A hive that does not answer now is judged by what the LSA last saw of it, and logged: refusing
+/// whenever some hive cannot be read would stop every workflow's deploy on every hive while one
+/// hive is down (the operator's principle of 2026-11-12, A-313: act only on what fails). A
+/// removal of such a version still waits for that hive's read of its use (A-281).
+async fn admit_workflow_package(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    caller: &str,
+    workflow: &str,
+    hive: &str,
+) -> Result<(), MeshRefusal> {
+    let refuse = |detail: String| {
+        MeshRefusal::Unauthorized(format!("{caller} may not change wf.{workflow}: {detail}"))
+    };
+    let connected = (ctx.connected_nodes)(&ctx.hive_id).map_err(|detail| {
+        MeshRefusal::InventoryUnavailable(format!(
+            "whether WF.{workflow} runs on another hive cannot be read: {detail}"
+        ))
+    })?;
+    workflow_nodes_elsewhere(&connected.nodes, workflow, hive).map_err(refuse)?;
+    workflow_nodes_elsewhere(&connected.last_seen, workflow, hive).map_err(|detail| {
+        refuse(format!(
+            "{detail} (as the LSA last saw its hive, which is cut off now)"
+        ))
+    })?;
+
+    let registry = hive_registry(ctx);
+    let mut hives: Vec<String> = registry_hive_entries(&registry)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.name().to_string())
+        .filter(|name| matches!(registered_hive(&registry, name), RegisteredHive::Other))
+        .chain(std::iter::once(ctx.hive_id.clone()))
+        .filter(|name| name != hive)
+        .collect();
+    hives.sort();
+    hives.dedup();
+    let reads = futures::future::join_all(
+        hives
+            .iter()
+            .map(|other| read_workflow_node_config(ctx, client, workflow, other)),
+    )
+    .await;
+    let mut unread = Vec::new();
+    for (other, read) in hives.iter().zip(reads) {
+        match read {
+            WorkflowNodeHeld::Held => {
+                return Err(refuse(format!(
+                    "wf.{workflow} is also the package of WF.{workflow}@{other}, whose config that hive holds, connected or not: only that hive's SY.wf-rules may change it, until its workflow is deleted there"
+                )));
+            }
+            WorkflowNodeHeld::None => {}
+            WorkflowNodeHeld::Unread(why) => unread.push(format!("{other} ({why})")),
+        }
+    }
+    if !unread.is_empty() {
+        tracing::warn!(
+            caller = %caller,
+            workflow = %workflow,
+            unread = %unread.join("; "),
+            "workflow package admitted without reading every hive's WF node: each hive not read is judged by what the LSA last saw of it"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `hive` holds the config of `WF.<workflow>@<hive>`, read through the motherbee's
+/// orchestrator (`get_node_config`) within `WF_PACKAGE_HOLDER_READ_TIMEOUT`.
+async fn read_workflow_node_config(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    workflow: &str,
+    hive: &str,
+) -> WorkflowNodeHeld {
+    let request = build_admin_request(
+        ctx,
+        "get_node_config",
+        serde_json::json!({
+            "node_name": format!("WF.{workflow}@{hive}"),
+            "target": hive,
+        }),
+        Some(hive.to_string()),
+    );
+    let answer = send_admin_request(
+        client,
+        request,
+        WF_PACKAGE_HOLDER_READ_TIMEOUT,
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await;
+    match answer {
+        Ok(answer) if payload_is_ok(&answer) => WorkflowNodeHeld::Held,
+        Ok(answer) => match payload_error_code(&answer).as_deref() {
+            Some("NODE_CONFIG_NOT_FOUND") => WorkflowNodeHeld::None,
+            // The file is there, and its node's runtime cannot be read: held all the same.
+            Some("NODE_CONFIG_READ_FAILED") => WorkflowNodeHeld::Held,
+            code => WorkflowNodeHeld::Unread(format!(
+                "{}: {}",
+                code.unwrap_or("no code"),
+                payload_error_detail(&answer).unwrap_or_default()
+            )),
+        },
+        Err(err) => WorkflowNodeHeld::Unread(err.to_string()),
     }
 }
 
@@ -9543,7 +9705,7 @@ async fn dispatch_internal_admin_command(
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     // A-62: a mesh caller is admitted by the table before anything else runs.
     if let AdminOrigin::Mesh(caller) = origin {
-        match admit_mesh_caller(ctx, caller, action, target, &params) {
+        match admit_mesh_caller(ctx, client, caller, action, target, &params).await {
             Ok(()) => {}
             Err(MeshRefusal::Unauthorized(detail)) => {
                 tracing::warn!(caller = %caller, action = %action, detail = %detail, "mesh caller refused");
@@ -28211,6 +28373,11 @@ mod tests {
             connected_hive_names("motherbee", &lsa, now),
             ["ingress1", "motherbee", "worker1"]
         );
+        // What the LSA last saw of the hives it holds as stale, not deleted (FINDINGS A-304).
+        assert_eq!(
+            last_seen_node_names("motherbee", &lsa, now),
+            ["WF.away@worker2", "WF.quiet@worker3"]
+        );
     }
 
     /// A read of the connected nodes that holds this admin's hive and `hives`, with `nodes`.
@@ -28221,6 +28388,7 @@ mod tests {
                 .chain(hives.iter().copied())
                 .map(str::to_string)
                 .collect(),
+            last_seen: Vec::new(),
         }
     }
 
@@ -34902,17 +35070,23 @@ mod tests {
                 &["WF.invoice@worker1", "WF.billing@worker2"],
             ))
         });
-        // Admitted: the publisher answers for itself (the tests have no runtime manifest).
-        let admitted = dispatch_internal_admin_command(
+        // Admitted once the motherbee says it holds no WF.invoice (FINDINGS A-304): the publisher
+        // answers for itself (the tests have no runtime manifest).
+        let publish = dispatch_internal_admin_command(
             &ctx,
             &ctx.rpc,
             "publish_runtime_package",
             None,
             params,
             caller,
-        )
-        .await
-        .expect("dispatch");
+        );
+        let none_there = json!({ "status": "error", "error_code": "NODE_CONFIG_NOT_FOUND" });
+        let (admitted, read) = tokio::join!(
+            publish,
+            answer_admin_relay(&mut harness, "get_node_config", none_there)
+        );
+        assert_eq!(read.payload["node_name"], json!("WF.invoice@motherbee"));
+        let admitted = admitted.expect("dispatch");
         for code in ["UNAUTHORIZED", "INVENTORY_UNAVAILABLE"] {
             assert_ne!(
                 admitted.envelope["error_code"],
@@ -34921,6 +35095,132 @@ mod tests {
                 admitted.envelope
             );
         }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// FINDINGS A-304, the operator's call of 2026-11-12 (option (a)): SY.wf-rules@H's publish or
+    /// removal of wf.<x> is refused while another hive holds a WF.<x>, connected or not: its config
+    /// read on every other hive that may run one (here the motherbee), and what the LSA last saw
+    /// of a hive cut off. Only the connected nodes were read, so a stopped WF.invoice@motherbee,
+    /// or one on a hive cut off, let worker1's deploy publish above its versions and purge them. A
+    /// hive that does not answer is judged by what the LSA last saw of it: nothing is refused for
+    /// it alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_wf_rules_package_is_refused_while_another_hive_holds_its_wf_node() {
+        let (mut ctx, mut harness) = mesh_test_admin("a304-wf-holders");
+        ctx.connected_nodes = Arc::new(|_| Ok(connected_now(&["worker1"], &[])));
+        let caller = AdminOrigin::Mesh("SY.wf-rules@worker1");
+        let publish = workflow_package(workflow_package_json(
+            "wf.invoice",
+            "workflow",
+            Some("wf.engine"),
+        ));
+        let removal = json!({ "runtime": "wf.invoice", "runtime_version": "0.0.2" });
+        let held = json!({
+            "status": "ok",
+            "node_name": "WF.invoice@motherbee",
+            "config": { "_system": { "runtime": "wf.invoice", "runtime_version": "0.0.1" } },
+        });
+        for (action, params) in [
+            ("publish_runtime_package", publish.clone()),
+            ("remove_runtime_version", removal.clone()),
+        ] {
+            let ask = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                action,
+                Some("motherbee"),
+                params,
+                caller,
+            );
+            let (refused, read) = tokio::join!(
+                ask,
+                answer_admin_relay(&mut harness, "get_node_config", held.clone())
+            );
+            assert_eq!(read.payload["node_name"], json!("WF.invoice@motherbee"));
+            assert_eq!(read.payload["target"], json!("motherbee"));
+            let refused = refused.expect("dispatch");
+            assert_eq!(refused.http_status, 403, "{action}: {}", refused.envelope);
+            assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
+            assert!(
+                refused.envelope["error_detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains(
+                        "wf.invoice is also the package of WF.invoice@motherbee, whose config \
+                         that hive holds, connected or not"
+                    )),
+                "{}",
+                refused.envelope
+            );
+        }
+
+        // A config its orchestrator cannot read is held all the same.
+        let ask = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "publish_runtime_package",
+            None,
+            publish.clone(),
+            caller,
+        );
+        let unreadable = json!({ "status": "error", "error_code": "NODE_CONFIG_READ_FAILED" });
+        let (refused, _) = tokio::join!(
+            ask,
+            answer_admin_relay(&mut harness, "get_node_config", unreadable)
+        );
+        assert_eq!(refused.expect("dispatch").http_status, 403);
+
+        // The motherbee does not answer within the 3 s: admitted on what the LSA last saw of it.
+        let ask = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "publish_runtime_package",
+            None,
+            publish.clone(),
+            caller,
+        );
+        let silent = async {
+            let read = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the read");
+            assert_eq!(read.meta.action.as_deref(), Some("get_node_config"));
+        };
+        let (admitted, ()) = tokio::join!(ask, silent);
+        let admitted = admitted.expect("dispatch");
+        assert_ne!(
+            admitted.envelope["error_code"],
+            json!("UNAUTHORIZED"),
+            "{}",
+            admitted.envelope
+        );
+
+        // A hive cut off whose last LSA showed WF.invoice: refused before anything is read.
+        ctx.connected_nodes = Arc::new(|_| {
+            Ok(ConnectedNow {
+                last_seen: vec!["WF.invoice@worker2".to_string()],
+                ..connected_now(&["worker1"], &[])
+            })
+        });
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "remove_runtime_version",
+            Some("motherbee"),
+            removal,
+            caller,
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+        assert!(refused.envelope["error_detail"]
+            .as_str()
+            .is_some_and(
+                |detail| detail.contains("WF.invoice@worker2") && detail.contains("cut off")
+            ));
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await

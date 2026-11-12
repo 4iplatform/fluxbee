@@ -327,11 +327,20 @@ caller and the action; a command with no stamped caller is refused too.
     `update_to` or bundle upload, and each file under one plain path;
   - `remove_runtime_version` `{runtime, runtime_version}`: a version of a `wf.<x>`, named in
     lowercase. A `test_hold_ms` would hold the manifest lock every publish and deploy waits for;
-  - both are refused while a `WF.<x>` is connected on another hive (`workflow_nodes_elsewhere`):
-    the package is the same on every hive. SY.admin reads the connected nodes from shared memory,
-    asking no one (`connected_nodes_from_shm`): the motherbee's own from the regions of its
-    routers, every other hive's from the LSA, as the router reaches them. Regions that cannot be
-    read answer `503 INVENTORY_UNAVAILABLE`, to retry (its `payload.retryable` true since
+  - both are refused (`403 UNAUTHORIZED`) while another hive holds a `WF.<x>`, connected or not
+    (`admit_workflow_package`; FINDINGS A-304, the operator's call of 2026-11-12, since 0.1.139):
+    the package is the same on every hive. First the nodes connected now, read from shared
+    memory, asking no one (`connected_nodes_from_shm`, `workflow_nodes_elsewhere`): the
+    motherbee's own from the regions of its routers, every other hive's from the LSA, as the
+    router reaches them, and what the LSA last saw of each hive it holds stale, a hive cut off
+    (`last_seen_node_names`). Then the node's config on every other hive that may run one (the
+    motherbee and each worker whose join is done), each asked at once through the motherbee's
+    orchestrator (`get_node_config` of `WF.<x>@<hive>`, 3 s: `read_workflow_node_config`): a hive
+    that holds it refuses, its node stopped, failed or not connected. A hive that does not answer
+    within the 3 s is judged by what the LSA last saw of it, and a warning names it: nothing is
+    refused for one hive that fails, and a removal still waits for that hive's read of the
+    version's use (A-281). Before 0.1.139 only a connected `WF.<x>` refused. Regions that cannot
+    be read answer `503 INVENTORY_UNAVAILABLE`, to retry (its `payload.retryable` true since
     0.1.139, FINDINGS A-305), never `UNAUTHORIZED`;
   - `sync_hint` `{channel, folder_id, wait_for_idle, timeout_ms}`: only a scan of
     `fluxbee-dist-runtimes` (channel `dist`) on the motherbee, as a worker's deploy asks for one
