@@ -8418,21 +8418,30 @@ fn cloud_edge_record_failure(record: &Result<(u16, String), AdminError>) -> Opti
 ///   back), and the edge took it; nothing closes the door;
 /// - that token is in no answer (A-124: a token through Archi reaches the AI provider), and in no
 ///   log line;
-/// - a token the edge held for that channel before is the edge's grace secret, accepted for 10
-///   minutes from the open (SY.edge's `SHARED_SECRET_GRACE_MS`), in its memory only: a restart of
-///   the edge ends it sooner;
+/// - a token the edge held for that channel before is the edge's grace secret, accepted for up to
+///   10 minutes from the open (SY.edge's `SHARED_SECRET_GRACE_MS`), in its memory only: a restart
+///   of the edge ends it sooner, and so does another run of the action, whose open puts this
+///   call's token, which no one holds, in its place (SY.edge's `apply_open_url` keeps one previous
+///   secret, the one it replaces);
 /// - nothing is applied to the running IO.cloud: it trusts what it trusted before (no edge, on a
 ///   first publish).
 ///
-/// Running the action again records the edge and hands a new token, once.
+/// So the action runs again only once the cause the detail names is fixed, on the motherbee's
+/// HTTP API, never through Archi (A-124), and the Cloud gets the new token at once (FINDINGS
+/// A-273's review): that run ends the grace at once, and one that fails at the record again
+/// leaves the door with no token anyone holds.
 fn cloud_edge_record_failed_detail(cloud_node: &str, edge_node: &str, failure: &str) -> String {
     format!(
         "the door is open on {edge_node} with the token this call minted, but recording \
          edge_node into {cloud_node} config failed twice, the last time{failure}. That token is \
          not handed out, and it cannot be read back: the vault keeps it for the edge alone. A \
-         previous token on {edge_node} keeps working only for the 10 minutes this rotation \
-         leaves it (sooner if the edge restarts). Run publish_cloud_endpoint again: it records \
-         the edge and hands a new token."
+         previous token on {edge_node} works for up to 10 minutes from this call, and stops \
+         sooner if the edge restarts or publish_cloud_endpoint runs again: the edge keeps one \
+         previous token, and another run puts this call's token in its place. So fix the cause \
+         above first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST \
+         /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124), and give the \
+         Cloud the new token at once: a run that answers CONFIG_RECORD_FAILED again leaves no \
+         token anyone holds."
     )
 }
 
@@ -17491,10 +17500,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The compact view gives each action its name, description and read_only, and is what the mesh and the executor answer. One action's schema and example are its help: get_admin_action_help (GET /admin/actions/{action}).",
         ],
         "publish_cloud_endpoint" => vec![
-            "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again, it mints a new token; the previous one works 10 more minutes.",
+            "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
             "IO.cloud trusts that edge at once (FINDINGS A-255): SY.admin records it in IO.cloud's config (set_node_config of io.edge_node), then applies it to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
-            "A record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED, with no token: the door is open on the edge with the token this call minted, which is handed to no one and cannot be read back; a previous token on that edge keeps working only for the 10 minutes the rotation leaves it (sooner if the edge restarts); nothing is applied to IO.cloud. Run publish_cloud_endpoint again: it records the edge and hands a new token. A token goes out once, only in an ok answer, never in an error or a log line.",
+            "A record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED, with no token: the door is open on the edge with the token this call minted, which is handed to no one and cannot be read back; nothing is applied to IO.cloud. A previous token on that edge works for up to 10 minutes from this call, and stops sooner if the edge restarts or publish_cloud_endpoint runs again: the edge keeps one previous token, and another run puts this call's token in its place. So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124), and give the Cloud the new token at once: a run that answers CONFIG_RECORD_FAILED again leaves no token anyone holds. A token goes out once, only in an ok answer, never in an error or a log line.",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
@@ -42318,8 +42327,11 @@ mod tests {
     /// A record that fails twice is the error answer (FINDINGS A-273): 502 CONFIG_RECORD_FAILED
     /// with no token in it, the token this call minted handed to no one, and its detail says what
     /// is left: the door open on the edge with that token, a previous token on that edge working
-    /// only for the rotation's 10 minutes, and publish_cloud_endpoint again for a new one. IO.cloud
-    /// is not asked. Neither a log line, at any level, nor the command log carries the token.
+    /// for up to 10 minutes and less once the action runs again, which puts this call's token in
+    /// the edge's one place for a previous token (A-273's review), and so the cause fixed first,
+    /// the run again on the motherbee's HTTP API, never through Archi (A-124), and the new token
+    /// to the Cloud at once. IO.cloud is not asked. Neither a log line, at any level, nor the
+    /// command log carries the token.
     #[tokio::test]
     async fn a_record_that_fails_twice_hands_no_token_and_says_what_is_left() {
         #[derive(Clone)]
@@ -42381,12 +42393,24 @@ mod tests {
             "the last time (HTTP ".to_string(),
             "NODE_CONFIG_NOT_FOUND".to_string(),
             "That token is not handed out".to_string(),
-            format!("A previous token on {CLOUD_EDGE} keeps working only for the 10 minutes"),
-            "Run publish_cloud_endpoint again: it records the edge and hands a new token"
+            format!("A previous token on {CLOUD_EDGE} works for up to 10 minutes from this call"),
+            "stops sooner if the edge restarts or publish_cloud_endpoint runs again".to_string(),
+            "the edge keeps one previous token, and another run puts this call's token in its \
+             place"
+                .to_string(),
+            "So fix the cause above first, then run publish_cloud_endpoint again on the \
+             motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi \
+             (FINDINGS A-124), and give the Cloud the new token at once"
+                .to_string(),
+            "a run that answers CONFIG_RECORD_FAILED again leaves no token anyone holds"
                 .to_string(),
         ] {
             assert!(detail.contains(&what), "{what}: {detail}");
         }
+        assert!(
+            !detail.contains("keeps working only for the 10 minutes"),
+            "the grace a run takes away: {detail}"
+        );
         assert!(
             harness
                 .next_outgoing_within(Duration::from_millis(200))
@@ -42422,6 +42446,41 @@ mod tests {
             serde_json::from_str(command_log.lines().last().expect("an entry")).expect("JSON");
         assert_eq!(entry["action"], "publish_cloud_endpoint");
         assert_eq!(entry["error_code"], "CONFIG_RECORD_FAILED");
+    }
+
+    /// publish_cloud_endpoint's help, which Archi reads, says what a run does to the token before
+    /// it (FINDINGS A-273's review): the edge keeps one previous token, for up to 10 minutes and in
+    /// its memory only, so a restart of the edge or another run ends it sooner. After
+    /// CONFIG_RECORD_FAILED: the cause fixed first, the run again on the motherbee's HTTP API,
+    /// never through Archi (A-124), and the new token to the Cloud at once. Before, the help
+    /// promised that token its 10 minutes and said to run again, which ends them.
+    #[test]
+    fn the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it() {
+        let notes = admin_action_request_notes("publish_cloud_endpoint");
+        let says = |words: &str| notes.iter().any(|note| note.contains(words));
+        for words in [
+            "Run again, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
+            "A previous token on that edge works for up to 10 minutes from this call, and stops sooner if the edge restarts or publish_cloud_endpoint runs again: the edge keeps one previous token, and another run puts this call's token in its place.",
+            "So fix the cause the detail names first, then run publish_cloud_endpoint again on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124), and give the Cloud the new token at once: a run that answers CONFIG_RECORD_FAILED again leaves no token anyone holds.",
+        ] {
+            assert!(says(words), "{words}: {notes:#?}");
+        }
+        for promise in [
+            "the previous one works 10 more minutes",
+            "keeps working only for the 10 minutes",
+        ] {
+            assert!(!says(promise), "{promise}: {notes:#?}");
+        }
+        // In the help itself, GET /admin/actions/publish_cloud_endpoint, and on the route it names.
+        let spec = resolve_internal_action_spec("publish_cloud_endpoint")
+            .expect("an action of the catalog");
+        assert!(build_admin_action_doc(spec).to_string().contains(
+            "(POST /hives/motherbee/cloud/endpoint), never through Archi (FINDINGS A-124)"
+        ));
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/motherbee/cloud/endpoint"),
+            vec!["POST"]
+        );
     }
 
     // --- unpublish_artifact: by its id or its link's key, by its publisher only -------------
