@@ -394,8 +394,10 @@ every hive and reports, per hive (`HEALTH_SCRIPT`):
 A hive is healthy only when all seven are 0 (`HEALTH_OK`). `wandrops` joined the check once every
 hive ran 0.1.135: until 0.1.135 most of its lines were a WAN broadcast echoed back to the peer it
 came from (A-272, under [WAN between hives](#wan-between-hives)). A router older than 0.1.135
-echoes again, and the hives that drop its echoes fail the check (every hive after a rollback to
-0.1.134). A journal that cannot be read is reported, never counted as zero.
+echoes again, and the hives that drop its echoes fail the check: after a rollback to 0.1.134, the
+motherbee whenever a node broadcasts over the WAN (each spoke sends back to the hub every
+broadcast the hub sent it, the motherbee's nodes' and the other spokes'), and a spoke when its own
+nodes do. A journal that cannot be read is reported, never counted as zero.
 
 ## Failure behavior
 

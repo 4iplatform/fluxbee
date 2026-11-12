@@ -14,8 +14,9 @@ Commands
   versions                         core version and manifest hash per hive
   opa-status [HIVE...]             user OPA policy per hive: version, in_sync, published, router
   health [--since HH:MM]           per VM: failed units, gate denials, routing.src drops, records
-                                   the router stream lost, usage records lost or rejected (UTC);
-                                   then the edge certificate (edge-cert) and the web door (web)
+                                   the router stream lost, usage records lost or rejected, the
+                                   lines of WAN frames dropped as foreign_source (UTC); then the
+                                   edge certificate (edge-cert) and the web door (web)
   build VERSION [--wait]           pull and build the .deb on the build VM (log /root/build-V.log)
   publish VERSION                  publish the built .deb to the apt repo on the build VM; the
                                    repo keeps the newest 10 versions, dist/ drops the older .debs
@@ -230,7 +231,9 @@ def cmd_opa_status(a):
 # vouch for; at most one line every 30 s a router, each with its cumulative count). Since 0.1.135,
 # which every hive runs, no router sends a WAN broadcast back to the peer it came from (A-272), so
 # a line is a real drop and the field is checked like the others. An older router echoes again, and
-# the hives that drop its echoes fail the check (every hive after a rollback to 0.1.134).
+# the hives that drop its echoes fail the check: after a rollback to 0.1.134, the motherbee whenever
+# a node broadcasts over the WAN (each spoke sends back to the hub every broadcast the hub sent it,
+# the motherbee's nodes' and the other spokes'), and a spoke when its own nodes do.
 HEALTH_OK = "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0 wandrops=0"
 HEALTH_SCRIPT = r"""
 if ! log=$(journalctl -u rt-gateway --since "%s" --no-pager -o cat 2>&1); then

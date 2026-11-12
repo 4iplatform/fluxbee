@@ -239,7 +239,7 @@ no change required
     A-314: a stopped node whose unit was gone was started (ok in 1.3 s, `RUNNING` at 11 s), and a
     core node's kill was refused. Health clean on every hive with `wandrops=0`, which `ops.py
     health` checks from now on.
-    **Next:** 0.1.136, the AI SDK alone (A-257, `coa/aisdk-135`).
+    **Next:** 0.1.136, the AI SDK alone (A-257, `coa/aisdk-136`).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -1919,7 +1919,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   this becomes the usual case under load (the old runtime ran such a turn, late).
 - **Fix, later (cognition):** an In turn whose `trace_id` the agent answered `ai_runtime_busy` is
   dropped or marked unanswered; the busy answer's trace entry says `busy` since 0.1.136.
-- **Built on `coa/cognition-136` (0.1.136).** From its review: cognition drops the refused turn even
+- **Built on `coa/cognition-136` (0.1.137).** From its review: cognition drops the refused turn even
   when the busy answer never reached the sender (the router copies the agent's send for cognition
   at entry, before routing, so a busy answer lost to `LINK_BUSY` still drops it); under io.slack
   the person reads *Error (invalid_text_payload)* and is never told to send again, so A-291's fix
@@ -2381,12 +2381,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `IO.gate0235r` and a sender `IO.gate0235s` on each of the four hives, each sender sending a
   broadcast (ttl 16, `meta.target` `IO.gate0235*`) every 15 s. On 0.1.134 (16 per hive) every
   receiver got each broadcast once, and the routers dropped the echoes and logged them as *"router
-  dropped a WAN frame"* (`foreign_source`): 7 lines on the motherbee (`reject_count` 133 to 178;
-  `peer_hive` worker1 and egress1, its own sender's broadcasts coming back) and 6 on each spoke
-  (`peer_hive` motherbee, the spoke's own sender's coming back from the hub). On 0.1.135 (32 per
-  hive, from 2 min after the last router restart) every receiver got each broadcast exactly once
-  (none missed, none twice), and no hive logged a drop line. Since then `ops.py health` checks
-  `wandrops=0` (`HEALTH_OK`).
+  dropped a WAN frame"* (`foreign_source`): 7 lines on the motherbee (`peer_hive` worker1 and
+  egress1, its own sender's broadcasts coming back) and 6 on each spoke (`peer_hive` motherbee, the
+  spoke's own sender's coming back from the hub); lines, not frames, at most one every 30 s a
+  router. On 0.1.135 (32 per hive, from 2 min after the last router restart) every receiver got
+  each broadcast exactly once (none missed, none twice), and no hive logged a drop line. Since then
+  `ops.py health` checks `wandrops=0` (`HEALTH_OK`).
 
 ### A-271 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133 with 0.1.134's A-314 fix, run on 0.1.134, 2026-11-11; 20 self-restarts on worker1 and egress1 acted on no check; its reading of a unit systemd does not have as no answer was A-314, fixed in 0.1.134) (found 2026-11-11 by the review of the orchestrator's 0.1.133 branch; read in the code; there before it) — A check that decides an action takes "no answer" for "no"
 
@@ -2450,7 +2450,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Another sender (A-293's review, 2026-11-11):** IO.cloud logs the Cloud's `op` unescaped
   (`op = %op`) on its received and completed lines; a trusted sender, left for the router's fix.
 
-### A-268 [General/router] ✅ VALIDATED ON 8.x (0.1.135, 2026-11-12; its race by its unit test, no live trigger; A-265's check, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
+### A-268 [General/router] ✅ BUILT (0.1.135, 2026-11-12; its race by its unit test, no live trigger; A-265's check unchanged on 8.x, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 
 - **Why:** `rebuild_fib` (`src/router/mod.rs`) reads the nodes, the siblings, the static routes, the
   LSA snapshot and the reachability, and stores its FIB at the end under the FIB's lock; nothing
@@ -2464,12 +2464,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** a generation per router, taken before the reads and compared under the FIB's lock, so
   only a newer build is stored; or a mutex taken first that serializes the builds, after checking
   that no caller holds their inputs.
-- **Checked on 8.x (0.1.135):** built as the first option, a generation per build (`625413a4`). Its
-  race has no live trigger; its unit test covers it
-  (`a_fib_build_that_read_before_an_lsa_never_undoes_the_lsas_own`). Through A-265's check, three
-  runs: a node connecting on worker1 was reached by name from ingress1, the first message delivered
-  0.05 s, 0.15 s and 0.14 s after its connect (0.1.132: 0.33 s); the messages sent before the
-  connect answered `NODE_NOT_FOUND` from ingress1's router, as expected.
+- **Built (0.1.135):** the first option, a generation per build (`625413a4`). Its race has no live
+  trigger; its unit test covers it
+  (`a_fib_build_that_read_before_an_lsa_never_undoes_the_lsas_own`).
+- **Checked on 8.x (0.1.135):** the rebuild path it guards, not the race (A-265's check, three
+  runs): a node connecting on worker1 was reached by name from ingress1, the first message
+  delivered 0.05 s, 0.15 s and 0.14 s after its connect (0.1.132: 0.33 s); the messages sent before
+  the connect answered `NODE_NOT_FOUND` from ingress1's router, as expected.
 
 ### A-267 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.133 with 0.1.134's A-314 fix, run on 0.1.134, 2026-11-11; 20 self-restarts of the orchestrator on worker1 and egress1: no service started, no false line) (found 2026-11-11 by 0.1.131's deploy timeline; seen on 8.x, read in the code) — The watchdog's last tick, during the orchestrator's own stop, reads a healthy service as down and tries to start it
 

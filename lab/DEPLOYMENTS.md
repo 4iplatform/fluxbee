@@ -21,7 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.135** | 2026-11-11 | `9a6ffb6d` | motherbee + spokes (core), the router alone: A-272 (split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one it came from, so no router sends a broadcast back to its peer, and over IRP a router that is not the gateway hands none back to the gateway), A-268 (two FIB builds at once are stored in the order they began, so a build that read before a change never undoes that change's rebuild); `ops.py health` checks `wandrops=0` from then on | ✅ live, checked on 8.x | snap `pre-router-0-1-135` (all 4 VMs) · `apt install fluxbee=0.1.134` + 0.1.134's `update_installation` (nothing one-way; the WAN echoes come back, and once `HEALTH_OK` checks `wandrops=0` a 0.1.134 hive fails health on them) |
+| **0.1.135** | 2026-11-11 | `9a6ffb6d` | motherbee + spokes (core), the router alone: A-272 (split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one it came from, so no router sends a broadcast back to its peer, and over IRP a router that is not the gateway hands none back to the gateway), A-268 (two FIB builds at once are stored in the order they began, so a build that read before a change never undoes that change's rebuild); `ops.py health` checks `wandrops=0` from then on | ✅ live, checked on 8.x | snap `pre-router-0-1-135` (all 4 VMs) · `apt install fluxbee=0.1.134` + 0.1.134's `update_installation` (nothing one-way; the WAN echoes come back, and now that `HEALTH_OK` checks `wandrops=0` the hives that drop them fail health: the motherbee whenever a node broadcasts over the WAN, a spoke when its own nodes do) |
 | **0.1.134** | 2026-11-11 | `8539bc64` | motherbee + spokes (core), the orchestrator alone, a hotfix: A-314 (a node unit systemd does not have reads as not running: on the hives' systemd 255 `systemctl is-active` exits 4 for it, which 0.1.133 read as no answer, so no node could be launched and a stopped node whose unit was gone could be neither started nor purged and read `UNKNOWN`); its review: `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name (`INVALID_REQUEST`) before anything is done, as `run_node` does | ✅ replaced by 0.1.135 | snap `pre-orch-0-1-134` (deleted 2026-11-11) · `apt install fluxbee=0.1.133` + 0.1.133's `update_installation` (that brings A-314 back); to 0.1.132 by apt (nothing one-way found) |
 | **0.1.133** | 2026-11-11 | `45c736e4` | motherbee + spokes (core), one branch per binary, the sweep's end: SY.identity and SY.admin (A-191: a system ILK is retired, never deleted, at SY.identity's start for an SY node its release no longer runs, and by `retire_hive_ilks` or `remove_hive` for a removed hive; A-232: SY.identity's listings refuse a cursor not theirs without repeating it), SY.admin (A-255: `publish_cloud_endpoint` applies the edge to the running IO.cloud; A-260 and A-274: the expiry sweep and a take-down call the edge and IO.blob outside the publication lock; A-281: no version removed while some hive's use of it was not read; A-285's texts), SY.timer 1.6 (A-258: its refusals logged, bounded; A-259: the heap holds the pending timers only; A-266: a page its `limit` cuts answers `next_cursor`), the orchestrator (A-240: a status read writes nothing, `status_version` gone from the answer; A-241: a worker cleans its own blob staging; A-267 and A-271: a check with no answer acts on nothing; A-281's use across the hives, `hives_without_runtimes`), SY.wf-rules (A-270: no delete without force of a WF node that is not `RUNNING`; A-281: a delete names the versions it left), SY.architect (A-279 with A-288: Archi's SCMD reads decode their query and keep it) | ✅ replaced by 0.1.134 (deployed 22:35Z, replaced 23:32Z; its gate found A-314) | snap `pre-sweep-0-1-133` (deleted 2026-11-11) · `apt install fluxbee=0.1.132` + 0.1.132's `update_installation` (nothing one-way found: the system ILKs 0.1.133 retired stay retired, harmless to 0.1.132) |
 | **0.1.132** | 2026-11-11 | `36135e52` | motherbee + spokes (core), the router alone: A-245 (a far router's `UNREACHABLE` or `TTL_EXCEEDED` reaches a sender on another spoke: the hub hands it on toward the spoke whose LSA lists the sender), A-195 (no WAN frame arrives before what names its sender: a new link's first frames are the LSA and the hub's reachability; the hub tells every spoke of a hive's changed nodes as its LSA comes; A-261, A-262 with it), A-265 (the hub rebuilds its FIB as it applies an LSA, and as a hive goes stale), A-246 (a broadcast answered once, by the router it entered), A-253 (a stream record too big for a batch named in the router's journal, its ids quoted, escaped and cut, at most 10 between two alarm lines), A-208 with A-247 (the several-routers mode, unsupported: no wedge, answers over the link a frame came from); `ops.py health` counts the router's lines only when the pattern opens the message | ✅ replaced by 0.1.133 | snap `pre-router-0-1-132` (deleted 2026-11-11) · `apt install fluxbee=0.1.131` + 0.1.131's `update_installation` (nothing one-way; the wire is the same) |
@@ -150,12 +150,13 @@
 - **Date:** 2026-11-11 (ART; deployed 2026-11-12 UTC) · **Previous version:** 0.1.134 · **Commit:**
   `9a6ffb6d`.
 - **Scope:** motherbee and the three spokes, through the installation's update.
-- **Why:** the router's two lows left by 0.1.132: A-272, found by its gate (every router sent a WAN
-  broadcast back to the peer it came from, and those echoes filled the `foreign_source` lines), and
-  A-268, found by its review (two FIB builds at once could store the older one last). The sweep's
-  end, as the operator set it on 2026-11-11 (FINDINGS' board, item 24); the router is shared code
-  and ships alone ([METHOD](logbook/METHOD.md) §9). Built and reviewed as 0.1.134; that number went
-  to the orchestrator's hotfix (A-314), so the router is 0.1.135.
+- **Why:** two of the router's three lows left by 0.1.132 (A-269 goes with its next change): A-272,
+  found by its gate (every router sent a WAN broadcast back to the peer it came from, and those
+  echoes filled the `foreign_source` lines), and A-268, found by its review (two FIB builds at once
+  could store the older one last). The sweep's end, as the operator set it on 2026-11-11 (FINDINGS'
+  board, item 24); the router is shared code and ships alone ([METHOD](logbook/METHOD.md) §9).
+  Built and reviewed as 0.1.134; that number went to the orchestrator's hotfix (A-314), so the
+  router is 0.1.135.
 - **What changed (`src/router/` only):**
   - **A-272 (`5de07b07`):** split horizon: a broadcast that came over the WAN goes on to every WAN
     peer but the one it came from. The hub hands a spoke's broadcast to every other spoke and never
@@ -200,10 +201,10 @@
     `IO.gate0235s` sending a broadcast (ttl 16, `meta.target` `IO.gate0235*`) every 15 s.
     - **On 0.1.134** (02:10:17–02:14:05Z, 16 per hive): every receiver got each broadcast once
       (16/16 from each hive at each hive), and the routers logged the echoes as *"router dropped a
-      WAN frame"* (`foreign_source`): the motherbee 7 lines (its `reject_count` from 133 to 178 in
-      72 s; `peer_hive` worker1 and egress1, its own sender's broadcasts coming back), worker1,
-      ingress1 and egress1 6 lines each (`reject_count` 10 to 16; `peer_hive` motherbee, each
-      spoke's own sender's coming back from the hub). Earlier on 0.1.134, one A-246 run (two
+      WAN frame"* (`foreign_source`): the motherbee 7 lines (`peer_hive` worker1 and egress1, its
+      own sender's broadcasts coming back), worker1, ingress1 and egress1 6 lines each
+      (`peer_hive` motherbee, each spoke's own sender's coming back from the hub). Lines, not
+      frames: a router logs at most one every 30 s. Earlier on 0.1.134, one A-246 run (two
       broadcasts from the motherbee) gave one line on the motherbee, `reject_count` 37.
     - **On 0.1.135** (02:37:02–02:46:13Z, 32 per hive, from 2 min after the last router restart):
       every receiver got each broadcast exactly once (32/32 from each hive at each hive, none
@@ -224,8 +225,11 @@
   gate's throwaway clients (`gate0232`, `gate0235`): their directories and units gone on every hive.
   `AI.gate0233@worker1` stays stopped with its ILK (it published 0.1.133's gate pages).
 - **Rollback:** the snapshot `pre-router-0-1-135` (all 4 VMs), or `apt install fluxbee=0.1.134` +
-  0.1.134's `update_installation`: nothing one-way; the WAN echoes come back, and once `HEALTH_OK`
-  checks `wandrops=0` a 0.1.134 hive fails health on them.
+  0.1.134's `update_installation`: nothing one-way; the WAN echoes come back, and now that
+  `HEALTH_OK` checks `wandrops=0` the hives that drop them fail health: the motherbee whenever a
+  node broadcasts over the WAN (each spoke sends back to the hub every broadcast the hub sent it,
+  the motherbee's nodes' and the other spokes' alike), a spoke when its own nodes do (the hub sends
+  them back to it).
 
 ## 0.1.134 — The orchestrator alone: a unit systemd does not have is not running (A-314)
 
