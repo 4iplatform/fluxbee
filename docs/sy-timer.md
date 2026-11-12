@@ -586,7 +586,7 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 
 Before v1.6 only the frame's cut gave `next_cursor`: a page its `limit` cut, 100 timers without one, read as the whole list. A list in pages is no snapshot: a timer whose fire time moves between two pages (a recurring timer's fire, a `TIMER_RESCHEDULE`) takes its new place in the order, so it can come again on a later page, or not at all. A response has no `total`. The cursor is a place in the order, never a timer `SY.timer` looks up: the timer it names canceled or deleted since, the next page still starts right after its place, and a well-formed cursor `SY.timer` never gave lists the timers after the place it names.
 
-Both SDKs' `List` follow the pages up to their own limit, lowering it by what came, and stop there: what they return carries no cursor (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk). So a WF reconciles its pending timers at start up to 1000, the first by fire time (`Recover`; [spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md) §11.4), and cannot tell whether more follow: a WF with more than 1000 pending timers reads the ones past the 1000th as missing from `SY.timer`, though `SY.timer`'s answer says more follow (a limit of the SDKs' `List` and the WF's reconcile, not of `SY.timer`). `SY.admin`'s `timer_list` answers one page, its `next_cursor` included, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
+Both SDKs' `List` follow the pages up to their own limit, lowering it by what came, from the filter's `cursor` on (§14). Each SDK also says where the timers past its list start (FINDINGS A-278, 0.1.138): the Go SDK's `ListPage` lists one page, one `TIMER_LIST`, with its `NextCursor`, where Go's `List` returns the timers only; the Rust SDK's `list` hands back `next_cursor` when it stops at its limit with timers following (before, it dropped it), and its `list_page` lists one page. A caller that wants every timer asks again from that cursor until a page has none. So does a WF's reconcile: it reads every page of its pending timers ([spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md) §11.4). Until 0.1.137 it read 1000 at the most, and took the ones of its index past the 1000th as missing from `SY.timer`, though `SY.timer`'s answer said more followed. `SY.admin`'s `timer_list` answers one page, its `next_cursor` included, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`, which SY.admin's route answers as HTTP 400 (FINDINGS A-251).
 
 ### 7.7 `TIMER_PURGE_OWNER` (exclusive use of `SY.orchestrator`)
 
@@ -1102,7 +1102,24 @@ func (c *TimerClient) Reschedule(ctx context.Context, id TimerID, newFireAt time
 func (c *TimerClient) RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) error
 func (c *TimerClient) Get(ctx context.Context, id TimerID) (*TimerInfo, error)
 func (c *TimerClient) GetByClientRef(ctx context.Context, clientRef string) (*TimerInfo, error)
+
+// --- Lists (§7.6) ---
+type ListFilter struct {
+    OwnerL2Name  string // optional: a node lists its own timers only
+    StatusFilter string // "pending" (default), "fired", "canceled", "all"
+    Limit        int    // default 100, at most MaxTimerListLimit
+    Cursor       string // optional: a NextCursor given back, where the list starts (FINDINGS A-278)
+}
+
+type TimerListPage struct {
+    Timers     []TimerInfo
+    NextCursor string // while timers follow the page's last one; "" once it lists the rest
+}
+
+// List follows SY.timer's pages up to filter.Limit and returns the timers only.
 func (c *TimerClient) List(ctx context.Context, filter ListFilter) ([]TimerInfo, error)
+// ListPage is one TIMER_LIST, one page as SY.timer answers it, and where the next page starts.
+func (c *TimerClient) ListPage(ctx context.Context, filter ListFilter) (TimerListPage, error)
 func (c *TimerClient) ListMine(ctx context.Context, filter ListFilter) ([]TimerInfo, error)
 
 // --- Introspection ---
@@ -1116,7 +1133,7 @@ The Go client has no `TIMER_PURGE_OWNER`: only `SY.orchestrator` sends it (§7.7
 
 ### 14.3 Rust
 
-`fluxbee_sdk::timer` (`crates/fluxbee_sdk/src/timer.rs`) has the same surface: a `TimerClient` built on the node's `RouterDispatcher` with `TimerClient::new_with_dispatcher`, with the time helpers (`now`, `now_in`, `convert`, `parse`, `format`, `help`), scheduling (`schedule`, `schedule_in`, `schedule_recurring`), reading (`get`, `get_by_client_ref`, `list`, `list_mine`), `cancel`, `reschedule` and their `_by_client_ref` forms, and `purge_owner`. `parse_timer_response` and `parse_timer_fired_event` read `TIMER_RESPONSE` and `TIMER_FIRED` (`FiredEvent`). `ai.generic` asks `TIMER_NOW_IN` through it for its `get_current_time` tool ([agent-tools-v1](agent-tools-v1.md) §6.1).
+`fluxbee_sdk::timer` (`crates/fluxbee_sdk/src/timer.rs`) has the same surface: a `TimerClient` built on the node's `RouterDispatcher` with `TimerClient::new_with_dispatcher`, with the time helpers (`now`, `now_in`, `convert`, `parse`, `format`, `help`), scheduling (`schedule`, `schedule_in`, `schedule_recurring`), reading (`get`, `get_by_client_ref`, `list`, `list_mine`, `list_page`), `cancel`, `reschedule` and their `_by_client_ref` forms, and `purge_owner`. `list` hands back `next_cursor` when it stops at its limit with timers following, and `list_page` lists one page, `next_cursor` included, as Go's `ListPage` (FINDINGS A-278, §7.6). `parse_timer_response` and `parse_timer_fired_event` read `TIMER_RESPONSE` and `TIMER_FIRED` (`FiredEvent`). `ai.generic` asks `TIMER_NOW_IN` through it for its `get_current_time` tool ([agent-tools-v1](agent-tools-v1.md) §6.1).
 
 ### 14.4 Retry of time operations
 

@@ -595,7 +595,7 @@ func TestTheReconcileSettlesATimerSYTimerHoldsLate(t *testing.T) {
 			tc.dispatch(unreachable(tc.timer.lastTrace(t), "NODE_NOT_FOUND"))
 			tc.later(c.after)
 			rescheduled := len(tc.timer.rescheduled)
-			tc.rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{timerInfo(ref, heldAt.UnixMilli())},
+			tc.rt.takeTimerList(context.Background(), timerListResult{listing: wholeList(timerInfo(ref, heldAt.UnixMilli())),
 				askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
 			switch {
 			case c.after < time.Hour-time.Minute:
@@ -767,7 +767,7 @@ func TestTheReconcileSettlesTheRefusedTimers(t *testing.T) {
 	scheduled := len(tc.timer.scheduled)
 	pending := timerInfo(timerClientRef(listed, "deadline"), fixedClock().Add(2*time.Hour).UnixMilli())
 	logged := nodeLog(t, func() {
-		tc.rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{pending}, askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+		tc.rt.takeTimerList(context.Background(), timerListResult{listing: wholeList(pending), askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
 	})
 	if row, _ := tc.deadline(listed); row.Refusal != "" {
 		t.Fatalf("SY.timer has the listed timer: %+v", row)
@@ -799,7 +799,7 @@ func TestTheReconcileSettlesTheRefusedTimers(t *testing.T) {
 	}
 	both := []sdk.TimerInfo{pending, timerInfo(timerClientRef(missing, "deadline"), fixedClock().Add(2*time.Hour).UnixMilli())}
 	logged = nodeLog(t, func() {
-		tc.rt.takeTimerList(context.Background(), timerListResult{timers: both, askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+		tc.rt.takeTimerList(context.Background(), timerListResult{listing: wholeList(both...), askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
 	})
 	if !strings.Contains(logged, "timers reconciled with SY.timer; the node is no longer degraded") {
 		t.Fatalf("nothing waits for SY.timer: %s", logged)
@@ -817,7 +817,7 @@ func TestTheTimersSYTimerLostGoAgainPaced(t *testing.T) {
 	}
 	tc.later(time.Second)
 	scheduled := len(tc.timer.scheduled)
-	tc.rt.takeTimerList(context.Background(), timerListResult{askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
+	tc.rt.takeTimerList(context.Background(), timerListResult{listing: wholeList(), askedAtMS: nowMS(tc.rt.ActCtx.Clock)}, recoverOpts)
 	if len(tc.timer.scheduled) != scheduled {
 		t.Fatalf("the reconcile sends none at once: %d", len(tc.timer.scheduled)-scheduled)
 	}
@@ -880,7 +880,9 @@ func (l *loopTimer) RescheduleInByClientRef(context.Context, string, time.Durati
 func (l *loopTimer) RescheduleByClientRef(context.Context, string, time.Time) (string, error) {
 	return l.schedule()
 }
-func (l *loopTimer) List(context.Context, sdk.ListFilter) ([]sdk.TimerInfo, error) { return nil, nil }
+func (l *loopTimer) ListPage(context.Context, sdk.ListFilter) (sdk.TimerListPage, error) {
+	return sdk.TimerListPage{}, nil
+}
 
 // FINDINGS A-254, the receive loop's wiring (serve), driven without a router: the router's
 // UNREACHABLE of a schedule comes on the loop's messages and makes the node DEGRADED; the loop's tick
@@ -1017,8 +1019,8 @@ func TestSYTimersAnswerToAScheduleReachesTheNode(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if timers, err := timer.List(ctx, sdk.ListFilter{OwnerL2Name: testNodeName, StatusFilter: "pending", Limit: 10}); err != nil || len(timers) != 0 {
-				t.Fatalf("TIMER_LIST: %v %v", timers, err)
+			if page, err := timer.ListPage(ctx, sdk.ListFilter{OwnerL2Name: testNodeName, StatusFilter: "pending", Limit: 10}); err != nil || len(page.Timers) != 0 || page.NextCursor != "" {
+				t.Fatalf("TIMER_LIST: %+v %v", page, err)
 			}
 			traceID, err := timer.ScheduleIn(ctx, 2*time.Hour, timerScheduleOptions(testNodeName, "wfi:1", "deadline"))
 			if err != nil || traceID == "" {

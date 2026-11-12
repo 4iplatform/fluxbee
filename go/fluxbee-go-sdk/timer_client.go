@@ -34,6 +34,18 @@ type ListFilter struct {
 	OwnerL2Name  string `json:"owner_l2_name,omitempty"`
 	StatusFilter string `json:"status_filter,omitempty"`
 	Limit        int    `json:"limit,omitempty"`
+	// Cursor is where the list starts: the NextCursor of the page before (TimerListPage), given
+	// back as it came. Empty, the list starts at its first timer (FINDINGS A-278).
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// TimerListPage is one page of SY.timer's TIMER_LIST, as ListPage answers it (FINDINGS A-278).
+type TimerListPage struct {
+	// Timers are the page's timers, by fire time, then uuid.
+	Timers []TimerInfo
+	// NextCursor, while timers follow the page's last one, is where the next page starts: the same
+	// filter with it as its Cursor lists that page. Empty once the page lists the rest of the list.
+	NextCursor string
 }
 
 type TimerInfo struct {

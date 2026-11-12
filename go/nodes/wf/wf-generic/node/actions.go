@@ -32,11 +32,12 @@ type Dispatcher interface {
 // Schedule, CancelByClientRef, RescheduleInByClientRef and RescheduleByClientRef send their request
 // without waiting for SY.timer's answer; a schedule and a reschedule return the trace_id their
 // request went under, which SY.timer's TIMER_RESPONSE and the router's UNREACHABLE carry back
-// (FINDINGS A-254). CancelByClientRefConfirmed and List wait for the answer.
+// (FINDINGS A-254). CancelByClientRefConfirmed and ListPage wait for the answer.
 //
 // ScheduleIn and RescheduleInByClientRef send a delay (fire_in_ms, new_fire_in_ms), which SY.timer
 // counts from when it gets the request, on its own clock, its 60 s floor included; Schedule and
-// RescheduleByClientRef send a time (fire_at_utc_ms, new_fire_at_utc_ms), for a fire_at.
+// RescheduleByClientRef send a time (fire_at_utc_ms, new_fire_at_utc_ms), for a fire_at. ListPage
+// is one TIMER_LIST: a page of SY.timer's list, and where the next page starts (FINDINGS A-278).
 type TimerSender interface {
 	ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (string, error)
 	Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (string, error)
@@ -44,7 +45,7 @@ type TimerSender interface {
 	CancelByClientRefConfirmed(ctx context.Context, clientRef string) error
 	RescheduleInByClientRef(ctx context.Context, clientRef string, d time.Duration) (string, error)
 	RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) (string, error)
-	List(ctx context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error)
+	ListPage(ctx context.Context, filter sdk.ListFilter) (sdk.TimerListPage, error)
 }
 
 // ActionContext bundles all dependencies needed to execute a workflow action.
@@ -861,8 +862,8 @@ func (t *SDKTimerSender) RescheduleByClientRef(ctx context.Context, clientRef st
 	})
 }
 
-func (t *SDKTimerSender) List(ctx context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error) {
-	return t.syncClient.List(ctx, filter)
+func (t *SDKTimerSender) ListPage(ctx context.Context, filter sdk.ListFilter) (sdk.TimerListPage, error) {
+	return t.syncClient.ListPage(ctx, filter)
 }
 
 // sendTimerRequest sends verb to SY.timer without waiting for its answer, and returns the trace_id

@@ -82,7 +82,12 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   index at that time: a fire of a timer it cancelled is dropped, and so is one of a timer it moved
   (a `TIMER_CANCEL` or a `TIMER_RESCHEDULE` goes fire-and-forget), which is scheduled again at its
   `fire_at`. A fired timer's index row goes with it, so a restart does not fire it again. A
-  restart fires the timers it missed in the order they fire, reading each row again first. If
+  restart fires the timers it missed in the order they fire, reading each row again first. It
+  reads every page of its pending timers in SY.timer, each from the `next_cursor` the page before
+  gave (FINDINGS A-278; until 0.1.137 it read 1000, and took the ones of its index past them as
+  missing, sent again while the node ran `DEGRADED`), 200 pages at the most; when the list stops
+  before its end (that bound, or an answer it cannot go on from), the timers past the last one
+  listed are left as they are, never taken as missing, and the log says why it stopped. If
   SY.timer does not answer at start, or the timer index (or a row of it) cannot be read, the node
   starts `DEGRADED` (`timers_not_reconciled`) and reconciles its timers on a later try, every 30 s;
   a timer SY.timer never got is scheduled again then, from the loop, 32 a second at most, and one

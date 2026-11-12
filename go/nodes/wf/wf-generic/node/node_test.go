@@ -692,11 +692,11 @@ func (s *switchedTimer) RescheduleInByClientRef(context.Context, string, time.Du
 func (s *switchedTimer) RescheduleByClientRef(context.Context, string, time.Time) (string, error) {
 	return "timer-trace", nil
 }
-func (s *switchedTimer) List(context.Context, sdk.ListFilter) ([]sdk.TimerInfo, error) {
+func (s *switchedTimer) ListPage(context.Context, sdk.ListFilter) (sdk.TimerListPage, error) {
 	if !s.answering.Load() {
-		return nil, errSendFailed
+		return sdk.TimerListPage{}, errSendFailed
 	}
-	return nil, nil
+	return sdk.TimerListPage{}, nil
 }
 
 // FINDINGS A-217's review: the receive loop's wiring (serve, Run once the router is connected),

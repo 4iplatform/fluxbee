@@ -387,7 +387,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
-- A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone).
+- A-278 🔵 A WF with more than 1000 pending timers cannot reconcile them (medium; the SDKs and the WF, alone; built on `coa/a278` for 0.1.138, its own release after 0.1.137).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
 - A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
@@ -2663,6 +2663,39 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   index timers past the last one listed as unknown, not missing.
 - **The operator's call (2026-11-11):** built in the sweep, its own release (the SDKs and the WF),
   after 0.1.137.
+- **Built on `coa/a278` (for 0.1.138; no SY.timer change):**
+  - **The SDKs say where the timers past a list start.** The Go SDK's `ListPage` is one
+    `TIMER_LIST`, one page as SY.timer answers it, with its `NextCursor`; `ListFilter.Cursor` is
+    where a list starts; `List` keeps its signature and what it returns. The Rust SDK's `list`
+    hands back SY.timer's `next_cursor` when it stops at its limit with timers following (before,
+    it dropped it), and `list_page` is one page. Every caller compiles unchanged: the WF, and the
+    Rust examples' `list_mine`.
+  - **The WF reads every page** (`listTimers`, `node/recover.go`): 1000 a page at the most, about
+    228 of a WF's timers to a page's 96 KiB, each page from the cursor the page before gave, until
+    one gives none. It stops before the end, with a log line that says why, at 200 pages (about
+    45,000 timers; SY.timer keeps 10,000 an owner, 44 pages), at a page of no timer that gives a
+    cursor, at a cursor a page before gave, or at a page of 1000 that gives none, as SY.timer before
+    1.6 answers a page its limit cut (A-266; a frame holds about 400 timers at the most, so the
+    limit 1000 never ends a page, and an older SY.timer is read whole too). When the list stops
+    before its end, an index timer from the last one listed on (within 2 s, the most later SY.timer
+    holds a timer than the index) is left as it is, never taken as missing nor fired; one before it
+    that SY.timer lacks still goes again. A timer that fires, or that an instance schedules or
+    moves, while the pages are read is taken as before (a fire given once; one scheduled or moved
+    after the list was asked left alone).
+  - **Tests** (`node/reconcile_pages_test.go`): 2,500 pending timers in pages of 1000, and of 228,
+    none taken as missing nor sent again; the bound (200 pages of 10); a page of no timer with a
+    cursor, and a cursor given again; an SY.timer before 1.6, whose frame ends the pages, and whose
+    limit ends one. Each fails on the reconcile before it, which took 1,500 or 2,000 of the timers
+    as missing. Beside them, the timers that fire, are scheduled and moved while the pages are
+    read. The SDKs: `TestListPage*` (Go),
+    `timer_client_list_hands_back_the_cursor_its_limit_stopped_at`,
+    `timer_client_list_stops_at_a_page_of_no_timers`, `timer_client_list_page_is_one_timer_list`
+    (Rust).
+  - **Its time, measured on the Mac (SQLite and the encoding, no router):** SY.timer lists 3,000 of a
+    WF's pending timers in 14 pages in 0.13 s, and 10,000 in 47 pages in 0.6 s (10 to 16 ms a page,
+    each reading the 1001 timers its limit asks); the WF's reconcile of them takes 0.23 s and
+    0.73 s more. Before, the node ran `DEGRADED` about a minute (3,000) or five (10,000) at each
+    reconcile, sending the timers past the 1000th again 32 a second.
 
 ### A-277 [General/identity] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; a removed throwaway worker's reconnects refused *"not in the hive registry"*, 132 with its key deleted and 74 with its key pinned in place, none during its joins; with the key pinned sy-identity was not restarted and the 10 s recheck closed its sessions, the last 7.7 s after the answer; at the deploy no refusal, and worker1's replica in sync, its metrics equal and 2 sessions) (found 2026-11-11 by the review fixes of identity's 0.1.133 branch; read in the code) — A removed hive whose identity key could not be deleted keeps reading the identity store
 

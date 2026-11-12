@@ -120,6 +120,7 @@ Available helper methods:
 - `Reschedule`
 - `RescheduleByClientRef`
 - `List`
+- `ListPage`
 - `ListMine`
 - `Help`
 
@@ -140,6 +141,31 @@ if err := timerClient.CancelByClientRef(ctx, clientRef); err != nil {
     return err
 }
 ```
+
+Listing every timer, in pages (FINDINGS A-278). `List` follows SY.timer's pages up to the filter's
+`Limit` (at most `MaxTimerListLimit`, 1000) and returns the timers only, nothing of those past it.
+`ListPage` is one `TIMER_LIST`: a page of SY.timer's, from the filter's `Cursor`, and its
+`NextCursor`, which is empty once the page lists the rest. A WF's reconcile reads its pending timers
+this way, with a bound on the pages ([SY.timer §7.6](../../docs/sy-timer.md#76-timer_list)):
+
+```go
+filter := sdk.ListFilter{StatusFilter: "pending", Limit: sdk.MaxTimerListLimit}
+for {
+    page, err := timerClient.ListPage(ctx, filter)
+    if err != nil {
+        return err
+    }
+    handle(page.Timers)
+    if page.NextCursor == "" {
+        break // the rest of the list
+    }
+    filter.Cursor = page.NextCursor
+}
+```
+
+A list in pages is no snapshot: a timer whose fire time moves between two pages can come again, or
+not at all. SY.timer before 1.6 (0.1.133) answers no `next_cursor` when the limit, not the frame, ends
+a page; at the limit 1000 that never happens, since a frame holds about 400 timers at the most.
 
 ## Identity SHM lookup
 

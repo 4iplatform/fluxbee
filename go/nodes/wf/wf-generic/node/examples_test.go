@@ -301,12 +301,12 @@ func (f *fakeSYTimer) RescheduleByClientRef(_ context.Context, ref string, newFi
 	f.pending[ref] = newFireAt
 	return "", nil
 }
-func (f *fakeSYTimer) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo, error) {
-	var timers []sdk.TimerInfo
+func (f *fakeSYTimer) ListPage(_ context.Context, _ sdk.ListFilter) (sdk.TimerListPage, error) {
+	var page sdk.TimerListPage
 	for ref, fireAt := range f.pending {
-		timers = append(timers, timerInfo(ref, fireAt.UnixMilli()))
+		page.Timers = append(page.Timers, timerInfo(ref, fireAt.UnixMilli()))
 	}
-	return timers, nil
+	return page, nil
 }
 
 // timerFiredFor is SY.timer's TIMER_FIRED of the timer node scheduled for instanceID, to fire at at,

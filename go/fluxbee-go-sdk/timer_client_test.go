@@ -766,6 +766,12 @@ func TestListRejectsInvalidFilters(t *testing.T) {
 	if _, err := client.List(context.Background(), ListFilter{Limit: MaxTimerListLimit + 1}); err == nil {
 		t.Fatalf("expected limit validation error")
 	}
+	if _, err := client.ListPage(context.Background(), ListFilter{Limit: MaxTimerListLimit + 1}); err == nil {
+		t.Fatalf("expected ListPage's limit validation error")
+	}
+	if _, err := client.ListPage(context.Background(), ListFilter{StatusFilter: "weird"}); err == nil {
+		t.Fatalf("expected ListPage's invalid status filter error")
+	}
 }
 
 func TestTimeFormattingOpsRejectEmptyFields(t *testing.T) {
@@ -1025,6 +1031,119 @@ func TestListFollowsSYTimersPages(t *testing.T) {
 	first, second := <-asked, <-asked
 	if first["cursor"] != nil || first["limit"] != float64(1000) || second["cursor"] != "2:timer-2" || second["limit"] != float64(998) {
 		t.Fatalf("the pages asked for: %v then %v", first, second)
+	}
+}
+
+// listTestTimer is a pending timer as SY.timer lists it.
+func listTestTimer(uuid string, fireAt int64) map[string]any {
+	return map[string]any{
+		"uuid": uuid, "owner_l2_name": "WF.demo@motherbee", "target_l2_name": "WF.demo@motherbee",
+		"kind": "oneshot", "fire_at_utc_ms": fireAt, "missed_policy": "fire", "status": "pending",
+		"created_at_utc_ms": int64(1775574000000), "fire_count": int64(0),
+	}
+}
+
+// answerTimerLists stands in for SY.timer: it answers each TIMER_LIST client sends with the next of
+// pages, and gives back the payload of each request, in order.
+func answerTimerLists(t *testing.T, pages []map[string]any) (*TimerClient, <-chan map[string]any) {
+	t.Helper()
+	tx := make(chan []byte, len(pages))
+	rx := make(chan receivedMessage, len(pages))
+	client, err := newTestTimerClientWithChannels(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	asked := make(chan map[string]any, len(pages))
+	go func() {
+		for _, page := range pages {
+			var request Message
+			if err := json.Unmarshal(<-tx, &request); err != nil {
+				t.Errorf("unmarshal request: %v", err)
+				return
+			}
+			var payload map[string]any
+			_ = json.Unmarshal(request.Payload, &payload)
+			asked <- payload
+			response, err := BuildSystemResponse(&request, "timer-uuid", MsgTimerResponse, page, SystemEnvelopeOptions{})
+			if err != nil {
+				t.Errorf("build response: %v", err)
+				return
+			}
+			rx <- receivedMessage{msg: response}
+		}
+	}()
+	return client, asked
+}
+
+// FINDINGS A-278 — ListPage is one TIMER_LIST, from the filter's cursor, with its limit: it gives the
+// page's timers and SY.timer's next_cursor as they came, so a caller lists every timer by asking
+// again from that cursor until a page has none. List starts at the filter's cursor too.
+func TestListPageGivesSYTimersPageAndWhereTheNextStarts(t *testing.T) {
+	client, asked := answerTimerLists(t, []map[string]any{
+		{"ok": true, "verb": "TIMER_LIST", "count": 2,
+			"timers": []map[string]any{listTestTimer("timer-1", 1), listTestTimer("timer-2", 2)}, "next_cursor": "2:timer-2"},
+		{"ok": true, "verb": "TIMER_LIST", "count": 1, "timers": []map[string]any{listTestTimer("timer-3", 3)}},
+		{"ok": true, "verb": "TIMER_LIST", "count": 1, "timers": []map[string]any{listTestTimer("timer-3", 3)}},
+	})
+	filter := ListFilter{OwnerL2Name: "WF.demo@motherbee", StatusFilter: "pending", Limit: MaxTimerListLimit}
+	first, err := client.ListPage(context.Background(), filter)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first.Timers) != 2 || first.Timers[1].UUID != "timer-2" || first.NextCursor != "2:timer-2" {
+		t.Fatalf("the first page: %+v", first)
+	}
+	filter.Cursor = first.NextCursor
+	second, err := client.ListPage(context.Background(), filter)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second.Timers) != 1 || second.Timers[0].UUID != "timer-3" || second.NextCursor != "" {
+		t.Fatalf("the last page has no next cursor: %+v", second)
+	}
+	for i, want := range []map[string]any{
+		{"owner_l2_name": "WF.demo@motherbee", "status_filter": "pending", "limit": float64(MaxTimerListLimit)},
+		{"owner_l2_name": "WF.demo@motherbee", "status_filter": "pending", "limit": float64(MaxTimerListLimit), "cursor": "2:timer-2"},
+	} {
+		got := <-asked
+		if len(got) != len(want) {
+			t.Fatalf("request %d: %v, want %v", i, got, want)
+		}
+		for key, value := range want {
+			if got[key] != value {
+				t.Fatalf("request %d: %v, want %v", i, got, want)
+			}
+		}
+	}
+
+	listed, err := client.List(context.Background(), ListFilter{Limit: 10, Cursor: "2:timer-2"})
+	if err != nil {
+		t.Fatalf("list from a cursor: %v", err)
+	}
+	if got := <-asked; len(listed) != 1 || listed[0].UUID != "timer-3" || got["cursor"] != "2:timer-2" || got["limit"] != float64(10) {
+		t.Fatalf("List starts at the filter's cursor: %+v, asked %v", listed, got)
+	}
+}
+
+// FINDINGS A-278 — ListPage gives a page as SY.timer answered it, an odd one too (SY.timer never
+// answers either): no timers with a next_cursor, and a cursor it gave before. What to make of them is
+// the caller's, as the WF's reconcile does.
+func TestListPageGivesAnOddPageAsItCame(t *testing.T) {
+	client, _ := answerTimerLists(t, []map[string]any{
+		{"ok": true, "verb": "TIMER_LIST", "count": 0, "timers": []map[string]any{}, "next_cursor": "5:timer-5"},
+		{"ok": true, "verb": "TIMER_LIST", "count": 1, "timers": []map[string]any{listTestTimer("timer-6", 6)}, "next_cursor": "5:timer-5"},
+	})
+	empty, err := client.ListPage(context.Background(), ListFilter{Limit: 100, Cursor: "5:timer-5"})
+	if err != nil || len(empty.Timers) != 0 || empty.NextCursor != "5:timer-5" {
+		t.Fatalf("an empty page with a cursor: %+v %v", empty, err)
+	}
+	again, err := client.ListPage(context.Background(), ListFilter{Limit: 100, Cursor: "5:timer-5"})
+	if err != nil || len(again.Timers) != 1 || again.NextCursor != "5:timer-5" {
+		t.Fatalf("a page that gives the cursor it was asked from: %+v %v", again, err)
 	}
 }
 

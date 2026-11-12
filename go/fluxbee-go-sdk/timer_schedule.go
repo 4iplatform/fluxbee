@@ -236,9 +236,10 @@ func (c *TimerClient) getWithMessage(ctx context.Context, msg Message) (*TimerIn
 	return &payload.Timer, nil
 }
 
-// List lists timers by fire time, up to filter.Limit (SY.timer's default, 100, when it has none).
-// SY.timer answers a page that fits one frame at a time, and List asks for the next one, after the
-// cursor SY.timer gives, until it has them all (FINDINGS A-151).
+// List lists timers by fire time, from filter.Cursor on, up to filter.Limit (SY.timer's default,
+// 100, when it has none). SY.timer answers a page that fits one frame at a time, and List asks for
+// the next one, after the cursor SY.timer gives, until it has them all (FINDINGS A-151). What it
+// returns says nothing of the timers past its limit: ListPage does (FINDINGS A-278).
 func (c *TimerClient) List(ctx context.Context, filter ListFilter) ([]TimerInfo, error) {
 	if err := validateListFilter(filter); err != nil {
 		return nil, err
@@ -248,43 +249,76 @@ func (c *TimerClient) List(ctx context.Context, filter ListFilter) ([]TimerInfo,
 		limit = defaultTimerListLimit
 	}
 	var timers []TimerInfo
-	cursor := ""
 	for {
-		payloadMap := map[string]any{"limit": limit - len(timers)}
-		if owner := strings.TrimSpace(filter.OwnerL2Name); owner != "" {
-			payloadMap["owner_l2_name"] = owner
-		}
-		if status := strings.TrimSpace(filter.StatusFilter); status != "" {
-			payloadMap["status_filter"] = status
-		}
-		if cursor != "" {
-			payloadMap["cursor"] = cursor
-		}
-		msg, err := c.buildRequest("TIMER_LIST", payloadMap)
+		filter.Limit = limit - len(timers)
+		page, err := c.listPage(ctx, filter)
 		if err != nil {
-			return nil, err
-		}
-		resp, err := c.sendTimerRPC(ctx, msg)
-		if err != nil {
-			return nil, err
-		}
-		timerResp, err := ParseTimerResponse(&resp)
-		if err != nil {
-			return nil, err
-		}
-		if respErr := timerResp.ResponseError(); respErr != nil {
-			return nil, respErr
-		}
-		var page timerListResponse
-		if err := ParseSystemResponse(&resp, MsgTimerResponse, &page); err != nil {
 			return nil, err
 		}
 		timers = append(timers, page.Timers...)
 		if page.NextCursor == "" || len(page.Timers) == 0 || len(timers) >= limit {
 			return timers, nil
 		}
-		cursor = page.NextCursor
+		filter.Cursor = page.NextCursor
 	}
+}
+
+// ListPage lists one page of timers, one TIMER_LIST as SY.timer answers it, and says where the next
+// page starts (FINDINGS A-278). By fire time, then uuid, from filter.Cursor on, a page holds the
+// timers that fit one frame, up to filter.Limit (SY.timer's default, 100, when it has none);
+// NextCursor, while timers follow its last one, is where the next page starts, whichever ended the
+// page. A caller that wants every timer asks again, with NextCursor as the filter's Cursor, until a
+// page has none.
+//
+// A list in pages is no snapshot: a timer whose fire time moves between two pages can come again,
+// or not at all (docs/sy-timer.md §7.6). SY.timer before 1.6 (0.1.133, FINDINGS A-266) answers no
+// next_cursor when the limit, not the frame, ends a page, so from it a page of filter.Limit timers
+// without one may have timers after it. A frame holds about 400 timers at the most (237 bytes each
+// at the least), so it ends a page of a higher limit first, and SY.timer answers that cut with a
+// next_cursor since 1.3.
+func (c *TimerClient) ListPage(ctx context.Context, filter ListFilter) (TimerListPage, error) {
+	if err := validateListFilter(filter); err != nil {
+		return TimerListPage{}, err
+	}
+	return c.listPage(ctx, filter)
+}
+
+// listPage asks SY.timer for the page filter names; filter is valid (validateListFilter).
+func (c *TimerClient) listPage(ctx context.Context, filter ListFilter) (TimerListPage, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultTimerListLimit
+	}
+	payloadMap := map[string]any{"limit": limit}
+	if owner := strings.TrimSpace(filter.OwnerL2Name); owner != "" {
+		payloadMap["owner_l2_name"] = owner
+	}
+	if status := strings.TrimSpace(filter.StatusFilter); status != "" {
+		payloadMap["status_filter"] = status
+	}
+	if cursor := strings.TrimSpace(filter.Cursor); cursor != "" {
+		payloadMap["cursor"] = cursor
+	}
+	msg, err := c.buildRequest("TIMER_LIST", payloadMap)
+	if err != nil {
+		return TimerListPage{}, err
+	}
+	resp, err := c.sendTimerRPC(ctx, msg)
+	if err != nil {
+		return TimerListPage{}, err
+	}
+	timerResp, err := ParseTimerResponse(&resp)
+	if err != nil {
+		return TimerListPage{}, err
+	}
+	if respErr := timerResp.ResponseError(); respErr != nil {
+		return TimerListPage{}, respErr
+	}
+	var page timerListResponse
+	if err := ParseSystemResponse(&resp, MsgTimerResponse, &page); err != nil {
+		return TimerListPage{}, err
+	}
+	return TimerListPage{Timers: page.Timers, NextCursor: page.NextCursor}, nil
 }
 
 func (c *TimerClient) ListMine(ctx context.Context, filter ListFilter) ([]TimerInfo, error) {

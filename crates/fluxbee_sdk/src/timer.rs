@@ -497,7 +497,9 @@ pub struct TimerListResponse {
     pub count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timers: Vec<TimerInfo>,
-    /// Where the next page starts, when SY.timer has more than fit one frame (FINDINGS A-151).
+    /// Where the next page starts, while timers follow the last one listed: SY.timer's, whether the
+    /// frame (FINDINGS A-151) or the limit (since 1.6, FINDINGS A-266) ended the page, and handed
+    /// back by `list` when it stops at its limit (FINDINGS A-278).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     #[serde(flatten)]
@@ -828,10 +830,16 @@ impl<'a> TimerClient<'a> {
         Ok(response.timer)
     }
 
-    /// Lists timers by fire time, up to the filter's limit (`DEFAULT_TIMER_LIST_LIMIT` without
-    /// one). SY.timer answers a page that fits one frame at a time, and `list` asks for the next,
-    /// after the cursor it gives, until it has them all (FINDINGS A-151): the response holds the
-    /// whole list, and no cursor.
+    /// Lists timers by fire time, then uuid, from the filter's `cursor` on, up to the filter's
+    /// limit (`DEFAULT_TIMER_LIST_LIMIT` without one). SY.timer answers a page that fits one frame
+    /// at a time, and `list` asks for the next, after the cursor it gives, until it has them all or
+    /// its limit (FINDINGS A-151). The response holds what came, and `next_cursor`, SY.timer's,
+    /// while timers follow the last one listed: given back as the filter's `cursor` it lists the
+    /// timers after it (FINDINGS A-278; before, `list` dropped it, and its response read as the
+    /// whole list). A page of no timers stops `list`, its `next_cursor` handed back as it came
+    /// (SY.timer never answers one). SY.timer before 1.6 (0.1.133, FINDINGS A-266) answers no
+    /// `next_cursor` when the limit, not the frame, ends a page: from it, a response of the limit
+    /// without one may have timers after it.
     pub async fn list(
         &mut self,
         mut filter: TimerListFilter,
@@ -850,7 +858,8 @@ impl<'a> TimerClient<'a> {
                     self.rpc_timeout,
                 )
                 .await?;
-            let next = page.next_cursor.take().filter(|_| !page.timers.is_empty());
+            let next = page.next_cursor.take();
+            let progressed = !page.timers.is_empty();
             let all = match listed.as_mut() {
                 Some(all) => {
                     all.timers.append(&mut page.timers);
@@ -861,10 +870,35 @@ impl<'a> TimerClient<'a> {
             all.count = all.timers.len() as u64;
             let more = (all.timers.len() as u32) < limit;
             match next {
-                Some(cursor) if more => filter.cursor = Some(cursor),
-                _ => return Ok(listed.expect("a page was listed")),
+                Some(cursor) if progressed && more => filter.cursor = Some(cursor),
+                next => {
+                    all.next_cursor = next;
+                    return Ok(listed.expect("a page was listed"));
+                }
             }
         }
+    }
+
+    /// Lists one page of timers, one `TIMER_LIST` as SY.timer answers it (FINDINGS A-278): by fire
+    /// time, then uuid, from the filter's `cursor` on, the timers that fit one frame, up to the
+    /// filter's limit (SY.timer's default, 100, without one), and `next_cursor`, while timers
+    /// follow the page's last one, where the next page starts, whichever ended the page. A caller
+    /// that wants every timer asks again, with `next_cursor` as the filter's `cursor`, until a page
+    /// has none. SY.timer before 1.6 (0.1.133, FINDINGS A-266) answers no `next_cursor` when the
+    /// limit, not the frame, ends a page; a frame holds about 400 timers at the most, so it ends a
+    /// page of a higher limit first, a cut SY.timer answers with a `next_cursor` since 1.3.
+    pub async fn list_page(
+        &mut self,
+        mut filter: TimerListFilter,
+    ) -> Result<TimerListResponse, TimerClientError> {
+        normalize_list_filter(&mut filter);
+        validate_list_filter(&filter)?;
+        self.call_decode(
+            MSG_TIMER_LIST,
+            serde_json::to_value(&filter)?,
+            self.rpc_timeout,
+        )
+        .await
     }
 
     pub async fn list_mine(
@@ -1545,6 +1579,11 @@ fn normalize_list_filter(filter: &mut TimerListFilter) {
         .take()
         .map(trim_owned)
         .filter(|value| !value.is_empty());
+    filter.cursor = filter
+        .cursor
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
 }
 
 fn validate_schedule_payload(
@@ -2070,6 +2109,149 @@ mod tests {
         assert_eq!(asked[0]["limit"], json!(1000));
         assert_eq!(asked[1]["cursor"], json!("2:timer-2"));
         assert_eq!(asked[1]["limit"], json!(998));
+    }
+
+    /// The pending timer SY.timer lists for `timer_client_list_*`, at `fire_at`.
+    fn listed_timer(uuid: &str, fire_at: i64) -> Value {
+        json!({
+            "uuid": uuid, "owner_l2_name": "WF.demo@motherbee", "target_l2_name": "WF.demo@motherbee",
+            "kind": "oneshot", "fire_at_utc_ms": fire_at, "missed_policy": "fire", "status": "pending",
+            "created_at_utc_ms": 1775574000000_i64, "fire_count": 0_u64
+        })
+    }
+
+    /// Stands in for SY.timer: answers each `TIMER_LIST` with the next of `pages`, and gives back
+    /// what each request asked.
+    fn answer_timer_lists(
+        mut harness: TimerTestHarness,
+        pages: Vec<Value>,
+    ) -> tokio::task::JoinHandle<Vec<Value>> {
+        tokio::spawn(async move {
+            let mut asked = Vec::new();
+            for page in pages {
+                let request = harness.next_request().await.expect("request");
+                asked.push(request.payload.clone());
+                harness
+                    .send_timer_response(&request, page)
+                    .await
+                    .expect("send a page");
+            }
+            asked
+        })
+    }
+
+    // FINDINGS A-278 — `list` stopped at its limit hands back SY.timer's `next_cursor`, where the
+    // timers it did not list start; before, it dropped it, and its response read as the whole list.
+    // It starts at the filter's cursor.
+    #[tokio::test]
+    async fn timer_client_list_hands_back_the_cursor_its_limit_stopped_at() {
+        let (sender, mut receiver, harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+        let asked = answer_timer_lists(
+            harness,
+            vec![
+                json!({"ok": true, "verb": "TIMER_LIST", "count": 2_u64,
+                       "timers": [listed_timer("timer-2", 2), listed_timer("timer-3", 3)], "next_cursor": "3:timer-3"}),
+                json!({"ok": true, "verb": "TIMER_LIST", "count": 1_u64,
+                       "timers": [listed_timer("timer-4", 4)], "next_cursor": "4:timer-4"}),
+            ],
+        );
+
+        let response = client
+            .list_mine(TimerListFilter {
+                limit: Some(3),
+                cursor: Some(" 1:timer-1 ".to_string()),
+                ..TimerListFilter::default()
+            })
+            .await
+            .expect("list mine");
+        let uuids = response
+            .timers
+            .iter()
+            .map(|timer| timer.uuid.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, ["timer-2", "timer-3", "timer-4"]);
+        assert_eq!(response.count, 3);
+        assert_eq!(response.next_cursor.as_deref(), Some("4:timer-4"));
+        let asked = asked.await.expect("the pages");
+        assert_eq!(asked[0]["cursor"], json!("1:timer-1"));
+        assert_eq!(asked[0]["limit"], json!(3));
+        assert_eq!(asked[1]["cursor"], json!("3:timer-3"));
+        assert_eq!(asked[1]["limit"], json!(1));
+    }
+
+    // FINDINGS A-278 — a page of no timers stops `list`, and its `next_cursor` is handed back as it
+    // came (SY.timer never answers one): `list` never asks again from it.
+    #[tokio::test]
+    async fn timer_client_list_stops_at_a_page_of_no_timers() {
+        let (sender, mut receiver, harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+        let asked = answer_timer_lists(
+            harness,
+            vec![
+                json!({"ok": true, "verb": "TIMER_LIST", "count": 1_u64,
+                       "timers": [listed_timer("timer-1", 1)], "next_cursor": "1:timer-1"}),
+                json!({"ok": true, "verb": "TIMER_LIST", "count": 0_u64, "next_cursor": "1:timer-1"}),
+            ],
+        );
+
+        let response = client
+            .list(TimerListFilter {
+                limit: Some(1000),
+                ..TimerListFilter::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(response.count, 1);
+        assert_eq!(response.next_cursor.as_deref(), Some("1:timer-1"));
+        assert_eq!(asked.await.expect("the pages").len(), 2);
+    }
+
+    // FINDINGS A-278 — `list_page` is one `TIMER_LIST`, from the filter's cursor, with its limit: it
+    // gives the page and SY.timer's `next_cursor` as they came.
+    #[tokio::test]
+    async fn timer_client_list_page_is_one_timer_list() {
+        let (sender, mut receiver, harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+        let asked = answer_timer_lists(
+            harness,
+            vec![json!({"ok": true, "verb": "TIMER_LIST", "count": 2_u64,
+                        "timers": [listed_timer("timer-3", 3), listed_timer("timer-4", 4)], "next_cursor": "4:timer-4"})],
+        );
+
+        let page = client
+            .list_page(TimerListFilter {
+                owner_l2_name: Some("WF.demo@motherbee".to_string()),
+                status_filter: Some(TimerStatusFilter::Pending),
+                limit: Some(TIMER_LIST_MAX_LIMIT),
+                cursor: Some("2:timer-2".to_string()),
+                ..TimerListFilter::default()
+            })
+            .await
+            .expect("list page");
+        assert_eq!(page.count, 2);
+        assert_eq!(page.timers[1].uuid.as_str(), "timer-4");
+        assert_eq!(page.next_cursor.as_deref(), Some("4:timer-4"));
+        let asked = asked.await.expect("the page");
+        assert_eq!(
+            asked,
+            [
+                json!({"owner_l2_name": "WF.demo@motherbee", "status_filter": "pending",
+                    "limit": TIMER_LIST_MAX_LIMIT, "cursor": "2:timer-2"})
+            ]
+        );
+        assert!(matches!(
+            client
+                .list_page(TimerListFilter {
+                    limit: Some(TIMER_LIST_MAX_LIMIT + 1),
+                    ..TimerListFilter::default()
+                })
+                .await,
+            Err(TimerClientError::InvalidRequest(_))
+        ));
     }
 
     #[test]

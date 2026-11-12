@@ -11,7 +11,8 @@ import (
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-// mockTimerLister extends mockTimerSender with a configurable List response.
+// mockTimerLister extends mockTimerSender with a configurable TIMER_LIST answer: timerList, whole, in
+// one page.
 type mockTimerLister struct {
 	mockTimerSender
 	timerList  []sdk.TimerInfo
@@ -19,9 +20,12 @@ type mockTimerLister struct {
 	lastFilter sdk.ListFilter
 }
 
-func (m *mockTimerLister) List(_ context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error) {
+func (m *mockTimerLister) ListPage(_ context.Context, filter sdk.ListFilter) (sdk.TimerListPage, error) {
 	m.lastFilter = filter
-	return m.timerList, m.listErr
+	if m.listErr != nil {
+		return sdk.TimerListPage{}, m.listErr
+	}
+	return sdk.TimerListPage{Timers: m.timerList}, nil
 }
 
 // recoverRuntime is a node runtime on definition whose SY.timer answers TIMER_LIST with timers.
@@ -330,8 +334,8 @@ func TestRecoverStartsDegradedWhenSYTimerDoesNotAnswer(t *testing.T) {
 
 	// SY.timer answers: the past timer is fired, and the node is healthy.
 	timer.listErr = nil
-	timers, err := rt.listTimers(context.Background(), recoverOpts)
-	rt.takeTimerList(context.Background(), timerListResult{timers: timers, err: err, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
+	listing, err := rt.listTimers(context.Background(), recoverOpts)
+	rt.takeTimerList(context.Background(), timerListResult{listing: listing, err: err, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
 	if rt.timersPending != nil {
 		t.Fatalf("still pending: %v", rt.timersPending)
 	}
@@ -462,8 +466,8 @@ func TestAReconcileThatCannotReadTheTimerIndexKeepsTheNodeDegraded(t *testing.T)
 	}
 	retry := func() {
 		t.Helper()
-		timers, err := rt.listTimers(ctx, recoverOpts)
-		rt.takeTimerList(ctx, timerListResult{timers: timers, err: err, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
+		listing, err := rt.listTimers(ctx, recoverOpts)
+		rt.takeTimerList(ctx, timerListResult{listing: listing, err: err, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
 	}
 
 	if err := rt.Recover(ctx, recoverOpts); err != nil {
@@ -539,7 +543,7 @@ func TestATimerScheduledWhileDegradedIsScheduledAgain(t *testing.T) {
 
 	// A minute later SY.timer answers, without the timer.
 	rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(time.Minute) }
-	rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{}, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
+	rt.takeTimerList(context.Background(), timerListResult{listing: wholeList(), askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
 	if rt.timersPending != nil {
 		t.Fatalf("still DEGRADED: %v", rt.timersPending)
 	}
@@ -599,7 +603,7 @@ func TestATimerScheduledAfterTheListWasAskedKeepsItsRow(t *testing.T) {
 	rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(time.Second) }
 	instanceID := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
 	scheduled := len(timer.scheduled)
-	rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{}, askedAtMS: askedAtMS}, recoverOpts)
+	rt.takeTimerList(context.Background(), timerListResult{listing: wholeList(), askedAtMS: askedAtMS}, recoverOpts)
 	if _, ok, _ := rt.Store.GetTimerForInstance(context.Background(), instanceID, "timeout"); !ok || len(timer.scheduled) != scheduled {
 		t.Fatalf("the row stays as it is: kept=%v, scheduled again %d times", ok, len(timer.scheduled)-scheduled)
 	}

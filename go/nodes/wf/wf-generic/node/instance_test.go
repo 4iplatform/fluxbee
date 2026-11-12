@@ -99,8 +99,8 @@ func (m *mockTimerSender) RescheduleByClientRef(_ context.Context, ref string, a
 	m.rescheduledIn, m.rescheduledAt = append(m.rescheduledIn, 0), append(m.rescheduledAt, at)
 	return m.sent(m.rescheduleErr)
 }
-func (m *mockTimerSender) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo, error) {
-	return nil, nil
+func (m *mockTimerSender) ListPage(_ context.Context, _ sdk.ListFilter) (sdk.TimerListPage, error) {
+	return sdk.TimerListPage{}, nil
 }
 
 // --- Helpers ---
