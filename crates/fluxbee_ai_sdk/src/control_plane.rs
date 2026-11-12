@@ -217,12 +217,13 @@ pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
 }
 
 /// The warning for a node's `NOT_TAKEN` (FINDINGS A-339): `refused_by` took nowhere a message this
-/// node sent on the trace, most often its answer (a WF whose queue is full, `node_busy`; one that
-/// cannot use its store, `unavailable`), and nothing of it ran there. It names that node, the
-/// reason, whether the same message sent again may be taken (`retryable`; a `NOT_TAKEN` without
-/// it, from a node before 0.1.141, is not) and the detail, as a router notice is named
-/// (`notice_line_due`): a busy WF refuses each answer that comes while it is full. The node does
-/// not send the message again: the runtime keeps no message it sent.
+/// node sent on the trace, most often its answer (a WF whose queue is full, `node_busy`, for any
+/// answer; one that cannot use its store, `unavailable`, for an answer with a name, while an
+/// agent's usual answer has none and gets nothing back), and nothing of it ran there. It names
+/// that node, the reason, whether the same message sent again may be taken (`retryable`; a
+/// `NOT_TAKEN` without it, from a node before 0.1.141, is not) and the detail, as a router notice
+/// is named (`notice_line_due`): a busy WF refuses each answer that comes while it is full. The
+/// node does not send the message again: the runtime keeps no message it sent.
 fn note_not_taken(node_name: &str, msg: &Message) {
     let reason = msg
         .payload

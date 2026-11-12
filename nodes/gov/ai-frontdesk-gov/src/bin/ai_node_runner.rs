@@ -5009,10 +5009,11 @@ mod tests {
     }
 
     /// FINDINGS A-339, as in ai.generic. A node whose queue is full answers the frontdesk's answer
-    /// `NOT_TAKEN` `node_busy` (the Go SDK since 0.1.141): nothing of the answer ran there. The
-    /// frontdesk takes it for a reply, as it takes an error answer (`<msg>.error`): no answer, where
-    /// it answered each one `unknown_system_msg`. Its journal says which node did not take a
-    /// message it sent, on which trace, why, and whether sending it again may pass.
+    /// `NOT_TAKEN` `node_busy` (the Rust SDK from 0.1.143, as this IO node's, or a WF's Go SDK from
+    /// 0.1.141): nothing of the answer ran there. The frontdesk takes it for a reply, as it takes
+    /// an error answer (`<msg>.error`): no answer, where it answered each one
+    /// `unknown_system_msg`. Its journal says which node did not take a message it sent, on which
+    /// trace, why, and whether sending it again may pass.
     #[tokio::test]
     async fn a_not_taken_or_an_error_answer_is_never_answered() {
         let node = test_node();

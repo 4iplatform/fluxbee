@@ -1811,18 +1811,39 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `a_not_taken_and_an_error_answer_are_replies`; ai.generic's and the frontdesk's
     `a_not_taken_or_an_error_answer_is_never_answered` (no answer to a `NOT_TAKEN` `node_busy`, nor
     to a `system` or `admin` `ask.error`, and the warning with `refused_by`, `reason`, `retryable`
-    and the detail). Without the change all three fail on an `unknown_system_msg` answer; without
+    and the detail). Without the change all three fail, the SDK's test on
+    `is_infrastructure_message`'s result, the runners' on the `unknown_system_msg` answer; without
     the `.error` arm, on the error answers; without the warning, on the runners' log checks.
   - **Docs:** the AI SDK's README, ai.generic's and the frontdesk's READMEs, the frontdesk's page,
     the WF spec's §14.5 (what an agent does with a `NOT_TAKEN`) and Archi's handbook §4.1 (*An
-    answer the WF does not take*).
-  - **At integration, after `coa/gosdk-141`:** three of its texts say an AI node answers a
-    `NOT_TAKEN` `unknown_system_msg`, or that the AI SDK's rule leaves `NOT_TAKEN` and `<msg>.error`
-    out, and take this release's words: `docs/reference/protocol.md` §6.10's row *"An AI node (the
-    AI SDK)"*; the WF spec's §14.5 paragraph on `NOT_TAKEN`, whose older sentence this branch
-    changed, so the rebase stops there; and SY.timer's `isInfrastructureMessage` comment
-    (`go/sy-timer/main.go`, *"name by name but for NOT_TAKEN and <msg>.error"*), with SY.timer's
-    next change.
+    answer the WF does not take*). The handbook, the AI SDK's README and `note_not_taken` say which
+    `NOT_TAKEN` reaches an agent: a busy WF's `node_busy` for any answer, and a WF without its store
+    `unavailable` only for an answer with a name (`answerNotTaken`, `neverAnswered`), so an agent's
+    usual answer, which has none, gets nothing back from it; and that a given turn may have no
+    warning of its own (the first of each reason, then at most one every 10 s).
+  - **At integration, after `coa/gosdk-141`:** five of its texts take this release's words. Two
+    say what an AI node does with a `NOT_TAKEN`: `docs/reference/protocol.md` §6.10's row *"An AI
+    node (the AI SDK)"* (it answers `unknown_system_msg`), and the WF spec's §14.5 paragraph on
+    `NOT_TAKEN`, whose older sentence this branch changed, so the rebase stops there. Three say the
+    AI SDK's rule leaves `NOT_TAKEN` and `<msg>.error` out, each to read *"wf-generic's rule and the
+    AI nodes', name by name (0.1.142)"*: `docs/sy-timer.md` §6.1's *"Only requests are answered"*
+    (*"wf-generic's rule, name by name, and the AI nodes' but for `NOT_TAKEN` and `<msg>.error`"*),
+    `docs/nodes/sy-timer.md`'s **Owner** rule (*"wf-generic's rule, name by name, and the AI nodes'
+    but for the last two"*), and SY.timer's `isInfrastructureMessage` comment
+    (`go/sy-timer/main.go`, *"name by name but for NOT_TAKEN and <msg>.error"*), the last with
+    SY.timer's next change.
+  - **With the WF engine's next change:** two of its comments, the same on `coa/gosdk-141`, still
+    say *"ai.generic ignores a system message it does not know"*, the sentence this branch corrected
+    in the WF spec's §14.5: false before (ai.generic answered `unknown_system_msg`), and false after
+    for any other `system` message it does not know. They are `answerNotTaken`'s
+    (`go/nodes/wf/wf-generic/node/correlate.go`) and `TestAMessageWithNoThreadStartsNothing`'s
+    (`go/nodes/wf/wf-generic/node/delivery_test.go`), each to read *"an AI node takes a
+    `NOT_TAKEN` for a reply and logs it (0.1.142)"*. No Go file changes in this release, the AI SDK
+    alone, as with SY.timer's comment.
+  - **At 0.1.143's rebase onto 0.1.142:** `coa/rustsdk-143` carries this entry's heading and first
+    three points (*Why*, *Effect*, *Fix, later*), unbuilt, and a board line of its own, so FINDINGS
+    conflicts there. Keep this branch's built entry and board line, and add `coa/rustsdk-143`'s
+    A-336.
 - **The resend of an answer not taken (proposed, to decide; not built):** what the runtime could do
   with a retryable `NOT_TAKEN` for its own answer.
   - **Today** the answer is lost: the WF's instance goes on as if the agent had not answered (in
@@ -1838,13 +1859,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     each, then drop it. In the runtime, before the node, so both runners get it.
   - **Its edges.** A WF takes an agent's answer by its thread, not its trace: an answer sent again
     after the WF stopped waiting reaches the instance as a late answer, which a definition already
-    meets when a model is slow (`wf.sales.invoice` logs sales' late answers); the last attempt by
-    about 35 s keeps it within a usual wait, and two answers on one thread swap only when the WF
-    asked twice within it. The router copies each message a node sends as a turn at its entry:
-    cognition takes the second copy as the same turn (its key is the trace, the writer and the
-    text), while SY.storage would keep a second turn row (the trace entry's time differs) unless the
-    resend is marked. Under a long backlog (1,024 messages at 30 a second, about 34 s) the attempts
-    may be refused again, each logged.
+    meets when a model is slow (`wf.sales.invoice` forwards sales' late answer to the person, or
+    acts on its option); the last attempt by about 35 s keeps it within a usual wait, and two
+    answers on one thread swap only when the WF asked twice within it. The router copies each
+    message a node sends as a turn at its entry: cognition takes the second copy as the same turn
+    (its key is the trace, the writer and the text), while SY.storage would keep a second turn row
+    (the trace entry's time differs) unless the resend is marked. Under a long backlog (1,024
+    messages at 30 a second, about 34 s) the attempts may be refused again, each logged.
   - It fits the operator's principle (the node that failed retries and logs) and A-329's call for
     SY.timer (a fire not taken is sent again). Best with the IO family's resend of a retryable
     `NOT_TAKEN` (A-329's leftovers): one rule for both.
