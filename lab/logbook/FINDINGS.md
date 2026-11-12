@@ -1871,6 +1871,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** a guard like the ACME one on `edge_channel_secret:*` and `edge_fanout_verify:*`
   for `vault_get` and `vault_assign`, or SY.vault refusing to assign an infrastructure secret
   dedicated to one node.
+- **Built on `coa/admin-139` for 0.1.139:** the guard, beside the ACME accounts' in
+  `handle_vault_command` (`refuse_edge_secret_read_back`): `vault_get` and `vault_assign` of a key
+  under `edge_channel_secret:`, `edge_tls` or `edge_fanout_verify:`, whatever its case, answer
+  `403 RESERVED_KEY` before anything reaches SY.vault, whoever asks (the operator, the executor,
+  Archi, Cloud). `edge_tls*` with them, as the state review of 2026-11-12 found: the edge's TLS key
+  was read back the same way. Their metadata stays readable, and the operator's puts, rotations,
+  rollbacks and deletes are not refused (SY.admin's own externalize stores the bearers and verify
+  tokens). SY.vault is unchanged. Its test, `the_admin_api_never_reads_back_an_edge_secret`, fails
+  without it. SY.admin's help (`vault_get`, `vault_assign`), sy-admin.md, sy-vault.md and Archi's
+  handbook (§4.5) say it.
 
 ### A-315 [Archi] 🔵 low (found 2026-11-11 by 0.1.133's gate; read in SY.admin's help, Archi's handbook and the code; since 0.1.133) — SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes`
 

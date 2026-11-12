@@ -262,6 +262,13 @@ enforces them in its admin API (`src/bin/sy_admin.rs`):
   operator included, may put, rotate, roll back, delete, assign or read the value of one: each is
   refused with `403 RESERVED_KEY` before anything reaches SY.vault. Only SY.admin's own ACME client
   writes and reads them.
+- `edge_channel_secret:*`, `edge_tls*` and `edge_fanout_verify:*` are each owned by an edge, which
+  alone reads them. No admin-API caller, the operator included, reads the value of one
+  (`vault_get`) or assigns one to a node (`vault_assign`): each is refused with
+  `403 RESERVED_KEY` before anything reaches SY.vault (`refuse_edge_secret_read_back`, FINDINGS
+  A-316, since 0.1.139), since an assign naming SY.admin's own ILK let a read through SY.admin
+  return the bearer. Their metadata stays readable; the operator still puts, rotates, rolls back
+  and deletes them.
 
 ## VAULT_SECRET_CHANGED
 

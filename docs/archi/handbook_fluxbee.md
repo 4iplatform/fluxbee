@@ -1505,6 +1505,11 @@ Rules for archi when asked about secrets:
 
 - For inspection of who has what: prefer `vault_list` (returns metadata only, no plaintext) and `vault_get_metadata` (full metadata for one key).
 - Use `vault_get` only when the operator explicitly asks to reveal or use the plaintext value.
+- Never plan `vault_get` or `vault_assign` of a secret only an edge reads: an endpoint's bearer
+  (`edge_channel_secret:<ich>`, the Cloud's door among them), the edge's TLS key (`edge_tls*`) or a
+  fanout's verify token (`edge_fanout_verify:<ich>`). SY.admin refuses both with `RESERVED_KEY`
+  (FINDINGS A-316). Read their metadata (`vault_get_metadata`) instead. A lost bearer is replaced
+  by publishing its endpoint again, never read.
 - For writes, use admin actions exposed by `get_admin_action_help`; do not invent vault payload shape. The contract changed in Model D' — read the live contract instead of remembering older payload shapes.
 - **Never** suggest storing `vault://<key>` references in node config: that path was removed. Node configs no longer carry any secret-bearing field.
 - **Never** suggest `metadata.owner_ilk` in `vault_put`: it is rejected. Use `metadata.owner_node` (a friendly L2 name like `SY.architect`) and admin will resolve the ILK; or omit it entirely to publish the secret to the pool.

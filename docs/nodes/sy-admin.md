@@ -347,6 +347,16 @@ Other checks:
   sets the executor catalog. Over the mesh only Archi asks for those two and for
   `send_node_message`.
 - Fanout `externalize` (with `fanout_family`) is operator-only (`handle_externalize`).
+- **The secrets only an edge reads are never read back** (FINDINGS A-316, since 0.1.139): an
+  externalized endpoint's bearer (`edge_channel_secret:<ich>`, the Cloud's door among them), the
+  edge's TLS key (`edge_tls*`) and a fanout's verify token (`edge_fanout_verify:<ich>`), each owned
+  by its edge. `vault_get` and `vault_assign` of one answer `403 RESERVED_KEY` before anything
+  reaches SY.vault (`refuse_edge_secret_read_back`), whoever asks: the operator, the executor,
+  Archi, Cloud. A `vault_assign` naming SY.admin's own ILK, then a `vault_get` through SY.admin, read
+  the Cloud's bearer back, and through Archi it reached the AI provider (A-124). Their metadata
+  stays readable; the operator still writes the edge's TLS key (put, rotate, the rollback of
+  [The ACME client](#the-acme-client)) and deletes any of them, and SY.admin stores the bearers
+  and verify tokens itself.
 - The operator's `unpublish_artifact` may revoke any tenant's publication
   (`handle_unpublish_artifact` with no caller): over HTTP, `POST /artifacts/unpublish`, or as a
   step of an executor plan. Archi takes a page down that way, with a plan the operator confirms,

@@ -17630,6 +17630,9 @@ const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. A node whose unit does not run is not listed (stopped, failed, or between two restarts of a crash loop): one relaunched later (relaunch_on_boot) fails to start once its version is gone, so stop it (kill_node) or move it first.";
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs or gives systemd no answer, which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
+/// What `vault_get` and `vault_assign` say of the secrets only an edge reads (FINDINGS A-316).
+const EDGE_ONLY_SECRETS_NOTE: &str = "A secret only an edge reads is never read back nor assigned through the admin API: vault_get and vault_assign of an endpoint's bearer (edge_channel_secret:<ich>, the Cloud's door among them), the edge's TLS key (edge_tls*) or a fanout's verify token (edge_fanout_verify:<ich>) answer 403 RESERVED_KEY before anything reaches SY.vault (FINDINGS A-316, since 0.1.139). Their metadata stays readable (vault_get_metadata). A lost bearer is replaced by publishing the endpoint again, never read.";
+
 /// What a runtime's use says of the ingress and egress hives (FINDINGS A-315): listed apart, neither
 /// counted nor skipped (FINDINGS A-281, since 0.1.133).
 const HIVES_WITHOUT_RUNTIMES_NOTE: &str = "usage_global_visible.hives_without_runtimes lists each ingress and each egress, {hive_id, role}, by the role the hive registry records whatever the state of its join (since 0.1.133). The runtimes never reach them (fluxbee-dist-runtimes goes to the workers only), so no managed node runs there: they are not asked, neither counted nor in skipped_hives, and one that is down holds no removal up. A hive listed there is no hive whose use is unknown.";
@@ -18036,9 +18039,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Reads the secret value and is secret-sensitive.",
             "Use only when the operator explicitly needs the plaintext value; prefer vault_get_metadata for inspection.",
             "Executor previews/history must redact the returned value.",
+            EDGE_ONLY_SECRETS_NOTE,
         ],
         "vault_assign" => vec![
             "Replaces the nodes the secret is assigned to; the value, its version and its owner stay.",
+            EDGE_ONLY_SECRETS_NOTE,
             "Each node must be charged to the key's tenant; a person is never assigned (a person owns secrets, nodes use them).",
             "A secret with no owner and no assigned node is its tenant's general secret: every node of the tenant uses it.",
             "Every node that had it or has it now is told (VAULT_SECRET_CHANGED, op assign).",
@@ -22543,7 +22548,9 @@ async fn handle_vault_command(
             .to_string(),
         ));
     }
-    if let Some(refusal) = refuse_acme_account_access(action, &payload) {
+    if let Some(refusal) = refuse_acme_account_access(action, &payload)
+        .or_else(|| refuse_edge_secret_read_back(action, &payload))
+    {
         return Ok(refusal);
     }
     let target = format!("SY.vault@{}", target_hive);
@@ -22757,6 +22764,52 @@ fn refuse_acme_account_access(action: &str, payload: &serde_json::Value) -> Opti
             "error_code": "RESERVED_KEY",
             "error_detail": format!(
                 "{key} holds SY.admin's ACME account: the admin API neither reads its value nor writes it"
+            ),
+        })
+        .to_string(),
+    ))
+}
+
+/// The secrets only an edge reads (FINDINGS A-316), each owned by its `SY.edge`: an externalized
+/// endpoint's bearer (`edge_channel_secret:<ich>`, the Cloud's door among them), the edge's TLS
+/// certificate and key (`edge_tls*`, the ingress' `edge.tls_vault_key`) and a fanout endpoint's
+/// verify token (`edge_fanout_verify:<ich>`). Prefixes, matched whatever their case, as
+/// `fluxbee_sdk::vault::is_cloud_reserved_vault_key` matches them.
+const EDGE_ONLY_VAULT_KEY_PREFIXES: &[&str] =
+    &["edge_channel_secret:", "edge_tls", "edge_fanout_verify:"];
+
+/// The admin API (the operator, the executor, Archi, Cloud) never reads the value of a secret only
+/// an edge reads (`EDGE_ONLY_VAULT_KEY_PREFIXES`) nor assigns one to another node (FINDINGS A-316):
+/// a `vault_assign` that named SY.admin's own ILK, or any node's, let a `vault_get` through
+/// SY.admin, or that node, read the bearer back, and through Archi it reached the AI provider
+/// (A-124). Both are refused `403 RESERVED_KEY` before anything reaches SY.vault. Its metadata
+/// stays readable, and the operator still writes the edge's TLS key (put, rotate, its documented
+/// rollback) and deletes any of them; SY.admin stores the bearers and verify tokens itself, owned
+/// by the edge.
+fn refuse_edge_secret_read_back(
+    action: &str,
+    payload: &serde_json::Value,
+) -> Option<(u16, String)> {
+    if !matches!(action, "vault_get" | "vault_assign") {
+        return None;
+    }
+    let key = payload.get("key").and_then(|value| value.as_str())?;
+    let named = key.trim().to_ascii_lowercase();
+    if !EDGE_ONLY_VAULT_KEY_PREFIXES
+        .iter()
+        .any(|prefix| named.starts_with(prefix))
+    {
+        return None;
+    }
+    Some((
+        403,
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "RESERVED_KEY",
+            "error_detail": format!(
+                "{key} is a secret only its edge reads (an endpoint's bearer, the edge's TLS key or a fanout's verify token): the admin API neither reads its value nor assigns it to another node; its metadata stays readable (vault_get_metadata)"
             ),
         })
         .to_string(),
@@ -34425,6 +34478,78 @@ mod tests {
         // Other keys are not reserved here.
         assert!(refuse_acme_account_access("vault_put", &json!({"key": "edge_tls"})).is_none());
         assert!(refuse_acme_account_access("vault_get", &json!({"key": "edge_tls"})).is_none());
+    }
+
+    /// FINDINGS A-316: the admin API never reads back a secret only an edge reads, nor assigns it
+    /// to another node: vault_get and vault_assign of an endpoint's bearer, the edge's TLS key or
+    /// a fanout's verify token are refused 403 RESERVED_KEY before anything reaches SY.vault, over
+    /// HTTP and over the mesh alike (Archi's own call). A vault_assign naming SY.admin's own ILK
+    /// then a vault_get through SY.admin read the Cloud's bearer back. Their metadata stays
+    /// readable, and the operator's writes of the TLS key and deletes are not refused here.
+    #[tokio::test]
+    async fn the_admin_api_never_reads_back_an_edge_secret() {
+        let (ctx, mut harness) = mesh_test_admin("a316-edge-secrets");
+        let ich = "ich:14b66389-d425-531c-a140-a591d25e8f39";
+        let keys = [
+            format!("edge_channel_secret:{ich}"),
+            format!("EDGE_CHANNEL_SECRET:{ich}"),
+            "edge_tls".to_string(),
+            "edge_tls_fluxbee_ai".to_string(),
+            format!(" edge_fanout_verify:{ich}"),
+        ];
+        for key in &keys {
+            for (action, payload) in [
+                ("vault_get", json!({ "key": key })),
+                (
+                    "vault_assign",
+                    json!({ "key": key, "assigned_nodes": ["SY.admin@motherbee"] }),
+                ),
+            ] {
+                let (status, body) = handle_vault_command(&ctx, &ctx.rpc, action, payload, None)
+                    .await
+                    .expect("answered");
+                let body: Value = serde_json::from_str(&body).expect("JSON");
+                assert_eq!(status, 403, "{action} {key}: {body}");
+                assert_eq!(body["error_code"], json!("RESERVED_KEY"), "{action} {key}");
+            }
+        }
+        // Over the mesh, as Archi would ask for it.
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "vault_get",
+            Some("motherbee"),
+            json!({ "key": format!("edge_channel_secret:{ich}") }),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+        assert_eq!(refused.envelope["error_code"], json!("RESERVED_KEY"));
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "nothing reached SY.vault"
+        );
+        // Not refused here: their metadata, the operator's writes and deletes, and other keys.
+        for action in [
+            "vault_get_metadata",
+            "vault_put",
+            "vault_rotate",
+            "vault_rollback",
+            "vault_delete",
+        ] {
+            assert!(
+                refuse_edge_secret_read_back(action, &json!({ "key": "edge_tls_fluxbee_ai" }))
+                    .is_none(),
+                "{action}"
+            );
+        }
+        for key in ["openai_default", "slack:auth:bot", "edge_other"] {
+            assert!(refuse_edge_secret_read_back("vault_get", &json!({ "key": key })).is_none());
+        }
     }
 
     /// The four ACME actions are in the catalog with their routes, read-only and confirmation
