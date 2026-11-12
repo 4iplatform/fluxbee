@@ -22,6 +22,7 @@ import (
 // turnRule is when a change's turn comes too late: SY.admin waits adminWait for SY.wf-rules' answer
 // (wf_rules_request_timeout, 75 s unless JSR_ADMIN_WF_RULES_TIMEOUT_SECS says otherwise), counted
 // here from when the request reached SY.wf-rules, and a change needs minLeft of it left at its turn.
+// The zero rule, no wait, refuses nothing (a Service NewService did not build).
 type turnRule struct {
 	adminWait, minLeft time.Duration
 }
@@ -29,14 +30,18 @@ type turnRule struct {
 var defaultTurnRule = turnRule{adminWait: 75 * time.Second, minLeft: 20 * time.Second}
 
 // late refuses a change that waited for its turn, BUSY and retryable, when less than minLeft of
-// SY.admin's wait is left; nil when it may run.
+// SY.admin's wait is left; nil when it may run. A change that runs is given its 60 s from its turn
+// all the same: minLeft is only what must be left of SY.admin's wait when the turn comes.
 func (r turnRule) late(node string, waited time.Duration) error {
+	if r.adminWait <= 0 {
+		return nil
+	}
 	left := r.adminWait - waited
 	if left >= r.minLeft {
 		return nil
 	}
 	return WfRulesError{Code: "BUSY", Retryable: true, Detail: fmt.Sprintf(
-		"%s takes one request at a time, and this change's turn came %s after it arrived, with %s left of SY.admin's %s wait for it, less than the %s a change is given: it was refused at once, and nothing was changed. Ask again",
+		"%s takes one request at a time, and this change's turn came %s after it arrived, with %s left of SY.admin's %s wait for it, less than the %s of it a change needs left at its turn: it was refused at once, and nothing was changed. Ask again",
 		node, waited.Round(time.Millisecond), max(left, 0).Round(time.Millisecond), r.adminWait, r.minLeft)}
 }
 

@@ -469,7 +469,7 @@ func (rt *NodeRuntime) takeTimerList(ctx context.Context, result timerListResult
 //   - scheduled, or moved, after SY.timer was asked: left alone; the list may not hold it, or hold
 //     it at its old time (its pages are read one after another, no snapshot). The node's own
 //     requests while the pages of a reconcile off the loop are read, a refused timer sent again from
-//     the loop's tick or one SY.timer holds late moved to its time (timerHeld), keep the row's
+//     the loop's tick or one SY.timer holds late moved to its time (moveHeldTimer), keep the row's
 //     scheduled_at_ms: SY.timer may take such a timer behind a page already read, and it then reads
 //     as missing and goes again once, which SY.timer answers already_existed (timerHeld);
 //   - in SY.timer but not in the index: an orphan, cancelled.

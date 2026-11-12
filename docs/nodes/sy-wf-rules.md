@@ -193,7 +193,13 @@ refused so. Before, a change queued behind another that held its 60 s (a purge w
 removal while a hive is not read) could end past SY.admin's 75 s, which answered `TIMEOUT` for a
 change that may still have completed. A change that starts keeps its 60 s from its turn: bounded
 by its arrival instead, one that ran out mid-flight would still send its next step (the Go SDK
-sends a request whose context has expired) and answer a failure for a step SY.admin then made.
+sends a request whose context has expired) and answer a failure for a step SY.admin then made. So a
+change whose turn comes with 20 s or more left can still end past SY.admin's wait, which answers
+`TIMEOUT` for it: SY.admin's help of each change (`WF_RULES_TIMEOUT_NOTE`) says to read
+`get_status`, answered once the change has ended, before asking again. The rule assumes SY.admin's
+default 75 s (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS` is SY.admin's alone), and counts a wait from when
+SY.wf-rules took the message: time before it (the process stopped, or 64 requests already waiting)
+is not counted.
 
 ### Delete
 

@@ -781,6 +781,13 @@ A-307, since 0.1.139; `WF_RULES_BUSY_NOTE`). Ask again. `wf_rules_check` and the
 refused so. Before, such a change ran behind the requests before it, and SY.admin could answer
 `TIMEOUT` while it went on.
 
+A change whose turn comes with 20 s or more left still runs with its 60 s from its turn, and can
+end past SY.admin's wait: `504 TIMEOUT` is no refusal, and the change may still complete. Before
+staging it again, read `wf_rules_get_status`, which SY.wf-rules answers once the change has ended
+(its requests in the order they came): its `current_version`, `staged_version` and `wf_node` say
+what the change did, and `WORKFLOW_NOT_FOUND` that a delete went through (`WF_RULES_TIMEOUT_NOTE`,
+in the help of each change).
+
 ### Operating instances
 
 Three actions on a WF node, each the engine's own verb sent to the node and its answer as it is

@@ -1658,7 +1658,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     deadline the fire scheduled again: it fails without the commit before a fire);
     `TestRecoveryFiresLostTimersInTheOrderTheyFire` fails without the read again after a fire.
     Docs: the WF's README, [spec-systemnode-wf-v1_1](../../docs/spec-systemnode-wf-v1_1.md)
-    §11.4 and [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md).
+    §11.4 and [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md). **The review:** the README and
+    the comments of `recover.go` and `timer_requests.go` named `timerHeld` for the reconcile's move
+    of a timer SY.timer holds late; they name `heldLate` and `moveHeldTimer`, `timerHeld` being
+    SY.timer's `already_existed` answer's alone.
 
 ### A-332 [General/cognition] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x; left by A-292's fix) — Cognition's model call on a person's turn that the agent then refuses completes
 
@@ -2662,8 +2665,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     20 s left of SY.admin's 75 s wait (`wf_rules_request_timeout`'s default; SY.wf-rules cannot
     read `JSR_ADMIN_WF_RULES_TIMEOUT_SECS`), counted from its arrival, is refused at once, before
     its first step: `BUSY`, `retryable: true` beside the error (`WfRulesError.Retryable`), the
-    detail saying how long it waited and how much was left; the log says *"<operation> refused
-    BUSY (trace_id=...): its turn came <waited> after it arrived"*. A check, the queries,
+    detail saying how long it waited and how much was left; the log says `<operation> refused
+    BUSY (trace_id=...): its turn came <waited> after it arrived`. A check, the queries,
     `CONFIG_GET` and `NODE_STATUS_GET` are never refused so. "Left" is read as SY.admin's wait,
     whose 75 s the entry's effect names: a change refused waited more than 55 s. A change that
     runs keeps its 60 s from its turn, as the entry's reasoning asks: bounded by its arrival, one
@@ -2688,6 +2691,33 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     Docs: [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md),
     [sy-wf-rules-spec](../../docs/sy-wf-rules-spec.md) §5.2 and §12,
     [sy-admin.md](../../docs/nodes/sy-admin.md) and Archi's handbook §4.2.7.
+  - **The review (on `coa/wf-139`):** the refusal's detail said a change waited *"less than the
+    20s a change is given"*, while a change that runs is given its 60 s from its turn: it now says
+    *"less than the 20s of it a change needs left at its turn"*. The zero rule (no wait) refuses
+    nothing, where a Service that `NewService` did not build would have refused every change that
+    waited at all (none is built so today). The residue is named where Archi and the operator read
+    it: `WF_RULES_TIMEOUT_NOTE`, in the help of the five changes, says a `504 TIMEOUT` from a
+    change is no refusal and the change may still complete, and to read `wf_rules_get_status`
+    before staging it again (SY.wf-rules answers it once the change has ended, its requests in
+    order; `WORKFLOW_NOT_FOUND` after a delete that went through); the handbook §4.2.7,
+    sy-admin.md, sy-wf-rules.md and the spec §5.2 say it too. A read is never refused, but it
+    waits its turn as any request, so one sent while changes hold SY.wf-rules can still get
+    SY.admin's `TIMEOUT` (the gate's reads are timed for it). Tests:
+    `TestTheZeroTurnRuleRefusesNothing` and the detail's words in
+    `TestAChangeWhoseTurnComesLateIsRefusedBusy`, each failing without its fix; SY.admin's
+    `a_wf_rules_change_that_times_out_is_no_refusal_and_its_help_says_to_read_the_status` (fails
+    without the note).
+  - **Left for Archi's branch (`coa/architect-139`), found by the review:** Archi's pipeline does
+    not know `BUSY`. A plan step refused so matches no rule of `classify_failure_deterministic`
+    (`src/bin/sy_architect/failure_classifier.rs`: at Execute only `COMPILE_ERROR` and
+    `WF_NODE_NOT_DEPLOYED`), falls to `ExecutionActionFailed`, and the run is blocked as
+    *"Pipeline execution failed"* with retry, restart_from_design and discard; Archi's prompt
+    facts (`src/bin/sy_architect.rs`, the General section and the executor's Lifecycle selection)
+    name only `SERVICE_FAILED` with `retryable: true` as a refusal that did nothing, and its text on
+    `wf_rules_compile_apply` names no `BUSY`. The handbook says it, so Archi's model knows; the
+    pipeline's own words do not. The fix there: a deterministic rule for `BUSY` (its payload
+    `retryable: true`) that says nothing changed and offers to stage the step again, and `BUSY`
+    beside `SERVICE_FAILED` in those facts.
 
 ### A-306 [General/admin] 🔵 low (found 2026-11-11 by A-281's SY.wf-rules review; read in the code; there before it) — A version's removal holds the manifest lock through its read of every hive's use, and a publish waits on it with no bound
 
@@ -2904,7 +2934,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Built on `coa/wf-139` (for 0.1.139), the WF node alone:** the node reads the path of its own
   binary at its start (`os.Executable`) and takes the runtime version whose directory holds it,
   `<dist>/runtimes/<runtime>/<version>/bin/<binary>`, the version its unit's ExecStart names
-  (`EngineOf`, `node/engine.go`); its journal says it (*"wf: engine wf.engine 0.1.139 (<path>)"*).
+  (`EngineOf`, `node/engine.go`); its journal says it (`wf: engine wf.engine 0.1.139 (<path>)`).
   `NODE_STATUS_GET` answers it as `extensions.engine` `{runtime, version, executable}` in every
   state (`HEALTHY`, `DEGRADED`, a config not in use), `runtime` and `version` null for a binary that
   is no runtime version's; the orchestrator's `get_node_status` already passes a node's
@@ -2916,6 +2946,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   WF's README, [spec-systemnode-wf-v1_1](../../docs/spec-systemnode-wf-v1_1.md)'s handlers,
   [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md), [sy-orchestrator.md](../../docs/nodes/sy-orchestrator.md),
   [operations.md](../../docs/reference/operations.md) and Archi's handbook §4.2.7.
+  **The review:** SY.admin's help of `get_node_status`, which Archi reads with the action catalog,
+  says it too (`WF_NODE_ENGINE_NOTE`: the engine in `node_status.extensions.engine`, and
+  `node_status.runtime.resolved_version` the package's own version), where only the handbook and
+  the node docs did; test `get_node_status_help_names_the_engine_a_wf_node_runs` (fails without
+  the note).
 
 ### A-301 [General/orchestrator] 🔵 low (found 2026-11-11 by A-277's review fixes; read in the code; there before it) — A fresh join under a removed hive's name reuses a surviving identity key
 

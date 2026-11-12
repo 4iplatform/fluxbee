@@ -115,8 +115,9 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   row: a timer the instance cancelled since does not go, one it moved goes at its new time, and a
   later request about the same timer supersedes an earlier one. A schedule SY.timer answers
   `already_existed` at a time later than the index's (a move it did not take of a timer it holds)
-  is moved to its time, a `TIMER_RESCHEDULE` followed the same way, as is one the reconcile finds
-  so (`timerHeld`). The answers the SDK drops, the node's channel for them full, are named in the
+  is moved to its time, a `TIMER_RESCHEDULE` followed the same way (`timerHeld`, then
+  `moveHeldTimer`), as is one the reconcile finds so, on the row it read (`heldLate`, then
+  `moveHeldTimer`). The answers the SDK drops, the node's channel for them full, are named in the
   log on the loop's tick. Before, a schedule refused while SY.timer restarted was lost until the
   node's next start, and the SDK dropped SY.timer's refusals.
 - **A store it cannot use stops the engine, never the node** (FINDINGS A-217). When the instance
@@ -138,8 +139,8 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   ExecStart runs), and `executable`, the binary's path; `runtime` and `version` are null for a
   binary that is no runtime version's (one run by hand). The orchestrator's `get_node_status`
   shows it as `node_status.extensions.engine`, next to `runtime`, the workflow package
-  (`wf.<name>`) on its own version; the node's journal says it at its start (*"wf: engine
-  wf.engine 0.1.139 (<path>)"*). Before, only the unit's ExecStart said which engine a WF node ran,
+  (`wf.<name>`) on its own version; the node's journal says it at its start (`wf: engine
+  wf.engine 0.1.139 (<path>)`). Before, only the unit's ExecStart said which engine a WF node ran,
   so a deploy read it on the hive.
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and
   `WF_CANCEL_INSTANCE` answer only SY.admin@motherbee and SY.wf-rules of the node's hive, in

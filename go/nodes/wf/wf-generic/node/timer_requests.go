@@ -40,7 +40,8 @@ import (
 // TIMER_NOT_FOUND from SY.timer, which never got the timer. A move SY.timer did not take of a timer
 // it holds is settled by the time SY.timer says it holds: the TIMER_SCHEDULE that goes again is
 // answered already_existed at the old time, and a time later than the index's is moved there, a
-// TIMER_RESCHEDULE (timerHeld), as is one the reconcile's TIMER_LIST lists.
+// TIMER_RESCHEDULE (timerHeld, then moveHeldTimer), as is one the reconcile's TIMER_LIST lists (the
+// reconcile settles the row it read: heldLate, then moveHeldTimer).
 
 const (
 	verbTimerSchedule   = "TIMER_SCHEDULE"
@@ -288,10 +289,11 @@ func timerTakenLine(row TimerRow) string {
 }
 
 // timerHeld settles timer ref, which SY.timer holds pending at heldAtMS: it answered a schedule
-// already_existed with that time (it keeps one pending timer per client_ref), or the reconcile's
-// TIMER_LIST lists it (the reconcile settles the row it read itself, the same way). The timer is
-// taken, its refusal cleared, unless SY.timer holds it later than the index's time, past a fire's
-// tolerance (heldLate), which moveHeldTimer settles.
+// already_existed with that time (it keeps one pending timer per client_ref). The timer is taken,
+// its refusal cleared, unless SY.timer holds it later than the index's time, past a fire's
+// tolerance (heldLate), which moveHeldTimer settles. A timer the reconcile's TIMER_LIST lists does
+// not come here: the reconcile settles the row it read the same way, with heldLate and
+// moveHeldTimer (FINDINGS A-333).
 func (rt *NodeRuntime) timerHeld(ctx context.Context, ref timerRef, heldAtMS int64) {
 	row, ok := rt.timerRow(ctx, ref, "held by SY.timer")
 	if !ok {

@@ -119,8 +119,11 @@ func TestAChangeWhoseTurnComesLateIsRefusedBusy(t *testing.T) {
 			if code, retryable := refusal(t, sender.sent[0]); code != "BUSY" || !retryable {
 				t.Fatalf("the late change is answered %q, retryable %v: %s", code, retryable, sender.sent[0].Payload)
 			}
+			// The detail states the rule: 20 s is what must be left of SY.admin's wait at the turn,
+			// not what a change is given (it is given its 60 s from its turn).
 			if detail := string(sender.sent[0].Payload); !strings.Contains(detail, "turn came 55.001s after it arrived") ||
-				!strings.Contains(detail, "19.999s left of SY.admin's 1m15s wait") || !strings.Contains(detail, "nothing was changed") {
+				!strings.Contains(detail, "19.999s left of SY.admin's 1m15s wait for it, less than the 20s of it a change needs left at its turn") ||
+				!strings.Contains(detail, "nothing was changed") {
 				t.Fatalf("the refusal's detail: %s", detail)
 			}
 			if after := snapshotTree(t, svc.store.Root(), svc.cfg.DistRuntimeRoot); !reflect.DeepEqual(before, after) || admin.publishCalls != publishes {
@@ -164,6 +167,25 @@ func TestAChangeWithItsTurnInTimeRunsAndAReadAlways(t *testing.T) {
 		if code, _ := refusal(t, sender.sent[sent]); code == "BUSY" {
 			t.Fatalf("a read is refused for its turn: %s", sender.sent[sent].Payload)
 		}
+	}
+}
+
+// FINDINGS A-307's review — the zero rule, no wait (a Service NewService did not build), refuses
+// nothing, however long a change waited: counted against a wait of 0 s, every change that waited at
+// all would be refused BUSY.
+func TestTheZeroTurnRuleRefusesNothing(t *testing.T) {
+	for _, waited := range []time.Duration{0, time.Millisecond, 55 * time.Second, 10 * time.Minute} {
+		if err := (turnRule{}).late("SY.wf-rules@motherbee", waited); err != nil {
+			t.Fatalf("the zero rule refused a change that waited %s: %v", waited, err)
+		}
+	}
+	svc := newTestService(t)
+	svc.turns = turnRule{}
+	sender := &recordingSender{}
+	svc.sender = sender
+	svc.handleTurn(configOperationMessage(t, "t-compile", map[string]any{"operation": "compile", "workflow_name": "invoice", "definition": validWorkflowDefinition()}), 10*time.Minute)
+	if code, _ := refusal(t, sender.sent[0]); code != "" {
+		t.Fatalf("a Service with the zero rule refused a change: %s", sender.sent[0].Payload)
 	}
 }
 

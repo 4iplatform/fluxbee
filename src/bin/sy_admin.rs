@@ -18499,6 +18499,16 @@ const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the vers
 /// SY.admin's wait is `wf_rules_request_timeout`).
 const WF_RULES_BUSY_NOTE: &str = "409 BUSY, with payload.retryable true: the hive's SY.wf-rules takes one request at a time, in the order they came, and this change's turn came with less than 20 s left of SY.admin's 75 s wait for it, the requests before it having taken the rest (FINDINGS A-307, since 0.1.139): it was refused at once, and nothing was changed (no version staged, published, applied or deleted). error_detail says how long it waited. Ask again; a check and the reads are never refused so.";
 
+/// What a change of a workflow that SY.admin got no answer for may have done (FINDINGS A-307's
+/// review): a change whose turn came in time keeps its 60 s from its turn (`turnRule` in
+/// go/sy-wf-rules/node/turn.go), so it can end past `wf_rules_request_timeout`.
+const WF_RULES_TIMEOUT_NOTE: &str = "504 TIMEOUT is no refusal: SY.admin waited 75 s for SY.wf-rules' answer, and the change may still complete. A change that waited its turn behind other requests keeps its 60 s from its turn, so one whose turn came with 20 s or more left can end past SY.admin's wait (FINDINGS A-307); an SY.wf-rules that is down or restarting answers nothing either. Never stage the change again at once: first read wf_rules_get_status, which SY.wf-rules answers after the change has ended, since it serves its requests in the order they came. Its current_version and staged_version, against what they were before the change (a compile stages a version; an apply, a compile_apply or a rollback changes the current one), and its wf_node say what the change did; WORKFLOW_NOT_FOUND says a delete went through. A read that times out too is read again.";
+
+/// What a WF node's status says of the engine it runs (FINDINGS A-302): the node's own
+/// `extensions.engine` (`Engine.status` in go/nodes/wf/wf-generic/node/engine.go), which the
+/// orchestrator's get_node_status passes on as it came.
+const WF_NODE_ENGINE_NOTE: &str = "For a WF.* node that answers, node_status.extensions.engine, {runtime, version, executable}, names the wf.engine it runs: the runtime version whose directory holds its binary, the one its unit's ExecStart names, and the binary's path (FINDINGS A-302, since 0.1.139). runtime and version are null for a binary outside a runtime version's directory (one run by hand); a node on an engine before 0.1.139, or one that does not answer, shows no engine. node_status.runtime.resolved_version is the workflow package's own version (wf.<workflow_name>), not the engine's.";
+
 /// What the instance actions say of the node they act on, and of the engine's refusals
 /// (`node_verb_answer`).
 const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
@@ -18651,6 +18661,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "payload.node_status holds lifecycle_state, read from the node's unit (an SY node's packaged unit, the router's rt-gateway) and the router's LSA, and health_state: for a RUNNING node what it reports (health_source NODE_REPORTED), or what the orchestrator infers when it does not answer (ORCHESTRATOR_INFERRED); UNKNOWN for any other node. A read writes nothing; observed_at dates it.",
             NODE_LIFECYCLE_NOTE,
             "A node that does not exist answers 404 NODE_NOT_FOUND: a managed node is gone only when nothing of it is left and systemd answers that its unit neither runs nor failed.",
+            WF_NODE_ENGINE_NOTE,
         ],
         "run_node" => vec![
             "Use this only when creating/spawning a new managed instance.",
@@ -19005,6 +19016,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
             WF_RULES_DEFINITION_NOTE,
             WF_RULES_BUSY_NOTE,
+            WF_RULES_TIMEOUT_NOTE,
         ],
         "wf_rules_compile" => vec![
             "workflow_name and definition are required.",
@@ -19013,6 +19025,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
             WF_RULES_DEFINITION_NOTE,
             WF_RULES_BUSY_NOTE,
+            WF_RULES_TIMEOUT_NOTE,
         ],
         "wf_rules_check" => vec![
             "workflow_name and definition are required.",
@@ -19028,6 +19041,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is only needed for first deploy when auto_spawn=true; existing-node rollout preserves the managed tenant_id.",
             WF_RULES_BUSY_NOTE,
+            WF_RULES_TIMEOUT_NOTE,
         ],
         "wf_rules_delete" => vec![
             "workflow_name is required.",
@@ -19040,6 +19054,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             PAGES_LEFT_UP_NOTE,
             "pages_left_up names the pages of its WF node, wf_node.node_name.",
             WF_RULES_BUSY_NOTE,
+            WF_RULES_TIMEOUT_NOTE,
         ],
         "wf_rules_get_workflow" | "wf_rules_get_status" | "wf_rules_list_workflows" => vec![
             "These are direct query operations against SY.wf-rules.",
@@ -37849,7 +37864,7 @@ mod tests {
             );
         }
         let (ctx, mut harness) = opa_test_admin("wf-rules-busy");
-        let detail = "SY.wf-rules@worker1 takes one request at a time, and this change's turn came 56s after it arrived, with 19s left of SY.admin's 1m15s wait for it, less than the 20s a change is given: it was refused at once, and nothing was changed. Ask again";
+        let detail = "SY.wf-rules@worker1 takes one request at a time, and this change's turn came 56s after it arrived, with 19s left of SY.admin's 1m15s wait for it, less than the 20s of it a change needs left at its turn: it was refused at once, and nothing was changed. Ask again";
         for action in [WfRulesAction::CompileApply, WfRulesAction::Delete] {
             let run =
                 handle_wf_rules_http(&ctx, &ctx.rpc, wf_rules_check_request(), action, "operator");
@@ -37899,6 +37914,61 @@ mod tests {
             assert_eq!(body["error_code"], json!("BUSY"), "{body}");
             assert_eq!(body["error_detail"], json!(detail), "{body}");
             assert_eq!(body["payload"]["retryable"], json!(true), "{body}");
+        }
+    }
+
+    /// A change whose turn came with 20 s or more of SY.admin's wait left runs with its 60 s, and
+    /// can end past SY.admin's 75 s, which answers 504 TIMEOUT for a change that may still complete
+    /// (A-307's residue, its review). Every change's help says so, and to read the workflow's
+    /// status before staging it again, where only BUSY was named; a check's and the reads' do not.
+    #[test]
+    fn a_wf_rules_change_that_times_out_is_no_refusal_and_its_help_says_to_read_the_status() {
+        for action in [
+            "wf_rules_compile_apply",
+            "wf_rules_compile",
+            "wf_rules_apply",
+            "wf_rules_rollback",
+            "wf_rules_delete",
+        ] {
+            assert!(
+                admin_action_request_notes(action).contains(&WF_RULES_TIMEOUT_NOTE),
+                "{action}"
+            );
+        }
+        for action in [
+            "wf_rules_check",
+            "wf_rules_get_workflow",
+            "wf_rules_get_status",
+            "wf_rules_list_workflows",
+        ] {
+            assert!(
+                !admin_action_request_notes(action).contains(&WF_RULES_TIMEOUT_NOTE),
+                "{action}"
+            );
+        }
+        assert_eq!(error_code_to_http_status("TIMEOUT"), 504);
+        assert!(WF_RULES_TIMEOUT_NOTE.starts_with("504 TIMEOUT is no refusal"));
+        for words in [
+            "the change may still complete",
+            "Never stage the change again at once: first read wf_rules_get_status",
+            "WORKFLOW_NOT_FOUND says a delete went through",
+        ] {
+            assert!(WF_RULES_TIMEOUT_NOTE.contains(words), "{words}");
+        }
+    }
+
+    /// A WF node names the wf.engine it runs in its status, which get_node_status passes on as
+    /// node_status.extensions.engine (FINDINGS A-302); its help says so, and that
+    /// runtime.resolved_version is the workflow package's own version (A-302's review), where only
+    /// the handbook did.
+    #[test]
+    fn get_node_status_help_names_the_engine_a_wf_node_runs() {
+        assert!(admin_action_request_notes("get_node_status").contains(&WF_NODE_ENGINE_NOTE));
+        for words in [
+            "node_status.extensions.engine, {runtime, version, executable}, names the wf.engine it runs",
+            "node_status.runtime.resolved_version is the workflow package's own version",
+        ] {
+            assert!(WF_NODE_ENGINE_NOTE.contains(words), "{words}");
         }
     }
 

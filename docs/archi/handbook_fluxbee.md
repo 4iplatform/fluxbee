@@ -981,6 +981,12 @@ person: when its provider gave no answer, the error carries the operator's text 
   `payload.retryable` is `true`: nothing changed, so the same request may go again as it was (in
   a plan, the step staged again for the operator's confirmation). Say so; never report it as a
   failed deploy or delete. A check and the reads are never refused so.
+- **A change answered `504 TIMEOUT` is no refusal, and may still complete:** a change whose turn
+  came with 20 s or more of SY.admin's wait left runs with its 60 s, and can end past the 75 s.
+  Never stage it again at once: first read `wf_rules_get_status`, which SY.wf-rules answers after
+  the change has ended, in the order the requests came. Its `current_version` and
+  `staged_version`, against what they were before, and its `wf_node` say what the change did;
+  `WORKFLOW_NOT_FOUND` says a delete went through. A read that times out too is read again.
 - **An update** starts from the deployed definition: read it with `GET
   /hives/{hive}/wf-rules?workflow_name=<name>` (`wf_rules_get_workflow`: its definition, version and
   hash), change only what the operator asked, and check it. Never rebuild it from memory. The

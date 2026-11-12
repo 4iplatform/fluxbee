@@ -169,7 +169,9 @@ it came. A change (`compile`, `apply`, `rollback`, `compile_apply`, `delete_work
 operation or a command) whose turn comes with less than 20 s left of SY.admin's 75 s wait for it
 is refused at once, `BUSY` with `retryable: true`, nothing changed (FINDINGS A-307, since 0.1.139;
 `node/turn.go`); a `check` and the queries never are. A change that runs keeps its 60 s from its
-turn.
+turn, so one whose turn came with 20 s or more left can still end past SY.admin's wait, which then
+answers `TIMEOUT` for a change that may complete: a `get_status` asked after it is answered once
+it has ended, and says what it did.
 
 ### 5.3 Operations (via CONFIG_SET or command)
 
