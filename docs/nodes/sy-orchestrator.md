@@ -1248,6 +1248,18 @@ after an open is not written. The detectors' rows keep their rule: any row of th
 the last hour keeps a new one out. The answer is `{status: "ok", recorded}`, with
 `recorded: false` for such a repeat; a failed write answers `DRIFT_ALERT_WRITE_FAILED`.
 
+**`list_deployments` and `get_deployments`** read `deployments-history.jsonl`
+(`read_deployment_history`), newest first: `limit` rows (50 when not given, at most 500), of one
+`category` when the payload names one, and for `get_deployments` those naming the hive (`target`)
+as a target or a worker.
+When no row read names this hive and the read may show it (`list_deployments`, or
+`get_deployments` of this hive), the rows of what this hive runs now are added
+(`local_deployment_history_snapshot_entries`, trigger `local_current_state`): its core, runtime and
+vendor rows, only the named category's when the read names one (FINDINGS A-296, since 0.1.139;
+before, a read of one category answered all three, which Archi's filtered reads reported as that
+category's deployments). Each row says whether its hives are still there (`target_hives_detail`,
+`hive_present`).
+
 **System messages** (`handle_system_message`), mostly between orchestrators: `SYSTEM_UPDATE`,
 `SYSTEM_CORE_ROLLBACK`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`, `KILL_NODE`, `START_NODE`,
 `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `NODE_STATE_GET`,

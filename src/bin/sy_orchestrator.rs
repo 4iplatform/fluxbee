@@ -22675,11 +22675,38 @@ fn local_deployment_history_snapshot_entries(
     entries
 }
 
+/// The rows of a deployments read (`list_deployments`, `get_deployments`), the history's `entries`
+/// read with `hive_filter` and `category_filter`, each with its hives' presence. When no row names
+/// this hive and the read may show it, the snapshot of what this hive runs now
+/// (`local_deployment_history_snapshot_entries`: its core, runtime and vendor rows) is added, only
+/// the row of `category_filter` when the read names one (FINDINGS A-296): a read of one category
+/// answered the snapshot rows of every category, which Archi's filtered reads reported as that
+/// category's deployments.
 fn enrich_deployment_history_entries(
+    state: &OrchestratorState,
+    entries: Vec<DeploymentHistoryEntry>,
+    hive_filter: Option<&str>,
+    category_filter: Option<&str>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    enrich_deployment_history_entries_with(
+        state,
+        entries,
+        hive_filter,
+        category_filter,
+        limit,
+        || local_deployment_history_snapshot_entries(state),
+    )
+}
+
+/// `enrich_deployment_history_entries` with this hive's snapshot rows from `local_snapshot`.
+fn enrich_deployment_history_entries_with(
     state: &OrchestratorState,
     mut entries: Vec<DeploymentHistoryEntry>,
     hive_filter: Option<&str>,
+    category_filter: Option<&str>,
     limit: usize,
+    local_snapshot: impl FnOnce() -> Vec<DeploymentHistoryEntry>,
 ) -> Vec<serde_json::Value> {
     let local_hive = state.hive_id.as_str();
     let should_include_local_snapshot = match hive_filter {
@@ -22692,7 +22719,11 @@ fn enrich_deployment_history_entries(
             .iter()
             .any(|entry| entry.target_hives.iter().any(|hive| hive == local_hive));
         if !local_already_present {
-            entries.extend(local_deployment_history_snapshot_entries(state));
+            entries.extend(
+                local_snapshot().into_iter().filter(|entry| {
+                    category_filter.is_none_or(|category| entry.category == category)
+                }),
+            );
             entries.sort_by_key(|entry| std::cmp::Reverse(entry.finished_at));
         }
     }
@@ -22816,7 +22847,7 @@ fn list_deployments_flow(
         Ok(entries) => serde_json::json!({
             "status": "ok",
             "view": "history",
-            "entries": enrich_deployment_history_entries(state, entries, None, limit),
+            "entries": enrich_deployment_history_entries(state, entries, None, category, limit),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -22842,7 +22873,13 @@ fn get_deployments_flow(
             "status": "ok",
             "view": "history",
             "hive_id": target_hive,
-            "entries": enrich_deployment_history_entries(state, entries, Some(&target_hive), limit),
+            "entries": enrich_deployment_history_entries(
+                state,
+                entries,
+                Some(&target_hive),
+                category,
+                limit,
+            ),
         }),
         Err(err) => serde_json::json!({
             "status": "error",
@@ -55246,6 +55283,100 @@ blob:
         assert!(own.get("note").is_none(), "{own}");
         let all = list_drift_alerts_flow(&state, &serde_json::json!({}));
         assert!(all["note"].as_str().is_some(), "{all}");
+    }
+
+    /// A deployments history row of `category` for `hives`, finished at `finished_at`.
+    fn deployment_row(category: &str, hives: &[&str], finished_at: u64) -> DeploymentHistoryEntry {
+        DeploymentHistoryEntry {
+            deployment_id: format!("{category}-{finished_at}"),
+            category: category.to_string(),
+            trigger: "test".to_string(),
+            actor: "SY.orchestrator@motherbee".to_string(),
+            started_at: finished_at,
+            finished_at,
+            manifest_version: None,
+            manifest_hash: None,
+            target_hives: hives.iter().map(|hive| hive.to_string()).collect(),
+            result: "ok".to_string(),
+            workers: Vec::new(),
+        }
+    }
+
+    /// FINDINGS A-296: a deployments read filtered by category gets the snapshot of what this hive
+    /// runs now only in that category's row. `GET /deployments?category=vendor&limit=5` on a
+    /// motherbee whose vendor rows did not name it answered its core and runtime snapshot rows
+    /// too, which Archi's filtered reads reported as vendor deployments. A read with no category
+    /// keeps the three rows, a category with no snapshot row gets none, and a row of the category
+    /// that names this hive keeps the snapshot out, as before.
+    #[test]
+    fn a_deployments_read_by_category_gets_only_that_categorys_snapshot_row() {
+        let state = sample_orchestrator_state_for_tests();
+        let snapshot = || {
+            ["core", "runtime", "vendor"]
+                .into_iter()
+                .zip([300, 200, 100])
+                .map(|(category, at)| deployment_row(category, &["motherbee"], at))
+                .collect::<Vec<_>>()
+        };
+        let categories = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter()
+                .map(|row| row["category"].as_str().unwrap_or("?").to_string())
+                .collect()
+        };
+        // The history's vendor rows, as read with the category: one names worker1 alone.
+        let vendor_rows = || vec![deployment_row("vendor", &["worker1"], 400)];
+
+        // list_deployments (no hive) and get_deployments of this hive, each with the category.
+        for hive_filter in [None, Some("motherbee")] {
+            let vendor = enrich_deployment_history_entries_with(
+                &state,
+                vendor_rows(),
+                hive_filter,
+                Some("vendor"),
+                5,
+                snapshot,
+            );
+            assert_eq!(categories(&vendor), ["vendor", "vendor"], "{vendor:?}");
+            assert_eq!(vendor[1]["deployment_id"], "vendor-100", "{vendor:?}");
+            assert_eq!(vendor[1]["history_view"], true, "{vendor:?}");
+        }
+        let none = enrich_deployment_history_entries_with(
+            &state,
+            Vec::new(),
+            None,
+            Some("workflow"),
+            5,
+            snapshot,
+        );
+        assert!(none.is_empty(), "{none:?}");
+        let every =
+            enrich_deployment_history_entries_with(&state, Vec::new(), None, None, 5, snapshot);
+        assert_eq!(
+            categories(&every),
+            ["core", "runtime", "vendor"],
+            "{every:?}"
+        );
+        // A vendor row that names this hive keeps the snapshot out.
+        let named = enrich_deployment_history_entries_with(
+            &state,
+            vec![deployment_row("vendor", &["motherbee"], 50)],
+            None,
+            Some("vendor"),
+            5,
+            snapshot,
+        );
+        assert_eq!(categories(&named), ["vendor"], "{named:?}");
+        assert_eq!(named[0]["deployment_id"], "vendor-50", "{named:?}");
+        // Another hive's read never gets this hive's snapshot.
+        let other = enrich_deployment_history_entries_with(
+            &state,
+            vendor_rows(),
+            Some("worker1"),
+            Some("vendor"),
+            5,
+            snapshot,
+        );
+        assert_eq!(categories(&other), ["vendor"], "{other:?}");
     }
 
     fn sample_orchestrator_state_for_tests() -> OrchestratorState {
