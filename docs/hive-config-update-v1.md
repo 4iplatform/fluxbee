@@ -654,7 +654,12 @@ one changed the design) and its gates (§10). The machinery is SY.admin's
     Since 0.1.137 (FINDINGS A-263) it reads every hive at once, as the explicit run does: one
     read at a time meant that a read a spoke's self-restart lost held up the reads of the hives
     after it for its whole bound, so their marks came one after the other, and an explicit run's
-    pass waited behind them. A read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`),
+    pass waited behind them. Since 0.1.139 (FINDINGS A-319) at most 8 at a time
+    (`BACKGROUND_READS_AT_ONCE`): bounded in time only, past about 16 in flight its reads queued
+    at the motherbee's orchestrator (16 forwarding places, 4 per target hive) while each one's
+    bound ran, and a queued read that timed out held its hive 50 s. A look takes its place before
+    it claims its hive, and lets it go once its read ends; the explicit run's reads and the
+    motherbee's own take none. A read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`),
     past that bound; one that timed out anyway keeps the hive unread for another 50 s, so a second
     never runs beside it. The re-read (`recheck`) claims its hive only for its own read, so an
     explicit run's pass on a hive waits only for the read of that hive under way (since 0.1.124

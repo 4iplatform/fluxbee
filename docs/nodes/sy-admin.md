@@ -1150,9 +1150,14 @@ time comes, in a task of its own, and sleeps until the next one is due:
   follow, the re-read and the automatic step share each hive's read, so at most one
   `GET_VERSIONS` of a hive is outstanding, and the hives' reads go beside each other: the
   background task reads every hive at once, each read under its own bound, since 0.1.137
-  (FINDINGS A-263). Before, it read one hive at a time, so a read that a spoke's self-restart lost
-  held up the reads of the hives after it for its whole bound, and an explicit run's pass waited
-  behind them. The motherbee's orchestrator forwards a spoke's read within its own bound (45 s,
+  (FINDINGS A-263), at most 8 at a time since 0.1.139 (`BACKGROUND_READS_AT_ONCE`, FINDINGS
+  A-319): past about 16 in flight the motherbee's orchestrator queued the rest (16 forwarding
+  places, 4 per target hive) while each read's bound ran. A look takes its place
+  (`background_place`) before it claims its hive and lets it go once its read ends, so a hive
+  waiting for a place is free for an explicit run; the explicit run's own reads, and the
+  motherbee's, which its orchestrator answers itself, take none. Before 0.1.137 it read one hive at
+  a time, so a read that a spoke's self-restart lost held up the reads of the hives after it for
+  its whole bound, and an explicit run's pass waited behind them. The motherbee's orchestrator forwards a spoke's read within its own bound (45 s,
   `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), each in a task of its own since 0.1.127 (FINDINGS
   A-199): a read waits 50 s (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`), and one that timed out
   anyway keeps that hive unread for another 50 s, so a second never runs beside it. A re-read

@@ -1827,6 +1827,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   per-read limit runs, and a queued read that times out outside a restart holds its hive 50 s.
 - **Effect:** none at 8.x's four hives; on a large installation the marks come late again.
 - **Fix, later:** cap the background reads below 16 (for example 8).
+- **Built on `coa/admin-139` for 0.1.139:** the background task reads at most 8 hives at once
+  (`BACKGROUND_READS_AT_ONCE`, a semaphore of `Updates`). Each look (the follow, the automatic
+  step, the re-read) takes its place before it claims its hive and lets it go once its read ends,
+  before anything else it does (`background_place`): a hive waiting for a place is free for an
+  explicit run, whose pass still waits only for that hive's read under way (A-263), and no look
+  waits for a second place while it holds one. The explicit run's reads and the motherbee's own
+  (`target_is_current`, which its orchestrator answers itself) take none. Its test,
+  `the_background_reads_at_most_eight_hives_at_once`, has twelve workers restart onto the target
+  with each read taking 300 ms: 8 at once, the update closed; without it, 12. sy-admin.md and
+  hive-config-update-v1 say it.
 
 ### A-318 [General/admin] 🔵 low (found 2026-11-11 by A-280's review; read in the code) — A failed publish's clean-up runs after the answer, so a stop of SY.admin during IO.blob's release orphans the copy
 

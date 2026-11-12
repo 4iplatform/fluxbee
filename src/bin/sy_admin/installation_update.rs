@@ -1522,6 +1522,17 @@ impl Bounds {
     }
 }
 
+/// How many hives the background task reads at once (FINDINGS A-319). Since 0.1.137 it reads every
+/// due hive beside the others (A-263), each read bounded in time only: past about 16 in flight the
+/// motherbee's orchestrator queues the rest (16 forwarding places, 4 per target hive) while
+/// SY.admin's bound of each runs, and a queued read that times out outside a restart holds its
+/// hive for another bound (50 s), so on a large installation the marks came late again. Under 16,
+/// so the background task alone never fills the orchestrator's places, and above what an
+/// installation of a few hives has due at once: none of 8.x's four waits. An explicit run's reads
+/// are not counted (they go once a run, the operator's), nor the motherbee's own, which its
+/// orchestrator answers itself (`target_is_current`).
+pub(crate) const BACKGROUND_READS_AT_ONCE: usize = 8;
+
 /// A task acting on a hive: what it does, for which update, since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Holder {
@@ -1554,6 +1565,8 @@ pub(crate) struct Updates {
     /// still be queued at the motherbee's orchestrator (outside a restart, FINDINGS A-250).
     reads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     quiet_until: Mutex<HashMap<String, u64>>,
+    /// The background task's places for a hive's read, `BACKGROUND_READS_AT_ONCE` (FINDINGS A-319).
+    background_reads: tokio::sync::Semaphore,
     /// One explicit run at a time.
     running: Mutex<Option<Running>>,
     /// The open update's target checked once after SY.admin's start; the registry's failure said.
@@ -1698,6 +1711,7 @@ impl Updates {
             ticked: Mutex::new(None),
             reads: Mutex::new(HashMap::new()),
             quiet_until: Mutex::new(HashMap::new()),
+            background_reads: tokio::sync::Semaphore::new(BACKGROUND_READS_AT_ONCE),
             running: Mutex::new(None),
             resume_checked: AtomicBool::new(false),
             registry_said: AtomicBool::new(false),
@@ -1881,6 +1895,9 @@ impl Updates {
     ///   own, is waited for all the same (this lock).
     ///
     /// A read that is answered ends any hold: the hive answers.
+    ///
+    /// The background task's looks take one of its places first (`background_place`, FINDINGS
+    /// A-319).
     pub(crate) async fn read_versions(
         &self,
         mesh: &dyn UpdateMesh,
@@ -1918,6 +1935,16 @@ impl Updates {
             Err(_) => {}
         }
         read
+    }
+
+    /// One of the background task's `BACKGROUND_READS_AT_ONCE` places for a hive's read (FINDINGS
+    /// A-319), held until it is dropped. A look takes it before it claims its hive and lets it go
+    /// once its read answered or gave up, before anything else it does: a look waiting for a place
+    /// holds no hive, so an explicit run's pass on a hive still waits only for that hive's read
+    /// under way (A-263), and a look never waits for a second place while it holds one. None only
+    /// when the places are closed, which nothing does.
+    pub(crate) async fn background_place(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.background_reads.acquire().await.ok()
     }
 
     /// Sets one hive's category in the update `id`, while it is the open one; logs an outcome on
@@ -3548,6 +3575,10 @@ pub(crate) async fn follow(
     target: &Target,
     bounds: &Bounds,
 ) {
+    // A place for its read, then the hive (FINDINGS A-319).
+    let Some(place) = updates.background_place().await else {
+        return;
+    };
     let Some(claim) = updates.claim(hive, READING, id) else {
         return;
     };
@@ -3557,8 +3588,12 @@ pub(crate) async fn follow(
     let automatic = entry.automatic.is_some();
     let mut ask_again = false;
     if entry.core.state == Standing::InFlight {
-        ask_again = follow_core(updates, mesh, &claim, id, hive, target, bounds, entry).await;
+        ask_again = follow_core(
+            updates, mesh, &claim, place, id, hive, target, bounds, entry,
+        )
+        .await;
     } else if entry.config.state == Standing::InFlight {
+        drop(place);
         if !target_is_current(updates, mesh, id, target, bounds).await {
             return;
         }
@@ -3595,6 +3630,7 @@ async fn follow_core(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
     claim: &Claim<'_>,
+    place: tokio::sync::SemaphorePermit<'_>,
     id: &str,
     hive: &str,
     target: &Target,
@@ -3610,6 +3646,7 @@ async fn follow_core(
     });
     let read_at = now_epoch_ms();
     let read = updates.read_versions(mesh, hive, bounds).await;
+    drop(place);
     let now = now_epoch_ms();
     let past_bound = now.saturating_sub(outcome.started_at_ms) > bounds.settle.as_millis() as u64;
     let watch = read.as_ref().ok().map(|snapshot| {
@@ -3833,10 +3870,16 @@ pub(crate) async fn automatic_step(
     if !target_is_current(updates, mesh, id, target, bounds).await {
         return;
     }
+    // A place for its read, then the hive (FINDINGS A-319).
+    let Some(place) = updates.background_place().await else {
+        return;
+    };
     let Some(claim) = updates.claim(hive, READING, id) else {
         return;
     };
-    let Ok(snapshot) = updates.read_versions(mesh, hive, bounds).await else {
+    let read = updates.read_versions(mesh, hive, bounds).await;
+    drop(place);
+    let Ok(snapshot) = read else {
         return;
     };
     // A core update found under way (one SY.admin's restart or a TIMEOUT left without its answer,
@@ -3952,13 +3995,19 @@ pub(crate) async fn recheck(
     if look == Look::AnswerCheck && mesh.orchestrator_connected(hive) == Some(false) {
         return;
     }
-    // The hive, then its read, beside the other hives' (FINDINGS A-263): it waits for no other
-    // hive's read, so an explicit run's pass on this hive waits only for this read.
+    // A place for its read, then the hive, then its read, beside the other hives' (FINDINGS A-263,
+    // A-319): it holds the hive only once it has its place, so an explicit run's pass on this hive
+    // waits only for this read.
+    let Some(place) = updates.background_place().await else {
+        return;
+    };
     let Some(_claim) = updates.claim(hive, READING, id) else {
         return;
     };
     let read_at = now_epoch_ms();
-    let Ok(snapshot) = updates.read_versions(mesh, hive, bounds).await else {
+    let read = updates.read_versions(mesh, hive, bounds).await;
+    drop(place);
+    let Ok(snapshot) = read else {
         return;
     };
     updates.set_role(id, hive, text_of(Some(&snapshot), "role"));

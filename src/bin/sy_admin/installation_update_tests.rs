@@ -994,6 +994,10 @@ struct FakeMesh {
     /// Reads of one hive outstanding at once, and the most seen.
     reading_now: Mutex<HashMap<String, usize>>,
     most_at_once: AtomicUsize,
+    /// Reads of any spoke (every hive but the motherbee) outstanding at once, and the most seen
+    /// (FINDINGS A-319).
+    spokes_reading: AtomicUsize,
+    most_spokes_at_once: AtomicUsize,
     /// How long a read takes.
     read_delay: Mutex<Duration>,
     registry_fails: AtomicBool,
@@ -1024,6 +1028,8 @@ impl FakeMesh {
             reads: AtomicU64::new(0),
             reading_now: Mutex::new(HashMap::new()),
             most_at_once: AtomicUsize::new(0),
+            spokes_reading: AtomicUsize::new(0),
+            most_spokes_at_once: AtomicUsize::new(0),
             read_delay: Mutex::new(Duration::ZERO),
             registry_fails: AtomicBool::new(false),
             lost_reads: Mutex::new(HashMap::new()),
@@ -1078,6 +1084,23 @@ impl FakeMesh {
     }
 }
 
+/// A spoke's read in flight on the fake mesh, counted from its start to its end (FINDINGS A-319).
+struct SpokeRead<'a>(&'a FakeMesh);
+
+impl<'a> SpokeRead<'a> {
+    fn start(mesh: &'a FakeMesh) -> SpokeRead<'a> {
+        let now = mesh.spokes_reading.fetch_add(1, Ordering::SeqCst) + 1;
+        mesh.most_spokes_at_once.fetch_max(now, Ordering::SeqCst);
+        SpokeRead(mesh)
+    }
+}
+
+impl Drop for SpokeRead<'_> {
+    fn drop(&mut self) {
+        self.0.spokes_reading.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[async_trait]
 impl UpdateMesh for FakeMesh {
     async fn versions(&self, hive: &str, timeout: Duration) -> Result<Value, String> {
@@ -1090,6 +1113,8 @@ impl UpdateMesh for FakeMesh {
             *count
         };
         self.most_at_once.fetch_max(at_once, Ordering::SeqCst);
+        // Every spoke's read in flight, counted until it ends whichever way it ends.
+        let _spoke = (hive != "motherbee").then(|| SpokeRead::start(self));
         let lost = match lock(&self.lost_reads).get_mut(hive) {
             Some(left) if *left > 0 => {
                 *left -= 1;
@@ -2070,6 +2095,87 @@ async fn the_follow_reads_every_hive_at_once() {
         );
         assert_eq!(entry.config.state, Standing::OnTarget, "{hive}");
     }
+}
+
+/// FINDINGS A-319: the background task reads at most `BACKGROUND_READS_AT_ONCE` hives at once.
+/// Twelve workers restart onto the target, each read taking 300 ms: the follow reads 8 at a time
+/// and the other 4 as places free, and the update closes with every worker settled and given its
+/// config. Since 0.1.137 it read every due hive at once (A-263), bounded in time only: twelve here,
+/// and past 16 the motherbee's orchestrator queued the rest while each read's bound ran. A look
+/// takes its place before it holds its hive, so a hive still waiting for one is free for an
+/// explicit run.
+#[tokio::test]
+async fn the_background_reads_at_most_eight_hives_at_once() {
+    let bounds = Bounds {
+        read: Duration::from_secs(30),
+        restart_read: Duration::from_secs(5),
+        flight_check: Duration::from_secs(30),
+        settle: Duration::from_secs(60),
+        ..quick()
+    };
+    let workers: Vec<String> = (1..=12).map(|n| format!("worker{n:02}")).collect();
+    let updates = Updates::load(&temp_state("installation-update-reads-capped"));
+    let mesh = FakeMesh::new(
+        std::iter::once(motherbee_on_target())
+            .chain(
+                workers
+                    .iter()
+                    .map(|hive| spoke_as(hive, "worker", worker_behind())),
+            )
+            .collect(),
+    );
+    let dyn_mesh: Arc<dyn UpdateMesh> = mesh.clone();
+    let motherbee = mesh.snapshot("motherbee");
+    let RunEnd::Update { update, .. } = run_explicit(
+        &updates,
+        &dyn_mesh,
+        "http",
+        Some("deploy 0.1.139"),
+        &[],
+        &motherbee,
+        &target_of(&motherbee),
+        &bounds,
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        panic!("an update opened");
+    };
+    for hive in &workers {
+        assert!(update.hives[hive].in_restart(), "{hive}");
+        mesh.set_snapshot(
+            hive,
+            spoke_as(hive, "worker", worker_settled_config_behind()),
+        );
+    }
+    // The explicit run read every hive at once, as it always did: only the background is counted.
+    mesh.most_spokes_at_once.store(0, Ordering::SeqCst);
+    *lock(&mesh.read_delay) = Duration::from_millis(300);
+
+    let background = tokio::spawn(run_background(
+        Arc::clone(&updates),
+        Arc::clone(&dyn_mesh),
+        bounds,
+    ));
+    for hive in &workers {
+        updates.look_now(hive);
+    }
+    wait_done(&updates, &update.id, Duration::from_secs(20)).await;
+    background.abort();
+    assert_eq!(
+        mesh.most_spokes_at_once.load(Ordering::SeqCst),
+        BACKGROUND_READS_AT_ONCE,
+        "the background read {} hives at once",
+        mesh.most_spokes_at_once.load(Ordering::SeqCst)
+    );
+    assert_eq!(mesh.most_at_once.load(Ordering::SeqCst), 1);
+    let done = updates.read(|file| file.closed[0].clone());
+    for hive in &workers {
+        let entry = &done.hives[hive.as_str()];
+        assert_eq!(entry.core.state, Standing::OnTarget, "{hive}");
+        assert_eq!(entry.config.state, Standing::OnTarget, "{hive}");
+    }
+    const { assert!(BACKGROUND_READS_AT_ONCE < 16) };
 }
 
 /// F2 (b) and (c): each hive is looked at by where it stands (in flight every few seconds; one that
