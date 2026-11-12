@@ -228,6 +228,38 @@ func TestAStorageRefusalIsLoggedWithTheDatabasesError(t *testing.T) {
 	}
 }
 
+// A timer that cannot be answered, its stored payload not JSON, is TIMER_INTERNAL to a TIMER_LIST, as
+// to a TIMER_GET: SY.timer's fault, not the database's, so the line gives no error, which would quote
+// the conversion's text as the database's. Since 1.7 the page's read meets it (takeTimerPage), and its
+// error carries the code (FINDINGS A-326's review); before, the handler did, and the read's errors
+// were TIMER_STORAGE_ERROR.
+func TestATimerListOfATimerThatCannotBeAnsweredIsInternal(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	logged := captureLog(t)
+	const owner = "WF.demo@motherbee"
+	now := time.Now().UTC()
+	// insertTimer refuses such a payload, so it goes in as no SY.timer writes it.
+	if _, err := service.db.Exec(`INSERT INTO timers (uuid, owner_l2_name, target_l2_name, kind, fire_at_utc, missed_policy, payload, status, created_at_utc)
+VALUES ('timer-unreadable', ?, ?, 'oneshot', ?, 'fire', '{"not json', 'pending', ?)`, owner, owner, now.Add(time.Hour).UnixMilli(), now.UnixMilli()); err != nil {
+		t.Fatalf("store the timer: %v", err)
+	}
+	msg := mustBuildSystemMessageAs(t, map[string]any{}, "TIMER_LIST", owner)
+	if err := service.handleMessage(msg); err != nil {
+		t.Fatalf("TIMER_LIST: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if response.OK || response.Error == nil || response.Error.Code != "TIMER_INTERNAL" {
+		t.Fatalf("TIMER_LIST: %+v (error %+v), want TIMER_INTERNAL", response, response.Error)
+	}
+	lines := loggedEvents(t, logged, "timer_request_refused")
+	want := map[string]any{"event": "timer_request_refused", "verb": "TIMER_LIST", "error_code": "TIMER_INTERNAL",
+		"src_l2_name": owner, "trace_id": msg.Routing.TraceID}
+	if len(lines) != 1 || fmt.Sprint(lines[0]) != fmt.Sprint(want) {
+		t.Fatalf("logged %v, want %v", lines, want)
+	}
+}
+
 // A message that is no request gets no answer, and a line bounded per sender as a refusal's is, in
 // windows of its own: 10 lines a minute per sender, then the count of the rest, with the last one's
 // name. Messages the router made have no sender, and share one window. Before, each got a plain line,

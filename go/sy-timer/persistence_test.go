@@ -20,7 +20,7 @@ import (
 func openTestTimerDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := openTimerDB(filepath.Join(dir, "timers.db"))
+	db, _, err := openTimerDB(filepath.Join(dir, "timers.db"))
 	if err != nil {
 		t.Fatalf("open timer db: %v", err)
 	}
@@ -190,9 +190,10 @@ var planIndex = regexp.MustCompile(`USING (?:COVERING )?INDEX (\w+)`)
 // cursor's place on, whatever its filters, and sorts nothing (FINDINGS A-326): it reads the timers it
 // lists and one more, whatever the hive holds. So on a new table, and on one an older SY.timer made,
 // to which the start adds the indexes. Before 1.7 a page of an owner's timers in one status searched
-// idx_timers_status and sorted every timer of the hive in that status, every owner's; a page of any
-// status sorted all of the owner's timers, or the whole table; and the cursor was a filter on what the
-// page read, not the place it started.
+// idx_timers_status, read every timer of the hive in that status, every owner's, and sorted the
+// owner's; a page of any status read and sorted all of the owner's timers, or the whole table; and the
+// cursor was a filter on what the page read, not the place it started. The hive's pending timers, the
+// list SY.admin asks with no owner and no status, are the review's case.
 func TestATimerListPageReadsAnIndexInTheListsOrder(t *testing.T) {
 	ofSYTimer14, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
 	if err != nil {
@@ -200,7 +201,7 @@ func TestATimerListPageReadsAnIndexInTheListsOrder(t *testing.T) {
 	}
 	defer ofSYTimer14.Close()
 	startAsSYTimer14(t, ofSYTimer14)
-	if err := ensureTimerSchema(ofSYTimer14); err != nil {
+	if _, err := ensureTimerSchema(ofSYTimer14); err != nil {
 		t.Fatalf("the start on SY.timer 1.4's table: %v", err)
 	}
 	after := &timerListCursor{fireAtUTC: 1775577600000, uuid: "timer-1"}
@@ -214,6 +215,7 @@ func TestATimerListPageReadsAnIndexInTheListsOrder(t *testing.T) {
 			{lists: "an owner's pending timers", owner: "WF.demo@motherbee", status: "pending", index: "idx_timers_list_owner_status"},
 			{lists: "an owner's canceled timers", owner: "WF.demo@motherbee", status: "canceled", index: "idx_timers_list_owner_status"},
 			{lists: "an owner's timers of any status", owner: "WF.demo@motherbee", status: "all", index: "idx_timers_list_owner"},
+			{lists: "the hive's pending timers", status: "pending", index: "idx_timers_list_status"},
 			{lists: "the hive's fired timers", status: "fired", index: "idx_timers_list_status"},
 			{lists: "the hive's timers of any status", status: "all", index: "idx_timers_list"},
 		} {
@@ -232,6 +234,156 @@ func TestATimerListPageReadsAnIndexInTheListsOrder(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// sortedTimerIndexNames lists the timers table's indexes by name, in order.
+func sortedTimerIndexNames(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	has, err := timerIndexNames(db)
+	if err != nil {
+		t.Fatalf("read the indexes: %v", err)
+	}
+	var names []string
+	for name := range has {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// The indexes of a timers table as the start leaves it since the review of A-326.
+var timerIndexesOf17 = []string{"idx_timers_list", "idx_timers_list_owner", "idx_timers_list_owner_status", "idx_timers_list_status",
+	"idx_timers_owner_clientref_pending", "idx_timers_status", "sqlite_autoindex_timers_1"}
+
+// The start builds the indexes the table lacks and, once it has the four idx_timers_list*, drops the
+// two of SY.timer before 1.7 they replace, idx_timers_owner and idx_timers_fire_at, which no statement
+// reads then and every write of a timer kept up, a purge most (the review of A-326). It says what it
+// built and dropped, and how long that took, for its ready line (startupIndexes). On a new table it
+// builds them all and drops nothing; on SY.timer 1.4's table it builds the four and drops the two;
+// the next start does nothing. The purge finds the owner's timers in the owner's list indexes, where
+// it read idx_timers_owner, and the hive's count of pending timers still reads idx_timers_status,
+// narrower than idx_timers_list_status. Before the review the start kept the two, and said nothing
+// of what it built.
+func TestTheStartBuildsTheListIndexesAndDropsTheTwoTheyReplace(t *testing.T) {
+	ctx := context.Background()
+	newTable, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer newTable.Close()
+	ofSYTimer14, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer ofSYTimer14.Close()
+	startAsSYTimer14(t, ofSYTimer14)
+	const owner = "WF.demo@motherbee"
+	insertPendingTimers(t, ofSYTimer14, owner, "timer-%04d", 300, 1775577600000, 1, `{}`)
+	for _, table := range []struct {
+		name           string
+		db             *sql.DB
+		built, dropped []string
+	}{
+		{name: "a new table", db: newTable,
+			built: []string{"idx_timers_status", "idx_timers_list_owner_status", "idx_timers_list_owner", "idx_timers_list_status", "idx_timers_list"}, dropped: []string{}},
+		{name: "SY.timer 1.4's table", db: ofSYTimer14,
+			built: []string{"idx_timers_list_owner_status", "idx_timers_list_owner", "idx_timers_list_status", "idx_timers_list"}, dropped: retiredTimerIndexes},
+	} {
+		for start := 1; start <= 2; start++ {
+			indexes, err := ensureTimerSchema(table.db)
+			if err != nil {
+				t.Fatalf("%s, start %d: %v", table.name, start, err)
+			}
+			built, dropped := table.built, table.dropped
+			if start == 2 {
+				built, dropped = []string{}, []string{}
+			}
+			if fmt.Sprint(indexes.built) != fmt.Sprint(built) || fmt.Sprint(indexes.dropped) != fmt.Sprint(dropped) || len(indexes.failed) != 0 {
+				t.Fatalf("%s, start %d: built %v, dropped %v, failed %v; want %v built and %v dropped", table.name, start,
+					indexes.built, indexes.dropped, indexes.failed, built, dropped)
+			}
+			if start == 1 && indexes.took <= 0 {
+				t.Fatalf("%s: the start's index step took %s", table.name, indexes.took)
+			}
+			if names := sortedTimerIndexNames(t, table.db); fmt.Sprint(names) != fmt.Sprint(timerIndexesOf17) {
+				t.Fatalf("%s, start %d: the indexes are %v, want %v", table.name, start, names, timerIndexesOf17)
+			}
+		}
+		for _, statement := range []struct {
+			does, query, index string
+			args               []any
+		}{
+			{does: "the purge's delete of the owner's pending timers", query: deleteOwnerPendingTimersSQL, index: "idx_timers_list_owner_status", args: []any{owner}},
+			{does: "the purge's delete of the owner's other timers", query: deleteOwnerTimersSQL, index: "idx_timers_list_owner", args: []any{owner}},
+			{does: "the hive's count of pending timers", query: `SELECT COUNT(*) FROM timers WHERE status='pending'`, index: "idx_timers_status"},
+		} {
+			plan := queryPlan(t, table.db, statement.query, statement.args...)
+			if found := planIndex.FindStringSubmatch(strings.Join(plan, " | ")); len(plan) != 1 || found == nil || found[1] != statement.index {
+				t.Fatalf("%s: %s reads %q, want the index %s", table.name, statement.does, plan, statement.index)
+			}
+		}
+	}
+	listed, more, err := listTimers(ctx, ofSYTimer14, owner, "all", maxListLimit, noFrameCut, nil)
+	if err != nil || more || len(listed) != 300 || listed[0].UUID != "timer-0000" || listed[299].UUID != "timer-0299" {
+		t.Fatalf("SY.timer 1.4's timers after the start: %d listed, more %v (%v)", len(listed), more, err)
+	}
+}
+
+// An index only speeds reads up, so a start that cannot build one goes on without it, and says so
+// (indexes_failed, startupIndexes): every read finds the same timers, more slowly. It keeps the two
+// indexes the four idx_timers_list* replace while one of the four is missing, for the reads they
+// serve, and the next start builds it and drops them. Here one build fails on a name a table holds,
+// where on a hive a disk short of room would fail the first start's builds over the whole table.
+// Before the review of A-326 a failed build stopped the start, and systemd started SY.timer again
+// every 5 s, failing each time.
+func TestAStartThatCannotBuildAnIndexGoesOnWithoutIt(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	startAsSYTimer14(t, db)
+	const owner = "WF.demo@motherbee"
+	insertPendingTimers(t, db, owner, "timer-%04d", 30, 1775577600000, 1, `{}`)
+	if _, err := db.Exec(`CREATE TABLE idx_timers_list_owner (taken INTEGER)`); err != nil {
+		t.Fatalf("take the name: %v", err)
+	}
+
+	indexes, err := ensureTimerSchema(db)
+	if err != nil {
+		t.Fatalf("the start stopped on an index it could not build: %v", err)
+	}
+	if fmt.Sprint(indexes.built) != "[idx_timers_list_owner_status idx_timers_list_status idx_timers_list]" || len(indexes.dropped) != 0 ||
+		len(indexes.failed) != 1 || !strings.Contains(indexes.failed["idx_timers_list_owner"], "already a table named idx_timers_list_owner") {
+		t.Fatalf("built %v, dropped %v, failed %v; want the three others built, nothing dropped, and idx_timers_list_owner's error", indexes.built, indexes.dropped, indexes.failed)
+	}
+	want := []string{"idx_timers_fire_at", "idx_timers_list", "idx_timers_list_owner_status", "idx_timers_list_status", "idx_timers_owner",
+		"idx_timers_owner_clientref_pending", "idx_timers_status", "sqlite_autoindex_timers_1"}
+	if names := sortedTimerIndexNames(t, db); fmt.Sprint(names) != fmt.Sprint(want) {
+		t.Fatalf("the indexes are %v, want %v", names, want)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersion {
+		t.Fatalf("user_version %d (%v), want %d: the rest of the schema step ran", version, err, timerSchemaVersion)
+	}
+	for _, status := range []string{"pending", "all"} {
+		listed, more, err := listTimers(ctx, db, owner, status, 20, noFrameCut, &timerListCursor{fireAtUTC: 1775577600000 + 4, uuid: "timer-0004"})
+		if err != nil || !more || len(listed) != 20 || listed[0].UUID != "timer-0005" || listed[19].UUID != "timer-0024" {
+			t.Fatalf("the owner's %s timers without the index: %d listed, more %v (%v)", status, len(listed), more, err)
+		}
+	}
+
+	if _, err := db.Exec(`DROP TABLE idx_timers_list_owner`); err != nil {
+		t.Fatalf("free the name: %v", err)
+	}
+	indexes, err = ensureTimerSchema(db)
+	if err != nil || fmt.Sprint(indexes.built) != "[idx_timers_list_owner]" || fmt.Sprint(indexes.dropped) != fmt.Sprint(retiredTimerIndexes) || len(indexes.failed) != 0 {
+		t.Fatalf("the next start built %v, dropped %v, failed %v (%v); want idx_timers_list_owner built and %v dropped", indexes.built, indexes.dropped, indexes.failed, err, retiredTimerIndexes)
+	}
+	if names := sortedTimerIndexNames(t, db); fmt.Sprint(names) != fmt.Sprint(timerIndexesOf17) {
+		t.Fatalf("the indexes are %v, want %v", names, timerIndexesOf17)
 	}
 }
 
@@ -482,7 +634,7 @@ INSERT INTO timers (
 		t.Fatalf("insert legacy rows: %v", err)
 	}
 
-	if err := ensureTimerSchema(db); err != nil {
+	if _, err := ensureTimerSchema(db); err != nil {
 		t.Fatalf("migrate legacy v1 db with unique client_refs: %v", err)
 	}
 
@@ -522,7 +674,7 @@ INSERT INTO timers (
 		t.Fatalf("insert duplicate legacy rows: %v", err)
 	}
 
-	err = ensureTimerSchema(db)
+	_, err = ensureTimerSchema(db)
 	if err == nil {
 		t.Fatalf("expected duplicate client_ref migration to fail")
 	}
@@ -556,7 +708,7 @@ func TestEnsureTimerSchemaAddsCanceledReasonToAVersion2Table(t *testing.T) {
 	}
 
 	for pass := 1; pass <= 2; pass++ {
-		if err := ensureTimerSchema(db); err != nil {
+		if _, err := ensureTimerSchema(db); err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
 		var version int
@@ -978,6 +1130,31 @@ func timersSchema(t *testing.T, db *sql.DB) string {
 	return strings.Join(schema, "\n")
 }
 
+// schemaChange is what changed from one timersSchema reading to the next: the lines only the first
+// has, and the lines only the second has, each in the readings' order.
+func schemaChange(before, after string) (removed, added []string) {
+	in := func(lines []string, line string) bool {
+		for _, other := range lines {
+			if other == line {
+				return true
+			}
+		}
+		return false
+	}
+	beforeLines, afterLines := strings.Split(before, "\n"), strings.Split(after, "\n")
+	for _, line := range beforeLines {
+		if !in(afterLines, line) {
+			removed = append(removed, line)
+		}
+	}
+	for _, line := range afterLines {
+		if !in(beforeLines, line) {
+			added = append(added, line)
+		}
+	}
+	return removed, added
+}
+
 // What SY.timer 1.4 sends its database, copied from its code (6c6b084f, go/sy-timer/persistence.go):
 // it names every column it writes and reads, and none is canceled_at_utc.
 const (
@@ -1054,7 +1231,7 @@ func TestEnsureTimerSchemaAddsCanceledAtToAVersion3Table(t *testing.T) {
 	}
 
 	for pass := 1; pass <= 2; pass++ {
-		if err := ensureTimerSchema(db); err != nil {
+		if _, err := ensureTimerSchema(db); err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
 		var version, hasColumn int
@@ -1077,10 +1254,11 @@ func TestEnsureTimerSchemaAddsCanceledAtToAVersion3Table(t *testing.T) {
 
 // Back to SY.timer 1.4 after 1.5 (FINDINGS A-238's rollback): 1.4 starts on the version 4 table, and
 // reads, writes and deletes its timers as before. Its start, its own schema step run as it is, writes
-// user_version 3 back and changes nothing else: every other statement of its ensureTimerSchema is IF
-// NOT EXISTS, or skipped. Its GC ages a canceled timer by its creation again. The date 1.5 gave a
-// cancellation survives 1.4's writes, and 1.4's own cancellation has none; 1.5, started again, keeps
-// the table and dates that one.
+// user_version 3 back and builds again the two indexes 1.7 dropped (retiredTimerIndexes), and changes
+// nothing else: every other statement of its ensureTimerSchema is IF NOT EXISTS, or skipped. Its GC
+// ages a canceled timer by its creation again. The date 1.5 gave a cancellation survives 1.4's writes,
+// and 1.4's own cancellation has none; 1.5, started again (1.7 today), drops the two again, keeps the
+// rest of the table and dates that one.
 func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 	db := openTestTimerDB(t)
 	ctx := context.Background()
@@ -1098,16 +1276,18 @@ func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 		}
 	}
 
-	// SY.timer 1.4 starts: its schema step, which leaves the table as it is, then its history GC,
-	// which takes the timer canceled an hour ago but scheduled a month ago.
+	// SY.timer 1.4 starts: its schema step, which builds its two indexes 1.7 dropped and leaves the
+	// rest of the table as it is, then its history GC, which takes the timer canceled an hour ago but
+	// scheduled a month ago.
 	schemaOf15 := timersSchema(t, db)
 	startAsSYTimer14(t, db)
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersionOfSYTimer14 {
 		t.Fatalf("SY.timer 1.4's start: user_version %d (%v), want %d", version, err, timerSchemaVersionOfSYTimer14)
 	}
-	if schema := timersSchema(t, db); schema != schemaOf15 {
-		t.Fatalf("SY.timer 1.4's start changed the table:\n%s\nwas:\n%s", schema, schemaOf15)
+	if removed, added := schemaChange(schemaOf15, timersSchema(t, db)); len(removed) != 0 || len(added) != 2 ||
+		!strings.HasPrefix(added[0], "index idx_timers_fire_at: ") || !strings.HasPrefix(added[1], "index idx_timers_owner: ") {
+		t.Fatalf("SY.timer 1.4's start removed %q and added %q, want its two indexes 1.7 dropped added", removed, added)
 	}
 	result, err := db.Exec(gcOfSYTimer14, now.Add(-defaultHistoryRetention).UnixMilli())
 	if err != nil {
@@ -1148,9 +1328,13 @@ func TestSYTimer14KeepsWorkingOnAVersion4Table(t *testing.T) {
 		t.Fatalf("1.4's own cancellation: %+v (%v)", row, err)
 	}
 
-	// SY.timer 1.5 starts again.
-	if err := ensureTimerSchema(db); err != nil {
+	// SY.timer 1.5 starts again: 1.7 today, which drops the two indexes 1.4 built.
+	indexes, err := ensureTimerSchema(db)
+	if err != nil {
 		t.Fatalf("ensure schema: %v", err)
+	}
+	if len(indexes.built) != 0 || strings.Join(indexes.dropped, ",") != strings.Join(retiredTimerIndexes, ",") || len(indexes.failed) != 0 {
+		t.Fatalf("the start built %v, dropped %v, failed %v; want %v dropped and nothing else", indexes.built, indexes.dropped, indexes.failed, retiredTimerIndexes)
 	}
 	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != timerSchemaVersion {
 		t.Fatalf("user_version %d (%v), want %d", version, err, timerSchemaVersion)
@@ -1230,7 +1414,7 @@ func TestManagedNodeInstanceDirUsesSYKindRoot(t *testing.T) {
 func TestOpenTimerDBCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "timers.db")
-	db, err := openTimerDB(path)
+	db, _, err := openTimerDB(path)
 	if err != nil {
 		t.Fatalf("open timer db: %v", err)
 	}

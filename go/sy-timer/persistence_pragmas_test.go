@@ -9,7 +9,7 @@ import (
 // The scheduler writes while requests are served, so the pool holds several connections: every one
 // of them must wait for the lock (busy_timeout) and run in WAL, not just the first.
 func TestEveryConnectionGetsThePragmas(t *testing.T) {
-	db, err := openTimerDB(filepath.Join(t.TempDir(), "timers.db"))
+	db, _, err := openTimerDB(filepath.Join(t.TempDir(), "timers.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -197,7 +197,7 @@ func main() {
 	}
 
 	dbPath := filepath.Join(instanceDir, "timers.db")
-	db, err := openTimerDB(dbPath)
+	db, indexes, err := openTimerDB(dbPath)
 	if err != nil {
 		log.Fatalf("failed to open timers db: %v", err)
 	}
@@ -227,10 +227,12 @@ func main() {
 		"node_name": service.nodeName,
 		"db_path":   service.dbPath,
 	}
-	pending := startupPending(startup, pendingCount, pendingErr)
-	gc := startupGC(startup, deleted, stamped, gcErr)
+	ready := []string{startupPending(startup, pendingCount, pendingErr), startupGC(startup, deleted, stamped, gcErr)}
+	if line := startupIndexes(startup, indexes); line != "" {
+		ready = append(ready, line)
+	}
 	logEvent("timer_startup", startup)
-	log.Printf("SY.timer ready: node=%s db=%s %s %s", service.nodeName, service.dbPath, pending, gc)
+	log.Printf("SY.timer ready: node=%s db=%s %s", service.nodeName, service.dbPath, strings.Join(ready, " "))
 	service.scheduler.start()
 	go service.sweepLogsEvery(senderLogSweepInterval)
 	service.run()
@@ -262,6 +264,29 @@ func startupGC(fields map[string]any, deleted, stamped int64, err error) string 
 	fields["gc_deleted"] = deleted
 	fields["gc_stamped"] = stamped
 	return fmt.Sprintf("gc_deleted=%d gc_stamped=%d", deleted, stamped)
+}
+
+// startupIndexes puts what the start did to the indexes (ensureTimerIndexes) in the timer_startup
+// event's fields, and returns it for the ready line, when it built or dropped one or could not; at a
+// start that did none of that, as most starts, nothing. indexes_built and indexes_dropped name them,
+// and indexes_ms is the step's time, before the history GC and the replay: the first start of 1.7
+// builds the four idx_timers_list* over the table it finds and drops the two they replace (FINDINGS
+// A-326). An index it could not build or drop is in indexes_failed, with the error, and the start
+// goes on without it, or with it (the review of A-326).
+func startupIndexes(fields map[string]any, step timerIndexStep) string {
+	if len(step.built)+len(step.dropped)+len(step.failed) == 0 {
+		return ""
+	}
+	took := step.took.Milliseconds()
+	fields["indexes_built"] = step.built
+	fields["indexes_dropped"] = step.dropped
+	fields["indexes_ms"] = took
+	line := fmt.Sprintf("indexes_built=%d indexes_dropped=%d indexes_ms=%d", len(step.built), len(step.dropped), took)
+	if len(step.failed) > 0 {
+		fields["indexes_failed"] = step.failed
+		line += fmt.Sprintf(" indexes_failed=%d", len(step.failed))
+	}
+	return line
 }
 
 func (s *Service) run() {
@@ -953,7 +978,11 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 	if !isCanonicalL2Name(ownerL2Name) {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INVALID_PAYLOAD", "owner_l2_name must be a canonical L2 name")
 	}
+	// took_ms is the delete's own time: the part SY.timer spends of the 3 s the orchestrator waits for
+	// the purge's answer, which each index makes longer (deleteTimersByOwner; the review of A-326).
+	started := time.Now()
 	deletedCount, pending, err := deleteTimersByOwner(context.Background(), s.db, ownerL2Name)
+	took := time.Since(started)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_STORAGE_ERROR", err.Error())
 	}
@@ -961,6 +990,7 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 	logEvent("timer_owner_purged", map[string]any{
 		"owner_l2_name": ownerL2Name,
 		"deleted_count": deletedCount,
+		"took_ms":       took.Milliseconds(),
 		"requester_l2":  requesterL2,
 		"trace_id":      incoming.Routing.TraceID,
 	})

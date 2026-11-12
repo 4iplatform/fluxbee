@@ -103,10 +103,12 @@ func TestACanceledOrMovedTimerKeepsNoEntryOrOne(t *testing.T) {
 }
 
 // A TIMER_PURGE_OWNER takes the owner's pending timers out of the heap, and only the owner's; its
-// answer still counts every timer it deleted, its history included.
+// answer still counts every timer it deleted, its history included. Its line gives the count, and the
+// delete's own time, took_ms, which the orchestrator gives 3 s (the review of A-326).
 func TestAPurgedOwnersTimersLeaveTheHeap(t *testing.T) {
 	service, tx := newTestService(t)
 	service.scheduler = newTimerScheduler(service)
+	logged := captureLog(t)
 	ask := func(verb, sender string, request map[string]any) string {
 		t.Helper()
 		if err := service.handleMessage(mustBuildSystemMessageAs(t, request, verb, sender)); err != nil {
@@ -138,6 +140,13 @@ func TestAPurgedOwnersTimersLeaveTheHeap(t *testing.T) {
 	}
 	if timers, retries := queuedTimers(t, service.scheduler); len(timers) != 1 || timers[other] == 0 || retries != 0 {
 		t.Fatalf("after the purge the heap holds %v and %d retries, want %s only", timers, retries, other)
+	}
+	lines := loggedEvents(t, logged, "timer_owner_purged")
+	if len(lines) != 1 || lines[0]["owner_l2_name"] != "WF.demo@motherbee" || lines[0]["deleted_count"] != float64(3) {
+		t.Fatalf("logged %v, want one timer_owner_purged of WF.demo@motherbee's 3 timers", lines)
+	}
+	if took, ok := lines[0]["took_ms"].(float64); !ok || took < 0 {
+		t.Fatalf("the purge's line gives took_ms %v, want the delete's time in ms", lines[0]["took_ms"])
 	}
 }
 

@@ -451,7 +451,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect).
 - A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
-- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate; built on `coa/timer-139` for 0.1.139, SY.timer 1.7: an index for each filter, `all` included, and a page that reads no further than its frame).
+- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate; built on `coa/timer-139` for 0.1.139, SY.timer 1.7: an index for each filter, `all` included, and a page that reads no further than its frame; its review: the two old indexes no statement reads dropped, as each index lengthens the purge, the builds best-effort and reported in the ready line, the purge's time in its line).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-328 🔵 SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next` (low; SY.admin's next change).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
@@ -1922,6 +1922,66 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     each through SY.admin. What held that one page up was not found: SY.timer logs no request's
     time, and the router's and SY.admin's part of it was not measured. 0.1.139's gate times the
     walk page by page on 0.1.138 and again on 0.1.139.
+- **The review (2026-11-12), applied on `coa/timer-139`:**
+  - **The purge's time (medium).** `TIMER_PURGE_OWNER` deletes each of the owner's timers from the
+    table and from every index, in one transaction, and the orchestrator waits 3 s for its answer: a
+    purge that misses them stops the node's removal (`TIMER_PURGE_FAILED`; running it again finishes
+    it). The four indexes lengthen it. Measured with SY.timer's SQLite (modernc) on the Mac, the
+    medians of 5 runs taken in turn, the timers scheduled ten at a time and interleaved over time:
+
+    | The owner's timers, among the hive's pending | 1.6 | 1.7 as first built | 1.7 after the review |
+    |---|---|---|---|
+    | 7,500 pending, among 18,000 (the gate's) | 130 ms | 211 ms | 206 ms |
+    | 7,500 pending and 20,000 fired, among 18,000 | 305 ms | 901 ms | 668 ms |
+    | 10,000 pending, among 100,000 | 438 ms | 819 ms | 757 ms |
+    | 10,000 pending and 20,000 fired, among 100,000 | 911 ms | 1,981 ms | 1,504 ms |
+
+    The slowest run of the last case took 2.06 s. With the Mac busier (a load of 12 on 16 cores),
+    single runs at 100,000 pending took 3.1 to 5.1 s on both 1.7s, none over 1.6 s on 1.6. The
+    owner's history counts most, and SY.timer deletes history only at a start, so it can grow for
+    weeks.
+  - **Two indexes dropped.** EXPLAIN over every statement (modernc, with the three old indexes and
+    the four new): `idx_timers_fire_at` is read by none; `idx_timers_owner` only by the purge's
+    delete of the owner's timers, which `idx_timers_list_owner` serves as well; `idx_timers_status`
+    by the hive's count of pending timers, which each new timer runs, and by the start's GC. So the
+    start drops `idx_timers_owner` and `idx_timers_fire_at` once it has the four (`retiredTimerIndexes`,
+    `ensureTimerIndexes`), and keeps `idx_timers_status`: its entries are narrower, and the hive's
+    count read it in 8 to 11 ms at 100,000 pending, where `idx_timers_list_status` took 13 to 16.
+    The purge is 2 to 26% faster than 1.7 as first built (the table above), still 1.6 to 2.2 times
+    1.6's. A rollback's start builds the two again, and the next start of 1.7 drops them again.
+  - **The builds best-effort (low).** An index the start cannot build (a disk short of room for the
+    first start's build over the whole table) goes in `indexes_failed` with its error, and the start
+    goes on without it; it keeps the two old indexes while one of the four is missing, and the next
+    start tries again. Before, the failure stopped the start (`log.Fatalf`), and systemd started
+    SY.timer again every 5 s, failing each time.
+  - **The start says what it did** (the gate's measurement of the build): `timer_startup` and the
+    ready line give `indexes_built`, `indexes_dropped`, `indexes_ms` (the index step's own time) and
+    `indexes_failed`, when the start built or dropped an index or could not (`startupIndexes`); the
+    first start of 1.7 says `indexes_built=4 indexes_dropped=2`. The interval from systemd's
+    `Started` line to the ready line also holds the identity wait and the router's connection,
+    which come first. Measured on the Mac on 1.6's table: 0.14 s at 18,000 pending timers, 1.8 to
+    1.9 s at 200,000 (100,000 pending and 100,000 fired); the pages in use from 8.1 to 12.0 MB and
+    from 81 to 126 MB, the dropped indexes' pages left free in the file.
+  - **The purge's line gives its time:** `timer_owner_purged` has `took_ms`, the delete's own time.
+  - **Tests:** `TestTheStartBuildsTheListIndexesAndDropsTheTwoTheyReplace` (a new table, SY.timer
+    1.4's, a second start; the purge's two deletes and the hive's count read their indexes),
+    `TestAStartThatCannotBuildAnIndexGoesOnWithoutIt` (the build fails on a name a table holds),
+    `TestSYTimer14KeepsWorkingOnAVersion4Table` (1.4's start builds the two again, 1.7's drops them),
+    `TestAStartSaysWhatItDidToTheIndexes`, `TestATimerListOfATimerThatCannotBeAnsweredIsInternal`
+    (a stored payload that is not JSON: `TIMER_INTERNAL`, and the refusal's line gives no `error`;
+    no test covered the code's move into the read), `TestAPurgedOwnersTimersLeaveTheHeap`
+    (`took_ms`), and the plan test's case of the hive's pending timers, the default list. Each
+    checked to fail without its part: the drop, the best-effort build, the wait for the four, the
+    code the read's error carries, the report, `took_ms`.
+  - **Wording:** before 1.7 a page read every timer of the hive in its status and sorted the
+    owner's past its cursor, not all of them (the code's comments, `docs/sy-timer.md` §7.6, the
+    node page).
+  - **A lever measured, not taken:** SY.timer runs with SQLite's default page cache, 2 MB per
+    connection, and a large purge spills to the WAL as it goes. With `cache_size` at 16 MiB the
+    purge of 10,000 pending and 20,000 fired among 100,000 took 1.12 s on 1.7 as first built, where
+    it took 2.2 s with the default, and 0.54 s on 1.6. It costs memory on every hive, up to that
+    much for each connection of the pool, so it is the operator's call if the gate's purge times
+    ask for it.
 
 ### A-325 [General/AI runners] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
 

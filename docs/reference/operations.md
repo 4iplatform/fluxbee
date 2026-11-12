@@ -857,7 +857,9 @@ stopped instance, `teardown_node` and `purge_ilk` of the node's ILK. In order:
    launch the node again;
 2. `TIMER_PURGE_OWNER` to the hive's SY.timer, 3 s (a failure stops the purge there:
    `TIMER_PURGE_FAILED`, with `relaunch_on_boot: false`, and the node stays stopped with its files
-   and identity until the purge runs again);
+   and identity until the purge runs again; SY.timer's `timer_owner_purged` line gives the delete's
+   own time, `took_ms`, which grows with the node's timers and their history:
+   [SY.timer](../sy-timer.md#77-timer_purge_owner-exclusive-use-of-syorchestrator));
 3. deletes the node directory, its UUID file and its identity-map entry;
 4. one `teardown_node {node_name, ilk_id}` to `SY.admin@motherbee`, which checks that the node is
    on the caller's hive and the ILK is the node's, deletes the secrets dedicated to the ILK, each

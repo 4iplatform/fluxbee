@@ -42,9 +42,14 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    with `busy_timeout(5000)` and WAL on every connection (`timerDSN`), and creates the `timers`
    table and its indexes (`ensureTimerSchema`, schema version 4: version 3 adds `canceled_reason`,
    FINDINGS A-220, and version 4 `canceled_at_utc`, FINDINGS A-238, to a table that lacks them,
-   whatever `user_version` says; `addTimerColumn`). Among the indexes, the four `TIMER_LIST`
-   reads (`idx_timers_list*`, since 1.7, FINDINGS A-326): the first start of 1.7 builds them over
-   the table it finds, 0.18 s for 15,000 timers and 2.7 s for 200,000 on the builder's Mac.
+   whatever `user_version` says; `addTimerColumn`). It builds the indexes the table lacks
+   (`ensureTimerIndexes`), among them the four `TIMER_LIST` reads (`idx_timers_list*`, since 1.7,
+   FINDINGS A-326): the first start of 1.7 builds them over the table it finds and then drops
+   `idx_timers_owner` and `idx_timers_fire_at`, which no statement reads once the four are there,
+   0.14 s with 18,000 pending timers and 1.8 to 1.9 s with 200,000 timers on a Mac. An index it
+   cannot build (a disk short of room) is reported in step 6 and the start goes on without it,
+   keeping the two old ones until the four are there; the next start tries again (the review of
+   A-326). Before, a build that failed stopped the start.
 5. Deletes the fired timers whose last fire, and the canceled timers whose cancellation, is more
    than 7 days old (`gcHistoricalTimers`, `defaultHistoryRetention`). A canceled timer with no
    cancellation time, canceled before 1.5 or by a SY.timer before it, is dated first and kept 7 days
@@ -58,6 +63,12 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
    failed GC's counts are 0, which would read as nothing to delete or to date. A count of the
    pending timers that fails is `pending=failed` the same way, with `pending_error` in
    `timer_startup` (`startupPending`, since 1.6, FINDINGS A-259); before, the line said `pending=0`.
+   A start that built or dropped an index in step 4, or could not, adds
+   `indexes_built=B indexes_dropped=D indexes_ms=T` to the line (and `indexes_failed=F`), and
+   `timer_startup` names them, with each failure's error, and gives `indexes_ms`, the time step 4
+   took for them (`startupIndexes`, since 1.7): the first start of 1.7 on an older table says
+   `indexes_built=4 indexes_dropped=2` (on a new database, `indexes_built=5`), later starts
+   nothing.
 
 ## Timers
 
@@ -200,10 +211,10 @@ router made, `trace_id`; `ignoredLog`), bounded the same way in windows of its o
 | `TIMER_SCHEDULE` | `fire_at_utc_ms` or `fire_in_ms` (exactly one), optional `target_l2_name`, `client_ref`, `payload`, `missed_policy`, `missed_within_ms`, `metadata` | any node; it becomes the owner, and the target unless it is a SY node |
 | `TIMER_SCHEDULE_RECURRING` | `cron_spec`, optional `cron_tz` and the same optional fields | any node; it becomes the owner, and the target unless it is a SY node |
 | `TIMER_GET` | `timer_uuid`, or `client_ref` (the caller's own pending timer) | the owner, and `SY.admin@motherbee` for any timer by `timer_uuid` (`TIMER_NOT_OWNER` otherwise) |
-| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page ends at `limit` or at one 128 KiB frame, whichever comes first, and while timers follow it answers `next_cursor`, its last timer's place, which given back as `cursor` lists the next; the page that lists the rest has none. The frame's cut since 1.3 (FINDINGS A-151), the limit's since 1.6 (FINDINGS A-266; `listTimers` reads one timer past the limit, never listed): before, a page its limit cut read as the whole list. A page reads its timers from an index that holds them in the list's order, one per filter, from its cursor's place on, and stops at the first one it cannot take (`timerListQuery`, `takeTimerPage`; since 1.7, FINDINGS A-326): it reads what it lists and one more, whatever the hive holds. Before, a page of an owner's timers in one status sorted every timer of the hive in that status, and a page read 1001 timers where about 228 of a WF's fit its frame. Both SDKs' `List` follow the pages up to their own limit. Go's `ListPage` and Rust's `list_page` list one page with its `next_cursor`, Rust's `list` hands it back when it stops at its limit, and Go's `List` returns the timers only (FINDINGS A-278); a WF's reconcile reads every page of its pending timers |
+| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page ends at `limit` or at one 128 KiB frame, whichever comes first, and while timers follow it answers `next_cursor`, its last timer's place, which given back as `cursor` lists the next; the page that lists the rest has none. The frame's cut since 1.3 (FINDINGS A-151), the limit's since 1.6 (FINDINGS A-266; `listTimers` reads one timer past the limit, never listed): before, a page its limit cut read as the whole list. A page reads its timers from an index that holds them in the list's order, one per filter, from its cursor's place on, and stops at the first one it cannot take (`timerListQuery`, `takeTimerPage`; since 1.7, FINDINGS A-326): it reads what it lists and one more, whatever the hive holds. Before, a page of an owner's timers in one status read every timer of the hive in that status, every owner's, and sorted the owner's, and a page read 1001 timers where about 228 of a WF's fit its frame. Both SDKs' `List` follow the pages up to their own limit. Go's `ListPage` and Rust's `list_page` list one page with its `next_cursor`, Rust's `list` hands it back when it stops at its limit, and Go's `List` returns the timers only (FINDINGS A-278); a WF's reconcile reads every page of its pending timers |
 | `TIMER_CANCEL` | `timer_uuid` or `client_ref` | the owner only (`TIMER_NOT_OWNER`); a `client_ref` with no pending timer answers `ok` with `found: false`; a fired one-shot gives `TIMER_ALREADY_FIRED` |
 | `TIMER_RESCHEDULE` | `timer_uuid` or `client_ref`, and `new_fire_at_utc_ms` or `new_fire_in_ms` | the owner only; pending one-shots only (`TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_ALREADY_FIRED`) |
-| `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status, in one transaction: the pending ones first, whose uuids come back for the heap, then the history, counted without being read (`deleteTimersByOwner`) |
+| `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status, in one transaction: the pending ones first, whose uuids come back for the heap, then the history, counted without being read (`deleteTimersByOwner`). The orchestrator waits 3 s for it; its time grows with the owner's timers, its history most, and with the indexes: about 0.2 s for 7,500 pending among 18,000 on a Mac, 1.5 s for 10,000 pending and 20,000 fired among 100,000 (docs/sy-timer.md §7.7) |
 | `TIMER_NOW` | none | anyone |
 | `TIMER_NOW_IN` | `tz` | anyone |
 | `TIMER_CONVERT` | `instant_utc_ms`, `to_tz` | anyone |
@@ -287,7 +298,8 @@ secret.
 
 - `systemctl status sy-timer`; `journalctl -u sy-timer`. Besides plain lines, the node logs one
   JSON object per event (`logEvent` in `logging.go`): `timer_startup`, `timer_scheduled`,
-  `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
+  `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`
+  (with `took_ms`, the delete's own time, since 1.7: the orchestrator waits 3 s for the purge),
   `timer_missed_policy_applied`, `timer_handler_error`, for a refused request
   `timer_request_refused` and `timer_request_refusals_not_logged`, for a message that is no request
   `timer_message_ignored` and `timer_messages_ignored_not_logged` (Messages, above), and for the

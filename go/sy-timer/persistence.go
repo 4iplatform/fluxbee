@@ -68,16 +68,19 @@ func scanTimerRow(scanner rowScanner) (timerRow, error) {
 	return row, err
 }
 
-func openTimerDB(path string) (*sql.DB, error) {
+// openTimerDB opens the database at path and makes its schema (ensureTimerSchema), and says what that
+// did to the indexes, for the start's log (startupIndexes).
+func openTimerDB(path string) (*sql.DB, timerIndexStep, error) {
 	db, err := sql.Open("sqlite", timerDSN(path))
 	if err != nil {
-		return nil, err
+		return nil, timerIndexStep{}, err
 	}
-	if err := ensureTimerSchema(db); err != nil {
+	indexes, err := ensureTimerSchema(db)
+	if err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, indexes, err
 	}
-	return db, nil
+	return db, indexes, nil
 }
 
 // timerDSN is path plus the pragmas every connection needs. A pragma belongs to one connection and
@@ -88,10 +91,13 @@ func timerDSN(path string) string {
 	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 }
 
-func ensureTimerSchema(db *sql.DB) error {
+// ensureTimerSchema makes the timers table, its indexes (ensureTimerIndexes) and its columns, and
+// says what it did to the indexes. Each step works on a table it made before, and on a table any
+// SY.timer before it made.
+func ensureTimerSchema(db *sql.DB) (timerIndexStep, error) {
 	var userVersion int
 	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&userVersion); err != nil {
-		return err
+		return timerIndexStep{}, err
 	}
 	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS timers (
@@ -116,33 +122,20 @@ CREATE TABLE IF NOT EXISTS timers (
     canceled_reason     TEXT,
     canceled_at_utc     INTEGER
 );`); err != nil {
-		return err
+		return timerIndexStep{}, err
 	}
-	indexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_timers_owner ON timers(owner_l2_name);`,
-		`CREATE INDEX IF NOT EXISTS idx_timers_fire_at ON timers(fire_at_utc) WHERE status='pending';`,
-		`CREATE INDEX IF NOT EXISTS idx_timers_status ON timers(status);`,
-		// A TIMER_LIST page reads one of these four, in the list's order (fire time, then uuid), from
-		// its cursor on: one owner's timers in one status, one owner's in any, the hive's in one, the
-		// hive's in any (timerListQuery, since 1.7, FINDINGS A-326). An older SY.timer started on the
-		// table leaves them as they are.
-		`CREATE INDEX IF NOT EXISTS idx_timers_list_owner_status ON timers(owner_l2_name, status, fire_at_utc, uuid);`,
-		`CREATE INDEX IF NOT EXISTS idx_timers_list_owner ON timers(owner_l2_name, fire_at_utc, uuid);`,
-		`CREATE INDEX IF NOT EXISTS idx_timers_list_status ON timers(status, fire_at_utc, uuid);`,
-		`CREATE INDEX IF NOT EXISTS idx_timers_list ON timers(fire_at_utc, uuid);`,
+	indexes, err := ensureTimerIndexes(db)
+	if err != nil {
+		return indexes, err
 	}
-	for _, stmt := range indexes {
-		if _, err := db.Exec(stmt); err != nil {
-			return err
-		}
-	}
+	// Unlike the indexes above, this one is a rule: a requester's client_ref names one pending timer.
 	if userVersion < 2 {
 		if _, err := db.Exec(`
 CREATE UNIQUE INDEX IF NOT EXISTS idx_timers_owner_clientref_pending
 ON timers(owner_l2_name, client_ref)
 WHERE client_ref IS NOT NULL AND status='pending';
 `); err != nil {
-			return fmt.Errorf("create unique pending client_ref index: %w", err)
+			return indexes, fmt.Errorf("create unique pending client_ref index: %w", err)
 		}
 	}
 	// Version 3 (FINDINGS A-220) adds canceled_reason, version 4 (FINDINGS A-238) canceled_at_utc.
@@ -151,13 +144,109 @@ WHERE client_ref IS NOT NULL AND status='pending';
 		{name: "canceled_at_utc", definition: "INTEGER"},
 	} {
 		if err := addTimerColumn(db, column.name, column.definition); err != nil {
-			return err
+			return indexes, err
 		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d;", timerSchemaVersion)); err != nil {
-		return err
+		return indexes, err
 	}
-	return nil
+	return indexes, nil
+}
+
+// timerIndexes are the indexes a start builds when the timers table lacks them (ensureTimerIndexes).
+// Each only speeds reads up: every statement reads the same timers without it, more slowly.
+// idx_timers_status is the one the hive's count of pending timers reads, which each new timer's cap
+// check runs (checkPendingLimits): its entries are narrower than idx_timers_list_status's, so the
+// count reads less, and the start's history GC reads it too. A TIMER_LIST page reads one of the four
+// idx_timers_list*, in the list's order (fire time, then uuid), from its cursor on: one owner's
+// timers in one status, one owner's in any, the hive's in one, the hive's in any (timerListQuery,
+// since 1.7, FINDINGS A-326). The owner's count of pending timers and TIMER_PURGE_OWNER read them
+// too (deleteTimersByOwner). An older SY.timer started on the table leaves the four as they are, and
+// its lists read them too.
+var timerIndexes = []struct{ name, columns string }{
+	{name: "idx_timers_status", columns: "status"},
+	{name: "idx_timers_list_owner_status", columns: "owner_l2_name, status, fire_at_utc, uuid"},
+	{name: "idx_timers_list_owner", columns: "owner_l2_name, fire_at_utc, uuid"},
+	{name: "idx_timers_list_status", columns: "status, fire_at_utc, uuid"},
+	{name: "idx_timers_list", columns: "fire_at_utc, uuid"},
+}
+
+// retiredTimerIndexes are two indexes of SY.timer before 1.7 that no statement reads once the table
+// has the four idx_timers_list*: idx_timers_owner, which TIMER_PURGE_OWNER's delete of an owner's
+// timers read and idx_timers_list_owner serves as well, and idx_timers_fire_at, the pending timers by
+// fire time, which idx_timers_list_status holds too. Kept, they cost every write of a timer, and a
+// purge most: it deletes each of the owner's timers from every index (the review of A-326). An older
+// SY.timer started on the table builds them again, and the next start of 1.7 drops them again.
+var retiredTimerIndexes = []string{"idx_timers_owner", "idx_timers_fire_at"}
+
+// timerIndexStep is what a start did to the timers table's indexes (ensureTimerIndexes), which its
+// timer_startup event and its ready line give (startupIndexes): the indexes it built, the table
+// lacking them; the retired ones it dropped; each one it could not build or drop, with the error;
+// and how long that took.
+type timerIndexStep struct {
+	built   []string
+	dropped []string
+	failed  map[string]string
+	took    time.Duration
+}
+
+// ensureTimerIndexes builds the indexes of timerIndexes the timers table lacks, and then, only once
+// it has every one of them, drops the retired ones it still has (retiredTimerIndexes): a start that
+// could not build an index leaves those as they were, for the reads they serve. An index it cannot
+// build or drop goes in the step's failed, with the error, and the start goes on: without the index,
+// whose reads are slower, or with a retired one, whose writes are; the next start tries again. Before,
+// a CREATE INDEX that failed stopped the start, and systemd started SY.timer again every 5 s; the
+// first start of 1.7 builds four indexes over the whole table, which a disk short of room can refuse
+// (the review of A-326). The error it returns is one reading which indexes the table has.
+func ensureTimerIndexes(db *sql.DB) (timerIndexStep, error) {
+	started := time.Now()
+	step := timerIndexStep{built: []string{}, dropped: []string{}, failed: map[string]string{}}
+	has, err := timerIndexNames(db)
+	if err != nil {
+		return step, err
+	}
+	for _, index := range timerIndexes {
+		if has[index.name] {
+			continue
+		}
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS ` + index.name + ` ON timers(` + index.columns + `);`); err != nil {
+			step.failed[index.name] = err.Error()
+			continue
+		}
+		step.built = append(step.built, index.name)
+	}
+	if len(step.failed) == 0 {
+		for _, name := range retiredTimerIndexes {
+			if !has[name] {
+				continue
+			}
+			if _, err := db.Exec(`DROP INDEX IF EXISTS ` + name + `;`); err != nil {
+				step.failed[name] = err.Error()
+				continue
+			}
+			step.dropped = append(step.dropped, name)
+		}
+	}
+	step.took = time.Since(started)
+	return step, nil
+}
+
+// timerIndexNames are the names of the timers table's indexes, as SQLite keeps them.
+func timerIndexNames(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='timers'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names[name] = true
+	}
+	return names, rows.Err()
 }
 
 // addTimerColumn adds a nullable column to a timers table that lacks it, whatever user_version says:
@@ -311,9 +400,9 @@ func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter strin
 // timers in the list's order (idx_timers_list*, ensureTimerSchema), and the cursor is a row value,
 // which SQLite searches that index for: a page starts at its place in the index and reads on in
 // order, with nothing to sort. Before 1.7 a page of an owner's timers in one status searched
-// idx_timers_status, read every timer of the hive in that status, every owner's, and sorted them; a
-// page of any status read all of the owner's, or the whole table for the hive's; and the cursor was
-// a filter on what it read (FINDINGS A-326).
+// idx_timers_status, read every timer of the hive in that status, every owner's, and sorted the
+// owner's past its cursor; a page of any status read all of the owner's, or the whole table for the
+// hive's, and sorted them; and the cursor was a filter on what it read (FINDINGS A-326).
 func timerListQuery(ownerL2Name, statusFilter string, limit int, after *timerListCursor) (string, []any) {
 	var conditions []string
 	var args []any
@@ -401,21 +490,23 @@ ORDER BY fire_at_utc ASC
 // heap (TIMER_PURGE_OWNER, FINDINGS A-259). The pending ones are deleted first, and only their uuids
 // come back (RETURNING); the rest, the owner's history of up to 7 days, is deleted and counted, not
 // read, as before 1.6. One statement that returned every deleted row read that whole history back,
-// within the orchestrator's 3 s for the purge (the review of A-259).
+// within the orchestrator's 3 s for the purge (the review of A-259). Each timer deleted leaves the
+// table and every index, so each index the table has makes the purge longer (retiredTimerIndexes;
+// its times in docs/sy-timer.md §7.7, the review of A-326).
 func deleteTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (deleted int64, pending []string, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.QueryContext(ctx, `DELETE FROM timers WHERE owner_l2_name=? AND status='pending' RETURNING uuid`, ownerL2Name)
+	rows, err := tx.QueryContext(ctx, deleteOwnerPendingTimersSQL, ownerL2Name)
 	if err != nil {
 		return 0, nil, err
 	}
 	if pending, err = collectUUIDs(rows); err != nil {
 		return 0, nil, err
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM timers WHERE owner_l2_name=?`, ownerL2Name)
+	result, err := tx.ExecContext(ctx, deleteOwnerTimersSQL, ownerL2Name)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -428,6 +519,14 @@ func deleteTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (d
 	}
 	return int64(len(pending)) + history, pending, nil
 }
+
+// The two statements of TIMER_PURGE_OWNER (deleteTimersByOwner): the owner's pending timers, whose
+// uuids come back, then the rest. They find the owner's timers in idx_timers_list_owner_status and
+// idx_timers_list_owner (timerIndexes).
+const (
+	deleteOwnerPendingTimersSQL = `DELETE FROM timers WHERE owner_l2_name=? AND status='pending' RETURNING uuid`
+	deleteOwnerTimersSQL        = `DELETE FROM timers WHERE owner_l2_name=?`
+)
 
 // collectUUIDs reads the uuids rows returns, and closes them.
 func collectUUIDs(rows *sql.Rows) ([]string, error) {

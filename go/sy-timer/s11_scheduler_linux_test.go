@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -209,5 +211,63 @@ func TestAStartWhoseCountOfPendingTimersFailedSaysSo(t *testing.T) {
 	if line := startupPending(fields, count, err); err == nil || count != 0 || line != "pending=failed" ||
 		len(fields) != 1 || fields["pending_error"] != err.Error() {
 		t.Fatalf("a count that failed: %d, %q, %v (%v)", count, line, fields, err)
+	}
+}
+
+// A start gives what it did to the indexes in its timer_startup event and its ready line, when it
+// built or dropped one or could not (startupIndexes): the first start of 1.7 builds the four
+// idx_timers_list* over the table it finds and drops the two they replace, and says how long that
+// took, indexes_ms, apart from the router's connection and the replay; an index it could not build
+// is in indexes_failed with the error, and the start goes on. A start that did none of it, as most,
+// says nothing of them (the review of A-326). Before, the ready line said nothing of the indexes, and
+// a build that failed stopped the start.
+func TestAStartSaysWhatItDidToTheIndexes(t *testing.T) {
+	db, err := sql.Open("sqlite", timerDSN(filepath.Join(t.TempDir(), "timers-v3.db")))
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	startAsSYTimer14(t, db)
+	if _, err := db.Exec(`CREATE TABLE idx_timers_list_owner (taken INTEGER)`); err != nil {
+		t.Fatalf("take an index's name: %v", err)
+	}
+	start := func() (string, map[string]any, timerIndexStep) {
+		t.Helper()
+		indexes, err := ensureTimerSchema(db)
+		if err != nil {
+			t.Fatalf("the start: %v", err)
+		}
+		fields := map[string]any{}
+		return startupIndexes(fields, indexes), fields, indexes
+	}
+
+	line, fields, indexes := start()
+	took := indexes.took.Milliseconds()
+	if want := fmt.Sprintf("indexes_built=3 indexes_dropped=0 indexes_ms=%d indexes_failed=1", took); line != want {
+		t.Fatalf("a start that could not build an index says %q, want %q", line, want)
+	}
+	failed, _ := fields["indexes_failed"].(map[string]string)
+	if len(fields) != 4 || fmt.Sprint(fields["indexes_built"]) != "[idx_timers_list_owner_status idx_timers_list_status idx_timers_list]" ||
+		fmt.Sprint(fields["indexes_dropped"]) != "[]" || fields["indexes_ms"] != took || len(failed) != 1 ||
+		!strings.Contains(failed["idx_timers_list_owner"], "already a table named idx_timers_list_owner") {
+		t.Fatalf("its timer_startup fields: %v", fields)
+	}
+	if encoded, err := json.Marshal(fields); err != nil || !strings.Contains(string(encoded), `"indexes_dropped":[]`) {
+		t.Fatalf("the fields as the event gives them: %s (%v)", encoded, err)
+	}
+
+	if _, err := db.Exec(`DROP TABLE idx_timers_list_owner`); err != nil {
+		t.Fatalf("free the name: %v", err)
+	}
+	line, fields, indexes = start()
+	took = indexes.took.Milliseconds()
+	if want := fmt.Sprintf("indexes_built=1 indexes_dropped=2 indexes_ms=%d", took); line != want ||
+		len(fields) != 3 || fmt.Sprint(fields["indexes_built"]) != "[idx_timers_list_owner]" ||
+		fmt.Sprint(fields["indexes_dropped"]) != "[idx_timers_owner idx_timers_fire_at]" || fields["indexes_ms"] != took {
+		t.Fatalf("the next start says %q, %v; want %q", line, fields, want)
+	}
+
+	if line, fields, _ = start(); line != "" || len(fields) != 0 {
+		t.Fatalf("a start that did nothing to the indexes says %q, %v", line, fields)
 	}
 }
