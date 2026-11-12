@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.136** (2026-11-12), and PROD runs **0.1.136**. Read from the code,
+> Contract as of **fluxbee 0.1.137** (2026-11-12), and PROD runs **0.1.137**. Read from the code,
 > operation by operation; §10 lists what was also checked live on the PROD hive. §9 lists what
 > changed for Cloud in each release. The model behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
@@ -713,17 +713,16 @@ operator's work, through Archi.
 - when the operator makes another version current, the hive relaunches a running node on
   `current` on it within a minute of the version reaching the node's hive, and leaves a pinned
   node as it is;
-- up to 0.1.136, a publish through Archi that makes the new version current does more, to every
-  node of that runtime on the motherbee, yours included, running or stopped, pinned or not: it
-  deletes the node and launches it again under the same name, on `current`. The node comes back
-  with a new identity (a credential assigned to the old one no longer reaches it), without the
-  credentials it owned, with the runtime's default config unless the operator keeps its own, and
-  with `launched_by: "archi"`, so `start_node`, `stop_node` and `delete_node` answer
-  `NODE_NOT_FOUND`. If it happens to a node of yours, give the operator its name. The operator
-  decided that it goes: from 0.1.137 (planned, built, not deployed yet) such a publish leaves your
-  nodes as they are: the hive moves a running node on `current` in place, as the point above says,
-  with its identity, its credentials, its config and its `launched_by`, and leaves a pinned or
-  stopped node as it is.
+- a publish through Archi that makes the new version current does nothing more (0.1.137): the hive
+  moves a running node on `current` in place, as the point above says, with its identity, its
+  credentials, its config and its `launched_by`, and leaves a pinned or stopped node as it is. Up
+  to 0.1.136 such a publish did more, to every node of that runtime on the motherbee, yours
+  included, running or stopped, pinned or not: it deleted the node and launched it again under the
+  same name, on `current`. The node came back with a new identity (a credential assigned to the old
+  one no longer reaches it), without the credentials it owned, with the runtime's default config
+  unless the operator kept its own, and with `launched_by: "archi"`, so `start_node`, `stop_node`
+  and `delete_node` answer `NODE_NOT_FOUND` for it. If a node of yours answers so after such a
+  publish, give the operator its name.
 
 #### `list_nodes`
 
@@ -949,12 +948,13 @@ to, for example. No op of this list reads them or takes them down.
 - **Its life is fixed when it is published:** 24 h by default, which is what an agent's page gets,
   and 30 days at most, never renewed. At its expiry the link answers 404 at once.
 - **No removal waits for a page** (0.1.131). After `delete_node`, `delete_tenant` or a suspension,
-  the pages stay up until they expire, and no answer Cloud gets names them. Sooner, only the agent
+  the pages stay up until they expire, and no answer Cloud gets names them. Sooner, only the node
   that published a page, or the operator, can take it down.
 - **Cloud can neither list them nor take them down.** Listing and taking down your tenant's pages
   through IO.cloud is planned with the Cloud track, not scheduled yet.
-- **Planned for 0.1.137, built, not deployed yet:** an `IO.*` or `WF.*` node can take down the
-  pages it published itself, as an agent can now. Cloud gets no op for pages with it.
+- **Each publisher takes down its own pages, and only its own** (0.1.137): an `IO.*` or `WF.*` node
+  can take down a page it published, as an agent can, and is refused another's. Up to 0.1.136 only
+  the agents could. Cloud gets no op for pages with it.
 
 ---
 
@@ -1086,17 +1086,14 @@ post '{"op":"list_cloud_actions"}'
    (§5.5); pricing it is Cloud's.
 9. **Public pages** (§5.7). Cloud can neither list nor take down its tenant's pages. Each stays up
    until its fixed expiry (24 h by default, 30 days at most), also after its node is deleted or its
-   tenant deleted or suspended; the agent that published it, or the operator, can take it down
+   tenant deleted or suspended; the node that published it, or the operator, can take it down
    sooner.
 
 ---
 
 ## 9. What changed for Cloud
 
-### 0.1.137 (not deployed yet)
-
-Built, not deployed yet: what this entry lists arrives with 0.1.137, and the sections above mark
-it "(0.1.137)".
+### 0.1.137
 
 - **`register_human`: a frontdesk error that says sending the request again may pass** answers
   `FRONTDESK_UNAVAILABLE`, as a frontdesk that does not answer in time does: send the request
@@ -1117,6 +1114,14 @@ it "(0.1.137)".
   so a passing failure no longer costs the operator a run (§7). A publish that answers it still
   hands over no token, and the token you hold stops within 10 minutes: the operator fixes the
   cause, publishes again and gives you the new token.
+- **A publish through Archi that makes a runtime's version current no longer deletes and relaunches
+  your nodes** (§5.4, FINDINGS A-298): the hive moves a running node on `current` to the new
+  version in place, with its identity, credentials, config and `launched_by`, and leaves a pinned
+  or stopped node as it is. Up to 0.1.136 such a publish deleted every node of that runtime on the
+  motherbee and launched it again with a new identity and `launched_by: "archi"`, so `start_node`,
+  `stop_node` and `delete_node` answered `NODE_NOT_FOUND` for it.
+- **An `IO.*` or `WF.*` node can take down a page it published** (§5.7, FINDINGS A-243), and only
+  its own, as an agent can. Cloud still has no op to list or take down pages.
 
 ### 0.1.136
 
@@ -1323,6 +1328,27 @@ it "(0.1.137)".
 ---
 
 ## 10. Checked live
+
+**0.1.137:** on PROD, 2026-11-12 from 10:07Z, through the public door with Cloud's token, in a test
+tenant (`lab/DEPLOYMENTS.md`, 0.1.137; FINDINGS A-293):
+
+- `register_human` with `subject.phone` a number answered `INVALID_REQUEST`, its `error_detail`
+  *"params.subject.phone must be a string"*, and one without `display_name` answered
+  `INVALID_REQUEST` naming the field; for neither did the email then have an account
+  (`exists: false`);
+- a well-formed registration answered ok, `complete`, in 1.42 s, and the same again
+  `existing: true` in 0.50 s;
+- with the hive's frontdesk stopped, `FRONTDESK_UNAVAILABLE` in 0.79 s, its `error_detail` the
+  hive's *"frontdesk handoff failed: transport unreachable"* (`NODE_NOT_FOUND`), with no `ilk_id`;
+  sent again once the frontdesk was back, ok, 5.7 s after its start. The hive starts a stopped
+  frontdesk again within seconds: a try right after the stop already found it back and answered
+  ok;
+- IO.cloud's journal names the `request_id` of each of the 9 requests (§4.2).
+
+Before the deploy, IO.cloud's journal of the last 30 days held 24 `register_human`: none answered
+`FRONTDESK_REJECTED`, and the 2 refused `missing_required_fields` for a missing `display_name` were
+the hive's own live checks of 2026-10-15, none of Cloud's. A frontdesk error marked retryable was
+not seen: today's frontdesk sends none for a registration (§5.2).
 
 **0.1.134:** on PROD, 2026-11-11 at 23:33Z, from inside the hive (`lab/DEPLOYMENTS.md`, 0.1.134;
 FINDINGS A-314): a new node was launched and stopped, and the stopped nodes with no unit read

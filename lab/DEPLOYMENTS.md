@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.136** | 2026-11-12 | `ba2addb2` | motherbee + spokes (core), the AI SDK alone: A-257 (the AI runtime reads every message while its 4 workers run LLM turns: a status, help or config request runs at once beside them on a direct lane of 64 places, and so does a handoff in the shape the frontdesk parses, on at most 8 of them and within 30 s; the turns start on the 4 workers in the order they came, with up to 128 waiting, and the next one is answered `ai_runtime_busy` at once, never run); its review's texts: an AI node answers status and help at once however busy only on ai.generic 0.1.136 or later, and ai.generic running its model for a handoff on the direct lane is a known limit | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-136` (all 4 VMs) · `apt install fluxbee=0.1.135` + 0.1.135's `update_installation` (nothing one-way; A-257 comes back) |
+| **0.1.137** | 2026-11-12 | `55fbdd85` | motherbee + spokes (core), the sweep's seven binaries, one branch per binary, with A-322 and A-323: SY.admin (A-243: an IO or WF node takes its own pages down, only its own; A-263: the update's background reads at once; A-273: a failed record of the Cloud's door tried once more; A-280: a failed publish answers within its budget, its clean-up after the answer; A-311's and A-314's help), the orchestrator (A-282: a check with no answer restarts a service only at a boot that found a replaced binary; A-283: Syncthing restarted after 5 min with no answer, at most once an hour, its unit with `TimeoutStopSec=30`; A-311: `get_hive` refuses an id that is not a hive id, and the registry's readers skip such a directory), SY.identity (A-277: a hive the registry does not list is refused), the WF (A-284: a count-only instance count), SY.cognition (A-292: a turn the agent refused leaves its communication), IO.cloud (A-293: a retryable frontdesk error answers `FRONTDESK_UNAVAILABLE`, a malformed registration is refused before anything is created), SY.architect (A-286 and A-287: an SCMD keeps `+` and decodes each segment once; A-298: a publish recreates no node; A-322: after a confirmed plan Archi's model tells what each step answered; A-323: no core node stopped through Archi) | ✅ live, checked on 8.x | snap `pre-sweep-0-1-137` (all 4 VMs) · `apt install fluxbee=0.1.136` + 0.1.136's `update_installation` (nothing one-way; the sweep's items come back, A-298's redeploy among them) |
+| **0.1.136** | 2026-11-12 | `ba2addb2` | motherbee + spokes (core), the AI SDK alone: A-257 (the AI runtime reads every message while its 4 workers run LLM turns: a status, help or config request runs at once beside them on a direct lane of 64 places, and so does a handoff in the shape the frontdesk parses, on at most 8 of them and within 30 s; the turns start on the 4 workers in the order they came, with up to 128 waiting, and the next one is answered `ai_runtime_busy` at once, never run); its review's texts: an AI node answers status and help at once however busy only on ai.generic 0.1.136 or later, and ai.generic running its model for a handoff on the direct lane is a known limit | ✅ replaced by 0.1.137 | snap `pre-aisdk-0-1-136` (deleted 2026-11-12) · `apt install fluxbee=0.1.135` + 0.1.135's `update_installation` (nothing one-way; A-257 comes back) |
 | **0.1.135** | 2026-11-11 | `9a6ffb6d` | motherbee + spokes (core), the router alone: A-272 (split horizon: a broadcast that came over the WAN goes on to every WAN peer but the one it came from, so no router sends a broadcast back to its peer, and over IRP a router that is not the gateway hands none back to the gateway), A-268 (two FIB builds at once are stored in the order they began, so a build that read before a change never undoes that change's rebuild); `ops.py health` checks `wandrops=0` from then on | ✅ replaced by 0.1.136 | snap `pre-router-0-1-135` (deleted 2026-11-12) · `apt install fluxbee=0.1.134` + 0.1.134's `update_installation` (nothing one-way; the WAN echoes come back, and now that `HEALTH_OK` checks `wandrops=0` the hives that drop them fail health: the motherbee whenever a node broadcasts over the WAN, a spoke when its own nodes do) |
 | **0.1.134** | 2026-11-11 | `8539bc64` | motherbee + spokes (core), the orchestrator alone, a hotfix: A-314 (a node unit systemd does not have reads as not running: on the hives' systemd 255 `systemctl is-active` exits 4 for it, which 0.1.133 read as no answer, so no node could be launched and a stopped node whose unit was gone could be neither started nor purged and read `UNKNOWN`); its review: `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name (`INVALID_REQUEST`) before anything is done, as `run_node` does | ✅ replaced by 0.1.135 | snap `pre-orch-0-1-134` (deleted 2026-11-11) · `apt install fluxbee=0.1.133` + 0.1.133's `update_installation` (that brings A-314 back); to 0.1.132 by apt (nothing one-way found) |
 | **0.1.133** | 2026-11-11 | `45c736e4` | motherbee + spokes (core), one branch per binary, the sweep's end: SY.identity and SY.admin (A-191: a system ILK is retired, never deleted, at SY.identity's start for an SY node its release no longer runs, and by `retire_hive_ilks` or `remove_hive` for a removed hive; A-232: SY.identity's listings refuse a cursor not theirs without repeating it), SY.admin (A-255: `publish_cloud_endpoint` applies the edge to the running IO.cloud; A-260 and A-274: the expiry sweep and a take-down call the edge and IO.blob outside the publication lock; A-281: no version removed while some hive's use of it was not read; A-285's texts), SY.timer 1.6 (A-258: its refusals logged, bounded; A-259: the heap holds the pending timers only; A-266: a page its `limit` cuts answers `next_cursor`), the orchestrator (A-240: a status read writes nothing, `status_version` gone from the answer; A-241: a worker cleans its own blob staging; A-267 and A-271: a check with no answer acts on nothing; A-281's use across the hives, `hives_without_runtimes`), SY.wf-rules (A-270: no delete without force of a WF node that is not `RUNNING`; A-281: a delete names the versions it left), SY.architect (A-279 with A-288: Archi's SCMD reads decode their query and keep it) | ✅ replaced by 0.1.134 (deployed 22:35Z, replaced 23:32Z; its gate found A-314) | snap `pre-sweep-0-1-133` (deleted 2026-11-11) · `apt install fluxbee=0.1.132` + 0.1.132's `update_installation` (nothing one-way found: the system ILKs 0.1.133 retired stay retired, harmless to 0.1.132) |
@@ -145,6 +146,198 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.137 — The sweep's binaries, one branch per binary, and Archi telling what a confirmed plan did
+
+- **Date:** 2026-11-12 (ART) · **Previous version:** 0.1.136 · **Commit:** `55fbdd85`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the sweep's binaries, as the operator set them on 2026-11-11 (FINDINGS' board, item 24):
+  the items decided that day, one branch per binary, none of them shared code
+  ([METHOD](logbook/METHOD.md) §9). Built and reviewed for 0.1.136; A-314's hotfix took 0.1.134, so
+  the router is 0.1.135, the AI SDK 0.1.136 and the sweep's binaries 0.1.137. With them, on
+  SY.architect, A-322 (the operator's call of 2026-11-12: after a plan the operator confirmed ran,
+  Archi's model tells what each step answered) and A-323's texts.
+- **What changed (one branch per binary; the commits as they are on daily):**
+  - **SY.admin (`coa/admin-136`):** A-243 (`15391283`, its review `9e7e956f`): over the mesh an
+    `IO.*` or `WF.*` node takes down a page it published, as an `AI.*` node does, and only its own
+    (the router-stamped caller, the page's tenant). A-263 (`bb37ce46`): the installation update's
+    background task reads every hive at once, each read under its own bound as before (10 s in a
+    restart, 50 s outside it). A-273 (`27b94c5a`, `9a9334bd`): `publish_cloud_endpoint` tries a
+    failed record of the edge in IO.cloud's config once more at once; when it fails again its 502
+    `CONFIG_RECORD_FAILED` says what is left (the door open with a token nobody received, the
+    previous token working for up to 10 minutes) and what to do, never through Archi. A-280
+    (`34c85e03`, `e29a03e0`): a publish that fails once IO.blob curated answers at once and lets
+    the publication lock go; its clean-up runs after the answer, in a task of its own, and ends
+    with one line, *"a failed publish's clean-up ended"*. The help Archi reads: `get_hive`,
+    `add_hive` and `remove_hive` name `INVALID_HIVE_ID` and the rule (A-311, `e1fbbd8e`);
+    `kill_node`, `remove_node_instance`, `teardown_node`, `get_node_config` and `set_node_config`
+    give `AI.sales@motherbee` as their example, and the first three say that a core node's name is
+    refused `INVALID_REQUEST` (A-314's leftover, `3507f09a`).
+  - **The orchestrator (`coa/orch-136`):** A-282 (`46f51bc7`, `0fd06638`, `5e739962`, `07fae956`):
+    a replaced-binary check that `systemctl show` gives no answer is asked again, up to 3 times
+    250 ms apart; at boot one still unanswered is restarted only when the same boot found a service
+    on a replaced binary, recorded in `core.last_update`; any other start restarts none. A-283
+    (`f60acf55`, `80170089`, `230a9481`, `9330642a`): the Syncthing check stops at the first folder
+    that gives no answer; 12 such ticks warn and open a `syncthing` drift alert, and 5 min with no
+    answer restart Syncthing, at most once an hour; a refused or timed-out connect to its API port
+    counts as no answer (*API port refused*); a setup the boot or a config change could not finish
+    is owed and runs at the first tick whose port answers; the unit gains `TimeoutStopSec=30`, so
+    each hive's first 0.1.137 start restarts Syncthing once. A-311 (`fe771593`, `94cd183d`,
+    `1e2491d2`): `get_hive` refuses a hive id that is not one (`INVALID_HIVE_ID`, the rule in
+    SY.admin's and SY.identity's words) and reads nothing, and the registry's readers skip a
+    directory whose name is not a hive id.
+  - **SY.identity (`coa/identity-136`):** A-277 (`b2e25c48`, `607aecd8`): the handshake refuses a
+    hive the hive registry does not list, before it looks for the key, with the same
+    *"authentication failed"*; a removed hive's open subscription and publish stream end within a
+    10 s recheck, so a removed hive whose key survived reads nothing more.
+  - **The WF, wf.engine and SY.wf-rules (`coa/wf-136`):** A-284 (`e279c396`, `c7ad15b0`):
+    SY.wf-rules counts a WF node's running instances with a count-only `WF_LIST_INSTANCES` (a
+    `COUNT(*)` with the list's filters, no rows), where the whole list passed the frame past about
+    350 instances.
+  - **SY.cognition (`coa/cognition-136`):** A-292 (`18a1f650`, `2a3e8bf5`): a turn its agent
+    refused without running it (`ai_runtime_busy`) is dropped from its communication and never
+    analyzed, so no package shows it said and unanswered, and the same text sent again is one turn.
+  - **IO.cloud (`coa/iocloud-136`):** A-293 (`f2c7db86`, `3472538c`, `288cb888`): a frontdesk error
+    marked retryable answers `FRONTDESK_UNAVAILABLE`, where every error was `FRONTDESK_REJECTED`; a
+    `subject` without a `display_name`, or with a field of another type, is refused
+    `INVALID_REQUEST` naming the field before anything is created; each Cloud request's
+    `request_id` is logged.
+  - **SY.architect (`coa/architect-136`; A-322 and A-323 on `coa/architect-137`):** A-286 and A-287
+    (`4302757b`, `4b8841cf`): an SCMD keeps a `+` in its query, as SY.admin's routes do, and
+    decodes each path segment once, Archi's own two paths too. A-298 (`9cc20ca0`, `70600804`,
+    `cbef4df1`): a publish that makes its version current sends `publish_runtime_package` and
+    nothing after it, where it killed and purged every motherbee node of that runtime and ran it
+    again; the answer's `next` says what follows. A-311's Archi side (`a4e358d0`, `474de9e2`): an
+    open `add_hive` record closes when `get_hive` refuses its hive id `INVALID_HIVE_ID`. A-322
+    (`6827b1e1`, its review `55fbdd85`): once a plan the operator confirmed ran, Archi's model gets
+    one turn, with no tool, 90 s at most, recorded with the usage stage `execution_report`, given
+    an allowlist of each step's fields and never its answer copied (no token, link, key or vault
+    value), and tells the operator what each step did; when the turn fails, the fixed line with
+    each step's code and detail under it; a canceled plan answers *"Plan discarded."*. Left out, as
+    sy-architect.md says: the pipeline's `CONFIRM 2` and a plan pasted or sent to `POST
+    /api/executor/plan`. A-323 (`688d2d5a`): Archi's handbook says a core node is never stopped,
+    started, restarted or removed through Archi, and that its hive's orchestrator starts a core
+    service that is not running within 5 s.
+  - **The integration's review (`7423878d`, on daily `6fbe98ab`):** the orchestrator's list for
+    Fluxbee Cloud's `list_nodes` and `/versions`, and every SY.admin read of the hive registry,
+    take only the registry's hives; io-cloud-api §7's steps after a `CONFIG_RECORD_FAILED`; the AI
+    SDK's handoff texts name IO.cloud 0.1.137's `FRONTDESK_UNAVAILABLE` (a comment and the README,
+    no code); Archi's handbook and `remove_hive`'s help name A-277's surviving key. And the texts
+    that named 0.1.136 as these items' release name 0.1.137 (`eaf37b30`); the host posture spec's
+    A-48 gate, which expects sy-identity's *"no key for hive"* for a removed hive, names 0.1.137's
+    *"is not in the hive registry"* beside it (A-277, `db5e82df`).
+- **Build and review:** the seven branches, each with its review round and its fixes, integrated on
+  `coa/sweep-137`: 40 commits on `ba2addb2`. Its three reviews (the integration, the contracts, the
+  texts) found nothing high; the medium (io-cloud-api §7's steps after a `CONFIG_RECORD_FAILED`)
+  and the lows were fixed in `7423878d`, CI green at 07:23Z (4 jobs). Rebased onto daily `03dce7c8`
+  as `6fbe98ab`: only `docs/io-cloud-api.md` §9 conflicted, the branch's 0.1.137 entry ("not
+  deployed yet") kept above daily's 0.1.136; daily fast-forwarded to `6fbe98ab` at 07:23Z, its CI
+  green at 07:27Z (5 jobs). A warm-up build of `6fbe98ab` on fb-build, 07:24:17–07:47:17Z
+  (23.0 min), not published. A-322 and A-323, built on `coa/sweep-137` as `coa/architect-137`
+  (`713a0f6e`, `6839501f`), reviewed with two lenses and fixed (`c761fcb1`), rebased onto
+  `6fbe98ab` with the same patch ids (`6827b1e1`, `688d2d5a`, `55fbdd85`); their review found A-327
+  and A-328 (low) and A-124 unchanged. CI green on `coa/architect-137` at 09:05Z (3 jobs) and on
+  daily `55fbdd85` at 09:10Z (3 jobs; go-tests and admin-catalog not triggered).
+- **The deploy:** build on fb-build 09:05:40–09:16:58Z (11.3 min, incremental after the warm-up),
+  publish in 15 s (09:17:57Z), `ops deploy 0.1.137` from 09:44:33Z in 312 s (snapshots 29.9 s, the
+  motherbee's apt 158.0 s, its admin on the version 53.5 s, the spokes answering 8.4 s, the
+  update's call 22.6 s, the hives on the target 26.6 s, health 5.3 s); snapshot
+  `pre-sweep-0-1-137`, `pre-aisdk-0-1-136` dropped. On the target after the update's call: egress1
+  35.3 s, ingress1 39.5 s, worker1 48.0 s, the motherbee 4.1 s; by their own records the spokes
+  restarted their services at +12.7–14.0 s (egress1), +14.7–17.4 s (ingress1) and +21.7–27.6 s
+  (worker1), and settled at +32.6 s, +35.2 s and +41.9 s. The update closed with every hive on the
+  target at 09:49:39Z. The motherbee's package boot took 24.707 s (0.1.136's 17.168 s): it also
+  restarted Syncthing once for its changed unit (A-283's `TimeoutStopSec=30`), as each spoke did
+  after its orchestrator's restart. Health clean, `wandrops=0` on every hive.
+- **Checked on 8.x (the gate, gate0237, 09:35–11:08Z, against a baseline on 0.1.136 the same
+  morning; its tools `scratchpad/gate-tools/r137_gate.py` and
+  `scratchpad/gate-tools/r137_archi_nl.py`, git-ignored; 237 PASS, 28 SEE and 18 FAIL, each FAIL
+  read in the logbook, no regression found among them: 13 the gate tool's, one on 0.1.136 (A-329),
+  one the step's 1.0 s bound (a count in 1.039 s), two from A-331 and one from A-332, a gap A-292's
+  fix left):**
+  - **The smoke (A-314's lesson):** `run_node AI.gate0237s@worker1` launched (ok in 2.7 s,
+    `RUNNING` 2.8 s later) and killed in 10.8 s; the stopped `AI.gate0233@worker1` reads `STOPPED`;
+    `kill_node SY.gate0237@motherbee` refused `INVALID_REQUEST` in 1.061 s.
+  - **A-284 (the WF):** `WF.gate0237w@worker1` with 1000 running conversations. On 0.1.136 its
+    count failed `INTERNAL_ERROR` (the list 338,309 bytes, past the frame), a delete without force
+    was refused `INSTANCES_UNKNOWN`, and Archi could not tell (*"at least 200"*). Across the deploy
+    (`get_status` every 3 s) every answer was one of the five kinds allowed (`internal_error` 28,
+    `transport` 43, `relaunch` 3, `ok_1000` 3); the engine moved 41.6 s before SY.wf-rules and
+    recovered its 1000 instances 1.76 s after its relaunch, and a delete without force in that
+    window was refused `INSTANCES_UNKNOWN`. On 0.1.137 the count answered 1000 in 0.50–1.04 s
+    (seven reads), `list_workflows` 1000, a page of 200 newest first, a delete without force
+    `INSTANCES_ACTIVE` (*"still has 1000"*); Archi named 1000 (12.9 s); the forced delete took
+    3.0 s.
+  - **A-277 (SY.identity):** at the deploy no refusal and no session closed, and worker1's replica
+    synced again with the motherbee's metrics (`tenant_count` 3, `ilk_count` 84, `ich_count` 6,
+    `deleted_ilk_count` 51). A throwaway worker on VM 104 joined as `gate0237i` (773 s) and was
+    removed with its box cut off: its key deleted, its 132 reconnects refused *"not in the hive
+    registry"* (about one a second, then two), its 6 system ILKs retired. As `gate0237j` on a fresh
+    VM (829 s), removed with its key pinned (`identity_key_cleanup` `delete_failed`, so
+    `identity_restart` `not_needed`: sy-identity not restarted): A-277's recheck closed its
+    sessions, the last 7.7 s after the answer, and its 74 reconnects were refused with the key file
+    still there; worker1's sessions unchanged.
+  - **A-282 and A-283 (the orchestrator):** the motherbee's package boot restarted the 10 services
+    the package replaced, none unanswered, and no core process ran a deleted binary on any hive; an
+    orchestrator restart on worker1 restarted no core service, and a vendor update with nothing new
+    restarted nothing; a `systemctl show` with no answer, A-282's own case, was not provoked: by
+    its tests. Every hive's Syncthing has `TimeoutStopUSec=30s`. worker1's Syncthing frozen: the
+    warning at the 12th tick (+179 s), the restart at +329 s (315 s unanswered), the API answering
+    2.2 s after it; frozen again within the hour, across an orchestrator restart: the warning
+    again, no second restart. Its API port refused: at a boot the warning named *"API port
+    refused"* and the owed setup ran 4.6 s after the rule went, no restart; lasting, on egress1,
+    the restart at 304 s unanswered, once. An nft drop made the connect time out, never `EPERM`,
+    and counted as the port's refusal: the `EPERM` path is covered by its unit tests only.
+  - **A-311 (the orchestrator, SY.admin and Archi):** `GET /hives/a.b` 400 `INVALID_HIVE_ID` with
+    the rule in 0.895 s, an unknown hive 404 in 0.009 s, `DELETE` and `POST` 400 in 8 ms, the
+    registry unchanged; through Archi `a.b` and `..%2Fx` refused the same, and a timed-out
+    `add_hive` closed on it, never `OPERATION_ALREADY_TRACKED`. A directory `gate0237.bak` planted
+    in the registry was no hive to the runtime-use read, `/versions` and the Cloud's `list_nodes`;
+    `list_hives` still lists it (A-330).
+  - **SY.admin (A-263, A-243, A-280, A-273):** the update's marks 2.9–4.4 s after each spoke's own
+    settle, 9.7 s apart (the spokes' own settles 9.3 s); an IO node took its own page down in
+    0.232 s (its link 404 after) and an IO and a WF node were refused another's (`UNAUTHORIZED`);
+    with `SY.edge@ingress1` frozen 88 s a publish answered `EDGE_PUBLISH_FAILED` in 76.6 s with no
+    ledger row, the reads right after it at once (0.079 s, 0.003 s), its clean-up's line 0.028 s
+    after the answer; `publish_cloud_endpoint`'s help names A-273's steps (its failure not
+    provoked: by its tests).
+  - **A-292 (SY.cognition):** a person's turn the agent refused busy was counted 0.037–0.255 s
+    after the busy answer, dropped and never analyzed, and the next package showed its text once;
+    with AI.pruebas' real runtime the text sent again was answered in 4.3 s. A tagger call already
+    in flight on a refused first turn completed: A-332.
+  - **A-293 (IO.cloud, through its public door with the Cloud's token):** a `phone` that is a
+    number and a missing `display_name` refused `INVALID_REQUEST`, nothing created; a registration
+    ok in 1.42 s, again `existing` in 0.50 s; with the frontdesk stopped `FRONTDESK_UNAVAILABLE` in
+    0.79 s, as 0.1.136 answered a frontdesk it could not reach, and the retry ok once it was back;
+    the `request_id` on 9 of 9 request lines. A retryable frontdesk error, the item's own change,
+    was not provoked (no frontdesk sends one): by its tests.
+  - **Archi (A-286, A-287, A-298, A-322, A-323):** through SCMD `+01:00` read as `%2B01:00` (5
+    records), `AI.pruebas%40worker1` as the `@` form, `config%2Dget` as `config-get`; a publish of
+    1.0.1 with promote moved the two running nodes on `current` in place (ILK, `launched_by` and
+    config kept) and left a pinned and a stopped node alone, Archi sending only
+    `publish_runtime_package`. After each of three CONFIRMs one model call told what each step
+    answered (a refusal's code, the hive not read and that asking again may pass; a delete's
+    versions left and why), 9.4–14.2 s and 60,514–61,938 tokens a run, with no link or token in its
+    words; asked to stop `SY.orchestrator@worker1`, Archi staged nothing and said why (7.3 s).
+    A-322's fallback to the fixed line and a canceled plan were not run: by their tests.
+  - **The cost:** 55 usage records, all the gate's: SY.architect 28, SY.admin's executor 8,
+    SY.cognition 17, AI.pruebas 2, the frontdesk none.
+  - **Found:** by the gate, A-329 (medium, on 0.1.136: the Go SDK drops a burst's messages when its
+    command channel is full, 344 of 1000 at 50 a second), A-330, A-331 and A-332 (low), and the
+    lab's template 9000, stale (B-18); by A-322's review, A-327 and A-328 (low).
+- **PROD after the gate:** all four hives on 0.1.137; snapshot `pre-sweep-0-1-137` on each VM. The
+  gate's pages taken down and their files removed; the workflow `gate0237w` deleted with force at
+  its step (its WF node's ILK purged with it, A-159's known behaviour) and `gate0237u` deleted;
+  `AI.gate0237s` torn down (no history); `AI.gate0237c` and `IO.gate0237u` kept stopped with their
+  ILKs (they made history); Archi's 3 sessions deleted by id; the runtimes `ai.gate0237p`,
+  `wf.gate0237w`, `wf.gate0237u` and `wf.gate0237a` gone on both hives; VM 104 destroyed. One
+  person stays in the tenant pruebas (A-293's registration). Health clean since 09:44Z,
+  `wandrops=0`. Pending: the gate's `drift` read at +24 h (2026-11-13, about 11:00Z), A-283's check
+  that no hive opened a Syncthing drift row outside the gate's steps; telling the Cloud team, whose
+  page is outside the repo, that A-243 and A-298 are live.
+- **Rollback:** the snapshot `pre-sweep-0-1-137` (all 4 VMs), or `apt install fluxbee=0.1.136` +
+  0.1.136's `update_installation`: nothing one-way; the sweep's items come back, A-298's redeploy
+  among them.
 
 ## 0.1.136 — The AI SDK alone: status, config and the handoff beside the LLM turns, and a busy answer past the queue (A-257)
 
