@@ -168,12 +168,12 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
     by UUID reads, and one by name got `NODE_NOT_FOUND` from the hub until its next rebuild, at a
     message of one of its own nodes or within 5 s. It rebuilds it, too, as it marks a hive stale:
     a frame by name to a node of that hive is answered `NODE_NOT_FOUND` at once, where until
-    0.1.132 it went on toward that hive until the next rebuild. Since 0.1.134 no build that runs
+    0.1.132 it went on toward that hive until the next rebuild. Since 0.1.135 no build that runs
     at once and read the tables before them undoes these rebuilds: builds are stored in the order
     they began, an older one dropped (A-268); until then one could, until the next build.
-  - **Broadcasts across the hub** (A-272, since 0.1.134): a gateway hands a broadcast that came
+  - **Broadcasts across the hub** (A-272, since 0.1.135): a gateway hands a broadcast that came
     over the WAN on to every WAN peer but the one it came from (split horizon): the hub to every
-    other spoke, a spoke, whose one peer is the hub, to none. Until 0.1.134 it went back too: each
+    other spoke, a spoke, whose one peer is the hub, to none. Until 0.1.135 it went back too: each
     spoke sent every broadcast of the hub back to it, and the hub sent a spoke's back to that spoke,
     where the source check dropped it (`router dropped a WAN frame`, counted as `foreign_source`).
     Most of that counter's drops on 8.x were these echoes.

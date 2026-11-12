@@ -63,7 +63,7 @@ Separate three things that are conflated today: **data** (which node lives on wh
   a refusal from another, as between any other two hives. Only an answer the adjacent router made
   itself goes on, and never back where it came from; one it does not hand on is counted and
   logged with the reason.
-- Since 0.1.134 (FINDINGS A-272) a broadcast takes the same **split horizon**: a gateway hands one
+- Since 0.1.135 (FINDINGS A-272) a broadcast takes the same **split horizon**: a gateway hands one
   that came over the WAN on to every WAN peer but the one it came from (`broadcast_to_wan`), so the
   hub hands a spoke's broadcast to every other spoke, and a spoke sends one from the hub back to no
   hive. Until then each went back too, and the router it went back to dropped it as a
@@ -86,7 +86,7 @@ Separate three things that are conflated today: **data** (which node lives on wh
   advertises that LSA's nodes, so a name a spoke has just announced resolves on the hub at once;
   until then the hub answered a frame relayed by name to it `NODE_NOT_FOUND` until its next
   rebuild, up to 5 s. It rebuilds it, too, as it marks a spoke stale, whose names then leave it at
-  once. Since 0.1.134 (FINDINGS A-268) no build that ran at once and read the tables before them
+  once. Since 0.1.135 (FINDINGS A-268) no build that ran at once and read the tables before them
   undoes these rebuilds, nor a spoke's as it applies a reachability advertisement
   (`apply_wan_reachability`): a FIB is stored only by a build newer than the one that stored the
   last.

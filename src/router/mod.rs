@@ -2172,7 +2172,7 @@ async fn broadcast_to_peers(
 /// Hands a broadcast to every WAN peer's link but that of `came_from`, the hive it came from when
 /// it came over the WAN, which has it already (split horizon, A-272): the hub hands a spoke's
 /// broadcast to every other spoke, and a spoke, whose one peer is the hub, hands one from the hub
-/// to no hive. Until 0.1.134 it went back too: each spoke sent every broadcast of the hub back to
+/// to no hive. Until 0.1.135 it went back too: each spoke sent every broadcast of the hub back to
 /// it, and the hub sent a spoke's back to that spoke, where the source check dropped it as a
 /// `foreign_source` frame (routing-and-policy.md §2): a frame wasted per spoke and per broadcast,
 /// and a counter and a line filled with echoes that hid a real drop. Its handler checked it first
@@ -2266,7 +2266,7 @@ async fn hand_to_hive(
 /// Hands a broadcast toward the WAN: the gateway to every WAN peer, another router to the gateway
 /// sibling, unless the copy came from that sibling over IRP (`came_from`, `None` for a node's
 /// broadcast): the gateway sent it toward the WAN itself, so it goes back no more (split horizon,
-/// A-272, since 0.1.134). The reason its sender would be answered `UNREACHABLE` with, if any:
+/// A-272, since 0.1.135). The reason its sender would be answered `UNREACHABLE` with, if any:
 /// `LINK_BUSY` when a link it was handed to was full (A-222); `GATEWAY_UNAVAILABLE` when it could
 /// not leave for the WAN at all, with no gateway sibling or no link to it. A `FRAME_TOO_LARGE` from
 /// that link would be answered the same way, but cannot come: the caller measured the broadcast
@@ -6973,7 +6973,7 @@ async fn rebuild_fib(
 /// it. Each build takes its generation before it reads anything (`build_fib`), and the change's
 /// own rebuild takes one after the change: so a build with a newer generation than that rebuild's
 /// read the change too, and one with an older generation is dropped. Once the rebuild that follows
-/// a change returns, the FIB has seen the change, whichever rebuild it is. Until 0.1.134 the last
+/// a change returns, the FIB has seen the change, whichever rebuild it is. Until 0.1.135 the last
 /// build to store won, and one that read before a change could undo the change's rebuild until
 /// the next build, 5 s at most: a node an LSA had just added missing from the hub's FIB (A-265),
 /// a stale hive's names left in it, or the nodes the hub had just vouched for missing from a
@@ -14937,7 +14937,7 @@ mod tests {
     /// handed it, here SY.admin@motherbee's from the WAN, back to no router: the gateway sent it
     /// toward the WAN itself. Its node gets it. One a sibling that is not the gateway hands it
     /// still goes on to the gateway
-    /// (`a_router_that_is_not_the_gateway_hands_a_siblings_frame_on_and_goes_on`). Until 0.1.134
+    /// (`a_router_that_is_not_the_gateway_hands_a_siblings_frame_on_and_goes_on`). Until 0.1.135
     /// the gateway's copy went back to it, which dropped it.
     #[tokio::test]
     async fn a_router_that_is_not_the_gateway_hands_the_gateways_broadcast_back_to_no_router() {
@@ -17661,7 +17661,7 @@ mod tests {
     /// they took before they read anything, whichever stores last. A build reads the hub's tables;
     /// worker1's LSA then names a new node, and the arm that applies it rebuilds the FIB (A-265);
     /// the first build stores last and is dropped, so a frame ingress1's node sends by name to the
-    /// new node goes on to worker1. A build taken after both stores. Until 0.1.134 the last build
+    /// new node goes on to worker1. A build taken after both stores. Until 0.1.135 the last build
     /// to store won: the older one undid A-265's rebuild, and the hub answered such a frame
     /// NODE_NOT_FOUND until its next build, up to 5 s later.
     #[tokio::test]
@@ -17827,7 +17827,7 @@ mod tests {
 
     /// A-272 on the hub, linked to two spokes: a broadcast of ingress1's node goes on to worker1,
     /// one hop of TTL less, and never back to ingress1, which has it; the hub's node gets it. With
-    /// 3 hops left it still reaches worker1, with 2 or 1 only the hub's node. Until 0.1.134 it went
+    /// 3 hops left it still reaches worker1, with 2 or 1 only the hub's node. Until 0.1.135 it went
     /// back to ingress1 too, where the source check dropped it as `foreign_source`.
     #[tokio::test]
     async fn the_hub_hands_a_spokes_broadcast_to_the_other_spoke_and_never_back() {
@@ -17868,7 +17868,7 @@ mod tests {
     /// A-272 on a spoke, whose one WAN peer is the hub: a broadcast from the hub, of the hub's node
     /// or of another spoke's node the hub relays, goes over no WAN link, back to the hub least of
     /// all; the spoke's node gets it, and a sibling router too, one hop less, as before. Until
-    /// 0.1.134, with 3 hops left or more, it went back to the hub, where the source check dropped
+    /// 0.1.135, with 3 hops left or more, it went back to the hub, where the source check dropped
     /// it.
     #[tokio::test]
     async fn a_spoke_hands_a_broadcast_from_the_hub_back_to_no_hive() {
@@ -17907,7 +17907,7 @@ mod tests {
     /// A-272 end to end, a router per hive as on 8.x: the hub linked to ingress1 and worker1, each
     /// spoke linked only to it. A broadcast of the hub's node reaches both spokes' nodes, and one
     /// of ingress1's node reaches the hub's and worker1's: each crosses each link once, away from
-    /// its sender, and no router drops a frame as a foreign source's. Until 0.1.134 each spoke sent
+    /// its sender, and no router drops a frame as a foreign source's. Until 0.1.135 each spoke sent
     /// the hub's broadcast back to it, and the hub sent ingress1's back to ingress1; each was
     /// dropped there as `foreign_source`, which counted mostly these echoes on 8.x.
     #[tokio::test]
