@@ -307,7 +307,7 @@ no change required
     SY.cognition: A-332; SY.edge: A-317; SY.timer: A-326; the WF engine and SY.wf-rules: A-302,
     A-307, A-333); then the router alone (A-269); the Go SDK alone (A-329 with SY.timer's resend,
     A-264); the AI SDK alone (A-294, A-290, A-325, `tool_choice` for A-327); the Rust SDK alone
-    (A-295, A-309, A-285's `cloud.rs` text). Lab: B-18 (the template). Out of it, by decision or as
+    (A-295, A-309, A-285's `cloud.rs` text). Lab: B-18, the template rebuilt (✅). Out of it, by decision or as
     large topics: A-159/A-275/A-276 (deletion), A-137/A-227 (cognition), A-142 (with io.web), A-168,
     the parked security items, A-289, A-199 step 2, A-250 (b), A-210 (after 2026-11-22).
 
@@ -467,7 +467,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 ### Infrastructure and the lab (section B)
 
 - B-14 🟡 The PROD VMs boot slowly (lab only).
-- B-18 🟡 The template 9000 is stale: a fresh clone upgrades its packages for about 11 min at its first boot, which a join waits out (lab only).
 
 ---
 
@@ -9645,7 +9644,7 @@ router reviews.
 - **A second environment fits:** half the pool is free, and the balloon floors leave room in
   memory without new hardware.
 
-### B-18 🟡 LAB ONLY, OPEN — The template 9000 is stale: a fresh clone upgrades its packages for about 11 min at its first boot
+### B-18 ✅ RESOLVED (2026-11-12, the template 9000 rebuilt: a fresh clone's cloud-init 661 s → 60 s) — The template 9000 was stale: a fresh clone upgraded its packages for about 11 min at its first boot
 
 - **What was observed (0.1.137's gate, 2026-11-12):** VM 104, cloned from the template 9000 for a
   throwaway worker, spent about 674 s of its first boot in cloud-init's package upgrade, which
@@ -9656,12 +9655,16 @@ router reviews.
   timings measure the template, not the join.
 - **To do:** refresh the template (`lab/template-prep.sh`), so that a clone does not start with a
   backlog of package upgrades.
-- **Fixed in the lab's tool (2026-11-12), the template untouched:** the upgrade is Proxmox's
-  cloud-init default (`ciupgrade`, unset on the template 9000; 8.x runs Proxmox 9.2.2, which has the
-  option since 8.1). `lab/pve.py create` now sets `ciupgrade=0` on its clones (`--ciupgrade 1` asks
-  for the upgrade), so a gate's throwaway worker boots without it and only the gate's own clones
-  change (the template may serve others). To check at the next join of a fresh clone (0.1.139's
-  gate): its time back near 0.1.118's 127 s.
+- **Resolved (2026-11-12, the operator: *"rehace el template 9000, no podemos esperar 11 min por cada
+  instalación cuando se resuelve corriendo todo en 11 min una vez"*):** the template 9000 (`fb-template`,
+  8.x, Proxmox 9.2.2) rebuilt by `lab/template-rebuild.py`, a valid template at every moment: a clone
+  (9001) ran its first-boot upgrade (661 s, 17:16–17:28Z), `dist-upgrade` found nothing more (2
+  packages phased), a reboot onto kernel 6.8.0-149, `lab/template-prep.sh`, then 9001 a template, the
+  old 9000 destroyed, 9001 cloned onto 9000 and made a template, 9001 destroyed (17:33Z). A check
+  clone with Proxmox's default upgrade on: cloud-init done at +60 s, 2 packages left (phased), its
+  own machine-id and SSH host keys. `lab/pve.py create` keeps Proxmox's default (`--ciupgrade 1`;
+  `0` skips the upgrade). Rebuild the template again when a clone's first boot grows long:
+  `python3 lab/template-rebuild.py --env scratchpad/pve.env --pve-host 192.168.8.207 all`.
 
 ---
 

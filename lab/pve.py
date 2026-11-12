@@ -183,8 +183,8 @@ def cmd_create(a):
     if a.ciuser:
         cfg["ciuser"] = a.ciuser
     # FINDINGS B-18: Proxmox's cloud-init upgrades every package at a clone's first boot unless
-    # ciupgrade is 0 (Proxmox 8.1+); on the stale template that held a join ~11 min in cloud-init.
-    # A lab clone skips it by default; --ciupgrade 1 asks for it.
+    # ciupgrade is 0 (Proxmox 8.1+). On a current template that takes about a minute (on a stale
+    # one it took 11: rebuild it with lab/template-rebuild.py). --ciupgrade 0 skips it.
     cfg["ciupgrade"] = int(a.ciupgrade)
     api("POST", "/nodes/%s/qemu/%s/config" % (n, a.id), cfg)
     if a.disk:
@@ -410,8 +410,8 @@ def main():
     s.add_argument("--ip", default="dhcp"); s.add_argument("--mem", default="4096")
     s.add_argument("--cores", default="2"); s.add_argument("--disk", default="20G")
     s.add_argument("--sshkey", default="~/.ssh/id_rsa.pub"); s.add_argument("--ciuser", default="fluxbee")
-    s.add_argument("--ciupgrade", default="0", choices=("0", "1"),
-                   help="cloud-init's package upgrade at the first boot (default 0: skipped, B-18)")
+    s.add_argument("--ciupgrade", default="1", choices=("0", "1"),
+                   help="cloud-init's package upgrade at the first boot (default 1, Proxmox's; 0 skips it)")
     s.add_argument("--start", action="store_true"); s.set_defaults(fn=cmd_create)
 
     for name, fn in (("start", cmd_start), ("reboot", cmd_reboot), ("status", cmd_status)):
