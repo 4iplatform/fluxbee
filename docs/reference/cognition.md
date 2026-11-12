@@ -314,15 +314,25 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
       way when it came.
     - A turn older than the grace when the worker takes it does not wait. The agent's own
       answers, the relays and the turns with no person at their other end never wait.
+    - A cognition that cannot call a model (`ai` settings it cannot use, or no key, §8) waits
+      all the same, then skips the turn: the wait costs no call, and a refused turn is counted as
+      refused, not as a tagger failure.
+    - `agent_waits_total` counts a wait only when the answer was not there at its first look. An
+      answer the intake took before the worker came to the turn needs none: one in the turn's own
+      stream batch (an answer within milliseconds can share it), or one taken while the worker
+      was on other turns.
     - **Why a grace, and neither the agent's whole answer nor a cancel:** the AI runtime refuses
       at once (7 to 12 ms), and on 8.x cognition took the refusal 0.04 to 0.26 s after it. Its
-      answer takes seconds, a minute with tools, or never comes: waiting for it would hold the
+      answer takes seconds, a minute with tools, or never comes (an agent that answers nothing, a
+      refusal its runtime could not send, `busy_answers_dropped`): waiting for it would hold the
       serial worker, and every other communication's turns with it. A call cancelled is billed by
       its provider all the same, its input at least, and recorded `abandoned`, without tokens: the
       cost would leave the accounts.
     - The answers are in memory only, those of the last grace (an older one is never looked for),
       4,096 at most (`COGNITION_ANSWERS_KEPT`). A refusal later than the grace finds the call made,
-      and its result is dropped as above.
+      and its result is dropped as above. When that call fails, the turn is skipped as a provider
+      error (`semantic_tagger_provider_errors_total`) before the refusal is looked at, and is not
+      in `refused_turns_not_analyzed_total`.
   - The refusals are in memory only (`Refusals`), the last 4,096 (`COGNITION_REFUSALS_KEPT`): a
     refusal matters while its turn may wait in the worker's queue or in the copy the worker took
     for one turn, and the refusals of turns the full queue dropped count too. 4,096 cover a full
@@ -821,9 +831,11 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
   people, §2), `duplicate_turns_skipped_total` (one message copied twice, §2), and the agents'
   refusals (§3.4): `refusals_total`, `refused_turns_dropped_total` (the turns they dropped) and
   `refused_turns_not_analyzed_total` (the refused turns the worker did not analyze, or whose
-  analysis it dropped); and the worker's waits for the agent (§3.4): `agent_waits_total` (the
-  person's turns it waited on) and `agent_waits_grace_over_total` (those whose wait ran its whole
-  grace, with no answer nor refusal);
+  analysis it dropped; one whose tagger call failed first counts as a provider error instead);
+  and the worker's waits for the agent (§3.4): `agent_waits_total` (the person's turns it waited
+  on, a cognition that cannot call a model included) and `agent_waits_grace_over_total` (those
+  whose wait ran its whole grace, with no answer nor refusal). Since 0.1.139 these five are in
+  `CONFIG_GET`'s `runtime` too (§8);
 - the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, provider errors,
   invalid outputs and other failures (§3.1);
 - the live state: the communications held, their contexts, reasons and co-occurrences, active

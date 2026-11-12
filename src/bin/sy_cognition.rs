@@ -342,9 +342,10 @@ struct CognitionRuntimeState {
     refusals_total: u64,
     refused_turns_dropped_total: u64,
     refused_turns_not_analyzed_total: u64,
-    /// The person's turns the worker waited on for their agent's answer or refusal before it
-    /// analyzed them (`wait_for_the_agent`, FINDINGS A-332), and those of them whose wait ran its
-    /// whole grace with neither.
+    /// The person's turns the worker waited on for their agent's answer or refusal before it went
+    /// on with them (`wait_for_the_agent`, FINDINGS A-332), and those of them whose wait ran its
+    /// whole grace with neither. A wait is counted only when the answer was not there at its
+    /// first look, and a cognition that cannot call a model waits too.
     agent_waits_total: u64,
     agent_waits_grace_over_total: u64,
     /// Records of a stream batch at or below the last seq taken for that stream and epoch.
@@ -2727,7 +2728,9 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     // A person's message the agent got, which the agent may still refuse, is analyzed once the
     // agent answered or refused it, or once its grace is over (FINDINGS A-332): a refusal the
     // intake takes while the tagger answers wastes that call. A turn no model reads waits for
-    // nothing.
+    // nothing. A cognition that cannot call a model (`ai_settings_error`, no key) waits all the
+    // same: the wait costs no call, and a refused turn is then counted as refused, not as a
+    // tagger failure.
     if person && !request.is_empty() {
         let started = time::Instant::now();
         let waited = wait_for_the_agent(&app_state, &key, &request, turn.taken_at).await;
@@ -11231,8 +11234,8 @@ mod tests {
 
     // --- The worker waits for the agent's answer before a person's turn (FINDINGS A-332) ---
 
-    /// A cognition with no model, whose analysis stops at its first model call, which counts it;
-    /// and the queue its intake hands the turns to.
+    /// A cognition that cannot call a model (its `ai` settings unusable), whose analysis stops at
+    /// its first model call, which counts it; and the queue its intake hands the turns to.
     async fn waiting_cognition(
         hive_id: &str,
         dir: &Path,
@@ -11267,7 +11270,8 @@ mod tests {
     /// stream's next batch 40 ms later (0.037 s on 8.x). A-292 dropped the call's result; the call
     /// was made. The worker now waits for the agent's answer: the refusal ends the wait at once,
     /// and no model is called. A refusal the intake took before the worker got to its turn ends no
-    /// wait: there is none.
+    /// wait: there is none. This cognition cannot call a model (`waiting_cognition`), and waits
+    /// all the same: the refused turn counts as refused, not as a tagger failure.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_after_the_worker_took_its_turn_costs_no_model_call() {
         let dir = TestDir::new();
@@ -11306,6 +11310,7 @@ mod tests {
         {
             let state = app_state.runtime_state.lock().await;
             assert_eq!(state.semantic_tagger_calls_total, 0, "no model call");
+            assert_eq!(state.semantic_tagger_failures_total, 0, "no tagger failure");
             assert_eq!(state.refused_turns_not_analyzed_total, 1);
             assert_eq!(
                 (state.agent_waits_total, state.agent_waits_grace_over_total),

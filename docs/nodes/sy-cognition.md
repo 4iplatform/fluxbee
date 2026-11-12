@@ -108,14 +108,20 @@ no turn:
     and only dropped the call's result.
   - A turn that waited longer than that in the queue does not wait again. The agent's own answers,
     the relays and the turns with no person at their other end never wait.
+  - A cognition that cannot call a model (its `ai` settings unusable, or no key) waits too, and
+    then skips the turn. The wait costs no call, and a refused turn is counted as refused, not as
+    a tagger failure.
   - A refusal that comes after the grace finds the call made, and drops its result as before.
+    When that call fails (no answer from the provider in time), the turn counts as a provider
+    error (`semantic_tagger_provider_errors_total`), not as a refused turn not analyzed.
 - **It remembers** the last 4,096 refusals (`COGNITION_REFUSALS_KEPT`), in memory only: a full
   turn queue's drain at about three refusals a second. Past that, a refused turn that still waits
   for the worker is analyzed, as before 0.1.137, and stays out of the last turns.
 - **The journal** names the refusals at info: the first at once, with its `trace_id` and what it
   left (`turn`: `dropped`, `relay_again`, `kept_for_another_copy` or `no_turn_held`), then at most
   one line every 10 s with how many came since (`refusals`), the end of a burst included (the
-  heartbeat names it). The counters are in `STATUS` (below).
+  heartbeat names it). The counters are in `STATUS` and, since 0.1.139, in `CONFIG_GET`'s
+  `runtime` (below).
 - **What it does not change:** a refusal the runtime could not send (its direct lane full) leaves
   the turn as before, and so does one of a turn a cognition older than 0.1.137 took. A message the
   router delivers to the agent before cognition takes the refusal still carries the refused turn
@@ -189,11 +195,12 @@ those are the installation's, in its installation file). It accepts `thresholds.
   `degraded_ai_settings_invalid`, `cognition_state_label`), the degraded reasons
   (`ai_settings_invalid`, `ai_provider_missing`), where the provider and the model came from
   (`ai_provider.settings`: `{from: installation_file, version, sha256}` or `{from: hive_yaml}`,
-  with `error` when they cannot be used; `config.ai.settings` in `CONFIG_GET`), the turn counters
-  (the agents' refusals among them: `refusals_total`, `refused_turns_dropped_total`,
-  `refused_turns_not_analyzed_total`; and the worker's waits for the agent, `agent_waits_total` and
-  `agent_waits_grace_over_total`, which `CONFIG_GET`'s `runtime` has too since 0.1.139), and the
-  clears it took (`clears`). Through the admin:
+  with `error` when they cannot be used; `config.ai.settings` in `CONFIG_GET`), the turn counters,
+  and the clears it took (`clears`).
+- Among the turn counters: the agents' refusals (`refusals_total`, `refused_turns_dropped_total`,
+  `refused_turns_not_analyzed_total`) and the worker's waits for the agent (`agent_waits_total`,
+  `agent_waits_grace_over_total`). Since 0.1.139 all five are in `CONFIG_GET`'s `runtime` too.
+- Through the admin, which reaches the node's `CONFIG_GET` and not its `STATUS`:
   `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
 
 ## Links

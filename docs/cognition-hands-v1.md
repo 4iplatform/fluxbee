@@ -203,8 +203,8 @@ Cognition analyzes the first two lines only: a person is at their other end.
     relay. One that also stands for another copy of its text, which the agent took (a WF can send
     it one text twice in one cycle), stays as it was.
   - The worker waits for the agent's answer or refusal before it analyzes a person's turn, 2 s at
-    most from its intake (FINDINGS A-332, since 0.1.139): a refusal then costs no model call, where
-    up to 0.1.138 the tagger's call was under way when the refusal came.
+    most from its intake (FINDINGS A-332, since 0.1.139): a refusal within that time costs no model
+    call, where up to 0.1.138 the tagger's call was under way when the refusal came.
   - The refusal is no turn.
   - **Dropped, not kept with a mark "unanswered":**
     - the agent never took the message, and its sender is told to send it again; the copy sent
