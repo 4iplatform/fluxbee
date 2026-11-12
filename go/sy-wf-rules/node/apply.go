@@ -48,20 +48,18 @@ func (s *Service) applyWorkflow(ctx context.Context, req ApplyRequest) (*ApplyRe
 	if err := s.checkSlotLoads(workflowName, "staged", stagedMeta.Version); err != nil {
 		return nil, err
 	}
-	if err := s.store.RotateToApply(workflowName); err != nil {
+	// The staged version's package first, the slots after it (publishSlot): a publish refused or not
+	// answered leaves the version staged, and current and backup as they were.
+	publish, err := s.publishSlot(ctx, workflowName, "staged", *stagedMeta)
+	if err != nil {
 		return nil, err
+	}
+	if err := s.store.RotateToApply(workflowName); err != nil {
+		return nil, slotsNotMoved(publish, err)
 	}
 	currentMeta, err := s.store.ReadCurrentMetadata(workflowName)
 	if err != nil {
 		return nil, err
-	}
-	definitionBytes, err := s.store.ReadCurrentDefinition(workflowName)
-	if err != nil {
-		return nil, err
-	}
-	publish, err := s.publishWorkflowPackage(ctx, workflowName, *currentMeta, definitionBytes)
-	if err != nil {
-		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
 	s.purgeAfterPublish(ctx, workflowName)
 	return &ApplyResult{

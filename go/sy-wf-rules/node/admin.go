@@ -13,15 +13,27 @@ import (
 
 const (
 	adminRPCTimeout = 5 * time.Second
+	// packagePublishTimeout is how long SY.wf-rules waits for SY.admin's answer to its
+	// publish_runtime_package. Before it installs anything, SY.admin reads whether another hive
+	// holds a WF.<workflow>, every other hive's config asked at once (up to 3 s since 0.1.139,
+	// WF_PACKAGE_HOLDER_READ_TIMEOUT, FINDINGS A-304), then waits for its own lock of the runtimes
+	// manifest, at most 4 s for a publish of SY.wf-rules (WF_RULES_PUBLISH_LOCK_WAIT), and answers
+	// RUNTIME_MANIFEST_BUSY, retryable, past it; the install of three small files and the mesh both
+	// ways take the rest. With 5 s, the admission and a lock held by another writer for 2 s made
+	// this a timeout while SY.admin went on waiting up to 60 s for the lock and then published the
+	// version as current, unseen (0.1.139's integration review).
+	packagePublishTimeout = 10 * time.Second
 	// runtimeRemovalTimeout is how long SY.wf-rules waits for SY.admin's answer to one
-	// remove_runtime_version. Before it removes anything, SY.admin reads the version's use on every
-	// hive that may run it (get_runtime to the motherbee's orchestrator, which it waits 30 s for
-	// unless JSR_ADMIN_ORCH_TIMEOUT_SECS says otherwise) and removes the version only once each of
-	// them answered (FINDINGS A-281): those 30 s and adminRPCTimeout for the rest (its checks of the
-	// manifest, its write, the mesh both ways), 35 s in all, so SY.admin's own answer, a refusal
-	// naming the hives it could not read included, comes before this wait ends. It can come later:
-	// since 0.1.139 SY.admin reads the use with no lock held, then waits up to 60 s for its
-	// manifest's lock, which a publish holds across its install and another removal across its
+	// remove_runtime_version. Before it removes anything, SY.admin admits the request (since
+	// 0.1.139 a read of every other hive's WF.<workflow> config, asked at once, up to 3 s: FINDINGS
+	// A-304), then reads the version's use on every hive that may run it (get_runtime to the
+	// motherbee's orchestrator, which it waits 30 s for unless JSR_ADMIN_ORCH_TIMEOUT_SECS says
+	// otherwise) and removes the version only once each of them answered (FINDINGS A-281): 33 s at
+	// most for those two reads, which leaves 2 s of 35 s for the rest (its checks of the manifest,
+	// its write, the mesh both ways), so SY.admin's own answer, a refusal naming the hives it could
+	// not read included, comes before this wait ends unless both reads take all their time. It can
+	// come later: since 0.1.139 SY.admin reads the use with no lock held, then waits up to 60 s for
+	// its manifest's lock, which a publish holds across its install and another removal across its
 	// write, and reads the use again under it when the runtime changed meanwhile (FINDINGS A-306);
 	// and a JSR_ADMIN_ORCH_TIMEOUT_SECS above 30 s waits longer. Such an answer is a TIMEOUT here
 	// (packages_left), which says SY.admin may still remove the version. With 5 s, before 0.1.133, a
@@ -99,7 +111,7 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 		},
 		"set_current": true,
 	}
-	response, err := c.request(ctx, publishRuntimePackageAction, "", params)
+	response, err := c.requestWithTimeout(ctx, publishRuntimePackageAction, "", params, packagePublishTimeout)
 	if err != nil {
 		return nil, err
 	}

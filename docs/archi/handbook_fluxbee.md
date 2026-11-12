@@ -1015,9 +1015,10 @@ person: when its provider gave no answer, the error carries the operator's text 
     again, nothing changed first, may remove it: not for `RUNTIME_IN_USE` (its node is stopped or
     moved first), nor for a `RUNTIME_USAGE_UNKNOWN` SY.admin says is not retryable (a hive not
     read is a join that ended, whose `next` says what ends it, or the motherbee could not read its
-    own nodes) and each `PURGE_STOPPED` after it. `payload.warning` says the workflow is deleted
-    and what removes them. Say the workflow is deleted, and which versions stayed and why; never
-    that the removal failed, and never run it again (it answers `WORKFLOW_NOT_FOUND`).
+    own nodes) and each `PURGE_STOPPED` after it, nor for `UNAUTHORIZED` and each `PURGE_STOPPED`
+    after it (below). `payload.warning` says the workflow is deleted and what removes them. Say
+    the workflow is deleted, and which versions stayed and why; never that the removal failed, and
+    never run it again (it answers `WORKFLOW_NOT_FOUND`).
   - In a plan's answer cut to fit the frame, the step keeps `packages_left` short: each version's
     `runtime`, `version`, `error_code` and `retryable`, the first one's `detail` cut, and each hive
     not read with its `reason` and `next`. When that is cut too (`truncated_items`), read `GET
@@ -1027,12 +1028,15 @@ person: when its provider gave no answer, the error carries the operator's text 
     `remove_runtime_version` step each (hive `motherbee`) once every hive answers, in
     `packages_left`'s order, the runtime's current last (a step refused `RUNTIME_CURRENT_CONFLICT`
     goes after the others), in a plan the operator confirms.
-  - `UNAUTHORIZED` (since 0.1.139, `retryable` false) is the exception: another hive holds a
-    `WF.<workflow_name>`, the node its `detail` names (a name deployed on two hives before
-    0.1.139, say), and the version is that node's package too (FINDINGS A-304). It stays until
-    that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is refused
-    the same way (§7.5). Tell the operator which hive uses the name, and never offer to remove
-    those versions.
+  - A purge that stopped at `UNAUTHORIZED` (since 0.1.139) is the exception, for every version it
+    left: another hive holds a `WF.<workflow_name>`, the node the first entry's `detail` names (a
+    name deployed on two hives before 0.1.139, say), and SY.admin refuses this hive every version
+    of the package alike (FINDINGS A-304). So the first entry is `UNAUTHORIZED` and each after it
+    `PURGE_STOPPED`, none `retryable`, and any of them may be that node's current or backup. They
+    stay until that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is
+    refused the same way (§7.5). Tell the operator which hive uses the name, and never offer to
+    remove any of them: a `remove_runtime_version` the operator confirms is not refused so, and
+    would take them from that hive.
   - `DIST_UNREADABLE` is the exception: it names no version, and until the hive's
     `dist/runtimes/wf.<workflow_name>` can be listed again, a compile of the name that names no
     version is refused (`WFRULES_ERROR`, nothing staged), so the workflow cannot be deployed again.
@@ -1521,7 +1525,7 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
   certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48),
   and a join that finds that box's `SY.orchestrator` online takes it over the socket, even when
   the join's address names another box, with no identity key and no new certificate (FINDINGS
-  A-335).
+  A-339).
   Tell the operator, and do not stage `add_hive` under that name until the operator has stopped
   that box's install or confirms the box is gone.
 - **`syncthing_peer_cleanup: kept_for_other_hive`** in a `remove_hive` answer (since 0.1.139,
@@ -1594,7 +1598,9 @@ Three actions answer a secret once: `publish_cloud_endpoint` the bearer token Fl
   their private channel (Fluxbee Cloud's token goes to the Cloud's operator, never in a chat).
 - If the operator lost it: it is not kept anywhere they can read. For the Cloud's token, publishing
   again (`publish_cloud_endpoint`, a plan they confirm) mints a new one, which the Cloud must get at
-  once; say so before staging it.
+  once; say so before staging it. One publish runs at a time: one asked while another runs is
+  refused at once, `BUSY` with `payload.retryable` true, nothing read or minted (since 0.1.139), so
+  offer to stage it again once the other has answered.
 - A step of those three actions never carries `executor_fill`: SY.admin's executor would run it
   through its model, which would get the answer. Nor does a step that takes one of their answers
   (`$steps.<id>...`, a `vault_put` that stores a copy, say): SY.admin resolves the reference into
@@ -1866,10 +1872,16 @@ Use:
 
 A workflow's name is one package for every hive (`wf.<name>`). While another hive holds a
 `WF.<name>` node, running or stopped, a deploy of that name on this hive fails: SY.admin refuses
-its package with `UNAUTHORIZED`, naming the other node (FINDINGS A-304). Tell the operator which
-hive uses the name, and offer another name, or the workflow's delete on that hive first. A delete
-of the name on this hive meanwhile removes its workflow, node and state, and leaves the versions
-the other node uses (`packages_left`, each `UNAUTHORIZED`).
+its package (FINDINGS A-304), and the deploy answers `PACKAGE_PUBLISH_FAILED` (422), its
+`error_detail` starting with SY.admin's refusal, `UNAUTHORIZED: SY.wf-rules@<hive> may not change
+wf.<name>: ...`, which names the other hive's `WF.<name>`. Since 0.1.139 such a deploy changes
+nothing on this hive: its version stays staged, and the current version and the WF node stay as
+they were. Tell the operator which hive uses the name, and offer another name, or the workflow's
+delete on that hive first. A `PACKAGE_PUBLISH_FAILED` whose detail starts `RUNTIME_MANIFEST_BUSY`
+comes with `payload.retryable` true: another change of the runtimes held their manifest, so offer
+to stage the deploy again. A delete of the name on this hive meanwhile removes its workflow, node
+and state, and leaves every version its purge had to remove (`packages_left`: the first
+`UNAUTHORIZED`, each after it `PURGE_STOPPED`, none `retryable`; §4.2.7).
 
 Use this when the operator is describing:
 - branching
@@ -1915,7 +1927,9 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
     `RELAUNCH_DUE` (its unit does not run, crashed or failed, and the orchestrator relaunches it on
     this version within a minute). Tell the operator which nodes, and that each must be stopped
     (`kill_node`) or moved to another version first. A node stopped with `kill_node` is not
-    listed.
+    listed. The node's own hive lists a `RELAUNCH_DUE` node, so a hive whose core is older than
+    0.1.139 (one the installation's update has not reached yet) lists none: while one is, tell the
+    operator that a crashed node there pinned to the version is not counted.
   - `RUNTIME_USAGE_UNKNOWN` when some hive's nodes could not be read: `payload.unanswered_hives`
     names each hive and why. A worker that gave no answer within 10 s (`TIMEOUT`: its orchestrator
     stuck or restarting), one down or stale (`UNREACHABLE`), or one that could not read its nodes

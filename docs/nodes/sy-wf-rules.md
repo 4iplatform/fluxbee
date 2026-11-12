@@ -71,7 +71,8 @@ request reaches a worker's SY.wf-rules from `SY.admin@motherbee`.
   read refuses the compile (`WFRULES_ERROR`, naming it, "nothing was staged"): a version above
   what it holds is unknown. A compile that names its `version` stages that one.
 - Apply moves `current` to `backup` and `staged` to `current` (`RotateToApply`). Rollback moves
-  `backup` to `current` and the old `current` to `staged` (`RotateToRollback`).
+  `backup` to `current` and the old `current` to `staged` (`RotateToRollback`). Either moves them
+  only once SY.admin took the package (see Apply and rollback).
 
 ## Operations
 
@@ -113,22 +114,38 @@ compile and its apply leaves the staged and the current definitions as they were
 
 `ApplyWorkflowAndDeploy` / `RollbackWorkflowAndDeploy` (`node/deploy.go`):
 
-1. Rotates the slots (apply needs a staged version, else `NOTHING_STAGED`; with an explicit
-   `version` it must match the staged one, else `VERSION_MISMATCH`; rollback needs a backup,
-   else `NO_BACKUP`). First it loads the definition it is about to publish, the staged one or the
-   backup, with `wfcel.LoadDefinitionBytes`, as the WF node will: one staged or backed up by an
-   earlier release may no longer load (a known option written whole, say). It is then
-   `COMPILE_ERROR`, naming the path, and nothing rotates or is published.
-2. Publishes the `current` definition as a runtime package (`publishWorkflowPackage`,
-   `node/package_publish.go`): it sends `publish_runtime_package` to `SY.admin@motherbee` with
-   an inline package and `set_current: true`. The package is:
+1. Publishes the definition it deploys, the staged one or, on a rollback, the backup, as a
+   runtime package (`publishSlot`, `publishWorkflowPackage`, `node/package_publish.go`): apply
+   needs a staged version, else `NOTHING_STAGED`; with an explicit `version` it must match the
+   staged one, else `VERSION_MISMATCH`; rollback needs a backup, else `NO_BACKUP`. First it loads
+   that definition with `wfcel.LoadDefinitionBytes`, as the WF node will: one staged or backed up
+   by an earlier release may no longer load (a known option written whole, say). It is then
+   `COMPILE_ERROR`, naming the path, and nothing is published or moved. The publish sends
+   `publish_runtime_package` to `SY.admin@motherbee` with an inline package and
+   `set_current: true`, and waits 10 s for the answer (`packagePublishTimeout`). The package is:
    - `package.json`: `name: wf.<workflow>`, `version: 0.0.<n>` (the counter as semver,
      `workflowRuntimeVersion`), `type: workflow`, `runtime_base: wf.engine`;
    - `flow/definition.json`: the definition;
    - `config/default-config.json`: `sy_timer_l2_name: SY.timer@<hive>`,
      `gc_retention_days: 7`, `gc_interval_seconds: 3600`.
 
-   A failure here is `PACKAGE_PUBLISH_FAILED`.
+   A failure here is `PACKAGE_PUBLISH_FAILED`, its detail SY.admin's refusal, its code first
+   (`UNAUTHORIZED` while another hive holds a `WF.<workflow>`, see
+   [Messages and who may send them](#messages-and-who-may-send-them); `RUNTIME_MANIFEST_BUSY`,
+   with `retryable` true, while another writer holds the runtimes manifest's lock, which SY.admin
+   waits for 4 s for this caller), or the wait that ran out. It changes nothing: the slots move
+   only after the publish (since 0.1.139's integration review; before, they moved first, so a
+   refused deploy left `current` naming a version never published, its backup dropped, and a
+   refused rollback moved them again). SY.admin answers a publish within those 10 s: its A-62
+   admission reads every other hive's `WF.<workflow>` for up to 3 s, then it waits for its own
+   lock of the manifest 4 s at most (5 s and 60 s before, so a lock held 2 s made the deploy a
+   timeout, and SY.admin published the version as current once the lock came). Only the
+   manifest's file lock, which a writer outside SY.admin holds (the package's seed, a hand
+   publish), can still hold a publish past them.
+2. Rotates the slots, now that the package is published (`RotateToApply`, `RotateToRollback`). A
+   rotation that fails (this hive's disk) answers that the package was published, that moving the
+   slots failed and that the WF node was not touched (`slotsNotMoved`): ask again, which publishes
+   the same package (SY.admin takes the same contents again) and moves them.
 3. Removes obsolete versions of `wf.<workflow>` from the motherbee's dist, keeping the current
    version, the backup version and the version the WF node is bound to
    (`purgeWorkflowPackages`). Removal goes through SY.admin's `remove_runtime_version` on the
@@ -148,8 +165,9 @@ compile and its apply leaves the staged and the current definitions as they were
    0.1.139; before, a removal held it across its own read of the use). The
    purge stops at the first removal refused or not answered: what refused it holds for the next.
    Here, between the publish and the node's step, the whole purge is bounded by 15 s
-   (`deployPurgeBudget`, `purgeAfterPublish`), so the node's step keeps 40 s at least, as before
-   0.1.133 when its purge stopped at a refused removal (the read, then that removal's 5 s); the
+   (`deployPurgeBudget`, `purgeAfterPublish`), so the node's step keeps 35 s at least (40 s
+   while the publish waited 5 s), about what it kept before 0.1.133 when its purge stopped at a
+   refused removal (the read, then that removal's 5 s); the
    deploy goes on whatever the purge leaves, which is logged (`purge left wf.<workflow>
    <version>: <code>: <detail>`), and the next deploy tries it again.
 4. Deploys `WF.<workflow>@<hive>` (`deployPublishedWorkflow`), always through SY.admin's node
@@ -176,7 +194,7 @@ calls (`announceRuntimes`), and retries a node call refused with `RUNTIME_NOT_AV
 `untilRuntimeSynced`). A whole request is bounded by 60 s (`wfRulesRequestBudget`); SY.admin
 waits 75 s for the answer (`wf_rules_request_timeout`, overridable with
 `JSR_ADMIN_WF_RULES_TIMEOUT_SECS`), and Archi 90 s for SY.admin's. Within the 60 s, a deploy's
-publish takes up to 5 s and its purge up to 15 s, and its node step has the rest, 40 s at least;
+publish takes up to 10 s and its purge up to 15 s, and its node step has the rest, 35 s at least;
 a delete's reads of the node take up to 22 s (`get_node_config` and `get_node_status`, 10 s
 each, the count 2 s) and its kill up to 25 s (`nodeDeleteTimeout`), and its purge has the rest:
 a removal it cuts there is named `TIMEOUT` in `packages_left`.
@@ -257,7 +275,9 @@ is not counted.
     way; or `TIMEOUT` when no answer came in time (SY.admin may still remove it:
     `remove_runtime_version` then answers `RUNTIME_VERSION_NOT_FOUND`), or `TRANSPORT_ERROR`
     when SY.admin was not reached;
-  - each one it had still to remove, `PURGE_STOPPED`;
+  - each one it had still to remove, `PURGE_STOPPED`; after an `UNAUTHORIZED` these are that
+    hive's package too, since SY.admin refuses every version of the name alike, and may be its
+    current or its backup;
   - or, when its versions could not be listed, one entry with the runtime, no version
     (`version: ""`) and `DIST_UNREADABLE`: nothing was removed.
 
@@ -269,7 +289,10 @@ is not counted.
   writer held past 60 s, true, FINDINGS A-305); without it, true for
   `RUNTIME_USAGE_UNKNOWN` and `INVENTORY_UNAVAILABLE`; true for `TIMEOUT`, `TRANSPORT_ERROR` and
   `PURGE_STOPPED`, but a `PURGE_STOPPED` after a `RUNTIME_USAGE_UNKNOWN` that is not retryable is
-  not either, since its removal reads the same hives (`purgeStoppedAt`); false for any other
+  not either, since its removal reads the same hives, nor one after an `UNAUTHORIZED`, which
+  holds for every version (`purgeStoppedAt`; since 0.1.139's integration review: it was true, an
+  offer to remove the other hive's versions through the operator's own `remove_runtime_version`,
+  which A-304 does not refuse); false for any other
   refusal (`RUNTIME_IN_USE`: stop or move the node first; `UNAUTHORIZED`: the other hive's
   workflow is deleted first) and for `DIST_UNREADABLE`.
   `unanswered_hives` is SY.admin's list of the hives whose nodes it could not read, each
@@ -355,9 +378,13 @@ one the LSA last saw on a hive cut off that the hive registry still lists (a hiv
 `remove_hive` holds nothing up), read from shared memory, or one whose config that hive's
 orchestrator reads, its node stopped or not, asked at once of every other hive that may run one
 (3 s each). So a deploy of a name another hive uses fails at its publish
-(`PACKAGE_PUBLISH_FAILED`), and moves and purges nothing of that hive's; it passes once that
-hive's workflow is deleted. A delete's purge here is refused the same way, and leaves those
-versions (`UNAUTHORIZED` in `packages_left`, see [Delete](#delete)). A hive that does not answer
+(`PACKAGE_PUBLISH_FAILED`, its detail starting with SY.admin's `UNAUTHORIZED` and naming that
+hive's node) and changes nothing: its version stays staged, and neither this hive's slots and WF
+node nor anything of that hive's is moved or purged (this hive's slots since 0.1.139's integration
+review: they had rotated before the publish). It passes once that hive's workflow is deleted. A
+delete's purge here is refused the same way, and leaves every version it had to remove (the first
+`UNAUTHORIZED` in `packages_left`, each after it `PURGE_STOPPED`, none retryable; see
+[Delete](#delete)). A hive that does not answer
 within the 3 s is judged by what the LSA last saw of it, which the motherbee's router keeps in
 memory from its last start (a deploy restarts it): a stopped `WF.<workflow>` on a hive down at
 that moment is not seen, nor one, stopped or running, on a hive cut off since before that start;
@@ -466,8 +493,9 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
 
 - Lock held, no identity SHM entry within 30 s, or no router: the process exits; systemd
   restarts it every 5 s.
-- A package that cannot be published fails the request (`PACKAGE_PUBLISH_FAILED`) after the
-  slots already rotated: `current` holds the new version.
+- A package that cannot be published fails the request (`PACKAGE_PUBLISH_FAILED`), and changes
+  nothing: the slots move only once SY.admin took the package (since 0.1.139's integration review;
+  before, they had rotated already, `current` holding a version never published).
 - A node step that fails after publishing refuses the deploy, `WF_NODE_NOT_DEPLOYED` (SY.admin
   502), with `wf_node.action` `restart_failed` (or `none`), the `warning` and what is current;
   re-run apply once the cause is fixed.

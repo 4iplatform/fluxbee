@@ -4118,6 +4118,9 @@ fn cut_executor_previews(envelope: &mut serde_json::Value, log_path: &serde_json
     if let Some(failure) = envelope.pointer_mut("/payload/summary/failure") {
         bound_text_field(failure, "detail", EXECUTOR_MESH_TEXT_MAX_BYTES);
     }
+    // The output of a step that answers a secret is never cut: a token cut short would be shown as
+    // the token (0.1.139's integration review). It stays whole, in what is fixed, or the outputs
+    // are dropped (step c), which keeps its secret.
     let previews: Vec<(usize, &str, &str, &str, usize)> = envelope
         .pointer("/payload/events")
         .and_then(serde_json::Value::as_array)
@@ -4125,8 +4128,10 @@ fn cut_executor_previews(envelope: &mut serde_json::Value, log_path: &serde_json
         .flatten()
         .enumerate()
         .flat_map(|(index, event)| {
+            let answers_a_secret = executor_event_answers_a_secret(event);
             EXECUTOR_PREVIEWS
                 .iter()
+                .filter(move |(field, _, _)| !(answers_a_secret && *field == "result_preview"))
                 .filter_map(move |(field, flag, bytes)| {
                     event
                         .get(*field)
@@ -4200,23 +4205,77 @@ fn cut_executor_previews(envelope: &mut serde_json::Value, log_path: &serde_json
     false
 }
 
+/// The actions whose ok answer carries a secret the operator takes once (FINDINGS A-124):
+/// `publish_cloud_endpoint`'s and `externalize`'s token (a fanout's `verify_token`) and
+/// `vault_get`'s value. Archi shows it once (`ACTIONS_ANSWERING_A_SECRET` in
+/// src/bin/sy_architect/shown_once.rs names the same three).
+const EXECUTOR_ACTIONS_ANSWERING_A_SECRET: &[&str] =
+    &["publish_cloud_endpoint", "externalize", "vault_get"];
+
+/// Whether an executor event is a step of an action that answers a secret
+/// (`EXECUTOR_ACTIONS_ANSWERING_A_SECRET`).
+fn executor_event_answers_a_secret(event: &serde_json::Value) -> bool {
+    event
+        .get("step_action")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|action| EXECUTOR_ACTIONS_ANSWERING_A_SECRET.contains(&action.trim()))
+}
+
+/// The secret fields of a step's answer `payload`, whole: each one whose name reads as a secret's
+/// (`redaction_field_is_secret`: `token`, `verify_token`) and a vault-shaped `value`, when it holds
+/// something. What a cut answer keeps of a step that answers a secret (`drop_executor_previews`):
+/// the operator gets the token in this answer only, SY.admin's run log keeps it redacted, and a
+/// minted one cannot be read back (0.1.139's integration review: the cut kept none, so Archi had
+/// nothing to show).
+fn executor_answer_secrets(payload: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    let Some(fields) = payload.as_object() else {
+        return Vec::new();
+    };
+    let vault_shaped = fields.contains_key("key");
+    fields
+        .iter()
+        .filter(|(key, value)| {
+            let lower = key.to_ascii_lowercase();
+            (redaction_field_is_secret(&lower) || (vault_shaped && lower == "value"))
+                && !value.is_null()
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// Step (c): every output and args dropped. Each event keeps its step, status, tool, error code
 /// and error text (cut short), and of its output what Archi reads (`executor_result_essentials`),
 /// with `output_truncated`/`args_truncated` and their sizes before; its run id, time and summary
-/// line go, as does every field left null. The summary's failure detail is cut short too.
+/// line go, as does every field left null. The summary's failure detail is cut short too. A step
+/// that answers a secret keeps that secret whole in its output's payload
+/// (`executor_answer_secrets`).
 fn drop_executor_previews(envelope: &mut serde_json::Value) {
     if let Some(events) = envelope
         .pointer_mut("/payload/events")
         .and_then(serde_json::Value::as_array_mut)
     {
         for event in events.iter_mut() {
+            let answers_a_secret = executor_event_answers_a_secret(event);
             for (field, flag, bytes) in EXECUTOR_PREVIEWS {
                 let Some(preview) = event.get(field).filter(|preview| !preview.is_null()) else {
                     continue;
                 };
                 let size = mesh_reply::serialized_len(preview);
                 let kept = if field == "result_preview" {
-                    executor_result_essentials(preview)
+                    let mut kept = executor_result_essentials(preview);
+                    if answers_a_secret {
+                        let secrets = preview
+                            .get("payload")
+                            .map(executor_answer_secrets)
+                            .unwrap_or_default();
+                        if let Some(payload) = kept
+                            .get_mut("payload")
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            payload.extend(secrets);
+                        }
+                    }
+                    kept
                 } else {
                     serde_json::Value::Null
                 };
@@ -6757,9 +6816,13 @@ async fn admit_mesh_caller(
 }
 
 /// How long the workflow-package admission waits for each hive's answer on its `WF.<x>` (FINDINGS
-/// A-304): all at once, well within the 5 s SY.wf-rules gives a publish (`adminRPCTimeout` in
-/// go/sy-wf-rules/node/admin.go). A config is a file its hive's orchestrator reads, in well under a
-/// second.
+/// A-304): all at once, before anything else of the request. A config is a file its hive's
+/// orchestrator reads, in well under a second. SY.wf-rules waits 10 s for a publish
+/// (`packagePublishTimeout` in go/sy-wf-rules/node/admin.go): these 3 s, then SY.admin's own lock
+/// of the runtimes manifest, waited for at most `WF_RULES_PUBLISH_LOCK_WAIT` (4 s) for it, then the
+/// install. And 35 s for a removal (`runtimeRemovalTimeout`): these 3 s, then the read of the
+/// version's use, 30 s at most (0.1.139's integration review: this said the 3 s were well within
+/// the publish's 5 s, which left a lock held 2 s a timeout there).
 const WF_PACKAGE_HOLDER_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What one hive answered of its `WF.<x>` (`read_workflow_node_config`).
@@ -8593,8 +8656,13 @@ async fn handle_publish_cloud_endpoint(
 
     // One run at a time (FINDINGS A-317): a run reads the edge the record names before it writes
     // its own, and closes that edge's door once its own is open. Two at once would read the same
-    // edge, and the door the first one opened would stay open behind the second.
-    let _one_run = ctx.cloud_door_lock.lock().await;
+    // edge, and the door the first one opened would stay open behind the second. Another run asked
+    // meanwhile is refused at once, nothing read or minted (0.1.139's integration review): it
+    // waited with no bound, so its caller could stop waiting first (Archi gives a plan's run 120 s
+    // and more per step) while the run went on to mint and answer a token no one read.
+    let Ok(_one_run) = ctx.cloud_door_lock.try_lock() else {
+        return Ok(cloud_door_busy());
+    };
 
     tracing::info!(
         cloud_node = %cloud_node,
@@ -8666,6 +8734,22 @@ async fn handle_publish_cloud_endpoint(
         &applied,
         moved.as_ref(),
     ))
+}
+
+/// The answer of a `publish_cloud_endpoint` asked while another run holds the door
+/// (`cloud_door_lock`): 409 `BUSY`, `payload.retryable: true`, with nothing read, recorded or
+/// minted, so the token the Cloud holds works as before (0.1.139's integration review).
+fn cloud_door_busy() -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 409,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": "publish_cloud_endpoint",
+            "payload": { "retryable": true },
+            "error_code": "BUSY",
+            "error_detail": "another publish_cloud_endpoint is running, one run at a time (FINDINGS A-317): nothing was read, recorded or minted, and the token the Cloud holds works as before. Ask again once that run has answered.",
+        }),
+    }
 }
 
 /// Whether `edge` names an edge, `SY.edge@<hive>`: the only node `publish_cloud_endpoint` records in
@@ -18468,12 +18552,12 @@ const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and
 /// What `remove_hive` says of the removed hive's identity key (FINDINGS A-301, since 0.1.139).
 const REMOVE_HIVE_IDENTITY_KEY_NOTE: &str = "payload.identity_key_cleanup says what became of the hive's identity key on the motherbee. delete_failed leaves it there, while a box the cleanup did not reach (payload.remote_cleanup other than socket_ok) may still run with it. Since 0.1.139 a new add_hive under that name deletes the key before it writes anything, so that box no longer reads or writes the identity store with it (FINDINGS A-301), and is refused 500 IO_ERROR, nothing written, when it cannot delete it: then the operator deletes /var/lib/fluxbee/identity/keys/<hive>.key on the motherbee (the orchestrator also deletes it at its next start) and asks again. Before 0.1.139 the join kept the key it found, and the new join's accept let that box read and write the identity store again (FINDINGS A-277).";
 
-/// What a box `remove_hive` did not reach keeps (FINDINGS A-335, the review of A-301): A-301 closes
+/// What a box `remove_hive` did not reach keeps (FINDINGS A-339, the review of A-301): A-301 closes
 /// the identity store to it, not the mesh.
-const REMOVE_HIVE_BOX_NOT_REACHED_NOTE: &str = "When payload.remote_cleanup is not socket_ok, the box was not reached and keeps its install and its mesh certificate, whatever identity_key_cleanup says: stop that install on the box, or make sure the box is gone, before adding a hive under its name. The router admits that certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48), and a join that finds that box's SY.orchestrator online takes it over the socket, even when the join's address names another box, with no identity key and no new certificate (FINDINGS A-335).";
+const REMOVE_HIVE_BOX_NOT_REACHED_NOTE: &str = "When payload.remote_cleanup is not socket_ok, the box was not reached and keeps its install and its mesh certificate, whatever identity_key_cleanup says: stop that install on the box, or make sure the box is gone, before adding a hive under its name. The router admits that certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48), and a join that finds that box's SY.orchestrator online takes it over the socket, even when the join's address names another box, with no identity key and no new certificate (FINDINGS A-339).";
 
 /// What `remove_runtime_version` refuses, nothing removed.
-const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. Since 0.1.139 a node pinned to the version whose unit does not run (failed, or between two restarts of a crash loop) and that the orchestrator relaunches on it within a minute (relaunch_on_boot) is listed too, as RELAUNCH_DUE (FINDINGS A-300): stop it (kill_node, which clears relaunch_on_boot) or move it first. A node stopped through kill_node is not listed, nor one that follows current.";
+const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. Since 0.1.139 a node pinned to the version whose unit does not run (failed, or between two restarts of a crash loop) and that the orchestrator relaunches on it within a minute (relaunch_on_boot) is listed too, as RELAUNCH_DUE (FINDINGS A-300): stop it (kill_node, which clears relaunch_on_boot) or move it first. The node's own hive lists it, so a hive whose core is older than 0.1.139 (one the installation's update has not reached yet) lists none: until every hive runs 0.1.139, a version a crashed node there is pinned to can still be removed under it. A node stopped through kill_node is not listed, nor one that follows current.";
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs, gives systemd no answer or, since 0.1.139, is on its way up or down in systemd, as a crash loop's unit is between two restarts (FINDINGS A-310), which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
 /// What `vault_get` and `vault_assign` say of the secrets only an edge reads (FINDINGS A-316).
@@ -18493,7 +18577,14 @@ const WF_DELETE_KILL_ERROR_NOTE: &str = "Any other ORCHESTRATOR_ERROR may come f
 /// again under the name numbers its versions (`nextWorkflowVersion` in
 /// go/sy-wf-rules/node/compile.go), which a hive's dist that cannot be listed refuses
 /// (`highestPublishedVersion`, the delete's DIST_UNREADABLE).
-const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the versions of wf.<workflow_name> last, once its WF node and its state are gone: each version its hive's dist lists and each its slots named, one remove_runtime_version at a time, the current last, each waited for up to 35 s (SY.admin reads every hive's use first) within what is left of the request's 60 s, and stops at the first that fails: a refusal (RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281; RUNTIME_IN_USE while a node runs it; UNAUTHORIZED, since 0.1.139, while another hive holds a WF.<workflow_name>: FINDINGS A-304) or no answer in time (TIMEOUT: SY.admin may still remove it). Since 0.1.133 the delete answers ok all the same: payload.packages_left names each version not removed, {runtime, version, error_code, detail, retryable, unanswered_hives}, the one it stopped at with its failure and each after it PURGE_STOPPED ([] when every version it knew of went; one entry with no version, DIST_UNREADABLE, when its hive's dist could not be listed and none was removed); retryable says whether asking again, nothing changed first, may remove it (false for RUNTIME_IN_USE: stop or move the node first; false for UNAUTHORIZED; false for a RUNTIME_USAGE_UNKNOWN that SY.admin says is not, a hive not read being a join that ended or the motherbee's own nodes unread, and for each PURGE_STOPPED after it, whose read meets the same), and unanswered_hives, when SY.admin named any, the hives it did not read. payload.warning says the workflow is deleted and what removes them. Say so; never that the delete failed, and never ask it again: it answers WORKFLOW_NOT_FOUND. The versions left block nothing, those refused UNAUTHORIZED aside: a workflow created again under that name numbers its versions above every version the dist holds, and its deploy's purge removes them. A version refused UNAUTHORIZED is also the package of the WF.<workflow_name> its detail names, on another hive (a name deployed on two hives before 0.1.139, say): it stays until that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is refused the same way; say which hive uses the name, and never offer to remove it. To remove the others sooner, remove_runtime_version each once every hive answers, in packages_left's order, the runtime's current last: one refused RUNTIME_CURRENT_CONFLICT goes after the others. DIST_UNREADABLE is the exception: until its hive's dist/runtimes/wf.<workflow_name> can be listed again, a compile of the name that names no version is refused (WFRULES_ERROR, nothing staged), so that folder is fixed first, and the versions to remove are those GET /hives/motherbee/runtimes/wf.<workflow_name> lists, not packages_left.";
+const WF_DELETE_VERSIONS_LEFT_NOTE: &str = "A workflow's delete removes the versions of wf.<workflow_name> last, once its WF node and its state are gone: each version its hive's dist lists and each its slots named, one remove_runtime_version at a time, the current last, each waited for up to 35 s (SY.admin reads every hive's use first) within what is left of the request's 60 s, and stops at the first that fails: a refusal (RUNTIME_USAGE_UNKNOWN while some hive's nodes cannot be read: FINDINGS A-281; RUNTIME_IN_USE while a node runs it; UNAUTHORIZED, since 0.1.139, while another hive holds a WF.<workflow_name>: FINDINGS A-304) or no answer in time (TIMEOUT: SY.admin may still remove it). Since 0.1.133 the delete answers ok all the same: payload.packages_left names each version not removed, {runtime, version, error_code, detail, retryable, unanswered_hives}, the one it stopped at with its failure and each after it PURGE_STOPPED ([] when every version it knew of went; one entry with no version, DIST_UNREADABLE, when its hive's dist could not be listed and none was removed); retryable says whether asking again, nothing changed first, may remove it (false for RUNTIME_IN_USE: stop or move the node first; false for a RUNTIME_USAGE_UNKNOWN that SY.admin says is not, a hive not read being a join that ended or the motherbee's own nodes unread, and for each PURGE_STOPPED after it, whose read meets the same; false for UNAUTHORIZED and each PURGE_STOPPED after it), and unanswered_hives, when SY.admin named any, the hives it did not read. payload.warning says the workflow is deleted and what removes them. Say so; never that the delete failed, and never ask it again: it answers WORKFLOW_NOT_FOUND. The versions left block nothing, unless the purge stopped at UNAUTHORIZED: a workflow created again under that name numbers its versions above every version the dist holds, and its deploy's purge removes them. SY.admin refuses UNAUTHORIZED every version of wf.<workflow_name> alike while another hive holds the WF.<workflow_name> the detail names (a name deployed on two hives before 0.1.139, say), so such a purge leaves the first UNAUTHORIZED and each after it PURGE_STOPPED, none retryable, and any of them may be that hive's current or backup: they stay until that hive's workflow is deleted, and meanwhile a deploy of the name on this hive is refused the same way. Say which hive uses the name, and never offer to remove any of them: remove_runtime_version asked by the operator is not refused so, and would take them from that hive. After any other refusal, to remove them sooner, remove_runtime_version each once every hive answers, in packages_left's order, the runtime's current last: one refused RUNTIME_CURRENT_CONFLICT goes after the others. DIST_UNREADABLE is the exception: until its hive's dist/runtimes/wf.<workflow_name> can be listed again, a compile of the name that names no version is refused (WFRULES_ERROR, nothing staged), so that folder is fixed first, and the versions to remove are those GET /hives/motherbee/runtimes/wf.<workflow_name> lists, not packages_left.";
+
+/// What a deploy answers when SY.wf-rules could not publish the workflow's package
+/// (`publishSlot` in go/sy-wf-rules/node/package_publish.go): SY.admin's refusal, which since
+/// 0.1.139 includes another hive's WF.<workflow_name> (FINDINGS A-304), or no answer in time. Since
+/// 0.1.139's integration review it publishes before its slots move, so such a refusal changes
+/// nothing on its hive; before, they had rotated, current naming a version never published.
+const WF_RULES_PACKAGE_REFUSED_NOTE: &str = "422 PACKAGE_PUBLISH_FAILED: SY.wf-rules could not publish the workflow's package wf.<workflow_name>, and error_detail is why: SY.admin's refusal, its code first, or no answer within SY.wf-rules' 10 s. Since 0.1.139 a deploy of a name another hive holds is refused so, whether that hive's node runs or not: the detail starts UNAUTHORIZED: SY.wf-rules@<hive> may not change wf.<workflow_name>: and names that hive's WF.<workflow_name> (FINDINGS A-304); tell the operator which hive uses the name, and offer another name, or the workflow's delete on that hive first. A detail that starts RUNTIME_MANIFEST_BUSY comes with payload.retryable true: another change of the runtimes held the manifest's lock, so ask again. Since 0.1.139 the package is published before the hive's slots move, so this answer changes nothing there: an apply's or a compile_apply's version stays staged, a rollback's backup stays the backup, and the current version and the WF node stay as they were (before, the slots had moved, current naming the version never published, and a rollback moved them again).";
 
 /// What a change of a workflow says of SY.wf-rules' turns (FINDINGS A-307): it takes one request at
 /// a time, and refuses a change whose turn comes too late (`turnRule` in go/sy-wf-rules/node/turn.go;
@@ -18551,7 +18642,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "publish_cloud_endpoint" => vec![
             "It publishes IO.cloud's channel on edge_node (externalize, shared-secret, POST only), mints the bearer token, stores it in the vault for the edge and answers it once in payload.token, with payload.url (/e/<ich>). Run again on the same edge, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
-            "A run goes in this order (FINDINGS A-317, since 0.1.139): the record first, IO.cloud's config read (get_node_config) and edge_node written in it (set_node_config of its io with io.edge_node, the rest of it as read); then the door, the token minted and the URL opened on the edge; then the edge applied to the running IO.cloud; last, when the door moved from another edge and the running IO.cloud trusts the new one, that edge's door closed. One run at a time: another waits for it.",
+            "A run goes in this order (FINDINGS A-317, since 0.1.139): the record first, IO.cloud's config read (get_node_config) and edge_node written in it (set_node_config of its io with io.edge_node, the rest of it as read); then the door, the token minted and the URL opened on the edge; then the edge applied to the running IO.cloud; last, when the door moved from another edge and the running IO.cloud trusts the new one, that edge's door closed. One run at a time: another asked meanwhile is refused at once, 409 BUSY with payload.retryable true, nothing read, recorded or minted (since 0.1.139); ask again once the first has answered.",
             "IO.cloud trusts that edge at once (FINDINGS A-255): once the door is open, SY.admin applies the edge it recorded to the running IO.cloud, a CONFIG_SET of its live config with that edge at its config_version + 1, or nothing when it trusts that edge already (a rotation on the same edge). A CONFIG_SET refused as stale (another config reached IO.cloud between the read and the write) or not answered is tried once more on the config read again, within 30 s in all. No restart of IO.cloud.",
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
             "A door moved to another edge (IO.cloud's config named another SY.edge) closes the old one (FINDINGS A-317, since 0.1.139): once the new door is open and the running IO.cloud trusts the new edge (payload.edge_applied true), SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel, tried once more at once, so the previous token stops at once: a move keeps no 10 minutes. When IO.cloud did not take the new edge, or SY.admin could not tell (edge_applied false), the old door is left open, not asked to close: IO.cloud may still trust the old edge, and that door is then the Cloud's only way in. payload.previous_edge_node names that edge and payload.previous_edge_closed says whether its door closed; false comes with payload.warning, which says why and how to close it (unexternalize, POST /channels/unexternalize): once that edge answers, or, for a door left open, once IO.cloud trusts the new edge and the Cloud has the new URL and token. Give the Cloud the new URL, on the new edge's host, and the new token at once.",
@@ -19016,6 +19107,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
             WF_RULES_DEFINITION_NOTE,
+            WF_RULES_PACKAGE_REFUSED_NOTE,
             WF_RULES_BUSY_NOTE,
             WF_RULES_TIMEOUT_NOTE,
         ],
@@ -19041,6 +19133,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "workflow_name is required.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is only needed for first deploy when auto_spawn=true; existing-node rollout preserves the managed tenant_id.",
+            WF_RULES_PACKAGE_REFUSED_NOTE,
             WF_RULES_BUSY_NOTE,
             WF_RULES_TIMEOUT_NOTE,
         ],
@@ -19083,7 +19176,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             WF_INSTANCE_ERRORS_NOTE,
         ],
         "get_runtime" => vec![
-            "The hive and the runtime come from the /hives/{hive}/runtimes/{runtime} path. Read on the motherbee, payload.usage_global_visible is the runtime's use across the hives, as remove_runtime_version reads it (FINDINGS A-281): running_nodes, each node of every hive on the runtime whose unit may run, or that its orchestrator relaunches on it within a minute, with its hive and lifecycle (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN, its hive's systemd did not answer; RELAUNCH_DUE, since 0.1.139, a node pinned to a version of it whose unit does not run, failed or between two restarts, and whose config keeps relaunch_on_boot: FINDINGS A-300), counted in running_count; skipped_hives, each hive whose nodes were not counted, {hive_id, reason} and its message when the hive's answer had one; hives_without_runtimes, each ingress and each egress, {hive_id, role}; and in_use. When the motherbee cannot read its own nodes or its hive registry, usage_global_visible is {scope, status: \"error\", message} instead, with none of those fields: the use across the hives is unknown, never none. Read on a worker, it is that worker's own use.",
+            "The hive and the runtime come from the /hives/{hive}/runtimes/{runtime} path. Read on the motherbee, payload.usage_global_visible is the runtime's use across the hives, as remove_runtime_version reads it (FINDINGS A-281): running_nodes, each node of every hive on the runtime whose unit may run, or that its orchestrator relaunches on it within a minute, with its hive and lifecycle (RUNNING; STARTING, its unit runs and the router does not see it yet; UNKNOWN, its hive's systemd did not answer; RELAUNCH_DUE, since 0.1.139, a node pinned to a version of it whose unit does not run, failed or between two restarts, and whose config keeps relaunch_on_boot: FINDINGS A-300; the node's own hive lists it, so none comes from a hive whose core is older), counted in running_count; skipped_hives, each hive whose nodes were not counted, {hive_id, reason} and its message when the hive's answer had one; hives_without_runtimes, each ingress and each egress, {hive_id, role}; and in_use. When the motherbee cannot read its own nodes or its hive registry, usage_global_visible is {scope, status: \"error\", message} instead, with none of those fields: the use across the hives is unknown, never none. Read on a worker, it is that worker's own use.",
             HIVES_WITHOUT_RUNTIMES_NOTE,
             "in_use is true while a node is listed, false only once every hive asked was counted, and null (unknown) while none is listed and a hive is in skipped_hives: never read null as not in use.",
         ],
@@ -19773,14 +19866,41 @@ fn load_local_runtime_manifest(ctx: &AdminContext) -> Result<Option<RuntimeManif
 async fn take_runtime_manifest_lock(
     ctx: &AdminContext,
 ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
-    tokio::time::timeout(RUNTIME_MANIFEST_LOCK_WAIT, ctx.runtime_manifest_lock.lock())
+    take_runtime_manifest_lock_within(ctx, RUNTIME_MANIFEST_LOCK_WAIT).await
+}
+
+/// `take_runtime_manifest_lock`, waiting `wait` at most: a SY.wf-rules publish's
+/// (`publish_lock_wait`).
+async fn take_runtime_manifest_lock_within(
+    ctx: &AdminContext,
+    wait: Duration,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    tokio::time::timeout(wait, ctx.runtime_manifest_lock.lock())
         .await
         .map_err(|_| {
             format!(
                 "{RUNTIME_MANIFEST_LOCK_HELD} SY.admin's own lock of the runtimes manifest for {}s (a publish, a removal or a reset of a runtime ran meanwhile)",
-                RUNTIME_MANIFEST_LOCK_WAIT.as_secs()
+                wait.as_secs()
             )
         })
+}
+
+/// How long a SY.wf-rules deploy's publish waits for SY.admin's own lock of the runtimes manifest
+/// (0.1.139's integration review): what fits that caller's wait for the answer
+/// (`packagePublishTimeout` in go/sy-wf-rules/node/admin.go, 10 s) after the A-62 admission's
+/// reads (`WF_PACKAGE_HOLDER_READ_TIMEOUT`, 3 s), so a lock held longer reaches it as
+/// `RUNTIME_MANIFEST_BUSY`, retryable, with nothing published. It waited the 60 s of every other
+/// writer, while SY.wf-rules gave up after 5 s: the deploy failed as a timeout, and SY.admin
+/// published the version as current once the lock came, unseen.
+const WF_RULES_PUBLISH_LOCK_WAIT: Duration = Duration::from_secs(4);
+
+/// How long a publish waits for SY.admin's own lock of the runtimes manifest: a publish of
+/// SY.wf-rules@<hive>, `WF_RULES_PUBLISH_LOCK_WAIT`; any other, `RUNTIME_MANIFEST_LOCK_WAIT`.
+fn publish_lock_wait(origin: AdminOrigin<'_>) -> Duration {
+    match origin.caller().and_then(|caller| caller.split_once('@')) {
+        Some(("SY.wf-rules", _)) => WF_RULES_PUBLISH_LOCK_WAIT,
+        _ => RUNTIME_MANIFEST_LOCK_WAIT,
+    }
 }
 
 /// The answer of a writer of the runtimes manifest that could not take its lock, with nothing
@@ -20918,6 +21038,7 @@ async fn handle_publish_runtime_package(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     payload: serde_json::Value,
+    lock_wait: Duration,
 ) -> Result<(u16, String), AdminError> {
     if ctx.hive_id != PRIMARY_HIVE_ID {
         return Ok((
@@ -20934,7 +21055,8 @@ async fn handle_publish_runtime_package(
     }
 
     // Bounded (FINDINGS A-306): a publish waited with no bound while another writer held the lock.
-    let _manifest_guard = match take_runtime_manifest_lock(ctx).await {
+    // A SY.wf-rules deploy's, within what that caller waits (`publish_lock_wait`).
+    let _manifest_guard = match take_runtime_manifest_lock_within(ctx, lock_wait).await {
         Ok(guard) => guard,
         Err(err) => return Ok(publish_runtime_package_failure(&err)),
     };
@@ -21922,7 +22044,8 @@ async fn handle_admin_command_inner(
         return Ok(build_admin_action_help_response(action_name));
     }
     if matches!(action, "publish_runtime_package") {
-        return handle_publish_runtime_package(ctx, client, payload).await;
+        return handle_publish_runtime_package(ctx, client, payload, publish_lock_wait(origin))
+            .await;
     }
     if matches!(action, "remove_runtime_version") {
         return handle_remove_runtime_version(ctx, client, payload, hive).await;
@@ -30521,6 +30644,117 @@ mod tests {
         );
     }
 
+    /// 0.1.139's integration review: a step that answers a secret the operator takes once
+    /// (publish_cloud_endpoint's token, externalize's, vault_get's value, FINDINGS A-124) keeps it
+    /// whole in a cut answer. Its output is never cut (step b), where a token cut short would be
+    /// shown as the token; and once every output is dropped (step c) its payload keeps the secret
+    /// beside what Archi reads, where it kept none and Archi had nothing to show, the run's log
+    /// keeping it redacted.
+    #[test]
+    fn a_cut_answer_keeps_whole_the_secret_a_step_answered() {
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let door = json!({
+            "status": "ok",
+            "action": "publish_cloud_endpoint",
+            "payload": {
+                "url": "/e/ich:1",
+                "ich": "ich:1",
+                "owner_l2_name": "IO.cloud@motherbee",
+                "edge_node": "SY.edge@ingress1",
+                "token": TOKEN,
+                "edge_applied": false,
+                "warning": "w".repeat(3_000),
+            },
+        });
+        let vault = json!({
+            "status": "ok",
+            "action": "vault_get",
+            "payload": {
+                "key": "slack-tokens",
+                "value": { "bot": "xoxb-0123456789" },
+                "metadata": { "owner": "IO.slack@motherbee" },
+            },
+        });
+        let with_secret_steps = |mut envelope: Value| {
+            for (index, answer) in [(1, &door), (3, &vault)] {
+                let action = answer["action"].clone();
+                envelope["payload"]["events"][index - 1]["step_action"] = action.clone();
+                envelope["payload"]["events"][index]["step_action"] = action;
+                envelope["payload"]["events"][index]["result_preview"] = answer.clone();
+            }
+            envelope
+        };
+
+        // Step (b): every other output is 4 KB, cut to a share under the door's 3 KB.
+        let mut envelope = with_secret_steps(executor_envelope(
+            60,
+            "get_node_status",
+            |_| json!({}),
+            |step| json!({ "status": "ok", "payload": { "node_name": format!("AI.n{step}@worker1"), "detail": "s".repeat(4_000) } }),
+        ));
+        assert_eq!(
+            fit_executor_answer_for_mesh(&mut envelope),
+            ExecutorAnswerFit::Cut
+        );
+        assert!(mesh_reply::oversized(&executor_reply(&envelope)).is_none());
+        let events = &envelope["payload"]["events"];
+        let share = envelope["payload"]["outputs_bounded"]["max_bytes_each"]
+            .as_u64()
+            .expect("a share") as usize;
+        assert!(share < mesh_reply::serialized_len(&door), "{share}");
+        assert_eq!(events[1]["result_preview"], door);
+        assert_eq!(events[3]["result_preview"], vault);
+        assert!(events[1].get("output_truncated").is_none());
+        assert_eq!(events[5]["output_truncated"], json!(true));
+
+        // Step (c): 300 steps, every output dropped.
+        let mut envelope = with_secret_steps(executor_envelope(
+            300,
+            "run_node",
+            |step| json!({ "node_name": format!("AI.n{step}@worker1"), "config": { "prompt": "p".repeat(1_000) } }),
+            |step| json!({ "status": "ok", "payload": { "node_name": format!("AI.n{step}@worker1"), "config": { "prompt": "p".repeat(2_000) } } }),
+        ));
+        let fit = fit_executor_answer_for_mesh(&mut envelope);
+        assert!(
+            matches!(
+                fit,
+                ExecutorAnswerFit::OutputsDropped | ExecutorAnswerFit::EventsCollapsed
+            ),
+            "{fit:?}"
+        );
+        assert!(mesh_reply::oversized(&executor_reply(&envelope)).is_none());
+        let last_of = |step: &str| {
+            envelope["payload"]["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .rfind(|event| event["step_id"] == json!(step))
+                .cloned()
+                .expect("the step's event")
+        };
+        let door_step = last_of("s0");
+        assert_eq!(door_step["output_truncated"], json!(true));
+        assert_eq!(
+            door_step["result_preview"]["payload"]["token"],
+            json!(TOKEN)
+        );
+        assert!(door_step["result_preview"]["payload"]
+            .get("warning")
+            .is_some());
+        let vault_step = last_of("s1");
+        assert_eq!(
+            vault_step["result_preview"]["payload"]["value"],
+            json!({ "bot": "xoxb-0123456789" })
+        );
+        assert_eq!(
+            vault_step["result_preview"]["payload"]["key"],
+            json!("slack-tokens")
+        );
+        // Any other step keeps no field its name calls a secret.
+        let other = last_of("s2");
+        assert!(other["result_preview"]["payload"].get("config").is_none());
+    }
+
     /// FINDINGS A-198, M4 (c): with its outputs dropped, a change's answer keeps what Archi reads
     /// of it: an installation update's id and state, the hives it has not reached yet, a
     /// version.
@@ -30682,6 +30916,8 @@ mod tests {
         let notes = admin_action_request_notes("get_runtime").join(" ");
         for words in [
             "RELAUNCH_DUE, since 0.1.139",
+            // 0.1.139's integration review: the mixed window of its update.
+            "the node's own hive lists it, so none comes from a hive whose core is older",
             "{hive_id, reason} and its message when the hive's answer had one",
             "usage_global_visible is {scope, status: \"error\", message} instead",
         ] {
@@ -37847,6 +38083,42 @@ mod tests {
         assert_eq!(envelopes[0], envelopes[1]);
     }
 
+    /// 0.1.139's integration review: the help of each deploy names what a refused publish of its
+    /// package answers (PACKAGE_PUBLISH_FAILED, SY.admin's refusal in its detail, UNAUTHORIZED
+    /// naming the other hive's node since FINDINGS A-304, RUNTIME_MANIFEST_BUSY retryable), and
+    /// that it changes nothing on the hive, since SY.wf-rules publishes before its slots move;
+    /// neither text named it, and the slots moved first.
+    #[test]
+    fn a_deploys_help_says_what_a_refused_package_answers() {
+        for action in [
+            "wf_rules_compile_apply",
+            "wf_rules_apply",
+            "wf_rules_rollback",
+        ] {
+            assert!(
+                admin_action_request_notes(action).contains(&WF_RULES_PACKAGE_REFUSED_NOTE),
+                "{action}"
+            );
+        }
+        for action in ["wf_rules_compile", "wf_rules_check", "wf_rules_delete"] {
+            assert!(
+                !admin_action_request_notes(action).contains(&WF_RULES_PACKAGE_REFUSED_NOTE),
+                "{action}"
+            );
+        }
+        assert!(WF_RULES_PACKAGE_REFUSED_NOTE.starts_with("422 PACKAGE_PUBLISH_FAILED"));
+        assert_eq!(error_code_to_http_status("PACKAGE_PUBLISH_FAILED"), 422);
+        for words in [
+            "the detail starts UNAUTHORIZED: SY.wf-rules@<hive> may not change wf.<workflow_name>: \
+             and names that hive's WF.<workflow_name> (FINDINGS A-304)",
+            "RUNTIME_MANIFEST_BUSY comes with payload.retryable true",
+            "an apply's or a compile_apply's version stays staged, a rollback's backup stays the \
+             backup, and the current version and the WF node stay as they were",
+        ] {
+            assert!(WF_RULES_PACKAGE_REFUSED_NOTE.contains(words), "{words}");
+        }
+    }
+
     /// SY.wf-rules takes one request at a time and refuses a change whose turn came with less than
     /// 20 s of SY.admin's wait left, BUSY and retryable, nothing changed (FINDINGS A-307): SY.admin
     /// answers it 409 BUSY with SY.wf-rules' payload, its retryable kept, from a CONFIG_SET
@@ -39109,35 +39381,64 @@ mod tests {
     /// answers `409 RUNTIME_MANIFEST_BUSY`, `payload.retryable: true`, with nothing published,
     /// where it waited with no bound; a reset waiting as long answers `RUNTIME_RESET_FAILED`,
     /// retryable. The manifest's file lock held past its own 60 s reads as busy too, where a
-    /// publish answered `SERVICE_FAILED`.
+    /// publish answered `SERVICE_FAILED`. 0.1.139's integration review: a SY.wf-rules deploy's
+    /// publish waits `WF_RULES_PUBLISH_LOCK_WAIT`, 4 s, which fits that caller's 10 s after the A-62
+    /// admission's 3 s, so the refusal reaches it and nothing is published after it gave up; it
+    /// waited the 60 s while SY.wf-rules gave up after 5 s.
     #[tokio::test(start_paused = true)]
     async fn a_publish_waits_for_the_manifest_lock_a_bounded_time() {
         let (ctx, _harness) = opa_test_admin("a306-publish-bounded");
         seed_runtimes(&ctx, json!({}));
         let other_writer = ctx.runtime_manifest_lock.lock().await;
-        let started = tokio::time::Instant::now();
-        let publish = handle_publish_runtime_package(
-            &ctx,
-            &ctx.rpc,
-            json!({
-                "source": {
-                    "kind": "inline_package",
-                    "files": {
-                        "package.json": "{\"name\": \"ai.support.demo\", \"version\": \"0.1.0\", \"type\": \"config_only\", \"runtime_base\": \"ai.generic\"}",
-                    },
+        let request = json!({
+            "source": {
+                "kind": "inline_package",
+                "files": {
+                    "package.json": "{\"name\": \"ai.support.demo\", \"version\": \"0.1.0\", \"type\": \"config_only\", \"runtime_base\": \"ai.generic\"}",
                 },
-            }),
-        );
-        let (status, body) = tokio::time::timeout(Duration::from_secs(120), publish)
-            .await
-            .expect("answered within its bound")
-            .expect("answered");
-        let body: Value = serde_json::from_str(&body).expect("JSON");
-        assert_eq!(status, 409, "{body}");
-        assert_eq!(body["error_code"], json!("RUNTIME_MANIFEST_BUSY"));
-        assert_eq!(body["payload"]["retryable"], json!(true));
-        assert!(started.elapsed() >= RUNTIME_MANIFEST_LOCK_WAIT);
-        assert!(!ctx.runtimes_root.join("ai.support.demo").exists());
+            },
+        });
+        for (origin, bound) in [
+            (AdminOrigin::Http, RUNTIME_MANIFEST_LOCK_WAIT),
+            (AdminOrigin::Executor, RUNTIME_MANIFEST_LOCK_WAIT),
+            (
+                AdminOrigin::Mesh("IO.blob@motherbee"),
+                RUNTIME_MANIFEST_LOCK_WAIT,
+            ),
+            (
+                AdminOrigin::Mesh("SY.wf-rules@worker1"),
+                WF_RULES_PUBLISH_LOCK_WAIT,
+            ),
+        ] {
+            assert_eq!(publish_lock_wait(origin), bound, "{origin:?}");
+            let started = tokio::time::Instant::now();
+            let publish = handle_admin_command_inner(
+                &ctx,
+                &ctx.rpc,
+                "publish_runtime_package",
+                request.clone(),
+                None,
+                origin,
+            );
+            let (status, body) = tokio::time::timeout(Duration::from_secs(120), publish)
+                .await
+                .expect("answered within its bound")
+                .expect("answered");
+            let body: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(status, 409, "{body}");
+            assert_eq!(body["error_code"], json!("RUNTIME_MANIFEST_BUSY"));
+            assert_eq!(body["payload"]["retryable"], json!(true));
+            assert!(
+                started.elapsed() >= bound && started.elapsed() < bound + Duration::from_secs(1)
+            );
+            assert!(!ctx.runtimes_root.join("ai.support.demo").exists());
+        }
+        const {
+            assert!(
+                WF_RULES_PUBLISH_LOCK_WAIT.as_secs() + WF_PACKAGE_HOLDER_READ_TIMEOUT.as_secs()
+                    < 10
+            )
+        };
 
         let reset = handle_reset_base_runtime(&ctx, json!({ "runtime": "ai.generic" }), None);
         let (status, body) = tokio::time::timeout(Duration::from_secs(120), reset)
@@ -39967,6 +40268,9 @@ mod tests {
         for words in [
             "listed too, as RELAUNCH_DUE (FINDINGS A-300)",
             "A node stopped through kill_node is not listed, nor one that follows current.",
+            // 0.1.139's integration review: the mixed window of its update.
+            "a hive whose core is older than 0.1.139 (one the installation's update has not \
+             reached yet) lists none",
         ] {
             assert!(RUNTIME_REMOVAL_IN_USE_NOTE.contains(words), "{words}");
         }
@@ -40002,10 +40306,15 @@ mod tests {
             "and for each PURGE_STOPPED after it",
             // A-304's review: another hive's WF.<workflow_name> keeps them, and its deploy here.
             "UNAUTHORIZED, since 0.1.139, while another hive holds a WF.<workflow_name>",
-            "false for UNAUTHORIZED",
-            "it stays until that hive's workflow is deleted, and meanwhile a deploy of the name on \
+            "false for UNAUTHORIZED and each PURGE_STOPPED after it",
+            "they stay until that hive's workflow is deleted, and meanwhile a deploy of the name on \
              this hive is refused the same way",
-            "never offer to remove it",
+            // 0.1.139's integration review: every version after it is that hive's too, none
+            // retryable, and none is offered for removal.
+            "so such a purge leaves the first UNAUTHORIZED and each after it PURGE_STOPPED, none \
+             retryable, and any of them may be that hive's current or backup",
+            "never offer to remove any of them",
+            "After any other refusal, to remove them sooner, remove_runtime_version each",
         ] {
             assert!(WF_DELETE_VERSIONS_LEFT_NOTE.contains(words), "{words}");
         }
@@ -40014,6 +40323,7 @@ mod tests {
             "0.0.1 again",
             "VERSION_CONFLICT",
             "all of them possibly",
+            "To remove the others sooner",
         ] {
             assert!(!WF_DELETE_VERSIONS_LEFT_NOTE.contains(gone), "{gone}");
         }
@@ -40023,7 +40333,7 @@ mod tests {
             .contains("packages_left"));
     }
 
-    /// FINDINGS A-335, the review of A-301: remove_hive's help keeps its caution about a box the
+    /// FINDINGS A-339, the review of A-301: remove_hive's help keeps its caution about a box the
     /// removal did not reach. A-301 closes the identity store to that box, not the mesh: its
     /// certificate is admitted again once a hive of its name is listed (A-48: leaf pinning not
     /// built), and a join that finds its orchestrator online takes it over the socket, whatever
@@ -40038,7 +40348,7 @@ mod tests {
              install on the box, or make sure the box is gone, before adding a hive under its name.",
             "(leaf pinning is not built, FINDINGS A-48)",
             "takes it over the socket, even when the join's address names another box",
-            "(FINDINGS A-335)",
+            "(FINDINGS A-339)",
             "deletes the key before it writes anything, so that box no longer reads or writes the \
              identity store with it (FINDINGS A-301)",
         ] {
@@ -45781,41 +46091,54 @@ mod tests {
     }
 
     /// One publish at a time (FINDINGS A-317): a run reads the edge the record names before it
-    /// writes its own and closes that edge's door once its own is open, so a second run starts only
-    /// once the first answered. Here two rotations on the same edge are asked at once, and the
-    /// second's read follows the first's last message.
+    /// writes its own and closes that edge's door once its own is open, so no second run starts
+    /// while one runs. Here two rotations on the same edge are asked at once: the first runs, and
+    /// the second is refused at once, 409 BUSY with payload.retryable true, having sent nothing; once
+    /// the first answered, a run goes again. 0.1.139's integration review: the second waited for the
+    /// first with no bound, past what its caller waits (Archi's plan), and then minted a token no one
+    /// read.
     #[tokio::test]
     async fn one_publish_runs_at_a_time() {
         let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-one-at-a-time");
         ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        async fn rotate(harness: &mut fluxbee_sdk::RouterDispatcherTestHarness) {
+            answer_cloud_edge_read(harness, json!({ "edge_node": CLOUD_EDGE })).await;
+            answer_cloud_edge_record(harness, cloud_edge_recorded()).await;
+            open_cloud_door(harness).await;
+            answer_cloud_config(
+                harness,
+                "CONFIG_GET",
+                "CONFIG_RESPONSE",
+                cloud_config_get(3, json!({ "io": { "edge_node": CLOUD_EDGE } })),
+            )
+            .await;
+        }
         let first =
             handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
         let second =
             handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
-        let drive = async {
-            for _ in 0..2 {
-                answer_cloud_edge_read(&mut harness, json!({ "edge_node": CLOUD_EDGE })).await;
-                answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
-                open_cloud_door(&mut harness).await;
-                answer_cloud_config(
-                    &mut harness,
-                    "CONFIG_GET",
-                    "CONFIG_RESPONSE",
-                    cloud_config_get(3, json!({ "io": { "edge_node": CLOUD_EDGE } })),
-                )
-                .await;
-            }
-        };
-        let (first, second, ()) = tokio::join!(first, second, drive);
-        for answer in [first, second] {
-            let answer = answer.expect("dispatch");
-            assert_eq!(answer.http_status, 200);
-            assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
-        }
+        let (first, second, ()) = tokio::join!(first, second, rotate(&mut harness));
+        let first = first.expect("dispatch");
+        assert_eq!(first.http_status, 200);
+        assert_eq!(first.envelope["payload"]["edge_applied"], json!(true));
+        let second = second.expect("dispatch");
+        assert_eq!(second.http_status, 409, "{}", second.envelope);
+        assert_eq!(second.envelope["error_code"], json!("BUSY"));
+        assert_eq!(second.envelope["payload"]["retryable"], json!(true));
+        let detail = second.envelope["error_detail"].as_str().expect("a detail");
+        assert!(
+            detail.contains("nothing was read, recorded or minted"),
+            "{detail}"
+        );
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+
+        let again =
+            handle_publish_cloud_endpoint(&ctx, &ctx.rpc, json!({ "edge_node": CLOUD_EDGE }));
+        let (again, ()) = tokio::join!(again, rotate(&mut harness));
+        assert_eq!(again.expect("dispatch").http_status, 200);
     }
 
     /// publish_cloud_endpoint's help, which Archi reads, says what a run does (FINDINGS A-273's
@@ -45829,7 +46152,8 @@ mod tests {
     /// one received. Since A-317's review: the old door closes only once IO.cloud trusts the new
     /// edge, and is left open otherwise; a write may have landed only when a try got no answer, and
     /// on a move the old edge goes back first; a door that does not open after the vault took the
-    /// token says so.
+    /// token says so. Since 0.1.139's integration review: a run asked while another runs is
+    /// refused at once, BUSY, where it waited for it.
     #[test]
     fn the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it() {
         let notes = admin_action_request_notes("publish_cloud_endpoint");
@@ -45837,7 +46161,7 @@ mod tests {
         for words in [
             "Run again on the same edge, it mints a new token, and the edge keeps the one it replaces working for up to 10 more minutes, in its memory only: a restart of the edge ends that sooner, and so does another run, since the edge keeps one previous token.",
             "A run goes in this order (FINDINGS A-317, since 0.1.139): the record first, IO.cloud's config read (get_node_config) and edge_node written in it",
-            "then the door, the token minted and the URL opened on the edge; then the edge applied to the running IO.cloud; last, when the door moved from another edge and the running IO.cloud trusts the new one, that edge's door closed. One run at a time: another waits for it.",
+            "then the door, the token minted and the URL opened on the edge; then the edge applied to the running IO.cloud; last, when the door moved from another edge and the running IO.cloud trusts the new one, that edge's door closed. One run at a time: another asked meanwhile is refused at once, 409 BUSY with payload.retryable true, nothing read, recorded or minted (since 0.1.139); ask again once the first has answered.",
             "once the new door is open and the running IO.cloud trusts the new edge (payload.edge_applied true), SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel, tried once more at once, so the previous token stops at once: a move keeps no 10 minutes.",
             "When IO.cloud did not take the new edge, or SY.admin could not tell (edge_applied false), the old door is left open, not asked to close: IO.cloud may still trust the old edge, and that door is then the Cloud's only way in.",
             "payload.previous_edge_node names that edge and payload.previous_edge_closed says whether its door closed; false comes with payload.warning, which says why and how to close it (unexternalize, POST /channels/unexternalize): once that edge answers, or, for a door left open, once IO.cloud trusts the new edge and the Cloud has the new URL and token.",
@@ -45859,6 +46183,7 @@ mod tests {
             "once the new door is open and applied",
             "A write that got no answer may have been written all the same",
             "never through Archi",
+            "another waits for it",
         ] {
             assert!(!says(promise), "{promise}: {notes:#?}");
         }

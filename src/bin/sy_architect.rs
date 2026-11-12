@@ -13259,6 +13259,17 @@ const EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS: u64 = 580;
 /// switch, 30 s, and of the confirm, 10 s, 60 s in all), with a margin.
 const EXECUTOR_EGRESS_SWITCH_WAIT_SECS: u64 = 70;
 
+/// What Archi waits for SY.admin's executor per publish of Fluxbee Cloud's door in a plan
+/// (`publish_cloud_endpoint`, FINDINGS A-317): SY.admin's ceiling for one run, whose step has no
+/// timeout of its own (the record's read and write of IO.cloud's config, 30 s each tried twice; the
+/// vault's store of the token, 30 s; the edge's open, 15 s; the apply to IO.cloud, 30 s; the old
+/// door's close on a move, 15 s tried twice: 225 s in all), with a margin. The run's answer is the
+/// only place the operator gets the token (FINDINGS A-124), so Archi waits for it: with 120 s it
+/// could stop waiting while the run went on to mint the token and answer it to no one (0.1.139's
+/// integration review). A run asked while another runs is refused at once (BUSY), so none waits
+/// for another.
+const EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS: u64 = 240;
+
 /// How long Archi follows an installation update its plan ran, past the executor's answer, while
 /// its hives only move (a core in flight to its settle and its config after it, or a hive not read
 /// yet): twice SY.admin's settle bound (300 s). A run is verified once the update is done or held.
@@ -13356,7 +13367,10 @@ fn add_plan_join_execution_hint(confirmation: &mut Value, plan: &Value) {
 }
 
 /// How long Archi waits for SY.admin's answer to `action`, sent with `params`. An executor run waits
-/// `JSR_ADMIN_EXECUTOR_TIMEOUT_SECS` (120 s), and 35 min more for each hive its plan joins.
+/// `JSR_ADMIN_EXECUTOR_TIMEOUT_SECS` (120 s), and more for each step SY.admin may take longer on:
+/// 35 min for each hive its plan joins, and SY.admin's ceiling, with a margin, for each workflow
+/// deploy or removal, change or update of the installation, worker put behind the egress or taken
+/// back, and publish of Fluxbee Cloud's door.
 fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
     let executor_secs = || env_timeout_secs("JSR_ADMIN_EXECUTOR_TIMEOUT_SECS").unwrap_or(120);
     match action {
@@ -13368,7 +13382,9 @@ fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
                 + plan_installation_changes(params.get("plan")) * EXECUTOR_INSTALLATION_WAIT_SECS
                 + plan_installation_updates(params.get("plan"))
                     * EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS
-                + plan_egress_switches(params.get("plan")) * EXECUTOR_EGRESS_SWITCH_WAIT_SECS,
+                + plan_egress_switches(params.get("plan")) * EXECUTOR_EGRESS_SWITCH_WAIT_SECS
+                + plan_steps_named(params.get("plan"), "publish_cloud_endpoint")
+                    * EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS,
         ),
         // SY.admin reads the motherbee's /versions for it, under its own 30 s: wait longer, or a
         // slow read is reported as Archi's timeout.
@@ -33417,6 +33433,33 @@ mod tests {
         assert!(system_get_may_run("GET", &translated.action));
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"get_installation_update"));
         assert!(!admin_action_allows_ai_write("update_installation"));
+    }
+
+    /// Fluxbee Cloud's door published in a plan (FINDINGS A-317): Archi waits for SY.admin's
+    /// ceiling of each run (225 s) with a margin, since the run's answer is the only place the
+    /// operator gets the token (FINDINGS A-124). 0.1.139's integration review: it waited 120 s for
+    /// the whole plan, and a run that took longer minted a token that reached no one.
+    #[test]
+    fn an_executor_run_waits_for_each_publish_of_the_cloud_door() {
+        let request = |actions: &[&str]| {
+            json!({ "execution_id": "run-1", "plan": { "execution": { "steps": actions
+                .iter()
+                .map(|action| json!({ "id": action, "action": action, "args": {} }))
+                .collect::<Vec<_>>() } } })
+        };
+        let base = architect_admin_action_timeout("executor_validate_plan", &json!({}));
+        assert_eq!(
+            architect_admin_action_timeout(
+                "executor_execute_plan",
+                &request(&["get_node_config", "publish_cloud_endpoint"])
+            ),
+            base + Duration::from_secs(EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS)
+        );
+        assert_eq!(
+            architect_admin_action_timeout("executor_execute_plan", &request(&["vault_get"])),
+            base
+        );
+        const { assert!(EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS > 2 * 30 + 2 * 30 + 30 + 15 + 30 + 2 * 15) };
     }
 
     /// A worker behind the egress, or back (docs/edge-egress-nat-spec.md §15): Archi waits for

@@ -40,20 +40,18 @@ func (s *Service) rollbackWorkflow(ctx context.Context, req RollbackRequest) (*R
 	if err := s.checkSlotLoads(workflowName, "backup", backupMeta.Version); err != nil {
 		return nil, err
 	}
-	if err := s.store.RotateToRollback(workflowName); err != nil {
+	// The backup's package first, the slots after it (publishSlot): a publish refused or not
+	// answered leaves the slots as they were, the backup there to roll back to.
+	publish, err := s.publishSlot(ctx, workflowName, "backup", *backupMeta)
+	if err != nil {
 		return nil, err
+	}
+	if err := s.store.RotateToRollback(workflowName); err != nil {
+		return nil, slotsNotMoved(publish, err)
 	}
 	currentMeta, err := s.store.ReadCurrentMetadata(workflowName)
 	if err != nil {
 		return nil, err
-	}
-	definitionBytes, err := s.store.ReadCurrentDefinition(workflowName)
-	if err != nil {
-		return nil, err
-	}
-	publish, err := s.publishWorkflowPackage(ctx, workflowName, *currentMeta, definitionBytes)
-	if err != nil {
-		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
 	s.purgeAfterPublish(ctx, workflowName)
 	return &RollbackResult{

@@ -22,11 +22,12 @@ const wfRulesRequestBudget = 60 * time.Second
 // SY.admin reads every hive's use of the version first: A-281). Unbounded, a removal waiting out a
 // hive that does not answer would take 30 s of the request's 60, and a worker's node step, which
 // waits for its package to arrive by Syncthing (~11 s, over 20 s while its folder retries a pull),
-// would run out. With 15 s the node step keeps 40 s at least (60 s, less the publish's 5 s and
-// these 15), what a purge that stopped at a refused removal left it before 0.1.133 (the read, then
-// that one 5 s removal); a purge whose removals all answered, slowly, had no bound then but the
-// request's 60 s. What this one cuts, the next deploy's purge removes. A delete's purge, its last
-// step, has no such bound: it takes what the request has left.
+// would run out. With 15 s the node step keeps 35 s at least (60 s, less the publish's 10 s,
+// packagePublishTimeout, and these 15; 40 s while the publish waited 5 s, before 0.1.139's
+// integration review), about what a purge that stopped at a refused removal left it before 0.1.133
+// (the read, then that one 5 s removal); a purge whose removals all answered, slowly, had no bound
+// then but the request's 60 s. What this one cuts, the next deploy's purge removes. A delete's
+// purge, its last step, has no such bound: it takes what the request has left.
 const deployPurgeBudget = 15 * time.Second
 
 // runtimeSyncBudget bounds how long a deploy waits for the package it just published to reach this

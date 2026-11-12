@@ -1014,7 +1014,9 @@ token and stores it in the vault, and answers with `url` (`/e/<ich>`) and `token
 shown only here.** Give Cloud `https://<public host><url>` and the token. Since 0.1.139 the record
 comes first, so a publish that fails at it mints nothing (FINDINGS A-317); `edge_node` must be
 `SY.edge@<hive>`, and anything else is refused before anything is read or recorded. One publish
-runs at a time: another waits for it.
+runs at a time: one asked while another runs is refused at once, `409 BUSY` with
+`payload.retryable: true`, nothing read, recorded or minted, so the token Cloud holds works as
+before; ask again once the other has answered (since 0.1.139; before, it waited for it).
 
 IO.cloud trusts that edge at once, the first time and whenever the door moves to another edge
 (0.1.133, FINDINGS A-255; in 0.1.132 only once IO.cloud restarts, or by the `CONFIG_SET` below):

@@ -302,7 +302,7 @@ could not be read whole. When the spoke did not answer, the motherbee restarts i
 `sy-identity` to close any session the removed hive still holds (`identity_restart`). A box the
 cleanup did not reach keeps its install and its mesh certificate, which the router admits again
 once a hive of that name is listed: stop its install, or make sure it is gone, before adding a
-hive under its name (FINDINGS A-335). The motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
+hive under its name (FINDINGS A-339). The motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
 the identity key of every hive with no `hives/<id>/`. Public pages never refuse the removal
 (FINDINGS A-242): the ok answer names in `pages_left_up` the pages a node of the hive published
 and the pages its edge serves, which stay up until they expire. The cleanup stops the hive's edge
@@ -467,8 +467,10 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
     and the router does not see it yet; `UNKNOWN`, systemd did not answer for its unit), and,
     since 0.1.139, each one whose unit does not run (failed, between two restarts of a crash loop)
     that the orchestrator relaunches on that version within a minute (`RELAUNCH_DUE`: its config
-    keeps `relaunch_on_boot`; FINDINGS A-300): stop it (`kill_node`) or move it first. A node
-    stopped with `kill_node` is not listed, nor one that follows `current`;
+    keeps `relaunch_on_boot`; FINDINGS A-300): stop it (`kill_node`) or move it first. The node's
+    own hive lists it, so a hive whose core is older than 0.1.139 lists none (hold removals until
+    every hive runs it). A node stopped with `kill_node` is not listed, nor one that follows
+    `current`;
   - `skipped_hives`: each hive whose use is unknown, with its `reason` and the `message` that came
     with it: `TIMEOUT` (no answer within 10 s: its orchestrator stopped or restarting while the
     LSA still shows it), `UNREACHABLE` (the request never reached it: down, or stale in the LSA),
@@ -524,9 +526,13 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   A workflow created again under that name numbers its versions above every version the dist
   holds, and its deploy's purge removes those left; to remove them sooner,
   `remove_runtime_version` each (`GET /hives/motherbee/runtimes/wf.<name>` lists them) once every
-  hive answers, the runtime's current last. One entry with no version, `DIST_UNREADABLE`, says the
-  hive's `dist/runtimes/wf.<name>` could not be listed: until it can, a compile of the name that
-  names no version is refused, so fix it first. `fluxbee-factory-reset` prints them under each
+  hive answers, the runtime's current last. Not after `UNAUTHORIZED` (since 0.1.139, FINDINGS
+  A-304): another hive holds a `WF.<name>`, SY.admin refuses this hive every version of the
+  package, and each one left (`UNAUTHORIZED`, then `PURGE_STOPPED`, none retryable) may be that
+  hive's: they stay until its workflow is deleted, and a deploy of the name here is refused
+  meanwhile (`PACKAGE_PUBLISH_FAILED`, nothing changed). One entry with no version,
+  `DIST_UNREADABLE`, says the hive's `dist/runtimes/wf.<name>` could not be listed: until it can,
+  a compile of the name that names no version is refused, so fix it first. `fluxbee-factory-reset` prints them under each
   deleted workflow and counts them in its log line (`packages_left=`); its next run no longer
   lists the workflow.
 - **One writer of the manifest at a time (FINDINGS A-171).** Every writer holds an `flock` on

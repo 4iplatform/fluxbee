@@ -701,10 +701,13 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
   the next step; 90 s more for each workflow deploy or removal; 240 s more for each
   `set_installation_ai` step (`EXECUTOR_INSTALLATION_WAIT_SECS`), past SY.admin's 210 s ceiling for
   it; 580 s more for each `update_installation` step (`EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS`),
-  past SY.admin's 550 s ceiling for it, and then up to 600 s following the update to its end; 35 s
-  for `get_installation`, past SY.admin's own 30 s read
-  of `/versions`; 30 s default
-  (`JSR_ADMIN_ORCH_TIMEOUT_SECS`) (`architect_admin_action_timeout`).
+  past SY.admin's 550 s ceiling for it, and then up to 600 s following the update to its end; 70 s
+  more for each worker put behind the egress or taken back (`EXECUTOR_EGRESS_SWITCH_WAIT_SECS`);
+  240 s more for each `publish_cloud_endpoint` step (`EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS`, since
+  0.1.139's integration review), past SY.admin's 225 s ceiling for a run, whose answer is the only
+  place the operator gets the Cloud's token (FINDINGS A-124, A-317); 35 s for `get_installation`,
+  past SY.admin's own 30 s read of `/versions`; 30 s default (`JSR_ADMIN_ORCH_TIMEOUT_SECS`)
+  (`architect_admin_action_timeout`).
   While a plan that joins hives runs, the chat's execution hint says so (`execution_hint` on the
   pending confirmation).
 

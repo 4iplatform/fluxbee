@@ -487,11 +487,14 @@ func TestADeleteWhosePurgeTimesOutIsDoneAndNamesThePackagesLeft(t *testing.T) {
 
 // While another hive holds a WF.<workflow>, SY.admin refuses this hive's removal of the package's
 // versions, and its deploy of the name, UNAUTHORIZED (FINDINGS A-304, since 0.1.139): the delete is
-// done, packages_left names the refusal, not retryable, and each version after it, and the warning
-// says that the versions stay until that hive's workflow is deleted and that a deploy of the name
-// here is refused meanwhile, as SY.admin's help of wf_rules_delete does. It said, as after any
-// other refusal, that remove_runtime_version or a later deploy of the name removes them (0.1.139's
-// integration: SY.admin's half and SY.wf-rules' warning were built apart).
+// done, packages_left names the refusal, not retryable, and each version after it, PURGE_STOPPED
+// and not retryable either, since SY.admin refuses every version of the name the same way and each
+// may be that hive's (its integration review: they were retryable, an offer to remove that hive's
+// versions through the operator's own remove_runtime_version, which A-304 does not refuse), and
+// the warning says that the versions stay until that hive's workflow is deleted and that a deploy
+// of the name here is refused meanwhile, as SY.admin's help of wf_rules_delete does. It said, as
+// after any other refusal, that remove_runtime_version or a later deploy of the name removes them
+// (0.1.139's integration: SY.admin's half and SY.wf-rules' warning were built apart).
 func TestADeleteWhosePurgeIsRefusedUnauthorizedSaysItsVersionsStay(t *testing.T) {
 	svc := newTestService(t)
 	for range 2 {
@@ -521,8 +524,8 @@ func TestADeleteWhosePurgeIsRefusedUnauthorizedSaysItsVersionsStay(t *testing.T)
 	if !reflect.DeepEqual(result.PackagesLeft[0], refused) {
 		t.Fatalf("the version refused:\n got %+v\nwant %+v", result.PackagesLeft[0], refused)
 	}
-	if left := result.PackagesLeft[1]; left.Version != "0.0.2" || left.ErrorCode != "PURGE_STOPPED" {
-		t.Fatalf("after it: %+v", left)
+	if left := result.PackagesLeft[1]; left.Version != "0.0.2" || left.ErrorCode != "PURGE_STOPPED" || left.Retryable {
+		t.Fatalf("after it, PURGE_STOPPED and not retryable: %+v", left)
 	}
 	const warning = "workflow invoice is deleted, but its purge did not remove 2 versions of wf.invoice from the motherbee's dist (packages_left): it stopped at 0.0.1, UNAUTHORIZED. Another hive holds a WF.invoice (packages_left's detail names it), and wf.invoice is its package too: the versions stay until that hive's workflow is deleted, and meanwhile a deploy of invoice on this hive is refused the same way."
 	if result.Warning != warning {

@@ -351,7 +351,9 @@ func installWorkflowPackageViaFakeAdmin(svc *Service, packageFiles map[string]st
 // SY.admin answers a removal only after its read of the version's use on every hive, which it waits
 // 30 s for (FINDINGS A-281): the removal waits runtimeRemovalTimeout, 35 s, for that answer, where it
 // waited 5 s and a read that took longer was a timeout. A refusal keeps SY.admin's code and detail,
-// which packages_left names. The publish still waits adminRPCTimeout.
+// which packages_left names. The publish waits packagePublishTimeout, 10 s: SY.admin's admission
+// (3 s at most) and its own lock's wait for SY.wf-rules (4 s at most) come first, so a
+// RUNTIME_MANIFEST_BUSY reaches it (0.1.139's integration review: it waited 5 s).
 func TestARemovalWaitsForSYAdminsReadOfEveryHive(t *testing.T) {
 	const refusal = "cannot tell whether runtime 'wf.invoice' version '0.0.1' is in use: the nodes of worker1 (UNREACHABLE) were not read, and nothing was removed"
 	admin := &recordingAdmin{reply: map[string]any{
@@ -392,7 +394,7 @@ func TestARemovalWaitsForSYAdminsReadOfEveryHive(t *testing.T) {
 	if _, err := client.PublishRuntimePackage(context.Background(), map[string]string{"package.json": "{}"}); err != nil {
 		t.Fatal(err)
 	}
-	if request, _ := admin.last(t); request.Action != "publish_runtime_package" || request.Timeout != adminRPCTimeout {
+	if request, _ := admin.last(t); request.Action != "publish_runtime_package" || request.Timeout != packagePublishTimeout || packagePublishTimeout != 10*time.Second {
 		t.Fatalf("the publish: %+v", request)
 	}
 }
@@ -456,6 +458,20 @@ func TestEachVersionLeftSaysWhetherAskingAgainMayRemoveIt(t *testing.T) {
 			if version.Retryable != retryable {
 				t.Fatalf("purge stopped at a use not read, retryable %v: %+v", retryable, left)
 			}
+		}
+	}
+	// Nor after an UNAUTHORIZED (FINDINGS A-304): SY.admin admits this hive's removals by the
+	// workflow, so another hive's WF.<workflow> refuses every version alike, and each may be that
+	// hive's current or backup; one offered as retryable was one the operator's own
+	// remove_runtime_version, which A-304 does not refuse, could take from it (0.1.139's
+	// integration review).
+	unauthorized := purgeStoppedAt("wf.invoice", "0.0.1", refusal("UNAUTHORIZED", nil), []string{"0.0.2", "0.0.3"})
+	if len(unauthorized) != 3 || unauthorized[0].ErrorCode != "UNAUTHORIZED" || unauthorized[1].ErrorCode != "PURGE_STOPPED" || unauthorized[2].ErrorCode != "PURGE_STOPPED" {
+		t.Fatalf("purge stopped at another hive's workflow: %+v", unauthorized)
+	}
+	for _, version := range unauthorized {
+		if version.Retryable {
+			t.Fatalf("purge stopped at another hive's workflow, none retryable: %+v", unauthorized)
 		}
 	}
 }

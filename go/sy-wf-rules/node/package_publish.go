@@ -108,9 +108,44 @@ func (s *Service) publishWorkflowPackage(ctx context.Context, workflowName strin
 	if s.admin == nil {
 		return nil, fmt.Errorf("admin client unavailable")
 	}
-	callCtx, cancel := context.WithTimeout(ctx, adminRPCTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, packagePublishTimeout)
 	defer cancel()
 	return s.admin.PublishRuntimePackage(callCtx, packageFiles)
+}
+
+// publishSlot publishes the definition a slot holds (staged for an apply, backup for a rollback)
+// as the workflow's package, before the slots move (0.1.139's integration review): a publish
+// SY.admin refuses or does not answer in time is PACKAGE_PUBLISH_FAILED, and leaves this hive's
+// slots as they were. They rotated first before: a refused deploy left current naming a version
+// never published, its backup dropped, while the WF node still ran the version before it, and a
+// rollback refused the same way rotated them again; since 0.1.139 SY.admin refuses the publish
+// whenever another hive holds a WF.<workflow> (FINDINGS A-304). Retryable is SY.admin's own word,
+// its payload's retryable (RUNTIME_MANIFEST_BUSY: another writer held the runtimes manifest's
+// lock), since nothing here changed.
+func (s *Service) publishSlot(ctx context.Context, workflowName, slot string, meta WfRulesMetadata) (*PackagePublishResult, error) {
+	definitionBytes, err := s.store.ReadDefinitionBytes(workflowName, slot)
+	if err != nil {
+		return nil, err
+	}
+	publish, err := s.publishWorkflowPackage(ctx, workflowName, meta, definitionBytes)
+	if err != nil {
+		failed := WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
+		var actionErr *adminActionError
+		if errors.As(err, &actionErr) {
+			payload, _ := actionErr.Payload["payload"].(map[string]any)
+			failed.Retryable, _ = payload["retryable"].(bool)
+		}
+		return nil, failed
+	}
+	return publish, nil
+}
+
+// slotsNotMoved is an apply's or a rollback's error when SY.admin took the package and moving the
+// slots then failed (this hive's disk): the motherbee's dist holds the version as current, this
+// hive's WF node was not touched, and asking again publishes the same package (SY.admin takes the
+// same contents again) and moves the slots.
+func slotsNotMoved(publish *PackagePublishResult, err error) error {
+	return fmt.Errorf("%s %s was published, but moving this hive's slots failed, and its WF node was not touched: %w; ask again", publish.RuntimeName, publish.Version, err)
 }
 
 func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (map[string]string, error) {
@@ -148,10 +183,11 @@ func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata
 
 // PackageLeft is a version of a workflow's package that a purge did not remove from the motherbee's
 // dist, and why: SY.admin refused its removal (ErrorCode is SY.admin's: RUNTIME_USAGE_UNKNOWN while
-// a hive that may run the version cannot be read, RUNTIME_IN_USE while a node runs it), did not
-// answer in time (TIMEOUT: it may still remove it) or could not be reached (TRANSPORT_ERROR); the
-// purge stopped at an earlier version and did not ask (PURGE_STOPPED); or the versions could not be
-// listed (DIST_UNREADABLE, with no Version).
+// a hive that may run the version cannot be read, RUNTIME_IN_USE while a node runs it, UNAUTHORIZED
+// while another hive holds a WF.<workflow>, FINDINGS A-304), did not answer in time (TIMEOUT: it
+// may still remove it) or could not be reached (TRANSPORT_ERROR); the purge stopped at an earlier
+// version and did not ask (PURGE_STOPPED); or the versions could not be listed (DIST_UNREADABLE,
+// with no Version).
 type PackageLeft struct {
 	Runtime   string `json:"runtime"`
 	Version   string `json:"version"`
@@ -160,8 +196,9 @@ type PackageLeft struct {
 	// Retryable says that remove_runtime_version asked again for the version, nothing else changed
 	// first, may remove it (removalFailure): true for a refusal SY.admin says may pass, a TIMEOUT, a
 	// TRANSPORT_ERROR and a PURGE_STOPPED; false for one that needs a change first (RUNTIME_IN_USE:
-	// stop or move the node; a RUNTIME_USAGE_UNKNOWN SY.admin says is not, with each PURGE_STOPPED
-	// after it: purgeStoppedAt) and for DIST_UNREADABLE (this hive's dist first).
+	// stop or move the node; a RUNTIME_USAGE_UNKNOWN SY.admin says is not, and UNAUTHORIZED, each
+	// with every PURGE_STOPPED after it: purgeStoppedAt) and for DIST_UNREADABLE (this hive's dist
+	// first).
 	Retryable bool `json:"retryable"`
 	// UnansweredHives are the hives whose nodes SY.admin could not read, as its refusal names them
 	// (its payload.unanswered_hives, each {hive, reason, detail}), when it names any.
@@ -299,14 +336,21 @@ func (s *Service) purgeOnPrimary(ctx context.Context, runtimeName string, versio
 // purgeStoppedAt is what a purge that stopped at version leaves: that version, with why its
 // removal failed (removalFailure), and each version it had still to remove, PURGE_STOPPED (a
 // version refused as current earlier in the pass, waiting to be asked again, among them), which
-// was not asked, so asking may remove it; but not after a RUNTIME_USAGE_UNKNOWN SY.admin says
-// cannot pass before something changes (a hive not read is a join that ended, or the motherbee
-// could not read its own nodes): what it could not read holds for every version, whose removal
-// reads the same (FINDINGS A-281, the integration's review).
+// was not asked, so asking may remove it; but not after a refusal that holds for every version
+// alike. A RUNTIME_USAGE_UNKNOWN SY.admin says cannot pass before something changes (a hive not
+// read is a join that ended, or the motherbee could not read its own nodes): what it could not
+// read holds for every version, whose removal reads the same (FINDINGS A-281, the integration's
+// review). An UNAUTHORIZED: SY.admin admits this hive's removals by the workflow, not by the
+// version, so while another hive holds a WF.<workflow> every version is that hive's package too
+// (FINDINGS A-304), its current and its backup among them, and none is for anyone to remove until
+// that hive's workflow is deleted; the operator's own remove_runtime_version is not refused so,
+// which made a PURGE_STOPPED offered as retryable a way to remove that hive's versions (0.1.139's
+// integration review).
 func purgeStoppedAt(runtimeName, version string, err error, notRemoved []string) []PackageLeft {
 	stopped := removalFailure(err)
 	stopped.Runtime, stopped.Version = runtimeName, version
-	retryable := stopped.Retryable || stopped.ErrorCode != "RUNTIME_USAGE_UNKNOWN"
+	holdsForEvery := stopped.ErrorCode == "RUNTIME_USAGE_UNKNOWN" || stopped.ErrorCode == "UNAUTHORIZED"
+	retryable := stopped.Retryable || !holdsForEvery
 	left := []PackageLeft{stopped}
 	for _, next := range notRemoved {
 		left = append(left, PackageLeft{
