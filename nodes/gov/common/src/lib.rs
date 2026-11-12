@@ -148,9 +148,12 @@ pub fn looks_like_tenant_id(raw: &str) -> bool {
     uuid::Uuid::parse_str(rest.trim()).is_ok()
 }
 
-/// The case has no tenant: the identity SHM, read whole, does not hold its ILK (SY.identity has no
-/// such ILK, or has it marked deleted), or holds no tenant id for it. Nothing is registered, and no
-/// tenant is created. A final verdict.
+/// The case has no tenant: the identity SHM, read whole and written by SY.identity (it holds
+/// SY.identity's own ILK), does not hold its ILK, or holds no tenant id for it. Mostly SY.identity
+/// has no such ILK, or has it marked deleted; a region SY.identity could not write the ILK to (a
+/// full one), or wrote from its bootstrap store while it runs without its database, reads the same
+/// (not told apart, FINDINGS A-303). Nothing is registered, and no tenant is created. A final
+/// verdict.
 pub const CASE_TENANT_MISSING: &str = "missing_tenant_id";
 /// The tenant of the case is unknown for now: the identity SHM could not be read, or SY.identity
 /// had not written it yet (a region created again, empty), on every read the frontdesk made

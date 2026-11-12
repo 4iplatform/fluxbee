@@ -432,7 +432,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator).
 - A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator).
 - A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic; seen live by 0.1.138's gate).
-- A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk; built on `coa/frontdesk-139` for 0.1.139).
+- A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk; built on `coa/frontdesk-139` for 0.1.139; two rarer paths not told apart, to decide).
 - A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives, to decide).
 - A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin).
 - A-306 🔵 A version's removal holds the manifest lock through its read of every hive's use; a publish waits with no bound (low; SY.admin).
@@ -2466,20 +2466,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Built on `coa/frontdesk-139` (for 0.1.139; the frontdesk and `gov-common`, no SY.identity or
   SDK change):**
   - **A read of the identity SHM gives one of three answers** (`IlkTenantRead`): the ILK's tenant;
-    not held (the region, as SY.identity wrote it, lacks the ILK: final, `tenant_unresolved` as
-    before); or unreadable (the SDK's read failed: a full rewrite of the region holds a reader past
-    its 5 ms seqlock wait, at SY.identity's start and on every delete, restore or purge; or the
-    region is being created again, or gone).
+    not held (the region holds SY.identity's own ILK but not the case's: final, `tenant_unresolved`
+    as before; mostly an ILK SY.identity does not hold, and two rarer paths read the same, below);
+    or unreadable (the SDK's read failed: a full rewrite of the region holds a reader past its 5 ms
+    seqlock wait, at SY.identity's start and on every delete, restore or purge; or the region is
+    being created again, or gone).
   - **A registration reads it again** (`read_ilk_tenant`, `SHM_READ_RETRY`), the handoff and
     `ilk_register` alike: after 50 ms, 200 ms and 500 ms, each failed read logged with its reason,
     the first answer the region gives taken. Still unreadable, nothing is sent and the answer may
     pass: `identity_shm_unreadable` (`CASE_TENANT_UNREADABLE` in `gov-common`, which
     `identity_error_is_transient` counts), `retryable: true`, `IDENTITY_UNAVAILABLE` /
     `identity_unavailable`, the case left open; in a conversation it is the turn's attempt. About
-    0.75 s and the reads before the registration's 8 s, under io.api's 10 s. The SHM stays shared
-    memory: the frontdesk asks SY.identity nothing in its place. The root-tenant check and the
-    usage account read it once, as before (unreadable: the turn goes on, usage `fallback_root`).
-  - **The state review's two rarer paths:**
+    0.75 s and the reads before the registration's 8 s, under io.api's 10 s: a handoff reads it
+    once, and its registration takes the tenant the handoff read (`IlkRegisterTool::case_tenant`;
+    the branch's review found a second read with its own 0.75 s, up to 9.5 s in all). The SHM
+    stays shared memory: the frontdesk asks SY.identity nothing in its place. The root-tenant check
+    and the usage account read it once, as before (unreadable: the turn goes on, usage
+    `fallback_root`).
+  - **The rarer paths** (the state review's two, and a third from the branch's review):
     - *A region created again empty after a limits change* (SY.identity unlinks and recreates it
       at a start with other limits, and writes it a moment later; the region stays empty if that
       first write fails): told apart. A region SY.identity wrote always holds SY.identity's own
@@ -2492,21 +2496,49 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       The region looks the same as for an ILK SY.identity does not hold, and the SDK's reader keeps
       the header's counts and limits to itself; a read again would not pass either, since nothing
       writes the ILK until a whole rewrite of the region holds it (a full region needs higher limits
-      first). It stays a final `tenant_unresolved`. Telling it apart needs the Rust SDK to expose the
-      header's counts and limits (its own release), or SY.identity to fail the provision or rebuild
-      the region when its write fails: left to the operator's call.
+      first). It stays a final `tenant_unresolved`.
+    - *A primary SY.identity running without its database* (the branch's review, 2026-11-12, read
+      in the code; there before it): its store starts as the bootstrap one (the root tenant), it
+      seeds the system ILKs, and rewrites the region from it, the region reused when the limits are
+      the same; the ILKs its replicas push come in too. So the region holds SY.identity's own ILK
+      and no person (`sy.identity started without active DB backend`, or `continuing with
+      in-memory bootstrap` when the load fails; SY.vault not answering within the 60 s SY.identity
+      waits for it at its start does it, until SY.vault's secret broadcast restarts SY.identity).
+      Not told apart: every person reads as not held, a final `tenant_unresolved`, while
+      SY.identity, with no database at all, answers a registration `DB_NOT_READY`, which may pass.
+      It answers a provision so too, so `register_human` stops at its provision; what meets it is a
+      case provisioned before that start: an io.api handoff for a subject io.api keeps in its
+      cache (it reuses the ILK when the SHM misses it), or a conversation's turn, which closes its
+      case as `completed_error` for good (`missing_tenant_id` is not transient).
+  - **To decide (the operator), for the two paths not told apart:**
+    - *The failed delta apply:* (a) the Rust SDK exposes the header's counts and limits (its own
+      release), so the frontdesk tells a full region apart; (b) SY.identity fails the provision, or
+      rebuilds the region, when its write fails; (c) leave it as it is.
+    - *The primary without its database:* (a) the frontdesk takes a region with no human ILK for
+      one not written in full: read again, then `identity_unavailable` (the frontdesk alone; on a
+      hive with no person yet, a case whose ILK is gone then answers one that may pass; a region of
+      system ILKs only, or of the root tenant only, would not catch it, since the replicas' node
+      ILKs come in); (b) SY.identity: a primary without its database keeps the content of a region
+      it reuses instead of rewriting it from the bootstrap store; (c) leave it as it is.
   - **Tests** (each fails without its part of the fix):
     `a_handoff_whose_identity_shm_cannot_be_read_answers_identity_unavailable` and
     `a_turn_whose_case_tenant_cannot_be_read_awaits_the_confirmation` (they read
     `tenant_unresolved`, or a final answer, with the unreadable read taken as no tenant);
     `the_identity_shm_is_read_again_while_it_cannot_be_read` and
-    `a_handoff_reads_the_identity_shm_again_and_registers` (without the reads again);
+    `a_handoff_reads_the_identity_shm_again_and_registers` (without the reads again; the latter
+    also with the handoff's registration reading the region again: 4 reads, not 3);
+    `a_handoff_reads_the_tenant_of_its_case_once` (with that second read, a region that turns
+    unreadable after the handoff's read failed the handoff with `identity_unavailable`);
     `an_identity_shm_not_written_yet_says_nothing_of_an_ilk` (an empty region read as not holding
     the ILK); `gov-common`'s `an_identity_shm_that_could_not_be_read_is_a_failure_that_may_pass`.
   - **Docs:** `docs/nodes/sy-frontdesk-gov.md` (Case tenant rules, ILK_REGISTER, Failure behavior,
     Health), `docs/ai-frontdesk-gov-spec.md` §4.3, §7.2, §9 and §12, `docs/reference/identity.md`,
     `docs/reference/shared-memory.md` §7, `docs/io-cloud-api.md` §5.2 and §9 (0.1.139, not deployed
-    yet), the node's README. Archi's handbook and SY.admin's help name none of it.
+    yet; `tenant_unresolved` as the frontdesk's copy of the registry not holding the identity, which
+    may still exist), the node's README. Archi's handbook and SY.admin's help name none of it.
+  - **At the integration:** `coa/edge-139` adds its own `### 0.1.139` to `docs/io-cloud-api.md` §9
+    at the same place; the two become one entry, under this branch's heading, which says
+    *not deployed yet* until the release is deployed.
 
 ### A-302 [WF/wf-generic] 🔵 low (found 2026-11-11 by A-284's review fixes; read in the code; seen live by 0.1.138's gate) — Which wf.engine a WF node runs shows only in its unit's ExecStart
 

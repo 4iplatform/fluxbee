@@ -195,11 +195,12 @@ tenant moves no key.
 4. **SY.frontdesk.gov registers the person** with `ILK_REGISTER`
    (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs`):
    - The tenant is the case's: the one SY.identity holds for the ILK, read from the identity SHM
-     (`identity_shm_ilk_tenant`, `case_tenant_of`). The frontdesk never creates a tenant. A
-     registration reads the SHM again while it cannot be read, or holds nothing SY.identity wrote
-     yet, then answers `IDENTITY_UNAVAILABLE`, which may pass, never the final
-     `TENANT_UNRESOLVED` (since 0.1.139, FINDINGS A-303;
-     [sy-frontdesk-gov](../nodes/sy-frontdesk-gov.md#case-tenant-rules)).
+     (`identity_shm_ilk_tenant`). The frontdesk never creates a tenant. A registration reads it
+     through `case_tenant_to_register` and `read_ilk_tenant`: the SHM read again while it cannot
+     be read, or holds nothing SY.identity wrote yet, then `IDENTITY_UNAVAILABLE`, which may pass,
+     never the final `TENANT_UNRESOLVED` (since 0.1.139, FINDINGS A-303;
+     [sy-frontdesk-gov](../nodes/sy-frontdesk-gov.md#case-tenant-rules)). The root-tenant check and
+     the usage account read it once (`case_tenant_of`).
    - Two methods. A structured `frontdesk_handoff` runs deterministically, with no model call. A
      person chatting is the conversational method, driven by the frontdesk's LLM.
    - A handoff is taken only from an IO node: the router-stamped `src_l2_name` must start with

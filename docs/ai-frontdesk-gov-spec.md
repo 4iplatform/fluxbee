@@ -148,19 +148,23 @@ Rules:
 - `frontdesk_handoff.tenant_id`, if present, is only compared with that tenant;
 - on the conversational path the only source is the ILK's tenant: the thread state is written by
   the LLM, so it is not a tenant source;
-- if the SHM, as `SY.identity` wrote it, does not hold the ILK (or holds no tenant for it), the case
-  has no tenant: no `ILK_REGISTER` is sent and nothing is created. The response is explicit and
-  final: `status = "error"`, `result_code = TENANT_UNRESOLVED`, `error_code = missing_tenant_id`;
+- if the SHM holds `SY.identity`'s own system ILK (every region `SY.identity` wrote does) but not
+  the case's ILK, or no tenant for it, the case has no tenant: no `ILK_REGISTER` is sent and
+  nothing is created. The response is explicit and final: `status = "error"`,
+  `result_code = TENANT_UNRESOLVED`, `error_code = missing_tenant_id`;
 - if the SHM cannot be read, or holds nothing `SY.identity` wrote yet (a region created again,
   empty, when `SY.identity` starts with other limits: it lacks `SY.identity`'s own system ILK),
   the frontdesk reads it again after 50 ms, 200 ms and 500 ms. Still unreadable, the tenant is
   unknown for now, not missing: no `ILK_REGISTER` is sent, and the answer is one that may pass
   (`IDENTITY_UNAVAILABLE`, `error_code = identity_shm_unreadable`, `retryable: true`; section 7.2;
   A-303). Up to 0.1.138 it was the final `TENANT_UNRESOLVED`. The frontdesk asks `SY.identity`
-  nothing in place of the SHM;
-- a provision `SY.identity` answered although its write to the SHM failed (a full region) is not
-  told apart from an ILK it does not hold: it reads as `TENANT_UNRESOLVED` until `SY.identity`
-  writes the whole region again with it;
+  nothing in place of the SHM. A handoff reads it once, and its registration takes that tenant;
+- two paths are not told apart from an ILK `SY.identity` does not hold, and read as
+  `TENANT_UNRESOLVED` although it holds it (A-303, left to the operator's call): a provision
+  `SY.identity` answered although its write to the SHM failed (a full region), until `SY.identity`
+  writes the whole region again with it; and every person while the primary `SY.identity` runs
+  without its database, when it writes the region from its bootstrap store (the root tenant and
+  the system ILKs, no person; with no database at all it answers registrations `DB_NOT_READY`);
 - there are no other sources: the tool has no `tenant_id` or `identity_candidate.tenant_hint`, and
   neither `effective_config.tenant_id` nor `GOV_IDENTITY_TENANT_ID` exists;
 - a `pending`, `suspended` or deleted tenant does not receive registrations: `SY.identity` responds

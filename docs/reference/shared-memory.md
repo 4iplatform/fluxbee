@@ -360,12 +360,17 @@ Sections follow the header in this order, each on a 64-byte boundary (`layout_id
   `WaitForSelfSystemIlkID`. It hard-codes the struct sizes and field offsets.
 
 **Restart.** SY.identity rebuilds the whole region at start from its store: the database on the
-primary, the full sync on a replica. Until then readers read what the region holds: the previous
-content, or nothing when the region was created again for other limits. Every read opens the region
-afresh (§2.4), so readers find a region created again from their next read on. A region SY.identity
-wrote always holds its own system ILK, seeded before its first write: SY.frontdesk.gov takes a region
-without it for one not written yet, and reads it again, as it does a read that failed (FINDINGS
-A-303; [sy-frontdesk-gov](../nodes/sy-frontdesk-gov.md#case-tenant-rules)).
+primary, the full sync on a replica. Without them (a primary that started without its database, a
+replica whose full sync failed) the store is the bootstrap one, the root tenant and the system ILKs,
+and the rebuild leaves the region with no person in it, the previous content gone. Until then
+readers read what the region holds: the previous content, or nothing when the region was created
+again for other limits. Every read opens the region afresh (§2.4), so readers find a region created
+again from their next read on. A region SY.identity wrote always holds its own system ILK, seeded
+before its first write: SY.frontdesk.gov takes a region without it for one not written yet, and
+reads it again, as it does a read that failed (FINDINGS A-303;
+[sy-frontdesk-gov](../nodes/sy-frontdesk-gov.md#case-tenant-rules)). A region rebuilt from the
+bootstrap store holds that ILK all the same: there SY.frontdesk.gov reads a person as one
+SY.identity does not hold (not told apart).
 
 ---
 

@@ -424,8 +424,9 @@ anyone. Send only emails Cloud has verified.
     case open): send it again (below). `missing_required_fields` and `invalid_request`: fix the
     request. Any other (`tenant_unresolved`, `tenant_not_registrable`, `register_failed`,
     `in_conversation`, `unknown`) is final: give the operator the `request_id`.
-    `tenant_unresolved` says the registry does not hold the identity IO.cloud created for the
-    request.
+    `tenant_unresolved` says the frontdesk's copy of the registry (the hive's shared memory, which
+    it reads) does not hold the identity IO.cloud created for the request. The identity may still
+    exist in the registry: the `request_id` lets the operator find out.
 - **When the frontdesk gives no verdict**, the answer is one of these codes. When the frontdesk
   sent an error, the answer also names the person (`ilk_id`), and (0.1.137) `error_detail` starts
   with the frontdesk's own code when it gave one (`"ai_runtime_error: …"`).
@@ -1104,7 +1105,8 @@ it "(0.1.139)".
   the hive's frontdesk could not read its identity registry for the moment (FINDINGS A-303): send
   the request again, as on any `identity_unavailable` (§5.2). The frontdesk reads the registry
   again for up to about 0.75 s before it answers so. `tenant_unresolved` stays final, for an
-  identity the registry does not hold.
+  identity the frontdesk's copy of the registry (the hive's shared memory) does not hold; the
+  identity may still exist, so give the operator the `request_id`.
 
 ### 0.1.137
 

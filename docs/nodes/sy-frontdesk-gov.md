@@ -204,9 +204,10 @@ SHM of the frontdesk's hive (`identity_shm_ilk_tenant`, a read of the region's I
 gives one of three answers (`IlkTenantRead`, `ilk_tenant_in_region`):
 
 - **the ILK's tenant**: the region holds the ILK;
-- **not held**: the region, as SY.identity wrote it, does not hold the ILK (SY.identity has no such
-  ILK, or holds it marked deleted). A region SY.identity wrote always holds SY.identity's own system
-  ILK (`deterministic_system_ilk_id("SY.identity@<hive>")`, seeded before its first write);
+- **not held**: the region holds SY.identity's own system ILK
+  (`deterministic_system_ilk_id("SY.identity@<hive>")`, seeded before its first write, so every
+  region SY.identity wrote holds it) but not the case's. Mostly SY.identity has no such ILK, or
+  holds it marked deleted; two other paths read the same and are not told apart (below);
 - **unreadable**: the read failed (SY.identity was rewriting the whole region, which holds a reader
   past its 5 ms seqlock wait, or creating it again, or it is gone), or the region does not hold
   SY.identity's own ILK: created again empty, when SY.identity starts with other limits, and not
@@ -234,7 +235,9 @@ if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
   that may pass: `retryable: true`, `IDENTITY_UNAVAILABLE` / `identity_unavailable` with
   `error_code` `identity_shm_unreadable` (`identity_error_is_transient` counts it). A handoff sent
   again, or the person's next confirmation, retries it; in a conversation it is the turn's attempt
-  (see ILK_REGISTER), and the case stays `awaiting_confirmation`.
+  (see ILK_REGISTER), and the case stays `awaiting_confirmation`. A handoff reads the region once:
+  its registration takes the tenant the handoff read (`IlkRegisterTool::case_tenant`), so it
+  spends those 0.75 s once before the 8 s, under io.api's 10 s.
 - **Root-tenant case: stop.** `root_tenant_case_result` answers before any LLM, identity call or
   state write: `TENANT_NOT_REGISTRABLE` / `TENANT_ROOT_NOT_REGISTRABLE`, "I cannot complete the
   registration through this channel: it does not belong to any organization." The ILK stays
@@ -245,11 +248,20 @@ if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
 - **Usage.** `usage_account` charges the case tenant with source `case`, from one read; when
   `case_tenant_of` fails (an unreadable read included), `AiAccount::charge` charges the root tenant
   as `fallback_root` (`crates/fluxbee_ai_sdk/src/usage.rs`).
-- **Not told apart:** an ILK whose provision SY.identity answered although its write to the region
-  failed (`identity shm delta apply FAILED` in SY.identity's journal; a full region does it) reads
-  as not held, a final `TENANT_UNRESOLVED`, until SY.identity writes the whole region again with
-  it (a full region needs higher limits first). The region looks the same as for an ILK SY.identity
-  does not hold, and the frontdesk asks SY.identity nothing in its place (FINDINGS A-303).
+- **Not told apart** (FINDINGS A-303, left to the operator's call): two paths read as not held, a
+  final `TENANT_UNRESOLVED`, although SY.identity holds the ILK. The region looks the same as for an
+  ILK SY.identity does not hold, and the frontdesk asks SY.identity nothing in its place:
+  - an ILK whose provision SY.identity answered although its write to the region failed
+    (`identity shm delta apply FAILED` in SY.identity's journal; a full region does it), until
+    SY.identity writes the whole region again with it (a full region needs higher limits first);
+  - every person, while the primary SY.identity runs without its database (`sy.identity started
+    without active DB backend` or `continuing with in-memory bootstrap` in its journal; SY.vault not
+    answering within the 60 s SY.identity waits for it at its start does it, until SY.vault's
+    secret broadcast restarts SY.identity): it writes the region from its bootstrap store, the root
+    tenant and the system ILKs (and the ILKs its replicas push), with no person in it. With no
+    database at all it answers a provision and a registration `DB_NOT_READY`, so what meets this is
+    a case provisioned before that start: an io.api handoff for a subject io.api keeps in its cache,
+    or a conversation's turn, which closes its case as `completed_error`.
 - The frontdesk never creates a tenant and takes none from the person, the LLM or its config
   (doc comment of `resolve_case_tenant`).
 
@@ -367,7 +379,9 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
   or the person's next confirmation, retries it. Up to 0.1.138 it answered the final
   `TENANT_UNRESOLVED`. A region created again empty, before SY.identity writes it, reads the same.
   The root-tenant check and the usage account read it once: the conversation goes on, and usage
-  goes to `fallback_root`.
+  goes to `fallback_root`. A region SY.identity wrote without the case's ILK (its write of it
+  failed, or a primary without its database) still answers the final `TENANT_UNRESOLVED` (Case
+  tenant rules, not told apart).
 - **Handler errors**: each message runs once under the AI runtime
   (`crates/fluxbee_ai_sdk/src/runtime.rs`): up to 47 min per conversation turn, each model call
   bounded at 5 min, and 30 s per handoff or `system` request. When the handler fails or runs out
