@@ -321,6 +321,13 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 			return nil
 		}
 	}
+	// So does the target's NOT_TAKEN for a fire: the Go SDK of a node whose queue was full answers it
+	// (FINDINGS A-329). Never answered either.
+	if notice, ok := fluxbeesdk.ParseNotTaken(msg); ok && s.scheduler != nil {
+		if s.scheduler.notTaken(msg.Routing.TraceID, msg.SourceL2Name(), notice) {
+			return nil
+		}
+	}
 	if isInfrastructureMessage(msg) {
 		// One line, bounded per sender as refusals are (ignoredLog): before, a plain line each, and a
 		// node that looped notices or replies at SY.timer wrote one per message (the review of A-258).
@@ -368,11 +375,12 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 // isInfrastructureMessage reports whether msg gets no answer: the router made it (it carries no
 // routing.src_l2_name, which the router stamps on everything a node sends), or it is a notice or a
 // reply, not a request: HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED, a message without a
-// name, or any *_RESPONSE (SY.timer awaits none). It is the AI SDK's is_infrastructure_message, name
-// by name, and wf-generic's isNotice and neverAnswered (FINDINGS A-218). An answer to the router's
-// UNREACHABLE would go to the router's own UUID, which no node has: the router would answer
-// UNREACHABLE again, and the two would bounce it forever (a TIMER_FIRED for a node not connected yet
-// starts it).
+// name, or a reply (fluxbeesdk.IsReplyName: any *_RESPONSE, a NOT_TAKEN, an agent's <msg>.error;
+// SY.timer awaits none). It is wf-generic's isNotice and neverAnswered, and the AI SDK's
+// is_infrastructure_message, name by name but for NOT_TAKEN and <msg>.error (FINDINGS A-218, A-329).
+// An answer to the router's UNREACHABLE would go to the router's own UUID, which no node has: the
+// router would answer UNREACHABLE again, and the two would bounce it forever (a TIMER_FIRED for a
+// node not connected yet starts it). Before 0.1.141 a NOT_TAKEN was answered TIMER_UNKNOWN_VERB.
 func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
 	if msg.SourceL2Name() == "" {
 		return true
@@ -387,7 +395,7 @@ func isInfrastructureMessage(msg fluxbeesdk.Message) bool {
 		fluxbeesdk.MSGTTLExceeded:
 		return true
 	}
-	return strings.HasSuffix(name, "_RESPONSE")
+	return fluxbeesdk.IsReplyName(name)
 }
 
 func (s *Service) respondTimerNow(incoming fluxbeesdk.Message) error {

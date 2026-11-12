@@ -70,13 +70,15 @@ type timerScheduler struct {
 
 	sentMu sync.Mutex
 	// sent holds each fire sent in the last deliveryAnswerWindow, by the trace_id of its
-	// TIMER_FIRED, for the router's UNREACHABLE to name it (undelivered).
+	// TIMER_FIRED, for the router's UNREACHABLE (undelivered) or its target's NOT_TAKEN (notTaken)
+	// to name it.
 	sent map[string]*fireAttempt
 }
 
 // Delivery (FINDINGS A-115). A fire is saved before it is sent, so a stop between the two loses it
 // instead of sending it twice. A fire the router answers UNREACHABLE because its target is not
-// connected, or its link is busy (transientUnreachable), is sent again while it is still on time:
+// connected, or its link is busy (transientUnreachable), or its target answers NOT_TAKEN retryable,
+// its queue full (notTaken, FINDINGS A-329), is sent again while it is still on time:
 // up to an hour from its first attempt, less for a fire_if_within one-shot (its window from its
 // scheduled time) and for a recurring timer (its next instance); a drop one-shot is not sent again.
 // The retries live in memory: a fire SY.timer is retrying when it stops is lost, as is one its
@@ -85,8 +87,8 @@ const (
 	// deliveryRetryWindow is how long a fire is sent again while its target cannot take it, from
 	// its first attempt.
 	deliveryRetryWindow = time.Hour
-	// deliveryAnswerWindow is how long a sent fire waits for the router's UNREACHABLE: one with no
-	// answer by then reached its target.
+	// deliveryAnswerWindow is how long a sent fire waits for the router's UNREACHABLE or its
+	// target's NOT_TAKEN: one with no answer by then reached its target.
 	deliveryAnswerWindow = 30 * time.Second
 	// storageRetryDelay is when a fire whose row could not be saved is tried again; nothing was sent.
 	storageRetryDelay = 30 * time.Second
@@ -469,6 +471,43 @@ func (s *timerScheduler) undelivered(traceID, reason string) bool {
 		log.Printf("fire of %s refused by the router (%s): not sent again", fire.row.UUID, reason)
 		return true
 	}
+	s.retryLater(fire, reason)
+	return true
+}
+
+// notTaken takes the NOT_TAKEN of the target of a fire sent in the last deliveryAnswerWindow
+// (FINDINGS A-329): the target's Go SDK did not queue the fire, its queue full (node_busy). A
+// retryable one is sent again as a fire whose target was not connected is (retryLater: after 5, 10,
+// 20 and 40 s, then each minute, while it is on time, and logged at each attempt); one that is not
+// retryable is not sent again. Only the fire's target, by the name its router stamps (from), decides
+// it: another node's NOT_TAKEN on the trace decides nothing, and the fire waits for its target's
+// answer. It reports whether traceID named a fire the NOT_TAKEN was taken for.
+func (s *timerScheduler) notTaken(traceID, from string, notice fluxbeesdk.NotTakenPayload) bool {
+	s.sentMu.Lock()
+	fire, ok := s.sent[traceID]
+	if ok && fire.row.TargetL2Name != from {
+		ok = false
+	}
+	if ok {
+		delete(s.sent, traceID)
+	}
+	s.sentMu.Unlock()
+	if !ok {
+		return false
+	}
+	reason := fluxbeesdk.MSGNotTaken + " " + notice.Reason
+	if !notice.Retryable {
+		logEvent("timer_fire_refused", map[string]any{
+			"timer_uuid":     fire.row.UUID,
+			"target_l2_name": fire.row.TargetL2Name,
+			"reason":         reason,
+			"detail":         notice.Detail,
+			"attempt":        fire.attempt,
+		})
+		log.Printf("fire of %s not taken by %s (%s, not retryable): not sent again", fire.row.UUID, from, notice.Reason)
+		return true
+	}
+	log.Printf("fire of %s not taken by %s (%s): sent again while it is on time", fire.row.UUID, from, notice.Reason)
 	s.retryLater(fire, reason)
 	return true
 }

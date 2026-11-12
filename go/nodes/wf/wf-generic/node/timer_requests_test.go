@@ -177,6 +177,15 @@ func unreachable(traceID, reason string) sdk.Message {
 	return routerRefusal(sdk.MSGUnreachable, traceID, map[string]any{"original_dst": "SY.timer@motherbee", "reason": reason})
 }
 
+// notTakenBy is sender's NOT_TAKEN for a message on traceID: its Go SDK's queue full (FINDINGS
+// A-329).
+func notTakenBy(sender, traceID string) sdk.Message {
+	request := sdk.Message{Routing: sdk.Routing{Src: "wf-uuid", TraceID: traceID}}
+	msg, _ := sdk.BuildNotTaken("sender-uuid", request, sdk.NotTakenReasonNodeBusy,
+		sender+" holds 1024 system messages, as many as it takes; send it again later", true)
+	return from(sender, msg)
+}
+
 // FINDINGS A-254: a schedule SY.timer does not take is no longer lost. The router's UNREACHABLE
 // (SY.timer restarting, NODE_NOT_FOUND; its link full, LINK_BUSY), its TTL_EXCEEDED, or SY.timer's
 // own refusal marks the timer in the index, never answered; the node is DEGRADED, naming it; the timer
@@ -198,6 +207,10 @@ func TestAScheduleSYTimerDoesNotTakeGoesAgainUntilItDoes(t *testing.T) {
 		{"SY.timer's own refusal", func(traceID string) sdk.Message {
 			return timerRefused(traceID, verbTimerSchedule, "TIMER_STORAGE_ERROR", "disk I/O error")
 		}, "SY.timer@motherbee answered TIMER_STORAGE_ERROR: disk I/O error"},
+		// FINDINGS A-329: SY.timer's queue full, its Go SDK's NOT_TAKEN; before, the WF dropped it and
+		// took the request as refused only once its 30 s passed.
+		{"SY.timer's queue full", func(traceID string) sdk.Message { return notTakenBy("SY.timer@motherbee", traceID) },
+			"SY.timer@motherbee answered NOT_TAKEN node_busy"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			tc := newRefusalTest(t)
@@ -738,6 +751,9 @@ func TestOnlyTheRouterAndSYTimerOfTheHiveRefuseARequest(t *testing.T) {
 		forged,
 		otherTimer,
 		from("IO.in@motherbee", timerRefused(traceID, verbTimerSchedule, "TIMER_STORAGE_ERROR", "x")),
+		notTakenBy("IO.in@motherbee", traceID),
+		notTakenBy("SY.timer@worker1", traceID),
+		notTakenBy("SY.timer@motherbee", "trace-of-something-else"),
 	} {
 		tc.dispatch(msg)
 	}

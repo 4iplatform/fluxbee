@@ -142,11 +142,8 @@ func (c *TimerClient) sendTimerRPC(ctx context.Context, msg Message) (Message, e
 		return Message{}, fmt.Errorf("timer client dispatcher is nil")
 	}
 	matcher := PendingMatcher{
-		Success: []RouteMatch{RouteExact{MsgType: SYSTEMKind, Msg: MsgTimerResponse}},
-		TerminalError: []RouteMatch{
-			RouteExact{MsgType: SYSTEMKind, Msg: MSGUnreachable},
-			RouteExact{MsgType: SYSTEMKind, Msg: MSGTTLExceeded},
-		},
+		Success:         []RouteMatch{RouteExact{MsgType: SYSTEMKind, Msg: MsgTimerResponse}},
+		TerminalError:   requestTerminalErrors(),
 		InvalidResponse: []RouteMatch{RouteAnyMsgOfType{MsgType: SYSTEMKind}},
 	}
 	labels := RpcRequestLabels{

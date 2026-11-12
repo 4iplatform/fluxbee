@@ -498,6 +498,37 @@ to `IO.*`). Reading identity needs no message: a node reads `/jsr-identity-<hive
 - `CONFIG_CHANGED`: from `SY.admin@motherbee` to SY.opa.rules, carrying the operator's OPA policy
   (`docs/opa-distribution.md`); protected.
 
+### 6.10 NOT_TAKEN
+
+A node's answer to the sender of a message it took nowhere: a `system` message, `msg` `NOT_TAKEN`,
+to the sender's uuid (`routing.src`), on the message's `trace_id` and `thread_id`, `ttl` 16, with
+`NotTakenPayload {ok: false, error: "not_taken", reason, detail, retryable}`
+(`go/fluxbee-go-sdk/not_taken.go`, `BuildNotTaken`, `ParseNotTaken`). `retryable` says whether the
+same message sent again may be taken; one without it (a WF engine before 0.1.141) is not. Two
+kinds of node send it:
+
+- **The Go SDK, for a message its command channel cannot hold** (since 0.1.141, planned; FINDINGS
+  A-329; §10.2): `reason` `node_busy`, `retryable` true, `detail` naming the node and the lane
+  (*"WF.x@worker1 holds 1024 non-system messages, as many as it takes; send it again later"*).
+  Every message gets one but a notice or a reply (`IsNoticeOrReply`, §10.5): a person's text, a
+  `user` message without a name, gets one.
+- **The WF engine, for a message its workflow takes nowhere**
+  ([the WF spec](../spec-systemnode-wf-v1_1.md) §14.5): `no_thread`, `no_conversation`,
+  `invalid_input` and `not_expected`, not retryable, and `unavailable` (the engine waits for its
+  store), retryable.
+
+A `NOT_TAKEN` is a reply: no one answers it, so two nodes never bounce one. The router treats it as
+any system message (not protected, not copied to the stream). What its receiver does with it:
+
+| Receiver | What it does |
+| --- | --- |
+| SY.timer, for a fire it sent (0.1.141) | Sends the fire again, retryable and from the fire's target, after 5, 10, 20 and 40 s, then each minute, while it is on time ([SY.timer](../sy-timer.md) §7.8). Before 0.1.141 it answered `TIMER_UNKNOWN_VERB`. |
+| A WF (0.1.141) | SY.timer's for a timer request refuses the request, and the timer goes again (FINDINGS A-254's schedule); any other is logged. Before 0.1.141 it was dropped as a system message, and a timer request was taken as refused only after 30 s. |
+| A Go request helper (0.1.141) | `SendSystemRPC`, `SendAdminRPC` and the timer client end at once with `RpcErrNotTaken`, its `Reason` and `Retryable` (§10.4). Before, a system request ended as `RpcErrInvalidResponse`, an admin request at its timeout. |
+| The Rust SDK's `send_system_rpc` | Ends as `RpcError::InvalidResponse` (any `system` message on its trace); `send_admin_rpc` waits for its timeout. |
+| io.slack | Shows the WF's to whoever wrote, by its `reason`; a reason it does not know (`node_busy` among them, until the IO track) as *"Not taken."*, with a warning line. Other IO nodes drop it. |
+| An AI node (the AI SDK) | Answers it with a `CONFIG_RESPONSE` error `unknown_system_msg`, as it does any system request it does not know (FINDINGS A-325), which the Go node drops as a reply. |
+
 ---
 
 ## 7. Protected system actions
@@ -647,6 +678,16 @@ later one.
 5. A `post_pending_rule` matches: its target.
 6. Otherwise dropped and counted (`metric_route_unmatched`).
 
+A Rust command channel is unbounded (FINDINGS A-295). A Go command channel is a queue of two lanes
+(`go/fluxbee-go-sdk/command_queue.go`, since 0.1.141, FINDINGS A-329): `system` messages and every
+other kind, each at most 1,024 messages or 8 MiB (the router's bound for a node's link,
+`LINK_QUEUE_MAX_FRAMES` and `LINK_QUEUE_MAX_BYTES`); its consumer gets the oldest system message
+first, then the oldest of the rest, so a system message never waits behind user ones. A message
+that does not fit its lane is answered `NOT_TAKEN` `node_busy`, retryable (§6.10), unless it is a
+notice or a reply; either way it is counted (`CommandChannelDrops`, `NotTakenSent`), and the node's
+log says so, the first at once, then a line at most every 10 s that counts what came since. Before
+0.1.141 a Go command channel held 64 messages and dropped the rest, telling no one.
+
 ### 10.3 Sending a request
 
 A `PendingMatcher` holds three `RouteMatch` lists, tried in order: `success` delivers the message,
@@ -658,6 +699,9 @@ A `PendingMatcher` holds three `RouteMatch` lists, tried in order: `success` del
 | `send_system_rpc(SystemRpcRequest {target, request_msg, response_msg, payload, timeout})` | `system` + `response_msg` | `system` + `UNREACHABLE` or `TTL_EXCEEDED` | any `system` |
 | `send_admin_rpc(AdminCommandRequest {admin_target, action, target, params, request_id, timeout})` | `admin` + `ADMIN_COMMAND_RESPONSE` | the same | any `admin` |
 | `send_with_matcher(message, matcher, labels, timeout)` | yours | yours | yours |
+
+In Go, `SendSystemRPC`, `SendAdminRPC` and the timer client's requests take the target's
+`NOT_TAKEN` as a terminal error too (`requestTerminalErrors`, since 0.1.141, FINDINGS A-329).
 
 `send_with_matcher` fails at once with `RpcError::Disconnected` when the link is down, fills an
 empty `trace_id` (a new UUID) and `src`, and refuses a `trace_id` already pending
@@ -673,7 +717,9 @@ A zero timeout means 5 s (`default_rpc_timeout`; Go `SendWithMatcher`).
 unknown, not failed: the peer may have done the work (`RpcError::is_timeout`). Transport errors are
 `RpcError::Unreachable {reason, original_dst}` and `RpcError::TtlExceeded {original_dst,
 last_hop}`. Go returns `*RpcError` with `Kind` `RpcErrTimeout`, `RpcErrTerminalTransport`,
-`RpcErrInvalidResponse`, `RpcErrDisconnected`, `RpcErrInvalidRequest` or `RpcErrMessageTooLarge`.
+`RpcErrInvalidResponse`, `RpcErrDisconnected`, `RpcErrInvalidRequest`, `RpcErrMessageTooLarge` or
+`RpcErrNotTaken` (the target answered `NOT_TAKEN`, with its `Reason` and `Retryable`, since
+0.1.141; its text *"rpc not taken: ... NOT_TAKEN reason=node_busy retryable=true: ..."*).
 Go's `RpcErrTerminalTransport` carries the notice as Rust's do (since 0.1.130, FINDINGS A-228):
 `Notice` (`UNREACHABLE` or `TTL_EXCEEDED`), `Reason`, `OriginalDst` and `LastHop`, a field the
 notice lacks empty, and its text names them (`rpc terminal transport error: UNREACHABLE
@@ -688,7 +734,9 @@ requester's dispatcher matches on that. Builders: `try_handle_default_node_statu
 `BuildSystemResponse`, `BuildCommandResponse`, `BuildQueryResponse`. Send through
 `RouterDispatcher::sender_snapshot()` (Go `SenderSnapshot()`). Do not reuse a response name as a
 command name: once a node has awaited `X_RESPONSE` with an exact matcher, an unsolicited
-`X_RESPONSE` is dropped (step 4 of §10.2). Answer requests only, never a reply or a notice. A
+`X_RESPONSE` is dropped (step 4 of §10.2). Answer requests only, never a reply (any `*_RESPONSE`,
+a `NOT_TAKEN`, an agent's `<msg>.error`) or a notice (HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE,
+TTL_EXCEEDED, a system message without a name); Go's `IsNoticeOrReply` is that rule. A
 message without `routing.src_l2_name` was made by the router (UNREACHABLE, TTL_EXCEEDED); its
 `routing.src` is the router's UUID, which no node has, so an answer comes back as another
 UNREACHABLE, and a node that answers every message bounces it forever.
@@ -701,8 +749,9 @@ UNREACHABLE, and a node that answers every message bounces it forever.
 | --- | --- | --- |
 | Reconnection | §2.5 | §2.5 |
 | A frame over 128 KiB | Refused before sending (`NodeError::MessageTooLarge`) | Refused before sending (`*MessageTooLargeError`); the connection stays up |
-| Inbound queue full (256) | Backpressure on the socket | The message is dropped; the dispatcher fails every pending request on any receive error (`dispatchLoop`) |
-| Command channels | Unbounded, warning at depth 1,000 (`RPC_COMMAND_DEPTH_WARN_THRESHOLD`) | 64 messages; when full, dropped and counted (`CommandChannelDrops`) |
+| Inbound queue full (256) | Backpressure on the socket | Backpressure on the socket since 0.1.141 (FINDINGS A-329): the reader waits for room, and the frames wait in the router's queue for the link. Before, the frame was dropped, and the dispatcher failed every pending request on the error |
+| Command channels | Unbounded, warning at depth 1,000 (`RPC_COMMAND_DEPTH_WARN_THRESHOLD`) | Since 0.1.141 (FINDINGS A-329) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is answered `NOT_TAKEN` `node_busy` (§6.10), counted (`CommandChannelDrops`, `NotTakenSent`) and logged. Before, 64 messages, the rest dropped and counted |
+| A target's `NOT_TAKEN` to a request | `InvalidResponse` (system), a timeout (admin) | `RpcErrNotTaken`, with `Reason` and `Retryable` (since 0.1.141) |
 | `AnyMsgOfType` success matcher | Never registered as a reply shape | The same (`registerResponseOnly`) |
 | System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC`: 16 unless `Options.TTL` sets another; `BuildSystemRequest` alone turns 0 into 1. It also sets `meta.action` to the verb |
 | Admin request result | `AdminCommandResult` | The raw `Message` |

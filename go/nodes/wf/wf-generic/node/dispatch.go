@@ -27,9 +27,10 @@ const (
 	MsgWFGetCodeResponse        = "WF_GET_CODE_RESPONSE"
 
 	// msgNotTaken is the engine's own error answer (wf-orchestration-v1 §5.4.6): the WF took the
-	// message nowhere, and its reason says why. An IO node shows it to whoever wrote; a WF and an
-	// agent act on none (answerNotTaken).
-	msgNotTaken = "NOT_TAKEN"
+	// message nowhere, and its reason says why. An IO node shows it to whoever wrote; an agent acts
+	// on none (answerNotTaken). The Go SDK sends the same answer for a message its queue cannot hold
+	// (FINDINGS A-329); a WF takes SY.timer's for a timer request as its refusal (takeNotTaken).
+	msgNotTaken = sdk.MSGNotTaken
 
 	errCodeUnauthorized = "UNAUTHORIZED"
 	// errCodeStoreError: the instance store failed a WF_* request, or is not open (storeDown).
@@ -160,6 +161,13 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 		return nil
 	}
 
+	// A NOT_TAKEN says a node took nowhere a message this one sent: SY.timer's for a timer request
+	// refuses it, and its timer goes again; any other is logged. Never answered (FINDINGS A-329).
+	if notice, ok := sdk.ParseNotTaken(msg); ok {
+		rt.takeNotTaken(ctx, msg, notice)
+		return nil
+	}
+
 	// A system message is control, never a workflow event, but a TIMER_FIRED: since 0.1.90 a WF sends
 	// user, an IO node relays user and an agent answers with the request's type (the AI and IO nodes
 	// take the system kind only as control, too). It is dropped and never answered.
@@ -234,7 +242,7 @@ func isNotice(msg sdk.Message) bool {
 // system message but a TIMER_FIRED); one that comes as a workflow message is a reply all the same, so
 // two WFs cannot bounce it (FINDINGS A-119).
 func isReply(name string) bool {
-	return strings.HasSuffix(name, "_RESPONSE") || name == msgNotTaken || strings.HasSuffix(name, ".error")
+	return sdk.IsReplyName(name)
 }
 
 // neverAnswered reports whether msg gets no answer from the engine, an error included, when its

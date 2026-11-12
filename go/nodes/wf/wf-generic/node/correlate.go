@@ -496,7 +496,10 @@ const (
 
 // answerNotTaken tells the sender of msg that the WF took it nowhere (wf-orchestration-v1 §5.4.6):
 // a NOT_TAKEN, a system message to the sender's uuid with msg's trace_id and thread, and the payload
-// {ok: false, error: not_taken, reason, detail}. Who gets one:
+// {ok: false, error: not_taken, reason, detail, retryable}, the SDK's (sdk.BuildNotTaken, the one
+// its queue answers when it is full, FINDINGS A-329). Only unavailable is retryable: the store opens
+// again, and the same message then may be taken; the other reasons say what the message is. Who
+// gets one:
 //   - an IO node (IO.*), for any message that is no reply and no notice, named or not: someone who
 //     writes is looking for a result, and the IO node shows it to them;
 //   - any other sender, only for a named request (neverAnswered), and only for no_thread,
@@ -520,34 +523,12 @@ func answerNotTaken(actx ActionContext, msg sdk.Message, reason, detail string) 
 	if replyTo == "" {
 		return nil
 	}
-	log.Printf("wf: sending %s reason=%s detail=%q reply_to=%s trace_id=%s src_l2=%q",
-		msgNotTaken, reason, detail, replyTo, msg.Routing.TraceID, msg.SourceL2Name())
-	payload, err := sdk.MarshalPayload(map[string]any{
-		"ok":     false,
-		"error":  "not_taken",
-		"reason": reason,
-		"detail": detail,
-	})
+	retryable := reason == notTakenUnavailable
+	log.Printf("wf: sending %s reason=%s retryable=%t detail=%q reply_to=%s trace_id=%s src_l2=%q",
+		msgNotTaken, reason, retryable, detail, replyTo, msg.Routing.TraceID, msg.SourceL2Name())
+	resp, err := sdk.BuildNotTaken(actx.Dispatcher.NodeUUID(), msg, reason, detail, retryable)
 	if err != nil {
 		return fmt.Errorf("%s not sent: %w", msgNotTaken, err)
-	}
-	msgName := msgNotTaken
-	resp := sdk.Message{
-		Routing: sdk.Routing{
-			Src:     actx.Dispatcher.NodeUUID(),
-			Dst:     sdk.UnicastDestination(replyTo),
-			TTL:     16,
-			TraceID: msg.Routing.TraceID,
-		},
-		Meta: sdk.Meta{
-			MsgType: sdk.SYSTEMKind,
-			Msg:     &msgName,
-		},
-		Payload: payload,
-	}
-	if threadID := msg.Meta.ThreadID; threadID != nil {
-		thread := *threadID
-		resp.Meta.ThreadID = &thread
 	}
 	if err := actx.Dispatcher.SendMsg(resp, sdk.TraceNote{}); err != nil {
 		return fmt.Errorf("%s not sent: %w", msgNotTaken, err)

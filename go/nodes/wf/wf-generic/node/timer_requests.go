@@ -18,6 +18,8 @@ import (
 // comes (timerRequests), and takes as refused one that:
 //   - the router answers UNREACHABLE (SY.timer not connected, NODE_NOT_FOUND, while it restarts; its
 //     link full, LINK_BUSY) or TTL_EXCEEDED (takeTimerRequestNotice);
+//   - SY.timer answers NOT_TAKEN: its queue full (node_busy, its Go SDK since 0.1.141, FINDINGS
+//     A-329; takeNotTaken);
 //   - SY.timer answers with ok false (its store failing, its limit of pending timers reached,
 //     takeTimerAnswer), or a TIMER_NOT_FOUND to a reschedule of a timer it never got;
 //   - gets no answer in timerAnswerTimeout (SY.timer dropped it under load, or its answer was lost);
@@ -49,8 +51,9 @@ const (
 	verbTimerCancel     = "TIMER_CANCEL"
 
 	// timerAnswerTimeout is how long the node waits for SY.timer's answer to a timer request before
-	// it takes the request as refused. SY.timer answers in milliseconds; one that dropped the request
-	// under load (its 64 messages at once, GO-2) never does.
+	// it takes the request as refused. SY.timer answers in milliseconds, a NOT_TAKEN when its queue
+	// is full (since 0.1.141, FINDINGS A-329); one before 0.1.141 dropped the request under load
+	// (its 64 messages at once, GO-2) and never answered.
 	timerAnswerTimeout = 30 * time.Second
 	// timerResendMaxDelay bounds the wait of a refused timer before it goes again.
 	timerResendMaxDelay = time.Minute
@@ -58,8 +61,8 @@ const (
 	// answered and at the refused timers, while there are any.
 	timerRequestsInterval = time.Second
 	// maxTimerRequestsPerTick bounds the unanswered requests one tick takes as refused, and the
-	// refused timers it sends again: SY.timer takes 64 messages at once, and the timers refused
-	// during a long outage go paced.
+	// refused timers it sends again: SY.timer takes 1,024 system messages at once (64 before
+	// 0.1.141, FINDINGS A-329), and the timers refused during a long outage go paced.
 	maxTimerRequestsPerTick = 32
 )
 
@@ -377,6 +380,23 @@ func routerNotice(name string, payload json.RawMessage) string {
 		}
 	}
 	return text
+}
+
+// takeNotTaken takes a node's NOT_TAKEN for a message this node sent (FINDINGS A-329), never
+// answered: SY.timer's for a timer request the node waits for is the request's refusal, and its timer
+// goes again (timerRequestRefused), as at the router's LINK_BUSY. Any other, a node that took nowhere
+// a message an instance sent (its queue full, node_busy, or a WF's own reasons), is logged: what an
+// instance sends is not sent again.
+func (rt *NodeRuntime) takeNotTaken(ctx context.Context, msg sdk.Message, notice sdk.NotTakenPayload) {
+	sender := msg.SourceL2Name()
+	if sender == timerAuthority(rt.NodeName) {
+		if req, waited := rt.ActCtx.Requests.answered(msg.Routing.TraceID); waited {
+			rt.timerRequestRefused(ctx, req, fmt.Sprintf("%s answered %s %s", sender, sdk.MSGNotTaken, notice.Reason))
+			return
+		}
+	}
+	log.Printf("wf: %s from %q (trace_id=%s thread_id=%q): reason=%s retryable=%t detail=%q: a message of this node was not taken",
+		sdk.MSGNotTaken, sender, msg.Routing.TraceID, derefStringPtr(msg.Meta.ThreadID), notice.Reason, notice.Retryable, notice.Detail)
 }
 
 // takeTimerAnswer takes SY.timer's TIMER_RESPONSE to a request the node sent without waiting, never

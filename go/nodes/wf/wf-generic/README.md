@@ -150,14 +150,24 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   conversation's next instance once one runs there. A message that neither the current state nor
   the catch takes is logged and dropped, never queued.
 - **Not taken.** A message the WF takes nowhere gets `NOT_TAKEN`, a system message with
-  `{"ok": false, "error": "not_taken", "reason", "detail"}`, on its thread and trace: `no_thread`
+  `{"ok": false, "error": "not_taken", "reason", "detail", "retryable"}` (the Go SDK's
+  `BuildNotTaken`; `retryable` since 0.1.141, true only for `unavailable`), on its thread and trace: `no_thread`
   (it has none), `no_conversation` (no instance holds its thread, and it starts none),
   `invalid_input` (`input_schema` refuses it), `not_expected` (its instance took nothing) or
   `unavailable` (the engine waits for its store, above). An `IO.*` node gets it for any message,
   named or not; any other sender only for a named request, and only `no_thread`, `invalid_input`
-  and `unavailable`; a WF and an agent act on none. A start that drops a
+  and `unavailable`; an agent acts on none. A start that drops a
   creation a crash left, which starts nothing now, answers it the same way. The default's
   `not_expected` goes once its event is consumed. It took `INVALID_INPUT`'s place.
+- **A burst over its pace** (FINDINGS A-329, since 0.1.141). The Go SDK queues what the node has
+  not read yet, system messages apart, each 1,024 messages or 8 MiB: the node reads a system
+  message (`NODE_STATUS_GET`, `CONFIG_*`, a `TIMER_FIRED`) before any user one still queued. A
+  message past that is answered `NOT_TAKEN` `node_busy`, retryable, before the engine sees it
+  (a notice or a reply is never answered), and the node's log says how many, at most a line every
+  10 s. SY.timer sends a fire so answered again; an IO node's message waits for its sender to send
+  it again. A `NOT_TAKEN` the node gets back is logged, and SY.timer's for one of its timer requests
+  refuses the request, so the timer goes again after 5 s, not after its 30 s without an answer
+  (`takeNotTaken`, `node/timer_requests.go`).
 - **Robustness.** A `$ref` to a missing field fails the action unless it gives a default
   (`{"$ref": "event.context", "default": {}}`, taken for a missing or `null` field); a `$ref` holds
   only `$ref` and `default`, and its default is a literal. The state holds plain JSON, and a JSON

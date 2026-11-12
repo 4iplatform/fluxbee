@@ -323,9 +323,14 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
   - `not_expected`: the instance took nothing, neither a transition nor the catch;
   - `unavailable`: the WF node cannot use its instance store, and takes no message until it can.
     Its status says why (§4.2.7).
+  - `node_busy` (since 0.1.141): the WF node holds as many messages as it takes, 1,024 waiting,
+    and its SDK answered before the engine saw the message. Whoever sent it gets it, IO node or
+    not. Sent again later, the message is taken; SY.timer sends a timer's fire again by itself.
 
-  Another sender gets it only for a named request. A sender the definition does not name gets
-  nothing.
+  Another sender gets the engine's reasons only for a named request. A sender the definition does
+  not name gets none of them. Each `NOT_TAKEN` says whether sending again may pass (`retryable`):
+  only `unavailable` and `node_busy` do. A WF node reads its system messages (status, config, a
+  timer's fire) before the user messages it holds, so a busy WF still answers its status.
 - **A state** has `name`, `description`, `entry_actions`, `exit_actions` and `transitions`. A state
   named `failed` must be terminal: an action that fails ends the instance there.
 - **A transition:**

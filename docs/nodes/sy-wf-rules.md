@@ -480,9 +480,12 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   on its thread or, from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`,
   `node/correlate.go`); a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) never starts one, and
   a notice or a reply is never answered. A message it takes nowhere gets `NOT_TAKEN`, with its
-  reason (`no_thread`, `no_conversation`, `invalid_input`, `not_expected` or `unavailable`): from
-  an `IO.*` node, any message; from any other node, only a named request, and only `no_thread`,
-  `invalid_input` and `unavailable`.
+  reason (`no_thread`, `no_conversation`, `invalid_input`, `not_expected` or `unavailable`, the only
+  one `retryable`): from an `IO.*` node, any message; from any other node, only a named request,
+  and only `no_thread`, `invalid_input` and `unavailable`. Its Go SDK answers `NOT_TAKEN`
+  `node_busy`, retryable, any message past what it queues (1,024 per lane, system messages apart
+  and first), and SY.timer's `NOT_TAKEN` for a timer request refuses it (FINDINGS A-329, since
+  0.1.141).
 
 ## Config
 

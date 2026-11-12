@@ -85,14 +85,17 @@ func notTakenReason(t *testing.T, msg sdk.Message) string {
 		return ""
 	}
 	var payload struct {
-		OK     *bool  `json:"ok"`
-		Error  string `json:"error"`
-		Reason string `json:"reason"`
-		Detail string `json:"detail"`
+		OK        *bool  `json:"ok"`
+		Error     string `json:"error"`
+		Reason    string `json:"reason"`
+		Detail    string `json:"detail"`
+		Retryable *bool  `json:"retryable"`
 	}
+	// Only unavailable is retryable: the store opens again (FINDINGS A-329).
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil || msg.Meta.MsgType != sdk.SYSTEMKind || payload.OK == nil || *payload.OK ||
-		payload.Error != "not_taken" || payload.Reason == "" || payload.Detail == "" {
-		t.Fatalf("a NOT_TAKEN is a system message with {ok: false, error: not_taken, reason, detail}: %+v %s (%v)", msg.Meta, msg.Payload, err)
+		payload.Error != "not_taken" || payload.Reason == "" || payload.Detail == "" ||
+		payload.Retryable == nil || *payload.Retryable != (payload.Reason == notTakenUnavailable) {
+		t.Fatalf("a NOT_TAKEN is a system message with {ok: false, error: not_taken, reason, detail, retryable}: %+v %s (%v)", msg.Meta, msg.Payload, err)
 	}
 	return payload.Reason
 }

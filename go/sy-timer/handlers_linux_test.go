@@ -135,8 +135,8 @@ func TestRefusedTimerResponseIsAnsweredWithAnError(t *testing.T) {
 // UNREACHABLE for a TIMER_FIRED whose target is not connected, and a reply from a node get no
 // answer: answering the router's UNREACHABLE would bounce between SY.timer and the router forever.
 // Nor does a notice from a node: HELLO, ANNOUNCE, WITHDRAW or a message without a name, the AI
-// nodes' list (FINDINGS A-218). An unknown verb from a node is still answered, with
-// TIMER_UNKNOWN_VERB.
+// nodes' list (FINDINGS A-218), nor a NOT_TAKEN or an agent's <msg>.error, replies (FINDINGS
+// A-329). An unknown verb from a node is still answered, with TIMER_UNKNOWN_VERB.
 func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
 	notice := func(msgName, srcL2Name string) fluxbeesdk.Message {
 		msg, err := fluxbeesdk.BuildSystemMessage(
@@ -167,6 +167,8 @@ func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
 		{name: "ANNOUNCE from a node", msg: notice(fluxbeesdk.MSGAnnounce, "WF.demo@motherbee")},
 		{name: "WITHDRAW from a node", msg: notice(fluxbeesdk.MSGWithdraw, "WF.demo@motherbee")},
 		{name: "a message without a name from a node", msg: notice("", "WF.demo@motherbee")},
+		{name: "NOT_TAKEN from a node", msg: notice(fluxbeesdk.MSGNotTaken, "WF.demo@motherbee")},
+		{name: "an agent's error from a node", msg: notice("TIMER_SCHEDULE.error", "AI.demo@motherbee")},
 		{name: "unknown verb from a node", msg: notice("TIMER_UNKNOWN", "WF.demo@motherbee"), answered: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -18,6 +18,8 @@ First-party consumers:
 
 - `SY.opa.rules`
 - `SY.timer`
+- `SY.wf-rules`
+- `wf-generic`, the WF engine
 
 ## Versioning and compatibility policy
 
@@ -89,7 +91,14 @@ The v1 stable surface is:
   - `RpcError`: why a request failed, by `Kind`. A router's `UNREACHABLE` or `TTL_EXCEEDED` is
     `RpcErrTerminalTransport`, with what the notice says: `Notice`, `Reason` (`LINK_BUSY`,
     `NODE_NOT_FOUND`, ...), `OriginalDst` and `LastHop` (`UnreachablePayload`,
-    `TTLExceededPayload`)
+    `TTLExceededPayload`). The target's `NOT_TAKEN` is `RpcErrNotTaken`, with its `Reason` and
+    `Retryable` (since 0.1.141)
+  - `RouterDispatcher.CommandChannelDrops`, `RouterDispatcher.NotTakenSent`: what the command
+    channels refused, and what the SDK answered (below)
+- `NOT_TAKEN` (below):
+  - `MSGNotTaken`, `NotTakenPayload`, `NotTakenReasonNodeBusy`
+  - `BuildNotTaken`, `ParseNotTaken`
+  - `IsNoticeOrReply`, `IsReplyName`: the messages no one answers
 - node control-plane helpers:
   - `CONFIG_GET`
   - `CONFIG_SET`
@@ -99,6 +108,44 @@ The v1 stable surface is:
 - `SY.timer` client/types/helpers
 - identity SHM lookup:
   - `LookupIlkByChannel`
+
+## Command channels and NOT_TAKEN
+
+A command channel (`TakeCommandReceiver`) hands its consumer a queue of two lanes (since 0.1.141,
+FINDINGS A-329): `system` messages and every other kind. The consumer gets the oldest system
+message first, then the oldest of the rest, each lane in the order it came: a `NODE_STATUS_GET`, a
+`CONFIG_SET` or a `TIMER_FIRED` never waits behind a backlog of user messages, only behind the one
+the consumer is working on (and, at most, the one handed over as it came). Each lane holds 1,024
+messages or 8 MiB, whichever comes first: the router's own bound for a node's link
+(`LINK_QUEUE_MAX_FRAMES`, `LINK_QUEUE_MAX_BYTES`), about 34 s of a WF that creates 30
+conversations a second, and two and a half times the backlog A-329 was seen with. Before 0.1.141 a
+command channel held 64 messages and dropped the rest, telling no one.
+
+A message that does not fit its lane is never waited for: the dispatcher answers its sender
+`NOT_TAKEN` at once, a `system` message to the sender's uuid on the message's `trace_id` and
+`thread_id`, with `{"ok": false, "error": "not_taken", "reason": "node_busy", "detail": "...",
+"retryable": true}` (`BuildNotTaken`). A notice or a reply is never answered (`IsNoticeOrReply`:
+one the router made, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, a system message
+without a name, any `*_RESPONSE`, a `NOT_TAKEN`, an `<msg>.error`), so two nodes never bounce one;
+a person's text, a user message without a name, is answered. Each refusal is counted
+(`CommandChannelDrops`, by channel; `NotTakenSent`: answered, unanswered, or whose `NOT_TAKEN`
+could not be sent) and logged: the first at once, then at most a line every 10 s per channel,
+counting what came since:
+
+```text
+fluxbee-go-sdk: command channel "incoming" full (0 system and 1024 non-system messages waiting): 344 message(s) not taken since 09:39:41.120Z: 344 answered NOT_TAKEN node_busy, 0 not answered (a notice or a reply), 0 whose NOT_TAKEN could not be sent; the last: msg_type="user" msg="" from "IO.gate@worker1" trace_id=...
+```
+
+Retrying is the sender's (the operator's principle of 2026-11-12: retry and log on the node that
+fails, never a global action). SY.timer sends a fire again; a WF takes SY.timer's `NOT_TAKEN` for a
+timer request as its refusal, and the timer goes again; the request helpers end with
+`RpcErrNotTaken`. A broadcast channel (`Subscribe`) keeps 64 messages per subscriber and drops what
+a slow one cannot hold, counted under `broadcast:<name>`: it carries replies, which no one answers.
+
+The connection's reader waits for room in the receiver's queue (256) instead of dropping a frame
+(since 0.1.141): the dispatcher never waits, so the wait is short, and meanwhile the frames wait in
+the router's queue for the link, which answers `LINK_BUSY` past its bound
+([protocol](../../docs/reference/protocol.md) §6.10, §10.2, §11).
 
 ## SY.timer client patterns
 

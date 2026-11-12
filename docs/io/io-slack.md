@@ -574,7 +574,9 @@ When a WF takes a message nowhere, it answers `NOT_TAKEN`
   - `no_thread`: "the message has no conversation";
   - `unavailable` (the WF cannot use its instance store, and takes no message until it can;
     FINDINGS A-217, A-226): "the conversation cannot take messages right now; try again later";
-  - a reason the node does not know: "Not taken.", with a `warn` line.
+  - a reason the node does not know: "Not taken.", with a `warn` line. Since 0.1.141 the Go SDK of a
+    WF whose queue is full answers `node_busy`, `retryable` (FINDINGS A-329), which io.slack does not
+    know yet: it shows "Not taken.", and does not send the message again (the IO track).
 - The text is fixed by the reason: the answer's `detail` is never posted. An answer is shown once,
   and one for a message not remembered is dropped with a log line.
 - Any other system message stays ignored, and never reaches the channel.

@@ -485,7 +485,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
-- A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
+- A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the operator's call of 2026-11-12, built on `coa/gosdk-141` for 0.1.141).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
@@ -2184,6 +2184,77 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (retryable) to the sender for each message that does not fit, its buffer grows, and SY.timer sends
   again a fire it gets `NOT_TAKEN` for; system messages never wait behind user ones. The Go SDK's
   own release (SY.timer's resend with it), in the bug push of item 30.
+- **Built on `coa/gosdk-141` (the Go SDK alone, planned 0.1.141; every Go binary takes it: SY.timer,
+  SY.wf-rules, SY.opa.rules and the WF engine), the call as it reads:**
+  - **`NOT_TAKEN` to the sender.** A message that does not fit its command channel is answered at
+    once, never waited for: a `system` message to the sender's uuid, on its `trace_id` and
+    `thread_id`, `{"ok": false, "error": "not_taken", "reason": "node_busy", "detail", "retryable":
+    true}` (`BuildNotTaken`, `go/fluxbee-go-sdk/not_taken.go`; `refuseCommand`,
+    `command_refusals.go`). A notice or a reply is never answered (`IsNoticeOrReply`: the WF's and
+    SY.timer's rule), so two Go nodes never bounce one; a person's text, a user message without a
+    name, is. Each refusal is counted (`CommandChannelDrops`, `NotTakenSent`: answered, unanswered,
+    or whose `NOT_TAKEN` could not go) and logged, the first at once, then a line at most every 10 s
+    per channel that counts what came since. The engine's own `NOT_TAKEN` takes the SDK's builder,
+    and with it `retryable`, true only for `unavailable` (its store opens again). Today's
+    `NOT_TAKEN` had no `retryable`; one without it is not retryable.
+  - **The buffer grows from 64 messages to 1,024 messages or 8 MiB a lane, whichever comes first**
+    (`command_queue.go`): the router's own bound for a node's link (`LINK_QUEUE_MAX_FRAMES`,
+    `LINK_QUEUE_MAX_BYTES`, A-222), so a Go node holds what its link would. It holds this entry's
+    burst (about 400 waiting at its end: 50 a second for 20 s against the engine's 30) two and a half
+    times over, about 34 s of that WF's work; past that the sender hears so, rather than waiting
+    longer without knowing. The bytes bound a lane's memory: 8 MiB where 1,024 frames of 128 KiB
+    would be 128 MiB.
+  - **System messages never wait behind user ones:** a command channel is a queue of two lanes,
+    `system` and the rest, and its consumer gets the oldest system message first. A system message
+    waits only for the message the consumer works on and, at most, the one handed over as it came,
+    never for the backlog; each lane has its own bound, so a user burst never refuses a
+    `NODE_STATUS_GET`, a `CONFIG_SET` or a `TIMER_FIRED`. The consumers' API is the same
+    (`TakeCommandReceiver`).
+  - **SY.timer sends again a fire its target answers `NOT_TAKEN` retryable** (`notTaken`,
+    `go/sy-timer/scheduler.go`), as one whose target is down: after 5, 10, 20 and 40 s, then each
+    minute, while it is on time (an hour, a `fire_if_within`'s window, a recurring timer's next
+    instance; a `drop` one-shot gets none), logged at each attempt (a plain line and
+    `timer_fire_undelivered`, then `timer_fire_lost` past its time). Only the fire's target decides
+    it, by the name its router stamps; one not retryable is not sent again (`timer_fire_refused`).
+    SY.timer answers no `NOT_TAKEN` and no `<msg>.error` now (`isInfrastructureMessage`; before, a
+    `NOT_TAKEN` got `TIMER_UNKNOWN_VERB`).
+  - **Found on the way, built with it:** the connection's reader dropped a frame when the
+    receiver's queue (256) was full and pushed an error, on which the dispatcher failed every
+    pending request as disconnected and slept 50 ms: the reader waits for room now (backpressure,
+    as the Rust SDK), the frames waiting in the router's queue for the link, which answers
+    `LINK_BUSY` past its bound; the dispatcher never waits, so the wait is short. The Go request
+    helpers (`SendSystemRPC`, `SendAdminRPC`, the timer client) end at once on the target's
+    `NOT_TAKEN`, `RpcErrNotTaken` with its `Reason` and `Retryable`, where a system request ended as
+    an invalid response and an admin request at its timeout. A WF takes SY.timer's `NOT_TAKEN` for
+    a timer request as the request's refusal (`takeNotTaken`): its timer goes again 5 s later, where
+    it waited for its 30 s without an answer; any other `NOT_TAKEN` it gets is logged.
+  - **By its tests, each checked failing without its fix** (the SDK on the Mac, SY.timer's in a
+    local Linux container, its tests being Linux-only): `TestAMessageThatDoesNotFitIsAnsweredNotTaken`,
+    `TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered`, `TestTheQueueHandsOverItsSystemMessagesFirst`,
+    `TestASystemMessageThatComesDuringABacklogGoesNext`, `TestALaneHoldsAtMostItsMessagesAndBytes`,
+    `TestTheLogSaysWhatTheQueueRefusedWithoutFlooding`, `TestARequestAnsweredNotTakenFailsWithItsReason`,
+    `TestTheReaderWaitsForRoomInsteadOfDroppingAFrame` (the SDK);
+    `TestAFireItsTargetAnsweredNotTakenIsSentAgain`, `TestANotTakenOfAnotherNodeLeavesTheFireWaiting`,
+    and `TestRouterNoticesAndRepliesGetNoAnswer`'s two new cases (SY.timer); the WF's
+    `TestAScheduleSYTimerDoesNotTakeGoesAgainUntilItDoes` (SY.timer's queue full), and its
+    `NOT_TAKEN` checks hold `retryable`.
+  - **Mixed versions (the deploy, a runtime pinned older):** a sender on the old Go SDK (a WF pinned
+    to an older wf-generic) never sends `NOT_TAKEN`, and drops one it gets as a system message; an
+    old SY.timer answers a new WF's `NOT_TAKEN` for a fire `TIMER_UNKNOWN_VERB` and does not send it
+    again (the fire lost, as before), which the new WF logs and drops (a reply, the request it would
+    settle unknown). Rust senders: `send_system_rpc` ends as `InvalidResponse` at once, where it
+    timed out; `send_admin_rpc` still waits for its timeout; io.slack shows the WF's `node_busy` as
+    *"Not taken."* (a reason it does not know, with a `warn` line); ai.generic answers it with a
+    `CONFIG_RESPONSE` `unknown_system_msg`, which the WF drops as a reply. No loop on any side: a
+    `NOT_TAKEN` and every `*_RESPONSE` are replies, never answered.
+  - **Left for the other releases of item 30, recorded here:** the AI SDK (0.1.142, with A-325): its
+    `is_infrastructure_message` takes neither `NOT_TAKEN` nor `<msg>.error` as a reply, so ai.generic
+    answers each `NOT_TAKEN` with an `unknown_system_msg` error; the Rust SDK (0.1.143): its request
+    helpers take no `NOT_TAKEN` as a terminal error (`send_admin_rpc` times out, `send_system_rpc`
+    loses its reason); the IO track: io.slack's text for `node_busy`, and an IO node's resend of a
+    retryable `NOT_TAKEN`. Not changed, seen in the code: the Go dispatcher still fails every pending
+    request when a frame does not parse as a message (a malformed frame from the router; never
+    seen).
 
 ### A-328 [General/admin] ✅ BUILT (0.1.139, 2026-11-12; not provoked on 8.x, it takes an executor answer past the mesh's frame: by SY.admin's and SY.architect's tests) (found 2026-11-12 by A-322's review; read in the code) — SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next`
 

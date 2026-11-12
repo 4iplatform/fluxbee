@@ -49,9 +49,12 @@ type NodeReceiver struct {
 	state    *connectionState
 }
 
+// receivedMessage is what the connection's reader hands the receiver: a message and its frame's
+// size in bytes, or an error.
 type receivedMessage struct {
-	msg Message
-	err error
+	msg  Message
+	size int
+	err  error
 }
 
 type connectionState struct {
@@ -254,15 +257,21 @@ func (s *NodeSender) RouterName() string {
 }
 
 func (r *NodeReceiver) Recv(ctx context.Context) (Message, error) {
+	item, err := r.recvItem(ctx)
+	return item.msg, err
+}
+
+// recvItem is Recv with the frame's size, which the dispatcher's command queues count.
+func (r *NodeReceiver) recvItem(ctx context.Context) (receivedMessage, error) {
 	select {
 	case <-ctx.Done():
-		return Message{}, ctx.Err()
+		return receivedMessage{}, ctx.Err()
 	case item, ok := <-r.rx:
 		if !ok {
 			r.state.SetConnected(false)
-			return Message{}, fmt.Errorf("disconnected")
+			return receivedMessage{}, fmt.Errorf("disconnected")
 		}
-		return item.msg, item.err
+		return item, item.err
 	}
 }
 
@@ -341,13 +350,16 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, fir
 					}
 					continue
 				}
+				// The reader waits for room: the dispatcher reads the queue without ever waiting
+				// itself (a full command channel refuses at once, FINDINGS A-329), so the wait is
+				// short, and while it lasts the frames stay in the router's queue for this link,
+				// which answers LINK_BUSY past its bound (FINDINGS A-222). Before 0.1.141 a frame
+				// that found the queue full was dropped, and the dispatcher failed every pending
+				// request as disconnected.
 				select {
-				case rx <- receivedMessage{msg: msg}:
-				default:
-					select {
-					case rx <- receivedMessage{err: fmt.Errorf("receiver queue full")}:
-					default:
-					}
+				case rx <- receivedMessage{msg: msg, size: len(frame)}:
+				case <-stop:
+					return
 				}
 			}
 		}()

@@ -189,6 +189,95 @@ func TestAFireRefusedLinkBusyIsSentAgain(t *testing.T) {
 	}
 }
 
+// notTaken is the NOT_TAKEN that from answers a fire of traceID with: its Go SDK's queue full
+// (FINDINGS A-329), retryable or not.
+func notTaken(t *testing.T, traceID, from string, retryable bool) fluxbeesdk.Message {
+	t.Helper()
+	fire := fluxbeesdk.Message{Routing: fluxbeesdk.Routing{Src: "timer-node-uuid", TraceID: traceID}}
+	msg, err := fluxbeesdk.BuildNotTaken("wf-node-uuid", fire, fluxbeesdk.NotTakenReasonNodeBusy,
+		"WF.demo@motherbee holds 1024 system messages, as many as it takes; send it again later", retryable)
+	if err != nil {
+		t.Fatalf("build NOT_TAKEN: %v", err)
+	}
+	msg.Routing.SrcL2Name = &from
+	return msg
+}
+
+// FINDINGS A-329: a fire its target answers NOT_TAKEN, retryable (its Go SDK's queue full), is sent
+// again while it is on time, as one whose target was not connected is; one not retryable is not.
+// Only the fire's target decides it, and a NOT_TAKEN is never answered. Before, a NOT_TAKEN got a
+// TIMER_UNKNOWN_VERB, and the fire was lost.
+func TestAFireItsTargetAnsweredNotTakenIsSentAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name, policy, from string
+		retryable, retried bool
+	}{
+		{name: "retryable", policy: "fire", from: "WF.demo@motherbee", retryable: true, retried: true},
+		{name: "retryable, inside its window", policy: "fire_if_within", from: "WF.demo@motherbee", retryable: true, retried: true},
+		{name: "retryable, a drop one-shot", policy: "drop", from: "WF.demo@motherbee", retryable: true},
+		{name: "not retryable", policy: "fire", from: "WF.demo@motherbee"},
+		{name: "from another node", policy: "fire", from: "WF.other@motherbee", retryable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fastRetries(t)
+			service, tx := newTestService(t)
+			service.scheduler = newTimerScheduler(service)
+			insertDueTimer(t, service, "timer-1", tc.policy)
+			first := fireOnce(t, service, tx, "timer-1")
+			if err := service.handleMessage(notTaken(t, first, tc.from, tc.retryable)); err != nil {
+				t.Fatalf("handle NOT_TAKEN: %v", err)
+			}
+			if len(tx) != 0 {
+				t.Fatalf("answered a NOT_TAKEN: %s", <-tx)
+			}
+			if retried := queuedRetries(service.scheduler) == 1; retried != tc.retried {
+				t.Fatalf("retried=%v, want %v", retried, tc.retried)
+			}
+			if !tc.retried {
+				return
+			}
+			service.scheduler.processDue(context.Background(), time.Now().UTC().Add(time.Second))
+			again, fired := mustReadFire(t, tx)
+			if again == first || fired.TimerUUID != "timer-1" || fired.FireCount != 1 {
+				t.Fatalf("the retry must be the same fire under a new trace_id: %s %+v", again, fired)
+			}
+			// The second attempt is answered NOT_TAKEN too: sent a third time.
+			if err := service.handleMessage(notTaken(t, again, tc.from, true)); err != nil {
+				t.Fatalf("handle NOT_TAKEN: %v", err)
+			}
+			service.scheduler.processDue(context.Background(), time.Now().UTC().Add(time.Second))
+			if third, fired := mustReadFire(t, tx); third == again || fired.TimerUUID != "timer-1" {
+				t.Fatalf("the third attempt: %s %+v", third, fired)
+			}
+		})
+	}
+}
+
+// FINDINGS A-329: a NOT_TAKEN another node sends on a fire's trace leaves the fire waiting for its
+// target's own answer, and one for no fire in flight is dropped, never answered.
+func TestANotTakenOfAnotherNodeLeavesTheFireWaiting(t *testing.T) {
+	fastRetries(t)
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	insertDueTimer(t, service, "timer-1", "fire")
+	first := fireOnce(t, service, tx, "timer-1")
+	if err := service.handleMessage(notTaken(t, first, "WF.other@motherbee", true)); err != nil {
+		t.Fatalf("handle NOT_TAKEN: %v", err)
+	}
+	if err := service.handleMessage(notTaken(t, first, "WF.demo@motherbee", true)); err != nil {
+		t.Fatalf("handle NOT_TAKEN: %v", err)
+	}
+	if queuedRetries(service.scheduler) != 1 || len(tx) != 0 {
+		t.Fatalf("the target's NOT_TAKEN sends the fire again, and nothing answers either: %d retries, %d sent", queuedRetries(service.scheduler), len(tx))
+	}
+	if err := service.handleMessage(notTaken(t, "no-fire-trace", "WF.demo@motherbee", true)); err != nil {
+		t.Fatalf("handle NOT_TAKEN: %v", err)
+	}
+	if queuedRetries(service.scheduler) != 1 || len(tx) != 0 {
+		t.Fatalf("a NOT_TAKEN of no fire changed nothing, and is not answered")
+	}
+}
+
 func TestAFireIsNotSentAgainWhenItWouldNotBeOnTime(t *testing.T) {
 	for _, tc := range []struct {
 		name, policy, reason string

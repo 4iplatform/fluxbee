@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -272,11 +271,14 @@ type RpcError struct {
 	// the Rust SDK's RpcError::Unreachable and RpcError::TtlExceeded carry it (FINDINGS A-228):
 	// Reason, UNREACHABLE's (NODE_NOT_FOUND, LINK_BUSY, FRAME_TOO_LARGE, ...), so a caller can tell
 	// a link that drains from a node that is not there; OriginalDst, the destination the router
-	// could not reach; LastHop, TTL_EXCEEDED's router. A field the notice lacks is empty.
+	// could not reach; LastHop, TTL_EXCEEDED's router. A field the notice lacks is empty. For
+	// RpcErrNotTaken, Notice is NOT_TAKEN, Reason its reason (node_busy, ...) and Retryable whether
+	// the same request sent again may be taken (FINDINGS A-329).
 	Notice      string
 	Reason      string
 	OriginalDst string
 	LastHop     string
+	Retryable   bool
 }
 
 type RpcErrorKind int
@@ -293,6 +295,11 @@ const (
 	// RpcErrMessageTooLarge means the request's frame was over the limit:
 	// nothing was sent and the link is up. Cause is the *MessageTooLargeError.
 	RpcErrMessageTooLarge
+	// RpcErrNotTaken means the target answered NOT_TAKEN: it took the request nowhere (its command
+	// channel full, node_busy, since 0.1.141, FINDINGS A-329), with its Reason, and Retryable when
+	// the same request sent again may be taken. A target on an SDK before 0.1.141 dropped such a
+	// request, and the caller got RpcErrTimeout.
+	RpcErrNotTaken
 )
 
 func (e *RpcError) Error() string {
@@ -312,6 +319,8 @@ func (e *RpcError) Error() string {
 		return fmt.Sprintf("rpc invalid request: %s", e.Message)
 	case RpcErrMessageTooLarge:
 		return fmt.Sprintf("rpc message too large: trace_id=%s target=%s verb=%s: %s", e.TraceID, e.Target, e.Verb, e.Message)
+	case RpcErrNotTaken:
+		return fmt.Sprintf("rpc not taken: trace_id=%s target=%s verb=%s: %s", e.TraceID, e.Target, e.Verb, e.Message)
 	default:
 		if e.Cause != nil {
 			return fmt.Sprintf("rpc error: %s", e.Cause.Error())
@@ -400,20 +409,20 @@ type RouterDispatcher struct {
 	pending   map[string]*pendingEntry
 
 	commandsMu sync.Mutex
-	commands   map[string]chan Message
+	commands   map[string]*commandQueue
 	taken      map[string]bool
 
 	broadcastsMu sync.Mutex
 	broadcasts   map[string][]chan Message
 
-	// GO-2: per-channel drop counters and a one-shot warn flag so command
-	// channels that fall behind a slow consumer report drops instead of
-	// silently discarding messages. Rust uses unbounded mpsc; here we keep
-	// the channel bounded at construction (default 64) and surface drops
-	// as visible signals.
-	dropMu        sync.Mutex
-	commandDrops  map[string]uint64
-	commandWarned map[string]bool
+	// dropMu guards what the dispatcher counts of the messages it did not hand over: per command
+	// channel, the messages its queue refused (commandDrops, the broadcast slots' drops under a
+	// "broadcast:" prefix), what it said of them (notTaken), and its log of them (refusalLogs,
+	// FINDINGS A-329).
+	dropMu       sync.Mutex
+	commandDrops map[string]uint64
+	notTaken     NotTakenCounts
+	refusalLogs  map[string]*refusalLog
 
 	// GO-1: recent-stale registry and response-only matcher set. Together
 	// they let `deliver` classify late replies (Stale) and orphaned
@@ -448,28 +457,37 @@ func ConnectWithRetry(cfg NodeConfig, delay time.Duration, profile OperationalRo
 			}
 		}
 	}
+	d := newRouterDispatcher(sender, receiver, profile)
+	go d.dispatchLoop()
+	return d, nil
+}
+
+// newRouterDispatcher is a dispatcher over sender and receiver, with a queue for each command
+// channel of profile, its forwarder running until Close; the caller starts dispatchLoop.
+func newRouterDispatcher(sender *NodeSender, receiver *NodeReceiver, profile OperationalRouteProfile) *RouterDispatcher {
 	d := &RouterDispatcher{
-		sender:        sender,
-		receiver:      receiver,
-		profile:       profile,
-		pending:       make(map[string]*pendingEntry),
-		commands:      make(map[string]chan Message),
-		taken:         make(map[string]bool),
-		broadcasts:    make(map[string][]chan Message),
-		commandDrops:  make(map[string]uint64),
-		commandWarned: make(map[string]bool),
-		staleEntries:  make(map[string]staleEntry),
-		responseOnly:  make(map[RouteMatch]struct{}),
-		done:          make(chan struct{}),
+		sender:       sender,
+		receiver:     receiver,
+		profile:      profile,
+		pending:      make(map[string]*pendingEntry),
+		commands:     make(map[string]*commandQueue),
+		taken:        make(map[string]bool),
+		broadcasts:   make(map[string][]chan Message),
+		commandDrops: make(map[string]uint64),
+		refusalLogs:  make(map[string]*refusalLog),
+		staleEntries: make(map[string]staleEntry),
+		responseOnly: make(map[RouteMatch]struct{}),
+		done:         make(chan struct{}),
 	}
 	for _, name := range profile.commandChannels {
-		d.commands[name] = make(chan Message, 64)
+		queue := newCommandQueue(name)
+		d.commands[name] = queue
+		go queue.run(d.done)
 	}
 	for _, name := range profile.broadcastChannels {
 		d.broadcasts[name] = nil
 	}
-	go d.dispatchLoop()
-	return d, nil
+	return d
 }
 
 // SenderSnapshot returns the underlying sender. Callers can `Send` outbound
@@ -481,18 +499,21 @@ func (d *RouterDispatcher) SenderSnapshot() *NodeSender {
 
 // TakeCommandReceiver returns the channel for an operational command
 // channel declared in the profile. Each channel can only be taken once.
+// The channel hands over the channel's queue (FINDINGS A-329): its system
+// messages first, then the rest, each in the order they came. A message the
+// queue cannot hold is answered NOT_TAKEN (refuseCommand).
 func (d *RouterDispatcher) TakeCommandReceiver(name string) (<-chan Message, error) {
 	d.commandsMu.Lock()
 	defer d.commandsMu.Unlock()
 	if d.taken[name] {
 		return nil, fmt.Errorf("command channel %q already taken", name)
 	}
-	ch, ok := d.commands[name]
+	queue, ok := d.commands[name]
 	if !ok {
 		return nil, fmt.Errorf("command channel %q not declared in profile", name)
 	}
 	d.taken[name] = true
-	return ch, nil
+	return queue.out, nil
 }
 
 func (d *RouterDispatcher) Subscribe(name string) (<-chan Message, error) {
@@ -547,11 +568,8 @@ func (d *RouterDispatcher) SendSystemRPC(ctx context.Context, request SystemRpcR
 		return Message{}, err
 	}
 	matcher := PendingMatcher{
-		Success: []RouteMatch{RouteExact{MsgType: SYSTEMKind, Msg: responseMsg}},
-		TerminalError: []RouteMatch{
-			RouteExact{MsgType: SYSTEMKind, Msg: MSGUnreachable},
-			RouteExact{MsgType: SYSTEMKind, Msg: MSGTTLExceeded},
-		},
+		Success:         []RouteMatch{RouteExact{MsgType: SYSTEMKind, Msg: responseMsg}},
+		TerminalError:   requestTerminalErrors(),
 		InvalidResponse: []RouteMatch{RouteAnyMsgOfType{MsgType: SYSTEMKind}},
 	}
 	return d.SendWithMatcher(ctx, msg, matcher, RpcRequestLabels{
@@ -608,11 +626,8 @@ func (d *RouterDispatcher) SendAdminRPC(ctx context.Context, request AdminRpcReq
 		Payload: raw,
 	}
 	matcher := PendingMatcher{
-		Success: []RouteMatch{RouteExact{MsgType: ADMINKind, Msg: MsgAdminCommandResponse}},
-		TerminalError: []RouteMatch{
-			RouteExact{MsgType: SYSTEMKind, Msg: MSGUnreachable},
-			RouteExact{MsgType: SYSTEMKind, Msg: MSGTTLExceeded},
-		},
+		Success:         []RouteMatch{RouteExact{MsgType: ADMINKind, Msg: MsgAdminCommandResponse}},
+		TerminalError:   requestTerminalErrors(),
 		InvalidResponse: []RouteMatch{RouteAnyMsgOfType{MsgType: ADMINKind}},
 	}
 	return d.SendWithMatcher(ctx, msg, matcher, RpcRequestLabels{
@@ -620,6 +635,19 @@ func (d *RouterDispatcher) SendAdminRPC(ctx context.Context, request AdminRpcReq
 		RequestMsg:  MsgAdminCommand,
 		ResponseMsg: MsgAdminCommandResponse,
 	}, request.Timeout)
+}
+
+// requestTerminalErrors are the answers that end a request without its reply, for the SDK's own
+// requests (SendSystemRPC, SendAdminRPC, the timer client's): the router's UNREACHABLE and
+// TTL_EXCEEDED (RpcErrTerminalTransport), and the target's NOT_TAKEN (RpcErrNotTaken, FINDINGS
+// A-329). Before 0.1.141 a NOT_TAKEN ended a system request as an invalid response, and an admin
+// request not at all (it timed out).
+func requestTerminalErrors() []RouteMatch {
+	return []RouteMatch{
+		RouteExact{MsgType: SYSTEMKind, Msg: MSGUnreachable},
+		RouteExact{MsgType: SYSTEMKind, Msg: MSGTTLExceeded},
+		RouteExact{MsgType: SYSTEMKind, Msg: MSGNotTaken},
+	}
 }
 
 // SendWithMatcher sends an outbound message and blocks until the matcher
@@ -734,7 +762,7 @@ func (d *RouterDispatcher) dispatchLoop() {
 			return
 		default:
 		}
-		msg, err := d.receiver.Recv(ctx)
+		item, err := d.receiver.recvItem(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
@@ -750,14 +778,20 @@ func (d *RouterDispatcher) dispatchLoop() {
 			}
 			continue
 		}
-		d.deliver(msg)
+		d.deliver(item.msg, item.size)
 	}
 }
 
-func (d *RouterDispatcher) deliver(msg Message) {
+// deliver takes msg, whose frame was size bytes (0 when not known), where it goes: to the request
+// that waits for it, a command channel or a broadcast channel, or nowhere. It never waits: a
+// command channel that cannot hold msg refuses it at once (refuseCommand).
+func (d *RouterDispatcher) deliver(msg Message, size int) {
 	traceID := msg.Routing.TraceID
 	msgName := stringValue(msg.Meta.Msg)
-	if d.routeByRules(d.profile.prePendingRules, msg, msgName) {
+	if size <= 0 {
+		size = approxMessageSize(msg)
+	}
+	if d.routeByRules(d.profile.prePendingRules, msg, msgName, size) {
 		return
 	}
 	if traceID != "" {
@@ -775,7 +809,7 @@ func (d *RouterDispatcher) deliver(msg Message) {
 			case outcomeTerminalError:
 				d.removePending(traceID)
 				d.noteStale(traceID, entry.matcher)
-				entry.deliver <- pendingResult{err: terminalTransportError(entry, msg, msgName)}
+				entry.deliver <- pendingResult{err: terminalError(entry, msg, msgName)}
 				return
 			case outcomeInvalidResponse:
 				d.removePending(traceID)
@@ -807,7 +841,38 @@ func (d *RouterDispatcher) deliver(msg Message) {
 	if d.classifyUnknownResponse(msg, msgName) {
 		return
 	}
-	_ = d.routeByRules(d.profile.postPendingRules, msg, msgName)
+	_ = d.routeByRules(d.profile.postPendingRules, msg, msgName, size)
+}
+
+// terminalError is the error of the request entry that msg, named msgName, ended as one of its
+// matcher's terminal errors: the target's NOT_TAKEN (notTakenError), or else the router's notice
+// (terminalTransportError).
+func terminalError(entry *pendingEntry, msg Message, msgName string) *RpcError {
+	if msgName == MSGNotTaken {
+		return notTakenError(entry, msg)
+	}
+	return terminalTransportError(entry, msg, msgName)
+}
+
+// notTakenError is the error of the request entry its target answered NOT_TAKEN (msg): its reason,
+// whether it is retryable, and its detail, as in "NOT_TAKEN reason=node_busy retryable=true:
+// WF.x@worker1 holds 1024 system messages, ...".
+func notTakenError(entry *pendingEntry, msg Message) *RpcError {
+	notice, _ := ParseNotTaken(msg)
+	text := fmt.Sprintf("%s reason=%s retryable=%t", MSGNotTaken, notice.Reason, notice.Retryable)
+	if notice.Detail != "" {
+		text += ": " + notice.Detail
+	}
+	return &RpcError{
+		Kind:      RpcErrNotTaken,
+		TraceID:   entry.traceID,
+		Target:    entry.target,
+		Verb:      entry.verb,
+		Notice:    MSGNotTaken,
+		Reason:    notice.Reason,
+		Retryable: notice.Retryable,
+		Message:   text,
+	}
 }
 
 // terminalTransportError is the error of the request entry that msg, named msgName, ended as one of
@@ -1005,34 +1070,27 @@ func (d *RouterDispatcher) UnknownResponseDrops() uint64 {
 	return d.unknownRespDrops
 }
 
-func (d *RouterDispatcher) routeByRules(rules []routeRule, msg Message, msgName string) bool {
+func (d *RouterDispatcher) routeByRules(rules []routeRule, msg Message, msgName string, size int) bool {
 	for _, rule := range rules {
 		if !rule.match.matches(msg.Meta.MsgType, msgName) {
 			continue
 		}
-		return d.routeToTarget(rule.target, msg)
+		return d.routeToTarget(rule.target, msg, size)
 	}
 	return false
 }
 
-func (d *RouterDispatcher) routeToTarget(target RouteTarget, msg Message) bool {
+func (d *RouterDispatcher) routeToTarget(target RouteTarget, msg Message, size int) bool {
 	switch t := target.(type) {
 	case RouteCommand:
 		d.commandsMu.Lock()
-		ch, ok := d.commands[t.Channel]
+		queue, ok := d.commands[t.Channel]
 		d.commandsMu.Unlock()
 		if !ok {
 			return true
 		}
-		select {
-		case ch <- msg:
-		default:
-			// GO-2: the command channel is full. Bump the per-channel
-			// drop counter and log a single warning per channel so the
-			// signal is visible without flooding logs under sustained
-			// backpressure. Operators can inspect counts via
-			// CommandChannelDrops.
-			d.noteCommandDrop(t.Channel, msg)
+		if !queue.offer(msg, size) {
+			d.refuseCommand(queue, msg)
 		}
 		return true
 	case RouteBroadcast:
@@ -1057,25 +1115,6 @@ func (d *RouterDispatcher) routeToTarget(target RouteTarget, msg Message) bool {
 	}
 }
 
-// noteCommandDrop bumps the drop counter for the named command channel and
-// emits a one-shot warning the first time a drop happens on that channel.
-func (d *RouterDispatcher) noteCommandDrop(channel string, msg Message) {
-	d.dropMu.Lock()
-	d.commandDrops[channel]++
-	firstTime := !d.commandWarned[channel]
-	if firstTime {
-		d.commandWarned[channel] = true
-	}
-	d.dropMu.Unlock()
-	if firstTime {
-		log.Printf(
-			"fluxbee-go-sdk: command channel %q is FULL — dropped message msg_type=%q msg=%q. "+
-				"This is the only warning for this channel; total drops are available via CommandChannelDrops().",
-			channel, msg.Meta.MsgType, stringValue(msg.Meta.Msg),
-		)
-	}
-}
-
 // noteBroadcastDrop bumps the drop counter for a broadcast channel slot.
 func (d *RouterDispatcher) noteBroadcastDrop(channel string) {
 	d.dropMu.Lock()
@@ -1083,10 +1122,11 @@ func (d *RouterDispatcher) noteBroadcastDrop(channel string) {
 	d.dropMu.Unlock()
 }
 
-// CommandChannelDrops returns a snapshot of how many messages have been
-// dropped per command channel due to a full buffer. Counters are
-// monotonic. Broadcast-channel drops are reported with a `broadcast:`
-// prefix on the channel name.
+// CommandChannelDrops returns a snapshot of how many messages each command channel's queue refused,
+// its lane full: each one answered NOT_TAKEN or, a notice or a reply, dropped (NotTakenSent says
+// which). Counters are monotonic. A broadcast slot that could not take a message counts under its
+// channel's name with a `broadcast:` prefix: a broadcast channel drops what a slow subscriber
+// cannot hold (64 messages), and tells no one.
 func (d *RouterDispatcher) CommandChannelDrops() map[string]uint64 {
 	d.dropMu.Lock()
 	defer d.dropMu.Unlock()

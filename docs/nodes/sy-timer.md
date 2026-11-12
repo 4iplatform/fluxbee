@@ -92,7 +92,8 @@ Rules enforced in `main.go`:
   (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line, bounded
   (`isInfrastructureMessage`; `timer_message_ignored`, Messages below).
   Nor does a notice or a reply from a node: `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a
-  name, or any `*_RESPONSE`; the AI nodes' rule and wf-generic's, name by name (FINDINGS A-218).
+  name, any `*_RESPONSE`, a `NOT_TAKEN` or an agent's `<msg>.error`; wf-generic's rule, name by name,
+  and the AI nodes' but for the last two (FINDINGS A-218, A-329).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
   `<kind>.<name>@<hive>`, with a dot before the `@` (`isCanonicalL2Name`).
 - **Target.** A node schedules for itself: a `target_l2_name` that names another node is
@@ -160,7 +161,12 @@ Each attempt goes under a new trace id, and is kept 30 s for the router's answer
 `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`) or whose link queue is full
 (`LINK_BUSY`, from the router of 0.1.129, FINDINGS A-222: it clears as the target reads), or a send
 that fails, sends the same fire again after 5, 10, 20 and 40 s, then each minute (`undelivered`,
-`retryLater`). The retries stop
+`retryLater`). So does the target's own `NOT_TAKEN` with that trace id, when it says `retryable`:
+the Go SDK of a target whose queue was full (`node_busy`, a WF's, since 0.1.141, FINDINGS A-329;
+`notTaken`, with a log line at each attempt). Only the fire's target, by the name its router
+stamps, decides it; one not retryable is not sent again (`timer_fire_refused`). Before 0.1.141 a Go
+target dropped a fire its queue (64) could not hold, and SY.timer answered a `NOT_TAKEN`
+`TIMER_UNKNOWN_VERB`. The retries stop
 an hour after the first attempt, sooner for a `fire_if_within` one-shot (its window from its
 scheduled time) and a recurring timer (its next instance), and a `drop` one-shot gets none
 (`deliveryDeadline`); then the fire is lost (`timer_fire_lost`). A fire the router refuses for
@@ -227,8 +233,9 @@ router made, `trace_id`; `ignoredLog`), bounded the same way in windows of its o
 | `NODE_STATUS_GET` | | answered `HEALTHY` (`BuildDefaultNodeStatusResponse`) |
 
 Any other verb gets `TIMER_UNKNOWN_VERB`; a notice or a reply gets no answer: one the router made,
-and from a node `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a name or any `*_RESPONSE`
-(`isInfrastructureMessage`, above). The router does not gate `TIMER_*` verbs: they are not in
+and from a node `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a name, any `*_RESPONSE`, a
+`NOT_TAKEN` or an agent's `<msg>.error` (`isInfrastructureMessage`, above; the last two since
+0.1.141, FINDINGS A-329). The router does not gate `TIMER_*` verbs: they are not in
 `PROTECTED_SYSTEM_ACTIONS` (`src/router/system_policy.rs`).
 
 Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_ABOVE_MAXIMUM`, `TIMER_LIMIT_EXCEEDED`,
