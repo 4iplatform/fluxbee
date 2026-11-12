@@ -2251,6 +2251,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `example_scmd` name no query either.
 - **Fix, later (SY.admin):** trim it and drop it when empty, as its other filters; the help names
   the filters.
+- **Built on `coa/admin-139` for 0.1.139:** the global reads take their `?hive=` trimmed, and an
+  empty or blank one is no filter, every hive's (`query_hive_filter`): `GET /deployments`,
+  `GET /drift-alerts`, and `GET /versions`, which read it the same way. The help of
+  `list_deployments`, `get_deployments`, `list_drift_alerts` and `get_drift_alerts` names the
+  query filters (`category` and `limit`; `severity` and `kind` for the drift alerts; `hive` for
+  the global two) and their examples carry a query. Its test,
+  `an_empty_hive_filter_reads_every_hive`, drives the HTTP routes and fails without it (the
+  motherbee's orchestrator was asked `get_deployments` for `/deployments?hive=`).
 
 ### A-296 [General/orchestrator] 🔵 low (found 2026-11-11 by A-288's review; read in the code; there before it) — A deployments read filtered by category also answers the local snapshot rows of every category
 

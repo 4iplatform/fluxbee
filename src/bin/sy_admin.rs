@@ -11488,7 +11488,7 @@ async fn handle_http(
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/versions") => {
-            let hive = query.get("hive").cloned();
+            let hive = query_hive_filter(&query);
             // ?versions_limit=&versions_before= pick the installation's versions; over every hive,
             // ?limit=&cursor= ask one page of hives (FINDINGS A-198).
             let mut payload = serde_json::Map::new();
@@ -11581,7 +11581,7 @@ async fn handle_http(
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/deployments") => {
-            let hive = query.get("hive").cloned();
+            let hive = query_hive_filter(&query);
             let payload = deployments_payload_from_query(&query);
             if hive.is_some() {
                 let (status, resp) =
@@ -11594,7 +11594,7 @@ async fn handle_http(
             }
         }
         ("GET", "/drift-alerts") => {
-            let hive = query.get("hive").cloned();
+            let hive = query_hive_filter(&query);
             let payload = drift_alerts_payload_from_query(&query);
             if hive.is_some() {
                 let (status, resp) =
@@ -13367,6 +13367,18 @@ fn decode_query_component(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The `?hive=` of a global read (`/versions`, `/deployments`, `/drift-alerts`), trimmed: an empty
+/// one is none, as each route's other filters are, and the read covers every hive (FINDINGS
+/// A-297). Taken as given, an empty one asked the per-hive action with a hive of "", which the
+/// orchestrator reads as its own: the motherbee's history answered for every hive's.
+fn query_hive_filter(query: &HashMap<String, String>) -> Option<String> {
+    query
+        .get("hive")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn deployments_payload_from_query(query: &HashMap<String, String>) -> serde_json::Value {
@@ -17465,10 +17477,12 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "get_storage" => "curl -X GET /config/storage",
         "set_storage" => r#"curl -X PUT /config/storage -d '{"path":"/var/lib/fluxbee"}'"#,
-        "list_deployments" => "curl -X GET /deployments",
-        "get_deployments" => "curl -X GET /hives/motherbee/deployments",
-        "list_drift_alerts" => "curl -X GET /drift-alerts",
-        "get_drift_alerts" => "curl -X GET /hives/motherbee/drift-alerts",
+        "list_deployments" => "curl -X GET '/deployments?category=core&limit=20'",
+        "get_deployments" => "curl -X GET '/hives/motherbee/deployments?category=core&limit=20'",
+        "list_drift_alerts" => "curl -X GET '/drift-alerts?severity=warning&limit=20'",
+        "get_drift_alerts" => {
+            "curl -X GET '/hives/motherbee/drift-alerts?category=syncthing&limit=20'"
+        }
         "update" => {
             r#"curl -X POST /hives/motherbee/update -d '{"manifest_hash":"sha256:deadbeef","category":"runtime","manifest_version":42,"runtime":"ai.generic","runtime_version":"0.1.2"}'"#
         }
@@ -17610,8 +17624,29 @@ const PAGE_NOTE: &str = "Pages (FINDINGS A-198): with limit, at most that many r
 const INSTALLATION_VERSIONS_LIMIT_NOTE: &str = "How many of the installation file's versions the motherbee's config lists (FINDINGS A-198): the newest ones, 1 to 100, 20 without it.";
 const INSTALLATION_VERSIONS_BEFORE_NOTE: &str = "List the versions older than this one: versions_next_before of the answer before, while older versions remain.";
 
+/// The query filters of the deployment reads (FINDINGS A-297).
+const DEPLOYMENTS_QUERY_NOTE: &str = "Query filters, each optional: ?category= one category of deployment (core, runtime, vendor), and ?limit= how many rows, 1 to 500 (50 without it), newest first. A filter left empty is no filter.";
+/// The query filters of the drift-alert reads (FINDINGS A-297).
+const DRIFT_ALERTS_QUERY_NOTE: &str = "Query filters, each optional: ?category= (core, egress, posture, syncthing, certificate), ?severity= (info, warning, error, critical), ?kind= one kind of alert, and ?limit= how many rows, 1 to 500 (50 without it), newest first. A filter left empty is no filter. The motherbee's orchestrator answers what it records, about itself and a spoke's core: a spoke's own checks stay in the spoke's file (FINDINGS A-175), and the answer's note says so.";
+
 fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
+        "list_deployments" => vec![
+            "Every hive's deployment history, as the motherbee's orchestrator records it. ?hive=<hive> reads one hive's, as GET /hives/{hive}/deployments does; an empty or blank ?hive= is no filter, every hive's (FINDINGS A-297, since 0.1.139: it read the motherbee's alone).",
+            DEPLOYMENTS_QUERY_NOTE,
+        ],
+        "get_deployments" => vec![
+            "One hive's deployment history: the hive comes from the /hives/{hive} path. GET /deployments reads every hive's.",
+            DEPLOYMENTS_QUERY_NOTE,
+        ],
+        "list_drift_alerts" => vec![
+            "Every hive's drift alerts the motherbee's orchestrator records. ?hive=<hive> reads one hive's, as GET /hives/{hive}/drift-alerts does; an empty or blank ?hive= is no filter, every hive's (FINDINGS A-297, since 0.1.139: it read the motherbee's alone).",
+            DRIFT_ALERTS_QUERY_NOTE,
+        ],
+        "get_drift_alerts" => vec![
+            "One hive's drift alerts: the hive comes from the /hives/{hive} path. GET /drift-alerts reads every hive's.",
+            DRIFT_ALERTS_QUERY_NOTE,
+        ],
         "list_admin_actions" => vec![
             "The answer is {registry_version, view, actions}. The full view gives each action its routes, request contract, executor schema and example; it is larger than one mesh frame (128 KiB), so only HTTP answers it (FINDINGS A-197).",
             "The compact view gives each action its name, description and read_only, and is what the mesh and the executor answer. One action's schema and example are its help: get_admin_action_help (GET /admin/actions/{action}).",
@@ -46101,6 +46136,95 @@ mod tests {
                 "{answer}"
             );
             assert!(!answer.contains("secret-marker"), "{answer}");
+            server.await.expect("the server");
+        });
+    }
+
+    /// FINDINGS A-297: an empty or blank `?hive=` on a global read is no filter, as each route's
+    /// other filters are: `GET /deployments?hive=` asks the motherbee's orchestrator for every
+    /// hive's history (`list_deployments`), where it asked `get_deployments` with a hive of "",
+    /// which the orchestrator reads as its own, so the motherbee's history answered for every
+    /// hive's. The drift alerts and `/versions` read the same way; a hive named, blanks around it,
+    /// still reads that hive's.
+    #[test]
+    fn an_empty_hive_filter_reads_every_hive() {
+        // handle_http's frames run deep in a debug build, as in the tests above.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(32 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (ctx, mut harness) = opa_test_admin("a297-empty-hive");
+            let cases = [
+                (
+                    "/deployments?hive=&category=core",
+                    "list_deployments",
+                    None,
+                    Some(("category", "core")),
+                ),
+                ("/deployments?hive=%20%20", "list_deployments", None, None),
+                (
+                    "/drift-alerts?hive=&severity=warning",
+                    "list_drift_alerts",
+                    None,
+                    Some(("severity", "warning")),
+                ),
+                ("/versions?hive=", "list_versions", None, None),
+                (
+                    "/deployments?hive=worker1",
+                    "get_deployments",
+                    Some("worker1"),
+                    None,
+                ),
+                (
+                    "/drift-alerts?hive=%20worker1%20",
+                    "get_drift_alerts",
+                    Some("worker1"),
+                    None,
+                ),
+            ];
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let addr = listener.local_addr().expect("its address");
+            let server_ctx = ctx.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..cases.len() {
+                    let (stream, _) = listener.accept().await.expect("a connection");
+                    serve_http_connection(stream, &server_ctx, &server_ctx.rpc).await;
+                }
+            });
+            for (path, action, hive, filter) in cases {
+                let ask = async {
+                    let mut stream = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("connected");
+                    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+                    stream.write_all(request.as_bytes()).await.expect("sent");
+                    let mut answer = Vec::new();
+                    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+                        .await
+                        .expect("answered")
+                        .expect("an answer");
+                    String::from_utf8(answer).expect("text")
+                };
+                let relayed = answer_admin_relay(
+                    &mut harness,
+                    action,
+                    json!({ "status": "ok", "view": "history", "entries": [] }),
+                );
+                let (answer, sent) = tokio::join!(ask, relayed);
+                assert!(
+                    answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                    "{path}: {answer}"
+                );
+                if let Some(hive) = hive {
+                    assert_eq!(sent.payload["target"], json!(hive), "{path}");
+                }
+                if let Some((field, value)) = filter {
+                    assert_eq!(sent.payload[field], json!(value), "{path}");
+                }
+            }
             server.await.expect("the server");
         });
     }
