@@ -511,14 +511,14 @@ struct HeldTurn {
     turn: MemoryTurn,
     /// Its key (`turn_key`), which leaves the communication's keys with it when its agent's refusal
     /// drops it (FINDINGS A-292), so the message sent again under the same key is a turn again.
-    /// Empty in a turn held before 0.1.136.
+    /// Empty in a turn held before 0.1.137.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     key: String,
     /// The messages its agent got that it stands for, when the turn is the agent's copy of one
     /// (`request_of`), and the agent did not refuse: the agent's refusal of one names it
     /// (`refused_request`). A WF can send the agent one text twice in one cycle, under one key: the
     /// turn stands for each copy (`said_to_the_agent_too`). Empty on the agent's own answers, on a
-    /// relay its agent did not get or refused, and in a turn held before 0.1.136.
+    /// relay its agent did not get or refused, and in a turn held before 0.1.137.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requests: Vec<String>,
     /// The copies of it its agent refused while another one, which the agent took, kept the turn:
@@ -1278,14 +1278,14 @@ fn recent_turn_of(
     })
 }
 
-/// The code of the AI runtime's answer to a turn it refused without running it, since 0.1.135
+/// The code of the AI runtime's answer to a turn it refused without running it, since 0.1.136
 /// (`busy_reply`, crates/fluxbee_ai_sdk/src/runtime.rs), and the one act of the agent's entry in that
 /// answer's trace (docs/message-trace-v1.md §5).
 const AI_RUNTIME_BUSY: &str = "ai_runtime_busy";
 const AI_RUNTIME_BUSY_ACT: &str = "busy";
 
 /// Whether a copy of what `agent_node` sent is its refusal of a turn it never ran (FINDINGS A-292):
-/// the AI runtime's answer `ai_runtime_busy` since 0.1.135 (`busy_reply`,
+/// the AI runtime's answer `ai_runtime_busy` since 0.1.136 (`busy_reply`,
 /// crates/fluxbee_ai_sdk/src/runtime.rs), by its exact shape, and nothing looser. Its router names
 /// the agent as its sender; its payload is the runtime's error and nothing else, `{"type": "error",
 /// "code": "ai_runtime_busy", "message": <text>, "retryable": true}`; and its trace ends with the
@@ -1608,7 +1608,7 @@ struct IntakeTally {
 /// load the queue (`COGNITION_TURN_QUEUE`, 256 turns of up to two model calls, about 5 s each)
 /// takes some 20 minutes to drain while the agents go on refusing, and this many cover that drain
 /// at about three refusals a second, in about a megabyte. Past that, a refused turn that still
-/// waits is analyzed, as before 0.1.136, and its line stays out of the last turns.
+/// waits is analyzed, as before 0.1.137, and its line stays out of the last turns.
 const COGNITION_REFUSALS_KEPT: usize = COGNITION_TAKES_KEPT;
 
 /// The turns its agents refused without running them (FINDINGS A-292), each by the agent's
@@ -2156,7 +2156,7 @@ enum RefusedTurn {
 /// the same key (a WF's send again in the same cycle) is a turn again. One a WF relayed to a person
 /// too stays, as that relay: it was said to them, not to the agent (docs/cognition-hands-v1.md
 /// §12.9). None when no held turn stands for that copy: it had no text nor files, or came before
-/// 0.1.136.
+/// 0.1.137.
 fn refuse_turn(held: &mut ThreadCognitionState, request: &str) -> Option<RefusedTurn> {
     let at = held
         .turns
@@ -2203,7 +2203,7 @@ fn echoes_own_answer(held: &ThreadCognitionState, recent: &RecentTurn) -> bool {
 /// (docs/cognition-hands-v1.md §12.9), and keeps it (`relayed`). A WF that forwards one message to
 /// an IO node and to the agent has its router copy each, and the two can come in two batches,
 /// either first; and a WF can send the agent one text twice in one cycle, under one key. Found by
-/// its key; by its writer, node and text only in a relay held before 0.1.136, which has no key.
+/// its key; by its writer, node and text only in a relay held before 0.1.137, which has no key.
 /// Whether a held turn changed.
 fn said_to_the_agent_too(turns: &mut [HeldTurn], copy: &RecentTurn) -> bool {
     if copy.turn.direction != MemoryTurnDirection::In || copy.request.is_empty() {
@@ -6318,7 +6318,7 @@ mod tests {
         recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, 0, ts_ms, no_facts).expect("a turn")
     }
 
-    /// A turn held with nothing but itself, as one held before 0.1.136.
+    /// A turn held with nothing but itself, as one held before 0.1.137.
     impl From<MemoryTurn> for HeldTurn {
         fn from(turn: MemoryTurn) -> Self {
             Self {
@@ -10142,7 +10142,7 @@ mod tests {
 
     // --- A turn its agent refused without running it (FINDINGS A-292) ---
 
-    /// What the agent's AI runtime answers a turn it refuses without running it, since 0.1.135
+    /// What the agent's AI runtime answers a turn it refuses without running it, since 0.1.136
     /// (`busy_reply` and `send_reply`, crates/fluxbee_ai_sdk/src/runtime.rs): the reply to the
     /// request with the runtime's error, stamped as the agent's, and the agent's entry in the
     /// trace, `busy`, as its SDK writes it; with the agent's name, as its router copies it.
@@ -10664,7 +10664,7 @@ mod tests {
     }
 
     /// A communication's row keeps what only cognition reads of each turn beside it, and a row
-    /// written before 0.1.136 reads as turns without it; the package carries the turns alone, as
+    /// written before 0.1.137 reads as turns without it; the package carries the turns alone, as
     /// they were.
     #[test]
     fn a_held_turn_keeps_its_own_fields_out_of_the_package() {
@@ -10688,10 +10688,10 @@ mod tests {
             held
         );
         assert_eq!(
-            serde_json::from_value::<MemoryTurn>(row).expect("a reader of 0.1.135"),
+            serde_json::from_value::<MemoryTurn>(row).expect("a reader of 0.1.136"),
             turn.turn
         );
-        let before = serde_json::to_value(&turn.turn).expect("a row of 0.1.135");
+        let before = serde_json::to_value(&turn.turn).expect("a row of 0.1.136");
         assert_eq!(
             serde_json::from_value::<HeldTurn>(before).expect("read"),
             HeldTurn::from(turn.turn.clone())

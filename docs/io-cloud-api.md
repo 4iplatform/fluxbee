@@ -372,7 +372,7 @@ handed out (§5.3, §5.4). The pages its nodes published stay up until they expi
 | `params.subject.phone`, `.company_name`, `.attributes` | optional | stored on the identity; strings, `.attributes` an object |
 
 A required field missing or empty, or a field of another type, is refused with `INVALID_REQUEST`
-before anything is created; `error_detail` names the field.
+before anything is created; `error_detail` names the field (0.1.137).
 
 **One email is one account, in the whole hive.** The person is charged to the tenant at the root;
 their email (the account's `cloud` channel) belongs to no tenant.
@@ -424,12 +424,12 @@ anyone. Send only emails Cloud has verified.
     `tenant_not_registrable`, `register_failed`, `in_conversation`, `unknown`) is final: give the
     operator the `request_id`.
 - **When the frontdesk gives no verdict**, the answer is one of these codes. When the frontdesk
-  sent an error, the answer also names the person (`ilk_id`), and `error_detail` starts with the
-  frontdesk's own code when it gave one (`"ai_runtime_busy: …"`).
+  sent an error, the answer also names the person (`ilk_id`), and (0.1.137) `error_detail` starts
+  with the frontdesk's own code when it gave one (`"ai_runtime_busy: …"`).
 
   | `error_code` | what happened | what Cloud does |
   |---|---|---|
-  | `FRONTDESK_UNAVAILABLE` | the frontdesk could not be reached (at once), did not answer within 20 s (§6), or answered with an error that says sending the request again may pass (it was busy) | send it again after a few seconds, a few times at most (below) |
+  | `FRONTDESK_UNAVAILABLE` | the frontdesk could not be reached (at once), did not answer within 20 s (§6), or (0.1.137) answered with an error that says sending the request again may pass (it was busy) | send it again after a few seconds, a few times at most (below) |
   | `FRONTDESK_REJECTED` | the frontdesk answered with an error that does not say so: it failed on this registration, and may have done part of it | do not resend it in a loop: read the person (`get_ilk` by email: its `registration_status`) and give the operator the `request_id` |
   | `INVALID_FRONTDESK_RESPONSE` | the frontdesk answered something that is neither its verdict nor an error: a fault on the hive's side | as `FRONTDESK_REJECTED` |
 

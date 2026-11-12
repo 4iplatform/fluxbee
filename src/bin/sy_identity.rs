@@ -5898,7 +5898,7 @@ async fn auth_read_line(
 
 /// Who the primary admits on :9100 (FINDINGS A-277): a hive the motherbee's registry lists
 /// (`HiveRegistry::lists`, the authority on which hives exist, A-48) that proves it holds its key,
-/// and only while the registry lists it. The key alone was enough until 0.1.136: a removed hive
+/// and only while the registry lists it. The key alone was enough until 0.1.137: a removed hive
 /// whose key the removal could not delete (`identity_key_cleanup: delete_failed`) kept its delta
 /// subscription and could take a new full sync, until the orchestrator's next start swept the key
 /// (`sweep_orphan_identity_keys`). The registry is read, never the key, after the handshake: when

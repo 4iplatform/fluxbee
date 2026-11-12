@@ -173,7 +173,7 @@ func TestACountOnlyListCountsAThousandRunningInstancesInOneAnswer(t *testing.T) 
 	}
 }
 
-// An SY.wf-rules before 0.1.136 asks without count_only, and is answered as before, which is how a
+// An SY.wf-rules before 0.1.137 asks without count_only, and is answered as before, which is how a
 // new engine and an old SY.wf-rules count together during a deploy: the whole list, which past the
 // router's frame the SDK refuses and the node answers INTERNAL_ERROR, never a list cut to fit, whose
 // count would read as fewer instances than run; a delete without force reads that refusal as

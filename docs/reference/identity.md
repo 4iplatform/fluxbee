@@ -643,12 +643,12 @@ converges to the union of the mesh.
 - The handshake is a mutual challenge and response (`server_auth_handshake`,
   `client_auth_handshake`).
 - The primary admits only a hive the motherbee's registry lists (FINDINGS A-277, `SyncAdmission`,
-  since 0.1.136). Its handshake refuses any other before it looks for a key, with the
+  since 0.1.137). Its handshake refuses any other before it looks for a key, with the
   `IDENTITY_AUTH_ERROR` "authentication failed" every refusal gets; only its log says why. It
   checks again when the request arrives: a hive removed since its handshake is served nothing,
   and its connection closes unanswered. A hive's open delta subscription and publish stream end
   when its hive leaves the registry, within one recheck (10 s, `IDENTITY_REGISTRY_RECHECK_SECS`),
-  and its reconnects are refused. Until 0.1.136 the key alone was enough, so a removed hive whose
+  and its reconnects are refused. Until 0.1.137 the key alone was enough, so a removed hive whose
   key the removal could not delete kept reading the store until the orchestrator's next start
   swept the key. A join is listed from its accept, before its bootstrap creates the key, so its
   first handshake passes.

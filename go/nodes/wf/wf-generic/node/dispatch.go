@@ -419,7 +419,7 @@ func handleWFListInstances(ctx context.Context, msg sdk.Message, rt *NodeRuntime
 	}
 	if req.CountOnly {
 		// SY.wf-rules' count of a workflow's running instances, which a delete without force decides
-		// on: {ok, count}, no rows, whatever the limit. Before 0.1.136 SY.wf-rules counted the rows of
+		// on: {ok, count}, no rows, whatever the limit. Before 0.1.137 SY.wf-rules counted the rows of
 		// the whole list, about 360 B each, which passed the frame past about 350 running instances:
 		// the node answered INTERNAL_ERROR, and the count was unknown exactly for a busy workflow
 		// (FINDINGS A-284).

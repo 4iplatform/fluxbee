@@ -195,7 +195,7 @@ Cognition analyzes the first two lines only: a person is at their other end.
 - **The agent reads it** (`render_memory_turn`, `current_message_label`, nodes/ai/ai-generic):
   `<kind> <name> (<ilk>)`, with `via <node>` for a person, and `you, to <whom>` for its own. A turn
   with no writer reads as before.
-- **A turn its agent refused** (FINDINGS A-292, since 0.1.136). Since 0.1.135 a busy AI runtime
+- **A turn its agent refused** (FINDINGS A-292, since 0.1.137). Since 0.1.136 a busy AI runtime
   refuses a turn without running it and answers `ai_runtime_busy`, after its router copied the
   turn for cognition:
   - The turn leaves its communication's last turns, and the worker does not analyze it. One a WF
@@ -212,7 +212,7 @@ Cognition analyzes the first two lines only: a person is at their other end.
     the agent's answer as the agent sends it, before routing it, so the turn drops even when the
     answer never reaches the sender (its link full, `LINK_BUSY`), or reaches a person who does not
     read it as "send it again" (io.slack shows it as `invalid_text_payload`, FINDINGS A-291). The
-    agent's next package then lacks what the person said, where up to 0.1.135 it showed it
+    agent's next package then lacks what the person said, where up to 0.1.136 it showed it
     unanswered; io.slack's fix (the answer's message, with a send-again hint) closes the second
     case.
   - How the refusal is recognized and which turn it drops:

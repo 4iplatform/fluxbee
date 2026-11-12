@@ -167,7 +167,7 @@ Identity is created in two steps:
   each worker its own. `add_hive` creates the key and copies it over SSH
   (`ensure_local_identity_key`, `distribute_hive_identity_key_inner`). A replica with auth
   required and no key file does not start.
-- **Only a hive the registry lists** (FINDINGS A-277, `SyncAdmission`, since 0.1.136): the
+- **Only a hive the registry lists** (FINDINGS A-277, `SyncAdmission`, since 0.1.137): the
   primary's handshake refuses a hive the motherbee's registry does not list (`HiveRegistry::lists`,
   `/var/lib/fluxbee/hives/<hive>/`, the authority on which hives exist) before it looks for the
   hive's key, with the `IDENTITY_AUTH_ERROR` "authentication failed" that every refusal gets; only
@@ -178,7 +178,7 @@ Identity is created in two steps:
   (10 s, `IDENTITY_REGISTRY_RECHECK_SECS`, the router's for a WAN link), with the warning
   `identity sync session closed: the hive is no longer in the registry (removed)`, and its
   reconnects are refused (see "A removed hive still connected" under Failure behavior for when a
-  restart ends them first). Until 0.1.136 the key alone was enough: a removed hive whose key
+  restart ends them first). Until 0.1.137 the key alone was enough: a removed hive whose key
   the removal could not delete (`identity_key_cleanup: delete_failed`) kept its subscription and
   could take a new full sync until the orchestrator's next start swept the key. A join is listed
   before its first handshake: the orchestrator creates the hive's directory when it accepts the

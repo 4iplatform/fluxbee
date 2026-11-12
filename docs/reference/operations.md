@@ -570,7 +570,7 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
   spokes, and moves managed nodes that follow `current` onto the new version
   (`reconcile_persisted_custom_nodes`, the pass its 60 s loop repeats). A boot that finds no
   replaced binary, any start of the orchestrator that follows no upgrade, restarts nothing: a
-  check with no answer only starts its service, with a warning (FINDINGS A-282, since 0.1.136).
+  check with no answer only starts its service, with a warning (FINDINGS A-282, since 0.1.137).
   An upgrade at whose boot every replaced service's check gives no answer leaves those services
   on their old binaries: `systemctl restart` each one those warnings name.
 
@@ -1062,7 +1062,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /installation` | the installation's `ai`: the motherbee's file, its versions and each hive's copy ([The installation's AI settings](#the-installations-ai-settings)) |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
-| `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`; `syncthing` `api_unanswered_restart` when the watchdog restarts Syncthing because its REST API gives no answer, FINDINGS A-283), and conditions, a row with `state: open` when one opens and an `info` row with `state: closed` when it closes: `syncthing` `api_unanswered`, the orchestrator's own, while Syncthing's REST API gives no answer, for every folder or at its port (`API port refused`, a port that refuses the connection or takes none within 2 s; FINDINGS A-283, since 0.1.136), and `certificate`, SY.admin's certificate conditions (`record_drift_alert`). A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |
+| `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`; `syncthing` `api_unanswered_restart` when the watchdog restarts Syncthing because its REST API gives no answer, FINDINGS A-283), and conditions, a row with `state: open` when one opens and an `info` row with `state: closed` when it closes: `syncthing` `api_unanswered`, the orchestrator's own, while Syncthing's REST API gives no answer, for every folder or at its port (`API port refused`, a port that refuses the connection or takes none within 2 s; FINDINGS A-283, since 0.1.137), and `certificate`, SY.admin's certificate conditions (`record_drift_alert`). A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |
 | `GET /acme/status` | the edge's certificate: ACME's configuration, the names, the open conditions ([Certificates](#certificates-acme)) |
 | `GET /web/status` | the web door: the declared host, the certificate's names, the edge's answer to the web routes with its way to io.web, io.web ([The web door](#the-web-door)) |
 | `GET /config/storage/metrics` | SY.storage's inbox |

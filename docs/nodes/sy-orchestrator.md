@@ -67,7 +67,7 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    6. starts Syncthing if blob or dist sync is enabled. A failure only warns, and the watchdog
       runs that setup again at its first tick whose Syncthing API port takes the connection, the
       folders' reconcile the failure skipped included ([Watchdog](#watchdog), FINDINGS A-283, since
-      0.1.136). While `dist/vendor` does not hold the Syncthing its manifest describes, it runs
+      0.1.137). While `dist/vendor` does not hold the Syncthing its manifest describes, it runs
       the Syncthing already installed and reports the vendor in `vendor.awaiting_update`; with
       none installed, Syncthing does not start, as before (FINDINGS A-189,
       [Syncthing](#syncthing));
@@ -86,7 +86,7 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
       `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45). A
       check with no answer, a `systemctl show -p MainPID` that gives none or a `/proc/<pid>/exe`
       link that cannot be read for another reason than a process gone, is asked again up to 3
-      times 250 ms apart (`BootBinaryChecks`, FINDINGS A-282, since 0.1.136). One that still
+      times 250 ms apart (`BootBinaryChecks`, FINDINGS A-282, since 0.1.137). One that still
       gives none restarts its service only when the same boot found a service on a replaced
       binary, the boot's own sign of a package upgrade (a restart also starts a stopped
       service); otherwise the service is only started, which leaves a running one as it is,
@@ -600,7 +600,7 @@ deletes the key of any hive with no directory under `hives/`, when both listings
 **Reading the registry.** `get_hive` (`get_hive_flow`) answers one hive's `info.yaml` as `hive`,
 and `NOT_FOUND` for a hive the registry does not have. A hive id that is not one, 1 to 64
 characters `[A-Za-z0-9_-]` (`valid_hive_id`, the check `add_hive` and `remove_hive` make), answers
-`INVALID_HIVE_ID` and nothing is read (FINDINGS A-311, since 0.1.136): joined into the path,
+`INVALID_HIVE_ID` and nothing is read (FINDINGS A-311, since 0.1.137): joined into the path,
 `/srv/x` read `/srv/x/info.yaml` and `..` climbed out of the registry. `add_hive`, at its accept and
 in each role's join flow, `remove_hive` and `get_hive` refuse such an id with one answer
 (`invalid_hive_id_answer`), whose message names the rule in the words SY.admin's and SY.identity's
@@ -740,7 +740,7 @@ The orchestrator runs Syncthing as `fluxbee-syncthing.service` (`syncthing_unit_
 user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the GUI and API on
 `127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`, and
 `TimeoutStopSec=30`: every Fluxbee unit bounds its stop, and Syncthing gets 30 s to close its
-database (FINDINGS A-283, since 0.1.136; before, systemd's default of 90 s). The release that
+database (FINDINGS A-283, since 0.1.137; before, systemd's default of 90 s). The release that
 brings it restarts Syncthing once on each hive, at its orchestrator's start: the unit changed.
 Every link is TCP to the motherbee's static address, so only the motherbee listens off
 loopback, on 22000/tcp; a spoke only dials (`syncthing_owned_listen_address`).
@@ -763,7 +763,7 @@ A running Syncthing keeps the binary and the unit it started with, so the same c
 instead of starting it, when it installed a new binary or wrote a new unit, or when the running
 process' binary was replaced on disk (`syncthing_runs_stale`, FINDINGS A-57), which catches a
 restart an earlier call never reached. That last check asks `systemctl show -p MainPID` again, up
-to 3 times 250 ms apart, while it gives no answer (FINDINGS A-282, since 0.1.136; before, it was
+to 3 times 250 ms apart, while it gives no answer (FINDINGS A-282, since 0.1.137; before, it was
 asked once). One that still gives none restarts nothing by itself, and the next call asks again:
 a restart on it would restart Syncthing at every call while `systemctl show` fails.
 
@@ -1083,7 +1083,7 @@ re-asserts only the IPv6 sysctl), and Syncthing is restarted for a folder only o
 answers for it. Before, each read as a "no": the tick in flight when systemd stops the
 orchestrator applied a healthy NAT table again, or restarted Syncthing.
 
-**A Syncthing REST API that gives no answer** (FINDINGS A-283, since 0.1.136; the operator's calls
+**A Syncthing REST API that gives no answer** (FINDINGS A-283, since 0.1.137; the operator's calls
 of 2026-11-11). At a tick at which systemd answers that Syncthing runs, the Syncthing check
 connects to its API port, 2 s at most (`syncthing_api_port`), then asks Syncthing's
 `/rest/db/status` for each of the hive's folders in turn, each with a 10 s timeout, and stops at
@@ -1131,7 +1131,7 @@ whose port takes no connection 2 s at most.
   setup again first (`finish_owed_syncthing_setup`), its wait ending at once, unless a join owns
   Syncthing, then asks the folders as any tick does; a setup that fails again is logged and stays
   owed for the next such tick. A setup that succeeds, whoever runs it (the unhealthy path, a sync
-  probe, `update category=vendor`), pays it. Before 0.1.136, a refused port took the unhealthy
+  probe, `update category=vendor`), pays it. Before 0.1.137, a refused port took the unhealthy
   path, whose setup ran it again, 30 s a tick. An egress, which syncs dist alone, no longer reads
   its start's config as a change at its first tick, which ran the setup again.
 - **A start.** A Syncthing that starts keeps its port closed for a few seconds, which count, and

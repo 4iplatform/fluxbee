@@ -21,7 +21,7 @@ const routerFrameLimit = 128 * 1024
 // wfEngine is how a WF node answers a WF_LIST_INSTANCES, given the request's payload.
 type wfEngine func(request map[string]any) map[string]any
 
-// countingEngine answers as wf.engine 0.1.136 does with running instances running: a count-only
+// countingEngine answers as wf.engine 0.1.137 does with running instances running: a count-only
 // request with how many and no rows; any other as before (listingEngine).
 func countingEngine(running int) wfEngine {
 	return func(request map[string]any) map[string]any {
@@ -32,7 +32,7 @@ func countingEngine(running int) wfEngine {
 	}
 }
 
-// listingEngine answers as wf.engine before 0.1.136 does with running instances running, and no
+// listingEngine answers as wf.engine before 0.1.137 does with running instances running, and no
 // other: it does not know count_only, lists the instances of the status asked for, newest first, as
 // many as the limit says (0, every one; less than 0, 50), about 340 B each, and counts the rows it
 // lists. A list over the router's frame is refused by the engine (wfNodeAnswer).
@@ -178,9 +178,9 @@ func serveAsWFNode(listener net.Listener, engine wfEngine, requests chan<- map[s
 
 // SY.wf-rules counts a WF node's running instances with WF_LIST_INSTANCES {status: running, limit:
 // 0, count_only: true}, through the SDK and a router of the test's playing the node. An engine of
-// 0.1.136 counts the 1000 running instances spec §21 allows a node in one answer; the whole list
+// 0.1.137 counts the 1000 running instances spec §21 allows a node in one answer; the whole list
 // SY.wf-rules asked for before passed the frame past about 350 of them, and the count failed exactly
-// for a busy workflow (FINDINGS A-284). During a deploy SY.wf-rules may ask an engine before 0.1.136,
+// for a busy workflow (FINDINGS A-284). During a deploy SY.wf-rules may ask an engine before 0.1.137,
 // which ignores count_only and lists every running instance, limit 0: its count is the whole count,
 // and past the frame its INTERNAL_ERROR is a refusal, never a count.
 func TestSYWfRulesCountsTheRunningInstancesWithACountOnlyList(t *testing.T) {
@@ -190,10 +190,10 @@ func TestSYWfRulesCountsTheRunningInstancesWithACountOnlyList(t *testing.T) {
 		count   int
 		refusal string // the node's refusal of the count, if it refuses it
 	}{
-		{"0.1.136 running 1000", countingEngine(1000), 1000, ""},
-		{"0.1.136 running none", countingEngine(0), 0, ""},
-		{"before 0.1.136 running 3", listingEngine(3), 3, ""},
-		{"before 0.1.136 running 1000", listingEngine(1000), 0, "INTERNAL_ERROR"},
+		{"0.1.137 running 1000", countingEngine(1000), 1000, ""},
+		{"0.1.137 running none", countingEngine(0), 0, ""},
+		{"before 0.1.137 running 3", listingEngine(3), 3, ""},
+		{"before 0.1.137 running 1000", listingEngine(1000), 0, "INTERNAL_ERROR"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, requests := wfNodeOnTestRouter(t, tc.engine)
@@ -218,7 +218,7 @@ func TestSYWfRulesCountsTheRunningInstancesWithACountOnlyList(t *testing.T) {
 // What the count shows the operator: get_status and list_workflows show the 1000 running instances
 // of a busy workflow, and a delete without force is refused INSTANCES_ACTIVE with that count; both
 // showed no count before (instances_error INTERNAL_ERROR), and the delete answered INSTANCES_UNKNOWN
-// (FINDINGS A-284). An engine before 0.1.136 running as many, during a deploy, still refuses the
+// (FINDINGS A-284). An engine before 0.1.137 running as many, during a deploy, still refuses the
 // count: the delete is refused INSTANCES_UNKNOWN, naming the refusal, and nothing is purged.
 func TestABusyWorkflowShowsItsRunningInstancesAndADeleteWithoutForceKeepsThem(t *testing.T) {
 	for _, tc := range []struct {
@@ -229,8 +229,8 @@ func TestABusyWorkflowShowsItsRunningInstancesAndADeleteWithoutForceKeepsThem(t 
 		code   string // the delete without force's refusal
 		says   string
 	}{
-		{"0.1.136", countingEngine(1000), intPtr(1000), "", "INSTANCES_ACTIVE", "wf node still has 1000 running instances"},
-		{"before 0.1.136", listingEngine(1000), nil, "INTERNAL_ERROR: WF_LIST_INSTANCES_RESPONSE not sent: message too large", "INSTANCES_UNKNOWN", "the wf node answered INTERNAL_ERROR: WF_LIST_INSTANCES_RESPONSE not sent: message too large"},
+		{"0.1.137", countingEngine(1000), intPtr(1000), "", "INSTANCES_ACTIVE", "wf node still has 1000 running instances"},
+		{"before 0.1.137", listingEngine(1000), nil, "INTERNAL_ERROR: WF_LIST_INSTANCES_RESPONSE not sent: message too large", "INSTANCES_UNKNOWN", "the wf node answered INTERNAL_ERROR: WF_LIST_INSTANCES_RESPONSE not sent: message too large"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newTestService(t)

@@ -198,9 +198,9 @@ a removal it cuts there is named `TIMEOUT` in `packages_left`.
   and `count_only: true` directly (2 s timeout, `node/wf_client.go`), which the node answers
   with a `COUNT(*)` and no rows; a count that is not a whole number from 0 is a count that
   failed (`instanceCount`). A node with a config is deleted only once it counted none
-  (`instancesUnconfirmed`). Before 0.1.136 it asked for the whole list, which passed the frame
+  (`instancesUnconfirmed`). Before 0.1.137 it asked for the whole list, which passed the frame
   past about 350 running instances: the node answered `INTERNAL_ERROR`, and a busy workflow's
-  delete `INSTANCES_UNKNOWN` (FINDINGS A-284). `limit` stays 0 for an engine before 0.1.136,
+  delete `INSTANCES_UNKNOWN` (FINDINGS A-284). `limit` stays 0 for an engine before 0.1.137,
   which ignores `count_only` and lists every running instance, so its count is still the whole
   count during a deploy (the spec's §5.7). A node that crashed, was stopped or is restarting
   keeps its instances in its store, which the kill's purge removes: before 0.1.133 (A-270) such a

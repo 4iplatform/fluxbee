@@ -66,10 +66,10 @@ func (c *l2WFNodeClient) wfSystemRPC(
 }
 
 // CountRunningInstances asks the WF node how many instances it runs: WF_LIST_INSTANCES with
-// count_only, which the node answers with a COUNT(*) and no rows. Before 0.1.136 it counted the rows
+// count_only, which the node answers with a COUNT(*) and no rows. Before 0.1.137 it counted the rows
 // of the whole list, which passed the frame past about 350 running instances: the node answered
 // INTERNAL_ERROR, and the count was unknown exactly for a busy workflow (FINDINGS A-284). limit
-// stays 0 for an engine before 0.1.136, which does not know count_only, ignores it as any field it
+// stays 0 for an engine before 0.1.137, which does not know count_only, ignores it as any field it
 // does not know, and lists every running instance: its count is then the whole count, as before, or
 // past the frame its INTERNAL_ERROR, a refusal. A limit would cut the count it answers.
 func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName string) (int, error) {

@@ -135,7 +135,7 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   communication holds an answer with its text (`echoes_own_answer`). When the agent's own copy of
   a message comes after its relay, the turn was said to the agent too: it no longer names where
   else it went (`said_to_the_agent_too`, which finds the relay by its key, and by its writer, node
-  and text only in a turn held before 0.1.136, with no key), and the worker's write-back keeps it
+  and text only in a turn held before 0.1.137, with no key), and the worker's write-back keeps it
   so (`merge_recent_turns` keeps the held copy of a turn, `same_turn`). An agent's refusal takes
   the key with the turn it drops (§3.4): the message sent again under that key is a turn again.
 - Then it hands each record but a refusal to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full
@@ -283,7 +283,7 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
 - **Which turns:** those with a thread id and an agent ILK, found as the worker finds them
   (`agent_identity_of`, cached); the worker counts the others. A turn with neither text, files
   nor a menu choice is left out: the package would show it empty.
-- **A turn the agent refused** (FINDINGS A-292, since 0.1.136): the agent's `ai_runtime_busy`, by
+- **A turn the agent refused** (FINDINGS A-292, since 0.1.137): the agent's `ai_runtime_busy`, by
   its exact shape (`is_busy_answer`), is no turn
   ([SY.cognition](../nodes/sy-cognition.md#the-interlocutor-model)).
   - It drops, in its batch's order, the turn that stands for the agent's copy of the message it
@@ -304,7 +304,7 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
     refusal matters while its turn may wait in the worker's queue or in the copy the worker took
     for one turn, and the refusals of turns the full queue dropped count too. 4,096 cover a full
     queue's drain (256 turns, about 5 s each) at about three refusals a second, in about a
-    megabyte. Past that, a refused turn that still waits is analyzed, as before 0.1.136, and its
+    megabyte. Past that, a refused turn that still waits is analyzed, as before 0.1.137, and its
     line stays out of the last turns.
   - The journal names them at info, at most one line every 10 s with how many came since
     (`RefusalLog`); the counters are in §10.
