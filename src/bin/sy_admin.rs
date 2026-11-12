@@ -8589,9 +8589,11 @@ async fn advance_publication(
 ///    record that fails is the error answer, before anything is minted: no token, no door opened
 ///    or closed, IO.cloud not asked, so the token the Cloud holds works as before.
 /// 2. The door: the externalize mints the token, stores it in the vault for the edge and opens the
-///    URL there. A door that does not open puts the record back as it was
-///    (`put_back_cloud_edge_record`), and the answer is the externalize's error, which says what
-///    the run left in the vault when the edge refused the open or did not answer it.
+///    URL there. A door that does not open after the vault took the token (the edge refused the
+///    open or did not answer it) rolls the vault's key back to the token before it, the one the
+///    door serves (`roll_back_cloud_token`, the operator's call of 2026-11-12); then any door that
+///    does not open puts the record back as it was (`put_back_cloud_edge_record`), and the answer
+///    is the externalize's error, which says what became of both.
 /// 3. The apply: the edge given to the running IO.cloud (`apply_cloud_edge`, FINDINGS A-255).
 /// 4. The old door: when the record named another edge, the door moved, and once the running
 ///    IO.cloud trusts the new edge, that edge's door is closed (`settle_moved_cloud_door`). Until
@@ -8681,7 +8683,8 @@ async fn handle_publish_cloud_endpoint(
     // Reuses the real path (mint -> store in the vault -> send only the secret_ref to the edge).
     // `caller_l2_name: None` is the trusted internal path of the operator's HTTP server, which
     // authorize_channel_command already accounts for.
-    let externalize = match handle_externalize(
+    let mut stored_token = None;
+    let externalize = match externalize_channel(
         ctx,
         client,
         serde_json::json!({
@@ -8692,21 +8695,43 @@ async fn handle_publish_cloud_endpoint(
             "methods": ["POST"],
         }),
         None,
+        &mut stored_token,
     )
     .await
     {
         Ok(opened) if opened.envelope.get("status").and_then(|v| v.as_str()) == Some("ok") => {
             opened
         }
-        // The door did not open: the record goes back to what it named before this run (FINDINGS
-        // A-317), so that IO.cloud, which reads it when it starts, trusts the edge whose door is
-        // open, and the next run finds the door where it is. The answer also says what the run
-        // left in the vault, when the edge refused the open or did not answer it.
+        // The door did not open. When the vault took this run's token first (the edge refused
+        // the open or did not answer it), the vault's key goes back to the token before it, the
+        // one the door serves (`roll_back_cloud_token`, the operator's call of 2026-11-12 on
+        // FINDINGS A-317). Then the record goes back to what it named before this run, so that
+        // IO.cloud, which reads it when it starts, trusts the edge whose door is open, and the
+        // next run finds the door where it is. The answer says what became of both.
         not_opened => {
+            let rolled_back = match &stored_token {
+                Some(stored) => {
+                    let rollback = roll_back_cloud_token(ctx, client, &edge_node, stored).await;
+                    Some((stored, rollback))
+                }
+                None => None,
+            };
             let put_back =
                 put_back_cloud_edge_record(ctx, client, &cloud_node, &edge_node, &record).await;
+            let token = rolled_back
+                .as_ref()
+                .map(|(stored, rollback)| (*stored, rollback));
             return not_opened.map(|failed| {
-                with_cloud_edge_put_back(failed, &cloud_node, &edge_node, &record, &put_back)
+                with_cloud_edge_put_back(
+                    failed,
+                    &CloudDoorNotOpened {
+                        cloud_node: &cloud_node,
+                        edge_node: &edge_node,
+                        record: &record,
+                        put_back: &put_back,
+                        token,
+                    },
+                )
             });
         }
     };
@@ -9179,25 +9204,37 @@ async fn put_back_cloud_edge_record(
     }
 }
 
+/// A run whose door did not open (FINDINGS A-317): what its answer says besides the externalize's
+/// error (`with_cloud_edge_put_back`).
+struct CloudDoorNotOpened<'a> {
+    cloud_node: &'a str,
+    edge_node: &'a str,
+    record: &'a CloudEdgeRecord,
+    put_back: &'a CloudEdgePutBack,
+    /// The token the vault took for this run before the door failed, and what became of it
+    /// (`roll_back_cloud_token`); none when the externalize failed before the vault took it, or
+    /// the vault refused it.
+    token: Option<(&'a StoredChannelToken, &'a CloudTokenRollback)>,
+}
+
 /// The externalize's error answer, its detail followed by what became of the record (FINDINGS
 /// A-317): put back, or still naming the run's edge, and what that does; nothing of it when the
-/// config named that edge already. Then, when the edge refused the open or did not answer it, what
-/// the run left in the vault (`unreceived_cloud_token`, A-317's review).
+/// config named that edge already. Then, when the vault took this run's token before the door
+/// failed (the edge refused the open or did not answer it), what became of that token
+/// (`cloud_token_said`).
 fn with_cloud_edge_put_back(
     mut failed: InternalAdminDispatchResult,
-    cloud_node: &str,
-    edge_node: &str,
-    record: &CloudEdgeRecord,
-    put_back: &CloudEdgePutBack,
+    run: &CloudDoorNotOpened<'_>,
 ) -> InternalAdminDispatchResult {
-    let before = record.previous_edge().unwrap_or("no edge");
+    let (cloud_node, edge_node) = (run.cloud_node, run.edge_node);
+    let before = run.record.previous_edge().unwrap_or("no edge");
     let detail = failed
         .envelope
         .get("error_detail")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let record_said = match put_back {
+    let record_said = match run.put_back {
         CloudEdgePutBack::Unchanged => None,
         CloudEdgePutBack::PutBack => Some(format!(
             "{cloud_node} config names {before} again: this run recorded {edge_node} in it before \
@@ -9211,10 +9248,13 @@ fn with_cloud_edge_put_back(
              io.edge_node back with set_node_config."
         )),
     };
-    let said: Vec<String> = record_said
-        .into_iter()
-        .chain(unreceived_cloud_token(&detail, edge_node, record))
-        .collect();
+    let said: Vec<String> =
+        record_said
+            .into_iter()
+            .chain(run.token.map(|(stored, rollback)| {
+                cloud_token_said(stored, rollback, edge_node, run.record)
+            }))
+            .collect();
     if said.is_empty() {
         return failed;
     }
@@ -9228,27 +9268,192 @@ fn with_cloud_edge_put_back(
     failed
 }
 
-/// What a door that did not open left in the vault (A-317's review), from the externalize's error
-/// `detail`: when the edge refused the open (`edge did not open URL`) or did not answer it (`edge
-/// unreachable / open_url failed`), as `handle_externalize` words them, its vault put came first,
-/// and `edge_channel_secret:<ich>` holds the token this run minted, for `edge_node`, which no one
-/// received. The edge the door was on keeps the token the Cloud holds in its memory only: once it
-/// restarts, as a deploy does, it loads that new token (the same edge) or none it may use (a move),
-/// and the Cloud's token stops. None when the externalize failed before its vault put, or the
-/// vault refused it. Whether to roll the vault's key back is the operator's call (FINDINGS A-317).
-fn unreceived_cloud_token(
-    detail: &str,
+/// How long SY.admin waits for SY.vault to answer each ask to roll back the token of a door that
+/// did not open (`roll_back_cloud_token`, FINDINGS A-317): SY.vault runs on the motherbee, as
+/// SY.admin does, and answers in milliseconds. It keeps such a run within what Archi waits for a
+/// publish of the door (240 s, `EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS` in sy_architect.rs): the
+/// record's read and write, 30 s each tried twice; the vault's store, 30 s; the edge's open, 15 s;
+/// the rollback, 5 s asked at most twice; the record put back, 30 s tried twice: 235 s.
+const CLOUD_TOKEN_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What became of the token a run left in the vault when its door did not open (FINDINGS A-317, the
+/// operator's call of 2026-11-12): `edge_channel_secret:<ich>` rolled back to the token before it,
+/// or why not (`roll_back_cloud_token`).
+#[derive(Debug, Clone, PartialEq)]
+enum CloudTokenRollback {
+    /// Rolled back: the vault holds the token it held before this run again, at this version.
+    RolledBack(Option<i64>),
+    /// The vault held no token for the channel before this run (`NO_PREVIOUS_VERSION`): there is
+    /// none to roll back to, and it holds this run's.
+    NoneBefore,
+    /// It failed, why the last time. `unanswered`: the last ask reached SY.vault and got no answer
+    /// in time, so SY.vault may have rolled the token back all the same; it is not asked again.
+    Failed { why: String, unanswered: bool },
+}
+
+/// Rolls the vault's channel token back to the one before this run's (FINDINGS A-317, the
+/// operator's call of 2026-11-12): `VAULT_ROLLBACK` of `edge_channel_secret:<ich>`, in the root
+/// tenant where the externalize stored it, so that the vault holds the token the door serves. The
+/// vault took this run's token before the edge refused the open or did not answer it; no one
+/// received that token, and an edge reads its door's token from the vault when it starts.
+///
+/// A refusal SY.vault answers, or an ask that did not reach it, changed nothing, and is asked once
+/// more at once (retry and log, the operator's principle of 2026-11-12, FINDINGS A-313);
+/// `NO_PREVIOUS_VERSION` is no failure, the vault having held no token before this run. An ask
+/// SY.vault did not answer in time is not asked again: a rollback swaps the token and the one
+/// before it, so a second one after a first that landed unanswered would put this run's token
+/// back. One that fails is told in the answer and logged, and nothing retries it later.
+async fn roll_back_cloud_token(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    edge_node: &str,
+    stored: &StoredChannelToken,
+) -> CloudTokenRollback {
+    let vault = format!("SY.vault@{}", ctx.hive_id);
+    let ask = || {
+        send_system_request_with_meta(
+            client,
+            &vault,
+            MSG_VAULT_ROLLBACK,
+            MSG_VAULT_ROLLBACK_RESPONSE,
+            serde_json::json!({
+                "key": stored.key,
+                "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            }),
+            16,
+            Some(ctx.self_ilk_id.clone()),
+            None,
+            Some(vault.clone()),
+            Some("vault_rollback".to_string()),
+            None,
+            CLOUD_TOKEN_ROLLBACK_TIMEOUT,
+        )
+    };
+    let mut rollback = cloud_token_rollback_outcome(ask().await);
+    if let CloudTokenRollback::Failed {
+        why,
+        unanswered: false,
+    } = &rollback
+    {
+        tracing::warn!(
+            edge_node = %edge_node,
+            key = %stored.key,
+            reason = %why,
+            "publish_cloud_endpoint: the door did not open, and rolling its token back in the \
+             vault failed: asked once more"
+        );
+        rollback = cloud_token_rollback_outcome(ask().await);
+    }
+    match &rollback {
+        CloudTokenRollback::RolledBack(version) => tracing::info!(
+            edge_node = %edge_node,
+            key = %stored.key,
+            version = ?version,
+            "publish_cloud_endpoint: the door did not open; its token in the vault is rolled back \
+             to the one before this run"
+        ),
+        CloudTokenRollback::NoneBefore => tracing::warn!(
+            edge_node = %edge_node,
+            key = %stored.key,
+            "publish_cloud_endpoint: the door did not open, and the vault held no token for its \
+             channel before this run: none to roll back to"
+        ),
+        CloudTokenRollback::Failed { why, unanswered } => tracing::warn!(
+            edge_node = %edge_node,
+            key = %stored.key,
+            reason = %why,
+            unanswered,
+            "publish_cloud_endpoint: the door did not open, and rolling its token back in the \
+             vault failed: the answer says so, and nothing asks again"
+        ),
+    }
+    rollback
+}
+
+/// What SY.vault's answer to a rollback says (`roll_back_cloud_token`): rolled back, at the version
+/// it answers; no version before this run's (`NO_PREVIOUS_VERSION`); or why it failed, and whether
+/// SY.vault may have rolled it back all the same: an ask that got no answer, a timeout above all.
+/// The router's `UNREACHABLE` or `TTL_EXCEEDED` never reached SY.vault.
+fn cloud_token_rollback_outcome(
+    answer: Result<serde_json::Value, AdminError>,
+) -> CloudTokenRollback {
+    match answer {
+        Ok(payload) if payload.get("status").and_then(serde_json::Value::as_str) == Some("ok") => {
+            CloudTokenRollback::RolledBack(
+                payload
+                    .get("current_version")
+                    .and_then(serde_json::Value::as_i64),
+            )
+        }
+        Ok(payload) => {
+            let code = payload
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no code");
+            if code == "NO_PREVIOUS_VERSION" {
+                return CloudTokenRollback::NoneBefore;
+            }
+            let message = payload
+                .get("message")
+                .or_else(|| payload.get("error_detail"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason given");
+            CloudTokenRollback::Failed {
+                why: format!(": SY.vault refused it, {code}: {message}"),
+                unanswered: false,
+            }
+        }
+        Err(err) => {
+            let undelivered = matches!(
+                err.downcast_ref::<fluxbee_sdk::RpcError>(),
+                Some(
+                    fluxbee_sdk::RpcError::Unreachable { .. }
+                        | fluxbee_sdk::RpcError::TtlExceeded { .. }
+                )
+            ) || err.to_string().starts_with("router returned ");
+            if undelivered {
+                CloudTokenRollback::Failed {
+                    why: format!(": it did not reach SY.vault: {err}"),
+                    unanswered: false,
+                }
+            } else {
+                CloudTokenRollback::Failed {
+                    why: format!(
+                        ": SY.vault did not answer it: {}",
+                        no_answer_detail(&err, CLOUD_TOKEN_ROLLBACK_TIMEOUT)
+                    ),
+                    unanswered: true,
+                }
+            }
+        }
+    }
+}
+
+/// What the answer of a run whose door did not open says of the token the vault took for it
+/// (FINDINGS A-317): rolled back to the token before it, the one the door serves (the operator's
+/// call of 2026-11-12), or why not and what that leaves. The door is the edge IO.cloud's config
+/// named before the run. On a rotation it is the run's own edge, which serves the token the Cloud
+/// holds and reads it again from the vault when it restarts. On a move it is another edge, which
+/// serves that token from its memory until it restarts, and then reads none: this run's put made
+/// the run's edge the key's owner, and a rollback restores the token, not its owner. With no door
+/// before, the vault holds again what it held. A token left in the vault, which no one received,
+/// is what an edge reads when it restarts: the Cloud's token works at most until then.
+fn cloud_token_said(
+    stored: &StoredChannelToken,
+    rollback: &CloudTokenRollback,
     edge_node: &str,
     record: &CloudEdgeRecord,
-) -> Option<String> {
-    let after_the_vault = detail.starts_with("edge did not open URL ")
-        || detail.starts_with("edge unreachable / open_url failed for ");
-    if !after_the_vault {
-        return None;
-    }
-    let held = record
+) -> String {
+    let key = &stored.key;
+    let door = record
         .previous_edge()
-        .filter(|door| is_cloud_door_edge(door))
+        .filter(|door| is_cloud_door_edge(door));
+    let took = format!(
+        "The vault took the token this run minted, for {edge_node}, before the door failed"
+    );
+    let again = "Run publish_cloud_endpoint again, on an edge that answers, and give the \
+                 Cloud the token it answers at once.";
+    let held = door
         .map(|door| {
             format!(
                 ": the token the Cloud holds works at most until {door} restarts, as a deploy \
@@ -9256,11 +9461,51 @@ fn unreceived_cloud_token(
             )
         })
         .unwrap_or_default();
-    Some(format!(
-        "The vault already holds the token this run minted, for {edge_node}, and no one received \
-         it (FINDINGS A-317){held}. Run publish_cloud_endpoint again, on an edge that answers, and \
-         give the Cloud the token it answers at once."
-    ))
+    match rollback {
+        CloudTokenRollback::RolledBack(_) => {
+            let serves = match door {
+                Some(door) if door == edge_node => format!(
+                    ": the one {door} serves, which the Cloud holds, and which {door} reads again \
+                     when it restarts."
+                ),
+                Some(door) => format!(
+                    ": the one {door} serves, which the Cloud holds. The key stays {edge_node}'s: \
+                     this run's put made that edge its owner, and a rollback does not change it, \
+                     so {door} reads none once it restarts, as a deploy does. {again}"
+                ),
+                None => ".".to_string(),
+            };
+            format!(
+                "{took}, and SY.admin rolled {key} back to the token it held before this run \
+                 (vault_rollback, FINDINGS A-317){serves}"
+            )
+        }
+        CloudTokenRollback::NoneBefore => format!(
+            "{took}, and held none for the channel before it, so there was none to roll it back \
+             to (vault_rollback, FINDINGS A-317): the vault holds that token, which no one \
+             received{held}. {again}"
+        ),
+        CloudTokenRollback::Failed { why, unanswered } => {
+            let holds = if *unanswered {
+                let version = stored
+                    .version
+                    .map(|version| format!(", version {version} while it does"))
+                    .unwrap_or_default();
+                format!(
+                    ". SY.vault may have rolled it back all the same, so it was not asked again, \
+                     since a rollback swaps the token and the one before it: vault_get_metadata of \
+                     {key} says whether the vault still holds the token this run minted{version}, \
+                     which no one received{held}."
+                )
+            } else {
+                format!(": the vault holds the token this run minted, which no one received{held}.")
+            };
+            format!(
+                "{took}, and rolling {key} back to the token before it failed, the last \
+                 time{why} (vault_rollback, FINDINGS A-317){holds} {again}"
+            )
+        }
+    }
 }
 
 /// IO.cloud's door on the edge it moved from (FINDINGS A-317): its channel, that edge, and what
@@ -9829,6 +10074,40 @@ async fn handle_externalize(
     params: serde_json::Value,
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
+    externalize_channel(ctx, client, params, caller_l2_name, &mut None).await
+}
+
+/// The channel token an externalize stored in the vault (FINDINGS A-317): its key and the version
+/// the vault's put answered. `publish_cloud_endpoint` rolls it back when the door then did not
+/// open (`roll_back_cloud_token`).
+#[derive(Debug, Clone, PartialEq)]
+struct StoredChannelToken {
+    /// `edge_channel_secret:<ich>`.
+    key: String,
+    /// The version the put answered; none when its answer named none.
+    version: Option<i64>,
+}
+
+/// The version a `vault_put` answered (`payload.version` of SY.admin's answer), if it named one.
+fn vault_put_version(body: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|answer| {
+            answer
+                .pointer("/payload/version")
+                .and_then(serde_json::Value::as_i64)
+        })
+}
+
+/// `handle_externalize`, which also gives `stored_token` the channel token the vault took for a
+/// shared-secret channel, once it took it, whatever comes after (FINDINGS A-317).
+async fn externalize_channel(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    params: serde_json::Value,
+    caller_l2_name: Option<&str>,
+    stored_token: &mut Option<StoredChannelToken>,
+) -> Result<InternalAdminDispatchResult, AdminError> {
     let get_str = |key: &str| {
         params
             .get(key)
@@ -10032,6 +10311,10 @@ async fn handle_externalize(
                 &format!("failed to store channel token in vault (owner {edge_node}): {body}"),
             ));
         }
+        *stored_token = Some(StoredChannelToken {
+            key: secret_ref.clone(),
+            version: vault_put_version(&body),
+        });
         (Some(secret_ref), Some(token))
     } else {
         (None, None)
@@ -18552,9 +18835,9 @@ const NODE_LIFECYCLE_NOTE: &str = "lifecycle_state is RUNNING (its unit runs and
 /// What `remove_hive` says of the removed hive's identity key (FINDINGS A-301, since 0.1.139).
 const REMOVE_HIVE_IDENTITY_KEY_NOTE: &str = "payload.identity_key_cleanup says what became of the hive's identity key on the motherbee. delete_failed leaves it there, while a box the cleanup did not reach (payload.remote_cleanup other than socket_ok) may still run with it. Since 0.1.139 a new add_hive under that name deletes the key before it writes anything, so that box no longer reads or writes the identity store with it (FINDINGS A-301), and is refused 500 IO_ERROR, nothing written, when it cannot delete it: then the operator deletes /var/lib/fluxbee/identity/keys/<hive>.key on the motherbee (the orchestrator also deletes it at its next start) and asks again. Before 0.1.139 the join kept the key it found, and the new join's accept let that box read and write the identity store again (FINDINGS A-277).";
 
-/// What a box `remove_hive` did not reach keeps (FINDINGS A-339, the review of A-301): A-301 closes
+/// What a box `remove_hive` did not reach keeps (FINDINGS A-335, the review of A-301): A-301 closes
 /// the identity store to it, not the mesh.
-const REMOVE_HIVE_BOX_NOT_REACHED_NOTE: &str = "When payload.remote_cleanup is not socket_ok, the box was not reached and keeps its install and its mesh certificate, whatever identity_key_cleanup says: stop that install on the box, or make sure the box is gone, before adding a hive under its name. The router admits that certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48), and a join that finds that box's SY.orchestrator online takes it over the socket, even when the join's address names another box, with no identity key and no new certificate (FINDINGS A-339).";
+const REMOVE_HIVE_BOX_NOT_REACHED_NOTE: &str = "When payload.remote_cleanup is not socket_ok, the box was not reached and keeps its install and its mesh certificate, whatever identity_key_cleanup says: stop that install on the box, or make sure the box is gone, before adding a hive under its name. The router admits that certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48), and a join that finds that box's SY.orchestrator online takes it over the socket, even when the join's address names another box, with no identity key and no new certificate (FINDINGS A-335).";
 
 /// What `remove_runtime_version` refuses, nothing removed.
 const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of any hive pinned to the version may run on it: its unit runs (RUNNING, or STARTING: the router does not see it yet) or its hive's systemd did not answer whether it runs (UNKNOWN: listed until systemd answers that it does not). The detail names each node (the first 20) with its hive and lifecycle, and payload.usage_global_visible.running_nodes lists them all. Stop each node that runs on the version, or move it to another, then ask again. Since 0.1.139 a node pinned to the version whose unit does not run (failed, or between two restarts of a crash loop) and that the orchestrator relaunches on it within a minute (relaunch_on_boot) is listed too, as RELAUNCH_DUE (FINDINGS A-300): stop it (kill_node, which clears relaunch_on_boot) or move it first. The node's own hive lists it, so a hive whose core is older than 0.1.139 (one the installation's update has not reached yet) lists none: until every hive runs 0.1.139, a version a crashed node there is pinned to can still be removed under it. A node stopped through kill_node is not listed, nor one that follows current.";
@@ -18647,7 +18930,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "payload.edge_applied says whether the running IO.cloud took the edge. false comes with payload.warning, which says why and which case it is: the edge is recorded but not applied yet (IO.cloud refused the read or the CONFIG_SET), and IO.cloud reads the record when it starts; SY.admin could not check whether IO.cloud trusts the edge (it did not answer in time, or does not run); or another config reached IO.cloud meanwhile, neither try took the edge, and that config may have replaced the record, so publish again. Until it takes the edge, IO.cloud drops every Cloud request through it; node_control_config_set applies it at once. The answer stays ok: the token is shown only there.",
             "A door moved to another edge (IO.cloud's config named another SY.edge) closes the old one (FINDINGS A-317, since 0.1.139): once the new door is open and the running IO.cloud trusts the new edge (payload.edge_applied true), SY.admin sends the old edge EDGE_CLOSE_URL of IO.cloud's channel, tried once more at once, so the previous token stops at once: a move keeps no 10 minutes. When IO.cloud did not take the new edge, or SY.admin could not tell (edge_applied false), the old door is left open, not asked to close: IO.cloud may still trust the old edge, and that door is then the Cloud's only way in. payload.previous_edge_node names that edge and payload.previous_edge_closed says whether its door closed; false comes with payload.warning, which says why and how to close it (unexternalize, POST /channels/unexternalize): once that edge answers, or, for a door left open, once IO.cloud trusts the new edge and the Cloud has the new URL and token. Give the Cloud the new URL, on the new edge's host, and the new token at once.",
             "A read or a write of the record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. When a try of the write got no answer, it may have been written all the same, and only then does the detail say so: get_node_config of IO.cloud shows what its config names, which IO.cloud reads when it starts. On a move, a config that names the new edge is put back to the old one with set_node_config first: IO.cloud would otherwise trust, from its next start, an edge with no door, and a run again would take that edge for the door's place and close no old door. So fix the cause the detail names first, then run publish_cloud_endpoint again, on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token once and keeps it masked (FINDINGS A-124, since 0.1.139). Up to 0.1.138 the record came after the token, and this answer left the door open with a token no one received.",
-            "A door that does not open (the externalize's error: the vault or the edge refused, or the edge did not answer) puts the record back as it was before the run, tried once more at once, and the error's detail says so, or that IO.cloud's config still names the edge, which IO.cloud reads when it starts (FINDINGS A-317, since 0.1.139). When the edge refused the open or did not answer it, the vault already holds the token this run minted, for that edge, which no one received, and the detail says so: the token the Cloud holds works at most until the edge the door was on restarts, as a deploy does, so run publish_cloud_endpoint again, on an edge that answers, and give the Cloud its token at once. A token goes out once, only in an ok answer, never in an error or a log line.",
+            "A door that does not open (the externalize's error: the vault or the edge refused, or the edge did not answer) puts the record back as it was before the run, tried once more at once, and the error's detail says so, or that IO.cloud's config still names the edge, which IO.cloud reads when it starts (FINDINGS A-317, since 0.1.139). A token goes out once, only in an ok answer, never in an error or a log line.",
+            "When the edge refused the open or did not answer it, the vault had already taken the token this run minted, for that edge, which no one received: SY.admin rolls edge_channel_secret:<ich> back to the token before it (vault_rollback, as soon as the door failed, before the record is put back), so the vault holds the token the door serves, and the detail says it rolled back (FINDINGS A-317, since 0.1.139). On a rotation on the same edge that is all: the edge serves the token the Cloud holds and reads it again when it restarts. On a move the key stays the new edge's, which this run's put made its owner and a rollback does not change, so the old edge reads none once it restarts, as a deploy does: run publish_cloud_endpoint again, on an edge that answers, and give the Cloud its token at once. A rollback SY.vault refused, or that did not reach it, is asked once more at once; one SY.vault did not answer in time is not asked again, since a rollback swaps the token and the one before it and that one may have landed (vault_get_metadata of the key shows its version); with no token before this run there is none to roll back to. When it fails, or there is none, the detail says so, and that the vault then holds (after an ask not answered, may hold) the token no one received, which the edge the door was on reads when it restarts: the token the Cloud holds works at most until then, so run publish_cloud_endpoint again, on an edge that answers. Nothing asks again later.",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
@@ -40333,7 +40617,7 @@ mod tests {
             .contains("packages_left"));
     }
 
-    /// FINDINGS A-339, the review of A-301: remove_hive's help keeps its caution about a box the
+    /// FINDINGS A-335, the review of A-301: remove_hive's help keeps its caution about a box the
     /// removal did not reach. A-301 closes the identity store to that box, not the mesh: its
     /// certificate is admitted again once a hive of its name is listed (A-48: leaf pinning not
     /// built), and a join that finds its orchestrator online takes it over the socket, whatever
@@ -40348,7 +40632,7 @@ mod tests {
              install on the box, or make sure the box is gone, before adding a hive under its name.",
             "(leaf pinning is not built, FINDINGS A-48)",
             "takes it over the socket, even when the join's address names another box",
-            "(FINDINGS A-339)",
+            "(FINDINGS A-335)",
             "deletes the key before it writes anything, so that box no longer reads or writes the \
              identity store with it (FINDINGS A-301)",
         ] {
@@ -45919,7 +46203,12 @@ mod tests {
             .as_str()
             .expect("the minted token")
             .to_string();
-        let stored = json!({ "status": "ok", "key": format!("edge_channel_secret:{CLOUD_ICH}") });
+        let stored = json!({
+            "status": "ok",
+            "key": format!("edge_channel_secret:{CLOUD_ICH}"),
+            "version": CLOUD_TOKEN_VERSION,
+            "changed": true,
+        });
         let refused = json!({
             "status": "error",
             "error_code": "VAULT_UNAVAILABLE",
@@ -45960,14 +46249,88 @@ mod tests {
         token
     }
 
+    /// The version of the token a failed door's run stored, as the vault's put answers it in
+    /// `fail_cloud_door`.
+    const CLOUD_TOKEN_VERSION: i64 = 8;
+
+    /// SY.vault's ok to the rollback of the token a failed door's run stored: back to the version
+    /// before it.
+    fn cloud_token_rolled_back() -> Value {
+        json!({
+            "status": "ok",
+            "key": format!("edge_channel_secret:{CLOUD_ICH}"),
+            "current_version": CLOUD_TOKEN_VERSION - 1,
+            "previous_version": CLOUD_TOKEN_VERSION,
+        })
+    }
+
+    /// SY.vault's refusal of a rollback, `code` with `message`, as its `error_payload` gives it.
+    fn cloud_token_rollback_refused(code: &str, message: &str) -> Value {
+        json!({ "status": "error", "error_code": code, "message": message })
+    }
+
+    /// The next message SY.admin sends, which must be the rollback of IO.cloud's channel token
+    /// (FINDINGS A-317): `VAULT_ROLLBACK` of `edge_channel_secret:<ich>` in the root tenant, to
+    /// SY.vault on the motherbee. `answer` is SY.vault's (`MSG_VAULT_ROLLBACK_RESPONSE`), the
+    /// router's (`MSG_UNREACHABLE`), or none.
+    async fn answer_cloud_token_rollback(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        answer: Option<(&str, Value)>,
+    ) {
+        let ask = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the token's rollback");
+        assert_eq!(ask.meta.msg.as_deref(), Some(MSG_VAULT_ROLLBACK));
+        assert_eq!(dst_of(&ask), json!(format!("SY.vault@{PRIMARY_HIVE_ID}")));
+        assert_eq!(
+            ask.payload,
+            json!({
+                "key": format!("edge_channel_secret:{CLOUD_ICH}"),
+                "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            })
+        );
+        if let Some((msg, answer)) = answer {
+            harness.inject(reply_to(&ask, msg, answer)).await.unwrap();
+        }
+    }
+
+    /// What the answer of a run whose door did not open says once the vault's key was rolled back
+    /// (FINDINGS A-317, the operator's call of 2026-11-12), the door having been on `door` before
+    /// the run.
+    fn cloud_token_rolled_back_said(door: Option<&str>) -> String {
+        let serves = match door {
+            Some(door) if door == CLOUD_EDGE => format!(
+                ": the one {door} serves, which the Cloud holds, and which {door} reads again when \
+                 it restarts."
+            ),
+            Some(door) => format!(
+                ": the one {door} serves, which the Cloud holds. The key stays {CLOUD_EDGE}'s: \
+                 this run's put made that edge its owner, and a rollback does not change it, so \
+                 {door} reads none once it restarts, as a deploy does. Run publish_cloud_endpoint \
+                 again, on an edge that answers, and give the Cloud the token it answers at once."
+            ),
+            None => ".".to_string(),
+        };
+        format!(
+            "The vault took the token this run minted, for {CLOUD_EDGE}, before the door failed, \
+             and SY.admin rolled edge_channel_secret:{CLOUD_ICH} back to the token it held before \
+             this run (vault_rollback, FINDINGS A-317){serves}"
+        )
+    }
+
     /// A door that does not open puts the record back (FINDINGS A-317): the record came first and
     /// named the new edge, so SY.admin writes back the `io` IO.cloud's config had before the run,
     /// and the externalize's error says so; IO.cloud is not asked and no door is closed. On a
     /// rotation on the same edge nothing is written back; one that cannot be written back is named.
-    /// When the edge refused the open or was not reached, the vault took this run's token first,
-    /// and the error says so too (A-317's review): no one received it, and the token the Cloud
-    /// holds works at most until the edge the door was on restarts. Before, it said nothing of the
-    /// vault, and read as a full undo. A vault that refused the token holds none of it.
+    /// When the edge refused the open or was not reached, the vault took this run's token first:
+    /// SY.admin rolls the vault's key back to the token before it (the operator's call of
+    /// 2026-11-12), before the record, and the error says so: on a rotation the edge serves that
+    /// token and reads it again when it restarts; on a move the key stays the new edge's, so the
+    /// old edge reads none once it restarts; with no door before, the vault holds what it held.
+    /// A-317's review said only that the vault held this run's token, which no one received, and
+    /// left it there; before, it said nothing of the vault, and read as a full undo. A vault that
+    /// refused the token holds none of it, and nothing is rolled back.
     #[tokio::test]
     async fn a_door_that_does_not_open_puts_the_record_back() {
         let (mut ctx, mut harness) = opa_test_admin("cloud-endpoint-not-opened");
@@ -45978,39 +46341,27 @@ mod tests {
             "{CLOUD_NODE} config names {OLD_CLOUD_EDGE} again: this run recorded {CLOUD_EDGE} in \
              it before the door, and put it back (FINDINGS A-317)."
         );
-        let unreceived = |held: &str| {
-            format!(
-                "The vault already holds the token this run minted, for {CLOUD_EDGE}, and no one \
-                 received it (FINDINGS A-317){held}. Run publish_cloud_endpoint again, on an edge \
-                 that answers, and give the Cloud the token it answers at once."
-            )
-        };
-        let until = |door: &str| {
-            format!(
-                ": the token the Cloud holds works at most until {door} restarts, as a deploy does"
-            )
-        };
         for (was, how, put_back, says, vault) in [
             (
                 old.clone(),
                 DoorFails::EdgeRefuses,
                 Some((old.clone(), cloud_edge_recorded())),
                 put_back_old.clone(),
-                Some(unreceived(&until(OLD_CLOUD_EDGE))),
+                Some(cloud_token_rolled_back_said(Some(OLD_CLOUD_EDGE))),
             ),
             (
                 Value::Null,
                 DoorFails::EdgeRefuses,
                 Some((json!({}), cloud_edge_recorded())),
                 format!("{CLOUD_NODE} config names no edge again"),
-                Some(unreceived("")),
+                Some(cloud_token_rolled_back_said(None)),
             ),
             (
                 same.clone(),
                 DoorFails::EdgeRefuses,
                 None,
                 String::new(),
-                Some(unreceived(&until(CLOUD_EDGE))),
+                Some(cloud_token_rolled_back_said(Some(CLOUD_EDGE))),
             ),
             (
                 old.clone(),
@@ -46021,14 +46372,14 @@ mod tests {
                      before the door (FINDINGS A-317): putting back {OLD_CLOUD_EDGE} failed twice, \
                      the last time (HTTP "
                 ),
-                Some(unreceived(&until(OLD_CLOUD_EDGE))),
+                Some(cloud_token_rolled_back_said(Some(OLD_CLOUD_EDGE))),
             ),
             (
                 old.clone(),
                 DoorFails::EdgeUnreachable,
                 Some((old.clone(), cloud_edge_recorded())),
                 put_back_old.clone(),
-                Some(unreceived(&until(OLD_CLOUD_EDGE))),
+                Some(cloud_token_rolled_back_said(Some(OLD_CLOUD_EDGE))),
             ),
             (
                 old.clone(),
@@ -46044,6 +46395,13 @@ mod tests {
                 answer_cloud_edge_read(&mut harness, was.clone()).await;
                 answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
                 let token = fail_cloud_door(&mut harness, how).await;
+                if how != DoorFails::VaultRefuses {
+                    answer_cloud_token_rollback(
+                        &mut harness,
+                        Some((MSG_VAULT_ROLLBACK_RESPONSE, cloud_token_rolled_back())),
+                    )
+                    .await;
+                }
                 if let Some((io, answer)) = &put_back {
                     answer_cloud_edge_write(&mut harness, io.clone(), answer.clone()).await;
                     if answer["status"] == json!("error") {
@@ -46085,9 +46443,176 @@ mod tests {
                     .next_outgoing_within(Duration::from_millis(200))
                     .await
                     .is_none(),
-                "{was} {how:?}: IO.cloud not asked, no door closed"
+                "{was} {how:?}: IO.cloud not asked, no door closed, nothing more rolled back"
             );
         }
+    }
+
+    /// The rollback of a door that did not open (FINDINGS A-317, the operator's call of
+    /// 2026-11-12), each way it can go: SY.vault's ok is rolled back; `NO_PREVIOUS_VERSION` is no
+    /// token before this run, not asked again; a refusal, or an ask the router did not deliver,
+    /// changed nothing and is asked once more at once, and a second refusal fails; an ask SY.vault
+    /// did not answer in time is not asked again, since a rollback swaps the token and the one
+    /// before it. Each failure is in the log, which says nothing asks again, and the answer's
+    /// detail says what the vault then holds, without the token.
+    #[tokio::test(start_paused = true)]
+    async fn a_token_rollback_is_asked_again_only_when_it_changed_nothing() {
+        let captured = LogCapture::start();
+        let (ctx, mut harness) = opa_test_admin("cloud-token-rollback");
+        let stored = StoredChannelToken {
+            key: format!("edge_channel_secret:{CLOUD_ICH}"),
+            version: Some(CLOUD_TOKEN_VERSION),
+        };
+        let refused = || {
+            (
+                MSG_VAULT_ROLLBACK_RESPONSE,
+                cloud_token_rollback_refused("STORAGE_ERROR", "database is locked"),
+            )
+        };
+        let unreachable = || {
+            (
+                MSG_UNREACHABLE,
+                json!({ "reason": "NODE_NOT_FOUND", "original_dst": "SY.vault@motherbee" }),
+            )
+        };
+        let rolled = || (MSG_VAULT_ROLLBACK_RESPONSE, cloud_token_rolled_back());
+        for (asks, outcome) in [
+            (
+                vec![Some(rolled())],
+                CloudTokenRollback::RolledBack(Some(CLOUD_TOKEN_VERSION - 1)),
+            ),
+            (
+                vec![Some((
+                    MSG_VAULT_ROLLBACK_RESPONSE,
+                    cloud_token_rollback_refused(
+                        "NO_PREVIOUS_VERSION",
+                        "no previous version available",
+                    ),
+                ))],
+                CloudTokenRollback::NoneBefore,
+            ),
+            (
+                vec![Some(refused()), Some(rolled())],
+                CloudTokenRollback::RolledBack(Some(CLOUD_TOKEN_VERSION - 1)),
+            ),
+            (
+                vec![Some(unreachable()), Some(rolled())],
+                CloudTokenRollback::RolledBack(Some(CLOUD_TOKEN_VERSION - 1)),
+            ),
+            (
+                vec![Some(refused()), Some(refused())],
+                CloudTokenRollback::Failed {
+                    why: ": SY.vault refused it, STORAGE_ERROR: database is locked".to_string(),
+                    unanswered: false,
+                },
+            ),
+            (
+                vec![None],
+                CloudTokenRollback::Failed {
+                    why: String::new(),
+                    unanswered: true,
+                },
+            ),
+        ] {
+            let rollback = roll_back_cloud_token(&ctx, &ctx.rpc, CLOUD_EDGE, &stored);
+            let drive = async {
+                for answer in &asks {
+                    answer_cloud_token_rollback(&mut harness, answer.clone()).await;
+                }
+            };
+            let (rollback, ()) = tokio::join!(rollback, drive);
+            match (&rollback, &outcome) {
+                (
+                    CloudTokenRollback::Failed {
+                        why,
+                        unanswered: true,
+                    },
+                    CloudTokenRollback::Failed {
+                        unanswered: true, ..
+                    },
+                ) => assert_eq!(why, ": SY.vault did not answer it: no answer in 5s"),
+                _ => assert_eq!(rollback, outcome, "{asks:?}"),
+            }
+            assert!(
+                harness
+                    .next_outgoing_within(Duration::from_millis(200))
+                    .await
+                    .is_none(),
+                "{asks:?}: asked {} times, no more",
+                asks.len()
+            );
+        }
+        let logs = captured.text();
+        for line in [
+            "rolling its token back in the vault failed: asked once more",
+            "its token in the vault is rolled back to the one before this run",
+            "the vault held no token for its channel before this run: none to roll back to",
+            "rolling its token back in the vault failed: the answer says so, and nothing asks again",
+        ] {
+            assert!(logs.contains(line), "{line}: {logs}");
+        }
+
+        // What the answer's detail says of each, a door on another edge before the run: the
+        // vault then holds the token this run minted, which no one received.
+        let record = CloudEdgeRecord {
+            previous_io: json!({ "edge_node": OLD_CLOUD_EDGE }).as_object().cloned(),
+        };
+        let left = format!(
+            ", which no one received: the token the Cloud holds works at most until \
+             {OLD_CLOUD_EDGE} restarts, as a deploy does. Run publish_cloud_endpoint again, on an \
+             edge that answers, and give the Cloud the token it answers at once."
+        );
+        let none_before = cloud_token_said(
+            &stored,
+            &CloudTokenRollback::NoneBefore,
+            CLOUD_EDGE,
+            &record,
+        );
+        assert!(
+            none_before.contains(
+                "held none for the channel before it, so there was none to roll it back to"
+            ) && none_before.ends_with(&left),
+            "{none_before}"
+        );
+        let refused_twice = cloud_token_said(
+            &stored,
+            &CloudTokenRollback::Failed {
+                why: ": SY.vault refused it, STORAGE_ERROR: database is locked".to_string(),
+                unanswered: false,
+            },
+            CLOUD_EDGE,
+            &record,
+        );
+        assert!(
+            refused_twice.contains(&format!(
+                "rolling edge_channel_secret:{CLOUD_ICH} back to the token before it failed, the \
+                 last time: SY.vault refused it, STORAGE_ERROR: database is locked"
+            )) && refused_twice.contains("the vault holds the token this run minted")
+                && refused_twice.ends_with(&left),
+            "{refused_twice}"
+        );
+        let unanswered = cloud_token_said(
+            &stored,
+            &CloudTokenRollback::Failed {
+                why: ": SY.vault did not answer it: no answer in 5s".to_string(),
+                unanswered: true,
+            },
+            CLOUD_EDGE,
+            &record,
+        );
+        assert!(
+            unanswered.contains(&format!(
+                "rolling edge_channel_secret:{CLOUD_ICH} back to the token before it failed, the \
+                 last time: SY.vault did not answer it: no answer in 5s (vault_rollback, FINDINGS \
+                 A-317). SY.vault may have rolled it back all the same, so it was not asked again, \
+                 since a rollback swaps the token and the one before it"
+            )) && unanswered.contains(&format!(
+                "vault_get_metadata of edge_channel_secret:{CLOUD_ICH} says whether the vault \
+                     still holds the token this run minted, version {CLOUD_TOKEN_VERSION} while it \
+                     does"
+            )) && unanswered.ends_with(&left),
+            "{unanswered}"
+        );
     }
 
     /// One publish at a time (FINDINGS A-317): a run reads the edge the record names before it
@@ -46153,7 +46678,9 @@ mod tests {
     /// edge, and is left open otherwise; a write may have landed only when a try got no answer, and
     /// on a move the old edge goes back first; a door that does not open after the vault took the
     /// token says so. Since 0.1.139's integration review: a run asked while another runs is
-    /// refused at once, BUSY, where it waited for it.
+    /// refused at once, BUSY, where it waited for it. Since the operator's call of 2026-11-12: such
+    /// a door rolls the vault's key back to the token before it, which the help says, and what a
+    /// move and a rollback that fails leave; it said the vault held the token no one received.
     #[test]
     fn the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it() {
         let notes = admin_action_request_notes("publish_cloud_endpoint");
@@ -46170,7 +46697,10 @@ mod tests {
             "On a move, a config that names the new edge is put back to the old one with set_node_config first",
             "So fix the cause the detail names first, then run publish_cloud_endpoint again, on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token once and keeps it masked (FINDINGS A-124, since 0.1.139).",
             "puts the record back as it was before the run, tried once more at once",
-            "When the edge refused the open or did not answer it, the vault already holds the token this run minted, for that edge, which no one received, and the detail says so: the token the Cloud holds works at most until the edge the door was on restarts, as a deploy does",
+            "When the edge refused the open or did not answer it, the vault had already taken the token this run minted, for that edge, which no one received: SY.admin rolls edge_channel_secret:<ich> back to the token before it (vault_rollback, as soon as the door failed, before the record is put back), so the vault holds the token the door serves, and the detail says it rolled back (FINDINGS A-317, since 0.1.139).",
+            "On a rotation on the same edge that is all: the edge serves the token the Cloud holds and reads it again when it restarts. On a move the key stays the new edge's, which this run's put made its owner and a rollback does not change, so the old edge reads none once it restarts",
+            "A rollback SY.vault refused, or that did not reach it, is asked once more at once; one SY.vault did not answer in time is not asked again, since a rollback swaps the token and the one before it",
+            "with no token before this run there is none to roll back to",
             "A token goes out once, only in an ok answer, never in an error or a log line.",
         ] {
             assert!(says(words), "{words}: {notes:#?}");
@@ -46184,6 +46714,7 @@ mod tests {
             "A write that got no answer may have been written all the same",
             "never through Archi",
             "another waits for it",
+            "the vault already holds the token this run minted",
         ] {
             assert!(!says(promise), "{promise}: {notes:#?}");
         }

@@ -7,7 +7,9 @@ import (
 )
 
 // The scheduler writes while requests are served, so the pool holds several connections: every one
-// of them must wait for the lock (busy_timeout) and run in WAL, not just the first.
+// of them must wait for the lock (busy_timeout), run in WAL and have the 16 MiB page cache
+// (cache_size, since 1.7, FINDINGS A-326: SQLite's default is 2,000 KiB, which a large
+// TIMER_PURGE_OWNER outgrows), not just the first.
 func TestEveryConnectionGetsThePragmas(t *testing.T) {
 	db, _, err := openTimerDB(filepath.Join(t.TempDir(), "timers.db"))
 	if err != nil {
@@ -32,6 +34,14 @@ func TestEveryConnectionGetsThePragmas(t *testing.T) {
 		}
 		if timeout != 5000 || mode != "wal" {
 			t.Fatalf("conn %d: busy_timeout=%d journal_mode=%s, want 5000 and wal", i, timeout, mode)
+		}
+		// A negative cache_size is the cache in KiB, whatever the page size.
+		var cache int
+		if err := conn.QueryRowContext(ctx, "PRAGMA cache_size;").Scan(&cache); err != nil {
+			t.Fatalf("conn %d cache_size: %v", i, err)
+		}
+		if cache != -16384 {
+			t.Fatalf("conn %d: cache_size=%d, want -16384 (16 MiB)", i, cache)
 		}
 	}
 }

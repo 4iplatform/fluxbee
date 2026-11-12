@@ -248,9 +248,10 @@ if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
 - **Usage.** `usage_account` charges the case tenant with source `case`, from one read; when
   `case_tenant_of` fails (an unreadable read included), `AiAccount::charge` charges the root tenant
   as `fallback_root` (`crates/fluxbee_ai_sdk/src/usage.rs`).
-- **Not told apart** (FINDINGS A-303, left to the operator's call): two paths read as not held, a
-  final `TENANT_UNRESOLVED`, although SY.identity holds the ILK. The region looks the same as for an
-  ILK SY.identity does not hold, and the frontdesk asks SY.identity nothing in its place:
+- **Not told apart** (FINDINGS A-303; left as they are and recorded, the operator's call of
+  2026-11-12): two paths read as not held, a final `TENANT_UNRESOLVED`, although SY.identity holds
+  the ILK. The region looks the same as for an ILK SY.identity does not hold, and the frontdesk
+  asks SY.identity nothing in its place:
   - an ILK whose provision SY.identity answered although its write to the region failed
     (`identity shm delta apply FAILED` in SY.identity's journal; a full region does it), until
     SY.identity writes the whole region again with it (a full region needs higher limits first);

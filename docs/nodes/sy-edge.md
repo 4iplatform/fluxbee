@@ -226,7 +226,11 @@ framed. A response the edge cannot build (an invalid header value, say) is a
   IO.cloud trusts the new edge (A-317), so the previous token stops at once. Until IO.cloud trusts
   it, the old door is left open, since it may be the Cloud's only way in. The vault keeps the
   channel's new token for the new edge, and an old door left open refuses every token once its
-  edge restarts.
+  edge restarts. A door that does not open after the vault took the new token (the edge refused
+  `EDGE_OPEN_URL` or did not answer it) has SY.admin roll the vault's key back to the token before
+  it (since 0.1.139, the operator's call of 2026-11-12), so the edge that serves the Cloud's token
+  reads it again when it restarts; on a move the key's owner stays the new edge, and the old
+  edge reads none (FINDINGS A-317).
 
 Where the token comes from (`handle_externalize` in `src/bin/sy_admin.rs`): SY.admin mints one
 (`mint_entry_token`, two UUIDv4 in hex) unless the caller sent `secret`, stores it in SY.vault as

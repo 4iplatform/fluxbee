@@ -300,7 +300,10 @@ no change required
     tiene que ver con nodos SY. RT. WF. AI ... y al menos resolver los más graves"*; IO only where a
     test needs it; then the IO family, applied to io.slack to close it).** From the state review of
     2026-11-12 (66 open items, a top 10 verified in the code). The operator's calls of the day:
-    A-329, A-304, A-307, A-124, A-313 (left as it is) and A-317 (recorded in each entry). Releases,
+    A-329, A-304, A-307, A-124, A-313 (left as it is) and A-317 (recorded in each entry); and, on
+    0.1.139's open points, A-317's two (the old door, as built; the vault's rollback, built at the
+    integration), A-332 (the grace 5 s), A-326 (a 16 MiB page cache), A-304, A-335 and A-303 (each
+    as built), recorded in each entry as *"The operator's call (2026-11-12)"*. Releases,
     one per binary group, the SDKs each alone: 0.1.139 the binaries (SY.admin: A-312, A-297, A-304,
     A-305, A-306, A-316, A-317 (built in SY.admin alone: SY.edge is unchanged), A-318, A-319, A-324,
     A-328; the orchestrator: A-296, A-299, A-300, A-301, A-308, A-310, A-330, A-331; Archi: A-124,
@@ -311,11 +314,14 @@ no change required
     rebuilt (✅). Out of it, by decision or as large topics: A-159/A-275/A-276 (deletion),
     A-137/A-227 (cognition), A-142 (with io.web), A-168, the parked security items, A-289, A-199
     step 2, A-250 (b), A-210 (after 2026-11-22).
-    **Numbers given on the push's branches** (0.1.139's integration review): A-335 and A-336 are
-    `coa/rustsdk-143`'s, A-335 built on `coa/aisdk-142`; A-337 is the architect review's (SY.admin's
-    plan review model), renumbered at the integration; A-338 is `coa/gosdk-141`'s; A-339 is the
-    orchestrator's (a box `remove_hive` did not reach), numbered A-335 on `coa/orch-139` after
-    `coa/rustsdk-143` had taken it. A branch's next new item takes A-340 or above.
+    **Numbers given on the push's branches** (the operator's call of 2026-11-12, where 0.1.139's
+    integration review had given the orchestrator's item A-339): A-335 is the orchestrator's (a box
+    `remove_hive` did not reach, 0.1.139); A-336 is the Rust SDK branch's (`coa/rustsdk-143`: the
+    orchestrator reads `NOT_TAKEN` as unknown); A-337 is Archi's plan-review item (SY.admin's plan
+    review model, found by A-124's review, 0.1.139); A-338 is the Go SDK branch's [General/blob]
+    item (`coa/gosdk-141`); A-339 is the AI SDK's item (*an AI node answers a `NOT_TAKEN` with
+    `unknown_system_msg`*), written A-335 on `coa/aisdk-142` and `coa/rustsdk-143`, to rename at
+    their integration. The next new number is A-340.
     **0.1.139's deploy:** the motherbee runs it before the workers do, and until every hive's core
     runs 0.1.139 no runtime version is removed and no workflow is deployed or deleted (their purges
     remove versions): a worker on 0.1.138 lists no `RELAUNCH_DUE` node (A-300), so a version a
@@ -443,10 +449,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-297 🔵 SY.admin's global deployments and drift-alerts routes read an empty `?hive=` as the motherbee (low; SY.admin; built on `coa/admin-139` for 0.1.139).
 - A-299 🔵 A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it (low; the orchestrator; built on `coa/orch-139` for 0.1.139).
 - A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator; built on `coa/orch-139` for 0.1.139; a worker lists `RELAUNCH_DUE` only once it runs 0.1.139, see item 30).
-- A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator; built on `coa/orch-139` for 0.1.139; what it leaves open is A-339).
+- A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator; built on `coa/orch-139` for 0.1.139; what it leaves open is A-335).
 - A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic; seen live by 0.1.138's gate; built on `coa/wf-139` for 0.1.139).
-- A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk; built on `coa/frontdesk-139` for 0.1.139; two rarer paths not told apart, to decide).
-- A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives; the operator's call (a), 2026-11-12; built on `coa/admin-139` for 0.1.139).
+- A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk; built on `coa/frontdesk-139` for 0.1.139; two rarer paths not told apart, left recorded by the operator's call of 2026-11-12).
+- A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives; the operator's call (a), 2026-11-12; built on `coa/admin-139` for 0.1.139; a hive that does not answer in 3 s judged by the LSA's last view and named in a warning, never refused for it, the operator's call of the same day).
 - A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin; built on `coa/admin-139` for 0.1.139).
 - A-306 🔵 A version's removal holds the manifest lock through its read of every hive's use; a publish waits with no bound (low; SY.admin; built on `coa/admin-139` for 0.1.139).
 - A-307 🔵 SY.wf-rules handles one request at a time; a queued request starts its 60 s late (low; SY.wf-rules; the operator's call (a), 2026-11-12; built on `coa/wf-139` for 0.1.139).
@@ -457,23 +463,23 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide).
 - A-315 🔵 SY.admin's help (`get_runtime`, `remove_runtime_version`) and Archi's handbook do not name `hives_without_runtimes` (low; SY.admin and SY.architect; found by 0.1.133's gate; both parts built for 0.1.139, SY.admin's on `coa/admin-139`, Archi's on `coa/architect-139`).
 - A-316 🔵 An edge channel's bearer can be read back through `vault_assign` then `vault_get` (low; SY.admin or SY.vault; built on `coa/admin-139` for 0.1.139, in SY.admin).
-- A-317 🔵 SY.edge keeps one previous channel secret, in memory only (low; decided 2026-11-12: the rotation complete and in order, no grace extension; built on `coa/edge-139` for 0.1.139, in SY.admin alone; for the operator: the old door left open while IO.cloud has not taken the new edge, the branch's reading, to confirm; and whether a door that did not open after the vault took the new token rolls the vault back, `vault_rollback`, to decide).
+- A-317 🔵 SY.edge keeps one previous channel secret, in memory only (low; decided 2026-11-12: the rotation complete and in order, no grace extension; built on `coa/edge-139` for 0.1.139, in SY.admin alone; the operator's calls of 2026-11-12 on its two points: the old door closes only once IO.cloud trusts the new edge, left open with a warning otherwise, as built; and a door that did not open after the vault took the new token rolls the vault's key back, `vault_rollback`, built at 0.1.139's integration).
 - A-318 🔵 A failed publish's clean-up after the answer can orphan IO.blob's copy if SY.admin stops (low; SY.admin; 0.1.137; built on `coa/admin-139` for 0.1.139).
 - A-319 🔵 The installation update's background reads are bounded in time, not in number (low; SY.admin; 0.1.137; built on `coa/admin-139` for 0.1.139).
 - A-320 🔵 Only `add_hive`'s timed-out records ever close in Archi (low; SY.architect; built on `coa/architect-139` for 0.1.139).
 - A-321 🔵 Archi's plans and texts around `add_hive` (manifests' hive ids, the SCMD example, a closed record's words) (low; SY.architect; built on `coa/architect-139` for 0.1.139).
 - A-324 🔵 SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline, which since 0.1.136 holds only for an older ai.generic (low; SY.admin's and the orchestrator's next text changes; built for 0.1.139, SY.admin's note on `coa/admin-139`, the comments on `coa/orch-139`).
 - A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change).
-- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate; built on `coa/timer-139` for 0.1.139, SY.timer 1.7: an index for each filter, `all` included, and a page that reads no further than its frame; its review: the two old indexes no statement reads dropped, as each index lengthens the purge, the builds best-effort and reported in the ready line, the purge's time in its line).
+- A-326 🔵 Each `TIMER_LIST` page reads every pending timer of the hive; a WF's reconcile asks one per frame since A-278 (low; SY.timer's own release: an index on the owner, status and order; seen live by 0.1.138's gate; built on `coa/timer-139` for 0.1.139, SY.timer 1.7: an index for each filter, `all` included, and a page that reads no further than its frame; its review: the two old indexes no statement reads dropped, as each index lengthens the purge, the builds best-effort and reported in the ready line, the purge's time in its line; the operator's call of 2026-11-12: a 16 MiB page cache per connection, built at 0.1.139's integration).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-328 🔵 SY.admin's cut of an executor answer drops a refused step's `retryable`, `unanswered_hives` and `next` (low; SY.admin's next change; built on `coa/admin-139` for 0.1.139).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the fix to decide).
 - A-330 🔵 `list_hives` lists a registry directory whose name is not a hive id (low; the orchestrator; built on `coa/orch-139` for 0.1.139).
 - A-331 🔵 `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT` (low; the orchestrator; built on `coa/orch-139` for 0.1.139).
-- A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition; built on `coa/cognition-139` for 0.1.139: a 2 s grace the agent's answer ends, the first of the entry's two fixes, the branch's choice for the operator to confirm).
+- A-332 🔵 Cognition's model call on a person's turn that the agent then refuses completes: a wasted call per refused first turn (low; cognition; built on `coa/cognition-139` for 0.1.139: a grace the agent's answer ends, the first of the entry's two fixes; 5 s by the operator's call of 2026-11-12, where the branch built 2 s, a timeout to review in a later improvement).
 - A-333 🔵 A WF's reconcile of 3,000 pending timers takes 3.6 s on worker1, and its receive loop starts after it (low; the WF engine; found by 0.1.138's gate; built on `coa/wf-139` for 0.1.139).
-- A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review).
-- A-339 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review, numbered A-335 on `coa/orch-139`; the texts built there for 0.1.139, the fix to decide).
+- A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
+- A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1551,40 +1557,6 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-339 [General/orchestrator] 🔵 low (found 2026-11-12 by A-301's builder on `coa/orch-139`, numbered A-335 by its review, A-339 since 0.1.139's integration review; read in the code; there before it) — A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names
-
-- **Why:** a box the removal's cleanup did not reach (`remote_cleanup` other than `socket_ok`)
-  keeps its install and its mesh certificate. The router admits that certificate again once the
-  registry lists a hive of that id (A-48: leaf pinning parked). `add_hive_flow`'s socket-first
-  path (`src/bin/sy_orchestrator.rs` ~35350 on `coa/orch-139`) takes any `SY.orchestrator@<hive>`
-  it sees online within 3 s (`wait_for_remote_orchestrator_node`), and
-  `probe_remote_orchestrator_socket_ready` forwards `GET_VERSIONS` by the hive's name, so
-  `address` is never checked. The socket-only finalize provisions no identity key and no TLS leaf
-  (`distribute_hive_identity_key_inner` is the SSH bootstrap's), and no join restarts a running
-  sy-identity, which loads its HMAC key only at its start (`src/bin/sy_identity.rs` ~4570).
-- **Effect:** a fresh `add_hive` under that name, even one whose `address` names a new box, can
-  adopt the old box: connected, with its old certificate, and its identity replica refused at
-  :9100 for good: the motherbee has no key for it, or a new one the box never got, and a restart
-  of its sy-identity loads only the old key the box kept. Before 0.1.139 a removal whose key deletion failed (`delete_failed`) let
-  that box back with its old key (A-277's case, A-301); since A-301 every such removal behaves as
-  one that deleted the key.
-- **Today:** the texts say it. SY.admin's `remove_hive` help (`REMOVE_HIVE_BOX_NOT_REACHED_NOTE`),
-  Archi's handbook, sy-orchestrator.md and operations.md: when `remote_cleanup` is not
-  `socket_ok`, stop that box's install, or make sure the box is gone, before adding a hive under
-  its name (built on `coa/orch-139` with A-301's review, for 0.1.139).
-- **Fix, to decide (the orchestrator):** a fresh join (`resumed == false`) never takes the
-  socket-only path; and A-331's probe refuses a fresh join onto a box that still runs that same
-  hive id, as it refuses another hive's install. Neither stops an old box from dialing in with its
-  certificate: that is A-48's leaf pinning, parked.
-- **Its number (0.1.139's integration review):** `coa/orch-139`'s review numbered it A-335 at
-  17:14, after `coa/rustsdk-143` had given A-335 at 16:56 to the AI SDK's item that `coa/aisdk-142`
-  builds (*an AI node answers a `NOT_TAKEN` with an `unknown_system_msg` error*), its code comments
-  included. So this one is A-339, the first number no branch had used (A-336 is `coa/rustsdk-143`'s,
-  A-337 the architect review's, renumbered at this integration, A-338 `coa/gosdk-141`'s), in its
-  places: this entry, its open line and A-301's entry, SY.admin's
-  `REMOVE_HIVE_BOX_NOT_REACHED_NOTE` and its test, Archi's handbook, sy-orchestrator.md and
-  operations.md.
-
 ### A-337 [General/admin] 🔵 low (found 2026-11-12 by A-124's review; read in the code, not run; there before it) — SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included
 
 - **Why:** `executor_validate_plan` (`src/bin/sy_admin.rs` ~10460) runs
@@ -1605,6 +1577,42 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   not given to the model.
 - **Today:** a secret is stored over SY.admin's HTTP API (`POST /hives/<hive>/vault/secrets`), not
   in a plan. Archi's handbook (§4.5.1) tells Archi to say so before it stages one.
+
+### A-335 [General/orchestrator] 🔵 low (found 2026-11-12 by A-301's builder on `coa/orch-139`, numbered by its review; read in the code; there before it) — A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names
+
+- **Why:** a box the removal's cleanup did not reach (`remote_cleanup` other than `socket_ok`)
+  keeps its install and its mesh certificate. The router admits that certificate again once the
+  registry lists a hive of that id (A-48: leaf pinning parked). `add_hive_flow`'s socket-first
+  path (`src/bin/sy_orchestrator.rs` ~35350 on `coa/orch-139`) takes any `SY.orchestrator@<hive>`
+  it sees online within 3 s (`wait_for_remote_orchestrator_node`), and
+  `probe_remote_orchestrator_socket_ready` forwards `GET_VERSIONS` by the hive's name, so
+  `address` is never checked. The socket-only finalize provisions no identity key and no TLS leaf
+  (`distribute_hive_identity_key_inner` is the SSH bootstrap's), and no join restarts a running
+  sy-identity, which loads its HMAC key only at its start (`src/bin/sy_identity.rs` ~4570).
+- **Effect:** a fresh `add_hive` under that name, even one whose `address` names a new box, can
+  adopt the old box: connected, with its old certificate, and its identity replica refused at
+  :9100 for good: the motherbee has no key for it, or a new one the box never got, and a restart
+  of its sy-identity loads only the old key the box kept. Before 0.1.139 a removal whose key deletion failed (`delete_failed`) let
+  that box back with its old key (A-277's case, A-301); since A-301 every such removal behaves as
+  one that deleted the key.
+- **Today:** the texts say it. SY.admin's `remove_hive` help (`REMOVE_HIVE_BOX_NOT_REACHED_NOTE`),
+  Archi's handbook, sy-orchestrator.md and operations.md: when `remote_cleanup` is not
+  `socket_ok`, stop that box's install, or make sure the box is gone, before adding a hive under
+  its name (built on `coa/orch-139` with A-301's review, for 0.1.139).
+- **Fixes considered (the orchestrator), not built:** a fresh join (`resumed == false`) never takes
+  the socket-only path; and A-331's probe refuses a fresh join onto a box that still runs that same
+  hive id, as it refuses another hive's install. Neither stops an old box from dialing in with its
+  certificate: that is A-48's leaf pinning, parked.
+- **The operator's call (2026-11-12):** left as documented, the texts warning of it (above); the
+  real guard comes with A-48's leaf pinning, which is parked security.
+- **Its number:** `coa/orch-139`'s review numbered it A-335 at 17:14, after `coa/rustsdk-143` had
+  given A-335 at 16:56 to the AI SDK's item that `coa/aisdk-142` builds (*an AI node answers a
+  `NOT_TAKEN` with an `unknown_system_msg` error*), its code comments included. 0.1.139's
+  integration review renumbered this one A-339; the operator's call of 2026-11-12 gave it A-335
+  back, in its places (this entry, its open line and A-301's entry, SY.admin's
+  `REMOVE_HIVE_BOX_NOT_REACHED_NOTE` and its test, Archi's handbook, sy-orchestrator.md and
+  operations.md), and the AI SDK's item A-339, renamed at the integration of `coa/aisdk-142` and
+  `coa/rustsdk-143` (board item 30).
 
 ### A-334 [General/orchestrator] ✅ CLOSED (2026-11-12, read on 8.x: transient, nothing left; no fault) (found 2026-11-12 in 0.1.138's deploy timeline; seen on 8.x) — worker1's Syncthing fails to delete some runtime directories of its receive-only dist mirror
 
@@ -1738,7 +1746,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **The choice is this branch's, not an operator's call.** The entry's *Fix, later* named two
     fixes, and no call of the operator's chose between them (board item 30 lists the day's
     calls, none on A-332). The branch took the first, for the reasons above: the operator may
-    confirm it, or reverse it for the cancel.
+    confirm it, or reverse it for the cancel. The operator kept the grace, at 5 s (below).
   - **What it leaves:**
     - A refusal later than 2 s (a batch the stream sends again, a slow intake) finds the call
       made, and A-292 drops its result, as before. When that call fails (no answer from the
@@ -1772,6 +1780,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     plan reads the 0.1.138 baseline from `CONFIG_GET` and the journal (no refused-not-analyzed
     count there), accepts `agent_waits_total` +0 when a turn and its answer share a batch, and
     expects two usage records on a trace whose answer is analyzed too.
+- **The operator's call (2026-11-12), a change:** the grace goes from 2 s to 5 s:
+  *"timeout para esto es peligroso, yo ahora podría 5sec y dejaría anotado para revisar en mejoras
+  posteriores"*: a timeout here is dangerous; 5 s for now, recorded to review in a later
+  improvement.
+- **Built at 0.1.139's integration (`coa/sweep-139`):** `COGNITION_REFUSAL_GRACE` is 5 s. What
+  the build says above of 2 s holds of 5 s now: a refusal later than 5 s finds the call made, and
+  with a worker that had nothing else to do a person's turn is analyzed once the agent answers it,
+  or 5 s after its intake at most, where 0.1.138 analyzed it at once.
+  `COGNITION_ANSWERS_KEPT` stays 4,096 answers: some 820 a second over the grace, where it was
+  2,048 a second over 2 s. Tests: `a_refusal_seconds_late_still_costs_no_model_call` (a refusal the
+  intake takes 3 s after the turn, a batch the stream sent again: no model call; with 2 s, one)
+  and `a_turn_with_no_answer_is_analyzed_once_its_grace_is_over` (analyzed 5 s after the intake,
+  the value written out); both fail with 2 s. Docs:
+  [sy-cognition.md](../../docs/nodes/sy-cognition.md),
+  [cognition.md](../../docs/reference/cognition.md) §3 and §3.4,
+  [cognition-hands-v1](../../docs/cognition-hands-v1.md) §6. **To review later:** the timeout
+  itself, the operator's note; the cancel (the entry's second fix) stays the other way.
 
 ### A-331 [General/orchestrator] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x) — `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT`
 
@@ -2048,6 +2073,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     it took 2.2 s with the default, and 0.54 s on 1.6. It costs memory on every hive, up to that
     much for each connection of the pool, so it is the operator's call if the gate's purge times
     ask for it.
+- **The operator's call (2026-11-12), a change:** SY.timer's SQLite page cache goes to 16 MiB per
+  connection now (*"Subirla ahora"*).
+- **Built at 0.1.139's integration (`coa/sweep-139`), SY.timer 1.7:** `PRAGMA cache_size` at
+  -16384 (16 MiB, whatever the page size) in `timerDSN`, so modernc's SQLite sets it on every
+  connection the pool opens, as `busy_timeout` and WAL (`timerPageCacheKiB`,
+  `go/sy-timer/persistence.go`). Test: `TestEveryConnectionGetsThePragmas` reads it on three
+  connections at once; without it each says -2000.
+  - **Measured as this entry's review did** (on the Mac, SY.timer's SQLite, the purge's delete
+    alone on a copy of the table, its timers and the others' scheduled ten at a time and
+    interleaved over time; the medians of 10 runs, two series of 5 taken in turn, with a load of
+    about 2.7 on 16 cores, quieter than the review's):
+
+    | The owner's timers, among the hive's pending | 1.6 | 1.7 as first built | 1.7, default cache | 1.7, 16 MiB |
+    |---|---|---|---|---|
+    | 7,500 pending, among 18,000 | 116 ms | 202 ms | 176 ms | 166 ms |
+    | 7,500 pending and 20,000 fired, among 18,000 | 288 ms | 836 ms | 630 ms | 424 ms |
+    | 10,000 pending, among 100,000 | 384 ms | 697 ms | 635 ms | 554 ms |
+    | 10,000 pending and 20,000 fired, among 100,000 | 652 ms | 1,368 ms | 1,128 ms | 892 ms |
+
+    The call's case, 10,000 pending and 20,000 fired among 100,000: 1.13 s with the default cache,
+    0.89 s with 16 MiB, a fifth less, its slowest run 1.20 s, within the orchestrator's 3 s. The
+    history case among 18,000 gains a third (630 to 424 ms), the pending alone among 18,000 a
+    twentieth (176 to 166 ms).
+  - **Its memory** (measured on the same Mac, a process of its own for each): a connection takes a
+    page of the cache only when a statement reads or writes it, and keeps it until the connection
+    closes. In modernc's SQLite a cached page of 4 KiB holds about 8 KiB: after a read of every
+    page of an 82 MB `timers.db` (the call's case), a connection's cache held 3.8 MiB with the
+    default cache, 15.5 MiB at 8 MiB, 31.0 MiB at 16 MiB and 62.1 MiB at 32 MiB (the process's
+    resident memory, the connection idle less the same once it closed), all of it freed once the
+    connection closed. After the call's purge the process held 43 MiB with the connection idle,
+    16 MiB with the default, 12 MiB once it closed, either way. The pool keeps two connections
+    (`database/sql`'s default idle ones; SY.timer serves one request at a time beside its
+    scheduler): up to about 62 MiB on a hive whose `timers.db` outgrows the cache (some 25,000
+    timers with 1.7's indexes), where the default kept up to about 8 MiB; on a smaller hive, what
+    its pages take. `docs/sy-timer.md` §5.2 and §7.7 and the node page say it.
 
 ### A-325 [General/AI runners] 🔵 low (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
 
@@ -2344,6 +2404,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     operator in the answer; whether to roll the vault's key back (`vault_rollback`) on a door that
     did not open stays the operator's call. Also not told: a vault put that got no answer but
     landed (the detail then starts `failed to store channel token in vault`), the same residual.
+    The first is decided since: the operator's call of 2026-11-12, below.
 - **Its review (`coa/edge-139`, for 0.1.139):**
   - **The old door closes only once IO.cloud trusts the new edge** (`settle_moved_cloud_door`):
     the apply `Applied` or `AlreadyTrusted`. When IO.cloud did not take it (`NotApplied`,
@@ -2355,7 +2416,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     edge, against its own help ("once the new door is open and applied"). The branch's reading of
     the operator's call ("in the right order") and of the operator's principle of 2026-11-12
     (A-313: act only on what fails), **for the operator to confirm**; the other way is to keep the
-    close whatever the apply did and say so in the help.
+    close whatever the apply did and say so in the help. Confirmed: the operator's call of
+    2026-11-12, below.
   - **A door that does not open says what it left in the vault** (`unreceived_cloud_token`): when
     the edge refused the open or did not answer it, the error's detail adds that the vault already
     holds the token this run minted, for that edge, which no one received; that the token the Cloud
@@ -2392,6 +2454,71 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (`EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS`, as for a workflow's deploy). Test
     `an_executor_run_waits_for_each_publish_of_the_cloud_door`.
   - **A cut answer keeps the token** (A-124's entry).
+- **The operator's call (2026-11-12) on the old door (i):** the old door closes only once IO.cloud
+  trusts the new edge; otherwise it is left open, with a warning. The code as built (A-317's
+  review).
+- **The operator's call (2026-11-12) on a door that did not open (ii), a change:** when the door
+  does not open after the vault took the new token (the edge refused `EDGE_OPEN_URL` or did not
+  answer it), SY.admin rolls the vault's `edge_channel_secret:<ich>` back to the token before it
+  (`vault_rollback`), automatically, so the vault holds the token the door serves, and the answer
+  says it rolled back. A rollback that fails is told in the answer and logged, never retried in a
+  loop: the operator's principle is retry and log on the one that fails (A-313).
+- **Built at 0.1.139's integration (`coa/sweep-139`), in SY.admin:**
+  - **The run knows the vault took its token** from the externalize itself: `externalize_channel`,
+    which `handle_externalize` now wraps, gives `publish_cloud_endpoint` the key and the version
+    the vault's put answered (`StoredChannelToken`) once the vault took the token. The review's
+    `unreceived_cloud_token` read it from the start of the error's wording.
+  - **The rollback** (`roll_back_cloud_token`): `VAULT_ROLLBACK` of the key in the root tenant,
+    straight to SY.vault with a bound of its own, 5 s (`CLOUD_TOKEN_ROLLBACK_TIMEOUT`), before the
+    record is put back (the run's steps undone in reverse). A refusal SY.vault answers, or an ask
+    the router did not deliver (`UNREACHABLE`, `TTL_EXCEEDED`), changed nothing and is asked once
+    more at once. `NO_PREVIOUS_VERSION` is no failure: the vault held no token for the channel
+    before the run (a first publish), and none is rolled back to. An ask SY.vault did not answer in
+    time is not asked again: a rollback swaps the token and the one before it, so a second one after
+    a first that landed unanswered would put the run's token back. Each outcome is logged, and
+    nothing asks again later.
+  - **The answer** (`cloud_token_said`, after what became of the record): rolled back, and on a
+    rotation on the same edge that edge serves the token the Cloud holds and reads it again when it
+    restarts, so nothing changed for the Cloud; on a move the old edge serves it, but reads none
+    once it restarts (below), so publish again on an edge that answers; with no door before, the
+    vault holds what it held. Or why not: the vault then holds (after an ask not answered, may
+    hold: `vault_get_metadata` shows the key's version, the one the run's put answered while it
+    still holds that token) the token no one received, which the edge the door was on reads when it
+    restarts; publish again.
+  - **Its time:** a run whose door did not open takes up to 235 s by its bounds (the record 120 s,
+    the store 30 s, the open 15 s, the rollback 10 s, the put-back 60 s), within the 240 s Archi
+    waits for each publish of the door (`EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS`, whose comment and
+    test's bound name both paths now).
+  - **What it leaves:**
+    - **On a move the key stays the new edge's.** The put names its owner (`owner_node`, the edge
+      the run opens the door on), and SY.vault's rollback restores the token and its version, not
+      the key's metadata, which it keeps one of per key. So the old edge, whose door the Cloud
+      uses, serves the Cloud's token from its memory and reads none once it restarts, as without
+      the rollback; the answer says to publish again on an edge that answers. Ways to close it, for
+      the operator: SY.vault's rollback brings back the owner of the version it restores (SY.vault);
+      SY.admin assigns the key to the old edge after the rollback (`vault_assign`, which SY.admin's
+      API refuses for an edge's key since A-316); or leave it, the answer telling to publish again.
+    - **An edge that took the open and whose answer was lost** read the run's token from the vault
+      right after the open (`resolve_secrets`), before the rollback, and serves it (on a rotation
+      with the old one beside it for 10 minutes) until it restarts: a `VAULT_SECRET_CHANGED`
+      re-reads only an entry that holds no token. Once it restarts it reads the Cloud's token from
+      the vault; without the rollback it read the run's there too.
+    - **A writer of the key meanwhile:** the rollback comes within seconds of the put, under the
+      one-run lock, so only an operator's own `externalize` of IO.cloud's channel in those seconds
+      could write it, and the rollback would undo that write. Unlike the ACME's rollback
+      (`rollback_if_current`), which may come hours after its write, it does not read the key's
+      version first.
+  - **Tests:** `a_door_that_does_not_open_puts_the_record_back` (the rollback asked before the
+    put-back after an edge's refusal and after an edge not reached, none when the vault refused the
+    token; the detail on a rotation, a move and a first publish) and
+    `a_token_rollback_is_asked_again_only_when_it_changed_nothing` (ok; `NO_PREVIOUS_VERSION`; a
+    refusal, then ok; an ask not delivered, then ok; two refusals; an ask not answered, not asked
+    again; the log lines; each detail), with the help's
+    (`the_cloud_endpoint_help_says_what_a_run_does_to_the_token_before_it`). Each fails on a mutant
+    without its part: no rollback; an unanswered ask asked again; no second ask after a refusal;
+    `NO_PREVIOUS_VERSION` read as a failure.
+  - **Texts:** SY.admin's help for `publish_cloud_endpoint`, sy-admin.md's row, io-cloud-api.md §7,
+    its 401 row and §9 (0.1.139), sy-edge.md's grace note and sy-architect.md's wait.
 
 ### A-316 [General/admin] 🔵 low (found 2026-11-11 by A-273's review; read in the code, not run; there before it) — An edge channel's bearer can be read back through `vault_assign` then `vault_get`
 
@@ -2940,6 +3067,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     only `UNAUTHORIZED`, which the deploy never answers). Test
     `a_deploys_help_says_what_a_refused_package_answers`.
   - Its admission's 3 s and the publish's wait: A-306's entry.
+- **The operator's call (2026-11-12), on what the build left to it:** a hive that does not answer in
+  3 s is judged by the LSA's last view and named in a warning (SY.admin's warn line), never refused
+  for it. The code as built: refusing whenever a hive cannot be read would stop every workflow's
+  deploy on every hive while one is down.
 
 ### A-303 [General/frontdesk] 🔵 low (found 2026-11-11 by A-293's review fixes; read in the code; there before it) — The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable
 
@@ -3007,6 +3138,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       system ILKs only, or of the root tenant only, would not catch it, since the replicas' node
       ILKs come in); (b) SY.identity: a primary without its database keeps the content of a region
       it reuses instead of rewriting it from the bootstrap store; (c) leave it as it is.
+  - **The operator's call (2026-11-12):** (c) for both: the two rare paths (a failed delta apply, a
+    primary without its database) are left as they are, recorded here and in the frontdesk's docs
+    (`docs/nodes/sy-frontdesk-gov.md`, `docs/ai-frontdesk-gov-spec.md` §4.3).
   - **Tests** (each fails without its part of the fix):
     `a_handoff_whose_identity_shm_cannot_be_read_answers_identity_unavailable` and
     `a_turn_whose_case_tenant_cannot_be_read_awaits_the_confirmation` (they read
@@ -3092,15 +3226,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   only at start (`src/bin/sy_identity.rs` ~4570): the box's replica is refused until its
   sy-identity restarts. That holds for every removal that deleted the key; this fix makes a
   `delete_failed` removal behave the same, where the key it left let the box back in. Numbered
-  A-335 by the review, A-339 since 0.1.139's integration review (A-339's entry says why).
+  A-335 by the review (A-339 for a while at 0.1.139's integration review; A-335's entry says why).
 - **The review (2026-11-12), built on `coa/orch-139`:** the first texts said that box was "never
   let back in" and dropped the caution not to add a hive under its name. A-301 closes :9100 to
-  it, not the mesh (A-339). SY.admin's `remove_hive` help (`REMOVE_HIVE_IDENTITY_KEY_NOTE`, and
+  it, not the mesh (A-335). SY.admin's `remove_hive` help (`REMOVE_HIVE_IDENTITY_KEY_NOTE`, and
   `REMOVE_HIVE_BOX_NOT_REACHED_NOTE` for the caution), Archi's handbook, sy-orchestrator.md and
   operations.md say it again: when `remote_cleanup` is not `socket_ok`, stop that box's install,
   or make sure the box is gone, before adding a hive under its name. Test
   `remove_hives_help_keeps_the_caution_about_a_box_it_did_not_reach` (fails with the first texts).
-  The code guard (a fresh join never takes the socket path) is A-339's, to decide.
+  The code guard (a fresh join never takes the socket path) is A-335's: not built, by the
+  operator's call of 2026-11-12, the real guard coming with A-48's leaf pinning.
 
 ### A-300 [General/orchestrator] 🔵 low (found 2026-11-11 by A-281's SY.admin review; read in the code; there before it) — A node pinned to a version is not counted as its use between crash-loop restarts, and the version can be removed under it
 

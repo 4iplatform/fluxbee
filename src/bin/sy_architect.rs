@@ -13262,10 +13262,12 @@ const EXECUTOR_EGRESS_SWITCH_WAIT_SECS: u64 = 70;
 /// What Archi waits for SY.admin's executor per publish of Fluxbee Cloud's door in a plan
 /// (`publish_cloud_endpoint`, FINDINGS A-317): SY.admin's ceiling for one run, whose step has no
 /// timeout of its own (the record's read and write of IO.cloud's config, 30 s each tried twice; the
-/// vault's store of the token, 30 s; the edge's open, 15 s; the apply to IO.cloud, 30 s; the old
-/// door's close on a move, 15 s tried twice: 225 s in all), with a margin. The run's answer is the
-/// only place the operator gets the token (FINDINGS A-124), so Archi waits for it: with 120 s it
-/// could stop waiting while the run went on to mint the token and answer it to no one (0.1.139's
+/// vault's store of the token, 30 s; the edge's open, 15 s; then the apply to IO.cloud, 30 s, and
+/// the old door's close on a move, 15 s tried twice: 225 s in all; or, for a door that did not
+/// open, the token's rollback in the vault, 5 s asked at most twice, and the record put back, 30 s
+/// tried twice: 235 s, since the operator's call of 2026-11-12), with a margin. The run's answer is
+/// the only place the operator gets the token (FINDINGS A-124), so Archi waits for it: with 120 s
+/// it could stop waiting while the run went on to mint the token and answer it to no one (0.1.139's
 /// integration review). A run asked while another runs is refused at once (BUSY), so none waits
 /// for another.
 const EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS: u64 = 240;
@@ -33436,9 +33438,11 @@ mod tests {
     }
 
     /// Fluxbee Cloud's door published in a plan (FINDINGS A-317): Archi waits for SY.admin's
-    /// ceiling of each run (225 s) with a margin, since the run's answer is the only place the
-    /// operator gets the token (FINDINGS A-124). 0.1.139's integration review: it waited 120 s for
-    /// the whole plan, and a run that took longer minted a token that reached no one.
+    /// ceiling of each run (225 s, or 235 s for a door that did not open, whose token SY.admin
+    /// rolls back in the vault since the operator's call of 2026-11-12) with a margin, since the
+    /// run's answer is the only place the operator gets the token (FINDINGS A-124). 0.1.139's
+    /// integration review: it waited 120 s for the whole plan, and a run that took longer minted a
+    /// token that reached no one.
     #[test]
     fn an_executor_run_waits_for_each_publish_of_the_cloud_door() {
         let request = |actions: &[&str]| {
@@ -33460,6 +33464,9 @@ mod tests {
             base
         );
         const { assert!(EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS > 2 * 30 + 2 * 30 + 30 + 15 + 30 + 2 * 15) };
+        // A door that did not open: its token rolled back in the vault, then the record put back.
+        const NOT_OPENED: u64 = 2 * 30 + 2 * 30 + 30 + 15 + 2 * 5 + 2 * 30;
+        const { assert!(EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS > NOT_OPENED) };
     }
 
     /// A worker behind the egress, or back (docs/edge-egress-nat-spec.md §15): Archi waits for

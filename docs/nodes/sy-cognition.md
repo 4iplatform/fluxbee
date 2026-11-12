@@ -69,7 +69,7 @@ Two paths take each turn:
   20 turns at most, and 48 KiB.
 - **The worker** takes the turns one at a time, with up to two model calls each (about 5 s a
   turn), and derives the labels, memories and feelings, and the episodes that pass the gate. A
-  person's message the agent got first waits for the agent's answer, 2 s at most (below). It
+  person's message the agent got first waits for the agent's answer, 5 s at most (below). It
   loads a communication it does not hold
   from its file first; then it works on a copy, so the intake never waits for it, and writes the
   copy back merging the turns the intake took meanwhile, then to its file. Its communication stays
@@ -99,8 +99,10 @@ no turn:
   drops what the turn derived and calls no model it has not called yet; a turn that is a relay
   again keeps it.
 - **The worker waits for the agent first** (FINDINGS A-332, since 0.1.139). It analyzes a
-  person's message the agent got once the agent answered or refused it, or 2 s after the intake
-  took it (`COGNITION_REFUSAL_GRACE`), whichever comes first (`wait_for_the_agent`).
+  person's message the agent got once the agent answered or refused it, or 5 s after the intake
+  took it (`COGNITION_REFUSAL_GRACE`), whichever comes first (`wait_for_the_agent`). The grace is
+  the operator's call of 2026-11-12, where the branch built 2 s; a timeout here is to review in a
+  later improvement (FINDINGS A-332).
   - The intake wakes it at each answer and refusal it takes, each told apart by the message it
     answers, as the refusal is.
   - So a refusal costs no model call. Up to 0.1.138 the worker, with nothing else to do, started

@@ -1525,7 +1525,7 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
   certificate again once a hive of that name is listed (leaf pinning is not built, FINDINGS A-48),
   and a join that finds that box's `SY.orchestrator` online takes it over the socket, even when
   the join's address names another box, with no identity key and no new certificate (FINDINGS
-  A-339).
+  A-335).
   Tell the operator, and do not stage `add_hive` under that name until the operator has stopped
   that box's install or confirms the box is gone.
 - **`syncthing_peer_cleanup: kept_for_other_hive`** in a `remove_hive` answer (since 0.1.139,

@@ -39,7 +39,10 @@ Each hive's timers are its own: `TIMER_LIST` reads the local database only.
 3. Connects to the router under `/var/run/fluxbee/routers` with a persistent UUID in
    `/var/lib/fluxbee/state/nodes` (`fluxbeesdk.ConnectWithRetry`, retry every 1 s).
 4. Opens `timers.db` in its instance directory (`managedNodeInstanceDir`: `/var/lib/fluxbee/nodes/<KIND>/<node name>`),
-   with `busy_timeout(5000)` and WAL on every connection (`timerDSN`), and creates the `timers`
+   with `busy_timeout(5000)`, WAL and a 16 MiB page cache on every connection (`timerDSN`; the
+   cache since 1.7, the operator's call of 2026-11-12, FINDINGS A-326: SQLite's default is 2,000
+   KiB, and a large purge spilled past it, below; up to about 31 MiB of memory for each of the
+   pool's two connections, `docs/sy-timer.md` §5.2), and creates the `timers`
    table and its indexes (`ensureTimerSchema`, schema version 4: version 3 adds `canceled_reason`,
    FINDINGS A-220, and version 4 `canceled_at_utc`, FINDINGS A-238, to a table that lacks them,
    whatever `user_version` says; `addTimerColumn`). It builds the indexes the table lacks
@@ -214,7 +217,7 @@ router made, `trace_id`; `ignoredLog`), bounded the same way in windows of its o
 | `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page ends at `limit` or at one 128 KiB frame, whichever comes first, and while timers follow it answers `next_cursor`, its last timer's place, which given back as `cursor` lists the next; the page that lists the rest has none. The frame's cut since 1.3 (FINDINGS A-151), the limit's since 1.6 (FINDINGS A-266; `listTimers` reads one timer past the limit, never listed): before, a page its limit cut read as the whole list. A page reads its timers from an index that holds them in the list's order, one per filter, from its cursor's place on, and stops at the first one it cannot take (`timerListQuery`, `takeTimerPage`; since 1.7, FINDINGS A-326): it reads what it lists and one more, whatever the hive holds. Before, a page of an owner's timers in one status read every timer of the hive in that status, every owner's, and sorted the owner's, and a page read 1001 timers where about 228 of a WF's fit its frame. Both SDKs' `List` follow the pages up to their own limit. Go's `ListPage` and Rust's `list_page` list one page with its `next_cursor`, Rust's `list` hands it back when it stops at its limit, and Go's `List` returns the timers only (FINDINGS A-278); a WF's reconcile reads every page of its pending timers |
 | `TIMER_CANCEL` | `timer_uuid` or `client_ref` | the owner only (`TIMER_NOT_OWNER`); a `client_ref` with no pending timer answers `ok` with `found: false`; a fired one-shot gives `TIMER_ALREADY_FIRED` |
 | `TIMER_RESCHEDULE` | `timer_uuid` or `client_ref`, and `new_fire_at_utc_ms` or `new_fire_in_ms` | the owner only; pending one-shots only (`TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_ALREADY_FIRED`) |
-| `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status, in one transaction: the pending ones first, whose uuids come back for the heap, then the history, counted without being read (`deleteTimersByOwner`). The orchestrator waits 3 s for it; its time grows with the owner's timers, its history most, and with the indexes: about 0.2 s for 7,500 pending among 18,000 on a Mac, 1.5 s for 10,000 pending and 20,000 fired among 100,000 (docs/sy-timer.md §7.7) |
+| `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status, in one transaction: the pending ones first, whose uuids come back for the heap, then the history, counted without being read (`deleteTimersByOwner`). The orchestrator waits 3 s for it; its time grows with the owner's timers, its history most, and with the indexes: about 0.17 s for 7,500 pending among 18,000 on a Mac, 0.89 s for 10,000 pending and 20,000 fired among 100,000, with 1.7's 16 MiB page cache (1.13 s with SQLite's default, the operator's call of 2026-11-12, FINDINGS A-326; docs/sy-timer.md §7.7) |
 | `TIMER_NOW` | none | anyone |
 | `TIMER_NOW_IN` | `tz` | anyone |
 | `TIMER_CONVERT` | `instant_utc_ms`, `to_tz` | anyone |
@@ -243,7 +246,9 @@ When the orchestrator purges a node (`kill_node` with `purge_instance`, `remove_
 it stops the node's unit first and clears its `relaunch_on_boot` (`clear_relaunch_on_boot`), then
 sends `TIMER_PURGE_OWNER` for that node to the `SY.timer` of the node's hive, with a 3 s timeout,
 and reports the result in its reply as `timer_purge` (`purge_owner_timers_before_teardown` in
-`src/bin/sy_orchestrator.rs`). A purge that is not `ok` or gets no answer stops the teardown there
+`src/bin/sy_orchestrator.rs`). The purge of an owner's 10,000 pending and 20,000 fired timers among
+the hive's 100,000 pending took 0.89 s on a Mac with 1.7's page cache, 1.13 s with SQLite's default
+(`docs/sy-timer.md` §7.7). A purge that is not `ok` or gets no answer stops the teardown there
 with `TIMER_PURGE_FAILED`, which reports `relaunch_on_boot: false`: the node stays stopped, with
 its files and its identity, until the purge is run again. The 60 s reconcile does not launch it
 again (FINDINGS A-121).

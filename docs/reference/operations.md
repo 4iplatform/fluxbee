@@ -302,7 +302,7 @@ could not be read whole. When the spoke did not answer, the motherbee restarts i
 `sy-identity` to close any session the removed hive still holds (`identity_restart`). A box the
 cleanup did not reach keeps its install and its mesh certificate, which the router admits again
 once a hive of that name is listed: stop its install, or make sure it is gone, before adding a
-hive under its name (FINDINGS A-339). The motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
+hive under its name (FINDINGS A-335). The motherbee itself cannot be removed. The registry is the authority: at boot the motherbee deletes
 the identity key of every hive with no `hives/<id>/`. Public pages never refuse the removal
 (FINDINGS A-242): the ok answer names in `pages_left_up` the pages a node of the hive published
 and the pages its edge serves, which stay up until they expire. The cleanup stops the hive's edge

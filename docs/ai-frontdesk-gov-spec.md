@@ -160,7 +160,8 @@ Rules:
   A-303). Up to 0.1.138 it was the final `TENANT_UNRESOLVED`. The frontdesk asks `SY.identity`
   nothing in place of the SHM. A handoff reads it once, and its registration takes that tenant;
 - two paths are not told apart from an ILK `SY.identity` does not hold, and read as
-  `TENANT_UNRESOLVED` although it holds it (A-303, left to the operator's call): a provision
+  `TENANT_UNRESOLVED` although it holds it (A-303; left as they are and recorded, the operator's
+  call of 2026-11-12): a provision
   `SY.identity` answered although its write to the SHM failed (a full region), until `SY.identity`
   writes the whole region again with it; and every person while the primary `SY.identity` runs
   without its database, when it writes the region from its bootstrap store (the root tenant and

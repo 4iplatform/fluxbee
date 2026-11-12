@@ -663,7 +663,7 @@ delete_failed`) before its accept writes anything, and is refused `IO_ERROR` nam
 nothing written, when it cannot (`drop_surviving_identity_key`, FINDINGS A-301, since 0.1.139); its
 bootstrap then generates the hive's key (`ensure_local_identity_key`). Before, the join reused the
 key it found, and the removed box, if it still ran, was let back onto :9100 from the accept on.
-What that does not close (FINDINGS A-339): a box the removal did not reach keeps its install and
+What that does not close (FINDINGS A-335): a box the removal did not reach keeps its install and
 its mesh certificate, which the router admits again once the accept lists the hive (leaf pinning,
 A-48, is not built), and the join's socket-first path takes any `SY.orchestrator@<hive>` it sees
 online within 3 s, whatever `address` names. That box is then the hive again, with no identity key

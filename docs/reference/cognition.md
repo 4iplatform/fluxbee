@@ -176,7 +176,7 @@ stays in the last turns.
      stops here: it stays among the last turns, which the intake wrote to the file, unanalyzed
      and unnumbered (`turns_not_analyzed_total`), with no model call.
    - **The agent's answer first** (FINDINGS A-332, since 0.1.139): a person's message the agent
-     got waits until the agent answered or refused it, or 2 s after its intake, whichever comes
+     got waits until the agent answered or refused it, or 5 s after its intake, whichever comes
      first (`wait_for_the_agent`, §3.4). A turn the agent refused stops here, with no model call.
    - **The state:** a communication this cognition does not hold is loaded from its file (§6),
      where the intake wrote its turn (`held_or_loaded`). If the file cannot be read, the turn is
@@ -305,8 +305,9 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
     after the copy and was its duplicate.
   - **The worker waits for the agent first** (FINDINGS A-332, since 0.1.139,
     `wait_for_the_agent`). A person's message the agent got (its `request_of`) is analyzed once
-    the agent answered or refused it, or `COGNITION_REFUSAL_GRACE` (2 s) after the intake took it,
-    whichever comes first.
+    the agent answered or refused it, or `COGNITION_REFUSAL_GRACE` (5 s) after the intake took it,
+    whichever comes first. The 5 s are the operator's call of 2026-11-12, where the branch built
+    2 s: a timeout here is risky, and is to review in a later improvement (FINDINGS A-332).
     - The intake notes each answer and each refusal by the agent's communication and the message
       it answers (`Answers`; `answered_request`: the answer's trace before the agent's entry,
       which must be its last), and wakes the worker.

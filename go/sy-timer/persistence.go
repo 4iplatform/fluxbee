@@ -87,9 +87,27 @@ func openTimerDB(path string) (*sql.DB, timerIndexStep, error) {
 // database/sql opens several (the scheduler writes while requests are served): in the DSN,
 // modernc.org/sqlite applies them to each connection it opens. Set once with db.Exec they reached
 // one connection only, and the others failed at once with SQLITE_BUSY instead of waiting.
+//
+// cache_size is each connection's page cache, timerPageCacheKiB (since 1.7, FINDINGS A-326).
 func timerDSN(path string) string {
-	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
+		fmt.Sprintf("&_pragma=cache_size(-%d)", timerPageCacheKiB)
 }
+
+// timerPageCacheKiB is each connection's SQLite page cache, in KiB: 16 MiB, where SQLite's default
+// is 2,000 KiB (since 1.7, the operator's call of 2026-11-12, FINDINGS A-326). TIMER_PURGE_OWNER
+// deletes each of the owner's timers from the table and from every index in one transaction, which
+// the orchestrator gives 3 s, and the pages it changes past the cache spill to the WAL as it goes:
+// on a Mac the purge of an owner's 10,000 pending and 20,000 fired timers among the hive's 100,000
+// pending took 1.13 s with the default cache and takes 0.89 s with this one (docs/sy-timer.md
+// §7.7). It costs memory: a connection takes a page of the cache only when a statement reads it,
+// and keeps it until the connection closes; in this SQLite (modernc's, in Go) a cached page of
+// 4 KiB holds about 8 KiB, so a full cache is about 31 MiB resident, the default's about 4 MiB. The
+// pool keeps two connections (database/sql's default idle ones; SY.timer serves one request at a
+// time beside its scheduler): up to about 62 MiB on a hive whose timers.db outgrows the cache (some
+// 25,000 timers), where the default kept up to about 8 MiB; on a smaller one, what its pages take
+// (docs/sy-timer.md §5.2).
+const timerPageCacheKiB = 16 * 1024
 
 // ensureTimerSchema makes the timers table, its indexes (ensureTimerIndexes) and its columns, and
 // says what it did to the indexes. Each step works on a table it made before, and on a table any

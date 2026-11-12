@@ -1745,14 +1745,16 @@ impl Refusals {
 /// How long, from its intake, the worker waits for an agent's answer to a person's message the
 /// agent got before it analyzes that turn (`wait_for_the_agent`, FINDINGS A-332). A busy AI runtime
 /// refuses a turn at once (`ai_runtime_busy`, in 7 to 12 ms), and on 8.x cognition took the refusal
-/// 0.04 to 0.26 s after it (A-292's gate): 2 s is some eight times the slowest, with room for a slow
-/// write of the batch before it. The wait ends as soon as the agent answers or refuses, so it holds
-/// back a turn the agent took by at most this, only when the worker had nothing else to do: a turn
-/// that waited in the queue longer than this does not wait again.
-const COGNITION_REFUSAL_GRACE: Duration = Duration::from_secs(2);
+/// 0.04 to 0.26 s after it (A-292's gate): 5 s is some twenty times the slowest, with room for a
+/// slow write of the batch before it or a batch the stream sends again (the operator's call of
+/// 2026-11-12, where the branch built 2 s; a timeout here is to review in a later improvement). The
+/// wait ends as soon as the agent answers or refuses, so it holds back a turn the agent took by at
+/// most this, only when the worker had nothing else to do: a turn that waited in the queue longer
+/// than this does not wait again.
+const COGNITION_REFUSAL_GRACE: Duration = Duration::from_secs(5);
 
-/// How many answers `Answers` keeps at most, the oldest out first: 2,048 answers a second over the
-/// grace. Past that, a wait for an answer that left runs out its grace, as with no answer.
+/// How many answers `Answers` keeps at most, the oldest out first: some 820 answers a second over
+/// the 5 s grace. Past that, a wait for an answer that left runs out its grace, as with no answer.
 const COGNITION_ANSWERS_KEPT: usize = 4096;
 
 /// The messages its agents answered lately, their refusals included (FINDINGS A-332): each by the
@@ -11370,6 +11372,49 @@ mod tests {
         }
     }
 
+    /// The grace is 5 s, by the operator's call of 2026-11-12 (FINDINGS A-332), where the branch
+    /// built 2 s: a refusal the intake takes 3 s after the person's turn (a batch the stream sends
+    /// again, or a slow write of the batch before it) still ends the wait before any model call.
+    /// With 2 s the worker's tagger call was under way at 2 s, and A-292 only dropped its result.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_seconds_late_still_costs_no_model_call() {
+        let dir = TestDir::new();
+        let (app_state, mut router, turn_tx, mut turn_rx) =
+            waiting_cognition("cogwaitlate", &dir.0).await;
+        let question = person_says("Is my invoice ready?");
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitlate",
+            &[(1, TEST_TS, &question)],
+        )
+        .await;
+        let worker = tokio::spawn(handle_turn(
+            turn_rx.try_recv().expect("the person's turn"),
+            Arc::clone(&app_state),
+        ));
+        time::sleep(Duration::from_secs(3)).await;
+        let busy = busy_answer_to(&question);
+        take_batch(
+            &app_state,
+            &mut router,
+            &turn_tx,
+            "cogwaitlate",
+            &[(2, TEST_TS + 3_000, &busy)],
+        )
+        .await;
+        worker.await.expect("the worker");
+        let state = app_state.runtime_state.lock().await;
+        assert_eq!(state.semantic_tagger_calls_total, 0, "no model call");
+        assert_eq!(state.semantic_tagger_failures_total, 0, "no tagger failure");
+        assert_eq!(state.refused_turns_not_analyzed_total, 1);
+        assert_eq!(
+            (state.agent_waits_total, state.agent_waits_grace_over_total),
+            (1, 0)
+        );
+    }
+
     /// A person's turn the agent took is analyzed all the same, as soon as the agent answers: here
     /// 300 ms after it, well within the grace. The agent's answer waits for nothing.
     #[tokio::test(start_paused = true)]
@@ -11434,8 +11479,9 @@ mod tests {
     }
 
     /// A person's turn the agent neither answers nor refuses within the grace is analyzed once the
-    /// grace is over; one that waited that long in the queue already does not wait again; and one
-    /// no model reads, with no person at its other end, waits for nothing.
+    /// grace is over, 5 s after its intake (the operator's call of 2026-11-12); one that waited
+    /// that long in the queue already does not wait again; and one no model reads, with no person
+    /// at its other end, waits for nothing.
     #[tokio::test(start_paused = true)]
     async fn a_turn_with_no_answer_is_analyzed_once_its_grace_is_over() {
         let dir = TestDir::new();
@@ -11456,7 +11502,11 @@ mod tests {
             Arc::clone(&app_state),
         )
         .await;
-        assert_eq!(start.elapsed(), COGNITION_REFUSAL_GRACE);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(5),
+            "the grace, the operator's call of 2026-11-12"
+        );
         {
             let state = app_state.runtime_state.lock().await;
             assert_eq!(state.semantic_tagger_calls_total, 1, "the turn is analyzed");
