@@ -1469,13 +1469,13 @@ lookup and of the identity SHM, their rows kept. `list_ilks` with `include_delet
     `NOT_FOUND`. Stage `retire_hive_ilks`, args `hive_id` (the removed hive), in a plan the operator
     confirms, once what failed answers again (`DB_NOT_READY`, a timeout).
 - **Also after `remove_hive`**, read `identity_key_cleanup` in its answer. `delete_failed` means the
-  removed hive's identity key is still on the motherbee, and a join under that name keeps a key it
-  finds: a box the removal's cleanup did not reach (`remote_cleanup` other than `socket_ok`) may
-  still run with that key, and the new join's accept would let it read and write the identity
-  store again (FINDINGS A-277, a known limit). Tell the operator, and do not stage `add_hive` under
-  that name until the key is gone: the orchestrator deletes it at its next start (it deletes the
-  key of every hive the registry does not have), or the operator deletes
-  `/var/lib/fluxbee/identity/keys/<hive>.key` on the motherbee.
+  removed hive's identity key is still on the motherbee, and a box the removal's cleanup did not
+  reach (`remote_cleanup` other than `socket_ok`) may still run with that key. Tell the operator.
+  A new `add_hive` under that name deletes that key before it writes anything, so that box is
+  never let back in (FINDINGS A-301, since 0.1.139); when it cannot delete it, the join is refused
+  `IO_ERROR` naming the file, nothing written: the operator deletes
+  `/var/lib/fluxbee/identity/keys/<hive>.key` on the motherbee (the orchestrator also deletes it at
+  its next start), then the join is asked again.
 - **A hive removed before this was built** (worker2, the throwaway gate workers before 0.1.133):
   its system ILKs are still active. On the operator's word, stage one `retire_hive_ilks` step per
   hive. Running it again is safe: it answers `count` 0.

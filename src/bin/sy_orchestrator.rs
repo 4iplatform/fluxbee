@@ -2111,6 +2111,41 @@ fn remove_identity_key_file(path: &Path) -> Result<bool, OrchestratorError> {
     }
 }
 
+/// FINDINGS A-301: a fresh join of `hive_id` (the registry has no entry for it) starts with no
+/// identity key for it. A key at `key_path` survives a removal of a hive of the same name that
+/// could not delete it (`identity_key_cleanup: delete_failed`). Reused by the join's bootstrap
+/// (`ensure_local_identity_key`), it let that hive's box, if it still ran, back onto :9100 once the
+/// join listed the hive again, past A-277's refusal of a hive the registry does not list: its
+/// publishes counted again and its stale snapshot competed with the new box's. The key is deleted
+/// before the join writes anything, and the bootstrap generates a new one; one that cannot be
+/// deleted refuses the join, nothing written, `IO_ERROR` naming the file. A session that box
+/// opened with the old key before stays open until sy-identity's next restart, as after a
+/// removal whose deletion failed.
+fn drop_surviving_identity_key(key_path: &Path, hive_id: &str) -> Result<(), serde_json::Value> {
+    match remove_identity_key_file(key_path) {
+        Ok(true) => {
+            tracing::warn!(
+                hive_id = hive_id,
+                key = %key_path.display(),
+                "a fresh join deleted the identity key an earlier hive of the same name left (A-301)"
+            );
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(err) => Err(serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "hive_id": hive_id,
+            "message": format!(
+                "the identity key an earlier hive named '{hive_id}' left could not be deleted \
+                 ({err}): a fresh join never reuses it, since that hive's box could authenticate \
+                 with it again; delete {} by hand, then ask again",
+                key_path.display()
+            ),
+        })),
+    }
+}
+
 /// FINDINGS A-48: the identity key files no registered hive owns, from the names in the keys
 /// directory and in `hives/`. The registry is the authority on which hives exist: a key whose hive
 /// has no `hives/<id>/` belongs to a hive that was removed, and must not authenticate to :9100
@@ -34383,6 +34418,14 @@ async fn accept_add_hive(
     let join_id = Uuid::new_v4().to_string();
     let now = now_epoch_ms().to_string();
     let resumed = hive_exists(&state.state_dir, &hive_id);
+    // FINDINGS A-301: a fresh join reuses no identity key a removed hive of the same name left.
+    if !resumed && hive_id != state.hive_id {
+        if let Err(refusal) =
+            drop_surviving_identity_key(&json_router::mesh_hmac::key_path(&hive_id), &hive_id)
+        {
+            return refusal;
+        }
+    }
     if let Err(err) = fs::create_dir_all(root.join(&hive_id)) {
         return serde_json::json!({
             "status": "error",
@@ -49588,6 +49631,51 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
             .find("if !identity_key_deleted || socket_cleanup_ok")
             .expect("restart only for a box the cleanup did not reach");
         assert!(registry < key && key < restart);
+    }
+
+    /// FINDINGS A-301: a fresh join reuses no identity key a removed hive of the same name left.
+    /// A removal that could not delete its key (`identity_key_cleanup: delete_failed`) left it, and
+    /// a new join under the name reused it, which let the old box, if it still ran, back onto :9100
+    /// once the accept listed the hive again. The accept deletes it, only for a fresh join and
+    /// before it writes anything, and refuses the join when it cannot (`IO_ERROR` naming it).
+    #[test]
+    fn a_fresh_join_reuses_no_surviving_identity_key() {
+        let dir =
+            std::env::temp_dir().join(format!("fluxbee-surviving-key-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).expect("dir");
+        let key = dir.join("worker9.key");
+        fs::write(&key, "00").expect("a surviving key");
+        assert_eq!(drop_surviving_identity_key(&key, "worker9"), Ok(()));
+        assert!(!key.exists(), "the surviving key is deleted");
+        assert_eq!(drop_surviving_identity_key(&key, "worker9"), Ok(()));
+
+        // A key that cannot be deleted (here a directory stands in its place) refuses the join.
+        fs::create_dir_all(key.join("held")).expect("an undeletable key");
+        let refusal = drop_surviving_identity_key(&key, "worker9").expect_err("refused");
+        assert_eq!(refusal["status"], "error", "{refusal}");
+        assert_eq!(refusal["error_code"], "IO_ERROR", "{refusal}");
+        assert_eq!(refusal["hive_id"], "worker9", "{refusal}");
+        let message = refusal["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("an earlier hive named 'worker9'")
+                && message.contains(&format!("delete {} by hand", key.display())),
+            "{message}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // The accept drops it for a fresh join only, before the entry's directory and its write.
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("async fn accept_add_hive(")
+            .expect("accept_add_hive");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let resumed = at("let resumed = hive_exists(&state.state_dir, &hive_id);");
+        let fresh = at("if !resumed && hive_id != state.hive_id {");
+        let drop = at("drop_surviving_identity_key(&json_router::mesh_hmac::key_path(&hive_id)");
+        let create = at("fs::create_dir_all(root.join(&hive_id))");
+        let write = at("update_join_state(&hive_id, \"joining\", \"accepted\"");
+        assert!(resumed < fresh && fresh < drop && drop < create && create < write);
     }
 
     #[test]

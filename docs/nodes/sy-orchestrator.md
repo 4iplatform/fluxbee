@@ -606,7 +606,12 @@ The registry is the authority on which hives exist (FINDINGS A-48). With the hiv
 to :9100 again; a deleted key ends no session already open, so when the cleanup did not reach the
 box it restarts the motherbee's `sy-identity` (`identity_restart`). At every boot the motherbee
 deletes the key of any hive with no directory under `hives/`, when both listings read completely
-(`sweep_orphan_identity_keys`).
+(`sweep_orphan_identity_keys`). A fresh join, an `add_hive` of a hive the registry has no entry
+for, deletes a key an earlier hive of that name left (a removal's `identity_key_cleanup:
+delete_failed`) before its accept writes anything, and is refused `IO_ERROR` naming the file,
+nothing written, when it cannot (`drop_surviving_identity_key`, FINDINGS A-301, since 0.1.139); its
+bootstrap then generates the hive's key (`ensure_local_identity_key`). Before, the join reused the
+key it found, and the removed box, if it still ran, was let back onto :9100 from the accept on.
 
 **Reading the registry.** `get_hive` (`get_hive_flow`) answers one hive's `info.yaml` as `hive`,
 and `NOT_FOUND` for a hive the registry does not have. A hive id that is not one, 1 to 64

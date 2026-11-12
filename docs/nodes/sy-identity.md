@@ -391,12 +391,16 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
   needed: the recheck reads the registry, not the key, so without it a session opened with a key
   the removal deleted would go on if the hive were joined again within one recheck, since the
   new join's accept lists the hive at once.
-- **A hive joined again under a removed hive's name (a known limit):** the new join keeps a key
-  that survived the removal (`ensure_local_identity_key` keeps a key it finds). A removed box
-  that still runs with that key (its cleanup not reached, `identity_key_cleanup: delete_failed`)
-  is then admitted again from the new join's accept, and its publishes are applied again. Until
-  a fresh join gets a new key in the orchestrator, do not join a hive again under the name of a
-  removed one whose box may still run.
+- **A hive joined again under a removed hive's name:** since 0.1.139 a fresh join's accept
+  deletes a key that survived the removal (its cleanup not reached, `identity_key_cleanup:
+  delete_failed`) before it writes anything, and the join's bootstrap generates a new one, so a
+  removed box that still runs with the old key is never admitted again; an accept that cannot
+  delete the key refuses the join, `IO_ERROR` naming the file (FINDINGS A-301). Before, the new
+  join kept the key (`ensure_local_identity_key` keeps a key it finds), and that box was admitted
+  again from the accept, its publishes applied again. What stays: a session that box opened with
+  the old key before the accept is not closed by the key's deletion, and the recheck finds the
+  hive listed again, so after a removal whose key could not be deleted, wait one recheck (10 s)
+  before adding the hive again under its name.
 - Startup errors (wrong role, bad `hive.yaml`, missing HMAC key on a replica) end the process;
   systemd restarts it every 5 s.
 

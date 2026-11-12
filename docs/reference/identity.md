@@ -657,10 +657,13 @@ converges to the union of the mesh.
   when the key could not be deleted. The restart stays needed: the recheck reads the registry,
   not the key, so a session opened with a deleted key would outlive a join of the same hive again
   within one recheck.
-- A known limit: a join under a removed hive's name keeps a key that survived the removal
-  (`ensure_local_identity_key`), so a removed box still running with it is admitted again from
-  the new join's accept. Until the orchestrator gives a fresh join a new key, a hive is not joined
-  again under the name of a removed one whose box may still run.
+- A join under a removed hive's name: since 0.1.139 a fresh join's accept deletes a key that
+  survived the removal, and its bootstrap generates a new one, so a removed box still running with
+  the old key is never admitted again; an accept that cannot delete it refuses the join,
+  `IO_ERROR` (FINDINGS A-301). Before, the join kept the key (`ensure_local_identity_key`) and the
+  box was admitted again from the accept. A session that box opened before the accept stays open
+  (the recheck reads the registry, which lists the hive again): after a removal whose key could not
+  be deleted, add the hive again only after one recheck, 10 s.
 - `identity.sync.auth` is fail-closed (`auth_mode_required`). Absent, empty or unknown means
   `required`. Only `disabled`, `off` or `none` turn it off, with a warning; then no handshake names
   a hive, and the registry is checked only on a publish.
