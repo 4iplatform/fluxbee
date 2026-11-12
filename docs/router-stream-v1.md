@@ -265,9 +265,11 @@ the motherbee and the workers, where they read them, and no longer on the ingres
     over about 62 KiB as a blob (`crates/fluxbee_sdk/src/send_normalization.rs`; it sends the text
     inline only when the blob cannot be written), and the IO nodes the same
     (`nodes/io/common/src/text_v1_blob.rs`), so their turns stay under it. What can reach it: a
-    WF's text of about 95 to 128 KiB, since the Go SDK sends a text as a blob only when the frame is
-    over 128 KiB (since 0.1.141, `go/fluxbee-go-sdk/text_offload.go`; the operator's call, so that a
-    text that fits a frame reaches a reader on any hive, FINDINGS A-264); a WF's large
+    WF's text of about 95 to 128 KiB, since the Go SDK sends a text as a blob only when the frame it
+    measures is over 128 KiB (since 0.1.141, `go/fluxbee-go-sdk/text_offload.go`; the operator's
+    call, FINDINGS A-264, so that a text that reached its reader inline before still does, on any
+    hive: one whose message fits the frame with the router's additions, the sender's name and the
+    action class, as before; a message those take over it is refused, FINDINGS A-202); a WF's large
     `meta.context` (its resolved `vars`) even with a short text; a payload that is not text; a text
     whose blob could not be written, which goes inline; and a raw client. SY.timer cannot: its
     messages are system ones, which the router never copies.

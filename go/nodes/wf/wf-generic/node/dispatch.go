@@ -216,12 +216,13 @@ func (rt *NodeRuntime) refuseWhileStoreDown(msg sdk.Message) error {
 // answer to the router's own notice would go to the router's UUID, which no node has: the router
 // would answer UNREACHABLE again, and the two would bounce it forever (FINDINGS A-112). SY.timer's
 // isInfrastructureMessage and the AI SDK's is_infrastructure_message are the same rule, name by name
-// (FINDINGS A-218); a WF also takes replies (isReply) as events. A system message that is none of
-// these, nor one of the node's verbs or a TIMER_FIRED, as a TIMER_HELP meant for SY.timer, is
-// dropped unanswered all the same: a system message is no workflow event (Dispatch). The router's
-// UNREACHABLE or TTL_EXCEEDED of a timer request the node waits on marks the request's timer first
-// (takeTimerRequestNotice, FINDINGS A-254), and SY.timer's TIMER_RESPONSE settles it
-// (takeTimerAnswer).
+// (FINDINGS A-218), but for SY.vault's VAULT_SECRET_CHANGED, a notice to SY.timer since 0.1.141
+// (FINDINGS A-325); a WF also takes replies (isReply) as events. A system message that is none of
+// these, nor one of the node's verbs or a TIMER_FIRED, as a TIMER_HELP meant for SY.timer or the
+// vault's VAULT_SECRET_CHANGED, is dropped unanswered all the same: a system message is no workflow
+// event (Dispatch). The router's UNREACHABLE or TTL_EXCEEDED of a timer request the node waits on
+// marks the request's timer first (takeTimerRequestNotice, FINDINGS A-254), and SY.timer's
+// TIMER_RESPONSE settles it (takeTimerAnswer).
 func isNotice(msg sdk.Message) bool {
 	if strings.TrimSpace(msg.SourceL2Name()) == "" {
 		return true

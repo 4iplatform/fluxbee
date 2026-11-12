@@ -126,12 +126,13 @@ A message that does not fit its lane is never waited for: the dispatcher answers
 `NOT_TAKEN` at once, a `system` message to the sender's uuid on the message's `trace_id` and
 `thread_id`, with `{"ok": false, "error": "not_taken", "reason": "node_busy", "detail": "...",
 "retryable": true}` (`BuildNotTaken`). A notice or a reply is never answered (`IsNoticeOrReply`:
-one the router made, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, a system message
-without a name, any `*_RESPONSE`, a `NOT_TAKEN`, an `<msg>.error`), so two nodes never bounce one;
-a person's text, a user message without a name, is answered. Each refusal is counted
-(`CommandChannelDrops`, by channel; `NotTakenSent`: answered, unanswered, or whose `NOT_TAKEN`
-could not be sent) and logged: the first at once, then at most a line every 10 s per channel,
-counting what came since:
+one the router made, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`, `TTL_EXCEEDED`, SY.vault's
+`VAULT_SECRET_CHANGED` (`MSGVaultSecretChanged`, whose answer SY.vault never reads, FINDINGS A-325),
+a system message without a name, any `*_RESPONSE`, a `NOT_TAKEN`, an `<msg>.error`), so two nodes
+never bounce one; a person's text, a user message without a name, is answered. Each refusal is
+counted (`CommandChannelDrops`, by channel; `NotTakenSent`: answered, unanswered, or whose
+`NOT_TAKEN` could not be sent) and logged: the first at once, then at most a line every 10 s per
+channel, counting what came since:
 
 ```text
 fluxbee-go-sdk: command channel "incoming" full (0 system and 1024 non-system messages waiting): 344 message(s) not taken since 09:39:41.120Z: 344 answered NOT_TAKEN node_busy, 0 not answered (a notice or a reply), 0 whose NOT_TAKEN could not be sent; the last: msg_type="user" msg="" from "IO.gate@worker1" trace_id=...
@@ -160,12 +161,17 @@ That is the operator's call of 2026-11-12, option (b): the Rust SDK sends a text
 as a blob, the Go SDK only past the frame. A reader on another hive gets a blob through Syncthing,
 about 10 s or more after the message, and today no reader waits that long: ai.generic reads a
 `content_ref` at once, io.slack and io.wapp wait 5 s (`read_blob_with_retry`), and a WF, io.api,
-io.web and io.linkedhelper read none. So what fit inline before 0.1.141 still goes inline and
-reaches every reader, and only a text that could not be sent at all goes as a blob: a reader on the
-sender's hive reads it at once, and one on another hive may not find it yet. Getting the blob to
-the reader's hive in time is a topic of its own. A text of about 95 to 128 KiB still reaches its
-node but not the router stream's turns (FINDINGS A-253), as before
+io.web and io.linkedhelper read none. So a text that reached its reader inline before 0.1.141 still
+does, on any hive, and only a message the SDK refused before goes with its text as a blob: a reader
+on the sender's hive reads it at once, and one on another hive may not find it yet. Getting the
+blob to the reader's hive in time is a topic of its own (FINDINGS A-338). A text of about 95 to
+128 KiB still reaches its node but not the router stream's turns (FINDINGS A-253), as before
 ([protocol](../../docs/reference/protocol.md) §8).
+
+The frame the SDK measures is the one it sends. The router then adds the sender's name and, when it
+is missing, the action class (about 64 bytes for `WF.demo@motherbee`), and refuses a frame they
+take over the limit, `UNREACHABLE` `FRAME_TOO_LARGE` (FINDINGS A-202): a text whose message comes
+that close to 128 KiB goes inline and is refused there, as before 0.1.141.
 
 The blob is `content_<the first 16 hex digits of its SHA-256>.txt`, `text/plain` (`text/html` or
 `image/svg+xml` when its first bytes are such a document, so it is served sandboxed), written to

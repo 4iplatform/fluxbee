@@ -383,8 +383,10 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
   oldest. They also stay under 48 KiB serialized (`COGNITION_RECENT_TURNS_MAX_BYTES`), the oldest
   going first, never the newest: 20 turns of 2,000 characters of Latin text fit; a script of more
   bytes a character keeps fewer. The bound keeps a package and the message it rides on under a
-  frame (128 KiB, of which an inline text message takes at most 64 KiB). A turn the communication
-  holds already (a batch sent again) is not added.
+  frame (128 KiB, of which an agent's or an IO node's inline text takes at most 64 KiB). A WF's
+  text goes inline up to the frame (FINDINGS A-264's call, as before 0.1.141): with a long one the
+  router cuts the package's oldest turns, or drops the package, to fit (§7). A turn the
+  communication holds already (a batch sent again) is not added.
 - **A communication not held** (new, after a restart, or let go from a full region, §7): the
   intake loads it from the file, or starts it new, and adds the turn (`held_or_loaded`). When the
   file cannot be read, the turn is kept out (`store_load_failures_total`): a new one would write

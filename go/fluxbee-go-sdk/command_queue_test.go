@@ -142,9 +142,26 @@ func TestAMessageThatDoesNotFitIsAnsweredNotTaken(t *testing.T) {
 	}
 }
 
+// vaultBroadcast is SY.vault's VAULT_SECRET_CHANGED as a node gets it, with the router's stamp
+// (secret_changed_notices, src/bin/sy_vault.rs): a broadcast, scope global, metadata only, and
+// meta.action action ("bootstrap" for the one SY.vault sends for each secret at its start).
+func vaultBroadcast(trace, action string) Message {
+	msg := systemMessage("SY.vault@motherbee", "vault-uuid", MSGVaultSecretChanged, trace)
+	msg.Routing.Dst = BroadcastDestination()
+	msg.Meta.Scope = stringPtr(ScopeGlobal)
+	if action != "" {
+		msg.Meta.Action = stringPtr(action)
+	}
+	msg.Payload = json.RawMessage(`{"op":"put","resource_type":"openai","tenant_id":"tnt:0d3c8e52",` +
+		`"general":true,"version":2,"key":"openai_api_key","hive_id":"motherbee","at_ms":1762958400000}`)
+	return msg
+}
+
 // FINDINGS A-329: no one answers a notice or a reply, a NOT_TAKEN included, so a refused one is
-// counted and dropped: two nodes never bounce a NOT_TAKEN (FINDINGS A-112, A-119). A person's text,
-// a user message without a name, is answered.
+// counted and dropped: two nodes never bounce a NOT_TAKEN (FINDINGS A-112, A-119). SY.vault's
+// VAULT_SECRET_CHANGED is a notice too: SY.vault reads no answer to it (FINDINGS A-325; as first
+// built for 0.1.141, a full system lane answered it NOT_TAKEN). A person's text, a user message
+// without a name, is answered.
 func TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered(t *testing.T) {
 	dispatcher, tx, rx := newDispatcherTestHarness(t, NewOperationalRouteProfile().
 		CommandChannel("incoming").
@@ -160,6 +177,8 @@ func TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered(t *testing.T) {
 		systemMessage("", "router-uuid", MSGUnreachable, "router-made"),
 		systemMessage("WF.other@worker1", "wf-uuid", MSGWithdraw, "withdraw"),
 		systemMessage("WF.other@worker1", "wf-uuid", "", "nameless-system"),
+		vaultBroadcast("vault-change", ""),
+		vaultBroadcast("vault-start", "bootstrap"),
 		systemMessage("SY.timer@worker1", "timer-uuid", MsgTimerResponse, "timer-answer"),
 		systemMessage("WF.other@worker1", "wf-uuid", MSGNotTaken, "not-taken"),
 		userMessage("AI.sales@worker1", "ai-uuid", "EVALUATE.error", "agent-error", "thread-1"),
@@ -168,7 +187,8 @@ func TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered(t *testing.T) {
 	for _, msg := range unanswered {
 		rx <- receivedMessage{msg: msg}
 	}
-	waitFor(t, "the refusals", func() bool { return dispatcher.NotTakenSent().Unanswered == uint64(len(unanswered)) })
+	// Every refusal counted, answered or not: one answered is then in tx.
+	waitFor(t, "the refusals", func() bool { return dispatcher.NotTakenSent().total() == uint64(len(unanswered)) })
 	select {
 	case frame := <-tx:
 		t.Fatalf("a notice or a reply was answered: %s", frame)

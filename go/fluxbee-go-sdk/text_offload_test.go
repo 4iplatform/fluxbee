@@ -115,9 +115,11 @@ func nothingWritten(t *testing.T, root string) {
 
 // FINDINGS A-264, the operator's call (b): a message that fits the frame goes as it is, byte for
 // byte, its text inline however long, and writes nothing: what went inline before 0.1.141 still
-// does, and reaches a reader on any hive. Built first at the Rust SDK's threshold (about 62 KiB),
-// such a text went as a blob, which a reader on another hive may not find yet. One byte over the
-// frame, the text goes as a blob.
+// does, the same frame, and reaches its reader on any hive as it did (the router's additions, the
+// sender's name and the action class, can still take a frame this close to the limit over it, and
+// the router refuses it, as before: FINDINGS A-202). Built first at the Rust SDK's threshold (about
+// 62 KiB), such a text went as a blob, which a reader on another hive may not find yet. One byte
+// over the frame, the text goes as a blob.
 func TestATextThatFitsTheFrameGoesInline(t *testing.T) {
 	root := t.TempDir()
 	empty, err := sendText(t, root, textMessage(t, "", nil))

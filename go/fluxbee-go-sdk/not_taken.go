@@ -92,21 +92,24 @@ func ParseNotTaken(msg Message) (NotTakenPayload, bool) {
 
 // IsNoticeOrReply reports whether msg is answered by no one, an error or a NOT_TAKEN included: the
 // router made it (it carries no routing.src_l2_name, which the router stamps on every message a node
-// sends), it is a presence or router notice (HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED)
-// or a system message without a name, or it is a reply (IsReplyName). An answer to the router's
-// notice would go to the router's uuid, which no node has, and the router would answer UNREACHABLE
-// again, forever (FINDINGS A-112); an answer to a reply could bounce between two nodes (FINDINGS
-// A-119). It is the rule of the WF engine (isNotice and isReply), SY.timer (isInfrastructureMessage)
-// and the AI SDK (is_infrastructure_message), which also leave a message without a name unanswered
-// when they would answer it with an error; a person's text, a user message without a name, gets a
-// NOT_TAKEN.
+// sends), it is a presence or router notice (HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED),
+// SY.vault's VAULT_SECRET_CHANGED or a system message without a name, or it is a reply
+// (IsReplyName). An answer to the router's notice would go to the router's uuid, which no node has,
+// and the router would answer UNREACHABLE again, forever (FINDINGS A-112); an answer to a reply
+// could bounce between two nodes (FINDINGS A-119); SY.vault broadcasts its notice to every node and
+// reads no answer to it (FINDINGS A-325). It is SY.timer's rule (isInfrastructureMessage), name by
+// name, and the WF engine's (isNotice and isReply) and the AI SDK's (is_infrastructure_message) but
+// for VAULT_SECRET_CHANGED, which a WF drops unanswered with every system message that is none of
+// its verbs and ai.generic still answers (FINDINGS A-325), and, for the AI SDK, NOT_TAKEN and
+// <msg>.error (FINDINGS A-329). They also leave a message without a name unanswered when they would
+// answer it with an error; a person's text, a user message without a name, gets a NOT_TAKEN.
 func IsNoticeOrReply(msg *Message) bool {
 	if strings.TrimSpace(msg.SourceL2Name()) == "" {
 		return true
 	}
 	name := stringValue(msg.Meta.Msg)
 	switch name {
-	case MSGHello, MSGAnnounce, MSGWithdraw, MSGUnreachable, MSGTTLExceeded:
+	case MSGHello, MSGAnnounce, MSGWithdraw, MSGUnreachable, MSGTTLExceeded, MSGVaultSecretChanged:
 		return true
 	case "":
 		return IsSystemKind(msg.Meta.MsgType)

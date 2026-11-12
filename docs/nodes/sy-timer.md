@@ -93,8 +93,9 @@ Rules enforced in `main.go`:
   (`isInfrastructureMessage`; `timer_message_ignored`, Messages below).
   Nor does a notice or a reply from a node: `HELLO`, `ANNOUNCE`, `WITHDRAW`, a message without a
   name, SY.vault's `VAULT_SECRET_CHANGED`, any `*_RESPONSE`, a `NOT_TAKEN` or an agent's
-  `<msg>.error`; wf-generic's rule, name by name, and the AI nodes' but for the vault's notice and
-  the last two (FINDINGS A-218, A-329, A-325).
+  `<msg>.error`. That is wf-generic's rule and the AI nodes', name by name, but for the vault's
+  notice, which a WF drops unanswered with every system message that is none of its verbs and
+  ai.generic still answers, and, for the AI nodes, the last two (FINDINGS A-218, A-329, A-325).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
   `<kind>.<name>@<hive>`, with a dot before the `@` (`isCanonicalL2Name`).
 - **Target.** A node schedules for itself: a `target_l2_name` that names another node is

@@ -769,7 +769,8 @@ func TestASystemMessageIsNoWorkflowEvent(t *testing.T) {
 // made (no src_l2_name), and from a node HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE, TTL_EXCEEDED or a
 // system message without a name. Another system message from a node, as a TIMER_HELP meant for
 // SY.timer, is no notice, and is dropped unanswered all the same: it starts nothing and gets
-// nothing, from a node the WF starts from too.
+// nothing, from a node the WF starts from too. So is SY.vault's VAULT_SECRET_CHANGED, which SY.timer
+// takes as a notice since 0.1.141 (FINDINGS A-325).
 func TestTheNoticesAreTheAINodesAndSYTimers(t *testing.T) {
 	system := func(name string) sdk.Message {
 		msg := sdk.Message{
@@ -792,7 +793,7 @@ func TestTheNoticesAreTheAINodesAndSYTimers(t *testing.T) {
 	}
 
 	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
-	for _, name := range []string{sdk.MsgTimerHelp, sdk.MSGConfigChanged} {
+	for _, name := range []string{sdk.MsgTimerHelp, sdk.MSGConfigChanged, sdk.MSGVaultSecretChanged} {
 		msg := from("IO.in@motherbee", system(name))
 		if isNotice(msg) {
 			t.Fatalf("%s from a node is no notice", name)

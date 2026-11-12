@@ -472,7 +472,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141 with the operator's call (b) of 2026-11-12: a WF's text goes as a blob only past the frame, so what fit inline before still goes inline).
+- A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone; built on `coa/gosdk-141` for 0.1.141 with the operator's call (b) of 2026-11-12: a WF's text goes as a blob only past the frame, so what fit inline before still goes inline; its option (c) is A-338).
 - A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, with 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
@@ -483,11 +483,12 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
-- A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change; its SY.timer sibling built on `coa/gosdk-141` for 0.1.141).
+- A-325 🔵 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; ai.generic's or the AI SDK's next change; its Go siblings, SY.timer's answer and the Go SDK's `NOT_TAKEN`, built on `coa/gosdk-141` for 0.1.141).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
 - A-329 🔵 The Go SDK drops a user message when its command channel is full, and nothing goes back to the sender (medium; the Go SDK alone; found by 0.1.137's gate on 0.1.136; the operator's call of 2026-11-12, built on `coa/gosdk-141` for 0.1.141).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
+- A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
 - A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; found by 0.1.139's gate; its local fix, `block_in_place`, to ask the operator).
@@ -1765,6 +1766,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** a revoke that fails to authenticate with that same key reports the key as not
   opening the box.
 
+### A-338 [General/blob] 🔵 low (found 2026-11-12 by the review of A-264's build on `coa/gosdk-141`; read in the code, not seen; there since the Rust SDK's text offload, wider from 0.1.141) — A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob
+
+- **Why:** a long text goes as a blob of the sender's hive, its `content_ref` in the message: the
+  Rust SDK's over about 62 KiB (an agent's long answer; the IO nodes the same), and from 0.1.141
+  the Go SDK's past the frame (a WF's text, A-264). The blob reaches another hive through
+  Syncthing, whose watcher scans a change 10 s after it (`fsWatcherDelayS`; renames held up to
+  60 s were seen in A-19), so the message comes first. Today ai.generic and SY.frontdesk.gov read a
+  `content_ref` at once (`BlobNotFound`), io.slack and io.wapp wait 5 s (`read_blob_with_retry`),
+  and a WF, io.api, io.web and io.linkedhelper read none (A-264's review names the code).
+- **Effect:** such a text fails at a reader on another hive (io.slack does not post it); a reader
+  on the sender's hive reads it at once. On 8.x the test agent and the gates' WFs run on worker1,
+  and the IO.slack nodes on the motherbee. From 0.1.141 it also takes a WF's text over the frame,
+  which no reader got before (refused), never one that went inline.
+- **Options (A-264's (c)):** the producer asks a sync and waits before it sends
+  (blob-annex-spec §6.6; the sync hint is SY.admin's alone today), or each reader waits longer
+  (the AI SDK's model input, the IO common code: their own releases).
+- **The operator (2026-11-12, A-264's call):** a topic of its own.
+
 ### A-337 [General/admin] 🔵 low (found 2026-11-12 by A-124's review; read in the code, not run; there before it) — SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included
 
 - **Why:** `executor_validate_plan` (`src/bin/sy_admin.rs` ~10460) runs
@@ -2190,11 +2209,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     once, never waited for: a `system` message to the sender's uuid, on its `trace_id` and
     `thread_id`, `{"ok": false, "error": "not_taken", "reason": "node_busy", "detail", "retryable":
     true}` (`BuildNotTaken`, `go/fluxbee-go-sdk/not_taken.go`; `refuseCommand`,
-    `command_refusals.go`). A notice or a reply is never answered (`IsNoticeOrReply`: the WF's and
-    SY.timer's rule), so two Go nodes never bounce one; a person's text, a user message without a
-    name, is. Each refusal is counted (`CommandChannelDrops`, `NotTakenSent`: answered, unanswered,
-    or whose `NOT_TAKEN` could not go) and logged, the first at once, then a line at most every 10 s
-    per channel that counts what came since. The engine's own `NOT_TAKEN` takes the SDK's builder,
+    `command_refusals.go`). A notice or a reply is never answered (`IsNoticeOrReply`: SY.timer's
+    rule, and the WF's but for SY.vault's `VAULT_SECRET_CHANGED`, which a WF drops unanswered with
+    every system message that is none of its verbs; the vault's notice since A-325's review), so
+    two Go nodes never bounce one; a person's text, a user message without a name, is. Each refusal
+    is counted (`CommandChannelDrops`, `NotTakenSent`: answered, unanswered, or whose `NOT_TAKEN`
+    could not go) and logged, the first at once, then a line at most every 10 s per channel that
+    counts what came since. The engine's own `NOT_TAKEN` takes the SDK's builder,
     and with it `retryable`, true only for `unavailable` (its store opens again). Today's
     `NOT_TAKEN` had no `retryable`; one without it is not retryable.
   - **The buffer grows from 64 messages to 1,024 messages or 8 MiB a lane, whichever comes first**
@@ -2544,9 +2565,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `timer_message_ignored` line bounded per sender, never a refusal's line; by
   `TestTheVaultsSecretChangedBroadcastGetsNoAnswer` (a change's broadcast and a start's, in a
   Linux container; it fails without the fix). The WF engine, SY.wf-rules and SY.opa.rules already
-  leave it unanswered (a system message that is none of their verbs). Left, read in the code: the
-  Go SDK's `NOT_TAKEN` `node_busy` (A-329) still answers it from a Go node whose system lane is
-  full, since `IsNoticeOrReply` does not name it.
+  leave it unanswered (a system message that is none of their verbs; the WF's by
+  `TestTheNoticesAreTheAINodesAndSYTimers` since the review). **The review of that build (read in
+  the code, and a probe):** the Go SDK's `NOT_TAKEN` `node_busy` (A-329, new in the same release)
+  still answered it to SY.vault from a Go node whose system lane was full, since `IsNoticeOrReply`
+  did not name it, though the SDK's comment and the protocol reference said the notice is never
+  answered. Now `IsNoticeOrReply` names it (`MSGVaultSecretChanged`), so no Go node answers it
+  either way; by `TestANoticeOrAReplyThatDoesNotFitIsNeverAnswered`'s two vault cases (a change's
+  broadcast and a start's), which fail without the name (a `NOT_TAKEN` `node_busy` to
+  `vault-uuid`).
 
 ### A-324 [General/admin] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.admin's help of `node_help`, read on 8.x, carries the new note: an AI node on ai.generic 0.1.136 or later answers at once however busy; the orchestrator's three are comments) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; since 0.1.136) — SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline
 
@@ -5128,11 +5155,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     user).
   - **What it does not cover, recorded:** a WF's text of about 95 to 128 KiB still reaches its node
     but not `turns` or cognition (A-253's window), as before 0.1.141: the call keeps it inline, so
-    that it reaches every reader. A WF's large `meta.context` (its resolved `vars`) with a short
-    text still takes the frame into the same window, and a payload that is not text is not
-    offloaded (both as in the Rust SDK). A blob left in `staging/` by a crash between its write and
-    its promote, or by a second copy of a blob already active, waits for the staging clean-up
-    (24 h, A-241), as the Rust SDK's does.
+    that it reaches its reader as before. The SDK measures the frame as it sends it: the router's
+    additions (the sender's name and, when missing, the action class, about 64 bytes for
+    `WF.demo@motherbee`; more with a longer name) still take a message that close to 128 KiB over
+    the frame, and the router refuses it `UNREACHABLE` `FRAME_TOO_LARGE` (A-202), as before. A WF's
+    long text to an agent still costs the memory package the router adds its oldest turns, or the
+    whole package (from about 80 KiB with a full package; `serialize_with_package`, cognition §7),
+    as before. A WF's large `meta.context` (its resolved `vars`) with a short text still takes the
+    frame into the same window, and a payload that is not text is not offloaded (both as in the
+    Rust SDK). A blob left in `staging/` by a crash between its write and its promote, or by a
+    second copy of a blob already active, waits for the staging clean-up (24 h, A-241), as the Rust
+    SDK's does.
   - **The review (2026-11-12) of the first build, read in the code: a text of about 62 to 128 KiB
     reached fewer readers than before.** Before 0.1.141 a WF's text in that band went inline and
     reached every reader; built first, it went as a `content_ref`, which only a reader whose hive
@@ -5168,7 +5201,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     today, blob-annex-spec §6.6), or each reader waits longer (the AI SDK's model input, the IO
     common code: their own releases). Built on `coa/gosdk-141` (above): what fit inline before
     still goes inline, and only a message over the frame, refused before, goes with its text as a
-    blob. (c) stays a topic of its own.
+    blob. (c) stays a topic of its own: A-338.
+  - **The review of the call's build (2026-11-12), read in the code:** no defect in the code (a
+    frame of 128 KiB or less goes byte for byte as on 0.1.138, so old and new engines send the
+    same frames during the deploy and no reader has to upgrade first). Its docs said a text that
+    fits the frame reaches a reader on any hive, and the cognition reference that an inline text
+    takes at most 64 KiB of an agent's frame: both now say the router's additions and the memory
+    package's cut (above). (c) had no item of its own: A-338.
   - **Mixed versions (only during the deploy):** every WF node runs its package's base, wf.engine's
     `current`, and moves to a new one within a minute of its files reaching its hive, pinned or not
     (`docs/nodes/sy-orchestrator.md`, "A running node and a new runtime version"); the orchestrator

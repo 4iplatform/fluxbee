@@ -364,8 +364,10 @@ pushes them in acknowledged batches to their sinks.
   - **Who sends one:** a frame may be up to 128 KiB, so such a turn reaches its node but neither
     `turns` nor cognition. The Rust SDK normally sends a text over about 62 KiB as a blob, and so
     do the IO nodes, so their turns stay under it. A WF's text of about 95 to 128 KiB reaches it:
-    the Go SDK sends a text as a blob only when the frame is over 128 KiB (since 0.1.141, the
-    operator's call, FINDINGS A-264), so that a text that fits a frame reaches a reader on any hive.
+    the Go SDK sends a text as a blob only when the frame it measures is over 128 KiB (since
+    0.1.141, the operator's call, FINDINGS A-264), so that a text that reached its reader inline
+    before still does, on any hive: one whose message fits the frame with the router's additions
+    (`FRAME_TOO_LARGE` above; a message those take over it is refused, as before).
     So can a WF's large `meta.context` (its resolved `vars`) with a short text, a payload that is not
     text, a text whose blob could not be written (it goes inline, with a log line), and a raw client.
     SY.timer cannot: its messages are system ones, never copied.

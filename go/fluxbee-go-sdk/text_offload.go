@@ -29,11 +29,14 @@ import (
 // watcher scans a change 10 s after it, so the message comes first, and no reader waits that long
 // today (ai.generic reads a content_ref at once, io.slack and io.wapp wait 5 s, and a WF, io.api,
 // io.web and io.linkedhelper read none). With the Rust SDK's threshold a WF's text of about 62 to
-// 128 KiB, which went inline before 0.1.141 and reached every reader, would fail at a reader on
-// another hive. Past the frame, what fit inline before still goes inline, and only a text that could
-// not be sent at all goes as a blob. A text of about 95 to 128 KiB still reaches its node but not the
-// router stream's turns (FINDINGS A-253), as before. Getting the blob to the reader's hive in time is
-// a topic of its own.
+// 128 KiB, which went inline before 0.1.141 and reached its reader on any hive, would fail at a
+// reader on another hive. Past the frame, what fit inline before still goes inline, the same frame,
+// and only a message refused before goes with its text as a blob. The frame is measured as this
+// node sends it: the router then adds the sender's name and, when it is missing, the action class,
+// and refuses a frame they take over the limit (UNREACHABLE FRAME_TOO_LARGE, FINDINGS A-202), as
+// before 0.1.141. A text of about 95 to 128 KiB still reaches its node but not the router stream's
+// turns (FINDINGS A-253), as before. Getting the blob to the reader's hive in time is a topic of its
+// own (FINDINGS A-338).
 //
 // The blob's layout and its promote are the Rust SDK's (crates/fluxbee_sdk/src/blob):
 // staging/<prefix>/<name> written to an exclusive temporary file and renamed, then moved to

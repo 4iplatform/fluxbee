@@ -476,9 +476,10 @@ assigned_ilks, general, version, key, hive_id, at_ms}` (`protocol.rs`). A consum
 also sends the notice to that edge as a unicast: the router lets only that unicast into the DMZ
 edge, never the broadcast (FINDINGS A-78). When SY.vault starts it broadcasts one for every
 secret with `meta.action` `bootstrap`: nothing changed, so a consumer whose reaction is costly (a
-restart) skips those. The notice is never answered, whether the node acts on it or not: SY.vault
-reads no answer to it (SY.timer leaves it unanswered since 0.1.141; ai.generic still answers it
-with an error, FINDINGS A-325).
+restart) skips those. SY.vault reads no answer to the notice, so a node leaves it unanswered,
+whether it acts on it or not. Since 0.1.141 SY.timer does, and so does the Go SDK when a node's
+command channel cannot hold it (no `NOT_TAKEN`, §6.10); ai.generic still answers it with an error
+(FINDINGS A-325).
 The Go SDK has no vault client; it names the notice (`MSGVaultSecretChanged`, since 0.1.141).
 Details: [SY.vault](../nodes/sy-vault.md) and `docs/history/sy-vault-spec.md`.
 
@@ -604,7 +605,11 @@ Conversational text is `TextV1Payload` (`crates/fluxbee_sdk/src/payload.rs`):
   `meta.context`) writes no blob, and is refused as before, as is one whose blob cannot be written.
   Before 0.1.141 a WF's text over the frame was refused (`MessageTooLargeError`). The threshold is
   the operator's call of 2026-11-12, option (b), for the readers below: what went inline before
-  still does.
+  still does, the same frame. The SDK measures the frame as it sends it; the router's additions
+  (the sender's name and the action class, §1.3) can still take a message that close to the limit
+  over it, which the router refuses `FRAME_TOO_LARGE`, as before (FINDINGS A-202). To an agent, the
+  router cuts the memory package it adds to fit the frame ([cognition](cognition.md) §7), so a
+  WF's long inline text costs the package its oldest turns, or all of it.
 - **A reader on another hive** gets an offloaded text's blob through Syncthing, whose watcher scans
   a change 10 s after it (`fsWatcherDelayS`), so the message comes first. Today ai.generic and
   SY.frontdesk.gov read a `content_ref` at once (`ModelInputOptions::default()`, no
@@ -612,7 +617,7 @@ Conversational text is `TextV1Payload` (`crates/fluxbee_sdk/src/payload.rs`):
   a WF, io.api, io.web and io.linkedhelper read none: such a text fails at a reader on another hive.
   That holds for an agent's long answer (the Rust SDK, over about 62 KiB) and, since 0.1.141, for a
   WF's text over the frame (the Go SDK), which could not be sent at all before. Getting the blob to
-  the reader's hive in time is a topic of its own (FINDINGS A-264).
+  the reader's hive in time is a topic of its own (FINDINGS A-338).
 - Limits: 128 KiB per frame (§1.3); with the Rust SDK, 64 KiB for an inline text payload, and with
   the Go SDK the frame. Other payloads are not offloaded: over the frame limit, `send` fails.
 
@@ -756,10 +761,11 @@ requester's dispatcher matches on that. Builders: `try_handle_default_node_statu
 command name: once a node has awaited `X_RESPONSE` with an exact matcher, an unsolicited
 `X_RESPONSE` is dropped (step 4 of §10.2). Answer requests only, never a reply (any `*_RESPONSE`,
 a `NOT_TAKEN`, an agent's `<msg>.error`) or a notice (HELLO, ANNOUNCE, WITHDRAW, UNREACHABLE,
-TTL_EXCEEDED, a system message without a name); Go's `IsNoticeOrReply` is that rule. A
-message without `routing.src_l2_name` was made by the router (UNREACHABLE, TTL_EXCEEDED); its
-`routing.src` is the router's UUID, which no node has, so an answer comes back as another
-UNREACHABLE, and a node that answers every message bounces it forever.
+TTL_EXCEEDED, SY.vault's `VAULT_SECRET_CHANGED` (§6.7), a system message without a name); Go's
+`IsNoticeOrReply` is that rule. A message without `routing.src_l2_name` was made by the router
+(UNREACHABLE, TTL_EXCEEDED); its `routing.src` is the router's UUID, which no node has, so an
+answer comes back as another UNREACHABLE, and a node that answers every message bounces it
+forever.
 
 ---
 
