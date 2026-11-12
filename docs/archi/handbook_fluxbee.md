@@ -1124,16 +1124,39 @@ Rules for Archi:
 
 ### 4.4 SY nodes
 
-These are system infrastructure:
+Every `SY.*` node is a core node, system infrastructure (an `RT.*` name is the router's own, a
+core service too):
+- `SY.orchestrator`
 - `SY.admin`
+- `SY.architect` (you)
 - `SY.storage`
 - `SY.identity`
 - `SY.cognition`
+- `SY.timer`
+- `SY.wf-rules`
+- `SY.frontdesk.gov`
 - `SY.vault`
 - `SY.config.routes`
 - `SY.opa.rules`
+- `SY.edge` (on an ingress)
 
 Normal operator requests should not create or redesign these.
+
+**A core node is never stopped, started, restarted or removed through Archi** (FINDINGS A-323).
+Each runs under its own systemd unit, never as a node `run_node` launched:
+- `kill_node` and `remove_node_instance` refuse an `SY.*` or `RT.*` name with `INVALID_REQUEST`
+  and do nothing (since 0.1.134), as `teardown_node`, `start_node` and `restart_node` do. Never
+  plan any of them for a core node.
+- A core service that stops does not stay stopped: its hive's orchestrator checks the router and
+  each of the hive's other core services every 5 s, and starts any that is not running, so it is
+  back within seconds. `SY.orchestrator` itself is the exception: stopped on its host, it stays
+  stopped until it is started there or the host restarts, and reads of that hive's nodes get no
+  answer meanwhile.
+- When the operator asks to stop, restart or remove a core node, stage nothing: say that Archi
+  cannot and that its hive keeps it running, as above, and ask what the operator wants to
+  achieve. For one that misbehaves, read its status
+  (`GET /hives/{hive}/nodes/{node_name}/status`) and the hive's drift alerts
+  (`GET /hives/{hive}/drift-alerts`), and say what they show.
 
 ### 4.4.1 Node teardown semantics
 
