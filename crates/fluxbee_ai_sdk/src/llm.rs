@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::errors::{AiSdkError, ProviderError, Result};
 use crate::function_calling::{
     FunctionCallingModel, FunctionLoopItem, FunctionModelTurnRequest, FunctionModelTurnResponse,
-    FunctionToolCall,
+    FunctionToolCall, ToolChoice,
 };
 use crate::text_payload::ModelContentPart;
 use crate::usage::AiAccount;
@@ -981,6 +981,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                 })
             })
             .collect::<Vec<_>>();
+        let tool_choice = openai_tool_choice(request.tool_choice, !tools.is_empty());
 
         let mut body = json!({
             "model": self.model,
@@ -991,6 +992,9 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             "temperature": self.model_settings.temperature,
             "top_p": self.model_settings.top_p,
         });
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
+        }
         if let Some(previous_response_id) = previous_response_id {
             body["previous_response_id"] = Value::String(previous_response_id);
         }
@@ -1097,6 +1101,27 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             tool_calls,
             tokens_used,
         })
+    }
+}
+
+/// The Responses API's `tool_choice` for a turn (FINDINGS A-327): `"none"` under
+/// `ToolChoice::None`, and nothing for `Auto`, OpenAI's own default, nor for a turn without tools.
+fn openai_tool_choice(choice: ToolChoice, has_tools: bool) -> Option<Value> {
+    match choice {
+        ToolChoice::None if has_tools => Some(json!("none")),
+        ToolChoice::None | ToolChoice::Auto => None,
+    }
+}
+
+/// The Messages API's `tool_choice` for a turn (FINDINGS A-327): `{"type": "none"}` under
+/// `ToolChoice::None`, and nothing for `Auto`, Anthropic's own default, nor for a turn without
+/// tools. A change of `tool_choice` keeps the cached tools and system prompt and invalidates only
+/// the messages' cache, so a turn under `None` with the same tools and system prompt as the turns
+/// before it reads what they cached.
+fn anthropic_tool_choice(choice: ToolChoice, has_tools: bool) -> Option<Value> {
+    match choice {
+        ToolChoice::None if has_tools => Some(json!({"type": "none"})),
+        ToolChoice::None | ToolChoice::Auto => None,
     }
 }
 
@@ -1704,11 +1729,15 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
         if let Some(last) = tools.last_mut() {
             last["cache_control"] = anthropic_cache_breakpoint();
         }
+        let tool_choice = anthropic_tool_choice(request.tool_choice, !tools.is_empty());
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), Value::String(self.model.clone()));
         body.insert("messages".to_string(), Value::Array(messages));
         if !tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(tools));
+        }
+        if let Some(tool_choice) = tool_choice {
+            body.insert("tool_choice".to_string(), tool_choice);
         }
         body.insert(
             "max_tokens".to_string(),
@@ -2969,6 +2998,7 @@ mod tests {
                 }],
                 tools: Vec::new(),
                 output_schema: None,
+                tool_choice: ToolChoice::Auto,
             })
             .await
             .expect_err("a cut turn is an error");
@@ -3054,6 +3084,7 @@ mod tests {
                     items,
                     tools: vec![tool_definition("thread_state_get")],
                     output_schema,
+                    tool_choice: ToolChoice::Auto,
                 })
                 .await
                 .expect("tool turn");
@@ -3113,6 +3144,7 @@ mod tests {
             items: Vec::new(),
             tools: Vec::new(),
             output_schema: None,
+            tool_choice: ToolChoice::Auto,
         };
 
         let slow = bounded(Duration::from_secs(5));
@@ -3256,6 +3288,17 @@ providers:
         tools: Vec<FunctionToolDefinition>,
         output_schema: Option<OutputSchemaSpec>,
     ) -> (Value, FunctionModelTurnResponse) {
+        anthropic_tool_turn_choosing(system, items, tools, output_schema, ToolChoice::Auto).await
+    }
+
+    /// `anthropic_tool_turn` under `tool_choice`.
+    async fn anthropic_tool_turn_choosing(
+        system: Option<&str>,
+        items: Vec<FunctionLoopItem>,
+        tools: Vec<FunctionToolDefinition>,
+        output_schema: Option<OutputSchemaSpec>,
+        tool_choice: ToolChoice,
+    ) -> (Value, FunctionModelTurnResponse) {
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
             "content": [{"type": "text", "text": "done"}],
             "stop_reason": "end_turn",
@@ -3278,6 +3321,7 @@ providers:
                 items,
                 tools,
                 output_schema,
+                tool_choice,
             })
             .await
             .expect("tool turn");
@@ -3336,6 +3380,107 @@ providers:
             "of the 4 breakpoints a request may have"
         );
         assert_eq!(turn.tokens_used, 3 + 50 + 4000 + 2);
+    }
+
+    /// FINDINGS A-327: a turn under `ToolChoice::None` sends the same tools and system prompt, with
+    /// the same breakpoints, as a turn under `Auto`, and `tool_choice: {"type": "none"}`: Anthropic
+    /// keeps the cached tools and system prompt across a change of `tool_choice`, so it reads what
+    /// the turns before it cached. `Auto` sends no `tool_choice`, as before; nor does a turn
+    /// without tools.
+    #[tokio::test]
+    async fn an_anthropic_turn_under_tool_choice_none_starts_as_the_turns_before_it() {
+        let items = || {
+            vec![
+                FunctionLoopItem::SystemText {
+                    content: "Immediate conversation summary:\ngoal: a report".to_string(),
+                },
+                FunctionLoopItem::UserText {
+                    content: "the report, please".to_string(),
+                },
+            ]
+        };
+        let tools = || {
+            vec![
+                tool_definition("fluxbee_plan_compiler"),
+                tool_definition("fluxbee_system_get"),
+            ]
+        };
+        let (chat, _) = anthropic_tool_turn(Some("You are Archi."), items(), tools(), None).await;
+        let (explanation, turn) = anthropic_tool_turn_choosing(
+            Some("You are Archi."),
+            items(),
+            tools(),
+            None,
+            ToolChoice::None,
+        )
+        .await;
+        assert_eq!(chat.get("tool_choice"), None, "Auto sends nothing");
+        assert_eq!(explanation["tool_choice"], json!({"type": "none"}));
+        assert_eq!(explanation["tools"], chat["tools"]);
+        assert_eq!(explanation["system"], chat["system"]);
+        assert_eq!(
+            explanation["tools"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(turn.assistant_text.as_deref(), Some("done"));
+
+        let (no_tools, _) = anthropic_tool_turn_choosing(
+            Some("You are Archi."),
+            items(),
+            Vec::new(),
+            None,
+            ToolChoice::None,
+        )
+        .await;
+        assert_eq!(no_tools.get("tools"), None);
+        assert_eq!(no_tools.get("tool_choice"), None);
+    }
+
+    /// FINDINGS A-327: OpenAI's Responses API gets `tool_choice: "none"` under `ToolChoice::None`,
+    /// with the tools; `Auto` sends no `tool_choice`, as before; nor does a turn without tools.
+    #[tokio::test]
+    async fn an_openai_turn_under_tool_choice_none_sends_none() {
+        for (tools, tool_choice, sent) in [
+            (
+                vec![tool_definition("thread_state_get")],
+                ToolChoice::None,
+                Some(json!("none")),
+            ),
+            (
+                vec![tool_definition("thread_state_get")],
+                ToolChoice::Auto,
+                None,
+            ),
+            (Vec::new(), ToolChoice::None, None),
+        ] {
+            let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output_text": "done"
+            }));
+            let turn = OpenAiResponsesClient::new("test-key", test_account())
+                .with_base_url(base_url)
+                .function_model("gpt-5.5", None, ModelSettings::default())
+                .run_turn(FunctionModelTurnRequest {
+                    items: vec![FunctionLoopItem::UserText {
+                        content: "explain the run".to_string(),
+                    }],
+                    tools: tools.clone(),
+                    output_schema: None,
+                    tool_choice,
+                })
+                .await
+                .expect("tool turn");
+            handle.join().expect("server thread");
+            assert_eq!(turn.assistant_text.as_deref(), Some("done"));
+            let body = body_rx.recv().expect("captured body");
+            assert_eq!(body.get("tool_choice"), sent.as_ref(), "{tool_choice:?}");
+            assert_eq!(
+                body["tools"].as_array().map(Vec::len),
+                Some(tools.len()),
+                "{tool_choice:?}"
+            );
+        }
     }
 
     /// A turn without tools sends no `tools` and marks nothing there; without a configured prompt,
@@ -3448,6 +3593,7 @@ providers:
                 }],
                 tools: vec![tool_definition("thread_state_get")],
                 output_schema: Some(answer_schema()),
+                tool_choice: ToolChoice::Auto,
             })
             .await
             .expect("the turn, asked again");
@@ -3507,6 +3653,7 @@ providers:
                 }],
                 tools: vec![tool_definition("thread_state_get")],
                 output_schema: Some(answer_schema()),
+                tool_choice: ToolChoice::Auto,
             })
             .await
             .expect("the turn, asked again");
@@ -3541,6 +3688,7 @@ providers:
             }],
             tools: vec![tool_definition("thread_state_get")],
             output_schema: None,
+            tool_choice: ToolChoice::Auto,
         }
     }
 

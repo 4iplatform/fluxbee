@@ -489,7 +489,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
 - A-325 🟡 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; its Go sibling ✅ 0.1.141; ai.generic's and SY.frontdesk.gov's part with 0.1.142).
-- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect).
+- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect; both built on `coa/aisdk-142`, planned 0.1.142).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
@@ -2365,6 +2365,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** the AI SDK gains `tool_choice` (`none`), in a release of its own; then the turn
   sends Archi's same tools with `tool_choice` `none` (a `tool_choice` change keeps the
   tools-and-system cache).
+- **Built on `coa/aisdk-142` (planned 0.1.142, the AI SDK with SY.architect, A-294, A-290 and
+  A-325):** the AI SDK's `ToolChoice` (`Auto`, the default, and `None`), on
+  `FunctionCallingConfig` and each `FunctionModelTurnRequest`: under `None` Anthropic gets
+  `tool_choice: {"type": "none"}` and OpenAI `tool_choice: "none"`; `Auto` sends nothing, so every
+  other call's request is as before; a turn without tools sends none. The runner runs no tool under
+  `None`: a turn that returns a call anyway ends the run with an error. Forced choices (`any`,
+  `tool`, `required`) are left out: Claude Opus 5.5 and Sonnet 5.5 refuse them. The cache rule,
+  checked against Anthropic's prompt-caching invalidation table: a `tool_choice` change keeps the
+  tools and system caches and invalidates only the messages'. SY.architect's explanation turn is
+  shown the chat's tools (`architect_chat_tools`, the chat's own registry, by their definitions
+  alone: `ShownTool`, which does nothing if called) under `ToolChoice::None`, so its prompt starts
+  with the tools and system prompt the chat's turn cached; its request now says the turn *calls no
+  tool*. Tests: the SDK's `every_turn_goes_with_the_runs_tool_choice`,
+  `a_run_whose_tool_choice_is_none_runs_no_tool`,
+  `an_anthropic_turn_under_tool_choice_none_starts_as_the_turns_before_it`,
+  `an_openai_turn_under_tool_choice_none_sends_none`; Archi's
+  `the_explanation_turn_gets_each_steps_answer_and_no_secret` (the chat's tools, under `None`) and
+  `a_turn_that_calls_a_shown_tool_runs_nothing_and_falls_back`. To check on 8.x: the
+  `execution_report` usage record's `cache_read` about the 40,000 tokens it wrote before.
 
 ### A-326 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.timer 1.7's first start built the four list indexes and dropped the two old ones, in 876 ms on worker1; the walks' page medians through SY.admin 0.090 to 0.106 s against 0.106 to 0.129 s on 0.1.138, a schedule's round trip 23 ms against 53 ms (medians); the 16 MiB cache: worker1's sy-timer 24,028 kB resident against 19,764 kB; the clean's purge of 4,430 timers 1,194 ms) (found 2026-11-12 by A-278's review; read in the code, its query plan checked with SQLite; there before it, more pages since A-278; seen live by 0.1.138's gate) — Each `TIMER_LIST` page reads every pending timer of the hive
 

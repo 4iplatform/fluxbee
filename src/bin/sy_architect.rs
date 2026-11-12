@@ -11001,13 +11001,9 @@ async fn handle_ai_chat(
         .usage_account("chat", None)
         .await
         .with_thread(Some(session.thread_id.clone()));
-    let tool_provider = ArchitectAdminReadToolsProvider::new(tool_context);
-    let mut tools = FunctionToolRegistry::new();
-    tool_provider
-        .register_tools(&mut tools)
-        .map_err(|err| -> ArchitectError {
-            format!("AI tool registration failed: {err}").into()
-        })?;
+    let tools = architect_chat_tools(tool_context).map_err(|err| -> ArchitectError {
+        format!("AI tool registration failed: {err}").into()
+    })?;
     let memory = build_session_immediate_memory(state, session).await?;
 
     let model = runtime.function_model(Some(runtime.instructions.clone()), account);
@@ -11152,14 +11148,27 @@ async fn handle_ai_chat(
     Ok(output)
 }
 
+/// The tools Archi's chat offers its model. The explanation turn after a CONFIRM shows its model
+/// the same definitions, under `tool_choice` none, so its prompt starts with the tools and system
+/// prompt the chat's turns cached (FINDINGS A-327).
+fn architect_chat_tools(
+    context: ArchitectAdminToolContext,
+) -> fluxbee_ai_sdk::Result<FunctionToolRegistry> {
+    let mut tools = FunctionToolRegistry::new();
+    ArchitectAdminReadToolsProvider::new(context).register_tools(&mut tools)?;
+    Ok(tools)
+}
+
 /// What the chat says once a plan the operator confirmed ran (FINDINGS A-322): Archi's model gets
-/// one turn, with no tool, its prompt and handbook as in the chat, the session's summary and
-/// recent turns, and each step's answer as `execution_report::step_views` keeps it, never a secret
-/// (FINDINGS A-124); it tells the operator what each step did, and its text becomes the run's
-/// `message`. Without an AI runtime, when the session's turns cannot be read, or when that turn
-/// fails, the message keeps the executor's fixed line with each step's code and detail under it.
-/// One model call per plan run, recorded with the stage `execution_report` and counted in the
-/// answer's `token_usage`; `output.explanation` says which it was.
+/// one turn, which calls no tool, its prompt and handbook as in the chat, the session's summary
+/// and recent turns, and each step's answer as `execution_report::step_views` keeps it, never a
+/// secret (FINDINGS A-124); it tells the operator what each step did, and its text becomes the
+/// run's `message`. The turn is shown the chat's tools by their definitions alone, under
+/// `tool_choice` none, so it reads the chat's prompt cache (FINDINGS A-327). Without an AI runtime,
+/// when the session's turns cannot be read, or when that turn fails, the message keeps the
+/// executor's fixed line with each step's code and detail under it. One model call per plan run,
+/// recorded with the stage `execution_report` and counted in the answer's `token_usage`;
+/// `output.explanation` says which it was.
 async fn explain_executed_plan(
     state: &ArchitectState,
     session: &ChatSessionRecord,
@@ -11167,19 +11176,36 @@ async fn explain_executed_plan(
     output: &mut Value,
 ) {
     let runtime = state.ai_runtime.lock().await.clone();
-    let built: Result<Arc<dyn FunctionCallingModel>, String> = match runtime {
-        Some(runtime) => {
-            let account = admin_tool_context(state, Some(&session.session_id))
-                .usage_account(execution_report::EXPLANATION_STAGE, None)
-                .await
-                .with_thread(Some(session.thread_id.clone()));
-            Ok(runtime.function_model(Some(runtime.instructions.clone()), account))
-        }
-        None => Err(architect_ai_unavailable_reason(state)),
-    };
-    let model = match &built {
-        Ok(model) => Ok(model.as_ref()),
-        Err(why) => Err(why.clone()),
+    let built: Result<(Arc<dyn FunctionCallingModel>, Vec<FunctionToolDefinition>), String> =
+        match runtime {
+            Some(runtime) => {
+                let tool_context = admin_tool_context(state, Some(&session.session_id));
+                let account = tool_context
+                    .usage_account(execution_report::EXPLANATION_STAGE, None)
+                    .await
+                    .with_thread(Some(session.thread_id.clone()));
+                // Without the chat's tools the turn still runs; it only reads no cache.
+                let chat_tools = match architect_chat_tools(tool_context) {
+                    Ok(tools) => tools.definitions(),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "sy.architect: the explanation turn runs without the chat's tools, so \
+                             it reads none of the chat's prompt cache"
+                        );
+                        Vec::new()
+                    }
+                };
+                Ok((
+                    runtime.function_model(Some(runtime.instructions.clone()), account),
+                    chat_tools,
+                ))
+            }
+            None => Err(architect_ai_unavailable_reason(state)),
+        };
+    let (model, chat_tools) = match &built {
+        Ok((model, chat_tools)) => (Ok(model.as_ref()), chat_tools.as_slice()),
+        Err(why) => (Err(why.clone()), &[][..]),
     };
     // The session's summary and recent turns, read only for a turn that runs.
     let memory = async {
@@ -11189,6 +11215,7 @@ async fn explain_executed_plan(
     };
     execution_report::explain_run(
         model,
+        chat_tools,
         memory,
         plan_steps,
         output,

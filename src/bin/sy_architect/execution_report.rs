@@ -4,14 +4,22 @@
 //! completed successfully" or "Execution stopped at step 's1'", and that line was all the chat
 //! showed: a refusal's code and whether asking again may pass went unsaid, and a workflow's delete
 //! that answered ok with two versions left read as a full success. Now Archi's model gets one
-//! turn, with no tool, with each step's answer, and tells the operator what happened, in the
+//! turn, which calls no tool, with each step's answer, and tells the operator what happened, in the
 //! operator's language and as its handbook says (`explain_run`). When there is no turn (Archi has
 //! no AI runtime, or the session's turns cannot be read) or it fails (the provider fails, no answer
-//! within `EXPLANATION_TURN_TIMEOUT`, no text), the chat keeps the fixed line with each step's code
-//! and detail under it (`fallback_text`), with no model. One model call per plan run, recorded with
-//! the stage `EXPLANATION_STAGE`.
+//! within `EXPLANATION_TURN_TIMEOUT`, no text, a tool called), the chat keeps the fixed line with
+//! each step's code and detail under it (`fallback_text`), with no model. One model call per plan
+//! run, recorded with the stage `EXPLANATION_STAGE`.
 //!
-//! No secret and no capability reaches that turn (FINDINGS A-124). Each step's view is built from
+//! The turn is shown the chat's tools, by their definitions alone (`ShownTool`), under
+//! `tool_choice` none (FINDINGS A-327): Anthropic caches a prompt as tools, then system, then
+//! messages, and keeps the cached tools and system prompt across a change of `tool_choice`, so the
+//! turn's prompt starts as the chat's does and reads the about 40,000 tokens the chat's turns
+//! cached, where a turn with no tools wrote them to the cache again at each run.
+//!
+//! No secret and no capability reaches that turn (FINDINGS A-124). Its tools are definitions that
+//! can do nothing: the provider holds the model to no call, the AI SDK's runner runs none that
+//! comes back anyway, and a `ShownTool` called would fail. Each step's view is built from
 //! an allowlist of fields (`step_view`), never by copying its answer, so a `publish_cloud_endpoint`
 //! token, a page's link, a vault value, an API key or a password is in none of them. Each text a
 //! view keeps is cut, and as a backstop loses the links, the credentials written with their value
@@ -19,11 +27,14 @@
 //! why the allowlist keeps no field that holds one.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner, FunctionRunInput,
-    FunctionToolRegistry, ImmediateConversationMemory,
+    AiSdkError, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolRegistry,
+    ImmediateConversationMemory, ToolChoice,
 };
 use serde_json::{json, Map, Value};
 
@@ -104,19 +115,21 @@ answered; run.verified says whether the run checked out as done. When pages_left
 (its error says why) or more above 0, or a removal failed, the pages that stay up are not all \
 named here: say so, and offer to read /artifacts. Never call the run a success when a step failed \
 or something stayed. Offer what your handbook says comes next, for the operator to ask for. This \
-turn has no tools: answer from this report alone, briefly, and do not say how to confirm.";
+turn calls no tool: answer from this report alone, briefly, and do not say how to confirm.";
 
 /// Explains the run in `output`, SY.admin's executor answer as Archi keeps it (its `message`, its
 /// `payload.events` and `payload.summary`, its `verification_verdict`, the installation updates it
 /// followed), with `plan_steps`, the confirmed plan's `execution.steps`. With `model`, one turn of
-/// it, the session's turns (`memory`, read only then) before the report; with none (`Err`, why
-/// there is none), when the session's turns cannot be read, or when the turn fails, the fixed line
-/// with each step under it. The run's `message` becomes what the chat says, and `explanation` says
-/// how it was made: its `source` (`model` or `fallback`), its `model_calls`, the `steps` the turn
-/// was given, and the turn's `tokens_used` (counted in the answer's `token_usage` too) or why it
-/// gave nothing (`error`).
+/// it, the session's turns (`memory`, read only then) before the report, `chat_tools` (the chat's
+/// tools' definitions) shown under `tool_choice` none; with none (`Err`, why there is none), when
+/// the session's turns cannot be read, or when the turn fails, the fixed line with each step under
+/// it. The run's `message` becomes what the chat says, and `explanation` says how it was made: its
+/// `source` (`model` or `fallback`), its `model_calls`, the `steps` the turn was given, and the
+/// turn's `tokens_used` (counted in the answer's `token_usage` too) or why it gave nothing
+/// (`error`).
 pub async fn explain_run<M>(
     model: Result<&dyn FunctionCallingModel, String>,
+    chat_tools: &[FunctionToolDefinition],
     memory: M,
     plan_steps: &[Value],
     output: &mut Value,
@@ -138,7 +151,7 @@ pub async fn explain_run<M>(
             Ok(memory) => {
                 let input = model_input(&run_view(output, &line), &steps);
                 (
-                    explanation_turn(model, Some(memory), input, timeout).await,
+                    explanation_turn(model, chat_tools, Some(memory), input, timeout).await,
                     1,
                 )
             }
@@ -180,11 +193,34 @@ pub async fn explain_run<M>(
     output["explanation"] = explanation;
 }
 
-/// The turn: one call of `model`, with no tool, the report as its message and `memory` (the
-/// session's summary and recent turns) before it, within `timeout`. Its text and the tokens it
-/// used, or why it gave no text.
+/// A tool the explanation turn shows its model and never runs (FINDINGS A-327): one of the chat's,
+/// by its definition alone, so the turn's prompt starts with the tools the chat's turns cached.
+/// The turn runs under `ToolChoice::None`: the provider holds the model to no call, and the AI
+/// SDK's runner runs none that comes back anyway. Were one ever to reach it, it does nothing and
+/// fails (FINDINGS A-124: no capability reaches the turn).
+struct ShownTool(FunctionToolDefinition);
+
+#[async_trait]
+impl FunctionTool for ShownTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        self.0.clone()
+    }
+
+    async fn call(&self, _arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        Err(AiSdkError::Protocol(format!(
+            "{} is not run in the explanation turn",
+            self.0.name
+        )))
+    }
+}
+
+/// The turn: one call of `model`, which calls no tool, the report as its message and `memory` (the
+/// session's summary and recent turns) before it, within `timeout`; `chat_tools` shown under
+/// `tool_choice` none (`ShownTool`). Its text and the tokens it used, or why it gave no text: a
+/// turn that calls a tool anyway ends with an error, the tool not run.
 async fn explanation_turn(
     model: &dyn FunctionCallingModel,
+    chat_tools: &[FunctionToolDefinition],
     memory: Option<ImmediateConversationMemory>,
     input: String,
     timeout: Duration,
@@ -192,8 +228,14 @@ async fn explanation_turn(
     let runner = FunctionCallingRunner::new(FunctionCallingConfig {
         max_turns: 1,
         output_schema: None,
+        tool_choice: ToolChoice::None,
     });
-    let tools = FunctionToolRegistry::new();
+    let mut tools = FunctionToolRegistry::new();
+    for definition in chat_tools {
+        tools
+            .register(Arc::new(ShownTool(definition.clone())))
+            .map_err(|err| format!("the chat's tools could not be shown: {err}"))?;
+    }
     let turn = runner.run_with_input(
         model,
         &tools,
@@ -1179,6 +1221,9 @@ mod tests {
         Text(&'static str),
         Fails,
         Hangs,
+        /// A call of the chat's `fluxbee_plan_compiler`, which a provider under `tool_choice`
+        /// none never sends.
+        CallsATool,
     }
 
     impl RecordingModel {
@@ -1221,8 +1266,29 @@ mod tests {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                     unreachable!("no turn waits an hour")
                 }
+                Answer::CallsATool => Ok(FunctionModelTurnResponse {
+                    assistant_text: None,
+                    tool_calls: vec![fluxbee_ai_sdk::FunctionToolCall {
+                        call_id: "call-1".to_string(),
+                        response_id: None,
+                        name: "fluxbee_plan_compiler".to_string(),
+                        arguments: json!({"task": "delete the workflow", "hive": "motherbee"}),
+                    }],
+                    tokens_used: 321,
+                }),
             }
         }
+    }
+
+    /// The chat's tools, as Archi's chat offers them: their definitions, in name order.
+    fn chat_tools() -> Vec<FunctionToolDefinition> {
+        ["fluxbee_plan_compiler", "fluxbee_system_get"]
+            .map(|name| FunctionToolDefinition {
+                name: name.to_string(),
+                description: format!("The chat's {name}."),
+                parameters_json_schema: json!({"type": "object", "properties": {}}),
+            })
+            .to_vec()
     }
 
     /// A session with no turns yet, read at once.
@@ -1389,6 +1455,7 @@ mod tests {
         output["token_usage"] = json!({ "plan_compile": 1000, "total": 1000, "budget": 60000 });
         explain_run(
             Ok(&model),
+            &chat_tools(),
             no_turns(),
             &plan_steps(),
             &mut output,
@@ -1398,7 +1465,10 @@ mod tests {
 
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 1, "one model call per run");
-        assert!(requests[0].tools.is_empty(), "the turn offers no tool");
+        // FINDINGS A-327: the chat's tools, shown under tool_choice none, so the turn reads the
+        // chat's prompt cache and calls none of them.
+        assert_eq!(requests[0].tools, chat_tools(), "the chat's tools");
+        assert_eq!(requests[0].tool_choice, ToolChoice::None);
         drop(requests);
         let sent = model.sent();
         for secret in secrets() {
@@ -1554,6 +1624,7 @@ mod tests {
             let mut output = run_output();
             explain_run(
                 Ok(&model),
+                &chat_tools(),
                 no_turns(),
                 &plan_steps(),
                 &mut output,
@@ -1589,6 +1660,7 @@ mod tests {
         let mut output = run_output();
         explain_run(
             Err("AI provider not configured.".to_string()),
+            &chat_tools(),
             no_turns(),
             &plan_steps(),
             &mut output,
@@ -1611,6 +1683,7 @@ mod tests {
         let mut output = run_output();
         explain_run(
             Ok(&model),
+            &chat_tools(),
             ready(Err::<ImmediateConversationMemory, String>(
                 "messages table: not found".to_string(),
             )),
@@ -1637,9 +1710,61 @@ mod tests {
     #[tokio::test]
     async fn a_turn_with_no_text_falls_back() {
         let model = RecordingModel::new(Answer::Text("  "));
-        let turn =
-            explanation_turn(&model, None, "report".to_string(), EXPLANATION_TURN_TIMEOUT).await;
+        let turn = explanation_turn(
+            &model,
+            &chat_tools(),
+            None,
+            "report".to_string(),
+            EXPLANATION_TURN_TIMEOUT,
+        )
+        .await;
         assert_eq!(turn, Err("the model gave no text".to_string()));
+    }
+
+    /// FINDINGS A-327 and A-124: a turn that calls one of the tools it was shown, which a provider
+    /// under tool_choice none never sends, runs nothing: the run ends with an error and the chat
+    /// keeps the fixed line with each step's code and detail.
+    #[tokio::test]
+    async fn a_turn_that_calls_a_shown_tool_runs_nothing_and_falls_back() {
+        let model = RecordingModel::new(Answer::CallsATool);
+        let mut output = run_output();
+        explain_run(
+            Ok(&model),
+            &chat_tools(),
+            no_turns(),
+            &plan_steps(),
+            &mut output,
+            EXPLANATION_TURN_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            model.requests.lock().unwrap().len(),
+            1,
+            "one turn, no other"
+        );
+        assert_eq!(output["explanation"]["source"], json!("fallback"));
+        let error = output["explanation"]["error"].as_str().unwrap();
+        assert!(
+            error.contains("called fluxbee_plan_compiler on a turn whose tool_choice is none"),
+            "{error}"
+        );
+        assert!(output["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Execution stopped at step 's2'\n- s1 wf_rules_delete"));
+
+        // Should a call ever reach a shown tool, it does nothing.
+        let shown = ShownTool(chat_tools().remove(0));
+        let refused = shown
+            .call(json!({}))
+            .await
+            .expect_err("a shown tool runs nothing");
+        assert!(
+            refused
+                .to_string()
+                .contains("fluxbee_plan_compiler is not run in the explanation turn"),
+            "{refused}"
+        );
     }
 
     /// When SY.admin's executor fails before its report (`EXECUTOR_UNAVAILABLE`: a step's model
@@ -1670,6 +1795,7 @@ mod tests {
 
         explain_run(
             Err("AI provider not configured.".to_string()),
+            &chat_tools(),
             no_turns(),
             &plan_steps(),
             &mut output,
@@ -1785,6 +1911,7 @@ mod tests {
             let model = RecordingModel::new(Answer::Text("The value was read."));
             explain_run(
                 Ok(&model),
+                &chat_tools(),
                 no_turns(),
                 &[],
                 &mut output,

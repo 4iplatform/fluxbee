@@ -28,7 +28,7 @@ pub use function_calling::{
     FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionModelTurnRequest,
     FunctionModelTurnResponse, FunctionTool, FunctionToolCall, FunctionToolDefinition,
     FunctionToolProvider, FunctionToolRegistry, FunctionToolResult, ToolCard, ToolCatalog,
-    ToolErrorCode, ToolRunWatch, DEFAULT_MAX_TURNS, TOOL_DESCRIPTION_MAX_CHARS,
+    ToolChoice, ToolErrorCode, ToolRunWatch, DEFAULT_MAX_TURNS, TOOL_DESCRIPTION_MAX_CHARS,
 };
 pub use immediate_memory::{
     ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,

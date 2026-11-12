@@ -322,8 +322,9 @@ showed only SY.admin's fixed line, "Execution completed successfully" or "Execut
 step 's1'": a refusal's code and whether asking again may pass went unsaid, and a workflow's delete
 that answered ok with versions left read as a full success.
 
-- **The turn**: one call of Archi's model, with no tool, its prompt and handbook as in the chat,
-  the session's summary and recent turns, and a message Archi writes: what to report (what each
+- **The turn**: one call of Archi's model, which calls no tool, its prompt and handbook as in the
+  chat, the chat's tools shown under `tool_choice` none (since 0.1.142, below), the session's
+  summary and recent turns, and a message Archi writes: what to report (what each
   step did, what is done, what stayed and why, a refusal's code, its detail and whether asking
   again may pass, the pages left up and until when, the warning, the steps that did not run, and
   what each step's status and the followed update mean), in the operator's language and as the
@@ -332,9 +333,18 @@ that answered ok with versions left read as a full success.
   Archi's own words. One model call per plan run, recorded with the stage `execution_report`,
   and bounded at 90 s (`EXPLANATION_TURN_TIMEOUT`).
 - **Its cost**: Archi's prompt and handbook (about 40,000 tokens), the session's turns and the
-  report, and a short answer. The turn sends no tools, and Anthropic caches a prompt as tools,
-  then system, then messages, so it never reads what a chat turn cached: its prompt is billed in
-  full, as a cache write, unless another such turn ran within the cache's lifetime.
+  report, and a short answer. Since 0.1.142 (FINDINGS A-327) the turn is shown the chat's tools
+  (`architect_chat_tools`, the same definitions in the same order) by their definitions alone, and
+  runs under the AI SDK's `ToolChoice::None`: Anthropic caches a prompt as tools, then system, then
+  messages, and keeps the cached tools and system prompt across a change of `tool_choice`, so the
+  turn reads the tools and the prompt the chat's turn wrote to the cache moments before (5 min
+  lifetime), as `cache_read` in its usage record. On 0.1.137 to 0.1.141 it sent no tools, so it
+  never read what a chat turn cached: its prompt was billed in full as a cache write, about 40,000
+  tokens a run (Claude Opus 5.5: about $0.20 a run, where a read costs about $0.01).
+- **No tool runs in it** (FINDINGS A-124 and A-327): the provider holds the model to no call; the
+  AI SDK's runner runs none that comes back anyway and ends the turn with an error, so the chat
+  keeps the fixed line; and each tool it is shown is a `ShownTool`, a definition that does nothing
+  if called.
 - **What the turn is given**: an allowlist, never a step's answer copied (FINDINGS A-124). Of the
   run, its status, its steps done of all, the step it stopped at, its answer's code
   (`EXECUTION_FAILED`, `EXECUTOR_UNAVAILABLE`...), whether Archi verified it and its line

@@ -218,6 +218,29 @@ pub enum FunctionLoopItem {
     },
 }
 
+/// Whether the model may call the tools a turn offers (FINDINGS A-327).
+///
+/// - `Auto` (the default): the model decides. Nothing goes on the wire for it, so a turn reads as
+///   it did before `tool_choice` existed: both providers decide by themselves when a request names
+///   none.
+/// - `None`: the model sees the tools and calls none: Anthropic gets `tool_choice: {"type":
+///   "none"}`, OpenAI `tool_choice: "none"`. A turn that must not act but should start with the
+///   same tools as the turns before it, so it reads their prompt cache (Anthropic keeps the cached
+///   tools and system prompt across a change of `tool_choice`; only the messages' cache is
+///   invalidated), offers them under `None`. The runner never runs a call such a turn returns
+///   anyway (`FunctionCallingRunner`).
+///
+/// A turn with no tools sends no `tool_choice` either way. The choices that force a call
+/// (Anthropic's `any` and `tool`, OpenAI's `required`) are left out: Claude Opus 5.5 and Claude
+/// Sonnet 5.5, the models 8.x runs, refuse them with a 400.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionModelTurnRequest {
     pub items: Vec<FunctionLoopItem>,
@@ -226,6 +249,9 @@ pub struct FunctionModelTurnRequest {
     /// the provider on this turn; `None` leaves the model's text free.
     #[serde(default)]
     pub output_schema: Option<OutputSchemaSpec>,
+    /// Whether the model may call `tools` on this turn (`FunctionCallingConfig::tool_choice`).
+    #[serde(default)]
+    pub tool_choice: ToolChoice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +284,10 @@ pub struct FunctionCallingConfig {
     /// only when the schema is `strict`). The runner does not check the answer: its caller does,
     /// as ai.generic checks a response contract's object (FINDINGS A-150).
     pub output_schema: Option<OutputSchemaSpec>,
+    /// Whether the model may call the tools, on every turn of the run (FINDINGS A-327). Under
+    /// `ToolChoice::None` the run runs no tool: a turn that returns a call anyway ends the run with
+    /// an error, and the call is never made.
+    pub tool_choice: ToolChoice,
 }
 
 impl Default for FunctionCallingConfig {
@@ -265,6 +295,7 @@ impl Default for FunctionCallingConfig {
         Self {
             max_turns: DEFAULT_MAX_TURNS,
             output_schema: None,
+            tool_choice: ToolChoice::Auto,
         }
     }
 }
@@ -386,10 +417,25 @@ impl FunctionCallingRunner {
                     items: items.clone(),
                     tools: tools.definitions(),
                     output_schema: self.config.output_schema.clone(),
+                    tool_choice: self.config.tool_choice,
                 })
                 .await?;
 
             total_tokens_used = total_tokens_used.saturating_add(response.tokens_used);
+
+            // A turn that may call no tool and calls one anyway: the provider did not hold the
+            // model to it. The run runs nothing it was not allowed to (FINDINGS A-327).
+            if self.config.tool_choice == ToolChoice::None && !response.tool_calls.is_empty() {
+                let names = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AiSdkError::Protocol(format!(
+                    "the model called {names} on a turn whose tool_choice is none; no tool was run"
+                )));
+            }
 
             let should_commit_assistant_text = response.tool_calls.is_empty();
             if should_commit_assistant_text {
@@ -990,6 +1036,117 @@ mod tests {
                 .expect("runner should succeed");
             assert_eq!(*model.schemas.lock().await, asked);
         }
+    }
+
+    /// `SequencedModel`, noting the tools and the `tool_choice` each turn is sent.
+    #[derive(Default)]
+    struct ChoiceNotingModel {
+        turns: SequencedModel,
+        asked: Mutex<Vec<(Vec<String>, ToolChoice)>>,
+    }
+
+    #[async_trait]
+    impl FunctionCallingModel for ChoiceNotingModel {
+        async fn run_turn(
+            &self,
+            request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            let names = request.tools.iter().map(|tool| tool.name.clone()).collect();
+            self.asked.lock().await.push((names, request.tool_choice));
+            self.turns.run_turn(request).await
+        }
+    }
+
+    /// A tool that counts its calls.
+    #[derive(Default)]
+    struct CountedTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FunctionTool for CountedTool {
+        fn definition(&self) -> FunctionToolDefinition {
+            DemoTool.definition()
+        }
+
+        async fn call(&self, _arguments: Value) -> Result<Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"status": "ok"}))
+        }
+    }
+
+    /// FINDINGS A-327: each turn goes with the run's `tool_choice` and its tools; `Auto` by
+    /// default.
+    #[tokio::test]
+    async fn every_turn_goes_with_the_runs_tool_choice() {
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(DemoTool))
+            .expect("tool should register");
+        let model = ChoiceNotingModel::default();
+        FunctionCallingRunner::new(FunctionCallingConfig::default())
+            .run(&model, &tools, "create hive worker-220")
+            .await
+            .expect("runner should succeed");
+        let demo = vec!["demo_write".to_string()];
+        assert_eq!(
+            *model.asked.lock().await,
+            vec![(demo.clone(), ToolChoice::Auto), (demo, ToolChoice::Auto)]
+        );
+        assert_eq!(
+            FunctionCallingConfig::default().tool_choice,
+            ToolChoice::Auto
+        );
+        assert_eq!(
+            serde_json::to_value(ToolChoice::None).unwrap(),
+            json!("none")
+        );
+        // A request written before the field reads as `Auto`.
+        let request: FunctionModelTurnRequest =
+            serde_json::from_value(json!({"items": [], "tools": []})).unwrap();
+        assert_eq!(request.tool_choice, ToolChoice::Auto);
+    }
+
+    /// FINDINGS A-327: under `ToolChoice::None` the model gets the tools and the run calls none of
+    /// them: a turn that returns a call anyway ends the run with an error, the call never made.
+    #[tokio::test]
+    async fn a_run_whose_tool_choice_is_none_runs_no_tool() {
+        let tool = Arc::new(CountedTool::default());
+        let mut tools = FunctionToolRegistry::new();
+        tools.register(tool.clone()).expect("tool should register");
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig {
+            max_turns: 1,
+            tool_choice: ToolChoice::None,
+            ..FunctionCallingConfig::default()
+        });
+
+        // The first turn of SequencedModel calls demo_write.
+        let model = ChoiceNotingModel::default();
+        let err = runner
+            .run(&model, &tools, "explain the run")
+            .await
+            .expect_err("a call under tool_choice none ends the run");
+        assert!(
+            err.to_string()
+                .contains("called demo_write on a turn whose tool_choice is none"),
+            "{err}"
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0, "no tool was run");
+        assert_eq!(
+            *model.asked.lock().await,
+            vec![(vec!["demo_write".to_string()], ToolChoice::None)]
+        );
+
+        // A turn that answers with text is the run's answer, the tools offered all the same.
+        let model = CaptureModel::default();
+        let result = runner
+            .run(&model, &tools, "explain the run")
+            .await
+            .expect("a turn with text");
+        assert_eq!(result.final_assistant_text.as_deref(), Some("ok"));
+        let request = model.last_request.lock().await.clone().expect("a turn");
+        assert_eq!(request.tool_choice, ToolChoice::None);
+        assert_eq!(request.tools, tools.definitions());
     }
 
     /// Fails the turn after the first: the first one asks for `demo_write`.

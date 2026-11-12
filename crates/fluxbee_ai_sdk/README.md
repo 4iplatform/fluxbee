@@ -146,6 +146,8 @@ pub fn create_function_calling_model(
   as `cache_read` and `cache_write`. The run's own system text (immediate memory) goes after the
   breakpoints, in a block of its own. A prompt shorter than the model's minimum is sent uncached,
   without an error. OpenAI caches a repeated prefix by itself. The plain path marks nothing.
+  A change of `tool_choice` (below) keeps the cached tools and system prompt; only the messages'
+  cache goes.
 
 ### A tool loop
 
@@ -209,6 +211,22 @@ let answer = result.final_assistant_text;
     the object checked afterwards only when the contract names a `text_field`).
   - The schema is the same on every turn of a run, so the turns still read Anthropic's prompt
     cache; a different `output_config` invalidates it.
+- **Whether the model may call the tools** (since 0.1.142, FINDINGS A-327):
+  `FunctionCallingConfig { tool_choice: ToolChoice::None, ..FunctionCallingConfig::default() }`
+  offers the model the tools and lets it call none of them; `ToolChoice::Auto`, the default, lets
+  it decide.
+  - Anthropic gets `tool_choice: {"type": "none"}` and OpenAI `tool_choice: "none"`. `Auto` sends
+    no `tool_choice`, as before, and nor does a turn without tools.
+  - What it is for: a turn that must not act, but whose prompt should start as the turns before it
+    did, so it reads their prompt cache. Anthropic caches tools, then system, then messages, and
+    keeps the cached tools and system prompt across a change of `tool_choice`: the same tools and
+    system prompt under `None` read what a turn under `Auto` cached, where a turn without the
+    tools writes its prompt to the cache again. Archi's explanation turn after a `CONFIRM` runs so
+    (docs/nodes/sy-architect.md).
+  - The runner runs no tool under `None`: a turn that returns a call anyway (the provider did not
+    hold the model to it) ends the run with an error, and the call is never made.
+  - The choices that force a call (Anthropic's `any` and `tool`, OpenAI's `required`) are not
+    there: Claude Opus 5.5 and Claude Sonnet 5.5 refuse them with a 400.
 
 ### A plain call
 
