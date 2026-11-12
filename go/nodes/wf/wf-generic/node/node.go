@@ -24,6 +24,9 @@ type RunOptions struct {
 	Clock ClockFunc
 	// SDKConfig is the SDK connection config. If nil, Run only checks the config and returns.
 	SDKConfig *sdk.NodeConfig
+	// Engine is the wf.engine the node runs (EngineOf its binary's path), which its status reports
+	// (FINDINGS A-302).
+	Engine Engine
 }
 
 // Run is the main lifecycle function. It:
@@ -58,6 +61,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 			return err
 		}
 	}
+	log.Printf("wf: engine %s", opts.Engine)
 	materialized := plane.Configured()
 	if materialized != nil {
 		log.Printf("wf: loaded definition workflow_type=%s states=%d", materialized.Definition.WorkflowType, len(materialized.Definition.States))
@@ -96,10 +100,10 @@ func Run(ctx context.Context, opts RunOptions) error {
 	rt := &NodeRuntime{
 		ActCtx: ActionContext{Dispatcher: NewSDKDispatcher(sender), Clock: clock, SelfILK: sdk.ReadSelfIlkFromEnv(),
 			Requests: newTimerRequests()},
-		NodeUUID:   sender.UUID(),
-		NodeName:   sender.FullName(),
-		Plane:      plane,
-		VersionStr: "1.0",
+		NodeUUID: sender.UUID(),
+		NodeName: sender.FullName(),
+		Plane:    plane,
+		Engine:   opts.Engine,
 		timerAnswerDrops: func() uint64 {
 			return routerDispatcher.CommandChannelDrops()["broadcast:"+timerAnswersChannel]
 		},

@@ -48,6 +48,13 @@ func main() {
 		log.Fatalf("wf-generic: managed node name unavailable: set %s or _system.node_name", sdk.ManagedNodeNameEnv)
 	}
 
+	// The engine it runs is the runtime version its binary is in, which its status reports
+	// (FINDINGS A-302): the start script the orchestrator launches runs the binary beside it.
+	executable, err := os.Executable()
+	if err != nil {
+		log.Printf("wf-generic: its binary's path could not be read, its status names no engine: %v", err)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -59,6 +66,7 @@ func main() {
 		ConfigPath: configPath,
 		NodeName:   nodeName,
 		Plane:      plane,
+		Engine:     node.EngineOf(executable),
 		SDKConfig: &sdk.NodeConfig{
 			Name:               plane.NodeName,
 			RouterSocket:       routerSockDir,

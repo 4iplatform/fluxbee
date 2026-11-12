@@ -1046,6 +1046,12 @@ person: when its provider gave no answer, the error carries the operator's text 
   verbs answer `STORE_ERROR` (`node_not_configured` for a bad `db_path`), and it opens the store
   again every 30 s, ready as soon as it opens. A `db_path` the operator changes is a config change,
   applied at the node's restart.
+- **Which `wf.engine` a WF node runs** is in its `get_node_status`: `node_status.extensions.engine`,
+  `{runtime, version, executable}` (the engine's version, and its binary's path), next to
+  `runtime.resolved_version`, which is the workflow package's own version, not the engine's
+  (FINDINGS A-302, since 0.1.139). `version` is null for an engine run by hand; a node on an engine
+  before 0.1.139 shows no `engine`. After a release, a WF node moves to the new engine at its
+  hive's next reconcile pass (60 s), once the engine has reached that hive.
 
 ### 4.3 IO nodes
 

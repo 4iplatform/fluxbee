@@ -49,16 +49,17 @@ const (
 type NodeRuntime struct {
 	// Def is the definition a new instance takes, DefJSON its bytes and DefHash their hash. A running
 	// instance keeps the one it was born with.
-	Def        *WorkflowDefinition
-	DefJSON    string // raw JSON of the definition (for WF_GET_CODE)
-	DefHash    string
-	Registry   *InstanceRegistry
-	Store      *Store
-	ActCtx     ActionContext
-	NodeUUID   string
-	NodeName   string
-	Plane      *ControlPlane
-	VersionStr string
+	Def      *WorkflowDefinition
+	DefJSON  string // raw JSON of the definition (for WF_GET_CODE)
+	DefHash  string
+	Registry *InstanceRegistry
+	Store    *Store
+	ActCtx   ActionContext
+	NodeUUID string
+	NodeName string
+	Plane    *ControlPlane
+	// Engine is the wf.engine the node runs, which its status reports (FINDINGS A-302).
+	Engine Engine
 	// timersPending is why the timer index is not reconciled with SY.timer yet (it did not answer,
 	// or the index could not be read): the node runs DEGRADED, and the receive loop tries again until
 	// it is.
@@ -290,19 +291,27 @@ func rawMsgName(msg sdk.Message) string {
 
 // --- Control verb handlers ---
 
+// handleNodeStatusGet answers NODE_STATUS_GET as the SDK's managed answer does (the health of the
+// config state, its last_error), with the engine the node runs under extensions.engine, which the
+// orchestrator's get_node_status passes on (FINDINGS A-302).
 func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
-	resp, err := sdk.BuildManagedNodeStatusResponse(&msg, rt.NodeUUID, rt.Plane.State)
+	payload := map[string]any{
+		"status":       "ok",
+		"health_state": sdk.ManagedHealthState(rt.Plane.State),
+		"extensions":   map[string]any{"engine": rt.Engine.status()},
+	}
+	if rt.Plane.State.LastError != nil {
+		payload["last_error"] = rt.Plane.State.LastError
+	}
 	if degraded := rt.degradedBy(ctx); degraded != nil && rt.Plane.Configured() != nil {
 		// Its config in use, but its engine waits for its store, or its timers for their reconcile or
 		// for SY.timer to take them: DEGRADED, saying why (the orchestrator's get_node_status reports
 		// both).
-		resp, err = sdk.BuildSystemMessage(rt.NodeUUID, sdk.UnicastDestination(msg.Routing.Src), 16, msg.Routing.TraceID,
-			sdk.MSGNodeStatusGetResponse, map[string]any{
-				"status":       "ok",
-				"health_state": "DEGRADED",
-				"last_error":   *degraded,
-			})
+		payload["health_state"] = "DEGRADED"
+		payload["last_error"] = *degraded
 	}
+	resp, err := sdk.BuildSystemMessage(rt.NodeUUID, sdk.UnicastDestination(msg.Routing.Src), 16, msg.Routing.TraceID,
+		sdk.MSGNodeStatusGetResponse, payload)
 	if err != nil {
 		return err
 	}

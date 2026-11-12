@@ -1116,7 +1116,7 @@ loop {
 
 Handlers:
 
-- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers are not reconciled: SY.timer did not answer, or the timer index could not be read (§11.4), or a timer SY.timer did not take waits to go again (§10.2).
+- `NODE_STATUS_GET` — the health of its config state: `HEALTHY` when `CONFIGURED`, `DEGRADED` with `last_error` otherwise (the orchestrator's `get_node_status` reports both); also `DEGRADED`, with `store_unavailable`, while the engine waits for its store (§14.1), and with `timers_not_reconciled`, while its timers are not reconciled: SY.timer did not answer, or the timer index could not be read (§11.4), or a timer SY.timer did not take waits to go again (§10.2). Every answer names the engine the node runs, `extensions.engine`: `runtime` and `version`, the runtime version whose directory holds its binary (`<dist>/runtimes/wf.engine/<version>/bin/`), null for a binary run by hand, and `executable`, its path; `get_node_status` shows it as `node_status.extensions.engine`, next to the workflow package's own version (FINDINGS A-302, since 0.1.139).
 - `WF_HELP` — returns the workflow HELP descriptor.
 - `WF_CANCEL_INSTANCE` — initiates soft abort.
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).

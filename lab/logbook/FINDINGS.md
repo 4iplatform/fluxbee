@@ -431,7 +431,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-299 🔵 A worker join that fails after linking the box into Syncthing records no device id, so `remove_hive` cannot unlink it (low; the orchestrator).
 - A-300 🔵 A node pinned to a version is not counted as its use between crash-loop restarts (low; the orchestrator).
 - A-301 🔵 A fresh join under a removed hive's name reuses a surviving identity key (low; the orchestrator).
-- A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic; seen live by 0.1.138's gate).
+- A-302 🔵 Which wf.engine a WF node runs shows only in its unit's ExecStart (low; wf-generic; seen live by 0.1.138's gate; built on `coa/wf-139` for 0.1.139).
 - A-303 🔵 The frontdesk answers a final `tenant_unresolved` when the identity SHM is momentarily unreadable (low; the frontdesk; built on `coa/frontdesk-139` for 0.1.139; two rarer paths not told apart, to decide).
 - A-304 🔵 A-62's workflow-package admission misses a WF node on a hive cut off from the LSA (low; SY.admin; since 0.1.133 also a name on two hives, to decide).
 - A-305 🔵 `INVENTORY_UNAVAILABLE` and a manifest lock not taken in time do not say in their payload that a retry may pass (low; SY.admin).
@@ -2866,6 +2866,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Seen live (0.1.138's deploy, 2026-11-12):** the deploy relaunched `WF.gate0238@worker1` on
   wf.engine 0.1.138: the gate's `pre` step read it in the WF unit's ExecStart at 13:29:35Z, after
   1 s of waiting for the relaunch.
+- **Built on `coa/wf-139` (for 0.1.139), the WF node alone:** the node reads the path of its own
+  binary at its start (`os.Executable`) and takes the runtime version whose directory holds it,
+  `<dist>/runtimes/<runtime>/<version>/bin/<binary>`, the version its unit's ExecStart names
+  (`EngineOf`, `node/engine.go`); its journal says it (*"wf: engine wf.engine 0.1.139 (<path>)"*).
+  `NODE_STATUS_GET` answers it as `extensions.engine` `{runtime, version, executable}` in every
+  state (`HEALTHY`, `DEGRADED`, a config not in use), `runtime` and `version` null for a binary that
+  is no runtime version's; the orchestrator's `get_node_status` already passes a node's
+  `extensions` on, so `GET /hives/{hive}/nodes/{node}/status` shows `node_status.extensions.engine`
+  next to `runtime.resolved_version`, the package's, with no orchestrator change. The dead
+  `VersionStr` (`"1.0"`) is gone; the router's HELLO still says `"1.0"`, never read for a version.
+  Not in `WF_HELP`, which no caller reads for it. Tests: `TestTheStatusNamesTheEngineTheNodeRuns`
+  (fails before: no `extensions`) and `TestEngineOfReadsTheRuntimeVersionItsBinaryIsIn`. Docs: the
+  WF's README, [spec-systemnode-wf-v1_1](../../docs/spec-systemnode-wf-v1_1.md)'s handlers,
+  [sy-wf-rules.md](../../docs/nodes/sy-wf-rules.md), [sy-orchestrator.md](../../docs/nodes/sy-orchestrator.md),
+  [operations.md](../../docs/reference/operations.md) and Archi's handbook §4.2.
 
 ### A-301 [General/orchestrator] 🔵 low (found 2026-11-11 by A-277's review fixes; read in the code; there before it) — A fresh join under a removed hive's name reuses a surviving identity key
 

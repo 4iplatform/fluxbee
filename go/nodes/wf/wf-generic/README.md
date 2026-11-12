@@ -132,6 +132,15 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   ready. A corrected `db_path` is a
   config change, applied at a restart. Before, the node exited, and its unit restarted it every 5 s
   with the reason only in its journal.
+- **It names the engine it runs** (FINDINGS A-302, since 0.1.139). `NODE_STATUS_GET` answers
+  `extensions.engine`: `runtime` and `version`, the runtime version whose directory holds its binary
+  (`<dist>/runtimes/wf.engine/<version>/bin/wf-generic`, beside the start script its unit's
+  ExecStart runs), and `executable`, the binary's path; `runtime` and `version` are null for a
+  binary that is no runtime version's (one run by hand). The orchestrator's `get_node_status`
+  shows it as `node_status.extensions.engine`, next to `runtime`, the workflow package
+  (`wf.<name>`) on its own version; the node's journal says it at its start (*"wf: engine
+  wf.engine 0.1.139 (<path>)"*). Before, only the unit's ExecStart said which engine a WF node ran,
+  so a deploy read it on the hive.
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and
   `WF_CANCEL_INSTANCE` answer only SY.admin@motherbee and SY.wf-rules of the node's hive, in
   snake_case keys. A router notice and a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) are never

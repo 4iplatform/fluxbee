@@ -416,7 +416,9 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   less than 60 s from its time is fired by the node itself, and one SY.timer holds at a later time
   (a move it did not take) is moved to its time (`node/timer_requests.go`, FINDINGS A-254 and its
   review).
-- **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`;
+- **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET` (its health, and the engine it
+  runs as `extensions.engine`, its runtime version and its binary's path: FINDINGS A-302, since
+  0.1.139; `node/engine.go`), `CONFIG_GET`, `CONFIG_SET`;
   `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES` (with `count_only`, only how many, a
   `COUNT(*)`; a payload it cannot read, or a status no instance has, `INVALID_REQUEST`),
   `WF_GET_CODE`, `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the

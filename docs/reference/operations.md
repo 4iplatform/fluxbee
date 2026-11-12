@@ -888,7 +888,11 @@ target. A pinned node keeps its version until `set_node_config` rebinds it, whic
 applies (a package node launched before 0.1.88 takes it at its next launch). Every launch writes
 the version into `_system.runtime_version` before it launches the node, so `status` and
 `NODE_HELP` report the version the node runs
-([SY.orchestrator](../nodes/sy-orchestrator.md#a-running-node-and-a-new-runtime-version)).
+([SY.orchestrator](../nodes/sy-orchestrator.md#a-running-node-and-a-new-runtime-version)). For a WF
+node that is its workflow package's version; the `wf.engine` it runs on, the node names itself in
+`GET /hives/{hive}/nodes/{node}/status` as `node_status.extensions.engine.version`, read without
+the unit's ExecStart (FINDINGS A-302, since 0.1.139; `null` for an engine run by hand, and no
+`engine` from an engine before 0.1.139).
 
 ## Orchestrator boot
 

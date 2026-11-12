@@ -419,7 +419,9 @@ What a unit runs is read from systemd, not from the config (`live_unit`): its Ex
 `FLUXBEE_NODE_RUNTIME_VERSION` (`build_managed_node_run_command`, since 0.1.88). A full runtime's
 ExecStart names its version, since the version is in the start script's path; a package's
 ExecStart is its base's start script, the same for every version of the package, so only that
-variable shows a package's version.
+variable shows a package's version. Which base version a WF node runs, its `wf.engine`, the node
+says itself in its status, which `get_node_status` passes on as `node_status.extensions.engine`
+(FINDINGS A-302, since 0.1.139).
 
 The move:
 
