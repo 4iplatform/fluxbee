@@ -21827,8 +21827,9 @@ fn registry_hives_with_roles(
 /// `lost+found`) is no hive: no join files one under such a name, no hive can be asked by it, and
 /// `add_hive`, `remove_hive` and `get_hive` refuse it (`INVALID_HIVE_ID`, FINDINGS A-311). The
 /// motherbee's readers of its hives leave it out (`registry_hives_with_roles`,
-/// `list_managed_hive_ids`), as the peer reconcile's reader does (`read_registry_snapshot`), and
-/// it is warned of once while the orchestrator runs.
+/// `list_managed_hive_ids`, and `list_hives` since 0.1.139, FINDINGS A-330), as the peer
+/// reconcile's reader does (`read_registry_snapshot`), and it is warned of once while the
+/// orchestrator runs.
 fn registry_directory_is_hive(root: &Path, name: &str) -> bool {
     let is_hive_id = valid_hive_id(name);
     if !is_hive_id && registry_name_not_a_hive_id_first_seen(name) {
@@ -23772,16 +23773,31 @@ fn node_name(entry: &NodeEntry) -> String {
 }
 
 fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, OrchestratorError> {
-    let root = hives_root();
+    list_hives_in(&hives_root(), state)
+}
+
+/// `list_hives` over the registry under `root`: each hive's `info.yaml`, by its name alone when
+/// it has none that parses (a join being accepted), and this hive when the registry has no entry
+/// for it, by hive id. A directory whose name is not a hive id is no hive and is left out
+/// (`registry_directory_is_hive`, FINDINGS A-330): listed by its name alone, a `gate0237.bak`
+/// showed in `GET /hives` as a hive that `get_hive`, `add_hive` and `remove_hive` refuse
+/// (`INVALID_HIVE_ID`).
+fn list_hives_in(
+    root: &Path,
+    state: &OrchestratorState,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     let mut out = Vec::new();
     if root.exists() {
-        for entry in fs::read_dir(&root)? {
+        for entry in fs::read_dir(root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
             let hive_id = entry.file_name().to_string_lossy().to_string();
-            if let Ok(info) = read_hive_info(&root, &hive_id) {
+            if !registry_directory_is_hive(root, &hive_id) {
+                continue;
+            }
+            if let Ok(info) = read_hive_info(root, &hive_id) {
                 out.push(info);
             } else {
                 out.push(serde_json::json!({ "hive_id": hive_id }));
@@ -56257,6 +56273,57 @@ blob:
                 "message": "its join status is failed",
             })]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-330: `list_hives` (`GET /hives`) lists the registry's hives, and a directory
+    /// whose name is not a hive id is none. Listed by its name alone, a `gate0237.bak` planted in
+    /// the motherbee's registry showed in `GET /hives` on 8.x (0.1.137), a hive that `get_hive`,
+    /// `add_hive` and `remove_hive` refuse (`INVALID_HIVE_ID`). An entry being accepted, with no
+    /// `info.yaml` yet, is still listed by its name, and this hive is listed when the registry has
+    /// no entry for it.
+    #[test]
+    fn list_hives_lists_no_registry_directory_that_is_not_a_hive() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxbee-list-hives-not-a-hive-{}",
+            Uuid::new_v4().simple()
+        ));
+        for (dir, info) in [
+            (
+                "worker1",
+                Some("hive_id: worker1\nrole: worker\nstatus: connected\n"),
+            ),
+            // A join being accepted: no info.yaml yet.
+            ("worker2", None),
+            // A copy of worker1's entry left beside it.
+            (
+                "gate0237.bak",
+                Some("hive_id: worker1\nrole: worker\nstatus: connected\n"),
+            ),
+            ("lost+found", None),
+            (
+                "worker 3",
+                Some("hive_id: worker 3\nrole: worker\nstatus: connected\n"),
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            if let Some(info) = info {
+                fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+            }
+        }
+        fs::write(root.join("stray-file"), "not a hive").unwrap();
+
+        let state = sample_orchestrator_state_for_tests();
+        let hives = list_hives_in(&root, &state).expect("the registry is listed");
+        let ids: Vec<&str> = hives
+            .iter()
+            .map(|hive| hive["hive_id"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(ids, ["motherbee", "worker1", "worker2"], "{hives:?}");
+        assert_eq!(hives[0]["is_local"], true, "{hives:?}");
+        assert_eq!(hives[1]["status"], "connected", "{hives:?}");
+        assert_eq!(hives[2], serde_json::json!({ "hive_id": "worker2" }));
 
         let _ = fs::remove_dir_all(&root);
     }

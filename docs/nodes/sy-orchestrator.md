@@ -609,9 +609,11 @@ characters `[A-Za-z0-9_-]` (`valid_hive_id`, the check `add_hive` and `remove_hi
 in each role's join flow, `remove_hive` and `get_hive` refuse such an id with one answer
 (`invalid_hive_id_answer`), whose message names the rule in the words SY.admin's and SY.identity's
 refusals of a hive id use: `hive_id must be a hive id: 1 to 64 letters, digits, '_' or '-'`.
-`read_hive_info` and `write_hive_info` refuse such an id as well (`hive_info_path`), so
-`list_hives` lists a directory whose name is not a hive id by its name alone, as it lists one
-without an `info.yaml`. The inventory leaves out a hive of the LSA with such a name, and a
+`read_hive_info` and `write_hive_info` refuse such an id as well (`hive_info_path`). `list_hives`
+(`GET /hives`) leaves out a directory whose name is not a hive id (FINDINGS A-330, since 0.1.139):
+before, it listed one by its name alone, a hive every action on it refuses; it still lists an entry
+being accepted, with no `info.yaml` yet, by its name. The inventory leaves out a hive of the LSA
+with such a name, and a
 deployment's or a drift alert's `present` and `hive_present` are false for one
 (`registry_has_hive`), with no path touched. The motherbee's read of a runtime's use across the
 hives (`registry_hives_with_roles`, FINDINGS A-281) and its list of the hives for Fluxbee Cloud's
