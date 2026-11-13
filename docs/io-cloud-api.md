@@ -2,8 +2,8 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.143** (2026-11-13), and PROD runs **0.1.143** (the router, the Go
-> SDK, the AI SDK and the Rust SDK since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
+> Contract as of **fluxbee 0.1.144** (2026-11-13), and PROD runs **0.1.144** (the router, the Go
+> SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
@@ -1152,6 +1152,14 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.144
+
+- **`provision_node` refuses a `params.config` whose top holds a `config` or a `_system` key**,
+  `INVALID_REQUEST`, before anything is created (§5.4, FINDINGS A-346): the config is the node's own
+  keys at its top. Up to 0.1.143 a `config` key there was stored as it came, and the node took it as
+  its whole config at its next start; a `_system` key answered `CONFIG_WRITE_FAILED` once the node's
+  identity had been registered. Send the node's keys at the top of `params.config`.
 
 ### 0.1.143
 

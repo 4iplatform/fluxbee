@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.143** | 2026-11-13 | `93fe0d3a` | motherbee + spokes (core), the Rust SDK alone: A-295 (a Rust node's command channels, two lanes of 1,024 messages or 8 MiB, the system lane first; a message without room is answered `NOT_TAKEN node_busy`, retryable, and a `NOT_TAKEN` ends a pending request), A-309 (a call its caller drops leaves nothing pending), A-269's call (b) (each record one line, escaped, cut at 16 KiB, every Rust binary), A-285's Cloud catalog text; A-336 recorded | ✅ live, checked on 8.x | snap `pre-rustsdk-0-1-143` (all 4 VMs) · `apt install fluxbee=0.1.142` + 0.1.142's `update_installation` (nothing one-way; the unbounded channels come back) |
+| **0.1.144** | 2026-11-13 | `3343b49a` | motherbee + spokes (core), the operator's calls on the bug push's findings, one branch per binary: the orchestrator (A-343: no call to Syncthing on the threads that serve its commands; A-346 (b): a config patch, or `run_node`'s config, with a top-level `config` key refused), SY.admin and Archi's handbook (A-346 (a): set_node_config's HTTP help names the route's body; A-344: what `WF_NODE_NOT_DEPLOYED` means and what to do) | ✅ live, checked on 8.x | snap `pre-orch-0-1-144` (all 4 VMs) · `apt install fluxbee=0.1.143` + 0.1.143's `update_installation` (nothing one-way; the stalls come back) |
+| **0.1.143** | 2026-11-13 | `93fe0d3a` | motherbee + spokes (core), the Rust SDK alone: A-295 (a Rust node's command channels, two lanes of 1,024 messages or 8 MiB, the system lane first; a message without room is answered `NOT_TAKEN node_busy`, retryable, and a `NOT_TAKEN` ends a pending request), A-309 (a call its caller drops leaves nothing pending), A-269's call (b) (each record one line, escaped, cut at 16 KiB, every Rust binary), A-285's Cloud catalog text; A-336 recorded | ✅ replaced by 0.1.144 | snap `pre-rustsdk-0-1-143` (deleted 2026-11-13) · `apt install fluxbee=0.1.142` + 0.1.142's `update_installation` (nothing one-way; the unbounded channels come back) |
 | **0.1.142** | 2026-11-13 | `bc62240f` | motherbee + spokes (core), the AI SDK alone: A-294 (a reply over the frame fails alone, the runtime goes on), A-290 (a saturated AI node reads `DEGRADED` `ai_runtime_saturated`, its load in its status), A-325 (ai.generic and SY.frontdesk.gov leave `VAULT_SECRET_CHANGED` unanswered), A-339 (and a `NOT_TAKEN` or an error answer, with a WARN), A-327's `tool_choice` (no caller yet) | ✅ replaced by 0.1.143 | snap `pre-aisdk-0-1-142` (deleted 2026-11-13) · `apt install fluxbee=0.1.141` + 0.1.141's `update_installation` (nothing one-way; A-294's restart comes back) |
 | **0.1.141** | 2026-11-13 | `2f1a0e1e` | motherbee + spokes (core), the Go SDK alone: A-329 (the Go SDK answers `NOT_TAKEN node_busy`, retryable, to the sender of each message its command channel cannot hold, two lanes of 1,024 messages or 8 MiB, where it held 64 and dropped the rest unseen; SY.timer sends again a fire its target answers so, while on time), A-264 (a WF's text past the frame, 128 KiB, goes as a blob, the operator's call (b)), A-325's Go sibling (SY.timer leaves `VAULT_SECRET_CHANGED` unanswered), with A-338 recorded | ✅ replaced by 0.1.142 | snap `pre-gosdk-0-1-141` (deleted 2026-11-13) · `apt install fluxbee=0.1.140` + 0.1.140's `update_installation` (nothing one-way; A-329's drops come back) |
 | **0.1.140** | 2026-11-13 | `28564648` | motherbee + spokes (core), the router alone: A-269's router part (the router refuses at HELLO a node name that is not an L2 name, ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes, before any line prints it; its review: both local accept loops log a failed connection's error quoted, escaped and cut) | ✅ replaced by 0.1.141 | snap `pre-router-0-1-140` (deleted 2026-11-13) · `apt install fluxbee=0.1.139` + 0.1.139's `update_installation` (nothing one-way; A-269's router part comes back) |
@@ -152,6 +153,59 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.144 — The orchestrator and SY.admin: a hung Syncthing no longer freezes the orchestrator, and set_node_config's help says what its route takes (A-343, A-346, A-344)
+
+- **Date:** 2026-11-13 (ART) · **Previous version:** 0.1.143 · **Commit:** `3343b49a`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** the operator's calls of 2026-11-13 on the bug push's findings (FINDINGS' board, item 30):
+  A-343 (*"watchdog nuevo no resuelve nada... que syncthing... cuelgue el orchestrator no puede
+  pasar... restart y log... el orchestrator es el watchdog del sistema"*), A-346 (*"sí, sin dudas,
+  sin ayuda archi no entiende nada"*), A-344 (*"que no reintente.. archi tiene que resolver"*);
+  A-347 waits. Two binaries, a branch each ([METHOD](logbook/METHOD.md) §9).
+- **What changed:**
+  - **The orchestrator (`coa/orch-144`; `956a82c5`, the review `17b05c8a`):** A-343: every call to
+    Syncthing (its REST curls, `syncthing device-id`, and the setup's restart, start and stop of its
+    unit, which a hung Syncthing can hold up to its 30 s stop timeout) runs through one runner,
+    `syncthing_call` (`tokio::task::block_in_place`), each with its own timeout, never on the
+    threads that serve commands; A-283's restart after 5 min unanswered unchanged, no new watchdog.
+    A-346 (b): `parse_config_patch` refuses a top-level `config` key as it refuses `_system`
+    (`INVALID_REQUEST`, HTTP 400), and `run_node` refuses such a config before anything is written
+    or forwarded (it answered `CONFIG_WRITE_FAILED` after registering the ILK).
+  - **SY.admin and Archi's handbook (`coa/admin-144`; `a792258f`, the review `3343b49a`):** A-346 (a):
+    set_node_config's HTTP help gives the route's body its own fields (the patch itself; the five
+    binding fields at the top; `?replace=1` in the query), one list of binding fields for the route
+    and the help, a flat example and an `example_scmd`; the executor's args unchanged. A-344: the
+    handbook's §4.2.7 on `WF_NODE_NOT_DEPLOYED` (not retryable; what to read; run it again once the
+    hive answers, or tell the operator). Recorded: A-348 (Archi's SCMD of that route reads no
+    `?replace` and leaves the binding fields in the patch).
+- **Build and review:** each branch built, reviewed once and fixed by its builder, its checks run
+  (fmt, build, its binary's tests, clippy `-D warnings`; the catalog and doc-links guards); the
+  admin branch rebased onto the orchestrator's (FINDINGS' A-346 line and entry, both kept); CI
+  green on `3343b49a`; daily fast-forwarded.
+- **The deploy:** build on fb-build 21:53:11–22:07:11Z (14.0 min), publish 16 s. The gate's mark at
+  22:08:02Z; `ops deploy 0.1.144 --snapshot pre-orch-0-1-144 --drop pre-rustsdk-0-1-143` in 329 s
+  (snapshots 29.7 s, the motherbee's apt 166.9 s, its admin on the version 45.9 s, the spokes
+  answering 9.1 s, the update's call 21.7 s, the hives on the target 14.6 s, health 31.8 s). On the
+  target after the update's call: the motherbee 4.2 s, egress1 and ingress1 30.8 s, worker1 35.1 s.
+  The update (`upd-1794607938185`) closed with every hive on the target, hash `da6ac0bcc8dcbeb8`.
+  Health clean.
+- **Checked on 8.x (the gate, gate0244, 20:47–22:16Z, its baseline on 0.1.143;
+  `scratchpad/gate-tools/r144_gate.py`, git-ignored; 17 PASS, 2 SEE, 0 FAIL):**
+  - **A-343:** worker1's Syncthing SIGSTOPped about 2 min, worker1's orchestrator read through
+    SY.admin every 0.5 s on the motherbee's clock: on 0.1.143, 16 of 170 reads took 9.2 to 11.5 s;
+    on 0.1.144, none over 3 s (median 0.156 s, max 0.364 s).
+  - **The smoke (A-314's lesson):** `run_node AI.gate0244s@worker1` ok in 2.2 s, `RUNNING` at 11.0 s on
+    0.1.144, killed without purge, `STOPPED`; the stopped `AI.gate0233@worker1` reads `STOPPED`.
+  - **A-346:** the help as built, the executor's contract requiring `config`; a wrapped patch
+    refused `INVALID_REQUEST`, nothing written; a flat patch taken.
+  - **A-344:** the motherbee's handbook names `WF_NODE_NOT_DEPLOYED`.
+  - **The cost:** 0 usage records.
+- **PROD after the gate:** all four hives on 0.1.144; snapshot `pre-orch-0-1-144` on each VM,
+  `pre-rustsdk-0-1-143` deleted. `AI.gate0244s` and `AI.gate0244t` purged (no history); worker1's
+  Syncthing running, no gate timer left.
+- **Rollback:** the snapshot `pre-orch-0-1-144` (all 4 VMs), or `apt install fluxbee=0.1.143` +
+  0.1.143's `update_installation`: nothing one-way.
 
 ## 0.1.143 — The Rust SDK alone: a Rust node without room answers, and every record is one line (A-295, A-309, A-269 (b), A-285)
 

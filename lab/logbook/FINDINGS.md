@@ -366,6 +366,12 @@ no change required
     threads that serve the orchestrator's commands; restart and log as A-283; no new watchdog) and
     A-346 (the help fixed, a top-level `config` key refused): to build; A-344 (not retryable,
     Archi resolves it: a handbook text); A-347 waits, recorded.
+    **0.1.144, the orchestrator and SY.admin (the operator's calls on the push's findings)** ✅ live
+    and checked on 8.x (2026-11-13): A-343 (with worker1's Syncthing frozen, its orchestrator's reads
+    in 0.16 s, at most 0.36 s, where 0.1.143 held 16 of 170 for 9 to 11.5 s), A-346 (the help
+    names the route's body, a wrapped patch refused, nothing written), A-344 (Archi's handbook text);
+    17 PASS, no model call. A-347 waits; A-348 (found building A-346: Archi's SCMD reads no
+    `?replace`) recorded.
     **Next:** the io.web talk (the operator's idea), then the IO family, with io.slack.
     **Numbers given on the push's branches** (the operator's call of 2026-11-12, where 0.1.139's
     integration review had given the orchestrator's item A-339): A-335 is the orchestrator's (a box
@@ -444,7 +450,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
 - A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
 - A-342 🔵 A WF's resends of its timers land up to about 2 s late (low; the WF engine; found by 0.1.139's gate; there before it, since A-254).
-- A-344 🔵 A change that ran and could not rebind its node answers 502 `WF_NODE_NOT_DEPLOYED` with no `retryable` (low; SY.wf-rules; the operator's call of 2026-11-13: it stays not retryable, Archi resolves it; its handbook text built on `coa/admin-144`, for 0.1.144).
 
 ### io.web
 
@@ -506,9 +511,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
-- A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; the operator's call of 2026-11-13: no Syncthing call on the threads that serve commands, restart and log as A-283, no new watchdog; built on `coa/orch-144` for 0.1.144: every call to Syncthing through one runner, off those threads).
 - A-345 🔵 `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one (low, observability; the orchestrator; found by 0.1.139's gate).
-- A-346 🔵 `set_node_config`'s help describes a body its HTTP route does not take (medium; SY.admin and the orchestrator; the hazard it left on IO.cloud fixed on 8.x; the operator's call of 2026-11-13: the help fixed and a top-level `config` key refused; (a), the help, built on `coa/admin-144` and (b), the refusal, on `coa/orch-144`, for 0.1.144).
 - A-347 🔵 `remove_hive`'s cleanup on the box races the box's own orchestrator, which starts again the core services the cleanup stopped (low; the orchestrator; found by 0.1.139's gate; the operator's call of 2026-11-13: it waits, recorded).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1635,7 +1638,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-13):** *"ok, puede esperar como registro de bug"*: recorded, not
   scheduled.
 
-### A-346 [General/admin] 🔵 medium (found 2026-11-13 by 0.1.139's gate, its step 44.1's S4; read in the code; there before it) — `set_node_config`'s help describes a body its HTTP route does not take
+### A-346 [General/admin] ✅ VALIDATED ON 8.x (0.1.144, 2026-11-13; set_node_config's HTTP help names the body as the patch itself and `?replace=1` in the query, the executor's args unchanged; a patch with a top-level `config` key refused `INVALID_REQUEST`, nothing written, a flat one taken) (found 2026-11-13 by 0.1.139's gate, its step 44.1's S4; read in the code; there before it) — `set_node_config`'s help describes a body its HTTP route does not take
 
 - **Seen on 8.x (0.1.139's gate, 2026-11-13 03:42Z):** the gate's tool wrote S4's fake record as
   `PUT /hives/motherbee/nodes/IO.cloud@motherbee/config` with the body `{"config": {"io": {...,
@@ -1725,6 +1728,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   read as the `config` wrapper this fix removes: they now name the config's `behavior.provider`
   and `behavior.model` (the args' `config` is that config). sy-admin.md named only the write's
   function for both routes; it names `get_node_config_flow` too.
+- **Validated on 8.x (0.1.144's gate, gate0244, 2026-11-13; `scratchpad/gate-tools/r144_gate.py`, git-ignored; 17 PASS, 2 SEE, 0 FAIL, no model call):** `GET /admin/actions/set_node_config` on 0.1.144: the HTTP body's
+  fields only the five binding fields (no `config`, no `replace`), `?replace=1` named, a note that
+  the body is the patch itself; the executor's contract still requires `hive`, `node_name` and
+  `config`. On a throwaway `AI.gate0244t@worker1` (no config): a PUT with `{"config": {...}}`
+  answered `INVALID_REQUEST` in 2.13 s, the config's keys and `config_version` unchanged; a flat
+  patch taken in 1.43 s, read back, `config_version` +1, no top-level `config`.
 
 ### A-345 [General/orchestrator] 🔵 low, observability (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it) — `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one
 
@@ -1743,7 +1752,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** the status carries the node's reported lifecycle state (for example
   `config_state`), so Archi tells them apart.
 
-### A-344 [WF/wf-rules] 🔵 low, a question for the operator (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code) — A change that ran and could not rebind its node answers 502 `WF_NODE_NOT_DEPLOYED` with no `retryable`
+### A-344 [WF/wf-rules] ✅ BUILT (0.1.144, 2026-11-13; the operator's call: not retryable, Archi resolves it; Archi's handbook says what the answer means and what to read and do, read on the motherbee's handbook) (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code) — A change that ran and could not rebind its node answers 502 `WF_NODE_NOT_DEPLOYED` with no `retryable`
 
 - **Seen on 8.x (0.1.139's gate, `wf-busy`, worker1's Syncthing frozen, 2026-11-13 01:46–01:48Z
   and 05:34–05:36Z):** the changes that ran answered 502 `WF_NODE_NOT_DEPLOYED`, *"Package
@@ -1780,8 +1789,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   *"Package published, but ..."*, which a restart's failure does not have (*"Package published
   and config rebound, but restart of the existing WF node failed"*, `deploy.go`): it now quotes
   *"Package published"*.
+- **Shipped in 0.1.144 (2026-11-13):** the motherbee's `/etc/fluxbee/handbook_fluxbee.md` holds
+  the new text on `WF_NODE_NOT_DEPLOYED` (§4.2.7); SY.wf-rules unchanged. Archi's use of it is
+  read at its next such answer.
 
-### A-343 [General/orchestrator] 🔵 medium (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code: the mechanism confirmed, the cadence plausible; there before it) — A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15
+### A-343 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.144, 2026-11-13; with worker1's Syncthing SIGSTOPped, 170 reads of worker1's orchestrator through SY.admin answered in 0.156 s median, 0.364 s at most, where 0.1.143 answered 16 of 170 in 9 to 11.5 s) (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code: the mechanism confirmed, the cadence plausible; there before it) — A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15
 
 - **Seen on 8.x (0.1.139's gate, `wf-busy`, worker1's Syncthing SIGSTOPped, 2026-11-13
   01:46–01:48Z):** SY.admin's `get_node_config` and `set_node_config` to worker1, for SY.wf-rules'
@@ -1853,6 +1865,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   them fails it). What stays: the watchdog's tick still waits for its curls, about 10 s a tick
   while Syncthing hangs (A-313's matter), and a sync hint or a finalize still holds the ordered
   lane while it waits (a scan up to 120 s).
+- **Validated on 8.x (0.1.144's gate, gate0244, 2026-11-13; `scratchpad/gate-tools/r144_gate.py`, git-ignored; 17 PASS, 2 SEE, 0 FAIL, no model call):** worker1's Syncthing SIGSTOPped about 2 min (a safety timer sending
+  CONT at 240 s), while a script on the motherbee read `GET /hives/worker1/nodes/AI.pruebas@worker1/config`
+  every 0.5 s, timed on the motherbee's clock. On 0.1.143 (20:47Z): 170 reads, all 200, median
+  0.160 s, but 16 of them 9.2 to 11.5 s, the watchdog's curl holding a worker. On 0.1.144 (22:14Z):
+  170 reads, all 200, median 0.156 s, p95 0.210 s, max 0.364 s, none over 3 s. Syncthing continued
+  and the safety timer gone both times. A-283's restart after 5 min unanswered not provoked (the
+  freeze shorter): by its tests and 0.1.137's gate.
 
 ### A-342 [WF] 🔵 low (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it, since A-254 in 0.1.131) — A WF's resends of its timers land up to about 2 s late
 
