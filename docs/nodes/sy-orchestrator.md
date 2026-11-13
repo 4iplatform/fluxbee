@@ -1294,7 +1294,11 @@ API, or `syncthing device-id`, through `syncthing_call` (`block_in_place`), each
 timeout: 5 s, 10 s for a folder's status and errors, 120 s for a scan or a revert. A Syncthing
 that is stopped (SIGSTOP) or hung still takes the connection, so a curl waits its whole timeout:
 run on one of the runtime's threads, it held the whole orchestrator, its commands and the router's
-messages included, about 10 s of every 15 while the watchdog asked the folders. Now only the
+messages included, about 10 s of every 15 while the watchdog asked the folders. The restart,
+start and stop of its unit that a setup (`ensure_blob_sync_runtime`) and a sync turned off
+(`disable_blob_sync_runtime_local`) run go through it too: a Syncthing that does not stop holds
+them up to the unit's stop timeout, 30 s, the reason the restarts of
+`restart_syncthing_for_pending` and the peer reconcile already ran off those threads. Now only the
 caller waits: the watchdog's tick, and a sync hint or a finalize, which hold the ordered lane
 while they wait, as before. Nothing else changed: no new watchdog, and a Syncthing whose REST API
 gives no answer is restarted and logged as above.

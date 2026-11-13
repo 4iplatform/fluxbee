@@ -1656,7 +1656,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   replaces it whole (the executor's args keep `config` and `replace`), and (b) the orchestrator
   refuses a top-level `config` key in a patch, as it refuses `_system`. To build.
 - **Built on `coa/orch-144` (for 0.1.144), (b):** `parse_config_patch` (`src/bin/sy_orchestrator.rs`
-  ~26330) refuses a top-level `config` key as it refuses `_system`, `INVALID_REQUEST`: *"invalid
+  ~26346) refuses a top-level `config` key as it refuses `_system`, `INVALID_REQUEST`: *"invalid
   config: a top-level key 'config' is not allowed: a node's config patch is the config itself, its
   keys at the top: {"io": {...}}, not {"config": {"io": {...}}} (over HTTP, set_node_config's PUT
   body is the patch itself)"*. Checked first that no node's config has a key of that name: the Rust
@@ -1677,7 +1677,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   says so. Test: `a_config_patch_with_a_top_level_config_key_is_refused_and_a_flat_one_goes_on`
   (the check, `set_node_config` with and without `replace`, `run_node` and the spawn's write: the
   wrapped patch refused, nothing written; a flat one, a `config` key below its top included, goes
-  on; without the check it fails at its first refusal). What stays: SY.admin's help, (a), on its
+  on; without the check it fails at its first refusal, and without `run_node`'s early check at
+  `run_node`'s, which the motherbee then forwards). What stays: SY.admin's help, (a), on its
   own branch; a stray top-level `replace` is still stored as a config key; a config.json that
   already holds a `config` key keeps it (8.x's IO.cloud was cleaned by hand, above).
 
@@ -1757,8 +1758,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   timeout; Syncthing that does not answer is restarted as A-283 has it (after 5 min unanswered, at
   most once an hour) and logged, and nothing else. To build.
 - **Built on `coa/orch-144` (for 0.1.144):** every call to Syncthing runs its command through one
-  runner, `syncthing_call` (`tokio::task::block_in_place`, `src/bin/sy_orchestrator.rs` ~15907),
-  in the eight functions that call it: the seven REST calls through curl
+  runner, `syncthing_call` (`tokio::task::block_in_place`, `src/bin/sy_orchestrator.rs` ~15909),
+  in the eight functions that call Syncthing: the seven REST calls through curl
   (`syncthing_device_connected`, `syncthing_folder_status`, `syncthing_remote_state`,
   `syncthing_revert_folder`, `syncthing_trigger_folder_scan`, `syncthing_rest_my_id`,
   `syncthing_folder_errors`) and `syncthing device-id` (`local_syncthing_device_id`), each with
@@ -1772,16 +1773,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   multi-thread runtime, on a blocking thread under `Handle::block_on` (a read, a background join),
   which allows it, inside another `block_in_place`, or outside any runtime; no test calls one on a
   current-thread runtime, where it would panic. Nothing else changed: no new watchdog, A-283's
-  restart and its log as they were. Tests:
+  restart and its log as they were. The review added the restart, start and stop of Syncthing's
+  unit that a setup (`ensure_blob_sync_runtime`, three) and a sync turned off
+  (`disable_blob_sync_runtime_local`) ran on those threads: a Syncthing that does not stop holds
+  them up to the unit's stop timeout, 30 s, the reason `restart_syncthing_for_pending` and the peer
+  reconcile already ran theirs off them; they go through the runner too. Tests:
   `a_call_to_a_syncthing_that_holds_its_answer_holds_no_runtime_thread` (a runtime of one worker
   thread and a fake REST API that holds its answer: a task that ticks every 10 ms keeps ticking
   through each of the seven calls, and each gets its answer; with the runner calling in place, as
-  before, it fails at the first call, 0 ticks in 200 ms) and
+  before, it fails at the first call, no tick in 2 s) and
   `every_call_to_syncthing_runs_off_the_threads_that_serve_commands` (every function of the code
-  that calls Syncthing runs its command through the runner and keeps its timeout; a call outside
-  it fails it). What stays: the watchdog's tick still waits for its curls, about 10 s a tick while
-  Syncthing hangs (A-313's matter), and a sync hint or a finalize still holds the ordered lane
-  while it waits (a scan up to 120 s).
+  that calls Syncthing runs its command through the runner and keeps its timeout, and every
+  restart, start or stop of its unit runs through it or inside a `block_in_place`; a call outside
+  them fails it). What stays: the watchdog's tick still waits for its curls, about 10 s a tick
+  while Syncthing hangs (A-313's matter), and a sync hint or a finalize still holds the ordered
+  lane while it waits (a scan up to 120 s).
 
 ### A-342 [WF] 🔵 low (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it, since A-254 in 0.1.131) — A WF's resends of its timers land up to about 2 s late
 

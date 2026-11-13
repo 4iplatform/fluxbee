@@ -15899,8 +15899,11 @@ fn syncthing_api_port_check_name(api_port: u16) -> String {
 /// waits its whole `--max-time`: run on an async worker, that call held every command the
 /// orchestrator was serving, about 10 s of every 15 while the watchdog asked the folders, and up to
 /// 120 s for a sync hint's scan. Every call to Syncthing goes through here, whoever makes it: the
-/// watchdog, the sync probe (`SYSTEM_SYNC_HINT`, a finalize's), a join, the peer reconcile. Its
-/// callers run on the orchestrator's multi-thread runtime, on a thread of the blocking pool (a
+/// watchdog, the sync probe (`SYSTEM_SYNC_HINT`, a finalize's), a join, the peer reconcile. So do
+/// systemd's restart, start and stop of its unit that the setup and the disable run (FINDINGS
+/// A-343, the review): a Syncthing that does not stop holds them up to the unit's stop timeout,
+/// 30 s, as `restart_syncthing_for_pending` and the peer reconcile run theirs off these threads.
+/// Its callers run on the orchestrator's multi-thread runtime, on a thread of the blocking pool (a
 /// read, a background join), inside another `block_in_place`, or outside any runtime; never on a
 /// current-thread runtime, where `block_in_place` panics.
 fn syncthing_call<T>(call: impl FnOnce() -> T) -> T {
@@ -19433,13 +19436,13 @@ async fn ensure_blob_sync_runtime(
             unit_changed,
             "restarting syncthing onto its installed binary and unit (A-57)"
         );
-        systemd_restart(SYNCTHING_SERVICE_NAME)?;
+        syncthing_call(|| systemd_restart(SYNCTHING_SERVICE_NAME))?;
     } else {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
             "starting blob sync service"
         );
-        systemd_start(SYNCTHING_SERVICE_NAME)?;
+        syncthing_call(|| systemd_start(SYNCTHING_SERVICE_NAME))?;
     }
     // FINDINGS A-283, the review: whoever runs this setup (the boot, the watchdog, a sync probe,
     // `update category=vendor`, an ingress join), a new process starts the run of ticks with no
@@ -19464,7 +19467,7 @@ async fn ensure_blob_sync_runtime(
         );
         let mut restart = Command::new("systemctl");
         restart.arg("restart").arg(SYNCTHING_SERVICE_NAME);
-        run_cmd(restart, "systemctl restart")?;
+        syncthing_call(|| run_cmd(restart, "systemctl restart"))?;
         // A new process, as above (FINDINGS A-283, the review).
         state.forget_syncthing_api_run();
         wait_for_service_active(
@@ -19733,7 +19736,7 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
             service = SYNCTHING_SERVICE_NAME,
             "stopping blob sync service"
         );
-        systemd_stop(SYNCTHING_SERVICE_NAME)?;
+        syncthing_call(|| systemd_stop(SYNCTHING_SERVICE_NAME))?;
     }
     // FINDINGS A-271: only systemctl's "no such unit" skips the disable. One with no answer
     // disables it too: a disable that finds no unit fails, and that is only a warning.
@@ -64464,7 +64467,8 @@ blob:
                 "myID": A343_DEVICE,
             })
             .to_string();
-            for stream in listener.incoming() {
+            // One connection for each of the seven calls below; then the thread ends.
+            for stream in listener.incoming().take(7) {
                 let Ok(mut stream) = stream else { return };
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 1024];
@@ -64579,9 +64583,14 @@ blob:
             let line = asked
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap_or_else(|_| panic!("{what}: the call never reached Syncthing's API"));
-            // The call waits for the API's answer now: 200 ms on this thread's clock.
+            // The call waits for the API's answer now: up to 2 s on this thread's clock for three
+            // ticks. A busy runner only slows them; a runtime thread the call held stops them.
             let before = ticks.load(Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(200));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while ticks.load(Ordering::SeqCst) - before < 3 && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let held = ticks.load(Ordering::SeqCst) - before;
             release.send(()).expect("the API waits to answer");
             let answer = task.await.expect("the call's task");
@@ -64599,8 +64608,10 @@ blob:
     /// FINDINGS A-343: every call to Syncthing in the code, its REST API through curl or its
     /// binary, runs its command through `syncthing_call`, off the threads that serve the
     /// orchestrator's commands, whoever makes it (the watchdog, the sync probe, a join, the peer
-    /// reconcile), and each keeps its own timeout. A function that calls Syncthing another way, or
-    /// a new one, fails this test.
+    /// reconcile), and each keeps its own timeout. So does each restart, start or stop of its unit,
+    /// which a Syncthing that does not stop holds up to its stop timeout (the review): through the
+    /// runner, or inside a `block_in_place` that does more. A function that calls Syncthing or its
+    /// unit another way, or a new one, fails this test.
     #[test]
     fn every_call_to_syncthing_runs_off_the_threads_that_serve_commands() {
         let src = include_str!("sy_orchestrator.rs");
@@ -64664,6 +64675,72 @@ blob:
         .map(|(name, timeout)| (name.to_string(), timeout.to_string()))
         .collect();
         assert_eq!(calls, expected);
+
+        // Each restart, start or stop of Syncthing's unit, by the function that runs it.
+        let unit_calls = [
+            "systemd_restart(SYNCTHING_SERVICE_NAME)",
+            "systemd_start(SYNCTHING_SERVICE_NAME)",
+            "systemd_stop(SYNCTHING_SERVICE_NAME)",
+            ".arg(\"restart\").arg(SYNCTHING_SERVICE_NAME)",
+        ];
+        let mut on_unit = BTreeMap::new();
+        for head in ["\nfn ", "\nasync fn "] {
+            for (at, _) in code.match_indices(head) {
+                let body = &code[at + 1..];
+                let body = &body[..body.find("\n}\n").expect("its end")];
+                let name = body.trim_start_matches("async ").trim_start_matches("fn ");
+                let name = &name[..name.find(['(', '<']).expect("its name")];
+                let body = squeeze(body);
+                let runs: usize = unit_calls
+                    .iter()
+                    .map(|call| body.matches(call).count())
+                    .sum();
+                if runs > 0 {
+                    on_unit.insert(name.to_string(), (runs, body));
+                }
+            }
+        }
+        let wrapped: [(&str, &[&str]); 4] = [
+            (
+                "disable_blob_sync_runtime_local",
+                &["syncthing_call(||systemd_stop(SYNCTHING_SERVICE_NAME))?;"],
+            ),
+            (
+                "ensure_blob_sync_runtime",
+                &[
+                    "syncthing_call(||systemd_restart(SYNCTHING_SERVICE_NAME))?;",
+                    "syncthing_call(||systemd_start(SYNCTHING_SERVICE_NAME))?;",
+                    "restart.arg(\"restart\").arg(SYNCTHING_SERVICE_NAME);\
+                     syncthing_call(||run_cmd(restart,\"systemctlrestart\"))?;",
+                ],
+            ),
+            (
+                "reconcile_syncthing_peer_addresses",
+                &[
+                    "block_in_place(||{letapplied=syncthing_restart_pending_token(&marker);\
+                   letmutrestart=Command::new(\"systemctl\");\
+                   restart.arg(\"restart\").arg(SYNCTHING_SERVICE_NAME);",
+                ],
+            ),
+            (
+                "restart_syncthing_for_pending",
+                &[
+                    "block_in_place(||{letapplied=syncthing_restart_pending_token(marker);\
+                   systemd_restart(SYNCTHING_SERVICE_NAME)",
+                ],
+            ),
+        ];
+        assert_eq!(
+            on_unit.keys().map(String::as_str).collect::<Vec<_>>(),
+            wrapped.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        );
+        for (name, forms) in wrapped {
+            let (runs, body) = &on_unit[name];
+            assert_eq!(*runs, forms.len(), "{name}");
+            for &form in forms {
+                assert!(body.contains(&squeeze(form)), "{name}: {form}");
+            }
+        }
     }
 
     /// FINDINGS A-283: the Syncthing check asks its folders in turn and stops at the first one
@@ -65630,10 +65707,10 @@ blob:
         let forgets = at(
             "if syncthing_setup_starts_a_process(activity, stale) {\n        state.forget_syncthing_api_run();\n    }",
         );
-        assert!(at("systemd_restart(SYNCTHING_SERVICE_NAME)?;") < forgets);
-        assert!(at("systemd_start(SYNCTHING_SERVICE_NAME)?;") < forgets);
+        assert!(at("syncthing_call(|| systemd_restart(SYNCTHING_SERVICE_NAME))?;") < forgets);
+        assert!(at("syncthing_call(|| systemd_start(SYNCTHING_SERVICE_NAME))?;") < forgets);
         assert!(forgets < at("wait_for_service_active("));
-        let repaired = at("run_cmd(restart, \"systemctl restart\")?;");
+        let repaired = at("syncthing_call(|| run_cmd(restart, \"systemctl restart\"))?;");
         let repaired_waits = repaired
             + ensure[repaired..]
                 .find("wait_for_service_active(")
