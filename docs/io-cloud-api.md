@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.137** (2026-11-12), and PROD runs **0.1.138**. Read from the code,
+> Contract as of **fluxbee 0.1.139** (2026-11-13), and PROD runs **0.1.139**. Read from the code,
 > operation by operation; §10 lists what was also checked live on the PROD hive. §9 lists what
 > changed for Cloud in each release. The model behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
@@ -1147,10 +1147,7 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.139 (not deployed yet)
-
-Built, not deployed yet: what this entry lists arrives with 0.1.139, and the sections above mark
-it "(0.1.139)".
+### 0.1.139
 
 - **`register_human` answers `identity_unavailable` where it answered `tenant_unresolved`** when
   the hive's frontdesk could not read its identity registry for the moment (FINDINGS A-303): send
@@ -1178,6 +1175,10 @@ it "(0.1.139)".
   move the old edge reads none once it restarts, and the operator publishes again. Up to 0.1.138
   such a publish left a new token nobody received in the vault, and yours stopped once the edge
   restarted.
+- **`list_nodes` answers within about 12 s**, naming a hive whose orchestrator does not answer in
+  `unreachable_hives` (`NODE_LIST_FAILED`), even while the operator's version reads wait on that
+  hive (§5.4, FINDINGS A-308). Up to 0.1.138 it waited behind them and could answer `TIMEOUT` past
+  your 20 s: 30.0 s seen on 0.1.138.
 
 ### 0.1.137
 
@@ -1414,6 +1415,25 @@ it "(0.1.139)".
 ---
 
 ## 10. Checked live
+
+**0.1.139:** on PROD, 2026-11-12/13, from inside the hive (`lab/DEPLOYMENTS.md`, 0.1.139; FINDINGS
+A-317, A-308, A-303):
+
+- the vault's rollback: with the edge frozen, a publish's door did not open (`INVALID_REQUEST`
+  after 17.7 s, no token); the hive rolled the vault back to the token you held, and that token
+  still opened the door, HTTP 200 (through the public door);
+- the record before the token: the edge was recorded in IO.cloud's config 16 ms before the vault
+  took the new token;
+- a refused `edge_node` and a publish whose record failed changed nothing: no token minted, nothing
+  rotated, IO.cloud not restarted;
+- your token rotated on 2026-11-13 at 03:42Z, on the same edge: the previous one worked its 10
+  minutes;
+- `list_nodes` for a test tenant, with a worker's orchestrator frozen: 200 in 12.5 s, that worker
+  in `unreachable_hives` (`NODE_LIST_FAILED`), where 0.1.138 answered `TIMEOUT` at 30.0 s;
+- the frontdesk, with its identity registry unreadable, answered `identity_unavailable` in about
+  0.77 s, asked from inside the hive, not through the door.
+
+A door moved to another edge, and the old door's close, were not run live: their tests cover them.
 
 **0.1.137:** on PROD, 2026-11-12 from 10:07Z, through the public door with Cloud's token, in a test
 tenant (`lab/DEPLOYMENTS.md`, 0.1.137; FINDINGS A-293):
