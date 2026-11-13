@@ -13416,13 +13416,7 @@ async fn handle_hive_paths(
             if let (Some(config_obj), Some(payload_obj)) =
                 (config_payload.as_object_mut(), payload.as_object_mut())
             {
-                for field in [
-                    "runtime",
-                    "runtime_version",
-                    "requested_runtime_version",
-                    "runtime_base",
-                    "package_path",
-                ] {
+                for field in NODE_BINDING_FIELDS {
                     if let Some(value) = config_obj.remove(field) {
                         payload_obj.insert(field.to_string(), value);
                         lifted.push(field);
@@ -17084,7 +17078,13 @@ fn admin_action_request_contract(action: &str) -> serde_json::Value {
             "notes": admin_action_request_notes(action),
         });
     }
-    serde_json::json!({
+    // A route whose body is not the action's args names its own fields (FINDINGS A-346).
+    let http_body = admin_action_http_body(action);
+    let (required_fields, optional_fields) = match &http_body {
+        Some(body) => (body.required_fields.clone(), body.optional_fields.clone()),
+        None => (required_fields, optional_fields),
+    };
+    let mut contract = serde_json::json!({
         "transport": "http_via_sy_admin",
         "method": admin_action_primary_method(action),
         "path_patterns": path_patterns,
@@ -17100,7 +17100,66 @@ fn admin_action_request_contract(action: &str) -> serde_json::Value {
         "example_payload": example_payload,
         "example_scmd": admin_action_example_scmd(action),
         "notes": admin_action_request_notes(action),
-    })
+    });
+    if let Some(body) = http_body {
+        contract["body"]["description"] = serde_json::Value::String(body.description.to_string());
+        contract["query_params"] = serde_json::Value::Array(body.query_params);
+    }
+    contract
+}
+
+/// The node's runtime binding, which `set_node_config` writes to the node's `_system`, never as a
+/// config key (U-10). Its HTTP route lifts these from the top level of the body, whose other keys
+/// are the config patch (`handle_hive_paths`), and its help names them (`admin_action_http_body`).
+const NODE_BINDING_FIELDS: [&str; 5] = [
+    "runtime",
+    "runtime_version",
+    "requested_runtime_version",
+    "runtime_base",
+    "package_path",
+];
+
+/// The HTTP body of an action whose route does not take the action's args as they are.
+struct AdminHttpBody {
+    description: &'static str,
+    required_fields: Vec<serde_json::Value>,
+    optional_fields: Vec<serde_json::Value>,
+    query_params: Vec<serde_json::Value>,
+}
+
+/// The HTTP body of an action whose route takes another shape than its args, or `None` when the
+/// body is the args (`admin_action_body_required_fields`, `admin_action_body_optional_fields`).
+/// The args stay what the executor's schema (`build_admin_executor_function_definition`) and a
+/// mesh caller send, and what SY.admin's handler reads.
+///
+/// `set_node_config` (FINDINGS A-346): `PUT /hives/{hive}/nodes/{node_name}/config` takes the body
+/// as the node's config patch itself, lifts the binding fields from its top level and reads
+/// `replace` from the query, while its args name the patch `config` and the replacement `replace`.
+/// Its help gave the HTTP body those two fields, and an example that wrapped the patch in `config`:
+/// a caller who followed it stored a top-level `config` key, which the node takes at its next start
+/// for its whole config.
+fn admin_action_http_body(action: &str) -> Option<AdminHttpBody> {
+    match action {
+        "set_node_config" => Some(AdminHttpBody {
+            description: "The node's config patch itself, its keys at the top level as get_node_config shows the node's config, for example {\"behavior\": {\"kind\": \"ai_chat\"}}: never wrapped in a config key, and with no replace key (FINDINGS A-346). SY.admin sends the body as the patch, which the executor's args and a mesh caller name config. Only the binding fields below are taken from it: at the top level of the body they go to the node's binding (_system), never into its config. ?replace=1 replaces the whole config with the body (query_params).",
+            required_fields: Vec::new(),
+            optional_fields: admin_action_body_optional_fields(action)
+                .into_iter()
+                .filter(|field| {
+                    field
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| NODE_BINDING_FIELDS.contains(&name))
+                })
+                .collect(),
+            query_params: vec![admin_action_query_param(
+                "replace",
+                "bool",
+                "?replace=1 (or true): the body replaces the node's whole config, all but its _system. Without it, or with any other value, the body is a patch: each top-level key it names replaces the stored one whole, and the keys it does not name stay as stored.",
+            )],
+        }),
+        _ => None,
+    }
 }
 
 fn admin_action_primary_method(action: &str) -> &'static str {
@@ -17464,10 +17523,12 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("match_dst", "string", "Exact destination L2 node name to match."),
             admin_action_body_field("target", "string", "Exact L2 node name that receives the secondary copy."),
         ],
+        // The executor's and a mesh caller's args; over HTTP the body is this patch itself
+        // (`admin_action_http_body`, FINDINGS A-346).
         "set_node_config" => vec![admin_action_body_field(
             "config",
             "object",
-            "Node config patch or replacement object.",
+            "The node's config patch, its keys as get_node_config shows the node's config: each top-level key it names replaces the stored one whole, and the rest stay. With replace true, the node's whole config, all but its _system. Over HTTP it is the body itself, never wrapped in config.",
         )],
         "node_control_config_set" => vec![
             admin_action_body_field(
@@ -17895,7 +17956,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "replace",
                 "bool",
-                "Replace full config instead of patch/merge.",
+                "true: config replaces the node's whole config, all but its _system. false or absent: config is a patch. Over HTTP it is the query's ?replace=1, never a body key.",
             ),
             // The node's runtime binding, at the top level: inside `config` it would be an inert
             // key (U-10).
@@ -18348,13 +18409,11 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         // No `behavior.provider` and no `behavior.model`: a copied example runs on the hive's
         // provider and that provider's model (the notes say when to name them, FINDINGS A-104).
+        // The HTTP body, the patch itself (FINDINGS A-346): `config` and `replace` are the args'.
         "set_node_config" => serde_json::json!({
-            "config": {
-                "behavior": {
-                    "kind": "ai_chat"
-                }
-            },
-            "replace": false
+            "behavior": {
+                "kind": "ai_chat"
+            }
         }),
         "node_control_config_get" => serde_json::json!({
             "requested_by": "archi"
@@ -18644,6 +18703,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "node_help" => "curl -X GET /hives/worker1/nodes/AI.sales@worker1/help",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
         "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/config",
+        // The body is the patch itself (FINDINGS A-346).
+        "set_node_config" => {
+            r#"curl -X PUT /hives/motherbee/nodes/AI.sales@motherbee/config -d '{"behavior":{"kind":"ai_chat"}}'"#
+        }
         "run_node" => {
             r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.sales@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
@@ -18862,6 +18925,12 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
 /// What the actions that take a workflow definition say of its name and of the definition.
 const WF_RULES_WORKFLOW_NAME_NOTE: &str = "workflow_name must match ^[a-z][a-z0-9]*(\\.[a-z0-9]+)*$, the runtime naming policy, since its runtime is wf.<workflow_name>: lowercase letters and digits, in parts joined by dots, the first starting with a letter. No hyphens and no underscores.";
 const WF_RULES_DEFINITION_NOTE: &str = "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.";
+
+/// What `set_node_config`'s help says of its two shapes, the HTTP body and the args
+/// (`admin_action_http_body`, FINDINGS A-346), and of what a patch does
+/// (`set_node_config_flow` in `src/bin/sy_orchestrator.rs`).
+const SET_NODE_CONFIG_SHAPES_NOTE: &str = "Over HTTP the body is the node's config patch itself (body.description, example_payload, example_scmd): {\"behavior\": {\"kind\": \"ai_chat\"}}, never {\"config\": {...}}, and ?replace=1 in the query replaces the whole config (query_params). The executor's step.args and a mesh caller send the same patch as config, with replace true or false, beside node_name and the binding fields (executor_contract.function_schema). A patch wrapped in a config key is no patch of the node's config: the node would take that key, at its next start, for its whole config (FINDINGS A-346).";
+const SET_NODE_CONFIG_PATCH_NOTE: &str = "A patch replaces each top-level key it names whole, a nested object included: to change one field of behavior, send the whole behavior as get_node_config reads it, that field changed. The keys it does not name stay as stored; a replacement keeps only the node's _system. A patch or a replacement that names _system is refused with INVALID_REQUEST, and a node with no config.json answers NODE_CONFIG_NOT_FOUND. The write tells the running node nothing: the node reads its config.json at its next start.";
 
 /// What the node routes that send to the node itself say of its name (`node_name_on_hive`).
 const NODE_ON_PATH_HIVE_NOTE: &str = "node_name is a node of the path's hive: a bare name is qualified with it (AI.sales on /hives/worker1 is AI.sales@worker1), and a name of another hive is refused with INVALID_REQUEST.";
@@ -19153,6 +19222,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "set_node_config" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            SET_NODE_CONFIG_SHAPES_NOTE,
+            SET_NODE_CONFIG_PATCH_NOTE,
             "For ai.generic, config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the installation's ai.default_provider and on that provider's model (the installation file's ai.providers.<provider>.model, the same on every hive), as the example does. Name them only when the node needs its own. A provider only when the node's tenant holds a key of that provider in SY.vault: a tenant's node never uses the root tenant's key, and without a key every message fails with missing_ai_api_key. A model must be one of the node's provider; with neither the node's nor the hive's, every message fails with missing_ai_model.",
             "Naming a provider other than the installation's default needs its config.behavior.model too, unless the installation file lists a model for it (ai.providers.<provider>.model). set_node_config stores the config without checking this; node_control_config_set refuses such a config (invalid_config).",
         ],
@@ -19614,6 +19685,14 @@ fn admin_action_path_param(name: &str, value_type: &str, description: &str) -> s
 }
 
 fn admin_action_body_field(name: &str, value_type: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "type": value_type,
+        "description": description,
+    })
+}
+
+fn admin_action_query_param(name: &str, value_type: &str, description: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "type": value_type,
@@ -48587,6 +48666,121 @@ mod tests {
                 "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000",
             }))
             .is_err());
+        }
+    }
+
+    /// FINDINGS A-346: set_node_config's HTTP help names the body its route takes. The route takes
+    /// the body as the node's config patch itself, lifts the binding fields from its top level and
+    /// reads replace from the query (`?replace=1`), where the help gave the body a required config
+    /// and an optional replace, and an example that wrapped the patch in config: a caller who
+    /// followed it stored a top-level config key, which the node takes at its next start for its
+    /// whole config. The args, which the executor's schema names and SY.admin's handler reads as
+    /// they are, keep config and replace; every other action's help is as it was.
+    #[tokio::test]
+    async fn set_node_configs_http_help_names_the_body_its_route_takes() {
+        let names = |fields: &Value| -> Vec<String> {
+            fields
+                .as_array()
+                .expect("a list of fields")
+                .iter()
+                .filter_map(|field| field["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let spec = resolve_internal_action_spec("set_node_config").expect("set_node_config");
+        let doc = build_admin_action_doc(spec);
+        let contract = &doc["request_contract"];
+        assert_eq!(contract["transport"], json!("http_via_sy_admin"));
+        assert_eq!(contract["method"], json!("PUT"));
+        let body = &contract["body"];
+        assert_eq!(body["kind"], json!("json_object"));
+        assert!(names(&body["required_fields"]).is_empty(), "{body}");
+        assert_eq!(names(&body["optional_fields"]), NODE_BINDING_FIELDS);
+        let description = body["description"]
+            .as_str()
+            .expect("the body's description");
+        assert!(
+            description.starts_with("The node's config patch itself")
+                && description.contains("never wrapped in a config key"),
+            "{description}"
+        );
+        assert_eq!(names(&contract["query_params"]), ["replace"]);
+        assert_eq!(contract["query_params"][0]["type"], json!("bool"));
+        let example = json!({ "behavior": { "kind": "ai_chat" } });
+        assert_eq!(contract["example_payload"], example);
+        assert_eq!(
+            contract["example_scmd"],
+            json!(format!(
+                "curl -X PUT /hives/motherbee/nodes/AI.sales@motherbee/config -d '{example}'"
+            ))
+        );
+        let notes = admin_action_request_notes("set_node_config");
+        assert!(notes.contains(&SET_NODE_CONFIG_SHAPES_NOTE));
+        assert!(notes.contains(&SET_NODE_CONFIG_PATCH_NOTE));
+
+        // The args: the patch config, the only one required beside the path's, then replace and
+        // the binding fields.
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(schema["required"], json!(["hive", "node_name", "config"]));
+        let mut args: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        args.sort_unstable();
+        let mut expected = vec!["hive", "node_name", "config", "replace"];
+        expected.extend(NODE_BINDING_FIELDS);
+        expected.sort_unstable();
+        assert_eq!(args, expected);
+
+        // Every other action's HTTP body is its args.
+        for spec in INTERNAL_ACTION_REGISTRY
+            .iter()
+            .filter(|spec| spec.action != "set_node_config")
+        {
+            let contract = admin_action_request_contract(spec.action);
+            assert!(contract.get("query_params").is_none(), "{}", spec.action);
+            assert!(
+                contract["body"].get("description").is_none(),
+                "{}",
+                spec.action
+            );
+        }
+
+        // The route: the help's example, sent as the help says, reaches the orchestrator as the
+        // patch itself, its replace the query's; a binding field at the body's top is lifted.
+        let (ctx, mut harness) = opa_test_admin("set-node-config-http-body");
+        let path = "/hives/motherbee/nodes/AI.sales@motherbee/config";
+        let mut bound = example.clone();
+        bound["runtime_version"] = json!("0.1.3");
+        for (query, body, replace) in [
+            (vec![], example.clone(), false),
+            (vec![("replace", "1")], example.clone(), true),
+            (vec![("replace", "TRUE")], example.clone(), true),
+            (vec![("replace", "0")], example.clone(), false),
+            (vec![], bound, false),
+        ] {
+            let query: HashMap<String, String> = query
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let raw = serde_json::to_vec(&body).expect("the body");
+            let ok =
+                json!({ "status": "ok", "node_name": "AI.sales@motherbee", "config_version": 2 });
+            let (answer, sent) = tokio::join!(
+                handle_hive_paths("PUT", path, &query, &raw, &ctx, &ctx.rpc),
+                answer_admin_relay(&mut harness, "set_node_config", ok)
+            );
+            let (status, answered) = answer.expect("the route").expect("served");
+            assert_eq!(status, 200, "{answered}");
+            assert_eq!(sent.payload["node_name"], json!("AI.sales@motherbee"));
+            assert_eq!(sent.payload["config"], example, "{query:?} {body}");
+            assert_eq!(sent.payload["replace"], json!(replace), "{query:?}");
+            assert_eq!(
+                sent.payload.get("runtime_version"),
+                body.get("runtime_version"),
+                "{body}"
+            );
         }
     }
 

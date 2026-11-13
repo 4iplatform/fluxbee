@@ -1029,9 +1029,35 @@ person: when its provider gave no answer, the error carries the operator's text 
   and `ownership`, and `tenant_id` for a workflow its hive does not have yet. The pipeline deploys
   with `auto_spawn` and that tenant, so a node that does not exist is spawned.
 - **In chat,** a first deploy is `wf_rules_compile_apply` with `auto_spawn: true` and `tenant_id`.
-- **A deploy whose node does not run the definition is refused,** `WF_NODE_NOT_DEPLOYED`: its
-  `wf_node` says why (a spawn or a restart that failed, a tenant that does not exist). The
-  definition is current anyway: fix the cause, and deploy again.
+- **A deploy whose node does not run the definition is refused,** `502 WF_NODE_NOT_DEPLOYED`:
+  the package is published and the definition is current (`config_version`), but its WF node was
+  not moved onto it. `error_detail` says which step failed and why, after *"Package published,
+  but ..."*: the rebind of the node's config (SY.wf-rules' `set_node_config` through SY.admin),
+  the read of the node's state (`get_node_config`), its restart, or a first deploy's spawn (a
+  tenant that does not exist, or none named); `wf_node` (`action`, `error` or `reason`) says the
+  same.
+  - It has no `retryable`, on purpose (FINDINGS A-344): nothing sends it again by itself. Never
+    stage it again blindly: read what happened first.
+  - *"rpc timeout"* (`target=SY.admin@motherbee`) means SY.admin, or the orchestrator of the WF
+    node's hive behind it, did not answer within SY.wf-rules' 10 s (15 s for a restart or a
+    spawn): that hive's core was slow or stuck (a hung Syncthing stalls its orchestrator, FINDINGS
+    A-343). A rebind that timed out may have been written all the same, and the hive's
+    orchestrator then moves the running node onto the new version within a minute.
+  - Read `wf_rules_get_status`: `wf_node.deployed_version`, the version the node's config names
+    (`0.0.<current_version>` once the deploy reached it), `wf_node.running` and `health_state`;
+    and `get_node_status` of `wf_node.node_name`: `lifecycle_state`, `health_state`,
+    `last_error`, `process.started_at`. A read that times out, or `wf_node.wf_node_timeout` true,
+    says the hive does not answer yet: read again in a minute, and change nothing meanwhile.
+  - Then: when the node's config names `0.0.<current_version>`, the deploy reached it: the node
+    runs the definition from its first start after the deploy (`process.started_at`), which its
+    hive's orchestrator makes within a minute; say so. When it still names the version before,
+    once its hive answers, deploy the definition now current again, in a plan the operator
+    confirms, with `wf_rules_compile_apply`: the same request after a compile_apply, and after an
+    apply or a rollback, one of the definition `wf_rules_get_workflow` reads. It compiles it as
+    the next version and deploys it, so it is safe to repeat; the backup is then the same
+    definition, so a rollback no longer reaches the one before. A cause that is not the hive's
+    answer (a tenant that does not exist, a spawn refused, a node that does not start: `FAILED`,
+    its `last_error`) is the operator's: tell them what you read.
 - **A change refused `409 BUSY` changed nothing** (FINDINGS A-307, since 0.1.139): a hive's
   SY.wf-rules takes one request at a time, and refuses at once a change (`wf_rules_compile_apply`,
   `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback`, `wf_rules_delete`) whose turn came
@@ -1347,8 +1373,9 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
     its provider would ask the new default provider for a model of the old one; a node that names
     its provider and not its model loses that model when the provider is dropped. Fix each first,
     as the operator decides: give it `behavior.provider` and `behavior.model` with
-    `set_node_config`, the ones it runs now. For your own `config.ai.model`: set it to null before
-    the switch, and to a model of the new provider after it.
+    `set_node_config`, the ones it runs now, in its whole `behavior` (§7.3). For your own
+    `config.ai.model`: set it to null before the switch, and to a model of the new provider after
+    it.
   - `HIVES_NOT_CHECKED`: a hive's AI nodes could not be read for that check. Retry once it
     answers.
   - `PROVIDER_KEYS_MISSING`: the change switches the default provider, and the readers it names
@@ -1356,7 +1383,7 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
     provider in SY.vault: none of their own, none assigned to them, no general one in their
     tenant. Tell the operator: they put the key in SY.vault (only the operator handles a key's
     value), or give that AI node its own `behavior.provider` and `behavior.model` with
-    `set_node_config`. Then stage the change again.
+    `set_node_config`, in its whole `behavior` (§7.3). Then stage the change again.
   - `KEYS_NOT_CHECKED`: SY.vault did not list a tenant's keys for that check. Retry once it
     answers.
   - `JOIN_IN_PROGRESS`: a hive is joining or being removed. Change it once that ends.
@@ -1931,6 +1958,13 @@ Restart bias:
 - `SY.*`: never `restart_node`, which refuses a core node with `INVALID_REQUEST` (§4.4): plan the
   config step alone, and when its contract says it applies only on a restart, tell the operator
   that no node action restarts a core node
+
+`set_node_config` writes the node's `config.json` and tells the running node nothing: the node
+reads it at its next start. Its `config` is a patch: each top-level key it names replaces the
+stored one whole, so to change one field of `behavior`, send the whole `behavior` as
+`get_node_config` reads it; the keys it does not name stay. `replace: true` makes `config` the
+whole config, all but `_system`. Over HTTP (`PUT /hives/{hive}/nodes/{node_name}/config`) the body
+is that patch itself, never wrapped in `config`, and `?replace=1` replaces (FINDINGS A-346).
 
 ### 7.4 Routing change
 

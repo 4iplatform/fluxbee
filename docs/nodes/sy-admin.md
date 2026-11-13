@@ -615,6 +615,35 @@ Archi, and over the mesh only Archi may ask for it (`mesh_access`).
 
 SY.timer describes itself with `timer_help` (`TIMER_HELP`) and may answer `NODE_HELP` later.
 
+## A node's config.json
+
+`GET /hives/{hive}/nodes/{node_name}/config` (`get_node_config`) reads the `config.json` of a node
+`run_node` launched, and `PUT` on the same path (`set_node_config`) writes it. The orchestrator of
+the node's hive does both (`set_node_config_flow` in `src/bin/sy_orchestrator.rs`); the write tells
+the running node nothing, and the node reads it at its next start.
+
+- **The body is the config patch itself** (FINDINGS A-346), its keys at the top level as
+  `get_node_config` shows the node's config: `{"behavior": {"kind": "ai_chat"}}`, never wrapped in
+  a `config` key. SY.admin sends it as the payload's `config` (`handle_hive_paths`). A patch
+  wrapped in `config` would put a key named `config` in `config.json`, which the node, at its next
+  start, takes for its whole config (the Rust SDK's `extract_effective_config`, the Go SDK's
+  `ExtractEffectiveConfig`). Up to 0.1.143 the help named a `config` and a `replace` field of the
+  body, and its example wrapped the patch.
+- **A patch** replaces each top-level key it names whole, a nested object included, and keeps the
+  keys it does not name. **`?replace=1`** (or `true`) makes the body the whole config, all but its
+  `_system`. A body that names `_system` is refused (`INVALID_REQUEST`); a node with no
+  `config.json` answers `NODE_CONFIG_NOT_FOUND`.
+- **The binding fields** (`NODE_BINDING_FIELDS`: `runtime`, `runtime_version`,
+  `requested_runtime_version`, `runtime_base`, `package_path`) at the top level of the body are
+  lifted out of the patch, and the orchestrator writes them to `_system`, never as config keys.
+- **The args** of the same action, which the executor's plans and a mesh caller send (and
+  SY.wf-rules, rebinding its WF nodes with an empty `config` and the binding fields), name the
+  patch `config` and the replacement `replace`, beside `node_name` and the binding fields. The
+  help gives each shape its own fields (`admin_action_http_body`): `request_contract` the HTTP
+  body, with `body.description` and `query_params`, and `executor_contract` the args.
+- Archi's SCMD of this route takes the body as the patch too, but always merges and leaves the
+  binding fields in the patch (FINDINGS A-348).
+
 ## A runtime package's publish
 
 `publish_runtime_package` (`POST /admin/runtime-packages/publish`,

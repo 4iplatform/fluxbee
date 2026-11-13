@@ -374,7 +374,8 @@ no change required
     review model, found by A-124's review, 0.1.139); A-338 is the Go SDK branch's [General/blob]
     item (`coa/gosdk-141`); A-339 is the AI SDK's item (*an AI node answers a `NOT_TAKEN` with
     `unknown_system_msg`*), written A-335 on `coa/aisdk-142` and `coa/rustsdk-143`, to rename at
-    their integration. The next new number is A-348.
+    their integration. A-348 is `coa/admin-144`'s [Archi] item (Archi's SCMD of
+    `set_node_config`'s route). The next new number is A-349.
     **0.1.139's deploy:** the motherbee ran it before the workers did, and until every hive's core
     ran 0.1.139 no runtime version was removed and no workflow deployed or deleted (their purges
     remove versions): a worker on 0.1.138 listed no `RELAUNCH_DUE` node (A-300), so a version a
@@ -443,7 +444,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
 - A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
 - A-342 🔵 A WF's resends of its timers land up to about 2 s late (low; the WF engine; found by 0.1.139's gate; there before it, since A-254).
-- A-344 🔵 A change that ran and could not rebind its node answers 502 `WF_NODE_NOT_DEPLOYED` with no `retryable` (low; SY.wf-rules; the operator's call of 2026-11-13: it stays not retryable, Archi resolves it; its handbook text to write).
+- A-344 🔵 A change that ran and could not rebind its node answers 502 `WF_NODE_NOT_DEPLOYED` with no `retryable` (low; SY.wf-rules; the operator's call of 2026-11-13: it stays not retryable, Archi resolves it; its handbook text built on `coa/admin-144`, for 0.1.144).
 
 ### io.web
 
@@ -454,6 +455,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 ### Archi
 
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
+- A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
@@ -506,7 +508,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
 - A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; the operator's call of 2026-11-13: no Syncthing call on the threads that serve commands, restart and log as A-283, no new watchdog; built on `coa/orch-144` for 0.1.144: every call to Syncthing through one runner, off those threads).
 - A-345 🔵 `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one (low, observability; the orchestrator; found by 0.1.139's gate).
-- A-346 🔵 `set_node_config`'s help describes a body its HTTP route does not take (medium; SY.admin and the orchestrator; the hazard it left on IO.cloud fixed on 8.x; the operator's call of 2026-11-13: the help fixed and a top-level `config` key refused; the refusal built on `coa/orch-144` for 0.1.144, the help on its own branch).
+- A-346 🔵 `set_node_config`'s help describes a body its HTTP route does not take (medium; SY.admin and the orchestrator; the hazard it left on IO.cloud fixed on 8.x; the operator's call of 2026-11-13: the help fixed and a top-level `config` key refused; (a), the help, built on `coa/admin-144` and (b), the refusal, on `coa/orch-144`, for 0.1.144).
 - A-347 🔵 `remove_hive`'s cleanup on the box races the box's own orchestrator, which starts again the core services the cleanup stopped (low; the orchestrator; found by 0.1.139's gate; the operator's call of 2026-11-13: it waits, recorded).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1585,6 +1587,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
+
+- **Why:** `translate_scmd` (`src/bin/sy_architect.rs` ~14588-14602) sends the SCMD's body as
+  `config` with `replace: false`, whatever its query (`scmd_path_parts` keeps it as `raw_query`,
+  which that arm never reads), and lifts no binding field. SY.admin's route (`handle_hive_paths`,
+  `src/bin/sy_admin.rs`) reads `?replace=1` (or `true`), and lifts `runtime`, `runtime_version`,
+  `requested_runtime_version`, `runtime_base` and `package_path` from the body's top level
+  (`NODE_BINDING_FIELDS`), as its help says since A-346's fix.
+- **Effect:** an operator's `SCMD: curl -X PUT /hives/<hive>/nodes/<node>/config?replace=1 -d
+  '{...}'` in Archi's chat merges the body into the config instead of replacing it, and a binding
+  field in the body is stored as a config key while the node is not rebound (U-10's case); both
+  answer ok. Archi's plans are not affected: they send `set_node_config`'s args (`config`,
+  `replace`, the binding fields) as the executor's schema names them, and SY.admin's
+  `example_scmd` for the route has no query and no binding field.
+- **Fix, later (Archi alone):** the arm reads `replace` from the query and lifts the binding fields
+  from the body's top level, as SY.admin's route does; a test translates SY.admin's example, a
+  `?replace=1` and a body with a `runtime_version`. To ask the operator.
+
 ### A-347 [General/orchestrator] 🔵 low (found 2026-11-13 by 0.1.139's gate; read in the code, consistent with what the gate saw twice; there before it) — `remove_hive`'s cleanup on the box races the box's own orchestrator, which starts again the core services the cleanup stopped before it
 
 - **Seen on 8.x (0.1.139's gate, VM 104, 2026-11-13 05:47–05:57Z):** after `remove_hive
@@ -1681,6 +1701,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `run_node`'s, which the motherbee then forwards). What stays: SY.admin's help, (a), on its
   own branch; a stray top-level `replace` is still stored as a config key; a config.json that
   already holds a `config` key keeps it (8.x's IO.cloud was cleaned by hand, above).
+- **Built on `coa/admin-144` (for 0.1.144), (a), SY.admin alone:** the help gives the route's
+  body its own fields (`admin_action_http_body`, `src/bin/sy_admin.rs`): the body is the config
+  patch itself (`body.description`), with no `config` and no `replace` field, its only fields the
+  binding fields the route lifts (`NODE_BINDING_FIELDS`, now one list for the route and the help);
+  `replace` is a query parameter (`query_params`: `?replace=1` or `true`); the example is
+  `{"behavior": {"kind": "ai_chat"}}`, and an `example_scmd` of the route is new, `curl -X PUT
+  /hives/motherbee/nodes/AI.sales@motherbee/config -d '{"behavior":{"kind":"ai_chat"}}'`. Two
+  notes say both shapes and what a patch does: each top-level key replaced whole, `_system` kept
+  by a replacement and refused in a body, the running node told nothing. The args, which the
+  executor's schema names and SY.admin's handler reads, keep `config` (required) and `replace`,
+  their descriptions now saying what each does and its HTTP form; every other action's help is as
+  it was. Its test, `set_node_configs_http_help_names_the_body_its_route_takes`, fails without it:
+  it pins the HTTP body's fields, the query parameter, the example and the args, and sends the
+  help's example through the route (no query, `?replace=1`, `TRUE`, `0`, and a `runtime_version`
+  at the body's top), each reaching the orchestrator as the patch itself. The catalog guard
+  passes. sy-admin.md (*A node's config.json*), node-spawn-config-spec.md §5.3 and Archi's
+  handbook (§7.3, and §4.4.3's `behavior`, which a patch replaces whole) say the same. What stays:
+  (b), the orchestrator's refusal of a top-level `config`, on its own branch; Archi's SCMD of the
+  route, which reads no `?replace` and leaves the binding fields in the patch (A-348).
 
 ### A-345 [General/orchestrator] 🔵 low, observability (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it) — `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one
 
@@ -1715,6 +1754,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   itself; Archi, seeing it, works out what happened and what to do. Nothing to build in SY.wf-rules;
   Archi's handbook says what the answer means and how to read the node's state (with A-346's help
   fix).
+- **Built on `coa/admin-144` (for 0.1.144), Archi's handbook alone:** §4.2.7 says what `502
+  WF_NODE_NOT_DEPLOYED` means (the package published and the definition current, the WF node not
+  moved onto it; the failed step and its cause in `error_detail`, after *"Package published, but
+  ..."*: `deployAnswer`, `go/sy-wf-rules/node/dispatch.go` ~572-605, and
+  `deployPublishedWorkflow`, `deploy.go` ~145-257); that it has no `retryable` on purpose and is
+  never staged again blindly; what an `rpc timeout` to `SY.admin@motherbee` means (SY.admin, or
+  the orchestrator of the node's hive, did not answer within SY.wf-rules' 10 s, 15 s for a restart
+  or a spawn, `node_lifecycle.go`; a rebind that timed out may have been written, and that
+  orchestrator's reconcile then moves the running node within a minute, `reconcile_step`,
+  `src/bin/sy_orchestrator.rs` ~3018); how to read it (`wf_rules_get_status`'s
+  `wf_node.deployed_version` against `0.0.<current_version>`, and `get_node_status`); and what to
+  do: a node on the new version, say so; one still on the version before, once its hive answers,
+  a `wf_rules_compile_apply` of the definition now current, in a plan the operator confirms (safe
+  to repeat: the next version, the same definition, the backup then the same too); a cause that is
+  not the hive's, the operator's. Nothing else changes: SY.wf-rules, and Archi's classifier, which
+  hands the code to the operator in the pipeline (`failure_classifier.rs`). No test reads the
+  handbook: the gate reads its text on the motherbee (`/etc/fluxbee/handbook_fluxbee.md`).
 
 ### A-343 [General/orchestrator] 🔵 medium (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code: the mechanism confirmed, the cadence plausible; there before it) — A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15
 

@@ -119,6 +119,7 @@ Behavior:
 `PUT /hives/{hive}/nodes/{node_name}/config`
 
 - orchestrator reads existing `config.json`, merges patch, writes atomically and increments config version metadata. (Until 0.1.44 it also sent `CONFIG_CHANGED` to the node; removed in 0.1.45, no node acted on it.)
+- The body is the patch itself, its keys at the top level (`{"behavior": {"kind": "ai_chat"}}`), never wrapped in `config` (FINDINGS A-346): each top-level key replaces the stored one whole, and the rest stay. `?replace=1` replaces the whole config, all but `_system`. `runtime`, `runtime_version`, `requested_runtime_version`, `runtime_base` and `package_path` at the top level of the body go to `_system`, not into the config ([SY.admin](nodes/sy-admin.md#a-nodes-configjson)).
 
 ### 5.4 Read State (diagnostic)
 
