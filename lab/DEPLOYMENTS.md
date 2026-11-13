@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.140** | 2026-11-13 | `28564648` | motherbee + spokes (core), the router alone: A-269's router part (the router refuses at HELLO a node name that is not an L2 name, ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes, before any line prints it; its review: both local accept loops log a failed connection's error quoted, escaped and cut) | ✅ live, checked on 8.x | snap `pre-router-0-1-140` (all 4 VMs) · `apt install fluxbee=0.1.139` + 0.1.139's `update_installation` (nothing one-way; A-269's router part comes back) |
+| **0.1.141** | 2026-11-13 | `2f1a0e1e` | motherbee + spokes (core), the Go SDK alone: A-329 (the Go SDK answers `NOT_TAKEN node_busy`, retryable, to the sender of each message its command channel cannot hold, two lanes of 1,024 messages or 8 MiB, where it held 64 and dropped the rest unseen; SY.timer sends again a fire its target answers so, while on time), A-264 (a WF's text past the frame, 128 KiB, goes as a blob, the operator's call (b)), A-325's Go sibling (SY.timer leaves `VAULT_SECRET_CHANGED` unanswered), with A-338 recorded | ✅ live, checked on 8.x | snap `pre-gosdk-0-1-141` (all 4 VMs) · `apt install fluxbee=0.1.140` + 0.1.140's `update_installation` (nothing one-way; A-329's drops come back) |
+| **0.1.140** | 2026-11-13 | `28564648` | motherbee + spokes (core), the router alone: A-269's router part (the router refuses at HELLO a node name that is not an L2 name, ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes, before any line prints it; its review: both local accept loops log a failed connection's error quoted, escaped and cut) | ✅ replaced by 0.1.141 | snap `pre-router-0-1-140` (deleted 2026-11-13) · `apt install fluxbee=0.1.139` + 0.1.139's `update_installation` (nothing one-way; A-269's router part comes back) |
 | **0.1.139** | 2026-11-12 | `204ee161` | motherbee + spokes (core), the bug push's binaries, one branch per binary, eight branches: SY.admin (A-297: an empty `?hive=` is every hive's; A-304: a WF package another hive holds refused; A-305 and A-306: a manifest lock waited for 60 s at most, answered retryable, and a removal's use read with no lock held; A-312: build metadata refused; A-316: an edge's secrets never read back; A-317: the Cloud's door recorded before its token, the vault rolled back when the door does not open; A-318, A-319, A-324, A-328), the orchestrator (A-296; A-299; A-300: `RELAUNCH_DUE`; A-301: a fresh join's surviving key; A-308: the Cloud's `list_nodes` in a lane of its own; A-310; A-330; A-331: `BOX_RUNS_ANOTHER_HIVE`), SY.architect (A-124: a secret an answer brings shown once, kept masked; A-315, A-320, A-321), SY.frontdesk.gov (A-303: `identity_unavailable`), SY.cognition (A-332: a grace of 5 s), SY.timer 1.7 (A-326: an index per list filter, a 16 MiB page cache), the WF engine and SY.wf-rules (A-302: the engine in the status; A-307: `BUSY`; A-333: one read of the index) | ✅ replaced by 0.1.140 | snap `pre-push-0-1-139` (deleted 2026-11-13) · `apt install fluxbee=0.1.138` + 0.1.138's `update_installation` (nothing one-way: SY.timer 1.6's start rebuilds its indexes and leaves the new ones) |
 | **0.1.138** | 2026-11-12 | `38ecd878` | motherbee + spokes (core), A-278 alone (the Go SDK, the Rust SDK and the WF engine): a WF reconciles all its pending timers: the Go SDK's `ListPage` and the Rust SDK's `list` and `list_page` say where the timers past a list start, and the WF's reconcile reads every page of SY.timer's list (200 at the most), never taking a timer past the last one listed as missing; its review: when the list stops before its end, a timer past its time and past the last one listed is fired, and the one SY.timer may hold cancelled | ✅ replaced by 0.1.139 | snap `pre-a278-0-1-138` (deleted 2026-11-12) · `apt install fluxbee=0.1.137` + 0.1.137's `update_installation` (nothing one-way; A-278 comes back) |
 | **0.1.137** | 2026-11-12 | `55fbdd85` | motherbee + spokes (core), the sweep's seven binaries, one branch per binary, with A-322 and A-323: SY.admin (A-243: an IO or WF node takes its own pages down, only its own; A-263: the update's background reads at once; A-273: a failed record of the Cloud's door tried once more; A-280: a failed publish answers within its budget, its clean-up after the answer; A-311's and A-314's help), the orchestrator (A-282: a check with no answer restarts a service only at a boot that found a replaced binary; A-283: Syncthing restarted after 5 min with no answer, at most once an hour, its unit with `TimeoutStopSec=30`; A-311: `get_hive` refuses an id that is not a hive id, and the registry's readers skip such a directory), SY.identity (A-277: a hive the registry does not list is refused), the WF (A-284: a count-only instance count), SY.cognition (A-292: a turn the agent refused leaves its communication), IO.cloud (A-293: a retryable frontdesk error answers `FRONTDESK_UNAVAILABLE`, a malformed registration is refused before anything is created), SY.architect (A-286 and A-287: an SCMD keeps `+` and decodes each segment once; A-298: a publish recreates no node; A-322: after a confirmed plan Archi's model tells what each step answered; A-323: no core node stopped through Archi) | ✅ replaced by 0.1.138 | snap `pre-sweep-0-1-137` (deleted 2026-11-12) · `apt install fluxbee=0.1.136` + 0.1.136's `update_installation` (nothing one-way; the sweep's items come back, A-298's redeploy among them) |
@@ -149,6 +150,75 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.141 — The Go SDK alone: a message a Go node cannot hold is answered, and a fire it cannot take is sent again (A-329, A-264)
+
+- **Date:** 2026-11-13 (ART) · **Previous version:** 0.1.140 · **Commit:** `2f1a0e1e`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The Go SDK changed,
+  so every Go binary (SY.timer, SY.wf-rules, SY.opa.rules, wf.engine) was rebuilt; no Rust code.
+- **Why:** A-329 (medium, found 2026-11-12 by 0.1.137's gate on 0.1.136): the Go SDK dropped a
+  user message when its command channel (64) was full and nothing went back to the sender, so a
+  burst to a WF lost messages unseen and a timer's fire behind them was lost; the operator's call of
+  2026-11-12: *"Avisar al que mandó"*. With A-264 (a WF's text over the frame failed; the operator's
+  call (b): a blob only past 128 KiB) and A-325's Go sibling. The SDKs are shared code: each ships
+  alone ([METHOD](logbook/METHOD.md) §9), board item 30.
+- **What changed (the Go SDK, SY.timer and the WF engine):** A-329 (`7218afed`, `e3f890e9`, its
+  review `49bc752e`): two lanes, user and system, of 1,024 messages or 8 MiB each (the router's own
+  bound for a node's link), system messages never behind user ones; a message that does not fit is
+  answered `NOT_TAKEN`, reason `node_busy`, retryable, unless it is a notice or a reply; the reader
+  waits for room instead of dropping a frame; the request helpers end with `RpcErrNotTaken`;
+  SY.timer sends again a fire its target answers `NOT_TAKEN` retryable while it is on time, with its
+  backoff, and logs it (*"not taken by"*, `timer_fire_undelivered`); a WF takes SY.timer's
+  `NOT_TAKEN` for a timer request as its refusal. A-264 (`2a4d805c`, the call (b) `b42f101f`): the Go
+  SDK sends a `text/v1` text as a blob (`content_ref`, the Rust SDK's layout and promote) only when
+  the message would pass the frame. A-325's Go sibling (`4d8680df`): SY.timer leaves
+  `VAULT_SECRET_CHANGED` unanswered. The review (`2f1a0e1e`), with A-338 recorded (a blob can reach
+  a reader on another hive after its message).
+- **Build and review:** `coa/gosdk-141`'s seven commits, built and reviewed on 2026-11-12 with the
+  bug push, rebased onto daily `13709be7` (0.1.140's records): `docs/sy-timer.md` (one line both
+  sides changed, both kept) and FINDINGS' open list and entries conflicted, resolved keeping both;
+  subjects re-prefixed `[0.1.140]`; `go vet` and `gofmt` clean on the six Go modules; CI green on
+  `2f1a0e1e` (5 jobs); daily fast-forwarded to it.
+- **The deploy:** build on fb-build 15:41:24–15:48:17Z (6.9 min: no Rust code changed), publish in
+  11 s. The gate's mark at 16:39:03Z; `ops deploy 0.1.141 --snapshot pre-gosdk-0-1-141 --drop
+  pre-router-0-1-140` in 245 s (snapshots 35.5 s, the motherbee's apt 115.2 s, its admin on the
+  version 36.0 s, the spokes answering 11.8 s, the update's call 24.5 s, the hives on the target
+  7.5 s, health 7.8 s). On the target after the update's call: the motherbee 6.4 s, ingress1 16.3 s,
+  egress1 21.0 s, worker1 26.8 s. The update (`upd-1794588154232`) closed with every hive on the
+  target, hash `73204a37cb2c`; worker1 ran an old and a new Go SDK side by side 27.6 s (the WF
+  relaunched first), nothing under load. Health clean.
+- **Checked on 8.x (the gate, gate0240-0243, 16:18–17:14Z, its baseline on 0.1.140 before the
+  deploy; `scratchpad/gate-tools/r141_gate.py`, git-ignored; 152 PASS, 19 SEE, 1 FAIL):**
+  - **The smoke (A-314's lesson):** `run_node AI.gate0242s@worker1` ok in 1.6 s, `RUNNING` at 6.0 s,
+    killed without purge, `STOPPED` (its ILK kept); the stopped `AI.gate0233` and `AI.gate0237c`
+    read `STOPPED`. Every hive on 0.1.141 with one hash; each Go service's running binary has the
+    package's SHA-256 and restarted after the mark; `WF.gate0240` on wf.engine 0.1.141, `HEALTHY`.
+  - **A-329, a burst to a WF (2,000 at 100/s):** 0.1.140 created 283 and dropped 1,717 unseen;
+    0.1.141 created 1,207 and answered the other 793 `NOT_TAKEN node_busy`, retryable, none
+    unaccounted for, the first once about 1,024 waited, no `LINK_BUSY`; sent again at 10/s, the
+    store at 2,000. Status reads under the load: p50 0.528 s, none inferred (0.1.140: p50 2.619 s,
+    6 of 7 inferred); one read at 2.029 s, over the gate's 1.5 s bound (its FAIL). A timer fire
+    behind the burst: taken 0.143 s after SY.timer fired it (0.1.140: never).
+  - **A-329, fires a WF cannot take:** 0.1.140, 1,500 conversations with one `fire_at`: 867 still
+    waiting 300 s after it (fires lost unseen). 0.1.141, 3,000 with one `fire_at`: SY.timer sent
+    again the 1,943 fires the WF answered `NOT_TAKEN` (up to 4 tries), all 3,000 done within 98.2 s
+    of their time, each fire taken once, 0 lost.
+  - **A-264:** a WF's 140 KiB text: refused on 0.1.140; on 0.1.141 a `content_ref` blob, received in
+    0.134 s, the motherbee's copy 11.7 s later; 100 and 40 KiB still inline. At the motherbee as the
+    reader the blob came 11.2 s after its message: A-338's window, recorded.
+  - **A-325's Go sibling:** SY.timer answered `VAULT_SECRET_CHANGED` `TIMER_UNKNOWN_VERB` on
+    0.1.140; on 0.1.141 no answer, one `timer_message_ignored`.
+  - **The cost:** 0 usage records of the gate (no model call).
+  - **By its tests:** the reader's backpressure, a notice or a reply never answered, the WF's take
+    of a timer request's `NOT_TAKEN`, a `NOT_TAKEN` that cannot be sent, a null text sent as it is.
+- **PROD after the gate:** all four hives on 0.1.141; snapshot `pre-gosdk-0-1-141` on each VM,
+  `pre-router-0-1-140` deleted. The clean (17:11–17:14Z, 28 PASS): the workflows gate0240, gate0241
+  and gate0243 force-deleted, their timers purged and their WF nodes' ILKs with them (A-159's known
+  behaviour), no version left; `AI.gate0242s` purged (no history); the gate's blobs and
+  `/root/gate0240` gone; no gate0240-0243 node on any hive. Kept: the tenant pruebas,
+  `AI.pruebas@worker1`, the stopped `AI.gate0233` and `AI.gate0237c`, the gate's turns.
+- **Rollback:** the snapshot `pre-gosdk-0-1-141` (all 4 VMs), or `apt install fluxbee=0.1.140` +
+  0.1.140's `update_installation`: nothing one-way; A-329's drops come back.
 
 ## 0.1.140 — The router alone: a node name that is not an L2 name refused at HELLO (A-269)
 

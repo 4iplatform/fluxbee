@@ -2,10 +2,10 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.139** (2026-11-13), and PROD runs **0.1.140** (the router alone:
-> nothing for Cloud). Read from the code, operation by operation; §10 lists what was also checked
-> live on the PROD hive. §9 lists what changed for Cloud in each release. The model behind it:
-> `docs/ilk-tenant-model-v1.md`
+> Contract as of **fluxbee 0.1.139** (2026-11-13), and PROD runs **0.1.141** (the router and the Go
+> SDK since: nothing for Cloud). Read from the code, operation by operation; §10 lists what was
+> also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
+> behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
 > system, never a company).
 >
