@@ -374,15 +374,6 @@ no change required
     answered `BUSY` (A-307), still moved its slots before a refused publish, and waited 5 s for a
     publish. Every hive runs 0.1.139 since the deploy's update closed (22:34 ART on 2026-11-12), so
     the hold is lifted.
-    A-305, A-306, A-316, A-318, A-319, A-324, A-328; the orchestrator: A-296, A-299, A-300, A-301,
-    A-308, A-310, A-330, A-331; Archi: A-124, A-315, A-320, A-321; SY.frontdesk.gov: A-303;
-    SY.cognition: A-332; SY.edge: A-317; SY.timer: A-326; the WF engine and SY.wf-rules: A-302,
-    A-307, A-333); then the router alone (A-269); the Go SDK alone (A-329 with SY.timer's resend,
-    A-264); the AI SDK alone (A-294, A-290, A-325, `tool_choice` for A-327); the Rust SDK alone
-    (A-295, A-309, A-285's `cloud.rs` text; A-269 (b), the operator's call: each record one line in
-    every Rust binary). Lab: B-18 (the template). Out of it, by decision or as
-    large topics: A-159/A-275/A-276 (deletion), A-137/A-227 (cognition), A-142 (with io.web), A-168,
-    the parked security items, A-289, A-199 step 2, A-250 (b), A-210 (after 2026-11-22).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -492,7 +483,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only; the operator's call (b), 2026-11-12: each record one line in every Rust binary, built on `coa/rustsdk-143`, for 0.1.143, planned).
+- A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, built on `coa/rustsdk-143` for 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
