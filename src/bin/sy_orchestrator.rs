@@ -15892,6 +15892,21 @@ fn syncthing_api_port_check_name(api_port: u16) -> String {
     format!("syncthing api port connect 127.0.0.1:{api_port}")
 }
 
+/// Runs `call`, one call to Syncthing (its REST API through curl, or its CLI), off the threads that
+/// serve the orchestrator's commands (FINDINGS A-343): `block_in_place` hands this worker's tasks
+/// to another thread for as long as the call lasts, which the call's own timeout bounds. A
+/// Syncthing that is stopped (SIGSTOP) or hung still completes the TCP handshake, so its curl
+/// waits its whole `--max-time`: run on an async worker, that call held every command the
+/// orchestrator was serving, about 10 s of every 15 while the watchdog asked the folders, and up to
+/// 120 s for a sync hint's scan. Every call to Syncthing goes through here, whoever makes it: the
+/// watchdog, the sync probe (`SYSTEM_SYNC_HINT`, a finalize's), a join, the peer reconcile. Its
+/// callers run on the orchestrator's multi-thread runtime, on a thread of the blocking pool (a
+/// read, a background join), inside another `block_in_place`, or outside any runtime; never on a
+/// current-thread runtime, where `block_in_place` panics.
+fn syncthing_call<T>(call: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(call)
+}
+
 fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     let (data, _) = read_syncthing_config(&config_path, false)?;
@@ -15923,7 +15938,7 @@ fn syncthing_device_connected(
         .arg("-H")
         .arg(format!("X-API-Key: {api_key}"))
         .arg(&endpoint);
-    let out = run_cmd_output(cmd, "syncthing system connections")?;
+    let out = syncthing_call(|| run_cmd_output(cmd, "syncthing system connections"))?;
     let payload: serde_json::Value = serde_json::from_str(&out)
         .map_err(|err| format!("invalid syncthing connections payload: {err}"))?;
     Ok(payload
@@ -16044,7 +16059,7 @@ fn syncthing_folder_status(
         .arg(&endpoint);
     folder_status_from_reply(
         syncthing_rest_reply(
-            cmd.output(),
+            syncthing_call(|| cmd.output()),
             &format!("syncthing db status folder={folder_id}"),
         ),
         folder_id,
@@ -16287,7 +16302,7 @@ fn syncthing_remote_state(
         .arg("-H")
         .arg(format!("X-API-Key: {api_key}"))
         .arg(&endpoint);
-    let out = run_cmd_output(cmd, "syncthing db completion")?;
+    let out = syncthing_call(|| run_cmd_output(cmd, "syncthing db completion"))?;
     let payload: serde_json::Value = serde_json::from_str(&out)
         .map_err(|err| format!("invalid syncthing completion payload: {err}"))?;
     Ok(payload
@@ -16316,7 +16331,8 @@ fn syncthing_revert_folder(
         .arg("-H")
         .arg(format!("X-API-Key: {}", api_key))
         .arg(&endpoint);
-    let _ = run_cmd_output(cmd, &format!("syncthing revert folder={folder_id}"))?;
+    let label = format!("syncthing revert folder={folder_id}");
+    let _ = syncthing_call(|| run_cmd_output(cmd, &label))?;
     Ok(())
 }
 
@@ -16338,7 +16354,8 @@ fn syncthing_trigger_folder_scan(
         .arg("-H")
         .arg(format!("X-API-Key: {}", api_key))
         .arg(&endpoint);
-    let _ = run_cmd_output(cmd, &format!("syncthing scan folder={folder_id}"))?;
+    let label = format!("syncthing scan folder={folder_id}");
+    let _ = syncthing_call(|| run_cmd_output(cmd, &label))?;
     Ok(())
 }
 
@@ -16431,7 +16448,7 @@ fn local_syncthing_device_id(sync: &BlobRuntimeConfig) -> Result<String, Orchest
             .arg("device-id")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &home);
-        match run_cmd_output(cmd, "syncthing device-id") {
+        match syncthing_call(|| run_cmd_output(cmd, "syncthing device-id")) {
             Ok(out) if valid_syncthing_device_id(out.trim()) => return Ok(out.trim().to_string()),
             Ok(out) => tracing::warn!(
                 output = %truncate_for_error(&out, 200),
@@ -17931,7 +17948,7 @@ fn syncthing_rest_my_id(sync: &BlobRuntimeConfig) -> Result<String, Orchestrator
         .arg("-H")
         .arg(format!("X-API-Key: {api_key}"))
         .arg(&endpoint);
-    let out = run_cmd_output(cmd, "syncthing system status")?;
+    let out = syncthing_call(|| run_cmd_output(cmd, "syncthing system status"))?;
     let payload: serde_json::Value = serde_json::from_str(&out)
         .map_err(|err| format!("invalid syncthing status payload: {err}"))?;
     payload
@@ -19688,7 +19705,8 @@ fn syncthing_folder_errors(
         .arg("-H")
         .arg(format!("X-API-Key: {}", api_key))
         .arg(&endpoint);
-    let out = run_cmd_output(cmd, &format!("syncthing folder errors folder={folder_id}"))?;
+    let label = format!("syncthing folder errors folder={folder_id}");
+    let out = syncthing_call(|| run_cmd_output(cmd, &label))?;
     let payload: serde_json::Value = serde_json::from_str(&out).map_err(|err| {
         format!("invalid syncthing folder/errors payload for folder '{folder_id}': {err}")
     })?;
@@ -19843,7 +19861,9 @@ impl SyncthingFolderChecks {
 /// never answered held each tick about 2 min on the motherbee (10 folders and 2 folder-error
 /// reads), and a stopped rt-gateway waited that long for its start. The folders of `ask_last`,
 /// which gave no answer when last asked, are asked after the others, in that order: one whose
-/// status stays slow never keeps the others from being asked (FINDINGS A-283, the review).
+/// status stays slow never keeps the others from being asked (FINDINGS A-283, the review). Each
+/// ask waits off the threads that serve the orchestrator's commands (`syncthing_call`, FINDINGS
+/// A-343): only the watchdog waits for it.
 fn check_syncthing_folders(
     folder_ids: &[String],
     ask_last: &[String],
@@ -26312,6 +26332,14 @@ fn load_node_effective_config(path: &Path) -> Result<serde_json::Value, Orchestr
     Ok(value)
 }
 
+/// The config a request gives a node (`run_node`'s `config`, a `set_node_config` patch): the node's
+/// config itself, its keys at the top. Neither `_system`, the orchestrator's, nor `config` is one
+/// of its keys (FINDINGS A-346): a top-level `config` is the SDKs' wrapped form
+/// (`extract_effective_config`, Rust and Go), which a node takes as its whole config at its next
+/// start, while every reader of `get_node_config` reads the keys beside it. Before, a patch that
+/// followed SY.admin's help, `{"config": {...}}` as the HTTP body, answered `ok`, bumped
+/// `config_version` and planted that key in silence: on 8.x, IO.cloud would have taken a gate's
+/// fake edge as its whole config at its next restart. No node's config has a key of that name.
 fn parse_config_patch(
     payload: &serde_json::Value,
     field: &str,
@@ -26326,6 +26354,14 @@ fn parse_config_patch(
         .clone();
     if config.contains_key("_system") {
         return Err(format!("invalid {field}: reserved key '_system' is not allowed").into());
+    }
+    if config.contains_key("config") {
+        return Err(format!(
+            "invalid {field}: a top-level key 'config' is not allowed: a node's config patch is \
+             the config itself, its keys at the top: {{\"io\": {{...}}}}, not {{\"config\": \
+             {{\"io\": {{...}}}}}} (over HTTP, set_node_config's PUT body is the patch itself)"
+        )
+        .into());
     }
     Ok(config)
 }
@@ -30240,6 +30276,18 @@ async fn run_node_flow(
     // forwarded: the node would run in one and the other would be dropped (FINDINGS A-213).
     if let Some(refusal) = spawn_tenant_conflict_refusal(&node_name, payload) {
         return refusal;
+    }
+    // FINDINGS A-346: a config that is not the node's own keys (a `_system` or a `config` key at
+    // its top, or no object) stops here too, before anything is written or forwarded, as
+    // set_node_config refuses such a patch. Its write would refuse it, but only once the node's ILK
+    // was registered, and as CONFIG_WRITE_FAILED.
+    if let Err(err) = parse_config_patch(payload, "config") {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": err.to_string(),
+            "node_name": node_name,
+        });
     }
     // The tenant this spawn would register and inject: the one both rules are about.
     let spawn_tenant = resolve_tenant_id_for_node(payload);
@@ -54441,6 +54489,119 @@ blob:
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// FINDINGS A-346: a node's config patch is the config itself, its keys at the top. One with a
+    /// top-level `config` key, the SDKs' wrapped form, which a node would take as its whole config
+    /// at its next start, is refused INVALID_REQUEST as one with `_system` is: by `set_node_config`
+    /// before it looks for the node's config, by `run_node` before anything is written or
+    /// forwarded, and by the spawn's write, which writes nothing. The message says the patch is
+    /// the config itself. A flat patch goes on as before, a `config` key below its top included.
+    /// Before, `{"config": {...}}` as `set_node_config`'s patch answered `ok` and planted the key.
+    #[tokio::test]
+    async fn a_config_patch_with_a_top_level_config_key_is_refused_and_a_flat_one_goes_on() {
+        let wrapped =
+            serde_json::json!({ "config": { "io": { "edge_node": "SY.edge@gate0239x" } } });
+        let flat = serde_json::json!({
+            "io": { "edge_node": "SY.edge@ingress1", "config": { "kept": true } },
+            "tenant_id": "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11",
+        });
+        let err = parse_config_patch(&serde_json::json!({ "config": wrapped }), "config")
+            .expect_err("a wrapped patch")
+            .to_string();
+        for said in [
+            "invalid config: a top-level key 'config' is not allowed",
+            "the config itself, its keys at the top",
+            "set_node_config's PUT body is the patch itself",
+        ] {
+            assert!(err.contains(said), "{said}: {err}");
+        }
+        let system = serde_json::json!({ "config": { "_system": {}, "io": {} } });
+        assert!(parse_config_patch(&system, "config")
+            .expect_err("_system")
+            .to_string()
+            .contains("reserved key '_system'"));
+        let patch = parse_config_patch(&serde_json::json!({ "config": flat }), "config")
+            .expect("a flat patch");
+        assert_eq!(serde_json::Value::Object(patch), flat);
+
+        // set_node_config refuses it before it looks for the node's config; a flat patch goes on to
+        // it, and finds none for this node.
+        let state = sample_orchestrator_state_for_tests();
+        let node = format!("IO.a346-{}@{}", Uuid::new_v4().simple(), state.hive_id);
+        let set = |config: &serde_json::Value| {
+            serde_json::json!({
+                "node_name": node,
+                "config": config,
+                "replace": false,
+            })
+        };
+        let refused = set_node_config_flow(&state, &set(&wrapped)).await;
+        assert_eq!(refused["status"], "error");
+        assert_eq!(refused["error_code"], "INVALID_REQUEST", "{refused}");
+        assert_eq!(refused["message"], err.as_str());
+        let replaced = set_node_config_flow(
+            &state,
+            &serde_json::json!({ "node_name": node, "config": wrapped, "replace": true }),
+        )
+        .await;
+        assert_eq!(replaced, refused, "replace refuses it too");
+        let went_on = set_node_config_flow(&state, &set(&flat)).await;
+        assert_eq!(went_on["error_code"], "NODE_CONFIG_NOT_FOUND", "{went_on}");
+
+        // run_node refuses it before anything is written or forwarded; a flat config goes on to
+        // its forward, which finds no router in a test.
+        let spawned = "IO.a346@worker1";
+        let spawn = |config: &serde_json::Value| {
+            serde_json::json!({
+                "node_name": spawned,
+                "runtime": "io.api",
+                "tenant_id": "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11",
+                "config": config,
+            })
+        };
+        assert_eq!(
+            run_node_flow(&state, &spawn(&wrapped)).await,
+            serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err,
+                "node_name": spawned,
+            })
+        );
+        let went_on = run_node_flow(&state, &spawn(&flat)).await;
+        assert_eq!(went_on["error_code"], "SPAWN_FAILED", "{went_on}");
+
+        // The spawn's write: a flat config is written as given, and a wrapped one never is.
+        let root = std::env::temp_dir().join(format!("fluxbee-a346-{}", Uuid::new_v4()));
+        let write = |payload: &serde_json::Value, nodes: &str| {
+            ensure_node_effective_config_on_spawn_with_roots(
+                &state,
+                payload,
+                spawned,
+                "worker1",
+                "io.api",
+                "1.0.0",
+                None,
+                None,
+                Some("ilk:11111111-1111-1111-1111-111111111111"),
+                &root.join("runtimes"),
+                &root.join(nodes),
+            )
+        };
+        let wrote = write(&spawn(&wrapped), "wrapped").expect_err("a wrapped config");
+        assert_eq!(wrote.to_string(), err);
+        let path =
+            node_effective_config_path_with_root(spawned, &root.join("wrapped")).expect("its path");
+        assert!(!path.exists(), "nothing written");
+        write(&spawn(&flat), "flat").expect("a flat config");
+        let path =
+            node_effective_config_path_with_root(spawned, &root.join("flat")).expect("its path");
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("read")).expect("parse");
+        assert_eq!(config["io"], flat["io"]);
+        assert!(config.get("config").is_none(), "{config}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A-16: the watchdog reads a receive-only folder's local changes from its status, which
     /// is what triggers the revert; a folder of another type reports none.
     #[test]
@@ -64263,6 +64424,246 @@ blob:
         assert!(body("fn check_syncthing_folders(")
             .contains("checks.folders.and(syncthing_folder_answer(folder, result))"));
         assert!(!watchdog.contains("folders_healthy = false"));
+    }
+
+    /// The device id the fake Syncthing REST API of A-343's test answers for.
+    const A343_DEVICE: &str = "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH";
+
+    /// FINDINGS A-343: a call to a Syncthing that takes the connection and holds its answer, as a
+    /// stopped (SIGSTOP) or hung one does, holds no thread that serves the orchestrator's commands.
+    /// On a runtime of one worker thread, a task that ticks as the message loop and the timers do
+    /// keeps ticking while each call to Syncthing waits for a fake REST API that holds its answer:
+    /// the watchdog's folder check, run as its tick runs it, its folder-error read, the sync
+    /// probe's scan, a join's peer and device-id reads, and a revert's. Each still gets its answer
+    /// once the API gives it. Before, the curl ran on the worker, and the ticks stopped for as long
+    /// as it waited: on 8.x about 10 s of every 15, every command with them. The test waits on its
+    /// own thread's clock, which no runtime thread drives, and lets the API answer before it
+    /// checks, so a call run on the worker fails it rather than hanging it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_call_to_a_syncthing_that_holds_its_answer_holds_no_runtime_thread() {
+        let home = std::env::temp_dir().join(format!("fluxbee-a343-{}", Uuid::new_v4()));
+        fs::create_dir_all(&home).expect("the Syncthing home");
+        fs::write(
+            home.join("config.xml"),
+            "<configuration><gui><apikey>a343-key</apikey></gui></configuration>",
+        )
+        .expect("config.xml");
+        // The fake REST API: it takes each connection, reads the request, says which, and answers
+        // only once the test lets it, with one body every caller reads its own keys from.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("its address").port();
+        let (asked_tx, asked) = std::sync::mpsc::channel::<String>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let body = serde_json::json!({
+                "state": "idle",
+                "needTotalItems": 0,
+                "errors": [],
+                "connections": { A343_DEVICE: { "connected": true } },
+                "remoteState": "valid",
+                "myID": A343_DEVICE,
+            })
+            .to_string();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if asked_tx.send(line).is_err() {
+                    return;
+                }
+                // Held until the test lets it answer, 20 s at most.
+                let _ = released.recv_timeout(Duration::from_secs(20));
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                         {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let sync = BlobRuntimeConfig {
+            sync_api_port: port,
+            sync_data_dir: home.clone(),
+            ..sample_blob_config()
+        };
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                let mut every = time::interval(Duration::from_millis(10));
+                loop {
+                    every.tick().await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        type Call = fn(&BlobRuntimeConfig) -> Result<String, String>;
+        let calls: [(&str, &str, Call); 7] = [
+            (
+                "the watchdog's folder check",
+                "GET /rest/db/status?folder=fluxbee-a343 ",
+                |sync| {
+                    let checks = check_syncthing_folders(&["fluxbee-a343".to_string()], &[], |f| {
+                        check_syncthing_folder(sync, f)
+                    });
+                    match checks.folders {
+                        CheckAnswer::Yes => Ok("healthy".to_string()),
+                        _ => Err(format!("{checks:?}")),
+                    }
+                },
+            ),
+            (
+                "the watchdog's folder-error read",
+                "GET /rest/folder/errors?folder=fluxbee-a343&perpage=100 ",
+                |sync| {
+                    syncthing_folder_errors(sync, "fluxbee-a343")
+                        .map(|(errors, _)| errors.to_string())
+                        .map_err(|err| err.to_string())
+                },
+            ),
+            (
+                "the sync probe's scan",
+                "POST /rest/db/scan?folder=fluxbee-a343 ",
+                |sync| {
+                    syncthing_trigger_folder_scan(sync, "fluxbee-a343")
+                        .map(|()| "scanned".to_string())
+                        .map_err(|err| err.to_string())
+                },
+            ),
+            (
+                "a join's wait for its peer",
+                "GET /rest/system/connections ",
+                |sync| {
+                    syncthing_device_connected(sync, A343_DEVICE)
+                        .map(|connected| connected.to_string())
+                        .map_err(|err| err.to_string())
+                },
+            ),
+            ("a join's device id", "GET /rest/system/status ", |sync| {
+                local_syncthing_device_id(sync).map_err(|err| err.to_string())
+            }),
+            (
+                "a revert's source check",
+                "GET /rest/db/completion?folder=fluxbee-a343&device=",
+                |sync| {
+                    syncthing_remote_state(sync, "fluxbee-a343", A343_DEVICE)
+                        .map_err(|err| err.to_string())
+                },
+            ),
+            (
+                "a revert",
+                "POST /rest/db/revert?folder=fluxbee-a343 ",
+                |sync| {
+                    syncthing_revert_folder(sync, "fluxbee-a343")
+                        .map(|()| "reverted".to_string())
+                        .map_err(|err| err.to_string())
+                },
+            ),
+        ];
+        for (what, request, call) in calls {
+            let call_sync = sync.clone();
+            let task = tokio::spawn(async move { call(&call_sync) });
+            let line = asked
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{what}: the call never reached Syncthing's API"));
+            // The call waits for the API's answer now: 200 ms on this thread's clock.
+            let before = ticks.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            let held = ticks.load(Ordering::SeqCst) - before;
+            release.send(()).expect("the API waits to answer");
+            let answer = task.await.expect("the call's task");
+            assert!(line.starts_with(request), "{what}: {line}");
+            assert!(
+                held >= 3,
+                "{what}: the runtime stopped while Syncthing held its answer ({held} ticks)"
+            );
+            assert!(answer.is_ok(), "{what}: {answer:?}");
+        }
+        ticker.abort();
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// FINDINGS A-343: every call to Syncthing in the code, its REST API through curl or its
+    /// binary, runs its command through `syncthing_call`, off the threads that serve the
+    /// orchestrator's commands, whoever makes it (the watchdog, the sync probe, a join, the peer
+    /// reconcile), and each keeps its own timeout. A function that calls Syncthing another way, or
+    /// a new one, fails this test.
+    #[test]
+    fn every_call_to_syncthing_runs_off_the_threads_that_serve_commands() {
+        let src = include_str!("sy_orchestrator.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests {").expect("the tests")];
+        let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+        let runner = &code[code.find("\nfn syncthing_call<T>(").expect("the runner")..];
+        let runner = &runner[..runner.find("\n}\n").expect("its end")];
+        assert!(squeeze(runner).ends_with("{tokio::task::block_in_place(call)"));
+
+        // Each function of the code that calls Syncthing, and the timeout of its call.
+        let mut calls = BTreeMap::new();
+        for head in ["\nfn ", "\nasync fn "] {
+            for (at, _) in code.match_indices(head) {
+                let body = &code[at + 1..];
+                let body = &body[..body.find("\n}\n").expect("its end")];
+                let rest_api = body.contains("Command::new(\"curl\")") && body.contains("/rest/");
+                if !rest_api && !body.contains(".arg(SYNCTHING_INSTALL_PATH)") {
+                    continue;
+                }
+                let name = body.trim_start_matches("async ").trim_start_matches("fn ");
+                let name = &name[..name.find(['(', '<']).expect("its name")];
+                let body = squeeze(body);
+                // Every command it runs, it runs through the runner.
+                let runs: usize = [
+                    "run_cmd_output(",
+                    "run_cmd(",
+                    ".output()",
+                    ".status()",
+                    ".spawn()",
+                ]
+                .iter()
+                .map(|runs| body.matches(runs).count())
+                .sum();
+                let through = body.matches("syncthing_call(||run_cmd_output(").count()
+                    + body.matches("syncthing_call(||cmd.output())").count();
+                assert!(through > 0 && runs == through, "{name}: {body}");
+                let timeout = [
+                    ".arg(\"--max-time\").arg(\"",
+                    "Command::new(\"timeout\");cmd.arg(\"",
+                ]
+                .iter()
+                .find_map(|lead| {
+                    let rest = &body[body.find(lead)? + lead.len()..];
+                    Some(rest[..rest.find('"')?].to_string())
+                })
+                .unwrap_or_else(|| panic!("{name}: no timeout"));
+                calls.insert(name.to_string(), timeout);
+            }
+        }
+        let expected: BTreeMap<String, String> = [
+            ("local_syncthing_device_id", "5"),
+            ("syncthing_device_connected", "5"),
+            ("syncthing_folder_errors", "10"),
+            ("syncthing_folder_status", "10"),
+            ("syncthing_remote_state", "5"),
+            ("syncthing_rest_my_id", "5"),
+            ("syncthing_revert_folder", "120"),
+            ("syncthing_trigger_folder_scan", "120"),
+        ]
+        .into_iter()
+        .map(|(name, timeout)| (name.to_string(), timeout.to_string()))
+        .collect();
+        assert_eq!(calls, expected);
     }
 
     /// FINDINGS A-283: the Syncthing check asks its folders in turn and stops at the first one

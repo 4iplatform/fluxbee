@@ -703,7 +703,7 @@ until it reloads; revoking the credential at the provider is what makes it usele
 | `RUNTIME_NOT_AVAILABLE` | the runtime or version cannot be resolved |
 | `RUNTIME_NOT_PRESENT` | that version has not reached the node's hive yet: retry later |
 | `CORE_IO_NAME_MISMATCH` / `TENANT_ROOT_REQUIRED` | the runtime is one of the hive's core IO runtimes (`io.cloud`, `io.blob`, `io.web`), or the name is one of their nodes (`IO.cloud@motherbee`…): each runs only as its one node, in the root tenant |
-| `INVALID_REQUEST` | not `IO.*`, runtime not derivable, bad version |
+| `INVALID_REQUEST` | not `IO.*`, runtime not derivable, bad version; a `params.config` with a `_system` or `config` key at its top (the config is the node's own keys, since 0.1.144) |
 | `IDENTITY_UPDATE_FAILED` | `add_channels` or `identity_change_reason` could not be applied (a channel another identity holds, for example); the launch is undone |
 | `SERVICE_FAILED` | the hive's systemd did not answer whether the node runs: nothing was launched. Since 0.1.133 nothing of the node stays either: send it again (in 0.1.132 a retry answers `NODE_ALREADY_EXISTS`: ask the operator) |
 | `IDENTITY_REGISTER_FAILED`, `CONFIG_WRITE_FAILED`, `SPAWN_FAILED` | the hive could not launch it; for a deleted tenant, `IDENTITY_REGISTER_FAILED` with `TENANT_DELETED` in the detail |

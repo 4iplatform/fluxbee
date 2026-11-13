@@ -504,9 +504,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
-- A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; the operator's call of 2026-11-13: no Syncthing call on the threads that serve commands, restart and log as A-283, no new watchdog; to build).
+- A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; the operator's call of 2026-11-13: no Syncthing call on the threads that serve commands, restart and log as A-283, no new watchdog; built on `coa/orch-144` for 0.1.144: every call to Syncthing through one runner, off those threads).
 - A-345 🔵 `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one (low, observability; the orchestrator; found by 0.1.139's gate).
-- A-346 🔵 `set_node_config`'s help describes a body its HTTP route does not take (medium; SY.admin and the orchestrator; the hazard it left on IO.cloud fixed on 8.x; the operator's call of 2026-11-13: the help fixed and a top-level `config` key refused; to build).
+- A-346 🔵 `set_node_config`'s help describes a body its HTTP route does not take (medium; SY.admin and the orchestrator; the hazard it left on IO.cloud fixed on 8.x; the operator's call of 2026-11-13: the help fixed and a top-level `config` key refused; the refusal built on `coa/orch-144` for 0.1.144, the help on its own branch).
 - A-347 🔵 `remove_hive`'s cleanup on the box races the box's own orchestrator, which starts again the core services the cleanup stopped (low; the orchestrator; found by 0.1.139's gate; the operator's call of 2026-11-13: it waits, recorded).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1655,6 +1655,31 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   fix recommended above: (a) the help says the HTTP body is the patch itself and `?replace=1`
   replaces it whole (the executor's args keep `config` and `replace`), and (b) the orchestrator
   refuses a top-level `config` key in a patch, as it refuses `_system`. To build.
+- **Built on `coa/orch-144` (for 0.1.144), (b):** `parse_config_patch` (`src/bin/sy_orchestrator.rs`
+  ~26330) refuses a top-level `config` key as it refuses `_system`, `INVALID_REQUEST`: *"invalid
+  config: a top-level key 'config' is not allowed: a node's config patch is the config itself, its
+  keys at the top: {"io": {...}}, not {"config": {"io": {...}}} (over HTTP, set_node_config's PUT
+  body is the patch itself)"*. Checked first that no node's config has a key of that name: the Rust
+  and Go SDKs both take one as the whole config (`extract_effective_config`,
+  `ExtractEffectiveConfig`); no contract reads one (ai.generic, SY.frontdesk.gov, the IO adapters
+  in `nodes/io/common`, the WF node's strict `OperatorConfig`); SY.wf-rules' WF configs, the WF
+  example templates, SY.admin's own patches (`{"io": ...}`) and the docs' examples use `config`
+  only as the request's field, never inside a config. Its path: `set_node_config` refuses it
+  before it looks for the node's config, with or without `replace`, on the hive that runs the node
+  (the motherbee forwards first); SY.admin's HTTP route answers 400 with `error_code`
+  `INVALID_REQUEST`, `error_detail` the message and the orchestrator's answer as `payload`
+  (`build_admin_http_response`), and Archi's SCMD (`PUT /hives/{hive}/nodes/{node}/config`, its
+  body taken as the patch, `src/bin/sy_architect.rs` ~14588) gets the same answer, its operation
+  failed. `run_node` takes its `config` through the same check, and now runs it before anything is
+  written or forwarded (`run_node_flow`, beside A-213's refusal): a wrapped config, or one with
+  `_system`, answers `INVALID_REQUEST` there, where it answered `CONFIG_WRITE_FAILED` once the
+  node's ILK was registered (and rolled back); `docs/io-cloud-api.md`'s `provision_node` table
+  says so. Test: `a_config_patch_with_a_top_level_config_key_is_refused_and_a_flat_one_goes_on`
+  (the check, `set_node_config` with and without `replace`, `run_node` and the spawn's write: the
+  wrapped patch refused, nothing written; a flat one, a `config` key below its top included, goes
+  on; without the check it fails at its first refusal). What stays: SY.admin's help, (a), on its
+  own branch; a stray top-level `replace` is still stored as a config key; a config.json that
+  already holds a `config` key keeps it (8.x's IO.cloud was cleaned by hand, above).
 
 ### A-345 [General/orchestrator] 🔵 low, observability (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it) — `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one
 
@@ -1731,6 +1756,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   hint's curls) runs on the threads that serve the orchestrator's commands, each keeping its own
   timeout; Syncthing that does not answer is restarted as A-283 has it (after 5 min unanswered, at
   most once an hour) and logged, and nothing else. To build.
+- **Built on `coa/orch-144` (for 0.1.144):** every call to Syncthing runs its command through one
+  runner, `syncthing_call` (`tokio::task::block_in_place`, `src/bin/sy_orchestrator.rs` ~15907),
+  in the eight functions that call it: the seven REST calls through curl
+  (`syncthing_device_connected`, `syncthing_folder_status`, `syncthing_remote_state`,
+  `syncthing_revert_folder`, `syncthing_trigger_folder_scan`, `syncthing_rest_my_id`,
+  `syncthing_folder_errors`) and `syncthing device-id` (`local_syncthing_device_id`), each with
+  its own timeout (5 s; 10 s for a folder's status and errors; 120 s for a scan or a revert). So
+  whoever calls Syncthing waits off the threads that serve commands: the watchdog's folder checks
+  and folder-error reads, the sync probe's scan and status (`SYSTEM_SYNC_HINT`, a finalize's), none
+  of them wrapped before; a join's reads, already on a blocking thread; the peer reconcile and the
+  options switch, already wrapped (now a nested call, which runs in place). Wrapped where each call
+  is made rather than at each async caller, so none can be missed; the tick's text, whose
+  source-text assertion the fix above was to update, did not change. Every caller runs on the
+  multi-thread runtime, on a blocking thread under `Handle::block_on` (a read, a background join),
+  which allows it, inside another `block_in_place`, or outside any runtime; no test calls one on a
+  current-thread runtime, where it would panic. Nothing else changed: no new watchdog, A-283's
+  restart and its log as they were. Tests:
+  `a_call_to_a_syncthing_that_holds_its_answer_holds_no_runtime_thread` (a runtime of one worker
+  thread and a fake REST API that holds its answer: a task that ticks every 10 ms keeps ticking
+  through each of the seven calls, and each gets its answer; with the runner calling in place, as
+  before, it fails at the first call, 0 ticks in 200 ms) and
+  `every_call_to_syncthing_runs_off_the_threads_that_serve_commands` (every function of the code
+  that calls Syncthing runs its command through the runner and keeps its timeout; a call outside
+  it fails it). What stays: the watchdog's tick still waits for its curls, about 10 s a tick while
+  Syncthing hangs (A-313's matter), and a sync hint or a finalize still holds the ordered lane
+  while it waits (a scan up to 120 s).
 
 ### A-342 [WF] 🔵 low (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it, since A-254 in 0.1.131) — A WF's resends of its timers land up to about 2 s late
 

@@ -192,7 +192,9 @@ shows those nodes the same way, with `managed: false`.
    (`managed_spawn_disallowed_reason`).
 2. A request whose `tenant_id` and `config.tenant_id` both name a tenant, and differ, is refused
    first (`spawn_tenant_conflict_refusal`: `INVALID_REQUEST`), before anything is written or
-   forwarded; the same tenant in both, or one alone, goes on (FINDINGS A-213). A node may not run
+   forwarded; the same tenant in both, or one alone, goes on (FINDINGS A-213). So is a `config`
+   that is not the node's own keys (`parse_config_patch`: no object, or a `_system` or `config`
+   key at its top; FINDINGS A-346, since 0.1.144, below). A node may not run
    in the root tenant unless it is core: `SY.*`, `RT.*`, or an `IO.*` node on `io.cloud`,
    `io.blob` or `io.web` (`is_core_node`, `genesis_refusal`:
    `TENANT_ROOT_NOT_ALLOWED`). The mirror (`core_io_refusal`): a core IO runtime runs only as its
@@ -253,6 +255,19 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   `operator`, or the caller's name. For Cloud's node actions SY.admin also sends
   `require_tenant_id` / `require_launched_by`, and a node that does not match answers
   `NODE_NOT_FOUND`.
+- **The config is the node's own keys.** `run_node`'s `config` and a `set_node_config` patch are
+  the node's config itself, its keys at the top (`{"io": {...}}`): `set_node_config` writes each
+  key over config.json's (`replace` takes the patch as the whole config, `_system` kept), and over
+  HTTP the PUT body is the patch (`?replace=1` for `replace`). A `config` with a `_system` key, the
+  orchestrator's, or a `config` key at its top is refused, `INVALID_REQUEST`, its message saying
+  the patch is the config itself (`parse_config_patch`; FINDINGS A-346, since 0.1.144): a
+  top-level `config` is the SDKs' wrapped form (`extract_effective_config`, Rust and Go), which a
+  node takes as its whole config at its next start, while every reader of `get_node_config` reads
+  the keys beside it, and no node's config has a key of that name. `set_node_config` refuses it
+  before it looks for the node's config, on the hive that runs the node; `run_node`, before
+  anything is written or forwarded. Before, such a patch answered `ok`, bumped `config_version`
+  and planted the key, and `run_node` refused `_system` only once the node's ILK was registered,
+  as `CONFIG_WRITE_FAILED`.
 - **Relaunch.** At boot and every 60 s (`run_managed_runtime_reconcile_loop`),
   `reconcile_persisted_custom_nodes` takes each persisted node with a runtime and
   `relaunch_on_boot: true`. It holds the node's lock (`try_lock_node`: a node an action holds waits
@@ -1271,6 +1286,18 @@ whose port takes no connection 2 s at most.
 
 Before, nothing repaired such a Syncthing, whose API took connections and never answered, or
 whose port refused them while it ran: the unhealthy path only starts a running one.
+
+**Every call to Syncthing runs off the threads that serve commands** (FINDINGS A-343, since
+0.1.144; the operator's call of 2026-11-13). The folder checks, the folder-error reads, the sync
+probe's scan and status, a join's reads, the revert and the device id run their curl to the REST
+API, or `syncthing device-id`, through `syncthing_call` (`block_in_place`), each with its own
+timeout: 5 s, 10 s for a folder's status and errors, 120 s for a scan or a revert. A Syncthing
+that is stopped (SIGSTOP) or hung still takes the connection, so a curl waits its whole timeout:
+run on one of the runtime's threads, it held the whole orchestrator, its commands and the router's
+messages included, about 10 s of every 15 while the watchdog asked the folders. Now only the
+caller waits: the watchdog's tick, and a sync hint or a finalize, which hold the ordered lane
+while they wait, as before. Nothing else changed: no new watchdog, and a Syncthing whose REST API
+gives no answer is restarted and logged as above.
 
 The same tick logs managed nodes that left the router, verifies runtimes, runs the blob GC (on the
 motherbee when its `blob.gc` turns it on, FINDINGS A-188; on a worker, every hour whatever its
