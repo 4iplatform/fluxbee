@@ -350,9 +350,14 @@ no change required
     where 0.1.140 lost 867 of 1,500), A-264 (a WF's 140 KiB text as a blob, where 0.1.140 refused
     it), A-325's Go sibling (SY.timer leaves `VAULT_SECRET_CHANGED` unanswered); A-338's window seen
     (a blob reached the motherbee 11.2 s after its message); 152 PASS, no model call.
-    **Next:** the AI SDK alone (0.1.142, `coa/aisdk-142`) and the Rust SDK alone (0.1.143,
-    `coa/rustsdk-143`, with A-269's call (b)), each built and pushed, not released; then the IO
-    family, with io.slack.
+    **0.1.142, the AI SDK alone** ✅ live and checked on 8.x (2026-11-13): A-294 (a reply over the
+    frame fails alone, the runtime goes on, where 0.1.141's process exited and restarted), A-290 (a
+    saturated AI node reads `DEGRADED` `ai_runtime_saturated` and turns one more turn away at once,
+    status reads under 1 s), A-325 (ai.generic and the frontdesk leave `VAULT_SECRET_CHANGED`
+    unanswered: closed with its Go sibling), A-339 (they leave a `NOT_TAKEN` and an error answer
+    unanswered); A-327's `tool_choice` by its tests; 97 PASS, no model call.
+    **Next:** the Rust SDK alone (0.1.143, `coa/rustsdk-143`, with A-269's call (b)), built and
+    pushed, not released; then the IO family, with io.slack.
     **Numbers given on the push's branches** (the operator's call of 2026-11-12, where 0.1.139's
     integration review had given the orchestrator's item A-339): A-335 is the orchestrator's (a box
     `remove_hive` did not reach, 0.1.139); A-336 is the Rust SDK branch's (`coa/rustsdk-143`: the
@@ -482,18 +487,14 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
-- A-290 🔵 An AI node answers `HEALTHY` while its runtime refuses every turn (low; the AI SDK, then the runners; built on `coa/aisdk-142`, planned 0.1.142).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
-- A-294 🔵 One answer over the frame limit stops the whole AI runtime (low; the AI SDK; built on `coa/aisdk-142`, planned 0.1.142).
 - A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK).
 - A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
-- A-325 🟡 ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops (low; its Go sibling ✅ 0.1.141; ai.generic's and SY.frontdesk.gov's part with 0.1.142).
-- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` first, in its own release, then SY.architect; the AI SDK's part built on `coa/aisdk-142`, planned 0.1.142; SY.architect's for its first release after it, its code in that branch's A-327 commit).
+- A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` ✅ 0.1.142, by its tests; SY.architect's use of it open, for its next release).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
 - A-337 🔵 SY.admin's plan review gives its model each step as written, a secret the operator wrote into its args included (low; SY.admin; found by A-124's review, Archi's branch, 0.1.139).
 - A-338 🔵 A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob (low; A-264's option (c), a topic of its own by the operator's call of 2026-11-12).
-- A-339 🔵 An AI node answers a `NOT_TAKEN` with an `unknown_system_msg` error (low; the AI SDK; found by the review of `coa/rustsdk-143`; built on `coa/aisdk-142`, planned 0.1.142; the resend of an answer not taken proposed, to decide).
 - A-340 🔵 A join refused at its key probe says the motherbee's key is still on the box, when the key does not open it (low; the orchestrator; found by 0.1.139's gate; misleading only).
 - A-341 🔵 `start_node` within about 10 s of a node's exit answers `already_running` and launches nothing (low; the orchestrator; found by 0.1.139's gate; the router writes its LSA region on its 10 s hello).
 - A-343 🔵 A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15 (medium; the orchestrator; found by 0.1.139's gate; its local fix, `block_in_place`, to ask the operator).
@@ -1771,7 +1772,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later:** a revoke that fails to authenticate with that same key reports the key as not
   opening the box.
 
-### A-339 [General/AI SDK] 🔵 low (found 2026-11-12 by the review of `coa/rustsdk-143`; read in the code, also on `coa/aisdk-142`; there since the WF engine's `NOT_TAKEN` (0.1.94), more often from 0.1.141) — An AI node answers a `NOT_TAKEN` with an `unknown_system_msg` error
+### A-339 [General/AI SDK] ✅ VALIDATED ON 8.x (0.1.142, 2026-11-13; AI.pruebas and SY.frontdesk.gov leave a `NOT_TAKEN` and a `<msg>.error` unanswered, a WARN naming who refused and why, where 0.1.141 answered each `unknown_system_msg`) (found 2026-11-12 by the review of `coa/rustsdk-143`; read in the code, also on `coa/aisdk-142`; there since the WF engine's `NOT_TAKEN` (0.1.94), more often from 0.1.141) — An AI node answers a `NOT_TAKEN` with an `unknown_system_msg` error
 
 - **Why:** the AI SDK's `is_infrastructure_message` (`crates/fluxbee_ai_sdk/src/control_plane.rs`
   ~114, the same on `coa/aisdk-142`, `bf7cd152`) takes for a notice or a reply only a message
@@ -1869,6 +1870,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - It fits the operator's principle (the node that failed retries and logs) and A-329's call for
     SY.timer (a fire not taken is sent again). Best with the IO family's resend of a retryable
     `NOT_TAKEN` (A-329's leftovers): one rule for both.
+- **Validated on 8.x (0.1.142's gate, gate0242, 2026-11-13; `scratchpad/gate-tools/r142_gate.py`, git-ignored; 97 PASS, 1 SEE, 0 FAIL, no model call):** on 0.1.141 AI.pruebas@worker1 and SY.frontdesk.gov@motherbee
+  answered a `NOT_TAKEN`, a `gate0242_probe.error` and an unknown verb each with `unknown_system_msg`
+  (0.003 to 0.023 s). On 0.1.142 the `NOT_TAKEN` and the `.error` got no answer within 5 s on either
+  node; the `NOT_TAKEN`'s WARN came 0.002 to 0.003 s after it, naming the refuser, the reason and
+  `retryable`; the error answer's info line *"a notice or a reply, not a request; not answered"*;
+  the unknown verb still answered. The resend of an answer not taken stays a proposal.
 
 ### A-338 [General/blob] 🔵 low (found 2026-11-12 by the review of A-264's build on `coa/gosdk-141`; read in the code, not seen; there since the Rust SDK's text offload, wider from 0.1.141) — A text sent as a blob can fail at a reader on another hive: the message comes before Syncthing copies the blob
 
@@ -2492,6 +2499,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the chat's last model call, with the executor's run before the explanation's call, so its gate
   confirms within about 3 min of the chat's answer. To check on 8.x then: the
   `execution_report` usage record's `cache_read` about the 40,000 tokens it wrote before.
+- **The AI SDK's part shipped in 0.1.142 (2026-11-13):** `tool_choice` (`ToolChoice::Auto`, the
+  default, which sends nothing, and `ToolChoice::None`) has no caller in 0.1.142, so by its tests
+  only; SY.architect's use of it, the fix itself, stays open for SY.architect's release.
 
 ### A-326 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.timer 1.7's first start built the four list indexes and dropped the two old ones, in 876 ms on worker1; the walks' page medians through SY.admin 0.090 to 0.106 s against 0.106 to 0.129 s on 0.1.138, a schedule's round trip 23 ms against 53 ms (medians); the 16 MiB cache: worker1's sy-timer 24,028 kB resident against 19,764 kB; the clean's purge of 4,430 timers 1,194 ms) (found 2026-11-12 by A-278's review; read in the code, its query plan checked with SQLite; there before it, more pages since A-278; seen live by 0.1.138's gate) — Each `TIMER_LIST` page reads every pending timer of the hive
 
@@ -2698,7 +2708,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   cancelled rows) in 434 ms, within the orchestrator's 3 s. An index that fails to build was not
   provoked: by its test.
 
-### A-325 [General/AI runners] 🟡 PARTIAL (0.1.141, 2026-11-13: its Go sibling VALIDATED ON 8.x: SY.timer leaves `VAULT_SECRET_CHANGED` unanswered, where 0.1.140 answered `TIMER_UNKNOWN_VERB`; ai.generic's and SY.frontdesk.gov's part ships with 0.1.142) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
+### A-325 [General/AI runners] ✅ VALIDATED ON 8.x (0.1.141 and 0.1.142, 2026-11-13; SY.timer (0.1.141), ai.generic and SY.frontdesk.gov (0.1.142) leave `VAULT_SECRET_CHANGED` unanswered, where they answered an error; an unknown verb still answered) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; there before it) — ai.generic answers each `VAULT_SECRET_CHANGED` broadcast with an `unknown_system_msg` error, which SY.vault drops
 
 - **Why:** SY.vault broadcasts `VAULT_SECRET_CHANGED`, a `system` message, at each change of a
   secret, and one for each secret it announces at its start (`emit_bootstrap_secret_broadcasts`,
@@ -2751,6 +2761,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   do). Not on board item 30: SY.timer's 0.1.139 (`coa/timer-139`) was built before it was found.
   It takes an A-number of its own when this branch is integrated, unless that release takes it
   first.
+- **Validated on 8.x for ai.generic (0.1.142's gate, gate0242, 2026-11-13; `scratchpad/gate-tools/r142_gate.py`, git-ignored; 97 PASS, 1 SEE, 0 FAIL, no model call):** on 0.1.141 AI.pruebas@worker1 answered a
+  `VAULT_SECRET_CHANGED` `CONFIG_RESPONSE` `unknown_system_msg` in 0.015 s; on 0.1.142 no answer
+  within 5 s (its metrics: processed +1, responses +0), while an unknown verb from the same client
+  was still answered `unknown_system_msg` in 0.005 s.
 
 ### A-324 [General/admin] ✅ VALIDATED ON 8.x (0.1.139, 2026-11-13; SY.admin's help of `node_help`, read on 8.x, carries the new note: an AI node on ai.generic 0.1.136 or later answers at once however busy; the orchestrator's three are comments) (found 2026-11-12 by the review of the AI SDK's 0.1.136; read in the code; since 0.1.136) — SY.admin's `node_help` note and three orchestrator comments still say a busy AI node may miss the deadline
 
@@ -4292,7 +4306,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, later (the Rust SDK alone):** a bounded channel with a named refusal past its bound.
 - **The operator (2026-11-11):** after the sweep (the Rust SDK alone, with the next change there).
 
-### A-294 [General/AI SDK] 🔵 low (found 2026-11-11 by A-257's builder and review; read in the code; there before it) — One answer over the frame limit stops the whole AI runtime
+### A-294 [General/AI SDK] ✅ VALIDATED ON 8.x (0.1.142, 2026-11-13; a reply over the frame limit failed alone, the runtime went on: the same process, no restart, `replies_too_large` 1, the next message answered at once, where 0.1.141's process exited and its unit restarted it, back 7.1 s later) (found 2026-11-11 by A-257's builder and review; read in the code; there before it) — One answer over the frame limit stops the whole AI runtime
 
 - **Why:** `NodeError::MessageTooLarge` (over 128 KiB, refused before sending in `send_traced`) is
   not recoverable (`crates/fluxbee_ai_sdk/src/errors.rs` ~185): `run_with_config` returns it, both
@@ -4319,6 +4333,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `a_context_too_large_for_any_answer_fails_its_message_alone` (runtime.rs) and
   `an_answer_over_the_frame_limit_fails_that_message_alone` (tests/runtime_lanes.rs, through the
   SDK's own sender), each failing with the old settle (the runtime stopped).
+- **Validated on 8.x (0.1.142's gate, gate0242, 2026-11-13; `scratchpad/gate-tools/r142_gate.py`, git-ignored; 97 PASS, 1 SEE, 0 FAIL, no model call):** on 0.1.141 a reply of 131,223 bytes from AI.pruebas@worker1 logged
+  `FRAME_TOO_LARGE` and the process exited (MainPID changed, NRestarts 0 to 1), the node back 7.1 s
+  later. On 0.1.142 the same: the SDK's `FRAME_TOO_LARGE` for the reply and for the error that would
+  replace it (its context as large), the runtime's WARN *"could not send a reply: it is larger than
+  a message may carry"* 0.032 s after the send, no *"ai runtime stopped"*, MainPID and NRestarts
+  unchanged over 20 reads, `replies_too_large` 1, and the next message answered in 0.008 s.
 
 ### A-293 [IO/io.cloud] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; through IO.cloud's public door a `phone` that is a number and a missing `display_name` refused `INVALID_REQUEST` naming the field, nothing created; a registration ok in 1.42 s and again `existing` in 0.50 s; with the frontdesk down `FRONTDESK_UNAVAILABLE` in 0.79 s, as before 0.1.137; a retryable frontdesk error, its own case, not provoked (no frontdesk sends one): by its tests; the `request_id` on 9 of 9 request lines) (found 2026-11-11 by A-257's review fixes; read in the code) — io.cloud answers `FRONTDESK_REJECTED` to a retryable frontdesk error
 
@@ -4405,7 +4425,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, with io.slack's revamp:** post the payload's `message`, with a send-again hint when
   `retryable` is true.
 
-### A-290 [General/AI runners] 🔵 low (found 2026-11-11 by A-257's reviews; read in the code) — An AI node answers `HEALTHY` while its runtime refuses every turn
+### A-290 [General/AI runners] ✅ VALIDATED ON 8.x (0.1.142, 2026-11-13; with its 4 workers held and its queue of 128 full, AI.pruebas and SY.frontdesk.gov answered one more turn `ai_runtime_busy` at once and read `DEGRADED`, `ai_runtime_saturated` naming the workers and the queue, until 30 s past the last refusal, then `HEALTHY`; status reads under 1 s throughout) (found 2026-11-11 by A-257's reviews; read in the code) — An AI node answers `HEALTHY` while its runtime refuses every turn
 
 - **Why:** `build_node_status_response_payload` (`crates/fluxbee_sdk/src/managed_control_plane.rs`
   ~342-367) looks only at the config state; since A-257 (0.1.136) `NODE_STATUS_GET` is always
@@ -4440,6 +4460,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `the_status_reads_the_load_of_the_runtime_the_node_runs_on` runs that runtime on the dispatcher's
   test harness and asks its status through it (the load there, with the bounds the runtime was
   started with), failing when the runtime is given no load or another one.
+- **Validated on 8.x (0.1.142's gate, gate0242, 2026-11-13; `scratchpad/gate-tools/r142_gate.py`, git-ignored; 97 PASS, 1 SEE, 0 FAIL, no model call):** the status of AI.pruebas@worker1, SY.frontdesk.gov@motherbee and
+  the smoke node carries `extensions.ai_runtime` (serving, busy 0/4, waiting 0/128, direct 1/64,
+  refused, dropped, too large, the window 30 s), each read in about 0.12 s. With the provider's
+  HTTPS held (an nft drop, its safety timer armed) and 4 turns holding the workers, 128 fillers
+  queued, one more turn answered `ai_runtime_busy`, retryable, in 0.006 to 0.008 s; the first read
+  after it `DEGRADED`, `last_error` `ai_runtime_saturated` (*"turned work away 4 s ago ... its 4
+  model workers busy and its queue of 128 full"*), every read `DEGRADED` while the last refusal was
+  under 30 s old, `HEALTHY` again 34 s after it with the queue still full (the state follows
+  refusals, not the queue); 19 status reads under the load, median 0.17 s, max 0.30 s; the holders
+  answered the provider's failure text after about 92 s, the fillers drained. A frontdesk handoff
+  during the hold answered at once.
 
 ### A-289 [General/router] 🔵 low (found 2026-11-11 by the router's 0.1.134 builder and review; read in the code; there before it; several routers a hive, not supported) — A broadcast from a router that is not the gateway needs ttl 4 to cross the WAN
 

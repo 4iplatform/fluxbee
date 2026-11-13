@@ -2,8 +2,8 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.139** (2026-11-13), and PROD runs **0.1.141** (the router and the Go
-> SDK since: nothing for Cloud). Read from the code, operation by operation; §10 lists what was
+> Contract as of **fluxbee 0.1.142** (2026-11-13), and PROD runs **0.1.142** (the router, the Go
+> SDK and the AI SDK since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
@@ -1151,6 +1151,15 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.142
+
+- **Nothing to change on your side.** §5.4 now says what `list_nodes`' `health_state` is: the hive's
+  own reading of the node (`HEALTHY` while it runs with its config, `ERROR` when that config is
+  missing or invalid, `UNKNOWN` when it does not run), not the node's answer, which
+  `get_node_status` reads. An AI node of your tenant reports its load since 0.1.142 (`DEGRADED`
+  while it turns messages away); that reaches only the operator's status read, never this API.
+  0.1.140 (the router) and 0.1.141 (the Go SDK) changed nothing for you.
 
 ### 0.1.139
 

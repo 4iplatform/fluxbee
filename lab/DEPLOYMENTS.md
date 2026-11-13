@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.141** | 2026-11-13 | `2f1a0e1e` | motherbee + spokes (core), the Go SDK alone: A-329 (the Go SDK answers `NOT_TAKEN node_busy`, retryable, to the sender of each message its command channel cannot hold, two lanes of 1,024 messages or 8 MiB, where it held 64 and dropped the rest unseen; SY.timer sends again a fire its target answers so, while on time), A-264 (a WF's text past the frame, 128 KiB, goes as a blob, the operator's call (b)), A-325's Go sibling (SY.timer leaves `VAULT_SECRET_CHANGED` unanswered), with A-338 recorded | ✅ live, checked on 8.x | snap `pre-gosdk-0-1-141` (all 4 VMs) · `apt install fluxbee=0.1.140` + 0.1.140's `update_installation` (nothing one-way; A-329's drops come back) |
+| **0.1.142** | 2026-11-13 | `bc62240f` | motherbee + spokes (core), the AI SDK alone: A-294 (a reply over the frame fails alone, the runtime goes on), A-290 (a saturated AI node reads `DEGRADED` `ai_runtime_saturated`, its load in its status), A-325 (ai.generic and SY.frontdesk.gov leave `VAULT_SECRET_CHANGED` unanswered), A-339 (and a `NOT_TAKEN` or an error answer, with a WARN), A-327's `tool_choice` (no caller yet) | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-142` (all 4 VMs) · `apt install fluxbee=0.1.141` + 0.1.141's `update_installation` (nothing one-way; A-294's restart comes back) |
+| **0.1.141** | 2026-11-13 | `2f1a0e1e` | motherbee + spokes (core), the Go SDK alone: A-329 (the Go SDK answers `NOT_TAKEN node_busy`, retryable, to the sender of each message its command channel cannot hold, two lanes of 1,024 messages or 8 MiB, where it held 64 and dropped the rest unseen; SY.timer sends again a fire its target answers so, while on time), A-264 (a WF's text past the frame, 128 KiB, goes as a blob, the operator's call (b)), A-325's Go sibling (SY.timer leaves `VAULT_SECRET_CHANGED` unanswered), with A-338 recorded | ✅ replaced by 0.1.142 | snap `pre-gosdk-0-1-141` (deleted 2026-11-13) · `apt install fluxbee=0.1.140` + 0.1.140's `update_installation` (nothing one-way; A-329's drops come back) |
 | **0.1.140** | 2026-11-13 | `28564648` | motherbee + spokes (core), the router alone: A-269's router part (the router refuses at HELLO a node name that is not an L2 name, ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes, before any line prints it; its review: both local accept loops log a failed connection's error quoted, escaped and cut) | ✅ replaced by 0.1.141 | snap `pre-router-0-1-140` (deleted 2026-11-13) · `apt install fluxbee=0.1.139` + 0.1.139's `update_installation` (nothing one-way; A-269's router part comes back) |
 | **0.1.139** | 2026-11-12 | `204ee161` | motherbee + spokes (core), the bug push's binaries, one branch per binary, eight branches: SY.admin (A-297: an empty `?hive=` is every hive's; A-304: a WF package another hive holds refused; A-305 and A-306: a manifest lock waited for 60 s at most, answered retryable, and a removal's use read with no lock held; A-312: build metadata refused; A-316: an edge's secrets never read back; A-317: the Cloud's door recorded before its token, the vault rolled back when the door does not open; A-318, A-319, A-324, A-328), the orchestrator (A-296; A-299; A-300: `RELAUNCH_DUE`; A-301: a fresh join's surviving key; A-308: the Cloud's `list_nodes` in a lane of its own; A-310; A-330; A-331: `BOX_RUNS_ANOTHER_HIVE`), SY.architect (A-124: a secret an answer brings shown once, kept masked; A-315, A-320, A-321), SY.frontdesk.gov (A-303: `identity_unavailable`), SY.cognition (A-332: a grace of 5 s), SY.timer 1.7 (A-326: an index per list filter, a 16 MiB page cache), the WF engine and SY.wf-rules (A-302: the engine in the status; A-307: `BUSY`; A-333: one read of the index) | ✅ replaced by 0.1.140 | snap `pre-push-0-1-139` (deleted 2026-11-13) · `apt install fluxbee=0.1.138` + 0.1.138's `update_installation` (nothing one-way: SY.timer 1.6's start rebuilds its indexes and leaves the new ones) |
 | **0.1.138** | 2026-11-12 | `38ecd878` | motherbee + spokes (core), A-278 alone (the Go SDK, the Rust SDK and the WF engine): a WF reconciles all its pending timers: the Go SDK's `ListPage` and the Rust SDK's `list` and `list_page` say where the timers past a list start, and the WF's reconcile reads every page of SY.timer's list (200 at the most), never taking a timer past the last one listed as missing; its review: when the list stops before its end, a timer past its time and past the last one listed is fired, and the one SY.timer may hold cancelled | ✅ replaced by 0.1.139 | snap `pre-a278-0-1-138` (deleted 2026-11-12) · `apt install fluxbee=0.1.137` + 0.1.137's `update_installation` (nothing one-way; A-278 comes back) |
@@ -150,6 +151,68 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.142 — The AI SDK alone: a reply too large fails alone, and a saturated AI node says so (A-294, A-290, A-325, A-339)
+
+- **Date:** 2026-11-13 (ART) · **Previous version:** 0.1.141 · **Commit:** `bc62240f`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The AI SDK changed,
+  so ai.generic and SY.frontdesk.gov's runner were rebuilt.
+- **Why:** A-294 (one reply over the frame limit stopped the whole AI runtime and its process),
+  A-290 (an AI node read `HEALTHY` while its runtime turned every turn away), A-325 (ai.generic
+  answered each `VAULT_SECRET_CHANGED` with an error), A-339 (and each `NOT_TAKEN` and error answer,
+  a wasted message), and A-327's first part (`tool_choice`). The SDKs are shared code: each ships
+  alone ([METHOD](logbook/METHOD.md) §9), board item 30.
+- **What changed (the AI SDK and its two runners):** A-327 (`c0db1afc`): `tool_choice`, `Auto` (the
+  default, sending nothing) and `None`. A-325 (`a6a5fe35`): ai.generic leaves `VAULT_SECRET_CHANGED`
+  unanswered, as SY.frontdesk.gov does. A-294 and A-290 (`11704ba9`, their review `5c734091`): a
+  reply over the frame limit fails its message alone (its sender gets `ai_runtime_reply_too_large`,
+  a control request nothing, counted in `replies_too_large`); the status carries
+  `extensions.ai_runtime`, and a runtime that turned work away in the last 30 s reads `DEGRADED`,
+  `ai_runtime_saturated`. A-339 (`538df4e4`, its review `bc62240f`): ai.generic and
+  SY.frontdesk.gov take a `NOT_TAKEN` and a `<msg>.error` for replies, never answered, a
+  `NOT_TAKEN` logged as a WARN naming who refused it and why. io-cloud-api §5.4 says what
+  `list_nodes`' `health_state` is (the hive's reading, not the node's answer).
+- **Build and review:** `coa/aisdk-142`, built and reviewed on 2026-11-12 with the bug push; its
+  item renumbered A-335 to A-339 through its history (A-335 is the orchestrator's, given at
+  0.1.139's integration), rebased onto 0.1.141's code and then onto daily `d6496cc3` (0.1.141's
+  records): FINDINGS' lists and entries, `docs/reference/protocol.md` (the Rust and Go rows, each
+  from its own side) and the WF spec's `NOT_TAKEN` paragraph (both sides' sentences) resolved;
+  re-prefixed `[0.1.141]`; CI green on `bc62240f`; daily fast-forwarded to it.
+- **The deploy:** build on fb-build 17:26:07–17:48:01Z (21.9 min), publish 21 s (the operator moved
+  places meanwhile: the build's wait lost the Proxmox at 17:38Z, the build went on). The gate's
+  mark at 17:51:33Z; `ops deploy 0.1.142 --snapshot pre-aisdk-0-1-142 --drop pre-gosdk-0-1-141` in
+  259 s (snapshots 31.7 s, the motherbee's apt 125.7 s, its admin on the version 40.0 s, the spokes
+  answering 10.7 s, the update's call 21.7 s, the hives on the target 14.6 s, health 6.0 s). On the
+  target after the update's call: the motherbee 4.4 s, egress1 and ingress1 26.4 s, worker1 35.1 s.
+  The update (`upd-1794592511140`) closed with every hive on the target, hash `0289af561e5676a8`.
+  Health clean.
+- **Checked on 8.x (the gate, gate0242, 17:20–18:07Z, its baseline on 0.1.141 before the deploy;
+  `scratchpad/gate-tools/r142_gate.py`, git-ignored; 97 PASS, 1 SEE, 0 FAIL):**
+  - **The baseline on 0.1.141:** AI.pruebas and SY.frontdesk.gov `HEALTHY` with no extensions;
+    `VAULT_SECRET_CHANGED`, a `NOT_TAKEN`, a `.error` and an unknown verb each answered
+    `unknown_system_msg`; a reply of 131,223 bytes logged `FRAME_TOO_LARGE`, the process exited and
+    its unit restarted it, back 7.1 s later.
+  - **The smoke (A-314's lesson):** `run_node AI.gate0242s@worker1` ok in 1.4 s, `RUNNING` at 8.3 s
+    on ai.generic 0.1.142 (`DEGRADED`, no config), its status with `extensions.ai_runtime`, killed
+    without purge, `STOPPED`; the stopped `AI.gate0233` and `AI.gate0237c` read `STOPPED`.
+  - **A-325 and A-339:** `VAULT_SECRET_CHANGED`, a `NOT_TAKEN` and a `.error` unanswered on
+    AI.pruebas and SY.frontdesk.gov, the `NOT_TAKEN`'s WARN within 3 ms, an unknown verb still
+    answered.
+  - **A-294:** the same reply too large failed alone: `replies_too_large` 1, the same process (no
+    restart in 20 reads), the next message answered in 0.008 s.
+  - **A-290:** with the provider's HTTPS held and 4 turns holding the workers, 128 queued, one more
+    turn answered `ai_runtime_busy` in 0.006–0.008 s; the status `DEGRADED` `ai_runtime_saturated`
+    for 30 s past the last refusal, `HEALTHY` 34 s after it with the queue still full; status reads
+    under the load median 0.17 s, max 0.30 s; on both AI.pruebas and SY.frontdesk.gov.
+  - **The cost:** 0 usage records of the gate (the held turns reached no provider).
+  - **By its tests:** `tool_choice` (no caller in 0.1.142), a reply too large whose context alone
+    is too large, the resend of an answer not taken (a proposal).
+- **PROD after the gate:** all four hives on 0.1.142; snapshot `pre-aisdk-0-1-142` on each VM,
+  `pre-gosdk-0-1-141` deleted. The clean: the clients stopped, no nft table or safety timer left,
+  `AI.gate0242s` purged (no history), AI.pruebas `HEALTHY` and its config never written. Kept: the
+  tenant pruebas, `AI.pruebas@worker1`, the stopped `AI.gate0233` and `AI.gate0237c`.
+- **Rollback:** the snapshot `pre-aisdk-0-1-142` (all 4 VMs), or `apt install fluxbee=0.1.141` +
+  0.1.141's `update_installation`: nothing one-way; A-294's restart comes back.
 
 ## 0.1.141 — The Go SDK alone: a message a Go node cannot hold is answered, and a fire it cannot take is sent again (A-329, A-264)
 
