@@ -315,6 +315,10 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
       way when it came.
     - A turn older than the grace when the worker takes it does not wait. The agent's own
       answers, the relays and the turns with no person at their other end never wait.
+    - The wait holds the serial worker: the turns queued behind a waiting turn, other
+      communications' included, wait with it, up to the grace from that turn's intake. A worker
+      that far behind loses no throughput; one that catches up may sit idle up to the grace on the
+      turn at its head (to review with the timeout, FINDINGS A-332).
     - A cognition that cannot call a model (`ai` settings it cannot use, or no key, §8) waits
       all the same, then skips the turn: the wait costs no call, and a refused turn is counted as
       refused, not as a tagger failure.
@@ -331,9 +335,11 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
       cost would leave the accounts.
     - The answers are in memory only, those of the last grace (an older one is never looked for),
       4,096 at most (`COGNITION_ANSWERS_KEPT`). A refusal later than the grace finds the call made,
-      and its result is dropped as above. When that call fails, the turn is skipped as a provider
-      error (`semantic_tagger_provider_errors_total`) before the refusal is looked at, and is not
-      in `refused_turns_not_analyzed_total`.
+      and its result is dropped as above: one in a batch the router's stream re-sends after its
+      5 s ack timeout (`STREAM_ACK_TIMEOUT_SECS`; a batch or its ack lost) comes 5.5 s or more
+      after it was first sent, past the grace, which equals that timeout. When that call fails,
+      the turn is skipped as a provider error (`semantic_tagger_provider_errors_total`) before the
+      refusal is looked at, and is not in `refused_turns_not_analyzed_total`.
   - The refusals are in memory only (`Refusals`), the last 4,096 (`COGNITION_REFUSALS_KEPT`): a
     refusal matters while its turn may wait in the worker's queue or in the copy the worker took
     for one turn, and the refusals of turns the full queue dropped count too. 4,096 cover a full

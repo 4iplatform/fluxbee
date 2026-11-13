@@ -1738,11 +1738,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       (A-292). The worker is serial, so every other communication's turns would wait behind it;
       setting a waiting turn aside would analyze a communication's turns out of order.
     - **The grace is bounded and covers the refusal.** A turn is analyzed at most 2 s late, and
-      only when the worker had nothing else to do: under load the queue's wait is longer, so the
-      worker's throughput does not change. It never loses a turn's analysis. The runtime refuses
-      in 7 to 12 ms (A-257's gate), and on 8.x cognition took the refusal 0.04 to 0.26 s after it
-      (A-292's gate), some eight times under the grace. The agent's answer ends it too, so a turn
-      the agent took is not held for the whole grace.
+      waits only when the worker comes to it within 2 s of its intake: a worker that far behind
+      under load waits on no turn, so its throughput does not change. The wait does hold the
+      serial worker, and the turns queued behind it (the review of the calls' build, below). It
+      never loses a turn's analysis. The runtime refuses in 7 to 12 ms (A-257's gate), and on 8.x
+      cognition took the refusal 0.04 to 0.26 s after it (A-292's gate), some eight times under
+      the grace. The agent's answer ends it too, so a turn the agent took is not held for the
+      whole grace.
   - **The choice is this branch's, not an operator's call.** The entry's *Fix, later* named two
     fixes, and no call of the operator's chose between them (board item 30 lists the day's
     calls, none on A-332). The branch took the first, for the reasons above: the operator may
@@ -1785,18 +1787,52 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   posteriores"*: a timeout here is dangerous; 5 s for now, recorded to review in a later
   improvement.
 - **Built at 0.1.139's integration (`coa/sweep-139`):** `COGNITION_REFUSAL_GRACE` is 5 s. What
-  the build says above of 2 s holds of 5 s now: a refusal later than 5 s finds the call made, and
-  with a worker that had nothing else to do a person's turn is analyzed once the agent answers it,
-  or 5 s after its intake at most, where 0.1.138 analyzed it at once.
+  the build says above of 2 s holds of 5 s now: a refusal later than 5 s finds the call made (one
+  in a batch the stream re-sends after its 5 s ack timeout, for one), and a person's turn the
+  worker comes to within 5 s of its intake is analyzed once the agent answers it, or 5 s after its
+  intake at most, where 0.1.138 analyzed it at once; the turns queued behind it wait with it.
   `COGNITION_ANSWERS_KEPT` stays 4,096 answers: some 820 a second over the grace, where it was
   2,048 a second over 2 s. Tests: `a_refusal_seconds_late_still_costs_no_model_call` (a refusal the
-  intake takes 3 s after the turn, a batch the stream sent again: no model call; with 2 s, one)
+  intake takes 3 s after the turn, as after a slow write of the batch before it, or in a batch the
+  stream re-sent after a quick failure: no model call; with 2 s, one)
   and `a_turn_with_no_answer_is_analyzed_once_its_grace_is_over` (analyzed 5 s after the intake,
   the value written out); both fail with 2 s. Docs:
   [sy-cognition.md](../../docs/nodes/sy-cognition.md),
   [cognition.md](../../docs/reference/cognition.md) §3 and §3.4,
   [cognition-hands-v1](../../docs/cognition-hands-v1.md) §6. **To review later:** the timeout
-  itself, the operator's note; the cancel (the entry's second fix) stays the other way.
+  itself, the operator's note; the cancel (the entry's second fix) stays the other way. With the
+  timeout, two things the review of this build found (below): the wait holds the serial worker,
+  the turns queued behind a waiting turn with it; and the grace equals the stream's ack timeout,
+  so a refusal in a batch re-sent after it always comes too late.
+- **From the review of the calls' build (2026-11-12, on `coa/sweep-139`):** two findings on this
+  entry's texts, fixed; the code is unchanged.
+  - **The wait holds the serial worker:** `run_turn_worker` awaits each turn, and `handle_turn`
+    awaits `wait_for_the_agent`. While a person's turn waits, every turn queued behind it waits
+    too, up to 5 s from that turn's intake: other communications' turns, and those that never
+    wait (the agent's answers, the relays, the turns with no person). The comment on
+    `COGNITION_REFUSAL_GRACE` and this entry said the wait held a turn back only when the worker
+    had nothing else to do, and that the worker's throughput did not change. It is bounded: a
+    turn that spent 5 s in the queue does not wait again. So each time the worker catches up it
+    adds at most 5 s (2 s before) to the turn at its head and the turns behind it, and may sit
+    idle up to 5 s; its throughput is unchanged only while the queue stays 5 s or more behind.
+    With an LLM agent that answers in more than 5 s, nearly every person's turn on an idle worker
+    waits the whole 5 s. Code options, for later: wait only when the queue is empty, or let other
+    communications' turns pass a waiting one, which keeps each communication's turns in order.
+  - **5 s does not cover a batch the stream re-sends after its ack timeout:** the router's stream
+    re-sends a batch with no ack only after `STREAM_ACK_TIMEOUT_SECS`, 5 s, plus at least 0.5 s
+    of backoff (`src/router/stream.rs`), and sends no next batch before one is acked. A refusal
+    whose own batch was lost, or that waited behind a batch whose ack was lost, reaches cognition
+    5.5 s or more after its first send, past the grace: the tagger's call is made. Only a batch
+    re-sent after a quick failure (backoff 0.5, then 1 and 2 s) fits within 5 s, and a refusal in
+    its turn's own batch is found at the first look. The comment, the test
+    `a_refusal_seconds_late_still_costs_no_model_call` and this entry said 5 s left room for a
+    batch the stream sends again; they name the quick failure now, and say that one re-sent after
+    the ack timeout comes too late.
+  - Docs: [sy-cognition.md](../../docs/nodes/sy-cognition.md),
+    [cognition.md](../../docs/reference/cognition.md) §3.4 and
+    [cognition-hands-v1](../../docs/cognition-hands-v1.md) §6 say the wait holds the worker and
+    the turns behind it; the first two, that a refusal in a batch re-sent after the ack timeout
+    comes too late.
 
 ### A-331 [General/orchestrator] 🔵 low (found 2026-11-12 by 0.1.137's gate; seen on 8.x) — `add_hive` onto a box that already ran another hive id fails `WORKER_ORCHESTRATOR_TIMEOUT`
 
@@ -2478,13 +2514,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     a first that landed unanswered would put the run's token back. Each outcome is logged, and
     nothing asks again later.
   - **The answer** (`cloud_token_said`, after what became of the record): rolled back, and on a
-    rotation on the same edge that edge serves the token the Cloud holds and reads it again when it
-    restarts, so nothing changed for the Cloud; on a move the old edge serves it, but reads none
-    once it restarts (below), so publish again on an edge that answers; with no door before, the
-    vault holds what it held. Or why not: the vault then holds (after an ask not answered, may
-    hold: `vault_get_metadata` shows the key's version, the one the run's put answered while it
-    still holds that token) the token no one received, which the edge the door was on reads when it
-    restarts; publish again.
+    rotation on the same edge, when the edge refused the open or the router did not reach it, that
+    edge serves the token the Cloud holds and reads it again when it restarts, so nothing changed
+    for the Cloud (an edge that did not answer the open: the review, below); on a move the old edge
+    serves it, but reads none once it restarts (below), so publish again on an edge that answers;
+    with no door before, the vault holds what it held. Or why not: the vault then holds (after an
+    ask not answered, may hold: `vault_get_metadata` shows the key's version, the one the run's put
+    answered while it still holds that token) the token no one received, which the edge the door
+    was on reads when it restarts on a rotation (after a move it reads none, below); publish again.
   - **Its time:** a run whose door did not open takes up to 235 s by its bounds (the record 120 s,
     the store 30 s, the open 15 s, the rollback 10 s, the put-back 60 s), within the 240 s Archi
     waits for each publish of the door (`EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS`, whose comment and
@@ -2502,7 +2539,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       right after the open (`resolve_secrets`), before the rollback, and serves it (on a rotation
       with the old one beside it for 10 minutes) until it restarts: a `VAULT_SECRET_CHANGED`
       re-reads only an entry that holds no token. Once it restarts it reads the Cloud's token from
-      the vault; without the rollback it read the run's there too.
+      the vault; without the rollback it read the run's there too. The answer said nothing of it,
+      and on a rotation that the edge served the Cloud's token; it says so since the review below.
     - **A writer of the key meanwhile:** the rollback comes within seconds of the put, under the
       one-run lock, so only an operator's own `externalize` of IO.cloud's channel in those seconds
       could write it, and the rollback would undo that write. Unlike the ACME's rollback
@@ -2519,6 +2557,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `NO_PREVIOUS_VERSION` read as a failure.
   - **Texts:** SY.admin's help for `publish_cloud_endpoint`, sy-admin.md's row, io-cloud-api.md §7,
     its 401 row and §9 (0.1.139), sy-edge.md's grace note and sy-architect.md's wait.
+- **From the review of the calls' build (2026-11-12, on `coa/sweep-139`):** two of its findings
+  were texts of A-317's rollback, both fixed. The rollback itself was checked and loses no token
+  the Cloud holds: it runs only after the vault answered the put, SY.vault swaps the two versions
+  in one transaction, and only an ask that changed nothing is asked again.
+  - **An edge that did not answer the open** (medium): the externalize answers
+    `edge unreachable / open_url failed` for any error of `EDGE_OPEN_URL`, its 15 s timeout
+    included, and SY.edge answers an open before it reads the new token from the vault, so an edge
+    whose answer was lost or late may serve the run's token, the Cloud's beside it for its
+    10 minutes only (*What it leaves*, above). The answer said on a rotation that the edge served
+    the Cloud's token, the help that this was all, and io-cloud-api.md §9 that the Cloud's token
+    kept working. Now the run knows how the open failed, not from the error's words:
+    `StoredChannelToken`'s `open_unanswered`, set for an error that may have reached the edge,
+    any but the router's `UNREACHABLE` or `TTL_EXCEEDED` (`never_reached`, which the rollback's
+    outcome uses too). The answer (`cloud_token_said`) then says the edge may have taken the open
+    and serve the run's token, on a rotation the Cloud's only for up to 10 minutes after the open,
+    and to run again on an edge that answers; an edge that refused the open, or that the router
+    did not reach, says as before. The help, sy-admin.md's row, io-cloud-api.md §7, its 401 row
+    and §9, and sy-edge.md's grace note say so.
+  - **After a move the old edge reads no token** once it restarts: the help and sy-admin.md said
+    that, when the rollback failed or there was none, the edge the door was on read the token no
+    one received; they say now that after a move it reads none, the key being the new edge's. The
+    answer's own detail said it right.
+  - **Tests:** `an_edge_that_did_not_answer_the_open_may_serve_the_run_token` (new, on a paused
+    clock: the edge never answers the open, SY.admin gives it up after 15 s, rolls the token back
+    and puts the record back; the detail on a rotation, a move and a first publish);
+    `a_door_that_does_not_open_puts_the_record_back` (a rotation the router did not reach says as
+    a refusal does); the rollback test's details with an open not answered (a rotation whose
+    rollback was refused, a move with no token before); the help's test (the new texts, and the
+    two old ones refused). Mutants: an open never marked unanswered fails the new test; every
+    error read as one that may have reached its target fails the door test and the rollback test.
+  - **To decide, the operator:** after a rollback whose open got no answer, SY.admin could send
+    the edge `EDGE_OPEN_URL` once more: the row comes back with no secret, so the edge's
+    `resolve_secrets` reads the rolled-back token, and the Cloud's works again at once, the run's
+    kept beside it for the grace. Not built: it is a change of behaviour, not of texts, and an
+    edge that did not answer may not answer again.
 
 ### A-316 [General/admin] 🔵 low (found 2026-11-11 by A-273's review; read in the code, not run; there before it) — An edge channel's bearer can be read back through `vault_assign` then `vault_get`
 

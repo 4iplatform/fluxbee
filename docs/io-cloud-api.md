@@ -1082,12 +1082,18 @@ Until IO.cloud takes the edge, it drops every Cloud request through it (a 504 fo
   starts. When the edge refused the open or did not answer it, the vault had already taken the
   token the publish minted, for that edge, and nobody received it: the hive rolls the vault back to
   the token before it, the one Cloud holds, and the detail says so (0.1.139, the operator's call of
-  2026-11-12, FINDINGS A-317). On a rotation on the same edge, Cloud's token goes on working, the
-  edge reading it again when it restarts. On a move the old edge, whose door Cloud uses, reads none
-  once it restarts, as a deploy does, since the vault's key stays the new edge's: publish again,
-  on an edge that answers, and give Cloud the new token at once. A rollback that fails is said in
-  the detail too, and nothing asks again: the token Cloud holds then works at most until the edge
-  the door was on restarts, so publish again the same way.
+  2026-11-12, FINDINGS A-317). On a rotation on the same edge, when the edge refused the open (or
+  was not reached), Cloud's token goes on working, the edge reading it again when it restarts. An
+  edge that did not answer the open may have taken it all the same: it answers an open and then
+  reads its token from the vault, and the rollback does not reach its memory. It then serves the
+  new token, which nobody received, until it restarts; on a rotation Cloud's goes on working beside
+  it only for up to 10 minutes after the open (its grace), and again once the edge restarts and
+  reads it from the vault. The detail says so (0.1.139's integration review): publish again, on an
+  edge that answers, and give Cloud the new token at once. On a move the old edge, whose door
+  Cloud uses, reads none once it restarts, as a deploy does, since the vault's key stays the new
+  edge's: publish again, on an edge that answers, and give Cloud the new token at once. A rollback
+  that fails is said in the detail too, and nothing asks again: the token Cloud holds then works at
+  most until the edge the door was on restarts, so publish again the same way.
 - **Check:** `curl 'http://127.0.0.1:8080/channels/externalized?edge_node=SY.edge@ingress1'` lists a
   row owned by `IO.cloud@motherbee`.
 - **IO.cloud's own state** (FINDINGS A-91): while it trusts no edge, it drops every Cloud request,
@@ -1109,7 +1115,7 @@ post '{"op":"list_cloud_actions"}'
 | Cloud sees | likely cause on the hive |
 |---|---|
 | **404** | the endpoint was never published, or the hive was reinstalled: publish again. Or the request named a host other than the hive's (§2), or the door moved to another edge, which closed the old one (0.1.139): the operator gives you the new URL |
-| **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log), or a publish whose door did not open could not roll the vault back, or was a move, and the edge restarted since (§7): the operator publishes again |
+| **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log), or a publish whose door did not open (§7): the edge did not answer it, and from 10 minutes after it may serve only the new token; or the hive could not roll the vault back, or it was a move, and the edge restarted since. The operator publishes again |
 | **502** `HANDLER_UNREACHABLE` | IO.cloud is not running (restarting, for example), or the edge's hive cannot reach the motherbee: the request never reached IO.cloud |
 | **504** | IO.cloud is busy (§6) or does not answer, or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
@@ -1164,10 +1170,14 @@ it "(0.1.139)".
   your only way in.
 - **A rotation on the same edge is as before** (§2): the previous token works up to 10 minutes, and
   an edge restart or another rotation within them ends it. Nothing extends it.
-- **A publish whose door does not open leaves your token working** (§7, FINDINGS A-317): the hive
-  rolls the vault back to the token you hold, so the edge reads it again when it restarts. On a
-  move the old edge does not, and the operator publishes again. Up to 0.1.138 such a publish left a
-  new token nobody received in the vault, and yours stopped once the edge restarted.
+- **A publish whose door does not open rolls the vault back to your token** (§7, FINDINGS A-317):
+  the hive rolls the vault back to the token you hold, so the edge reads it again when it restarts,
+  and an edge that refused the open goes on serving it. An edge that did not answer the open may
+  have taken it all the same: your token then works for up to 10 minutes after it, then not until
+  the edge restarts, and the operator publishes again and gives you the new token at once. On a
+  move the old edge reads none once it restarts, and the operator publishes again. Up to 0.1.138
+  such a publish left a new token nobody received in the vault, and yours stopped once the edge
+  restarted.
 
 ### 0.1.137
 

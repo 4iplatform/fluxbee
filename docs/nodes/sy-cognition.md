@@ -110,10 +110,16 @@ no turn:
     and only dropped the call's result.
   - A turn that waited longer than that in the queue does not wait again. The agent's own answers,
     the relays and the turns with no person at their other end never wait.
+  - The wait holds the worker, which takes one turn at a time: the turns queued behind a waiting
+    turn, other communications' included, wait with it, up to 5 s from that turn's intake. A
+    worker 5 s or more behind loses no throughput; one that catches up may sit idle up to 5 s on
+    the turn at its head (to review with the timeout, FINDINGS A-332).
   - A cognition that cannot call a model (its `ai` settings unusable, or no key) waits too, and
     then skips the turn. The wait costs no call, and a refused turn is counted as refused, not as
     a tagger failure.
-  - A refusal that comes after the grace finds the call made, and drops its result as before.
+  - A refusal that comes after the grace finds the call made, and drops its result as before:
+    one in a batch the router's stream re-sends after its 5 s ack timeout (a batch or its ack
+    lost) comes 5.5 s or more after it was first sent.
     When that call fails (no answer from the provider in time), the turn counts as a provider
     error (`semantic_tagger_provider_errors_total`), not as a refused turn not analyzed.
 - **It remembers** the last 4,096 refusals (`COGNITION_REFUSALS_KEPT`), in memory only: a full

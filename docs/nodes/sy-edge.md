@@ -230,7 +230,11 @@ framed. A response the edge cannot build (an invalid header value, say) is a
   `EDGE_OPEN_URL` or did not answer it) has SY.admin roll the vault's key back to the token before
   it (since 0.1.139, the operator's call of 2026-11-12), so the edge that serves the Cloud's token
   reads it again when it restarts; on a move the key's owner stays the new edge, and the old
-  edge reads none (FINDINGS A-317).
+  edge reads none (FINDINGS A-317). The rollback reaches the vault, not an edge's memory: an edge
+  that took the open but whose answer SY.admin never got (`apply_open_url` answers, then
+  `resolve_secrets` reads the new token at once) serves the new token until it restarts, with the
+  one before it for its 10 minutes, since a `VAULT_SECRET_CHANGED` re-reads only an entry that
+  holds no secret. SY.admin's answer says so (0.1.139's integration review).
 
 Where the token comes from (`handle_externalize` in `src/bin/sy_admin.rs`): SY.admin mints one
 (`mint_entry_token`, two UUIDv4 in hex) unless the caller sent `secret`, stores it in SY.vault as

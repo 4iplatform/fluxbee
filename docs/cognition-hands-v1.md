@@ -205,7 +205,8 @@ Cognition analyzes the first two lines only: a person is at their other end.
   - The worker waits for the agent's answer or refusal before it analyzes a person's turn, 5 s at
     most from its intake (FINDINGS A-332, since 0.1.139; the operator's call of 2026-11-12, a
     timeout to review in a later improvement): a refusal within that time costs no model call,
-    where up to 0.1.138 the tagger's call was under way when the refusal came.
+    where up to 0.1.138 the tagger's call was under way when the refusal came. The worker is
+    serial, so the turns queued behind a waiting turn wait with it.
   - The refusal is no turn.
   - **Dropped, not kept with a mark "unanswered":**
     - the agent never took the message, and its sender is told to send it again; the copy sent

@@ -1746,11 +1746,16 @@ impl Refusals {
 /// agent got before it analyzes that turn (`wait_for_the_agent`, FINDINGS A-332). A busy AI runtime
 /// refuses a turn at once (`ai_runtime_busy`, in 7 to 12 ms), and on 8.x cognition took the refusal
 /// 0.04 to 0.26 s after it (A-292's gate): 5 s is some twenty times the slowest, with room for a
-/// slow write of the batch before it or a batch the stream sends again (the operator's call of
-/// 2026-11-12, where the branch built 2 s; a timeout here is to review in a later improvement). The
-/// wait ends as soon as the agent answers or refuses, so it holds back a turn the agent took by at
-/// most this, only when the worker had nothing else to do: a turn that waited in the queue longer
-/// than this does not wait again.
+/// slow write of the batch before it, or a batch the stream re-sent after a quick failure (it waits
+/// 0.5 s, then 1 and 2 s). One the stream re-sends after its ack timeout (the router's
+/// `STREAM_ACK_TIMEOUT_SECS`, 5 s: a batch or its ack lost) comes 5.5 s or more after its first
+/// send, too late: the turn's call is made. 5 s is the operator's call of 2026-11-12, where the
+/// branch built 2 s; a timeout here is to review in a later improvement. The wait ends as soon as
+/// the agent answers or refuses. It holds the worker, which is serial: the turns queued behind a
+/// waiting turn, other communications' included, wait with it, up to this from that turn's
+/// intake. A turn that waited in the queue longer than this does not wait again, so a worker that
+/// far behind loses no throughput; one that catches up may sit idle up to this on the turn at its
+/// head (to review with the timeout).
 const COGNITION_REFUSAL_GRACE: Duration = Duration::from_secs(5);
 
 /// How many answers `Answers` keeps at most, the oldest out first: some 820 answers a second over
@@ -11373,9 +11378,11 @@ mod tests {
     }
 
     /// The grace is 5 s, by the operator's call of 2026-11-12 (FINDINGS A-332), where the branch
-    /// built 2 s: a refusal the intake takes 3 s after the person's turn (a batch the stream sends
-    /// again, or a slow write of the batch before it) still ends the wait before any model call.
-    /// With 2 s the worker's tagger call was under way at 2 s, and A-292 only dropped its result.
+    /// built 2 s: a refusal the intake takes 3 s after the person's turn (after a slow write of the
+    /// batch before it, or in a batch the stream re-sent after a quick failure) still ends the wait
+    /// before any model call. With 2 s the worker's tagger call was under way at 2 s, and A-292
+    /// only dropped its result. A batch the stream re-sends after its 5 s ack timeout comes later
+    /// than the grace, and is not this case.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_seconds_late_still_costs_no_model_call() {
         let dir = TestDir::new();
