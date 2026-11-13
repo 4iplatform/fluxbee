@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   - a message no rule matches is dropped and counted (`metric_route_unmatched`).
 - **A command channel holds at most 1,024 messages or 8 MiB in each of its two lanes**
   (`RPC_COMMAND_CHANNEL_CAPACITY`, `RPC_COMMAND_CHANNEL_MAX_BYTES`, the bytes counted as the frames
-  came off the socket; since 0.1.143, planned; FINDINGS A-295). The Go SDK's channels take as many
+  came off the socket; since 0.1.143; FINDINGS A-295). The Go SDK's channels take as many
   since 0.1.141 (A-329). Until 0.1.143 the Rust channels had no bound, only a warning at a depth of
   1,000.
   - The lanes: the `system` messages (`meta.type`, in any case), and every other kind. `recv` and
@@ -216,7 +216,7 @@ response_msg, payload, timeout })`. It sends one `system` message and waits for 
 - **Transport errors are errors:** `UNREACHABLE` and `TTL_EXCEEDED` become `RpcError::Unreachable`
   and `RpcError::TtlExceeded`.
 - **A request its destination did not take** ends at once with `RpcError::NotTaken { trace_id,
-  target, request_msg, reason, detail, retryable }` (since 0.1.143, planned; FINDINGS A-295): the
+  target, request_msg, reason, detail, retryable }` (since 0.1.143; FINDINGS A-295): the
   destination answered `NOT_TAKEN` on its `trace_id`.
   - `node_busy`, from a node whose channel was full (a Rust or a Go node), is `retryable`: nothing
     ran, and asking again later may pass.
@@ -230,7 +230,7 @@ response_msg, payload, timeout })`. It sends one `system` message and waits for 
     last `": ..."` only when the `NOT_TAKEN` has a detail.
 - **No answer in time** is `RpcError::Timeout`. A zero timeout means 5 s.
 - **A link that is down** fails at once with `RpcError::Disconnected`.
-- **A call its caller drops leaves nothing behind** (since 0.1.143, planned; FINDINGS A-309). This
+- **A call its caller drops leaves nothing behind** (since 0.1.143; FINDINGS A-309). This
   covers a call wrapped in an outer `timeout` or lost in a `select!`:
   - its pending entry goes, so its `trace_id` is free again;
   - an answer that comes later is dropped as stale and counted (`metric_stale_responses`), never
@@ -386,7 +386,7 @@ router. The router keeps a short, best-effort log and delivers it in batches to 
 | Thread id | `fluxbee_sdk::{compute_thread_id, ThreadIdInput}` | the canonical `thread_id` of a conversation |
 | Vault | `fluxbee_sdk::VaultClient` | `VaultClient::for_primary(dispatcher, VaultCallerOwned::new(ilk, node_name))`; `resolve_resource(resource_type, tenant, timeout)` returns the node's own key, else one assigned to it, else its tenant's general key |
 | Timer | `fluxbee_sdk::TimerClient` | SY.timer: `TimerClient::new_with_dispatcher(dispatcher, TimerClientConfig::default())`; see `examples/timer_client.rs`. `list` follows SY.timer's pages up to its limit and hands back `next_cursor` while timers follow; `list_page` is one page; give the cursor back as the filter's `cursor` for the next ([SY.timer §7.6](../../docs/sy-timer.md#76-timer_list), FINDINGS A-278) |
-| Logging | `fluxbee_sdk::logging::fmt()`; `logging::layer()` for a subscriber built of layers (SY.edge's) | the `tracing` subscriber every binary uses: colour only on a terminal (FINDINGS A-31), and each record one line of at most 16 KiB (`RECORD_MAX_BYTES`; since 0.1.143, planned; FINDINGS A-269). Its control characters are escaped as `Debug` shows them (`\n`, `\r`, `\t`, `\0`, `\u{1b}`), so a field with a newline stays inside its record's line and can open no line of its own in the journal; a record's message comes with its ESC, BEL, BS, FF and DEL already escaped in tracing-subscriber's own form (`\x1b`, `\x07`, `\x08`, `\x0c`, `\x7f`), so a message's ESC shows as `\x1b` and a field's as `\u{1b}`. On a terminal every colour code stays, a field's too (it can recolour or hide the rest of its line there), and no other escape. A record longer than 16 KiB is cut and ends with `... (cut: N bytes)`, N the bytes it had. A record with neither is written as before. Never build a `fmt::layer()` of your own: its records would skip this |
+| Logging | `fluxbee_sdk::logging::fmt()`; `logging::layer()` for a subscriber built of layers (SY.edge's) | the `tracing` subscriber every binary uses: colour only on a terminal (FINDINGS A-31), and each record one line of at most 16 KiB (`RECORD_MAX_BYTES`; since 0.1.143; FINDINGS A-269). Its control characters are escaped as `Debug` shows them (`\n`, `\r`, `\t`, `\0`, `\u{1b}`), so a field with a newline stays inside its record's line and can open no line of its own in the journal; a record's message comes with its ESC, BEL, BS, FF and DEL already escaped in tracing-subscriber's own form (`\x1b`, `\x07`, `\x08`, `\x0c`, `\x7f`), so a message's ESC shows as `\x1b` and a field's as `\u{1b}`. On a terminal every colour code stays, a field's too (it can recolour or hide the rest of its line there), and no other escape. A record longer than 16 KiB is cut and ends with `... (cut: N bytes)`, N the bytes it had. A record with neither is written as before. Never build a `fmt::layer()` of your own: its records would skip this |
 | Prelude | `fluxbee_sdk::prelude::*` | common symbols. `RouteMatch`, `RouteTarget` and `RpcCommandReceiver` come from the crate root |
 | Mesh (feature `mesh-tls`) | `fluxbee_sdk::mesh` | the mesh TLS material (`MeshCa`, `MeshTlsMaterial`: the WAN's configs, the client that verifies io.web by name, the server that admits only some roles) and the motherbee's hive registry (`HiveRegistry`: `lists`, the strict `role`, `entries`, `until_not`); `IO_WEB_PORT`, `IO_WEB_SERVER_NAME`. Only a node that speaks mesh TLS enables it |
 

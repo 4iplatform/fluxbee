@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.142** | 2026-11-13 | `bc62240f` | motherbee + spokes (core), the AI SDK alone: A-294 (a reply over the frame fails alone, the runtime goes on), A-290 (a saturated AI node reads `DEGRADED` `ai_runtime_saturated`, its load in its status), A-325 (ai.generic and SY.frontdesk.gov leave `VAULT_SECRET_CHANGED` unanswered), A-339 (and a `NOT_TAKEN` or an error answer, with a WARN), A-327's `tool_choice` (no caller yet) | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-142` (all 4 VMs) · `apt install fluxbee=0.1.141` + 0.1.141's `update_installation` (nothing one-way; A-294's restart comes back) |
+| **0.1.143** | 2026-11-13 | `93fe0d3a` | motherbee + spokes (core), the Rust SDK alone: A-295 (a Rust node's command channels, two lanes of 1,024 messages or 8 MiB, the system lane first; a message without room is answered `NOT_TAKEN node_busy`, retryable, and a `NOT_TAKEN` ends a pending request), A-309 (a call its caller drops leaves nothing pending), A-269's call (b) (each record one line, escaped, cut at 16 KiB, every Rust binary), A-285's Cloud catalog text; A-336 recorded | ✅ live, checked on 8.x | snap `pre-rustsdk-0-1-143` (all 4 VMs) · `apt install fluxbee=0.1.142` + 0.1.142's `update_installation` (nothing one-way; the unbounded channels come back) |
+| **0.1.142** | 2026-11-13 | `bc62240f` | motherbee + spokes (core), the AI SDK alone: A-294 (a reply over the frame fails alone, the runtime goes on), A-290 (a saturated AI node reads `DEGRADED` `ai_runtime_saturated`, its load in its status), A-325 (ai.generic and SY.frontdesk.gov leave `VAULT_SECRET_CHANGED` unanswered), A-339 (and a `NOT_TAKEN` or an error answer, with a WARN), A-327's `tool_choice` (no caller yet) | ✅ replaced by 0.1.143 | snap `pre-aisdk-0-1-142` (deleted 2026-11-13) · `apt install fluxbee=0.1.141` + 0.1.141's `update_installation` (nothing one-way; A-294's restart comes back) |
 | **0.1.141** | 2026-11-13 | `2f1a0e1e` | motherbee + spokes (core), the Go SDK alone: A-329 (the Go SDK answers `NOT_TAKEN node_busy`, retryable, to the sender of each message its command channel cannot hold, two lanes of 1,024 messages or 8 MiB, where it held 64 and dropped the rest unseen; SY.timer sends again a fire its target answers so, while on time), A-264 (a WF's text past the frame, 128 KiB, goes as a blob, the operator's call (b)), A-325's Go sibling (SY.timer leaves `VAULT_SECRET_CHANGED` unanswered), with A-338 recorded | ✅ replaced by 0.1.142 | snap `pre-gosdk-0-1-141` (deleted 2026-11-13) · `apt install fluxbee=0.1.140` + 0.1.140's `update_installation` (nothing one-way; A-329's drops come back) |
 | **0.1.140** | 2026-11-13 | `28564648` | motherbee + spokes (core), the router alone: A-269's router part (the router refuses at HELLO a node name that is not an L2 name, ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes, before any line prints it; its review: both local accept loops log a failed connection's error quoted, escaped and cut) | ✅ replaced by 0.1.141 | snap `pre-router-0-1-140` (deleted 2026-11-13) · `apt install fluxbee=0.1.139` + 0.1.139's `update_installation` (nothing one-way; A-269's router part comes back) |
 | **0.1.139** | 2026-11-12 | `204ee161` | motherbee + spokes (core), the bug push's binaries, one branch per binary, eight branches: SY.admin (A-297: an empty `?hive=` is every hive's; A-304: a WF package another hive holds refused; A-305 and A-306: a manifest lock waited for 60 s at most, answered retryable, and a removal's use read with no lock held; A-312: build metadata refused; A-316: an edge's secrets never read back; A-317: the Cloud's door recorded before its token, the vault rolled back when the door does not open; A-318, A-319, A-324, A-328), the orchestrator (A-296; A-299; A-300: `RELAUNCH_DUE`; A-301: a fresh join's surviving key; A-308: the Cloud's `list_nodes` in a lane of its own; A-310; A-330; A-331: `BOX_RUNS_ANOTHER_HIVE`), SY.architect (A-124: a secret an answer brings shown once, kept masked; A-315, A-320, A-321), SY.frontdesk.gov (A-303: `identity_unavailable`), SY.cognition (A-332: a grace of 5 s), SY.timer 1.7 (A-326: an index per list filter, a 16 MiB page cache), the WF engine and SY.wf-rules (A-302: the engine in the status; A-307: `BUSY`; A-333: one read of the index) | ✅ replaced by 0.1.140 | snap `pre-push-0-1-139` (deleted 2026-11-13) · `apt install fluxbee=0.1.138` + 0.1.138's `update_installation` (nothing one-way: SY.timer 1.6's start rebuilds its indexes and leaves the new ones) |
@@ -151,6 +152,72 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.143 — The Rust SDK alone: a Rust node without room answers, and every record is one line (A-295, A-309, A-269 (b), A-285)
+
+- **Date:** 2026-11-13 (ART) · **Previous version:** 0.1.142 · **Commit:** `93fe0d3a`.
+- **Scope:** motherbee and the three spokes, through the installation's update. The Rust SDK
+  changed, so every Rust binary was rebuilt.
+- **Why:** A-295 (a Rust node's command channels had no bound: a node that cannot keep up grows
+  without limit and tells no one), A-309 (a call its caller drops kept its pending entry), A-269's
+  operator's call (b) (the Rust SDK's logging writes a record a sender's newline can split, every
+  Rust binary), A-285 (the Cloud catalog's texts behind 0.1.133's answers). The last of the bug
+  push's releases, each SDK alone ([METHOD](logbook/METHOD.md) §9), board item 30.
+- **What changed (the Rust SDK; `cloud.rs`):** A-285 (`b3672e56`): `list_cloud_actions` names
+  `UNKNOWN` and `SERVICE_FAILED`. A-295 and A-309 (`1f44a796`, the review `ea3536fc`): two lanes of
+  1,024 messages or 8 MiB each, the system lane read first; a message that does not fit is refused,
+  counted, logged (*"rpc command channel full"*) and answered `NOT_TAKEN` `node_busy`, retryable, but
+  a notice, a reply, a broadcast or a tap copy; a `NOT_TAKEN` ends any request on its trace with
+  `RpcError::NotTaken`; a call its caller drops removes its pending entry. A-269 (b) (`29f9a9a9`, the
+  review `865a35a3`): the SDK's `logging` writes each record as one line, its control characters
+  escaped (a field's as `\u{..}`, a message's as `\x..`) and the record cut at 16 KiB. A-336
+  recorded (the orchestrator reads a `NOT_TAKEN` as unknown; its next change). The texts' *"0.1.143
+  (planned)"* now read *"0.1.143"* (docs; the code's comments for its next change).
+- **Build and review:** `coa/rustsdk-143`, built and reviewed on 2026-11-12 with the bug push; the
+  AI SDK's item it wrote as A-335 renamed A-339 through its history; rebased onto 0.1.142's code and
+  then onto daily `9206ad00` (0.1.142's records): FINDINGS' lists and entries (A-339 kept as daily
+  has it, A-336 placed between A-337 and A-335), the contract's §9 (0.1.143 above), the protocol's
+  command-channel, `RpcError` and table sections (Rust from the branch, Go from daily); board item 30
+  and A-269's open-list line fixed by hand (`93fe0d3a`); re-prefixed `[0.1.142]`; CI green on
+  `93fe0d3a`; daily fast-forwarded to it.
+- **The deploy:** build on fb-build 18:15:59–18:42:46Z (26.8 min: every Rust binary), publish 12 s.
+  The gate's mark at 18:48:22Z; `ops deploy 0.1.143 --snapshot pre-rustsdk-0-1-143 --drop
+  pre-aisdk-0-1-142` in 239 s (snapshots 31.0 s, the motherbee's apt 107.1 s, its admin on the
+  version 47.0 s, the spokes answering 9.3 s, the update's call 17.1 s, the hives on the target
+  14.5 s, health 7.5 s). On the target after the update's call: the motherbee 4.2 s, egress1 21.5 s,
+  ingress1 25.8 s, worker1 30.2 s. The update (`upd-1794595925808`) closed with every hive on the
+  target, hash `7b56fbae19cc132d`. Health clean; IO.cloud `HEALTHY` on io.cloud 0.1.143.
+- **Checked on 8.x (the gate, gate0240-0243, 18:10–18:58Z, its baseline on 0.1.142; the tool
+  `scratchpad/gate-tools/r143_gate.py`, git-ignored, with io-sim built on fb-build at both commits;
+  66 PASS, 2 SEE, 8 FAIL, every FAIL the tool's):**
+  - **Before (0.1.142):** no Rust unit on worker1, ingress1 or egress1 ever wrote the old
+    soft-threshold line (whole journals), nor the motherbee's 17 in the last 7 days (its whole 2.9
+    GB journal did not scan within 15 min: a FAIL of the tool's read); io-sim on the old SDK took
+    1,100 probes and answered none; its log record split at a newline into a forged entry with a
+    raw ESC (the tool's matcher missed the second entry: a FAIL).
+  - **The Cloud catalog across the deploy (A-285):** through the door, old summaries 19 times, then
+    the new ones 19 times, never back (one edge 502 while IO.cloud restarted); exactly six changed.
+  - **The smoke (A-314's lesson):** `run_node AI.gate0243s@worker1` ok in 1.4 s, `RUNNING` at
+    12.2 s on ai.generic 0.1.143, killed without purge, `STOPPED`; the stopped `AI.gate0233` and
+    `AI.gate0237c` read `STOPPED`; `kill_node` of a core name refused.
+  - **A-295:** io-sim on the new SDK held 1,024 and answered each probe past them `NOT_TAKEN`
+    `node_busy`, retryable, p50 3.3 ms, in order, no `UNREACHABLE` or `LINK_BUSY`; its warnings'
+    counts right; a reply, a `NOT_TAKEN` and a nameless message unanswered; the 8 MiB bound at the
+    84th frame of 100 KB; *"rpc command channel full"* only in the gate's io-sim on every hive. The
+    requester step (S3b) failed before it sent (its provision data missing, the tool's: 3 FAILs), so
+    a `NOT_TAKEN` ending a pending request stays by its tests.
+  - **A-269 (b):** the same text logged by io-sim on the new SDK: one entry of 16,383 bytes, the
+    newline `\n`, the ESC `\u{1b}`, no raw control character, ending *"... (cut: 20372 bytes)"*
+    (read from the journal; the tool's matchers missed it: 3 FAILs).
+  - **The handbook** on the motherbee holds *"A node with no room for a message refuses it"*.
+  - **The cost:** 0 usage records (no model call).
+- **PROD after the gate:** all four hives on 0.1.143; snapshot `pre-rustsdk-0-1-143` on each VM,
+  `pre-aisdk-0-1-142` deleted. The clean: io-sim's units, timers, builds and states gone on worker1,
+  fb-build's build units and directory removed, `AI.gate0243s` purged (no history), no gate node
+  listed. Kept: the tenant pruebas, `AI.pruebas@worker1` (`HEALTHY` on 0.1.143), the stopped
+  `AI.gate0233` and `AI.gate0237c`.
+- **Rollback:** the snapshot `pre-rustsdk-0-1-143` (all 4 VMs), or `apt install fluxbee=0.1.142` +
+  0.1.142's `update_installation`: nothing one-way; the unbounded channels come back.
 
 ## 0.1.142 — The AI SDK alone: a reply too large fails alone, and a saturated AI node says so (A-294, A-290, A-325, A-339)
 

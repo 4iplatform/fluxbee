@@ -1267,7 +1267,7 @@ under its own systemd unit, never as a node `run_node` launched; only an install
   (`GET /hives/{hive}/nodes/{node_name}/status`) and the hive's drift alerts
   (`GET /hives/{hive}/drift-alerts`), and say what they show.
 
-**A node with no room for a message refuses it** (FINDINGS A-295; since 0.1.143, planned). This
+**A node with no room for a message refuses it** (FINDINGS A-295; since 0.1.143). This
 holds for every node built on the Rust SDK:
 - every SY node but `SY.timer`, `SY.wf-rules` and `SY.opa.rules`;
 - the routers' stream;

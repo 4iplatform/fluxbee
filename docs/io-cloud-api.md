@@ -2,8 +2,8 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.142** (2026-11-13), and PROD runs **0.1.142** (the router, the Go
-> SDK and the AI SDK since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
+> Contract as of **fluxbee 0.1.143** (2026-11-13), and PROD runs **0.1.143** (the router, the Go
+> SDK, the AI SDK and the Rust SDK since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
 > (an identity is the actor and is never duplicated; a tenant is a cost center, a workspace of the
@@ -1122,7 +1122,7 @@ post '{"op":"list_cloud_actions"}'
 | **404** | the endpoint was never published, or the hive was reinstalled: publish again. Or the request named a host other than the hive's (§2), or the door moved to another edge, which closed the old one (0.1.139): the operator gives you the new URL |
 | **401** with the right token | the door was published again (new token), or the edge could not read the token from the vault (`could not fetch channel secret from vault` in its log), or a publish whose door did not open (§7): the edge did not answer it, and from 10 minutes after it may serve only the new token; or the hive could not roll the vault back, or it was a move, and the edge restarted since. The operator publishes again |
 | **502** `HANDLER_UNREACHABLE` | IO.cloud is not running (restarting, for example), or the edge's hive cannot reach the motherbee: the request never reached IO.cloud |
-| **502** `HANDLER_ERROR` | among other causes, since 0.1.143 (planned): IO.cloud had 1,024 requests (or 8 MiB of them) waiting already and took this one nowhere. Nothing of it ran (IO.cloud's journal warns `rpc command channel full`): send it again after a pause |
+| **502** `HANDLER_ERROR` | among other causes, since 0.1.143: IO.cloud had 1,024 requests (or 8 MiB of them) waiting already and took this one nowhere. Nothing of it ran (IO.cloud's journal warns `rpc command channel full`): send it again after a pause |
 | **504** | IO.cloud is busy (§6) or does not answer, or it does not trust this edge: a publish that answered `edge_applied: false` (its `warning` says why). IO.cloud's journal says `IO.cloud dropped a request for its channel` for a request from an edge it does not trust |
 
 ---
@@ -1153,7 +1153,7 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.143 (planned)
+### 0.1.143
 
 - **`list_cloud_actions` describes the answers §5.4 lists since 0.1.133** (FINDINGS A-285). The
   ops themselves did not change:
@@ -1442,6 +1442,14 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.143:** on PROD, 2026-11-13 from 18:48Z, through the public door with Cloud's token
+(`lab/DEPLOYMENTS.md`, 0.1.143; FINDINGS A-285): `list_cloud_actions` every 10 s across the deploy
+answered its 25 ops with the old summaries 19 times, then the new ones 19 times, never back; one
+answer, while IO.cloud restarted on the new release, was the edge's 502 (§4, the request did not
+reach IO.cloud). After it exactly six summaries had changed: `list_nodes` and `get_node_status`
+name `UNKNOWN`, the four node ops `SERVICE_FAILED`. IO.cloud's bound of 1,024 waiting requests was
+not reached live (a test node of the gate showed the Rust SDK's bound: §9).
 
 **0.1.139:** on PROD, 2026-11-12/13, from inside the hive (`lab/DEPLOYMENTS.md`, 0.1.139; FINDINGS
 A-317, A-308, A-303):

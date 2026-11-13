@@ -356,8 +356,13 @@ no change required
     status reads under 1 s), A-325 (ai.generic and the frontdesk leave `VAULT_SECRET_CHANGED`
     unanswered: closed with its Go sibling), A-339 (they leave a `NOT_TAKEN` and an error answer
     unanswered); A-327's `tool_choice` by its tests; 97 PASS, no model call.
-    **Next:** the Rust SDK alone (0.1.143, `coa/rustsdk-143`, with A-269's call (b)), built and
-    pushed, not released; then the IO family, with io.slack.
+    **0.1.143, the Rust SDK alone** ✅ live and checked on 8.x (2026-11-13): A-295 (a Rust node
+    without room answers `NOT_TAKEN node_busy` past 1,024 messages or 8 MiB, where 0.1.142 held
+    them all; no live node near the bound), A-269's call (b) (each record one line, escaped, cut at
+    16 KiB, where 0.1.142 split one into a forged entry), A-285's Cloud catalog (the six summaries,
+    through the door across the deploy), A-309 by its tests; A-336 stays open; 66 PASS, no model
+    call. **The bug push's releases are all live (0.1.139 to 0.1.143).**
+    **Next:** the io.web talk (the operator's idea), then the IO family, with io.slack.
     **Numbers given on the push's branches** (the operator's call of 2026-11-12, where 0.1.139's
     integration review had given the orchestrator's item A-339): A-335 is the orchestrator's (a box
     `remove_hive` did not reach, 0.1.139); A-336 is the Rust SDK branch's (`coa/rustsdk-143`: the
@@ -483,13 +488,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-22, and a few the builder found); A-218 ✅ 0.1.128 (the dead identity surface, the Rust SDK alone). Cron descriptors wait for the talk on a WF that starts on a schedule.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
-- A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, built on `coa/rustsdk-143` for 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
 - A-291 🔵 io.slack posts an agent's error answer as *invalid_text_payload* (low; io.slack's revamp).
-- A-295 🔵 The Rust SDK's command channels are unbounded (low; the Rust SDK; built on `coa/rustsdk-143`, for 0.1.143, planned).
-- A-309 🔵 The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call (low, latent; the Rust SDK; built on `coa/rustsdk-143`, for 0.1.143, planned).
 - A-313 🔵 A Syncthing that cannot come up holds the whole watchdog about 35 s a tick (low; the orchestrator; to decide) (see A-343: a hung Syncthing freezes the hive's orchestrator, not only its watchdog).
 - A-327 🔵 Archi's explanation turn after a CONFIRM never reads the prompt cache: about 40,000 tokens written to it at each run (low; the AI SDK's `tool_choice` ✅ 0.1.142, by its tests; SY.architect's use of it open, for its next release).
 - A-335 🔵 A box `remove_hive` did not reach is taken again over the socket by a join under its hive's name, whatever address it names, with no identity key and no new certificate (low; the orchestrator; found by A-301's builder and review; the texts built on `coa/orch-139` for 0.1.139; the operator's call of 2026-11-12: left as documented, the texts warn, and the real guard comes with A-48's leaf pinning, parked security).
@@ -1779,7 +1781,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   ~114, the same on `coa/aisdk-142`, `bf7cd152`) takes for a notice or a reply only a message
   without `src_l2_name`, one without a name, `HELLO`, `ANNOUNCE`, `WITHDRAW`, `UNREACHABLE`,
   `TTL_EXCEEDED` and any `*_RESPONSE`. A `NOT_TAKEN` (the WF engine's since 0.1.94, the Go SDK's
-  `node_busy` since 0.1.141, the Rust SDK's since 0.1.143, planned) or a `<msg>.error` reply reaches
+  `node_busy` since 0.1.141, the Rust SDK's since 0.1.143) or a `<msg>.error` reply reaches
   the control plane as a system request it does not know. ai.generic
   (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ~1361) and SY.frontdesk.gov
   (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` ~2300) answer it with a
@@ -1921,9 +1923,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Today:** a secret is stored over SY.admin's HTTP API (`POST /hives/<hive>/vault/secrets`), not
   in a plan. Archi's handbook (§4.5.1) tells Archi to say so before it stages one.
 
-### A-336 [General/orchestrator] 🔵 low (found 2026-11-12 by the review of `coa/rustsdk-143`; read in the code; from 0.1.143, planned) — The orchestrator reads SY.admin's `NOT_TAKEN` as an unknown outcome, and a spoke orchestrator's as unreachable
+### A-336 [General/orchestrator] 🔵 low (found 2026-11-12 by the review of `coa/rustsdk-143`; read in the code; from 0.1.143) — The orchestrator reads SY.admin's `NOT_TAKEN` as an unknown outcome, and a spoke orchestrator's as unreachable
 
-- **Why:** since 0.1.143 (planned; A-295) a Rust node whose command channel has no room answers
+- **Why:** since 0.1.143 (A-295) a Rust node whose command channel has no room answers
   `NOT_TAKEN` `node_busy`, retryable, and the requester's call ends with `RpcError::NotTaken`:
   nothing of the request ran. The orchestrator's readings of a failed call do not know it:
   - `teardown_node_call_failure` (`src/bin/sy_orchestrator.rs` ~31129) takes every `RpcError` but
@@ -3566,7 +3568,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   restored the line no longer named it. Not run on 0.1.138 (the optional baseline); a version that
   left the manifest by hand while the node runs on it, by its tests.
 
-### A-309 [General/SDK] 🔵 low (found 2026-11-11 by A-281's orchestrator review; read in the code; latent) — The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call
+### A-309 [General/SDK] ✅ BUILT (0.1.143, 2026-11-13; a call its caller drops leaves no pending entry, a late answer read as stale: by its tests, no caller drops one on 8.x) (found 2026-11-11 by A-281's orchestrator review; read in the code; latent) — The Rust SDK's `send_with_matcher` keeps its pending entry when its caller drops the call
 
 - **Why:** `crates/fluxbee_sdk/src/rpc.rs` ~1103 inserts the `PendingEntry` before the send
   (~1111); only an answer, the inner timeout or a failed send removes it. A caller that wraps the
@@ -3578,7 +3580,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   would leak again.
 - **Fix, later:** a drop guard that removes the entry and marks the trace stale, in a release of
   the Rust SDK of its own (METHOD §9), with the SDK's lows.
-- **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30).**
+- **Built on `coa/rustsdk-143` (for 0.1.143; the Rust SDK alone, board item 30).**
   - **The guard.** `send_with_matcher` holds its entry through a `PendingGuard` from its insert to
     the call's end. A caller that drops the call drops the guard, and the guard removes the entry
     and notes the trace stale under one hold of the pending table. This covers an outer `timeout`
@@ -4335,7 +4337,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   rows only, and the motherbee's `?category=runtime` its runtime row only. Each read took 1.07 to
   1.81 s through SY.admin (0.99 to 1.78 s on 0.1.138), over the step's 1 s: a SEE.
 
-### A-295 [General/Rust SDK] 🔵 low (found 2026-11-11 by A-257's builder; read in the code; there before it) — The Rust SDK's command channels are unbounded
+### A-295 [General/Rust SDK] ✅ VALIDATED ON 8.x (0.1.143, 2026-11-13; a Rust node that never reads held 1,024 messages and answered each one past them `NOT_TAKEN node_busy`, retryable, in 3.3 ms (p50), and its 8 MiB bound cut at the 84th frame of 100 KB, where 0.1.142's held 1,100 and answered none; no live node near the bound on any hive) (found 2026-11-11 by A-257's builder; read in the code; there before it) — The Rust SDK's command channels are unbounded
 
 - **Why:** `RouterDispatcher`'s command channels are `mpsc::unbounded_channel`
   (`crates/fluxbee_sdk/src/rpc.rs` ~593), with only a WARN at a depth of 1,000 (~76, ~614). The AI
@@ -4344,7 +4346,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   channel grows without limit.
 - **Fix, later (the Rust SDK alone):** a bounded channel with a named refusal past its bound.
 - **The operator (2026-11-11):** after the sweep (the Rust SDK alone, with the next change there).
-- **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30), as
+- **Built on `coa/rustsdk-143` (for 0.1.143; the Rust SDK alone, board item 30), as
   A-329's call for the Go SDK says:** NOT_TAKEN, retryable, to the sender, and system messages
   never wait behind user ones. The contract is the Go SDK's of `coa/gosdk-141` (`620f07e7`, the
   `detail`'s words as `6d35cf2a` changed them): reason `node_busy`, its `detail`'s words, lanes of
@@ -4442,6 +4444,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       running io-sim waited there for good, a case of this item. Since then the 1,025th and later
       are refused. Run by hand with its stdin held open, it is the live gate's node that never
       drains its channel.
+- **Validated on 8.x (0.1.143's gate, gate0240-0243, 2026-11-13; `scratchpad/gate-tools/r143_gate.py` with io-sim built at 0.1.142's and 0.1.143's commits, git-ignored; 66 PASS, 2 SEE, 8 FAIL, each FAIL the tool's (its matchers and a requester's missing provision data), no model call):**
+  - **Before the deploy (0.1.142):** no Rust unit on worker1, ingress1 or egress1 ever wrote the old
+    *"depth crossed soft threshold"* line (their whole journals), nor any of the motherbee's 17 Rust
+    units in the last 7 days (its whole 2.9 GB journal did not scan within 15 min): the new bound
+    would have refused nothing seen. io-sim built with the old SDK, a node that never reads its
+    command channel, took 1,100 probes at 200/s and answered none (its one soft-threshold line).
+  - **After it (0.1.143):** io-sim with the new SDK held 1,024 and answered every probe from the
+    1,025th on `NOT_TAKEN` (`node_busy`, retryable, the detail naming 1,024 held), in order, p50
+    3.3 ms, max 5.5 ms, no `UNREACHABLE` or `LINK_BUSY`; its warnings at the first refusal and 10 s
+    later, their counts adding up; a reply by name, a `NOT_TAKEN` and a nameless message got no
+    answer; frames of 100 KB were refused from the 84th, past 8 MiB (8,322,078 bytes held); since
+    the deploy *"rpc command channel full"* only in the gate's io-sim on every hive, and no
+    soft-threshold line anywhere.
+  - **By its tests:** a `NOT_TAKEN` ending a pending request with `RpcError::NotTaken` (the gate's
+    requester step failed before sending, its provision data missing), a broadcast or a tap copy
+    never answered.
 
 ### A-294 [General/AI SDK] ✅ VALIDATED ON 8.x (0.1.142, 2026-11-13; a reply over the frame limit failed alone, the runtime went on: the same process, no restart, `replies_too_large` 1, the next message answered at once, where 0.1.141's process exited and its unit restarted it, back 7.1 s later) (found 2026-11-11 by A-257's builder and review; read in the code; there before it) — One answer over the frame limit stops the whole AI runtime
 
@@ -4676,7 +4694,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   through Archi's SCMD, a usage read whose `from` has the offset `+01:00` reached SY.storage and
   answered ok, 5 records, the same as with `%2B01:00`.
 
-### A-285 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.admin's help names each new answer the gate looked for, all missing on 0.1.132, but not `hives_without_runtimes`, A-315) · the Cloud catalog's text (`cloud.rs`) built on `coa/rustsdk-143`, for 0.1.143 (planned) (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
+### A-285 [Archi] ✅ VALIDATED ON 8.x (0.1.133, 2026-11-11; SY.admin's help names each new answer the gate looked for, all missing on 0.1.132, but not `hives_without_runtimes`, A-315) · the Cloud catalog's text (`cloud.rs`) VALIDATED ON 8.x (0.1.143, 2026-11-13: `list_cloud_actions` through the door answered the old text 19 times, then the new one 19 times, never back, exactly six summaries changed) (found 2026-11-11 by the reviews of A-270 and A-271) — The texts Archi and Cloud read do not describe 0.1.133's new answers
 
 - **`delete_workflow` (A-270):** a WF node that is not RUNNING, or whose instances cannot be
   counted, now needs `force` or a start first, and a config read with no answer is
@@ -4698,7 +4716,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `INVENTORY_UNAVAILABLE` (`teardown_node`), and `RUNTIME_USAGE_UNKNOWN`, `NO_USAGE` and
   `USAGE_UNREADABLE` (`remove_runtime_version`), each missing on 0.1.132. Named neither there nor in
   Archi's handbook: `hives_without_runtimes` (A-315).
-- **`cloud.rs` built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item
+- **`cloud.rs` built on `coa/rustsdk-143` (for 0.1.143; the Rust SDK alone, board item
   30):** the catalog that `list_cloud_actions` returns says what §5.4 of `docs/io-cloud-api.md`
   says since 0.1.133.
   - `list_nodes` lists the fifth state, `UNKNOWN` while the hive cannot tell (read it again), never
@@ -4712,6 +4730,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Found on the way, not changed:** the catalog names no paging for `list_nodes` and
     `list_tenants` (`params.limit`, `params.cursor`, `next_cursor`), which the contract has
     (§4.4, §5.1, §5.4). It is a text of the same kind, for the SDK's next change.
+- **The Cloud catalog validated on 8.x (0.1.143's gate, 2026-11-13):** through IO.cloud's public
+  door with the Cloud's token, `list_cloud_actions` every 10 s across the deploy: the old text 19
+  times (and one edge 502 while IO.cloud restarted), then the new text 19 times, never back; after
+  it `list_nodes` and `get_node_status` name *"UNKNOWN while the hive cannot tell"*, and
+  `provision_node`, `start_node`, `stop_node` and `delete_node` name `SERVICE_FAILED` and *"send it
+  again"*: exactly those six of the 25 summaries changed.
 
 ### A-284 [WF/wf-generic] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; a WF node with 1000 running instances counted 1000 in 0.50 to 1.04 s, where 0.1.136's count failed `INTERNAL_ERROR` past the frame; a delete without force `INSTANCES_ACTIVE`; Archi named 1000; across the deploy every answer one of the five kinds allowed) (found 2026-11-11 by A-270's review; read in the code) — The running-instance count fails for a busy WF: past ~350 instances its answer passes the frame
 
@@ -5319,7 +5343,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   without purge (`STOPPED`); `delete_workflow` without force answered `INSTANCES_UNKNOWN` (*"the wf
   node is STOPPED, not RUNNING (delete with force to remove it anyway)"*); with force, ok.
 
-### A-269 [General/router] 🟡 PARTIAL (0.1.140, 2026-11-13: the router's part VALIDATED ON 8.x: a name that is not an L2 name refused at HELLO in 1.1 to 3.0 ms with no line forged, where 0.1.139 announced a name with a newline and its journal took 3 forged lines, and no live node refused; the operator's call (b), the Rust SDK's logging for every Rust binary, ships with 0.1.143) (found 2026-11-11 by the review fixes of the router's A-253; read in the code) — The router takes any node name and logs it unescaped: a local node can write a line of its own into the router's journal
+### A-269 [General/router] ✅ VALIDATED ON 8.x (0.1.140 and 0.1.143, 2026-11-13; the router refuses a node name that is not an L2 name at HELLO, no line forged (0.1.140); every Rust binary writes each record as one line, its control characters escaped and cut at 16 KiB, where 0.1.142 split a record at a newline into a forged entry (0.1.143)) (found 2026-11-11 by the review fixes of the router's A-253; read in the code) — The router takes any node name and logs it unescaped: a local node can write a line of its own into the router's journal
 
 - **Why:** the router checks no length or characters in a HELLO's name (`normalize_name` in
   `src/router/mod.rs` only appends `@<hive>`), and several of its lines print the name with `%`,
@@ -5427,7 +5451,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   its control characters escaped and the record cut at 16 KiB, in one place for every Rust binary,
   IO.cloud's `op` among them, with the Rust SDK's release. The router's own part (the HELLO's name,
   its accept loops' errors) ships on `coa/router-140` (0.1.140, planned).
-- **Built on `coa/rustsdk-143` (for 0.1.143, planned; the Rust SDK alone, board item 30):**
+- **Built on `coa/rustsdk-143` (for 0.1.143; the Rust SDK alone, board item 30):**
   - **The writer.** `fluxbee_sdk::logging::fmt()` writes through `OneLine`, a `MakeWriter`. The fmt
     layer asks it for a writer for each record (`RecordWriter`), which takes the whole record,
     however many writes it takes, and writes it once, as one line, when the layer drops it at the
@@ -5483,6 +5507,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   and `refused=99999` fails the check. **Fix, later (`ops.py`'s next change):** anchor it as the
   router's patterns are, the words opening the line's message after its time, `WARN` and target.
   `docs/nodes/rt-gateway.md` says so meanwhile.
+- **The operator's call (b) validated on 8.x (0.1.143's gate, gate0240-0243, 2026-11-13; `scratchpad/gate-tools/r143_gate.py` with io-sim built at 0.1.142's and 0.1.143's commits, git-ignored; 66 PASS, 2 SEE, 8 FAIL, each FAIL the tool's (its matchers and a requester's missing provision data), no model call):** io-sim (a Rust IO node) logged a text
+  with a newline, an ESC and 20,000 bytes. Built with 0.1.142's SDK, its *"received"* record ended
+  at the newline (243 bytes) and a second journal entry of 20,128 bytes opened with the sender's
+  text, its ESC raw. Built with 0.1.143's, one entry of 16,383 bytes, the newline written `\n` and
+  the ESC `\u{1b}`, no raw control character, ending *"... (cut: 20372 bytes)"*; its debug line of
+  the wire cut alike (16,383 bytes, 20,508 before). The gate's matchers missed both shapes (its 3
+  FAIL lines); read from the journal itself.
 
 ### A-268 [General/router] ✅ BUILT (0.1.135, 2026-11-11; its race by its unit test, no live trigger; A-265's check unchanged on 8.x, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 

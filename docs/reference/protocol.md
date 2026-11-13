@@ -698,7 +698,7 @@ later one.
 
 1. A `pre_pending_rule` matches: its target. For commands that must never be taken for a reply.
 2. A request is pending on this `trace_id` and its `PendingMatcher` matches: the request completes.
-   A `NOT_TAKEN` on its `trace_id` ends it whatever its matcher (§10.4; since 0.1.143, planned).
+   A `NOT_TAKEN` on its `trace_id` ends it whatever its matcher (§10.4; since 0.1.143).
 3. A request on this `trace_id` ended in the last 30 s and the message matches its matcher, or is
    a `NOT_TAKEN`: dropped as stale (`RECENT_STALE_TTL`, at most 1,024 kept).
 4. The message has the exact shape of a reply this node has awaited before
@@ -710,7 +710,7 @@ later one.
 
 A Rust command channel holds at most 1,024 messages or 8 MiB in each of its two lanes
 (`RPC_COMMAND_CHANNEL_CAPACITY`, `RPC_COMMAND_CHANNEL_MAX_BYTES`, the bytes counted as the frames
-came off the socket; since 0.1.143, planned; FINDINGS A-295). These are the Go SDK's numbers
+came off the socket; since 0.1.143; FINDINGS A-295). These are the Go SDK's numbers
 (A-329, since 0.1.141). Until 0.1.143 the Rust channels had no bound.
 
 - **The lanes.** One holds the channel's `system` messages, the other every other kind. Its
@@ -776,7 +776,7 @@ empty `trace_id` (a new UUID) and `src`, and refuses a `trace_id` already pendin
 pending. `send_system_rpc` sends `ttl` 16 to the unicast `target`, with `action_class` from
 `classify_system_message`.
 
-A call its caller drops leaves nothing pending (since 0.1.143, planned; FINDINGS A-309). That is a
+A call its caller drops leaves nothing pending (since 0.1.143; FINDINGS A-309). That is a
 call wrapped in an outer `timeout`, or the losing branch of a `select!`.
 
 - Its entry goes, and its `trace_id` is free again.
@@ -796,7 +796,7 @@ last_hop}`.
 
 `RpcError::NotTaken {trace_id, target, request_msg, reason, detail, retryable}` means the
 destination answered `NOT_TAKEN` on the request's `trace_id`: it took the request nowhere, and
-nothing of it ran (since 0.1.143, planned; FINDINGS A-295).
+nothing of it ran (since 0.1.143; FINDINGS A-295).
 
 - `node_busy` comes from a node whose channel had no room (§10.2), a Rust or a Go node, and is
   retryable: asking again later may pass.
@@ -845,9 +845,9 @@ forever.
 | Reconnection | §2.5 | §2.5 |
 | A frame over 128 KiB | Refused before sending (`NodeError::MessageTooLarge`) | Refused before sending (`*MessageTooLargeError`); the connection stays up |
 | Inbound queue full (256) | Backpressure on the socket | Backpressure on the socket since 0.1.141 (FINDINGS A-329): the reader waits for room, and the frames wait in the router's queue for the link. Before, the frame was dropped, and the dispatcher failed every pending request on the error |
-| Command channels | Since 0.1.143 (planned; FINDINGS A-295) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is refused, counted (`command_refused`), logged and answered `NOT_TAKEN` `node_busy`, retryable (§10.2), but a notice, a reply, a broadcast or a tap copy. Before, unbounded, with a warning at depth 1,000 | Since 0.1.141 (FINDINGS A-329) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is answered `NOT_TAKEN` `node_busy` (§6.10), counted (`CommandChannelDrops`, `NotTakenSent`) and logged. Before, 64 messages, the rest dropped and counted |
-| A `NOT_TAKEN` on a pending request | Ends it with `RpcError::NotTaken`, whatever its matcher (since 0.1.143, planned) | `RpcErrNotTaken`, with `Reason` and `Retryable` (since 0.1.141) |
-| A call its caller gives up | Dropped: its pending entry goes, and a late answer is stale (since 0.1.143, planned) | Its `ctx` done: the same (`SendWithMatcher`) |
+| Command channels | Since 0.1.143 (FINDINGS A-295) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is refused, counted (`command_refused`), logged and answered `NOT_TAKEN` `node_busy`, retryable (§10.2), but a notice, a reply, a broadcast or a tap copy. Before, unbounded, with a warning at depth 1,000 | Since 0.1.141 (FINDINGS A-329) two lanes, system first, each 1,024 messages or 8 MiB; a message that does not fit is answered `NOT_TAKEN` `node_busy` (§6.10), counted (`CommandChannelDrops`, `NotTakenSent`) and logged. Before, 64 messages, the rest dropped and counted |
+| A `NOT_TAKEN` on a pending request | Ends it with `RpcError::NotTaken`, whatever its matcher (since 0.1.143) | `RpcErrNotTaken`, with `Reason` and `Retryable` (since 0.1.141) |
+| A call its caller gives up | Dropped: its pending entry goes, and a late answer is stale (since 0.1.143) | Its `ctx` done: the same (`SendWithMatcher`) |
 | `AnyMsgOfType` success matcher | Never registered as a reply shape | The same (`registerResponseOnly`) |
 | System request `ttl` | `send_system_rpc`: 16 | `SendSystemRPC`: 16 unless `Options.TTL` sets another; `BuildSystemRequest` alone turns 0 into 1. It also sets `meta.action` to the verb |
 | Admin request result | `AdminCommandResult` | The raw `Message` |

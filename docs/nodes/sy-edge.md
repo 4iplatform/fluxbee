@@ -207,7 +207,7 @@ framed. A response the edge cannot build (an invalid header value, say) is a
    `200 application/json` response; the node cannot choose the HTTP status. Router
    `UNREACHABLE`/`TTL_EXCEEDED`: `502 HANDLER_UNREACHABLE`. Timeout: `504 HANDLER_TIMEOUT`
    (`rpc_error_to_http_status`, `rpc_error_code`). A handler with no room for the request
-   answers `NOT_TAKEN` (`node_busy`; since 0.1.143, planned; FINDINGS A-295). The wait ends at once,
+   answers `NOT_TAKEN` (`node_busy`; since 0.1.143; FINDINGS A-295). The wait ends at once,
    and the edge answers `502 HANDLER_ERROR`, a code other failures share. An edge before 0.1.143
    takes a `NOT_TAKEN` for the handler's reply and answers `200` with its payload, the handler's
    name in its `detail`: during a deploy, while the handler runs 0.1.143 and the edge does not yet.
