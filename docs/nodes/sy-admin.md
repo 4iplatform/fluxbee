@@ -619,8 +619,9 @@ SY.timer describes itself with `timer_help` (`TIMER_HELP`) and may answer `NODE_
 
 `GET /hives/{hive}/nodes/{node_name}/config` (`get_node_config`) reads the `config.json` of a node
 `run_node` launched, and `PUT` on the same path (`set_node_config`) writes it. The orchestrator of
-the node's hive does both (`set_node_config_flow` in `src/bin/sy_orchestrator.rs`); the write tells
-the running node nothing, and the node reads it at its next start.
+the node's hive does both (`get_node_config_flow`, `set_node_config_flow` in
+`src/bin/sy_orchestrator.rs`); the write tells the running node nothing, and the node reads it at
+its next start.
 
 - **The body is the config patch itself** (FINDINGS A-346), its keys at the top level as
   `get_node_config` shows the node's config: `{"behavior": {"kind": "ai_chat"}}`, never wrapped in

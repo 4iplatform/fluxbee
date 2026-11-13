@@ -1031,11 +1031,10 @@ person: when its provider gave no answer, the error carries the operator's text 
 - **In chat,** a first deploy is `wf_rules_compile_apply` with `auto_spawn: true` and `tenant_id`.
 - **A deploy whose node does not run the definition is refused,** `502 WF_NODE_NOT_DEPLOYED`:
   the package is published and the definition is current (`config_version`), but its WF node was
-  not moved onto it. `error_detail` says which step failed and why, after *"Package published,
-  but ..."*: the rebind of the node's config (SY.wf-rules' `set_node_config` through SY.admin),
-  the read of the node's state (`get_node_config`), its restart, or a first deploy's spawn (a
-  tenant that does not exist, or none named); `wf_node` (`action`, `error` or `reason`) says the
-  same.
+  not moved onto it. `error_detail` says which step failed and why, after *"Package published"*:
+  the rebind of the node's config (SY.wf-rules' `set_node_config` through SY.admin), the read of
+  the node's state (`get_node_config`), its restart, or a first deploy's spawn (a tenant that
+  does not exist, or none named); `wf_node` (`action`, `error` or `reason`) says the same.
   - It has no `retryable`, on purpose (FINDINGS A-344): nothing sends it again by itself. Never
     stage it again blindly: read what happened first.
   - *"rpc timeout"* (`target=SY.admin@motherbee`) means SY.admin, or the orchestrator of the WF

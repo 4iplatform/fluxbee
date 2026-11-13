@@ -1720,6 +1720,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   handbook (§7.3, and §4.4.3's `behavior`, which a patch replaces whole) say the same. What stays:
   (b), the orchestrator's refusal of a top-level `config`, on its own branch; Archi's SCMD of the
   route, which reads no `?replace` and leaves the binding fields in the patch (A-348).
+- **Its review (2026-11-13), on `coa/admin-144`:** the help's two notes on an AI node's provider
+  and model still named `config.behavior.provider` and `config.behavior.model`, which over HTTP
+  read as the `config` wrapper this fix removes: they now name the config's `behavior.provider`
+  and `behavior.model` (the args' `config` is that config). sy-admin.md named only the write's
+  function for both routes; it names `get_node_config_flow` too.
 
 ### A-345 [General/orchestrator] 🔵 low, observability (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code; there before it) — `get_node_status` cannot tell an unconfigured node from any other `DEGRADED` one
 
@@ -1771,6 +1776,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   not the hive's, the operator's. Nothing else changes: SY.wf-rules, and Archi's classifier, which
   hands the code to the operator in the pipeline (`failure_classifier.rs`). No test reads the
   handbook: the gate reads its text on the motherbee (`/etc/fluxbee/handbook_fluxbee.md`).
+- **Its review (2026-11-13), on `coa/admin-144`:** the text quoted the detail's start as
+  *"Package published, but ..."*, which a restart's failure does not have (*"Package published
+  and config rebound, but restart of the existing WF node failed"*, `deploy.go`): it now quotes
+  *"Package published"*.
 
 ### A-343 [General/orchestrator] 🔵 medium (found 2026-11-13 by 0.1.139's gate; seen on 8.x, read in the code: the mechanism confirmed, the cadence plausible; there before it) — A hung Syncthing freezes its hive's orchestrator for about 10 s of every 15
 
