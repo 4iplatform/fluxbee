@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.139** | 2026-11-12 | `204ee161` | motherbee + spokes (core), the bug push's binaries, one branch per binary, eight branches: SY.admin (A-297: an empty `?hive=` is every hive's; A-304: a WF package another hive holds refused; A-305 and A-306: a manifest lock waited for 60 s at most, answered retryable, and a removal's use read with no lock held; A-312: build metadata refused; A-316: an edge's secrets never read back; A-317: the Cloud's door recorded before its token, the vault rolled back when the door does not open; A-318, A-319, A-324, A-328), the orchestrator (A-296; A-299; A-300: `RELAUNCH_DUE`; A-301: a fresh join's surviving key; A-308: the Cloud's `list_nodes` in a lane of its own; A-310; A-330; A-331: `BOX_RUNS_ANOTHER_HIVE`), SY.architect (A-124: a secret an answer brings shown once, kept masked; A-315, A-320, A-321), SY.frontdesk.gov (A-303: `identity_unavailable`), SY.cognition (A-332: a grace of 5 s), SY.timer 1.7 (A-326: an index per list filter, a 16 MiB page cache), the WF engine and SY.wf-rules (A-302: the engine in the status; A-307: `BUSY`; A-333: one read of the index) | ✅ live, checked on 8.x | snap `pre-push-0-1-139` (all 4 VMs) · `apt install fluxbee=0.1.138` + 0.1.138's `update_installation` (nothing one-way: SY.timer 1.6's start rebuilds its indexes and leaves the new ones) |
+| **0.1.140** | 2026-11-13 | `28564648` | motherbee + spokes (core), the router alone: A-269's router part (the router refuses at HELLO a node name that is not an L2 name, ASCII letters, digits, `.`, `-` and `_` on each side of one `@`, at most 256 bytes, before any line prints it; its review: both local accept loops log a failed connection's error quoted, escaped and cut) | ✅ live, checked on 8.x | snap `pre-router-0-1-140` (all 4 VMs) · `apt install fluxbee=0.1.139` + 0.1.139's `update_installation` (nothing one-way; A-269's router part comes back) |
+| **0.1.139** | 2026-11-12 | `204ee161` | motherbee + spokes (core), the bug push's binaries, one branch per binary, eight branches: SY.admin (A-297: an empty `?hive=` is every hive's; A-304: a WF package another hive holds refused; A-305 and A-306: a manifest lock waited for 60 s at most, answered retryable, and a removal's use read with no lock held; A-312: build metadata refused; A-316: an edge's secrets never read back; A-317: the Cloud's door recorded before its token, the vault rolled back when the door does not open; A-318, A-319, A-324, A-328), the orchestrator (A-296; A-299; A-300: `RELAUNCH_DUE`; A-301: a fresh join's surviving key; A-308: the Cloud's `list_nodes` in a lane of its own; A-310; A-330; A-331: `BOX_RUNS_ANOTHER_HIVE`), SY.architect (A-124: a secret an answer brings shown once, kept masked; A-315, A-320, A-321), SY.frontdesk.gov (A-303: `identity_unavailable`), SY.cognition (A-332: a grace of 5 s), SY.timer 1.7 (A-326: an index per list filter, a 16 MiB page cache), the WF engine and SY.wf-rules (A-302: the engine in the status; A-307: `BUSY`; A-333: one read of the index) | ✅ replaced by 0.1.140 | snap `pre-push-0-1-139` (deleted 2026-11-13) · `apt install fluxbee=0.1.138` + 0.1.138's `update_installation` (nothing one-way: SY.timer 1.6's start rebuilds its indexes and leaves the new ones) |
 | **0.1.138** | 2026-11-12 | `38ecd878` | motherbee + spokes (core), A-278 alone (the Go SDK, the Rust SDK and the WF engine): a WF reconciles all its pending timers: the Go SDK's `ListPage` and the Rust SDK's `list` and `list_page` say where the timers past a list start, and the WF's reconcile reads every page of SY.timer's list (200 at the most), never taking a timer past the last one listed as missing; its review: when the list stops before its end, a timer past its time and past the last one listed is fired, and the one SY.timer may hold cancelled | ✅ replaced by 0.1.139 | snap `pre-a278-0-1-138` (deleted 2026-11-12) · `apt install fluxbee=0.1.137` + 0.1.137's `update_installation` (nothing one-way; A-278 comes back) |
 | **0.1.137** | 2026-11-12 | `55fbdd85` | motherbee + spokes (core), the sweep's seven binaries, one branch per binary, with A-322 and A-323: SY.admin (A-243: an IO or WF node takes its own pages down, only its own; A-263: the update's background reads at once; A-273: a failed record of the Cloud's door tried once more; A-280: a failed publish answers within its budget, its clean-up after the answer; A-311's and A-314's help), the orchestrator (A-282: a check with no answer restarts a service only at a boot that found a replaced binary; A-283: Syncthing restarted after 5 min with no answer, at most once an hour, its unit with `TimeoutStopSec=30`; A-311: `get_hive` refuses an id that is not a hive id, and the registry's readers skip such a directory), SY.identity (A-277: a hive the registry does not list is refused), the WF (A-284: a count-only instance count), SY.cognition (A-292: a turn the agent refused leaves its communication), IO.cloud (A-293: a retryable frontdesk error answers `FRONTDESK_UNAVAILABLE`, a malformed registration is refused before anything is created), SY.architect (A-286 and A-287: an SCMD keeps `+` and decodes each segment once; A-298: a publish recreates no node; A-322: after a confirmed plan Archi's model tells what each step answered; A-323: no core node stopped through Archi) | ✅ replaced by 0.1.138 | snap `pre-sweep-0-1-137` (deleted 2026-11-12) · `apt install fluxbee=0.1.136` + 0.1.136's `update_installation` (nothing one-way; the sweep's items come back, A-298's redeploy among them) |
 | **0.1.136** | 2026-11-12 | `ba2addb2` | motherbee + spokes (core), the AI SDK alone: A-257 (the AI runtime reads every message while its 4 workers run LLM turns: a status, help or config request runs at once beside them on a direct lane of 64 places, and so does a handoff in the shape the frontdesk parses, on at most 8 of them and within 30 s; the turns start on the 4 workers in the order they came, with up to 128 waiting, and the next one is answered `ai_runtime_busy` at once, never run); its review's texts: an AI node answers status and help at once however busy only on ai.generic 0.1.136 or later, and ai.generic running its model for a handoff on the direct lane is a known limit | ✅ replaced by 0.1.137 | snap `pre-aisdk-0-1-136` (deleted 2026-11-12) · `apt install fluxbee=0.1.135` + 0.1.135's `update_installation` (nothing one-way; A-257 comes back) |
@@ -148,6 +149,65 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.140 — The router alone: a node name that is not an L2 name refused at HELLO (A-269)
+
+- **Date:** 2026-11-13 (ART) · **Previous version:** 0.1.139 · **Commit:** `28564648`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** A-269 (found 2026-11-11 by the review fixes of the router's A-253): the router took any
+  node name a local node sent in its HELLO and printed it unescaped, so a name with a newline
+  wrote lines of the sender's choosing into rt-gateway's journal, the stream's loss alarm that
+  `ops.py health` sums among them. The router is shared code, so it ships alone
+  ([METHOD](logbook/METHOD.md) §9): FINDINGS' board, item 30, the bug push's first release after
+  0.1.139's binaries.
+- **What changed (the router; no other binary's code):**
+  - **A-269 (`2de162bc`):** `handle_node` checks the name as soon as it has its hive, before any
+    line prints it and before the `RT.` check, the link, the VPN and the registration take it: a
+    local part and a hive on each side of one `@`, each of ASCII letters, digits, `.`, `-` and
+    `_`, at most 256 bytes in all. Any other name gets no ANNOUNCE and its connection closes,
+    with *"HELLO rejected: the node name is not an L2 name"* showing it quoted, escaped and cut.
+  - **Its review (`28564648`):** both local accept loops (the nodes' socket and the sibling
+    routers') log a failed connection's error quoted, escaped and cut at 128 bytes, since a HELLO
+    frame that does not parse was a way in too; the router's tests capture their journal through
+    one global subscriber.
+- **Build and review:** `coa/router-140`'s two commits, built and reviewed on 2026-11-12 with the
+  bug push, rebased onto daily `1d7f6189` (0.1.139's records) with no conflict and their subjects
+  re-prefixed `[0.1.139]`; CI green on `28564648` (5 jobs, 14:33Z to 14:38Z); daily fast-forwarded
+  to it.
+- **The deploy:** build on fb-build 14:53:16–15:12:50Z (19.6 min), publish in 16 s (10 packages
+  indexed). The gate's mark at 15:13:32Z; `ops deploy 0.1.140 --snapshot pre-router-0-1-140 --drop
+  pre-push-0-1-139` in 308 s (snapshots 35.3 s, the motherbee's apt 145.2 s, its admin on the
+  version 49.8 s, the spokes answering 10.6 s, the update's call 28.0 s, the hives on the target
+  21.0 s, health 7.0 s). On the target after the update's call: the motherbee 9.3 s, egress1 and
+  ingress1 33.0 s, worker1 42.8 s; by their own records the spokes restarted their services at
+  +19.1–19.9 s (egress1), +21.3–22.8 s (ingress1) and +26.5–29.0 s (worker1), and settled at
+  +27.7 s, +29.8 s and +36.0 s. The update (`upd-1794583069778`) closed with every hive on the
+  target, hash `fb159fd57c525a09`. Health clean; the edge's certificate `acme=on`; the web route
+  `acknowledged`, upstream `ready`.
+- **Checked on 8.x (the gate, gate0240, 14:33–15:21Z, its baseline on 0.1.139 before the deploy;
+  the probe `scratchpad/gate-tools/gate0240_hello_probe.py` and `r140_gate.py`, git-ignored;
+  50 PASS):**
+  - **The baseline on 0.1.139:** no name on any router since its start, and none in any node
+    list, broke the rule. On worker1 a name with a newline was announced and registered, and its
+    newline opened 3 lines of the probe's marker in rt-gateway's journal; a frame naming an
+    unknown variant opened 1 on each local socket; 0 refusals.
+  - **The smoke (A-314's lesson, 15:18:58Z):** `run_node AI.gate0241s@worker1` ok in 3.7 s,
+    `RUNNING` (`DEGRADED`, no config) after 8.7 s, killed without purge in 12.6 s, `STOPPED`; the
+    stopped `AI.gate0233@worker1` reads `STOPPED`.
+  - **No node refused by the deploy:** rt-gateway started once on every hive, no HELLO refused, no
+    connection error; the node lists as before it (17, 10, 5 and 4 names).
+  - **The 9 cases on worker1 and the motherbee:** the valid name and one of 256 bytes announced; a
+    newline, 257 bytes, an empty name and two `@` refused at HELLO in 1.1 to 3.0 ms, the refusal
+    showing the name escaped and the long one cut; the `RT.` rule as before; the frame variant
+    refused on both sockets, its error escaped; 0 lines forged; the two announced probes
+    disconnected, none left listed; health clean.
+  - **The cost:** 0 usage records from 14:30Z to the clean (no model call).
+- **PROD after the gate:** all four hives on 0.1.140; snapshot `pre-router-0-1-140` on each VM,
+  `pre-push-0-1-139` deleted. `AI.gate0241s@worker1` purged (no history) in 1.9 s; no
+  gate0240/gate0241 node on any hive; the probe left nothing on any VM (it streams). Kept: the
+  tenant pruebas, `AI.pruebas@worker1`, the stopped `AI.gate0233` and `AI.gate0237c`.
+- **Rollback:** the snapshot `pre-router-0-1-140` (all 4 VMs), or `apt install fluxbee=0.1.139` +
+  0.1.139's `update_installation`: nothing one-way; A-269's router part comes back.
 
 ## 0.1.139 — The bug push's binaries, one branch per binary: eight branches, and the Cloud's door in order
 

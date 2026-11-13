@@ -258,8 +258,8 @@ no change required
     checked on 8.x (2026-11-12): SY.admin (A-243, each publisher takes its own pages down; A-263,
     the update's reads at once; A-273, its help, the failure not provoked; A-280, a failed publish
     answers within its budget; A-311's and A-314's help), the orchestrator (A-282, a
-    `systemctl show` with no answer by its tests; A-283, the bounded Syncthing restart:
-    **[A-283 DRIFT READ PENDING, +24 h]**; A-311, with the integration's readers), SY.identity
+    `systemctl show` with no answer by its tests; A-283, the bounded Syncthing restart, and its
+    drift read at +24 h: no warning opened unprovoked; A-311, with the integration's readers), SY.identity
     (A-277), the WF (A-284), SY.cognition (A-292), IO.cloud (A-293, a retryable frontdesk error by
     its tests) and SY.architect (A-286, A-287, A-298, A-311's reconcile, A-322, A-323). On 8.x: a
     WF node's 1000 running instances counted in 0.50 to 1.04 s, where 0.1.136's count failed past
@@ -291,7 +291,8 @@ no change required
     slowest page 7.204 s); A-302 seen live. **In its deploy's timeline:** A-334 (worker1's
     Syncthing failed to delete some directories of its receive-only mirror), closed: a later pass
     deleted them, nothing left.
-    **Pending:** the 0.1.137 gate's `drift` read at +24 h (2026-11-13, about 11:00Z) for A-283.
+    **The 0.1.137 gate's `drift` read for A-283** (2026-11-13, 14:35Z, 29 h from 0.1.137's
+    deploy): no `api_unanswered` opened unprovoked on any hive (A-283).
     **Then:** A-191's leftover, the operator's call of 2026-11-12 (*"Purge the 61 from removed
     workers"*): the 61 retired system ILKs of removed hives purged, each first read free of history;
     SY.policy's 2 stay retired (A-191).
@@ -339,9 +340,13 @@ no change required
     cannot tell an unconfigured node from any other `DEGRADED` one); A-346 [General/admin], medium
     (`set_node_config`'s help describes a body its HTTP route does not take; the fix to decide);
     A-347 [General/orchestrator], low (`remove_hive`'s cleanup races the box's own orchestrator).
-    **Next:** the router alone (0.1.140, `coa/router-140`), the Go SDK alone (0.1.141,
-    `coa/gosdk-141`), the AI SDK alone (0.1.142, `coa/aisdk-142`) and the Rust SDK alone (0.1.143,
-    `coa/rustsdk-143`), each built and pushed, not released; then the IO family, with io.slack.
+    **0.1.140, the router alone** ✅ live and checked on 8.x (2026-11-13): A-269's router part: a
+    node name that is not an L2 name refused at HELLO in 1.1 to 3.0 ms with no line forged in
+    rt-gateway's journal, where 0.1.139 announced a name with a newline and took 3 forged lines;
+    the deploy refused no live node (every node list as before it); 50 PASS, no model call.
+    **Next:** the Go SDK alone (0.1.141, `coa/gosdk-141`), the AI SDK alone (0.1.142,
+    `coa/aisdk-142`) and the Rust SDK alone (0.1.143, `coa/rustsdk-143`, with A-269's call (b)),
+    each built and pushed, not released; then the IO family, with io.slack.
     **Numbers given on the push's branches** (the operator's call of 2026-11-12, where 0.1.139's
     integration review had given the orchestrator's item A-339): A-335 is the orchestrator's (a box
     `remove_hive` did not reach, 0.1.139); A-336 is the Rust SDK branch's (`coa/rustsdk-143`: the
@@ -468,7 +473,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-227 🔵 A relay that names no one is attributed to the last other person who wrote through that
   IO node (low).
 - A-264 🔵 The Go SDK has no text blob offload: a WF's text over 128 KiB fails (low; the Go SDK alone).
-- A-269 🔵 The router takes any node name and logs it unescaped (low; the router; local nodes only; built on `coa/router-140` for 0.1.140 with its review's fixes, a failed connection's error line escaped on both local sockets; the other fields a node writes left to decide).
+- A-269 🟡 The router takes any node name and logs it unescaped (low; the router's part ✅ 0.1.140; the operator's call (b), the Rust SDK's logging for every Rust binary, with 0.1.143).
 - A-275 🔵 A removed hive's managed nodes keep their ILKs active and their vault secrets (low; the operator's rule of 2026-11-11 keeps them; with A-159).
 - A-276 🔵 A replica cut off during a purge can bring back a purged node ILK (low; with A-159).
 - A-289 🔵 Several routers on a hive (not supported): a broadcast from a router that is not the gateway needs ttl 4 to cross the WAN (low; a known limit).
@@ -4221,7 +4226,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   refused `INSTANCES_ACTIVE` (*"wf node still has 1000 running instances"*), nothing purged; Archi
   named 1000 running conversations (12.9 s); the forced delete took 3.0 s.
 
-### A-283 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; worker1's Syncthing frozen: the warning at the 12th tick, +179 s, the restart at +329 s, the API answering 2.2 s after, and no second restart within the hour; a refused API port warned at its 12th check, and lasting on egress1 restarted it at 304 s unanswered, once; `TimeoutStopUSec=30s` on every hive; **[A-283 DRIFT READ PENDING, +24 h]**) (found 2026-11-11 by A-271's review; read in the code; there before it; to decide) — The Syncthing watchdog waits on an API that never answers, and never repairs it
+### A-283 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; worker1's Syncthing frozen: the warning at the 12th tick, +179 s, the restart at +329 s, the API answering 2.2 s after, and no second restart within the hour; a refused API port warned at its 12th check, and lasting on egress1 restarted it at 304 s unanswered, once; `TimeoutStopUSec=30s` on every hive; its drift read at +24 h, 2026-11-13: no warning opened unprovoked) (found 2026-11-11 by A-271's review; read in the code; there before it; to decide) — The Syncthing watchdog waits on an API that never answers, and never repairs it
 
 - **Why:** `watchdog_blob_sync` (`src/bin/sy_orchestrator.rs` ~18627) asks each folder with a 10 s
   timeout: about 120 s a tick on the motherbee (10 folders and 2 folder-error reads), about 80 s on
@@ -4287,9 +4292,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Lasting (G3, egress1, 10:44:39–10:52:22Z):** the warning at 12 checks (54 s), the restart at
     +312.8 s from the rule with 304 s unanswered, one restart while the rule stayed, and *"blob
     sync watchdog failed"* once, the restart's own wait for its port.
-- **Pending:** the gate's `drift` read at +24 h (2026-11-13, about 11:00Z): every hive's own
-  `syncthing` drift rows, none opened outside the gate's steps.
-  **[A-283 DRIFT READ PENDING, +24 h]**
+- **The drift read at +24 h (2026-11-13, 14:35Z; `r137_gate.py drift --hours 29`, from 0.1.137's
+  deploy at 09:44Z the day before):** no `api_unanswered` opened unprovoked on any hive. The
+  motherbee and ingress1 had no row; egress1 3, all in the gate's A-283 steps; worker1 11, 9 in
+  the gate's steps and one warning, opened at 01:08:36Z and closed 5.7 s later, during 0.1.139's
+  gate's own freeze of worker1's Syncthing (01:05:38 to 01:08:39Z, 177.6 s: the warning at its
+  12th tick, as built); no restart outside the gates.
 
 ### A-282 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.137, 2026-11-12; the motherbee's package boot restarted the 10 services the package replaced, none unanswered, and no core process ran a deleted binary on any hive; an orchestrator restart on worker1 restarted no core service, and a vendor update with nothing new restarted nothing; a `systemctl show` with no answer not provoked on 8.x: by its tests) (found 2026-11-11 by A-271's builder and review; read in the code; there before it) — A replaced binary is taken for current when `systemctl show` gives no answer
 
@@ -4785,7 +4793,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   without purge (`STOPPED`); `delete_workflow` without force answered `INSTANCES_UNKNOWN` (*"the wf
   node is STOPPED, not RUNNING (delete with force to remove it anyway)"*); with force, ok.
 
-### A-269 [General/router] 🔵 low (found 2026-11-11 by the review fixes of the router's A-253; read in the code) — The router takes any node name and logs it unescaped: a local node can write a line of its own into the router's journal
+### A-269 [General/router] 🟡 PARTIAL (0.1.140, 2026-11-13: the router's part VALIDATED ON 8.x: a name that is not an L2 name refused at HELLO in 1.1 to 3.0 ms with no line forged, where 0.1.139 announced a name with a newline and its journal took 3 forged lines, and no live node refused; the operator's call (b), the Rust SDK's logging for every Rust binary, ships with 0.1.143) (found 2026-11-11 by the review fixes of the router's A-253; read in the code) — The router takes any node name and logs it unescaped: a local node can write a line of its own into the router's journal
 
 - **Why:** the router checks no length or characters in a HELLO's name (`normalize_name` in
   `src/router/mod.rs` only appends `@<hive>`), and several of its lines print the name with `%`,
@@ -4868,6 +4876,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Proposed: (b).
 - **IO.cloud's `op`** stays for IO.cloud's next change, or (b) above: the router's release goes
   alone (METHOD §9).
+- **Validated on 8.x (0.1.140's gate, gate0240, 2026-11-13; the probe
+  `scratchpad/gate-tools/gate0240_hello_probe.py` and `r140_gate.py`, git-ignored; 50 PASS, no
+  model call):**
+  - **The baseline on 0.1.139 (14:33 to 14:35Z):** no node name on any hive's router since its
+    start, and none in any node list, broke the rule (so the deploy would refuse no live node). On
+    worker1 the name `IO.gate0240\n<marker>` was announced and registered, its newline opening 3
+    lines of the probe's marker in rt-gateway's journal (*loading config snapshot*, *vpn
+    assigned*, *node registered*); a HELLO frame naming an unknown variant opened 1 on each local
+    socket (*node connection error*, *peer connection error*); 0 refusals; the 257-byte name
+    printed whole twice before the node table refused it (`value_too_long` 1).
+  - **The deploy (15:13:32Z mark, 308 s):** rt-gateway started once on every hive; no HELLO
+    refused, no connection error; every node list as before it (17, 10, 5 and 4 names); every name
+    registered since is an L2 name.
+  - **The 9 cases on worker1 and the motherbee (15:20Z):** the valid name and a 256-byte name
+    announced; a newline, 257 bytes, an empty name and two `@` refused at HELLO in 1.1 to 3.0 ms
+    (no ANNOUNCE, the connection closed), each refusal showing the name escaped and the long one
+    cut; the `RT.` rule still applied; the frame variant refused on both sockets with its error
+    escaped; 0 forged lines; the two announced probes disconnected; no probe left in any node
+    list; health clean.
+  - **Still open:** the operator's call (b) (the Rust SDK's logging, every Rust binary,
+    IO.cloud's `op` among them) ships with 0.1.143.
 
 ### A-268 [General/router] ✅ BUILT (0.1.135, 2026-11-11; its race by its unit test, no live trigger; A-265's check unchanged on 8.x, three runs: a new node on worker1 reached by name from ingress1 0.05 s, 0.15 s and 0.14 s after its connect, 0.33 s on 0.1.132) (found 2026-11-11 by the review of the router's 0.1.132; read in the code; there before it) — Two FIB builds at once can store the older one last
 
