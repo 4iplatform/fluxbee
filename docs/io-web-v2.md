@@ -8,8 +8,10 @@
     0.1.84);
   - release 0.1.85, the proxy and io.web, is validated on 8.x (2026-10-24; ledger 0.1.85):
     `https://archi.<id>/` serves io.web's page through the edge.
-- Next is stage 2 (§11.3: sessions, Cloud's one-time code, Archi behind io.web). It waits for
-  the operator's definition of its security.
+- Next is stage 2, **redefined with the operator on 2026-11-13 (§12)**: io.web as a transparent
+  reverse proxy for exposures that Cloud publishes and enables through io.cloud, each with its own
+  host, its sessions minted from a one-time link, and enablements that expire. §12 supersedes §10's
+  open questions and §9's step 2.
 - FINDINGS A-89 and A-90, the proxy's and io.web's limits under load, are live since 0.1.99
   (2026-11-04, checked on 8.x):
   io.web's handshakes have slots of their own, and the proxy gives each client a share, has
@@ -471,3 +473,111 @@ These come from the security review:
 - proxy logs carry paths without their query, so the exchange code never reaches a journal;
 - io.web answers 401 from the headers before reading any body;
 - large bodies only on upload paths, counted on the bytes streamed.
+
+---
+
+## 12. Stage 2 redefined (the operator, 2026-11-13): exposures through io.web
+
+The operator's words are quoted in Spanish; everything else is the decision as agreed in that
+conversation. The code was read first: §12.1 is what exists today.
+
+### 12.1 What exists (read in the code, 2026-11-13)
+
+- **The pipe is built and secure** (0.1.84–0.1.85, its limits 0.1.99):
+  - the edge terminates TLS with ACME certificates per host and routes by host;
+  - it connects to one fixed upstream only, io.web on the motherbee's port 9200, over mutual TLS;
+  - io.web admits only the mesh certificate of a connected ingress, re-checked during the
+    connection;
+  - the edge rebuilds the framing, strips the hop-by-hop headers both ways, sets the forwarding
+    headers itself (never the client's), and drops the method overrides and URL-rewrite headers;
+  - it paces slow clients and gives each client a share.
+- **The forwarding is not built.**
+  - The edge's web surface takes GET and HEAD only, with no body and no upgrade (no WebSockets),
+    HTTP/1 only (`web_policy_refusal`, `serve_http` in `src/bin/sy_edge.rs`).
+  - io.web reads no request body and forwards nothing: it serves its own placeholder page
+    (`respond` in `nodes/io/io-web/src/web.rs`). Archi is not behind it yet.
+
+### 12.2 The model
+
+- **io.cloud is the root door** into the hive, its token set by hand. *"Esa primera entrada da la
+  capacidad de exponer lo demás"*: every exposure is asked for by Fluxbee Cloud only, through the
+  edge and io.cloud to SY.admin, the standard path of Cloud's commands. Nothing else may ask for
+  one (*"el pedido de exteriorizar viene por io.cloud solamente"*).
+- **An exposure is one external URL on a host of its own, mapped to one internal upstream**, as a
+  reverse proxy (*"io.web expone 1 url externo con uno interno"*). The upstream is fixed when the
+  exposure is published and never comes from a request.
+- **The upstreams allowed:**
+  - Archi, always on the motherbee (the designed exception);
+  - a third-party system in the infrastructure or on the same network: a hive by name (resolved
+    to its internal address from the registry) or an internal address, and a port. Its own
+    website, its JavaScript and its own API if it has one.
+- **Never a Fluxbee service** (*"lo que no quería era un backdoor con un nodo hecho e instalado
+  para Fluxbee"*): no exposure targets SY.admin, the router, identity, Syncthing, io.web itself or
+  any managed node. Fluxbee's own functions always enter through an io.* node.
+- **io.web runs on the motherbee and is the only hop from the DMZ inward.** It opens the
+  connection to the upstream. An exposed service listens on the internal network and should have
+  its own authentication, since it is reachable there without the proxy.
+- **No third-party proxy product.** The pipe stays on hyper and rustls, as built; Pingora, a
+  library, stays an option inside io.web if balancing, caching or retries are ever needed.
+
+### 12.3 Access: publish, enable, sessions
+
+- **Publish and enable are two steps** (*"no quede el url abierto para siempre con el mismo
+  token"*).
+  - Publishing creates the exposure, its host and its upstream, closed.
+  - Enabling opens it for a window. Cloud asks for it through io.cloud, with the duration it
+    chooses, capped at 8 hours and renewable.
+  - Cloud may close it at any time (*"para ver si le baja o no el website al cliente"*). An
+    enablement that ends without renewal closes the exposure by itself.
+- **Each enablement mints a new secret,** the one that signs the exposure's sessions. Rotation is
+  implicit; nobody rotates by hand as in v1 (*"tampoco quiero andar rotando como v1"*).
+- **The way in:**
+  - while the exposure is enabled, Cloud asks, through io.cloud, for a one-time access link:
+    about 120 s, single use, bound to the exposure's host, logged;
+  - the browser opens it, and io.web sets a session cookie for that host;
+  - the session ends after 30 minutes idle, and at the end of the enablement at most.
+- **Archi is used only from inside Cloud** (*"archi se usa sólo dentro del cloud"*).
+  - Stage 2a: Cloud opens Archi in its own tab. The cookie is a host-only `__Host-` cookie,
+    `Secure`, `HttpOnly`, `SameSite=Strict`, with §11.3's points.
+  - Stage 2b: Cloud embeds Archi in its iframe (*"fluxbee cloud ahora es iframe"*). The same
+    server-side session travels in a partitioned cookie (`SameSite=None; Partitioned`), with
+    `frame-ancestors` limited to Cloud's origin and the request's Origin checked. The session lives
+    in io.web and the cookie only carries it, so 2b changes no more of io.web (*"que la evolución de
+    cookie a otra cosa sea fácil, no rehacer el io.web"*). Each browser's support of partitioned
+    cookies is checked at 2b.
+
+### 12.4 A transparent proxy, and a grade A
+
+- **Every method with its body**, streaming both ways: forms, uploads (Archi takes up to 128 MiB),
+  server-sent events, WebSockets, long-lived connections; limits and timeouts per exposure.
+- **The forwarding headers** set by the edge only: `X-Forwarded-For`, `X-Forwarded-Proto`,
+  `X-Forwarded-Host`, `Forwarded`; never the client's (as built).
+- **The response headers** for a grade A on the usual scans (SSL Labs, Mozilla Observatory,
+  securityheaders): `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy`, `Permissions-Policy`, `Content-Security-Policy` with `frame-ancestors`; the
+  ones that leak, such as `Server` and `X-Powered-By`, removed. TLS 1.2 and 1.3 only, with strong
+  ciphers (*"recordar que tenga los X- necesarios ... para que el website no sea considerado
+  clase C"*).
+
+### 12.5 Open for the build
+
+- Each exposure's host needs a DNS record and a certificate: the certificate from SY.admin's ACME
+  client, as for `archi.<id>`. The DNS record by hand per host (D12), or one wildcard DNS record for
+  the hive's names (a DNS record, not a wildcard certificate): the operator's call when the first
+  third-party exposure comes.
+- How a third-party upstream is declared (a hive and a port, or an internal address and a port)
+  and the list of Fluxbee's own ports refused.
+- The operator without Cloud (§10, question 3) stays as today: the motherbee or an SSH tunnel.
+
+### 12.6 The build, from the outside in
+
+1. **Exposures and access:** SY.admin's actions, from io.cloud only (publish, enable with its
+   duration, disable, the one-time link) and Cloud's catalog; the edge's routes per exposure host
+   and their certificates; io.web's sessions (the link redeemed, the cookie, idle and enablement
+   expiry, the per-enablement secret in the vault). Behind it, io.web's placeholder page still.
+2. **The transparent proxy:** io.web forwards to the exposure's upstream; the edge takes every
+   method, bodies and upgrades on an exposure with a valid session; the response headers of §12.4.
+   Archi in its own tab (2a).
+3. **The iframe** (2b), when Cloud needs Archi inside its page.
+
+Each with its review and its gate on 8.x.
