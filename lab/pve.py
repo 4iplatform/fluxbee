@@ -85,8 +85,11 @@ def api(method, path, data=None, timeout=30, quiet_errors=False):
             if quiet_errors:
                 raise
             sys.exit("API %s %s -> HTTP %s: %s" % (method, path, e.code, e.read().decode("utf-8", "replace")))
-        except (ConnectionResetError, urllib.error.URLError) as e:
-            dropped = isinstance(e, ConnectionResetError) or isinstance(getattr(e, "reason", None), ConnectionResetError)
+        except (ConnectionResetError, ssl.SSLEOFError, urllib.error.URLError) as e:
+            # A TLS EOF is pveproxy closing the connection as well (0.1.139's gate, 2026-11-13: "[SSL:
+            # UNEXPECTED_EOF_WHILE_READING]" on a GET exec-status, inside a URLError): a GET is retried.
+            dropped_types = (ConnectionResetError, ssl.SSLEOFError)
+            dropped = isinstance(e, dropped_types) or isinstance(getattr(e, "reason", None), dropped_types)
             if dropped and attempt + 1 < attempts:
                 time.sleep(1 + attempt)
                 continue
