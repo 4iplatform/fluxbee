@@ -14,7 +14,9 @@
 //! - it relays the bounded Cloud set (`fluxbee_sdk::cloud::CLOUD_OP_ACTIONS`) to `SY.admin` and
 //!   answers the identity reads in `CLOUD_LOCAL_OPS` itself;
 //! - every op on a tenant acts on the tenant at the envelope root, never the root tenant
-//!   (`claimed_tenant`), and SY.admin re-checks that server-side.
+//!   (`claimed_tenant`), and SY.admin re-checks that server-side;
+//! - the exposure ops act on the installation and refuse an envelope tenant (`refuse_tenant`,
+//!   docs/io-web-v2-stage-2-1.md §5.3).
 //!
 //! # Configuration: managed CONFIG plane, NOT env
 //!
@@ -57,9 +59,10 @@ use fluxbee_sdk::node_config::NodeConfigSetPayload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, MSG_NODE_STATUS_GET,
     MSG_NODE_STATUS_GET_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    WEB_EXPOSURE_ID_PREFIX,
 };
 use fluxbee_sdk::rpc::AdminCommandRequest;
-use fluxbee_sdk::vault::is_cloud_reserved_vault_key;
+use fluxbee_sdk::vault::{is_cloud_reserved_vault_key, CLOUD_RESERVED_VAULT_KEY_PREFIXES};
 use fluxbee_sdk::{
     managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
     PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
@@ -557,6 +560,8 @@ async fn run_loop(
         // Egress/outcome line — the half the ingress log was missing. Every Cloud op now logs its
         // result (status, error, the id it touched, elapsed) at INFO, keyed by the SAME trace_id, so
         // the whole round-trip is greppable end-to-end (family tracing convention, cf. SY.identity).
+        // It reads named fields only, never the result itself: a link's answer carries a one-time
+        // code that no log may hold (docs/io-web-v2-stage-2-1.md §3.2).
         // NOTE: inside `tracing::*!`, a bare `Value` resolves to `tracing::Value` (a trait), so use
         // closures rather than `Value::as_str` for the serde_json reads here.
         tracing::info!(
@@ -1088,6 +1093,64 @@ fn tenant_in_params(request: &Value) -> bool {
         .is_some()
 }
 
+/// The envelope's `tenant_id` as the translation reads it: absent or null is none, a string goes
+/// as sent, and anything else as its JSON text. A malformed tenant is then refused, as not
+/// canonical (`require_tenant_id`) or as one an op takes none of (`refuse_tenant`), never read as
+/// absent.
+fn envelope_tenant(request: &Value) -> Option<String> {
+    match request.get("tenant_id")? {
+        Value::Null => None,
+        Value::String(tenant) => Some(tenant.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// The exposure ops act on the installation (docs/io-web-v2-stage-2-1.md §5.3): an envelope
+/// tenant, any one, is refused rather than ignored, so a client that sends one finds out.
+fn refuse_tenant(tenant_id: Option<&str>, op: &str) -> Result<(), Value> {
+    match tenant_id {
+        Some(_) => Err(cloud_error(&format!(
+            "{op} takes no tenant_id: an exposure is the installation's, not a tenant's"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `params.exposure_id`, canonical `exp:<uuid>`: the hyphenated lowercase spelling SY.admin mints
+/// (docs/io-web-v2-stage-2-1.md §2.1). Another spelling names no exposure, and SY.admin would
+/// answer it `EXPOSURE_NOT_FOUND`, which after an unpublish means done (§6).
+fn require_exposure_id(params: &Value, op: &str) -> Result<String, Value> {
+    let exposure_id = required_string(params, "exposure_id")?;
+    let canonical = exposure_id
+        .strip_prefix(WEB_EXPOSURE_ID_PREFIX)
+        .and_then(|raw| {
+            Uuid::parse_str(raw)
+                .ok()
+                .filter(|uuid| uuid.to_string() == raw)
+        })
+        .is_some();
+    if !canonical {
+        return Err(cloud_error(&format!(
+            "{op} requires params.exposure_id as exp:<uuid>, as publish_exposure answered it"
+        )));
+    }
+    Ok(exposure_id)
+}
+
+/// The refusal of a reserved infrastructure key by `put_token`, `assign_token` or `delete_token`.
+/// It names the namespaces from the SDK's list, the one `is_cloud_reserved_vault_key` checks, so
+/// the text names every key the check refuses (docs/io-cloud-api.md §5.3).
+fn reserved_vault_key_refusal(op: &str, verb: &str) -> Value {
+    let reserved = CLOUD_RESERVED_VAULT_KEY_PREFIXES
+        .iter()
+        .map(|prefix| format!("{prefix}*"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    cloud_error(&format!(
+        "{op} may not {verb} a reserved infrastructure key ({reserved})"
+    ))
+}
+
 fn copy_optional_field(
     src: &serde_json::Value,
     dst: &mut serde_json::Map<String, serde_json::Value>,
@@ -1161,8 +1224,9 @@ fn split_nodes(
 }
 
 /// Pure translation of a Cloud op into the admin `(action, params)`, injecting the tenant claim.
-/// Returns `Err(error_payload)` for a missing/unknown op or a missing tenant. Kept pure (no admin
-/// call) so it is unit-testable; the op→action pairs are pinned to the shared source
+/// Returns `Err(error_payload)` for a missing/unknown op, a missing tenant, or a tenant on an op
+/// that takes none (the exposures', `refuse_tenant`). Kept pure (no admin call) so it is
+/// unit-testable; the op→action pairs are pinned to the shared source
 /// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (which SY.admin's relay allowlist also derives from) by
 /// `translate_cloud_op_actions_match_the_shared_sdk_vocabulary`.
 fn translate_cloud_op(
@@ -1192,13 +1256,11 @@ fn translate_cloud_op(
         "put_token" => {
             let tenant_id = claimed_tenant(tenant_id, "put_token")?;
             let key = required_string(params, "key")?;
-            // put_token stores PROVIDER tokens; the keys that protect the mesh itself (endpoint
-            // bearers, edge TLS, spoke recovery keys) are reserved for SY.* internals. Reject early
+            // put_token stores PROVIDER tokens; the keys that protect the mesh itself
+            // (CLOUD_RESERVED_VAULT_KEY_PREFIXES) are reserved for SY.* internals. Reject early
             // with a clear error — SY.admin re-enforces this server-side (single source in the SDK).
             if is_cloud_reserved_vault_key(&key) {
-                return Err(cloud_error(
-                    "put_token may not write a reserved infrastructure key (edge_channel_secret:*, edge_tls*, ssh:*, edge_fanout_verify:*)",
-                ));
+                return Err(reserved_vault_key_refusal(op, "write"));
             }
             let value = params
                 .get("value")
@@ -1272,9 +1334,7 @@ fn translate_cloud_op(
             let tenant_id = claimed_tenant(tenant_id, "assign_token")?;
             let key = required_string(params, "key")?;
             if is_cloud_reserved_vault_key(&key) {
-                return Err(cloud_error(
-                    "assign_token may not touch a reserved infrastructure key (edge_channel_secret:*, edge_tls*, ssh:*, edge_fanout_verify:*)",
-                ));
+                return Err(reserved_vault_key_refusal(op, "touch"));
             }
             // A list, always: a missing or null one must never unassign everything by accident.
             if !params.get("nodes").is_some_and(Value::is_array) {
@@ -1420,9 +1480,7 @@ fn translate_cloud_op(
             let tenant_id = claimed_tenant(tenant_id, op)?;
             let key = required_string(params, "key")?;
             if is_cloud_reserved_vault_key(&key) {
-                return Err(cloud_error(
-                    "delete_token may not delete a reserved infrastructure key (edge_channel_secret:*, edge_tls*, ssh:*, edge_fanout_verify:*)",
-                ));
+                return Err(reserved_vault_key_refusal(op, "delete"));
             }
             Ok((
                 "vault_delete",
@@ -1593,6 +1651,61 @@ fn translate_cloud_op(
             }
             Ok(("get_llm_usage", Value::Object(query)))
         }
+        // The hive's web exposures (docs/io-web-v2-stage-2-1.md §5.1, §5.3): each op relays to the
+        // action of its own name with its own fields only, and refuses an envelope tenant. SY.admin
+        // checks the values (the label's rules, the upstream, the duration's range) and answers
+        // the codes of §6.
+        "publish_exposure" => {
+            refuse_tenant(tenant_id, op)?;
+            // Taken as given, never trimmed or folded (§2.1): SY.admin refuses one that is not a
+            // DNS label.
+            let label = params
+                .get("label")
+                .and_then(Value::as_str)
+                .ok_or_else(|| cloud_error("publish_exposure requires params.label, a string"))?;
+            // Its kind and fields are SY.admin's to check (§2.2).
+            let upstream = params
+                .get("upstream")
+                .filter(|upstream| upstream.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    cloud_error("publish_exposure requires params.upstream, an object")
+                })?;
+            Ok((
+                "publish_exposure",
+                json!({ "label": label, "upstream": upstream }),
+            ))
+        }
+        "enable_exposure" => {
+            refuse_tenant(tenant_id, op)?;
+            let exposure_id = require_exposure_id(params, op)?;
+            let duration_s = params
+                .get("duration_s")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    cloud_error(
+                        "enable_exposure requires params.duration_s, a whole number of seconds",
+                    )
+                })?;
+            Ok((
+                "enable_exposure",
+                json!({ "exposure_id": exposure_id, "duration_s": duration_s }),
+            ))
+        }
+        "disable_exposure" | "unpublish_exposure" | "issue_exposure_link" => {
+            refuse_tenant(tenant_id, op)?;
+            let exposure_id = require_exposure_id(params, op)?;
+            let action = match op {
+                "disable_exposure" => "disable_exposure",
+                "unpublish_exposure" => "unpublish_exposure",
+                _ => "issue_exposure_link",
+            };
+            Ok((action, json!({ "exposure_id": exposure_id })))
+        }
+        "list_exposures" => {
+            refuse_tenant(tenant_id, op)?;
+            Ok(("list_exposures", json!({})))
+        }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
     }
@@ -1614,7 +1727,8 @@ async fn dispatch_cloud_op(
     request: &serde_json::Value,
 ) -> serde_json::Value {
     let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    let tenant_id = request.get("tenant_id").and_then(|v| v.as_str());
+    let tenant_id = envelope_tenant(request);
+    let tenant_id = tenant_id.as_deref();
     let mut params = request.get("params").cloned().unwrap_or_else(|| json!({}));
 
     // get_ilk_details accepts an email selector: pre-resolve email -> canonical ilk_id from the
@@ -1686,7 +1800,9 @@ async fn dispatch_cloud_op(
             params: admin_params,
             request_id,
             // Launching a node, tearing one down and reading the usage records (SY.admin waits up to
-            // 20 s for SY.storage) take the longest; all stay under the edge's 30 s.
+            // 20 s for SY.storage) take the longest; all stay under the edge's 30 s. An exposure op
+            // takes about 15 s at most, a link that finds io.web's set older: three calls of 5 s
+            // (docs/io-web-v2-stage-2-1.md §5.1).
             timeout: Duration::from_secs(match action {
                 "run_node" | "kill_node" | "get_llm_usage" => 25,
                 _ => 20,
@@ -2657,6 +2773,19 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
 
+    /// The exposure ops (docs/io-web-v2-stage-2-1.md §5.3), each relayed to the action of its own
+    /// name, with no tenant.
+    const EXPOSURE_OPS: [&str; 6] = [
+        "publish_exposure",
+        "enable_exposure",
+        "disable_exposure",
+        "unpublish_exposure",
+        "issue_exposure_link",
+        "list_exposures",
+    ];
+    /// An exposure id as SY.admin mints it, `exp:<uuid v4>`.
+    const EXPOSURE_ID: &str = "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
     #[test]
     fn translate_cloud_op_actions_match_the_shared_sdk_vocabulary() {
         // FIX-12: io.cloud's op→action translation must agree with the single source in
@@ -2674,6 +2803,8 @@ mod tests {
             "node_name": "IO.wapp@motherbee",
             "ilk_id": "ilk:22222222-2222-4222-8222-222222222222",
             "nodes": [],
+            "label": "shop", "upstream": {"kind": "archi"},
+            "exposure_id": EXPOSURE_ID, "duration_s": 600,
         });
         for (op, expected_action) in CLOUD_OP_ACTIONS {
             let op_params = match *op {
@@ -2681,7 +2812,9 @@ mod tests {
                 "get_usage" => json!({"since": "2026-10-01T00:00:00Z"}),
                 _ => params.clone(),
             };
-            let (action, _) = translate_cloud_op(op, Some(tenant), &op_params)
+            // An exposure is the installation's: its ops refuse a tenant (docs/io-cloud-api.md §5.8).
+            let claimed = (!EXPOSURE_OPS.contains(op)).then_some(tenant);
+            let (action, _) = translate_cloud_op(op, claimed, &op_params)
                 .unwrap_or_else(|e| panic!("op {op} should translate: {e:?}"));
             assert_eq!(&action, expected_action, "op {op} action drift");
             assert_eq!(admin_action_for_cloud_op(op), Some(action));
@@ -3576,6 +3709,203 @@ mod tests {
         assert_eq!(action, "vault_put");
     }
 
+    /// Each op that refuses a reserved key names every namespace the SDK reserves, read from the
+    /// SDK's own list, the one the check reads (docs/io-cloud-api.md §5.3).
+    #[test]
+    fn reserved_key_refusals_name_every_reserved_prefix() {
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        for prefix in CLOUD_RESERVED_VAULT_KEY_PREFIXES {
+            let key = format!("{prefix}x");
+            for (op, params) in [
+                (
+                    "put_token",
+                    json!({"key": key, "value": {"secret": "x"}, "resource_type": "bearer_token"}),
+                ),
+                ("assign_token", json!({"key": key, "nodes": []})),
+                ("delete_token", json!({"key": key})),
+            ] {
+                let err = translate_cloud_op(op, Some(tenant), &params).unwrap_err();
+                assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {key}");
+                let detail = err["error_detail"].as_str().unwrap_or_default();
+                assert!(
+                    detail.starts_with(op) && detail.contains("reserved infrastructure key"),
+                    "{op} {key}: {detail}"
+                );
+                for named in CLOUD_RESERVED_VAULT_KEY_PREFIXES {
+                    assert!(
+                        detail.contains(&format!("{named}*")),
+                        "{op}'s refusal of {key} names {named}*: {detail}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// io.web's stage 2.1 (docs/io-web-v2-stage-2-1.md §5.3): each exposure op relays to the action
+    /// of its own name with its own fields only, dropping the rest as the other relay ops do, and
+    /// refuses an envelope tenant, whichever, rather than ignore it. SY.admin checks the values.
+    #[test]
+    fn translate_exposure_ops_copy_only_their_fields_and_refuse_a_tenant() {
+        let own_fields = |op: &str| match op {
+            "publish_exposure" => json!({
+                "label": "shop",
+                "upstream": {"kind": "hive", "hive": "worker1", "port": 8080},
+            }),
+            "enable_exposure" => json!({"exposure_id": EXPOSURE_ID, "duration_s": 600}),
+            "list_exposures" => json!({}),
+            _ => json!({"exposure_id": EXPOSURE_ID}),
+        };
+        for op in EXPOSURE_OPS {
+            let own = own_fields(op);
+            // Fields the op does not take, other exposure ops' among them, are dropped.
+            let mut sent = json!({
+                "name": "acme", "key": "k", "node_name": "IO.x@motherbee", "until": 1,
+                "slot": "a", "enablement_id": "enb:x", "label": "other",
+                "upstream": {"kind": "archi"}, "exposure_id": EXPOSURE_ID, "duration_s": 5,
+            });
+            for (field, value) in own.as_object().unwrap() {
+                sent[field] = value.clone();
+            }
+            assert_eq!(
+                translate_cloud_op(op, None, &sent).unwrap(),
+                (op, own.clone()),
+                "{op} relays its own fields only"
+            );
+            // Any envelope tenant is refused: a tenant's, the root one, an empty one, or a
+            // malformed one, which `envelope_tenant` reads as its JSON text.
+            for tenant in [
+                "tnt:11111111-1111-4111-8111-111111111111",
+                fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+                "",
+                "5",
+            ] {
+                let err = translate_cloud_op(op, Some(tenant), &own).unwrap_err();
+                assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {tenant:?}");
+                assert_eq!(
+                    err["error_detail"],
+                    format!(
+                        "{op} takes no tenant_id: an exposure is the installation's, not a tenant's"
+                    )
+                );
+            }
+            // The hive's answer reaches Cloud untouched, a link's url included.
+            let answer = json!({
+                "exposure_id": EXPOSURE_ID,
+                "url": "https://shop.hive-k3m9x7q2.fluxbee.ai/.fluxbee/enter?code=L1.x",
+                "expires_at": 1_763_121_720u64, "link_id": "0123456789abcdef",
+            });
+            assert_eq!(cloud_view(op, answer.clone()), answer, "{op}");
+        }
+        // The label goes as given, never trimmed or folded, and the upstream as sent, whatever it
+        // holds: SY.admin refuses a label that is not a DNS label (§2.1) and checks the upstream
+        // (§2.2).
+        for label in ["Shop", " shop", ""] {
+            let (_, relayed) = translate_cloud_op(
+                "publish_exposure",
+                None,
+                &json!({"label": label, "upstream": {"kind": "archi"}}),
+            )
+            .unwrap();
+            assert_eq!(relayed["label"], label);
+        }
+        let refused_upstream =
+            json!({"kind": "address", "address": "127.0.0.1", "port": 22, "x": 1});
+        let (_, relayed) = translate_cloud_op(
+            "publish_exposure",
+            None,
+            &json!({"label": "shop", "upstream": refused_upstream}),
+        )
+        .unwrap();
+        assert_eq!(relayed["upstream"], refused_upstream);
+        // A field missing, or of another type, is refused.
+        for (op, bad) in [
+            ("publish_exposure", json!({"upstream": {"kind": "archi"}})),
+            (
+                "publish_exposure",
+                json!({"label": 5, "upstream": {"kind": "archi"}}),
+            ),
+            ("publish_exposure", json!({"label": "shop"})),
+            (
+                "publish_exposure",
+                json!({"label": "shop", "upstream": "archi"}),
+            ),
+            (
+                "publish_exposure",
+                json!({"label": "shop", "upstream": null}),
+            ),
+            ("enable_exposure", json!({"exposure_id": EXPOSURE_ID})),
+            (
+                "enable_exposure",
+                json!({"exposure_id": EXPOSURE_ID, "duration_s": "600"}),
+            ),
+            (
+                "enable_exposure",
+                json!({"exposure_id": EXPOSURE_ID, "duration_s": -1}),
+            ),
+            (
+                "enable_exposure",
+                json!({"exposure_id": EXPOSURE_ID, "duration_s": 600.5}),
+            ),
+            ("enable_exposure", json!({"duration_s": 600})),
+        ] {
+            let err = translate_cloud_op(op, None, &bad).unwrap_err();
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {bad}");
+        }
+        // The id as SY.admin mints it, and no other spelling: another names no exposure.
+        for op in [
+            "enable_exposure",
+            "disable_exposure",
+            "unpublish_exposure",
+            "issue_exposure_link",
+        ] {
+            for id in [
+                json!(null),
+                json!(5),
+                json!("shop"),
+                json!("6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"),
+                json!("exp:6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B"),
+                json!("exp:{6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b}"),
+                json!("exp:6f1c2a3b4d5e4f608a7b9c0d1e2f3a4b"),
+                json!("enb:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"),
+            ] {
+                let err =
+                    translate_cloud_op(op, None, &json!({"exposure_id": id, "duration_s": 600}))
+                        .unwrap_err();
+                assert_eq!(err["error_code"], "INVALID_REQUEST", "{op} {id}");
+            }
+        }
+    }
+
+    /// The envelope's tenant is read by its presence (`envelope_tenant`): a malformed one is
+    /// refused, never read as absent. An exposure op refuses it; a tenant op finds it missing or
+    /// not canonical.
+    #[test]
+    fn a_malformed_envelope_tenant_is_refused_never_read_as_absent() {
+        assert_eq!(envelope_tenant(&json!({"op": "list_exposures"})), None);
+        assert_eq!(envelope_tenant(&json!({"tenant_id": null})), None);
+        assert_eq!(
+            envelope_tenant(&json!({"tenant_id": "tnt:a"})).as_deref(),
+            Some("tnt:a")
+        );
+        for malformed in [
+            json!(5),
+            json!({"tenant_id": "tnt:a"}),
+            json!(["tnt:a"]),
+            json!(true),
+            json!(""),
+        ] {
+            let tenant = envelope_tenant(&json!({"op": "x", "tenant_id": malformed}));
+            assert!(tenant.is_some(), "{malformed}");
+            assert!(
+                translate_cloud_op("list_exposures", tenant.as_deref(), &json!({})).is_err(),
+                "{malformed}"
+            );
+            let err =
+                translate_cloud_op("delete_tenant", tenant.as_deref(), &json!({})).unwrap_err();
+            assert_eq!(err["error_code"], "INVALID_REQUEST", "{malformed}");
+        }
+    }
+
     #[test]
     fn cloud_message_requires_edge_origin_and_own_ich() {
         let mut msg = Message {
@@ -4354,5 +4684,81 @@ mod tests {
         let bare = frontdesk_error_reply(TEST_TEMP_ILK, &bare);
         assert_eq!(bare["error_detail"], "the frontdesk answered with an error");
         assert_eq!(bare["ilk_id"], TEST_TEMP_ILK);
+    }
+
+    /// `issue_exposure_link` through the relay, the test playing SY.admin (docs/io-cloud-api.md
+    /// §5.8): one command, the action of the op's own name with its own fields, on the motherbee;
+    /// the hive's answer reaches Cloud untouched, its url included; an error comes back as its code
+    /// and text, so Cloud matches on the code.
+    #[tokio::test]
+    async fn an_exposure_op_relays_its_own_fields_and_the_hive_s_answer() {
+        let link = json!({
+            "exposure_id": EXPOSURE_ID,
+            "url": "https://shop.hive-k3m9x7q2.fluxbee.ai/.fluxbee/enter?code=L1.x",
+            "expires_at": 1_763_121_720u64, "link_id": "0123456789abcdef",
+        });
+        let unavailable = json!({
+            "status": "error", "action": "issue_exposure_link", "request_id": "req-link",
+            "payload": {"retryable": true}, "error_code": "IO_WEB_UNAVAILABLE",
+            "error_detail": "io.web did not answer",
+        });
+        for (answer, cloud_sees) in [
+            (
+                json!({"status": "ok", "action": "issue_exposure_link", "request_id": "req-link",
+                       "payload": link}),
+                json!({"status": "ok", "op": "issue_exposure_link", "request_id": "req-link",
+                       "result": link}),
+            ),
+            (
+                unavailable,
+                json!({"status": "error", "op": "issue_exposure_link", "request_id": "req-link",
+                       "error_code": "IO_WEB_UNAVAILABLE", "error_detail": "io.web did not answer"}),
+            ),
+        ] {
+            let (state, mut router) = io_cloud_on_a_test_router();
+            let request = json!({
+                "op": "issue_exposure_link", "request_id": "req-link",
+                "params": {"exposure_id": EXPOSURE_ID, "duration_s": 600},
+            });
+            let admin = async {
+                let command = router
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("io.cloud asks SY.admin");
+                assert_eq!(
+                    command.meta.msg.as_deref(),
+                    Some(fluxbee_sdk::MSG_ADMIN_COMMAND)
+                );
+                assert!(matches!(
+                    &command.routing.dst,
+                    Destination::Unicast(target) if target == "SY.admin@motherbee"
+                ));
+                assert_eq!(command.payload["action"], "issue_exposure_link");
+                assert_eq!(command.payload["target"], "motherbee");
+                assert_eq!(
+                    command.payload["params"],
+                    json!({"exposure_id": EXPOSURE_ID})
+                );
+                router
+                    .inject(answer_to(
+                        &command,
+                        fluxbee_sdk::ADMIN_KIND,
+                        Some(fluxbee_sdk::MSG_ADMIN_COMMAND_RESPONSE),
+                        answer,
+                    ))
+                    .await
+                    .expect("SY.admin answers");
+            };
+            let (seen, ()) = tokio::join!(
+                dispatch_cloud_op(
+                    &state.dispatcher,
+                    &state.config.admin_target,
+                    &state.config.hive_id,
+                    &request
+                ),
+                admin
+            );
+            assert_eq!(seen, cloud_sees);
+        }
     }
 }
