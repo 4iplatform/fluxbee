@@ -381,7 +381,7 @@ no change required
     item (`coa/gosdk-141`); A-339 is the AI SDK's item (*an AI node answers a `NOT_TAKEN` with
     `unknown_system_msg`*), written A-335 on `coa/aisdk-142` and `coa/rustsdk-143`, to rename at
     their integration. A-348 is `coa/admin-144`'s [Archi] item (Archi's SCMD of
-    `set_node_config`'s route). The next new number is A-349.
+    `set_node_config`'s route). The next new number is A-350.
     **0.1.139's deploy:** the motherbee ran it before the workers did, and until every hive's core
     ran 0.1.139 no runtime version was removed and no workflow deployed or deleted (their purges
     remove versions): a worker on 0.1.138 listed no `RELAUNCH_DUE` node (A-300), so a version a
@@ -461,6 +461,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
+- A-349 🔵 Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns, `put_token`'s credential values among them (medium; the router; found by io.web stage 2.1's design; the operator's call of 2026-11-13: fixed in stage 2.1's router release, R2).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
@@ -1589,6 +1590,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-349 [General/router] 🔵 medium (found 2026-11-13 by io.web stage 2.1's build design; read in the code; there since Cloud's channel) — Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns: `put_token`'s credential values at rest today
+
+- **Why:** Cloud's traffic rides the `user` message family (the edge's message, `src/bin/sy_edge.rs`
+  ~5446; SY.admin ~8706; io.cloud `nodes/io/io-cloud/src/main.rs` ~115, ~587). A router copies every
+  `user` message a node sends to its stream, whole (`src/router/mod.rs` ~886-889, ~7752-7759,
+  ~7794-7796; `crates/fluxbee_sdk/src/protocol.rs` ~608-610), and SY.storage keeps the payload in
+  `turns` (`src/bin/sy_storage.rs` ~2052), the ingress' stream included (~2913-2915).
+- **Effect:** the credential values Cloud loads with `put_token` (a tenant's provider keys) are
+  stored at rest in SY.storage's `turns`; io.web's one-time access links would be too, from stage
+  2.1 on (single use, 120 s, bound to their host).
+- **The operator's call (2026-11-13):** *"los pedidos de Cloud viajan como mensajes"*: fix it in the
+  router's release of io.web's stage 2.1 (R2, docs/io-web-v2-stage-2-1.md): no turn for Cloud's
+  channel. What is stored already stays until the operator decides whether to scrub it.
 
 ### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
 

@@ -580,4 +580,7 @@ conversation. The code was read first: §12.1 is what exists today.
    Archi in its own tab (2a).
 3. **The iframe** (2b), when Cloud needs Archi inside its page.
 
-Each with its review and its gate on 8.x.
+Each with its review and its gate on 8.x. Stage 2.1's build design, with the operator's decisions
+of 2026-11-13: [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md). It corrects §12.1 and §12.2 where the
+code differs: one certificate serves every host, a name per host; an exposure's host is
+`<label>.<main host>`; Cloud-only needs a new rule, since Archi reaches every listed action today.
