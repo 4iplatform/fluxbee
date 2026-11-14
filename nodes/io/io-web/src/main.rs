@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! `IO.web` is the motherbee's web node behind the edge (docs/io-web-v2.md §11.2 item 3; the
-//! operator's page is docs/io/io-web.md).
+//! `IO.web` is the motherbee's web node behind the edge (docs/io-web-v2.md §11.2 item 3, §12;
+//! docs/io-web-v2-stage-2-1.md; the operator's page is docs/io/io-web.md).
 //!
-//! The edge on the ingress proxies each web host (`archi.<id>`) to it over the mesh's mutual TLS,
-//! on `fluxbee_sdk::mesh::IO_WEB_PORT`. In stage 1 it serves one static page and `/healthz`
-//! (`web`); the sessions, and Archi behind them, come in stage 2 (§11.3).
+//! The edge on the ingress proxies each exposure's host to it over the mesh's mutual TLS, on
+//! `fluxbee_sdk::mesh::IO_WEB_PORT` (`web`). In stage 2.1 it holds the exposures SY.admin pushes
+//! and their keys (`exposures`), mints and redeems their one-time links, and serves its placeholder
+//! page to a valid session (`access`); the upstreams behind the exposures come in stage 2.2. The
+//! exposures' two commands come on a channel of their own, from `SY.admin@motherbee` alone
+//! (`run_exposure_commands`).
 //!
 //! Like io.blob and io.cloud it is a FIRST-CLASS MANAGED IO NODE in the root tenant: only
 //! `IO.web@motherbee`, in the root tenant, by a fail-closed self-check in the binary
@@ -20,6 +23,8 @@
 //! (`boot_control_plane`). The port opens once the config is in use: a config the contract refuses
 //! leaves io.web FAILED_CONFIG, serving nobody, until a CONFIG_SET it accepts.
 
+mod access;
+mod exposures;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -32,13 +37,17 @@ use fluxbee_sdk::managed_control_plane::{
 };
 use fluxbee_sdk::node_config::NodeConfigSetPayload;
 use fluxbee_sdk::protocol::{
-    is_system_kind, Destination, Message, Meta, Routing, MSG_CONFIG_GET, MSG_CONFIG_SET,
+    is_system_kind, Destination, IoWebAccessLinkRequest, IoWebAccessLinkResponse,
+    IoWebExposuresPayload, IoWebExposuresResponse, Message, Meta, Routing,
+    IO_WEB_ERROR_UNAUTHORIZED, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_IO_WEB_ACCESS_LINK,
+    MSG_IO_WEB_ACCESS_LINK_RESPONSE, MSG_IO_WEB_EXPOSURES, MSG_IO_WEB_EXPOSURES_RESPONSE,
     MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE, PRIMARY_HIVE_ID, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    is_root_tenant, managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode,
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, DEFAULT_ROOT_TENANT_ID,
-    ENV_SELF_TENANT_ID, FLUXBEE_NODE_NAME_ENV,
+    is_root_tenant, managed_node_config_path, managed_node_config_path_with_root,
+    read_self_ilk_from_env, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver, RpcError,
+    DEFAULT_ROOT_TENANT_ID, ENV_SELF_TENANT_ID, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
@@ -57,18 +66,32 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_web_adapter_config::IoWebAdapterConfigContract;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{watch, RwLock};
 use tracing_subscriber::EnvFilter;
 
+use exposures::{boot_second, unix_now, Exposures, VaultKeys, EXPOSURES_FILE, KEY_RETRY};
 use web::{WebSetup, WebState, WebStatus};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const RPC_CH_CONTROL: &str = "control";
+/// The exposures' two commands, served by their own task (`run_exposure_commands`), so a key read
+/// never holds NODE_STATUS_GET or CONFIG (docs/io-web-v2-stage-2-1.md §5.5).
+const RPC_CH_EXPOSURES: &str = "exposures";
 
 /// The local name of the one node io.web runs as, `IO.web@motherbee`.
 const IO_WEB_LOCAL_NAME: &str = "IO.web";
+
+/// The one sender of io.web's exposure commands, as the router stamps it: SY.admin on the
+/// motherbee (§5.5), which acts on them for io.cloud alone (§5.1). A constant, never the config's
+/// `admin_target`, which a node's `config.json` may name otherwise.
+const EXPOSURES_AUTHORITY: &str = "SY.admin@motherbee";
+
+/// The error code of an exposure command whose payload io.web cannot read: the set or the link
+/// request is not taken.
+const INVALID_REQUEST: &str = "INVALID_REQUEST";
 
 /// Boot infra from the managed spawn (the env the runtime injects, or the `node`/`_system` of
 /// `config.json`), as io.blob reads it. None of it is operator config.
@@ -154,6 +177,7 @@ struct RuntimeState {
     configured: watch::Sender<bool>,
     web_setup: WebSetup,
     web_status: Arc<WebStatus>,
+    exposures: Arc<Exposures>,
 }
 
 #[tokio::main]
@@ -185,18 +209,7 @@ async fn main() -> Result<(), DynError> {
         Path::new(DEFAULT_MANAGED_NODES_ROOT),
     );
 
-    let profile = OperationalRouteProfile::builder()
-        .command_channel(RPC_CH_CONTROL)
-        .post_pending_rule(
-            RouteMatch::exact(SYSTEM_KIND, MSG_NODE_STATUS_GET),
-            RouteTarget::Command(RPC_CH_CONTROL),
-        )
-        // Managed control plane: CONFIG_GET/SET come in through the same channel.
-        .post_pending_rule(
-            RouteMatch::one_of(SYSTEM_KIND, [MSG_CONFIG_GET, MSG_CONFIG_SET]),
-            RouteTarget::Command(RPC_CH_CONTROL),
-        )
-        .build()?;
+    let started = unix_now();
     let node_config = NodeConfig {
         name: config.node_name.clone(),
         router_socket: config.router_socket.clone(),
@@ -205,9 +218,34 @@ async fn main() -> Result<(), DynError> {
         config_dir: config.config_dir.clone(),
         version: config.node_version.clone(),
     };
-    let dispatcher =
-        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let dispatcher = RouterDispatcher::connect_with_retry(
+        node_config,
+        Duration::from_secs(1),
+        io_web_profile()?,
+    )
+    .await?;
     let sender = dispatcher.sender_snapshot();
+
+    // The exposures: their keys read from the vault as io.web, with the ILK the orchestrator
+    // injected at the spawn (§3.1); their copy beside io.web's config.json (§2.3).
+    let ilk = read_self_ilk_from_env();
+    let exposures = Arc::new(Exposures::new(
+        exposures_file(&config.node_name, Path::new(DEFAULT_MANAGED_NODES_ROOT)),
+        Arc::new(VaultKeys::new(
+            dispatcher.clone(),
+            &config.node_name,
+            ilk.clone(),
+        )),
+        boot_second(started),
+    ));
+    let (loaded, loaded_rx) = watch::channel(false);
+    tokio::spawn(run_exposure_commands(
+        dispatcher.take_command_receiver(RPC_CH_EXPOSURES).await?,
+        sender.clone(),
+        Arc::clone(&exposures),
+        loaded,
+    ));
+    tokio::spawn(run_key_retries(Arc::clone(&exposures)));
 
     let web_setup = WebSetup::motherbee();
     let web_status = Arc::new(WebStatus::new());
@@ -221,12 +259,17 @@ async fn main() -> Result<(), DynError> {
         listen = %web_setup.listen,
         tls_dir = %web_setup.tls_dir.display(),
         hive_registry = %web_setup.registry.root().display(),
-        "IO.web ready (managed control plane); its port opens once its config is in use"
+        exposures_file = %exposures.file().display(),
+        ilk = ilk.as_deref().unwrap_or("none: no key can be read"),
+        "IO.web ready (managed control plane); its port opens once its config is in use and its \
+         exposures are loaded"
     );
     tokio::spawn(web::run(
         web_setup.clone(),
         Arc::clone(&web_status),
         configured_rx,
+        loaded_rx,
+        Arc::clone(&exposures),
     ));
 
     let state = RuntimeState {
@@ -241,6 +284,7 @@ async fn main() -> Result<(), DynError> {
         configured,
         web_setup,
         web_status,
+        exposures,
     };
 
     let mut incoming = dispatcher.take_command_receiver(RPC_CH_CONTROL).await?;
@@ -250,6 +294,7 @@ async fn main() -> Result<(), DynError> {
                 &*state.control_plane.read().await,
                 &state.web_status.get(),
                 &state.web_setup,
+                state.exposures.view(unix_now()),
             );
             build_reply(&sender, &message, MSG_NODE_STATUS_GET_RESPONSE, payload)
         } else if is_config_command(&message) {
@@ -292,6 +337,211 @@ fn ensure_canonical_instance(node_name: &str, tenant_id: Option<&str>) -> Result
             "IO.web runs only in the root tenant {DEFAULT_ROOT_TENANT_ID}, and its spawn names no tenant ({ENV_SELF_TENANT_ID}, or tenant_id in its config.json)"
         )),
     }
+}
+
+/// What reaches io.web, and where:
+/// - the exposures' commands, by name, on their own channel, before any pending answer, as the
+///   edge takes its door's commands (docs/io-web-v2-stage-2-1.md §5.5);
+/// - NODE_STATUS_GET and CONFIG_GET/SET on the control channel;
+/// - anything else on the exposures' channel too, which answers `UNAUTHORIZED` to a message named
+///   after a command that is not a system one, and ignores the rest.
+fn io_web_profile() -> Result<OperationalRouteProfile, RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_CONTROL)
+        .command_channel(RPC_CH_EXPOSURES)
+        .pre_pending_rule(
+            RouteMatch::one_of(SYSTEM_KIND, [MSG_IO_WEB_EXPOSURES, MSG_IO_WEB_ACCESS_LINK]),
+            RouteTarget::Command(RPC_CH_EXPOSURES),
+        )
+        .post_pending_rule(
+            RouteMatch::exact(SYSTEM_KIND, MSG_NODE_STATUS_GET),
+            RouteTarget::Command(RPC_CH_CONTROL),
+        )
+        // Managed control plane: CONFIG_GET/SET come in through the same channel.
+        .post_pending_rule(
+            RouteMatch::one_of(SYSTEM_KIND, [MSG_CONFIG_GET, MSG_CONFIG_SET]),
+            RouteTarget::Command(RPC_CH_CONTROL),
+        )
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_EXPOSURES))
+        .build()
+}
+
+/// io.web's copy of the exposures: `exposures.json` beside its `config.json` (§2.3), so a purge of
+/// the node takes it too.
+fn exposures_file(node_name: &str, nodes_root: &Path) -> PathBuf {
+    managed_node_config_path_with_root(node_name, nodes_root)
+        .ok()
+        .and_then(|config| config.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| nodes_root.to_path_buf())
+        .join(EXPOSURES_FILE)
+}
+
+/// io.web's exposure commands (§5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExposureCommand {
+    Exposures,
+    AccessLink,
+}
+
+impl ExposureCommand {
+    /// The command a message is named after, in any case and spacing: a variant of the name is
+    /// refused (`authorize_exposure_command`), never ignored.
+    fn of(message: &Message) -> Option<Self> {
+        let name = message.meta.msg.as_deref()?.trim();
+        if name.eq_ignore_ascii_case(MSG_IO_WEB_EXPOSURES) {
+            Some(Self::Exposures)
+        } else if name.eq_ignore_ascii_case(MSG_IO_WEB_ACCESS_LINK) {
+            Some(Self::AccessLink)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Exposures => MSG_IO_WEB_EXPOSURES,
+            Self::AccessLink => MSG_IO_WEB_ACCESS_LINK,
+        }
+    }
+
+    fn response(self) -> &'static str {
+        match self {
+            Self::Exposures => MSG_IO_WEB_EXPOSURES_RESPONSE,
+            Self::AccessLink => MSG_IO_WEB_ACCESS_LINK_RESPONSE,
+        }
+    }
+}
+
+/// The exposures' channel: first the set of io.web's file and its keys, then `loaded` turns true
+/// and the port may open; then each command in its own task, so a link never waits behind a push
+/// reading keys (pushes take their turn in `Exposures`).
+async fn run_exposure_commands(
+    mut commands: RpcCommandReceiver,
+    sender: NodeSender,
+    exposures: Arc<Exposures>,
+    loaded: watch::Sender<bool>,
+) {
+    exposures.load_at_boot(unix_now()).await;
+    loaded.send_replace(true);
+    while let Some(message) = commands.recv().await {
+        let Some(command) = ExposureCommand::of(&message) else {
+            tracing::debug!(
+                trace_id = %message.routing.trace_id,
+                caller = ?message.routing.src_l2_name,
+                msg_type = %message.meta.msg_type,
+                msg = ?message.meta.msg,
+                "IO.web ignored a message it does not serve"
+            );
+            continue;
+        };
+        let sender = sender.clone();
+        let exposures = Arc::clone(&exposures);
+        tokio::spawn(async move {
+            let payload = answer_exposure_command(&exposures, command, &message, unix_now()).await;
+            let reply = build_reply(&sender, &message, command.response(), payload);
+            if let Err(err) = sender.send(reply).await {
+                tracing::warn!(
+                    trace_id = %message.routing.trace_id,
+                    command = command.name(),
+                    error = %err,
+                    "IO.web could not answer an exposure command"
+                );
+            }
+        });
+    }
+}
+
+/// Every 30 s, the keys still unavailable are read again (§5.5).
+async fn run_key_retries(exposures: Arc<Exposures>) {
+    let mut every = tokio::time::interval(KEY_RETRY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is at once, and the boot reads the keys itself.
+    every.tick().await;
+    loop {
+        every.tick().await;
+        exposures.retry(unix_now()).await;
+    }
+}
+
+/// An exposure command is taken only as a system message from the router-stamped
+/// `SY.admin@motherbee`, by its exact name, and never as a tap copy, which keeps its sender's name
+/// but was sent to another node (§5.5). Why not, otherwise.
+fn authorize_exposure_command(message: &Message, command: ExposureCommand) -> Result<(), String> {
+    if message.meta.via_tap {
+        return Err("a tap copy".to_string());
+    }
+    if !is_system_kind(&message.meta.msg_type) {
+        return Err(format!(
+            "not a system message (type '{}')",
+            message.meta.msg_type
+        ));
+    }
+    if message.meta.msg.as_deref() != Some(command.name()) {
+        return Err(format!("not named exactly {}", command.name()));
+    }
+    match message.routing.src_l2_name.as_deref().map(str::trim) {
+        Some(EXPOSURES_AUTHORITY) => Ok(()),
+        Some("") | None => Err("no router-stamped sender".to_string()),
+        Some(sender) => Err(format!("from {sender}")),
+    }
+}
+
+/// The answer's payload to an exposure command: `UNAUTHORIZED`, logged, when it is not
+/// SY.admin's; the set applied or the link minted otherwise.
+async fn answer_exposure_command(
+    exposures: &Exposures,
+    command: ExposureCommand,
+    message: &Message,
+    now: u64,
+) -> Value {
+    if let Err(why) = authorize_exposure_command(message, command) {
+        tracing::warn!(
+            trace_id = %message.routing.trace_id,
+            caller = ?message.routing.src_l2_name,
+            msg = ?message.meta.msg,
+            msg_type = %message.meta.msg_type,
+            via_tap = message.meta.via_tap,
+            why = %why,
+            "IO.web refused an exposure command: only SY.admin@motherbee sends them"
+        );
+        return refusal(
+            IO_WEB_ERROR_UNAUTHORIZED,
+            format!(
+                "{} is taken only from {EXPOSURES_AUTHORITY}, as a system message: {why}",
+                command.name()
+            ),
+        );
+    }
+    match command {
+        ExposureCommand::Exposures => {
+            match serde_json::from_value::<IoWebExposuresPayload>(message.payload.clone()) {
+                Ok(set) => wire(&exposures.apply_push(set, now).await),
+                Err(err) => wire(&IoWebExposuresResponse::Error {
+                    error_code: INVALID_REQUEST.to_string(),
+                    error_detail: format!("io.web cannot read the set: {err}"),
+                }),
+            }
+        }
+        ExposureCommand::AccessLink => {
+            match serde_json::from_value::<IoWebAccessLinkRequest>(message.payload.clone()) {
+                Ok(request) => wire(&exposures.issue_link(&request, now)),
+                Err(err) => wire(&IoWebAccessLinkResponse::Error {
+                    error_code: INVALID_REQUEST.to_string(),
+                    error_detail: format!("io.web cannot read the request: {err}"),
+                }),
+            }
+        }
+    }
+}
+
+/// `{"status": "error", error_code, error_detail}`, the error shape of both answers.
+fn refusal(error_code: &str, error_detail: String) -> Value {
+    json!({"status": "error", "error_code": error_code, "error_detail": error_detail})
+}
+
+/// An answer as it travels. Both answers' shapes always serialize.
+fn wire(answer: &impl Serialize) -> Value {
+    serde_json::to_value(answer).unwrap_or_else(|err| refusal(INVALID_REQUEST, err.to_string()))
 }
 
 // --- Control plane (a mirror of io.blob's) -------------------------------------------------------
@@ -362,9 +612,15 @@ fn is_node_status_request(message: &Message) -> bool {
 /// the port's. io.web is HEALTHY only while its config is in use AND its port serves. Otherwise it
 /// is DEGRADED, never ERROR, as across the managed family, with the reason in `last_error`: the
 /// config's while it is not in use, else the port's (`web::MESH_TLS_UNAVAILABLE` and the other
-/// codes). `extensions.web` is the port's state. The orchestrator's `get_node_status` reports
-/// `health_state`, `last_error` and `extensions`.
-fn node_status_payload(control: &IoControlPlaneState, web: &WebState, setup: &WebSetup) -> Value {
+/// codes). `extensions.web` is the port's state, with its `exposures` (`Exposures::view`,
+/// docs/io-web-v2-stage-2-1.md §5.5). The orchestrator's `get_node_status` reports `health_state`,
+/// `last_error` and `extensions`.
+fn node_status_payload(
+    control: &IoControlPlaneState,
+    web: &WebState,
+    setup: &WebSetup,
+    exposures: Value,
+) -> Value {
     let lifecycle = match control.current_state {
         IoNodeLifecycleState::Unconfigured => ManagedNodeLifecycleState::Unconfigured,
         IoNodeLifecycleState::Configured => ManagedNodeLifecycleState::Configured,
@@ -388,7 +644,9 @@ fn node_status_payload(control: &IoControlPlaneState, web: &WebState, setup: &We
             }
         }
     }
-    payload["extensions"] = json!({ "web": setup.view(web) });
+    let mut view = setup.view(web);
+    view["exposures"] = exposures;
+    payload["extensions"] = json!({ "web": view });
     payload
 }
 
@@ -562,13 +820,15 @@ async fn apply_config_set(state: &RuntimeState, payload: &NodeConfigSetPayload) 
 }
 
 fn inject_runtime_status(payload: &mut Value, state: &RuntimeState) {
+    let mut web = state.web_setup.view(&state.web_status.get());
+    web["exposures"] = state.exposures.view(unix_now());
     if let Some(object) = payload.as_object_mut() {
         object.insert(
             "runtime".to_string(),
             json!({
                 "transport":"router_socket",
                 "role":"web",
-                "web":state.web_setup.view(&state.web_status.get()),
+                "web":web,
                 "tls_dir":state.web_setup.tls_dir.display().to_string(),
                 "hive_registry":state.web_setup.registry.root().display().to_string(),
                 "control_plane_metrics":state.control_metrics.snapshot(),
@@ -815,17 +1075,24 @@ mod tests {
             last_error: None,
         };
 
-        let serving = node_status_payload(&configured, &WebState::Serving, &setup);
+        let exposures = json!({"generation": 7, "exposures": 1, "enabled": 1});
+        let serving =
+            node_status_payload(&configured, &WebState::Serving, &setup, exposures.clone());
         assert_eq!(serving["status"], "ok");
         assert_eq!(serving["health_state"], "HEALTHY");
         assert_eq!(serving["lifecycle_state"], "CONFIGURED");
         assert!(serving.get("last_error").is_none());
         assert_eq!(
             serving["extensions"]["web"],
-            json!({"state": "serving", "listen": "0.0.0.0:9200", "admits": ["ingress"]})
+            json!({
+                "state": "serving",
+                "listen": "0.0.0.0:9200",
+                "admits": ["ingress"],
+                "exposures": exposures,
+            })
         );
 
-        let starting = node_status_payload(&configured, &WebState::Starting, &setup);
+        let starting = node_status_payload(&configured, &WebState::Starting, &setup, json!({}));
         assert_eq!(starting["health_state"], "DEGRADED");
         assert!(starting.get("last_error").is_none());
         assert_eq!(starting["extensions"]["web"]["state"], "starting");
@@ -834,7 +1101,7 @@ mod tests {
             code: web::MESH_TLS_UNAVAILABLE,
             message: "/var/lib/fluxbee/tls/motherbee: io: not found".to_string(),
         };
-        let no_material = node_status_payload(&configured, &unavailable, &setup);
+        let no_material = node_status_payload(&configured, &unavailable, &setup, json!({}));
         assert_eq!(no_material["health_state"], "DEGRADED");
         assert_eq!(no_material["lifecycle_state"], "CONFIGURED");
         assert_eq!(no_material["last_error"]["code"], "mesh_tls_unavailable");
@@ -854,7 +1121,7 @@ mod tests {
             }),
             ..configured
         };
-        let refused = node_status_payload(&failed, &WebState::Starting, &setup);
+        let refused = node_status_payload(&failed, &WebState::Starting, &setup, json!({}));
         assert_eq!(refused["health_state"], "DEGRADED");
         assert_eq!(refused["lifecycle_state"], "FAILED_CONFIG");
         assert_eq!(refused["last_error"]["code"], "invalid_config");
@@ -907,5 +1174,231 @@ mod tests {
                 "{caller:?}"
             );
         }
+    }
+
+    /// An exposure command as it arrives: `msg` of kind `msg_type`, from the router-stamped
+    /// `caller`, a tap copy when `via_tap`.
+    fn exposure_command(
+        caller: Option<&str>,
+        msg_type: &str,
+        msg: &str,
+        via_tap: bool,
+        payload: Value,
+    ) -> Message {
+        Message {
+            routing: Routing {
+                src: "00000000-0000-4000-8000-0000000000ad".to_string(),
+                src_l2_name: caller.map(str::to_string),
+                dst: Destination::Unicast(NODE.to_string()),
+                ttl: 16,
+                trace_id: uuid::Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                msg: Some(msg.to_string()),
+                via_tap,
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    /// Through io.web's own routes and channel: the exposures' commands are taken only as system
+    /// messages, by their exact names, from the router-stamped SY.admin@motherbee, never as a tap
+    /// copy. Anything else is answered UNAUTHORIZED, on its own trace, and changes nothing.
+    #[tokio::test]
+    async fn pushes_are_taken_only_from_sy_admin_at_the_motherbee_and_never_via_tap() {
+        use crate::exposures::testing::{
+            enablement, exposure, file, remove, MapKeys, SHOP, SHOP_ENB, SHOP_ID,
+        };
+        use fluxbee_sdk::protocol::WebExposureKeySlot;
+        use fluxbee_sdk::RouterDispatcherTestHarness;
+
+        assert_eq!(EXPOSURES_AUTHORITY, format!("SY.admin@{PRIMARY_HIVE_ID}"));
+        let (dispatcher, mut router) =
+            RouterDispatcherTestHarness::new(NODE, io_web_profile().expect("io.web's profile"));
+        let keys = MapKeys::new();
+        keys.put(SHOP_ID, WebExposureKeySlot::A, 4, 1);
+        let now = unix_now();
+        let exposures = Arc::new(Exposures::new(file("authority"), keys, now));
+        let (loaded, mut loaded_rx) = watch::channel(false);
+        tokio::spawn(run_exposure_commands(
+            dispatcher
+                .take_command_receiver(RPC_CH_EXPOSURES)
+                .await
+                .expect("the exposures' channel"),
+            dispatcher.sender_snapshot(),
+            Arc::clone(&exposures),
+            loaded,
+        ));
+        loaded_rx.wait_for(|loaded| *loaded).await.unwrap();
+
+        let shop = exposure(
+            SHOP_ID,
+            SHOP,
+            vec![enablement(SHOP_ENB, now + 3600, WebExposureKeySlot::A, 4)],
+        );
+        let set = json!({"generation": 5, "exposures": [shop]});
+        let ask = json!({"exposure_id": SHOP_ID, "enablement_id": SHOP_ENB, "generation": 5});
+        let admin = Some(EXPOSURES_AUTHORITY);
+        let push = MSG_IO_WEB_EXPOSURES;
+        let link = MSG_IO_WEB_ACCESS_LINK;
+        for (case, message) in [
+            (
+                "SY.admin@worker1",
+                exposure_command(
+                    Some("SY.admin@worker1"),
+                    SYSTEM_KIND,
+                    push,
+                    false,
+                    set.clone(),
+                ),
+            ),
+            (
+                "SY.architect@motherbee",
+                exposure_command(
+                    Some("SY.architect@motherbee"),
+                    SYSTEM_KIND,
+                    push,
+                    false,
+                    set.clone(),
+                ),
+            ),
+            (
+                "IO.cloud@motherbee",
+                exposure_command(
+                    Some("IO.cloud@motherbee"),
+                    SYSTEM_KIND,
+                    push,
+                    false,
+                    set.clone(),
+                ),
+            ),
+            (
+                "no router-stamped sender",
+                exposure_command(None, SYSTEM_KIND, push, false, set.clone()),
+            ),
+            (
+                "an empty sender",
+                exposure_command(Some(""), SYSTEM_KIND, push, false, set.clone()),
+            ),
+            (
+                "a tap copy",
+                exposure_command(admin, SYSTEM_KIND, push, true, set.clone()),
+            ),
+            (
+                "not a system message",
+                exposure_command(admin, "user", push, false, set.clone()),
+            ),
+            (
+                "another spelling",
+                exposure_command(admin, SYSTEM_KIND, "io_web_exposures", false, set.clone()),
+            ),
+            (
+                "a link for SY.architect",
+                exposure_command(
+                    Some("SY.architect@motherbee"),
+                    SYSTEM_KIND,
+                    link,
+                    false,
+                    ask.clone(),
+                ),
+            ),
+            (
+                "a link as a tap copy",
+                exposure_command(admin, SYSTEM_KIND, link, true, ask.clone()),
+            ),
+        ] {
+            let trace = message.routing.trace_id.clone();
+            let expected = ExposureCommand::of(&message).expect(case).response();
+            router.inject(message).await.unwrap();
+            let answer = router
+                .next_outgoing_within(Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|| panic!("{case}: answered"));
+            assert_eq!(answer.meta.msg.as_deref(), Some(expected), "{case}");
+            assert_eq!(answer.routing.trace_id, trace, "{case}");
+            assert_eq!(answer.payload["status"], "error", "{case}");
+            assert_eq!(
+                answer.payload["error_code"], IO_WEB_ERROR_UNAUTHORIZED,
+                "{case}"
+            );
+            assert_eq!(
+                exposures.view(now)["generation"],
+                0,
+                "{case}: nothing taken"
+            );
+            assert_eq!(exposures.view(now)["links_issued"], 0, "{case}: no link");
+        }
+
+        router
+            .inject(exposure_command(admin, SYSTEM_KIND, push, false, set))
+            .await
+            .unwrap();
+        let answer = router
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("SY.admin's push is answered");
+        assert_eq!(
+            answer.meta.msg.as_deref(),
+            Some(MSG_IO_WEB_EXPOSURES_RESPONSE)
+        );
+        assert!(
+            matches!(
+                &answer.routing.dst,
+                Destination::Unicast(to) if to == "00000000-0000-4000-8000-0000000000ad"
+            ),
+            "answered to SY.admin's own uuid: {:?}",
+            answer.routing.dst
+        );
+        assert_eq!(answer.payload["status"], "ok");
+        assert_eq!(answer.payload["generation"], 5);
+        assert_eq!(answer.payload["enablements"][0]["key"], "ready");
+
+        router
+            .inject(exposure_command(admin, SYSTEM_KIND, link, false, ask))
+            .await
+            .unwrap();
+        let answer = router
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("SY.admin's link is answered");
+        assert_eq!(
+            answer.meta.msg.as_deref(),
+            Some(MSG_IO_WEB_ACCESS_LINK_RESPONSE)
+        );
+        assert_eq!(answer.payload["status"], "ok");
+        assert!(answer.payload["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("https://{SHOP}/.fluxbee/enter?code=L1.")));
+
+        // A payload io.web cannot read is not taken.
+        router
+            .inject(exposure_command(
+                admin,
+                SYSTEM_KIND,
+                push,
+                false,
+                json!({"generation": "x"}),
+            ))
+            .await
+            .unwrap();
+        let answer = router
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("answered");
+        assert_eq!(answer.payload["error_code"], INVALID_REQUEST);
+        assert_eq!(exposures.view(now)["generation"], 5);
+        remove(&exposures);
+    }
+
+    /// io.web's copy of the exposures lies beside its config.json.
+    #[test]
+    fn the_exposures_file_lies_beside_the_config() {
+        assert_eq!(
+            exposures_file(NODE, Path::new("/var/lib/fluxbee/nodes")),
+            Path::new("/var/lib/fluxbee/nodes/IO/IO.web@motherbee/exposures.json")
+        );
     }
 }

@@ -12,12 +12,18 @@ bytes.workspace = true
 # `mesh-tls`: the motherbee's mesh leaf, the client verifier that admits a connected ingress, and
 # the hive registry (fluxbee_sdk::mesh).
 fluxbee-sdk = { workspace = true, features = ["mesh-tls"] }
+# The links' and sessions' MACs (docs/io-web-v2-stage-2-1.md §3).
+hmac.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 io-common = { path = "../common" }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# A link's `jti` and a session's `sid`: 16 random bytes each, from a v4 uuid (§5.5).
+uuid.workspace = true

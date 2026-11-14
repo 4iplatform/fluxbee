@@ -952,15 +952,19 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "fluxbee-sdk",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
  "io-common",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

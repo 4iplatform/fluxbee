@@ -3,15 +3,18 @@
 //! # Why it exists
 //!
 //! io.web is a managed IO node like io.blob and io.cloud: what is set on it goes through
-//! CONFIG_SET/GET, never through ENV (docs/io-web-v2.md §6). In stage 1 it serves one static page
-//! to the edge, and nothing about that is the operator's to choose:
+//! CONFIG_SET/GET, never through ENV (docs/io-web-v2.md §6). It serves the exposures SY.admin
+//! pushes to the edge, and nothing about that is the operator's to choose:
 //!
 //! - **the port** is the shared constant `fluxbee_sdk::mesh::IO_WEB_PORT`, the one the edge dials;
 //! - **the TLS material** is the motherbee's mesh leaf, at its fixed path;
-//! - **who may connect** is the hive registry's connected ingress, never a list in a config.
+//! - **who may connect** is the hive registry's connected ingress, never a list in a config;
+//! - **the exposures and the keys that sign their links and sessions** come by SY.admin's push
+//!   (`IO_WEB_EXPOSURES`), never by config: only Cloud asks for an exposure, through io.cloud and
+//!   SY.admin, and a config is open to more than Cloud (docs/io-web-v2.md §12.2,
+//!   docs/io-web-v2-stage-2-1.md §1, §5.5).
 //!
-//! So the contract has no field yet. Stage 2 (sessions) brings the first ones, the key that signs
-//! sessions among them, by `vault_ref` (docs/io-web-v2.md §11.3).
+//! So the contract has no field.
 //!
 //! # What a config may hold
 //!
@@ -47,8 +50,8 @@ impl IoAdapterConfigContract for IoWebAdapterConfigContract {
             "Its port is the shared constant IO_WEB_PORT (9200), which the edge dials; its TLS \
              certificate is the motherbee's mesh leaf; it admits only a hive the registry lists as \
              a connected ingress. None of them is config.",
-            "There is deliberately NO secret field yet: the sessions of stage 2 bring the first \
-             one, by vault_ref.",
+            "There is deliberately NO secret field: the keys come by SY.admin's push, never by \
+             config (docs/io-web-v2.md §12.2: Cloud alone).",
         ]
     }
 

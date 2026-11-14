@@ -1,16 +1,25 @@
 # IO.web
 
-IO.web is the motherbee's web node behind the edge. The edge on the ingress proxies each web host
-that SY.admin declares (`archi.<id>`) to it, over the mesh's own mutual TLS. In this stage (release
-0.1.85, [io.web v2](../io-web-v2.md) §11.2) it serves one static page and a health check; the
-sessions, and Archi behind them, come in stage 2 (§11.3). Only a hive the motherbee's registry
-lists as a connected ingress may connect: any other client fails inside the TLS handshake. It
-never serves plaintext.
+IO.web is the motherbee's web node behind the edge. The edge on the ingress proxies each exposure's
+host to it, over the mesh's own mutual TLS. An exposure is one host, `<label>.<main host>`, mapped
+to one internal upstream; Fluxbee Cloud alone publishes, enables and closes one, through io.cloud
+and SY.admin ([io.web v2](../io-web-v2.md) §12). In stage 2.1
+([its design](../io-web-v2-stage-2-1.md)) io.web holds the exposures SY.admin pushes, mints and
+redeems their one-time links, keeps their sessions in signed cookies, and serves a placeholder page
+to a valid session; the upstream behind an exposure comes in stage 2.2. Only a hive the
+motherbee's registry lists as a connected ingress may connect: any other client fails inside the
+TLS handshake. It never serves plaintext.
 
-Source: `nodes/io/io-web/src/main.rs` (the node: boot, self-check, control plane, status) and
-`nodes/io/io-web/src/web.rs` (the port: TLS, connections, routes). Its config contract is
-`nodes/io/common/src/io_web_adapter_config.rs`. The mesh TLS and the hive registry it reads are
-`fluxbee_sdk::mesh` (`crates/fluxbee_sdk/src/mesh/`, feature `mesh-tls`).
+Source, in `nodes/io/io-web/src/`:
+
+- `main.rs`: the node (boot, self-check, control plane, status) and the exposures' two commands;
+- `exposures.rs`: the set SY.admin pushes, its file, the keys, the links and the sessions;
+- `access.rs`: the link's and the cookie's formats and MACs;
+- `web.rs`: the port (TLS, connections) and what each request gets.
+
+Its config contract is `nodes/io/common/src/io_web_adapter_config.rs`. The commands' shapes are in
+`fluxbee_sdk::protocol` (`IoWebExposuresPayload` and the rest). The mesh TLS and the hive registry
+it reads are `fluxbee_sdk::mesh` (`crates/fluxbee_sdk/src/mesh/`, feature `mesh-tls`).
 
 | | |
 | --- | --- |
@@ -20,7 +29,9 @@ Source: `nodes/io/io-web/src/main.rs` (the node: boot, self-check, control plane
 | Listens on | `0.0.0.0:9200` (`fluxbee_sdk::mesh::IO_WEB_PORT`), TLS only |
 | Certificate | the motherbee's mesh leaf, `/var/lib/fluxbee/tls/motherbee/` (`ca.crt`, `cert.crt`, `cert.key`), which SY.orchestrator writes at its boot |
 | Admits | a client certificate from the mesh CA whose hive `/var/lib/fluxbee/hives` lists as a connected ingress |
-| Config | `/var/lib/fluxbee/nodes/IO/IO.web@motherbee/config.json`; no field in this stage |
+| Config | `/var/lib/fluxbee/nodes/IO/IO.web@motherbee/config.json`; no field |
+| Exposures | `/var/lib/fluxbee/nodes/IO/IO.web@motherbee/exposures.json`, mode 0600: its copy of SY.admin's set, without secrets |
+| Keys | in SY.vault, `web_exposure_key:<exposure uuid>:<a\|b>`, owned by IO.web; read with its own ILK |
 
 ## Where it runs
 
@@ -42,7 +53,7 @@ Source: `nodes/io/io-web/src/main.rs` (the node: boot, self-check, control plane
   own node (`CORE_IO_NAME_MISMATCH`: `io.web` only as `IO.web@motherbee`, and that name only on
   `io.web`) and only in the root tenant (`TENANT_ROOT_REQUIRED`; `core_io_refusal`).
 - **Next to Archi** (io-web-v2 §3), which listens on the motherbee's loopback. It does not reach
-  Archi yet.
+  Archi, nor any upstream, before stage 2.2.
 
 ## How it starts
 
@@ -68,17 +79,34 @@ From then on it is a managed node like the others:
 `fluxbee-factory-reset` keeps only the base nodes that boot, so it treats `IO.web@motherbee` as a
 node the operator created: it kills and purges it, and the operator starts it again afterwards.
 
+A purge removes its `exposures.json` too, which SY.admin pushes back within a minute. The keys
+written for its old ILK stay unreadable to the new one, so each enablement stays closed until Cloud
+enables it again. Enabling an exposure needs io.web launched: SY.admin answers `IO_WEB_ABSENT`
+until `run_node IO.web@motherbee` has run. The brake on every exposure at once is
+`kill_node IO.web@motherbee`.
+
 ## What it serves
 
-HTTP/1.1 only. The answer depends on the method and the path alone; a request body is never read.
+HTTP/1.1 only. The answer depends on the request's host, its session cookie and its path
+(`respond` in `web.rs`); a request body is never read, so a 401 comes from the headers alone. The
+host is the one `Host` header the edge sets, in its canonical form.
 
 | Request | Answer |
 | --- | --- |
-| `GET /`, `HEAD /` | 200, `text/html; charset=utf-8`: a minimal static page, with no version and nothing internal |
-| `GET /healthz`, `HEAD /healthz` | 200, `text/plain`, `ok` |
-| anything else (another path, another method) | 404, `text/plain`, `not found` |
+| `GET`/`HEAD /.fluxbee/healthz`, on any host | 200, `text/plain`, `ok` |
+| `GET /.fluxbee/enter?code=…` | a link redeemed: 200 with the session's `Set-Cookie` and a page that moves on to `/`; otherwise the 401 page |
+| `/.fluxbee/enter` with any other method, `HEAD` included | the 401 page: only a GET redeems |
+| any other path under `/.fluxbee/` | 404, `text/plain`, `not found` |
+| any other path on a host that is no exposure's | 404, `text/plain`, `not found` |
+| `GET`/`HEAD` of any other path with a valid session | 200, `text/html`: the placeholder page, with no version and nothing internal |
+| another method with a valid session | 404 |
+| any other path without a valid session | 401, `text/html`: the fixed 401 page; a session cookie that is not valid is cleared (`Max-Age=0`) |
 
-A HEAD answer carries the GET answer's headers and no body.
+- **`/.fluxbee/` is reserved on every host,** and in stage 2.2 it never reaches an upstream.
+  `/.fluxbee/healthz` replaced `/healthz` in stage 2.1, since `/healthz` would shadow an upstream's
+  own; `/healthz` is now a path like any other.
+- **Every refusal answers the same 401 page,** whatever the reason, which only the log holds.
+- **A HEAD answer** carries the GET answer's headers and no body.
 
 Every answer carries these headers (`SECURITY_HEADERS` in `web.rs`), the edge door's set:
 
@@ -92,8 +120,123 @@ Every answer carries these headers (`SECURITY_HEADERS` in `web.rs`), the edge do
 
 **The policy loads nothing,** not even from the page's own origin, and no page may frame it.
 `base-uri`, `form-action` and `frame-ancestors` do not fall back to `default-src`, so each is
-named. The page is plain text in HTML: no style, no script, no image and no link. It therefore
-renders under its own policy, which a test checks (`the_page_loads_nothing_and_names_nothing_internal`).
+named. The pages are plain text in HTML: no style, no script, no image and no link. They therefore
+render under their own policy, which a test checks (`the_pages_load_nothing_and_name_nothing_internal`).
+
+## Exposures
+
+SY.admin owns the set of exposures and pushes it whole to io.web with `IO_WEB_EXPOSURES`: at each
+change, then every 60 s ([stage 2.1](../io-web-v2-stage-2-1.md) §2.3, §5.5). Each exposure has its
+id (`exp:<uuid>`), its host, its upstream, and its live enablements, newest last, each
+`{enablement_id, until, slot, key_version}`. None of it is secret.
+
+**Who may push.** The two commands arrive on a channel of their own (`exposures`), served by their
+own task, so a key read never holds NODE_STATUS_GET or CONFIG. io.web takes them only:
+
+- as system messages, by their exact names;
+- from the router-stamped `SY.admin@motherbee`, a constant: never the config's `admin_target`;
+- never as a tap copy (`via_tap`).
+
+Anything else named after one of them is answered `UNAUTHORIZED`, on its own trace, and logged; it
+changes nothing.
+
+**A push** (`IO_WEB_EXPOSURES`, answered with `IO_WEB_EXPOSURES_RESPONSE`):
+
+| Its generation | io.web |
+| --- | --- |
+| lower than the one held | refuses it, `STALE_GENERATION`, and keeps its set |
+| equal | acknowledges it and reads nothing |
+| higher | replaces its set in memory at once, writes its file, then reads the keys it does not hold |
+
+- **Revocation is at once.** Whatever the new set no longer holds (a disabled exposure, an
+  unpublished one, the oldest enablement of a renewal) fails at the next request, before any key
+  is read.
+- **The answer** is `{status: ok, generation, changed, enablements: [{enablement_id, key: ready |
+  unavailable, detail}]}`, one entry per live enablement. SY.admin's enable waits for it: io.web
+  answers once it holds the new key. A payload it cannot read is `INVALID_REQUEST`, and changes
+  nothing.
+
+**The keys.** Each enablement's secret `K` is in SY.vault, in its exposure's key slot
+`web_exposure_key:<uuid>:<slot>`, which SY.admin put at the enable and forgot (§3.1). io.web reads
+it:
+
+- as its owner, with its own ILK (`FLUXBEE_NODE_ILK_ID`), as io.slack reads its key, within 3 s,
+  every missing key at once;
+- and takes it only as SY.admin wrote it: resource type `web_session_key`, owned by IO.web, at the
+  enablement's `key_version`, value `{secret: <64 hex>}`.
+
+A key that cannot be read, or does not match, is `unavailable` with the reason: its links and
+sessions fail closed, and io.web reads it again every 30 s. Once a key is read, io.web keeps only
+the two keys derived from it, `K_link` and `K_sess` (HMAC-SHA256 of `K` with two fixed labels), so
+that a link never verifies as a cookie.
+
+**Its file.** `exposures.json` beside its `config.json`, mode 0600, written through a temporary
+file: `{schema_version: 1, generation, exposures}`, without secrets. A write that fails takes the
+old file away, so that a restart never brings back what a newer set dropped, and is tried again at
+the next push or retry.
+
+**At boot** io.web loads its file, then reads its keys, and only then opens its port: sessions
+survive a restart. A file it cannot read leaves it with no exposure, which fails closed, until
+SY.admin's next push.
+
+**A link** (`IO_WEB_ACCESS_LINK {exposure_id, enablement_id, generation}`) is minted only for the
+exposure's current enablement, live, with its key held. Otherwise the answer is `EXPOSURE_UNKNOWN`,
+`ENABLEMENT_UNKNOWN` (io.web's set may be older: SY.admin pushes it and asks once more) or
+`KEY_UNAVAILABLE`.
+
+## Links and sessions
+
+**The link** (§3.2) is `https://<host>/.fluxbee/enter?code=L1.<x>.<e>.<jti>.<iat>.<tag>`:
+
+- `x` and `e` are the exposure's and the enablement's uuids in 32 hex;
+- `jti` is 16 random bytes in hex, `iat` when io.web minted it in Unix seconds;
+- `tag` is the HMAC-SHA256, under `K_link`, of `L1|<host>|<x>|<e>|<jti>|<iat>`. The host is in the
+  MAC and not in the code, so a code redeemed on another host fails.
+
+Its answer gives `url`, `expires_at` (`iat` + 120) and `link_id`, the first 16 hex of the SHA-256
+of `jti`. The code rides the query, so no journal ever holds it.
+
+**Redeeming it.** A `GET /.fluxbee/enter` checks, in this order:
+
+1. the host is an exposure's;
+2. the code parses strictly;
+3. `x` is that exposure;
+4. `e` is a live enablement of it, whose key io.web holds;
+5. the tag verifies, compared in constant time;
+6. `iat` is no earlier than io.web's boot (the first whole second after it started), and the link
+   is at most 120 s old;
+7. `jti` was never redeemed; it is then kept until `iat` + 120.
+
+Any failure answers the same 401 page. A link minted before io.web restarted is refused, and Cloud
+asks for another. A HEAD never redeems, so a link's preview does not spend it.
+
+**The session** (§3.3) is one cookie, set by the redeemed link:
+
+```text
+__Host-fluxbee_session=S1.<x>.<e>.<sid>.<issued>.<active>.<tag>; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=<min(1800, until - now)>
+```
+
+- `tag` is the HMAC-SHA256, under `K_sess`, of `S1|<host>|<x>|<e>|<sid>|<issued>|<active>`.
+- **No `Domain`:** the cookie is the host's alone, as `__Host-` requires.
+- **The link's answer is a page, not a redirect:** it sets the cookie and moves on to `/` with a
+  meta refresh. A `SameSite=Strict` cookie is withheld from a redirect inside a navigation that
+  began on Cloud's site, and is sent on the navigation the page starts.
+- **It is valid while** its tag verifies over the request's host, its enablement is live with its
+  key held, and its last activity (`active`) is at most 30 min old. More than one session cookie
+  in a request is refused.
+- **It slides:** once `active` is 60 s old, the answer carries the cookie again with `active = now`.
+- **No table holds sessions:** the cookie is the session, so they survive a restart of io.web.
+
+**How access ends** (§3.4):
+
+| Event | Effect |
+| --- | --- |
+| Cloud disables or unpublishes the exposure | SY.admin's push drops the enablements: every link and session fails at the next request |
+| The enablement reaches its `until` | io.web's own clock ends its links and sessions |
+| A renewal | a new enablement, key and slot; the previous one's sessions run to its own `until`, and new links come from the new one only |
+| 30 min without a request | the session ends |
+| io.web restarts | sessions survive (both slots are read again); links minted before it are refused |
+| io.web purged and launched again | a new ILK cannot read the old keys: closed until Cloud enables again |
 
 ## TLS and who may call it
 
@@ -141,11 +284,13 @@ connection io.web is closing.
 
 ## Configuration
 
-The contract (`IoWebAdapterConfigContract`) has **no field** in this stage:
+The contract (`IoWebAdapterConfigContract`) has **no field**:
 
 - **the port** is the shared constant `IO_WEB_PORT`, the one the edge dials;
 - **the certificate** is the motherbee's mesh leaf, at its fixed path;
-- **who may connect** is the registry's connected ingress, never a list in a config.
+- **who may connect** is the registry's connected ingress, never a list in a config;
+- **the exposures and their keys** come by SY.admin's push, never by config: a config is open to
+  more than Cloud, and only Cloud asks for an exposure (io-web-v2 §12.2).
 
 So the orchestrator's seed alone is io.web's whole config:
 
@@ -170,7 +315,7 @@ curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/nodes/IO.web@motherbee/co
 
 Besides the common fields, the answer has `runtime`:
 
-- `web`, the port's state (below);
+- `web`, the port's state and its `exposures` (below);
 - `tls_dir` and `hive_registry`, where it reads its material and its registry;
 - `control_plane_metrics`.
 
@@ -195,6 +340,17 @@ Besides the common fields, the answer has `runtime`:
 
 - **`extensions.web`** is the port's state: `state` (`starting`, `serving` or `unavailable`),
   `listen`, `admits: ["ingress"]`, and `code` and `message` while unavailable.
+- **`extensions.web.exposures`** is what io.web holds of the exposures:
+
+  | Field | Meaning |
+  | --- | --- |
+  | `generation` | the generation of the set it holds; 0 before any |
+  | `exposures` | the exposures in its set |
+  | `enabled` | those with a live enablement |
+  | `keys_unavailable` | live enablements whose key io.web does not hold: they fail closed |
+  | `links_issued`, `links_redeemed`, `links_refused`, `sessions_minted` | since io.web started |
+
+  SY.admin's `web_status` shows the same set from SY.admin's side, with io.web's last answer.
 
 io.web tries its material and its port again every 30 s. It checks the registry every 10 s, so the
 state follows the registry both ways.
@@ -207,7 +363,24 @@ io.web logs to its unit's journal: `journalctl -u fluxbee-node-IO.web-motherbee`
 | Line | Level | When |
 | --- | --- | --- |
 | `IO.web runs only as IO.web@motherbee in the root tenant; refusing to run` | error | at boot, with the name, the tenant and why, before it exits |
-| `IO.web ready (managed control plane); its port opens once its config is in use` | info | at boot, with the config state, the port, the TLS directory and the registry |
+| `IO.web ready (managed control plane); its port opens once its config is in use and its exposures are loaded` | info | at boot, with the config state, the port, the TLS directory, the registry, the exposures' file and its ILK |
+| `IO.web loaded its exposures from its file` | info | at boot, with the path, the generation and the count |
+| `IO.web has no exposures file yet: …` | info | at boot, without a file |
+| `IO.web cannot read its exposures file: …` | error | at boot, with why: it holds none until SY.admin's next push |
+| `IO.web holds an exposure` | info | an exposure new or changed in a set, with its enablements' ids and ends |
+| `IO.web dropped an exposure: its links and sessions fail from now on` | info | an exposure a new set no longer holds |
+| `IO.web applied its exposures` | info | a newer set taken, with its generation, whether it changed, and the counts |
+| `IO.web refused a set older than the one it holds` | warn | `STALE_GENERATION` |
+| `IO.web key ready` | info | a key read and taken, with its slot and version |
+| `IO.web key unavailable: …` | warn | a key not read or not matching, with why; a retry logs only a change |
+| `IO.web could not write its exposures file: …` | error | with the path and why, and whether the old file is gone |
+| `IO.web refused an exposure command: only SY.admin@motherbee sends them` | warn | with the caller, the name, the kind, `via_tap` and why |
+| `IO.web link issued` | info | with `link_id` and `expires_at` |
+| `IO.web issued no link` | warn | with the error code and why |
+| `IO.web link redeemed` | info | with `link_id`, `expires_at`, the edge's `X-Request-Id` and `X-Forwarded-For` |
+| `IO.web session minted` | info | with `sid` (its first 8 hex) and `max_age` |
+| `IO.web link refused` | warn | with the reason, `link_id` when the code parsed, `X-Request-Id` and `X-Forwarded-For` |
+| `IO.web refused a session` | debug | with the host and the reason |
 | `IO.web serving: it admits only a connected ingress, over the mesh's mutual TLS` | info | the port serves, at first and after a recovery |
 | `IO.web serves nobody, and nothing over plaintext` | error | with `code` and `detail`, once per change |
 | `mesh client refused in the handshake: ...` | warn | a refused hive, with its role (logged by `fluxbee_sdk::mesh`) |
@@ -215,13 +388,18 @@ io.web logs to its unit's journal: `journalctl -u fluxbee-node-IO.web-motherbee`
 | `IO.web cut a connection: its hive is no longer a connected ingress` | info | the registry demoted or removed the hive |
 | `IO.web at its handshake cap; closing new connections` | warn | at most every 10 s, with the count |
 | `IO.web at its connection cap; closing a connection past its handshake` | warn | each one, with the peer |
-| `IO.web answered` | debug | each request: hive, method, path, status, the edge's `X-Request-Id` |
+| `IO.web answered` | debug | each request: hive, method, host, path, status, the edge's `X-Request-Id` |
 
-**A request's path is logged without its query,** so no query string reaches the journal
-(io-web-v2 §11.3).
+Every line about an exposure carries its `exposure_id` and its `host`, and the enablement's
+`enablement_id` when there is one ([stage 2.1](../io-web-v2-stage-2-1.md) §5.10).
 
-io.web exchanges only system messages on the mesh (CONFIG_*, NODE_STATUS_*), which the router does
-not copy to its stream, so nothing of it reaches the router stream yet.
+**No line holds a key, a code, a URL with its query, or a cookie.** A link is named by its
+`link_id`, a session by the first 8 hex of its `sid`, and a request's path is logged without its
+query (io-web-v2 §11.3).
+
+io.web exchanges only system messages on the mesh (CONFIG_*, NODE_STATUS_*, its exposures'
+commands and its vault reads), which the router does not copy to its stream: the link's answer,
+which holds the code, never reaches the router stream.
 
 ## Posture
 
@@ -237,14 +415,20 @@ not copy to its stream, so nothing of it reaches the router stream yet.
 
 ## Not there yet
 
-- Sessions from Cloud's one-time code, the operator's own way in, and Archi behind io.web
-  (io-web-v2 §11.3).
-- Any configurable field. The first ones, the key that signs sessions among them by `vault_ref`,
-  come with the sessions.
+- The upstreams: in stage 2.1 a valid session gets io.web's placeholder page. Stage 2.2 forwards
+  each exposure to its upstream (Archi, a worker's port, an internal address), with every method,
+  the Origin check for unsafe methods, and the session cookie carried again on proxied answers
+  (io-web-v2 §12.4).
+- Archi inside Cloud's iframe (stage 2b): only the cookie's attributes change
+  (`SameSite=None; Partitioned`).
+- A logout, and a deny-list of sessions by `sid`: a stolen cookie lasts until 30 min idle or its
+  enablement's end, and Cloud's remedy is a disable and a new enable.
+- The operator's own way in, other than the motherbee or an SSH tunnel.
 
 ## Links
 
-- [io.web v2](../io-web-v2.md): the design, §11.2 for this release.
+- [io.web v2](../io-web-v2.md): the design, §11.2 for stage 1 and §12 for exposures.
+- [io.web stage 2.1](../io-web-v2-stage-2-1.md): exposures and access, the build design.
 - [SY.edge](../nodes/sy-edge.md): the door, and the proxy that dials io.web.
-- [SY.admin](../nodes/sy-admin.md): the web host declaration and `web_status`.
+- [SY.admin](../nodes/sy-admin.md): the exposures' actions, their pushes and `web_status`.
 - [io-common](io-common.md): what every IO node shares.
