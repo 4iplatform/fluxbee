@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.145** (2026-11-13), and PROD runs **0.1.145** (the router, the Go
+> Contract as of **fluxbee 0.1.146** (2026-11-13), and PROD runs **0.1.146** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1153,6 +1153,13 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
+### 0.1.146
+
+- **The hive no longer stores your requests or its answers in its message store** (FINDINGS
+  A-349): until 0.1.145 each request through the door, and io.cloud's answer, was kept whole in
+  SY.storage's `turns`, a `put_token`'s credential values among them. Nothing changes in what you
+  send or get back. What was stored before stays until the hive's operator decides.
+
 ### 0.1.145
 
 - **`web_exposure_key:*` joined the reserved keys** (`put_token`, `assign_token` and `delete_token`
@@ -1456,6 +1463,11 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.146:** on PROD, 2026-11-14 at 02:00Z (23:00 ART on 2026-11-13), through the public door with
+Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.146; FINDINGS A-349): a `put_token` and its
+`delete_token` left no row in the hive's message store, where 0.1.145 kept 4 (each request and
+its answer).
 
 **0.1.145:** on PROD, 2026-11-14 at 01:26Z (22:26 ART on 2026-11-13), through the public door
 with Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.145): `put_token`, `assign_token` and `delete_token` of a

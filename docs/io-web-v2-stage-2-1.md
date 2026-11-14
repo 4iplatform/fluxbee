@@ -2,7 +2,7 @@
 
 Base: `daily_onworking_coa` at `74ededeb`, 0.1.144 live. This is the build design of
 docs/io-web-v2.md §12.6 step 1. Every claim about existing code carries `file:line`, read on
-2026-11-13. Built so far: R1 (§8), live in 0.1.145 (2026-11-13); the rest is not built.
+2026-11-13. Built so far: R1 and R2 (§8), live in 0.1.145 and 0.1.146 (2026-11-13); the rest is not built.
 
 Paths are shortened: `admin` = `src/bin/sy_admin.rs`, `acme` = `src/bin/sy_admin/acme.rs`, `edge` =
 `src/bin/sy_edge.rs`, `web/main` and `web/web` = `nodes/io/io-web/src/{main,web}.rs`, `cloud/main` =

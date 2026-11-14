@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.145** | 2026-11-13 | `6514bded` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.1's R1 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): the messages SY.admin is to send io.web, `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` with their answers, their types and io.web's error codes (no node sends them before R3), and `web_exposure_key:` among the vault prefixes Cloud may not write, so io.cloud's `put_token`, `assign_token` and `delete_token` refuse it | ✅ live, checked on 8.x | snap `pre-websdk-0-1-145` (all 4 VMs) · `apt install fluxbee=0.1.144` + 0.1.144's `update_installation` (nothing one-way; Cloud could write a `web_exposure_key:` key again) |
+| **0.1.146** | 2026-11-13 | `39f33517` | motherbee + spokes (core), the router alone, io.web stage 2.1's R2 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): A-349 (no turn of Fluxbee Cloud's channel, a message IO.cloud sends or one addressed to it by name, for SY.storage nor for cognition), and `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` protected, SY.admin@motherbee alone (`web_service_actions` in system.rego, both wasm rebuilt) | ✅ live, checked on 8.x | snap `pre-router-0-1-146` (all 4 VMs) · `apt install fluxbee=0.1.145` + 0.1.145's `update_installation` (nothing one-way; Cloud's requests stored in `turns` again) |
+| **0.1.145** | 2026-11-13 | `6514bded` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.1's R1 ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): the messages SY.admin is to send io.web, `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` with their answers, their types and io.web's error codes (no node sends them before R3), and `web_exposure_key:` among the vault prefixes Cloud may not write, so io.cloud's `put_token`, `assign_token` and `delete_token` refuse it | ✅ replaced by 0.1.146 | snap `pre-websdk-0-1-145` (deleted 2026-11-13) · `apt install fluxbee=0.1.144` + 0.1.144's `update_installation` (nothing one-way; Cloud could write a `web_exposure_key:` key again) |
 | **0.1.144** | 2026-11-13 | `3343b49a` | motherbee + spokes (core), the operator's calls on the bug push's findings, one branch per binary: the orchestrator (A-343: no call to Syncthing on the threads that serve its commands; A-346 (b): a config patch, or `run_node`'s config, with a top-level `config` key refused), SY.admin and Archi's handbook (A-346 (a): set_node_config's HTTP help names the route's body; A-344: what `WF_NODE_NOT_DEPLOYED` means and what to do) | ✅ replaced by 0.1.145 | snap `pre-orch-0-1-144` (deleted 2026-11-13) · `apt install fluxbee=0.1.143` + 0.1.143's `update_installation` (nothing one-way; the stalls come back) |
 | **0.1.143** | 2026-11-13 | `93fe0d3a` | motherbee + spokes (core), the Rust SDK alone: A-295 (a Rust node's command channels, two lanes of 1,024 messages or 8 MiB, the system lane first; a message without room is answered `NOT_TAKEN node_busy`, retryable, and a `NOT_TAKEN` ends a pending request), A-309 (a call its caller drops leaves nothing pending), A-269's call (b) (each record one line, escaped, cut at 16 KiB, every Rust binary), A-285's Cloud catalog text; A-336 recorded | ✅ replaced by 0.1.144 | snap `pre-rustsdk-0-1-143` (deleted 2026-11-13) · `apt install fluxbee=0.1.142` + 0.1.142's `update_installation` (nothing one-way; the unbounded channels come back) |
 | **0.1.142** | 2026-11-13 | `bc62240f` | motherbee + spokes (core), the AI SDK alone: A-294 (a reply over the frame fails alone, the runtime goes on), A-290 (a saturated AI node reads `DEGRADED` `ai_runtime_saturated`, its load in its status), A-325 (ai.generic and SY.frontdesk.gov leave `VAULT_SECRET_CHANGED` unanswered), A-339 (and a `NOT_TAKEN` or an error answer, with a WARN), A-327's `tool_choice` (no caller yet) | ✅ replaced by 0.1.143 | snap `pre-aisdk-0-1-142` (deleted 2026-11-13) · `apt install fluxbee=0.1.141` + 0.1.141's `update_installation` (nothing one-way; A-294's restart comes back) |
@@ -154,6 +155,59 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.146 — The router alone: Cloud's channel no longer stored, and io.web's commands from SY.admin alone (A-349; io.web stage 2.1's R2)
+
+- **Date:** 2026-11-13 (ART) · **Previous version:** 0.1.145 · **Commit:** `39f33517`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** A-349, found by stage 2.1's design (Cloud's requests and io.cloud's answers stored whole
+  in SY.storage's `turns`, `put_token`'s credential values among them), with the operator's call of
+  2026-11-13 to fix it in the router's release (*"los pedidos de Cloud viajan como mensajes"*); and
+  stage 2.1's §5.8, io.web's two commands protected before any node sends them. The router ships
+  alone ([METHOD](logbook/METHOD.md) §9).
+- **What changed (`coa/web21-router`; `900974dc`, the review `39f33517`):** `should_publish_turn`
+  takes the router-bound sender and refuses a message on Cloud's channel (`on_cloud_channel`:
+  IO.cloud sends it, or it is addressed to IO.cloud by name, `IO.cloud@<hive>` or `@*`, in any
+  case), for the `storage.turns` copy and for cognition's, at entry and at delivery; IO.cloud's
+  `register_human` handoff to the frontdesk, which carries Cloud's payload, is no longer copied
+  either; a reply to IO.cloud by its UUID still is (no Cloud request). `IO_WEB_EXPOSURES` and
+  `IO_WEB_ACCESS_LINK` join the protected SYSTEM actions (35), with `web_service_actions` in
+  `policy/system.rego` (SY.admin on the primary hive) and both wasm rebuilt. Docs: rt-gateway,
+  router-stream-v1 §2.2, storage, protocol, architecture, cognition, message-trace-v1 and
+  sy-architect's Messages page. SY.storage is unchanged, and what it stored before stays.
+- **Build and review:** built by an agent in its own worktree and target, reviewed once and fixed;
+  rebased onto 0.1.145's records (`fb4193f6`; its copy of `e85f5417` dropped); CI green on
+  `39f33517` (rust-tests, router-dispatcher-guards, policy-wasm-guard, posture-guards); daily
+  fast-forwarded.
+- **The deploy:** build on fb-build 01:37:26–01:54:41Z (17.3 min), publish 13 s. The gate's mark at
+  01:55:19Z; `ops deploy 0.1.146 --snapshot pre-router-0-1-146 --drop pre-websdk-0-1-145` in 249 s
+  (snapshots 31.3 s, the motherbee's apt 114.1 s, its admin on the version 41.4 s, the spokes
+  answering 8.7 s, the update's call 21.7 s, the hives on the target 15.7 s, health 6.7 s). On the
+  target after the update's call: the motherbee 4.4 s, egress1 and ingress1 26.8 s, worker1 35.7 s.
+  The update (`upd-1794621519533`) closed with every hive on the target, core hash
+  `7edb76176e7bd29b`. Health clean; the web line as before (route acknowledged, io.web running).
+- **Checked on 8.x (the gate, gate0246: its baseline on 0.1.145 at 01:27–01:28Z, then 01:59–02:02Z;
+  `scratchpad/gate-tools/r146_gate.py` with `r146_client.py`, git-ignored; 13 PASS, 1 SEE, 1 FAIL
+  of the tool's own matcher, its rerun a PASS; no model call):**
+  - **A-349:** through the public door with Cloud's token, a `put_token` of a dummy value and its
+    `delete_token`, each with a unique request id: on 0.1.145 `turns` held 4 rows of them (for each,
+    the edge's request to `IO.cloud@motherbee` and IO.cloud's answer to the edge); on 0.1.146, none
+    after 20 s. The control: a plain `user` message between two throwaway IO nodes on worker1 is
+    still stored (1 row by its trace).
+  - **The protected actions:** two throwaway IO nodes on worker1: `IO_WEB_EXPOSURES` and
+    `IO_WEB_ACCESS_LINK` reached their target on 0.1.145; on 0.1.146 worker1's router dropped both
+    and logged *"router dropped protected SYSTEM action from unauthorized origin"*, and a control
+    message on the same pair was delivered.
+  - **The smoke (A-314's lesson):** `run_node AI.gate0246s@worker1` ok in 1.5 s, `RUNNING` at 8.2 s
+    on 0.1.146, killed without purge, `STOPPED`; the stopped `AI.gate0233@worker1` reads `STOPPED`.
+  - **The cost:** 0 usage records.
+- **What stays:** SY.storage keeps the 595 rows of Cloud's channel it stored before (2026-10-17 to
+  the baseline), 49 of them `put_token`'s; the operator decides whether to scrub them (FINDINGS
+  A-349).
+- **PROD after the gate:** all four hives on 0.1.146; snapshot `pre-router-0-1-146` on each VM,
+  `pre-websdk-0-1-145` deleted. `AI.gate0246s` purged (no history); the gate's vault keys deleted.
+- **Rollback:** the snapshot `pre-router-0-1-146` (all 4 VMs), or `apt install fluxbee=0.1.145` +
+  0.1.145's `update_installation`: nothing one-way.
 
 ## 0.1.145 — The Rust SDK alone: io.web's new messages, and the exposures' vault keys reserved (io.web stage 2.1's R1)
 

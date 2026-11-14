@@ -402,10 +402,14 @@ no change required
     and their types in the SDK (no node sends them before R3); `web_exposure_key:` reserved:
     Cloud's `put_token`, `assign_token` and `delete_token` of such a key refused `INVALID_REQUEST`
     through the public door, a control key taken; 11 PASS, no model call.
-    **R2, the router alone with A-349:** built on `coa/web21-router`, CI green on `170ad09c`. Its
-    baseline on 0.1.145: a `put_token` and a `delete_token` through Cloud's door leave 4 turns (the
-    edge's request to IO.cloud and IO.cloud's answer, for each), and a throwaway IO node's
-    `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` reach their target.
+    **0.1.146, R2, the router alone with A-349** ✅ live and checked on 8.x (2026-11-13): through
+    Cloud's door a `put_token` and its `delete_token` leave no turn, where 0.1.145 left 4 (the
+    edge's request to IO.cloud and IO.cloud's answer, for each), and a plain `user` message is still
+    stored; a throwaway IO node's `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` dropped by the router
+    and logged, where 0.1.145 delivered them, a control message delivered; 13 PASS, no model call.
+    The 595 rows of Cloud's channel stored before stay: the operator's call.
+    **R3, the binaries:** `coa/web21-admin`, `coa/web21-edge`, `coa/web21-io-web` and
+    `coa/web21-io-cloud`, each built by an agent in its own worktree and target from `fb4193f6`.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -477,7 +481,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
-- A-349 🔵 Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns, `put_token`'s credential values among them (medium; the router; found by io.web stage 2.1's design; the operator's call of 2026-11-13: fixed in stage 2.1's router release, R2; built on `coa/web21-router`, no turn of a message IO.cloud sends or that is addressed to it by name, to ship with the router alone; what is stored already stays, the operator's call pending).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
@@ -1607,7 +1610,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-349 [General/router] 🔵 medium (found 2026-11-13 by io.web stage 2.1's build design; read in the code; there since Cloud's channel) — Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns: `put_token`'s credential values at rest today
+### A-349 [General/router] ✅ VALIDATED ON 8.x (0.1.146, 2026-11-13; through Cloud's door a `put_token` and its `delete_token` leave no turn, where 0.1.145 left 4; a plain `user` message is still stored) (medium; found 2026-11-13 by io.web stage 2.1's build design; read in the code; there since Cloud's channel) — Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns: `put_token`'s credential values at rest today
 
 - **Why:** Cloud's traffic rides the `user` message family (the edge's message, `src/bin/sy_edge.rs`
   ~5446; SY.admin ~8706; io.cloud `nodes/io/io-cloud/src/main.rs` ~115, ~587). A router copies every
@@ -1648,6 +1651,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   The gate on 8.x: after a `put_token` through Cloud's door, `turns` holds no row with its trace_id
   (IO.cloud's journal gives it). Until the fix, the ingress' router, where the edge enters, copied
   the request, and the motherbee's the answer.
+- **Validated on 8.x (0.1.146, 2026-11-13; gate0246):** through the public door with Cloud's token,
+  a `put_token` of a dummy value and its `delete_token`, each with a unique request id: on 0.1.145
+  `turns` held 4 rows of them (for each, the edge's request to `IO.cloud@motherbee` and IO.cloud's
+  answer to the edge); on 0.1.146, none. A plain `user` message between two throwaway IO nodes on
+  worker1 is still stored (1 row by its trace). **What stays:** 595 rows of Cloud's channel stored
+  from 2026-10-17 to the baseline, 49 of them `put_token`'s; the operator's call on scrubbing them
+  is pending.
 
 ### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
 
