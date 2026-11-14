@@ -554,7 +554,9 @@ secret in SY.vault, credentials and host only (a URL with a database name is ref
 `fluxbee_storage` itself (`ARCHITECT_MESSAGES_DB_NAME`). Without that secret the routes answer
 503 `messages_db_not_configured`. The list is newest first, default 200 rows, at most 500; the
 stream (`/api/messages/stream`) polls every second. Every row keeps the whole message as the router
-copied it (`turns.message`): the sender, the size and the detail come from it. A message copied
+copied it (`turns.message`): the sender, the size and the detail come from it. Fluxbee Cloud's
+traffic is not there: the router copies no message IO.cloud sends nor one addressed to it by name
+(FINDINGS A-349, [rt-gateway](rt-gateway.md)); rows stored before stay. A message copied
 before routers stamped names (the rows backfilled at 0.1.76) shows the sender's ILK, and a
 resolved destination, which the message carries as null, the destination ILK.
 

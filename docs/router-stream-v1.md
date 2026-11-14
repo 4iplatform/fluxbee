@@ -146,8 +146,9 @@ and the per-frame loop. The socket stays.
      name its `/e/` row holds, and IO.cloud answers each one; both are `user` messages, so until
      then SY.storage kept them whole in `turns`, `put_token`'s credential values among them, and
      io.web's one-time access links would have followed. The rule also leaves out IO.cloud's
-     `register_human` handoff to SY.frontdesk.gov (the person's name and email); the frontdesk's
-     verdict, addressed to IO.cloud by its UUID as every reply is, is still copied. What
+     `register_human` handoff to SY.frontdesk.gov, Cloud's `frontdesk_handoff` payload as Cloud
+     sent it (the person's name and email); the frontdesk's verdict, addressed to IO.cloud by its
+     UUID as every reply is, is still copied. What
      SY.storage stored before stays until the operator decides whether to scrub it.
    - The copy is made once, by the router where the message enters.
    - The copy carries the sender's real name (`conn_node_name`). Today it keeps whatever

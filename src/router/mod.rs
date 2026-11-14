@@ -7809,8 +7809,9 @@ fn should_publish_turn(sender: &str, msg: &Message) -> bool {
 /// router copies none of them, for SY.storage nor for cognition.
 ///
 /// What else this stops copying: IO.cloud's handoff of a `register_human` to SY.frontdesk.gov,
-/// which carries the person's name and email Cloud sent. The frontdesk's verdict, addressed to
-/// IO.cloud by its UUID as every reply is, is still a turn: it carries no Cloud request.
+/// which carries Cloud's `frontdesk_handoff` payload as Cloud sent it, the person's name and email
+/// (`nodes/io/io-cloud/src/main.rs`). The frontdesk's verdict, addressed to IO.cloud by its UUID as
+/// every reply is, is still a turn: it carries no Cloud request.
 fn on_cloud_channel(sender: &str, msg: &Message) -> bool {
     is_cloud_node(sender)
         || matches!(&msg.routing.dst, Destination::Unicast(dst) if is_cloud_node(dst))
@@ -11961,6 +11962,16 @@ mod tests {
                 .expect("delivered");
             serde_json::from_slice(&frame).expect("message")
         }
+        // The stream's records as a failure shows them: subject, producer and the copy as text.
+        let shown = |copies: &[(String, String, Vec<u8>)]| -> Vec<(String, String, String)> {
+            copies
+                .iter()
+                .map(|(subject, producer, payload)| {
+                    let text = String::from_utf8_lossy(payload).into_owned();
+                    (subject.clone(), producer.clone(), text)
+                })
+                .collect()
+        };
 
         // The edge forwards Cloud's request to IO.cloud by name, then a request of another
         // channel to IO.api.
@@ -11992,7 +12003,7 @@ mod tests {
         assert_eq!(got.payload["params"]["value"]["api_key"], secret);
         received(&mut receivers.get_mut("IO.api@motherbee").unwrap().1).await;
         let copies = observed.drain();
-        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies.len(), 1, "{:?}", shown(&copies));
         assert_eq!(copies[0].0, fluxbee_sdk::stream::SUBJECT_STORAGE_TURNS);
         let copy: Message = serde_json::from_slice(&copies[0].2).expect("the turn copy");
         assert_eq!(copy.payload["n"], "another channel");
@@ -12037,7 +12048,7 @@ mod tests {
         received(&mut receivers.get_mut("SY.frontdesk.gov@motherbee").unwrap().1).await;
         received(&mut receivers.get_mut("AI.sales@motherbee").unwrap().1).await;
         let copies = observed.drain();
-        assert!(copies.is_empty(), "{copies:?}");
+        assert!(copies.is_empty(), "{:?}", shown(&copies));
     }
 
     /// A message to an agent on `thread:t1`, from IO.api, whose text is `content`.
@@ -12415,6 +12426,11 @@ mod tests {
                 to(cloud),
                 "an agent's message to IO.cloud",
             ),
+            (
+                "WF.soporte@motherbee",
+                to(cloud),
+                "a WF's message to IO.cloud, an IO node: no relay to cognition",
+            ),
         ] {
             assert!(!should_publish_turn(sender, &msg), "{why}");
             assert!(!is_communication_turn(sender, &msg), "{why}");
@@ -12443,10 +12459,14 @@ mod tests {
             "IO.api@motherbee",
             &message(Destination::Unicast(cloud.to_string()), SYSTEM_KIND)
         ));
-        // An agent's turn to another IO node still goes to its cognition.
+        // An agent's turn and a WF's relay to another IO node still go to cognition.
         assert!(copied_for_cognition_at_entry(
             "AI.sales@motherbee",
             &to("IO.api@motherbee")
+        ));
+        assert!(copied_for_cognition_at_entry(
+            "WF.soporte@motherbee",
+            &to("IO.slack@motherbee")
         ));
     }
 

@@ -52,7 +52,7 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "EDGE_WEB_ROUTES",
     // io.web's own: the set of exposures it serves, with their enablements, and the one-time access
     // link it mints for one (docs/io-web-v2-stage-2-1.md §5.5): SY.admin@motherbee alone sends them
-    // (`web_service_actions`), and io.web checks the sender too.
+    // (`web_service_actions`). io.web is to check the sender as well, in its own release (§5.5).
     "IO_WEB_EXPOSURES",
     "IO_WEB_ACCESS_LINK",
     "SPAWN_NODE",

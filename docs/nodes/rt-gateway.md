@@ -314,8 +314,8 @@ by its canonical name (`authorize_system`); a denial drops the message with
 `router dropped protected SYSTEM action from unauthorized origin`. The rules
 (`policy/system.rego`): edge commands, io.web's commands (`web_service_actions`,
 [io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.8) and node control only from
-`SY.admin@motherbee`; the
-orchestrator's mutating actions only from `SY.orchestrator@motherbee` (`ADD_HIVE_FINALIZE` and
+`SY.admin@motherbee`; the orchestrator's mutating actions only from `SY.orchestrator@motherbee`
+(`ADD_HIVE_FINALIZE` and
 `REMOVE_HIVE_CLEANUP` never on the motherbee itself), its reads also from the same hive's
 `SY.orchestrator`; every other protected action from the
 same hive's `SY.admin`; `NODE_STATUS_GET` also from the same hive's `SY.vault`. The policy is
@@ -345,8 +345,9 @@ pushes them in acknowledged batches to their sinks.
     answer IO.cloud gives it, both `user` messages: a request carried what Cloud sent,
     `put_token`'s credential values among it, and an answer carries what the hive gives back,
     io.web's one-time access links from its stage 2.1 on. It is also IO.cloud's `register_human`
-    handoff to SY.frontdesk.gov, with the person's name and email. A message to IO.cloud by its
-    UUID, as every reply is, is still copied: the frontdesk's verdict. Archi's Messages page no
+    handoff to SY.frontdesk.gov: Cloud's `frontdesk_handoff` payload as Cloud sent it, the
+    person's name and email. A message to IO.cloud by its UUID, as every reply is, is still
+    copied: the frontdesk's verdict (`success`, `human_message`, `ilk_id`). Archi's Messages page no
     longer shows Cloud's traffic; IO.cloud's journal keeps each request's op, trace_id,
     request_id, status and time (`IO.cloud received a Cloud request`, `IO.cloud Cloud op
     completed`). What SY.storage stored before stays in `turns`, until the operator decides

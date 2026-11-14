@@ -1631,8 +1631,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `@*`, in any case). Both copies go through it: the node loop's `storage.turns` copy (~886) and
   cognition's, at entry and at delivery (`is_communication_turn`, ~7871, ~7920). SY.storage is
   unchanged. **What else it stops copying:** IO.cloud's `register_human` handoff to
-  SY.frontdesk.gov (`nodes/io/io-cloud/src/main.rs` ~2413-2423: a `user` message with the
-  person's name and email); IO.cloud sends no other non-system message (its other sends are
+  SY.frontdesk.gov, a `user` message that carries Cloud's `frontdesk_handoff` payload verbatim,
+  the person's name and email (`nodes/io/io-cloud/src/main.rs` ~2333, ~2413-2423), so it is
+  Cloud's request too; IO.cloud sends no other non-system message (its other sends are
   system or admin: config, status, identity, the relay to SY.admin). It never reached cognition
   (neither end is an agent), and Archi's Messages page loses Cloud's rows; IO.cloud's journal keeps
   each request's op, trace_id, request_id, status and time. **Still copied:** a message to
@@ -1642,10 +1643,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   edge's `put_token` to IO.cloud, IO.cloud's answer with a link, its handoff and its message to an
   agent; the edge's request to IO.api is copied. Without the fix the four are turns, and the
   agent's a cognition copy too) and `a_message_on_cloud_s_channel_is_no_turn` (the rule's
-  table). Docs: rt-gateway.md, router-stream-v1.md §2.2, and the references that state the rule
-  (storage, protocol, architecture, cognition, message-trace-v1). The gate on 8.x: after a
-  `put_token` through Cloud's door, `turns` holds no row with its trace_id (IO.cloud's journal
-  gives it), from the ingress' stream nor the motherbee's.
+  table). Docs: rt-gateway.md, router-stream-v1.md §2.2, sy-architect.md's Messages page, and the
+  references that state the rule (storage, protocol, architecture, cognition, message-trace-v1).
+  The gate on 8.x: after a `put_token` through Cloud's door, `turns` holds no row with its trace_id
+  (IO.cloud's journal gives it). Until the fix, the ingress' router, where the edge enters, copied
+  the request, and the motherbee's the answer.
 
 ### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
 
