@@ -372,7 +372,8 @@ no change required
     names the route's body, a wrapped patch refused, nothing written), A-344 (Archi's handbook text);
     17 PASS, no model call. A-347 waits; A-348 (found building A-346: Archi's SCMD reads no
     `?replace`) recorded.
-    **Next:** the io.web talk (the operator's idea), then the IO family, with io.slack.
+    **Next:** the io.web talk ✅ (2026-11-13: item 31, io.web's stage 2.1), then the IO family, with
+    io.slack.
     **Numbers given on the push's branches** (the operator's call of 2026-11-12, where 0.1.139's
     integration review had given the orchestrator's item A-339): A-335 is the orchestrator's (a box
     `remove_hive` did not reach, 0.1.139); A-336 is the Rust SDK branch's (`coa/rustsdk-143`: the
@@ -390,6 +391,21 @@ no change required
     answered `BUSY` (A-307), still moved its slots before a refused publish, and waited 5 s for a
     publish. Every hive runs 0.1.139 since the deploy's update closed (22:34 ART on 2026-11-12), so
     the hold is lifted.
+31. **io.web's stage 2.1, exposures and access (the operator, 2026-11-13: *"concuerdo.. cerrado el
+    doc. arranca cuando quieras. firmo"*).** Stage 2 redefined in [io-web-v2](../../docs/io-web-v2.md)
+    §12; its first step's build design, with the operator's six decisions in its §0, is
+    [io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md). Four releases, each with its gate (§8):
+    R1 the Rust SDK alone, R2 the router alone with A-349, R3 the binaries (SY.admin with ACME, the
+    edge, io.web, io.cloud), R4 the Rust SDK's Cloud catalog; then §7's gate. The wildcard DNS
+    record `*.hive-k3m9x7q2.fluxbee.ai` made by the operator and checked (2026-11-13).
+    **0.1.145, R1, the Rust SDK alone** ✅ live and checked on 8.x (2026-11-13): io.web's messages
+    and their types in the SDK (no node sends them before R3); `web_exposure_key:` reserved:
+    Cloud's `put_token`, `assign_token` and `delete_token` of such a key refused `INVALID_REQUEST`
+    through the public door, a control key taken; 11 PASS, no model call.
+    **R2, the router alone with A-349:** built on `coa/web21-router`, CI green on `170ad09c`. Its
+    baseline on 0.1.145: a `put_token` and a `delete_token` through Cloud's door leave 4 turns (the
+    edge's request to IO.cloud and IO.cloud's answer, for each), and a throwaway IO node's
+    `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` reach their target.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 

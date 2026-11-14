@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.144** (2026-11-13), and PROD runs **0.1.144** (the router, the Go
+> Contract as of **fluxbee 0.1.145** (2026-11-13), and PROD runs **0.1.145** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1153,7 +1153,7 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.145 (planned)
+### 0.1.145
 
 - **`web_exposure_key:*` joined the reserved keys** (`put_token`, `assign_token` and `delete_token`
   answer `INVALID_REQUEST`): the hive keeps its exposures' session keys there, and only the hive
@@ -1456,6 +1456,11 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.145:** on PROD, 2026-11-14 at 01:26Z (22:26 ART on 2026-11-13), through the public door
+with Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.145): `put_token`, `assign_token` and `delete_token` of a
+`web_exposure_key:` key answered `INVALID_REQUEST` (HTTP 200); a control `put_token` of another key
+was taken and deleted.
 
 **0.1.143:** on PROD, 2026-11-13 from 18:48Z, through the public door with Cloud's token
 (`lab/DEPLOYMENTS.md`, 0.1.143; FINDINGS A-285): `list_cloud_actions` every 10 s across the deploy
