@@ -3583,11 +3583,11 @@ struct WebRouteTable {
 }
 
 impl WebRouteTable {
-    /// The set the file holds. No file is no web host. An unreadable or corrupt file, or a set a
-    /// push would be refused for (`validate_web_routes`: the edge never wrote it), is an ERROR and
-    /// starts empty, until SY.admin pushes the set again, within a minute; meanwhile a web host is
-    /// an unknown host to the door (`host_route`), which answers it 404. The main name is checked
-    /// once a certificate is served (`forget_main_name`).
+    /// The set the file holds. No file is no web host. An unreadable or corrupt file, or one
+    /// holding a set over the cap (more than `MAX_WEB_ROUTES` hosts; the edge never writes one),
+    /// is an ERROR and starts empty, until SY.admin pushes the set again, within a minute;
+    /// meanwhile a web host is an unknown host to the door (`host_route`), which answers it 404.
+    /// The main name is checked once a certificate is served (`forget_main_name`).
     fn load(path: PathBuf) -> Self {
         let read = match std::fs::read(&path) {
             Ok(raw) => serde_json::from_slice::<WebRoutes>(&raw)
@@ -3744,8 +3744,9 @@ fn validate_web_routes(requested: WebRoutes, certified: &[String]) -> Result<Web
 }
 
 /// The edge's main name, when its certificate tells it: its only DNS name, or the one every other
-/// name lies under (SY.admin derives each web host from it: `archi.` + the main host). `None`
-/// when no certificate is served (awaiting, plaintext) or the names are unrelated.
+/// name lies under (SY.admin derives each exposure's host from it, `<label>.` + the main host:
+/// docs/io-web-v2-stage-2-1.md §2.1). `None` when no certificate is served (awaiting, plaintext)
+/// or the names are unrelated.
 fn main_certified_name(names: &[String]) -> Option<&str> {
     names
         .iter()

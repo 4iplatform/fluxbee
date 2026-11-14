@@ -8,9 +8,9 @@ gave it, and it takes commands only from `SY.admin@motherbee`. Its certificate c
 it swaps a new one in place and answers the ACME TLS-ALPN-01 challenge SY.admin arms when it
 orders one ([ACME design](../acme-edge-certificates-v1.md) §4). It chooses each request's host
 before any path: only its main name, an IP literal or no host reach `/e/` and `/public/`; the web
-hosts SY.admin declares (`archi.<id>`) go to io.web on the motherbee, through a reverse proxy over
-the mesh's mutual TLS, its third surface ([io.web v2](../io-web-v2.md) §11.2); any other host
-answers 404.
+hosts, those of the exposures Fluxbee Cloud publishes through io.cloud, go to io.web on the
+motherbee, through a reverse proxy over the mesh's mutual TLS, its third surface
+([io.web v2](../io-web-v2.md) §11.2); any other host answers 404.
 
 Source: `src/bin/sy_edge.rs`; the certificate checks it shares with SY.admin are in
 `src/tls_material.rs`. The URL commands it receives are sent by `SY.admin`
@@ -427,8 +427,11 @@ by the operator. See [SY.admin](sy-admin.md).
 
 ## Web hosts
 
-The hosts the door serves only through io.web ([io.web v2](../io-web-v2.md) §11.1): today
-`archi.<id>`, which SY.admin derives from its `web:` declaration and pushes every minute. The edge
+The hosts the door serves only through io.web ([io.web v2](../io-web-v2.md) §11.1): the hosts of
+the exposures Fluxbee Cloud publishes through io.cloud, each `<label>.<main name>`
+([io.web stage 2.1](../io-web-v2-stage-2-1.md) §2). SY.admin pushes them with `EDGE_WEB_ROUTES` at
+each publish and unpublish, and every minute. Archi's host, `archi.<id>`, is one of them once
+Cloud publishes it; SY.admin's `web:` declaration in hive.yaml is retired (stage 2.1 §0). The edge
 keeps them in `WebRouteTable`, read by every request (see HTTP surface).
 
 `EDGE_WEB_ROUTES` carries the full set, `{routes: [{host, upstream}]}`, and replaces it whole
@@ -445,9 +448,9 @@ stays, when:
   connects to a host or a port a route names);
 - a host is the edge's main name, which would take `/e/` and `/public/` off it. The edge tells
   its main name from the certificate it serves (`main_certified_name`): its only DNS name (PROD
-  before the combined certificate), or the one every other name lies under (after it,
-  `archi.<id>` lies under `<id>`). With unrelated names, or no certificate served (awaiting,
-  plaintext), it cannot tell, and the check is skipped.
+  before the combined certificate), or the one every other name lies under (after it, every web
+  host, `<label>.<main name>`, lies under the main name). With unrelated names, or no certificate
+  served (awaiting, plaintext), it cannot tell, and the check is skipped.
 
 The answer is `{status: "ok", routes, changed, persisted, upstream}`: the set served from now on,
 in canonical form and sorted, whether it differs from the one before, whether the file holds it,
@@ -468,10 +471,10 @@ At boot the file is read before the door opens, so a restarted edge proxies a we
 file is no web host. It is read before any certificate: once the boot read of the
 certificate serves one, a route that names the main name is dropped, logged at ERROR, and written
 over at the next push (`WebRouteTable::forget_main_name`); a request for the main name gets the
-door's routes in any case (`host_route`). A corrupt or unreadable file, or one holding a set a
-push would be refused for (more than 64 hosts, say: the edge never writes one), is an ERROR and
-starts with no web host until SY.admin pushes the set again, within a minute; meanwhile the web
-host is an unknown host, and gets the same 404.
+door's routes in any case (`host_route`). A corrupt or unreadable file, or one holding a set over
+the cap (more than 64 hosts; the edge never writes one), is an ERROR and starts with no web host
+until SY.admin pushes the set again, within a minute; meanwhile the web host is an unknown host,
+and gets the same 404.
 
 ## TLS and the certificate
 
@@ -732,7 +735,9 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 - The proxy: `sy-edge web proxy ready: web hosts go to io.web` at boot names the upstream, and
   each proxied request leaves its line (see The proxy to io.web). On the motherbee,
   `GET /web/status` shows its upstream and last failure (`routes.upstream`). Through the edge,
-  `curl -s https://archi.<id>/healthz` asks io.web's own `/healthz`.
+  `curl -s https://<exposure host>/.fluxbee/healthz` asks io.web's own health check
+  ([io.web stage 2.1](../io-web-v2-stage-2-1.md) §5.5); `archi.<id>` answers 404 until Cloud
+  publishes it.
 - The open channels: `GET /channels/externalized?edge_node=SY.edge@<ingress>` on SY.admin
   (`list_externalized` → `EDGE_LIST_URLS`).
 
