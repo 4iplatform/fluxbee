@@ -327,8 +327,18 @@ stage every web route takes GET and HEAD with no body:
   `X-Forwarded-Proto` (`https`, or `http` on a plaintext door), `X-Forwarded-Host` (the web
   host), `Forwarded` (RFC 7239, `for=<peer>;proto=<proto>;host=<host>`, an IPv6 peer as
   `"[<address>]"`) and a fresh `X-Request-Id` (a UUID);
-- no body: the framing is the edge's own. Cookies and `Authorization` pass as the client sent
-  them; the session rules come with stage 2 (io-web-v2 §11.3).
+- of the client's cookies, only the pairs whose name begins with `__Host-` (matched as written:
+  `__host-` is another name), in their order, in one `Cookie`, each after the first behind a `;`
+  and a space; with none left, no `Cookie` at all (`host_prefixed_cookies`,
+  [io.web stage 2.1](../io-web-v2-stage-2-1.md) §5.4). A browser keeps a `__Host-` cookie only
+  from the host itself (`Secure`, `Path=/`, no `Domain`), so no other host under the main name,
+  another exposure or the main host, can set one for a web host. Every `Cookie` the client sent
+  is split at each `;`, and the spaces around each pair go. A pair outside RFC 6265's syntax stays
+  out, and the pairs beside it pass: a token for the name, `=`, then cookie octets, bare or in
+  double quotes, so a value may hold `=` but no space, comma, semicolon, double quote, backslash
+  or byte past ASCII. The edge reads no session and logs no cookie; io.web checks the session
+  (stage 2.1 §4). The main name's routes get no cookie (`/e/`'s allowlist);
+- no body: the framing is the edge's own. `Authorization` passes as the client sent it.
 
 **What the client gets** (`from_io_web`): io.web's status and headers, without the hop-by-hop ones
 and those io.web's `Connection` names, and without a `Content-Length` that a `Transfer-Encoding`
@@ -425,6 +435,9 @@ keeps them in `WebRouteTable`, read by every request (see HTTP surface).
 (`web_routes_answer`). The payload refuses unknown fields. A set is refused, and the one served
 stays, when:
 
+- it holds more than 64 hosts (`MAX_WEB_ROUTES`): SY.admin publishes at most 16 exposures
+  ([io.web stage 2.1](../io-web-v2-stage-2-1.md) §2.1), and the edge keeps a looser bound of its
+  own (§5.4), so no push grows the set every request scans past it;
 - a host is not a DNS name once in `canonical_host` form: a port other than 443, a wildcard, an
   IP literal (`validate_web_routes`, `is_dns_host_name`);
 - a host appears twice;
@@ -455,9 +468,10 @@ At boot the file is read before the door opens, so a restarted edge proxies a we
 file is no web host. It is read before any certificate: once the boot read of the
 certificate serves one, a route that names the main name is dropped, logged at ERROR, and written
 over at the next push (`WebRouteTable::forget_main_name`); a request for the main name gets the
-door's routes in any case (`host_route`). A corrupt or unreadable file is an ERROR and starts with
-no web host until SY.admin pushes the set again, within a minute; meanwhile the web host is an
-unknown host, and gets the same 404.
+door's routes in any case (`host_route`). A corrupt or unreadable file, or one holding a set a
+push would be refused for (more than 64 hosts, say: the edge never writes one), is an ERROR and
+starts with no web host until SY.admin pushes the set again, within a minute; meanwhile the web
+host is an unknown host, and gets the same 404.
 
 ## TLS and the certificate
 
@@ -700,9 +714,8 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 - One certificate for every name: the edge chooses no certificate by SNI. SY.admin's ACME client
   orders one that names the main host and every web host, and the edge terminates TLS for all of
   them (io-web-v2 §5, O6; §11.1).
-- The proxy's stage 2 (io-web-v2 §11.3): the edge passes cookies and `Authorization` to io.web as
-  the client sent them; filtering cookies to `__Host-` ones, and bodies on upload paths, come
-  with sessions. Today every web route is GET and HEAD with no body.
+- Bodies, on upload paths only (io-web-v2 §11.3): every web route is GET and HEAD with no body,
+  as stage 2.1 keeps it.
 - The proxy keeps no connection to io.web between requests: each one is a new TCP connection and
   TLS handshake, closed by io.web once its response ends (A-90).
 - The `shared-secret` mode is one static bearer per channel. There is no other auth mode.

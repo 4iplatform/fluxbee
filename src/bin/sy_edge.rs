@@ -3583,10 +3583,11 @@ struct WebRouteTable {
 }
 
 impl WebRouteTable {
-    /// The set the file holds. No file is no web host. An unreadable or corrupt file is an ERROR
-    /// and starts empty, until SY.admin pushes the set again, within a minute; meanwhile a web
-    /// host is an unknown host to the door (`host_route`), which answers it 404. The main name is
-    /// checked once a certificate is served (`forget_main_name`).
+    /// The set the file holds. No file is no web host. An unreadable or corrupt file, or a set a
+    /// push would be refused for (`validate_web_routes`: the edge never wrote it), is an ERROR and
+    /// starts empty, until SY.admin pushes the set again, within a minute; meanwhile a web host is
+    /// an unknown host to the door (`host_route`), which answers it 404. The main name is checked
+    /// once a certificate is served (`forget_main_name`).
     fn load(path: PathBuf) -> Self {
         let read = match std::fs::read(&path) {
             Ok(raw) => serde_json::from_slice::<WebRoutes>(&raw)
@@ -3691,15 +3692,26 @@ impl WebRouteTable {
     }
 }
 
+/// The most web hosts a set may hold. SY.admin publishes at most 16 exposures
+/// (docs/io-web-v2-stage-2-1.md §2.1); the edge keeps a looser bound of its own (§5.4), so no push
+/// grows the set every request scans (`WebRouteTable::serves`) past it.
+const MAX_WEB_ROUTES: usize = 64;
+
 /// A requested set of web hosts in canonical form (sorted, each host in `canonical_host` form),
-/// or why it is refused: a host that is not a DNS name (a port other than 443, a wildcard, an IP
-/// literal), one named twice, or the edge's main name. The upstream is io.web, the only one
-/// `WebUpstream` admits.
+/// or why it is refused: more than `MAX_WEB_ROUTES` hosts, a host that is not a DNS name (a port
+/// other than 443, a wildcard, an IP literal), one named twice, or the edge's main name. The
+/// upstream is io.web, the only one `WebUpstream` admits.
 ///
 /// `certified`: the DNS names of the certificate the door serves (none while it serves none),
 /// from which `main_certified_name` tells the main name when it can. A web host there would leave
 /// `/e/` and `/public/` without it.
 fn validate_web_routes(requested: WebRoutes, certified: &[String]) -> Result<WebRoutes, String> {
+    if requested.routes.len() > MAX_WEB_ROUTES {
+        return Err(format!(
+            "a set holds at most {MAX_WEB_ROUTES} web hosts, got {}",
+            requested.routes.len()
+        ));
+    }
     let mut routes: Vec<WebRoute> = Vec::with_capacity(requested.routes.len());
     for route in requested.routes {
         let host = canonical_host(&route.host)
@@ -4304,8 +4316,9 @@ impl<B> Drop for DemandBody<B> {
 // The proxy to io.web (docs/io-web-v2.md §11.2), the door's third surface: a web host's requests
 // go to io.web on the motherbee over the mesh's mutual TLS, and nowhere else (never a host or a
 // port a request or a route names). In this stage a web host takes GET and HEAD with no body. The
-// edge rebuilds the framing, strips the hop-by-hop headers both ways and sets the forwarding
-// headers itself; io.web's body streams back through the door's paced stream.
+// edge rebuilds the framing, strips the hop-by-hop headers both ways, passes only `__Host-`
+// cookies and sets the forwarding headers itself; io.web's body streams back through the door's
+// paced stream.
 // ---------------------------------------------------------------------------
 
 /// The TCP connection to io.web and the TLS handshake on it must finish within this, together.
@@ -4349,6 +4362,13 @@ const DROPPED_REQUEST_HEADERS: [&str; 12] = [
     "x-http-method",
     "x-method-override",
 ];
+
+/// The start of the only cookie names that reach io.web (docs/io-web-v2-stage-2-1.md §5.4). A
+/// browser keeps a `__Host-` cookie only from the host itself, `Secure`, with `Path=/` and no
+/// `Domain` (RFC 6265bis §4.1.3.2), so no other host under the main name (another exposure, the
+/// main host) can set one for a web host. Matched as written: a browser that compares the prefix
+/// case-sensitively takes a `__HOST-` cookie from any host.
+const HOST_COOKIE_PREFIX: &[u8] = b"__Host-";
 
 /// The door's third surface: the web hosts' requests to io.web, under the route's policy
 /// (`web_policy_refusal`) and the proxy's cap.
@@ -4788,10 +4808,11 @@ fn io_web_request(req: &Request, forwarding: &Forwarding<'_>) -> hyper::Request<
 
 /// The client's headers as io.web gets them: the hop-by-hop ones and those `Connection` names
 /// stripped first (`strip_hop_by_hop`), then `DROPPED_REQUEST_HEADERS` and every `X-Forwarded-*`;
-/// then the edge's own `Host` (the web host), `X-Forwarded-For`, `X-Forwarded-Proto`,
-/// `X-Forwarded-Host`, `Forwarded` (RFC 7239) and `X-Request-Id`, in place of any the client sent;
-/// and `Connection: close`, so io.web closes first: no port of the ingress toward the motherbee is
-/// left in TIME_WAIT after a request (FINDINGS A-90).
+/// `Cookie` with its `__Host-` pairs only, or none (`host_prefixed_cookies`); then the edge's own
+/// `Host` (the web host), `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`
+/// (RFC 7239) and `X-Request-Id`, in place of any the client sent; and `Connection: close`, so
+/// io.web closes first: no port of the ingress toward the motherbee is left in TIME_WAIT after a
+/// request (FINDINGS A-90).
 fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> HeaderMap {
     let mut headers = inbound.clone();
     strip_hop_by_hop(&mut headers);
@@ -4805,6 +4826,14 @@ fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> H
         .collect();
     for name in dropped {
         headers.remove(name);
+    }
+    match host_prefixed_cookies(&headers) {
+        Some(cookie) => {
+            headers.insert(header::COOKIE, cookie);
+        }
+        None => {
+            headers.remove(header::COOKIE);
+        }
     }
     let client = forwarding.client.to_canonical();
     // RFC 7239 §6: an IPv6 node is bracketed, and then quoted.
@@ -4844,6 +4873,56 @@ fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> H
         }
     }
     headers
+}
+
+/// The `Cookie` io.web gets (docs/io-web-v2-stage-2-1.md §5.4), or `None` when no pair is left:
+/// the pairs of every `Cookie` the client sent whose name begins with `HOST_COOKIE_PREFIX`, in
+/// their order, in one header joined by `; ` (RFC 6265 §4.2.1). Each value is split at every `;`,
+/// and the spaces and tabs around a pair go (a header value holds no other ASCII whitespace). A
+/// pair outside RFC 6265 §4.1.1's syntax stays out (`is_host_prefixed_cookie_pair`), so no other
+/// cookie can ride inside a value that io.web, or an upstream, would split otherwise.
+fn host_prefixed_cookies(headers: &HeaderMap) -> Option<HeaderValue> {
+    let pairs: Vec<&[u8]> = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b';'))
+        .map(<[u8]>::trim_ascii)
+        .filter(|pair| is_host_prefixed_cookie_pair(pair))
+        .collect();
+    if pairs.is_empty() {
+        return None;
+    }
+    // Token characters, cookie octets and the separators: always a valid header value.
+    HeaderValue::from_bytes(&pairs.join(&b"; "[..])).ok()
+}
+
+/// Whether `pair` is a `name=value` cookie pair (RFC 6265 §4.1.1) whose name begins with
+/// `HOST_COOKIE_PREFIX`: the name a token (`is_tchar`), then `=`, then cookie octets
+/// (`is_cookie_octet`), bare or in double quotes. The value runs from the first `=` on, so it may
+/// hold `=`, never a space, a comma, a semicolon, a double quote or a backslash.
+fn is_host_prefixed_cookie_pair(pair: &[u8]) -> bool {
+    let Some(equals) = pair.iter().position(|byte| *byte == b'=') else {
+        return false;
+    };
+    let (name, value) = (&pair[..equals], &pair[equals + 1..]);
+    let value = value
+        .strip_prefix(b"\"")
+        .and_then(|quoted| quoted.strip_suffix(b"\""))
+        .unwrap_or(value);
+    name.starts_with(HOST_COOKIE_PREFIX)
+        && name.iter().all(|byte| is_tchar(*byte))
+        && value.iter().all(|byte| is_cookie_octet(*byte))
+}
+
+/// A token's character (RFC 9110 §5.6.2).
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// A cookie octet (RFC 6265 §4.1.1): visible ASCII but the double quote, the comma, the
+/// semicolon and the backslash.
+fn is_cookie_octet(byte: u8) -> bool {
+    matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
 }
 
 /// Remove the hop-by-hop headers (`HOP_BY_HOP_HEADERS`) and every header a `Connection` header
@@ -8681,6 +8760,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
+    /// io-web-v2-stage-2-1 §5.4: a set of more than `MAX_WEB_ROUTES` hosts is refused, and the
+    /// set served stays, on disk too; a set at the cap is taken. A file over the cap is one the
+    /// edge never wrote: it starts with no web host, as a corrupt one does.
+    #[tokio::test]
+    async fn a_set_over_the_cap_is_refused_and_the_served_set_stays() {
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let path = std::env::temp_dir()
+            .join(format!("sy-edge-web-{}", Uuid::new_v4()))
+            .join("web_routes.json");
+        let table = WebRouteTable::load(path.clone());
+        let hosts = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("h{index}.edge.example.com"))
+                .collect()
+        };
+        let payload = |set: &[String]| {
+            let routes: Vec<(&str, &str)> =
+                set.iter().map(|host| (host.as_str(), "io.web")).collect();
+            routes_payload(&routes)
+        };
+        let served =
+            push_web_routes(Some(&tls), &table, routes_payload(&[(WEB_HOST, "io.web")])).await;
+        assert_eq!(served["status"], "ok");
+
+        let over = hosts(MAX_WEB_ROUTES + 1);
+        let refused = push_web_routes(Some(&tls), &table, payload(&over)).await;
+        assert_eq!(refused["status"], "error", "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(&MAX_WEB_ROUTES.to_string())),
+            "{refused}"
+        );
+        assert_eq!(table.snapshot().hosts(), [WEB_HOST]);
+        assert!(over.iter().all(|host| !table.serves(host)));
+        assert_eq!(
+            WebRouteTable::load(path.clone()).snapshot().hosts(),
+            [WEB_HOST]
+        );
+
+        let at_cap = hosts(MAX_WEB_ROUTES);
+        let taken = push_web_routes(Some(&tls), &table, payload(&at_cap)).await;
+        assert_eq!(taken["status"], "ok", "{taken}");
+        assert!(at_cap.iter().all(|host| table.serves(host)));
+        assert!(!table.serves(WEB_HOST));
+
+        let file_over = WebRoutes {
+            routes: over
+                .iter()
+                .map(|host| WebRoute {
+                    host: host.clone(),
+                    upstream: WebUpstream::IoWeb,
+                })
+                .collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&file_over).expect("json")).expect("write");
+        assert_eq!(
+            WebRouteTable::load(path.clone()).snapshot(),
+            WebRoutes::default()
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
     #[test]
     fn the_edge_tells_its_main_name_from_its_certificate() {
         let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
@@ -10002,7 +10144,8 @@ mod tests {
 
     /// io-web-v2 §11.2: the headers io.web gets. The hop-by-hop ones and those `Connection` names
     /// go first, then the framing, `Expect`, `Host`, the trust and forwarding headers the client
-    /// sent and the method overrides; the edge's own take their place.
+    /// sent and the method overrides; the edge's own take their place. `Cookie` keeps its
+    /// `__Host-` pairs (`the_proxy_passes_only_host_prefixed_cookies`).
     #[test]
     fn the_edge_rebuilds_the_headers_io_web_gets() {
         let inbound = header_map(&[
@@ -10034,7 +10177,7 @@ mod tests {
             ("x-http-method-override", "DELETE"),
             ("x-http-method", "DELETE"),
             ("x-method-override", "DELETE"),
-            ("cookie", "a=b"),
+            ("cookie", "a=b; __Host-s=1"),
             ("authorization", "Bearer t"),
             ("accept", "text/html"),
             ("user-agent", "edge-test"),
@@ -10083,7 +10226,7 @@ mod tests {
             format!("for=203.0.113.7;proto=https;host={WEB_HOST}")
         );
         assert_eq!(value(&headers, "x-request-id"), request_id);
-        assert_eq!(value(&headers, "cookie"), "a=b");
+        assert_eq!(value(&headers, "cookie"), "__Host-s=1");
         // The edge's own, not the client's: io.web closes first (A-90).
         assert_eq!(value(&headers, "connection"), "close");
 
@@ -10098,6 +10241,113 @@ mod tests {
         let mapped = io_web_request_headers(&inbound, &forwarding("::ffff:203.0.113.7"));
         assert_eq!(value(&mapped, "x-forwarded-for"), "203.0.113.7");
         assert!(value(&mapped, "forwarded").starts_with("for=203.0.113.7;"));
+    }
+
+    /// io-web-v2-stage-2-1 §5.4: of the client's cookies, only the pairs whose name begins with
+    /// `__Host-` reach io.web, in one `Cookie`, and no `Cookie` when none is left. The client's
+    /// headers are split at each `;` (RFC 6265 §4.2.1); a pair outside RFC 6265 §4.1.1's syntax
+    /// stays out, and the pairs beside it pass.
+    #[test]
+    fn the_proxy_passes_only_host_prefixed_cookies() {
+        let request_id = Uuid::new_v4().to_string();
+        let forwarding = Forwarding {
+            host: WEB_HOST,
+            client: "203.0.113.7".parse().expect("ip"),
+            proto: "https",
+            request_id: &request_id,
+        };
+        // The `Cookie` io.web gets for these client headers: one header, or none.
+        let cookie_for = |headers: &HeaderMap| -> Option<String> {
+            let forwarded = io_web_request_headers(headers, &forwarding);
+            let values: Vec<String> = forwarded
+                .get_all(header::COOKIE)
+                .iter()
+                .map(|value| value.to_str().expect("text").to_string())
+                .collect();
+            assert!(values.len() <= 1, "one Cookie at most: {values:?}");
+            values.into_iter().next()
+        };
+        let cookies = |values: &[&str]| {
+            let pairs: Vec<(&str, &str)> = values.iter().map(|value| ("cookie", *value)).collect();
+            cookie_for(&header_map(&pairs))
+        };
+        let cookie = |value: &str| cookies(&[value]);
+
+        assert_eq!(
+            cookie("a=1; __Host-fluxbee_session=x; b=2").as_deref(),
+            Some("__Host-fluxbee_session=x")
+        );
+        // None left: no header at all.
+        assert_eq!(cookie("a=1"), None);
+        assert_eq!(cookie(""), None);
+        // Several `Cookie` headers: their `__Host-` pairs, in their order, in one header.
+        assert_eq!(
+            cookies(&["a=1; __Host-one=1", "b=2", "__Host-two=2; c=3"]).as_deref(),
+            Some("__Host-one=1; __Host-two=2")
+        );
+        assert_eq!(cookies(&["a=1", "b=2"]), None);
+        // Spaces and tabs around a pair go with its separators, as do empty pairs.
+        assert_eq!(
+            cookie("a=1 ;  __Host-s=x \t;b=2").as_deref(),
+            Some("__Host-s=x")
+        );
+        assert_eq!(cookie(";;__Host-s=x;").as_deref(), Some("__Host-s=x"));
+        // A value may hold `=`, be quoted, or be empty.
+        assert_eq!(
+            cookie("__Host-v=YQ==; a=b=c").as_deref(),
+            Some("__Host-v=YQ==")
+        );
+        assert_eq!(
+            cookie("__Host-q=\"abc\"").as_deref(),
+            Some("__Host-q=\"abc\"")
+        );
+        assert_eq!(cookie("__Host-e=").as_deref(), Some("__Host-e="));
+        // A malformed pair stays out, and the one beside it passes: spaces inside a pair, no `=`,
+        // a quote that does not close or sits inside, a quoted `;`, a comma (a second cookie
+        // inside the value, to a server that splits at commas), a backslash, a name that is not a
+        // token.
+        for malformed in [
+            "__Host-s = x",
+            "__Host-s =x",
+            "__Host-s= x",
+            "__Host-s=x y",
+            "__Host- s=x",
+            "__Host-flag",
+            "__Host-q=\"abc",
+            "__Host-q=abc\"",
+            "__Host-q=a\"b",
+            "__Host-q=\"a;b\"",
+            "__Host-c=1,__Host-d=2",
+            "__Host-c=1, d=2",
+            "__Host-b=a\\b",
+            "__Host-(x)=1",
+            "__Host-x@y=1",
+        ] {
+            assert_eq!(
+                cookie(&format!("{malformed}; __Host-ok=1")).as_deref(),
+                Some("__Host-ok=1"),
+                "{malformed}"
+            );
+        }
+        let mut opaque = HeaderMap::new();
+        opaque.append(
+            header::COOKIE,
+            HeaderValue::from_bytes(b"__Host-u=caf\xc3\xa9; __Host-ok=1").expect("obs-text"),
+        );
+        assert_eq!(cookie_for(&opaque).as_deref(), Some("__Host-ok=1"));
+        // The prefix as written, and only at the start of the name: a browser that compares it
+        // case-sensitively takes `__HOST-` from any host. A nameless cookie whose value looks
+        // like one is not one.
+        for other in [
+            "__host-s=x",
+            "__HOST-s=x",
+            "__Secure-s=x",
+            "_Host-s=x",
+            "x__Host-s=x",
+            "=__Host-s=x",
+        ] {
+            assert_eq!(cookie(&format!("a=1; {other}")), None, "{other}");
+        }
     }
 
     /// io-web-v2 §11.2: io.web's hop-by-hop headers, and those its `Connection` names, never reach
@@ -10136,8 +10386,9 @@ mod tests {
     }
 
     /// io-web-v2 §11.2: a web host's request reaches io.web over the mesh's mutual TLS. io.web
-    /// sees the ingress's certificate, the target, the edge's own forwarding headers and none of
-    /// the client's hop-by-hop or trust headers; the client gets io.web's answer without io.web's
+    /// sees the ingress's certificate, the target, the edge's own forwarding headers, only the
+    /// client's `__Host-` cookies (io-web-v2-stage-2-1 §5.4) and none of the client's hop-by-hop
+    /// or trust headers; the client gets io.web's answer without io.web's
     /// hop-by-hop headers, with io.web's content policy and the door's other security headers. A
     /// leaf of another hive, from the same CA, never passes for io.web.
     #[tokio::test]
@@ -10172,7 +10423,8 @@ mod tests {
             "proxy-authorization: Basic Zm9vOmJhcg==\r\n",
             "expect: 100-continue\r\n",
             "content-length: 0\r\n",
-            "cookie: a=b\r\n",
+            "cookie: a=b; __Host-fluxbee_session=x\r\n",
+            "cookie: c=d; __Host-other=y\r\n",
             "user-agent: edge-test\r\n",
         );
         let answer = exchange(
@@ -10221,7 +10473,11 @@ mod tests {
             request_id.len() == 1 && Uuid::parse_str(&request_id[0]).is_ok(),
             "a fresh request id: {request_id:?}"
         );
-        assert_eq!(values("cookie"), ["a=b"]);
+        // Only the `__Host-` cookies, of both headers, in one.
+        assert_eq!(
+            values("cookie"),
+            ["__Host-fluxbee_session=x; __Host-other=y"]
+        );
         assert_eq!(values("user-agent"), ["edge-test"]);
         assert_eq!(values("connection"), ["close"]);
         for gone in [
