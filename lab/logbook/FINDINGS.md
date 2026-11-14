@@ -407,7 +407,7 @@ no change required
     edge's request to IO.cloud and IO.cloud's answer, for each), and a plain `user` message is still
     stored; a throwaway IO node's `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK` dropped by the router
     and logged, where 0.1.145 delivered them, a control message delivered; 13 PASS, no model call.
-    The 595 rows of Cloud's channel stored before stay: the operator's call.
+    The rows of Cloud's channel stored before were scrubbed by the operator's call (819, 2026-11-13).
     **R3, the binaries:** `coa/web21-admin`, `coa/web21-edge`, `coa/web21-io-web` and
     `coa/web21-io-cloud`, each built by an agent in its own worktree and target from `fb4193f6`.
 
@@ -1655,9 +1655,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   a `put_token` of a dummy value and its `delete_token`, each with a unique request id: on 0.1.145
   `turns` held 4 rows of them (for each, the edge's request to `IO.cloud@motherbee` and IO.cloud's
   answer to the edge); on 0.1.146, none. A plain `user` message between two throwaway IO nodes on
-  worker1 is still stored (1 row by its trace). **What stays:** 595 rows of Cloud's channel stored
-  from 2026-10-17 to the baseline, 49 of them `put_token`'s; the operator's call on scrubbing them
-  is pending.
+  worker1 is still stored (1 row by its trace).
+- **Scrubbed (the operator's call, 2026-11-13: *"Si, borra todo lo anterior sobre log si necesitas"*):** at about 02:20Z
+  on 2026-11-14 (23:20 ART), 819 rows of Cloud's channel deleted from `turns` in one statement
+  that would have rolled back on any other count: the 595 by name (2026-10-17 to the baseline, 49
+  of them `put_token`'s) and 224 of IO.cloud's answers from 2026-10-16, stored with no sender name
+  (`payload.handled_by` IO.cloud); the table rewritten (`VACUUM FULL`, 7.3 s, 47 MB to 42 MB) and a
+  checkpoint. After it `turns` holds no row of the channel and none that names `put_token`; a plain
+  `user` message is still stored. Nothing else held Cloud's requests: `llm_usage` and
+  `storage_inbox`, and the `fluxbee` and `fluxbee_identity` databases, scanned (counts only); no
+  key-like string in `turns` or `llm_usage`; SY.admin's command log redacts vault values. Kept: the
+  frontdesk's 4 replies to IO.cloud by its UUID (no credential; the router still stores such
+  replies). The VM snapshot `pre-router-0-1-146` holds the old rows until the next deploy drops it.
 
 ### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
 

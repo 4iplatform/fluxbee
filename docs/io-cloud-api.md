@@ -1158,7 +1158,7 @@ post '{"op":"list_cloud_actions"}'
 - **The hive no longer stores your requests or its answers in its message store** (FINDINGS
   A-349): until 0.1.145 each request through the door, and io.cloud's answer, was kept whole in
   SY.storage's `turns`, a `put_token`'s credential values among them. Nothing changes in what you
-  send or get back. What was stored before stays until the hive's operator decides.
+  send or get back. On PROD, what was stored before was deleted on 2026-11-13.
 
 ### 0.1.145
 

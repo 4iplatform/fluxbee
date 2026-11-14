@@ -201,9 +201,11 @@
   - **The smoke (A-314's lesson):** `run_node AI.gate0246s@worker1` ok in 1.5 s, `RUNNING` at 8.2 s
     on 0.1.146, killed without purge, `STOPPED`; the stopped `AI.gate0233@worker1` reads `STOPPED`.
   - **The cost:** 0 usage records.
-- **What stays:** SY.storage keeps the 595 rows of Cloud's channel it stored before (2026-10-17 to
-  the baseline), 49 of them `put_token`'s; the operator decides whether to scrub them (FINDINGS
-  A-349).
+- **Scrubbed after the gate (the operator's call):** the 819 rows of Cloud's channel SY.storage had
+  stored before (595 by name since 2026-10-17, 49 of them `put_token`'s, and 224 of IO.cloud's
+  answers from 2026-10-16 with no sender name) deleted from `turns`, the table rewritten (`VACUUM
+  FULL`) and a checkpoint; a plain `user` message still stored after it (FINDINGS A-349). The
+  snapshot `pre-router-0-1-146` holds the old rows until the next deploy drops it.
 - **PROD after the gate:** all four hives on 0.1.146; snapshot `pre-router-0-1-146` on each VM,
   `pre-websdk-0-1-145` deleted. `AI.gate0246s` purged (no history); the gate's vault keys deleted.
 - **Rollback:** the snapshot `pre-router-0-1-146` (all 4 VMs), or `apt install fluxbee=0.1.145` +
