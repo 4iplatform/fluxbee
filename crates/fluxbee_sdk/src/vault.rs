@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, PRIMARY_HIVE_ID,
-    SYSTEM_KIND,
+    Destination, Message, Meta, Routing, WebExposureKeySlot, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
+    PRIMARY_HIVE_ID, SYSTEM_KIND, WEB_EXPOSURE_ID_PREFIX,
 };
 use crate::rpc::{PendingMatcher, RouteMatch, RouterDispatcher, RpcError, RpcRequestLabels};
 use crate::NodeError;
@@ -605,6 +605,9 @@ pub fn vault_key_is_valid(key: &str) -> bool {
 /// - `acme_account:<16 hex>` — SY.admin's account at an ACME certificate authority, one per
 ///   directory URL (docs/acme-edge-certificates-v1.md §3); overwriting it swaps the account the
 ///   edge's certificate is ordered with.
+/// - `web_exposure_key:<exposure uuid>:<slot>` ([`WEB_EXPOSURE_KEY_PREFIX`]) — the secret of an
+///   exposure's enablement, which signs its links and sessions (docs/io-web-v2-stage-2-1.md §3.1);
+///   a Cloud caller that wrote one could mint them.
 ///
 /// This is NOT a general vault ACL: only the Cloud-relay origin is bound, for writes and deletes
 /// alike (enforced SERVER-SIDE in SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud
@@ -616,7 +619,30 @@ pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] = &[
     "ssh:",
     "edge_fanout_verify:",
     "acme_account",
+    WEB_EXPOSURE_KEY_PREFIX,
 ];
+
+/// The vault namespace of io.web's session keys (docs/io-web-v2-stage-2-1.md §3.1): two keys per
+/// exposure, one per slot, named by [`web_exposure_vault_key`]. At each enable SY.admin puts a new
+/// secret of 32 random bytes in the slot the current enablement does not use, as `value {"secret":
+/// <64 hex>}`, resource type [`WEB_SESSION_KEY_RESOURCE_TYPE`], in the root tenant and owned by
+/// `IO.web@motherbee`, and keeps no copy; io.web alone reads it. Cloud may never write one
+/// ([`CLOUD_RESERVED_VAULT_KEY_PREFIXES`]).
+pub const WEB_EXPOSURE_KEY_PREFIX: &str = "web_exposure_key:";
+
+/// The resource type of a [`WEB_EXPOSURE_KEY_PREFIX`] key. io.web takes no key of another type.
+pub const WEB_SESSION_KEY_RESOURCE_TYPE: &str = "web_session_key";
+
+/// The vault key of one of an exposure's two key slots, `web_exposure_key:<uuid>:<a|b>`, from the
+/// exposure's id (`exp:<uuid>`, [`WEB_EXPOSURE_ID_PREFIX`]). The uuid is written as the id writes
+/// it, in the hyphenated lowercase form SY.admin mints; any other id gives `None`. SY.admin, which
+/// writes the key, and io.web, which reads it, name it through this function, so they never name
+/// two keys for one slot.
+pub fn web_exposure_vault_key(exposure_id: &str, slot: WebExposureKeySlot) -> Option<String> {
+    let uuid = exposure_id.strip_prefix(WEB_EXPOSURE_ID_PREFIX)?;
+    let canonical = uuid::Uuid::parse_str(uuid).ok()?.hyphenated().to_string();
+    (canonical == uuid).then(|| format!("{WEB_EXPOSURE_KEY_PREFIX}{uuid}:{}", slot.as_str()))
+}
 
 /// True when `key` falls in a hive-infrastructure namespace the Cloud relay may never write
 /// ([`CLOUD_RESERVED_VAULT_KEY_PREFIXES`]). Prefix match (so `edge_tls` also covers `edge_tls:*`),
@@ -1064,6 +1090,65 @@ mod tests {
             assert!(
                 !is_cloud_reserved_vault_key(ok),
                 "expected {ok:?} to be allowed"
+            );
+        }
+    }
+
+    /// io.web's session keys (docs/io-web-v2-stage-2-1.md §5.6): Cloud's `put_token`, and its
+    /// `assign_token` and `delete_token`, may not touch one. io.cloud refuses them through this
+    /// check, and SY.admin again (`enforce_cloud_relay_content`).
+    #[test]
+    fn web_exposure_keys_are_reserved() {
+        for reserved in [
+            "web_exposure_key:x", // the gate's put_token (§8)
+            "web_exposure_key:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b:a",
+            "web_exposure_key:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b:b",
+            " WEB_EXPOSURE_KEY:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b:a ",
+        ] {
+            assert!(
+                is_cloud_reserved_vault_key(reserved),
+                "expected {reserved:?} to be reserved"
+            );
+        }
+        for ok in [
+            "web_exposure_keys",  // not the namespace, which ends with its colon
+            "web_session_key",    // the resource type's name, not a key of the namespace
+            "webhook:shop:token", // a provider token
+        ] {
+            assert!(
+                !is_cloud_reserved_vault_key(ok),
+                "expected {ok:?} to be allowed"
+            );
+        }
+    }
+
+    /// One exposure's two slots are two keys of the reserved namespace, named only from the id
+    /// SY.admin mints, so SY.admin and io.web never name different keys for one slot.
+    #[test]
+    fn web_exposure_vault_key_names_each_slot_of_a_minted_id() {
+        let id = "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+        let a = web_exposure_vault_key(id, WebExposureKeySlot::A).expect("a key");
+        let b = web_exposure_vault_key(id, WebExposureKeySlot::B).expect("b key");
+        assert_eq!(a, "web_exposure_key:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b:a");
+        assert_eq!(b, "web_exposure_key:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b:b");
+        for key in [&a, &b] {
+            assert!(vault_key_is_valid(key), "{key}");
+            assert!(is_cloud_reserved_vault_key(key), "{key}");
+        }
+        assert_eq!(WEB_SESSION_KEY_RESOURCE_TYPE, "web_session_key");
+        for other in [
+            "exp:6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B", // not folded
+            "exp:6f1c2a3b4d5e4f608a7b9c0d1e2f3a4b",     // the link's form, not the id's
+            "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "enb:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "exp:{6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b}",
+            "exp:shop",
+            "exp:",
+        ] {
+            assert_eq!(
+                web_exposure_vault_key(other, WebExposureKeySlot::A),
+                None,
+                "{other}"
             );
         }
     }

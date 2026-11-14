@@ -505,6 +505,11 @@ to `IO.*`). Reading identity needs no message: a node reads `/jsr-identity-<hive
 - `LSA`, `WAN_REACHABILITY`, `WAN_ACCEPT`, `WAN_REJECT` and the WAN HELLO: between routers.
 - `CONFIG_CHANGED`: from `SY.admin@motherbee` to SY.opa.rules, carrying the operator's OPA policy
   (`docs/opa-distribution.md`); protected.
+- `IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK`, each answered `<msg>_RESPONSE`: from
+  `SY.admin@motherbee` to `IO.web@motherbee`, the set of exposures and a one-time link
+  ([io.web stage 2.1](../io-web-v2-stage-2-1.md) §5.5). `protocol.rs` holds their names, their
+  payloads (`IoWebExposuresPayload`, `IoWebAccessLinkRequest`) and their answers since 0.1.145
+  (planned); io.web answers them, and the router protects them (§7), from their own releases on.
 
 ### 6.10 NOT_TAKEN
 

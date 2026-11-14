@@ -408,7 +408,7 @@ it:
 - `vault_put` may not set `metadata.ilk`, `owner_ilk` or `owner_l2`; `owner_node` must be an
   `IO.*` node; `vault_put`, `vault_assign` and `vault_delete` may not touch the reserved keys
   (`edge_channel_secret:`, `edge_tls`, `ssh:`, `edge_fanout_verify:`, `acme_account`,
-  `is_cloud_reserved_vault_key`).
+  `web_exposure_key:` since 0.1.145 (planned); `is_cloud_reserved_vault_key`).
 - `run_node`, `start_node`, `kill_node` and `get_node_status` act only on `IO.*` nodes.
 - `update_tenant` sets `status` only to `active` or `suspended`; `get_llm_usage` never reads all
   tenants.

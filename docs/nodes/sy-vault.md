@@ -249,9 +249,9 @@ is measured serialized against the frame less the router's 1 KiB reserve (`max`)
 ### Reserved keys
 
 `CLOUD_RESERVED_VAULT_KEY_PREFIXES` in `crates/fluxbee_sdk/src/vault.rs`: `edge_channel_secret:`,
-`edge_tls`, `ssh:`, `edge_fanout_verify:`, `acme_account` (prefix match, case-insensitive,
-`is_cloud_reserved_vault_key`). These are not vault rules: SY.vault checks none of them. SY.admin
-enforces them in its admin API (`src/bin/sy_admin.rs`):
+`edge_tls`, `ssh:`, `edge_fanout_verify:`, `acme_account`, `web_exposure_key:` (prefix match,
+case-insensitive, `is_cloud_reserved_vault_key`). These are not vault rules: SY.vault checks none
+of them. SY.admin enforces them in its admin API (`src/bin/sy_admin.rs`):
 
 - The IO.cloud relay may not put, assign or delete any of these keys
   (`enforce_cloud_relay_content`). SY.admin itself stores `edge_channel_secret:<ich>` and the
@@ -269,6 +269,12 @@ enforces them in its admin API (`src/bin/sy_admin.rs`):
   A-316, since 0.1.139), since an assign naming SY.admin's own ILK let a read through SY.admin
   return the bearer. Their metadata stays readable; the operator still puts, rotates, rolls back
   and deletes them.
+- `web_exposure_key:<exposure uuid>:<a|b>` is the namespace of io.web's session keys, two per
+  exposure ([io.web stage 2.1](../io-web-v2-stage-2-1.md) §3.1; `web_exposure_vault_key` names
+  them): SY.admin is to put one at each enable, `resource_type: web_session_key`, in the root
+  tenant and owned by `IO.web@motherbee`, which alone reads it. It is reserved since 0.1.145
+  (planned, the Rust SDK alone), before anything writes one. SY.admin's own refusal of
+  `vault_get` and `vault_assign` of these keys comes with its stage 2.1 release (§5.6).
 
 ## VAULT_SECRET_CHANGED
 

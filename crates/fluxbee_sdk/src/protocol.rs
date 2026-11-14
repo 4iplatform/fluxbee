@@ -1,3 +1,6 @@
+use std::fmt;
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -702,6 +705,15 @@ pub const MSG_EDGE_ACME_CHALLENGE_RESPONSE: &str = "EDGE_ACME_CHALLENGE_RESPONSE
 // minute; the edge keeps it on disk.
 pub const MSG_EDGE_WEB_ROUTES: &str = "EDGE_WEB_ROUTES";
 pub const MSG_EDGE_WEB_ROUTES_RESPONSE: &str = "EDGE_WEB_ROUTES_RESPONSE";
+// io.web's exposures (SY.admin -> IO.web; docs/io-web-v2-stage-2-1.md §5.5): the whole set of
+// exposures with their live enablements (`IoWebExposuresPayload`), and a one-time link to an
+// exposure's current enablement (`IoWebAccessLinkRequest`). Only `SY.admin@motherbee` sends them,
+// as system messages; neither carries a secret, since io.web reads each enablement's key from the
+// vault itself (`vault::web_exposure_vault_key`).
+pub const MSG_IO_WEB_EXPOSURES: &str = "IO_WEB_EXPOSURES";
+pub const MSG_IO_WEB_EXPOSURES_RESPONSE: &str = "IO_WEB_EXPOSURES_RESPONSE";
+pub const MSG_IO_WEB_ACCESS_LINK: &str = "IO_WEB_ACCESS_LINK";
+pub const MSG_IO_WEB_ACCESS_LINK_RESPONSE: &str = "IO_WEB_ACCESS_LINK_RESPONSE";
 
 // IO.blob curator worker plane (SY.admin -> IO.blob). These commands never publish a URL and
 // carry no external bytes: admin has already authorized the producer and resolved its tenant;
@@ -721,6 +733,209 @@ pub struct OpaReloadPayload {
     pub version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// io.web's exposures (docs/io-web-v2-stage-2-1.md): what SY.admin pushes to io.web
+// (`MSG_IO_WEB_EXPOSURES`) and asks of it (`MSG_IO_WEB_ACCESS_LINK`), and their answers. SY.admin
+// and io.web ship in different cargo workspaces, so their shapes live here.
+// ---------------------------------------------------------------------------
+
+/// The prefix of an exposure's id, `exp:<uuid v4>`, which SY.admin mints at publish and never
+/// reuses (docs/io-web-v2-stage-2-1.md §2.1).
+pub const WEB_EXPOSURE_ID_PREFIX: &str = "exp:";
+/// The prefix of an enablement's id, `enb:<uuid v4>`, which SY.admin mints at each enable (§2.3).
+pub const WEB_ENABLEMENT_ID_PREFIX: &str = "enb:";
+
+/// io.web's answer to a [`MSG_IO_WEB_EXPOSURES`] or a [`MSG_IO_WEB_ACCESS_LINK`] from anyone but
+/// `SY.admin@motherbee`, or that came as a tap copy: nothing was read (§5.5).
+pub const IO_WEB_ERROR_UNAUTHORIZED: &str = "UNAUTHORIZED";
+/// A pushed set whose generation is lower than the one io.web holds: io.web keeps its own (§5.5).
+pub const IO_WEB_ERROR_STALE_GENERATION: &str = "STALE_GENERATION";
+/// A link asked for an exposure io.web's set does not hold (§5.5).
+pub const IO_WEB_ERROR_EXPOSURE_UNKNOWN: &str = "EXPOSURE_UNKNOWN";
+/// A link asked for an enablement that is not the exposure's current one in io.web's set. SY.admin
+/// then pushes the set and asks once more (§5.1).
+pub const IO_WEB_ERROR_ENABLEMENT_UNKNOWN: &str = "ENABLEMENT_UNKNOWN";
+/// A link asked for the current enablement while io.web does not hold its key. SY.admin answers
+/// `IO_WEB_UNAVAILABLE`, retryable (§5.1).
+pub const IO_WEB_ERROR_KEY_UNAVAILABLE: &str = "KEY_UNAVAILABLE";
+
+/// [`MSG_IO_WEB_EXPOSURES`]: the whole set of exposures, which replaces io.web's (§2.3, §5.5).
+/// SY.admin pushes it at each change and every 60 s. It holds no secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoWebExposuresPayload {
+    /// `max(previous + 1, now in ms)`, so it never goes back, even when SY.admin's file is lost
+    /// (§2.3). io.web refuses a lower one than it holds ([`IO_WEB_ERROR_STALE_GENERATION`]) and
+    /// acknowledges an equal one without reading anything.
+    pub generation: u64,
+    /// Every published exposure, the closed ones included.
+    pub exposures: Vec<IoWebExposure>,
+}
+
+/// One exposure as io.web holds it (§2.3): one host to one fixed upstream, with its live
+/// enablements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoWebExposure {
+    /// `exp:<uuid v4>` ([`WEB_EXPOSURE_ID_PREFIX`]).
+    pub exposure_id: String,
+    /// `<label>.<main>`: the host its requests come with (§2.1).
+    pub host: String,
+    pub upstream: WebExposureUpstream,
+    /// Its live enablements, newest last: at most two, the current one and the one it renewed,
+    /// whose sessions run to that one's own end (§2.3, §3.4). None: the exposure is closed.
+    pub enablements: Vec<IoWebEnablement>,
+}
+
+/// Where an exposure leads (§2.2): recorded in stage 2.1, dialled in 2.2. SY.admin checks it at
+/// publish, and never takes one of Fluxbee's own services or ports. Each kind takes only its own
+/// fields: any other is refused, never ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WebExposureUpstream {
+    /// Archi on the motherbee's loopback, whose address is io.web's own constant: `{"kind":
+    /// "archi"}`, no field.
+    Archi {},
+    /// A worker of the hive registry, by its hive id, at the registry's address.
+    Hive { hive: String, port: u16 },
+    /// An IP literal in a private range, never a name.
+    Address { address: IpAddr, port: u16 },
+}
+
+/// A live enablement as io.web holds it (§2.3), never its key, which io.web reads from the vault
+/// itself (`vault::web_exposure_vault_key`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoWebEnablement {
+    /// `enb:<uuid v4>` ([`WEB_ENABLEMENT_ID_PREFIX`]).
+    pub enablement_id: String,
+    /// Its end, in Unix seconds: io.web's own clock closes it then (§3.4).
+    pub until: u64,
+    /// The vault slot SY.admin put its key in.
+    pub slot: WebExposureKeySlot,
+    /// The version of the slot's key SY.admin wrote for it. io.web takes the key at this version
+    /// only (§3.1).
+    pub key_version: i64,
+}
+
+/// One of an exposure's two key slots (§2.3). Each enable writes the slot the current enablement
+/// does not use, so a put that fails or goes unanswered never touches a live enablement's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebExposureKeySlot {
+    A,
+    B,
+}
+
+impl WebExposureKeySlot {
+    /// `a` or `b`, as the payloads and the vault key name the slot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+        }
+    }
+}
+
+/// [`MSG_IO_WEB_EXPOSURES_RESPONSE`] (§5.5): `{"status": "ok", generation, changed, enablements}`,
+/// or `{"status": "error", error_code, error_detail}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum IoWebExposuresResponse {
+    /// io.web holds the set pushed, or held it already.
+    Ok {
+        /// The generation io.web holds now.
+        generation: u64,
+        /// The set differs from the one io.web held.
+        changed: bool,
+        /// Each live enablement of the set, and whether io.web holds its key.
+        enablements: Vec<IoWebEnablementKey>,
+    },
+    /// The set was not taken: [`IO_WEB_ERROR_UNAUTHORIZED`], [`IO_WEB_ERROR_STALE_GENERATION`],
+    /// or a payload io.web could not read.
+    Error {
+        error_code: String,
+        #[serde(default)]
+        error_detail: String,
+    },
+}
+
+/// Whether io.web holds an enablement's key (§5.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoWebEnablementKey {
+    pub enablement_id: String,
+    pub key: IoWebKeyState,
+    /// Why the key is unavailable: the vault's answer, another version or another resource type.
+    /// Never the key. `None` when it is ready.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoWebKeyState {
+    /// io.web holds the key at the enablement's version: its links and sessions work.
+    Ready,
+    /// io.web could not read the key, or it did not match: the enablement fails closed, and io.web
+    /// reads it again every 30 s.
+    Unavailable,
+}
+
+/// [`MSG_IO_WEB_ACCESS_LINK`] (§5.1, §5.5): a one-time link to an exposure's current enablement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoWebAccessLinkRequest {
+    pub exposure_id: String,
+    pub enablement_id: String,
+    /// The generation of SY.admin's set when it asked. While io.web's set is older it may not know
+    /// the enablement yet ([`IO_WEB_ERROR_ENABLEMENT_UNKNOWN`]).
+    pub generation: u64,
+}
+
+/// [`MSG_IO_WEB_ACCESS_LINK_RESPONSE`] (§3.2, §5.5): `{"status": "ok", url, expires_at, link_id}`,
+/// or `{"status": "error", error_code, error_detail}`. Its `Debug` leaves the link out: the link
+/// holds the one-time code, which no log holds.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum IoWebAccessLinkResponse {
+    Ok {
+        /// `https://<host>/.fluxbee/enter?code=…`, opened once, top-level, before `expires_at`.
+        url: String,
+        /// When the code stops being taken, in Unix seconds: about 120 s after io.web minted it.
+        expires_at: u64,
+        /// What the logs name the link by: the first 16 hex of the SHA-256 of its `jti`.
+        link_id: String,
+    },
+    /// No link: [`IO_WEB_ERROR_EXPOSURE_UNKNOWN`], [`IO_WEB_ERROR_ENABLEMENT_UNKNOWN`],
+    /// [`IO_WEB_ERROR_KEY_UNAVAILABLE`] or [`IO_WEB_ERROR_UNAUTHORIZED`].
+    Error {
+        error_code: String,
+        #[serde(default)]
+        error_detail: String,
+    },
+}
+
+impl fmt::Debug for IoWebAccessLinkResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok {
+                url: _,
+                expires_at,
+                link_id,
+            } => f
+                .debug_struct("Ok")
+                .field("url", &crate::node_secret::NODE_SECRET_REDACTION_TOKEN)
+                .field("expires_at", expires_at)
+                .field("link_id", link_id)
+                .finish(),
+            Self::Error {
+                error_code,
+                error_detail,
+            } => f
+                .debug_struct("Error")
+                .field("error_code", error_code)
+                .field("error_detail", error_detail)
+                .finish(),
+        }
+    }
 }
 
 pub fn build_system_message(
@@ -1257,5 +1472,233 @@ mod tests {
             my_ilk: Some("ilk:sy-storage"),
             system_caller: true,
         }));
+    }
+
+    /// Sends `payload` as `msg` from SY.admin to io.web, through the wire, and reads it back as `T`.
+    fn through_the_wire<T>(msg: &str, payload: &T) -> (String, T)
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let sent = build_system_message(
+            "admin-uuid",
+            Destination::Unicast("IO.web@motherbee".to_string()),
+            16,
+            "trace-web",
+            msg,
+            serde_json::to_value(payload).expect("encode payload"),
+        );
+        let wire = serde_json::to_string(&sent).expect("encode message");
+        let got: Message = serde_json::from_str(&wire).expect("decode message");
+        assert_eq!(got.meta.msg_type, SYSTEM_KIND);
+        (
+            got.meta.msg.expect("named"),
+            serde_json::from_value(got.payload).expect("decode payload"),
+        )
+    }
+
+    /// io.web's commands, their answers and its error codes carry the names
+    /// docs/io-web-v2-stage-2-1.md §5.5 gives them, which SY.admin and io.web both compile against.
+    #[test]
+    fn io_web_commands_and_codes_keep_the_designs_names() {
+        assert_eq!(MSG_IO_WEB_EXPOSURES, "IO_WEB_EXPOSURES");
+        assert_eq!(MSG_IO_WEB_EXPOSURES_RESPONSE, "IO_WEB_EXPOSURES_RESPONSE");
+        assert_eq!(MSG_IO_WEB_ACCESS_LINK, "IO_WEB_ACCESS_LINK");
+        assert_eq!(
+            MSG_IO_WEB_ACCESS_LINK_RESPONSE,
+            "IO_WEB_ACCESS_LINK_RESPONSE"
+        );
+        assert_eq!(IO_WEB_ERROR_UNAUTHORIZED, "UNAUTHORIZED");
+        assert_eq!(IO_WEB_ERROR_STALE_GENERATION, "STALE_GENERATION");
+        assert_eq!(IO_WEB_ERROR_EXPOSURE_UNKNOWN, "EXPOSURE_UNKNOWN");
+        assert_eq!(IO_WEB_ERROR_ENABLEMENT_UNKNOWN, "ENABLEMENT_UNKNOWN");
+        assert_eq!(IO_WEB_ERROR_KEY_UNAVAILABLE, "KEY_UNAVAILABLE");
+        assert_eq!(WEB_EXPOSURE_ID_PREFIX, "exp:");
+        assert_eq!(WEB_ENABLEMENT_ID_PREFIX, "enb:");
+    }
+
+    /// `IO_WEB_EXPOSURES` reads and writes the set as §2.3 shows it, each upstream kind with its
+    /// own fields, and crosses a message whole.
+    #[test]
+    fn io_web_exposures_round_trip_in_the_designs_shape() {
+        let wire = json!({
+            "generation": 1_763_121_600_123u64,
+            "exposures": [
+                {
+                    "exposure_id": "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                    "host": "shop.hive-k3m9x7q2.fluxbee.ai",
+                    "upstream": {"kind": "hive", "hive": "worker1", "port": 8080},
+                    "enablements": [
+                        {"enablement_id": "enb:0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b1c2d3",
+                         "until": 1_763_150_500u64, "slot": "a", "key_version": 4},
+                        {"enablement_id": "enb:1b2c3d4e-5f6a-4b7c-9d8e-9fa0b1c2d3e4",
+                         "until": 1_763_179_300u64, "slot": "b", "key_version": 1}
+                    ]
+                },
+                {
+                    "exposure_id": "exp:7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d",
+                    "host": "archi.hive-k3m9x7q2.fluxbee.ai",
+                    "upstream": {"kind": "archi"},
+                    "enablements": []
+                },
+                {
+                    "exposure_id": "exp:8b9c0d1e-2f3a-4b4c-9d5e-6f7a8b9c0d1e",
+                    "host": "erp.hive-k3m9x7q2.fluxbee.ai",
+                    "upstream": {"kind": "address", "address": "fc00::12", "port": 8443},
+                    "enablements": []
+                }
+            ]
+        });
+        let set: IoWebExposuresPayload = serde_json::from_value(wire.clone()).expect("parse");
+        assert_eq!(set.generation, 1_763_121_600_123);
+        assert_eq!(
+            set.exposures[0].upstream,
+            WebExposureUpstream::Hive {
+                hive: "worker1".to_string(),
+                port: 8080
+            }
+        );
+        let renewed = &set.exposures[0].enablements;
+        assert_eq!(
+            (renewed[0].slot, renewed[0].key_version),
+            (WebExposureKeySlot::A, 4)
+        );
+        assert_eq!(
+            (renewed[1].slot, renewed[1].until),
+            (WebExposureKeySlot::B, 1_763_179_300)
+        );
+        assert_eq!(set.exposures[1].upstream, WebExposureUpstream::Archi {});
+        assert_eq!(
+            set.exposures[2].upstream,
+            WebExposureUpstream::Address {
+                address: "fc00::12".parse().expect("ip"),
+                port: 8443
+            }
+        );
+        assert_eq!(serde_json::to_value(&set).expect("encode"), wire);
+
+        let (msg, got) = through_the_wire(MSG_IO_WEB_EXPOSURES, &set);
+        assert_eq!((msg.as_str(), got), (MSG_IO_WEB_EXPOSURES, set));
+    }
+
+    /// An upstream takes only its kind's own fields, and an address only as an IP literal (§2.2):
+    /// anything else is refused, never ignored.
+    #[test]
+    fn an_exposure_upstream_takes_only_its_own_fields() {
+        for refused in [
+            json!({"kind": "archi", "port": 3000}),
+            json!({"kind": "hive", "hive": "worker1", "port": 8080, "address": "10.0.0.5"}),
+            json!({"kind": "address", "address": "erp.example.com", "port": 8443}),
+            json!({"kind": "address", "address": "10.0.0.5"}),
+            json!({"kind": "hive", "hive": "worker1", "port": 70000}),
+            json!({"kind": "Hive", "hive": "worker1", "port": 8080}),
+            json!({"kind": "url", "url": "http://10.0.0.5/"}),
+            json!({"hive": "worker1", "port": 8080}),
+        ] {
+            assert!(
+                serde_json::from_value::<WebExposureUpstream>(refused.clone()).is_err(),
+                "{refused} must be refused"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(WebExposureUpstream::Archi {}).expect("encode"),
+            json!({"kind": "archi"})
+        );
+    }
+
+    /// io.web's answer to a push, taken and refused, reads and writes as §5.5 gives it.
+    #[test]
+    fn io_web_exposures_answers_round_trip_in_the_designs_shape() {
+        let taken = json!({
+            "status": "ok", "generation": 1_763_121_600_123u64, "changed": true,
+            "enablements": [
+                {"enablement_id": "enb:0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b1c2d3", "key": "ready",
+                 "detail": null},
+                {"enablement_id": "enb:1b2c3d4e-5f6a-4b7c-9d8e-9fa0b1c2d3e4", "key": "unavailable",
+                 "detail": "the key is at version 2, not 3"}
+            ]
+        });
+        let answer: IoWebExposuresResponse = serde_json::from_value(taken.clone()).expect("parse");
+        let IoWebExposuresResponse::Ok {
+            generation,
+            changed,
+            enablements,
+        } = &answer
+        else {
+            panic!("an ok answer: {answer:?}");
+        };
+        assert_eq!((*generation, *changed), (1_763_121_600_123, true));
+        assert_eq!(enablements[0].key, IoWebKeyState::Ready);
+        assert_eq!(enablements[1].key, IoWebKeyState::Unavailable);
+        assert_eq!(serde_json::to_value(&answer).expect("encode"), taken);
+        let (msg, got) = through_the_wire(MSG_IO_WEB_EXPOSURES_RESPONSE, &answer);
+        assert_eq!((msg.as_str(), got), (MSG_IO_WEB_EXPOSURES_RESPONSE, answer));
+
+        let refused = json!({
+            "status": "error", "error_code": "STALE_GENERATION",
+            "error_detail": "io.web holds generation 1763121600124"
+        });
+        let answer: IoWebExposuresResponse =
+            serde_json::from_value(refused.clone()).expect("parse");
+        assert!(matches!(
+            &answer,
+            IoWebExposuresResponse::Error { error_code, .. }
+                if error_code == IO_WEB_ERROR_STALE_GENERATION
+        ));
+        assert_eq!(serde_json::to_value(&answer).expect("encode"), refused);
+        // An ok answer without its generation is no answer.
+        assert!(serde_json::from_value::<IoWebExposuresResponse>(
+            json!({"status": "ok", "changed": false, "enablements": []})
+        )
+        .is_err());
+    }
+
+    /// `IO_WEB_ACCESS_LINK` and its answers read and write as §5.1 and §5.5 give them, and the
+    /// answer's `Debug` never shows the link, which holds the one-time code.
+    #[test]
+    fn io_web_access_link_round_trips_and_never_debugs_its_code() {
+        let ask = json!({
+            "exposure_id": "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "enablement_id": "enb:0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b1c2d3",
+            "generation": 1_763_121_600_123u64
+        });
+        let request: IoWebAccessLinkRequest = serde_json::from_value(ask.clone()).expect("parse");
+        assert_eq!(serde_json::to_value(&request).expect("encode"), ask);
+        let (msg, got) = through_the_wire(MSG_IO_WEB_ACCESS_LINK, &request);
+        assert_eq!((msg.as_str(), got), (MSG_IO_WEB_ACCESS_LINK, request));
+
+        let code = "L1.6f1c2a3b4d5e4f608a7b9c0d1e2f3a4b.0a1b2c3d4e5f4a6b8c7d8e9fa0b1c2d3.\
+                    00112233445566778899aabbccddeeff.1763121700.deadbeef";
+        let linked = json!({
+            "status": "ok",
+            "url": format!("https://shop.hive-k3m9x7q2.fluxbee.ai/.fluxbee/enter?code={code}"),
+            "expires_at": 1_763_121_820u64,
+            "link_id": "0123456789abcdef"
+        });
+        let answer: IoWebAccessLinkResponse =
+            serde_json::from_value(linked.clone()).expect("parse");
+        assert_eq!(serde_json::to_value(&answer).expect("encode"), linked);
+        let (msg, got) = through_the_wire(MSG_IO_WEB_ACCESS_LINK_RESPONSE, &answer);
+        assert_eq!(
+            (msg.as_str(), &got),
+            (MSG_IO_WEB_ACCESS_LINK_RESPONSE, &answer)
+        );
+        let debugged = format!("{answer:?}");
+        assert!(!debugged.contains("code="), "{debugged}");
+        assert!(!debugged.contains("deadbeef"), "{debugged}");
+        assert!(debugged.contains("0123456789abcdef"), "{debugged}");
+
+        let refused = json!({
+            "status": "error", "error_code": "ENABLEMENT_UNKNOWN",
+            "error_detail": "enb:0a1b2c3d-4e5f-4a6b-8c7d-8e9fa0b1c2d3 is not the current enablement"
+        });
+        let answer: IoWebAccessLinkResponse =
+            serde_json::from_value(refused.clone()).expect("parse");
+        assert!(matches!(
+            &answer,
+            IoWebAccessLinkResponse::Error { error_code, .. }
+                if error_code == IO_WEB_ERROR_ENABLEMENT_UNKNOWN
+        ));
+        assert_eq!(serde_json::to_value(&answer).expect("encode"), refused);
+        assert!(format!("{answer:?}").contains("ENABLEMENT_UNKNOWN"));
     }
 }
