@@ -304,14 +304,17 @@ until its writer hands it to the socket (`src/router/link.rs`, A-222, since 0.1.
 
 ### System authority
 
-32 actions are protected (`PROTECTED_SYSTEM_ACTIONS` in `src/router/system_policy.rs`: node
-lifecycle, `CONFIG_GET`/`CONFIG_SET`/`CONFIG_CHANGED`, `SYSTEM_UPDATE`, edge commands, ...).
+35 actions are protected (`PROTECTED_SYSTEM_ACTIONS` in `src/router/system_policy.rs`: node
+lifecycle, `CONFIG_GET`/`CONFIG_SET`/`CONFIG_CHANGED`, `SYSTEM_UPDATE`, edge commands, io.web's
+`IO_WEB_EXPOSURES` and `IO_WEB_ACCESS_LINK`, ...).
 A message's `meta.msg` names one whatever its `msg_type`, in any case and with spaces around it
 (`protected_system_action`, FINDINGS A-100): `config_get` sent as `admin` is CONFIG_GET. At local
 delivery the router asks the baked `policy/system.wasm` whether the sender may perform the action,
 by its canonical name (`authorize_system`); a denial drops the message with
 `router dropped protected SYSTEM action from unauthorized origin`. The rules
-(`policy/system.rego`): edge commands and node control only from `SY.admin@motherbee`; the
+(`policy/system.rego`): edge commands, io.web's commands (`web_service_actions`,
+[io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.8) and node control only from
+`SY.admin@motherbee`; the
 orchestrator's mutating actions only from `SY.orchestrator@motherbee` (`ADD_HIVE_FINALIZE` and
 `REMOVE_HIVE_CLEANUP` never on the motherbee itself), its reads also from the same hive's
 `SY.orchestrator`; every other protected action from the
@@ -332,9 +335,22 @@ pushes them in acknowledged batches to their sinks.
 
 - **Records:**
   - `storage.turns`: a copy of each message a local node sends, except `SYSTEM`, `admin` and
-    `query_response` messages (`should_publish_turn`);
+    `query_response` messages and Fluxbee Cloud's channel (`should_publish_turn`);
   - `cognition.turns`: messages that local `AI.*` agents send or receive with a thread id; one
-    an agent receives only once its link has taken it (A-221, since 0.1.129);
+    an agent receives only once its link has taken it (A-221, since 0.1.129); none of Cloud's
+    channel either;
+  - **Fluxbee Cloud's channel is never copied** (`on_cloud_channel`, FINDINGS A-349, built on
+    `coa/web21-router`): no message IO.cloud sends, and none addressed to IO.cloud by name. That
+    is every request of Cloud's the edge forwards (to the owner its `/e/` row names) and every
+    answer IO.cloud gives it, both `user` messages: a request carried what Cloud sent,
+    `put_token`'s credential values among it, and an answer carries what the hive gives back,
+    io.web's one-time access links from its stage 2.1 on. It is also IO.cloud's `register_human`
+    handoff to SY.frontdesk.gov, with the person's name and email. A message to IO.cloud by its
+    UUID, as every reply is, is still copied: the frontdesk's verdict. Archi's Messages page no
+    longer shows Cloud's traffic; IO.cloud's journal keeps each request's op, trace_id,
+    request_id, status and time (`IO.cloud received a Cloud request`, `IO.cloud Cloud op
+    completed`). What SY.storage stored before stays in `turns`, until the operator decides
+    whether to scrub it;
   - `STREAM_APPEND` from nodes: only `storage.usage` (LLM usage records), with SY.cognition
     accepted only on motherbee and worker hives and SY.frontdesk.gov, SY.architect and SY.admin
     only on the motherbee (`subject_allowed`). A refused append is counted. SY.cognition's

@@ -477,7 +477,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
-- A-349 🔵 Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns, `put_token`'s credential values among them (medium; the router; found by io.web stage 2.1's design; the operator's call of 2026-11-13: fixed in stage 2.1's router release, R2).
+- A-349 🔵 Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns, `put_token`'s credential values among them (medium; the router; found by io.web stage 2.1's design; the operator's call of 2026-11-13: fixed in stage 2.1's router release, R2; built on `coa/web21-router`, no turn of a message IO.cloud sends or that is addressed to it by name, to ship with the router alone; what is stored already stays, the operator's call pending).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
@@ -1620,6 +1620,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-13):** *"los pedidos de Cloud viajan como mensajes"*: fix it in the
   router's release of io.web's stage 2.1 (R2, docs/io-web-v2-stage-2-1.md): no turn for Cloud's
   channel. What is stored already stays until the operator decides whether to scrub it.
+- **Built on `coa/web21-router` (io.web stage 2.1's R2):** the router alone, with §5.8's protected
+  actions on the same branch. Cloud's channel is told apart by IO.cloud's name, the only thing that
+  marks it in the router: the edge forwards each of Cloud's requests to the owner its `/e/` row
+  names, always a fully qualified `IO.*` name (`src/bin/sy_edge.rs` ~1319-1323, ~5500), and
+  IO.cloud answers from its own connection, whose name the router binds; `meta.ich` is opaque to
+  the router and the `user` family is everyone's. `should_publish_turn` (`src/router/mod.rs`
+  ~7798) now takes the router-bound sender and refuses a message that `on_cloud_channel` (~7814)
+  finds: IO.cloud sends it, or it is addressed to IO.cloud by name (`IO.cloud@<hive>` or
+  `@*`, in any case). Both copies go through it: the node loop's `storage.turns` copy (~886) and
+  cognition's, at entry and at delivery (`is_communication_turn`, ~7871, ~7920). SY.storage is
+  unchanged. **What else it stops copying:** IO.cloud's `register_human` handoff to
+  SY.frontdesk.gov (`nodes/io/io-cloud/src/main.rs` ~2413-2423: a `user` message with the
+  person's name and email); IO.cloud sends no other non-system message (its other sends are
+  system or admin: config, status, identity, the relay to SY.admin). It never reached cognition
+  (neither end is an agent), and Archi's Messages page loses Cloud's rows; IO.cloud's journal keeps
+  each request's op, trace_id, request_id, status and time. **Still copied:** a message to
+  IO.cloud by its UUID, as every reply is: the frontdesk's verdict (`success`, `human_message`,
+  `ilk_id`), no Cloud request. Tests: `the_router_copies_nothing_of_cloud_s_channel_to_its_stream`
+  (through the node loop, four messages reach their node and leave nothing in the stream: the
+  edge's `put_token` to IO.cloud, IO.cloud's answer with a link, its handoff and its message to an
+  agent; the edge's request to IO.api is copied. Without the fix the four are turns, and the
+  agent's a cognition copy too) and `a_message_on_cloud_s_channel_is_no_turn` (the rule's
+  table). Docs: rt-gateway.md, router-stream-v1.md §2.2, and the references that state the rule
+  (storage, protocol, architecture, cognition, message-trace-v1). The gate on 8.x: after a
+  `put_token` through Cloud's door, `turns` holds no row with its trace_id (IO.cloud's journal
+  gives it), from the ingress' stream nor the motherbee's.
 
 ### A-348 [Archi] 🔵 low (found 2026-11-13 by A-346's builder on `coa/admin-144`; read in the code, not run; there before it) — Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch
 

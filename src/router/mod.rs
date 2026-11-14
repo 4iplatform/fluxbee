@@ -883,7 +883,7 @@ async fn handle_node(
                     msg = ?msg.meta.msg,
                     "message received"
                 );
-                if should_publish_turn(&msg) {
+                if should_publish_turn(&conn_node_name, &msg) {
                     if let Some(copy) = turn_copy(&msg, &conn_node_name) {
                         log_stream.append_turn(&conn_node_name, copy);
                     }
@@ -7791,8 +7791,37 @@ fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &s
     }
 }
 
-fn should_publish_turn(msg: &Message) -> bool {
-    is_solution_kind(&msg.meta.msg_type)
+/// Whether a node's message is a turn its router copies to the stream: a kind that counts as one
+/// (`is_solution_kind`: neither `system`, `admin` nor `query_response`), and none of Fluxbee Cloud's
+/// (`on_cloud_channel`, FINDINGS A-349). `sender` is the router-bound name of the node that sent
+/// it. Cognition's copies go through it too (`is_communication_turn`).
+fn should_publish_turn(sender: &str, msg: &Message) -> bool {
+    is_solution_kind(&msg.meta.msg_type) && !on_cloud_channel(sender, msg)
+}
+
+/// Whether a message rides Fluxbee Cloud's channel (FINDINGS A-349): IO.cloud sends it, or it is
+/// addressed to IO.cloud by name. IO.cloud serves Cloud's door alone: the edge forwards each of
+/// Cloud's requests to the owner its `/e/` row names, a fully qualified `IO.*` name
+/// (`src/bin/sy_edge.rs`, Option Z), and IO.cloud answers each one from its own connection, whose
+/// name the router binds. Both ride the `user` family, so both were turns, and SY.storage kept them
+/// whole in `turns`: a request carries what Cloud sends, `put_token`'s credential values among it,
+/// and an answer what the hive gives back, io.web's one-time links from its stage 2.1 on. The
+/// router copies none of them, for SY.storage nor for cognition.
+///
+/// What else this stops copying: IO.cloud's handoff of a `register_human` to SY.frontdesk.gov,
+/// which carries the person's name and email Cloud sent. The frontdesk's verdict, addressed to
+/// IO.cloud by its UUID as every reply is, is still a turn: it carries no Cloud request.
+fn on_cloud_channel(sender: &str, msg: &Message) -> bool {
+    is_cloud_node(sender)
+        || matches!(&msg.routing.dst, Destination::Unicast(dst) if is_cloud_node(dst))
+}
+
+/// Whether `name` is IO.cloud's, on any hive: `IO.cloud@<hive>` or `IO.cloud@*`. In any case, a
+/// superset of the names that reach it (the router resolves names as written).
+fn is_cloud_node(name: &str) -> bool {
+    name.split_once('@')
+        .map_or(name, |(role, _)| role)
+        .eq_ignore_ascii_case("IO.cloud")
 }
 
 fn should_enrich_with_memory_package(msg: &Message) -> bool {
@@ -7832,14 +7861,15 @@ fn is_workflow_node(name: &str) -> bool {
 /// What a WF sends an agent is copied at the agent's delivery, as any turn an agent receives.
 fn copied_for_cognition_at_entry(sender: &str, msg: &Message) -> bool {
     let to_an_io_node = matches!(&msg.routing.dst, Destination::Unicast(dst) if is_io_node(dst));
-    is_communication_turn(msg)
+    is_communication_turn(sender, msg)
         && (is_agent_node(sender) || (is_workflow_node(sender) && to_an_io_node))
 }
 
-/// Whether a message is a turn of a communication: a kind that counts as a turn, with a thread,
-/// neither a tap copy nor a broadcast (§6.2).
-fn is_communication_turn(msg: &Message) -> bool {
-    should_publish_turn(msg)
+/// Whether a message `sender` sent is a turn of a communication: a kind that counts as a turn, not
+/// Fluxbee Cloud's (`should_publish_turn`), with a thread, neither a tap copy nor a broadcast
+/// (§6.2).
+fn is_communication_turn(sender: &str, msg: &Message) -> bool {
+    should_publish_turn(sender, msg)
         && !msg.meta.via_tap
         && !matches!(msg.routing.dst, Destination::Broadcast)
         && canonical_thread_id_from_meta(&msg.meta).is_some()
@@ -7886,8 +7916,8 @@ async fn deliver_locally(
     let mut too_large = false;
     let mut busy = false;
     let mut undelivered = false;
-    let turn = is_communication_turn(&prepared);
     let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
+    let turn = is_communication_turn(&sender_name, &prepared);
     let mut plain: Option<Vec<u8>> = None;
     let mut memory: Option<Option<Arc<MemoryShmSnapshot>>> = None;
     for delivery in deliveries {
@@ -10375,6 +10405,65 @@ mod tests {
         assert!(prepare_local_delivery("worker1", &tapped, false).is_none());
     }
 
+    /// io.web's commands (docs/io-web-v2-stage-2-1.md §5.8), the set of exposures and the access
+    /// link, reach IO.web@motherbee only from SY.admin@motherbee, in any case. SY.admin of another
+    /// hive, Archi and IO.cloud are dropped at delivery, and so are a tap copy of SY.admin's own and
+    /// a sender known only through the hub. io.web's answers go back unchecked: they are no command.
+    #[test]
+    fn io_web_commands_reach_io_web_only_from_the_primary_admin() {
+        let delivery = |sender: &str, action: &str| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(sender.to_string()),
+                dst: Destination::Unicast("IO.web@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: system_meta(action),
+            payload: serde_json::json!({ "generation": 1, "exposures": [] }),
+        };
+        for action in [
+            "IO_WEB_EXPOSURES",
+            "IO_WEB_ACCESS_LINK",
+            "io_web_exposures",
+            " Io_Web_Access_Link ",
+        ] {
+            assert!(
+                prepare_local_delivery("motherbee", &delivery("SY.admin@motherbee", action), false)
+                    .is_some(),
+                "{action:?} from SY.admin@motherbee must reach io.web"
+            );
+            for rogue in [
+                "SY.admin@worker1",
+                "SY.architect@motherbee",
+                "IO.cloud@motherbee",
+                "SY.orchestrator@motherbee",
+                "AI.sales@motherbee",
+            ] {
+                assert!(
+                    prepare_local_delivery("motherbee", &delivery(rogue, action), false).is_none(),
+                    "{action:?} from {rogue} must be dropped"
+                );
+            }
+            assert!(
+                prepare_local_delivery("motherbee", &delivery("SY.admin@motherbee", action), true)
+                    .is_none(),
+                "{action:?} from a sender known only through the hub must be dropped"
+            );
+            let mut tapped = delivery("SY.admin@motherbee", action);
+            tapped.meta.via_tap = true;
+            assert!(
+                prepare_local_delivery("motherbee", &tapped, false).is_none(),
+                "a tap copy of {action:?} must be dropped"
+            );
+        }
+        for answer in ["IO_WEB_EXPOSURES_RESPONSE", "IO_WEB_ACCESS_LINK_RESPONSE"] {
+            let mut back = delivery("IO.web@motherbee", answer);
+            back.routing.dst = Destination::Unicast("SY.admin@motherbee".to_string());
+            assert!(prepare_local_delivery("motherbee", &back, false).is_some());
+        }
+    }
+
     /// The edge gate and the system policy list the same edge commands. A command missing from the
     /// gate is answered VPN_BLOCKED before the policy is asked; one missing from the protected
     /// actions reaches the edge without the policy. Every command has its answer in the gate.
@@ -11799,6 +11888,158 @@ mod tests {
         assert_eq!(cognition[1].2.payload["n"], 4);
     }
 
+    /// FINDINGS A-349: the router copies nothing of Fluxbee Cloud's channel to its stream. The
+    /// edge's `user` request to IO.cloud, a `put_token` with its credential value, and IO.cloud's
+    /// answer to the edge's UUID, a one-time link, both reach their node and neither reaches
+    /// `storage.turns`; nor do IO.cloud's handoff to SY.frontdesk.gov and a message it sent an
+    /// agent, which `cognition.turns` does not get either. The edge's request to another IO node is
+    /// still copied. Until the fix SY.storage kept each of them whole in `turns`.
+    #[tokio::test]
+    async fn the_router_copies_nothing_of_cloud_s_channel_to_its_stream() {
+        let shm = TestShm::new("rt-a349");
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut receivers = HashMap::new();
+        {
+            let mut guard = nodes.lock().await;
+            for name in [
+                "IO.cloud@motherbee",
+                "IO.api@motherbee",
+                "SY.frontdesk.gov@motherbee",
+                "AI.sales@motherbee",
+            ] {
+                let uuid = Uuid::new_v4();
+                let (sender, rx) = link_queue("node");
+                guard.insert(
+                    uuid,
+                    NodeHandle {
+                        name: name.to_string(),
+                        vpn_id: 0,
+                        sender,
+                        connected_at: 0,
+                    },
+                );
+                receivers.insert(name, (uuid, rx));
+            }
+        }
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let connect = |name: &'static str| {
+            let shm = &shm;
+            let nodes = &nodes;
+            let log_stream = log_stream.clone();
+            async move {
+                let uuid = Uuid::new_v4();
+                let (mut client, server) = UnixStream::pair().expect("socket pair");
+                let _connection = spawn_node_connection_with_stream(server, shm, nodes, log_stream);
+                let hello = test_frame(
+                    uuid,
+                    SYSTEM_KIND,
+                    Some(MSG_HELLO),
+                    Destination::Broadcast,
+                    serde_json::json!({ "uuid": uuid.to_string(), "name": name, "version": "1" }),
+                );
+                write_frame(&mut client, &hello).await.expect("hello");
+                time::timeout(Duration::from_secs(5), read_frame(&mut client))
+                    .await
+                    .expect("announce in time")
+                    .expect("read")
+                    .expect("announce");
+                (uuid, client)
+            }
+        };
+        let user =
+            |src: Uuid, dst: Destination, thread: Option<&str>, payload: serde_json::Value| {
+                let mut msg: Message =
+                    serde_json::from_slice(&test_frame(src, "user", None, dst, payload)).unwrap();
+                msg.meta.ich = Some("ich:cloud".to_string());
+                msg.meta.thread_id = thread.map(str::to_string);
+                serde_json::to_vec(&msg).unwrap()
+            };
+        async fn received(rx: &mut LinkReceiver) -> Message {
+            let frame = time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("delivery in time")
+                .expect("delivered");
+            serde_json::from_slice(&frame).expect("message")
+        }
+
+        // The edge forwards Cloud's request to IO.cloud by name, then a request of another
+        // channel to IO.api.
+        let (edge_uuid, mut edge) = connect("SY.edge").await;
+        let secret = "sk-a349-credential-value";
+        write_frame(
+            &mut edge,
+            &user(
+                edge_uuid,
+                Destination::Unicast("IO.cloud@motherbee".to_string()),
+                None,
+                serde_json::json!({ "op": "put_token", "params": { "value": { "api_key": secret } } }),
+            ),
+        )
+        .await
+        .expect("Cloud's request");
+        write_frame(
+            &mut edge,
+            &user(
+                edge_uuid,
+                Destination::Unicast("IO.api@motherbee".to_string()),
+                None,
+                serde_json::json!({ "n": "another channel" }),
+            ),
+        )
+        .await
+        .expect("another channel's request");
+        let got = received(&mut receivers.get_mut("IO.cloud@motherbee").unwrap().1).await;
+        assert_eq!(got.payload["params"]["value"]["api_key"], secret);
+        received(&mut receivers.get_mut("IO.api@motherbee").unwrap().1).await;
+        let copies = observed.drain();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].0, fluxbee_sdk::stream::SUBJECT_STORAGE_TURNS);
+        let copy: Message = serde_json::from_slice(&copies[0].2).expect("the turn copy");
+        assert_eq!(copy.payload["n"], "another channel");
+
+        // IO.cloud answers the edge's UUID with a link, hands a registration to the frontdesk, and
+        // writes to an agent, both on a thread. Its stand-in above goes first.
+        let (stand_in, _) = receivers.remove("IO.cloud@motherbee").unwrap();
+        nodes.lock().await.remove(&stand_in);
+        let (cloud_uuid, mut cloud) = connect("IO.cloud").await;
+        let link = "https://shop.hive-x.fluxbee.ai/.fluxbee/enter?code=L1.a.b.c.1.d";
+        write_frame(
+            &mut cloud,
+            &user(
+                cloud_uuid,
+                Destination::Unicast(edge_uuid.to_string()),
+                None,
+                serde_json::json!({ "status": "ok", "result": { "url": link } }),
+            ),
+        )
+        .await
+        .expect("IO.cloud's answer");
+        for (dst, n) in [("SY.frontdesk.gov@motherbee", 1), ("AI.sales@motherbee", 2)] {
+            write_frame(
+                &mut cloud,
+                &user(
+                    cloud_uuid,
+                    Destination::Unicast(dst.to_string()),
+                    Some("thread:cloud:req-a349"),
+                    serde_json::json!({ "n": n }),
+                ),
+            )
+            .await
+            .expect("IO.cloud's message");
+        }
+        let answer = time::timeout(Duration::from_secs(5), read_frame(&mut edge))
+            .await
+            .expect("answer in time")
+            .expect("read")
+            .expect("answer");
+        let answer: Message = serde_json::from_slice(&answer).expect("message");
+        assert_eq!(answer.payload["result"]["url"], link);
+        received(&mut receivers.get_mut("SY.frontdesk.gov@motherbee").unwrap().1).await;
+        received(&mut receivers.get_mut("AI.sales@motherbee").unwrap().1).await;
+        let copies = observed.drain();
+        assert!(copies.is_empty(), "{copies:?}");
+    }
+
     /// A message to an agent on `thread:t1`, from IO.api, whose text is `content`.
     fn agent_turn(content: &str) -> Message {
         let mut msg: Message = serde_json::from_slice(&test_frame(
@@ -12128,6 +12369,84 @@ mod tests {
         assert!(!copied_for_cognition_at_entry(
             "WF.soporte@worker1",
             &no_thread
+        ));
+    }
+
+    /// FINDINGS A-349: a message on Fluxbee Cloud's channel is no turn, for SY.storage nor for
+    /// cognition. It is told apart by IO.cloud's name: IO.cloud sends it, or it is addressed to
+    /// IO.cloud by name, as the edge forwards every Cloud request. A message of another channel,
+    /// and one addressed to IO.cloud by its UUID (the frontdesk's verdict), still are turns.
+    #[test]
+    fn a_message_on_cloud_s_channel_is_no_turn() {
+        let message = |dst: Destination, msg_type: &str| {
+            let mut msg: Message = serde_json::from_slice(&test_frame(
+                Uuid::new_v4(),
+                msg_type,
+                None,
+                dst,
+                serde_json::json!({ "op": "put_token", "params": { "value": { "token": "x" } } }),
+            ))
+            .unwrap();
+            msg.meta.ich = Some("ich:cloud".to_string());
+            msg.meta.thread_id = Some("thread:cloud:req-1".to_string());
+            msg
+        };
+        let to = |dst: &str| message(Destination::Unicast(dst.to_string()), "user");
+        let by_uuid = || message(Destination::Unicast(Uuid::new_v4().to_string()), "user");
+        let edge = "SY.edge@ingress1";
+        let cloud = "IO.cloud@motherbee";
+        for (sender, msg, why) in [
+            (edge, to(cloud), "Cloud's request, forwarded by the edge"),
+            (edge, to("IO.cloud@*"), "a request to IO.cloud on any hive"),
+            (
+                edge,
+                to("io.cloud@motherbee"),
+                "IO.cloud's name in another case",
+            ),
+            (cloud, by_uuid(), "IO.cloud's answer, to the edge's UUID"),
+            (
+                cloud,
+                to("SY.frontdesk.gov@motherbee"),
+                "IO.cloud's register_human handoff",
+            ),
+            (cloud, to("AI.sales@motherbee"), "anything IO.cloud sends"),
+            (
+                "AI.sales@motherbee",
+                to(cloud),
+                "an agent's message to IO.cloud",
+            ),
+        ] {
+            assert!(!should_publish_turn(sender, &msg), "{why}");
+            assert!(!is_communication_turn(sender, &msg), "{why}");
+            assert!(!copied_for_cognition_at_entry(sender, &msg), "{why}");
+        }
+        for (sender, msg, why) in [
+            (edge, to("IO.api@motherbee"), "another channel's request"),
+            ("IO.api@motherbee", by_uuid(), "another channel's answer"),
+            (
+                "SY.frontdesk.gov@motherbee",
+                by_uuid(),
+                "a message to IO.cloud by its UUID: the frontdesk's verdict",
+            ),
+            (edge, to("IO.cloudx@motherbee"), "another node's name"),
+            (edge, to("IO.cloud.x@motherbee"), "another node's name"),
+            (
+                edge,
+                message(Destination::Broadcast, "user"),
+                "the edge's fan-out",
+            ),
+        ] {
+            assert!(should_publish_turn(sender, &msg), "{why}");
+        }
+        // The kinds that never were turns still are none.
+        assert!(!should_publish_turn(
+            "IO.api@motherbee",
+            &message(Destination::Unicast(cloud.to_string()), SYSTEM_KIND)
+        ));
+        // An agent's turn to another IO node still goes to its cognition.
+        assert!(copied_for_cognition_at_entry(
+            "AI.sales@motherbee",
+            &to("IO.api@motherbee")
         ));
     }
 

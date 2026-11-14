@@ -67,8 +67,9 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
   - the WF's block: `Workflow context:`, with `Path:` from the trail, `Variables:` and the menu;
   - the label `Current user message, from <ILK> via <node>:`.
 - **Storage and Archi:**
-  - The router publishes as a turn every message that is not system, admin or `query_response`
-    (`should_publish_turn`, src/router/mod.rs).
+  - The router publishes as a turn every message that is not system, admin or `query_response`,
+    nor of Fluxbee Cloud's channel, sent by IO.cloud or addressed to it by name
+    (`should_publish_turn`, src/router/mod.rs; FINDINGS A-349).
   - `turns` keeps the whole message, with its `thread_id` and `trace_id`.
   - Archi's Messages screen reads them (`/api/messages`).
 - **Size:**

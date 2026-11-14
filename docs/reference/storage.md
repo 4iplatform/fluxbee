@@ -116,8 +116,11 @@ directory is not usable, the router carries on and the stream keeps records in m
 
 1. **Turn copy** (`turn_copy`, `src/router/mod.rs`): the router where a message comes in copies it
    as `storage.turns`, with the real name of the sender in `routing.src_l2_name`. It does not copy
-   the `system`, `admin` or `query_response` types (`should_publish_turn`). Each message is copied
-   only once, on the router of its sender.
+   the `system`, `admin` or `query_response` types (`should_publish_turn`), nor Fluxbee Cloud's
+   channel: no message IO.cloud sends and none addressed to it by name, so neither Cloud's
+   requests (`put_token`'s credential values) nor IO.cloud's answers reach `turns` (FINDINGS
+   A-349, `on_cloud_channel`; what was stored before stays). Each message is copied only once, on
+   the router of its sender.
 2. **Copy for cognition** (`cognition_copy`): the router where an agent (`AI.*`) is connected
    copies as `cognition.turns` each turn with a `thread_id` that the agent sends (when it comes in)
    or receives (when it is delivered). No tap copies and no broadcasts. Details in

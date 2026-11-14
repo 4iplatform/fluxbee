@@ -424,12 +424,13 @@ wasm and baked into the router binary with `include_bytes!` (`src/router/system_
 ### 6.2 Protected actions and who may send them
 
 The gate covers system messages (`meta.type` compared without case, `is_system_kind`) whose
-`meta.msg` is one of the 33 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
+`meta.msg` is one of the 35 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
 `src_l2_name` (§2) and the hive of the router doing the delivery.
 
 | Rule in `system.rego` | Actions | Allowed origin |
 | --- | --- | --- |
 | (1) | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `EDGE_WEB_ROUTES` | `SY.admin@motherbee` |
+| (1), io.web | `IO_WEB_EXPOSURES`, `IO_WEB_ACCESS_LINK` (`web_service_actions`, [io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.8) | `SY.admin@motherbee` |
 | (2) | `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` | `SY.admin@motherbee` |
 | (3) mutations | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`, `SYSTEM_EGRESS_ROUTE` | `SY.orchestrator@motherbee`; `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` and `SYSTEM_EGRESS_ROUTE` never on the motherbee itself |
 | (3) reads | `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `NODE_HELP` (a node's self-description, [agent-tools-v1](../agent-tools-v1.md) §3.3), `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`, `SY.orchestrator@<this hive>` |
@@ -439,7 +440,7 @@ The gate covers system messages (`meta.type` compared without case, `is_system_k
 
 - In short: node lifecycle verbs (SPAWN, KILL, …) come from the motherbee's orchestrator or from the
   admin of the same hive, and the node reads also from the same hive's orchestrator;
-  `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_*` and the edge commands come only from
+  `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_*`, the edge commands and io.web's come only from
   `SY.admin@motherbee`.
 - Rule (3) has a direction (FINDINGS A-20, [control-path-hardening-v1.md](../control-path-hardening-v1.md)
   §3). Every orchestrator message that crosses hives goes from the motherbee to a spoke, and the

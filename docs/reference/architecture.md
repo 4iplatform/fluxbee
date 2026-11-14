@@ -606,7 +606,8 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
   replicas (§5.3). Reference: [identity.md](identity.md); model:
   [ilk-tenant-model-v1.md](../ilk-tenant-model-v1.md).
 - **The message log.** The router where a message enters copies it to its stream under
-  `storage.turns`, for every kind except `system`, `admin` and `query_response`
+  `storage.turns`, for every kind except `system`, `admin` and `query_response`, and never a
+  message of Fluxbee Cloud's channel, sent by IO.cloud or addressed to it by name (FINDINGS A-349)
   (`should_publish_turn`). Every hive's streams deliver `storage.*` subjects to
   `SY.storage@motherbee` (`sinks_for`), which writes the `fluxbee_storage` database (table `turns`).
   Design: [router-stream-v1.md](../router-stream-v1.md); storage: [13-storage.md](storage.md).

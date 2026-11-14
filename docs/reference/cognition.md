@@ -86,7 +86,8 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
 
 **What counts as a turn** (`is_communication_turn`):
 
-- not a `system`, `admin` or `query_response` message (`should_publish_turn`);
+- not a `system`, `admin` or `query_response` message, nor one of Fluxbee Cloud's channel, sent by
+  IO.cloud or addressed to it by name (`should_publish_turn`, FINDINGS A-349);
 - it carries `meta.thread_id`;
 - it is not a tap copy (`meta.via_tap`) nor a broadcast.
 

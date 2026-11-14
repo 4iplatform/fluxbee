@@ -660,7 +660,7 @@ translations.
 | Release | Branches | What | Why in this order |
 | --- | --- | --- | --- |
 | R1, Rust SDK alone | `coa/web21-sdk-protocol` | `MSG_IO_WEB_EXPOSURES` and `MSG_IO_WEB_ACCESS_LINK` with their responses (sdk/protocol.rs); the reserved prefix (§5.6) | SY.admin and io.web compile against the constants |
-| R2, router alone | `coa/web21-router` | the protected actions, rego, both wasm (§5.8) | independent: before or after R3, always before the gate |
+| R2, router alone | `coa/web21-router` | the protected actions, rego, both wasm (§5.8); A-349's fix, no turn for Cloud's channel (§0, decision 6) | independent: before or after R3, always before the gate |
 | R3, binaries | `coa/web21-admin` (SY.admin and acme.rs), `coa/web21-edge`, `coa/web21-io-web`, `coa/web21-io-cloud` | §5.1, §5.2, §5.4, §5.5, §5.3's translation; each with its docs | each is green alone. io.cloud's new arms pass while `CLOUD_OP_ACTIONS` lacks the rows (cloud/main:2678-2692 loops over the rows) |
 | R4, Rust SDK alone | `coa/web21-sdk-cloud` | `cloud.rs`'s six rows and catalog (§5.3) | it needs SY.admin's registry (admin:30285-30291) and io.cloud's arms (cloud/main:2684-2685) green first. Only then can Cloud reach the ops |
 

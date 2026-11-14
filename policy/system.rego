@@ -50,6 +50,11 @@ edge_service_actions := {
 	"EDGE_WEB_ROUTES",
 }
 
+# io.web's service commands: the whole set of exposures it serves, with their enablements, and the
+# one-time access link it mints for one of them (docs/io-web-v2-stage-2-1.md §5.5 and §5.8): only
+# SY.admin on the primary hive, as the edge's.
+web_service_actions := {"IO_WEB_EXPOSURES", "IO_WEB_ACCESS_LINK"}
+
 # Live node config and runtime distribution are forwarded directly by the singleton Admin to
 # managed nodes or orchestrators on workers. CONFIG_CHANGED carries the user OPA policy (writes to
 # the motherbee's SY.opa.rules, the notice of a newly published one to every hive): Admin only.
@@ -121,6 +126,14 @@ allow if {
 	parsed.hive == "motherbee"
 }
 
+# io.web's service command -> exactly SY.admin@motherbee, on the same terms: rule (4) guards
+# `not web` as it guards `not edge`, and no other rule names these actions.
+allow if {
+	input.action in web_service_actions
+	parsed.role == "SY.admin"
+	parsed.hive == "motherbee"
+}
+
 # (2) The primary Admin may forward managed-node config and runtime distribution cross-hive.
 allow if {
 	input.action in node_control_actions
@@ -152,6 +165,7 @@ allow if {
 # (docs/wf-standard-path-v1.md, FINDINGS A-68).
 allow if {
 	not input.action in edge_service_actions
+	not input.action in web_service_actions
 	not input.action in node_control_actions
 	not input.action in reachability_actions
 	not spoke_only_action_on_motherbee

@@ -287,7 +287,8 @@ compares it case-insensitively, but the SDK reply matchers (`RouteMatch`, §10) 
 
 Each router keeps a short, best-effort log, its stream (`docs/router-stream-v1.md`). The router a
 message enters by copies it there when its kind is not `system`, `admin` or `query_response`
-(`should_publish_turn`; subject `storage.turns`, delivered to `SY.storage@motherbee`). When an
+and it is not on Fluxbee Cloud's channel, sent by IO.cloud or addressed to it by name (FINDINGS
+A-349) (`should_publish_turn`; subject `storage.turns`, delivered to `SY.storage@motherbee`). When an
 `AI.*` node sends or receives a turn that has a `thread_id` and is neither a broadcast nor a tap
 copy, the agent's router also copies it for the hive's SY.cognition (`is_communication_turn`,
 subject `cognition.turns`). Nodes never see these copies.

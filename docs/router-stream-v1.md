@@ -4,7 +4,8 @@ Status: design reviewed once (2026-10-16); stages 1a and 1b validated on 8.x (0.
 stage 2 designed with the operator and reviewed (2026-10-17, §6), validated on 8.x (2a in 0.1.77,
 §6.8; 2b in 0.1.78, §6.9: NATS is gone); stage 3 designed with the operator and reviewed once
 (2026-10-17, §7), built and its code reviewed once (§7.9), validated on 8.x (0.1.79, §7.10). Finding
-A-70 (`lab/logbook/FINDINGS.md`).
+A-70 (`lab/logbook/FINDINGS.md`). Fluxbee Cloud's channel is no longer copied (A-349, §2.2), built
+on `coa/web21-router`.
 
 The router gets a small stream of its own. It replaces the embedded NATS broker, and carries three
 kinds of data to SY.storage:
@@ -137,6 +138,17 @@ and the per-frame loop. The socket stays.
    - It is the same copy as today: after `thread_seq` is assigned, with `action_class` (SY.policy
      reads it).
    - The rule stays: every message except `system`, `admin` and `query_response` kinds.
+   - **Fluxbee Cloud's channel is never copied** (FINDINGS A-349; the operator's call of
+     2026-11-13, built on `coa/web21-router`, io.web stage 2.1's router release,
+     [io-web-v2-stage-2-1](io-web-v2-stage-2-1.md) §0 decision 6): no message IO.cloud sends, and
+     none addressed to IO.cloud by name (`on_cloud_channel`, `src/router/mod.rs`), under
+     `storage.turns` nor `cognition.turns`. Cloud's requests reach IO.cloud from the edge, by the
+     name its `/e/` row holds, and IO.cloud answers each one; both are `user` messages, so until
+     then SY.storage kept them whole in `turns`, `put_token`'s credential values among them, and
+     io.web's one-time access links would have followed. The rule also leaves out IO.cloud's
+     `register_human` handoff to SY.frontdesk.gov (the person's name and email); the frontdesk's
+     verdict, addressed to IO.cloud by its UUID as every reply is, is still copied. What
+     SY.storage stored before stays until the operator decides whether to scrub it.
    - The copy is made once, by the router where the message enters.
    - The copy carries the sender's real name (`conn_node_name`). Today it keeps whatever
      `src_l2_name` the node wrote, because the router stamps it only later.

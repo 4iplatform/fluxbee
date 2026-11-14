@@ -50,6 +50,11 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "EDGE_ACME_CHALLENGE",
     // The full set of hosts the edge serves only through io.web (docs/io-web-v2.md §11.1).
     "EDGE_WEB_ROUTES",
+    // io.web's own: the set of exposures it serves, with their enablements, and the one-time access
+    // link it mints for one (docs/io-web-v2-stage-2-1.md §5.5): SY.admin@motherbee alone sends them
+    // (`web_service_actions`), and io.web checks the sender too.
+    "IO_WEB_EXPOSURES",
+    "IO_WEB_ACCESS_LINK",
     "SPAWN_NODE",
     "KILL_NODE",
     "START_NODE",
@@ -576,6 +581,10 @@ mod tests {
         "SYSTEM_EGRESS_ROUTE",
     ];
 
+    /// io.web's service commands (`web_service_actions` in `policy/system.rego`,
+    /// docs/io-web-v2-stage-2-1.md §5.8).
+    const IO_WEB_SERVICE_ACTIONS: [&str; 2] = ["IO_WEB_EXPOSURES", "IO_WEB_ACCESS_LINK"];
+
     /// Rule (3)'s reads (`orchestrator_reads`).
     const ORCHESTRATOR_READS: [&str; 8] = [
         "NODE_CONFIG_GET",
@@ -625,9 +634,11 @@ mod tests {
             "EDGE_ACME_CHALLENGE",
             "EDGE_WEB_ROUTES",
         ];
+        let web = IO_WEB_SERVICE_ACTIONS;
         for action in never_sent
             .iter()
             .chain(edge.iter())
+            .chain(web.iter())
             .chain(["WAN_REACHABILITY_VOUCH"].iter())
         {
             for orchestrator in [
@@ -644,11 +655,13 @@ mod tests {
             }
         }
         // Completeness: every protected action is placed on purpose — forwarded by orchestrators,
-        // never sent by them, or Admin-only edge. A new protected action must be placed here.
+        // never sent by them, or Admin-only edge and io.web. A new protected action must be placed
+        // here.
         let mut placed: Vec<&str> = forwarded
             .iter()
             .chain(never_sent.iter())
             .chain(edge.iter())
+            .chain(web.iter())
             .copied()
             .collect();
         placed.sort_unstable();
@@ -863,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_33_actions() {
+    fn protected_set_is_the_35_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -878,6 +891,9 @@ mod tests {
             "EDGE_ACME_CHALLENGE",
             // The edge's web hosts (docs/io-web-v2.md §11.1).
             "EDGE_WEB_ROUTES",
+            // io.web's exposures and its one-time access links (docs/io-web-v2-stage-2-1.md §5.8).
+            "IO_WEB_EXPOSURES",
+            "IO_WEB_ACCESS_LINK",
             "SPAWN_NODE",
             "KILL_NODE",
             "START_NODE",
@@ -910,7 +926,7 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 33);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 35);
         for action in [
             "RUNTIME_UPDATE",
             "HELLO",
@@ -923,6 +939,9 @@ mod tests {
             "EDGE_TLS_RELOAD_RESPONSE",
             "EDGE_ACME_CHALLENGE_RESPONSE",
             "EDGE_WEB_ROUTES_RESPONSE",
+            // io.web answers SY.admin with these; nothing acts on them.
+            "IO_WEB_EXPOSURES_RESPONSE",
+            "IO_WEB_ACCESS_LINK_RESPONSE",
         ] {
             assert!(!is_protected_system_action(action));
         }
@@ -999,6 +1018,53 @@ mod tests {
                     assert!(
                         !authorize_system(action, rogue, edge_hive),
                         "{rogue:?} must be denied {action} on {edge_hive}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// io.web's service commands (docs/io-web-v2-stage-2-1.md §5.8) take rule (1)'s terms: only
+    /// SY.admin@motherbee, whatever hive answers. SY.admin on another hive is refused even on its
+    /// own (rule (4) does not reach them), and so are Archi, IO.cloud (it asks SY.admin, never
+    /// io.web), io.web itself, the orchestrators and every other node.
+    #[test]
+    fn io_web_service_actions_are_motherbee_admin_only() {
+        for action in IO_WEB_SERVICE_ACTIONS {
+            assert!(
+                is_protected_system_action(action),
+                "{action} must be protected"
+            );
+            assert_eq!(
+                protected_system_action(&format!(" {} ", action.to_ascii_lowercase())),
+                Some(action)
+            );
+            for hive in ["motherbee", "worker1", "ingress1"] {
+                assert!(
+                    authorize_system(action, Some("SY.admin@motherbee"), hive),
+                    "SY.admin@motherbee must be admitted for {action} on {hive}"
+                );
+                for rogue in [
+                    Some("SY.admin@worker1"),
+                    Some("SY.admin@ingress1"),
+                    Some("SY.architect@motherbee"),
+                    Some("IO.cloud@motherbee"),
+                    Some("IO.web@motherbee"),
+                    Some("SY.orchestrator@motherbee"),
+                    Some("SY.orchestrator@worker1"),
+                    Some("SY.edge@ingress1"),
+                    Some("SY.vault@motherbee"),
+                    Some("SY.wf-rules@motherbee"),
+                    Some("AI.sales@motherbee"),
+                    Some("WF.invoice@motherbee"),
+                    Some("SY.admin.relay@motherbee"),
+                    Some("SY.admin"),
+                    Some(""),
+                    None,
+                ] {
+                    assert!(
+                        !authorize_system(action, rogue, hive),
+                        "{rogue:?} must be denied {action} on {hive}"
                     );
                 }
             }
