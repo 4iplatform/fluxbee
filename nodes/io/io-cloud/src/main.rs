@@ -1094,9 +1094,9 @@ fn tenant_in_params(request: &Value) -> bool {
 }
 
 /// The envelope's `tenant_id` as the translation reads it: absent or null is none, a string goes
-/// as sent, and anything else as its JSON text. A malformed tenant is then refused, as not
-/// canonical (`require_tenant_id`) or as one an op takes none of (`refuse_tenant`), never read as
-/// absent.
+/// as sent, and anything else as its JSON text, so a malformed tenant is never read as absent. An
+/// op that reads the tenant refuses it as not canonical (`require_tenant_id`), and an exposure op
+/// refuses any (`refuse_tenant`); the ops that take no tenant ignore it.
 fn envelope_tenant(request: &Value) -> Option<String> {
     match request.get("tenant_id")? {
         Value::Null => None,
@@ -2786,6 +2786,19 @@ mod tests {
     /// An exposure id as SY.admin mints it, `exp:<uuid v4>`.
     const EXPOSURE_ID: &str = "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 
+    /// The fields each exposure op takes, with values io.cloud relays as they are.
+    fn exposure_op_fields(op: &str) -> Value {
+        match op {
+            "publish_exposure" => json!({
+                "label": "shop",
+                "upstream": {"kind": "hive", "hive": "worker1", "port": 8080},
+            }),
+            "enable_exposure" => json!({"exposure_id": EXPOSURE_ID, "duration_s": 600}),
+            "list_exposures" => json!({}),
+            _ => json!({"exposure_id": EXPOSURE_ID}),
+        }
+    }
+
     #[test]
     fn translate_cloud_op_actions_match_the_shared_sdk_vocabulary() {
         // FIX-12: io.cloud's op→action translation must agree with the single source in
@@ -3746,17 +3759,8 @@ mod tests {
     /// refuses an envelope tenant, whichever, rather than ignore it. SY.admin checks the values.
     #[test]
     fn translate_exposure_ops_copy_only_their_fields_and_refuse_a_tenant() {
-        let own_fields = |op: &str| match op {
-            "publish_exposure" => json!({
-                "label": "shop",
-                "upstream": {"kind": "hive", "hive": "worker1", "port": 8080},
-            }),
-            "enable_exposure" => json!({"exposure_id": EXPOSURE_ID, "duration_s": 600}),
-            "list_exposures" => json!({}),
-            _ => json!({"exposure_id": EXPOSURE_ID}),
-        };
         for op in EXPOSURE_OPS {
-            let own = own_fields(op);
+            let own = exposure_op_fields(op);
             // Fields the op does not take, other exposure ops' among them, are dropped.
             let mut sent = json!({
                 "name": "acme", "key": "k", "node_name": "IO.x@motherbee", "until": 1,
@@ -4759,6 +4763,38 @@ mod tests {
                 admin
             );
             assert_eq!(seen, cloud_sees);
+        }
+    }
+
+    /// A numeric envelope tenant on each exposure op, through the relay: refused with
+    /// INVALID_REQUEST at once, and no ADMIN_COMMAND leaves io.cloud. The tenant is read by its
+    /// presence (`envelope_tenant`); read as absent, the op would go to SY.admin, which the test
+    /// never answers.
+    #[tokio::test]
+    async fn a_numeric_envelope_tenant_on_an_exposure_op_never_reaches_sy_admin() {
+        let (state, mut router) = io_cloud_on_a_test_router();
+        for op in EXPOSURE_OPS {
+            let request = json!({"op": op, "tenant_id": 5, "params": exposure_op_fields(op)});
+            let answer = timeout(
+                Duration::from_secs(3),
+                dispatch_cloud_op(
+                    &state.dispatcher,
+                    &state.config.admin_target,
+                    &state.config.hive_id,
+                    &request,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{op}: io.cloud answers at once, asking SY.admin nothing"));
+            assert_eq!(answer["status"], "error", "{op}");
+            assert_eq!(answer["error_code"], "INVALID_REQUEST", "{op}");
+            assert!(
+                router
+                    .next_outgoing_within(Duration::from_millis(200))
+                    .await
+                    .is_none(),
+                "{op}: no ADMIN_COMMAND leaves io.cloud"
+            );
         }
     }
 }

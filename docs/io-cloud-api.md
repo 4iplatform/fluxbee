@@ -123,8 +123,8 @@ An error of the service comes back as `status:"error"` with the service's `error
   another tenant.
 - **Ops with no tenant:** `create_tenant` (the tenant does not exist yet), `list_tenants`,
   `list_cloud_actions`, `get_ilk` and `get_ilk_details`, and `delete_ilk` and `restore_ilk`.
-- **The exposure ops refuse one** (§5.8): an exposure is the installation's, not a tenant's, so an
-  envelope `tenant_id` answers `INVALID_REQUEST` there, whatever it holds.
+- **The exposure ops refuse one** (§5.8): an exposure is the installation's, not a tenant's, so any
+  envelope `tenant_id` but `null` answers `INVALID_REQUEST` there (`null` reads as absent).
 
 The hive's admin checks rule 3 again on its side for every relayed op, and the vault and the
 identity registry refuse anything of another tenant themselves.
@@ -982,12 +982,12 @@ upstream. Cloud publishes it, opens it for a while, and lets a person in with a 
 person then browses that host with a session the hive keeps in a cookie on that host alone. Only
 Cloud publishes, opens, closes and removes exposures, and only Cloud asks for links.
 
-- **Reachable from 0.1.148.** Before it, IO.cloud answers these ops `INVALID_REQUEST` (an unknown
-  op), or, once IO.cloud knows them, the hive answers `UNAUTHORIZED`. `list_cloud_actions` lists
-  them from 0.1.148.
-- **No tenant.** An exposure is the installation's, not a tenant's: an envelope `tenant_id` is
-  refused with `INVALID_REQUEST`, not ignored (§3). Each op takes the params listed for it; other
-  fields are ignored (§3, rule 1).
+- **Reachable from 0.1.148.** Up to 0.1.146 IO.cloud answers these ops `INVALID_REQUEST` (an
+  unknown op); in 0.1.147 IO.cloud knows them, and the hive answers `UNAUTHORIZED`.
+  `list_cloud_actions` lists them from 0.1.148.
+- **No tenant.** An exposure is the installation's, not a tenant's: any envelope `tenant_id` but
+  `null` is refused with `INVALID_REQUEST`, not ignored (§3). Each op takes the params listed for
+  it; other fields are ignored (§3, rule 1).
 - **What a person sees for now:** with a session, the hive's placeholder page. The hive records the
   upstream already, and leads the host to it in a later release. Paths under `/.fluxbee/` belong to
   the hive on every exposure host, and never reach the upstream.
@@ -1028,7 +1028,7 @@ entry of `list_exposures`' `exposures`:
 | `state` | `closed`, or `enabled` until `enabled_until` (RFC 3339, UTC), when it closes by itself |
 | `certificate` | whether browsers accept the host: below |
 | `route.state` | `acknowledged`: the hive's door serves the host. `pending`: not confirmed yet, and the hive tells the door again every minute. `no_edge`: the hive has no door for it: the operator's |
-| `io_web.state` | io.web, the hive's web node, checks the links and sessions: `acknowledged`, it holds the exposure as it is now; `pending`, not confirmed yet, and the hive tells it again every minute; `absent`, it does not run: the operator's |
+| `io_web.state` | io.web, the hive's web node, checks the links and sessions. `acknowledged`: it holds the hive's current set of exposures. `pending`: it has not acknowledged the current set (it is stopped, restarting or slow), and the hive tells it again every minute. `absent`: io.web was never launched in the hive, the same condition as `IO_WEB_ABSENT`: the operator's |
 
 | `certificate.state` | what it means |
 |---|---|
@@ -1091,6 +1091,9 @@ Fluxbee's own ports are refused for every kind: 22, 80, 443, 3000, 8080, 8384, 9
   exposure stays open with no gap. A session never outlives the enablement it was taken under:
   the sessions taken before the renewal end at the previous `enabled_until`, and new links come from
   the new enablement only. To keep a person in past that time, give them a new link.
+- **Two enablements at most** stay live, the newest and the one it renewed: another renewal ends
+  the oldest at once, and its sessions with it. Renew each enablement once, well before its
+  `enabled_until`.
 - **A session** lasts while the person is active, 30 minutes idle at most, and never past the end
   of its enablement.
 
@@ -1100,10 +1103,12 @@ Fluxbee's own ports are refused for every kind: 22, 80, 443, 3000, 8080, 8384, 9
 
 ```json
 {"status":"ok","op":"issue_exposure_link","result":{"exposure_id":"exp:6f1c…",
- "url":"https://shop.hive-k3m9x7q2.fluxbee.ai/.fluxbee/enter?code=…","expires_at":…,"link_id":"9f2c…"}}
+ "url":"https://shop.hive-k3m9x7q2.fluxbee.ai/.fluxbee/enter?code=…",
+ "expires_at":"2026-11-14T10:02:00Z","link_id":"9f2c…"}}
 ```
 
-**The `url` lets one person in, once, for about 120 s** (until `expires_at`):
+**The `url` lets one person in, once, for about 120 s**, until `expires_at` (RFC 3339, UTC, like
+the view's times):
 
 - **open it once, top-level, in Cloud's own tab, within 120 s.** The person's browser goes to it;
   the hive sets its session cookie on the host and moves on to the host's page;
@@ -1149,26 +1154,28 @@ ones included.
 | `EXPOSURE_LIMIT` | publish | 16 are published | unpublish one |
 | `NO_MAIN_HOST` | publish | the hive has no public host to put the label under | the operator |
 | `EXPOSURE_CLOSED` | link | the exposure is not enabled | enable it first |
-| `IO_WEB_ABSENT` | enable | io.web, the hive's web node, was never launched | the operator |
-| `BUSY` | publish, enable, disable, unpublish | another of these is running | send it again |
+| `IO_WEB_ABSENT` | enable | io.web, the hive's web node, was never launched in the hive (`io_web.state` `absent`) | the operator |
+| `BUSY` | publish, enable, disable, unpublish | another of these four is running. Only they answer it: `issue_exposure_link` and `list_exposures` never do | send it again |
 | `VAULT_UNAVAILABLE` | enable | the new secret could not be stored: nothing changed | send it again |
 | `RECORD_FAILED` | publish, enable, disable, unpublish | the hive could not record it: nothing was opened | send it again; if it stays, the operator's |
 | `IO_WEB_UNAVAILABLE` | link | io.web did not answer, or does not hold the secret yet | send it again |
 
 Match on the code: IO.cloud passes the hive's text as `error_detail`, with no retry flag (§5.4).
 
-**Sending one again after `ADMIN_UNAVAILABLE`** (§6), when the first may have completed, is safe for
-every exposure op:
+**Sending one again after `ADMIN_UNAVAILABLE`** (§6), when the first may have completed:
 
 - `publish_exposure` answers the same exposure, `created: false`;
-- `enable_exposure` makes one more enablement, which is harmless (`renewed: true` if the first one
-  completed);
+- `enable_exposure` makes one more enablement (`renewed: true` if the first one completed). **That
+  is not harmless when the first one was a renewal:** the hive keeps two live enablements at most,
+  so the second one ends, at once, the enablement the first one renewed, and its sessions with it.
+  The people in it need a new link. Send an enable again only after `ADMIN_UNAVAILABLE` (or a code
+  that says nothing was done), never just to be sure, and renew well before `enabled_until`;
 - `disable_exposure` answers `was_enabled: false`;
 - `unpublish_exposure` answers `EXPOSURE_NOT_FOUND`, which then means done;
 - `issue_exposure_link` gives a new link, and the unused one expires;
 - `list_exposures` is a read.
 
-While the first one still runs, the second may answer `BUSY`: send it again shortly.
+While the first one still runs, a write sent again may answer `BUSY`: send it again shortly.
 
 ---
 
@@ -1195,7 +1202,9 @@ completing inside**. Treat it as **unknown**, not failed:
   `list_nodes` to know.
 - `register_human`: safe to send again, a few times at most, on `FRONTDESK_UNAVAILABLE` or a 504
   (§5.2).
-- the exposure ops: safe to send again; §5.8 says what each answers then.
+- the exposure ops: §5.8 says what each answers when sent again. All are safe but an
+  `enable_exposure` whose first try was a renewal: the second ends the enablement the first one
+  renewed, with its sessions.
 
 **IO.cloud serves one request at a time.** Concurrent calls queue, and a queued one can spend the
 edge's 30 s and get a 504. Serialize your calls.
@@ -1364,11 +1373,14 @@ post '{"op":"list_cloud_actions"}'
   that leads to one upstream, open it for a while, let a person in with a one-time link, close it,
   remove it and list them: `publish_exposure`, `enable_exposure`, `disable_exposure`,
   `unpublish_exposure`, `issue_exposure_link` and `list_exposures`. They take no tenant and refuse
-  an envelope `tenant_id`. Before 0.1.148 they answer `INVALID_REQUEST` (an unknown op) or
-  `UNAUTHORIZED`.
-- **An envelope `tenant_id` that is not a string is refused** (`INVALID_REQUEST`, not canonical),
-  where IO.cloud read it as absent: `get_ilk_details` by email then looked for the account without
-  the tenant. Send a tenant as `tnt:<uuid>`, or leave it out.
+  any envelope `tenant_id` but `null`. Up to 0.1.146 they answer `INVALID_REQUEST` (an unknown op),
+  and in 0.1.147 `UNAUTHORIZED`.
+
+### 0.1.147 (planned)
+
+- **`get_ilk_details` by email refuses an envelope `tenant_id` that is not a string**
+  (`INVALID_REQUEST`), where it searched the whole installation, as with no tenant. The ops that
+  take no tenant still ignore one (§3). Send a tenant as `tnt:<uuid>`, or leave it out.
 
 ### 0.1.146
 
