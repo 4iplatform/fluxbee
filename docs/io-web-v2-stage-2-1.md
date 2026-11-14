@@ -86,8 +86,9 @@ Asked with their options and recommendations; the operator took every recommenda
 ### 2.1 Identity and host
 
 - `exposure_id`: `exp:<uuid v4>`, minted by SY.admin at publish and never reused.
-- `label`: chosen by Cloud, one DNS label `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`, taken as given (an
-  uppercase label is refused, never folded).
+- `label`: chosen by Cloud, one DNS label: lowercase ASCII letters, digits and hyphens, 1 to 63
+  characters, starting and ending with a letter or a digit; taken as given (an uppercase label is
+  refused, never folded).
 - `host`: `<label>.<main>`, main being `acme::certified_name(admin.public_base_url)` (acme:242-313):
   the derivation `web:` uses for `archi.`, with its 253-character check (admin:953-964). Cloud names
   no domain, and the domain never comes from code (§11.1).
