@@ -382,7 +382,7 @@ no change required
     item (`coa/gosdk-141`); A-339 is the AI SDK's item (*an AI node answers a `NOT_TAKEN` with
     `unknown_system_msg`*), written A-335 on `coa/aisdk-142` and `coa/rustsdk-143`, to rename at
     their integration. A-348 is `coa/admin-144`'s [Archi] item (Archi's SCMD of
-    `set_node_config`'s route). The next new number is A-350.
+    `set_node_config`'s route). The next new number is A-352.
     **0.1.139's deploy:** the motherbee ran it before the workers did, and until every hive's core
     ran 0.1.139 no runtime version was removed and no workflow deployed or deleted (their purges
     remove versions): a worker on 0.1.138 listed no `RELAUNCH_DUE` node (A-300), so a version a
@@ -473,9 +473,11 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### io.web
 
-- Stage 2 ([io-web-v2](../../docs/io-web-v2.md)): sessions, Cloud's one-time code, Archi behind
-  io.web. It waits for the operator's definition of its security.
+- Stage 2 ([io-web-v2](../../docs/io-web-v2.md) §12): stage 2.1 building, the board's item 31
+  ([io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md)); then 2.2, the transparent proxy, and
+  2.3, Cloud's iframe.
 - A-142 (Archi) bites here once stage 2 proxies Archi.
+- A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
 
 ### Archi
 
@@ -505,6 +507,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   standard.
 
 ### General
+
+- A-350 🔵 A node's config can name its control authority: a `node.admin_target` set by `set_node_config` points IO.cloud's relay of Cloud's ops at another node after its next start (medium; the orchestrator's patch rule and the IO nodes; found by R3's io.web builder; read in the code; to ask the operator).
 
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
@@ -1609,6 +1613,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-351 [io.web] 🔵 design, for stage 2.2 (found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-edge`; read in the code) — the edge passes io.web only `__Host-` cookies, so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying
+
+- **Why:** stage 2.1's §5.4 has the edge rebuild `Cookie` with only the pairs whose name begins with
+  `__Host-` (`io_web_request_headers`, `src/bin/sy_edge.rs`, from 0.1.147), so the main host and any
+  cookie scoped wider than one host never reach io.web. io.web reads its session from
+  `__Host-fluxbee_session` (§3.3).
+- **Effect in 2.2 (not in 2.1, where io.web proxies nothing):** a third-party system behind an
+  exposure (an ERP, a portal) keeps its own session in cookies such as `JSESSIONID` or `sessionid`,
+  which the browser sends and the edge drops: its login never holds. And io.web's own
+  `__Host-fluxbee_session` would reach that upstream unless io.web strips it: Fluxbee's session
+  token in a third party's logs.
+- **For 2.2's design:** per exposure, the edge passes the client's cookies for the upstream (scoped
+  to the exposure's host), and io.web removes `__Host-fluxbee_session` (and any `__Host-fluxbee_*`)
+  before it proxies, and never forwards a `Set-Cookie` of that name from the upstream. Archi and
+  io.web set or read no cookie today.
+
+### A-350 [General/orchestrator] 🔵 medium (found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-io-web`; read in the code, not run; there since the IO nodes' spawn config) — a node's config can name its control authority: IO.cloud's relay of Cloud's ops can be pointed at another node
+
+- **Why:** IO.cloud and IO.api read `node.admin_target` (and IO.cloud `node.orchestrator_target`)
+  from their own config.json, falling back to `SY.admin@<hive>` (`nodes/io/io-cloud/src/main.rs`
+  ~2599-2602; `nodes/io/io-api/src/config.rs`; io.web did until stage 2.1's R3, which takes the
+  constant `SY.admin@motherbee`), and IO.cloud relays every Cloud op but its local ones to it
+  (`dispatch_cloud_op`, ~521-526). `set_node_config` merges each top-level key of its patch into
+  config.json (`set_node_config_flow`, `src/bin/sy_orchestrator.rs` ~30050-30058) and
+  `parse_config_patch` (~26346) refuses only `_system` and `config`; the orchestrator writes its own
+  `_system` block and never a `node` block, so a patched one stays across restarts. SY.admin admits
+  Archi to `set_node_config` on any node (`mesh_access`, `src/bin/sy_admin.rs` ~6051;
+  `authorize_mesh_caller` ~6321-6326), and the operator's HTTP API reaches it; SY.wf-rules' rule
+  covers WF nodes only.
+- **Effect:** a patch `{"node": {"admin_target": "<another node>"}}` on `IO.cloud@motherbee` takes
+  effect at IO.cloud's next start: from then on Cloud's requests, `put_token`'s credential values
+  among them, go to that node, which answers or not. On IO.api, its relays.
+- **Fix, to ask the operator:** the control targets are not config: each IO node takes them from
+  the SDK's constants (as SY.edge's `EDGE_CONTROL_AUTHORITY` and io.web from R3), or
+  `parse_config_patch` refuses a `node` block as it refuses `_system`. The other IO nodes' reads to
+  be checked with it.
 
 ### A-349 [General/router] ✅ VALIDATED ON 8.x (0.1.146, 2026-11-13; through Cloud's door a `put_token` and its `delete_token` leave no turn, where 0.1.145 left 4; a plain `user` message is still stored) (medium; found 2026-11-13 by io.web stage 2.1's build design; read in the code; there since Cloud's channel) — Cloud's requests and io.cloud's answers are stored whole in SY.storage's turns: `put_token`'s credential values at rest today
 
