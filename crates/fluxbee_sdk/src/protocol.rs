@@ -708,8 +708,9 @@ pub const MSG_EDGE_WEB_ROUTES_RESPONSE: &str = "EDGE_WEB_ROUTES_RESPONSE";
 // io.web's exposures (SY.admin -> IO.web; docs/io-web-v2-stage-2-1.md §5.5): the whole set of
 // exposures with their live enablements (`IoWebExposuresPayload`), and a one-time link to an
 // exposure's current enablement (`IoWebAccessLinkRequest`). Only `SY.admin@motherbee` sends them,
-// as system messages; neither carries a secret, since io.web reads each enablement's key from the
-// vault itself (`vault::web_exposure_vault_key`).
+// as system messages. Neither carries a key: io.web reads each enablement's key from the vault
+// itself (`vault::web_exposure_vault_key`). The link's answer carries the one-time code, which no
+// log may hold.
 pub const MSG_IO_WEB_EXPOSURES: &str = "IO_WEB_EXPOSURES";
 pub const MSG_IO_WEB_EXPOSURES_RESPONSE: &str = "IO_WEB_EXPOSURES_RESPONSE";
 pub const MSG_IO_WEB_ACCESS_LINK: &str = "IO_WEB_ACCESS_LINK";
@@ -744,11 +745,12 @@ pub struct OpaReloadPayload {
 /// The prefix of an exposure's id, `exp:<uuid v4>`, which SY.admin mints at publish and never
 /// reuses (docs/io-web-v2-stage-2-1.md §2.1).
 pub const WEB_EXPOSURE_ID_PREFIX: &str = "exp:";
-/// The prefix of an enablement's id, `enb:<uuid v4>`, which SY.admin mints at each enable (§2.3).
+/// The prefix of an enablement's id, `enb:<uuid>`, which SY.admin mints at each enable (§2.3).
 pub const WEB_ENABLEMENT_ID_PREFIX: &str = "enb:";
 
-/// io.web's answer to a [`MSG_IO_WEB_EXPOSURES`] or a [`MSG_IO_WEB_ACCESS_LINK`] from anyone but
-/// `SY.admin@motherbee`, or that came as a tap copy: nothing was read (§5.5).
+/// io.web's answer to a [`MSG_IO_WEB_EXPOSURES`] or a [`MSG_IO_WEB_ACCESS_LINK`] that is not a
+/// system message from the router-stamped `SY.admin@motherbee`, or that came as a tap copy:
+/// nothing was read (§5.5).
 pub const IO_WEB_ERROR_UNAUTHORIZED: &str = "UNAUTHORIZED";
 /// A pushed set whose generation is lower than the one io.web holds: io.web keeps its own (§5.5).
 pub const IO_WEB_ERROR_STALE_GENERATION: &str = "STALE_GENERATION";
@@ -798,7 +800,7 @@ pub enum WebExposureUpstream {
     Archi {},
     /// A worker of the hive registry, by its hive id, at the registry's address.
     Hive { hive: String, port: u16 },
-    /// An IP literal in a private range, never a name.
+    /// An IP literal, never a name; SY.admin takes it only in a private range (§2.2).
     Address { address: IpAddr, port: u16 },
 }
 
@@ -806,7 +808,7 @@ pub enum WebExposureUpstream {
 /// itself (`vault::web_exposure_vault_key`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IoWebEnablement {
-    /// `enb:<uuid v4>` ([`WEB_ENABLEMENT_ID_PREFIX`]).
+    /// `enb:<uuid>` ([`WEB_ENABLEMENT_ID_PREFIX`]).
     pub enablement_id: String,
     /// Its end, in Unix seconds: io.web's own clock closes it then (§3.4).
     pub until: u64,
@@ -899,7 +901,8 @@ pub enum IoWebAccessLinkResponse {
     Ok {
         /// `https://<host>/.fluxbee/enter?code=…`, opened once, top-level, before `expires_at`.
         url: String,
-        /// When the code stops being taken, in Unix seconds: about 120 s after io.web minted it.
+        /// When the code can no longer be redeemed, in Unix seconds: about 120 s after io.web
+        /// minted it.
         expires_at: u64,
         /// What the logs name the link by: the first 16 hex of the SHA-256 of its `jti`.
         link_id: String,
@@ -1474,7 +1477,7 @@ mod tests {
         }));
     }
 
-    /// Sends `payload` as `msg` from SY.admin to io.web, through the wire, and reads it back as `T`.
+    /// Carries `payload` as the system message `msg` through the wire, and reads it back as `T`.
     fn through_the_wire<T>(msg: &str, payload: &T) -> (String, T)
     where
         T: Serialize + serde::de::DeserializeOwned,

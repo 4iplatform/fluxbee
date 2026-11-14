@@ -606,8 +606,9 @@ pub fn vault_key_is_valid(key: &str) -> bool {
 ///   directory URL (docs/acme-edge-certificates-v1.md §3); overwriting it swaps the account the
 ///   edge's certificate is ordered with.
 /// - `web_exposure_key:<exposure uuid>:<slot>` ([`WEB_EXPOSURE_KEY_PREFIX`]) — the secret of an
-///   exposure's enablement, which signs its links and sessions (docs/io-web-v2-stage-2-1.md §3.1);
-///   a Cloud caller that wrote one could mint them.
+///   exposure's enablement, which signs its links and sessions (docs/io-web-v2-stage-2-1.md §3.1).
+///   Only SY.admin writes one: a key Cloud wrote first would hold its name (`KEY_TAKEN`), and
+///   SY.admin could no longer enable the exposure.
 ///
 /// This is NOT a general vault ACL: only the Cloud-relay origin is bound, for writes and deletes
 /// alike (enforced SERVER-SIDE in SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud
