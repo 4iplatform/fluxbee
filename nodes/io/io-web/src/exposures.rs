@@ -122,11 +122,12 @@ impl KeySource for VaultKeys {
 pub struct Exposures {
     file: PathBuf,
     keys: Arc<dyn KeySource>,
-    /// `boot_second` of this process: links minted before it are refused.
+    /// `boot_second` of this process: links minted before it are refused, and io.web mints none
+    /// before it (§3.2).
     boot: u64,
     held: RwLock<Held>,
-    /// One change at a time: a push, the boot's load, a retry of the keys. Links and requests never
-    /// wait on it.
+    /// One change at a time: a push, the boot's load, a retry's choice of the keys to read and its
+    /// file write. A retry's reads do not hold it (`retry`). Links and requests never wait on it.
     changes: tokio::sync::Mutex<()>,
     /// The links redeemed, `jti → iat + 120`, pruned at each insert: bounded by the redemptions of
     /// the last 120 s (§3.2).
@@ -238,6 +239,8 @@ struct Entered {
 struct LinkRefusal {
     reason: &'static str,
     link_id: Option<String>,
+    /// `iat + 120`, once the code parses (§3.2).
+    expires_at: Option<u64>,
     exposure_id: Option<String>,
     enablement_id: Option<String>,
 }
@@ -247,6 +250,18 @@ impl LinkRefusal {
         self.reason = reason;
         self
     }
+}
+
+/// Why a session cookie does not serve (§3.3), with what was known of it by then, for the log.
+#[derive(Debug, Default)]
+pub struct SessionRefusal {
+    pub reason: &'static str,
+    pub exposure_id: Option<String>,
+    pub enablement_id: Option<String>,
+    /// The cookie is kept: its enablement is live, but io.web does not hold its key yet (a
+    /// restart before the vault answered, §3.4), and it serves again once the retry reads it. Any
+    /// other refusal is final, and the answer clears the cookie.
+    pub kept: bool,
 }
 
 impl Held {
@@ -292,7 +307,8 @@ impl Held {
     }
 
     /// Sets the key `want` asked for, if its enablement is still held at the same slot and
-    /// version; the key it replaced.
+    /// version, and io.web does not hold its key yet; the key it replaced. A key held stays: a
+    /// retry's read, which holds no lock (`Exposures::retry`), may end after a push read it.
     fn set_key(&mut self, want: &KeyWant, key: KeyState) -> Option<KeyState> {
         let enablement = self
             .exposures
@@ -302,6 +318,9 @@ impl Held {
             })
             .flat_map(|exposure| exposure.enablements.iter_mut())
             .find(|held| same_enablement(&held.wire, &want.enablement))?;
+        if enablement.key.is_ready() {
+            return None;
+        }
         Some(std::mem::replace(&mut enablement.key, key))
     }
 }
@@ -359,8 +378,8 @@ fn uuid_hex(id: &str, prefix: &str) -> Option<String> {
 }
 
 /// The enablement's keys from the vault's answer, once it is the key SY.admin wrote for it
-/// (§3.1): a `web_session_key` owned by io.web, at the enablement's version, whose value is
-/// `{secret: <64 hex>}`. Otherwise why not, never the value.
+/// (§3.1): a `web_session_key` owned by io.web and assigned to no other node, at the enablement's
+/// version, whose value is `{secret: <64 hex>}`. Otherwise why not, never the value.
 fn take_key(
     answer: &VaultValueResponse,
     enablement: &IoWebEnablement,
@@ -396,6 +415,11 @@ fn take_key(
     });
     if owner.is_none() || key_owner != owner {
         return Err("the key is not io.web's own".to_string());
+    }
+    // Nobody else reads `K` (§3.1): a key that other nodes may read too is not the one SY.admin
+    // wrote.
+    if metadata.is_some_and(|metadata| !metadata.assigned_ilks.is_empty()) {
+        return Err("the key is assigned to other nodes".to_string());
     }
     let secret = answer
         .value
@@ -509,12 +533,18 @@ impl Exposures {
         self.answer(changed, now)
     }
 
-    /// Every 30 s: the keys still unavailable are read again, and a file whose last write failed
-    /// is written again.
+    /// Every 30 s: a file whose last write failed is written again, and the keys still unavailable
+    /// are read again. The keys to read are chosen in the changes' turn, and read out of it, so a
+    /// push, a disable above all, never waits up to 3 s behind the retry's reads (§3.4); each
+    /// outcome is then taken only by an enablement still held at the same slot and version
+    /// (`Held::set_key`).
     pub async fn retry(&self, now: u64) {
-        let _change = self.changes.lock().await;
-        self.read_missing_keys(now, KeyLog::Changes).await;
-        self.save_if_unsaved();
+        let wanted = {
+            let _change = self.changes.lock().await;
+            self.save_if_unsaved();
+            self.held().missing_keys(now)
+        };
+        self.read_keys(&wanted, KeyLog::Changes).await;
     }
 
     /// The set held becomes `set`, at once: what it no longer holds is gone before any key is
@@ -565,10 +595,15 @@ impl Exposures {
         changed
     }
 
-    /// Reads, at once and each within 3 s, the key of every live enablement whose key io.web
-    /// does not hold, and takes each one that matches its enablement (`take_key`).
+    /// Reads the key of every live enablement whose key io.web does not hold (`read_keys`).
     async fn read_missing_keys(&self, now: u64, log: KeyLog) {
         let wanted = self.held().missing_keys(now);
+        self.read_keys(&wanted, log).await;
+    }
+
+    /// Reads, at once and each within 3 s, the keys `wanted`, and takes each one that matches its
+    /// enablement (`take_key`).
+    async fn read_keys(&self, wanted: &[KeyWant], log: KeyLog) {
         if wanted.is_empty() {
             return;
         }
@@ -684,15 +719,17 @@ impl Exposures {
     }
 
     /// `IO_WEB_ACCESS_LINK` (§3.2, §5.5): a one-time link to the exposure's current enablement,
-    /// which must be live, with its key held.
+    /// which must be live, with its key held, from io.web's boot on.
     pub fn issue_link(
         &self,
         request: &IoWebAccessLinkRequest,
         now: u64,
     ) -> IoWebAccessLinkResponse {
-        let refused = |error_code: &str, error_detail: String| {
+        // `host` is the exposure's, empty when io.web holds no such exposure.
+        let refused = |host: &str, error_code: &str, error_detail: String| {
             tracing::warn!(
                 exposure_id = %request.exposure_id,
+                host = %host,
                 enablement_id = %request.enablement_id,
                 error_code,
                 detail = %error_detail,
@@ -710,6 +747,7 @@ impl Exposures {
             .find(|exposure| exposure.wire.exposure_id == request.exposure_id)
         else {
             return refused(
+                "",
                 IO_WEB_ERROR_EXPOSURE_UNKNOWN,
                 format!(
                     "io.web's set (generation {}) holds no exposure {}",
@@ -721,6 +759,7 @@ impl Exposures {
             current.wire.enablement_id == request.enablement_id && now < current.wire.until
         }) else {
             return refused(
+                &exposure.host,
                 IO_WEB_ERROR_ENABLEMENT_UNKNOWN,
                 format!(
                     "{} is not the live current enablement of {} in io.web's set (generation {}; \
@@ -736,11 +775,25 @@ impl Exposures {
                 KeyState::Ready(_) => "its id is not a uuid",
             };
             return refused(
+                &exposure.host,
                 IO_WEB_ERROR_KEY_UNAVAILABLE,
                 format!("io.web holds no key for {}: {why}", request.enablement_id),
             );
         };
-        let iat = now.max(self.boot);
+        // io.web mints from its boot on (§3.2). In the second it started, `iat = now` would be
+        // before its boot, so the link would never redeem; `iat = boot` would let a successor
+        // started within that same second, whose boot is the same, redeem a code spent here.
+        if now < self.boot {
+            return refused(
+                &exposure.host,
+                IO_WEB_ERROR_KEY_UNAVAILABLE,
+                format!(
+                    "io.web started within the last second and mints links from {} on",
+                    self.boot
+                ),
+            );
+        }
+        let iat = now;
         let jti = fresh_token();
         let code = LinkCode::mint(keys, &exposure.host, x, e, &jti, iat);
         let expires_at = iat.saturating_add(LINK_LIFETIME_S);
@@ -764,6 +817,13 @@ impl Exposures {
     /// Whether `host` is an exposure's.
     pub fn knows_host(&self, host: &str) -> bool {
         self.held().by_host(host).is_some()
+    }
+
+    /// The id of the exposure of `host`, for the logs.
+    pub fn exposure_of(&self, host: &str) -> Option<String> {
+        self.held()
+            .by_host(host)
+            .map(|exposure| exposure.wire.exposure_id.clone())
     }
 
     /// A `GET /.fluxbee/enter` on `host` (§3.2): the `Set-Cookie` of a new session once the code
@@ -805,6 +865,7 @@ impl Exposures {
                 tracing::warn!(
                     reason = refusal.reason,
                     link_id = refusal.link_id.as_deref().unwrap_or_default(),
+                    expires_at = refusal.expires_at,
                     exposure_id = refusal.exposure_id.as_deref().unwrap_or_default(),
                     host = %host,
                     enablement_id = refusal.enablement_id.as_deref().unwrap_or_default(),
@@ -831,6 +892,7 @@ impl Exposures {
             return Err(refusal.because("no code, or a malformed one"));
         };
         refusal.link_id = Some(link_id(code.jti));
+        refusal.expires_at = Some(code.iat.saturating_add(LINK_LIFETIME_S));
         // (3) It is this exposure's.
         if exposure.x.as_deref() != Some(code.x) {
             return Err(refusal.because("the code is another exposure's"));
@@ -887,36 +949,61 @@ impl Exposures {
 
     /// A session cookie's value on `host` (§3.3): `Ok` while its tag verifies over the host, its
     /// enablement is live with its key held and it was active within 30 min; with the cookie again,
-    /// `active = now`, once its last activity is 60 s old. Otherwise why not.
+    /// `active = now`, once its last activity is 60 s old. Otherwise why not, and whether the
+    /// cookie is kept: only while its enablement is live and its key not read yet (§3.4).
     pub fn session(
         &self,
         host: &str,
         value: &str,
         now: u64,
-    ) -> Result<Option<String>, &'static str> {
+    ) -> Result<Option<String>, SessionRefusal> {
         let held = self.held();
-        let exposure = held.by_host(host).ok_or("the host is no exposure's")?;
-        let token = SessionToken::parse(value).ok_or("a malformed session cookie")?;
+        let Some(exposure) = held.by_host(host) else {
+            return Err(SessionRefusal {
+                reason: "the host is no exposure's",
+                ..SessionRefusal::default()
+            });
+        };
+        // Built only for a refusal: a request that serves allocates nothing for it.
+        let refused = |reason: &'static str, enablement: Option<&HeldEnablement>| SessionRefusal {
+            reason,
+            exposure_id: Some(exposure.wire.exposure_id.clone()),
+            enablement_id: enablement.map(|enablement| enablement.wire.enablement_id.clone()),
+            kept: false,
+        };
+        let Some(token) = SessionToken::parse(value) else {
+            return Err(refused("a malformed session cookie", None));
+        };
         if exposure.x.as_deref() != Some(token.x) {
-            return Err("another exposure's session");
+            return Err(refused("another exposure's session", None));
         }
-        let enablement = exposure
+        let Some(enablement) = exposure
             .enablements
             .iter()
             .find(|enablement| enablement.e.as_deref() == Some(token.e))
-            .ok_or("its enablement is not one io.web holds")?;
+        else {
+            return Err(refused("its enablement is not one io.web holds", None));
+        };
         if now >= enablement.wire.until {
-            return Err("its enablement has ended");
+            return Err(refused("its enablement has ended", Some(enablement)));
         }
         let KeyState::Ready(keys) = &enablement.key else {
-            return Err("io.web holds no key for its enablement");
+            // Its key may yet be read (every 30 s): the cookie is kept, to serve then, as a session
+            // survives a restart of io.web whose first read of the key failed (§3.4).
+            return Err(SessionRefusal {
+                kept: true,
+                ..refused(
+                    "io.web holds no key for its enablement yet",
+                    Some(enablement),
+                )
+            });
         };
         if !token.verifies(keys, host) {
-            return Err("its tag does not verify");
+            return Err(refused("its tag does not verify", Some(enablement)));
         }
         let idle = now.saturating_sub(token.active);
         if idle > SESSION_IDLE_S {
-            return Err("idle for more than 30 min");
+            return Err(refused("idle for more than 30 min", Some(enablement)));
         }
         if idle < SESSION_SLIDE_S {
             return Ok(None);
@@ -1047,6 +1134,9 @@ pub(crate) mod testing {
         owner: Option<String>,
         answers: Mutex<HashMap<String, Result<VaultValueResponse, String>>>,
         pub reads: AtomicUsize,
+        /// Open, each read answers at once; closed, it waits until the gate opens, as a vault that
+        /// is slow to answer.
+        gate: tokio::sync::watch::Sender<bool>,
     }
 
     impl MapKeys {
@@ -1055,7 +1145,17 @@ pub(crate) mod testing {
                 owner: Some(IO_WEB_ILK.to_string()),
                 answers: Mutex::new(HashMap::new()),
                 reads: AtomicUsize::new(0),
+                gate: tokio::sync::watch::Sender::new(true),
             })
+        }
+
+        /// From now on each read waits, with the answer it found, until `open`.
+        pub fn close(&self) {
+            self.gate.send_replace(false);
+        }
+
+        pub fn open(&self) {
+            self.gate.send_replace(true);
         }
 
         /// SY.admin's put: `secret` in the exposure's `slot`, at `version`, owned by io.web.
@@ -1095,7 +1195,11 @@ pub(crate) mod testing {
                         "vault returned error code=KEY_NOT_FOUND message={vault_key}"
                     ))
                 });
-            Box::pin(std::future::ready(answer))
+            let mut gate = self.gate.subscribe();
+            Box::pin(async move {
+                let _ = gate.wait_for(|open| *open).await;
+                answer
+            })
         }
     }
 
@@ -1377,8 +1481,9 @@ mod tests {
         remove(&exposures);
     }
 
-    /// The key is taken only as SY.admin wrote it (§3.1): its resource type, its owner, its
-    /// version and its value's shape; the answer names why, never the value.
+    /// The key is taken only as SY.admin wrote it (§3.1): its resource type, its owner and no
+    /// other node assigned to it, its version and its value's shape; the answer names why, never
+    /// the value.
     #[test]
     fn a_key_is_taken_only_as_sy_admin_wrote_it() {
         let vault_key = web_exposure_vault_key(SHOP_ID, WebExposureKeySlot::A).unwrap();
@@ -1393,6 +1498,9 @@ mod tests {
         other_type.metadata.as_mut().unwrap().resource_type = Some("slack".to_string());
         let mut pooled = good.clone();
         pooled.metadata.as_mut().unwrap().ilk = None;
+        let mut shared = good.clone();
+        shared.metadata.as_mut().unwrap().assigned_ilks =
+            vec!["ilk:00000000-0000-4000-8000-000000000000".to_string()];
         let mut not_hex = good.clone();
         not_hex.value = Some(json!({"secret": "x".repeat(64)}));
         let mut no_version = good.clone();
@@ -1406,6 +1514,7 @@ mod tests {
                 "not io.web's own",
             ),
             (&good, None, "not io.web's own"),
+            (&shared, Some(IO_WEB_ILK), "assigned to other nodes"),
             (&not_hex, Some(IO_WEB_ILK), "{secret: <64 hex>}"),
             (&no_version, Some(IO_WEB_ILK), "no version"),
         ] {
@@ -1500,6 +1609,70 @@ mod tests {
         exposures.retry(BOOT + 60).await;
         assert_eq!(keys.read_count(), 2);
         remove(&exposures);
+    }
+
+    /// A retry reads its keys out of the changes' turn: a disable is applied while the retry still
+    /// waits on the vault (§3.4), and the key that read brings back afterwards goes to no
+    /// enablement the disable dropped. A key held stays, whatever a read that ends later says.
+    #[tokio::test]
+    async fn a_push_never_waits_for_a_retry_s_reads() {
+        let keys = MapKeys::new();
+        // No key in the vault yet: the enablement's is unavailable, and the retry reads it again.
+        let exposures = holding(
+            "unblocked",
+            keys.clone(),
+            BOOT,
+            set(1, vec![enabled_shop()]),
+        )
+        .await;
+        keys.put(SHOP_ID, WebExposureKeySlot::A, 4, 1);
+        keys.close();
+        let retry = tokio::spawn({
+            let exposures = Arc::clone(&exposures);
+            async move { exposures.retry(BOOT + 30).await }
+        });
+        while keys.read_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let disabled = tokio::time::timeout(
+            Duration::from_secs(1),
+            exposures.apply_push(set(2, vec![shop(Vec::new())]), BOOT + 31),
+        )
+        .await
+        .expect("the disable does not wait for the retry's read");
+        assert!(
+            matches!(disabled, IoWebExposuresResponse::Ok { generation: 2, .. }),
+            "{disabled:?}"
+        );
+        keys.open();
+        retry.await.unwrap();
+        assert_eq!(exposures.view(BOOT + 32)["enabled"], 0);
+        let request = IoWebAccessLinkRequest {
+            exposure_id: SHOP_ID.to_string(),
+            enablement_id: SHOP_ENB.to_string(),
+            generation: 2,
+        };
+        assert!(matches!(
+            exposures.issue_link(&request, BOOT + 32),
+            IoWebAccessLinkResponse::Error { error_code, .. } if error_code == IO_WEB_ERROR_ENABLEMENT_UNKNOWN
+        ));
+        remove(&exposures);
+
+        // A push read the key while a retry's read of it was still out: the retry's failure,
+        // ending later, takes nothing back.
+        let keys = MapKeys::new();
+        keys.put(SHOP_ID, WebExposureKeySlot::A, 4, 1);
+        let ready = holding("stays", keys, BOOT, set(1, vec![enabled_shop()])).await;
+        let late = KeyWant {
+            exposure_id: SHOP_ID.to_string(),
+            host: SHOP.to_string(),
+            enablement: enablement(SHOP_ENB, UNTIL, WebExposureKeySlot::A, 4),
+            vault_key: Ok(web_exposure_vault_key(SHOP_ID, WebExposureKeySlot::A).unwrap()),
+        };
+        let failed = KeyState::Unavailable("the vault did not answer within 3 s".to_string());
+        assert!(ready.held_mut().set_key(&late, failed).is_none());
+        assert_eq!(ready.view(BOOT + 1)["keys_unavailable"], 0);
+        remove(&ready);
     }
 
     /// A link is minted only for the current enablement, live, with its key: otherwise the code

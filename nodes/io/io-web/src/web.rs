@@ -44,7 +44,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use crate::access::{session_clear_cookie, SESSION_COOKIE};
-use crate::exposures::{unix_now, Exposures, RequestTrace, ENTER_PATH};
+use crate::exposures::{unix_now, Exposures, RequestTrace, SessionRefusal, ENTER_PATH};
 
 /// Why io.web serves nobody: NODE_STATUS_GET's `last_error.code`. The motherbee's mesh material
 /// (`ca.crt`, `cert.crt`, `cert.key`) cannot be read or used.
@@ -544,6 +544,7 @@ const HTML: &str = "text/html; charset=utf-8";
 /// - Any other path needs a valid session: then GET and HEAD get the placeholder page, with the
 ///   cookie again once its last activity is 60 s old, and another method 404. Without one, the
 ///   fixed 401 page, which clears a session cookie that is not valid; more than one is not valid.
+///   A cookie whose enablement is live but whose key io.web has not read yet is kept (§3.4).
 ///
 /// Every answer carries `SECURITY_HEADERS`.
 fn respond<B>(exposures: &Exposures, request: &Request<B>, now: u64) -> Response<Full<Bytes>> {
@@ -569,20 +570,35 @@ fn respond<B>(exposures: &Exposures, request: &Request<B>, now: u64) -> Response
         _ if !exposures.knows_host(&host) => not_found(),
         _ => match session_cookie(headers) {
             SessionCookie::Absent => unauthorized(None),
-            SessionCookie::Several => {
-                tracing::debug!(host = %host, "IO.web refused more than one session cookie");
-                unauthorized(Some(session_clear_cookie()))
-            }
+            SessionCookie::Several => refused_session(
+                &host,
+                &SessionRefusal {
+                    reason: "more than one session cookie",
+                    exposure_id: exposures.exposure_of(&host),
+                    ..SessionRefusal::default()
+                },
+            ),
             SessionCookie::One(value) => match exposures.session(&host, value, now) {
                 Ok(slid) if readable => answer(StatusCode::OK, HTML, PAGE, slid),
                 Ok(_) => not_found(),
-                Err(reason) => {
-                    tracing::debug!(host = %host, reason, "IO.web refused a session");
-                    unauthorized(Some(session_clear_cookie()))
-                }
+                Err(refusal) => refused_session(&host, &refusal),
             },
         },
     }
+}
+
+/// The fixed 401 page for a session cookie that does not serve, logged with its exposure, its
+/// host and why (stage 2.1 §5.10). It clears the cookie, unless the cookie may serve once io.web
+/// reads its enablement's key (`SessionRefusal::kept`, §3.4).
+fn refused_session(host: &str, refusal: &SessionRefusal) -> Response<Full<Bytes>> {
+    tracing::debug!(
+        exposure_id = refusal.exposure_id.as_deref().unwrap_or_default(),
+        host = %host,
+        enablement_id = refusal.enablement_id.as_deref().unwrap_or_default(),
+        reason = refusal.reason,
+        "IO.web refused a session"
+    );
+    unauthorized((!refusal.kept).then(session_clear_cookie))
 }
 
 /// An answer with `SECURITY_HEADERS`, and `set_cookie` when there is one.
@@ -686,7 +702,11 @@ mod tests {
     use crate::exposures::testing::*;
     use crate::exposures::{boot_second, Exposures};
     use fluxbee_sdk::mesh::{MeshCa, IO_WEB_SERVER_NAME};
-    use fluxbee_sdk::protocol::{IoWebExposuresResponse, WebExposureKeySlot};
+    use fluxbee_sdk::protocol::{
+        IoWebAccessLinkRequest, IoWebAccessLinkResponse, IoWebExposuresResponse,
+        WebExposureKeySlot, IO_WEB_ERROR_KEY_UNAVAILABLE,
+    };
+    use fluxbee_sdk::vault::web_exposure_vault_key;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1695,7 +1715,9 @@ mod tests {
     }
 
     /// A link minted before io.web's boot is refused after it, one minted in the very second
-    /// io.web started again included; one it mints since redeems (§3.2, §3.4).
+    /// io.web started again included; one it mints since redeems (§3.2, §3.4). In the second it
+    /// started io.web mints none: dated at its boot, such a link, once spent, would redeem again at
+    /// a successor started within that same second, whose boot is the same.
     #[tokio::test]
     async fn a_link_is_refused_from_before_the_boot() {
         let keys = MapKeys::new();
@@ -1706,16 +1728,39 @@ mod tests {
         let last_second = link(&before, SHOP_ID, SHOP_ENB, BOOT + 20);
 
         // io.web starts again within BOOT + 20, and loads its set and its keys.
-        let after = Exposures::new(before.file().to_path_buf(), keys, boot_second(BOOT + 20));
-        after.load_at_boot(BOOT + 20).await;
+        let started = BOOT + 20;
+        let file = before.file().to_path_buf();
+        let after = Exposures::new(file.clone(), keys.clone(), boot_second(started));
+        after.load_at_boot(started).await;
         for (case, code) in [("earlier", &earlier), ("in its last second", &last_second)] {
-            assert_unauthorized(respond(&after, &enter(code, SHOP), BOOT + 21), false, case).await;
+            let response = respond(&after, &enter(code, SHOP), started + 1);
+            assert_unauthorized(response, false, case).await;
         }
-        let fresh = link(&after, SHOP_ID, SHOP_ENB, BOOT + 20);
+        let request = IoWebAccessLinkRequest {
+            exposure_id: SHOP_ID.to_string(),
+            enablement_id: SHOP_ENB.to_string(),
+            generation: 1,
+        };
+        assert!(
+            matches!(
+                after.issue_link(&request, started),
+                IoWebAccessLinkResponse::Error { error_code, .. }
+                    if error_code == IO_WEB_ERROR_KEY_UNAVAILABLE
+            ),
+            "no link in the second it started"
+        );
+        let fresh = link(&after, SHOP_ID, SHOP_ENB, started + 1);
         assert_eq!(
-            respond(&after, &enter(&fresh, SHOP), BOOT + 21).status(),
+            respond(&after, &enter(&fresh, SHOP), started + 1).status(),
             StatusCode::OK
         );
+
+        // It stops within the second it minted that link, and its successor, started in it too,
+        // refuses the code it spent.
+        let successor = Exposures::new(file, keys, boot_second(started + 1));
+        successor.load_at_boot(started + 1).await;
+        let again = respond(&successor, &enter(&fresh, SHOP), started + 1);
+        assert_unauthorized(again, false, "spent before a restart within its second").await;
         remove(&before);
     }
 
@@ -1847,6 +1892,41 @@ mod tests {
         )
         .await;
         remove(&exposures);
+    }
+
+    /// A session waits for its key (§3.4): io.web restarted and could not read the key yet, as
+    /// with SY.vault or identity not ready, so the session gets the 401 page with its cookie kept,
+    /// not cleared; once the retry reads the key, the same cookie serves the page again.
+    #[tokio::test]
+    async fn a_session_waits_for_its_key_after_a_restart() {
+        let keys = MapKeys::new();
+        keys.put(SHOP_ID, A, 4, 1);
+        let shop = exposure(SHOP_ID, SHOP, vec![enablement(SHOP_ENB, UNTIL, A, 4)]);
+        let before = holding("waits", keys.clone(), BOOT, set(1, vec![shop])).await;
+        let cookie = sign_in(&before, SHOP_ID, SHOP_ENB, SHOP, BOOT + 10);
+
+        let vault_key = web_exposure_vault_key(SHOP_ID, A).unwrap();
+        keys.answer(&vault_key, Err("SY.vault is not ready".to_string()));
+        let after = Exposures::new(
+            before.file().to_path_buf(),
+            keys.clone(),
+            boot_second(BOOT + 100),
+        );
+        after.load_at_boot(BOOT + 100).await;
+        assert_eq!(after.view(BOOT + 100)["keys_unavailable"], 1);
+        assert_unauthorized(
+            respond(&after, &page(SHOP, &cookie), BOOT + 101),
+            false,
+            "its key not read yet",
+        )
+        .await;
+
+        keys.put(SHOP_ID, A, 4, 1);
+        after.retry(BOOT + 130).await;
+        let served = respond(&after, &page(SHOP, &cookie), BOOT + 131);
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(body(served).await, PAGE.as_bytes());
+        remove(&before);
     }
 
     /// A session is its exposure's alone: on another exposure's host it is refused and cleared

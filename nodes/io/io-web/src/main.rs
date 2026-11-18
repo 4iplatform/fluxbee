@@ -80,6 +80,10 @@ const RPC_CH_CONTROL: &str = "control";
 /// The exposures' two commands, served by their own task (`run_exposure_commands`), so a key read
 /// never holds NODE_STATUS_GET or CONFIG (docs/io-web-v2-stage-2-1.md §5.5).
 const RPC_CH_EXPOSURES: &str = "exposures";
+/// Whatever else reaches io.web, on a channel and a task of its own (`run_unserved`): a flood of it
+/// fills only its own bounded lanes, never those of the exposures' channel, where it would get
+/// SY.admin's commands refused `NOT_TAKEN` (`node_busy`).
+const RPC_CH_UNSERVED: &str = "unserved";
 
 /// The local name of the one node io.web runs as, `IO.web@motherbee`.
 const IO_WEB_LOCAL_NAME: &str = "IO.web";
@@ -245,6 +249,10 @@ async fn main() -> Result<(), DynError> {
         Arc::clone(&exposures),
         loaded,
     ));
+    tokio::spawn(run_unserved(
+        dispatcher.take_command_receiver(RPC_CH_UNSERVED).await?,
+        sender.clone(),
+    ));
     tokio::spawn(run_key_retries(Arc::clone(&exposures)));
 
     let web_setup = WebSetup::motherbee();
@@ -340,15 +348,16 @@ fn ensure_canonical_instance(node_name: &str, tenant_id: Option<&str>) -> Result
 }
 
 /// What reaches io.web, and where:
-/// - the exposures' commands, by name, on their own channel, before any pending answer, as the
-///   edge takes its door's commands (docs/io-web-v2-stage-2-1.md §5.5);
+/// - the exposures' commands, by their exact names, on their own channel, before any pending
+///   answer, as the edge takes its door's commands (docs/io-web-v2-stage-2-1.md §5.5);
 /// - NODE_STATUS_GET and CONFIG_GET/SET on the control channel;
-/// - anything else on the exposures' channel too, which answers `UNAUTHORIZED` to a message named
-///   after a command that is not a system one, and ignores the rest.
+/// - anything else on a channel of its own (`run_unserved`), which answers `UNAUTHORIZED` to a
+///   message named after a command in another kind or spelling, and drops the rest.
 fn io_web_profile() -> Result<OperationalRouteProfile, RpcError> {
     OperationalRouteProfile::builder()
         .command_channel(RPC_CH_CONTROL)
         .command_channel(RPC_CH_EXPOSURES)
+        .command_channel(RPC_CH_UNSERVED)
         .pre_pending_rule(
             RouteMatch::one_of(SYSTEM_KIND, [MSG_IO_WEB_EXPOSURES, MSG_IO_WEB_ACCESS_LINK]),
             RouteTarget::Command(RPC_CH_EXPOSURES),
@@ -362,7 +371,7 @@ fn io_web_profile() -> Result<OperationalRouteProfile, RpcError> {
             RouteMatch::one_of(SYSTEM_KIND, [MSG_CONFIG_GET, MSG_CONFIG_SET]),
             RouteTarget::Command(RPC_CH_CONTROL),
         )
-        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_EXPOSURES))
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_UNSERVED))
         .build()
 }
 
@@ -424,30 +433,52 @@ async fn run_exposure_commands(
     exposures.load_at_boot(unix_now()).await;
     loaded.send_replace(true);
     while let Some(message) = commands.recv().await {
+        // Only the commands' exact names are routed here (`io_web_profile`).
         let Some(command) = ExposureCommand::of(&message) else {
-            tracing::debug!(
-                trace_id = %message.routing.trace_id,
-                caller = ?message.routing.src_l2_name,
-                msg_type = %message.meta.msg_type,
-                msg = ?message.meta.msg,
-                "IO.web ignored a message it does not serve"
-            );
             continue;
         };
         let sender = sender.clone();
         let exposures = Arc::clone(&exposures);
         tokio::spawn(async move {
             let payload = answer_exposure_command(&exposures, command, &message, unix_now()).await;
-            let reply = build_reply(&sender, &message, command.response(), payload);
-            if let Err(err) = sender.send(reply).await {
-                tracing::warn!(
-                    trace_id = %message.routing.trace_id,
-                    command = command.name(),
-                    error = %err,
-                    "IO.web could not answer an exposure command"
-                );
-            }
+            send_answer(&sender, &message, command, payload).await;
         });
+    }
+}
+
+/// Whatever else reaches io.web (`RPC_CH_UNSERVED`): a message named after an exposure command in
+/// another kind or spelling is answered `UNAUTHORIZED` and logged, never taken; the rest is
+/// dropped without a line each, which a flood of it would turn into a flood of the journal.
+async fn run_unserved(mut unserved: RpcCommandReceiver, sender: NodeSender) {
+    while let Some(message) = unserved.recv().await {
+        let Some(command) = ExposureCommand::of(&message) else {
+            continue;
+        };
+        // The exact names go to the exposures' channel, so this never passes; and if it did, it
+        // would still be refused here.
+        let why = authorize_exposure_command(&message, command)
+            .err()
+            .unwrap_or_else(|| "not on the exposures' channel".to_string());
+        let payload = refuse_exposure_command(&message, command, &why);
+        send_answer(&sender, &message, command, payload).await;
+    }
+}
+
+/// Sends the answer to an exposure command, logged when it cannot.
+async fn send_answer(
+    sender: &NodeSender,
+    message: &Message,
+    command: ExposureCommand,
+    payload: Value,
+) {
+    let reply = build_reply(sender, message, command.response(), payload);
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(
+            trace_id = %message.routing.trace_id,
+            command = command.name(),
+            error = %err,
+            "IO.web could not answer an exposure command"
+        );
     }
 }
 
@@ -495,22 +526,7 @@ async fn answer_exposure_command(
     now: u64,
 ) -> Value {
     if let Err(why) = authorize_exposure_command(message, command) {
-        tracing::warn!(
-            trace_id = %message.routing.trace_id,
-            caller = ?message.routing.src_l2_name,
-            msg = ?message.meta.msg,
-            msg_type = %message.meta.msg_type,
-            via_tap = message.meta.via_tap,
-            why = %why,
-            "IO.web refused an exposure command: only SY.admin@motherbee sends them"
-        );
-        return refusal(
-            IO_WEB_ERROR_UNAUTHORIZED,
-            format!(
-                "{} is taken only from {EXPOSURES_AUTHORITY}, as a system message: {why}",
-                command.name()
-            ),
-        );
+        return refuse_exposure_command(message, command, &why);
     }
     match command {
         ExposureCommand::Exposures => {
@@ -532,6 +548,27 @@ async fn answer_exposure_command(
             }
         }
     }
+}
+
+/// The `UNAUTHORIZED` answer's payload to an exposure command that is not SY.admin's, logged
+/// with why.
+fn refuse_exposure_command(message: &Message, command: ExposureCommand, why: &str) -> Value {
+    tracing::warn!(
+        trace_id = %message.routing.trace_id,
+        caller = ?message.routing.src_l2_name,
+        msg = ?message.meta.msg,
+        msg_type = %message.meta.msg_type,
+        via_tap = message.meta.via_tap,
+        why = %why,
+        "IO.web refused an exposure command: only SY.admin@motherbee sends them"
+    );
+    refusal(
+        IO_WEB_ERROR_UNAUTHORIZED,
+        format!(
+            "{} is taken only from {EXPOSURES_AUTHORITY}, as a system message: {why}",
+            command.name()
+        ),
+    )
 }
 
 /// `{"status": "error", error_code, error_detail}`, the error shape of both answers.
@@ -1203,9 +1240,10 @@ mod tests {
         }
     }
 
-    /// Through io.web's own routes and channel: the exposures' commands are taken only as system
+    /// Through io.web's own routes and channels: the exposures' commands are taken only as system
     /// messages, by their exact names, from the router-stamped SY.admin@motherbee, never as a tap
-    /// copy. Anything else is answered UNAUTHORIZED, on its own trace, and changes nothing.
+    /// copy. Anything else named after them is answered UNAUTHORIZED, on its own trace, and
+    /// changes nothing.
     #[tokio::test]
     async fn pushes_are_taken_only_from_sy_admin_at_the_motherbee_and_never_via_tap() {
         use crate::exposures::testing::{
@@ -1230,6 +1268,13 @@ mod tests {
             dispatcher.sender_snapshot(),
             Arc::clone(&exposures),
             loaded,
+        ));
+        tokio::spawn(run_unserved(
+            dispatcher
+                .take_command_receiver(RPC_CH_UNSERVED)
+                .await
+                .expect("the unserved channel"),
+            dispatcher.sender_snapshot(),
         ));
         loaded_rx.wait_for(|loaded| *loaded).await.unwrap();
 
@@ -1391,6 +1436,91 @@ mod tests {
         assert_eq!(answer.payload["error_code"], INVALID_REQUEST);
         assert_eq!(exposures.view(now)["generation"], 5);
         remove(&exposures);
+    }
+
+    /// Whatever else reaches io.web, unrelated messages and the commands' names in another kind
+    /// or spelling, has a channel of its own and never enters the exposures' bounded lanes, so a
+    /// flood of it cannot get SY.admin's commands refused NOT_TAKEN. There the variants are
+    /// answered UNAUTHORIZED, and the rest is dropped unanswered.
+    #[tokio::test]
+    async fn the_catch_all_never_reaches_the_exposures_channel() {
+        use fluxbee_sdk::RouterDispatcherTestHarness;
+
+        let (dispatcher, mut router) =
+            RouterDispatcherTestHarness::new(NODE, io_web_profile().expect("io.web's profile"));
+        let mut commands = dispatcher
+            .take_command_receiver(RPC_CH_EXPOSURES)
+            .await
+            .expect("the exposures' channel");
+        tokio::spawn(run_unserved(
+            dispatcher
+                .take_command_receiver(RPC_CH_UNSERVED)
+                .await
+                .expect("the unserved channel"),
+            dispatcher.sender_snapshot(),
+        ));
+        let admin = Some(EXPOSURES_AUTHORITY);
+        let unrelated = [
+            exposure_command(admin, SYSTEM_KIND, "VAULT_CHANGED", false, json!({})),
+            exposure_command(
+                Some("AI.chat@motherbee"),
+                "user",
+                "hello",
+                false,
+                json!({"text": "hi"}),
+            ),
+            exposure_command(None, "user", "", false, json!({})),
+        ];
+        let variants = [
+            exposure_command(admin, "user", MSG_IO_WEB_EXPOSURES, false, json!({})),
+            exposure_command(admin, SYSTEM_KIND, "io_web_exposures", false, json!({})),
+            exposure_command(admin, SYSTEM_KIND, " IO_WEB_ACCESS_LINK", false, json!({})),
+        ];
+        let mut refused: Vec<String> = variants
+            .iter()
+            .map(|message| message.routing.trace_id.clone())
+            .collect();
+        refused.sort();
+        for message in unrelated.into_iter().chain(variants) {
+            router.inject(message).await.unwrap();
+        }
+        // SY.admin's push comes last, and is the first message the exposures' channel holds.
+        let push = exposure_command(
+            admin,
+            SYSTEM_KIND,
+            MSG_IO_WEB_EXPOSURES,
+            false,
+            json!({"generation": 1, "exposures": []}),
+        );
+        let trace = push.routing.trace_id.clone();
+        router.inject(push).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+            .await
+            .expect("the push reaches the exposures' channel")
+            .expect("the channel is open");
+        assert_eq!(first.routing.trace_id, trace, "nothing came before it");
+        assert!(commands.try_recv().is_none(), "nothing came after it");
+
+        // Each variant is refused on its own trace; a channel reads its system lane first, so not
+        // in the order they came.
+        let mut answers = Vec::new();
+        for _ in 0..refused.len() {
+            let answer = router
+                .next_outgoing_within(Duration::from_secs(2))
+                .await
+                .expect("a variant is answered");
+            assert_eq!(answer.payload["error_code"], IO_WEB_ERROR_UNAUTHORIZED);
+            answers.push(answer.routing.trace_id);
+        }
+        answers.sort();
+        assert_eq!(answers, refused);
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the rest goes unanswered"
+        );
     }
 
     /// io.web's copy of the exposures lies beside its config.json.

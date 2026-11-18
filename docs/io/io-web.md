@@ -153,8 +153,9 @@ changes nothing.
   is read.
 - **The answer** is `{status: ok, generation, changed, enablements: [{enablement_id, key: ready |
   unavailable, detail}]}`, one entry per live enablement. SY.admin's enable waits for it: io.web
-  answers once it holds the new key. A payload it cannot read is `INVALID_REQUEST`, and changes
-  nothing.
+  answers once it has tried to read each key it lacks, `key: ready`, or `key: unavailable` with why
+  in `detail` when the read failed or the key did not match. A payload it cannot read is
+  `INVALID_REQUEST`, and changes nothing.
 
 **The keys.** Each enablement's secret `K` is in SY.vault, in its exposure's key slot
 `web_exposure_key:<uuid>:<slot>`, which SY.admin put at the enable and forgot (§3.1). io.web reads
@@ -175,14 +176,16 @@ file: `{schema_version: 1, generation, exposures}`, without secrets. A write tha
 old file away, so that a restart never brings back what a newer set dropped, and is tried again at
 the next push or retry.
 
-**At boot** io.web loads its file, then reads its keys, and only then opens its port: sessions
-survive a restart. A file it cannot read leaves it with no exposure, which fails closed, until
+**At boot** io.web loads its file, then reads its keys, and only then opens its port, so sessions
+survive a restart. A session whose key io.web could not read at boot (SY.vault or identity not
+ready yet) waits: it is answered the 401 page, with its cookie kept, until the retry reads the key,
+and then serves again. A file it cannot read leaves it with no exposure, which fails closed, until
 SY.admin's next push.
 
 **A link** (`IO_WEB_ACCESS_LINK {exposure_id, enablement_id, generation}`) is minted only for the
-exposure's current enablement, live, with its key held. Otherwise the answer is `EXPOSURE_UNKNOWN`,
-`ENABLEMENT_UNKNOWN` (io.web's set may be older: SY.admin pushes it and asks once more) or
-`KEY_UNAVAILABLE`.
+exposure's current enablement, live, with its key held, and never in the second io.web started.
+Otherwise the answer is `EXPOSURE_UNKNOWN`, `ENABLEMENT_UNKNOWN` (io.web's set may be older:
+SY.admin pushes it and asks once more) or `KEY_UNAVAILABLE` (in that first second too: ask again).
 
 ## Links and sessions
 
@@ -235,7 +238,7 @@ __Host-fluxbee_session=S1.<x>.<e>.<sid>.<issued>.<active>.<tag>; Path=/; Secure;
 | The enablement reaches its `until` | io.web's own clock ends its links and sessions |
 | A renewal | a new enablement, key and slot; the previous one's sessions run to its own `until`, and new links come from the new one only |
 | 30 min without a request | the session ends |
-| io.web restarts | sessions survive (both slots are read again); links minted before it are refused |
+| io.web restarts | sessions survive (both slots are read again); one whose key is not read yet waits, answered 401 with its cookie kept, until the key is read; links minted before it are refused |
 | io.web purged and launched again | a new ILK cannot read the old keys: closed until Cloud enables again |
 
 ## TLS and who may call it
@@ -379,8 +382,8 @@ io.web logs to its unit's journal: `journalctl -u fluxbee-node-IO.web-motherbee`
 | `IO.web issued no link` | warn | with the error code and why |
 | `IO.web link redeemed` | info | with `link_id`, `expires_at`, the edge's `X-Request-Id` and `X-Forwarded-For` |
 | `IO.web session minted` | info | with `sid` (its first 8 hex) and `max_age` |
-| `IO.web link refused` | warn | with the reason, `link_id` when the code parsed, `X-Request-Id` and `X-Forwarded-For` |
-| `IO.web refused a session` | debug | with the host and the reason |
+| `IO.web link refused` | warn | with the reason, `link_id` and `expires_at` when the code parsed, `X-Request-Id` and `X-Forwarded-For` |
+| `IO.web refused a session` | debug | with the reason, more than one session cookie included |
 | `IO.web serving: it admits only a connected ingress, over the mesh's mutual TLS` | info | the port serves, at first and after a recovery |
 | `IO.web serves nobody, and nothing over plaintext` | error | with `code` and `detail`, once per change |
 | `mesh client refused in the handshake: ...` | warn | a refused hive, with its role (logged by `fluxbee_sdk::mesh`) |

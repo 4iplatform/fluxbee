@@ -79,7 +79,7 @@ fn verifies(key: &[u8], message: &[u8], tag: &[u8; 32]) -> bool {
 /// enablement's uuids in 32 hex, `jti` 16 random bytes in hex, `iat` when io.web minted it in Unix
 /// seconds, and `tag` the MAC of the host and the rest under `K_link`. The host is in the MAC and
 /// not in the code, so a code redeemed on another host fails.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LinkCode<'a> {
     pub x: &'a str,
     pub e: &'a str,
@@ -136,6 +136,18 @@ impl<'a> LinkCode<'a> {
     }
 }
 
+/// Never the bearer: no tag, and the `jti` only as the logs name it, its `link_id` (§3.2).
+impl fmt::Debug for LinkCode<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinkCode")
+            .field("x", &self.x)
+            .field("e", &self.e)
+            .field("link_id", &link_id(self.jti))
+            .field("iat", &self.iat)
+            .finish_non_exhaustive()
+    }
+}
+
 fn link_message(host: &str, x: &str, e: &str, jti: &str, iat: u64) -> String {
     format!("{LINK_FORMAT}|{host}|{x}|{e}|{jti}|{iat}")
 }
@@ -144,7 +156,7 @@ fn link_message(host: &str, x: &str, e: &str, jti: &str, iat: u64) -> String {
 /// and the enablement's uuids in 32 hex, the session's id (16 random bytes in hex), when it was
 /// minted and when it was last carried again, in Unix seconds, and the MAC of the host and the
 /// rest under `K_sess`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionToken<'a> {
     pub x: &'a str,
     pub e: &'a str,
@@ -206,6 +218,19 @@ impl<'a> SessionToken<'a> {
     pub fn verifies(&self, keys: &EnablementKeys, host: &str) -> bool {
         let message = session_message(host, self.x, self.e, self.sid, self.issued, self.active);
         verifies(&keys.session, message.as_bytes(), &self.tag)
+    }
+}
+
+/// Never the bearer: no tag, and of the `sid` its first 8 hex only, as the logs show it (§3.3).
+impl fmt::Debug for SessionToken<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionToken")
+            .field("x", &self.x)
+            .field("e", &self.e)
+            .field("sid", &sid_prefix(self.sid))
+            .field("issued", &self.issued)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
     }
 }
 
@@ -394,6 +419,87 @@ mod tests {
             String::from("S1"),
         ] {
             assert!(SessionToken::parse(&bad).is_none(), "{bad}");
+        }
+    }
+
+    /// Every field is under its MAC (§3.2, §3.3): a code or a cookie's value with any one field
+    /// changed, still well formed, no longer verifies under the same keys on the same host.
+    #[test]
+    fn every_field_is_under_the_mac() {
+        const OTHER: &str = "ffeeddccbbaa99887766554433221100";
+        let keys = keys(5);
+        // `value` with its field `index` replaced by `by`.
+        let with = |value: &str, index: usize, by: &str| {
+            let mut fields: Vec<&str> = value.split('.').collect();
+            fields[index] = by;
+            fields.join(".")
+        };
+
+        let code = LinkCode::mint(&keys, HOST, X, E, JTI, 1_763_121_700);
+        assert!(LinkCode::parse(&code).unwrap().verifies(&keys, HOST));
+        let unbound: Vec<&str> = [
+            (1, "x", OTHER),
+            (2, "e", OTHER),
+            (3, "jti", OTHER),
+            (4, "iat", "1763121701"),
+        ]
+        .into_iter()
+        .filter(|(index, name, by)| {
+            let changed = with(&code, *index, by);
+            LinkCode::parse(&changed)
+                .unwrap_or_else(|| panic!("a code with another {name} parses"))
+                .verifies(&keys, HOST)
+        })
+        .map(|(_, name, _)| name)
+        .collect();
+        assert!(
+            unbound.is_empty(),
+            "a link's fields outside its MAC: {unbound:?}"
+        );
+
+        let value = SessionToken::mint(&keys, HOST, X, E, JTI, 100, 160);
+        assert!(SessionToken::parse(&value).unwrap().verifies(&keys, HOST));
+        let unbound: Vec<&str> = [
+            (1, "x", OTHER),
+            (2, "e", OTHER),
+            (3, "sid", OTHER),
+            (4, "issued", "101"),
+            (5, "active", "161"),
+        ]
+        .into_iter()
+        .filter(|(index, name, by)| {
+            let changed = with(&value, *index, by);
+            SessionToken::parse(&changed)
+                .unwrap_or_else(|| panic!("a value with another {name} parses"))
+                .verifies(&keys, HOST)
+        })
+        .map(|(_, name, _)| name)
+        .collect();
+        assert!(
+            unbound.is_empty(),
+            "a session's fields outside its MAC: {unbound:?}"
+        );
+    }
+
+    /// Neither a code nor a cookie's value prints its bearer: no tag, no `jti` and no whole `sid`,
+    /// only what the logs show of them, `link_id` and the sid's first 8 hex (§3.2, §3.3).
+    #[test]
+    fn a_code_and_a_session_print_no_bearer() {
+        let code = LinkCode::mint(&keys(1), HOST, X, E, JTI, 1_763_121_700);
+        let link = LinkCode::parse(&code).unwrap();
+        let value = SessionToken::mint(&keys(1), HOST, X, E, JTI, 100, 160);
+        let session = SessionToken::parse(&value).unwrap();
+        let (link_printed, session_printed) = (format!("{link:?}"), format!("{session:?}"));
+        assert!(link_printed.contains(&link_id(JTI)), "{link_printed}");
+        assert!(
+            session_printed.contains(&format!("\"{}\"", sid_prefix(JTI))),
+            "{session_printed}"
+        );
+        for (printed, tag) in [(&link_printed, &link.tag), (&session_printed, &session.tag)] {
+            assert!(!printed.contains(JTI), "{printed}");
+            assert!(!printed.contains("tag"), "{printed}");
+            assert!(!printed.contains(&hex(tag)), "{printed}");
+            assert!(!printed.contains(&format!("{tag:?}")), "{printed}");
         }
     }
 
