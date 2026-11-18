@@ -301,11 +301,12 @@ def certificate_health():
 
 
 def web_health():
-    """The web door (GET /web/status, docs/io-web-v2.md §11.2): the declared host, the edge's
-    answer to the web routes, the edge's way to io.web (`unknown` unless the last push was
-    acknowledged) with the kind and time of its last failure, and io.web's state with its health
-    when it is not HEALTHY. It never fails the health check: io.web runs only once the operator
-    starts it, and the edge answers again within a minute of a restart."""
+    """The web door (GET /web/status; docs/io-web-v2-stage-2-1.md §5.10): the exposures Cloud
+    published, how many are enabled, their certificates by state, the edge's answer to the web
+    routes, and io.web's state with the generation it acknowledged of the one pushed. Up to 0.1.146
+    (no exposures in the answer): the declared host, the routes, the edge's way to io.web and
+    io.web's state. It never fails the health check: io.web runs only once the operator starts it,
+    and the edge and io.web answer again within a minute of a restart."""
     reply = admin("GET", "/web/status", timeout=15)
     body = reply.get("payload")
     if not isinstance(body, dict) or "io_web" not in body:
@@ -313,14 +314,28 @@ def web_health():
         return
     web, io_web = body.get("web") or {}, body.get("io_web") or {}
     routes = body.get("routes") or {}
-    host = ",".join(web.get("hosts") or []) or ("none" if web.get("state") == "absent" else web.get("state"))
-    upstream = routes.get("upstream") or {}
-    failure = upstream.get("last_failure") or {}
     health = (io_web.get("answer") or {}).get("health_state")
-    print("%-10s host=%s route=%s upstream=%s%s io.web=%s%s" % (
-        "web", host, routes.get("state"), upstream.get("state") or "unknown",
-        "(%s@%s)" % (failure.get("kind"), failure.get("at")) if failure else "",
-        io_web.get("state"), "(%s)" % health if health and health != "HEALTHY" else ""))
+    health = "(%s)" % health if health and health != "HEALTHY" else ""
+    if "exposures" not in body:
+        host = ",".join(web.get("hosts") or []) or ("none" if web.get("state") == "absent" else web.get("state"))
+        upstream = routes.get("upstream") or {}
+        failure = upstream.get("last_failure") or {}
+        print("%-10s host=%s route=%s upstream=%s%s io.web=%s%s" % (
+            "web", host, routes.get("state"), upstream.get("state") or "unknown",
+            "(%s@%s)" % (failure.get("kind"), failure.get("at")) if failure else "",
+            io_web.get("state"), health))
+        return
+    views = [v for v in body.get("exposures") or [] if isinstance(v, dict)]
+    certs = {}
+    for view in views:
+        state = (view.get("certificate") or {}).get("state") or "?"
+        certs[state] = certs.get(state, 0) + 1
+    sync = io_web.get("exposures") or {}
+    print("%-10s exposures=%d enabled=%d cert=%s route=%s io.web=%s%s(ack %s of %s)%s" % (
+        "web", len(views), sum(1 for v in views if v.get("state") == "enabled"),
+        ",".join("%s:%d" % kv for kv in sorted(certs.items())) or "none", routes.get("state"),
+        io_web.get("state"), health, sync.get("acknowledged_generation"), sync.get("pushed_generation"),
+        " registry=unreadable" if web.get("state") == "unreadable" else ""))
 
 
 def utc_stamp(epoch):

@@ -382,7 +382,7 @@ no change required
     item (`coa/gosdk-141`); A-339 is the AI SDK's item (*an AI node answers a `NOT_TAKEN` with
     `unknown_system_msg`*), written A-335 on `coa/aisdk-142` and `coa/rustsdk-143`, to rename at
     their integration. A-348 is `coa/admin-144`'s [Archi] item (Archi's SCMD of
-    `set_node_config`'s route). The next new number is A-352.
+    `set_node_config`'s route). The next new number is A-353.
     **0.1.139's deploy:** the motherbee ran it before the workers did, and until every hive's core
     ran 0.1.139 no runtime version was removed and no workflow deployed or deleted (their purges
     remove versions): a worker on 0.1.138 listed no `RELAUNCH_DUE` node (A-300), so a version a
@@ -508,6 +508,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### General
 
+- A-352 🔵 `send_node_message` sends any system message as SY.admin's own, with any `src_ilk`: SY.vault's writes and the edge's commands pass by it around SY.admin's own guards (low-medium; SY.admin; found by R3's SY.admin builder; read in the code; to ask the operator).
 - A-350 🔵 A node's config can name its control authority: a `node.admin_target` set by `set_node_config` points IO.cloud's relay of Cloud's ops at another node after its next start (medium; the orchestrator's patch rule and the IO nodes; found by R3's io.web builder; read in the code; to ask the operator).
 
 - A-96 🔵 How the SY nodes' tokens are measured per message.
@@ -1613,6 +1614,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-352 [General/admin] 🔵 low-medium (found 2026-11-18 by io.web stage 2.1's R3 builder on `coa/web21-admin`; read in the code, not run; there since `send_node_message`) — `send_node_message` sends any system message as SY.admin's own: SY.vault's writes and the edge's commands pass by it around SY.admin's guards
+
+- **Why:** `handle_send_node_message` (`src/bin/sy_admin.rs` ~22590-22660) builds a message with the
+  caller's `msg_type`, `msg`, payload and `src_ilk` and sends it on SY.admin's own connection, so
+  the router stamps `SY.admin@motherbee` as its sender and admits every protected SYSTEM action
+  SY.admin may send. It refuses only `COGNITION_CLEAR` (A-160), and from stage 2.1's R3 the two
+  io.web commands. SY.vault's `check_caller_binding` (`src/bin/sy_vault.rs` ~1880-1908) accepts an
+  SY node's deterministic ILK for its stamped name, so a `VAULT_PUT`, `VAULT_DELETE`,
+  `VAULT_ASSIGN` or `VAULT_ROLLBACK` sent so with SY.admin's ILK is SY.admin's own.
+- **Effect:** the guards SY.admin's own vault actions keep (`RESERVED_KEY` for `edge_tls*`,
+  `acme_account*` and, from R3, `web_exposure_key:`; A-316) and the edge's command channel
+  (`EDGE_*`, `EDGE_WEB_ROUTES`) are reached around them. Who can: the operator's HTTP API, and
+  Archi through a plan the operator confirms.
+- **Fix, to ask the operator:** `send_node_message` refuses the router's protected SYSTEM actions
+  and SY.vault's writes, each of which has its own action with its own checks, as it refuses
+  `COGNITION_CLEAR`; or it keeps an allowlist of what it may carry.
 
 ### A-351 [io.web] 🔵 design, for stage 2.2 (found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-edge`; read in the code) — the edge passes io.web only `__Host-` cookies, so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying
 
