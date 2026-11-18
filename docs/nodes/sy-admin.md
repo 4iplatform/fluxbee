@@ -1945,9 +1945,9 @@ Source: `src/bin/sy_admin/exposures.rs`.
   route, io_web, persisted}`; its keys stay in the vault, and its name on the certificate until
   the renewal. An id no exposure has answers `404 EXPOSURE_NOT_FOUND`: after an unpublish whose
   answer was lost, it means done.
-- **issue_exposure_link** `{exposure_id}` asks io.web for a link to the current enablement
-  (`IO_WEB_ACCESS_LINK {exposure_id, enablement_id, generation}`): `409 EXPOSURE_CLOSED` while
-  closed. When io.web's set is older (`ENABLEMENT_UNKNOWN`, `EXPOSURE_UNKNOWN`) SY.admin pushes it
+- **issue_exposure_link** `{exposure_id}` asks io.web for a link to the last enablement, the
+  one io.web mints links from (`IO_WEB_ACCESS_LINK {exposure_id, enablement_id, generation}`):
+  `409 EXPOSURE_CLOSED` while closed. When io.web's set is older (`ENABLEMENT_UNKNOWN`, `EXPOSURE_UNKNOWN`) SY.admin pushes it
   and asks once more. The answer, `{exposure_id, url, expires_at, link_id}` with `expires_at` in
   RFC 3339, is given once; io.web issuing none (`KEY_UNAVAILABLE`, `UNAUTHORIZED`) or not
   answering is `503 IO_WEB_UNAVAILABLE` with `payload.retryable: true`.
@@ -1960,8 +1960,10 @@ Source: `src/bin/sy_admin/exposures.rs`.
   newer one overtook is not. A change of answer is logged (no io.web while nothing is published at
   INFO), and each enablement whose key io.web lacks, by its exposure and host.
 - **The view**, in every answer, in `list_exposures` and in `web_status`: `exposure_id`, `label`,
-  `host`, `url`, `upstream`, `state` (`closed`, or `enabled` with `enabled_until`),
-  `published_at`, `certificate {state, detail, retry_at}` ([Published hosts](#published-hosts)),
+  `host`, `url`, `upstream`, `state` (`enabled` with `enabled_until` while the last enablement,
+  the one io.web mints links from, is live; else `closed`, even while the enablement it renewed
+  runs its sessions to its own end, which a disable closes too), `published_at`,
+  `certificate {state, detail, retry_at}` ([Published hosts](#published-hosts)),
   `route {state}` (`acknowledged` once the edge acknowledged a set with the host, `pending`, or
   `no_edge`) and `io_web {state}`: `acknowledged` once io.web answered ok at the current
   generation (whether it holds the keys is in `web_status`), `pending` while it has not (stopped,

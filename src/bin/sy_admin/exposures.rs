@@ -167,12 +167,23 @@ pub(crate) struct EnablementRecord {
 }
 
 impl ExposureRecord {
-    /// The current enablement: the newest one still live at `now` (Unix seconds). None: closed.
+    /// The newest enablement still live at `now` (Unix seconds): the one an enable keeps and whose
+    /// slot it leaves alone, and what a disable closes, with every other. None: none is live.
     pub(crate) fn current(&self, now: u64) -> Option<&EnablementRecord> {
         self.enablements
             .iter()
             .rev()
             .find(|enablement| enablement.until > now)
+    }
+
+    /// The enablement the exposure is open by at `now`, as io.web judges it (§3.4): the last one,
+    /// while it is live, from which alone io.web mints new links. None: closed, the view says so
+    /// and a link is `EXPOSURE_CLOSED`, though the enablement the last one renewed may run its
+    /// sessions to its own end.
+    pub(crate) fn open(&self, now: u64) -> Option<&EnablementRecord> {
+        self.enablements
+            .last()
+            .filter(|enablement| enablement.until > now)
     }
 
     /// As io.web holds it (§5.5): no secret.
@@ -1097,7 +1108,8 @@ pub(crate) fn exposure_view(
     exposure: &ExposureRecord,
     facts: &ViewFacts,
 ) -> Value {
-    let current = exposure.current(facts.now);
+    // Enabled while io.web mints links (§3.4): by the last enablement, while it is live.
+    let open = exposure.open(facts.now);
     let acknowledged = ctx.exposures.io_web_acknowledged(facts.generation);
     json!({
         "exposure_id": exposure.exposure_id,
@@ -1105,8 +1117,8 @@ pub(crate) fn exposure_view(
         "host": exposure.host,
         "url": format!("https://{}/", exposure.host),
         "upstream": exposure.upstream,
-        "state": if current.is_some() { "enabled" } else { "closed" },
-        "enabled_until": current.map(|current| unix_rfc3339(current.until as i64)),
+        "state": if open.is_some() { "enabled" } else { "closed" },
+        "enabled_until": open.map(|open| unix_rfc3339(open.until as i64)),
         "published_at": unix_rfc3339(exposure.published_at),
         "certificate": ctx.acme.host_certificate(&exposure.host),
         "route": { "state": ctx.web.route_state(&exposure.host) },
@@ -1836,8 +1848,9 @@ fn set_older(answer: &IoWebAccessLinkResponse) -> bool {
     }
 }
 
-/// `issue_exposure_link {exposure_id}` (§5.1, §3.2): the exposure must be enabled; io.web mints
-/// the link of its current enablement. When io.web's set is older, it gets the set and is asked
+/// `issue_exposure_link {exposure_id}` (§5.1, §3.2): the exposure must be open, its last
+/// enablement live ([`ExposureRecord::open`]); io.web mints the link of that enablement. When
+/// io.web's set is older, it gets the set and is asked
 /// once more. The link is answered once, `expires_at` in RFC 3339, and logged by its `link_id`
 /// alone. It takes no exposure lock, so it never answers `BUSY`.
 async fn issue_link(
@@ -1864,7 +1877,9 @@ async fn issue_link(
     else {
         return not_found(action, &request.exposure_id);
     };
-    let Some(current) = exposure.current(now) else {
+    // io.web mints links from the last enablement alone, while it is live (§3.4): after a renewal
+    // that ended before the enablement it renewed, the exposure is closed to new links.
+    let Some(current) = exposure.open(now) else {
         return answer_error(
             action,
             409,

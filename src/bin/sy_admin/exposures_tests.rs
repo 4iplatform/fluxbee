@@ -1437,6 +1437,42 @@ async fn issue_link_is_refused_while_closed() {
     assert_eq!(answer.http_status, 404, "{}", answer.envelope);
 }
 
+/// §3.4: io.web mints links from the last enablement alone, while it is live. A renewal that ends
+/// before the enablement it renewed closes the exposure at its own end: the view says `closed` and
+/// a link answers 409 EXPOSURE_CLOSED, io.web not asked, while the first enablement still runs its
+/// sessions; a disable still closes that one.
+#[tokio::test(start_paused = true)]
+async fn a_renewal_that_ends_first_closes_the_exposure_to_new_links() {
+    let mut admin = exposures_admin("web21-renewal-ends-first", Some(EDGE));
+    let id = admin.publish("shop", shop_upstream()).await;
+    admin.enable(&id, 8 * 3_600).await;
+    admin.advance(600);
+    let renewal = admin.enable(&id, 3_600).await;
+    assert_eq!(renewal["renewed"], true);
+    assert_eq!(renewal["exposure"]["enabled_until"], "2026-11-18T01:10:00Z");
+
+    // The renewal's end: the first enablement runs to 08:00, and the exposure is closed.
+    admin.advance(3_600);
+    let view = admin.views()[0].clone();
+    assert_eq!(view["state"], "closed", "{view}");
+    assert_eq!(view["enabled_until"], Value::Null, "{view}");
+    let (answer, sent) = admin
+        .cloud("issue_exposure_link", json!({ "exposure_id": id }))
+        .await;
+    assert_eq!(answer.http_status, 409, "{}", answer.envelope);
+    assert_eq!(error_code(&answer), "EXPOSURE_CLOSED");
+    assert!(sent.is_empty(), "io.web is not asked");
+
+    let (answer, sent) = admin
+        .cloud("disable_exposure", json!({ "exposure_id": id }))
+        .await;
+    assert_eq!(answer.http_status, 200, "{}", answer.envelope);
+    assert_eq!(answer.envelope["payload"]["was_enabled"], true);
+    assert!(set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES)).exposures[0]
+        .enablements
+        .is_empty());
+}
+
 /// io.web mints the link of the current enablement; SY.admin answers it once, `expires_at` in RFC
 /// 3339. io.web issuing none, or not answering: 503 IO_WEB_UNAVAILABLE, retryable, asked once.
 #[tokio::test(start_paused = true)]
