@@ -1,5 +1,7 @@
 #[path = "sy_admin/acme.rs"]
 mod acme;
+#[path = "sy_admin/exposures.rs"]
+mod exposures;
 #[path = "sy_admin/installation_update.rs"]
 mod installation_update;
 
@@ -42,9 +44,9 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
     MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
     MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
-    MSG_EDGE_WEB_ROUTES, MSG_EDGE_WEB_ROUTES_RESPONSE, MSG_NODE_STATUS_GET,
-    MSG_NODE_STATUS_GET_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED,
-    SCOPE_GLOBAL, SYSTEM_KIND,
+    MSG_EDGE_WEB_ROUTES, MSG_EDGE_WEB_ROUTES_RESPONSE, MSG_IO_WEB_ACCESS_LINK,
+    MSG_IO_WEB_EXPOSURES, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -188,9 +190,6 @@ struct HiveFile {
     /// The ACME client's section (docs/acme-edge-certificates-v1.md §3), read as raw YAML: a
     /// section that cannot work turns ACME off with a reason, it never fails the boot.
     acme: Option<serde_yaml::Value>,
-    /// The web hosts (docs/io-web-v2.md §11.1), read as raw YAML like `acme:`: a section that
-    /// cannot work declares nothing, it never fails the boot.
-    web: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,8 +376,15 @@ struct AdminContext {
     command_log_lock: Arc<std::sync::Mutex<()>>,
     /// The public edge's certificate (docs/acme-edge-certificates-v1.md §6, §7).
     acme: Arc<acme::AcmeService>,
-    /// The web hosts and the edge's last answer to their routes (docs/io-web-v2.md §11).
+    /// The edge's routes to the published exposure hosts and its last answer to them
+    /// (docs/io-web-v2-stage-2-1.md §5.1).
     web: Arc<WebRoutes>,
+    /// io.web's exposures: their registry, the lock of their writes and io.web's last answer
+    /// (docs/io-web-v2-stage-2-1.md §2.3, §5.1).
+    exposures: Arc<exposures::Exposures>,
+    /// Reads the ILK identity's shared memory holds for a node, given this hive's config dir:
+    /// io.web's, which owns an enablement's key (`enable_exposure`).
+    node_ilk: NodeIlk,
     /// The nodes connected now, given this hive (`connected_nodes_from_shm`).
     connected_nodes: ConnectedNodes,
     /// The tenant identity charges a node that publishes or takes down a page to
@@ -411,6 +417,10 @@ struct ConnectedNow {
 /// Reads the tenant of a node, `<name>@<hive>`, from identity's shared memory, given this hive's
 /// config dir: an error says why the node is no publisher.
 type PublisherTenant = Arc<dyn Fn(&Path, &str) -> Result<String, String> + Send + Sync>;
+
+/// Reads the ILK of a node, `<name>@<hive>`, from identity's shared memory, given this hive's
+/// config dir: `None` when identity holds none for it.
+type NodeIlk = Arc<dyn Fn(&Path, &str) -> Result<Option<String>, String> + Send + Sync>;
 
 /// Reads the channels (ICH) from identity's shared memory, given this hive's config dir.
 type ChannelOptions = Arc<
@@ -726,14 +736,16 @@ async fn main() -> Result<(), AdminError> {
                 .map(|value| value.trim().trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty())
         });
-    // The web hosts (docs/io-web-v2.md §11.1): the edge serves them only through io.web, and the
-    // edge's certificate carries them after the main name. Like `acme:`, never a boot failure.
-    let web = WebConfig::from_hive(hive.web.as_ref(), public_base_url.as_deref());
-    web.log();
+    // hive.yaml's `web:` is retired (docs/io-web-v2-stage-2-1.md §0, Q2): Archi's host is the
+    // exposure Cloud publishes. A key left there is ignored, with one warning.
+    warn_retired_web_section(&config_dir);
+    // io.web's exposures (docs/io-web-v2-stage-2-1.md §2.3): the registry SY.admin holds, read
+    // once at boot. The edge's routes are its hosts.
+    let exposures = exposures::Exposures::load(&state_dir, Arc::new(now_epoch_ms));
     // The ACME client (docs/acme-edge-certificates-v1.md §6, §7). Its configuration never fails
     // the boot: a section that cannot work turns ACME off, and the log and /acme/status say why.
     let acme_config =
-        acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref(), &web.hosts);
+        acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref(), &[]);
     match &acme_config {
         acme::AcmeConfig::Off { .. } => tracing::error!("{}", acme_config.describe()),
         _ => tracing::info!("{}", acme_config.describe()),
@@ -743,7 +755,10 @@ async fn main() -> Result<(), AdminError> {
         let registry = hive_registry_for(&state_dir);
         Arc::new(move || resolve_public_edge_node_from(configured.as_deref(), &registry))
     };
-    let web_routes = Arc::new(WebRoutes::new(web, Arc::clone(&acme_edge)));
+    let web_routes = Arc::new(WebRoutes::new(
+        Arc::clone(&exposures),
+        Arc::clone(&acme_edge),
+    ));
     let acme_ca = Arc::new(acme::InstantAcmeCa::new(
         &acme_config.trust_anchor_roots(),
         acme::platform_roots,
@@ -794,6 +809,8 @@ async fn main() -> Result<(), AdminError> {
         command_log_lock: Arc::new(std::sync::Mutex::new(())),
         acme: acme_service,
         web: web_routes,
+        exposures,
+        node_ilk: Arc::new(node_ilk_from_shm),
         connected_nodes: Arc::new(connected_nodes_from_shm),
         publisher_tenant: Arc::new(publisher_tenant_from_shm),
         channel_options: Arc::new(channel_options_from_shm),
@@ -897,111 +914,53 @@ fn configured_blob_root(hive: &HiveFile) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_BLOB_ROOT))
 }
 
-// --- The web hosts (docs/io-web-v2.md §11.1) -----------------------------------------------
+// --- The web routes (docs/io-web-v2-stage-2-1.md §5.1) --------------------------------------
 
-/// The keys `web:` knows: each the label of one web host, declared with `true`.
-const WEB_HOST_LABELS: &[&str] = &["archi"];
 /// How often SY.admin pushes the web routes to the public edge: its own loop, since the ACME
 /// check runs every 6 h.
 const WEB_ROUTES_PUSH_INTERVAL: Duration = Duration::from_secs(60);
-/// One EDGE_WEB_ROUTES waits as long as one EDGE_TLS_STATUS (`acme::Timings::edge_call`).
+/// One EDGE_WEB_ROUTES of the loop waits as long as one EDGE_TLS_STATUS
+/// (`acme::Timings::edge_call`); an exposure action's waits `exposures::EXPOSURE_CALL_TIMEOUT`.
 const WEB_ROUTES_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The one upstream the edge accepts for a web host.
 const WEB_ROUTES_UPSTREAM: &str = "io.web";
 
-/// The motherbee's `web:` section: the hosts the public edge serves only through io.web, never
-/// through `/e/` or `/public/`. Each is a label before the host of `admin.public_base_url`
-/// (`archi: true` declares `archi.<that host>`), so the domain never comes from code. A bare
-/// `web:`, or one with no key set, declares nothing.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct WebConfig {
-    /// The declared hosts, lowercase, in the order of `WEB_HOST_LABELS`.
-    hosts: Vec<String>,
-    /// Why a section with keys declares nothing.
-    error: Option<String>,
+/// The hive.yaml that still holds a `web:` key, retired (docs/io-web-v2-stage-2-1.md §0, Q2).
+fn web_section_left(config_dir: &Path) -> Option<PathBuf> {
+    let path = config_dir.join("hive.yaml");
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .is_some_and(|hive| hive.get("web").is_some())
+        .then_some(path)
 }
 
-impl WebConfig {
-    fn from_hive(section: Option<&serde_yaml::Value>, public_base_url: Option<&str>) -> Self {
-        let refused = |error: String| Self {
-            hosts: Vec::new(),
-            error: Some(error),
-        };
-        let map = match section {
-            None | Some(serde_yaml::Value::Null) => return Self::default(),
-            Some(serde_yaml::Value::Mapping(map)) => map,
-            Some(_) => return refused("the web section is not a mapping".to_string()),
-        };
-        let mut declared = Vec::new();
-        for (key, value) in map {
-            let key = key.as_str().unwrap_or("?");
-            if !WEB_HOST_LABELS.contains(&key) {
-                return refused(format!(
-                    "web.{key} is not a setting (known: {})",
-                    WEB_HOST_LABELS.join(", ")
-                ));
-            }
-            match value.as_bool() {
-                Some(true) => declared.push(key),
-                Some(false) => {}
-                None => return refused(format!("web.{key} is not true or false")),
-            }
-        }
-        if declared.is_empty() {
-            return Self::default();
-        }
-        let main = match acme::certified_name(public_base_url) {
-            Ok(main) => main,
-            Err(reason) => return refused(format!("no web host can be derived: {reason}")),
-        };
-        let hosts: Vec<String> = WEB_HOST_LABELS
-            .iter()
-            .filter(|label| declared.contains(*label))
-            .map(|label| format!("{label}.{main}"))
-            .collect();
-        if let Some(host) = hosts.iter().find(|host| host.len() > 253) {
-            return refused(format!("the web host {host} is longer than a DNS name"));
-        }
-        Self { hosts, error: None }
-    }
-
-    /// `declared` (with hosts), `absent` (no section, or no key set) or `invalid` (a section that
-    /// cannot work, with its error), for `GET /web/status`.
-    fn state(&self) -> &'static str {
-        match (&self.error, self.hosts.is_empty()) {
-            (Some(_), _) => "invalid",
-            (None, true) => "absent",
-            (None, false) => "declared",
-        }
-    }
-
-    /// The boot log line: the declared hosts, or why a section declares nothing.
-    fn log(&self) {
-        match (&self.error, self.hosts.as_slice()) {
-            (Some(error), _) => {
-                tracing::error!(error = %error, "the web section declares no host")
-            }
-            (None, []) => {
-                tracing::info!("no web host declared: the edge gets an empty set of web routes")
-            }
-            (None, hosts) => tracing::info!(
-                hosts = %hosts.join(", "),
-                "web hosts declared: the edge serves them only through io.web"
-            ),
-        }
+/// hive.yaml's `web:` is retired (docs/io-web-v2-stage-2-1.md §0, Q2): the hosts the edge serves
+/// through io.web are the exposures Cloud publishes, Archi's among them. `HiveFile` does not deny
+/// unknown keys, so a `web:` left there is ignored; this says so once, at boot.
+fn warn_retired_web_section(config_dir: &Path) {
+    if let Some(path) = web_section_left(config_dir) {
+        tracing::warn!(
+            path = %path.display(),
+            "hive.yaml's web section is retired and ignored: the web hosts are the exposures \
+             Fluxbee Cloud publishes (publish_exposure, Archi's with upstream archi); remove it"
+        );
     }
 }
 
-/// The web routes SY.admin pushes to the public edge every minute, and the edge's last answer.
-/// Each push carries the full set, an empty one when `web:` declares nothing, so a host taken out
-/// of `web:` leaves the edge at the first push after the restart. It goes to the edge ACME
-/// addresses, and the edge takes it on its TLS command channel, beside its system loop.
+/// The web routes SY.admin pushes to the public edge, and the edge's last answer. Each push
+/// carries the full set, the published exposures' hosts as the registry holds them (an empty set
+/// when none is published, or when the registry could not be read), so an unpublished host leaves
+/// the edge at the next push. It goes to the edge ACME addresses, and the edge takes it on its TLS
+/// command channel, beside its system loop.
 struct WebRoutes {
-    /// `web:` as read at boot: the hosts pushed, or why none is.
-    config: WebConfig,
+    /// The registry whose hosts every push carries.
+    exposures: Arc<exposures::Exposures>,
     edge: acme::EdgeResolver,
-    timeout: Duration,
     last: std::sync::Mutex<Option<WebRoutesPush>>,
+    /// One push at a time, its set read once it holds this: a push never overtakes a newer set
+    /// on its way to the edge, which keeps the last set it took.
+    pushing: Mutex<()>,
 }
 
 /// How the edge answered a push.
@@ -1033,10 +992,14 @@ impl WebRoutesOutcome {
 struct WebRoutesPush {
     edge: Option<String>,
     outcome: WebRoutesOutcome,
+    /// The hosts this push carried.
+    hosts: Vec<String>,
     /// Since when the edge answers this way (Unix seconds).
     since: i64,
     /// When the edge last acknowledged the set.
     acknowledged_at: Option<i64>,
+    /// The hosts of the last set the edge acknowledged: the routes it holds.
+    acknowledged_hosts: Option<Vec<String>>,
     /// The edge's proxy to io.web, as its acknowledgement of this push reports it; `None` for any
     /// other answer.
     upstream: Option<EdgeWebUpstream>,
@@ -1081,12 +1044,12 @@ impl EdgeWebUpstream {
 }
 
 impl WebRoutes {
-    fn new(config: WebConfig, edge: acme::EdgeResolver) -> Self {
+    fn new(exposures: Arc<exposures::Exposures>, edge: acme::EdgeResolver) -> Self {
         Self {
-            config,
+            exposures,
             edge,
-            timeout: WEB_ROUTES_CALL_TIMEOUT,
             last: std::sync::Mutex::new(None),
+            pushing: Mutex::new(()),
         }
     }
 
@@ -1096,24 +1059,51 @@ impl WebRoutes {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            self.push_once(&client).await;
+            self.push_once(&client, WEB_ROUTES_CALL_TIMEOUT).await;
         }
     }
 
-    /// `EDGE_WEB_ROUTES {routes: [{host, upstream}]}`.
-    fn payload(&self) -> serde_json::Value {
-        let routes: Vec<serde_json::Value> = self
-            .config
-            .hosts
+    /// `EDGE_WEB_ROUTES {routes: [{host, upstream}]}` for `hosts`.
+    fn payload_for(hosts: &[String]) -> serde_json::Value {
+        let routes: Vec<serde_json::Value> = hosts
             .iter()
             .map(|host| serde_json::json!({ "host": host, "upstream": WEB_ROUTES_UPSTREAM }))
             .collect();
         serde_json::json!({ "routes": routes })
     }
 
-    /// One push. Only a change (another edge, or another answer) is logged; returns the push and
-    /// whether it changed.
-    async fn push_once(&self, client: &RouterDispatcher) -> (WebRoutesPush, bool) {
+    /// The set a push carries now: every published host.
+    fn payload(&self) -> serde_json::Value {
+        Self::payload_for(&self.exposures.hosts())
+    }
+
+    /// One push, waited for `timeout` in all, the set read once no other push is under way. Only
+    /// a change (another edge, or another answer) is logged; returns the push and whether it
+    /// changed. A push that found another one holding the edge past its time sends nothing and
+    /// keeps nothing: the other one's answer stays the last.
+    async fn push_once(
+        &self,
+        client: &RouterDispatcher,
+        timeout: Duration,
+    ) -> (WebRoutesPush, bool) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let one_push = tokio::time::timeout_at(deadline, self.pushing.lock()).await;
+        let (Ok(_one_push), Some(left)) = (one_push, time_left(deadline, timeout)) else {
+            let waited = WebRoutesPush {
+                edge: None,
+                outcome: WebRoutesOutcome::NoAnswer(format!(
+                    "another push of the web routes held the edge past {timeout:?}: this one was \
+                     not sent"
+                )),
+                hosts: Vec::new(),
+                since: Utc::now().timestamp(),
+                acknowledged_at: None,
+                acknowledged_hosts: None,
+                upstream: None,
+            };
+            return (waited, false);
+        };
+        let hosts = self.exposures.hosts();
         let now = Utc::now().timestamp();
         let (edge, outcome, upstream) = match (self.edge)() {
             Err(reason) => (None, WebRoutesOutcome::NoEdge(reason), None),
@@ -1123,14 +1113,14 @@ impl WebRoutes {
                     &edge,
                     MSG_EDGE_WEB_ROUTES,
                     MSG_EDGE_WEB_ROUTES_RESPONSE,
-                    self.payload(),
+                    Self::payload_for(&hosts),
                     16,
                     None,
                     None,
                     Some(edge.clone()),
                     None,
                     None,
-                    self.timeout,
+                    left,
                 )
                 .await;
                 let (outcome, upstream) = match answer {
@@ -1145,7 +1135,7 @@ impl WebRoutes {
                         None,
                     ),
                     Err(err) => (
-                        WebRoutesOutcome::NoAnswer(no_answer_detail(&err, self.timeout)),
+                        WebRoutesOutcome::NoAnswer(no_answer_detail(&err, timeout)),
                         None,
                     ),
                 };
@@ -1160,30 +1150,61 @@ impl WebRoutes {
         let same = previous
             .as_ref()
             .is_some_and(|previous| previous.edge == edge && previous.outcome == outcome);
+        let acknowledged = outcome == WebRoutesOutcome::Acknowledged;
         let push = WebRoutesPush {
             since: match &previous {
                 Some(previous) if same => previous.since,
                 _ => now,
             },
-            acknowledged_at: if outcome == WebRoutesOutcome::Acknowledged {
+            acknowledged_at: if acknowledged {
                 Some(now)
             } else {
                 previous
                     .as_ref()
                     .and_then(|previous| previous.acknowledged_at)
             },
+            acknowledged_hosts: if acknowledged {
+                Some(hosts.clone())
+            } else {
+                previous
+                    .as_ref()
+                    .and_then(|previous| previous.acknowledged_hosts.clone())
+            },
             edge,
             outcome,
+            hosts,
             upstream,
         };
         if !same {
-            self.log_change(&push, previous.as_ref());
+            Self::log_change(&push, previous.as_ref());
         }
         *last = Some(push.clone());
         (push, !same)
     }
 
-    /// The routes in `GET /web/status`: the full set every push carries, the edge's answer to the
+    /// The route of one host as an exposure's view shows it (docs/io-web-v2-stage-2-1.md §6):
+    /// `no_edge` while no edge resolves, `acknowledged` once the edge acknowledged a set with the
+    /// host, `pending` otherwise (not pushed yet, refused, or no answer).
+    fn route_state(&self, host: &str) -> &'static str {
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match last.as_ref() {
+            Some(push) if matches!(push.outcome, WebRoutesOutcome::NoEdge(_)) => "no_edge",
+            Some(push)
+                if push
+                    .acknowledged_hosts
+                    .as_ref()
+                    .is_some_and(|hosts| hosts.iter().any(|acked| acked == host)) =>
+            {
+                "acknowledged"
+            }
+            _ => "pending",
+        }
+    }
+
+    /// The routes in `GET /web/status`: the full set a push carries now, the edge's answer to the
     /// last one (`not_pushed` before the first), and the proxy's `upstream` that answer reported
     /// (null unless it acknowledged the set).
     fn status(&self) -> serde_json::Value {
@@ -1212,12 +1233,12 @@ impl WebRoutes {
         })
     }
 
-    fn log_change(&self, push: &WebRoutesPush, previous: Option<&WebRoutesPush>) {
+    fn log_change(push: &WebRoutesPush, previous: Option<&WebRoutesPush>) {
         let edge = push.edge.as_deref().unwrap_or("none");
-        let hosts = if self.config.hosts.is_empty() {
+        let hosts = if push.hosts.is_empty() {
             "none".to_string()
         } else {
-            self.config.hosts.join(", ")
+            push.hosts.join(", ")
         };
         let before = previous.map_or_else(
             || "the first push".to_string(),
@@ -1255,8 +1276,8 @@ impl WebRoutes {
                 before = %before,
                 "the edge did not answer its web routes; pushed again every minute"
             ),
-            // With no host declared there is nothing the edge misses.
-            WebRoutesOutcome::NoEdge(reason) if self.config.hosts.is_empty() => tracing::info!(
+            // With no host published there is nothing the edge misses.
+            WebRoutesOutcome::NoEdge(reason) if push.hosts.is_empty() => tracing::info!(
                 reason = %reason,
                 before = %before,
                 "no public edge to push the (empty) web routes to"
@@ -1414,30 +1435,46 @@ async fn io_web_status(
     })
 }
 
-/// The answer of `GET /web/status`: the hosts `web:` declares, the certificate's names as the
-/// ACME client holds them, the routes and the edge's last answer to them, and io.web.
+/// The registry's state in `GET /web/status`: `published` (hosts), `none`, or `unreadable` when
+/// the file could not be read at boot (its reason beside).
+fn web_registry_state(unreadable: bool, hosts: &[String]) -> &'static str {
+    match (unreadable, hosts.is_empty()) {
+        (true, _) => "unreadable",
+        (false, true) => "none",
+        (false, false) => "published",
+    }
+}
+
+/// The answer of `GET /web/status` (docs/io-web-v2-stage-2-1.md §5.1): the published hosts, each
+/// exposure's view, the certificate's names as the ACME client holds them, the routes and the
+/// edge's last answer to them, and io.web, with what it last answered to the exposures' pushes.
 async fn web_status_payload(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     view_limit: Duration,
     probe_limit: Duration,
 ) -> serde_json::Value {
-    let web = &ctx.web.config;
+    let hosts = ctx.exposures.hosts();
+    let unreadable = ctx.exposures.unreadable();
+    let mut io_web = io_web_status(ctx, client, view_limit, probe_limit).await;
+    io_web["exposures"] = ctx.exposures.io_web_status();
     serde_json::json!({
         "now_at": unix_rfc3339(Utc::now().timestamp()),
         "web": {
-            "state": web.state(),
-            "hosts": web.hosts,
-            "reason": web.error,
+            "state": web_registry_state(unreadable.is_some(), &hosts),
+            "hosts": hosts,
+            "reason": unreadable,
         },
-        "certificate": ctx.acme.web_certificate(&web.hosts),
+        "exposures": exposures::exposure_views(ctx),
+        "certificate": ctx.acme.web_certificate(&hosts),
         "routes": ctx.web.status(),
-        "io_web": io_web_status(ctx, client, view_limit, probe_limit).await,
+        "io_web": io_web,
     })
 }
 
-/// `web_status` (docs/io-web-v2.md §11.2). It takes no parameter, and it always answers 200: no
-/// `web:`, no edge, and a missing or silent io.web are states, named in the answer.
+/// `web_status` (docs/io-web-v2.md §11.2, docs/io-web-v2-stage-2-1.md §5.1). It takes no
+/// parameter, and it always answers 200: no exposure, no edge, and a missing or silent io.web are
+/// states, named in the answer.
 async fn handle_web_status(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -5268,7 +5305,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "26";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "27";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -6013,12 +6050,51 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: false,
         allow_legacy_hive_id: false,
     },
+    // io.web's exposures (docs/io-web-v2-stage-2-1.md §5.1): each answered by its own arm of
+    // `dispatch_internal_admin_command`, the five changes Fluxbee Cloud's alone.
+    InternalActionSpec {
+        action: "publish_exposure",
+        route: InternalActionRoute::Command("publish_exposure"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "enable_exposure",
+        route: InternalActionRoute::Command("enable_exposure"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "disable_exposure",
+        route: InternalActionRoute::Command("disable_exposure"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "unpublish_exposure",
+        route: InternalActionRoute::Command("unpublish_exposure"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "issue_exposure_link",
+        route: InternalActionRoute::Command("issue_exposure_link"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_exposures",
+        route: InternalActionRoute::Command("list_exposures"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 /// A-62: who on the mesh may ask for an action (docs/control-path-hardening-v1.md §2). The HTTP
-/// API and the executor are not mesh callers and reach every action. Over the mesh,
-/// `SY.architect@motherbee` (Archi, the operator's agent) may ask for every action listed in
-/// `mesh_access` but those closed to the mesh (`Nobody`), `IO.cloud@motherbee` for each of
+/// API and the executor are not mesh callers and reach every action but Fluxbee Cloud's (`Cloud`,
+/// whose handlers refuse every other origin). Over the mesh, `SY.architect@motherbee` (Archi, the
+/// operator's agent) may ask for every action listed in `mesh_access` but those closed to the
+/// mesh (`Nobody`) and Cloud's (`Cloud`), `IO.cloud@motherbee` for each of
 /// `CLOUD_EXPOSED_ACTIONS`, and the access of the action names who else may. A caller on an ingress
 /// or egress hive may ask for nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6041,6 +6117,10 @@ enum MeshAccess {
     /// Nobody, Archi included: the operator's alone, on loopback or as a step of a plan Archi
     /// stages and the operator confirms (the executor is no mesh caller).
     Nobody,
+    /// Fluxbee Cloud's alone, through IO.cloud@motherbee's relay, for the actions of
+    /// `CLOUD_EXPOSED_ACTIONS` (docs/io-web-v2-stage-2-1.md §5.1): not Archi, nobody else on the
+    /// mesh, and the handlers refuse the HTTP API and the executor too.
+    Cloud,
 }
 
 /// The mesh decision of each action of the catalog and of each mesh command off it. `None`, an
@@ -6073,6 +6153,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         // Every hive's core and installation file move to the motherbee's: the operator's word
         // (docs/hive-config-update-v1.md §6, stage 4).
         "update_installation" => MeshAccess::Nobody,
+        // An exposure opened to the internet, and its way in: Fluxbee Cloud's alone
+        // (docs/io-web-v2-stage-2-1.md §5.1, Q3).
+        action if exposures::EXPOSURE_CLOUD_ACTIONS.contains(&action) => MeshAccess::Cloud,
         // A worker's default route and IPv6 change, and its agents' internet with them: the
         // operator's word (docs/edge-egress-nat-spec.md §15, FINDINGS A-219).
         "set_hive_egress" | "clear_hive_egress" => MeshAccess::Nobody,
@@ -6185,7 +6268,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "acme_renew"
         | "acme_test"
         | "acme_reload"
-        | "web_status" => MeshAccess::Archi,
+        | "web_status"
+        // The exposures: Archi reads them, and IO.cloud once Cloud's catalog lists the read.
+        | "list_exposures" => MeshAccess::Archi,
         _ => return None,
     };
     Some(access)
@@ -6280,7 +6365,8 @@ enum MeshAdmission {
 /// never a field of the params, and `caller_hive` the role of its hive (`caller_hive_role`). In
 /// order: a caller on an ingress or egress hive, or on a hive the registry does not hold, gets
 /// nothing; nobody gets an action closed to the mesh (`MeshAccess::Nobody`); Archi gets every other
-/// listed action; IO.cloud the Cloud-exposed ones; then the action's own `MeshAccess`.
+/// listed action but Fluxbee Cloud's (`MeshAccess::Cloud`); IO.cloud the Cloud-exposed ones; then
+/// the action's own `MeshAccess`.
 fn authorize_mesh_caller(
     caller: &str,
     caller_hive: Option<CallerHive>,
@@ -6318,7 +6404,7 @@ fn authorize_mesh_caller(
         }
         Some(access) => access,
     };
-    if caller == format!("SY.architect@{admin_hive}")
+    if (caller == format!("SY.architect@{admin_hive}") && access != MeshAccess::Cloud)
         || (caller == format!("IO.cloud@{admin_hive}")
             && IO_CLOUD_EXPOSED_ACTIONS.contains(&action))
     {
@@ -7741,6 +7827,14 @@ fn publisher_tenant_from_shm(config_dir: &Path, caller: &str) -> Result<String, 
         return Err("publisher identity has an invalid tenant_id".to_string());
     }
     Ok(option.tenant_id)
+}
+
+/// The ILK identity's shared memory holds for `node` now (`ctx.node_ilk`): `enable_exposure`
+/// names io.web's as the owner of an enablement's key (docs/io-web-v2-stage-2-1.md §3.1).
+fn node_ilk_from_shm(config_dir: &Path, node: &str) -> Result<Option<String>, String> {
+    fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(config_dir, node)
+        .map(|found| found.map(|(_, ilk)| ilk.ilk_id))
+        .map_err(|err| err.to_string())
 }
 
 /// The channels (ICH) identity's shared memory holds now (`ctx.channel_options`): `externalize`
@@ -10850,6 +10944,21 @@ async fn dispatch_internal_admin_command(
             append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
+        // io.web's exposures (docs/io-web-v2-stage-2-1.md §5.1): Fluxbee Cloud's alone, the
+        // handler refusing every origin but IO.cloud@motherbee's relay. Audited like their
+        // siblings: the params name the exposure, and the link an answer carries never reaches
+        // the log.
+        _ if exposures::EXPOSURE_CLOUD_ACTIONS.contains(&action) => {
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result =
+                Ok(exposures::handle_exposure_write(ctx, client, action, &params, origin).await);
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
+            return result;
+        }
+        // A read of SY.admin's own registry, so not in the audit log. The registry is the
+        // motherbee's, whatever hive a caller names as the target (Archi names its own).
+        "list_exposures" => return Ok(exposures::handle_list_exposures(ctx, &params)),
         "unexternalize" => {
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
@@ -11617,10 +11726,10 @@ fn enforce_cloud_relay_content(
         }
         Ok(())
     };
-    // Reserved infra namespaces (endpoint bearers `edge_channel_secret:*`, `edge_tls`, `ssh:*`,
-    // fanout verify tokens): the Cloud relay stores and deletes PROVIDER tokens, never the keys
-    // that protect the mesh itself. Single source: fluxbee_sdk::vault (io.cloud mirrors it for a
-    // clean early error).
+    // The reserved infrastructure namespaces: the Cloud relay stores and deletes PROVIDER tokens,
+    // never the keys that protect the mesh itself. Single source:
+    // `fluxbee_sdk::vault::CLOUD_RESERVED_VAULT_KEY_PREFIXES`, which io.cloud checks too for a
+    // clean early error.
     let not_reserved = |key: &str| -> Result<(), String> {
         if fluxbee_sdk::vault::is_cloud_reserved_vault_key(key) {
             return Err(format!(
@@ -11831,6 +11940,17 @@ fn enforce_cloud_relay_content(
                     .unwrap_or_default(),
             )?;
             only_fields(Some(params), &["key", "tenant_id"])?;
+        }
+        // io.web's exposures (docs/io-web-v2-stage-2-1.md §5.1 (3)): each action's own fields,
+        // and never a tenant: an exposure is the installation's, not a tenant's.
+        _ if exposures::relay_fields(action).is_some() => {
+            if params.get("tenant_id").is_some() {
+                return Err(format!(
+                    "IO.cloud {action} carries no tenant_id: an exposure is the installation's, \
+                     not a tenant's"
+                ));
+            }
+            only_fields(Some(params), exposures::relay_fields(action).unwrap_or(&[]))?;
         }
         _ => {}
     }
@@ -12764,6 +12884,20 @@ async fn handle_http(
                 ctx,
                 client,
                 "web_status",
+                None,
+                serde_json::json!({}),
+                AdminOrigin::Http,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        // The exposures (docs/io-web-v2-stage-2-1.md §5.1): the read alone. Their changes have
+        // no route: they are Fluxbee Cloud's, through IO.cloud's relay.
+        ("GET", "/web/exposures") => {
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "list_exposures",
                 None,
                 serde_json::json!({}),
                 AdminOrigin::Http,
@@ -16539,6 +16673,12 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "acme_renew"
             | "acme_test"
             | "acme_reload"
+            | "publish_exposure"
+            | "enable_exposure"
+            | "disable_exposure"
+            | "unpublish_exposure"
+            // It mints a one-time way in to an exposure.
+            | "issue_exposure_link"
     )
 }
 
@@ -16786,7 +16926,13 @@ fn admin_action_summary(action: &str) -> &'static str {
         "acme_renew" => "Order the public edge's certificate now (forced: no backoff, no cap). Replaces a hand-seeded or foreign certificate, certifies a new name, and lifts an install_refused hold. Answers 202; progress in GET /acme/status.",
         "acme_test" => "Run a test order against the staging directory with the real names: issued and checked, never stored or installed. Answers 202; result in GET /acme/status (last_test).",
         "acme_reload" => "Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback.",
-        "web_status" => "Read the web door: the hosts the web section declares, the certificate's names, the routes pushed to the public edge with its last answer, and io.web's state. The names come from the ACME client (the ones it certifies, and the leaf the edge served at its last look); io.web's state from the orchestrator's view of IO.web@motherbee and the node's own NODE_STATUS_GET answer.",
+        "web_status" => "Read the web door: the published exposures' hosts and each exposure's view, the certificate's names, the routes pushed to the public edge with its last answer, and io.web's state with its last answer to the exposures. The names come from the ACME client (the ones it certifies, and the leaf the edge served at its last look); io.web's state from the orchestrator's view of IO.web@motherbee and the node's own NODE_STATUS_GET answer.",
+        "publish_exposure" => "Fluxbee Cloud's alone (IO.cloud's relay): publish an exposure, a host <label>.<main name> on the public edge leading to one fixed upstream (Archi, a worker and a port, or a private address and a port), closed until enabled. The same label and upstream again answers the same exposure (created false).",
+        "enable_exposure" => "Fluxbee Cloud's alone (IO.cloud's relay): open an exposure for duration_s (60 to 28800 seconds) with a new key, stored for io.web alone; enabling an open one renews it, the previous enablement's sessions running to its own end.",
+        "disable_exposure" => "Fluxbee Cloud's alone (IO.cloud's relay): close an exposure at once: io.web drops its enablements and keys, and every link and session of it fails at the next request.",
+        "unpublish_exposure" => "Fluxbee Cloud's alone (IO.cloud's relay): remove an exposure: the edge's route goes and its host answers 404; the name stays on the certificate until its renewal.",
+        "issue_exposure_link" => "Fluxbee Cloud's alone (IO.cloud's relay): a one-time link to an enabled exposure, minted by io.web, opened once top-level within about 120 s; never logged.",
+        "list_exposures" => "List the exposures: each one's id, label, host, url, upstream, state (closed or enabled, with enabled_until), certificate, route and io.web states.",
         _ => "Admin action.",
     }
 }
@@ -17038,6 +17184,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "acme_test" => vec!["POST /acme/test"],
         "acme_reload" => vec!["POST /acme/reload"],
         "web_status" => vec!["GET /web/status"],
+        // The exposures' changes have no route: Fluxbee Cloud's alone, over the mesh.
+        "list_exposures" => vec!["GET /web/exposures"],
         _ => Vec::new(),
     }
 }
@@ -17456,11 +17604,39 @@ fn admin_action_body_required(action: &str) -> bool {
             | "timer_convert"
             | "timer_parse"
             | "timer_format"
+            | "publish_exposure"
+            | "enable_exposure"
+            | "disable_exposure"
+            | "unpublish_exposure"
+            | "issue_exposure_link"
     )
 }
 
 fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "publish_exposure" => vec![
+            admin_action_body_field(
+                "label",
+                "string",
+                "The exposure's host is <label>.<main name>, the main name the host of admin.public_base_url. One DNS label: 1 to 63 lowercase letters, digits and hyphens, starting and ending with a letter or a digit; an uppercase label is refused, never folded. Every host lands in the Certificate Transparency logs: a label never names a customer.",
+            ),
+            admin_action_body_field(
+                "upstream",
+                "object",
+                "Where the exposure leads, fixed at publish: {\"kind\": \"archi\"} (Archi on the motherbee, at most one exposure), {\"kind\": \"hive\", \"hive\": <a worker of the registry>, \"port\"} or {\"kind\": \"address\", \"address\": <an IP literal in 10/8, 172.16/12, 192.168/16 or fc00::/7, no hive's>, \"port\"}. Each kind takes only its own fields. Fluxbee's own ports are refused: 22, 80, 443, 3000, 8080, 8384, 9000, 9100, 9200, 21027, 22000.",
+            ),
+        ],
+        "enable_exposure" => vec![
+            admin_action_body_field("exposure_id", "string", "The exposure, exp:<uuid>."),
+            admin_action_body_field(
+                "duration_s",
+                "u64",
+                "The window, a whole number of seconds from 60 to 28800 (8 hours). Renew before it ends to keep the exposure open.",
+            ),
+        ],
+        "disable_exposure" | "unpublish_exposure" | "issue_exposure_link" => vec![
+            admin_action_body_field("exposure_id", "string", "The exposure, exp:<uuid>."),
+        ],
         "publish_artifact" => vec![admin_action_body_field(
             "blob_ref",
             "object",
@@ -18598,6 +18774,17 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "remove_runtime_version" => serde_json::json!({
             "test_hold_ms": 250
         }),
+        "publish_exposure" => serde_json::json!({
+            "label": "shop",
+            "upstream": { "kind": "hive", "hive": "worker1", "port": 8443 }
+        }),
+        "enable_exposure" => serde_json::json!({
+            "exposure_id": "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "duration_s": 3600
+        }),
+        "disable_exposure" | "unpublish_exposure" | "issue_exposure_link" => serde_json::json!({
+            "exposure_id": "exp:6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+        }),
         _ => serde_json::Value::Null,
     }
 }
@@ -18917,6 +19104,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "acme_test" => "curl -X POST /acme/test",
         "acme_reload" => "curl -X POST /acme/reload",
         "web_status" => "curl -X GET /web/status",
+        "list_exposures" => "curl -X GET /web/exposures",
         _ => return None,
     };
     Some(text.to_string())
@@ -18967,7 +19155,7 @@ const RUNTIME_REMOVAL_IN_USE_NOTE: &str = "409 RUNTIME_IN_USE while a node of an
 const RUNTIME_REMOVAL_UNKNOWN_NOTE: &str = "409 RUNTIME_USAGE_UNKNOWN when the version's use could not be read on every hive that may run it (FINDINGS A-281, since 0.1.133): nothing was removed, payload.unanswered_hives names each hive not read, {hive, reason, detail}, and payload.retryable says whether asking again, nothing changed first, may pass: false while a hive not read is a join that ended (failed or interrupted), and when the motherbee could not read its own nodes or its registry (USAGE_READ_FAILED); true otherwise. Either the read failed on the motherbee, and no hive's nodes were counted: its orchestrator did not answer it (TIMEOUT: no answer within SY.admin's 30 s, that orchestrator stuck or restarting, or its read waiting behind other reads of a runtime's use, which it runs 4 at a time; TRANSPORT_ERROR), refused it (its code), could not make it (USAGE_READ_FAILED: its registry or its own nodes unread, a node's config.json that cannot be read while the node may run among them, which fails every read until it is fixed: stop the node the detail names (kill_node) or fix its config, or make the folder or the registry it names readable) or gave no usage of every hive (NO_USAGE). Or the motherbee's orchestrator, which asks every worker at once, could not count a worker, or a hive whose join is not done (its status and join_phase named: finish its join with add_hive again, or remove it with remove_hive; one that ended is read only then): it gave no answer within 10 s (TIMEOUT: its orchestrator stuck or restarting while the LSA shows it); the request never reached it (UNREACHABLE: down, or stale in the LSA); it answered an error (only a worker before 0.1.133 does: RUNTIME_NOT_FOUND while its copy of the manifest does not list the runtime yet, RUNTIME_MANIFEST_MISSING without one; a 0.1.133 worker answers its nodes whatever its copy lists); or it could not read its own nodes (USAGE_UNREADABLE: its nodes' folder, or the config.json of a node whose unit runs, gives systemd no answer or, since 0.1.139, is on its way up or down in systemd, as a crash loop's unit is between two restarts (FINDINGS A-310), which the detail names: stop that node or fix its config). An ingress or an egress, by the role its registry entry records in any state of its join, receives no runtime and is never one of them. Ask again once each hive answers; a hive gone for good is removed with remove_hive first, and is then no longer asked.";
 
 /// What `vault_get` and `vault_assign` say of the secrets only an edge reads (FINDINGS A-316).
-const EDGE_ONLY_SECRETS_NOTE: &str = "A secret only an edge reads is never read back nor assigned through the admin API: vault_get and vault_assign of an endpoint's bearer (edge_channel_secret:<ich>, the Cloud's door among them), the edge's TLS key (edge_tls*) or a fanout's verify token (edge_fanout_verify:<ich>) answer 403 RESERVED_KEY before anything reaches SY.vault (FINDINGS A-316, since 0.1.139). Their metadata stays readable (vault_get_metadata). A lost bearer is replaced by publishing the endpoint again, never read.";
+const NODE_ONLY_SECRETS_NOTE: &str = "A secret only its node reads is never read back nor assigned through the admin API: vault_get and vault_assign of an endpoint's bearer (edge_channel_secret:<ich>, the Cloud's door among them), the edge's TLS key (edge_tls*), a fanout's verify token (edge_fanout_verify:<ich>) or io.web's key of an exposure (web_exposure_key:<uuid>:<slot>) answer 403 RESERVED_KEY before anything reaches SY.vault (FINDINGS A-316, since 0.1.139; io.web's keys since io.web's stage 2.1, docs/io-web-v2-stage-2-1.md §5.6). Their metadata stays readable (vault_get_metadata). A lost bearer is replaced by publishing the endpoint again, never read; io.web's key by enabling the exposure again.";
 
 /// What a runtime's use says of the ingress and egress hives (FINDINGS A-315): listed apart, neither
 /// counted nor skipped (FINDINGS A-281, since 0.1.133).
@@ -19406,11 +19594,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Reads the secret value and is secret-sensitive.",
             "Use only when the operator explicitly needs the plaintext value; prefer vault_get_metadata for inspection.",
             "Executor previews/history must redact the returned value.",
-            EDGE_ONLY_SECRETS_NOTE,
+            NODE_ONLY_SECRETS_NOTE,
         ],
         "vault_assign" => vec![
             "Replaces the nodes the secret is assigned to; the value, its version and its owner stay.",
-            EDGE_ONLY_SECRETS_NOTE,
+            NODE_ONLY_SECRETS_NOTE,
             "Each node must be charged to the key's tenant; a person is never assigned (a person owns secrets, nodes use them).",
             "A secret with no owner and no assigned node is its tenant's general secret: every node of the tenant uses it.",
             "Every node that had it or has it now is told (VAULT_SECRET_CHANGED, op assign).",
@@ -19666,11 +19854,30 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "504 EDGE_NO_ANSWER when the edge does not answer in 75 s; 502 EDGE_ERROR when it cannot run the command (not a vault edge); 409 ACME_BUSY while an ACME run is in flight.",
         ],
         "web_status" => vec![
-            "Motherbee-only: SY.admin answers it (docs/io-web-v2.md §11.2). Takes no body. Always 200: no web section, no edge, and a missing or silent io.web are states, named in the answer.",
-            "web.state is declared (web.hosts), absent (no web section, or no key set) or invalid (web.reason says why). hive.yaml is read at boot.",
-            "certificate.names are the names the ACME client certifies (config.names of GET /acme/status); certificate.served is the leaf the edge served at the ACME client's last look (edge.last_seen there), last_answer_at the edge's last answer, and hosts_missing the web hosts that leaf does not cover (null without a leaf). GET /acme/status asks the edge afresh.",
+            "Motherbee-only: SY.admin answers it (docs/io-web-v2.md §11.2, docs/io-web-v2-stage-2-1.md §5.1). Takes no body. Always 200: no exposure, no edge, and a missing or silent io.web are states, named in the answer.",
+            "web.state is published (web.hosts, the published exposures' hosts), none, or unreadable: the exposures registry (state/sy-admin/exposures.json) could not be read at SY.admin's start, web.reason says why; it is kept for the operator, the edge and io.web get empty sets, and every exposure change answers RECORD_FAILED. hive.yaml's web section is retired: Archi's host is the exposure Cloud publishes with upstream archi.",
+            "exposures holds each exposure's view, as list_exposures answers it (GET /web/exposures).",
+            "certificate.names are the names the ACME client certifies (config.names of GET /acme/status); certificate.served is the leaf the edge served at the ACME client's last look (edge.last_seen there), last_answer_at the edge's last answer, and hosts_missing the published hosts that leaf does not cover (null without a leaf). GET /acme/status asks the edge afresh.",
             "routes.state is the edge's answer to the last push of the full set (routes.set, pushed at the start and every 60 s): acknowledged, refused, no_answer, no_edge (no admin.public_edge_node and not exactly one connected ingress; routes.detail says which) or not_pushed before the first push. acknowledged_at is the edge's last acknowledgement.",
             "io_web.state: running (it answered NODE_STATUS_GET in 3 s: io_web.answer); otherwise the orchestrator's view (lifecycle_state, as GET /hives/motherbee/nodes/IO.web@motherbee/status reads it): silent (it runs but did not answer), starting, stopped, failed, absent (no IO.web@motherbee: it starts only with run_node, in the root tenant); unknown when neither says (view_error, answer_error), or when the orchestrator's lifecycle_state is UNKNOWN (the hive's systemd did not answer for io.web's unit: read it again).",
+            "io_web.exposures is io.web's side of the exposures' pushes (IO_WEB_EXPOSURES, at each change and every 60 s): pushed_generation, acknowledged_generation (the set io.web holds), last_answer (taken with each live enablement's key ready or unavailable, refused with its error_code, no_answer, or absent: no io.web was reached) and since when it answers that way.",
+        ],
+        "publish_exposure" | "enable_exposure" | "disable_exposure" | "unpublish_exposure" | "issue_exposure_link" => vec![
+            "Fluxbee Cloud's alone (docs/io-web-v2-stage-2-1.md §5.1): SY.admin takes it only from IO.cloud@motherbee's relay. Any other caller, Archi, the HTTP API and the executor included, gets 403 UNAUTHORIZED: say so, and never retry it. There is no HTTP route. The operator's brake is kill_node IO.web@motherbee.",
+            "IO.cloud relays only the action's own fields, and never a tenant_id: an exposure is the installation's, not a tenant's.",
+            "One exposure change at a time (publish, enable, disable, unpublish): another one asked meanwhile answers 409 BUSY with payload.retryable true, nothing read or changed. issue_exposure_link and list_exposures take no lock and never answer BUSY.",
+            "The answer's exposure is the view list_exposures gives: exposure_id, label, host, url, upstream, state (closed or enabled), enabled_until, published_at, certificate {state: covered, pending, waiting_dns, failed, held or off; detail; retry_at}, route {state: acknowledged, pending or no_edge} and io_web {state: acknowledged, pending or absent}.",
+            "publish_exposure {label, upstream} answers {exposure, created}: 409 NO_MAIN_HOST (admin.public_base_url gives no host), EXPOSURE_EXISTS (the label with another upstream, or a second archi), EXPOSURE_LIMIT (16 published); 500 RECORD_FAILED when the registry cannot be written, nothing published. It wakes the ACME client: a host the certificate misses is ordered within a minute once its DNS name answers the main name's addresses.",
+            "enable_exposure {exposure_id, duration_s} answers {exposure, renewed}: 409 IO_WEB_ABSENT (run_node IO.web@motherbee in the root tenant first), 502 VAULT_UNAVAILABLE (nothing changed), 500 RECORD_FAILED. Each enable mints a new key; a renewal keeps the previous enablement's sessions to its own end. At most two enablements live: a retried enable (after a lost answer) makes one more, and the one before the enablement it renews ends at once.",
+            "disable_exposure {exposure_id} answers {exposure, was_enabled, persisted}; unpublish_exposure {exposure_id} answers {exposure_id, host, removed, route, io_web, persisted}. Each acts at once and then writes the registry; persisted false means the write is tried again every minute.",
+            "issue_exposure_link {exposure_id} answers {exposure_id, url, expires_at (RFC 3339), link_id}: 409 EXPOSURE_CLOSED when not enabled, 503 IO_WEB_UNAVAILABLE (payload.retryable true) when io.web did not answer or holds no key yet. When io.web's set is older (ENABLEMENT_UNKNOWN), SY.admin pushes it and asks once more. The url is a one-time code, opened top-level within about 120 s, once; it is never logged, and the logs name the link by link_id.",
+            "404 EXPOSURE_NOT_FOUND names an exposure_id no exposure has; after an unpublish whose answer was lost it means done.",
+        ],
+        "list_exposures" => vec![
+            "Takes no body. The answer is {exposures: [view], count, max: 16}, each view as the exposure actions answer it (docs/io-web-v2-stage-2-1.md §6).",
+            "state is closed or enabled (enabled_until set). certificate.state: covered (the served leaf names the host), pending (an order is due or running), waiting_dns (the host's DNS name does not answer the main name's addresses yet; resolved again every 5 min), failed (the CA refused it: detail, retry_at), held (the ACME budget or a hold: retry_at, or the operator's POST /acme/renew) or off (no ACME: the operator certifies by hand).",
+            "route.state: acknowledged (the edge holds the host), pending, or no_edge. io_web.state: acknowledged (io.web answered ok at the current generation), pending (it has not: stopped, after kill_node IO.web@motherbee, restarting, or slow), or absent (IO.web@motherbee has no identity: never launched, run_node IO.web@motherbee in the root tenant; what enable_exposure answers IO_WEB_ABSENT for).",
+            "Read by IO.cloud and Archi over the mesh, the operator over HTTP. The changes are Fluxbee Cloud's alone.",
         ],
         _ => vec![],
     }
@@ -22633,6 +22840,18 @@ async fn handle_send_node_message(
     {
         return invalid("COGNITION_CLEAR is sent only by cognition_clear");
     }
+    // io.web's commands go only through the exposure actions, Fluxbee Cloud's alone: io.web takes
+    // them from SY.admin@motherbee, and sent as a plain message they would pass as SY.admin's own
+    // (docs/io-web-v2-stage-2-1.md §5.1).
+    if req.msg.as_deref().map(str::trim).is_some_and(|msg| {
+        [MSG_IO_WEB_EXPOSURES, MSG_IO_WEB_ACCESS_LINK]
+            .iter()
+            .any(|command| msg.eq_ignore_ascii_case(command))
+    }) {
+        return invalid(
+            "IO_WEB_EXPOSURES and IO_WEB_ACCESS_LINK are sent only by SY.admin's exposure actions",
+        );
+    }
     let msg_name = req.msg.clone();
     let msg_type = req.msg_type.trim().to_string();
     let message = Message {
@@ -24058,7 +24277,7 @@ async fn handle_vault_command(
         ));
     }
     if let Some(refusal) = refuse_acme_account_access(action, &payload)
-        .or_else(|| refuse_edge_secret_read_back(action, &payload))
+        .or_else(|| refuse_node_secret_read_back(action, &payload))
     {
         return Ok(refusal);
     }
@@ -24279,23 +24498,29 @@ fn refuse_acme_account_access(action: &str, payload: &serde_json::Value) -> Opti
     ))
 }
 
-/// The secrets only an edge reads (FINDINGS A-316), each owned by its `SY.edge`: an externalized
-/// endpoint's bearer (`edge_channel_secret:<ich>`, the Cloud's door among them), the edge's TLS
-/// certificate and key (`edge_tls*`, the ingress' `edge.tls_vault_key`) and a fanout endpoint's
-/// verify token (`edge_fanout_verify:<ich>`). Prefixes, matched whatever their case, as
+/// The secrets only their node reads, each owned by it: an edge's (FINDINGS A-316), an
+/// externalized endpoint's bearer (`edge_channel_secret:<ich>`, the Cloud's door among them), the
+/// edge's TLS certificate and key (`edge_tls*`, the ingress' `edge.tls_vault_key`) and a fanout
+/// endpoint's verify token (`edge_fanout_verify:<ich>`); and io.web's, the key of an exposure's
+/// enablement (`web_exposure_key:<uuid>:<slot>`, docs/io-web-v2-stage-2-1.md §5.6), which signs
+/// its links and sessions. Prefixes, matched whatever their case, as
 /// `fluxbee_sdk::vault::is_cloud_reserved_vault_key` matches them.
-const EDGE_ONLY_VAULT_KEY_PREFIXES: &[&str] =
-    &["edge_channel_secret:", "edge_tls", "edge_fanout_verify:"];
+const NODE_ONLY_VAULT_KEY_PREFIXES: &[&str] = &[
+    "edge_channel_secret:",
+    "edge_tls",
+    "edge_fanout_verify:",
+    fluxbee_sdk::vault::WEB_EXPOSURE_KEY_PREFIX,
+];
 
 /// The admin API (the operator, the executor, Archi, Cloud) never reads the value of a secret only
-/// an edge reads (`EDGE_ONLY_VAULT_KEY_PREFIXES`) nor assigns one to another node (FINDINGS A-316):
-/// a `vault_assign` that named SY.admin's own ILK, or any node's, let a `vault_get` through
-/// SY.admin, or that node, read the bearer back, and through Archi it reached the AI provider
+/// its node reads (`NODE_ONLY_VAULT_KEY_PREFIXES`) nor assigns one to another node (FINDINGS
+/// A-316): a `vault_assign` that named SY.admin's own ILK, or any node's, let a `vault_get` through
+/// SY.admin, or that node, read the secret back, and through Archi it reached the AI provider
 /// (A-124). Both are refused `403 RESERVED_KEY` before anything reaches SY.vault. Its metadata
 /// stays readable, and the operator still writes the edge's TLS key (put, rotate, its documented
-/// rollback) and deletes any of them; SY.admin stores the bearers and verify tokens itself, owned
-/// by the edge.
-fn refuse_edge_secret_read_back(
+/// rollback) and deletes any of them; SY.admin stores the bearers, verify tokens and io.web's keys
+/// itself, each owned by its node.
+fn refuse_node_secret_read_back(
     action: &str,
     payload: &serde_json::Value,
 ) -> Option<(u16, String)> {
@@ -24304,7 +24529,7 @@ fn refuse_edge_secret_read_back(
     }
     let key = payload.get("key").and_then(|value| value.as_str())?;
     let named = key.trim().to_ascii_lowercase();
-    if !EDGE_ONLY_VAULT_KEY_PREFIXES
+    if !NODE_ONLY_VAULT_KEY_PREFIXES
         .iter()
         .any(|prefix| named.starts_with(prefix))
     {
@@ -24318,7 +24543,7 @@ fn refuse_edge_secret_read_back(
             "payload": serde_json::Value::Null,
             "error_code": "RESERVED_KEY",
             "error_detail": format!(
-                "{key} is a secret only its edge reads (an endpoint's bearer, the edge's TLS key or a fanout's verify token): the admin API neither reads its value nor assigns it to another node; its metadata stays readable (vault_get_metadata)"
+                "{key} is a secret only its node reads (an endpoint's bearer, the edge's TLS key, a fanout's verify token or io.web's exposure key): the admin API neither reads its value nor assigns it to another node; its metadata stays readable (vault_get_metadata)"
             ),
         })
         .to_string(),
@@ -28475,12 +28700,16 @@ mod tests {
     }
 
     /// Archi, the operator's agent on the motherbee, may ask for every listed action but those
-    /// closed to the mesh, which no caller may; Archi's name on another hive is no one's agent.
+    /// closed to the mesh, which no caller may, and Fluxbee Cloud's (docs/io-web-v2-stage-2-1.md
+    /// §5.1); Archi's name on another hive is no one's agent.
     #[test]
     fn archi_on_the_motherbee_may_ask_for_every_listed_action() {
         for action in every_mesh_action() {
             let archi = mesh_admits("SY.architect@motherbee", action, None, &json!({}));
-            if mesh_access(action) == Some(MeshAccess::Nobody) {
+            if matches!(
+                mesh_access(action),
+                Some(MeshAccess::Nobody | MeshAccess::Cloud)
+            ) {
                 assert!(archi.is_err(), "{action}");
             } else {
                 assert_eq!(archi, Ok(MeshAdmission::Admitted), "{action}");
@@ -28698,7 +28927,7 @@ mod tests {
         .is_err());
     }
 
-    fn write_registry_entry(root: &Path, dir: &str, info: &str) {
+    pub(crate) fn write_registry_entry(root: &Path, dir: &str, info: &str) {
         fs::create_dir_all(root.join(dir)).unwrap();
         fs::write(root.join(dir).join("info.yaml"), info).unwrap();
     }
@@ -30250,6 +30479,10 @@ mod tests {
         assert!(!owner_node_has_deterministic_ilk("AI.demo@motherbee"));
     }
 
+    /// The Cloud-exposed surface: these twenty, and io.web's exposure actions once the SDK's
+    /// catalog lists them (docs/io-web-v2-stage-2-1.md §8, R4, a later release of the SDK alone).
+    /// Every exposed action is in the registry, and `list_cloud_actions` projects exactly the
+    /// exposed set.
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
         let expected_surface: std::collections::HashSet<&str> = [
@@ -30278,7 +30511,18 @@ mod tests {
         .collect();
         let configured_surface: std::collections::HashSet<&str> =
             IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
-        assert_eq!(configured_surface, expected_surface);
+        let exposure_actions: std::collections::HashSet<&str> = exposures::EXPOSURE_CLOUD_ACTIONS
+            .iter()
+            .chain([&exposures::LIST_EXPOSURES])
+            .copied()
+            .collect();
+        assert_eq!(
+            configured_surface
+                .difference(&exposure_actions)
+                .copied()
+                .collect::<std::collections::HashSet<&str>>(),
+            expected_surface
+        );
 
         // Every IO.cloud-exposed action must exist in the registry, else a typo would silently
         // drop it from Cloud's discoverable surface (and later from the authz gate).
@@ -30301,7 +30545,7 @@ mod tests {
             .iter()
             .map(|a| a["action"].as_str().unwrap())
             .collect();
-        assert_eq!(got, expected_surface);
+        assert_eq!(got, configured_surface);
     }
 
     /// FINDINGS A-197: over the mesh the action catalog is the compact one, each action's name,
@@ -31926,7 +32170,7 @@ mod tests {
         );
     }
 
-    fn test_temp_dir(prefix: &str) -> PathBuf {
+    pub(crate) fn test_temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
@@ -32115,8 +32359,10 @@ mod tests {
     }
 
     /// An admin wired to the in-process test dispatcher, with an empty hives registry (so a write
-    /// expects the motherbee only).
-    fn opa_test_admin(prefix: &str) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
+    /// expects the motherbee only) and no exposure.
+    pub(crate) fn opa_test_admin(
+        prefix: &str,
+    ) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
         let profile = build_admin_rpc_profile().expect("admin rpc profile");
         let (client, harness) = fluxbee_sdk::RouterDispatcherTestHarness::new_with_uuid(
             "admin-test-uuid",
@@ -32125,6 +32371,7 @@ mod tests {
         );
         let root = test_temp_dir(prefix);
         let state_dir = root.join("state");
+        let exposures = exposures::Exposures::load(&state_dir, Arc::new(now_epoch_ms));
         let ctx = AdminContext {
             config_dir: root.join("config"),
             state_dir: state_dir.clone(),
@@ -32150,9 +32397,11 @@ mod tests {
             command_log_lock: Arc::new(std::sync::Mutex::new(())),
             acme: acme::tests::inert_service(&state_dir),
             web: Arc::new(WebRoutes::new(
-                WebConfig::default(),
+                Arc::clone(&exposures),
                 Arc::new(|| Err("no edge in the tests".to_string())),
             )),
+            exposures,
+            node_ilk: Arc::new(|_, _| Err("no shared memory in the tests".to_string())),
             connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
             publisher_tenant: Arc::new(|_, _| Err("no shared memory in the tests".to_string())),
             channel_options: Arc::new(|_| Err("no shared memory in the tests".to_string())),
@@ -32247,7 +32496,7 @@ mod tests {
         answer
     }
 
-    fn reply_to(request: &Message, msg: &str, payload: Value) -> Message {
+    pub(crate) fn reply_to(request: &Message, msg: &str, payload: Value) -> Message {
         Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
@@ -32265,7 +32514,7 @@ mod tests {
         }
     }
 
-    fn dst_of(msg: &Message) -> Value {
+    pub(crate) fn dst_of(msg: &Message) -> Value {
         serde_json::to_value(&msg.routing.dst).expect("dst")
     }
 
@@ -36185,14 +36434,88 @@ mod tests {
             "vault_delete",
         ] {
             assert!(
-                refuse_edge_secret_read_back(action, &json!({ "key": "edge_tls_fluxbee_ai" }))
+                refuse_node_secret_read_back(action, &json!({ "key": "edge_tls_fluxbee_ai" }))
                     .is_none(),
                 "{action}"
             );
         }
         for key in ["openai_default", "slack:auth:bot", "edge_other"] {
-            assert!(refuse_edge_secret_read_back("vault_get", &json!({ "key": key })).is_none());
+            assert!(refuse_node_secret_read_back("vault_get", &json!({ "key": key })).is_none());
         }
+    }
+
+    /// docs/io-web-v2-stage-2-1.md §5.6: io.web's exposure keys join the secrets only their node
+    /// reads. vault_get and vault_assign of one are refused 403 RESERVED_KEY before anything
+    /// reaches SY.vault, over HTTP and over the mesh alike; otherwise an assign to SY.admin, then a
+    /// get through it, would read the key back and mint links (A-316). Its metadata stays
+    /// readable, and SY.admin's own put is not refused here.
+    #[tokio::test]
+    async fn vault_get_and_assign_refuse_web_exposure_keys() {
+        let (ctx, mut harness) = mesh_test_admin("web21-vault-keys");
+        let uuid = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+        let keys = [
+            format!("web_exposure_key:{uuid}:a"),
+            format!("web_exposure_key:{uuid}:b"),
+            format!(" WEB_EXPOSURE_KEY:{uuid}:a"),
+        ];
+        for key in &keys {
+            for (action, payload) in [
+                ("vault_get", json!({ "key": key })),
+                (
+                    "vault_assign",
+                    json!({ "key": key, "assigned_nodes": ["SY.admin@motherbee"] }),
+                ),
+            ] {
+                let (status, body) = handle_vault_command(&ctx, &ctx.rpc, action, payload, None)
+                    .await
+                    .expect("answered");
+                let body: Value = serde_json::from_str(&body).expect("JSON");
+                assert_eq!(status, 403, "{action} {key}: {body}");
+                assert_eq!(body["error_code"], json!("RESERVED_KEY"), "{action} {key}");
+                assert!(
+                    body["error_detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("io.web's exposure key")),
+                    "{body}"
+                );
+            }
+        }
+        for action in ["vault_get", "vault_assign"] {
+            let refused = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                action,
+                Some("motherbee"),
+                json!({ "key": format!("web_exposure_key:{uuid}:a") }),
+                AdminOrigin::Mesh("SY.architect@motherbee"),
+            )
+            .await
+            .expect("answered");
+            assert_eq!(refused.http_status, 403, "{action}: {}", refused.envelope);
+            assert_eq!(refused.envelope["error_code"], json!("RESERVED_KEY"));
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "nothing reached SY.vault"
+        );
+        for action in ["vault_get_metadata", "vault_put", "vault_delete"] {
+            assert!(
+                refuse_node_secret_read_back(
+                    action,
+                    &json!({ "key": format!("web_exposure_key:{uuid}:a") })
+                )
+                .is_none(),
+                "{action}"
+            );
+        }
+        // Not the namespace: its colon belongs to it.
+        assert!(
+            refuse_node_secret_read_back("vault_get", &json!({ "key": "web_exposure_keys" }))
+                .is_none()
+        );
     }
 
     /// The four ACME actions are in the catalog with their routes, read-only and confirmation
@@ -36246,7 +36569,9 @@ mod tests {
 
     /// An admin wired to the test dispatcher whose registry holds worker1 (a worker) and ingress1
     /// (an ingress), both joined.
-    fn mesh_test_admin(prefix: &str) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
+    pub(crate) fn mesh_test_admin(
+        prefix: &str,
+    ) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
         let (ctx, harness) = opa_test_admin(prefix);
         let registry = hive_registry(&ctx);
         for (hive, role) in [("worker1", "worker"), ("ingress1", "ingress")] {
@@ -37533,89 +37858,37 @@ mod tests {
             .is_none());
     }
 
-    // --- The web hosts (docs/io-web-v2.md §11.1) ------------------------------------------
+    // --- The web routes (docs/io-web-v2-stage-2-1.md §5.1) ------------------------------------
 
-    const WEB_BASE_URL: &str = "https://hive-1.example.com";
     const WEB_ARCHI: &str = "archi.hive-1.example.com";
 
-    fn web_section(text: &str) -> serde_yaml::Value {
-        serde_yaml::from_str(text).expect("yaml")
-    }
-
+    /// Q2 (a): hive.yaml's `web:` is retired. A section left there no longer fails nor feeds
+    /// anything: hive.yaml still loads (HiveFile denies no unknown key), and the boot warns once.
     #[test]
-    fn web_declares_archi_before_the_host_of_the_public_base_url() {
-        let web = WebConfig::from_hive(Some(&web_section("archi: true")), Some(WEB_BASE_URL));
-        assert_eq!(
-            web,
-            WebConfig {
-                hosts: vec![WEB_ARCHI.to_string()],
-                error: None
-            }
-        );
-        // The certified name's host: lowercase, with no trailing dot and no port.
-        let web = WebConfig::from_hive(
-            Some(&web_section("archi: true")),
-            Some("https://Hive-1.Example.com.:443/base"),
-        );
-        assert_eq!(web.hosts, vec![WEB_ARCHI.to_string()]);
+    fn a_web_section_left_in_hive_yaml_is_ignored_with_a_warning() {
+        let root = test_temp_dir("web21-retired-web");
+        fs::write(
+            root.join("hive.yaml"),
+            "hive_id: motherbee\nrole: motherbee\nweb:\n  archi: true\n",
+        )
+        .expect("hive.yaml");
+        assert!(load_hive(&root).is_ok(), "hive.yaml still loads");
+        assert_eq!(web_section_left(&root), Some(root.join("hive.yaml")));
+        fs::write(
+            root.join("hive.yaml"),
+            "hive_id: motherbee\nrole: motherbee\n",
+        )
+        .expect("hive.yaml");
+        assert_eq!(web_section_left(&root), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
-    /// `web:` needs one key set: a bare `web:` reads as absent, as do `{}` and `archi: false`.
-    #[test]
-    fn a_bare_web_section_declares_nothing() {
-        for text in [
-            "hive_id: motherbee\nweb:\n",
-            "hive_id: motherbee\nweb: {}\n",
-            "hive_id: motherbee\nweb:\n  archi: false\n",
-            "hive_id: motherbee\n",
-        ] {
-            let hive: HiveFile = serde_yaml::from_str(text).expect("hive.yaml");
-            let web = WebConfig::from_hive(hive.web.as_ref(), Some(WEB_BASE_URL));
-            assert_eq!(web, WebConfig::default(), "{text}");
-        }
-        let hive: HiveFile =
-            serde_yaml::from_str("hive_id: motherbee\nweb:\n  archi: true\n").expect("hive.yaml");
-        assert_eq!(
-            WebConfig::from_hive(hive.web.as_ref(), Some(WEB_BASE_URL)).hosts,
-            vec![WEB_ARCHI.to_string()]
-        );
-        assert_eq!(
-            WebConfig::from_hive(Some(&serde_yaml::Value::Null), Some(WEB_BASE_URL)),
-            WebConfig::default()
-        );
-    }
-
-    #[test]
-    fn a_web_section_that_cannot_work_declares_nothing_and_says_why() {
-        for (text, base, why) in [
-            (
-                "archie: true",
-                Some(WEB_BASE_URL),
-                "web.archie is not a setting",
-            ),
-            ("archi: \"yes\"", Some(WEB_BASE_URL), "not true or false"),
-            ("[archi]", Some(WEB_BASE_URL), "not a mapping"),
-            ("archi: true", None, "admin.public_base_url is missing"),
-            ("archi: true", Some("https://203.0.113.7"), "IP literal"),
-        ] {
-            let web = WebConfig::from_hive(Some(&web_section(text)), base);
-            assert!(web.hosts.is_empty(), "{text}");
-            let error = web.error.expect("a reason");
-            assert!(error.contains(why), "{text}: {error}");
-        }
-    }
-
+    /// Web routes over a registry that holds `hosts`, pushed to `edge`.
     fn web_routes(hosts: &[&str], edge: Result<&str, &str>) -> WebRoutes {
         let edge = edge.map(str::to_string).map_err(str::to_string);
-        WebRoutes {
-            config: WebConfig {
-                hosts: hosts.iter().map(|host| host.to_string()).collect(),
-                error: None,
-            },
-            edge: Arc::new(move || edge.clone()),
-            timeout: Duration::from_secs(5),
-            last: std::sync::Mutex::new(None),
-        }
+        let registry =
+            exposures::tests::registry_with_hosts(&test_temp_dir("web-routes-registry"), hosts);
+        WebRoutes::new(registry, Arc::new(move || edge.clone()))
     }
 
     /// Each push carries the full set to the edge ACME addresses, and the edge's answer is kept:
@@ -37648,7 +37921,8 @@ mod tests {
             );
             harness.inject(ok).await.unwrap();
         };
-        let ((first, changed), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+        let ((first, changed), ()) =
+            tokio::join!(routes.push_once(&ctx.rpc, Duration::from_secs(5)), drive);
         assert!(changed, "the first answer is news");
         assert_eq!(first.outcome, WebRoutesOutcome::Acknowledged);
         assert_eq!(first.edge.as_deref(), Some("SY.edge@ingress1"));
@@ -37675,7 +37949,8 @@ mod tests {
             );
             harness.inject(refused).await.unwrap();
         };
-        let ((second, _), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+        let ((second, _), ()) =
+            tokio::join!(routes.push_once(&ctx.rpc, Duration::from_secs(5)), drive);
         assert_eq!(
             second.outcome,
             WebRoutesOutcome::Refused("unknown upstream".to_string())
@@ -37706,22 +37981,20 @@ mod tests {
                 );
                 harness.inject(refused).await.unwrap();
             };
-            let ((_, changed), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+            let ((_, changed), ()) =
+                tokio::join!(routes.push_once(&ctx.rpc, Duration::from_secs(5)), drive);
             news.push(changed);
         }
         assert_eq!(news, vec![true, false, true]);
 
-        let silent = WebRoutes {
-            timeout: Duration::from_millis(50),
-            ..web_routes(&[WEB_ARCHI], Ok("SY.edge@ingress1"))
-        };
-        let (first, changed) = silent.push_once(&ctx.rpc).await;
+        let silent = web_routes(&[WEB_ARCHI], Ok("SY.edge@ingress1"));
+        let (first, changed) = silent.push_once(&ctx.rpc, Duration::from_millis(50)).await;
         assert!(changed);
         assert_eq!(
             first.outcome,
             WebRoutesOutcome::NoAnswer("no answer in 50ms".to_string())
         );
-        let (_, changed) = silent.push_once(&ctx.rpc).await;
+        let (_, changed) = silent.push_once(&ctx.rpc, Duration::from_millis(50)).await;
         assert!(!changed, "a second timeout is the same answer");
         while harness
             .next_outgoing_within(Duration::from_millis(50))
@@ -37730,8 +38003,8 @@ mod tests {
         {}
     }
 
-    /// Without `web:` the set is empty, so a host taken out of `web:` leaves the edge; an edge
-    /// that cannot take it is no answer, and no edge at all sends nothing.
+    /// Without a published exposure the set is empty, so an unpublished host leaves the edge; an
+    /// edge that cannot take it is no answer, and no edge at all sends nothing.
     #[tokio::test]
     async fn without_web_the_edge_gets_an_empty_set() {
         let (ctx, mut harness) = opa_test_admin("web-routes-empty");
@@ -37749,7 +38022,8 @@ mod tests {
             );
             harness.inject(blocked).await.unwrap();
         };
-        let ((push, _), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+        let ((push, _), ()) =
+            tokio::join!(routes.push_once(&ctx.rpc, Duration::from_secs(5)), drive);
         assert!(
             matches!(&push.outcome, WebRoutesOutcome::NoAnswer(detail) if detail.contains("VPN_BLOCKED")),
             "{push:?}"
@@ -37757,7 +38031,7 @@ mod tests {
         assert_eq!(push.acknowledged_at, None);
 
         let nowhere = web_routes(&[WEB_ARCHI], Err("no connected ingress hive"));
-        let (push, _) = nowhere.push_once(&ctx.rpc).await;
+        let (push, _) = nowhere.push_once(&ctx.rpc, Duration::from_secs(5)).await;
         assert_eq!(
             push.outcome,
             WebRoutesOutcome::NoEdge("no connected ingress hive".to_string())
@@ -37876,9 +38150,11 @@ mod tests {
         payload
     }
 
-    fn with_last_push(routes: WebRoutes, push: Option<WebRoutesPush>) -> Arc<WebRoutes> {
+    /// `routes` with `push` as its last, and `ctx` holding the registry `routes` pushes.
+    fn with_last_push(ctx: &mut AdminContext, routes: WebRoutes, push: Option<WebRoutesPush>) {
         *routes.last.lock().unwrap() = push;
-        Arc::new(routes)
+        ctx.exposures = Arc::clone(&routes.exposures);
+        ctx.web = Arc::new(routes);
     }
 
     /// The routes as the edge last answered them: acknowledged (with the edge's proxy, ready or
@@ -37891,11 +38167,14 @@ mod tests {
         let edge = "SY.edge@ingress1";
         let acknowledged_at = WEB_SINCE + 600;
         let failed_at = WEB_SINCE + 300;
+        let hosts = vec![WEB_ARCHI.to_string()];
         let acknowledged = |upstream: EdgeWebUpstream| WebRoutesPush {
             edge: Some(edge.to_string()),
             outcome: WebRoutesOutcome::Acknowledged,
+            hosts: hosts.clone(),
             since: WEB_SINCE,
             acknowledged_at: Some(acknowledged_at),
+            acknowledged_hosts: Some(hosts.clone()),
             upstream: Some(upstream),
         };
         let no_material = "mesh TLS material in /var/lib/fluxbee/tls/ingress1: io: not found";
@@ -37934,8 +38213,10 @@ mod tests {
                 Some(WebRoutesPush {
                     edge: Some(edge.to_string()),
                     outcome: WebRoutesOutcome::Refused("unknown upstream".to_string()),
+                    hosts: hosts.clone(),
                     since: WEB_SINCE,
                     acknowledged_at: Some(acknowledged_at),
+                    acknowledged_hosts: Some(hosts.clone()),
                     upstream: None,
                 }),
                 "refused",
@@ -37948,8 +38229,10 @@ mod tests {
                 Some(WebRoutesPush {
                     edge: None,
                     outcome: WebRoutesOutcome::NoEdge("no connected ingress hive".to_string()),
+                    hosts: hosts.clone(),
                     since: WEB_SINCE,
                     acknowledged_at: None,
+                    acknowledged_hosts: None,
                     upstream: None,
                 }),
                 "no_edge",
@@ -37960,7 +38243,7 @@ mod tests {
         ] {
             let pushed = push.is_some();
             let edge_of_push = push.as_ref().and_then(|push| push.edge.clone());
-            ctx.web = with_last_push(web_routes(&[WEB_ARCHI], Ok(edge)), push);
+            with_last_push(&mut ctx, web_routes(&[WEB_ARCHI], Ok(edge)), push);
             let payload = web_status_with(&ctx, &mut harness, IoWebScript::Absent).await;
             let routes = &payload["routes"];
             assert_eq!(routes["state"], state, "{payload}");
@@ -37978,8 +38261,9 @@ mod tests {
                 "{state}"
             );
             assert_eq!(routes["upstream"], upstream, "{state}");
-            assert_eq!(payload["web"]["state"], "declared");
+            assert_eq!(payload["web"]["state"], "published");
             assert_eq!(payload["web"]["hosts"], json!([WEB_ARCHI]));
+            assert_eq!(payload["exposures"][0]["host"], WEB_ARCHI, "{state}");
         }
     }
 
@@ -38056,8 +38340,8 @@ mod tests {
         }
     }
 
-    /// Through the dispatcher, as the HTTP route reaches it: 200 with every part, without `web:`
-    /// and with no edge; a parameter is refused.
+    /// Through the dispatcher, as the HTTP route reaches it: 200 with every part, with no exposure
+    /// and no edge; a parameter is refused.
     #[tokio::test]
     async fn web_status_answers_200_without_web_and_without_an_edge() {
         let (ctx, mut harness) = opa_test_admin("web-status-dispatch");
@@ -38079,7 +38363,13 @@ mod tests {
         assert_eq!(result.envelope["status"], "ok");
         assert_eq!(
             payload["web"],
-            json!({ "state": "absent", "hosts": [], "reason": null })
+            json!({ "state": "none", "hosts": [], "reason": null })
+        );
+        assert_eq!(payload["exposures"], json!([]));
+        assert_eq!(
+            payload["io_web"]["exposures"]["acknowledged_generation"],
+            Value::Null,
+            "nothing pushed in this test"
         );
         assert_eq!(payload["certificate"]["acme"], "absent");
         assert_eq!(payload["routes"]["state"], "not_pushed");
@@ -38105,16 +38395,15 @@ mod tests {
             .is_none());
     }
 
-    /// The web section's state: declared, absent, or invalid (with its reason) when it cannot
-    /// work.
+    /// The registry's state in `web_status`: published (with hosts), none, or unreadable (with
+    /// its reason) when the file could not be read at boot.
     #[test]
-    fn the_web_sections_state_is_declared_absent_or_invalid() {
-        assert_eq!(WebConfig::default().state(), "absent");
-        let declared = WebConfig::from_hive(Some(&web_section("archi: true")), Some(WEB_BASE_URL));
-        assert_eq!(declared.state(), "declared");
-        let invalid = WebConfig::from_hive(Some(&web_section("archie: true")), Some(WEB_BASE_URL));
-        assert_eq!(invalid.state(), "invalid");
-        assert!(invalid.error.is_some());
+    fn the_web_registry_state_is_published_none_or_unreadable() {
+        let hosts = vec![WEB_ARCHI.to_string()];
+        assert_eq!(web_registry_state(false, &hosts), "published");
+        assert_eq!(web_registry_state(false, &[]), "none");
+        assert_eq!(web_registry_state(true, &[]), "unreadable");
+        assert_eq!(web_registry_state(true, &hosts), "unreadable");
     }
 
     /// `web_status` is in the catalog like `acme_status`: a read, with its route, help and
@@ -39499,7 +39788,7 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "26");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "27");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over

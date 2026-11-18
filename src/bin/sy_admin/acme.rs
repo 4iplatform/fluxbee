@@ -79,6 +79,8 @@ const RATE_LIMIT_DEFAULT_SECS: i64 = 86_400;
 const ARI_REFETCH_MIN_SECS: i64 = 3_600;
 const ARI_REFETCH_MAX_SECS: i64 = 86_400;
 const CONDITION_CATEGORY: &str = "certificate";
+/// After the published hosts change, a check runs within this (docs/io-web-v2-stage-2-1.md §5.2).
+const NAMES_CHANGED_CHECK_SECS: i64 = 60;
 
 /// The durations of §6 and §7. The tests shorten them; production uses [`Timings::default`].
 #[derive(Debug, Clone)]
@@ -2175,6 +2177,11 @@ enum Reloaded {
 
 pub(crate) struct AcmeService {
     config: AcmeConfig,
+    /// Wakes the loop when the published hosts change (`names_changed`).
+    wake: tokio::sync::Notify,
+    /// The published hosts changed since the last check read them: the next check runs within a
+    /// minute, even when a run held the slot.
+    names_dirty: std::sync::atomic::AtomicBool,
     /// A later finding that turned ACME off (the directory does not offer the profile).
     off_reason: Mutex<Option<String>>,
     /// SY.admin's own ILK: the owner of the account secrets.
@@ -2213,6 +2220,8 @@ impl AcmeService {
         }
         Arc::new(Self {
             config,
+            wake: tokio::sync::Notify::new(),
+            names_dirty: std::sync::atomic::AtomicBool::new(false),
             off_reason: Mutex::new(None),
             admin_ilk,
             hive_id,
@@ -2234,6 +2243,22 @@ impl AcmeService {
         match &self.config {
             AcmeConfig::On(settings) if lock(&self.off_reason).is_none() => Some(settings.clone()),
             _ => None,
+        }
+    }
+
+    /// The published hosts changed (docs/io-web-v2-stage-2-1.md §5.2): the loop wakes, and a
+    /// check runs within a minute.
+    pub(crate) fn names_changed(&self) {
+        self.names_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    /// Sleep `wait`, or until the published hosts change.
+    async fn sleep_or_wake(&self, wait: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = self.wake.notified() => {}
         }
     }
 
@@ -2315,13 +2340,18 @@ impl AcmeService {
         }
     }
 
-    /// The loop: the first check 2 min after start, then at the time each check sets.
+    /// The loop: the first check 2 min after start, then at the time each check sets; a change of
+    /// the published hosts wakes it at once (`names_changed`).
     pub(crate) async fn run(self: Arc<Self>) {
-        tokio::time::sleep(self.deps.timings.first_check).await;
+        self.sleep_or_wake(self.deps.timings.first_check).await;
         loop {
-            let next = self.check_once().await;
+            let mut next = self.check_once().await;
+            // A check that could not run (another run held the slot) left the change unread.
+            if self.names_dirty.load(std::sync::atomic::Ordering::SeqCst) {
+                next = next.min(self.now() + NAMES_CHANGED_CHECK_SECS);
+            }
             let wait = (next - self.now()).max(1) as u64;
-            tokio::time::sleep(Duration::from_secs(wait)).await;
+            self.sleep_or_wake(Duration::from_secs(wait)).await;
         }
     }
 
@@ -2337,6 +2367,9 @@ impl AcmeService {
     }
 
     async fn check_inner(self: &Arc<Self>) -> i64 {
+        // This check reads the names (`settings`): a change before it is read now.
+        self.names_dirty
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let now = self.now();
         let timings = &self.deps.timings;
         let jitter =
@@ -4294,6 +4327,68 @@ impl AcmeService {
             (AcmeConfig::Off { reason, .. }, _) => ("off", Some(reason.clone())),
             (AcmeConfig::On(_), Some(reason)) => ("off", Some(reason)),
             (AcmeConfig::On(_), None) => ("on", None),
+        }
+    }
+
+    /// One published host's certificate, as an exposure's view shows it
+    /// (docs/io-web-v2-stage-2-1.md §5.2, §6), from what this client holds, with no call: the leaf
+    /// the edge served at the last look and the last attempt's failed names. `covered`: that leaf
+    /// names it. `off`: ACME is absent or off (the operator certifies by hand), or the edge's TLS
+    /// is not ACME's to manage. `failed`: the last attempt failed on it (`retry_at`, the backoff's
+    /// end). `held`: a hold, the CA's rate limit or the backoff (until `retry_at`), or a served
+    /// leaf this account did not issue (no `retry_at`: the operator's `POST /acme/renew` replaces
+    /// it). `pending`: an order is due or running.
+    pub(crate) fn host_certificate(&self, host: &str) -> Value {
+        let now = self.now();
+        let host = tls_material::normalize_name(host);
+        let state = self.read(Clone::clone);
+        let answer = |name: &str, detail: Option<String>, retry_at: Option<i64>| {
+            json!({
+                "state": name,
+                "detail": detail,
+                "retry_at": retry_at.map(iso),
+            })
+        };
+        let Some(view) = state.edge.last_status.clone() else {
+            return match self.settings() {
+                Some(_) => answer(
+                    "pending",
+                    Some("the edge's certificate has not been looked at yet".to_string()),
+                    None,
+                ),
+                None => answer("off", Some(self.off_detail()), None),
+            };
+        };
+        let leaf = view.leaf.as_ref().filter(|_| view.serving());
+        if leaf.is_some_and(|leaf| tls_material::name_covered(&leaf.names, &host)) {
+            return answer("covered", None, None);
+        }
+        let Some(settings) = self.settings() else {
+            return answer("off", Some(self.off_detail()), None);
+        };
+        if let Some(attempt) = state
+            .last_attempt
+            .as_ref()
+            .filter(|attempt| attempt.failed() && attempt.failed_names.contains(&host))
+        {
+            return answer(
+                "failed",
+                attempt.detail.clone(),
+                state
+                    .backoff
+                    .rate_limited_until
+                    .or(state.backoff.next_attempt_at)
+                    .filter(|until| *until > now),
+            );
+        }
+        let renew_at = leaf.map(|leaf| renewal_point(&state, leaf));
+        match decide(&view, &settings, &state, renew_at, now) {
+            Decision::Held { until, reason } => answer("held", Some(reason), until),
+            Decision::AlertOnly(reason) => answer("held", Some(reason), None),
+            Decision::LeaveAlone(reason) => answer("off", Some(reason), None),
+            Decision::Order { .. } | Decision::Reload(_) | Decision::Idle { .. } => {
+                answer("pending", None, None)
+            }
         }
     }
 

@@ -131,6 +131,13 @@ v1_http_only = {
 mesh_only = {
     "publish_artifact",  # the producer (an AI.*, IO.* or WF.* node) asks the admin over the mesh
     "list_cloud_actions",  # IO.cloud asks which actions it may relay
+    # io.web's exposures: Fluxbee Cloud's alone, through IO.cloud's relay
+    # (docs/io-web-v2-stage-2-1.md §5.1); only their read, list_exposures, has a route.
+    "publish_exposure",
+    "enable_exposure",
+    "disable_exposure",
+    "unpublish_exposure",
+    "issue_exposure_link",
 }
 extra_in_registry = sorted(set(extra_in_registry) - mesh_only)
 stale_mesh_only = sorted(mesh_only - registry_actions)
