@@ -1,10 +1,13 @@
 //! SY.admin's ACME client: the public edge's certificate, issued and renewed by an ACME CA with
 //! TLS-ALPN-01 on the :443 the edge already opens (docs/acme-edge-certificates-v1.md §3, §6, §7).
 //!
-//! - [`AcmeConfig`]: the motherbee's `acme:` section and the certified names (§3): the main one,
-//!   the host of `admin.public_base_url`, then the web hosts `web:` declares
-//!   (docs/io-web-v2.md §11.1). A section that cannot work turns ACME off with a reason; nothing
-//!   here stops SY.admin from starting.
+//! - [`AcmeConfig`]: the motherbee's `acme:` section and the main certified name (§3), the host of
+//!   `admin.public_base_url`. A section that cannot work turns ACME off with a reason; nothing here
+//!   stops SY.admin from starting.
+//! - The names after the main one are the published exposures' hosts, read live
+//!   ([`NamesSource`]), each ordered once its DNS name answers the main name's addresses
+//!   ([`NameResolver`]); a host the leaf misses is ordered at once, outside the cap, within a
+//!   budget of its own (docs/io-web-v2-stage-2-1.md §5.2).
 //! - [`AcmeCa`]: the CA, behind a small trait so the flow runs against a fake in the tests.
 //!   [`InstantAcmeCa`] is the real one (instant-acme 0.8.5, plus a plain GET of the directory).
 //! - [`AcmeMesh`]: the calls to the edge, SY.vault and SY.orchestrator. [`RouterMesh`] is the real
@@ -19,6 +22,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::Write;
+use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -81,6 +85,14 @@ const ARI_REFETCH_MAX_SECS: i64 = 86_400;
 const CONDITION_CATEGORY: &str = "certificate";
 /// After the published hosts change, a check runs within this (docs/io-web-v2-stage-2-1.md §5.2).
 const NAMES_CHANGED_CHECK_SECS: i64 = 60;
+/// Name-change orders (docs/io-web-v2-stage-2-1.md §5.2): one per 15 min, the hosts published
+/// meanwhile riding it, and five per rolling 7 days.
+const NAME_CHANGE_SPACING_SECS: i64 = 15 * 60;
+const NAME_CHANGE_WEEKLY_MAX: usize = 5;
+const NAME_CHANGE_WINDOW_SECS: i64 = 7 * 86_400;
+/// A published host the leaf misses is resolved again after this, and checked again within it
+/// while it waits for its DNS name (§5.2).
+const DNS_RECHECK_SECS: i64 = 300;
 
 /// The durations of §6 and §7. The tests shorten them; production uses [`Timings::default`].
 #[derive(Debug, Clone)]
@@ -111,6 +123,8 @@ pub(crate) struct Timings {
     pub(crate) vault_retry_every: Duration,
     /// How long the directory's terms URL and profiles are kept before they are read again.
     pub(crate) directory_refresh: Duration,
+    /// One DNS resolution of a published host (docs/io-web-v2-stage-2-1.md §5.2).
+    pub(crate) dns_call: Duration,
 }
 
 impl Default for Timings {
@@ -130,6 +144,7 @@ impl Default for Timings {
             vault_retry_window: Duration::from_secs(600),
             vault_retry_every: Duration::from_secs(30),
             directory_refresh: Duration::from_secs(86_400),
+            dns_call: Duration::from_secs(10),
         }
     }
 }
@@ -142,7 +157,8 @@ impl Default for Timings {
 #[derive(Clone)]
 pub(crate) struct AcmeSettings {
     /// The names the certificate carries, lowercase, without a trailing dot: the main one first
-    /// (the host of `admin.public_base_url`), then the web hosts `web:` declares.
+    /// (the host of `admin.public_base_url`), then the published hosts. The configuration holds
+    /// the main one alone; [`AcmeService`] adds the published hosts as it reads them, live.
     pub(crate) names: Vec<String>,
     pub(crate) directory_url: String,
     pub(crate) staging_directory_url: String,
@@ -177,20 +193,15 @@ pub(crate) enum AcmeConfig {
 
 impl AcmeConfig {
     /// Read the `acme:` section (`None` when the hive.yaml has none) against the effective
-    /// `admin.public_base_url`, with the web hosts `web:` declares as the names after the main
-    /// one. Never fails: a section that cannot work is [`AcmeConfig::Off`].
+    /// `admin.public_base_url`, whose host is the main name. Never fails: a section that cannot
+    /// work is [`AcmeConfig::Off`]. The published hosts are not configuration: the service reads
+    /// them live (docs/io-web-v2-stage-2-1.md §5.2).
     pub(crate) fn from_hive(
         section: Option<&serde_yaml::Value>,
         public_base_url: Option<&str>,
-        web_hosts: &[String],
     ) -> Self {
         let main = certified_name(public_base_url);
-        let names: Vec<String> = match &main {
-            Ok(main) => std::iter::once(main.clone())
-                .chain(web_hosts.iter().cloned())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let names: Vec<String> = main.iter().cloned().collect();
         let Some(section) = section else {
             return AcmeConfig::Absent { names };
         };
@@ -205,7 +216,8 @@ impl AcmeConfig {
         self.names().first().map(String::as_str)
     }
 
-    /// Every certified name, the main one first (none when `admin.public_base_url` is unusable).
+    /// The configured name, the main one (none when `admin.public_base_url` is unusable); the
+    /// names with the published hosts are [`AcmeService::names`].
     pub(crate) fn names(&self) -> &[String] {
         match self {
             AcmeConfig::Absent { names } | AcmeConfig::Off { names, .. } => names,
@@ -753,6 +765,10 @@ pub(crate) struct AcmeState {
     pub(crate) unsent_closures: Vec<ClosedCondition>,
     #[serde(default)]
     pub(crate) next_check_at: Option<i64>,
+    /// When each name-change order of the last 7 days started: their budget
+    /// (docs/io-web-v2-stage-2-1.md §5.2).
+    #[serde(default)]
+    pub(crate) name_change_orders: Vec<i64>,
 }
 
 impl Default for AcmeState {
@@ -774,6 +790,7 @@ impl Default for AcmeState {
             conditions: BTreeMap::new(),
             unsent_closures: Vec::new(),
             next_check_at: None,
+            name_change_orders: Vec::new(),
         }
     }
 }
@@ -1301,6 +1318,9 @@ pub(crate) enum Decision {
         reason: String,
         /// For the main name alone: its renewal is overdue (docs/io-web-v2.md §11.1).
         main_only: bool,
+        /// For a published host the leaf this account issued misses (docs/io-web-v2-stage-2-1.md
+        /// §5.2): outside the cap, within its own budget, and never narrowed to the main name.
+        name_change: bool,
     },
     /// An order is due but held until then (`None`: until the operator acts).
     Held { until: Option<i64>, reason: String },
@@ -1407,14 +1427,17 @@ pub(crate) fn rate_limited_until(detail: &str, now: i64) -> i64 {
 }
 
 /// The decision table of §7 for an edge that answered, with `acme:` configured. `renew_at` is the
-/// served leaf's renewal point when this account issued it (ARI or two thirds). A leaf is judged
-/// by the main name: one this account issued that misses an added name is renewed at its point,
-/// with every name, and `name_not_covered` alerts meanwhile (docs/io-web-v2.md §11.1).
+/// served leaf's renewal point when this account issued it (ARI or two thirds); `orderable` the
+/// names an order carries now (`AcmeService::orderable_names`). A leaf is judged by the main name:
+/// one this account issued that misses a published host whose DNS name answers is ordered at once
+/// (a name-change order, docs/io-web-v2-stage-2-1.md §5.2); one that misses a host still waiting
+/// for its DNS name is renewed at its point, and `name_not_covered` alerts meanwhile.
 pub(crate) fn decide(
     view: &EdgeView,
     settings: &AcmeSettings,
     state: &AcmeState,
     renew_at: Option<i64>,
+    orderable: &[String],
     now: i64,
 ) -> Decision {
     if !view.is_vault() {
@@ -1466,6 +1489,11 @@ pub(crate) fn decide(
     let main = settings.main_name();
     let covers_main = tls_material::name_covered(&leaf.names, main);
     let ours = issued_by_account(state, &settings.directory_url, &leaf.fingerprint);
+    let added: Vec<&str> = orderable
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !tls_material::name_covered(&leaf.names, name))
+        .collect();
     match ours {
         Some(record) if covers_main => {
             let renew_at = renew_at.unwrap_or_else(|| leaf.two_thirds());
@@ -1489,7 +1517,15 @@ pub(crate) fn decide(
                         iso(renew_at)
                     )
                 };
-                gate(state, settings, record.cert_ref(), overdue, reason, now)
+                match gate(state, settings, record.cert_ref(), overdue, reason, now) {
+                    // The cap holds the renewal; a published host it misses is ordered outside it.
+                    Decision::Held { .. } if !added.is_empty() => {
+                        gate_name_change(state, record.cert_ref(), &added, now)
+                    }
+                    decision => decision,
+                }
+            } else if !added.is_empty() {
+                gate_name_change(state, record.cert_ref(), &added, now)
             } else {
                 Decision::Idle {
                     renew_at,
@@ -1551,31 +1587,8 @@ fn gate(
     reason: String,
     now: i64,
 ) -> Decision {
-    if let Some(refused) = &state.install_refused {
-        return Decision::Held {
-            until: None,
-            reason: format!(
-                "the edge refused the certificate {} ({}): nothing is ordered until the operator acts (POST /acme/renew)",
-                short(&refused.fingerprint),
-                refused.detail
-            ),
-        };
-    }
-    if let Some(until) = state
-        .backoff
-        .rate_limited_until
-        .filter(|until| *until > now)
-    {
-        return Decision::Held {
-            until: Some(until),
-            reason: "the CA rate-limited the last order".to_string(),
-        };
-    }
-    if let Some(until) = state.backoff.next_attempt_at.filter(|until| *until > now) {
-        return Decision::Held {
-            until: Some(until),
-            reason: format!("backing off after {} failure(s)", state.backoff.failures),
-        };
+    if let Some(held) = held_for_any_order(state, now) {
+        return held;
     }
     if let Some(until) = cap_until(state, &settings.directory_url, now) {
         return Decision::Held {
@@ -1587,7 +1600,100 @@ fn gate(
         replaces,
         reason,
         main_only,
+        name_change: false,
     }
+}
+
+/// A name-change order for `added` (docs/io-web-v2-stage-2-1.md §5.2): held for the operator, a
+/// rate limit and the backoff as any order, and by its own budget instead of the cap.
+fn gate_name_change(
+    state: &AcmeState,
+    replaces: Option<CertRef>,
+    added: &[&str],
+    now: i64,
+) -> Decision {
+    if let Some(held) = held_for_any_order(state, now) {
+        return held;
+    }
+    if let Some(until) = name_change_budget_until(state, now) {
+        return Decision::Held {
+            until: Some(until),
+            reason: format!(
+                "{} published and not on the leaf: name-change orders go one per 15 min and five \
+                 per 7 days (POST /acme/renew orders now)",
+                added.join(", ")
+            ),
+        };
+    }
+    Decision::Order {
+        replaces,
+        reason: format!(
+            "{} published and not on the leaf this account issued: a name-change order",
+            added.join(", ")
+        ),
+        main_only: false,
+        name_change: true,
+    }
+}
+
+/// When the next name-change order may start: 15 min after the last one, and once fewer than five
+/// started in the last 7 days. `None`: now.
+fn name_change_budget_until(state: &AcmeState, now: i64) -> Option<i64> {
+    let mut recent: Vec<i64> = state
+        .name_change_orders
+        .iter()
+        .copied()
+        .filter(|at| *at > now - NAME_CHANGE_WINDOW_SECS)
+        .collect();
+    recent.sort_unstable();
+    let spacing = recent
+        .last()
+        .map(|last| last + NAME_CHANGE_SPACING_SECS)
+        .filter(|until| *until > now);
+    let weekly = recent
+        .len()
+        .checked_sub(NAME_CHANGE_WEEKLY_MAX)
+        .map(|oldest| recent[oldest] + NAME_CHANGE_WINDOW_SECS);
+    spacing.into_iter().chain(weekly).max()
+}
+
+/// A name-change order starts now: it spends its budget, the ones past 7 days forgotten.
+fn note_name_change_order(state: &mut AcmeState, now: i64) {
+    state
+        .name_change_orders
+        .retain(|at| *at > now - NAME_CHANGE_WINDOW_SECS);
+    state.name_change_orders.push(now);
+}
+
+/// What holds every order: the operator, after a refused install; the CA's rate limit; the backoff.
+fn held_for_any_order(state: &AcmeState, now: i64) -> Option<Decision> {
+    if let Some(refused) = &state.install_refused {
+        return Some(Decision::Held {
+            until: None,
+            reason: format!(
+                "the edge refused the certificate {} ({}): nothing is ordered until the operator acts (POST /acme/renew)",
+                short(&refused.fingerprint),
+                refused.detail
+            ),
+        });
+    }
+    if let Some(until) = state
+        .backoff
+        .rate_limited_until
+        .filter(|until| *until > now)
+    {
+        return Some(Decision::Held {
+            until: Some(until),
+            reason: "the CA rate-limited the last order".to_string(),
+        });
+    }
+    if let Some(until) = state.backoff.next_attempt_at.filter(|until| *until > now) {
+        return Some(Decision::Held {
+            until: Some(until),
+            reason: format!("backing off after {} failure(s)", state.backoff.failures),
+        });
+    }
+    None
 }
 
 /// A condition open now.
@@ -1899,6 +2005,52 @@ pub(crate) type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub(crate) type Random = Arc<dyn Fn() -> f64 + Send + Sync>;
 pub(crate) type RootsLoader =
     Arc<dyn Fn() -> Result<Vec<CertificateDer<'static>>, String> + Send + Sync>;
+/// The published exposures' hosts, the names after the main one (docs/io-web-v2-stage-2-1.md
+/// §5.2), read at each use.
+pub(crate) type NamesSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Resolves a DNS name to its addresses: a published host is ordered once it answers the main
+/// name's (docs/io-web-v2-stage-2-1.md §5.2). [`SystemResolver`] is the real one.
+#[async_trait]
+pub(crate) trait NameResolver: Send + Sync {
+    async fn resolve(&self, name: &str) -> Result<Vec<IpAddr>, String>;
+}
+
+/// The system's resolver, as any client of the host resolves a name.
+pub(crate) struct SystemResolver;
+
+#[async_trait]
+impl NameResolver for SystemResolver {
+    async fn resolve(&self, name: &str) -> Result<Vec<IpAddr>, String> {
+        let found = tokio::net::lookup_host((name, 443))
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut addresses: Vec<IpAddr> = found.map(|socket| socket.ip()).collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
+    }
+}
+
+/// A published host's last resolution.
+#[derive(Debug, Clone)]
+struct DnsEntry {
+    /// When (Unix seconds).
+    at: i64,
+    /// Its addresses, or why there are none.
+    answer: Result<Vec<IpAddr>, String>,
+}
+
+/// Whether a published host's DNS name answers the main name's addresses.
+#[derive(Debug, Clone, PartialEq)]
+enum DnsState {
+    /// Every address it resolves to is one of the main name's: it may be ordered.
+    Ready,
+    /// Not yet: why, and when it was resolved.
+    Waiting { detail: String, at: i64 },
+    /// Not resolved yet: the next check resolves it.
+    Unknown,
+}
 
 /// What the service talks to and how it tells time.
 pub(crate) struct AcmeDeps {
@@ -1910,6 +2062,9 @@ pub(crate) struct AcmeDeps {
     pub(crate) random: Random,
     pub(crate) platform_roots: RootsLoader,
     pub(crate) timings: Timings,
+    /// The published hosts (docs/io-web-v2-stage-2-1.md §5.2).
+    pub(crate) names: NamesSource,
+    pub(crate) resolver: Arc<dyn NameResolver>,
 }
 
 /// An operator action refused before it started.
@@ -2193,6 +2348,8 @@ pub(crate) struct AcmeService {
     state_warning: Option<String>,
     slot: Mutex<Option<Progress>>,
     directories: Mutex<BTreeMap<String, DirectoryCacheEntry>>,
+    /// The published hosts' last resolutions, and the main name's (§5.2): memory only.
+    dns: Mutex<BTreeMap<String, DnsEntry>>,
     deps: AcmeDeps,
 }
 
@@ -2230,6 +2387,7 @@ impl AcmeService {
             state_warning,
             slot: Mutex::new(None),
             directories: Mutex::new(BTreeMap::new()),
+            dns: Mutex::new(BTreeMap::new()),
             deps,
         })
     }
@@ -2238,12 +2396,157 @@ impl AcmeService {
         (self.deps.clock)()
     }
 
-    /// The working settings, unless ACME is absent or off.
+    /// Every name the certificate carries now: the main one, then the published hosts, read live
+    /// (docs/io-web-v2-stage-2-1.md §5.2), lowercase and once each. None without a main name.
+    pub(crate) fn names(&self) -> Vec<String> {
+        let Some(main) = self.config.name() else {
+            return Vec::new();
+        };
+        let mut hosts: Vec<String> = (self.deps.names)()
+            .iter()
+            .map(|host| tls_material::normalize_name(host))
+            .filter(|host| !host.is_empty() && host != main)
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        std::iter::once(main.to_string()).chain(hosts).collect()
+    }
+
+    /// The working settings, with the names as they are now, unless ACME is absent or off.
     fn settings(&self) -> Option<AcmeSettings> {
         match &self.config {
-            AcmeConfig::On(settings) if lock(&self.off_reason).is_none() => Some(settings.clone()),
+            AcmeConfig::On(settings) if lock(&self.off_reason).is_none() => Some(AcmeSettings {
+                names: self.names(),
+                ..settings.clone()
+            }),
             _ => None,
         }
+    }
+
+    /// Resolve the main name and each published host the served leaf misses, unless resolved in
+    /// the last 5 min (docs/io-web-v2-stage-2-1.md §5.2: DNS first). Nothing is resolved when the
+    /// leaf misses none. A change of a host's state is logged.
+    async fn refresh_dns(&self, settings: &AcmeSettings, view: &EdgeView) {
+        let now = self.now();
+        let main = settings.main_name().to_string();
+        let leaf = view.leaf.as_ref().filter(|_| view.serving());
+        let missing: Vec<String> = settings
+            .names
+            .iter()
+            .filter(|name| **name != main)
+            .filter(|name| !leaf.is_some_and(|leaf| tls_material::name_covered(&leaf.names, name)))
+            .cloned()
+            .collect();
+        lock(&self.dns).retain(|name, _| settings.names.contains(name));
+        if missing.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = std::iter::once(main.clone())
+            .chain(missing.iter().cloned())
+            .filter(|name| {
+                lock(&self.dns)
+                    .get(name)
+                    .is_none_or(|entry| now - entry.at >= DNS_RECHECK_SECS)
+            })
+            .collect();
+        let before: Vec<(String, DnsState)> = missing
+            .iter()
+            .map(|name| (name.clone(), self.dns_state(name, &main)))
+            .collect();
+        for name in stale {
+            let limit = self.deps.timings.dns_call;
+            let answer = match tokio::time::timeout(limit, self.deps.resolver.resolve(&name)).await
+            {
+                Ok(answer) => answer,
+                Err(_) => Err(format!("no answer in {limit:?}")),
+            };
+            lock(&self.dns).insert(name, DnsEntry { at: now, answer });
+        }
+        for (name, was) in before {
+            match (self.dns_state(&name, &main), was) {
+                (DnsState::Ready, DnsState::Ready) => {}
+                (DnsState::Ready, _) => tracing::info!(
+                    host = %name,
+                    "the published host's DNS name answers the main name's addresses: it is ordered"
+                ),
+                (DnsState::Waiting { detail, .. }, DnsState::Waiting { detail: old, .. })
+                    if detail == old => {}
+                (DnsState::Waiting { detail, .. }, _) => tracing::warn!(
+                    host = %name,
+                    detail = %detail,
+                    "the published host waits for its DNS name: left out of the orders, resolved again every 5 min"
+                ),
+                (DnsState::Unknown, _) => {}
+            }
+        }
+    }
+
+    /// Whether `name` answers `main`'s addresses, from the last resolutions.
+    fn dns_state(&self, name: &str, main: &str) -> DnsState {
+        let dns = lock(&self.dns);
+        let Some(entry) = dns.get(name) else {
+            return DnsState::Unknown;
+        };
+        let waiting = |detail: String| DnsState::Waiting {
+            detail,
+            at: entry.at,
+        };
+        let addresses = match &entry.answer {
+            Ok(addresses) if !addresses.is_empty() => addresses,
+            Ok(_) => return waiting(format!("{name} resolves to no address")),
+            Err(err) => return waiting(format!("{name} does not resolve: {err}")),
+        };
+        let main_addresses = match dns.get(main).map(|main| &main.answer) {
+            Some(Ok(main_addresses)) if !main_addresses.is_empty() => main_addresses,
+            Some(Ok(_)) => {
+                return waiting(format!(
+                    "the main name {main} resolves to no address to judge {name} by"
+                ))
+            }
+            Some(Err(err)) => {
+                return waiting(format!(
+                    "the main name {main} does not resolve ({err}): {name} cannot be judged"
+                ))
+            }
+            None => return DnsState::Unknown,
+        };
+        let foreign: Vec<String> = addresses
+            .iter()
+            .filter(|address| !main_addresses.contains(address))
+            .map(ToString::to_string)
+            .collect();
+        if foreign.is_empty() {
+            DnsState::Ready
+        } else {
+            waiting(format!(
+                "{name} resolves to {}, which the main name {main} does not ({})",
+                foreign.join(", "),
+                main_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
+
+    /// The names an order carries now (docs/io-web-v2-stage-2-1.md §5.2): the main one, each
+    /// published host the served leaf covers, and each other one whose DNS name answers the main
+    /// name's addresses. A host still waiting is left out, so it never fails the order for every
+    /// name.
+    fn orderable_names(&self, settings: &AcmeSettings, view: &EdgeView) -> Vec<String> {
+        let main = settings.main_name();
+        let leaf = view.leaf.as_ref().filter(|_| view.serving());
+        settings
+            .names
+            .iter()
+            .filter(|name| {
+                name.as_str() == main
+                    || leaf.is_some_and(|leaf| tls_material::name_covered(&leaf.names, name))
+                    || self.dns_state(name, main) == DnsState::Ready
+            })
+            .cloned()
+            .collect()
     }
 
     /// The published hosts changed (docs/io-web-v2-stage-2-1.md §5.2): the loop wakes, and a
@@ -2566,7 +2869,16 @@ impl AcmeService {
         let now = self.now();
         self.settle_pending(&view).await;
         let renew_at = self.plan_renewal(settings, &view).await;
-        let decision = self.read(|state| decide(&view, settings, state, renew_at, now));
+        self.refresh_dns(settings, &view).await;
+        let orderable = self.orderable_names(settings, &view);
+        // A published host waiting for its DNS name is looked at again within 5 min.
+        let (regular, retry) = if orderable.len() < settings.names.len() {
+            let soon = now + DNS_RECHECK_SECS;
+            (regular.min(soon), retry.min(soon))
+        } else {
+            (regular, retry)
+        };
+        let decision = self.read(|state| decide(&view, settings, state, renew_at, &orderable, now));
         self.note_check(&decision.describe());
         match decision {
             Decision::LeaveAlone(_) | Decision::AlertOnly(_) => regular,
@@ -2583,6 +2895,7 @@ impl AcmeService {
             Decision::Order {
                 replaces,
                 main_only,
+                name_change,
                 ..
             } => {
                 let mut run = Run::every_name(
@@ -2593,9 +2906,14 @@ impl AcmeService {
                     view,
                     replaces,
                 );
-                // A check orders only when the main name needs the certificate; what the edge
-                // serves decides whether a failed added name lets it go alone.
-                run.fallback = true;
+                run.names = orderable;
+                // A renewal orders only when the main name needs the certificate; what the edge
+                // serves decides whether a failed added name lets it go alone. A name-change
+                // order never does: it would spend an issuance on the names the edge serves.
+                run.fallback = !name_change;
+                if name_change {
+                    self.update(|state| note_name_change_order(state, now));
+                }
                 if main_only {
                     let main = settings.main_name().to_string();
                     run.note = Some(format!(
@@ -4103,7 +4421,7 @@ impl AcmeService {
         });
         Ok(json!({
             "kind": "renew",
-            "names": self.config.names(),
+            "names": self.names(),
             "started_at": iso(now),
             "progress": "GET /acme/status",
         }))
@@ -4137,6 +4455,8 @@ impl AcmeService {
             }
         };
         self.settle_pending(&view).await;
+        self.refresh_dns(&settings, &view).await;
+        let orderable = self.orderable_names(&settings, &view);
         let now = self.now();
         let (replaces, fallback) = self.read(|state| {
             let replaces = view.leaf.as_ref().and_then(|leaf| {
@@ -4156,6 +4476,7 @@ impl AcmeService {
             view,
             replaces,
         );
+        run.names = orderable;
         run.fallback = fallback;
         let end = self.order_flow(&run).await;
         self.finish(&run, started_at, end);
@@ -4186,7 +4507,7 @@ impl AcmeService {
         });
         Ok(json!({
             "kind": "test",
-            "names": self.config.names(),
+            "names": self.names(),
             "directory_url": self.config_staging_url(),
             "started_at": iso(now),
             "progress": "GET /acme/status",
@@ -4332,12 +4653,14 @@ impl AcmeService {
 
     /// One published host's certificate, as an exposure's view shows it
     /// (docs/io-web-v2-stage-2-1.md §5.2, §6), from what this client holds, with no call: the leaf
-    /// the edge served at the last look and the last attempt's failed names. `covered`: that leaf
-    /// names it. `off`: ACME is absent or off (the operator certifies by hand), or the edge's TLS
-    /// is not ACME's to manage. `failed`: the last attempt failed on it (`retry_at`, the backoff's
-    /// end). `held`: a hold, the CA's rate limit or the backoff (until `retry_at`), or a served
-    /// leaf this account did not issue (no `retry_at`: the operator's `POST /acme/renew` replaces
-    /// it). `pending`: an order is due or running.
+    /// the edge served at the last look, the last attempt's failed names and the last resolutions.
+    /// `covered`: that leaf names it. `off`: ACME is absent or off (the operator certifies by
+    /// hand), or the edge's TLS is not ACME's to manage. `failed`: the last attempt failed on it
+    /// (`retry_at`, the backoff's end). `waiting_dns`: its DNS name does not answer the main name's
+    /// addresses (`retry_at`, the next resolution). `held`: a hold, the CA's rate limit, the
+    /// backoff or the name-change budget (until `retry_at`), or a served leaf this account did not
+    /// issue (no `retry_at`: the operator's `POST /acme/renew` replaces it). `pending`: an order is
+    /// due or running, or the host is not resolved yet.
     pub(crate) fn host_certificate(&self, host: &str) -> Value {
         let now = self.now();
         let host = tls_material::normalize_name(host);
@@ -4381,8 +4704,22 @@ impl AcmeService {
                     .filter(|until| *until > now),
             );
         }
+        match self.dns_state(&host, settings.main_name()) {
+            DnsState::Ready => {}
+            DnsState::Waiting { detail, at } => {
+                return answer("waiting_dns", Some(detail), Some(at + DNS_RECHECK_SECS))
+            }
+            DnsState::Unknown => {
+                return answer(
+                    "pending",
+                    Some("its DNS name is resolved at the next check".to_string()),
+                    None,
+                )
+            }
+        }
+        let orderable = self.orderable_names(&settings, &view);
         let renew_at = leaf.map(|leaf| renewal_point(&state, leaf));
-        match decide(&view, &settings, &state, renew_at, now) {
+        match decide(&view, &settings, &state, renew_at, &orderable, now) {
             Decision::Held { until, reason } => answer("held", Some(reason), until),
             Decision::AlertOnly(reason) => answer("held", Some(reason), None),
             Decision::LeaveAlone(reason) => answer("off", Some(reason), None),
@@ -4416,7 +4753,7 @@ impl AcmeService {
         });
         let mut certificate = json!({
             "acme": config_state,
-            "names": self.config.names(),
+            "names": self.names(),
             "served": leaf.as_ref().map(|leaf| json!({
                 "names": leaf.names,
                 "not_after": leaf.not_after,
@@ -4437,7 +4774,7 @@ impl AcmeService {
             "state": config_state,
             "reason": reason,
             "name": self.config.name(),
-            "names": self.config.names(),
+            "names": self.names(),
         });
         if let AcmeConfig::On(settings) = &self.config {
             config["directory_url"] = json!(settings.directory_url);
@@ -4490,7 +4827,7 @@ impl AcmeService {
             .last_status
             .as_ref()
             .and_then(|view| view.leaf.as_ref());
-        let names = self.config.names();
+        let names = self.names();
         let names_missing: Option<Vec<&String>> =
             served.filter(|_| !names.is_empty()).map(|leaf| {
                 names
@@ -4530,6 +4867,33 @@ impl AcmeService {
             })
             .collect();
         let in_flight = lock(&self.slot).clone();
+        // The published hosts' last resolutions (docs/io-web-v2-stage-2-1.md §5.2).
+        let main = self.config.name().unwrap_or_default().to_string();
+        let resolutions: Vec<(String, DnsEntry)> = lock(&self.dns)
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect();
+        let dns: serde_json::Map<String, Value> = resolutions
+            .into_iter()
+            .map(|(name, entry)| {
+                let (dns_state, detail) = match self.dns_state(&name, &main) {
+                    DnsState::Ready => ("ready", None),
+                    DnsState::Waiting { detail, .. } => ("waiting", Some(detail)),
+                    DnsState::Unknown => ("unknown", None),
+                };
+                let value = json!({
+                    "state": dns_state,
+                    "addresses": entry.answer.as_ref().ok(),
+                    "detail": detail,
+                    "resolved_at": entry.at,
+                });
+                (name, value)
+            })
+            .collect();
+        let name_change_orders = json!({
+            "started": state.name_change_orders.iter().map(|at| iso(*at)).collect::<Vec<_>>(),
+            "next_allowed_at": name_change_budget_until(&state, now),
+        });
         let mut status = json!({
             "now_at": now,
             "config": config,
@@ -4562,6 +4926,8 @@ impl AcmeService {
             "renewal": state.renewal,
             "issued": state.issued,
             "conditions": conditions,
+            "dns": dns,
+            "name_change_orders": name_change_orders,
             "warnings": self.state_warning.iter().collect::<Vec<_>>(),
         });
         humanize_times(&mut status);

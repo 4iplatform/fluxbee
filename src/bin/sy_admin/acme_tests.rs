@@ -4,6 +4,7 @@
 
 use super::*;
 use std::collections::{HashMap, VecDeque};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rcgen::{
@@ -896,6 +897,34 @@ fn settings_with_archi() -> AcmeSettings {
     }
 }
 
+/// The address the main name and every published host resolve to unless a test says otherwise.
+const EDGE_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+
+/// The DNS the tests resolve against (docs/io-web-v2-stage-2-1.md §5.2).
+#[derive(Default)]
+struct FakeDns {
+    /// The answers other than [`EDGE_ADDRESS`], by name.
+    answers: BTreeMap<String, Result<Vec<IpAddr>, String>>,
+    /// Every name asked, in order.
+    asked: Vec<String>,
+}
+
+struct FakeResolver {
+    script: Arc<Mutex<FakeDns>>,
+}
+
+#[async_trait]
+impl NameResolver for FakeResolver {
+    async fn resolve(&self, name: &str) -> Result<Vec<IpAddr>, String> {
+        let mut dns = lock(&self.script);
+        dns.asked.push(name.to_string());
+        dns.answers
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| Ok(vec![EDGE_ADDRESS]))
+    }
+}
+
 fn test_timings() -> Timings {
     Timings {
         first_check: Duration::from_millis(1),
@@ -912,6 +941,7 @@ fn test_timings() -> Timings {
         vault_retry_window: Duration::from_millis(300),
         vault_retry_every: Duration::from_millis(5),
         directory_refresh: Duration::from_secs(86_400),
+        dns_call: Duration::from_secs(1),
     }
 }
 
@@ -920,6 +950,9 @@ struct Harness {
     config: AcmeConfig,
     ca: Arc<Mutex<CaScript>>,
     mesh: Arc<Mutex<MeshScript>>,
+    /// The published hosts the service reads.
+    published: Arc<Mutex<Vec<String>>>,
+    dns: Arc<Mutex<FakeDns>>,
     clock: Arc<AtomicI64>,
     pki: Arc<TestPki>,
     platform: Arc<TestPki>,
@@ -935,6 +968,8 @@ impl Harness {
             config,
             ca: Arc::new(Mutex::new(CaScript::default())),
             mesh: Arc::new(Mutex::new(MeshScript::default())),
+            published: Arc::new(Mutex::new(Vec::new())),
+            dns: Arc::new(Mutex::new(FakeDns::default())),
             clock,
             platform: Arc::clone(&pki),
             pki,
@@ -948,8 +983,22 @@ impl Harness {
         Self::new(AcmeConfig::On(settings()))
     }
 
+    /// Archi's host published.
     fn with_archi() -> Self {
-        Self::new(AcmeConfig::On(settings_with_archi()))
+        let harness = Self::on();
+        harness.publish(&[ARCHI]);
+        harness
+    }
+
+    /// The published hosts are now `hosts`, as `publish_exposure` and `unpublish_exposure` leave
+    /// them; the service is told, as SY.admin tells it on a publish.
+    fn publish(&self, hosts: &[&str]) {
+        *lock(&self.published) = names(hosts);
+        self.service.names_changed();
+    }
+
+    fn dns(&self) -> MutexGuard<'_, FakeDns> {
+        lock(&self.dns)
     }
 
     fn absent() -> Self {
@@ -976,6 +1025,13 @@ impl Harness {
             random: Arc::new(|| 0.5),
             platform_roots: Arc::new(move || Ok(vec![platform.root_der.clone()])),
             timings: test_timings(),
+            names: {
+                let published = Arc::clone(&self.published);
+                Arc::new(move || lock(&published).clone())
+            },
+            resolver: Arc::new(FakeResolver {
+                script: Arc::clone(&self.dns),
+            }),
         };
         self.service = AcmeService::new(
             self.config.clone(),
@@ -1074,6 +1130,10 @@ pub(crate) fn inert_service(state_dir: &Path) -> Arc<AcmeService> {
             random: Arc::new(|| 0.5),
             platform_roots: Arc::new(|| Err("no roots in this test".to_string())),
             timings: test_timings(),
+            names: Arc::new(Vec::new),
+            resolver: Arc::new(FakeResolver {
+                script: Arc::new(Mutex::new(FakeDns::default())),
+            }),
         },
         state_dir.join("sy-admin/acme.json"),
         admin_ilk(),
@@ -1757,9 +1817,8 @@ async fn the_web_status_shows_the_certified_names_and_the_leaf_last_seen() {
     assert_eq!(missing["hosts_missing"], json!([ARCHI]));
 
     // Without an acme section the names are still the ones a renewal would certify.
-    let absent = Harness::new(AcmeConfig::Absent {
-        names: names(&[NAME, ARCHI]),
-    });
+    let absent = Harness::absent();
+    absent.publish(&[ARCHI]);
     let certificate = absent.service.web_certificate(&web_hosts);
     assert_eq!(certificate["acme"], "absent");
     assert_eq!(certificate["names"], json!([NAME, ARCHI]));
@@ -2005,44 +2064,190 @@ async fn a_test_order_carries_every_name_and_never_falls_back() {
     assert_eq!(h.ca().log.new_orders[0].0, names(&[NAME, ARCHI]));
 }
 
+// ---------------------------------------------------------------------------------------------
+// The published hosts (docs/io-web-v2-stage-2-1.md §5.2)
+// ---------------------------------------------------------------------------------------------
+
+/// A published host the leaf this account issued misses is ordered at once, outside the cap of one
+/// issuance per third of the lifetime: the order carries the main name and the host, and replaces
+/// the leaf. Its view goes from pending to covered.
 #[tokio::test]
-async fn adding_a_name_alerts_and_the_explicit_renewal_certifies_it() {
-    let mut h = Harness::on();
+async fn a_published_host_missing_from_the_leaf_is_ordered_outside_the_cap() {
+    let h = Harness::on();
     h.install_first().await;
-    // web: {archi: true}, and SY.admin restarted.
-    h.config = AcmeConfig::On(settings_with_archi());
-    h.restart();
     h.advance(DAY);
-    h.service.check_once().await;
-    assert_eq!(
-        h.ca().log.new_orders.len(),
-        1,
-        "a missing name is alerted only"
-    );
-    assert!(h.state().last_check.unwrap().decision.starts_with("idle"));
-    assert_eq!(h.open_conditions(), vec!["name_not_covered"]);
-    // POST /acme/renew, forced past the cap.
-    h.service.begin_renew().expect("renew");
-    h.settle().await;
-    assert_eq!(h.ca().log.new_orders[1].0, names(&[NAME, ARCHI]));
     assert!(
-        h.ca().log.new_orders[1].2,
-        "it replaces the leaf this account issued"
+        cap_until(&h.state(), DIRECTORY, h.now()).is_some(),
+        "the cap holds a renewal"
     );
-    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    h.publish(&[ARCHI]);
+    assert_eq!(h.service.host_certificate(ARCHI)["state"], "pending");
     h.service.check_once().await;
+    let orders = h.ca().log.new_orders.clone();
+    assert_eq!(orders.len(), 2);
+    assert_eq!(orders[1].0, names(&[NAME, ARCHI]));
+    assert!(orders[1].2, "it replaces the leaf this account issued");
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    let state = h.state();
+    let decision = state.last_check.expect("a check").decision;
+    assert!(decision.contains("name-change"), "{decision}");
+    assert_eq!(state.name_change_orders, vec![h.now()]);
+    assert_eq!(state.last_attempt.expect("an attempt").result, "installed");
+    assert_eq!(h.service.host_certificate(ARCHI)["state"], "covered");
+    // Nothing more: the leaf covers every name.
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 2);
     assert!(h.open_conditions().is_empty(), "{:?}", h.open_conditions());
-    assert!(h
-        .alerts()
-        .contains(&("name_not_covered".to_string(), "closed".to_string())));
 }
 
+/// DNS first: a published host whose DNS name does not answer the main name's addresses is left
+/// out of the order, so it never fails the order for every name; it waits (`waiting_dns`),
+/// resolved again every 5 min and looked at again within them, and is ordered once it answers.
 #[tokio::test]
-async fn removing_a_name_takes_effect_at_the_next_renewal() {
-    let mut h = Harness::with_archi();
+async fn a_host_without_dns_is_left_out_and_waits() {
+    let h = Harness::on();
+    h.dns()
+        .answers
+        .insert(ARCHI.to_string(), Err("NXDOMAIN".to_string()));
+    h.publish(&[ARCHI]);
+    let next = h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 1);
+    assert_eq!(
+        h.ca().log.new_orders[0].0,
+        names(&[NAME]),
+        "Archi's host is left out"
+    );
+    assert_eq!(served_names(&h), names(&[NAME]));
+    assert!(
+        next <= h.now() + DNS_RECHECK_SECS,
+        "looked at again within 5 min"
+    );
+    let view = h.service.host_certificate(ARCHI);
+    assert_eq!(view["state"], "waiting_dns", "{view}");
+    assert!(
+        view["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("does not resolve")),
+        "{view}"
+    );
+    assert_eq!(view["retry_at"], iso(h.now() + DNS_RECHECK_SECS));
+    assert_eq!(h.open_conditions(), vec!["name_not_covered"]);
+
+    // Within the 5 min nothing is resolved again.
+    let asked = h.dns().asked.len();
+    h.advance(60);
+    h.service.check_once().await;
+    assert_eq!(h.dns().asked.len(), asked);
+
+    // It resolves, to an address the main name does not: it still waits.
+    h.dns()
+        .answers
+        .insert(ARCHI.to_string(), Ok(vec!["198.51.100.7".parse().unwrap()]));
+    h.advance(DNS_RECHECK_SECS);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 1);
+    let view = h.service.host_certificate(ARCHI);
+    assert_eq!(view["state"], "waiting_dns", "{view}");
+    assert!(
+        view["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("198.51.100.7")),
+        "{view}"
+    );
+
+    // It answers the main name's address: ordered.
+    h.dns().answers.remove(ARCHI);
+    h.advance(DNS_RECHECK_SECS);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 2);
+    assert_eq!(h.ca().log.new_orders[1].0, names(&[NAME, ARCHI]));
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    assert_eq!(h.service.host_certificate(ARCHI)["state"], "covered");
+    let status = h.service.status().await;
+    assert_eq!(status["dns"][ARCHI]["state"], "ready", "{}", status["dns"]);
+}
+
+/// Name-change orders go one per 15 min, the hosts published meanwhile riding the next one, and
+/// five per rolling 7 days; past the budget a host is held until it frees, and the operator's
+/// POST /acme/renew still orders it.
+#[tokio::test]
+async fn name_change_orders_coalesce_and_stop_at_the_weekly_budget() {
+    let h = Harness::on();
     h.install_first().await;
-    h.config = AcmeConfig::On(settings());
-    h.restart();
+    let host = |label: &str| format!("{label}.{NAME}");
+    let published = Mutex::new(Vec::<String>::new());
+    let publish = |label: &str| {
+        let mut hosts = lock(&published);
+        hosts.push(host(label));
+        h.publish(&hosts.iter().map(String::as_str).collect::<Vec<_>>());
+    };
+    let orders = || h.ca().log.new_orders.len();
+
+    publish("shop");
+    h.service.check_once().await;
+    assert_eq!(orders(), 2, "the first name-change order");
+    let first = h.now();
+
+    // Two more within the 15 min: held, then one order carries both.
+    for label in ["docs", "wiki"] {
+        h.advance(60);
+        publish(label);
+        h.service.check_once().await;
+    }
+    assert_eq!(orders(), 2, "one per 15 min");
+    let view = h.service.host_certificate(&host("docs"));
+    assert_eq!(view["state"], "held", "{view}");
+    assert_eq!(view["retry_at"], iso(first + NAME_CHANGE_SPACING_SECS));
+    h.clock
+        .store(first + NAME_CHANGE_SPACING_SECS, Ordering::SeqCst);
+    h.service.check_once().await;
+    assert_eq!(orders(), 3);
+    assert_eq!(
+        h.ca().log.new_orders[2].0,
+        vec![NAME.to_string(), host("docs"), host("shop"), host("wiki")]
+    );
+
+    // Three more make five in 7 days; a sixth host waits for the first to age out.
+    for label in ["crm", "blog", "mail"] {
+        h.advance(NAME_CHANGE_SPACING_SECS);
+        publish(label);
+        h.service.check_once().await;
+    }
+    assert_eq!(orders(), 6);
+    assert_eq!(h.state().name_change_orders.len(), 5);
+    h.advance(NAME_CHANGE_SPACING_SECS);
+    publish("news");
+    h.service.check_once().await;
+    assert_eq!(orders(), 6, "five per 7 days");
+    let view = h.service.host_certificate(&host("news"));
+    assert_eq!(view["state"], "held", "{view}");
+    assert_eq!(view["retry_at"], iso(first + NAME_CHANGE_WINDOW_SECS));
+    let status = h.service.status().await;
+    assert_eq!(
+        status["name_change_orders"]["next_allowed_at"],
+        iso(first + NAME_CHANGE_WINDOW_SECS)
+    );
+
+    // The operator's renewal orders it, past the budget.
+    h.service.begin_renew().expect("renew");
+    h.settle().await;
+    assert_eq!(orders(), 7);
+    assert!(served_names(&h).contains(&host("news")));
+    assert_eq!(
+        h.state().name_change_orders.len(),
+        5,
+        "a renewal spends none"
+    );
+}
+
+/// A host taken out orders nothing: the leaf keeps it until its renewal, which names the main name
+/// and the hosts still published.
+#[tokio::test]
+async fn a_dropped_name_orders_nothing() {
+    let h = Harness::with_archi();
+    h.install_first().await;
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    h.publish(&[]);
     h.advance(DAY);
     h.service.check_once().await;
     assert!(
@@ -2050,6 +2255,8 @@ async fn removing_a_name_takes_effect_at_the_next_renewal() {
         "the served leaf covers the one name"
     );
     assert_eq!(h.ca().log.new_orders.len(), 1);
+    let decision = h.state().last_check.expect("a check").decision;
+    assert!(decision.starts_with("idle"), "{decision}");
     // At the renewal point, the order names the main name only.
     let not_before = h.state().issued[0].not_before;
     h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
@@ -2114,15 +2321,49 @@ fn the_decision_table_judges_a_leaf_by_the_main_name() {
     let (chain, _) = pki.seeded(&[NAME], now - 10 * DAY, now + 80 * DAY);
     let leaf = leaf_of(&chain);
     let ours = issued_state(&leaf, now - 40 * DAY);
-    // A leaf this account issued for the main name only: renewed at its point, with every name.
+    // A leaf this account issued for the main name only, Archi's host still waiting for its DNS
+    // name (the names an order carries are the main one alone): renewed at its point.
+    let main_alone = names(&[NAME]);
     assert!(matches!(
-        decide(&view_serving(&leaf), &both, &ours, Some(now + DAY), now),
+        decide(
+            &view_serving(&leaf),
+            &both,
+            &ours,
+            Some(now + DAY),
+            &main_alone,
+            now
+        ),
         Decision::Idle { .. }
     ));
     assert!(matches!(
-        decide(&view_serving(&leaf), &both, &ours, Some(now - 1), now),
+        decide(
+            &view_serving(&leaf),
+            &both,
+            &ours,
+            Some(now - 1),
+            &both.names,
+            now
+        ),
         Decision::Order {
             main_only: false,
+            name_change: false,
+            ..
+        }
+    ));
+    // Once Archi's host answers, it is ordered before the point: a name-change order
+    // (docs/io-web-v2-stage-2-1.md §5.2).
+    assert!(matches!(
+        decide(
+            &view_serving(&leaf),
+            &both,
+            &ours,
+            Some(now + DAY),
+            &both.names,
+            now
+        ),
+        Decision::Order {
+            main_only: false,
+            name_change: true,
             ..
         }
     ));
@@ -2149,6 +2390,7 @@ fn the_decision_table_judges_a_leaf_by_the_main_name() {
         settings,
         state,
         Some(now - 48 * HOUR),
+        &settings.names,
         now,
     ) {
         Decision::Order { main_only, .. } => main_only,
@@ -2164,7 +2406,14 @@ fn the_decision_table_judges_a_leaf_by_the_main_name() {
     assert!(!overdue(&settings(), &failed_on(&[ARCHI])));
     // A hand-seeded leaf for the main name stays alerted only.
     assert!(matches!(
-        decide(&view_serving(&leaf), &both, &AcmeState::default(), None, now),
+        decide(
+            &view_serving(&leaf),
+            &both,
+            &AcmeState::default(),
+            None,
+            &both.names,
+            now
+        ),
         Decision::AlertOnly(reason) if reason.contains("seeded by hand")
     ));
     // name_not_covered names only the missing name.
@@ -2216,25 +2465,54 @@ fn the_material_check_and_the_chain_check_run_per_name() {
         .is_ok());
 }
 
-#[test]
-fn the_names_come_from_the_public_base_url_and_web() {
+/// The configuration holds the main name alone, the host of admin.public_base_url; the names after
+/// it are the published hosts, read at each use, without a restart: lowercase, sorted and once
+/// each (docs/io-web-v2-stage-2-1.md §5.2).
+#[tokio::test]
+async fn the_names_are_the_main_one_then_the_published_hosts() {
     let url = Some("https://hive-1.example.com");
-    let archi = [ARCHI.to_string()];
-    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url, &archi) {
+    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url) {
         AcmeConfig::On(settings) => {
-            assert_eq!(settings.names, names(&[NAME, ARCHI]));
+            assert_eq!(settings.names, names(&[NAME]));
             assert_eq!(settings.main_name(), NAME);
         }
         _ => panic!("expected on"),
     }
-    let absent = AcmeConfig::from_hive(None, url, &archi);
-    assert_eq!(absent.names(), names(&[NAME, ARCHI]).as_slice());
+    let absent = AcmeConfig::from_hive(None, url);
+    assert_eq!(absent.names(), names(&[NAME]).as_slice());
     assert_eq!(absent.name(), Some(NAME));
-    let off = AcmeConfig::from_hive(Some(&yaml("terms_agreed: false")), url, &archi);
-    assert_eq!(off.names(), names(&[NAME, ARCHI]).as_slice());
+    let off = AcmeConfig::from_hive(Some(&yaml("terms_agreed: false")), url);
+    assert_eq!(off.names(), names(&[NAME]).as_slice());
     // Without a usable public_base_url there is no name at all.
-    let none = AcmeConfig::from_hive(None, Some("http://hive-1.example.com"), &archi);
+    let none = AcmeConfig::from_hive(None, Some("http://hive-1.example.com"));
     assert!(none.names().is_empty() && none.name().is_none());
+
+    let h = Harness::on();
+    assert_eq!(h.service.names(), names(&[NAME]));
+    h.publish(&[
+        "shop.hive-1.example.com",
+        ARCHI,
+        "Docs.Hive-1.example.com.",
+        ARCHI,
+        NAME,
+        "",
+    ]);
+    let live = names(&[
+        NAME,
+        ARCHI,
+        "docs.hive-1.example.com",
+        "shop.hive-1.example.com",
+    ]);
+    assert_eq!(h.service.names(), live);
+    assert_eq!(h.service.settings().expect("on").names, live);
+    assert_eq!(h.service.web_certificate(&[])["names"], json!(live));
+    assert_eq!(h.service.status().await["config"]["names"], json!(live));
+    h.publish(&[]);
+    assert_eq!(h.service.names(), names(&[NAME]));
+    // Without an acme section, the names a renewal would certify all the same.
+    let absent = Harness::absent();
+    absent.publish(&[ARCHI]);
+    assert_eq!(absent.service.names(), names(&[NAME, ARCHI]));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2369,10 +2647,11 @@ fn acme_json_on_disk(order_url: &str) -> String {
     )
 }
 
-/// A harness whose acme.json is `acme_json_on_disk`, its account in the vault: SY.admin restarted
-/// onto it.
-fn restarted_on_acme_json(config: AcmeConfig, order_url: &str) -> Harness {
+/// A harness whose acme.json is `acme_json_on_disk`, its account in the vault, `published` the
+/// published hosts: SY.admin restarted onto it.
+fn restarted_on_acme_json(config: AcmeConfig, published: &[&str], order_url: &str) -> Harness {
     let mut h = Harness::new(config);
+    *lock(&h.published) = names(published);
     h.mesh().put(
         &account_vault_key(DIRECTORY),
         json!({ "id": account_url_for(DIRECTORY) }),
@@ -2387,7 +2666,7 @@ fn restarted_on_acme_json(config: AcmeConfig, order_url: &str) -> Harness {
 #[tokio::test]
 async fn an_acme_json_that_records_names_still_loads() {
     let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
-    let h = restarted_on_acme_json(AcmeConfig::On(settings()), &order_url);
+    let h = restarted_on_acme_json(AcmeConfig::On(settings()), &[], &order_url);
     assert!(
         h.service.state_warning.is_none(),
         "{:?}",
@@ -2418,10 +2697,39 @@ async fn an_acme_json_that_records_names_still_loads() {
     }
 }
 
+/// acme.json keeps its schema 1 (docs/io-web-v2-stage-2-1.md §5.2): one written before the
+/// name-change budget loads in place with an empty budget, and the next write adds it.
+#[tokio::test]
+async fn acme_json_of_0_1_144_keeps_parsing() {
+    assert_eq!(STATE_SCHEMA_VERSION, 1);
+    let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
+    assert!(
+        !acme_json_on_disk(&order_url).contains("name_change_orders"),
+        "0.1.144's fields only"
+    );
+    let h = restarted_on_acme_json(AcmeConfig::On(settings()), &[], &order_url);
+    assert!(
+        h.service.state_warning.is_none(),
+        "{:?}",
+        h.service.state_warning
+    );
+    assert!(h.state().name_change_orders.is_empty());
+    h.service.check_once().await;
+    let written: Value =
+        serde_json::from_str(&fs::read_to_string(h.state_path()).unwrap()).unwrap();
+    assert_eq!(written["schema_version"], 1);
+    assert_eq!(written["name_change_orders"], json!([]));
+    let mut state: AcmeState = serde_json::from_value(written).expect("parses");
+    state.name_change_orders = vec![1_761_000_000];
+    let again: AcmeState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).expect("parses");
+    assert_eq!(again.name_change_orders, vec![1_761_000_000]);
+}
+
 #[tokio::test]
 async fn a_recorded_one_name_order_is_not_resumed_for_two_names() {
     let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
-    let h = restarted_on_acme_json(AcmeConfig::On(settings_with_archi()), &order_url);
+    let h = restarted_on_acme_json(AcmeConfig::On(settings()), &[ARCHI], &order_url);
     assert!(h.service.state_warning.is_none());
     h.service.check_once().await;
     assert!(h.ca().log.resumed.is_empty());
@@ -2507,29 +2815,44 @@ fn the_decision_table_rows() {
     let mut disk = view_serving(&leaf);
     disk.mode = Some("disk".to_string());
     assert!(matches!(
-        decide(&disk, &settings, &empty, None, now),
+        decide(&disk, &settings, &empty, None, &settings.names, now),
         Decision::LeaveAlone(_)
     ));
     let mut other_key = view_serving(&leaf);
     other_key.tls_vault_key = Some("vault_db_password".to_string());
     assert!(matches!(
-        decide(&other_key, &settings, &empty, None, now),
+        decide(&other_key, &settings, &empty, None, &settings.names, now),
         Decision::LeaveAlone(_)
     ));
 
     // awaiting, not_found: order now, nothing to replace.
     assert_eq!(
-        decide(&view_awaiting("not_found"), &settings, &empty, None, now),
+        decide(
+            &view_awaiting("not_found"),
+            &settings,
+            &empty,
+            None,
+            &settings.names,
+            now
+        ),
         Decision::Order {
             replaces: None,
             reason: "the edge has no certificate: there is nothing to replace".to_string(),
             main_only: false,
+            name_change: false,
         }
     );
     // awaiting, any other verdict: reload, never order.
     for verdict in ["forbidden", "invalid_material", "transient"] {
         assert!(matches!(
-            decide(&view_awaiting(verdict), &settings, &empty, None, now),
+            decide(
+                &view_awaiting(verdict),
+                &settings,
+                &empty,
+                None,
+                &settings.names,
+                now
+            ),
             Decision::Reload(_)
         ));
     }
@@ -2538,10 +2861,17 @@ fn the_decision_table_rows() {
     let ours = issued_state(&leaf, now - 40 * DAY);
     let renew_at = now + 5 * DAY;
     assert!(matches!(
-        decide(&view_serving(&leaf), &settings, &ours, Some(renew_at), now),
+        decide(&view_serving(&leaf), &settings, &ours, Some(renew_at), &settings.names, now),
         Decision::Idle { renew_at: at, .. } if at == renew_at
     ));
-    match decide(&view_serving(&leaf), &settings, &ours, Some(now - 1), now) {
+    match decide(
+        &view_serving(&leaf),
+        &settings,
+        &ours,
+        Some(now - 1),
+        &settings.names,
+        now,
+    ) {
         Decision::Order { replaces, .. } => {
             let replaces = replaces.expect("replaces");
             assert_eq!(replaces.serial, leaf.serial);
@@ -2555,17 +2885,31 @@ fn the_decision_table_rows() {
     // Issued less than a third of its lifetime ago: the cap holds even a due renewal.
     let recent = issued_state(&leaf, now - 10 * DAY);
     assert!(matches!(
-        decide(&view_serving(&leaf), &settings, &recent, Some(now - 1), now),
+        decide(&view_serving(&leaf), &settings, &recent, Some(now - 1), &settings.names, now),
         Decision::Held { until: Some(until), .. } if until == now + 20 * DAY
     ));
     // Without ARI the renewal point is two thirds of the lifetime (day 60 of 90 here).
     let two_thirds = leaf.not_before + (leaf.not_after - leaf.not_before) * 2 / 3;
     assert!(matches!(
-        decide(&view_serving(&leaf), &settings, &ours, None, two_thirds - 1),
+        decide(
+            &view_serving(&leaf),
+            &settings,
+            &ours,
+            None,
+            &settings.names,
+            two_thirds - 1
+        ),
         Decision::Idle { .. }
     ));
     assert!(matches!(
-        decide(&view_serving(&leaf), &settings, &ours, None, two_thirds),
+        decide(
+            &view_serving(&leaf),
+            &settings,
+            &ours,
+            None,
+            &settings.names,
+            two_thirds
+        ),
         Decision::Order { .. }
     ));
 
@@ -2588,30 +2932,45 @@ fn the_decision_table_rows() {
             &settings,
             &waiting,
             Some(now - 1),
+            &settings.names,
             now
         ),
         Decision::Reload(_)
     ));
     assert!(matches!(
-        decide(&view_awaiting("not_found"), &settings, &waiting, None, now),
+        decide(
+            &view_awaiting("not_found"),
+            &settings,
+            &waiting,
+            None,
+            &settings.names,
+            now
+        ),
         Decision::Reload(_)
     ));
 
     // A hand-seeded leaf, or one for another name: alerts only.
     assert!(matches!(
-        decide(&view_serving(&leaf), &settings, &empty, None, now + 70 * DAY),
+        decide(&view_serving(&leaf), &settings, &empty, None, &settings.names, now + 70 * DAY),
         Decision::AlertOnly(reason) if reason.contains("seeded by hand")
     ));
     let (other, _) = pki.seeded(&["other.example.org"], now - DAY, now + 80 * DAY);
     assert!(matches!(
-        decide(&view_serving(&leaf_of(&other)), &settings, &empty, None, now),
+        decide(&view_serving(&leaf_of(&other)), &settings, &empty, None, &settings.names, now),
         Decision::AlertOnly(reason) if reason.contains("does not cover")
     ));
     // A leaf this account issued for another name is not renewed automatically either.
     let mut renamed = settings.clone();
     renamed.names = vec!["hive-2.example.com".to_string()];
     assert!(matches!(
-        decide(&view_serving(&leaf), &renamed, &ours, Some(now - 1), now),
+        decide(
+            &view_serving(&leaf),
+            &renamed,
+            &ours,
+            Some(now - 1),
+            &renamed.names,
+            now
+        ),
         Decision::AlertOnly(_)
     ));
 }
@@ -3272,10 +3631,10 @@ fn the_name_is_the_lowercase_host_of_the_public_base_url() {
 fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
     let url = Some("https://hive-1.example.com");
     assert!(matches!(
-        AcmeConfig::from_hive(None, url, &[]),
+        AcmeConfig::from_hive(None, url),
         AcmeConfig::Absent { ref names } if names == &[NAME.to_string()]
     ));
-    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url, &[]) {
+    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url) {
         AcmeConfig::On(settings) => {
             assert_eq!(settings.names, vec![NAME.to_string()]);
             assert_eq!(settings.directory_url, LETS_ENCRYPT_DIRECTORY);
@@ -3292,7 +3651,6 @@ fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
             "terms_agreed: true\ndirectory_url: https://acme.example.net/dir\nstaging_directory_url: https://acme-staging.example.net/dir\nprofile: classic\ncontact: mailto:ops@example.com",
         )),
         url,
-        &[],
     ) {
         AcmeConfig::On(settings) => {
             assert_eq!(settings.directory_url, "https://acme.example.net/dir");
@@ -3320,7 +3678,7 @@ fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
         ),
         ("[1, 2]", "not a mapping"),
     ] {
-        let reason = off_reason(&AcmeConfig::from_hive(Some(&yaml(section)), url, &[]));
+        let reason = off_reason(&AcmeConfig::from_hive(Some(&yaml(section)), url));
         assert!(reason.contains(why), "{section}: {reason}");
     }
     for (base, why) in [
@@ -3333,7 +3691,6 @@ fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
         let reason = off_reason(&AcmeConfig::from_hive(
             Some(&yaml("terms_agreed: true")),
             base,
-            &[],
         ));
         assert!(reason.contains(why), "{base:?}: {reason}");
     }
@@ -3349,7 +3706,7 @@ fn a_trust_anchor_is_read_at_boot() {
         "terms_agreed: true\ntrust_anchor: {}",
         path.display()
     ));
-    match AcmeConfig::from_hive(Some(&section), Some("https://hive-1.example.com"), &[]) {
+    match AcmeConfig::from_hive(Some(&section), Some("https://hive-1.example.com")) {
         AcmeConfig::On(settings) => assert_eq!(settings.trust_anchor_roots.len(), 1),
         _ => panic!("expected on"),
     }
@@ -3361,8 +3718,7 @@ fn a_trust_anchor_is_read_at_boot() {
     ));
     assert!(off_reason(&AcmeConfig::from_hive(
         Some(&section),
-        Some("https://hive-1.example.com"),
-        &[]
+        Some("https://hive-1.example.com")
     ))
     .contains("holds no certificate"));
 }

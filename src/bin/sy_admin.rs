@@ -744,8 +744,7 @@ async fn main() -> Result<(), AdminError> {
     let exposures = exposures::Exposures::load(&state_dir, Arc::new(now_epoch_ms));
     // The ACME client (docs/acme-edge-certificates-v1.md §6, §7). Its configuration never fails
     // the boot: a section that cannot work turns ACME off, and the log and /acme/status say why.
-    let acme_config =
-        acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref(), &[]);
+    let acme_config = acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref());
     match &acme_config {
         acme::AcmeConfig::Off { .. } => tracing::error!("{}", acme_config.describe()),
         _ => tracing::info!("{}", acme_config.describe()),
@@ -777,6 +776,13 @@ async fn main() -> Result<(), AdminError> {
             random: Arc::new(rand::random::<f64>),
             platform_roots: Arc::new(acme::platform_roots),
             timings: acme::Timings::default(),
+            // The names after the main one: the published exposures' hosts, read live
+            // (docs/io-web-v2-stage-2-1.md §5.2).
+            names: {
+                let exposures = Arc::clone(&exposures);
+                Arc::new(move || exposures.hosts())
+            },
+            resolver: Arc::new(acme::SystemResolver),
         },
         state_dir.join("sy-admin/acme.json"),
         self_ilk_id.clone(),
