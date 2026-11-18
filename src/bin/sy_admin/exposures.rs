@@ -79,6 +79,12 @@ pub(crate) const ENABLE_MAX_SECS: u64 = 8 * 3_600;
 /// `pending` for the 60 s loops to send again.
 pub(crate) const EXPOSURE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// io.web's set is pushed at each change and every 60 s (§2.3), so an io.web that was stopped or
+/// restarted holds it within a minute; a write a closing change left undone is tried again then.
+pub(crate) const IO_WEB_PUSH_INTERVAL: Duration = Duration::from_secs(60);
+/// One push of the loop waits this long, as one of the edge's routes does.
+pub(crate) const IO_WEB_LOOP_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Fluxbee's own ports, never an upstream's, whatever its kind (§2.2): where each is set.
 pub(crate) const REFUSED_UPSTREAM_PORTS: &[(u16, &str)] = &[
     (22, "SSH"),
@@ -373,6 +379,41 @@ impl Exposures {
         prune_ended(&mut registry.file, now_ms / 1_000);
         registry.file.generation = next_generation(registry.file.generation, now_ms);
         registry.unpersisted = Some("not written yet".to_string());
+    }
+
+    /// Write again what a closing change left unwritten: true when the file holds what memory
+    /// holds. The caller holds the exposure lock, so no change is under way.
+    pub(crate) fn retry_persist(&self) -> bool {
+        if self.persisted() {
+            return true;
+        }
+        let written = self.persist().is_ok();
+        if written {
+            tracing::info!(
+                path = %self.path.display(),
+                "the exposures registry is written: the file holds the last change again"
+            );
+        }
+        written
+    }
+
+    /// The loop (§2.3, §5.1): every minute, the write a closing change left undone (under the
+    /// exposure lock: a change under way writes and pushes for itself), then io.web's whole set.
+    pub(crate) async fn run_io_web(
+        self: Arc<Self>,
+        client: Arc<RouterDispatcher>,
+        hive_id: String,
+    ) {
+        let mut ticker = tokio::time::interval(IO_WEB_PUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Some(_one_write) = self.try_lock() {
+                self.retry_persist();
+            }
+            self.push_io_web(&client, &hive_id, IO_WEB_LOOP_CALL_TIMEOUT)
+                .await;
+        }
     }
 
     /// Write what memory holds. A failure is kept, logged, and written again every minute.
@@ -921,6 +962,16 @@ impl Exposures {
                 before = %before,
                 "io.web did not answer the exposures; pushed again every minute"
             ),
+            IoWebAnswer::Absent(detail)
+                if self.read(|registry| registry.file.exposures.is_empty()) =>
+            {
+                tracing::info!(
+                    generation,
+                    detail = %detail,
+                    before = %before,
+                    "no io.web to push the (empty) exposures to"
+                )
+            }
             IoWebAnswer::Absent(detail) => tracing::warn!(
                 generation,
                 detail = %detail,

@@ -790,6 +790,9 @@ async fn main() -> Result<(), AdminError> {
     );
     tokio::spawn(Arc::clone(&acme_service).run());
     tokio::spawn(Arc::clone(&web_routes).run(Arc::clone(&router_client)));
+    // io.web's set every minute, and a write a closing change left undone
+    // (docs/io-web-v2-stage-2-1.md §2.3).
+    tokio::spawn(Arc::clone(&exposures).run_io_web(Arc::clone(&router_client), hive_id.clone()));
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),

@@ -1274,6 +1274,55 @@ async fn disable_answers_persisted_false_when_the_write_fails() {
     assert!(admin.ctx.exposures.file().exposures[0]
         .enablements
         .is_empty());
+
+    // Tried again while the way is blocked; then written once it is clear.
+    assert!(!admin.ctx.exposures.retry_persist());
+    fs::remove_dir_all(&admin.mesh.registry).expect("the directory");
+    assert!(admin.ctx.exposures.retry_persist());
+    assert!(admin.ctx.exposures.persisted());
+    assert_eq!(admin.on_disk(), admin.ctx.exposures.file());
+    assert!(admin.on_disk().exposures[0].enablements.is_empty());
+}
+
+/// The loop (§2.3): at once and then every minute, it writes what a closing change left
+/// unwritten, then pushes io.web's whole set, so an io.web that was stopped (kill_node) holds it
+/// within a minute of its return.
+#[tokio::test(start_paused = true)]
+async fn the_io_web_loop_writes_what_a_closing_change_left_and_pushes_every_minute() {
+    let mut admin = exposures_admin("web21-loop", Some(EDGE));
+    let id = admin.publish("shop", shop_upstream()).await;
+    admin.enable(&id, 3600).await;
+    // io.web is stopped, and the write fails: the disable is done all the same.
+    admin.mesh.io_web = IoWebScript::Absent;
+    fs::remove_file(&admin.mesh.registry).expect("the file");
+    fs::create_dir_all(admin.mesh.registry.join("in-the-way")).expect("a directory");
+    let (answer, _) = admin
+        .cloud("disable_exposure", json!({ "exposure_id": id }))
+        .await;
+    assert_eq!(answer.envelope["payload"]["persisted"], false);
+    let generation = admin.ctx.exposures.file().generation;
+    assert!(!admin.ctx.exposures.io_web_acknowledged(generation));
+
+    // The way is clear and io.web is back.
+    fs::remove_dir_all(&admin.mesh.registry).expect("the directory");
+    admin.mesh.io_web = IoWebScript::Ready;
+    let exposures = Arc::clone(&admin.ctx.exposures);
+    let looping = tokio::spawn(
+        Arc::clone(&exposures).run_io_web(Arc::clone(&admin.ctx.rpc), "motherbee".to_string()),
+    );
+    serve(&mut admin.harness, &mut admin.mesh).await;
+    let sent = std::mem::take(&mut admin.mesh.sent);
+    assert_eq!(names_of(&sent), [MSG_IO_WEB_EXPOSURES]);
+    assert!(set_of(&sent[0]).exposures[0].enablements.is_empty());
+    assert!(exposures.persisted());
+    assert_eq!(admin.on_disk(), exposures.file());
+    assert!(exposures.io_web_acknowledged(generation));
+
+    tokio::time::advance(IO_WEB_PUSH_INTERVAL).await;
+    serve(&mut admin.harness, &mut admin.mesh).await;
+    let sent = std::mem::take(&mut admin.mesh.sent);
+    assert_eq!(names_of(&sent), [MSG_IO_WEB_EXPOSURES], "a minute later");
+    looping.abort();
 }
 
 /// unpublish: the exposure leaves memory, the edge's routes and io.web's set are pushed while the
