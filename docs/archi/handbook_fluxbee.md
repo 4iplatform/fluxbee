@@ -1255,6 +1255,61 @@ Rules for Archi:
 - If expiration is not specified, Admin defaults to 24 hours and clamps requested lifetimes to the
   supported range. Do not build independent expiry policy into the producer.
 
+### 4.3.2 Web exposures (io.web)
+
+An exposure is one host on the public edge, `<label>.<main name>`, leading to one fixed upstream
+(Archi, a worker and a port, or a private address and a port) through `IO.web@motherbee`, and
+opened for a window by an enablement. A person enters with a one-time link, then a session
+cookie. Design: [io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md).
+
+**Fluxbee Cloud alone changes them.** `publish_exposure`, `enable_exposure`, `disable_exposure`,
+`unpublish_exposure` and `issue_exposure_link` reach SY.admin only through IO.cloud's relay. For
+you, the operator and the executor each answers `403 UNAUTHORIZED`: never stage one in a plan,
+and if one comes back `UNAUTHORIZED`, say that the change is Fluxbee Cloud's and never retry it.
+When the operator wants an exposure published, opened, closed, removed or a link, it is done in
+Fluxbee Cloud. You never see a link, and never ask for one.
+
+**Reading them.** Read `/web/status` with `fluxbee_system_get` (`web_status`, a read; it always
+answers 200). Its `exposures` part holds each exposure's view:
+
+- `exposure_id` (`exp:<uuid>`), `label`, `host`, `url`, `upstream`, `published_at`;
+- `state`: `closed`, or `enabled` until `enabled_until` (RFC 3339; Cloud renews before it ends);
+- `certificate.state`, with `detail` and `retry_at`, and what each asks of the operator:
+  - `covered`: the served certificate names the host. Nothing to do.
+  - `pending`: an order is due or running, or the host's DNS name is resolved at the next check.
+    Wait a few minutes and read again.
+  - `waiting_dns`: the host's DNS name does not answer the main name's addresses (`detail` says
+    what it resolves to). The operator adds or fixes the DNS record (a CNAME to the main name, or
+    the same addresses); SY.admin resolves it again every 5 min (`retry_at`) and orders it then.
+  - `failed`: the CA refused it (`detail` has its error: DNS, a CAA record, the edge); it is
+    tried again after `retry_at`.
+  - `held`: name-change orders go one per 15 min and five per 7 days, or the backoff or the CA's
+    rate limit holds every order, until `retry_at`. To order now, the operator confirms a plan
+    with `acme_renew` (`POST /acme/renew`; never past the CA's rate limit). With no `retry_at`, the
+    served certificate is not this ACME account's: `acme_renew` replaces it.
+  - `off`: no ACME client, or it is off (`/acme/status` says why): the operator certifies by hand.
+- `route.state`: `acknowledged` (the edge serves the host), `pending` (pushed again every minute),
+  or `no_edge` (no public edge resolves);
+- `io_web.state`: `acknowledged` (io.web holds the current set), `pending` (io.web has not taken
+  it: stopped, restarting or slow; it gets it within a minute of its return), or `absent`
+  (`IO.web@motherbee` was never launched).
+
+`web` lists the published hosts (`state` `published`, `none`, or `unreadable`: the registry file
+could not be read at SY.admin's start, `reason` says why, and every change is refused until the
+operator fixes or removes the file and restarts SY.admin). `io_web.exposures` says what io.web
+last answered and whether it holds each open exposure's key. `/acme/status` shows the
+certificate's names and DNS resolutions.
+
+**What the operator does:**
+
+- An exposure Cloud cannot enable because io.web is absent (`IO_WEB_ABSENT`): stage
+  `run_node IO.web@motherbee` in the root tenant, in a plan the operator confirms.
+- **The brake** is `kill_node IO.web@motherbee`, in a plan the operator confirms: every exposure's
+  host then answers the edge's 502, and the exposures stay published. `run_node` brings io.web
+  back, and it gets the set within a minute.
+- hive.yaml's `web:` section is retired: Archi's own host is the exposure Cloud publishes with the
+  upstream `archi`. A `web:` left in hive.yaml is ignored.
+
 ### 4.4 SY nodes
 
 Every `SY.*` node is a core node, system infrastructure (an `RT.*` name is the router's own, a

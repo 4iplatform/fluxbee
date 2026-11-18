@@ -213,7 +213,7 @@ A new node is not a special case. Every leg of Fluxbee has to know it:
 | Vault | its secrets (for example the key that signs sessions) by `vault_ref` |
 | SY.admin | the actions and HTTP routes that declare proxy routes and mint codes; `mesh_access` rows; the action catalog |
 | Router and policy | its name and the messages it exchanges; whatever the system policy needs |
-| The edge | the third surface: proxy routes pushed by SY.admin, rebuilt after a reimage, the certificates per host |
+| The edge | the third surface: proxy routes pushed by SY.admin, rebuilt after a reimage, one certificate with a name per host |
 | Cloud | the operation that asks for the code, relayed by io.cloud (the Cloud tables and catalog) |
 | Archi | its tools and handbook, and its write list if new actions mutate |
 | Observability | logs in its unit's journal (its mesh messages are all system ones, which the router stream does not copy); `NODE_STATUS_GET` with the port's state in `extensions.web`; health in `ops.py health` |
@@ -481,10 +481,17 @@ These come from the security review:
 The operator's words are quoted in Spanish; everything else is the decision as agreed in that
 conversation. The code was read first: §12.1 is what exists today.
 
+**Status:** stage 2.1, §12.6's step 1, is built in four releases
+([io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) §8): R1 (the SDK's messages and the reserved
+vault prefix) and R2 (the router) are live in 0.1.145 and 0.1.146; R3 brings SY.admin's
+exposures (the registry, the actions only Fluxbee Cloud asks for, the certificate's names read
+live) with the edge, io.web and io.cloud; R4, Cloud's catalog, opens them to Cloud. hive.yaml's
+`web:` is retired with R3: Archi's host is the exposure Cloud publishes.
+
 ### 12.1 What exists (read in the code, 2026-11-13)
 
 - **The pipe is built and secure** (0.1.84–0.1.85, its limits 0.1.99):
-  - the edge terminates TLS with ACME certificates per host and routes by host;
+  - the edge terminates TLS with one ACME certificate, a name per host, and routes by host;
   - it connects to one fixed upstream only, io.web on the motherbee's port 9200, over mutual TLS;
   - io.web admits only the mesh certificate of a connected ingress, re-checked during the
     connection;

@@ -5,7 +5,10 @@ a Let's Encrypt certificate (lab/DEPLOYMENTS.md, 0.1.82). Design of 2026-10-21, 
 review round (protocol and security, fit with the code, operations). **Decisions:** the operator's O6 (2026-10-13), D1–D5 and the naming rules
 (2026-10-20). **Findings:** FINDINGS A-78 (new), PENDING-BUGS PB-1. **0.1.84:** one certificate
 for several names, the main one and the web hosts `web:` declares ([io-web-v2](io-web-v2.md)
-§11.1); §3, §6, §7 and §9 say what changed.
+§11.1); §3, §6, §7 and §9 say what changed. **io.web's stage 2.1 (R3):** the names after the main
+one are the published exposures' hosts, read live; `web:` is retired; a published host is ordered
+at once, outside the cap, once its DNS name answers ([io-web-v2-stage-2-1](io-web-v2-stage-2-1.md)
+§5.2; §3, §6 and §7 below).
 
 Each installation's public edge serves its own certificate from an ACME certificate authority, issued
 and renewed with no human step, validated with TLS-ALPN-01 on the :443 the edge already opens. The
@@ -13,9 +16,9 @@ CA is Let's Encrypt unless configured otherwise. Nothing in the code names a dom
 the names and the CA come from `hive.yaml`, so the open-source package works under any domain.
 
 Out of scope for v1:
-- `cloud.<id>`: not planned. `archi.<id>` is a web host since 0.1.84: the edge terminates it and
-  proxies it to io.web ([io-web-v2](io-web-v2.md)), and this client certifies it with the main
-  name (§3).
+- `cloud.<id>`: not planned. Archi's host, and every other host an exposure publishes, is a web
+  host: the edge terminates it and proxies it to io.web ([io-web-v2](io-web-v2.md)), and this
+  client certifies it with the main name (§3).
 - More than one edge per installation (O7).
 - DNS automation and wildcard certificates.
 - External Account Binding, for CAs that need it.
@@ -32,7 +35,7 @@ Out of scope for v1:
 | D3 | Renew in the window the CA suggests (ARI, RFC 9773), else at two thirds of the lifetime. Alerts are relative to the lifetime; O6's fixed 21-day alert goes. |
 | D4 | The CA's default profile unless configured. At Let's Encrypt that is `classic`: 90 days today, 64 from 2027-02-10, 45 from 2028-02-16. Every rule here works with 45-day certificates. |
 | D5 | First an order against Let's Encrypt staging with the real PROD name, never installed; then production. |
-| Names | The certified name is the host of `admin.public_base_url`, so the URLs the system hands out and the certificate cannot disagree. Since 0.1.84 it is the main name of one certificate that also carries the web hosts `web:` declares (§3). |
+| Names | The certified name is the host of `admin.public_base_url`, so the URLs the system hands out and the certificate cannot disagree. It is the main name of one certificate that also carries the published exposures' hosts, read live (§3; `web:`'s hosts from 0.1.84 until io.web's stage 2.1). |
 | Egress | The internet probe takes its target from `hive.yaml` (`egress.reachability_url`). There is no default. |
 | Examples | Shipped examples use neutral names (`edge_tls`, `example.com`). |
 
@@ -126,20 +129,19 @@ acme:
   profile: "classic"                    # optional: the CA's default when absent
   contact: "mailto:ops@example.com"     # optional (Let's Encrypt no longer emails)
   trust_anchor: "/etc/fluxbee/acme-ca.pem"   # optional, only for a private CA
-web:
-  archi: true                           # optional (0.1.84): archi.<the main name> joins the certificate
 ```
 
 - **Without `acme:`** nothing is ordered. The edge serves a certificate seeded by hand, as today, and
   the expiry checks and alerts of §7 still run.
-- **The names (0.1.84).** The main name comes first; then each web host of `web:`
-  ([io-web-v2](io-web-v2.md) §11.1), a label before the main name (`archi: true` declares
-  `archi.<main name>`). `web:` needs one key set: a bare `web:` declares nothing, and a section that
-  cannot work declares nothing and says why in the boot log. One certificate carries every name.
-- **Adding a name is explicit,** as a new main name is: the served certificate only raises
-  `name_not_covered` for it, and the cap holds automatic orders. The operator adds `web:`, restarts
-  SY.admin, runs `POST /acme/test` (the staging order validates every name), then `POST /acme/renew`
-  (forced, past the cap). Removing a name takes effect at the next renewal.
+- **The names.** The main name comes first; then the published exposures' hosts
+  ([io-web-v2-stage-2-1](io-web-v2-stage-2-1.md) §2.1, §5.2), each `<label>.<main name>`, sorted,
+  read live at each use (SY.admin's registry, `AcmeDeps.names`): no restart, no configuration. One
+  certificate carries every name. hive.yaml's `web:`, which declared them from 0.1.84, is retired:
+  a section left there is ignored, with one warning at boot.
+- **A published host is ordered at once** (a name-change order, §7), once its DNS name answers the
+  main name's addresses (§6 step 2); a host still waiting raises `name_not_covered`. An unpublished
+  host orders nothing: it leaves at the next renewal. `POST /acme/renew` still orders now, past
+  the cap and the name-change budget.
 - **A section that cannot work turns ACME off.** SY.admin keeps running, and `/acme/status` and the
   log say why. That happens when:
   - `terms_agreed` is not `true`;
@@ -157,8 +159,8 @@ web:
 |---|---|---|---|
 | The certificate and its private key | SY.vault, under the ingress' `edge.tls_vault_key` (PROD `edge_tls_fluxbee_ai`, new installs `edge_tls`) | `SY.edge@<ingress>` | `{cert, key}` PEM, `resource_type: tls`, root tenant. One previous version for rollback. Only the edge reads it. |
 | The ACME account | SY.vault, `acme_account:<16 hex of SHA-256(directory_url)>` | `SY.admin@motherbee` | The library's credentials JSON; the URL in the metadata description. Cloud and the admin API cannot write it. |
-| Order state | `state_dir/sy-admin/acme.json` on the motherbee | | The account URL per directory, the order in flight, the last attempt, the last 20 issued certificates (serial, dates, names, profile), the last edge status seen, the conditions. No key. An order and a certificate record their `names`. |
-| The names | `admin.public_base_url` and `web:` (motherbee) | | |
+| Order state | `state_dir/sy-admin/acme.json` on the motherbee | | The account URL per directory, the order in flight, the last attempt, the last 20 issued certificates (serial, dates, names, profile), the last edge status seen, the conditions, the name-change orders of the last 7 days (`name_change_orders`). No key. An order and a certificate record their `names`. Schema 1 throughout: a file of 0.1.144 loads in place. |
+| The names | `admin.public_base_url` (the main one) and the exposures registry (motherbee; the published hosts) | | |
 | The edge's secret name | `edge.tls_vault_key` (ingress) | | SY.admin asks the edge for it, and accepts only names that start with `edge_tls`. |
 
 ---
@@ -274,7 +276,13 @@ single in-flight slot. A busy slot answers 409.
    - When the secret exists, its metadata must say `resource_type: tls`, root tenant, owner = this
      edge. That keeps a compromised edge from steering SY.admin's write onto another secret.
    - Confirm the vault answers before any CA call.
-2. **Order.** One `newOrder` with every name as an identifier, the main one first, with the profile.
+2. **Order.** One `newOrder` with its names as identifiers, the main one first, with the profile.
+   - **DNS first** ([io-web-v2-stage-2-1](io-web-v2-stage-2-1.md) §5.2). The names are the main
+     one, every published host the served leaf covers, and each other one whose DNS name answers
+     the main name's addresses: every address it resolves to is one of the main name's. SY.admin
+     resolves the hosts the leaf misses with the system's resolver, at most every 5 min, in
+     memory. A host still waiting is left out, so it never fails the order for every name, and
+     the check comes back within 5 min. A test order carries every name.
    - `replaces` is the served leaf's ARI identifier, and only when `acme.json` records that serial as
      issued to this account by this directory.
    - If an error points to `replaces`, the order is retried once without it.
@@ -363,24 +371,42 @@ order. It reads `EDGE_TLS_STATUS`:
 | serves a leaf this account issued; no ARI answer | renew at two thirds of its lifetime | n/a |
 | `acme.json` holds a newer certificate than the served one | `EDGE_TLS_RELOAD`, never a new order | n/a |
 | serves a leaf seeded by hand, or for another main name | alert only (`foreign_certificate` at its renewal point, `name_not_covered`); `POST /acme/renew` replaces it | expiry checks only |
-| serves a leaf this account issued for the main name that misses an added name (0.1.84) | `name_not_covered`; renewed at its point, with every name; `POST /acme/renew` certifies the name now | n/a |
+| serves a leaf this account issued for the main name that misses a published host whose DNS name answers | a name-change order now, outside the cap, within its budget | n/a |
+| serves a leaf this account issued for the main name that misses a published host still waiting for its DNS name | `name_not_covered`; renewed at its point; `POST /acme/renew` orders now | n/a |
 
 - **Name coverage:** a wildcard SAN covers one leftmost label. PROD's `*.fluxbee.ai` covers
   `hive-k3m9x7q2.fluxbee.ai`, not `archi.hive-k3m9x7q2.fluxbee.ai`. A leaf is judged by the main
-  name; each other name only raises `name_not_covered`.
+  name; a published host it misses raises `name_not_covered` until a name-change order (below)
+  certifies it.
 - **Failures back off** 1 h, 2 h, 4 h and so on, up to 24 h. The failure count and the next attempt
   are kept in `acme.json`.
   - That stays under Let's Encrypt's limit of 5 failed validations per account and name per hour.
   - A `rateLimited` answer waits until the time the CA sends, or 24 h.
-- **The cap:** at most one issuance per third of the current lifetime, unless the order is forced. A
-  clock far ahead or a bug cannot burn the weekly limit.
+- **The cap:** at most one issuance per third of the current lifetime, unless the order is forced
+  or a name-change order. A clock far ahead or a bug cannot burn the weekly limit.
+- **Name-change orders** ([io-web-v2-stage-2-1](io-web-v2-stage-2-1.md) §5.2). A published host
+  the leaf this account issued misses, its DNS name answering, is due now: an order with the main
+  name, the names the leaf covers and the new ones, replacing the leaf. It is outside the cap,
+  held by an `install_refused`, the CA's rate limit and the backoff like any order, and has a
+  budget of its own: one per 15 min (the hosts published meanwhile ride the next one) and five per
+  rolling 7 days, recorded in `acme.json`. Past the budget the host is `held` until it frees;
+  `POST /acme/renew` overrides. It never falls back to the main name alone: that would spend an
+  issuance on the names the edge already serves. A publish wakes the check at once; a change while
+  a run holds the slot is checked within a minute. A dropped host orders nothing.
+- **A host's certificate,** in each exposure's view (`host_certificate`), with no call: `covered`
+  (the leaf the edge served at the last look names it), `pending` (an order is due or running, or
+  the host is not resolved yet), `waiting_dns` (its DNS name does not answer the main name's
+  addresses; `retry_at` the next resolution), `failed` (the last attempt failed on it; `retry_at`
+  the backoff's end), `held` (the budget, the backoff, the rate limit or an `install_refused`,
+  until `retry_at`; or a leaf this account did not issue, which `POST /acme/renew` replaces) or
+  `off` (no ACME: the operator certifies by hand).
 
 **Operator actions:**
 
 | Action | Effect |
 |---|---|
-| `GET /acme/status` | the configuration and why it is off, if it is (`config.names`: every name, the main one first); the terms URL; the accounts; the edge's live status, and which names the served leaf misses (`edge.names_missing`); the order in flight and its progress; the last attempt; the next check and the ARI window; the last issued certificates; the conditions open now |
-| `POST /acme/renew` | an order now: replaces a hand-seeded or foreign certificate, certifies a new name (a new main name, or a web host). Needs confirmation; answers 202. |
+| `GET /acme/status` | the configuration and why it is off, if it is (`config.names`: every name, the main one first); the terms URL; the accounts; the edge's live status, and which names the served leaf misses (`edge.names_missing`); the order in flight and its progress; the last attempt; the next check and the ARI window; the last issued certificates; the conditions open now; the published hosts' DNS resolutions (`dns`: `state` ready or waiting, `addresses`, `detail`, `resolved_at`) and the name-change orders (`name_change_orders`: `started`, `next_allowed_at`). |
+| `POST /acme/renew` | an order now, past the backoff, the cap and the name-change budget, never past the CA's rate limit: replaces a hand-seeded or foreign certificate, certifies a new main name or a published host now. Its names are the ones an order carries (a host waiting for its DNS name stays out). Needs confirmation; answers 202. |
 | `POST /acme/test` | the staging order of §6. Needs confirmation; answers 202. |
 | `POST /acme/reload` | `EDGE_TLS_RELOAD`, after a manual change or a vault rollback |
 
@@ -478,6 +504,13 @@ keeps parsing, and without `web:` the names are the one main name. Then, each st
 **Rollback:** 0.1.83 cannot read the `names` lists 0.1.84 writes. It sets `acme.json` aside and
 starts empty, so it judges the served leaf hand-seeded (alerts only, `foreign_certificate` at its
 renewal point) until a `POST /acme/renew`.
+
+**io.web's stage 2.1 (R3): the names from the exposures** ([io-web-v2-stage-2-1](io-web-v2-stage-2-1.md)
+§5.2). The upgrade retires `web:` (a section left in `hive.yaml` is ignored, with one warning at
+boot), and `acme.json` keeps parsing. Until Cloud publishes Archi's exposure (label `archi`,
+upstream `archi`), the names are the main one alone: the served leaf keeps Archi's name until its
+renewal, which drops it. Once published, `archi.<main name>` is the leaf's already: nothing is
+ordered.
 
 ---
 

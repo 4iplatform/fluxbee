@@ -70,16 +70,20 @@ fails with `missing_ai_api_key`.
    whole hive restarts at once, so the read waits for a vault that does not answer yet, up to 60 s
    (`resolve_resource_awaiting_vault`, `VAULT_BOOT_WAIT`; FINDINGS A-141), and the admin serves
    meanwhile. Until the key is read, and with no key in the vault, the executor is unavailable.
-8. Reads the `web:` section (`WebConfig::from_hive`) and logs the web hosts it declares, then the
-   `acme:` section and the certified names (`AcmeConfig::from_hive`): the main name, then those
-   hosts. A section that cannot work declares nothing (`web:`) or turns ACME off (`acme:`) with a
-   reason, in the log (and in `GET /acme/status`); neither stops the start.
+8. Warns once when hive.yaml still holds the retired `web:` section (`warn_retired_web_section`),
+   loads the exposures registry (`Exposures::load`, [The exposures](#the-exposures)), then reads
+   the `acme:` section and the main certified name (`AcmeConfig::from_hive`). An `acme:` section
+   that cannot work turns ACME off with a reason, in the log (and in `GET /acme/status`); a
+   registry that cannot be read is kept for the operator and refuses every exposure change.
+   Neither stops the start.
 9. Starts the HTTP server, the `NODE_STATUS_GET` loop, the `ADMIN_COMMAND` loop, the system loop
    (`CONFIG_GET`, `CONFIG_SET`, `VAULT_SECRET_CHANGED`), the publication expiry sweep (every
    600 s, `run_publication_expiry_sweep`), the ACME check (2 min after the start, then about
-   every 6 h, `AcmeService::run`; see [The ACME client](#the-acme-client)), the web routes push
-   (at once, then every 60 s, `WebRoutes::run`; see [The web hosts](#the-web-hosts)) and the
-   installation update's background task, which picks an open update up from disk
+   every 6 h, `AcmeService::run`, woken when the published hosts change; see
+   [The ACME client](#the-acme-client)), the web routes push (at once, then every 60 s,
+   `WebRoutes::run`; see [The web routes](#the-web-routes)), io.web's set (at once, then every
+   60 s, `Exposures::run_io_web`; see [The exposures](#the-exposures)) and the installation
+   update's background task, which picks an open update up from disk
    (`installation_update::run_background`; see
    [The installation's update](#the-installations-update)).
 
@@ -288,8 +292,8 @@ caller and the action; a command with no stamped caller is refused too.
 | Caller | May ask for | Checked in |
 | --- | --- | --- |
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
-| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`, `update_installation`, `set_hive_egress`, `clear_hive_egress`) | `authorize_llm_usage_scope` |
-| `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`); payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
+| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`, `set_installation_ai`, `update_installation`, `set_hive_egress`, `clear_hive_egress`) and Fluxbee Cloud's (`publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`, `issue_exposure_link`; `MeshAccess::Cloud`) | `authorize_llm_usage_scope` |
+| `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`), io.web's exposure actions among them once the SDK's catalog lists them; payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
 | `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
@@ -308,6 +312,15 @@ caller and the action; a command with no stamped caller is refused too.
   warning for each one that gets none (`log_registry_caller_roles`).
 - **Only Archi and the HTTP API** ask for `executor_validate_plan`, `executor_execute_plan` and
   `publish_cloud_endpoint`. The executor then runs every step of the plan as the operator.
+- **Fluxbee Cloud's alone** ([io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.1): the five
+  exposure actions pass three checks. The A-62 table gives them `MeshAccess::Cloud`, which admits
+  `IO.cloud@motherbee` alone, for the actions `CLOUD_EXPOSED_ACTIONS` lists, and never Archi;
+  IO.cloud's relay carries each one's own fields and no `tenant_id`
+  (`enforce_cloud_relay_content`); and the handler refuses every origin but IO.cloud@motherbee's,
+  the HTTP API and the executor included, `403 UNAUTHORIZED` (`cloud_alone`). A plan step that
+  names one reaches the handler and gets that refusal. They have no HTTP route; their read,
+  `list_exposures`, is Archi's and the operator's (`GET /web/exposures`), and IO.cloud's once the
+  catalog lists it ([The exposures](#the-exposures)).
 - **Closed to the whole mesh,** Archi included: `cognition_clear`, `reset_base_runtime`,
   `set_installation_ai`, `update_installation`, `set_hive_egress` and `clear_hive_egress`
   (`MeshAccess::Nobody`). The operator asks for them on loopback, or Archi stages them in a plan
@@ -367,12 +380,14 @@ Other checks:
   sets the executor catalog. Over the mesh only Archi asks for those two and for
   `send_node_message`.
 - Fanout `externalize` (with `fanout_family`) is operator-only (`handle_externalize`).
-- **The secrets only an edge reads are never read back** (FINDINGS A-316, since 0.1.139): an
+- **The secrets only their node reads are never read back** (FINDINGS A-316, since 0.1.139): an
   externalized endpoint's bearer (`edge_channel_secret:<ich>`, the Cloud's door among them), the
   edge's TLS key (`edge_tls*`) and a fanout's verify token (`edge_fanout_verify:<ich>`), each owned
-  by its edge. `vault_get` and `vault_assign` of one answer `403 RESERVED_KEY` before anything
-  reaches SY.vault (`refuse_edge_secret_read_back`), whoever asks: the operator, the executor,
-  Archi, Cloud. A `vault_assign` naming SY.admin's own ILK, then a `vault_get` through SY.admin, read
+  by its edge, and io.web's key of an exposure's enablement (`web_exposure_key:<uuid>:<slot>`,
+  owned by io.web; [io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.6), which signs its links
+  and sessions. `vault_get` and `vault_assign` of one answer `403 RESERVED_KEY` before anything
+  reaches SY.vault (`refuse_node_secret_read_back`, `NODE_ONLY_VAULT_KEY_PREFIXES`), whoever asks:
+  the operator, the executor, Archi, Cloud. A `vault_assign` naming SY.admin's own ILK, then a `vault_get` through SY.admin, read
   the Cloud's bearer back, and through Archi it reached the AI provider (A-124). Their metadata
   stays readable; the operator still writes the edge's TLS key (put, rotate, the rollback of
   [The ACME client](#the-acme-client)) and deletes any of them, and SY.admin stores the bearers
@@ -408,11 +423,15 @@ it:
 - `vault_put` may not set `metadata.ilk`, `owner_ilk` or `owner_l2`; `owner_node` must be an
   `IO.*` node; `vault_put`, `vault_assign` and `vault_delete` may not touch the reserved keys
   (`edge_channel_secret:`, `edge_tls`, `ssh:`, `edge_fanout_verify:`, `acme_account`,
-  `web_exposure_key:` since 0.1.145 (planned); `is_cloud_reserved_vault_key`).
+  `web_exposure_key:` since 0.1.145; `is_cloud_reserved_vault_key`, over the SDK's
+  `CLOUD_RESERVED_VAULT_KEY_PREFIXES`).
 - `run_node`, `start_node`, `kill_node` and `get_node_status` act only on `IO.*` nodes.
 - `update_tenant` sets `status` only to `active` or `suspended`; `get_llm_usage` never reads all
   tenants.
-- Most actions accept only a fixed set of fields (`only_fields`).
+- Most actions accept only a fixed set of fields (`only_fields`). The exposure actions carry
+  their own and never a `tenant_id`: `publish_exposure` `label` and `upstream`;
+  `enable_exposure` `exposure_id` and `duration_s`; `disable_exposure`, `unpublish_exposure` and
+  `issue_exposure_link` `exposure_id`; `list_exposures` nothing.
 
 `stamp_relay_facts` then adds what SY.admin knows and the caller cannot forge: `launched_by` on
 `run_node` (`cloud`, `archi`, `operator`, or the caller's name; `launched_by_for_caller`),
@@ -455,7 +474,9 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `unpublish_artifact` | the publication's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
 | `list_published_artifacts` | answered by SY.admin from its publication ledger | |
 | `acme_status`, `acme_renew`, `acme_test`, `acme_reload` | answered by SY.admin's ACME client, which asks the public edge, SY.vault, the CA and SY.orchestrator | `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `VAULT_*`, `record_drift_alert` ([The ACME client](#the-acme-client)) |
-| `web_status` | answered by SY.admin from what it holds, plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
+| `web_status` | answered by SY.admin from what it holds (the exposures registry, the edge's and io.web's last answers, the ACME client), plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
+| `publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure`, `issue_exposure_link` | `SY.vault@motherbee` (an enable's key), the public edge (a publish's and an unpublish's routes) and `IO.web@motherbee` | `VAULT_PUT`, `EDGE_WEB_ROUTES`, `IO_WEB_EXPOSURES`, `IO_WEB_ACCESS_LINK`, each waited 5 s ([The exposures](#the-exposures)) |
+| `list_exposures` | answered by SY.admin from its registry | |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
@@ -469,7 +490,9 @@ answer, `JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`, two reads of its `/version
 `sync_hint` 45, `core_rollback` 300, `set_hive_egress` and `clear_hive_egress` 60
 (`JSR_ADMIN_EGRESS_TIMEOUT_SECS`; the motherbee forwards the switch with 30 and the confirm with
 10), `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
-`node_help` 10 (the node's hive gives the node 3 s, the motherbee gives that hive 7 s),
+`node_help` 10 (the node's hive gives the node 3 s, the motherbee gives that hive 7 s), the
+exposure actions the default 30 (each of their calls waits 5 s: the longest, a link asked twice
+around a push, answers within 15),
 `kill_node` and `remove_node_instance` 180 (a purge waits for the node's teardown: the
 orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purge 150 s),
 catalog/help/timer/`hive_status`/`list_streams`/`web_status` 5 (`JSR_ADMIN_TIMEOUT_SECS`; for
@@ -1665,16 +1688,14 @@ acme:
   profile: "classic"                    # optional: the CA's default when absent
   contact: "mailto:ops@example.com"     # optional
   trust_anchor: "/etc/fluxbee/acme-ca.pem"   # optional, only for a private CA
-web:
-  archi: true                           # optional: archi.<the main name> joins the certificate
 ```
 
 - The main certified name is the host of `admin.public_base_url` (`SY_ADMIN_PUBLIC_BASE_URL`
-  wins), lowercase, with no trailing dot. The web hosts `web:` declares follow it
-  ([The web hosts](#the-web-hosts)); one certificate carries every name. They are read at boot: a
-  new name takes effect when SY.admin restarts, and certifying it is an explicit
-  `POST /acme/renew` (after `POST /acme/test`). Until then the served certificate only raises
-  `name_not_covered`. A name taken out goes at the next renewal.
+  wins), lowercase, with no trailing dot. The names after it are the published exposures' hosts
+  ([The exposures](#the-exposures)), read live, sorted, at each use (`AcmeService::names`, over
+  `AcmeDeps.names`): one certificate carries every name. A host published is ordered within the
+  minute once its DNS name answers ([Published hosts](#published-hosts)); one unpublished stays on
+  the certificate until its renewal. hive.yaml's `web:` no longer names any.
 - **Without `acme:`** nothing is ordered; the expiry checks and their alerts still run.
 - **A section that cannot work turns ACME off** (`config.state: off` and `config.reason` in
   `GET /acme/status`, an ERROR line in the log): `terms_agreed` not `true`; `public_base_url`
@@ -1719,7 +1740,10 @@ share one in-flight slot; a busy one answers `409 ACME_BUSY` with what is runnin
    (a metadata-only write, such as `vault_assign`, moves `updated_at` without changing the
    certificate) and compared again (`writable`); a difference that stays, or an edge that now
    serves another leaf, stops the run before any CA call.
-2. **Order**: one order with every name as an identifier, the main one first, with the profile.
+2. **Order**: one order with its names as identifiers, the main one first, with the profile: the
+   main name, every published host the served leaf covers, and each other one whose DNS name
+   answers the main name's addresses ([Published hosts](#published-hosts)); a test order carries
+   every name.
    `replaces` names the served leaf (its ARI identifier) only when `acme.json` records it as issued
    by this account of this directory; an error that points to it is retried once without it. The
    order URL is recorded at once with its names, and after a restart the order is resumed
@@ -1782,7 +1806,7 @@ The next renewal tries every name again.
 | answers `status: error` (no public listener, another origin) | a configuration error, in `edge.config_error`: no order, the regular schedule, no alert | the same |
 | `awaiting`, `not_found` | order now | `edge_without_certificate` |
 | `awaiting`, another reason | `EDGE_TLS_RELOAD`, then the alert; no order | `edge_without_certificate` |
-| serves a leaf this account issued for the main name | renew at a random point of the CA's ARI window (asked again after its Retry-After), else at two thirds of the lifetime, with every name (a leaf that misses an added name too: `name_not_covered` meanwhile); 48 h past that point, after an order that failed only on added names, the main name alone | expiry checks only |
+| serves a leaf this account issued for the main name | renew at a random point of the CA's ARI window (asked again after its Retry-After), else at two thirds of the lifetime, with the names an order carries; a published host it misses whose DNS name answers: a name-change order at once, outside the cap, within its budget; one still waiting for its DNS name: `name_not_covered` meanwhile; 48 h past the renewal point, after an order that failed only on added names, the main name alone | expiry checks only |
 | `acme.json` holds a newer certificate than the served one | `EDGE_TLS_RELOAD`, never a new order | |
 | serves a hand-seeded leaf, or one for another main name | alerts only; `POST /acme/renew` replaces it | expiry checks only |
 | `disk` or `plaintext` mode | left alone | expiry checks only |
@@ -1791,8 +1815,9 @@ The next renewal tries every name again.
   waits until the time the CA names, or 24 h. Both are in `acme.json`, so a restart never spends
   an order.
 - **The cap**: at most one issuance per third of the last certificate's lifetime, unless forced
-  (`POST /acme/renew`). It counts the certificates stored and served or waiting to be served; a
-  failure after issuance is bounded by the backoff, and never holds an edge with no certificate.
+  (`POST /acme/renew`) or a name-change order. It counts the certificates stored and served or
+  waiting to be served; a failure after issuance is bounded by the backoff, and never holds an
+  edge with no certificate.
 
 **Conditions** (`evaluate_conditions`), shown in `GET /acme/status`. Each writes one drift alert
 when it opens and one `info` row when it closes, through `record_drift_alert` to
@@ -1819,56 +1844,171 @@ others need it on.
 
 | Action | Route | Answer |
 | --- | --- | --- |
-| `acme_status` | `GET /acme/status` | the configuration (and why it is off; `config.name` is the main name, `config.names` every name), the terms URL, the directories read, the accounts, the edge (`live`: a fresh `EDGE_TLS_STATUS`; `last_seen`: what the last check judged by; `names_covered` and `names_missing`: the names its leaf covers), the run in flight, the order recorded, a certificate waiting to be served, the hold and the pending rollback, the last check, attempt and test, the backoff, the next check, the renewal plan, the last 20 issued certificates (each with its `names`) and the open conditions. Times are RFC 3339. |
-| `acme_renew` | `POST /acme/renew` | `202 accepted`; needs confirmation. Forced: no backoff and no cap, never past the CA's rate limit. Lifts an `install_refused` hold. Refused with `409`: `ACME_OFF`, `EDGE_NOT_CONFIGURED`, `ACME_BUSY`, `ACME_RATE_LIMITED`, `CERTIFICATE_NOT_SERVED` (reload first), `ROLLBACK_PENDING` |
+| `acme_status` | `GET /acme/status` | the configuration (and why it is off; `config.name` is the main name, `config.names` every name), the terms URL, the directories read, the accounts, the edge (`live`: a fresh `EDGE_TLS_STATUS`; `last_seen`: what the last check judged by; `names_covered` and `names_missing`: the names its leaf covers), the run in flight, the order recorded, a certificate waiting to be served, the hold and the pending rollback, the last check, attempt and test, the backoff, the next check, the renewal plan, the last 20 issued certificates (each with its `names`), the open conditions, `dns` (each host resolved: `state` `ready` or `waiting`, `addresses`, `detail`, `resolved_at`) and `name_change_orders` (`started`, `next_allowed_at`). `config.names` are the main name and the published hosts now. Times are RFC 3339. |
+| `acme_renew` | `POST /acme/renew` | `202 accepted`; needs confirmation. Forced: no backoff, no cap and no name-change budget, never past the CA's rate limit; the names an order carries (a host waiting for its DNS name stays out). Lifts an `install_refused` hold. Refused with `409`: `ACME_OFF`, `EDGE_NOT_CONFIGURED`, `ACME_BUSY`, `ACME_RATE_LIMITED`, `CERTIFICATE_NOT_SERVED` (reload first), `ROLLBACK_PENDING` |
 | `acme_test` | `POST /acme/test` | `202 accepted`; needs confirmation. Steps 1–5 against `staging_directory_url` with its own account and no `replaces`; nothing is stored or installed, and the staging root is reported untrusted (`last_test`). `409 ACME_TEST_SAME_DIRECTORY` when staging equals production |
 | `acme_reload` | `POST /acme/reload` | `EDGE_TLS_RELOAD`, after a manual change or a vault rollback: `200` with what the edge serves, `422 EDGE_REFUSED` (the edge kept its certificate, `refused.reason` and `refused.detail`), `503 EDGE_VAULT_UNAVAILABLE` (a `transient` refusal), `504 EDGE_NO_ANSWER`, `502 EDGE_ERROR` |
 
 None takes a parameter: a body with a field answers `400 INVALID_REQUEST`. The three POSTs are
 in the audit log. SY.architect's read tool translates `GET /acme/status`.
 
-## The web hosts
+### Published hosts
 
-The motherbee's `web:` section declares the hosts the public edge serves only through io.web,
-never through `/e/` or `/public/` ([docs/io-web-v2.md](../io-web-v2.md) §11.1). Source:
-`WebConfig` and `WebRoutes` in `src/bin/sy_admin.rs`.
+The names after the main one follow the exposures Fluxbee Cloud publishes
+([io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.2):
 
-- **The declaration** (`WebConfig::from_hive`): each key is a host label, declared with `true`;
-  `archi` is the only one. The host is the label before the main certified name (`archi: true`
-  declares `archi.<host of admin.public_base_url>`), so the domain never comes from code. A bare
-  `web:`, `{}` or `archi: false` declares nothing. An unknown key, a value that is not a boolean, or
-  a `public_base_url` with no certifiable host declares nothing, with an ERROR line. It is read at
-  boot, which logs the declared hosts. The ACME client certifies them after the main name
-  ([The ACME client](#the-acme-client)).
-- **The push** (`WebRoutes::run`): at the start and every 60 s, SY.admin's own loop (the ACME check
-  runs every 6 h) sends `EDGE_WEB_ROUTES {routes: [{host, upstream: "io.web"}]}` to the public edge
-  as the ACME client resolves it (`admin.public_edge_node`, else the one connected ingress), with
-  a 20 s timeout. The edge takes it on its TLS command channel. Each push carries the full set: an
-  empty one without `web:`, so a host taken out leaves the edge at the first push after the
-  restart.
+- **Woken at once.** A publish calls `names_changed()`: the loop wakes and checks at once, and a
+  change that came while a run held the slot is checked within a minute. An unpublish orders
+  nothing.
+- **DNS first.** A published host the served leaf misses is resolved with the system's resolver
+  (`SystemResolver`, 10 s), and the main name with it, at most every 5 min, in memory only. It is
+  ordered only once every address it resolves to is one of the main name's; until then it is left
+  out of every order, so it never fails the order for every name, and the check comes back within
+  5 min. A change of its state is logged.
+- **A name-change order.** A published host the leaf this account issued misses, its DNS name
+  answering, is ordered at once with the main name and every name the leaf covers, replacing the
+  leaf: outside the cap; held by an `install_refused`, the CA's rate limit and the backoff as any
+  order; within a budget of its own, one per 15 min (the hosts published meanwhile ride the next
+  one) and five per rolling 7 days (`acme.json`'s `name_change_orders`). It never falls back to
+  the main name alone, which would spend an issuance on the names the edge serves. Past the budget
+  the host is `held` until it frees; `POST /acme/renew` orders past it.
+- **A host's certificate** (`host_certificate`, in each exposure's view), from what the client
+  holds, with no call: `covered` (the leaf the edge served at the last look names it), `pending`
+  (an order is due or running, or the host is not resolved yet), `waiting_dns` (its DNS name does
+  not answer the main name's addresses; `retry_at` the next resolution), `failed` (the last
+  attempt failed on it; `retry_at` the backoff's end), `held` (the budget, the backoff, the rate
+  limit or an `install_refused` until `retry_at`; a leaf this account did not issue with no
+  `retry_at`: `POST /acme/renew` replaces it) or `off` (no ACME: the operator certifies by hand,
+  or the edge's TLS is not ACME's).
+
+## The exposures
+
+io.web's exposures ([io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §2, §5.1, §6): one host on
+the public edge, `<label>.<main name>`, leading to one fixed upstream, opened for a window by an
+enablement whose key signs its links and sessions. Fluxbee Cloud alone publishes, enables,
+disables and unpublishes them and asks for their links ([Who may call what](#who-may-call-what)).
+Source: `src/bin/sy_admin/exposures.rs`.
+
+- **The registry**, `/var/lib/fluxbee/state/sy-admin/exposures.json` (schema 1), written as
+  `publications.json` is (a temporary file of mode 0640, synced, renamed) and held in memory:
+  each exposure's id (`exp:<uuid>`), label, host, upstream, `published_at`, `published_by`
+  (`cloud`) and its live enablements, at most two, the current one and the one it renewed (id,
+  `from`, `until`, its key's slot and version, never the key). Its `generation` is
+  `max(previous + 1, now in ms)` at each write, so it never goes back, even after the file is
+  lost. An opening change (publish, enable) writes the file before it opens anything; a closing
+  one (disable, unpublish) acts first, in memory and in the pushes, then writes, and a write that
+  fails answers `persisted: false` and is tried again every minute. A file that cannot be read at
+  boot is kept as it is: SY.admin logs an ERROR, pushes empty sets (they fail closed) and answers
+  every exposure change `500 RECORD_FAILED` until the operator fixes or removes it and restarts
+  SY.admin.
+- **The checks**, before anything is read: a label is one DNS label (1 to 63 lowercase letters,
+  digits and hyphens, a letter or a digit at each end), taken as given, never folded; the host is
+  under the main name, the host of `admin.public_base_url` (`409 NO_MAIN_HOST` without one); the
+  upstream is `{"kind": "archi"}` (one exposure at most), a worker of the registry with its join
+  done and a port (`{"kind": "hive", "hive", "port"}`), or a private IP literal (10/8, 172.16/12,
+  192.168/16, fc00::/7; never loopback, link-local, multicast, broadcast or unspecified) that is
+  no hive's recorded address, with a port (`{"kind": "address", "address", "port"}`); each kind
+  takes only its own fields, and Fluxbee's own ports are refused (22, 80, 443, 3000, 8080, 8384,
+  9000, 9100, 9200, 21027, 22000). At most 16 exposures (`409 EXPOSURE_LIMIT`).
+- **One change at a time** (the exposure lock): a publish, enable, disable or unpublish asked
+  while another runs answers `409 BUSY` with `payload.retryable: true` at once, after its field
+  checks, nothing read or changed. `issue_exposure_link` and `list_exposures` take no lock and
+  never answer `BUSY`.
+- **publish_exposure** `{label, upstream}`: the host; the same label with the same upstream
+  answers the same exposure (`created: false`, nothing written or pushed), another upstream under
+  it, or a second Archi, `409 EXPOSURE_EXISTS`; the file; the edge's routes and io.web's set,
+  pushed together; the ACME client woken ([Published hosts](#published-hosts)); the answer
+  `{exposure, created}`.
+- **enable_exposure** `{exposure_id, duration_s}` (60 to 28800 s): io.web's ILK from identity
+  (`409 IO_WEB_ABSENT` without one: `run_node IO.web@motherbee` in the root tenant first); a new
+  key, 32 bytes from the OS as 64 hex, put first in the slot the current enablement does not use,
+  `web_exposure_key:<uuid>:<a|b>`, as `{secret}` with `resource_type: web_session_key`, the root
+  tenant and `metadata.ilk` io.web's ILK; then the file and io.web's set; the answer
+  `{exposure, renewed}`. A put unanswered or refused changes nothing: `502 VAULT_UNAVAILABLE`. A
+  renewal keeps the enablement it renews, whose sessions run to its own end. With at most two
+  live, a retried enable (after a lost answer) makes one more, and the enablement before the
+  renewed one ends at once.
+- **disable_exposure** `{exposure_id}` clears the enablements, pushes io.web's set, then writes:
+  `{exposure, was_enabled, persisted}`. **unpublish_exposure** `{exposure_id}` removes the
+  exposure, pushes the edge's routes and io.web's set, then writes: `{exposure_id, host, removed,
+  route, io_web, persisted}`; its keys stay in the vault, and its name on the certificate until
+  the renewal. An id no exposure has answers `404 EXPOSURE_NOT_FOUND`: after an unpublish whose
+  answer was lost, it means done.
+- **issue_exposure_link** `{exposure_id}` asks io.web for a link to the current enablement
+  (`IO_WEB_ACCESS_LINK {exposure_id, enablement_id, generation}`): `409 EXPOSURE_CLOSED` while
+  closed. When io.web's set is older (`ENABLEMENT_UNKNOWN`, `EXPOSURE_UNKNOWN`) SY.admin pushes it
+  and asks once more. The answer, `{exposure_id, url, expires_at, link_id}` with `expires_at` in
+  RFC 3339, is given once; io.web issuing none (`KEY_UNAVAILABLE`, `UNAUTHORIZED`) or not
+  answering is `503 IO_WEB_UNAVAILABLE` with `payload.retryable: true`.
+- **Each call waits 5 s** (`EXPOSURE_CALL_TIMEOUT`): a vault put, a push, a link. A push
+  unanswered in an action comes back `pending` in its answer, for the loops to send again.
+- **io.web's set** (`IO_WEB_EXPOSURES`: the whole set with its generation, never a secret) goes at
+  each change and every 60 s from the start (`Exposures::run_io_web`, 20 s each), which first
+  writes, under the exposure lock, what a closing change left unwritten. io.web's answer is kept:
+  the generation it holds and whether it holds each live enablement's key; the answer to a push a
+  newer one overtook is not. A change of answer is logged (no io.web while nothing is published at
+  INFO), and each enablement whose key io.web lacks, by its exposure and host.
+- **The view**, in every answer, in `list_exposures` and in `web_status`: `exposure_id`, `label`,
+  `host`, `url`, `upstream`, `state` (`closed`, or `enabled` with `enabled_until`),
+  `published_at`, `certificate {state, detail, retry_at}` ([Published hosts](#published-hosts)),
+  `route {state}` (`acknowledged` once the edge acknowledged a set with the host, `pending`, or
+  `no_edge`) and `io_web {state}`: `acknowledged` once io.web answered ok at the current
+  generation (whether it holds the keys is in `web_status`), `pending` while it has not (stopped,
+  after `kill_node IO.web@motherbee`, restarting, or slow), `absent` while IO.web@motherbee has no
+  ILK (never launched: what `enable_exposure` answers `IO_WEB_ABSENT` for). `list_exposures`
+  answers `{exposures, count, max: 16}`. Times are RFC 3339.
+- **The logs** name each exposure by its id and host, never a key, a link or a code:
+  `exposure published`, `exposure enabled` (its end, slot and version), `exposure disabled`,
+  `exposure unpublished`, `link issued` (its `link_id`), `io.web issued no link`, and io.web's
+  answers when they change. The five actions are in the audit log with their params; the link an
+  answer carries never is.
+- **The brake** is the operator's `kill_node IO.web@motherbee`: every exposure's host then answers
+  the edge's 502 until io.web runs again.
+
+## The web routes
+
+SY.admin pushes the published exposures' hosts to the public edge, which serves them only through
+io.web, never through `/e/` or `/public/` ([docs/io-web-v2.md](../io-web-v2.md) §11.1,
+[io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.1). Source: `WebRoutes` in
+`src/bin/sy_admin.rs`.
+
+- **hive.yaml's `web:` is retired** (stage 2.1's Q2 (a)): Archi's host is the exposure Cloud
+  publishes with `upstream: {"kind": "archi"}`. A `web:` left there is ignored, with one warning
+  at boot.
+- **The push** (`WebRoutes::push_once`): at the start and every 60 s, SY.admin's own loop
+  (`WebRoutes::run`, 20 s each; the ACME check runs every 6 h), and at each publish and unpublish
+  (5 s), SY.admin sends `EDGE_WEB_ROUTES {routes: [{host, upstream: "io.web"}]}` with every
+  published host to the public edge as the ACME client resolves it (`admin.public_edge_node`, else
+  the one connected ingress). The edge takes it on its TLS command channel. Each push carries the
+  full set, an empty one with nothing published or while the registry cannot be read, so an
+  unpublished host leaves the edge at once. One push at a time, its set read once it goes: an
+  older set never overtakes a newer one.
 - **The answer** is kept in memory: the edge, `acknowledged`, `refused`, `no_answer` or `no_edge`
-  with its detail, since when, and when the edge last acknowledged the set. An acknowledgement
-  also carries the edge's proxy to io.web (`upstream`: `ready` or `unavailable` with its reason,
-  and the last request io.web did not answer, its time and kind), kept with that push
-  (`EdgeWebUpstream`). Only a change of edge or of answer is logged, the detail included (a
+  with its detail, since when, when the edge last acknowledged a set and that set's hosts. An
+  acknowledgement also carries the edge's proxy to io.web (`upstream`: `ready` or `unavailable`
+  with its reason, and the last request io.web did not answer, its time and kind), kept with that
+  push (`EdgeWebUpstream`). Only a change of edge or of answer is logged, the detail included (a
   timeout reads `no answer in 20s`, so repeated ones are no change), never a change of upstream:
-  INFO when acknowledged, and for no edge while no host is declared; WARN otherwise, with the last
-  acknowledgement. An edge older than 0.1.84 does not take the command, which reads as no answer.
+  INFO when acknowledged, and for no edge while nothing is published; WARN otherwise, with the
+  last acknowledgement. An edge older than 0.1.84 does not take the command, which reads as no
+  answer.
 
 ## The web door's status
 
 `GET /web/status` (`web_status`) is the operator's view of the web door
 ([docs/io-web-v2.md](../io-web-v2.md) §11.2): what SY.admin holds, plus two reads of io.web. It
-takes no body and always answers 200: no `web:`, no edge, and a missing or silent io.web are
+takes no body and always answers 200: no exposure, no edge, and a missing or silent io.web are
 states, named in the answer. Source: `handle_web_status` and `io_web_status` in
-`src/bin/sy_admin.rs`, `AcmeService::web_certificate` in `src/bin/sy_admin/acme.rs`.
+`src/bin/sy_admin.rs`, `AcmeService::web_certificate` in `src/bin/sy_admin/acme.rs`, the views in
+`src/bin/sy_admin/exposures.rs`.
 
 | Part | What it says | From |
 | --- | --- | --- |
-| `web` | `state`: `declared` (with `hosts`), `absent` (no section, or no key set) or `invalid` (`reason` says why) | `web:` as read at boot |
-| `certificate` | `acme` (the client's `config.state`); `names`, the names it certifies (the main one, then the web hosts); `served`, the `names` and `not_after` of the leaf the edge served at the client's last look; `last_answer_at`, the edge's last answer to the client; `hosts_missing`, the web hosts that leaf does not cover (null without a leaf) | the ACME client, with no call to the edge: `config.names` and `edge.last_seen` of `GET /acme/status`, which asks the edge afresh |
-| `routes` | `state`: `acknowledged`, `refused`, `no_answer`, `no_edge`, or `not_pushed` before the first push; `edge`, `set` (the full set every push carries), `detail`, `since_at` and `acknowledged_at`; `upstream`, the edge's way to io.web as its acknowledgement reported it (null for any other answer): `state` `ready` or `unavailable` (then every web host answers 502), `reason` (what the edge found missing at its boot), `last_failure` (`at`, `kind` of the last request io.web did not answer, or null) | the last push ([The web hosts](#the-web-hosts)) |
-| `io_web` | `node` (`IO.web@motherbee`), `state`; `lifecycle_state` and `runtime_version`, the orchestrator's view; `answer`, the node's own `NODE_STATUS_GET` answer; `view_error` and `answer_error` | `get_node_status` to `SY.orchestrator@motherbee` (5 s) and `NODE_STATUS_GET` to `IO.web@motherbee` (3 s), sent together |
+| `web` | `state`: `published` (with `hosts`, the published exposures' hosts), `none`, or `unreadable` (the registry could not be read at boot; `reason` says why) | the exposures registry |
+| `exposures` | each exposure's view ([The exposures](#the-exposures)) | the registry, the ACME client, the routes' and io.web's last answers |
+| `certificate` | `acme` (the client's `config.state`); `names`, the names it certifies (the main one, then the published hosts); `served`, the `names` and `not_after` of the leaf the edge served at the client's last look; `last_answer_at`, the edge's last answer to the client; `hosts_missing`, the published hosts that leaf does not cover (null without a leaf) | the ACME client, with no call to the edge: `config.names` and `edge.last_seen` of `GET /acme/status`, which asks the edge afresh |
+| `routes` | `state`: `acknowledged`, `refused`, `no_answer`, `no_edge`, or `not_pushed` before the first push; `edge`, `set` (the full set every push carries), `detail`, `since_at` and `acknowledged_at`; `upstream`, the edge's way to io.web as its acknowledgement reported it (null for any other answer): `state` `ready` or `unavailable` (then every web host answers 502), `reason` (what the edge found missing at its boot), `last_failure` (`at`, `kind` of the last request io.web did not answer, or null) | the last push ([The web routes](#the-web-routes)) |
+| `io_web` | `node` (`IO.web@motherbee`), `state`; `lifecycle_state` and `runtime_version`, the orchestrator's view; `answer`, the node's own `NODE_STATUS_GET` answer; `view_error` and `answer_error`; `exposures`, io.web's side of the exposures' pushes: `pushed_generation`, `acknowledged_generation` (the set io.web holds), `last_answer` (`taken` with each live enablement's key `ready` or `unavailable`, `refused` with its `error_code`, `no_answer`, or `absent`: no io.web was reached) and `since` | `get_node_status` to `SY.orchestrator@motherbee` (5 s) and `NODE_STATUS_GET` to `IO.web@motherbee` (3 s), sent together; `exposures` from SY.admin's memory |
 
 `io_web.state`:
 
@@ -1895,7 +2035,7 @@ Times are RFC 3339. A read, so it is not in the audit log; over the mesh only Ar
 | `admin.listen` | HTTP address (env `JSR_ADMIN_LISTEN` wins) |
 | `admin.public_edge_node`, `admin.public_base_url` | public artifacts and the ACME client; the host of `public_base_url` is the certified name (env `SY_ADMIN_PUBLIC_EDGE_NODE`, `SY_ADMIN_PUBLIC_BASE_URL` win) |
 | `acme` | the ACME client ([The ACME client](#the-acme-client)) |
-| `web` | the web hosts, pushed to the public edge and certified after the main name ([The web hosts](#the-web-hosts)) |
+| `web` | retired (io.web's stage 2.1, Q2 (a)): ignored, with one warning at boot; the web hosts are the published exposures ([The web routes](#the-web-routes)) |
 | `ai` | executor provider and model while the hive holds no installation file; ignored once it holds one |
 | `dist.path` | where the installation file is: `<dist.path>/installation/installation.json`, default `/var/lib/fluxbee/dist` |
 | `blob.path` | blob root, default `/var/lib/fluxbee/blob` |
@@ -1933,6 +2073,10 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
   the last attempt and test, the last 20 issued certificates, the backoff, the renewal plan, the
   last edge status seen and the conditions. An unreadable file is moved aside
   (`acme.json.unreadable-<time>`) and ACME starts empty.
+- `/var/lib/fluxbee/state/sy-admin/exposures.json`: io.web's exposures, written atomically, never
+  a key: the generation and each exposure with its live enablements
+  ([The exposures](#the-exposures)). An unreadable file is kept as it is, and every exposure
+  change is refused until the operator fixes or removes it and restarts SY.admin.
 - `/var/lib/fluxbee/state/sy-admin/installation-update.json`: the installation's update, written
   atomically: the open update with each hive's state, outcome and next step, and the last 20
   closed ones ([The installation's update](#the-installations-update)). An unreadable file is moved
@@ -1973,8 +2117,12 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
 - **ACME**: a section that cannot work turns ACME off; a CA, edge, vault or orchestrator that
   fails only fails the order or the alert, which the backoff and the next check retry. Nothing
   in the ACME client stops SY.admin.
-- **Web routes**: a `web:` section that cannot work declares nothing; an edge that refuses the
-  routes or does not answer is logged when that starts, and the full set goes again every minute.
+- **Web routes**: an edge that refuses the routes or does not answer is logged when that starts,
+  and the full set goes again every minute.
+- **Exposures**: a registry that cannot be read refuses every change (`RECORD_FAILED`) and pushes
+  empty sets; a closing change whose write fails is done all the same and written again every
+  minute; an io.web that is stopped or silent gets the set within a minute of its return, its
+  exposures `pending` meanwhile; a vault that does not answer fails the enable alone.
 
 ## Health
 
@@ -1986,7 +2134,7 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 26, 121 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 27, 127 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -2112,7 +2260,13 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `acme_renew` | `POST /acme/renew` | Order the public edge's certificate now (forced: no backoff, no cap). |
 | `acme_test` | `POST /acme/test` | Run a test order against the staging directory with the real names: issued and checked, never stored or installed. |
 | `acme_reload` | `POST /acme/reload` | Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback. |
-| `web_status` | `GET /web/status` | Read the web door: the hosts the web section declares, the certificate's names, the routes pushed to the public edge with its last answer, and io.web's state. |
+| `web_status` | `GET /web/status` | Read the web door: the published exposures' hosts and each exposure's view, the certificate's names, the routes pushed to the public edge with its last answer, and io.web's state with its last answer to the exposures. |
+| `publish_exposure` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): publish an exposure, a host <label>.<main name> on the public edge leading to one fixed upstream (Archi, a worker and a port, or a private address and a port), closed until enabled. |
+| `enable_exposure` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): open an exposure for duration_s (60 to 28800 seconds) with a new key, stored for io.web alone; enabling an open one renews it, the previous enablement's sessions running to its own end. |
+| `disable_exposure` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): close an exposure at once: io.web drops its enablements and keys, and every link and session of it fails at the next request. |
+| `unpublish_exposure` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): remove an exposure: the edge's route goes and its host answers 404; the name stays on the certificate until its renewal. |
+| `issue_exposure_link` | — (no HTTP route) | Fluxbee Cloud's alone (IO.cloud's relay): a one-time link to an enabled exposure, minted by io.web, opened once top-level within about 120 s; never logged. |
+| `list_exposures` | `GET /web/exposures` | List the exposures: each one's id, label, host, url, upstream, state (closed or enabled, with enabled_until), certificate, route and io.web states. |
 
 ### HTTP routes outside the catalog
 

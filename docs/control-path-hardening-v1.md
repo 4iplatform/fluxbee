@@ -54,8 +54,8 @@ types a registered person's email is merged into that person.
 | Caller | Admitted |
 | --- | --- |
 | any caller on an ingress or egress hive | nothing (checked before every row below) |
-| `SY.architect@motherbee` | everything (the operator's agent), but what is closed to the mesh: since A-160, `cognition_clear`, since A-122, `reset_base_runtime`, since stage 3c of [hive-config-update-v1](hive-config-update-v1.md), `set_installation_ai`, and since its stage 4, `update_installation`, which Archi stages in a plan the operator confirms; their reads, `get_installation` and `get_installation_update`, are Archi's |
-| `IO.cloud@motherbee` | the Cloud-exposed actions; externalize, unexternalize and list for its own channel; as an IO node, `publish_artifact`, and `unpublish_artifact` of its own publications (it publishes none) |
+| `SY.architect@motherbee` | everything (the operator's agent), but what is closed to the mesh: since A-160, `cognition_clear`, since A-122, `reset_base_runtime`, since stage 3c of [hive-config-update-v1](hive-config-update-v1.md), `set_installation_ai`, and since its stage 4, `update_installation`, which Archi stages in a plan the operator confirms; their reads, `get_installation` and `get_installation_update`, are Archi's. Nor Fluxbee Cloud's (`MeshAccess::Cloud`, since io.web's stage 2.1): `publish_exposure`, `enable_exposure`, `disable_exposure`, `unpublish_exposure` and `issue_exposure_link`; their read, `list_exposures`, is Archi's |
+| `IO.cloud@motherbee` | the Cloud-exposed actions, io.web's exposure actions among them once Cloud's catalog lists them; externalize, unexternalize and list for its own channel; as an IO node, `publish_artifact`, and `unpublish_artifact` of its own publications (it publishes none) |
 | `SY.wf-rules@H` | node actions; package actions; `sync_hint` (detailed below) |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` (new, below) |
 | `IO.*@H` | externalize, unexternalize and list for its own channels (checked in the handler, as today) |
@@ -80,6 +80,11 @@ types a registered person's email is merged into that person.
 **Callers and roles:**
 
 - **Only from Archi and the HTTP API:** `executor_*` and `publish_cloud_endpoint`.
+- **Fluxbee Cloud's alone** ([io-web-v2-stage-2-1](io-web-v2-stage-2-1.md) §5.1): io.web's five
+  exposure actions pass three checks. The table's `Cloud` class admits `IO.cloud@motherbee` alone,
+  for the actions Cloud's catalog lists, and never Archi; the relay's content check takes each
+  action's own fields and no `tenant_id`; and the handler refuses every other origin, the HTTP API
+  and the executor included, `403 UNAUTHORIZED`. They have no HTTP route.
 - **A hive's role comes from the registry** (`hives/<id>/info.yaml`). It fails closed: no file, no
   role, a hive still joining, or a removed one gets nothing. The local hive is the motherbee.
 
