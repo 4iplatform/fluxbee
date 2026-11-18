@@ -1051,8 +1051,10 @@ entry of `list_exposures`' `exposures`:
 ```
 
 - **The label:** lowercase ASCII letters, digits and hyphens, 1 to 63 characters, starting and
-  ending with a letter or a digit. It is taken as given: an uppercase label is refused, never
-  lowered. You name no domain: the host is always the label under the hive's public host.
+  ending with a letter or a digit, and never with two hyphens as its 3rd and 4th characters
+  (`my--shop`, `xn--...`: the certificate authority refuses such a name). It is taken as given: an
+  uppercase label is refused, never lowered. You name no domain: the host is always the label
+  under the hive's public host.
 - **Every host is public:** its name lands in the public Certificate Transparency logs, so a label
   never names a customer.
 - **One label, one exposure.** The same label with the same upstream again answers that exposure,
