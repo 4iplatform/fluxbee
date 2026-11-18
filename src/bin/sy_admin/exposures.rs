@@ -530,7 +530,8 @@ fn write_registry(path: &Path, file: &RegistryFile) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 
 /// One DNS label: lowercase ASCII letters, digits and hyphens, 1 to 63 characters, starting and
-/// ending with a letter or a digit. Taken as given: an uppercase label is refused, never folded.
+/// ending with a letter or a digit, and never hyphens as its 3rd and 4th characters. Taken as
+/// given: an uppercase label is refused, never folded.
 pub(crate) fn check_label(label: &str) -> Result<(), String> {
     let edge_ok = |byte: Option<&u8>| {
         byte.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
@@ -542,6 +543,15 @@ pub(crate) fn check_label(label: &str) -> Result<(), String> {
         && edge_ok(label.as_bytes().first())
         && edge_ok(label.as_bytes().last());
     if valid {
+        // A label shaped '??--' is a reserved LDH label (R-LDH, RFC 5890 §2.3.1; 'xn--' is one):
+        // Let's Encrypt refuses it when the order is created, so one such host would fail every
+        // order that carries it (§2.1, §5.2).
+        if label.as_bytes().get(2..4) == Some(b"--".as_slice()) {
+            return Err(format!(
+                "label '{label}' has hyphens as its 3rd and 4th characters: a label shaped '??--' \
+                 is a reserved LDH label (R-LDH, as 'xn--' is), which the CA refuses"
+            ));
+        }
         return Ok(());
     }
     let folded = label.to_ascii_lowercase();

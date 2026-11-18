@@ -282,7 +282,15 @@ single in-flight slot. A busy slot answers 409.
      the main name's addresses: every address it resolves to is one of the main name's. SY.admin
      resolves the hosts the leaf misses with the system's resolver, at most every 5 min, in
      memory. A host still waiting is left out, so it never fails the order for every name, and
-     the check comes back within 5 min. A test order carries every name.
+     the check comes back within 5 min. A host the CA refused by name at the last attempt
+     (`failed_names`) is left out too, until the backoff that failure started ends. A test order
+     carries every name.
+   - **A renewal never carries a new host.** A check's renewal of the served leaf carries the main
+     name and the published hosts that leaf covers; a host it misses rides a name-change order,
+     for which the check comes back within a minute. So no published host holds the main name's
+     renewal, not even one the CA refuses when the order is created (a reserved `??--` label,
+     say), which names no authorization and lets no fallback fire. With no certificate on the
+     edge, the first order carries every name above.
    - `replaces` is the served leaf's ARI identifier, and only when `acme.json` records that serial as
      issued to this account by this directory.
    - If an error points to `replaces`, the order is retried once without it.
@@ -344,7 +352,8 @@ not: its DNS record is missing, or points elsewhere.
 - **A renewal 48 h past its point** (the `renewal_overdue` mark), after an order that failed only
   on added names, orders the main name alone. A failure that named no authorization (the order
   refused) keeps every name.
-- The next renewal tries every name again.
+- The next renewal carries the names the served leaf covers; a published host it misses is a
+  name-change order's.
 
 **The test order (D5).** `POST /acme/test` takes no URL.
 - It runs steps 1–5 against `staging_directory_url`, with that directory's account and without

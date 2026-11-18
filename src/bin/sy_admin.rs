@@ -17627,7 +17627,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "label",
                 "string",
-                "The exposure's host is <label>.<main name>, the main name the host of admin.public_base_url. One DNS label: 1 to 63 lowercase letters, digits and hyphens, starting and ending with a letter or a digit; an uppercase label is refused, never folded. Every host lands in the Certificate Transparency logs: a label never names a customer.",
+                "The exposure's host is <label>.<main name>, the main name the host of admin.public_base_url. One DNS label: 1 to 63 lowercase letters, digits and hyphens, starting and ending with a letter or a digit, never with hyphens as its 3rd and 4th characters (a reserved '??--' label, R-LDH, as xn-- is, which the CA refuses); an uppercase label is refused, never folded. Every host lands in the Certificate Transparency logs: a label never names a customer.",
             ),
             admin_action_body_field(
                 "upstream",

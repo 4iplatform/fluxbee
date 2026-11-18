@@ -1578,6 +1578,22 @@ fn main_alone_loses_nothing(view: &EdgeView, names: &[String], now: i64) -> bool
     !covered(main) || !dropped.iter().any(covered) || expiring
 }
 
+/// The names a check's renewal carries (docs/io-web-v2-stage-2-1.md §5.2): the main one and each
+/// of `orderable` the served leaf covers, never a host it misses. A new host rides a name-change
+/// order, so none can hold the main name's renewal, not even one the CA refuses when the order
+/// is created, which names no authorization and lets no fallback fire. With no served leaf there
+/// is nothing to renew: the first certificate carries every name `orderable` holds.
+fn renewal_names(settings: &AcmeSettings, view: &EdgeView, orderable: Vec<String>) -> Vec<String> {
+    let Some(leaf) = view.leaf.as_ref().filter(|_| view.serving()) else {
+        return orderable;
+    };
+    let main = settings.main_name();
+    orderable
+        .into_iter()
+        .filter(|name| name == main || tls_material::name_covered(&leaf.names, name))
+        .collect()
+}
+
 /// Hold a due order for the operator, a rate limit, the backoff or the cap.
 fn gate(
     state: &AcmeState,
@@ -2533,20 +2549,50 @@ impl AcmeService {
     /// The names an order carries now (docs/io-web-v2-stage-2-1.md §5.2): the main one, each
     /// published host the served leaf covers, and each other one whose DNS name answers the main
     /// name's addresses. A host still waiting is left out, so it never fails the order for every
-    /// name.
+    /// name; so is one the CA refused by name at the last attempt, until that attempt's backoff
+    /// ends (`refused_by_name`).
     fn orderable_names(&self, settings: &AcmeSettings, view: &EdgeView) -> Vec<String> {
         let main = settings.main_name();
         let leaf = view.leaf.as_ref().filter(|_| view.serving());
+        let refused = self.refused_by_name(self.now());
         settings
             .names
             .iter()
             .filter(|name| {
                 name.as_str() == main
                     || leaf.is_some_and(|leaf| tls_material::name_covered(&leaf.names, name))
-                    || self.dns_state(name, main) == DnsState::Ready
+                    || (self.dns_state(name, main) == DnsState::Ready && !refused.contains(name))
             })
             .cloned()
             .collect()
+    }
+
+    /// The names the CA refused by name at the last attempt (`failed_names`) while the backoff that
+    /// failure started runs (docs/io-web-v2-stage-2-1.md §5.2): ordered again at once, a host the
+    /// CA refuses fails the order for every name it carries.
+    fn refused_by_name(&self, now: i64) -> Vec<String> {
+        self.read(|state| {
+            let backing_off = state
+                .backoff
+                .next_attempt_at
+                .is_some_and(|until| until > now);
+            match &state.last_attempt {
+                Some(attempt) if backing_off && attempt.failed() => attempt.failed_names.clone(),
+                _ => Vec::new(),
+            }
+        })
+    }
+
+    /// Whether a published host the served leaf misses still waits for its DNS name: the check
+    /// comes back within 5 min (docs/io-web-v2-stage-2-1.md §5.2).
+    fn dns_waiting(&self, settings: &AcmeSettings, view: &EdgeView) -> bool {
+        let main = settings.main_name();
+        let leaf = view.leaf.as_ref().filter(|_| view.serving());
+        settings.names.iter().any(|name| {
+            name.as_str() != main
+                && !leaf.is_some_and(|leaf| tls_material::name_covered(&leaf.names, name))
+                && self.dns_state(name, main) != DnsState::Ready
+        })
     }
 
     /// The published hosts changed (docs/io-web-v2-stage-2-1.md §5.2): the loop wakes, and a
@@ -2872,7 +2918,7 @@ impl AcmeService {
         self.refresh_dns(settings, &view).await;
         let orderable = self.orderable_names(settings, &view);
         // A published host waiting for its DNS name is looked at again within 5 min.
-        let (regular, retry) = if orderable.len() < settings.names.len() {
+        let (regular, retry) = if self.dns_waiting(settings, &view) {
             let soon = now + DNS_RECHECK_SECS;
             (regular.min(soon), retry.min(soon))
         } else {
@@ -2906,7 +2952,16 @@ impl AcmeService {
                     view,
                     replaces,
                 );
-                run.names = orderable;
+                // A name-change order carries the new hosts; a renewal only the names the served
+                // leaf covers (`renewal_names`), so no new host can hold it. A host it leaves out
+                // is still due: the check comes back within a minute for its name-change order.
+                let orderable_len = orderable.len();
+                run.names = if name_change {
+                    orderable
+                } else {
+                    renewal_names(settings, &run.view, orderable)
+                };
+                let left_out = !main_only && run.names.len() < orderable_len;
                 // A renewal orders only when the main name needs the certificate; what the edge
                 // serves decides whether a failed added name lets it go alone. A name-change
                 // order never does: it would spend an issuance on the names the edge serves.
@@ -2934,10 +2989,15 @@ impl AcmeService {
                         .filter(|until| *until > now)
                         .max()
                 });
-                if pending {
+                let next = if pending {
                     retry
                 } else {
                     held.map_or(regular, |until| regular.min(until))
+                };
+                if left_out {
+                    next.min(now + NAMES_CHANGED_CHECK_SECS)
+                } else {
+                    next
                 }
             }
         }

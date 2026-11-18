@@ -1865,6 +1865,15 @@ The names after the main one follow the exposures Fluxbee Cloud publishes
   ordered only once every address it resolves to is one of the main name's; until then it is left
   out of every order, so it never fails the order for every name, and the check comes back within
   5 min. A change of its state is logged.
+- **A host the CA refused by name** (the last attempt's `failed_names`) is left out of every
+  order, the operator's `POST /acme/renew` included, until the backoff that failure started ends;
+  then it is ordered again.
+- **A renewal never carries a new host.** A check's renewal of the served leaf carries the main
+  name and the published hosts that leaf covers, nothing else: a host it misses rides a
+  name-change order, for which the check comes back within a minute, so no published host can
+  hold the main name's renewal, not even one the CA refuses when the order is created, which
+  names no authorization and lets no fallback fire. With no certificate on the edge, the first
+  order carries every name it may.
 - **A name-change order.** A published host the leaf this account issued misses, its DNS name
   answering, is ordered at once with the main name and every name the leaf covers, replacing the
   leaf: outside the cap; held by an `install_refused`, the CA's rate limit and the backoff as any
@@ -1902,14 +1911,16 @@ Source: `src/bin/sy_admin/exposures.rs`.
   every exposure change `500 RECORD_FAILED` until the operator fixes or removes it and restarts
   SY.admin.
 - **The checks**, before anything is read: a label is one DNS label (1 to 63 lowercase letters,
-  digits and hyphens, a letter or a digit at each end), taken as given, never folded; the host is
-  under the main name, the host of `admin.public_base_url` (`409 NO_MAIN_HOST` without one); the
-  upstream is `{"kind": "archi"}` (one exposure at most), a worker of the registry with its join
-  done and a port (`{"kind": "hive", "hive", "port"}`), or a private IP literal (10/8, 172.16/12,
-  192.168/16, fc00::/7; never loopback, link-local, multicast, broadcast or unspecified) that is
-  no hive's recorded address, with a port (`{"kind": "address", "address", "port"}`); each kind
-  takes only its own fields, and Fluxbee's own ports are refused (22, 80, 443, 3000, 8080, 8384,
-  9000, 9100, 9200, 21027, 22000). At most 16 exposures (`409 EXPOSURE_LIMIT`).
+  digits and hyphens, a letter or a digit at each end, never hyphens as its 3rd and 4th
+  characters: a reserved `??--` label, R-LDH, as `xn--` is, which Let's Encrypt refuses when the
+  order is created), taken as given, never folded; the host is under the main name, the host of
+  `admin.public_base_url` (`409 NO_MAIN_HOST` without one); the upstream is `{"kind": "archi"}`
+  (one exposure at most), a worker of the registry with its join done and a port
+  (`{"kind": "hive", "hive", "port"}`), or a private IP literal (10/8, 172.16/12, 192.168/16,
+  fc00::/7; never loopback, link-local, multicast, broadcast or unspecified) that is no hive's
+  recorded address, with a port (`{"kind": "address", "address", "port"}`); each kind takes only
+  its own fields, and Fluxbee's own ports are refused (22, 80, 443, 3000, 8080, 8384, 9000, 9100,
+  9200, 21027, 22000). At most 16 exposures (`409 EXPOSURE_LIMIT`).
 - **One change at a time** (the exposure lock): a publish, enable, disable or unpublish asked
   while another runs answers `409 BUSY` with `payload.retryable: true` at once, after its field
   checks, nothing read or changed. `issue_exposure_link` and `list_exposures` take no lock and

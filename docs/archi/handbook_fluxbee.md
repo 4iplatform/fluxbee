@@ -1262,6 +1262,11 @@ An exposure is one host on the public edge, `<label>.<main name>`, leading to on
 opened for a window by an enablement. A person enters with a one-time link, then a session
 cookie. Design: [io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md).
 
+The label is one DNS label: 1 to 63 lowercase letters, digits and hyphens, a letter or a digit at
+each end, never hyphens as its 3rd and 4th characters (a reserved `??--` label, as `xn--` is,
+which the CA refuses). Anything else is refused at publish, `400 INVALID_REQUEST`, and never
+folded to lowercase.
+
 **Fluxbee Cloud alone changes them.** `publish_exposure`, `enable_exposure`, `disable_exposure`,
 `unpublish_exposure` and `issue_exposure_link` reach SY.admin only through IO.cloud's relay. For
 you, the operator and the executor each answers `403 UNAUTHORIZED`: never stage one in a plan,

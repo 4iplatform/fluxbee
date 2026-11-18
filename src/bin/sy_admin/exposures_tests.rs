@@ -754,6 +754,34 @@ async fn publish_exposure_refuses_a_bad_label_and_never_folds_it() {
     admin.publish("0-shop-1", shop_upstream()).await;
 }
 
+/// §2.1, §5.2: a label with hyphens as its 3rd and 4th characters is a reserved LDH label ('??--',
+/// R-LDH), which Let's Encrypt refuses when the order is created: refused at publish, 400
+/// INVALID_REQUEST naming the rule, nothing written or sent. Hyphens elsewhere are a label.
+#[tokio::test(start_paused = true)]
+async fn publish_exposure_refuses_a_reserved_ldh_label() {
+    let mut admin = exposures_admin("web21-labels-rldh", Some(EDGE));
+    for label in ["my--shop", "xn--zz"] {
+        let (answer, sent) = admin
+            .cloud(
+                "publish_exposure",
+                json!({ "label": label, "upstream": shop_upstream() }),
+            )
+            .await;
+        assert_eq!(answer.http_status, 400, "'{label}': {}", answer.envelope);
+        assert_eq!(error_code(&answer), "INVALID_REQUEST");
+        let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("3rd and 4th") && detail.contains("R-LDH"),
+            "'{label}': {detail}"
+        );
+        assert!(sent.is_empty(), "'{label}'");
+    }
+    assert!(!admin.mesh.registry.exists(), "nothing written");
+    admin.publish("a--shop", shop_upstream()).await;
+    admin.publish("my-shop", shop_upstream()).await;
+    admin.publish("myshop--1", shop_upstream()).await;
+}
+
 /// §2.2: an upstream is Archi, a worker of the registry, or a private address that is no hive's,
 /// never one of Fluxbee's own ports.
 #[tokio::test(start_paused = true)]

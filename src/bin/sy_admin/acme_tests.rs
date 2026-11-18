@@ -157,6 +157,9 @@ pub(super) struct CaScript {
     /// Names whose challenge the CA refuses, with its error: their authorization goes invalid,
     /// the order with it at once, and the other names validate.
     refused: BTreeMap<String, String>,
+    /// Names the CA refuses when the order is created, with its error (`rejectedIdentifier`): an
+    /// order that carries one is refused whole, naming no authorization.
+    refused_at_order: BTreeMap<String, String>,
     /// Names whose validation is still running through this many reads of the order's
     /// authorizations asked again, the order's verdict notwithstanding.
     slow: BTreeMap<String, usize>,
@@ -186,6 +189,7 @@ impl Default for CaScript {
             poll: Ok(OrderStatus::Ready),
             challenge_error: None,
             refused: BTreeMap::new(),
+            refused_at_order: BTreeMap::new(),
             slow: BTreeMap::new(),
             set_ready_errors: BTreeMap::new(),
             valid: Vec::new(),
@@ -289,6 +293,12 @@ impl CaAccount for FakeAccount {
         ));
         if let Some(err) = script.new_order_errors.pop_front() {
             return Err(err);
+        }
+        if let Some(error) = names
+            .iter()
+            .find_map(|name| script.refused_at_order.get(name))
+        {
+            return Err(CaError::Problem(error.clone()));
         }
         let n = script.log.new_orders.len();
         let url = format!("{}/order/{n}", self.url);
@@ -1931,7 +1941,9 @@ async fn a_failure_on_an_added_name_keeps_a_certificate_for_every_name() {
 }
 
 /// A leaf for the main name alone loses nothing by another: at its point it is renewed for the
-/// main name alone while Archi's name still fails.
+/// main name alone while Archi's name still fails. A renewal carries the names the leaf covers,
+/// so it goes for the main name at once; Archi's host is a name-change order's
+/// (docs/io-web-v2-stage-2-1.md §5.2).
 #[tokio::test]
 async fn a_leaf_already_without_the_added_name_renews_for_the_main_name_alone() {
     let h = Harness::with_archi();
@@ -1952,8 +1964,8 @@ async fn a_leaf_already_without_the_added_name_renews_for_the_main_name_alone() 
         .collect();
     assert_eq!(
         orders[2..],
-        [names(&[NAME, ARCHI]), names(&[NAME])],
-        "every name first, then the main name alone"
+        [names(&[NAME])],
+        "the names the leaf covers: the main name alone, at once"
     );
     assert_eq!(h.state().last_attempt.unwrap().result, "installed");
 }
@@ -2040,8 +2052,10 @@ async fn a_forced_renewal_does_not_fall_back_while_the_main_name_is_served_and_n
     assert_eq!(attempt.result, "failed");
     assert!(attempt.detail.unwrap().contains(ARCHI));
     assert_eq!(served_names(&h), names(&[NAME]));
-    // Once Archi's name validates, the same call certifies both.
+    // Once Archi's name validates, the same call certifies both, past the backoff its failure
+    // started: until then the name is left out of every order (docs/io-web-v2-stage-2-1.md §5.2).
     h.ca().refused.clear();
+    h.advance(HOUR);
     h.service.begin_renew().expect("renew");
     h.settle().await;
     assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
@@ -2311,6 +2325,100 @@ async fn a_renewal_overdue_after_a_failure_that_named_no_added_name_keeps_every_
     h.service.check_once().await;
     assert_eq!(h.ca().log.new_orders[2].0, names(&[NAME, ARCHI]));
     assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+}
+
+/// A published host the CA refuses when the order is created (`rejectedIdentifier`) fails its
+/// name-change order whole, naming no authorization, so no fallback fires. The renewal still goes
+/// out at its point, with the main name and the names the served leaf covers only: no host can
+/// hold the main name's renewal (docs/io-web-v2-stage-2-1.md §5.2).
+#[tokio::test]
+async fn a_host_refused_when_its_order_is_created_never_holds_the_renewal() {
+    let h = Harness::with_archi();
+    h.install_first().await;
+    let not_before = h.state().issued[0].not_before;
+    let shop = format!("shop.{NAME}");
+    h.ca().refused_at_order.insert(
+        shop.clone(),
+        "urn:ietf:params:acme:error:rejectedIdentifier: the CA will not issue for this name"
+            .to_string(),
+    );
+    h.publish(&[ARCHI, shop.as_str()]);
+    h.service.check_once().await;
+    assert_eq!(
+        h.ca().log.new_orders[1].0,
+        names(&[NAME, ARCHI, shop.as_str()]),
+        "the name-change order"
+    );
+    let attempt = h.state().last_attempt.expect("an attempt");
+    assert_eq!(
+        (attempt.result.as_str(), attempt.stage.as_deref()),
+        ("failed", Some("order"))
+    );
+    assert!(attempt.failed_names.is_empty(), "no authorization named");
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+
+    // The renewal point, past the backoff: the main name and Archi's, which the leaf covers.
+    h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
+    let next = h.service.check_once().await;
+    let orders = h.ca().log.new_orders.clone();
+    assert_eq!(orders.len(), 3);
+    assert_eq!(orders[2].0, names(&[NAME, ARCHI]), "no new host rides it");
+    assert!(orders[2].2, "it replaces the leaf this account issued");
+    let attempt = h.state().last_attempt.expect("an attempt");
+    assert_eq!(attempt.result, "installed", "{:?}", attempt.detail);
+    assert_eq!(h.state().issued.len(), 2, "renewed");
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+
+    // The host it left out is still due: the check comes back within a minute for its own order.
+    assert!(next <= h.now() + 60, "next check at {next}");
+    h.advance(60);
+    h.service.check_once().await;
+    assert_eq!(
+        h.ca().log.new_orders[3].0,
+        names(&[NAME, ARCHI, shop.as_str()])
+    );
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+}
+
+/// A published host the CA refused by name (its authorization invalid) is left out of every
+/// order until the backoff that failure started ends, so meanwhile it fails no order for the other
+/// names; once the backoff ends it is ordered again (docs/io-web-v2-stage-2-1.md §5.2).
+#[tokio::test]
+async fn a_host_the_ca_refused_by_name_is_left_out_until_the_backoff_ends() {
+    let h = Harness::on();
+    h.install_first().await;
+    let shop = format!("shop.{NAME}");
+    let wiki = format!("wiki.{NAME}");
+    h.ca().refused.insert(
+        shop.clone(),
+        "DNS problem: NXDOMAIN looking up A for the shop host".to_string(),
+    );
+    h.publish(&[shop.as_str(), wiki.as_str()]);
+    h.service.check_once().await;
+    let every = names(&[NAME, shop.as_str(), wiki.as_str()]);
+    assert_eq!(h.ca().log.new_orders[1].0, every, "the name-change order");
+    let attempt = h.state().last_attempt.expect("an attempt");
+    assert_eq!(attempt.failed_names, names(&[shop.as_str()]));
+    assert_eq!(h.service.host_certificate(&shop)["state"], "failed");
+
+    // The backoff ended: ordered again, refused again, a longer backoff.
+    h.advance(HOUR);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 3);
+    assert_eq!(h.ca().log.new_orders[2].0, every, "ordered again");
+    assert_eq!(h.state().backoff.failures, 2);
+
+    // Within that backoff the next order, the operator's, leaves it out: the other host goes on.
+    h.advance(60);
+    h.service.begin_renew().expect("renew");
+    h.settle().await;
+    assert_eq!(h.ca().log.new_orders.len(), 4);
+    assert_eq!(h.ca().log.new_orders[3].0, names(&[NAME, wiki.as_str()]));
+    assert_eq!(
+        h.state().last_attempt.expect("an attempt").result,
+        "installed"
+    );
+    assert_eq!(served_names(&h), names(&[NAME, wiki.as_str()]));
 }
 
 #[test]
