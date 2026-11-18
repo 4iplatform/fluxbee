@@ -423,6 +423,7 @@ async fn exposure_writes_are_iocloud_s_alone() {
         assert_eq!(mesh_access(action), Some(MeshAccess::Cloud), "{action}");
         for caller in [
             ARCHI,
+            "IO.api.x@motherbee",
             "AI.support@motherbee",
             "SY.wf-rules@worker1",
             "IO.cloud@worker1",
@@ -438,6 +439,7 @@ async fn exposure_writes_are_iocloud_s_alone() {
             AdminOrigin::Http,
             AdminOrigin::Executor,
             AdminOrigin::Mesh(ARCHI),
+            AdminOrigin::Mesh("IO.api.x@motherbee"),
             AdminOrigin::Mesh("IO.cloud@worker1"),
             AdminOrigin::Mesh(""),
         ] {
