@@ -36,9 +36,9 @@ use fluxbee_sdk::protocol::{
     IoWebAccessLinkRequest, IoWebAccessLinkResponse, IoWebEnablement, IoWebEnablementKey,
     IoWebExposure, IoWebExposuresPayload, IoWebExposuresResponse, IoWebKeyState,
     WebExposureKeySlot, WebExposureUpstream, IO_WEB_ERROR_ENABLEMENT_UNKNOWN,
-    IO_WEB_ERROR_EXPOSURE_UNKNOWN, MSG_IO_WEB_ACCESS_LINK, MSG_IO_WEB_ACCESS_LINK_RESPONSE,
-    MSG_IO_WEB_EXPOSURES, MSG_IO_WEB_EXPOSURES_RESPONSE, WEB_ENABLEMENT_ID_PREFIX,
-    WEB_EXPOSURE_ID_PREFIX,
+    IO_WEB_ERROR_EXPOSURE_UNKNOWN, IO_WEB_ERROR_STALE_GENERATION, MSG_IO_WEB_ACCESS_LINK,
+    MSG_IO_WEB_ACCESS_LINK_RESPONSE, MSG_IO_WEB_EXPOSURES, MSG_IO_WEB_EXPOSURES_RESPONSE,
+    WEB_ENABLEMENT_ID_PREFIX, WEB_EXPOSURE_ID_PREFIX,
 };
 use fluxbee_sdk::vault::{web_exposure_vault_key, WEB_SESSION_KEY_RESOURCE_TYPE};
 use fluxbee_sdk::{
@@ -238,6 +238,9 @@ struct Registry {
 pub(crate) struct Exposures {
     path: PathBuf,
     clock: ClockMs,
+    /// The main name SY.admin started with, the host of `admin.public_base_url` (§2.1): every
+    /// host served is its exposure's label under it. None: no exposure host is served.
+    main: Option<String>,
     registry: RwLock<Registry>,
     /// One exposure write at a time (`exposure_lock`, §5.1): publish, enable, disable and
     /// unpublish. Another one is refused at once, `409 BUSY`, nothing read. The link and the list
@@ -256,11 +259,12 @@ impl Exposures {
     /// The registry at `state_dir/sy-admin/exposures.json`. A missing file is an empty registry
     /// whose generation is now in ms, past every set pushed before; a file that cannot be read is
     /// logged as an ERROR, kept for the operator and held as an empty registry that refuses every
-    /// write.
-    pub(crate) fn load(state_dir: &Path, clock: ClockMs) -> Arc<Self> {
+    /// write. Each host is derived again from its label and `main`, the main name now (§2.1), so
+    /// a change of `admin.public_base_url` moves them all; the generation is the file's.
+    pub(crate) fn load(state_dir: &Path, main: Option<&str>, clock: ClockMs) -> Arc<Self> {
         let path = registry_path(state_dir);
         let now_ms = clock();
-        let (file, unreadable) = match read_registry(&path) {
+        let (mut file, unreadable) = match read_registry(&path) {
             Ok(Some(file)) => (file, None),
             Ok(None) => (empty_registry(now_ms), None),
             Err(reason) => {
@@ -268,12 +272,15 @@ impl Exposures {
                     path = %path.display(),
                     reason = %reason,
                     "the exposures registry cannot be read: kept as it is for the operator; \
-                     SY.admin pushes empty sets and refuses every exposure write until it is \
-                     fixed or removed and SY.admin restarts"
+                     SY.admin pushes empty sets and refuses every exposure write until the \
+                     operator removes it and SY.admin restarts. Never repair it in place: it \
+                     keeps its older generation, and io.web refuses every set after the empty \
+                     ones pushed meanwhile"
                 );
                 (empty_registry(now_ms), Some(reason))
             }
         };
+        rederive_hosts(&mut file, main);
         if unreadable.is_none() {
             tracing::info!(
                 path = %path.display(),
@@ -285,6 +292,7 @@ impl Exposures {
         Arc::new(Self {
             path,
             clock,
+            main: main.map(str::to_string),
             registry: RwLock::new(Registry {
                 file,
                 unreadable,
@@ -316,13 +324,23 @@ impl Exposures {
         self.read(|registry| registry.file.clone())
     }
 
-    /// The published hosts, sorted: the edge's routes and the certificate's added names.
+    /// Whether an exposure's host is served: it is the exposure's label under the main name now
+    /// (§2.1). With no main name, none is.
+    fn served(&self, exposure: &ExposureRecord) -> bool {
+        self.main.as_deref().is_some_and(|main| {
+            exposure_host(&exposure.label, main).is_ok_and(|host| host == exposure.host)
+        })
+    }
+
+    /// The published hosts, sorted: the edge's routes and the certificate's added names. Only the
+    /// ones served: none without a main name.
     pub(crate) fn hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self.read(|registry| {
             registry
                 .file
                 .exposures
                 .iter()
+                .filter(|exposure| self.served(exposure))
                 .map(|exposure| exposure.host.clone())
                 .collect()
         });
@@ -340,7 +358,7 @@ impl Exposures {
         self.read(|registry| registry.unpersisted.is_none())
     }
 
-    /// The set io.web gets (§5.5), with no secret.
+    /// The set io.web gets (§5.5), with no secret: the exposures served, none without a main name.
     pub(crate) fn io_web_payload(&self) -> IoWebExposuresPayload {
         self.read(|registry| IoWebExposuresPayload {
             generation: registry.file.generation,
@@ -348,6 +366,7 @@ impl Exposures {
                 .file
                 .exposures
                 .iter()
+                .filter(|exposure| self.served(exposure))
                 .map(ExposureRecord::for_io_web)
                 .collect(),
         })
@@ -457,6 +476,54 @@ fn empty_registry(now_ms: u64) -> RegistryFile {
         schema_version: REGISTRY_SCHEMA_VERSION,
         generation: now_ms,
         exposures: Vec::new(),
+    }
+}
+
+/// An exposure's host (§2.1): its label under the main name, within a DNS name's 253 characters.
+fn exposure_host(label: &str, main: &str) -> Result<String, String> {
+    let host = format!("{label}.{main}");
+    if host.len() > 253 {
+        return Err(format!(
+            "the host {host} is longer than a DNS name (253 characters)"
+        ));
+    }
+    Ok(host)
+}
+
+/// Each exposure's host derived again from its label and the main name SY.admin starts with
+/// (§2.1), each change logged. With no main name, or a host too long under it, the stored host is
+/// kept and the exposure is not served: neither routed, pushed to io.web nor ordered.
+fn rederive_hosts(file: &mut RegistryFile, main: Option<&str>) {
+    let Some(main) = main else {
+        if !file.exposures.is_empty() {
+            tracing::warn!(
+                exposures = file.exposures.len(),
+                "the hive has no main name (admin.public_base_url): no exposure's host is routed, \
+                 pushed to io.web or ordered until it names one and SY.admin restarts"
+            );
+        }
+        return;
+    };
+    for exposure in &mut file.exposures {
+        match exposure_host(&exposure.label, main) {
+            Ok(host) if host == exposure.host => {}
+            Ok(host) => {
+                tracing::info!(
+                    exposure_id = %exposure.exposure_id,
+                    from = %exposure.host,
+                    host = %host,
+                    "the exposure's host follows the main name"
+                );
+                exposure.host = host;
+            }
+            Err(reason) => tracing::error!(
+                exposure_id = %exposure.exposure_id,
+                host = %exposure.host,
+                reason = %reason,
+                "the exposure's host cannot follow the main name: it is not routed, pushed to \
+                 io.web or ordered"
+            ),
+        }
     }
 }
 
@@ -998,6 +1065,23 @@ impl Exposures {
                 before = %before,
                 "io.web took the exposures"
             ),
+            // io.web holds a newer set than the registry's: a file repaired or restored in place
+            // keeps its older generation, while SY.admin pushed newer (empty) sets when it could
+            // not read it. The generation is never moved at load: the remedy is the operator's.
+            IoWebAnswer::Refused { code, detail } if code == IO_WEB_ERROR_STALE_GENERATION => {
+                tracing::error!(
+                    generation,
+                    error_code = %code,
+                    detail = %detail,
+                    before = %before,
+                    path = %self.path.display(),
+                    "io.web holds a newer set of exposures than SY.admin's registry and refuses \
+                     every push until a newer one: the registry file carries an older generation, \
+                     as one repaired or restored in place does. An unreadable registry is \
+                     removed, never repaired; Fluxbee Cloud's next exposure change pushes a newer \
+                     set"
+                )
+            }
             IoWebAnswer::Refused { code, detail } => tracing::warn!(
                 generation,
                 error_code = %code,
@@ -1025,7 +1109,9 @@ impl Exposures {
                 generation,
                 detail = %detail,
                 before = %before,
-                "no io.web to push the exposures to (run_node IO.web@motherbee, in the root tenant)"
+                "no io.web to push the exposures to: start_node IO.web@motherbee after the \
+                 brake's kill_node, or run_node IO.web@motherbee in the root tenant if it was \
+                 never launched"
             ),
         }
         let keys = |answer: Option<&IoWebAnswer>| -> BTreeMap<String, IoWebKeyState> {
@@ -1222,7 +1308,7 @@ fn busy(action: &str) -> InternalAdminDispatchResult {
 }
 
 /// `500 RECORD_FAILED` while the registry on disk could not be read at boot: nothing opens or
-/// closes until the operator fixes or removes the file and SY.admin restarts.
+/// closes until the operator removes the file and SY.admin restarts.
 fn registry_unreadable(action: &str, path: &Path, reason: &str) -> InternalAdminDispatchResult {
     answer_error(
         action,
@@ -1230,7 +1316,8 @@ fn registry_unreadable(action: &str, path: &Path, reason: &str) -> InternalAdmin
         "RECORD_FAILED",
         format!(
             "the exposures registry {} could not be read at SY.admin's start ({reason}): nothing \
-             was changed. The operator fixes or removes the file, then restarts SY.admin.",
+             was changed. The operator removes the file, never repairs it, then restarts \
+             SY.admin.",
             path.display()
         ),
     )
@@ -1382,13 +1469,10 @@ async fn publish(
             )
         }
     };
-    let host = format!("{}.{main}", request.label);
-    if host.len() > 253 {
-        return invalid(
-            action,
-            format!("the host {host} is longer than a DNS name (253 characters)"),
-        );
-    }
+    let host = match exposure_host(&request.label, &main) {
+        Ok(host) => host,
+        Err(detail) => return invalid(action, detail),
+    };
     // (2) One label, one exposure; one exposure of Archi; at most MAX_EXPOSURES.
     let file = ctx.exposures.file();
     let now = ctx.exposures.now_secs();

@@ -1027,31 +1027,34 @@ orders now: the new certificate goes into the edge's secret, the hand-seeded one
 vault as the previous version, and the edge reloads. From then on the check renews it by itself.
 The same call certifies a new name after `public_base_url` changed and SY.admin restarted.
 
-**Add a web host to the certificate** (Archi's, [io-web-v2](../io-web-v2.md) §11.1). One
-certificate carries the main name and every host `web:` declares, each a label before the main
-name:
+**The web hosts on the certificate** ([io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.2).
+The web hosts are the exposures Fluxbee Cloud publishes through IO.cloud, each
+`<label>.<main name>` ([SY.admin](../nodes/sy-admin.md#the-exposures)), Archi's among them.
+hive.yaml no longer declares any: a `web:` key left there is ignored, with one warning at
+SY.admin's start. One certificate carries the main name and every published host, and SY.admin
+adds each host by itself:
 
-1. **DNS.** A record for `archi.<main name>` pointing at the ingress, like the main name's (a CNAME
-   of it works), made by hand.
-2. **The motherbee's hive.yaml:** `web: {archi: true}`. A bare `web:` declares nothing.
-3. **Restart SY.admin** when it is idle. Its log names the declared host, and the edge gets the
-   host's route within a minute. The served certificate does not cover the host yet: the check
-   raises `name_not_covered` (warning) and orders nothing, since the leaf is not due and the cap
-   holds automatic orders.
-4. **`POST /acme/test`**, confirmed: the staging order carries every name, and `last_test` says
-   which one the CA did not validate, if any.
-5. **`POST /acme/renew`**, confirmed (forced, past the cap). Then `config.names` lists every name,
-   `edge.names_missing` is empty, and `name_not_covered` closes.
+1. **DNS.** A record for the host pointing at the ingress, like the main name's (a CNAME of it
+   works), made by hand. Until every address it resolves to is one of the main name's, the host
+   is `waiting_dns` in its exposure's view, left out of every order, and resolved again every
+   5 min.
+2. **The name-change order.** Once its DNS name answers, a host the served leaf misses is ordered
+   within a minute of its publish, with the main name and every name the leaf covers: outside the
+   cap, one such order per 15 min and five per 7 days. Past that budget the host is `held` until
+   `retry_at`; `POST /acme/renew`, confirmed, orders it now. Each exposure's `certificate.state`
+   in `GET /web/status` says where its host stands, and `name_not_covered` stays open until the
+   leaf covers it.
 
-When the CA validates the main name but not the added one, an order goes on with the main name
-alone only when the edge would lose nothing it serves, or cannot wait: no certificate for the
-main name, one that already lacks the added name, or one in the last sixth of its lifetime;
-`last_attempt.detail` says why. Otherwise the attempt fails (`last_attempt.failed_names` names
-the host) and the backoff retries every name, so a certificate for both names is kept; 48 h past
-its renewal point, after such a failure, the main name is renewed alone. A `POST /acme/renew`
-while the main name is served and not due just fails: fix the host's DNS and renew again.
-Removing `web:` (and restarting) takes the host's route off the edge within a minute and its name
-off the certificate at the next renewal.
+A renewal of the served leaf carries the main name and the hosts that leaf covers, never a new
+one, so no published host can hold the main name's certificate. When the CA validates the main
+name but not an added one, an order goes on with the main name alone only when the edge would
+lose nothing it serves, or cannot wait: no certificate for the main name, one that already lacks
+the added name, or one in the last sixth of its lifetime; `last_attempt.detail` says why.
+Otherwise the attempt fails (`last_attempt.failed_names` names the host, `failed` in its view)
+and the backoff retries; the host is left out of every order, `POST /acme/renew` included, until
+that backoff ends, and 48 h past its renewal point, after such a failure, the main name is renewed
+alone. Fix the host's DNS and wait for the backoff's end. An unpublished host leaves the edge's
+routes at once and the certificate at its next renewal.
 
 **Roll back.** `POST /hives/motherbee/vault/secrets/<the edge's secret>/rollback` puts the previous
 version back, then `POST /acme/reload` makes the edge serve it. The check then sees a hand-seeded
@@ -1090,20 +1093,23 @@ public name's certificate expiry, run from outside the installation, covers that
 
 ## The web door
 
-The public edge serves each host `web:` declares only through io.web
-([io-web-v2](../io-web-v2.md) §11): the edge on the ingress takes the request and proxies it to
-`IO.web@motherbee`. `GET /web/status` on the motherbee shows the four pieces of the door, each a
-state, never an error ([SY.admin](../nodes/sy-admin.md#the-web-doors-status)):
+The public edge serves each host Fluxbee Cloud publishes (an exposure, through IO.cloud) only
+through io.web ([io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md)): the edge on the ingress takes
+the request and proxies it to `IO.web@motherbee`. A `web:` key left in hive.yaml is ignored, with
+one warning at SY.admin's start. `GET /web/status` on the motherbee shows the four pieces of the
+door, each a state, never an error, and each exposure's view in `exposures`
+([SY.admin](../nodes/sy-admin.md#the-web-doors-status)):
 
 | Piece | Ready | Otherwise |
 | --- | --- | --- |
-| `web`: the host | `state: declared`, the host in `hosts` | `absent`: add `web: {archi: true}` to the motherbee's hive.yaml and restart SY.admin; `invalid`: `reason` says why |
-| `certificate` | `hosts_missing: []` | `POST /acme/test`, then `POST /acme/renew` ("Add a web host to the certificate" in [Certificates](#certificates-acme)). `served` is the leaf at the ACME client's last look; `GET /acme/status` asks the edge afresh |
+| `web`: the hosts | `state: published`, the published hosts in `hosts` | `none`: Fluxbee Cloud published no exposure; `unreadable`: SY.admin could not read its registry at its start (`reason` says why) and refuses every exposure change: remove the file, never repair it, and restart SY.admin; Fluxbee Cloud then publishes again ([SY.admin](../nodes/sy-admin.md#the-exposures)) |
+| `certificate` | `hosts_missing: []` | each host is ordered by itself once its DNS name answers ("The web hosts on the certificate" in [Certificates](#certificates-acme)), and each exposure's `certificate.state` says where it stands. `served` is the leaf at the ACME client's last look; `GET /acme/status` asks the edge afresh |
 | `routes`: the edge's answer to the last push | `state: acknowledged`, `acknowledged_at` within the last minutes (SY.admin pushes every 60 s), and `upstream.state: ready`, the edge's way to io.web | `no_edge`: no `admin.public_edge_node` and not exactly one connected ingress (`detail` says which); `no_answer`: the edge is down or older than 0.1.84; `refused`: the edge's journal says why; `upstream.state: unavailable`: the edge has no way to io.web and answers every web host 502, `upstream.reason` says what is missing on the ingress (its mesh TLS material, `hive_id`, `wan.uplinks`), then restart `sy-edge` there. `upstream.last_failure` is the last request io.web did not answer (`at`, `kind`); the edge's journal says why (`io.web did not answer proxied requests`) |
-| `io_web` | `state: running`, `answer.health_state: HEALTHY` | `absent`: io.web starts only by an explicit launch, once ([Node lifecycle](#node-lifecycle)): `POST /hives/motherbee/nodes` with `node_name: IO.web@motherbee`, `runtime: io.web` and the root tenant as `tenant_id`; `stopped`: `start_node`; `failed` or `silent`: `journalctl -u fluxbee-node-IO.web-motherbee`, then `restart_node`; `unknown`: the orchestrator did not answer (`view_error`), or its `lifecycle_state` is `UNKNOWN` (systemd did not answer for io.web's unit), retry |
+| `io_web` | `state: running`, `answer.health_state: HEALTHY` | `absent`: io.web starts only by an explicit launch, once ([Node lifecycle](#node-lifecycle)): `POST /hives/motherbee/nodes` with `node_name: IO.web@motherbee`, `runtime: io.web` and the root tenant as `tenant_id`; `stopped`: `start_node`; `failed` or `silent`: `journalctl -u fluxbee-node-IO.web-motherbee`, then `restart_node`; `unknown`: the orchestrator did not answer (`view_error`), or its `lifecycle_state` is `UNKNOWN` (systemd did not answer for io.web's unit), retry. `exposures.last_answer` `refused` with `STALE_GENERATION`: the registry file was repaired or restored in place and io.web refuses every set until Fluxbee Cloud's next change (an ERROR in SY.admin's log) |
 
-With all four ready, the edge's upstream included, `https://archi.<main name>/` answers io.web's
-page from outside, with a valid certificate. A recent `routes.upstream.last_failure` with
+With all four ready, the edge's upstream included, each published host answers through io.web
+from outside, with a valid certificate; a person enters an enabled exposure with the one-time link
+Fluxbee Cloud issues. A recent `routes.upstream.last_failure` with
 everything else ready means io.web refused the edge or did not answer it: the edge's journal on the
 ingress and io.web's on the motherbee say why.
 
@@ -1122,7 +1128,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
 | `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`; `syncthing` `api_unanswered_restart` when the watchdog restarts Syncthing because its REST API gives no answer, FINDINGS A-283), and conditions, a row with `state: open` when one opens and an `info` row with `state: closed` when it closes: `syncthing` `api_unanswered`, the orchestrator's own, while Syncthing's REST API gives no answer, for every folder or at its port (`API port refused`, a port that refuses the connection or takes none within 2 s; FINDINGS A-283, since 0.1.137), and `certificate`, SY.admin's certificate conditions (`record_drift_alert`). A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |
 | `GET /acme/status` | the edge's certificate: ACME's configuration, the names, the open conditions ([Certificates](#certificates-acme)) |
-| `GET /web/status` | the web door: the declared host, the certificate's names, the edge's answer to the web routes with its way to io.web, io.web ([The web door](#the-web-door)) |
+| `GET /web/status` | the web door: the published hosts and each exposure's view, the certificate's names, the edge's answer to the web routes with its way to io.web, io.web ([The web door](#the-web-door)) |
 | `GET /config/storage/metrics` | SY.storage's inbox |
 | `systemctl --failed`, `journalctl -u <unit>` | per host. A Rust binary writes each record as one line of at most 16 KiB (the Rust SDK's `logging`; since 0.1.143; FINDINGS A-269): its control characters escaped as Rust's `Debug` shows them (`\n`, `\u{1b}`), so a field with a newline stays inside its record's line, and a longer record cut, its line ending `... (cut: N bytes)`. In a record's message, ESC, BEL, BS, FF and DEL show as tracing-subscriber escapes them (`\x1b`, `\x07`, `\x08`, `\x0c`, `\x7f`): a message's ESC is `\x1b`, a field's `\u{1b}`, so a search for an escape takes both forms. The Go nodes (SY.timer, SY.wf-rules, SY.opa.rules, the WF engine) print through Go's `log`, which escapes nothing |
 

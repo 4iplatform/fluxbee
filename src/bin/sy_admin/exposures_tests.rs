@@ -32,8 +32,8 @@ const SHOP: &str = "shop.hive-1.example.com";
 const START_MS: u64 = 1_794_960_000_000;
 const START_SECS: u64 = START_MS / 1_000;
 
-/// A registry in `state_dir` holding one closed exposure for each of `hosts`, loaded as SY.admin's
-/// start loads it.
+/// A registry in `state_dir` holding one closed exposure for each of `hosts`, each a label under
+/// the main name MAIN, loaded as SY.admin's start loads it under MAIN.
 pub(crate) fn registry_with_hosts(state_dir: &Path, hosts: &[&str]) -> Arc<Exposures> {
     let file = RegistryFile {
         schema_version: REGISTRY_SCHEMA_VERSION,
@@ -56,7 +56,11 @@ pub(crate) fn registry_with_hosts(state_dir: &Path, hosts: &[&str]) -> Arc<Expos
             .collect(),
     };
     write_registry(&registry_path(state_dir), &file).expect("the registry");
-    Exposures::load(state_dir, Arc::new(json_router::shm::now_epoch_ms))
+    Exposures::load(
+        state_dir,
+        Some(MAIN),
+        Arc::new(json_router::shm::now_epoch_ms),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -273,12 +277,14 @@ fn exposures_admin(prefix: &str, edge: Option<&'static str>) -> Admin {
 }
 
 impl Admin {
-    /// What SY.admin's start does: the registry loaded from its file, on the test clock, and the
-    /// web routes over it.
+    /// What SY.admin's start does: the registry loaded from its file, on the test clock, under
+    /// the main name `admin.public_base_url` gives, and the web routes over it.
     fn restart(&mut self) {
         let clock = Arc::clone(&self.clock);
+        let main = acme::certified_name(self.ctx.public_base_url.as_deref()).ok();
         self.ctx.exposures = Exposures::load(
             &self.ctx.state_dir,
+            main.as_deref(),
             Arc::new(move || clock.load(Ordering::SeqCst)),
         );
         let edge = self.edge;
@@ -1074,6 +1080,20 @@ async fn enable_puts_a_new_key_owned_by_io_web_in_the_free_slot_then_records_the
     assert!(!sent[1].payload.to_string().contains(secret), "nor the set");
     let first = admin.on_disk().exposures[0].enablements.clone();
     assert_eq!(first.len(), 1);
+    // Opening persists before it opens (§2.3): the file held the enablement when the set left.
+    let file_at_push = |admin: &Admin| {
+        admin
+            .mesh
+            .on_disk_at_push
+            .last()
+            .cloned()
+            .flatten()
+            .expect("a file when IO_WEB_EXPOSURES left")
+            .exposures[0]
+            .enablements
+            .clone()
+    };
+    assert_eq!(file_at_push(&admin), first, "written before the push");
     assert_eq!(
         (
             first[0].from,
@@ -1111,6 +1131,7 @@ async fn enable_puts_a_new_key_owned_by_io_web_in_the_free_slot_then_records_the
     let second = admin.on_disk().exposures[0].enablements.clone();
     assert_eq!(second.len(), 2);
     assert_eq!(second[0], first[0]);
+    assert_eq!(file_at_push(&admin), second, "written before the push");
     assert_eq!(
         (second[1].slot, second[1].key_version),
         (WebExposureKeySlot::B, 1)
@@ -1688,6 +1709,42 @@ async fn the_generation_never_goes_back_even_after_the_file_is_lost() {
     assert!(set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES)).generation > taken);
 }
 
+/// §2.1: a host is its label under the main name SY.admin starts with. A registry written under
+/// another main name loads with every host under the current one, so the edge's routes, io.web's
+/// set and the certificate's names follow `admin.public_base_url`, and the next write keeps it.
+/// With no main name no exposure's host is routed, pushed to io.web or ordered, and the registry
+/// keeps the exposure for when one returns.
+#[tokio::test(start_paused = true)]
+async fn the_hosts_follow_the_main_name_at_each_start() {
+    let mut admin = exposures_admin("web21-main-name-moves", Some(EDGE));
+    let id = admin.publish("shop", shop_upstream()).await;
+    assert_eq!(admin.ctx.exposures.hosts(), [SHOP]);
+
+    // admin.public_base_url names another host, and SY.admin starts again.
+    admin.ctx.public_base_url = Some("https://hive-2.example.com".to_string());
+    admin.restart();
+    let moved = "shop.hive-2.example.com";
+    assert_eq!(admin.ctx.exposures.hosts(), [moved]);
+    assert_eq!(
+        admin.ctx.web.payload(),
+        json!({ "routes": [{ "host": moved, "upstream": "io.web" }] })
+    );
+    assert_eq!(
+        admin.ctx.exposures.io_web_payload().exposures[0].host,
+        moved
+    );
+    assert_eq!(admin.views()[0]["host"], moved);
+    admin.enable(&id, 60).await;
+    assert_eq!(admin.on_disk().exposures[0].host, moved, "the next write");
+
+    // No main name.
+    admin.ctx.public_base_url = None;
+    admin.restart();
+    assert!(admin.ctx.exposures.hosts().is_empty());
+    assert!(admin.ctx.exposures.io_web_payload().exposures.is_empty());
+    assert_eq!(admin.ctx.exposures.file().exposures.len(), 1, "kept");
+}
+
 /// A file that cannot be read is kept as it is for the operator; the sets pushed are empty, and
 /// every exposure write is refused, 500 RECORD_FAILED, with nothing sent.
 #[tokio::test(start_paused = true)]
@@ -1730,6 +1787,44 @@ async fn an_unreadable_registry_is_kept_pushes_empty_sets_and_refuses_writes() {
             broken
         );
     }
+}
+
+/// A registry repaired in place keeps the generation it had, older than the empty sets SY.admin
+/// pushed while it could not read it, and io.web refuses every push as STALE_GENERATION until
+/// Fluxbee Cloud's next change. That answer is an ERROR, once, naming the cause and the remedy:
+/// an unreadable registry is removed, never repaired. Another refusal stays a warning.
+#[test]
+fn a_stale_generation_answer_is_an_error_naming_a_repaired_registry() {
+    let captured = crate::tests::LogCapture::start();
+    let exposures = registry_with_hosts(&test_temp_dir("web21-stale-generation"), &[SHOP]);
+    let stale = IoWebAnswer::Refused {
+        code: IO_WEB_ERROR_STALE_GENERATION.to_string(),
+        detail: "generation 1 is older than the one held".to_string(),
+    };
+    exposures.record_io_web(1, &stale);
+    exposures.record_io_web(1, &stale);
+    let text = captured.text();
+    let errors: Vec<&str> = text.lines().filter(|line| line.contains("ERROR")).collect();
+    assert_eq!(errors.len(), 1, "{text}");
+    assert!(
+        errors[0].contains("repaired or restored in place")
+            && errors[0].contains("removed, never repaired"),
+        "{}",
+        errors[0]
+    );
+    exposures.record_io_web(
+        2,
+        &IoWebAnswer::Refused {
+            code: IO_WEB_ERROR_UNAUTHORIZED.to_string(),
+            detail: "not from SY.admin".to_string(),
+        },
+    );
+    let text = captured.text();
+    assert_eq!(
+        text.lines().filter(|line| line.contains("ERROR")).count(),
+        1
+    );
+    assert!(text.contains("WARN"), "{text}");
 }
 
 /// §6: io.web's answer to a set is kept, an acknowledgement at the current generation or a later

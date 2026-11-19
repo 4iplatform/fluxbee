@@ -1301,17 +1301,20 @@ answers 200). Its `exposures` part holds each exposure's view:
 
 `web` lists the published hosts (`state` `published`, `none`, or `unreadable`: the registry file
 could not be read at SY.admin's start, `reason` says why, and every change is refused until the
-operator fixes or removes the file and restarts SY.admin). `io_web.exposures` says what io.web
-last answered and whether it holds each open exposure's key. `/acme/status` shows the
-certificate's names and DNS resolutions.
+operator removes the file and restarts SY.admin; Fluxbee Cloud then publishes again). The file is
+removed, never repaired: a repaired one keeps its older generation, and io.web refuses every set
+SY.admin pushes (`io_web.exposures.last_answer`: `refused`, `STALE_GENERATION`) until Fluxbee
+Cloud's next change. `io_web.exposures` says what io.web last answered and whether it holds each
+open exposure's key. `/acme/status` shows the certificate's names and DNS resolutions.
 
 **What the operator does:**
 
 - An exposure Cloud cannot enable because io.web is absent (`IO_WEB_ABSENT`): stage
   `run_node IO.web@motherbee` in the root tenant, in a plan the operator confirms.
 - **The brake** is `kill_node IO.web@motherbee`, in a plan the operator confirms: every exposure's
-  host then answers the edge's 502, and the exposures stay published. `run_node` brings io.web
-  back, and it gets the set within a minute.
+  host then answers the edge's 502, and the exposures stay published. `start_node IO.web@motherbee`
+  brings io.web back (its instance stays, so `run_node` would answer `NODE_ALREADY_EXISTS`), and
+  it gets the set within a minute.
 - hive.yaml's `web:` section is retired: Archi's own host is the exposure Cloud publishes with the
   upstream `archi`. A `web:` left in hive.yaml is ignored.
 

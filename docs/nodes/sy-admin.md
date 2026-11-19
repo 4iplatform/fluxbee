@@ -1906,10 +1906,17 @@ Source: `src/bin/sy_admin/exposures.rs`.
   `max(previous + 1, now in ms)` at each write, so it never goes back, even after the file is
   lost. An opening change (publish, enable) writes the file before it opens anything; a closing
   one (disable, unpublish) acts first, in memory and in the pushes, then writes, and a write that
-  fails answers `persisted: false` and is tried again every minute. A file that cannot be read at
-  boot is kept as it is: SY.admin logs an ERROR, pushes empty sets (they fail closed) and answers
-  every exposure change `500 RECORD_FAILED` until the operator fixes or removes it and restarts
-  SY.admin.
+  fails answers `persisted: false` and is tried again every minute. Each host is derived again
+  at boot from its label and the main name SY.admin starts with, so a change of
+  `admin.public_base_url` moves every host at the restart (the next write keeps it); with no main
+  name, no exposure's host is routed, pushed to io.web or ordered, and the file keeps them. A file
+  that cannot be read at boot is kept as it is: SY.admin logs an ERROR, pushes empty sets (they
+  fail closed) and answers every exposure change `500 RECORD_FAILED` until the operator removes
+  it and restarts SY.admin, which starts an empty registry past every set pushed (Fluxbee Cloud
+  publishes again). It is never repaired in place: a repaired file loads with its older
+  generation, below the empty sets pushed meanwhile, and io.web refuses every push
+  (`STALE_GENERATION`, an ERROR in SY.admin's log that names this cause) until Fluxbee Cloud's
+  next change. The generation is never moved at load.
 - **The checks**, before anything is read: a label is one DNS label (1 to 63 lowercase letters,
   digits and hyphens, a letter or a digit at each end, never hyphens as its 3rd and 4th
   characters: a reserved `??--` label, R-LDH, as `xn--` is, which Let's Encrypt refuses when the
@@ -1978,7 +1985,8 @@ Source: `src/bin/sy_admin/exposures.rs`.
   answers when they change. The five actions are in the audit log with their params; the link an
   answer carries never is.
 - **The brake** is the operator's `kill_node IO.web@motherbee`: every exposure's host then answers
-  the edge's 502 until io.web runs again.
+  the edge's 502 until `start_node IO.web@motherbee` runs it again (its instance stays, so
+  `run_node` answers `NODE_ALREADY_EXISTS`).
 
 ## The web routes
 
@@ -2091,7 +2099,7 @@ Every read of the registry's entries reads them as the orchestrator does (FINDIN
 - `/var/lib/fluxbee/state/sy-admin/exposures.json`: io.web's exposures, written atomically, never
   a key: the generation and each exposure with its live enablements
   ([The exposures](#the-exposures)). An unreadable file is kept as it is, and every exposure
-  change is refused until the operator fixes or removes it and restarts SY.admin.
+  change is refused until the operator removes it, never repairs it, and restarts SY.admin.
 - `/var/lib/fluxbee/state/sy-admin/installation-update.json`: the installation's update, written
   atomically: the open update with each hive's state, outcome and next step, and the last 20
   closed ones ([The installation's update](#the-installations-update)). An unreadable file is moved

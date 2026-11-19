@@ -740,8 +740,15 @@ async fn main() -> Result<(), AdminError> {
     // exposure Cloud publishes. A key left there is ignored, with one warning.
     warn_retired_web_section(&config_dir);
     // io.web's exposures (docs/io-web-v2-stage-2-1.md §2.3): the registry SY.admin holds, read
-    // once at boot. The edge's routes are its hosts.
-    let exposures = exposures::Exposures::load(&state_dir, Arc::new(now_epoch_ms));
+    // once at boot, each host under the main name it starts with (§2.1). The edge's routes are its
+    // hosts.
+    let exposures = exposures::Exposures::load(
+        &state_dir,
+        acme::certified_name(public_base_url.as_deref())
+            .ok()
+            .as_deref(),
+        Arc::new(now_epoch_ms),
+    );
     // The ACME client (docs/acme-edge-certificates-v1.md §6, §7). Its configuration never fails
     // the boot: a section that cannot work turns ACME off, and the log and /acme/status say why.
     let acme_config = acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref());
@@ -19839,13 +19846,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "acme_status" => vec![
             "Motherbee-only: SY.admin is the ACME client (docs/acme-edge-certificates-v1.md).",
             "config.state is on, off (with the reason) or absent; without an acme section nothing is ordered and the expiry checks still run.",
-            "The main certified name is the host of admin.public_base_url, followed by the web hosts the web section declares (config.names); the edge is admin.public_edge_node, else the one connected ingress (edge.not_configured otherwise).",
+            "The main certified name is the host of admin.public_base_url, followed by the hosts of the exposures Fluxbee Cloud publishes, read live (config.names; hive.yaml's web section is retired); the edge is admin.public_edge_node, else the one connected ingress (edge.not_configured otherwise).",
             "edge.live is a fresh EDGE_TLS_STATUS; edge.last_seen is what the last check judged by.",
             "conditions are the open certificate conditions; each wrote one drift alert when it opened and writes an info row when it closes (GET /drift-alerts).",
         ],
         "acme_renew" => vec![
             "Confirm with the operator first: it spends an order at the CA.",
-            "Takes no body: the names come from admin.public_base_url and the web section, the CA from the acme section.",
+            "Takes no body: the names are the host of admin.public_base_url and the published exposures' hosts an order carries now (one whose DNS name does not answer yet, or that the CA refused by name until that failure's backoff ends, is left out); the CA comes from the acme section.",
             "409 ACME_BUSY while another ACME run is in flight (one at a time); 409 ACME_OFF, EDGE_NOT_CONFIGURED, ACME_RATE_LIMITED, CERTIFICATE_NOT_SERVED (POST /acme/reload first) or ROLLBACK_PENDING when it cannot start.",
             "Forced: ignores the failure backoff and the issuance cap, never the CA's rate limit. It is the operator's act that lifts an install_refused hold.",
             "Puts the certificate in the edge's secret (the previous version stays for rollback) and reloads the edge; the result is in GET /acme/status (last_attempt).",
@@ -32380,7 +32387,7 @@ mod tests {
         );
         let root = test_temp_dir(prefix);
         let state_dir = root.join("state");
-        let exposures = exposures::Exposures::load(&state_dir, Arc::new(now_epoch_ms));
+        let exposures = exposures::Exposures::load(&state_dir, None, Arc::new(now_epoch_ms));
         let ctx = AdminContext {
             config_dir: root.join("config"),
             state_dir: state_dir.clone(),
@@ -46108,14 +46115,14 @@ mod tests {
     /// it wants the event: with one alone, a callsite another test's thread reaches first is
     /// cached as unwanted for every thread (tracing-core's `has_just_one`), and this thread's
     /// lines would be lost.
-    struct LogCapture {
+    pub(crate) struct LogCapture {
         lines: Arc<std::sync::Mutex<Vec<u8>>>,
         _logs: tracing::subscriber::DefaultGuard,
         _other: tracing::Dispatch,
     }
 
     impl LogCapture {
-        fn start() -> Self {
+        pub(crate) fn start() -> Self {
             #[derive(Clone)]
             struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
             impl std::io::Write for Captured {
@@ -46149,7 +46156,7 @@ mod tests {
         }
 
         /// What this thread logged so far, line by line.
-        fn text(&self) -> String {
+        pub(crate) fn text(&self) -> String {
             String::from_utf8_lossy(
                 &self
                     .lines
