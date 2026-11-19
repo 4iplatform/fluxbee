@@ -187,10 +187,13 @@ The door's headers (`with_security_headers` in `Door::handle`; io-web-v2 §13.7,
   the `/e/` relay, the fanout `hub.challenge` echo, axum's own 404 and 400, `/healthz`, every
   `/public` answer, an unknown host's 404, a refused host's 400, and the proxy's own errors on a
   web host (its 502, 503, 429, 405, 400 and 408). A published artifact's `200`, `206` and `304`
-  keep the content policy the artifact chose (`OwnContentPolicy`): the sandboxed page its own CSP,
-  a download or a static file none, since a `default-src 'none'` can stop a browser's PDF viewer
-  and artifacts may be framed. A response the edge cannot build (an invalid header value, say) is
-  a `500 INTERNAL_ERROR` with them, never an empty 200 (`built`, A-83).
+  (`OwnContentPolicy`) are content, not Fluxbee's own pages: they keep the content policy the
+  artifact chose, the sandboxed page its own CSP, a download or a static file none, since a
+  `default-src 'none'` can stop a browser's PDF viewer and artifacts may be framed; and they get no
+  `Permissions-Policy`, so a copy button or fullscreen in an artifact keeps working. HSTS still
+  applies to them, and `/public`'s errors (its 404, 405, 416, 429, 503) are the edge's own pages
+  and get the whole set. A response the edge cannot build (an invalid header value, say) is a
+  `500 INTERNAL_ERROR` with them, never an empty 200 (`built`, A-83).
 - **On a web host whose routes name frame origins** (`frame_origins`, see Web hosts), the edge's
   own answers there take `default-src 'none'; frame-ancestors <the origins>` in place of `'none'`
   (`WebRouteTable::framed_content_policy`), so an edge error inside Fluxbee Cloud's frame shows
@@ -295,7 +298,8 @@ token is stored as `edge_fanout_verify:<ich>` and fetched the same way.
 - Headers: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `X-Robots-Tag: noindex, nofollow, noarchive`, `Referrer-Policy: no-referrer`,
   `Content-Disposition` inline or attachment, and for `sandboxed-html-v1` a sandboxing
-  `Content-Security-Policy`.
+  `Content-Security-Policy`; HSTS on a TLS door, and no `Permissions-Policy` (see HTTP surface: an
+  artifact is content, not one of Fluxbee's own pages).
 
 Allowed content (`validate_public_artifact_row`): `sandboxed-html-v1` with
 `text/html; charset=utf-8`; `static-v1` with plain text, JSON, PDF, PNG, JPEG, WebP or GIF

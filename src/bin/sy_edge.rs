@@ -4078,7 +4078,9 @@ fn host_route(
 /// - An answer from io.web (`IoWebAnswer`) gets nothing else: io.web sets its own headers, and the
 ///   application's.
 /// - The edge's own answers get each of `SECURITY_HEADERS` they lack, so a handler's own header
-///   stays; a published artifact keeps the content policy it chose (`OwnContentPolicy`).
+///   stays. A published artifact (`OwnContentPolicy`) is content, not one of Fluxbee's own pages:
+///   it keeps the content policy it chose and gets no `Permissions-Policy`, so a copy button or
+///   fullscreen in it keeps working; HSTS still applies to it.
 /// - `web_host`, the routes when the request is for a web host: while they name frame origins, the
 ///   edge's own answers there (its errors, all built with `OWN_CSP` by `error_answer`) take the
 ///   policy that lets those origins frame them (`WebRouteTable::framed_content_policy`), so an edge
@@ -4089,8 +4091,8 @@ fn with_security_headers(
     web_host: Option<&WebRouteTable>,
 ) -> Response {
     let from_io_web = response.extensions().get::<IoWebAnswer>().is_some();
-    let own_policy = response.extensions().get::<OwnContentPolicy>().is_some();
-    let framed = if from_io_web || own_policy {
+    let artifact = response.extensions().get::<OwnContentPolicy>().is_some();
+    let framed = if from_io_web || artifact {
         None
     } else {
         web_host.and_then(WebRouteTable::framed_content_policy)
@@ -4105,7 +4107,12 @@ fn with_security_headers(
         return response;
     }
     for (name, value) in SECURITY_HEADERS {
-        if name == header::CONTENT_SECURITY_POLICY.as_str() && (own_policy || framed.is_some()) {
+        let skipped = match name {
+            "content-security-policy" => artifact || framed.is_some(),
+            "permissions-policy" => artifact,
+            _ => false,
+        };
+        if skipped {
             continue;
         }
         headers
@@ -5658,7 +5665,8 @@ async fn serve_public_artifact(
 /// Marks a response whose content policy the artifact decides (`content_policy`): the door adds
 /// none of its own (`with_security_headers`). A sandboxed page carries its own CSP; a PDF or an
 /// image keeps none, since a `default-src 'none'` can stop a browser's viewer, and artifacts may be
-/// framed.
+/// framed. Nor does the door add `Permissions-Policy`: an artifact is content, not one of
+/// Fluxbee's own pages, and a copy button or fullscreen in it must keep working.
 #[derive(Debug, Clone, Copy)]
 struct OwnContentPolicy;
 
@@ -6312,8 +6320,9 @@ fn base64_encode(input: &[u8]) -> String {
 /// its own answers.
 const HSTS: &str = "max-age=31536000";
 
-/// Every browser feature off (io-web-v2 §13.7), on the edge's own answers only: an application's
-/// answer never gets it, since it could turn off something the application uses.
+/// Every browser feature off (io-web-v2 §13.7), on Fluxbee's own pages only: an application's
+/// answer never gets it, since it could turn off something the application uses, and neither does
+/// a published artifact, which is content (`OwnContentPolicy`).
 const PERMISSIONS_POLICY: &str = "accelerometer=(), ambient-light-sensor=(), autoplay=(), \
      bluetooth=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), \
      encrypted-media=(), fullscreen=(), gamepad=(), geolocation=(), gyroscope=(), hid=(), \
@@ -6329,8 +6338,9 @@ const OWN_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 
 /// The headers on every answer the edge writes itself: its errors, an unknown host's 404, its own
 /// routes' answers and the 500 of a response it could not build (A-83). Nothing is cached,
-/// sniffed, framed, indexed or referred, and no browser feature is on. io.web's answers get none
-/// of them (`with_security_headers`); over TLS every answer also gets `HSTS`.
+/// sniffed, framed, indexed or referred, and no browser feature is on. A published artifact keeps
+/// its own content policy and gets no `Permissions-Policy` (`OwnContentPolicy`); io.web's answers
+/// get none of them (`with_security_headers`); over TLS every answer also gets `HSTS`.
 const SECURITY_HEADERS: [(&str, &str); 6] = [
     ("cache-control", "no-store"),
     ("x-content-type-options", "nosniff"),
@@ -10223,7 +10233,8 @@ mod tests {
     }
 
     /// E7: every answer of the door carries the security headers; a published artifact keeps the
-    /// content policy it chose.
+    /// content policy it chose and gets no `Permissions-Policy` (stage 2.2 §3.2); a TLS door adds
+    /// HSTS to all of them.
     #[tokio::test]
     async fn every_answer_of_the_door_carries_the_security_headers() {
         let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
@@ -10388,33 +10399,60 @@ mod tests {
         .await;
         assert_eq!(not_modified.status, 304);
         assert_eq!(csp(&not_modified), None);
+        // An artifact is content, not one of Fluxbee's own pages: no `Permissions-Policy` either,
+        // so a copy button or fullscreen in it keeps working.
         for answer in [&served_page, &served_download, &not_modified] {
             for (name, value) in SECURITY_HEADERS {
-                if name != "content-security-policy" {
-                    assert_eq!(answer.header(name).as_deref(), Some(value), "{name}");
+                match name {
+                    "content-security-policy" => {}
+                    "permissions-policy" => assert_eq!(answer.header(name), None, "{name}"),
+                    _ => assert_eq!(answer.header(name).as_deref(), Some(value), "{name}"),
                 }
             }
         }
         assert_ne!(csp(&served_page), door_csp);
 
-        // Stage 2.2 §3.2: a TLS door adds HSTS, one year and nothing more, to every answer, the
-        // unknown host's 404 and a refused host included.
-        let tls_door = labelled_door(
-            scratch_web_routes(),
-            serving_edge(self_signed(&[EDGE])).await,
-        );
-        for request in [
-            get("/healthz", ""),
-            "GET / HTTP/1.1\r\nhost: other.example.org\r\nconnection: close\r\n\r\n".to_string(),
-            "GET / HTTP/1.1\r\nhost: a\r\nhost: b\r\nconnection: close\r\n\r\n".to_string(),
+        // Stage 2.2 §3.2: a TLS door adds HSTS, one year and nothing more, to every answer: the
+        // door's own, an unknown host's 404, a refused host, an edge error on `/public/`, and a
+        // published artifact too, which still gets no `Permissions-Policy`.
+        let tls_door = Door {
+            tls: serving_edge(self_signed(&[EDGE])).await,
+            ..real_door(&state)
+        };
+        let unknown_artifact = format!("/public/{}", "0".repeat(64));
+        for (case, request, own_page) in [
+            ("healthz", get("/healthz", ""), true),
+            (
+                "unknown host",
+                "GET / HTTP/1.1\r\nhost: other.example.org\r\nconnection: close\r\n\r\n"
+                    .to_string(),
+                true,
+            ),
+            (
+                "two hosts",
+                "GET / HTTP/1.1\r\nhost: a\r\nhost: b\r\nconnection: close\r\n\r\n".to_string(),
+                true,
+            ),
+            ("unknown artifact", get(&unknown_artifact, ""), true),
+            ("page", get(&format!("/public/{page_key}"), ""), false),
+            (
+                "download",
+                get(&format!("/public/{download_key}"), ""),
+                false,
+            ),
         ] {
             let answer = exchange(&tls_door, &request).await;
-            assert_security_headers(&answer);
             assert_eq!(
                 answer.header("strict-transport-security").as_deref(),
                 Some(HSTS),
-                "{request}"
+                "{case}"
             );
+            if own_page {
+                assert_security_headers(&answer);
+            } else {
+                assert_eq!(answer.status, 200, "{case}");
+                assert_eq!(answer.header("permissions-policy"), None, "{case}");
+            }
         }
         let _ = std::fs::remove_dir_all(root);
     }
