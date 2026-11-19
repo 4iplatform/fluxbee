@@ -433,6 +433,13 @@ no change required
     `IO_WEB_EXPOSURES` can carry `cloud_origins`, absent while empty; io.web acknowledging the set,
     the door reading the exposures, Archi closed; 10 PASS, no model call. R2, the three binaries, is
     being built ([io-web-v2-stage-2-2](../../docs/io-web-v2-stage-2-2.md) §8).
+    **0.1.151, stage 2.2's R2 (SY.edge, SY.admin, io.web), with A-356 and A-357** ✅ live and checked
+    on 8.x (2026-11-19): io.web a transparent proxy straight to Cloud's iframe; Cloud's origin named
+    (`cloud_origins`, Cloud's token rotated, the operator told Cloud's team); through the real door a
+    90 s answer, SSE every 1.0 s, 100 MB whole, a WebSocket, the cookies, the forwarding headers, the
+    header table, the Origin check, the cut (every socket closed before the disable's answer), the
+    renewal (nothing cut), the clock's end, Archi's page, stream and one chat turn, the restarts; 44
+    PASS, one model call. **Stage 2.2 is built;** left: the iframe in a real browser with Cloud's team.
     **Stage 2.2's design talk (2026-11-19):** what is left was redefined with the operator
     ([io-web-v2](../../docs/io-web-v2.md) §13): a transparent proxy, straight to Cloud's iframe (no
     stage in its own tab); no time, size or rewrite of the proxy's own (A-142 settled for the
@@ -507,15 +514,15 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   ([io-web-v2-stage-2-1](../../docs/io-web-v2-stage-2-1.md)). What is left was redefined on
   2026-11-19 (§13): one stage 2.2, a transparent proxy straight to Cloud's iframe; its talk goes on
   with §13.9.
-- A-142 (Archi) is settled for the proxy by §13.3: no wait of the proxy's own; built with 2.2.
-- A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
+- A-142 (Archi) ✅ validated with 0.1.151: no wait of the proxy's own.
+- A-351 ✅ validated on 8.x with 0.1.151: the system's cookies reach its upstream, Fluxbee's never do, and an upstream cannot set Fluxbee's.
 - A-358 🔵 SY.admin publishes a `hive` upstream whose registry address io.web then refuses (502 at every request); SY.admin should check it at publish (medium-low).
-- A-356, A-357 🔵 SY.admin's executor contract: `publish_cloud_endpoint`'s `cloud_node` among the required fields (low); `vault_assign`'s lists read as strings (medium); built for 0.1.151.
+- A-356, A-357 ✅ built in 0.1.151: SY.admin's executor contract (`publish_cloud_endpoint`'s `cloud_node` optional; `vault_assign`'s lists are lists).
 - A-355 🔵 Fluxbee's own ports are listed in SY.admin alone; stage 2.2's io.web keeps a copy to refuse an Archi listen on one of them, until the next Rust SDK release shares the list (design; found by 2.2's design review).
 
 ### Archi
 
-- A-142 🔵 Archi's chat answers only when its turn ends, and the edge waits 30 s: decided for io.web stage 2.2 (2026-11-19, io-web-v2 §13.3: the proxy has no wait of its own); built with 2.2.
+- A-142 ✅ validated on 8.x with 0.1.151: the proxy has no wait of its own (a 90 s answer passes, Archi's chat turns through the proxy).
 - A-348 🔵 Archi's SCMD of `PUT /hives/{hive}/nodes/{node}/config` reads no `?replace` and leaves the binding fields in the patch (low; SY.architect; found by A-346's builder on `coa/admin-144`; to ask the operator).
 - A-307's Archi part 🔵 Archi's pipeline does not know `BUSY`: a step SY.wf-rules refused so, nothing changed and `retryable` true (A-307), blocks the run as *"Pipeline execution failed"*, not as a refusal that may pass asked again (low; SY.architect: a deterministic rule in `classify_failure_deterministic` and `BUSY` beside `SERVICE_FAILED` in the prompt facts; left by A-307's review, see its entry; the handbook already tells Archi's model, as it does of SY.admin's own `BUSY` for a Cloud door publish while another runs, since 0.1.139's integration review).
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
@@ -1658,7 +1665,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** SY.admin applies the same checks to the hive's registry address at publish, and says why
   it refuses. The address can still change after publish, so io.web's check stays.
 
-### A-357 [General/admin] 🔵 BUILT for 0.1.151 (`coa/fix-151-contract`) (medium; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run; there since `vault_assign`'s contract) — the executor's schema reads `vault_assign`'s lists as strings, so a plan step that passes a list is refused
+### A-357 [General/admin] ✅ BUILT (0.1.151, 2026-11-19, by its test; live with 0.1.151) (medium; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run; there since `vault_assign`'s contract) — the executor's schema reads `vault_assign`'s lists as strings, so a plan step that passes a list is refused
 
 - **Why:** `vault_assign`'s optional fields `assigned_nodes` and `assigned_ilks` were typed
   `array<string>` (`admin_action_body_optional_fields`, `src/bin/sy_admin.rs` ~18063-18072), and
@@ -1668,7 +1675,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** both typed `string[]`, as every other list field is; the test
   `the_executor_s_schemas_take_lists_as_arrays_and_cloud_node_as_optional`.
 
-### A-356 [General/admin] 🔵 BUILT for 0.1.151 (`coa/fix-151-contract`) (low; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run) — `publish_cloud_endpoint`'s `cloud_node` sits among the required fields, so every plan step must name it
+### A-356 [General/admin] ✅ BUILT (0.1.151, 2026-11-19, by its test; live with 0.1.151) (low; found 2026-11-19 by io.web stage 2.2's SY.admin builder; read in the code, not run) — `publish_cloud_endpoint`'s `cloud_node` sits among the required fields, so every plan step must name it
 
 - **Why:** its description says "Optional. Defaults to IO.cloud@<hive>", but it was listed in
   `admin_action_body_required_fields` (`src/bin/sy_admin.rs` ~17831), whose fields go into the
@@ -1736,7 +1743,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   and SY.vault's writes, each of which has its own action with its own checks, as it refuses
   `COGNITION_CLEAR`; or it keeps an allowlist of what it may carry.
 
-### A-351 [io.web] 🔵 design, for stage 2.2 (found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-edge`; read in the code) — the edge passes io.web only `__Host-` cookies, so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying
+### A-351 [io.web] ✅ VALIDATED ON 8.x (0.1.151, 2026-11-19: the upstream got the client's cookie and never Fluxbee's, and a `__Host-fluxbee_session` the upstream set never reached the browser) (found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-edge`; read in the code) — the edge passes io.web only `__Host-` cookies, so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying
 
 - **Why:** stage 2.1's §5.4 has the edge rebuild `Cookie` with only the pairs whose name begins with
   `__Host-` (`io_web_request_headers`, `src/bin/sy_edge.rs`, from 0.1.147), so the main host and any
@@ -8964,7 +8971,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   the primary. A read still goes to the path's hive. A test covers both
   (`identity_writes_go_to_the_primary_whatever_hive_the_path_names`).
 
-### A-142 [Archi] 🔵 DECIDED for io.web stage 2.2 (2026-11-19: the proxy has no wait of its own); was OPEN for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
+### A-142 [Archi] ✅ VALIDATED ON 8.x (0.1.151, 2026-11-19: a 90 s answer through the door at 91.6 s, and a chat turn of Archi's through the proxy; the proxy has no wait of its own); was OPEN for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
 
 - **What happens:** Archi's `POST /api/chat` holds the request until the whole turn ends
   (`handle_chat_message`, src/bin/sy_architect.rs). A turn can last minutes: since 0.1.95 each

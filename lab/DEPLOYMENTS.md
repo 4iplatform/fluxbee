@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.150** | 2026-11-19 | `671dc2ca` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.2's R1 ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): `IO_WEB_EXPOSURES` carries `cloud_origins`, the origins of the Fluxbee Cloud page that may frame the exposures, absent on the wire while empty; SY.admin and io.web send and read none before R2 | ✅ live, checked on 8.x | snap `pre-websdk-0-1-150` (all 4 VMs) · `apt install fluxbee=0.1.149` + 0.1.149's `update_installation` (nothing one-way) |
+| **0.1.151** | 2026-11-19 | `890d258f` | motherbee + spokes (core), io.web stage 2.2's R2, the binaries, one branch per binary ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): io.web a transparent reverse proxy to each exposure's upstream (every method, bodies and streams frame by frame, WebSockets, no wait of its own; the Origin check; the header table; a renewal moves the sessions; what is open cut at once when the access ends), SY.edge the pass-through (every method but CONNECT and TRACE, bodies, WebSockets in their connection's scope, no wait of its own, TCP keepalive, every cookie pair, HSTS, frame_origins), SY.admin `publish_cloud_endpoint`'s `cloud_origins`; with A-356 and A-357 (SY.admin's executor contract) | ✅ live, checked on 8.x | snap `pre-web22-0-1-151` (all 4 VMs) · `apt install fluxbee=0.1.150` + 0.1.150's `update_installation` (nothing one-way; exposures go back to the placeholder; io.web's and the edge's files hold the origins, which their 0.1.150 refuses: each serves SY.admin's next push, within 60 s; 0.1.150's SY.admin drops the origins from its registry, so name them again after coming back) |
+| **0.1.150** | 2026-11-19 | `671dc2ca` | motherbee + spokes (core), the Rust SDK alone, io.web stage 2.2's R1 ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md) §8): `IO_WEB_EXPOSURES` carries `cloud_origins`, the origins of the Fluxbee Cloud page that may frame the exposures, absent on the wire while empty; SY.admin and io.web send and read none before R2 | ✅ replaced by 0.1.151 | snap `pre-websdk-0-1-150` (deleted 2026-11-19) · `apt install fluxbee=0.1.149` + 0.1.149's `update_installation` (nothing one-way) |
 | **0.1.149** | 2026-11-19 | `0874f4e0` | motherbee + spokes (core), two small fixes 0.1.148's gate found: A-353 (SY.edge asks the vault again every 30 s for a channel secret it missed at boot, where Cloud's door refused every request until a restart) and A-354 (a host reads pending, not held, while its own ACME order runs) | ✅ replaced by 0.1.150 | snap `pre-fix-0-1-149` (deleted 2026-11-19) · `apt install fluxbee=0.1.148` + 0.1.148's `update_installation` (nothing one-way) |
 | **0.1.148** | 2026-11-18 | `90996258` | motherbee + spokes (core), small changes in one release: io.web stage 2.1's R4 (the Rust SDK's Cloud catalog names the six exposure ops: Cloud reaches them; SY.admin's Cloud catalog carries what the relay sends, within a mesh reply), A-352 (`send_node_message` refuses the protected SYSTEM actions and SY.vault's writes) and A-350 (io.cloud and io.api take the nodes they answer to from no config.json); io.web stage 2.1's full gate | ✅ replaced by 0.1.149 | snap `pre-web21r4-0-1-148` (deleted 2026-11-19) · `apt install fluxbee=0.1.147` + 0.1.147's `update_installation` (nothing one-way; Cloud's exposure ops closed again, published exposures kept) |
 | **0.1.147** | 2026-11-18 | `56be48ee` | motherbee + spokes (core), io.web stage 2.1's R3, the binaries, one branch per binary ([io-web-v2-stage-2-1](../docs/io-web-v2-stage-2-1.md) §8): SY.admin (the exposures' registry and six actions, Fluxbee Cloud's own access class, io.web's keys among the node-only vault keys, `web:` retired; ACME certifies the published hosts read live, DNS first, name-change orders outside the cap, and no exposure host can hold the main name's renewal), SY.edge (only `__Host-` cookies to io.web, at most 64 web hosts), io.web (the exposures' set from SY.admin alone, one-time links, the session cookie), io.cloud (the six ops translated, closed until R4; a non-string envelope tenant refused) | ✅ replaced by 0.1.148 | snap `pre-web21-0-1-147` (deleted 2026-11-18) · `apt install fluxbee=0.1.146` + 0.1.146's `update_installation` (nothing one-way; `archi.<id>` routed again by `web:`) |
@@ -159,6 +160,80 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.151 — io.web, a transparent proxy straight to Cloud's iframe (io.web stage 2.2's R2), with A-356 and A-357
+
+- **Date:** 2026-11-19 (ART) · **Previous version:** 0.1.150 · **Commit:** `890d258f`.
+- **Scope:** motherbee and the three spokes, through the installation's update.
+- **Why:** io.web stage 2.2 ([io-web-v2](../docs/io-web-v2.md) §13, the operator's decisions of
+  2026-11-19): Archi, and any exposure, as on its own port, inside Fluxbee Cloud's iframe; Fluxbee
+  adds only the entry, the end and the permission to frame. Its build design
+  ([io-web-v2-stage-2-2](../docs/io-web-v2-stage-2-2.md)) after one review round (18 items, 4 high).
+- **What changed (three builder branches, rebased and fast-forwarded, plus a small fix):**
+  - `coa/web22-edge` (SY.edge): every method but CONNECT and TRACE; the body streamed (client-body
+    failures answered 408 or 400 by the edge, an unknown-size body chunked); WebSockets tunnelled
+    inside their connection's scope, holding their permits and slots, both sides ended at the first
+    end; no head wait and no silence cut; TCP keepalive (60 s, 10 s, 6 probes); every cookie pair
+    whose name is a token; HSTS on every TLS answer; the edge's own set and Permissions-Policy on its
+    own answers only (artifacts get no Permissions-Policy); `frame_origins` in `EDGE_WEB_ROUTES`.
+  - `coa/web22-admin` (SY.admin): `publish_cloud_endpoint`'s `cloud_origins`, checked before
+    anything is minted, kept in the exposures registry once the door is open, pushed to the edge and
+    io.web; `GET /web/status` shows them and the edge's acknowledged `frame_origins`.
+  - `coa/web22-io-web` (io.web): the proxy to the upstream (Archi where hive.yaml says it listens; a
+    worker of the registry, its name resolved and checked; an address), the Origin check, the header
+    table, the renewal's move, the cut (a gate per exposure, one clock), logs and status per exposure,
+    `cloud_origins` kept in its file.
+  - `coa/fix-151-contract` (SY.admin, A-356 and A-357): `vault_assign`'s lists typed `string[]`;
+    `publish_cloud_endpoint`'s `cloud_node` among the optional fields.
+  - ops.py's `web` line adds `open`, `fail` and `origins`.
+- **Build:** CI green on each branch and on `d3a3a32a` after the rebase. Build on fb-build
+  19:54:20–20:06:24Z (12.1 min), publish 12 s.
+- **The deploy:** the gate's mark at 20:06:52Z; `ops deploy 0.1.151 --snapshot pre-web22-0-1-151
+  --drop pre-websdk-0-1-150` in 268 s (snapshots 33.2 s, the motherbee's apt 157.6 s, its admin on the
+  version 25.6 s, the spokes answering 9.4 s, the update's call 22.0 s, the hives on the target 5.7 s,
+  health 6.8 s). On the target after the update's call: the motherbee 4.3 s, egress1 and ingress1
+  17.6 s, worker1 26.3 s. The update (`upd-1795119048883`) closed with every hive on the target, core
+  hash `7e47526977e7e364`. Health clean, the web line `open=0 fail=0 origins=0`.
+- **Checked on 8.x (the gate, gate0251, 20:11–20:22Z; `scratchpad/gate-tools/r151_gate.py` with the
+  throwaway upstream `web22_upstream.py` on worker1:18080, git-ignored; 44 PASS, one model call):**
+  - **Cloud's origin** (the operator told Fluxbee Cloud's team first): `publish_cloud_endpoint` with
+    `cloud_origins: ["https://cloud.fluxbee.ai"]` in 1.45 s; the edge echoed it, io.web acknowledged
+    in 2.8 s, the door answered with the new token. **Cloud's token rotated at 20:12:02Z**; its answer
+    is in `scratchpad/cloud-bearer-0.1.151.json` (0600), handed over by the operator. One FAIL of
+    the tool's own (it read `cloud_origins` at the payload's root, not `web.cloud_origins`), read again
+    with no rotation: PASS.
+  - **Through Cloud's door to `gate22`:** a 90 s answer at 91.6 s (A-142's case); the SSE events every
+    1.0 s with no burst; 100 MB uploaded whole, the same hash, 46.3 s (the Mac's uplink), its
+    `Content-Length` kept; a WebSocket echoed; the upstream's `Cookie` without Fluxbee's, its planted
+    `__Host-fluxbee_session` never reaching the browser; the public `Host` and the edge's forwarding
+    headers at the upstream; io.web's own time to the upstream's head about 10 ms (its log), the rest
+    of the 0.7 s per request the Mac's new TLS connection.
+  - **The headers:** a proxied answer with HSTS, the upstream's CSP untouched beside Fluxbee's
+    `frame-ancestors 'self' https://cloud.fluxbee.ai`, `nosniff`, no `Server` or `X-Powered-By`;
+    io.web's own 401 with the strict set, HSTS, Permissions-Policy and Cloud's origin.
+  - **The Origin check:** same-site, a sibling's Origin, `Origin: null` and a sibling's PROPPATCH
+    403; same-origin and neither header 200; a GET from a sibling 200; a WebSocket from a sibling 403.
+  - **The cut:** a disable through the door in 0.57 s, and the stream, the waiting request (401) and
+    the WebSocket already closed when its answer came (29, 20 and 43 ms before); the reconnect 401.
+  - **The renewal:** the cookie moved to the new enablement, the stream lived past the first end (140
+    events), the session served. **The clock's end:** a stream cut 0.5 s from `until`.
+  - **Archi through the proxy:** its page (186,633 bytes), `/api/status`, `/api/sessions`, its
+    messages stream with a ping every 5.0 s, one chat turn 200 in 4.4 s (the one model call), a
+    sibling's POST to `/api/chat` 403. Archi's exposure enabled for the checks and closed again.
+  - **Restarts:** io.web's ended its open stream and the session served again 2.2 s after; the edge's,
+    2.8 s after.
+  - **The smoke and the cost:** `run_node AI.gate0251s@worker1` `RUNNING` at 4.9 s on 0.1.151,
+    killed, stopped; one usage record, Archi's chat turn.
+- **Left for later:** the iframe in a real browser inside Cloud's page, once, with Fluxbee Cloud's
+  team (the design's §7 step 9).
+- **PROD after the gate:** all four hives on 0.1.151; snapshot `pre-web22-0-1-151` on each VM,
+  `pre-websdk-0-1-150` deleted. Archi's exposure published and closed; Cloud's origin named;
+  `gate22` unpublished, the test upstream removed, `AI.gate0251s` purged.
+- **Rollback:** the snapshot `pre-web22-0-1-151` (all 4 VMs), or `apt install fluxbee=0.1.150` +
+  0.1.150's `update_installation`: nothing one-way. Exposures go back to the placeholder. io.web's
+  and the edge's files hold the origins, a field their 0.1.150 refuses, so each starts empty and
+  serves SY.admin's next push, within 60 s. 0.1.150's SY.admin keeps no origins in its registry: name
+  them again after coming back to 0.1.151 (`publish_cloud_endpoint`, which rotates Cloud's token).
 
 ## 0.1.150 — io.web's set can carry Cloud's origins (io.web stage 2.2's R1, the Rust SDK alone)
 

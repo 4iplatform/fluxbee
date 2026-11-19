@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.150** (2026-11-19), and PROD runs **0.1.150** (the router, the Go
+> Contract as of **fluxbee 0.1.151** (2026-11-19), and PROD runs **0.1.151** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1750,6 +1750,16 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.151:** on PROD, 2026-11-19 from 20:12Z (17:12 ART), through the public door with
+Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.151): Cloud's origin `https://cloud.fluxbee.ai` named by the
+operator (Cloud's token rotated then); an exposure to a test system on a worker answered as the system
+itself: a 90 s answer, a stream every second with no burst, 100 MB uploaded whole, a WebSocket, the
+system's cookies (never Fluxbee's), the public host; the headers of §5.8; a write or a WebSocket
+from a sibling origin refused 403; a disable cut a stream, a waiting request and a WebSocket before
+its answer came; a renewal cut nothing; an enablement's end cut a stream at once; Archi's page,
+status, sessions, messages stream and one chat turn through the proxy. The iframe in a real
+browser inside Cloud's page is checked with Cloud's team.
 
 **0.1.149:** on PROD, 2026-11-19 at 03:11Z (00:11 ART), through the public door with Cloud's token
 (`lab/DEPLOYMENTS.md`, 0.1.149): with the hive's vault frozen and its edge restarted, the door

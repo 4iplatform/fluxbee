@@ -15,7 +15,7 @@
 - Stage 2.1, §12.6's step 1, is complete (0.1.145 to 0.1.148; its gate passed on 2026-11-18). What
   is left was **redefined with the operator on 2026-11-19 (§13)**: a transparent proxy, straight to
   Cloud's iframe. §13 supersedes §12.3's two stages (own tab, then iframe), §12.4's limits per
-  exposure, and §12.6's steps 2 and 3.
+  exposure, and §12.6's steps 2 and 3. Built and live in 0.1.150 and 0.1.151 (2026-11-19).
 - FINDINGS A-89 and A-90, the proxy's and io.web's limits under load, are live since 0.1.99
   (2026-11-04, checked on 8.x):
   io.web's handshakes have slots of their own, and the proxy gives each client a share, has
@@ -610,7 +610,8 @@ exposure", and §12.6's steps 2 and 3, which become one. Stage 2.1's exposures, 
 registry stay as built.
 
 **Status:** agreed in the talk of 2026-11-19, the gate of §13.9 included. The build design is
-[io-web-v2-stage-2-2.md](io-web-v2-stage-2-2.md).
+[io-web-v2-stage-2-2.md](io-web-v2-stage-2-2.md). Built and live in 0.1.150 and 0.1.151 (2026-11-19), its
+gate passed on 8.x; left: the iframe in a real browser with Fluxbee Cloud's team.
 
 ### 13.1 Decisions
 
