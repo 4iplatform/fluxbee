@@ -773,6 +773,12 @@ registry stay as built.
   has no such problem.
 - **The upstream's scheme** (http or https, and the certificate of an internal https upstream) is
   not recorded (§13.2). It is open until the first third-party exposure.
+- **Cookies across the site.** Every `*.fluxbee.ai` host is one site (decision 4). An upstream can
+  plant `Domain=fluxbee.ai` cookies into the other hosts, which is session fixation against another
+  hive's system. Whether io.web strips the `Domain` attribute of an upstream's `Set-Cookie`, making
+  it host-only, is a rewrite like the framing one: a question for the first third-party exposure.
+  Cloud is safe if its own credentials are host-only `__Host-` cookies, a requirement on Cloud
+  (build design §6).
 
 ### 13.6 Withdrawn
 

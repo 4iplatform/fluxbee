@@ -505,6 +505,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   with §13.9.
 - A-142 (Archi) is settled for the proxy by §13.3: no wait of the proxy's own; built with 2.2.
 - A-351 🔵 For stage 2.2: the edge passes io.web only `__Host-` cookies (stage 2.1's §5.4), so a third-party upstream's own cookies never reach it, and io.web must strip its own session cookie before proxying (design; found by R3's edge builder).
+- A-355 🔵 Fluxbee's own ports are listed in SY.admin alone; stage 2.2's io.web keeps a copy to refuse an Archi listen on one of them, until the next Rust SDK release shares the list (design; found by 2.2's design review).
 
 ### Archi
 
@@ -1639,6 +1640,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-355 [io.web] 🔵 design, for the next Rust SDK release (found 2026-11-19 by io.web stage 2.2's design review; read in the code) — Fluxbee's own ports are listed in SY.admin alone, and io.web needs them too
+
+- **Why:** SY.admin refuses an exposure upstream on one of Fluxbee's own ports
+  (`REFUSED_UPSTREAM_PORTS`, `src/bin/sy_admin/exposures.rs` ~89-107). Stage 2.2's io.web dials
+  Archi where hive.yaml's `architect.listen` says it listens, a setting SY.admin never checks. A
+  listen on one of those ports would let Archi's exposure reach a Fluxbee service
+  ([io-web-v2-stage-2-2](../../docs/io-web-v2-stage-2-2.md) §4.2).
+- **For 2.2:** io.web refuses such a port with a copy of the list. SY.admin and io.web build in
+  different cargo workspaces, so the shared place is the Rust SDK, and R1 (0.1.150) was already
+  closed when the review found it.
+- **Fix:** the next Rust SDK release moves the list into the SDK, and both read it from there.
 
 ### A-354 [General/admin] ✅ VALIDATED ON 8.x (0.1.149, 2026-11-19; a new exposure host read pending, then covered at 9.1 s, never held) (low; found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code) — a published host reads `held` while its own name-change order runs
 

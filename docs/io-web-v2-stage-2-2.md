@@ -75,19 +75,27 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 - **Where it is kept.** In SY.admin's exposures registry, `RegistryFile` (exposures:131-137), as
   `cloud_origins` with `#[serde(default)]`; `schema_version` stays 1.
   - It is written with a new generation once the run's door is open, after step 2 of the run's
-    order (admin:8706-8726).
+    order (admin:8706-8726). The write waits for the exposure lock (`lock().await`), where the
+    exposure actions take it with `try_lock` and answer 409 (exposures:375-378): the token has
+    already rotated, so the run does not give up its origins.
   - A door that does not open changes none of it. A write that fails is in the answer
     (`cloud_origins_persisted: false`), and the next write of the registry retries it, as its other
     writes do.
   - The answer names the origins kept.
 - **The pushes:**
+  - Both sets go out at once after the write, as the exposure actions push them
+    (exposures:1554-1556).
   - `IO_WEB_EXPOSURES` carries them as `cloud_origins`, from R1's field (§8). They come from
-    `io_web_payload` (exposures:362-373).
+    `io_web_payload` (exposures:362-373). A change of the origins alone comes with a new generation,
+    so io.web's shortcut for an equal one (web/exposures:515-519) never hides it.
   - `EDGE_WEB_ROUTES` carries them as `frame_origins`, from `payload_for` (admin:1082-1094), and
-    only when there is at least one. The edge before 2.2 refuses any unknown field
-    (`#[serde(deny_unknown_fields)]`, edge:3559-3572), so it never sees one until the operator
-    names an origin, after the deploy.
-- **`GET /web/status`** shows `cloud_origins`.
+    only when there is at least one. The edge's answer echoes `frame_origins` beside `routes`
+    (edge:3810), and SY.admin keeps them beside `acknowledged_hosts` (admin:1018), so
+    `GET /web/status` shows what the edge took.
+  - **The order:** every edge runs 2.2 before the first origin is named. An edge before 2.2
+    refuses any unknown field (`#[serde(deny_unknown_fields)]`, edge:3559-3572), so it would refuse
+    every push whole and keep its last set, and a new exposure would never reach it.
+- **`GET /web/status`** shows `cloud_origins`, and the edge's acknowledged `frame_origins`.
 - **The action's contract and summary** name the field (`admin_action_request_contract`,
   `admin_action_summary`). The executor runs this action and shows its token once
   (admin:4272-4276), so Archi's handbook names the field: the origins are the page of the Fluxbee
@@ -108,22 +116,41 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 - **Methods.** `web_policy_refusal` (edge:4764-4800) refuses only `CONNECT` and `TRACE`, with 405
   and `Allow` naming the methods it serves.
 - **Bodies** pass. The request io.web gets carries the client's body, the `DemandBody` the door
-  already wraps it in (edge:3836-3838), in place of `Body::empty()` (`io_web_request`,
-  edge:4815-4833). hyper rebuilds the framing, as the door does today: `Content-Length` when the
-  body's size is known, chunked otherwise.
+  already wraps it in (edge:3836-3838), in place of `Body::empty()`.
+  - `io_web_request` (edge:4815-4833) takes the request by value, so it can give its body away; for
+    an upgrade, after `hyper::upgrade::on(&mut req)`.
+  - hyper rebuilds the framing, as the door does today: `Content-Length` when the body's size is
+    known (through the size hint), chunked otherwise.
+  - hyper sends no `Content-Length` for an empty body, and some servers answer 411 to such a POST.
+    So a client's `Content-Length: 0` on a method other than GET and HEAD goes on as it came.
 - **Upgrades.** `Upgrade: websocket` on a GET whose `Connection` names `upgrade` passes; any other
   upgrade is refused, as today (400 `UPGRADE_NOT_ALLOWED`).
-  - The door serves with upgrades (`serve_connection(…).with_upgrades()`, edge:3846-3849), and so
-    does the connection to io.web (`dial`, edge:4666-4686).
+  - Both are changes. The door's `serve_connection` (edge:3846-3849, whose doc says "no upgrade",
+    edge:3826) and `dial`'s connection (edge:4678-4688) get `.with_upgrades()`.
   - The request to io.web carries `Connection: upgrade` and `Upgrade: websocket` in place of
     `Connection: close` (edge:4886). The strip of hop-by-hop headers keeps them for this request
     only (edge:4354-4364).
-  - On io.web's 101, which `send` takes for a failure today (`IoWebFailure::Switched`,
-    edge:4661-4663), the edge answers the client 101. It then copies bytes both ways between the two
-    upgraded streams (`hyper::upgrade::on`) until either side closes.
+  - On io.web's 101 to an admitted WebSocket handshake, the edge answers the client 101. That
+    answer keeps `Upgrade: websocket` and `Connection: upgrade`, and passes
+    `Sec-WebSocket-Accept`, `-Protocol` and `-Extensions`. `strip_io_web_response_headers` and
+    `strip_hop_by_hop` (edge:4949-4973) would remove the first two, and hyper adds neither to a 101.
+    A 101 to anything else stays a failure (`IoWebFailure::Switched`, edge:4661-4663).
+  - The tunnel then copies bytes both ways between the two upgraded streams
+    (`hyper::upgrade::on`).
+  - **The tunnel stays inside its connection's scope.** hyper's upgradeable connection resolves the
+    moment it hands the IO over, which today would drop the door's permit and per-address slot
+    (edge:3047-3062). The A-90 slots live in `IoWebBody` (edge:5009), which a 101's empty body drops
+    at once. So the tunnel runs where the connection ran and holds the door's permit, the
+    per-address slot and the request's A-90 slots until it ends.
+  - It ends both sides at the first end, the cut included. `copy_bidirectional` half-closes and
+    waits for the other side, so a client that never closes would keep its slots.
 - **No wait of its own.** `IO_WEB_HEAD_TIMEOUT` and `IO_WEB_BODY_IDLE_TIMEOUT` (edge:4347, 4998)
   go, with the `stalled` timer of `IoWebBody` (edge:5004-5040). `IO_WEB_CONNECT_TIMEOUT`
   (edge:4344) stays: reaching io.web is the edge's own work, not the application's.
+- **TCP keepalive** on the door's accepted sockets and on the socket to io.web. With no wait left,
+  a peer gone without FIN or RST (power lost, a partition) would otherwise hold a stream, a
+  WebSocket or a pending chat and its slots for ever. Like the connect timeout, this is
+  reachability, not a wait put on the application.
 - **The pace** (A-86, edge:4057-4240) stays as built.
   - It cuts a client that stops reading what the edge writes, and one that does not send a body the
     edge waits for.
@@ -131,17 +158,25 @@ The answer comes back the same way, frame by frame. io.web sets the application'
     an idle WebSocket or a long wait for Archi's answer is never taken for a slow client.
 - **The slots** (A-90): a stream or a WebSocket holds its request's slots until it ends. By default
   that is 16 per address and 128 in all (edge:144-147). Archi's page holds one stream.
-- **Cookies** (A-351). `Cookie` passes with every well-formed pair the client sent, whatever its
-  name. `host_prefixed_cookies` (edge:4903-4920) keeps its syntax check (`is_tchar`,
-  `is_cookie_octet`) and drops the prefix condition. io.web removes Fluxbee's own pairs (§4.3).
+- **Cookies** (A-351). `Cookie` passes with every pair the client sent whose name is a token,
+  whatever the name. `host_prefixed_cookies` (edge:4903-4935) keeps the name's check (`is_tchar`)
+  and drops both the prefix condition and the value's check (`is_cookie_octet`): browsers send
+  values with spaces, commas and quotes. The safety is the split at every `;` and the name's check,
+  so only a pair whose name is not a token is dropped. io.web removes Fluxbee's own pairs (§4.3).
+  - Every `*.fluxbee.ai` host is one site (§13.1, decision 4). A cookie that Cloud, or any of
+    those hosts, sets with `Domain=fluxbee.ai` reaches every exposure and so every upstream. Cloud's
+    own credentials must therefore be host-only `__Host-` cookies (§6).
 - **Kept as built:** the method overrides and the URL-rewrite headers are dropped
   (`DROPPED_REQUEST_HEADERS`, edge:4370-4383), so no GET reaches an upstream as a write past io.web's
   Origin check. The edge's forwarding headers replace the client's (edge:4835-4891).
 
 ### 3.2 Headers
 
-- **`Strict-Transport-Security: max-age=31536000; includeSubDomains`** on every answer of the door,
-  on every host (`with_security_headers`, edge:3965-3977). The door serves TLS only.
+- **`Strict-Transport-Security: max-age=31536000`** on every answer of the door, on every host
+  (`with_security_headers`, edge:3965-3977), when the door serves TLS. A plaintext door
+  (`TlsMode::Plaintext`, edge:2025-2027) sends none, since browsers ignore it over HTTP. There is no
+  `includeSubDomains`: a main host that is an own domain's apex would bind every name under it for
+  a year. Every exposure host gets its own HSTS from its own answers.
 - **The edge's own set** (edge:5929-5938) goes on the edge's own answers only.
   - An answer that comes from io.web is marked, as `OwnContentPolicy` marks one today (edge:5280).
     It gets HSTS and nothing else: io.web sets its own headers (§4.4, §4.5).
@@ -170,7 +205,21 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 - `an_io_web_answer_gets_hsts_and_none_of_the_edge_s_set`
 - `the_edge_s_own_answer_on_a_web_host_names_the_frame_origins`
 - `an_idle_stream_is_not_cut_by_the_pace`
+- `a_websocket_holds_its_slots_until_it_ends`
 - the A-90 slot tests and the A-86 pace tests, kept green
+
+**2.1's tests that change** (they assert what 2.2 undoes):
+
+- `the_edge_refuses_other_methods_bodies_and_upgrades_before_io_web` (edge:10625)
+- `the_proxy_passes_only_host_prefixed_cookies` (edge:10270)
+- `the_edge_rebuilds_the_headers_io_web_gets` (edge:10169)
+- the forwarding-headers test's asserts on the cookie, `connection: close`, and the
+  `cache-control` and `nosniff` the edge added (edge:10495-10530)
+- the head-timeout and `Switched` cases of `every_failure_to_reach_io_web_is_the_fixed_502`
+  (edge:10702)
+- `a_body_io_web_stalls_ends_and_gives_its_slots_back` (edge:10973)
+- docs/nodes/sy-edge.md:466-467 still lists the failure kinds `head_timeout` and
+  `switched_protocols`.
 
 ---
 
@@ -178,17 +227,26 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 
 ### 4.1 Serving
 
-- `serve_http` (web/web:433-460) serves with upgrades. `respond` (web/web:550-591) becomes
-  asynchronous. Its first steps are 2.1's: the reserved prefix, the unknown host (404) and the
-  session, with the 401 coming from the headers before a byte of the body is read.
+- `serve_http` (web/web:433-460) serves with upgrades, a change. `respond` (web/web:550-591)
+  becomes asynchronous. Its first steps are 2.1's: the reserved prefix, the unknown host (404) and
+  the session, with the 401 coming from the headers before a byte of the body is read.
+- **An upgraded connection stays inside its connection's scope.** hyper's upgradeable connection
+  resolves the moment it hands the IO over, so `serve_http` would return. The `select!` that holds
+  the ingress re-check would end, and the connection's permit would drop (web/web:382, 412-427).
+  The tunnel therefore runs inside that same `select!`: it keeps the permit, and a demoted ingress
+  still cuts it.
 - **A valid session reaches the upstream**, whatever the method. The placeholder page (`PAGE`,
   web/web:467-479) goes.
-- **The `Origin` check** (§13.8) runs before anything is forwarded, on POST, PUT, PATCH and DELETE,
-  and on a GET with `Upgrade: websocket`. It is the algorithm of Go's `CrossOriginProtection`:
+- **The `Origin` check** (§13.8) runs before anything is forwarded. It covers every method but GET,
+  HEAD and OPTIONS, as Go's `CrossOriginProtection` does (Go 1.25, `net/http/csrf.go:131-135`), and
+  also a GET with `Upgrade: websocket`, which goes beyond Go. The rule:
   - `Sec-Fetch-Site: same-origin` or `none` passes;
   - any other value answers 403;
-  - without that header, an `Origin` equal to `https://<host>` passes and any other answers 403;
-  - with neither header, the request passes;
+  - without that header, an `Origin` equal to `https://<host>` passes and any other answers 403,
+    `Origin: null` included. This is stricter than Go, which compares the origin's host with
+    `Host` and ignores the scheme (csrf.go:157-165).
+  - with neither header, the request passes. A browser always sends `Origin` on a WebSocket
+    handshake (RFC 6455 §4.1), so a handshake without `Sec-Fetch-Site` falls to that check.
   - the 403 is a fixed page of io.web's, like the 401's (web/web:499-513), logged with its
     exposure and the header that refused it.
 
@@ -196,14 +254,22 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 
 | `upstream.kind` | Dialled | Read from |
 | --- | --- | --- |
-| `archi` | `127.0.0.1:<port>` | hive.yaml's `architect.listen` (arch:235-237, 6450-6459), read at boot from io.web's `config_dir` (web/main:111, 146-148); the default `127.0.0.1:3000` (arch:92). A listen on `0.0.0.0` or `[::]` is dialled on loopback. Archi's `JSR_ARCHITECT_LISTEN` lives in Archi's unit, which io.web cannot read: the node page documents it |
-| `hive` | `<address>:<port>` | the registry's `address` (sdk/mesh/registry.rs:134-136) at the request. A hive gone from the registry answers 502 |
+| `archi` | the address Archi listens on | hive.yaml's `architect.listen` (arch:235-237, 6450-6459), read at boot from io.web's `config_dir` (web/main:111, 146-148); the default `127.0.0.1:3000` (arch:92). A listen on `0.0.0.0` or `[::]` is dialled on loopback, and any other address as it is. Archi's `JSR_ARCHITECT_LISTEN` lives in Archi's unit, which io.web cannot read: the node page documents it |
+| `hive` | `<address>:<port>` | the registry's `address` (sdk/mesh/registry.rs:134-136) at the request. It may be a DNS name (sy_orchestrator.rs:38129-38141): io.web resolves it then, and applies 2.1's checks of an `address` upstream to what it resolves (a private range; never loopback, link-local, unspecified, multicast or an address the motherbee holds). A hive gone from the registry, or an address refused, answers 502 |
 | `address` | `<address>:<port>` | the exposure |
 
+- **Never a Fluxbee port.** A port of Archi's listen that is one of Fluxbee's own (SY.admin's
+  `REFUSED_UPSTREAM_PORTS`, exposures:89-107) is refused, so a misconfigured listen can never make
+  Archi's exposure reach a Fluxbee service. io.web holds a copy of that list until the next Rust
+  SDK release moves it into the SDK, shared by both (FINDINGS A-355).
 - **The transport** is plain HTTP/1.1, one connection per request, nothing pooled, as the edge's to
   io.web (edge:4588-4593). The scheme stays open for the first third-party exposure (§13.5).
-- **The connect timeout** is 5 s, io.web's own reachability. There is no wait for the head and no
-  cut for silence.
+- **The connect timeout** is 5 s, io.web's own reachability, with TCP keepalive on the socket for
+  the same reason as the edge's (§3.1). There is no wait for the head and no cut for silence.
+- **The manifest.** io-web's dependencies give hyper only `["server", "http1"]`
+  (nodes/io/Cargo.toml). The new client needs hyper's `client` feature, added there. The workspace
+  build unifies it through reqwest, but io-web built alone (`scripts/publish-io-runtime.sh:117`)
+  would fail.
 - **An upstream that refuses or fails** answers io.web's fixed 502 page, logged with the failure's
   kind.
 
@@ -212,22 +278,30 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 - **The headers** are the edge's, as they came: `Host` is the public host, and `X-Forwarded-For`,
   `-Proto`, `-Host`, `Forwarded` and `X-Request-Id` are the edge's (edge:4835-4891). The
   hop-by-hop headers are stripped again; io.web sends `Connection: close`, or the upgrade's pair.
-- **`Cookie`** loses every pair whose name begins with `__Host-fluxbee_`, and goes when none is
-  left.
-- **The body** streams as it comes.
-- **An upgrade:** on the upstream's 101, io.web answers the edge 101 and copies bytes both ways.
+- **`Cookie`** loses every pair whose name begins with `__Host-fluxbee_`, matched
+  case-insensitively, and goes when none is left.
+- **The body** streams as it comes. `Content-Length` is dropped and hyper frames the body, as the
+  edge does (edge:4371), except an empty body's `Content-Length: 0` (§3.1).
+- **An upgrade:** on the upstream's 101 to the admitted handshake, io.web answers the edge 101 with
+  the handshake's headers (§3.1), and copies bytes both ways inside the connection's scope (§4.1).
+  It ends both sides at the first end.
 
 ### 4.4 The answer back (§13.7's table, the application's column)
 
 - **The body** streams frame by frame (hyper's `Incoming` as the response body), never gathered and
   never compressed.
 - **The headers:**
-  - the hop-by-hop ones are stripped;
-  - every `Set-Cookie` whose name begins with `__Host-fluxbee_` is removed;
+  - the hop-by-hop ones are stripped, and the edge's framing rule (edge:4968-4973) applies to the
+    upstream's answer: hyper's client decodes by `Transfer-Encoding` but keeps a `Content-Length`
+    beside it, which io.web's server would take for the length;
+  - every `Set-Cookie` whose name begins with `__Host-fluxbee_` is removed, matched
+    case-insensitively, and so is a nameless one (`Set-Cookie: =__Host-fluxbee_…`), which a
+    browser would send back as that name;
   - `Server` and `X-Powered-By` are removed;
   - `X-Content-Type-Options: nosniff` is added when missing;
-  - `Content-Security-Policy: frame-ancestors <origins>` is added as a header of its own, `'none'`
-    without origins; the application's own CSP headers stay as they are;
+  - `Content-Security-Policy: frame-ancestors 'self' <origins>` is added as a header of its own,
+    `'self'` alone without origins. `'self'` keeps an application able to frame its own pages
+    (Archi does not; systems like Odoo do). The application's own CSP headers stay as they are;
   - the edge adds HSTS (§3.2).
 - **The session's cookie** is appended when it slides (web/exposures:1008-1014) or moves (§4.6).
 
@@ -243,12 +317,24 @@ The answer comes back the same way, frame by frame. io.web sets the application'
 
 - `Exposures::session` (web/exposures:954-1015) checks a cookie as today.
 - When the exposure's newest enablement is another one whose key io.web holds, a cookie that serves
-  is minted again under it:
+  is minted again under it at once, without waiting for the slide's 60 s (web/exposures:1008-1010):
   - its `e` and its tag change; `sid` and `issued` stay; `active` is now;
-  - its `Max-Age` runs to the newest enablement's end;
+  - its `Max-Age` is the slide's, `min(30 min, until − now)` (web/exposures:1012), with the newest
+    enablement's `until`;
   - the answer carries it, as a slide.
 - The previous enablement stays live in the set until its own end ("at most two",
   sdk/protocol.rs:787-790), so its key still verifies the cookie meanwhile.
+- If the newest key is still unread when the previous enablement ends, the session fails and its
+  cookie is cleared, since an ended enablement is never kept (web/exposures:988). Cloud's link
+  brings it back, as for a session that made no request (io-web-v2 §13.4).
+
+### 4.6a Where io.web keeps the origins
+
+- `Held` (web/exposures:144-148) and io.web's file, `ExposuresFile` (web/exposures:210-216, which
+  denies unknown fields), keep `cloud_origins` with `#[serde(default)]`.
+- So a restart keeps them: io.web loads its file, and SY.admin's next push of the same generation
+  is acknowledged without a read (web/exposures:515-519).
+- R1's `read_file` gives them `Vec::new()` (web/exposures:1082). R2 reads them from the file.
 
 ### 4.7 The cut (§13.4)
 
@@ -264,6 +350,9 @@ The answer comes back the same way, frame by frame. io.web sets the application'
   - **an upgraded connection:** both streams are dropped.
 - **The bound** is the push. A disable's push was acknowledged in 0.57 s in 2.1's gate. The clock's
   end comes at the second.
+- **No race.** A request registers under the same lock as its session check, or checks the access
+  again once registered. Otherwise one whose check passed just before a push or the timer, and
+  that registered after the cut ran, would escape it.
 
 ### 4.8 Logs and status
 
@@ -307,8 +396,18 @@ The answer comes back the same way, frame by frame. io.web sets the application'
   - `a_disable_cuts_what_is_open_at_once` (a wait, a stream, a WebSocket)
   - `the_enablement_s_end_cuts_what_is_open`
 - the upstream's address:
-  - `archi_is_dialled_where_hive_yaml_says_it_listens`
+  - `archi_is_dialled_where_hive_yaml_says_it_listens` (loopback for `0.0.0.0`, a Fluxbee port
+    refused)
+  - `a_hive_s_name_is_resolved_and_checked`
   - `an_upstream_that_refuses_answers_502`
+- the origins: `a_restart_keeps_cloud_s_origins`
+- the framing: `an_upstream_s_chunked_answer_loses_its_content_length`,
+  `an_empty_post_keeps_its_content_length_0`
+
+**2.1's tests that change:** `each_route_answers_with_the_security_headers` (its PAGE and
+POST→404 rows, web/web:1346-1349), `the_pages_load_nothing…` (web/web:1454),
+`the_page_goes_out_with_its_headers…` (web/web:1491) and
+`a_session_serves_the_page_and_slides_after_60_s` (web/web:1810).
 
 ---
 
@@ -336,9 +435,17 @@ The answer comes back the same way, frame by frame. io.web sets the application'
   - the hive frames only the origins its operator named in `publish_cloud_endpoint`;
   - one domain, or the cookie does not travel;
   - a renewal moves the sessions;
-  - writes come from the exposure's own page.
+  - writes come from the exposure's own page;
+  - **Cloud's own credentials are host-only `__Host-` cookies.** Every `*.fluxbee.ai` host is one
+    site, so a cookie Cloud set with `Domain=fluxbee.ai` would reach every exposure's upstream. A
+    `__Host-` cookie also cannot be overwritten by one that an upstream plants with
+    `Domain=fluxbee.ai`. The same goes on the Cloud page for Fluxbee Cloud's team.
+- **docs/io/io-web.md, for third parties:** an upstream can plant `Domain=fluxbee.ai` cookies into
+  the other hosts of the site. Whether io.web strips the `Domain` attribute of an upstream's
+  `Set-Cookie` is a question for the first third-party exposure (io-web-v2 §13.5).
 - **docs/reference/operations.md:** the `web` line.
-- **FINDINGS:** A-142 and A-351 are marked built at integration; the board's item 31 is updated.
+- **FINDINGS:** A-142 and A-351 are marked built at integration; the board's item 31 is updated;
+  A-355 records io.web's copy of the refused ports (§4.2).
 
 ---
 
@@ -422,7 +529,7 @@ corner cases; the pace and the slots.
 
 | Release | Branches | What | Why in this order |
 | --- | --- | --- | --- |
-| R1, the Rust SDK alone | `coa/web22-sdk` | `IoWebExposuresPayload.cloud_origins` (sdk/protocol.rs:769-776), `#[serde(default, skip_serializing_if = "Vec::is_empty")]`, with its wire test | SY.admin and io.web compile against it; io.web before R2 ignores it |
+| R1, the Rust SDK alone | `coa/web22-sdk`, built as `671dc2ca` | `IoWebExposuresPayload.cloud_origins` (sdk/protocol.rs:769-776), `#[serde(default, skip_serializing_if = "Vec::is_empty")]`, with its wire test. The payload has no `Default`, so the three literals that build it get `cloud_origins: Vec::new()`: `io_web_payload` (exposures:363), io.web's `read_file` (web/exposures:1082) and its test helper `set` (web/exposures:1258) | SY.admin and io.web compile against it. The payload has no `deny_unknown_fields`, so an io.web before R2 ignores the field |
 | R2, the binaries | `coa/web22-admin`, `coa/web22-edge`, `coa/web22-io-web` | §2, §3 and §4, each with its docs and tests; ops.py at integration | each is green alone. The edge's pass-through reaches io.web, which refuses or forwards; io.web with no origins frames nothing |
 
 - **Totals:** four branches, two releases.
