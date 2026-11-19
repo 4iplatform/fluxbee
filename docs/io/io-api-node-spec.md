@@ -155,9 +155,12 @@ Rules:
 - `caller_is_subject` requires `ingress.caller_identity.external_user_id`.
 - Relay config follows the shared `io-common` contract.
 - `node.*` and `runtime.*` remain infrastructure sections and may require restart.
-- `node.frontdesk_target` (or `IO_API_FRONTDESK_TARGET`) is infrastructure wiring for the
-  intermediate registration handoff. It defaults to the canonical singleton
-  `SY.frontdesk.gov@motherbee`.
+- The nodes IO.api answers to and hands people to (SY.admin, SY.identity, SY.frontdesk.gov, its
+  hive's SY.orchestrator) never come from its config.json, which a config patch writes (FINDINGS
+  A-350): only from its unit's environment (`IO_API_ADMIN_TARGET`, `IO_API_IDENTITY_TARGET`,
+  `IO_API_FRONTDESK_TARGET`, `IO_API_ORCHESTRATOR_TARGET`) or the canonical singletons
+  (`SY.frontdesk.gov@motherbee` for the registration handoff). A `node.*_target` in the config
+  is ignored.
 - `node.identity_timeout_ms` (or `IO_API_IDENTITY_TIMEOUT_MS`), 10 000 by default, is how long
   IO.api waits for each of its own SY.identity calls (registering or disabling its ICH,
   provisioning a subject) and for the Frontdesk's answer to a handoff. It must stay above the

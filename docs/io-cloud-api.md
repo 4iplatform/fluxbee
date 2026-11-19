@@ -1371,7 +1371,7 @@ post '{"op":"list_cloud_actions"}'
 
 ### 0.1.148 (planned)
 
-- **New: exposures** (§5.8). Six ops publish a web host of the hive, `<label>.<hive public host>`,
+- **New: exposures** (§5.8), listed by `list_cloud_actions`. Six ops publish a web host of the hive, `<label>.<hive public host>`,
   that leads to one upstream, open it for a while, let a person in with a one-time link, close it,
   remove it and list them: `publish_exposure`, `enable_exposure`, `disable_exposure`,
   `unpublish_exposure`, `issue_exposure_link` and `list_exposures`. They take no tenant and refuse

@@ -2686,6 +2686,15 @@ impl Config {
         })?;
         let spawn_cfg = load_spawn_config(&node_name)?;
         tracing::info!(path = %spawn_cfg.path.display(), "io-cloud loaded managed spawn config");
+        Self::from_spawn(node_name, hive_id, spawn_cfg)
+    }
+
+    /// The config from the node's name, its hive and its managed config.json.
+    fn from_spawn(
+        node_name: String,
+        hive_id: String,
+        spawn_cfg: SpawnConfig,
+    ) -> Result<Self, DynError> {
         let spawn_doc = &spawn_cfg.doc;
 
         Ok(Self {
@@ -2710,12 +2719,12 @@ impl Config {
                     .unwrap_or_else(|| "/etc/fluxbee".to_string()),
             ),
             spawn_config_path: spawn_cfg.path,
-            identity_target: json_get_string(spawn_doc, "node.identity_target")
-                .unwrap_or_else(|| format!("SY.identity@{hive_id}")),
-            admin_target: json_get_string(spawn_doc, "node.admin_target")
-                .unwrap_or_else(|| format!("SY.admin@{hive_id}")),
-            orchestrator_target: json_get_string(spawn_doc, "node.orchestrator_target")
-                .unwrap_or_else(|| format!("SY.orchestrator@{hive_id}")),
+            // The nodes it answers to are never config: a `node.*_target` a config patch wrote
+            // would point Cloud's relay, put_token's values among it, at another node after a
+            // restart (FINDINGS A-350). SY.admin lives on the primary hive alone.
+            identity_target: format!("SY.identity@{hive_id}"),
+            admin_target: format!("SY.admin@{}", fluxbee_sdk::protocol::PRIMARY_HIVE_ID),
+            orchestrator_target: format!("SY.orchestrator@{hive_id}"),
         })
     }
 }
@@ -2772,6 +2781,27 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FINDINGS A-350: the nodes io.cloud answers to never come from its config.json, which a
+    /// config patch writes: a `node.*_target` there would point Cloud's relay at another node.
+    #[test]
+    fn a_config_names_none_of_the_nodes_io_cloud_answers_to() {
+        let rogue = "AI.rogue@worker1";
+        let doc = json!({ "node": {
+            "admin_target": rogue, "identity_target": rogue, "orchestrator_target": rogue } });
+        let config = Config::from_spawn(
+            "IO.cloud@motherbee".to_string(),
+            "motherbee".to_string(),
+            SpawnConfig {
+                path: PathBuf::from("/nonexistent/config.json"),
+                doc,
+            },
+        )
+        .expect("config");
+        assert_eq!(config.admin_target, "SY.admin@motherbee");
+        assert_eq!(config.identity_target, "SY.identity@motherbee");
+        assert_eq!(config.orchestrator_target, "SY.orchestrator@motherbee");
+    }
 
     /// The exposure ops (docs/io-web-v2-stage-2-1.md §5.3), each relayed to the action of its own
     /// name, with no tenant.

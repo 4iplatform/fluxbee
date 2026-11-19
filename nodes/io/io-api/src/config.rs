@@ -17,6 +17,11 @@ impl Config {
         })?;
         let spawn_cfg = load_spawn_config(&node_name)?;
         tracing::info!(path = %spawn_cfg.path.display(), "io-api loaded managed spawn config");
+        Self::from_spawn(node_name, hive_id, spawn_cfg)
+    }
+
+    /// The config from the node's name, its hive and its managed config.json.
+    fn from_spawn(node_name: String, hive_id: String, spawn_cfg: SpawnConfig) -> Result<Self> {
         let spawn_doc = &spawn_cfg.doc;
 
         Ok(Self {
@@ -41,17 +46,15 @@ impl Config {
                     .unwrap_or_else(|| "/etc/fluxbee".to_string()),
             ),
             spawn_config_path: spawn_cfg.path,
+            // The nodes it answers to never come from its config.json, which a config patch writes
+            // (FINDINGS A-350): only from its unit's environment, or the defaults.
             identity_target: env("IO_API_IDENTITY_TARGET")
-                .or_else(|| json_get_string(spawn_doc, "node.identity_target"))
                 .unwrap_or_else(|| "SY.identity@motherbee".to_string()),
             frontdesk_target: env("IO_API_FRONTDESK_TARGET")
-                .or_else(|| json_get_string(spawn_doc, "node.frontdesk_target"))
                 .unwrap_or_else(|| "SY.frontdesk.gov@motherbee".to_string()),
             admin_target: env("IO_API_ADMIN_TARGET")
-                .or_else(|| json_get_string(spawn_doc, "node.admin_target"))
                 .unwrap_or_else(|| "SY.admin@motherbee".to_string()),
             orchestrator_target: env("IO_API_ORCHESTRATOR_TARGET")
-                .or_else(|| json_get_string(spawn_doc, "node.orchestrator_target"))
                 .unwrap_or_else(|| format!("SY.orchestrator@{hive_id}")),
             identity_timeout_ms: env_u64("IO_API_IDENTITY_TIMEOUT_MS")
                 .or_else(|| json_get_u64(spawn_doc, "node.identity_timeout_ms"))
@@ -219,6 +222,34 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FINDINGS A-350: the nodes io.api answers to never come from its config.json, which a config
+    /// patch writes; only its unit's environment or the defaults name them.
+    #[test]
+    fn a_config_names_none_of_the_nodes_io_api_answers_to() {
+        let rogue = "AI.rogue@worker1";
+        let doc = serde_json::json!({ "node": {
+            "admin_target": rogue, "identity_target": rogue, "frontdesk_target": rogue,
+            "orchestrator_target": rogue } });
+        let config = Config::from_spawn(
+            "IO.api.gate@worker1".to_string(),
+            "worker1".to_string(),
+            SpawnConfig {
+                path: std::path::PathBuf::from("/nonexistent/config.json"),
+                doc,
+            },
+        )
+        .expect("config");
+        for target in [
+            &config.admin_target,
+            &config.identity_target,
+            &config.frontdesk_target,
+            &config.orchestrator_target,
+        ] {
+            assert_ne!(target.as_str(), rogue);
+        }
+        assert_eq!(config.admin_target, "SY.admin@motherbee");
+    }
 
     #[test]
     fn relay_defaults_to_passthrough() {
