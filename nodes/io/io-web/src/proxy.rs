@@ -287,11 +287,12 @@ pub async fn forward(
     };
     let answer = match answered {
         Ok(answer) => answer,
+        // The client's body broke first: the edge could not finish it (an aborted upload, a
+        // client below its pace) and answered the client itself. The request is dropped.
+        Err(_) if exchange.client_failed.load(Ordering::Relaxed) => {
+            return client_gone(exchange, &framing);
+        }
         Err(err) => {
-            // The client's body broke first: the edge went away, and nobody gets this answer.
-            if exchange.client_failed.load(Ordering::Relaxed) {
-                exchange.end(Ending::ClientClosed);
-            }
             return unreachable(exchange, Failure::new("head", error_chain(&err)), &framing);
         }
     };
@@ -306,7 +307,9 @@ pub async fn forward(
                 exchange,
                 Failure::new(
                     "switched",
-                    "the upstream switched protocols to what io.web did not ask for",
+                    "the upstream switched protocols to what io.web did not ask for, or answered \
+                     a WebSocket's handshake without one Upgrade: websocket and one \
+                     Sec-WebSocket-Accept",
                 ),
                 &framing,
             ),
@@ -365,6 +368,15 @@ fn cut_while_waiting(mut exchange: Exchange, framing: &Framing) -> Response<WebB
     exchange.status = Some(StatusCode::UNAUTHORIZED.as_u16());
     exchange.end(Ending::Cut);
     web::unauthorized(Some(session_clear_cookie()), framing)
+}
+
+/// A request whose client's body broke on its way (`CountedBody`): the edge has answered the
+/// client itself, so nobody reads io.web's answer; it is logged `client_closed`, with no status,
+/// and counted nowhere.
+fn client_gone(mut exchange: Exchange, framing: &Framing) -> Response<WebBody> {
+    exchange.detail = Some("the client's body broke on its way to the upstream".to_string());
+    exchange.end(Ending::ClientClosed);
+    web::bad_gateway(framing)
 }
 
 /// io.web's fixed 502 page for an upstream not reached, or one whose answer io.web cannot pass,
@@ -553,7 +565,13 @@ impl Body for UpstreamBody {
             Poll::Ready(Some(Err(err))) => {
                 this.upstream = None;
                 this.exchange.detail = Some(error_chain(&err));
-                this.exchange.end(Ending::UpstreamClosed);
+                // A client's body that broke ends the upstream's connection too.
+                let ending = if this.exchange.client_failed.load(Ordering::Relaxed) {
+                    Ending::ClientClosed
+                } else {
+                    Ending::UpstreamClosed
+                };
+                this.exchange.end(ending);
                 Poll::Ready(Some(Err(err.into())))
             }
             Poll::Ready(None) => {
@@ -1069,13 +1087,20 @@ mod tests {
     async fn a_websocket_is_tunnelled_and_cut() {
         let live = Live::start("websocket").await;
         let (mut tls, headers) = live.websocket().await;
-        assert_eq!(header(&headers, "upgrade"), "websocket");
-        assert_eq!(header(&headers, "connection"), "upgrade");
-        assert_eq!(
-            header(&headers, "sec-websocket-accept"),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
-        assert_eq!(header(&headers, "sec-websocket-protocol"), "chat");
+        // Exactly one of each, as the edge takes a 101 (stage 2.2 §3.1).
+        for (name, value) in [
+            ("upgrade", "websocket"),
+            ("connection", "upgrade"),
+            ("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            ("sec-websocket-protocol", "chat"),
+        ] {
+            let values: Vec<&str> = headers
+                .iter()
+                .filter(|(header, _)| header == name)
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(values, [value], "{name}");
+        }
         assert_eq!(header(&headers, "server"), "");
         let handshake = &live.site.upstream.requests()[0];
         assert_eq!(handshake.headers["upgrade"], "websocket");
@@ -1514,7 +1539,8 @@ mod tests {
                 "{case}"
             );
         }
-        // An upstream that answers 101 to a plain request: io.web passes no switch it did not ask.
+        // An upstream that answers 101 to a plain request, or a handshake's 101 without its
+        // `Sec-WebSocket-Accept`: io.web passes no switch it did not ask for, nor a broken one.
         let upstream = TestUpstream::start().await;
         let switching = proxy(Arc::clone(&exposures), upstream.address);
         let unasked = answer_to(
@@ -1524,8 +1550,22 @@ mod tests {
         )
         .await;
         assert_eq!(unasked.status(), StatusCode::BAD_GATEWAY);
+        let mut handshake = request(Method::GET, "/ws-no-accept", SHOP, Some(&shop));
+        for (name, value) in [
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-key", WEBSOCKET_KEY),
+            ("sec-websocket-version", "13"),
+        ] {
+            handshake
+                .headers_mut()
+                .insert(name, HeaderValue::from_static(value));
+        }
+        let broken = answer_to(&switching, without_body(handshake), BOOT + 12).await;
+        assert_eq!(broken.status(), StatusCode::BAD_GATEWAY);
         let view = exposures.view(BOOT + 12);
-        assert_eq!(view["per_exposure"][0]["upstream_failures"], 2);
+        assert_eq!(view["per_exposure"][0]["upstream_failures"], 3);
+        assert_eq!(view["per_exposure"][0]["proxied"]["1xx"], 0);
         assert_eq!(view["per_exposure"][1]["upstream_failures"], 1);
         remove(&exposures);
     }
@@ -1632,6 +1672,46 @@ mod tests {
         .await;
         assert_eq!(streamed["headers"]["transfer-encoding"], json!(["chunked"]));
         assert_eq!(streamed["body_bytes"], 7);
+        remove(site.exposures());
+    }
+
+    /// A body that errors at its first frame's heels, as the edge passes one it could not finish.
+    struct Broken(bool);
+
+    impl Body for Broken {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            let sent = std::mem::replace(&mut self.get_mut().0, true);
+            Poll::Ready(Some(if sent {
+                Err("the edge could not finish the body".into())
+            } else {
+                Ok(Frame::data(Bytes::from_static(b"partial")))
+            }))
+        }
+    }
+
+    /// A client's body the edge could not finish (an aborted upload, a client below its pace)
+    /// reaches io.web as a body that errors: the edge answered the client itself, so io.web drops
+    /// the request, `client_closed`, and counts no upstream failure.
+    #[tokio::test]
+    async fn a_client_body_that_breaks_drops_its_request() {
+        let site = enabled("broken-body", BOOT, UNTIL).await;
+        let cookie = site.sign_in(SHOP_ID, SHOP_ENB, SHOP, BOOT + 10).await;
+        let upload = request(Method::POST, "/echo", SHOP, Some(&cookie))
+            .map(|()| crate::testing::boxed(Broken(false)));
+        let _ = answer_to(&site.proxy, upload, BOOT + 11).await;
+        let status = status_of(site.exposures(), BOOT + 11, 0);
+        assert_eq!(status["upstream_failures"], 0, "{status}");
+        assert_eq!(status["proxied"]["2xx"], 0, "{status}");
+        assert_eq!(
+            status["open"],
+            json!({"waiting": 0, "streams": 0, "websockets": 0})
+        );
         remove(site.exposures());
     }
 

@@ -440,7 +440,8 @@ pub struct UpstreamState {
 ///   body's length and SHA-256;
 /// - `/sse` answers `text/event-stream`, one event at once and one per `send_event`;
 /// - `/slow` answers only once released;
-/// - `/ws` takes a WebSocket's handshake and echoes the bytes;
+/// - `/ws` takes a WebSocket's handshake and echoes the bytes; `/ws-no-accept` the same, its 101
+///   without `Sec-WebSocket-Accept`;
 /// - `/headers` answers its page with `Server`, `X-Powered-By`, a policy and cookies of its own,
 ///   Fluxbee's among them;
 /// - any other path reads the body and answers `UPSTREAM_PAGE`, with its length.
@@ -607,7 +608,8 @@ async fn route(
             waiting.armed = false;
             Response::new(full("slow\n"))
         }
-        "/ws" => {
+        "/ws" | "/ws-no-accept" => {
+            let accept = seen.path == "/ws";
             state.requests.lock().unwrap().push(seen);
             let upgrade = hyper::upgrade::on(&mut request);
             let state = Arc::clone(state);
@@ -634,11 +636,16 @@ async fn route(
             for (name, value) in [
                 ("upgrade", "websocket"),
                 ("connection", "Upgrade"),
-                ("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
                 ("sec-websocket-protocol", "chat"),
                 ("server", "upstream/1.0"),
             ] {
                 headers.insert(name, HeaderValue::from_static(value));
+            }
+            if accept {
+                headers.insert(
+                    "sec-websocket-accept",
+                    HeaderValue::from_static("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+                );
             }
             response
         }

@@ -28,12 +28,15 @@ pub const OWN_POLICY: &str = "default-src 'none'; base-uri 'none'; form-action '
 
 /// Every feature a page can ask for, off (io-web-v2 §13.7): io.web's own pages are text and use
 /// none. Never on an application's answer, where it could turn off something the application uses.
+/// The edge's own answers carry the same value (src/bin/sy_edge.rs): the two stay the same.
 pub const PERMISSIONS_POLICY: &str = "accelerometer=(), ambient-light-sensor=(), autoplay=(), \
-     bluetooth=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(), gamepad=(), \
-     geolocation=(), gyroscope=(), hid=(), idle-detection=(), local-fonts=(), magnetometer=(), \
-     microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), \
-     publickey-credentials-get=(), screen-wake-lock=(), serial=(), storage-access=(), usb=(), \
-     web-share=(), window-management=(), xr-spatial-tracking=()";
+     bluetooth=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), \
+     encrypted-media=(), fullscreen=(), gamepad=(), geolocation=(), gyroscope=(), hid=(), \
+     identity-credentials-get=(), idle-detection=(), local-fonts=(), magnetometer=(), \
+     microphone=(), midi=(), otp-credentials=(), payment=(), picture-in-picture=(), \
+     publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), \
+     serial=(), storage-access=(), sync-xhr=(), usb=(), web-share=(), window-management=(), \
+     xr-spatial-tracking=()";
 
 /// Every own answer's headers but its policy (`Framing::own_policy`): the edge door's set, and
 /// `Permissions-Policy`.
@@ -169,13 +172,21 @@ pub fn set_own_headers(headers: &mut HeaderMap, framing: &Framing) {
     }
 }
 
-/// A WebSocket handshake that io.web tunnels (§4.3): a GET whose `Connection` names `upgrade` and
-/// whose `Upgrade` names `websocket`, as the edge passes it. Any other upgrade goes on as a plain
-/// request, its `Upgrade` stripped as a hop-by-hop header.
+/// A WebSocket handshake that io.web tunnels (§4.3), as the edge passes one: a GET whose
+/// `Connection` names `upgrade`, with exactly one `Upgrade`, `websocket`. Any other upgrade goes on
+/// as a plain request, its `Upgrade` stripped as a hop-by-hop header.
 pub fn is_websocket_handshake(method: &Method, headers: &HeaderMap) -> bool {
-    *method == Method::GET
-        && names_token(headers, &CONNECTION, "upgrade")
-        && names_token(headers, &UPGRADE, "websocket")
+    *method == Method::GET && names_token(headers, &CONNECTION, "upgrade") && is_websocket(headers)
+}
+
+/// Exactly one `Upgrade`, `websocket`, in any case.
+fn is_websocket(headers: &HeaderMap) -> bool {
+    let mut upgrades = headers.get_all(UPGRADE).iter();
+    matches!(
+        (upgrades.next(), upgrades.next()),
+        (Some(upgrade), None)
+            if upgrade.to_str().is_ok_and(|upgrade| upgrade.trim().eq_ignore_ascii_case("websocket"))
+    )
 }
 
 /// Whether one of `name`'s values lists `token`, in any case (a comma-separated list).
@@ -339,9 +350,11 @@ pub fn set_application_headers(headers: &mut HeaderMap, framing: &Framing) {
     headers.append(CONTENT_SECURITY_POLICY, framing.application.clone());
 }
 
-/// Whether the upstream's 101 switches to a WebSocket, the one upgrade io.web asks for.
+/// Whether the upstream's 101 answers a WebSocket's handshake, the one upgrade io.web asks for:
+/// exactly one `Upgrade`, `websocket`, and one `Sec-WebSocket-Accept`, which the edge passes on and
+/// a browser requires (RFC 6455 §4.1). Any other 101 is the upstream's failure, answered 502 here.
 pub fn upgrades_to_websocket(headers: &HeaderMap) -> bool {
-    names_token(headers, &UPGRADE, "websocket")
+    is_websocket(headers) && headers.get_all(SEC_WEBSOCKET_ACCEPT).iter().count() == 1
 }
 
 /// The headers of io.web's 101 to a WebSocket's handshake (§4.3, §3.1): `Upgrade: websocket` and
@@ -517,6 +530,21 @@ mod tests {
         ]);
         assert!(is_websocket_handshake(&Method::GET, &handshake));
         assert!(!is_websocket_handshake(&Method::POST, &handshake));
+        for (connection, upgrades) in [
+            ("keep-alive", vec!["websocket"]),
+            ("upgrade", vec!["websocket, h2c"]),
+            ("upgrade", vec!["websocket", "websocket"]),
+            ("upgrade", vec![]),
+        ] {
+            let mut odd = map(&[("connection", connection)]);
+            for upgrade in &upgrades {
+                odd.append(UPGRADE, HeaderValue::from_str(upgrade).unwrap());
+            }
+            assert!(
+                !is_websocket_handshake(&Method::GET, &odd),
+                "{connection} {upgrades:?}"
+            );
+        }
         let headers = upstream_request_headers(&handshake, true);
         assert_eq!(values(&headers, "connection"), ["upgrade"]);
         assert_eq!(values(&headers, "upgrade"), ["websocket"]);
@@ -632,7 +660,22 @@ mod tests {
             ("set-cookie", "__Host-fluxbee_session=planted"),
         ]);
         assert!(upgrades_to_websocket(&upstream));
-        assert!(!upgrades_to_websocket(&map(&[("upgrade", "h2c")])));
+        for refused in [
+            map(&[("upgrade", "h2c"), ("sec-websocket-accept", "x")]),
+            map(&[("upgrade", "websocket")]),
+            map(&[
+                ("upgrade", "websocket"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-accept", "x"),
+            ]),
+            map(&[
+                ("upgrade", "websocket"),
+                ("sec-websocket-accept", "x"),
+                ("sec-websocket-accept", "y"),
+            ]),
+        ] {
+            assert!(!upgrades_to_websocket(&refused), "{refused:?}");
+        }
         let headers = websocket_answer_headers(&upstream);
         assert_eq!(headers.len(), 5);
         assert_eq!(values(&headers, "upgrade"), ["websocket"]);
@@ -665,8 +708,10 @@ mod tests {
         for (name, value) in SECURITY_HEADERS {
             assert_eq!(values(&headers, name), [value], "{name}");
         }
-        assert!(PERMISSIONS_POLICY
-            .split(", ")
-            .all(|feature| feature.ends_with("=()")));
+        let features: Vec<&str> = PERMISSIONS_POLICY.split(", ").collect();
+        assert_eq!(features.len(), 33, "the edge's value");
+        assert!(features
+            .iter()
+            .all(|feature| feature.ends_with("=()") && !feature.contains(' ')));
     }
 }
