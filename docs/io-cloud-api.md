@@ -2,7 +2,7 @@
 
 > **For the Fluxbee Cloud developers.** You do not need to know fluxbee's internals.
 >
-> Contract as of **fluxbee 0.1.147** (2026-11-18), and PROD runs **0.1.147** (the router, the Go
+> Contract as of **fluxbee 0.1.148** (2026-11-18), and PROD runs **0.1.148** (the router, the Go
 > SDK, the AI SDK, the Rust SDK and the orchestrator since 0.1.139: §9). Read from the code, operation by operation; §10 lists what was
 > also checked live on the PROD hive. §9 lists what changed for Cloud in each release. The model
 > behind it: `docs/ilk-tenant-model-v1.md`
@@ -1369,7 +1369,7 @@ post '{"op":"list_cloud_actions"}'
 
 ## 9. What changed for Cloud
 
-### 0.1.148 (planned)
+### 0.1.148
 
 - **New: exposures** (§5.8), listed by `list_cloud_actions`. Six ops publish a web host of the hive, `<label>.<hive public host>`,
   that leads to one upstream, open it for a while, let a person in with a one-time link, close it,
@@ -1694,6 +1694,16 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 10. Checked live
+
+**0.1.148:** on PROD, 2026-11-19 from 02:35Z (23:35 ART on 2026-11-18), through the public door with
+Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.148): every op of §5.8. `list_cloud_actions` names the six;
+`archi` published (`covered` at once: the certificate already named it) and a new host certified
+in 8 s; the refusals of §5.8; an exposure enabled, a link opened once into a session cookie, the
+same link again, on another host and after 125 s refused; a session cut at its enablement's end and
+at once by `disable_exposure`; a renewal kept the earlier session; io.web, SY.admin and the edge
+restarted with the session and the hosts back within 3 s; an exposure unpublished answered 404.
+For two minutes after the deploy the door answered 401 (FINDINGS A-353, fixed in 0.1.149), and a
+new host read `held` for its order's 8 s (A-354, 0.1.149).
 
 **0.1.147:** on PROD, 2026-11-19 at 00:42Z (21:42 ART on 2026-11-18), through the public door with
 Cloud's token (`lab/DEPLOYMENTS.md`, 0.1.147): `list_exposures` and `publish_exposure` answered

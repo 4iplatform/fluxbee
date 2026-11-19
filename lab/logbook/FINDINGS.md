@@ -382,7 +382,7 @@ no change required
     item (`coa/gosdk-141`); A-339 is the AI SDK's item (*an AI node answers a `NOT_TAKEN` with
     `unknown_system_msg`*), written A-335 on `coa/aisdk-142` and `coa/rustsdk-143`, to rename at
     their integration. A-348 is `coa/admin-144`'s [Archi] item (Archi's SCMD of
-    `set_node_config`'s route). The next new number is A-353.
+    `set_node_config`'s route). The next new number is A-355.
     **0.1.139's deploy:** the motherbee ran it before the workers did, and until every hive's core
     ran 0.1.139 no runtime version was removed and no workflow deployed or deleted (their purges
     remove versions): a worker on 0.1.138 listed no `RELAUNCH_DUE` node (A-300), so a version a
@@ -414,7 +414,17 @@ no change required
     until R4, io.web's commands refused through `send_node_message` and from any other node; 19
     PASS, no model call. Its reviews found and fixed one high item (a label Let's Encrypt refuses at
     order time would have held the main name's renewal) and two medium. Found building it: A-350,
-    A-351 (for 2.2), A-352. **Next:** R4, the Rust SDK's Cloud catalog (0.1.148), then §7's gate.
+    A-351 (for 2.2), A-352.
+    **0.1.148, R4 (the Rust SDK's Cloud catalog), with A-352 and A-350** ✅ live and checked on 8.x
+    (2026-11-18): **stage 2.1's full gate through Cloud's real door**: Archi's exposure published
+    and covered; a new host certified in 8 s; the refusals; enable, the one-time link and the
+    `__Host-` session cookie (once, host-bound, 120 s, in no journal and no turn); an enablement's
+    end, a renewal, a disable cutting the live session at once; io.web, SY.admin and the edge
+    restarted with sessions and routes back within 3 s; 46 PASS. **Stage 2.1 is complete.** Found
+    by the gate: A-353 (Cloud's door down 2 min after the deploy: the edge never asked the vault
+    again for a channel secret it missed at boot) and A-354 (a host read `held` during its own
+    order), both built on `coa/fix-149` for 0.1.149. **Next:** 0.1.149, then stage 2.2 (the
+    transparent proxy, Archi in its own tab; A-351).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -513,8 +523,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### General
 
-- A-352 🔵 `send_node_message` sends any system message as SY.admin's own, with any `src_ilk`: SY.vault's writes and the edge's commands pass by it around SY.admin's own guards (low-medium; SY.admin; found by R3's SY.admin builder; read in the code; to ask the operator).
-- A-350 🔵 A node's config can name its control authority: a `node.admin_target` set by `set_node_config` points IO.cloud's relay of Cloud's ops at another node after its next start (medium; the orchestrator's patch rule and the IO nodes; found by R3's io.web builder; read in the code; to ask the operator).
+- A-353 🔴 SY.edge never asks the vault again for a channel secret it could not fetch at boot: the channel refuses every request (401) until a restart (high; SY.edge; found by 0.1.148's gate: Cloud's door down 2 min after the deploy; built on `coa/fix-149` for 0.1.149).
+- A-354 🔵 A published host reads `held` while its own name-change order runs (low; SY.admin's ACME; found by 0.1.148's gate; built on `coa/fix-149` for 0.1.149).
 
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
@@ -1620,7 +1630,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-352 [General/admin] 🔵 low-medium (found 2026-11-18 by io.web stage 2.1's R3 builder on `coa/web21-admin`; read in the code, not run; there since `send_node_message`) — `send_node_message` sends any system message as SY.admin's own: SY.vault's writes and the edge's commands pass by it around SY.admin's guards
+### A-354 [General/admin] 🔵 low (found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code) — a published host reads `held` while its own name-change order runs
+
+- **Why:** `host_certificate` (`src/bin/sy_admin/acme.rs` ~4724) asks `decide`, whose
+  `gate_name_change` holds a host by the name-change budget (one order per 15 min); the order that
+  carries the host spends that budget at its start, so while it runs the host reads `held`, with
+  the budget's end as its `retry_at`.
+- **Effect:** for the order's seconds (8 s on 8.x, 2026-11-19 at 02:37:17Z) Cloud's view of a new
+  exposure says `held`, which the contract tells Cloud is the operator's to act on; then `covered`.
+- **Fix, built on `coa/fix-149` for 0.1.149:** while an ACME run is in flight, a host the leaf does
+  not cover reads `pending` (`a_host_reads_pending_while_a_run_is_in_flight`, which fails without
+  it).
+
+### A-353 [General/edge] 🔴 high (found 2026-11-19 by 0.1.148's gate; seen on 8.x, read in the code; there since the edge's warm start) — SY.edge never asks the vault again for a channel secret it could not fetch at boot
+
+- **Why:** the edge resolves a channel's secret at boot, at an `EDGE_OPEN_URL` and at a
+  `VAULT_SECRET_CHANGED` (`resolve_secrets`, `src/bin/sy_edge.rs` ~3435; its calls ~285, ~477,
+  ~541), and logs a failed fetch as *"channel rejects until resolved"*; nothing asks again.
+- **Effect:** in 0.1.148's deploy ingress1's edge restarted before its router reached the vault
+  (`Connection refused`), fetched nothing, and Cloud's door answered 401 to every request from
+  02:34:41 to 02:36:48Z on 2026-11-19, when the edge was restarted by hand. Any restart of the
+  ingress while the motherbee is slow to answer does the same; earlier deploys won the race.
+- **Fix, built on `coa/fix-149` for 0.1.149:** the edge asks again every 30 s while a channel's
+  secret is unresolved (none when all are). Its gate: the edge restarted with the vault frozen,
+  the door back within 30 s of the vault answering, with no restart.
+
+### A-352 [General/admin] ✅ VALIDATED ON 8.x (0.1.148, 2026-11-18; `send_node_message` of `VAULT_PUT` and of `EDGE_WEB_ROUTES` refused 400 naming A-352; the operator's call of 2026-11-18: build it) (low-medium; found 2026-11-18 by io.web stage 2.1's R3 builder on `coa/web21-admin`; read in the code, not run; there since `send_node_message`) — `send_node_message` sends any system message as SY.admin's own: SY.vault's writes and the edge's commands pass by it around SY.admin's guards
 
 - **Why:** `handle_send_node_message` (`src/bin/sy_admin.rs` ~22590-22660) builds a message with the
   caller's `msg_type`, `msg`, payload and `src_ilk` and sends it on SY.admin's own connection, so
@@ -1653,7 +1688,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   before it proxies, and never forwards a `Set-Cookie` of that name from the upstream. Archi and
   io.web set or read no cookie today.
 
-### A-350 [General/orchestrator] 🔵 medium (found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-io-web`; read in the code, not run; there since the IO nodes' spawn config) — a node's config can name its control authority: IO.cloud's relay of Cloud's ops can be pointed at another node
+### A-350 [General/orchestrator] ✅ BUILT (0.1.148, 2026-11-18, by its tests: io.cloud and io.api ignore a `node.*_target` in their config.json; the operator's call of 2026-11-18: build it) (medium; found 2026-11-13 by io.web stage 2.1's R3 builder on `coa/web21-io-web`; read in the code, not run; there since the IO nodes' spawn config) — a node's config can name its control authority: IO.cloud's relay of Cloud's ops can be pointed at another node
 
 - **Why:** IO.cloud and IO.api read `node.admin_target` (and IO.cloud `node.orchestrator_target`)
   from their own config.json, falling back to `SY.admin@<hive>` (`nodes/io/io-cloud/src/main.rs`

@@ -481,11 +481,12 @@ These come from the security review:
 The operator's words are quoted in Spanish; everything else is the decision as agreed in that
 conversation. The code was read first: §12.1 is what exists today.
 
-**Status:** stage 2.1, §12.6's step 1, is built in four releases
-([io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) §8): R1 (the SDK's messages and the reserved
-vault prefix) and R2 (the router) are live in 0.1.145 and 0.1.146; R3 brings SY.admin's
+**Status:** stage 2.1, §12.6's step 1, is complete: built in four releases
+([io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) §8), live in 0.1.145 to 0.1.148, and its gate passed
+on 8.x with 0.1.148 (2026-11-18). R1 (the SDK's messages and the reserved
+vault prefix) and R2 (the router) came first; R3 brought SY.admin's
 exposures (the registry, the actions only Fluxbee Cloud asks for, the certificate's names read
-live) with the edge, io.web and io.cloud; R4, Cloud's catalog, opens them to Cloud. hive.yaml's
+live) with the edge, io.web and io.cloud; R4, Cloud's catalog, opened them to Cloud. hive.yaml's
 `web:` is retired with R3: Archi's host is the exposure Cloud publishes.
 
 ### 12.1 What exists (read in the code, 2026-11-13)
