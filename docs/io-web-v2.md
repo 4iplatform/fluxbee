@@ -609,8 +609,8 @@ two stages (Archi in its own tab, then in Cloud's iframe), §12.4's "limits and 
 exposure", and §12.6's steps 2 and 3, which become one. Stage 2.1's exposures, links, sessions and
 registry stay as built.
 
-**Status:** agreed in the talk of 2026-11-19. The point of §13.9 comes next in the same talk; then
-the build design, as [io-web-v2-stage-2-1.md](io-web-v2-stage-2-1.md) was for 2.1.
+**Status:** agreed in the talk of 2026-11-19, the gate of §13.9 included. The build design is
+[io-web-v2-stage-2-2.md](io-web-v2-stage-2-2.md).
 
 ### 13.1 Decisions
 
@@ -821,8 +821,9 @@ comando"*).
   Cloud's operations through it to SY.admin. Archi receives none of them and does not know it is
   exposed.
 - `cloud_origins`: one or more `https://<host>` origins. More than one covers a move, while
-  `cloud.fluxbee.ai` and the root live together. SY.admin keeps them with the record of Cloud's door
-  and sends them to io.web with the exposures. Its checks of the field are the build design's.
+  `cloud.fluxbee.ai` and the root live together. SY.admin keeps them in its exposures registry and
+  sends them to io.web and the edge with its pushes; the field's checks are the build design's
+  ([io-web-v2-stage-2-2.md](io-web-v2-stage-2-2.md) §2).
 - Without one, nobody frames an exposure, which then works in its own tab only.
 - Changing it is running the command again, which rotates Cloud's token, as every publish does. On
   PROD, whose door is published, that is one rotation when 2.2 arrives, and then one each time
@@ -863,9 +864,22 @@ comando"*).
     a third party, against decision 4.
   - Not checking leaves the example open.
 
-### 13.9 Open: the talk's last point
+### 13.9 Observability and the gate (agreed 2026-11-19)
 
-- **Observability and the gate:** what io.web counts and logs per exposure, and the timings the
-  gate measures (the SSE cadence, the cut).
+- **Logs** stay local. io.web writes one line per forwarded request when it ends, joined to the
+  edge's by its request id: the exposure, the method, the path without its query, the status,
+  the bytes each way, the times to the head and in all, and how it ended. It never writes a
+  cookie, a query or a body. A stream or a WebSocket also writes a line when it opens.
+- **Status** per exposure: what is open, what was forwarded by class, the 401 and 403 refusals,
+  the upstream's failures, the cuts and the sessions moved. The `web` line of `ops.py health`
+  adds what is open and the failures.
+- **The gate on 8.x**, after the smoke:
+  - the rotation that names Cloud's origin, told to Cloud's team first;
+  - a throwaway test upstream on worker1, which exercises with no model call a 90 s answer,
+    the SSE cadence, a 100 MB upload, a WebSocket, the forwarding headers, the cookies, the
+    header table, the `Origin` check, the cut (measured per socket) and the renewal;
+  - Archi through the proxy, with one real chat turn, the one model call;
+  - the iframe in a real browser, once, with Cloud's team.
+- The details are in the build design's §7.
 
 Then the build design, its review, the releases and the gate on 8.x.
