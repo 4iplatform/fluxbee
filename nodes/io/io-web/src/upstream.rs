@@ -661,10 +661,10 @@ mod tests {
     /// failure; one that never answers the SYN is `connect_timeout`.
     #[tokio::test]
     async fn an_unreachable_upstream_is_a_connect_failure() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let closed = probe.local_addr().unwrap();
-        drop(probe);
-        let upstreams = Upstreams::new(Ok(closed), HiveRegistry::new("/nowhere"));
+        let upstreams = Upstreams::new(
+            Ok(crate::testing::closed_port()),
+            HiveRegistry::new("/nowhere"),
+        );
         let failure = upstreams
             .connect(&WebExposureUpstream::Archi {})
             .await

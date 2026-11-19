@@ -95,10 +95,10 @@ pub fn limits() -> WebLimits {
     }
 }
 
-/// A loopback address nothing listens on: bound, then closed.
+/// A loopback address nothing listens on: port 1 (tcpmux), which no test binds and no runner
+/// serves. A port bound and closed again could be taken by a test upstream started meanwhile.
 pub fn closed_port() -> SocketAddr {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    probe.local_addr().unwrap()
+    SocketAddr::from(([127, 0, 0, 1], 1))
 }
 
 /// io.web answering for `exposures`, with Archi at `archi` and no worker.
