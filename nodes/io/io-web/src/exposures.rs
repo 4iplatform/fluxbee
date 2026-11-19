@@ -1082,6 +1082,8 @@ fn read_file(path: &Path) -> Result<Option<IoWebExposuresPayload>, String> {
     Ok(Some(IoWebExposuresPayload {
         generation: file.generation,
         exposures: file.exposures,
+        // The file keeps them from stage 2.2's R2 on (io-web-v2-stage-2-2 §4.5).
+        cloud_origins: Vec::new(),
     }))
 }
 
@@ -1258,6 +1260,7 @@ pub(crate) mod testing {
         IoWebExposuresPayload {
             generation,
             exposures,
+            cloud_origins: Vec::new(),
         }
     }
 

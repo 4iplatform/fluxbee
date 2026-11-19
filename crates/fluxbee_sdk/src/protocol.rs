@@ -773,6 +773,12 @@ pub struct IoWebExposuresPayload {
     pub generation: u64,
     /// Every published exposure, the closed ones included.
     pub exposures: Vec<IoWebExposure>,
+    /// The origins of the Fluxbee Cloud page that may frame the exposures, `https://<host>` with an
+    /// optional port, as the operator named them in `publish_cloud_endpoint` (docs/io-web-v2.md
+    /// §13.7; docs/io-web-v2-stage-2-2.md §2). Empty, and then absent on the wire: no page may
+    /// frame them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cloud_origins: Vec<String>,
 }
 
 /// One exposure as io.web holds it (§2.3): one host to one fixed upstream, with its live
@@ -1581,6 +1587,34 @@ mod tests {
 
         let (msg, got) = through_the_wire(MSG_IO_WEB_EXPOSURES, &set);
         assert_eq!((msg.as_str(), got), (MSG_IO_WEB_EXPOSURES, set));
+    }
+
+    /// Cloud's origins ride the set only when the operator named some (docs/io-web-v2-stage-2-2.md
+    /// §2): a set without them reads as none and writes no field, so an io.web older than the field
+    /// reads every set the same.
+    #[test]
+    fn io_web_exposures_carry_cloud_s_origins_only_when_named() {
+        let named = json!({
+            "generation": 7u64,
+            "exposures": [],
+            "cloud_origins": ["https://cloud.fluxbee.ai", "https://fluxbee.ai:8443"]
+        });
+        let set: IoWebExposuresPayload = serde_json::from_value(named.clone()).expect("parse");
+        assert_eq!(
+            set.cloud_origins,
+            ["https://cloud.fluxbee.ai", "https://fluxbee.ai:8443"]
+        );
+        assert_eq!(serde_json::to_value(&set).expect("encode"), named);
+        let (msg, got) = through_the_wire(MSG_IO_WEB_EXPOSURES, &set);
+        assert_eq!((msg.as_str(), got), (MSG_IO_WEB_EXPOSURES, set));
+
+        let none: IoWebExposuresPayload =
+            serde_json::from_value(json!({"generation": 8u64, "exposures": []})).expect("parse");
+        assert!(none.cloud_origins.is_empty());
+        assert_eq!(
+            serde_json::to_value(&none).expect("encode"),
+            json!({"generation": 8u64, "exposures": []})
+        );
     }
 
     /// An upstream takes only its kind's own fields, and an address only as an IP literal (§2.2):

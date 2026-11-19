@@ -369,6 +369,8 @@ impl Exposures {
                 .filter(|exposure| self.served(exposure))
                 .map(ExposureRecord::for_io_web)
                 .collect(),
+            // Stage 2.2's R2 fills them from `publish_cloud_endpoint` (io-web-v2-stage-2-2 §2).
+            cloud_origins: Vec::new(),
         })
     }
 
