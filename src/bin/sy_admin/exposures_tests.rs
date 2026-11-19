@@ -1,7 +1,7 @@
 //! The tests of io.web's exposures in SY.admin (docs/io-web-v2-stage-2-1.md §5.1, §5.6, §6): the
-//! registry, the five actions only IO.cloud's relay asks for, and the read of them all. A scripted
-//! mesh answers for the edge, io.web and SY.vault; the time is paused, so a call that goes
-//! unanswered waits its 5 s at once.
+//! registry, the five actions only IO.cloud's relay asks for, the read of them all, and Cloud's
+//! origins in the pushes (docs/io-web-v2-stage-2-2.md §2). A scripted mesh answers for the edge,
+//! io.web and SY.vault; the time is paused, so a call that goes unanswered waits its 5 s at once.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -54,6 +54,7 @@ pub(crate) fn registry_with_hosts(state_dir: &Path, hosts: &[&str]) -> Arc<Expos
                 enablements: Vec::new(),
             })
             .collect(),
+        cloud_origins: Vec::new(),
     };
     write_registry(&registry_path(state_dir), &file).expect("the registry");
     Exposures::load(
@@ -94,6 +95,9 @@ enum VaultScript {
 /// How the edge, io.web and SY.vault answer, and what SY.admin sent them.
 struct Mesh {
     edge_answers: bool,
+    /// The edge runs a version before 2.2: it refuses a set with any field but `routes`, as its
+    /// `deny_unknown_fields` does, and names no `frame_origins`.
+    edge_before_2_2: bool,
     io_web: IoWebScript,
     vault: VaultScript,
     /// io.web's answers to the links asked, in order, the last one repeated; `None` is silence.
@@ -113,6 +117,30 @@ impl Mesh {
     fn answer_links(&mut self, links: Vec<Option<Value>>) {
         self.links = links;
         self.links_asked = 0;
+    }
+}
+
+/// The edge's answer to the routes in `payload`: a 2.2 edge takes them and names the
+/// `frame_origins` it took beside its routes; one before 2.2 refuses a field it does not know.
+fn edge_answer(payload: &Value, before_2_2: bool) -> Value {
+    let unknown = payload
+        .as_object()
+        .and_then(|fields| fields.keys().find(|field| *field != "routes"));
+    match unknown {
+        Some(field) if before_2_2 => json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": format!(
+                "invalid EDGE_WEB_ROUTES payload: unknown field `{field}`, expected `routes`"
+            ),
+        }),
+        _ => {
+            let mut taken = json!({ "status": "ok", "routes": payload["routes"] });
+            if let Some(origins) = payload.get("frame_origins") {
+                taken["frame_origins"] = origins.clone();
+            }
+            taken
+        }
     }
 }
 
@@ -188,7 +216,7 @@ async fn serve(harness: &mut RouterDispatcherTestHarness, mesh: &mut Mesh) {
             Some(MSG_EDGE_WEB_ROUTES) if mesh.edge_answers => Some(reply_to(
                 &sent,
                 MSG_EDGE_WEB_ROUTES_RESPONSE,
-                json!({ "status": "ok" }),
+                edge_answer(&sent.payload, mesh.edge_before_2_2),
             )),
             Some(MSG_IO_WEB_EXPOSURES) => {
                 mesh.on_disk_at_push
@@ -256,6 +284,7 @@ fn exposures_admin(prefix: &str, edge: Option<&'static str>) -> Admin {
         Arc::new(|_: &Path, node: &str| Ok((node == IO_WEB).then(|| IO_WEB_ILK.to_string())));
     let mesh = Mesh {
         edge_answers: true,
+        edge_before_2_2: false,
         io_web: IoWebScript::Ready,
         vault: VaultScript::Writes,
         links: Vec::new(),
@@ -342,6 +371,35 @@ impl Admin {
             .await;
         assert_eq!(answer.http_status, 200, "{}", answer.envelope);
         answer.envelope["payload"].clone()
+    }
+
+    /// What a run of publish_cloud_endpoint that names `origins` does once its door is open
+    /// (`keep_cloud_origins`, docs/io-web-v2-stage-2-2.md §2): whether the file holds them, and
+    /// what SY.admin sent.
+    async fn keep_origins(&mut self, origins: &[&str]) -> (Result<(), String>, Vec<Message>) {
+        let Admin {
+            ctx, harness, mesh, ..
+        } = self;
+        let origins = origins.iter().map(|origin| origin.to_string()).collect();
+        let (written, ()) = tokio::join!(
+            crate::keep_cloud_origins(ctx, &ctx.rpc, origins),
+            serve(harness, mesh)
+        );
+        (written, std::mem::take(&mut mesh.sent))
+    }
+
+    /// `GET /web/status`'s payload, io.web's own two reads left unanswered.
+    async fn web_status(&mut self) -> Value {
+        let Admin {
+            ctx, harness, mesh, ..
+        } = self;
+        let limit = Duration::from_millis(50);
+        let (payload, ()) = tokio::join!(
+            crate::web_status_payload(ctx, &ctx.rpc, limit, limit),
+            serve(harness, mesh)
+        );
+        mesh.sent.clear();
+        payload
     }
 
     /// The registry's file as it is on disk.
@@ -2064,4 +2122,218 @@ async fn list_exposures_answers_every_view_and_takes_no_parameter() {
         .next_outgoing_within(Duration::from_millis(50))
         .await
         .is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cloud's origins (docs/io-web-v2-stage-2-2.md §2)
+// ---------------------------------------------------------------------------------------------
+
+/// The origin of Cloud's page, and a second one as while it moves (io-web-v2 §13.7).
+const CLOUD_PAGE: &str = "https://cloud.fluxbee.ai";
+const CLOUD_ROOT: &str = "https://fluxbee.ai:8443";
+
+/// Both pushes carry Cloud's origins, whoever sends them: the run of publish_cloud_endpoint that
+/// names them (`keep_cloud_origins`, both at once), then every exposure change and every loop. The
+/// edge's routes carry them as `frame_origins` only while there is one, so an edge before 2.2,
+/// which refuses a field it does not know, takes every set while none is named, and refuses one
+/// that names them (why every edge runs 2.2 before the first origin); io.web's set carries them as
+/// `cloud_origins`, absent on the wire while empty. The `frame_origins` the edge's acknowledgement
+/// names are kept beside its hosts, past a refusal, and `GET /web/status` shows them with the
+/// origins SY.admin holds.
+#[tokio::test(start_paused = true)]
+async fn the_pushes_carry_the_origins_and_the_edge_gets_none_while_empty() {
+    let mut admin = exposures_admin("web22-origins-pushes", Some(EDGE));
+    let shop_route = json!([{ "host": SHOP, "upstream": "io.web" }]);
+    // None named: neither push names the field, and an edge before 2.2 takes the routes.
+    admin.mesh.edge_before_2_2 = true;
+    let (answer, sent) = admin
+        .cloud(
+            "publish_exposure",
+            json!({ "label": "shop", "upstream": shop_upstream() }),
+        )
+        .await;
+    assert_eq!(answer.http_status, 200, "{}", answer.envelope);
+    assert_eq!(
+        answer.envelope["payload"]["exposure"]["route"]["state"],
+        "acknowledged"
+    );
+    assert_eq!(
+        sent_named(&sent, MSG_EDGE_WEB_ROUTES).payload,
+        json!({ "routes": shop_route })
+    );
+    let set = &sent_named(&sent, MSG_IO_WEB_EXPOSURES).payload;
+    assert!(set.get("cloud_origins").is_none(), "{set}");
+    assert_eq!(
+        admin.ctx.web.status()["acknowledged_frame_origins"],
+        json!([])
+    );
+
+    // Named: both pushes at once, after the write.
+    admin.mesh.edge_before_2_2 = false;
+    admin.mesh.on_disk_at_push.clear();
+    let origins = json!([CLOUD_PAGE, CLOUD_ROOT]);
+    let (written, sent) = admin.keep_origins(&[CLOUD_PAGE, CLOUD_ROOT]).await;
+    assert_eq!(written, Ok(()));
+    assert_eq!(names_of(&sent), [MSG_EDGE_WEB_ROUTES, MSG_IO_WEB_EXPOSURES]);
+    assert_eq!(
+        sent_named(&sent, MSG_EDGE_WEB_ROUTES).payload,
+        json!({ "routes": shop_route, "frame_origins": origins })
+    );
+    let set = set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES));
+    assert_eq!(set.cloud_origins, [CLOUD_PAGE, CLOUD_ROOT]);
+    assert_eq!(set, admin.ctx.exposures.io_web_payload());
+    assert_eq!(admin.mesh.on_disk_at_push, vec![Some(admin.on_disk())]);
+    assert_eq!(
+        admin.ctx.web.status()["acknowledged_frame_origins"],
+        origins
+    );
+    let status = admin.web_status().await;
+    assert_eq!(status["web"]["cloud_origins"], origins, "{status}");
+    assert_eq!(
+        status["routes"]["acknowledged_frame_origins"], origins,
+        "{status}"
+    );
+
+    // Every later push carries them: an enable's set, a publish's routes and set, the loops'.
+    let id = admin.ctx.exposures.file().exposures[0].exposure_id.clone();
+    let (_, sent) = admin
+        .cloud(
+            "enable_exposure",
+            json!({ "exposure_id": id, "duration_s": 3600 }),
+        )
+        .await;
+    assert_eq!(
+        set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES)).cloud_origins,
+        [CLOUD_PAGE, CLOUD_ROOT]
+    );
+    let (_, sent) = admin
+        .cloud(
+            "publish_exposure",
+            json!({ "label": "docs", "upstream": { "kind": "archi" } }),
+        )
+        .await;
+    assert_eq!(
+        sent_named(&sent, MSG_EDGE_WEB_ROUTES).payload["frame_origins"],
+        origins
+    );
+    assert_eq!(
+        set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES)).cloud_origins,
+        [CLOUD_PAGE, CLOUD_ROOT]
+    );
+    assert_eq!(admin.ctx.web.payload()["frame_origins"], origins);
+    let exposures = Arc::clone(&admin.ctx.exposures);
+    let looping = tokio::spawn(
+        Arc::clone(&exposures).run_io_web(Arc::clone(&admin.ctx.rpc), "motherbee".to_string()),
+    );
+    serve(&mut admin.harness, &mut admin.mesh).await;
+    let sent = std::mem::take(&mut admin.mesh.sent);
+    assert_eq!(
+        set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES)).cloud_origins,
+        [CLOUD_PAGE, CLOUD_ROOT],
+        "the loop's push"
+    );
+    looping.abort();
+
+    // An edge before 2.2 refuses a set that names them and keeps its last set; what the edge
+    // acknowledged last is kept.
+    admin.mesh.edge_before_2_2 = true;
+    let docs = admin.ctx.exposures.file().exposures[1].exposure_id.clone();
+    let (answer, _) = admin
+        .cloud("unpublish_exposure", json!({ "exposure_id": docs }))
+        .await;
+    assert_eq!(answer.envelope["payload"]["route"]["state"], "pending");
+    let routes = admin.ctx.web.status();
+    assert_eq!(routes["state"], "refused", "{routes}");
+    assert!(
+        routes["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("unknown field `frame_origins`")),
+        "{routes}"
+    );
+    assert_eq!(routes["acknowledged_frame_origins"], origins, "{routes}");
+
+    // Cleared: neither push names the field again, and an edge before 2.2 takes the set.
+    let (written, sent) = admin.keep_origins(&[]).await;
+    assert_eq!(written, Ok(()));
+    assert_eq!(
+        sent_named(&sent, MSG_EDGE_WEB_ROUTES).payload,
+        json!({ "routes": shop_route })
+    );
+    let set = &sent_named(&sent, MSG_IO_WEB_EXPOSURES).payload;
+    assert!(set.get("cloud_origins").is_none(), "{set}");
+    let routes = admin.ctx.web.status();
+    assert_eq!(routes["state"], "acknowledged", "{routes}");
+    assert_eq!(routes["acknowledged_frame_origins"], json!([]), "{routes}");
+    assert_eq!(admin.web_status().await["web"]["cloud_origins"], json!([]));
+}
+
+/// A change of Cloud's origins alone moves the registry's generation, as an exposure change does,
+/// so io.web, which acknowledges a set of the generation it holds without reading it, reads the
+/// new origins: the exposures as they were, the origins new, at a generation past the one io.web
+/// holds, in the file before the pushes leave. Named again as they are, they are written again
+/// with a new generation, as a run that retries a failed write does. A file written before 2.2
+/// names none: it loads with none, its schema still 1, and the next write names them.
+#[tokio::test(start_paused = true)]
+async fn a_change_of_the_origins_alone_gives_a_new_generation() {
+    let mut admin = exposures_admin("web22-origins-generation", Some(EDGE));
+    let id = admin.publish("shop", shop_upstream()).await;
+    admin.enable(&id, 3600).await;
+    let before = admin.on_disk();
+    let set_before = admin.ctx.exposures.io_web_payload();
+    assert!(admin.ctx.exposures.io_web_acknowledged(before.generation));
+    admin.mesh.on_disk_at_push.clear();
+
+    let (written, sent) = admin.keep_origins(&[CLOUD_PAGE]).await;
+    assert_eq!(written, Ok(()));
+    let after = admin.on_disk();
+    assert!(after.generation > before.generation, "a new generation");
+    assert_eq!(
+        after.exposures, before.exposures,
+        "the exposures as they were"
+    );
+    assert_eq!(after.cloud_origins, [CLOUD_PAGE]);
+    assert_eq!(after, admin.ctx.exposures.file());
+    let set = set_of(sent_named(&sent, MSG_IO_WEB_EXPOSURES));
+    assert_eq!(set.generation, after.generation);
+    assert_eq!(set.exposures, set_before.exposures);
+    assert_eq!(set.cloud_origins, [CLOUD_PAGE]);
+    assert_eq!(
+        admin.mesh.on_disk_at_push,
+        vec![Some(after.clone())],
+        "written before the push"
+    );
+    assert!(admin.ctx.exposures.io_web_acknowledged(after.generation));
+
+    let (written, _) = admin.keep_origins(&[CLOUD_PAGE]).await;
+    assert_eq!(written, Ok(()));
+    let again = admin.on_disk();
+    assert!(again.generation > after.generation, "written again");
+    assert_eq!(again.cloud_origins, [CLOUD_PAGE]);
+
+    // A file written before 2.2: no cloud_origins.
+    let mut file: Value =
+        serde_json::from_slice(&fs::read(&admin.mesh.registry).expect("the file")).expect("JSON");
+    file.as_object_mut()
+        .expect("an object")
+        .remove("cloud_origins");
+    fs::write(
+        &admin.mesh.registry,
+        serde_json::to_vec_pretty(&file).expect("serializes"),
+    )
+    .expect("written");
+    admin.restart();
+    assert_eq!(admin.ctx.exposures.unreadable(), None);
+    let loaded = admin.ctx.exposures.file();
+    assert_eq!(loaded.schema_version, 1);
+    assert!(loaded.cloud_origins.is_empty());
+    assert_eq!(loaded.exposures, again.exposures);
+    assert!(admin
+        .ctx
+        .exposures
+        .io_web_payload()
+        .cloud_origins
+        .is_empty());
+    let (written, _) = admin.keep_origins(&[CLOUD_ROOT]).await;
+    assert_eq!(written, Ok(()));
+    assert_eq!(admin.on_disk().cloud_origins, [CLOUD_ROOT]);
 }

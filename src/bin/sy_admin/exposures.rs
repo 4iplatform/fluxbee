@@ -13,6 +13,9 @@
 //!   `unpublish_exposure` and `issue_exposure_link`, IO.cloud@motherbee's alone
 //!   ([`handle_exposure_write`]), and `list_exposures`, read by IO.cloud and Archi
 //!   ([`handle_list_exposures`]).
+//! - **Cloud's origins** (docs/io-web-v2-stage-2-2.md §2): the origins of the Fluxbee Cloud page
+//!   that may frame the exposures, which the operator names in `publish_cloud_endpoint`
+//!   ([`cloud_origins_param`], [`Exposures::set_cloud_origins`]). Both pushes carry them.
 //!
 //! No log line holds a key, a link or a code; each one about an exposure names it and its host
 //! (§5.10).
@@ -134,6 +137,11 @@ pub(crate) struct RegistryFile {
     pub(crate) generation: u64,
     #[serde(default)]
     pub(crate) exposures: Vec<ExposureRecord>,
+    /// The origins of the Fluxbee Cloud page that may frame the exposures, as the operator named
+    /// them in `publish_cloud_endpoint` (docs/io-web-v2-stage-2-2.md §2). None: nobody frames.
+    /// A file written before 2.2 holds none, so the schema stays 1.
+    #[serde(default)]
+    pub(crate) cloud_origins: Vec<String>,
 }
 
 /// One exposure, as the registry keeps it.
@@ -358,7 +366,8 @@ impl Exposures {
         self.read(|registry| registry.unpersisted.is_none())
     }
 
-    /// The set io.web gets (§5.5), with no secret: the exposures served, none without a main name.
+    /// The set io.web gets (§5.5), with no secret: the exposures served, none without a main name,
+    /// and Cloud's origins (io-web-v2-stage-2-2 §2).
     pub(crate) fn io_web_payload(&self) -> IoWebExposuresPayload {
         self.read(|registry| IoWebExposuresPayload {
             generation: registry.file.generation,
@@ -369,14 +378,45 @@ impl Exposures {
                 .filter(|exposure| self.served(exposure))
                 .map(ExposureRecord::for_io_web)
                 .collect(),
-            // Stage 2.2's R2 fills them from `publish_cloud_endpoint` (io-web-v2-stage-2-2 §2).
-            cloud_origins: Vec::new(),
+            cloud_origins: registry.file.cloud_origins.clone(),
         })
+    }
+
+    /// Cloud's origins as memory holds them (io-web-v2-stage-2-2 §2): the edge's `frame_origins`
+    /// and io.web's `cloud_origins`. None while the registry could not be read: nobody frames.
+    pub(crate) fn cloud_origins(&self) -> Vec<String> {
+        self.read(|registry| registry.file.cloud_origins.clone())
     }
 
     /// The exposure lock, if no other exposure write holds it.
     pub(crate) fn try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
         self.write_lock.try_lock().ok()
+    }
+
+    /// The exposure lock, waited for: `publish_cloud_endpoint`'s write of Cloud's origins, which
+    /// comes once its token has rotated and so never gives them up as an exposure change does
+    /// (`409 BUSY`). Each holder holds it for its own calls alone, 5 s each.
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().await
+    }
+
+    /// Cloud's origins (io-web-v2-stage-2-2 §2), as a run of `publish_cloud_endpoint` names them
+    /// once its door is open: memory takes them with the ended enablements pruned and a new
+    /// generation, so that io.web's shortcut for an equal one never hides them, then the file.
+    /// A write that fails is kept and tried again, as a closing change's is (the loop every
+    /// minute, or the next write); the caller pushes after, and answers whether the file holds
+    /// them. The caller holds the exposure lock. A registry that could not be read at the start
+    /// changes nothing: its file is the operator's, never written over (the caller refuses such a
+    /// run before anything is minted, `cloud_origins_registry_unreadable`).
+    pub(crate) fn set_cloud_origins(&self, origins: Vec<String>) -> Result<(), String> {
+        if let Some(reason) = self.unreadable() {
+            return Err(format!(
+                "the registry could not be read at SY.admin's start ({reason}), and is never \
+                 written until the operator removes it"
+            ));
+        }
+        self.close_change(|file| file.cloud_origins = origins);
+        self.persist()
     }
 
     /// An opening change (§2.3): `change` on a copy, the ended enablements pruned and the
@@ -478,6 +518,7 @@ fn empty_registry(now_ms: u64) -> RegistryFile {
         schema_version: REGISTRY_SCHEMA_VERSION,
         generation: now_ms,
         exposures: Vec::new(),
+        cloud_origins: Vec::new(),
     }
 }
 
@@ -834,6 +875,152 @@ fn check_exposure_id(exposure_id: &str) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Cloud's origins (docs/io-web-v2-stage-2-2.md §2), which the operator names
+// ---------------------------------------------------------------------------------------------
+
+/// The most origins `publish_cloud_endpoint` keeps: two cover a move of Cloud's page, while
+/// `cloud.fluxbee.ai` and the root live together (io-web-v2 §13.7), and every origin goes into the
+/// `frame-ancestors` of each answer.
+pub(crate) const MAX_CLOUD_ORIGINS: usize = 4;
+
+/// `publish_cloud_endpoint`'s `cloud_origins`, checked before anything is read or minted: `None`
+/// when absent or null, the origins kept staying (a run that only rotates a lost token names
+/// none, and the executor gives null to an optional field a plan does not name); else the
+/// origins to keep, `[]` clearing them. At most [`MAX_CLOUD_ORIGINS`], none twice, each as
+/// [`check_cloud_origin`] takes it. The error names the origin and the rule.
+pub(crate) fn cloud_origins_param(params: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = params.get("cloud_origins").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "cloud_origins is a list of origins, https://<host>[:<port>], not {value}"
+        ));
+    };
+    if items.len() > MAX_CLOUD_ORIGINS {
+        return Err(format!(
+            "cloud_origins holds at most {MAX_CLOUD_ORIGINS} origins, got {}",
+            items.len()
+        ));
+    }
+    let mut origins: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(origin) = item.as_str() else {
+            return Err(format!(
+                "cloud_origins: {item} is not an origin, https://<host>[:<port>]: an origin is a \
+                 string"
+            ));
+        };
+        check_cloud_origin(origin)?;
+        if origins.iter().any(|known| known == origin) {
+            return Err(format!(
+                "cloud_origins: '{origin}' is named twice: each origin once"
+            ));
+        }
+        origins.push(origin.to_string());
+    }
+    Ok(Some(origins))
+}
+
+/// One of Cloud's origins: `https://`, a DNS host and an optional port, written as a browser
+/// writes an origin (RFC 6454 §6.1), so that each origin has one spelling and a duplicate is the
+/// same text. Taken as given, never folded: lowercase; no user, path (not even `/`), query,
+/// fragment or wildcard; never an IP literal, nor a host whose last label is a number, which a
+/// browser reads as an IPv4 address; a port of 1 to 65535 with no leading zero, and never 443,
+/// which an origin leaves out. The edge checks its `frame_origins` by the same rule
+/// (io-web-v2-stage-2-2 §3.2), and an origin it refused would make it refuse the whole set: it
+/// takes every origin this one takes.
+pub(crate) fn check_cloud_origin(origin: &str) -> Result<(), String> {
+    let refused = |rule: &str| {
+        Err(format!(
+            "cloud_origins: '{origin}' is not an origin, https://<host>[:<port>]: {rule}"
+        ))
+    };
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return refused("it begins with https://, in lowercase");
+    };
+    if authority.contains('@') {
+        return refused("it has no user");
+    }
+    if authority.contains('/') {
+        return refused("it has no path, not even '/'");
+    }
+    if authority.contains('?') {
+        return refused("it has no query");
+    }
+    if authority.contains('#') {
+        return refused("it has no fragment");
+    }
+    if authority.contains('*') {
+        return refused("it has no wildcard: name each host");
+    }
+    if authority.starts_with('[') {
+        return refused("its host is a DNS name, never an IP literal");
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return refused("its host is lowercase, taken as given and never folded");
+    }
+    let last_is_a_number = host
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()));
+    if host.parse::<IpAddr>().is_ok() || last_is_a_number {
+        return refused("its host is a DNS name, never an IP literal");
+    }
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    if host.len() > 253 || !host.split('.').all(label_ok) {
+        return refused(
+            "its host is a DNS name: labels of 1 to 63 lowercase letters, digits and hyphens, no \
+             hyphen at either end, no trailing dot, 253 characters at most",
+        );
+    }
+    if let Some(port) = port {
+        if port == "443" {
+            return refused("it leaves out the port 443, as an origin does: https://<host>");
+        }
+        // Digits alone: `u16`'s parse also takes a leading '+'.
+        let digits = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+        if !digits || port.starts_with('0') || port.parse::<u16>().is_err() {
+            return refused("its port is 1 to 65535, with no leading zero");
+        }
+    }
+    Ok(())
+}
+
+/// `publish_cloud_endpoint`'s answer when it names `cloud_origins` while the registry could not be
+/// read at SY.admin's start: `500 RECORD_FAILED`, as every exposure change answers then, asked
+/// before anything is read or minted, so no token rotates for origins that could not be kept. The
+/// file is kept for the operator and never written until they remove it and restart SY.admin.
+pub(crate) fn cloud_origins_registry_unreadable(
+    state_dir: &Path,
+    reason: &str,
+) -> InternalAdminDispatchResult {
+    answer_error(
+        "publish_cloud_endpoint",
+        500,
+        "RECORD_FAILED",
+        format!(
+            "the exposures registry {} could not be read at SY.admin's start ({reason}), so it \
+             keeps no cloud_origins: nothing was read or minted, and the token the Cloud holds \
+             works as before. The operator removes the file, never repairs it, restarts \
+             SY.admin, then runs publish_cloud_endpoint again with cloud_origins.",
+            registry_path(state_dir).display()
+        ),
+    )
+}
+
 /// `publish_exposure`'s params.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -893,7 +1080,7 @@ pub(crate) enum IoWebAnswer {
 }
 
 impl IoWebAnswer {
-    fn state(&self) -> &'static str {
+    pub(crate) fn state(&self) -> &'static str {
         match self {
             IoWebAnswer::Taken { .. } => "taken",
             IoWebAnswer::Refused { .. } => "refused",

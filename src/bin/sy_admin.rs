@@ -1016,6 +1016,10 @@ struct WebRoutesPush {
     acknowledged_at: Option<i64>,
     /// The hosts of the last set the edge acknowledged: the routes it holds.
     acknowledged_hosts: Option<Vec<String>>,
+    /// The `frame_origins` the edge's last acknowledgement names beside its routes
+    /// (docs/io-web-v2-stage-2-2.md §2): Cloud's origins as the edge took them, none from an edge
+    /// that names none (one before 2.2 names none).
+    acknowledged_frame_origins: Option<Vec<String>>,
     /// The edge's proxy to io.web, as its acknowledgement of this push reports it; `None` for any
     /// other answer.
     upstream: Option<EdgeWebUpstream>,
@@ -1079,18 +1083,40 @@ impl WebRoutes {
         }
     }
 
-    /// `EDGE_WEB_ROUTES {routes: [{host, upstream}]}` for `hosts`.
-    fn payload_for(hosts: &[String]) -> serde_json::Value {
+    /// `EDGE_WEB_ROUTES {routes: [{host, upstream}], frame_origins}` for `hosts` and Cloud's
+    /// origins (docs/io-web-v2-stage-2-2.md §2), `frame_origins` only when there is one: an edge
+    /// before 2.2 refuses any field it does not know (`deny_unknown_fields`), so it would refuse
+    /// every push whole and keep its last set, and a new exposure would never reach it.
+    fn payload_for(hosts: &[String], frame_origins: &[String]) -> serde_json::Value {
         let routes: Vec<serde_json::Value> = hosts
             .iter()
             .map(|host| serde_json::json!({ "host": host, "upstream": WEB_ROUTES_UPSTREAM }))
             .collect();
-        serde_json::json!({ "routes": routes })
+        let mut payload = serde_json::json!({ "routes": routes });
+        if !frame_origins.is_empty() {
+            payload["frame_origins"] = serde_json::json!(frame_origins);
+        }
+        payload
     }
 
-    /// The set a push carries now: every published host.
+    /// The set a push carries now: every published host, and Cloud's origins.
     fn payload(&self) -> serde_json::Value {
-        Self::payload_for(&self.exposures.hosts())
+        Self::payload_for(&self.exposures.hosts(), &self.exposures.cloud_origins())
+    }
+
+    /// The `frame_origins` an acknowledgement names beside its routes: none when it names none.
+    fn acknowledged_frame_origins(payload: &serde_json::Value) -> Vec<String> {
+        payload
+            .get("frame_origins")
+            .and_then(serde_json::Value::as_array)
+            .map(|origins| {
+                origins
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// One push, waited for `timeout` in all, the set read once no other push is under way. Only
@@ -1115,21 +1141,23 @@ impl WebRoutes {
                 since: Utc::now().timestamp(),
                 acknowledged_at: None,
                 acknowledged_hosts: None,
+                acknowledged_frame_origins: None,
                 upstream: None,
             };
             return (waited, false);
         };
         let hosts = self.exposures.hosts();
+        let frame_origins = self.exposures.cloud_origins();
         let now = Utc::now().timestamp();
-        let (edge, outcome, upstream) = match (self.edge)() {
-            Err(reason) => (None, WebRoutesOutcome::NoEdge(reason), None),
+        let (edge, outcome, upstream, echoed) = match (self.edge)() {
+            Err(reason) => (None, WebRoutesOutcome::NoEdge(reason), None, None),
             Ok(edge) => {
                 let answer = send_system_request_with_meta(
                     client,
                     &edge,
                     MSG_EDGE_WEB_ROUTES,
                     MSG_EDGE_WEB_ROUTES_RESPONSE,
-                    Self::payload_for(&hosts),
+                    Self::payload_for(&hosts, &frame_origins),
                     16,
                     None,
                     None,
@@ -1139,23 +1167,26 @@ impl WebRoutes {
                     left,
                 )
                 .await;
-                let (outcome, upstream) = match answer {
+                let (outcome, upstream, echoed) = match answer {
                     Ok(payload) if payload_is_ok(&payload) => (
                         WebRoutesOutcome::Acknowledged,
                         EdgeWebUpstream::from_answer(&payload),
+                        Some(Self::acknowledged_frame_origins(&payload)),
                     ),
                     Ok(payload) => (
                         WebRoutesOutcome::Refused(
                             payload_error_detail(&payload).unwrap_or_else(|| payload.to_string()),
                         ),
                         None,
+                        None,
                     ),
                     Err(err) => (
                         WebRoutesOutcome::NoAnswer(no_answer_detail(&err, timeout)),
                         None,
+                        None,
                     ),
                 };
-                (Some(edge), outcome, upstream)
+                (Some(edge), outcome, upstream, echoed)
             }
         };
         let mut last = self
@@ -1186,6 +1217,11 @@ impl WebRoutes {
                     .as_ref()
                     .and_then(|previous| previous.acknowledged_hosts.clone())
             },
+            acknowledged_frame_origins: echoed.or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|previous| previous.acknowledged_frame_origins.clone())
+            }),
             edge,
             outcome,
             hosts,
@@ -1221,8 +1257,9 @@ impl WebRoutes {
     }
 
     /// The routes in `GET /web/status`: the full set a push carries now, the edge's answer to the
-    /// last one (`not_pushed` before the first), and the proxy's `upstream` that answer reported
-    /// (null unless it acknowledged the set).
+    /// last one (`not_pushed` before the first), the proxy's `upstream` that answer reported
+    /// (null unless it acknowledged the set), and the `frame_origins` the edge's last
+    /// acknowledgement named (null before one).
     fn status(&self) -> serde_json::Value {
         let last = self
             .last
@@ -1242,6 +1279,9 @@ impl WebRoutes {
                 .as_ref()
                 .and_then(|push| push.acknowledged_at)
                 .map(unix_rfc3339),
+            "acknowledged_frame_origins": last
+                .as_ref()
+                .and_then(|push| push.acknowledged_frame_origins.as_ref()),
             "upstream": last
                 .as_ref()
                 .and_then(|push| push.upstream.as_ref())
@@ -1461,9 +1501,10 @@ fn web_registry_state(unreadable: bool, hosts: &[String]) -> &'static str {
     }
 }
 
-/// The answer of `GET /web/status` (docs/io-web-v2-stage-2-1.md §5.1): the published hosts, each
-/// exposure's view, the certificate's names as the ACME client holds them, the routes and the
-/// edge's last answer to them, and io.web, with what it last answered to the exposures' pushes.
+/// The answer of `GET /web/status` (docs/io-web-v2-stage-2-1.md §5.1): the published hosts and
+/// Cloud's origins (docs/io-web-v2-stage-2-2.md §2), each exposure's view, the certificate's names
+/// as the ACME client holds them, the routes and the edge's last answer to them, and io.web, with
+/// what it last answered to the exposures' pushes.
 async fn web_status_payload(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -1480,6 +1521,7 @@ async fn web_status_payload(
             "state": web_registry_state(unreadable.is_some(), &hosts),
             "hosts": hosts,
             "reason": unreadable,
+            "cloud_origins": ctx.exposures.cloud_origins(),
         },
         "exposures": exposures::exposure_views(ctx),
         "certificate": ctx.acme.web_certificate(&hosts),
@@ -8716,7 +8758,11 @@ async fn advance_publication(
 ///    which the answer says (`cloud_token_said`). Then any door that does not open puts the record
 ///    back as it was (`put_back_cloud_edge_record`), and the answer is the externalize's error,
 ///    which says what became of both.
-/// 3. The apply: the edge given to the running IO.cloud (`apply_cloud_edge`, FINDINGS A-255).
+/// 3. The apply: the edge given to the running IO.cloud (`apply_cloud_edge`, FINDINGS A-255). Beside
+///    it, when the run names `cloud_origins`, Cloud's origins are kept in the exposures registry and
+///    pushed to the edge and io.web (`keep_cloud_origins`, docs/io-web-v2-stage-2-2.md §2): only
+///    once the door is open, so a door that does not open changes none of them; at the same time
+///    as the apply, so the run's ceiling stays the one Archi waits for.
 /// 4. The old door: when the record named another edge, the door moved, and once the running
 ///    IO.cloud trusts the new edge, that edge's door is closed (`settle_moved_cloud_door`). Until
 ///    then IO.cloud may still trust the old edge, whose door is the Cloud's only way in, so it is
@@ -8724,7 +8770,7 @@ async fn advance_publication(
 ///
 /// A rotation on the same edge keeps the edge's one previous token for up to 10 minutes (SY.edge's
 /// grace, in its memory); a move closes the old door at once. Nothing extends that grace, by the
-/// operator's call (2026-11-12).
+/// operator's call (2026-11-12). Changing Cloud's origins is a run too, so it rotates the token.
 async fn handle_publish_cloud_endpoint(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -8762,6 +8808,21 @@ async fn handle_publish_cloud_endpoint(
             "publish_cloud_endpoint",
             &format!("edge_node must be an edge, SY.edge@<hive>, not '{edge_node}'"),
         ));
+    }
+    // Cloud's origins, before anything is read or minted too (docs/io-web-v2-stage-2-2.md §2):
+    // absent keeps the origins kept, `[]` clears them. A registry that could not be read at the
+    // start keeps none, and a run that named them would rotate the token for nothing.
+    let cloud_origins = match exposures::cloud_origins_param(&params) {
+        Ok(origins) => origins,
+        Err(detail) => return Ok(internal_invalid_request("publish_cloud_endpoint", &detail)),
+    };
+    if cloud_origins.is_some() {
+        if let Some(reason) = ctx.exposures.unreadable() {
+            return Ok(exposures::cloud_origins_registry_unreadable(
+                &ctx.state_dir,
+                &reason,
+            ));
+        }
     }
 
     // The operator names the NODE; we resolve the ICH.
@@ -8860,8 +8921,17 @@ async fn handle_publish_cloud_endpoint(
     };
 
     // The edge IO.cloud is to trust, applied to the running IO.cloud once its door is open
-    // (`apply_cloud_edge`, FINDINGS A-255); the answer says whether it took it.
-    let applied = apply_cloud_edge(client, &cloud_node, &edge_node).await;
+    // (`apply_cloud_edge`, FINDINGS A-255); the answer says whether it took it. Cloud's origins,
+    // when the run names them, are kept and pushed at the same time (`keep_cloud_origins`): the
+    // two touch nothing of each other's, and one after the other they could take the run past
+    // what Archi waits for it (`EXECUTOR_CLOUD_ENDPOINT_WAIT_SECS` in sy_architect.rs).
+    let (applied, origins_written) =
+        tokio::join!(apply_cloud_edge(client, &cloud_node, &edge_node), async {
+            match cloud_origins {
+                Some(origins) => Some(keep_cloud_origins(ctx, client, origins).await),
+                None => None,
+            }
+        });
     log_cloud_edge_apply(&cloud_node, &edge_node, &applied);
 
     // The door moved to another edge: the old edge's door is closed (FINDINGS A-317), once the
@@ -8881,7 +8951,51 @@ async fn handle_publish_cloud_endpoint(
         &edge_node,
         &applied,
         moved.as_ref(),
+        &CloudOriginsKept {
+            origins: ctx.exposures.cloud_origins(),
+            written: origins_written,
+        },
     ))
+}
+
+/// Cloud's origins a run names, once its door is open (docs/io-web-v2-stage-2-2.md §2): kept in
+/// SY.admin's exposures registry with a new generation (`Exposures::set_cloud_origins`), then
+/// pushed to the edge (`frame_origins`) and io.web (`cloud_origins`) at once, as the exposure
+/// actions push their changes. `Err`: why the file does not hold them yet; memory holds them,
+/// the pushes carry them, and the next write of the registry tries again.
+async fn keep_cloud_origins(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    origins: Vec<String>,
+) -> Result<(), String> {
+    // Waited for, where an exposure change answers BUSY: the token has rotated by now, so the
+    // run does not give its origins up. An exposure change holds the lock for its own calls
+    // alone, 5 s each.
+    let _one_write = ctx.exposures.lock().await;
+    let written = ctx.exposures.set_cloud_origins(origins);
+    let ((routes, _), io_web) = tokio::join!(
+        ctx.web.push_once(client, exposures::EXPOSURE_CALL_TIMEOUT),
+        ctx.exposures
+            .push_io_web(client, &ctx.hive_id, exposures::EXPOSURE_CALL_TIMEOUT)
+    );
+    let file = ctx.exposures.file();
+    tracing::info!(
+        cloud_origins = %file.cloud_origins.join(", "),
+        generation = file.generation,
+        persisted = written.is_ok(),
+        route = %routes.outcome.state().0,
+        io_web = %io_web.state(),
+        "publish_cloud_endpoint: Fluxbee Cloud's origins kept and pushed"
+    );
+    written
+}
+
+/// The origins of the Fluxbee Cloud page that frame the exposures, after a run
+/// (docs/io-web-v2-stage-2-2.md §2): `origins` the ones kept, and `written` whether the file holds
+/// the ones the run named (`None`: it named none, and kept the ones before).
+struct CloudOriginsKept {
+    origins: Vec<String>,
+    written: Option<Result<(), String>>,
 }
 
 /// The answer of a `publish_cloud_endpoint` asked while another run holds the door
@@ -10090,14 +10204,18 @@ fn cloud_edge_set_outcome(
 /// SY.admin could not tell, a `warning` that says so (`cloud_edge_warning`), never a plain success.
 /// When the door moved from another edge (FINDINGS A-317), `previous_edge_node` names that edge and
 /// `previous_edge_closed` says whether its door closed; one left open or that did not close is in
-/// the `warning` too (`moved_cloud_door_warning`). The publish worked and its token is shown only
-/// here, so the answer stays `ok`.
+/// the `warning` too (`moved_cloud_door_warning`). `cloud_origins` names the origins kept
+/// (docs/io-web-v2-stage-2-2.md §2); when the run named them, `cloud_origins_persisted` says
+/// whether the file holds them, and `false` comes with a `warning` too
+/// (`cloud_origins_warning`). The publish worked and its token is shown only here, so the answer
+/// stays `ok`.
 fn cloud_endpoint_answer(
     mut externalize: InternalAdminDispatchResult,
     cloud_node: &str,
     edge_node: &str,
     applied: &CloudEdgeApply,
     moved: Option<&MovedCloudDoor>,
+    origins: &CloudOriginsKept,
 ) -> InternalAdminDispatchResult {
     let Some(payload) = externalize
         .envelope
@@ -10121,14 +10239,40 @@ fn cloud_endpoint_answer(
             serde_json::json!(matches!(moved.door, OldCloudDoor::Closed(_))),
         );
     }
+    payload.insert(
+        "cloud_origins".to_string(),
+        serde_json::json!(origins.origins),
+    );
+    if let Some(written) = &origins.written {
+        payload.insert(
+            "cloud_origins_persisted".to_string(),
+            serde_json::json!(written.is_ok()),
+        );
+    }
     let warnings: Vec<String> = apply_warning
         .into_iter()
         .chain(moved.and_then(|moved| moved_cloud_door_warning(cloud_node, edge_node, moved)))
+        .chain(cloud_origins_warning(origins))
         .collect();
     if !warnings.is_empty() {
         payload.insert("warning".to_string(), serde_json::json!(warnings.join(" ")));
     }
     externalize
+}
+
+/// The warning of origins a run named that the file does not hold (docs/io-web-v2-stage-2-2.md
+/// §2): why, what SY.admin does meanwhile and what a restart before the write would lose; none
+/// once written, or when the run named none.
+fn cloud_origins_warning(origins: &CloudOriginsKept) -> Option<String> {
+    let Some(Err(why)) = &origins.written else {
+        return None;
+    };
+    Some(format!(
+        "Fluxbee Cloud's origins are in SY.admin's memory and pushed to the edge and io.web, but \
+         the exposures registry could not be written ({why}): SY.admin writes it again every \
+         minute. A restart of SY.admin before then loses them, and publish_cloud_endpoint then \
+         runs again with cloud_origins."
+    ))
 }
 
 /// The warning of a door moved to another edge whose old door is not closed (FINDINGS A-317): which
@@ -16781,7 +16925,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_admin_action_help" => "Return help metadata for one admin action.",
         "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
-        "publish_cloud_endpoint" => "Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). The token cannot be read back afterwards: if it is lost, publish again to rotate.",
+        "publish_cloud_endpoint" => "Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). The token cannot be read back afterwards: if it is lost, publish again to rotate. cloud_origins names the origins of the Fluxbee Cloud page that may frame the hive's exposures (absent keeps them, [] clears them); changing them is a run too, which rotates the token.",
         "publish_artifact" => {
             "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner."
         }
@@ -17900,6 +18044,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             "view",
             "string",
             "compact (each action's name, description and read_only) or full (every field). Over HTTP the default is full, and ?view=compact asks the compact one; over the mesh and to the executor the default and the only view is compact, since the full catalog does not fit in one mesh frame (CATALOG_TOO_LARGE_FOR_MESH).",
+        )],
+        "publish_cloud_endpoint" => vec![admin_action_body_field(
+            "cloud_origins",
+            "string[]",
+            "Optional. The origins of the Fluxbee Cloud page that manages the hive, which may frame its exposures (docs/io-web-v2-stage-2-2.md §2, since 0.1.150): each https://<host> with an optional port, as a browser writes an origin (lowercase, no user, path, query, fragment or wildcard, never an IP literal, never :443), at most 4, none twice; anything else is refused (INVALID_REQUEST, naming the origin and the rule) before anything is read or minted. Absent or null keeps the origins kept; [] clears them, and nobody frames. SY.admin keeps them in its exposures registry once the door is open (a door that does not open changes none) and pushes them to the edge and io.web; the answer names them (cloud_origins) and whether the registry's file holds them (cloud_origins_persisted). An origin outside the hive's own domain is taken, but frames a page whose session cookie does not travel.",
         )],
         "vault_delete" | "vault_rotate" | "vault_rollback" => vec![admin_action_body_field(
                 "tenant_id",
@@ -19272,6 +19421,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "A read or a write of the record that fails is tried once more at once (FINDINGS A-273, since 0.1.137). One that fails again answers 502 CONFIG_RECORD_FAILED before anything is minted (FINDINGS A-317, since 0.1.139): no token, no door opened or closed, IO.cloud not asked, so a token the Cloud holds works as before. When a try of the write got no answer, it may have been written all the same, and only then does the detail say so: get_node_config of IO.cloud shows what its config names, which IO.cloud reads when it starts. On a move, a config that names the new edge is put back to the old one with set_node_config first: IO.cloud would otherwise trust, from its next start, an edge with no door, and a run again would take that edge for the door's place and close no old door. So fix the cause the detail names first, then run publish_cloud_endpoint again, on the motherbee's HTTP API (POST /hives/motherbee/cloud/endpoint) or through Archi, which shows the token once and keeps it masked (FINDINGS A-124, since 0.1.139). Up to 0.1.138 the record came after the token, and this answer left the door open with a token no one received.",
             "A door that does not open (the externalize's error: the vault or the edge refused, or the edge did not answer) puts the record back as it was before the run, tried once more at once, and the error's detail says so, or that IO.cloud's config still names the edge, which IO.cloud reads when it starts (FINDINGS A-317, since 0.1.139). A token goes out once, only in an ok answer, never in an error or a log line.",
             "When the edge refused the open or did not answer it, the vault had already taken the token this run minted, for that edge, which no one received: SY.admin rolls edge_channel_secret:<ich> back to the token before it (vault_rollback, as soon as the door failed, before the record is put back), so the vault holds the token the door served before the run, and the detail says it rolled back (FINDINGS A-317, since 0.1.139). On a rotation on the same edge, when the edge refused the open or the router did not reach it, that is all: the edge serves the token the Cloud holds and reads it again when it restarts. An edge that did not answer the open (a 15 s timeout, say) may have taken it all the same, since it answers an open and then reads its token from the vault, and the rollback reaches the vault, not the edge's memory: it then serves the token this run minted until it restarts, and on a rotation the Cloud's beside it only for up to 10 minutes after the open (its grace). The detail says so (since 0.1.139's integration review): run publish_cloud_endpoint again, on an edge that answers, and give the Cloud its token at once. On a move the key stays the new edge's, which this run's put made its owner and a rollback does not change, so the old edge reads none once it restarts, as a deploy does: run publish_cloud_endpoint again, on an edge that answers, and give the Cloud its token at once. A rollback SY.vault refused, or that did not reach it, is asked once more at once; one SY.vault did not answer in time is not asked again, since a rollback swaps the token and the one before it and that one may have landed (vault_get_metadata of the key shows its version); with no token before this run there is none to roll back to. When it fails, or there is none, the detail says so, and that the vault then holds (after an ask not answered, may hold) the token no one received, which the edge the door was on reads when it restarts (after a move it reads none: the key is the new edge's): the token the Cloud holds works at most until then, so run publish_cloud_endpoint again, on an edge that answers. Nothing asks again later.",
+            "cloud_origins (docs/io-web-v2-stage-2-2.md §2, since 0.1.150) are the origins of the Fluxbee Cloud page that manages the hive: the edge and io.web let that page frame the hive's exposures (frame-ancestors), and nobody else. A run that names them keeps them in the exposures registry with a new generation once its door is open, beside the apply to IO.cloud, waiting for an exposure change under way (never BUSY: the token has rotated by then), and pushes them at once to the edge (EDGE_WEB_ROUTES frame_origins, only when there is one: an edge before 2.2 refuses the field) and io.web (IO_WEB_EXPOSURES cloud_origins). A door that does not open changes none of them. Changing them is running publish_cloud_endpoint again, which rotates the token: the Cloud gets the new one at once. payload.cloud_origins names the origins kept; payload.cloud_origins_persisted, when the run named them, says whether the registry's file holds them, and false comes with payload.warning: SY.admin holds them in memory, pushes them, and writes them again every minute. While the registry could not be read at SY.admin's start, a run that names them is refused, 500 RECORD_FAILED, before anything is read or minted. GET /web/status shows them (web.cloud_origins) and the frame_origins the edge acknowledged (routes.acknowledged_frame_origins).",
         ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
@@ -38229,6 +38379,7 @@ mod tests {
             since: WEB_SINCE,
             acknowledged_at: Some(acknowledged_at),
             acknowledged_hosts: Some(hosts.clone()),
+            acknowledged_frame_origins: Some(Vec::new()),
             upstream: Some(upstream),
         };
         let no_material = "mesh TLS material in /var/lib/fluxbee/tls/ingress1: io: not found";
@@ -38271,6 +38422,7 @@ mod tests {
                     since: WEB_SINCE,
                     acknowledged_at: Some(acknowledged_at),
                     acknowledged_hosts: Some(hosts.clone()),
+                    acknowledged_frame_origins: Some(Vec::new()),
                     upstream: None,
                 }),
                 "refused",
@@ -38287,6 +38439,7 @@ mod tests {
                     since: WEB_SINCE,
                     acknowledged_at: None,
                     acknowledged_hosts: None,
+                    acknowledged_frame_origins: None,
                     upstream: None,
                 }),
                 "no_edge",
@@ -38417,7 +38570,7 @@ mod tests {
         assert_eq!(result.envelope["status"], "ok");
         assert_eq!(
             payload["web"],
-            json!({ "state": "none", "hosts": [], "reason": null })
+            json!({ "state": "none", "hosts": [], "reason": null, "cloud_origins": [] })
         );
         assert_eq!(payload["exposures"], json!([]));
         assert_eq!(
@@ -44976,6 +45129,14 @@ mod tests {
         }
     }
 
+    /// The origins of a run that named none, with none kept before it.
+    fn no_cloud_origins() -> CloudOriginsKept {
+        CloudOriginsKept {
+            origins: Vec::new(),
+            written: None,
+        }
+    }
+
     /// The warning of the publish's answer when the running IO.cloud did not take the edge, or
     /// SY.admin could not tell: the answer stays `ok` with the token, which is shown only there,
     /// says `edge_applied: false`, and asks for no restart.
@@ -44986,6 +45147,7 @@ mod tests {
             CLOUD_EDGE,
             applied,
             None,
+            &no_cloud_origins(),
         );
         assert_eq!(answer.http_status, 200);
         assert_eq!(answer.envelope["status"], json!("ok"));
@@ -45054,6 +45216,7 @@ mod tests {
             CLOUD_EDGE,
             &applied,
             None,
+            &no_cloud_origins(),
         );
         assert_eq!(answer.http_status, 200);
         assert_eq!(answer.envelope["status"], json!("ok"));
@@ -45195,6 +45358,7 @@ mod tests {
             CLOUD_EDGE,
             &applied,
             None,
+            &no_cloud_origins(),
         );
         assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
         assert!(answer.envelope["payload"].get("warning").is_none());
@@ -45491,6 +45655,7 @@ mod tests {
                 CLOUD_EDGE,
                 &applied,
                 None,
+                &no_cloud_origins(),
             );
             assert_eq!(answer.envelope["payload"]["edge_applied"], json!(true));
         }
@@ -46389,6 +46554,579 @@ mod tests {
                 .is_none(),
             "nothing read, recorded or opened"
         );
+    }
+
+    // --- publish_cloud_endpoint: Cloud's origins (docs/io-web-v2-stage-2-2.md §2) -----------
+
+    /// The origin of Cloud's page (io-web-v2 §13.1, decision 4).
+    const CLOUD_PAGE: &str = "https://cloud.fluxbee.ai";
+    /// A second origin, as while Cloud's page moves (io-web-v2 §13.7), with a port of its own.
+    const CLOUD_ROOT: &str = "https://fluxbee.ai:8443";
+
+    /// An admin whose public edge is CLOUD_EDGE, so that a run's origins reach both pushes, the
+    /// edge's routes and io.web's set, and whose IO.cloud owns CLOUD_ICH.
+    fn cloud_origins_admin(
+        prefix: &str,
+    ) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
+        let (mut ctx, harness) = opa_test_admin(prefix);
+        ctx.channel_options = Arc::new(|_| Ok(vec![ich_option(CLOUD_ICH, Some(CLOUD_NODE), true)]));
+        ctx.web = Arc::new(WebRoutes::new(
+            Arc::clone(&ctx.exposures),
+            Arc::new(|| Ok(CLOUD_EDGE.to_string())),
+        ));
+        (ctx, harness)
+    }
+
+    /// SY.admin's exposures registry as its file holds it.
+    fn exposures_on_disk(ctx: &AdminContext) -> exposures::RegistryFile {
+        let raw = fs::read(exposures::registry_path(&ctx.state_dir)).expect("the registry's file");
+        serde_json::from_slice(&raw).expect("the registry")
+    }
+
+    /// The message named `msg` among `sent`.
+    fn sent_one<'a>(sent: &'a [Message], msg: &str) -> &'a Message {
+        sent.iter()
+            .find(|message| message.meta.msg.as_deref() == Some(msg))
+            .unwrap_or_else(|| panic!("no {msg} sent"))
+    }
+
+    /// What follows the door's open, in the order SY.admin sends it: IO.cloud's CONFIG_GET, which
+    /// finds the edge trusted already (a rotation on the same edge), and the `pushes` that Cloud's
+    /// origins make beside it, each acknowledged as a 2.2 edge and io.web acknowledge: the edge
+    /// names the frame_origins it took beside its routes. The pushes, as SY.admin sent them.
+    async fn answer_apply_and_pushes(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        pushes: usize,
+    ) -> Vec<Message> {
+        let mut sent_pushes = Vec::new();
+        for _ in 0..=pushes {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the apply's CONFIG_GET or a push");
+            let answer = match sent.meta.msg.as_deref() {
+                Some("CONFIG_GET") => {
+                    assert_eq!(dst_of(&sent), json!(CLOUD_NODE));
+                    let trusted = json!({ "io": { "edge_node": CLOUD_EDGE } });
+                    reply_to(&sent, "CONFIG_RESPONSE", cloud_config_get(3, trusted))
+                }
+                Some(MSG_EDGE_WEB_ROUTES) => {
+                    assert_eq!(dst_of(&sent), json!(CLOUD_EDGE));
+                    let mut taken = json!({
+                        "status": "ok",
+                        "routes": sent.payload["routes"],
+                        "changed": true,
+                        "persisted": true,
+                    });
+                    if let Some(origins) = sent.payload.get("frame_origins") {
+                        taken["frame_origins"] = origins.clone();
+                    }
+                    reply_to(&sent, MSG_EDGE_WEB_ROUTES_RESPONSE, taken)
+                }
+                Some(MSG_IO_WEB_EXPOSURES) => {
+                    assert_eq!(dst_of(&sent), json!(format!("IO.web@{PRIMARY_HIVE_ID}")));
+                    let set: fluxbee_sdk::protocol::IoWebExposuresPayload =
+                        serde_json::from_value(sent.payload.clone()).expect("io.web's set");
+                    let taken = fluxbee_sdk::protocol::IoWebExposuresResponse::Ok {
+                        generation: set.generation,
+                        changed: true,
+                        enablements: Vec::new(),
+                    };
+                    reply_to(
+                        &sent,
+                        fluxbee_sdk::protocol::MSG_IO_WEB_EXPOSURES_RESPONSE,
+                        serde_json::to_value(taken).expect("serializes"),
+                    )
+                }
+                other => panic!("SY.admin sent {other:?}: {}", sent.payload),
+            };
+            harness.inject(answer).await.unwrap();
+            if sent.meta.msg.as_deref() != Some("CONFIG_GET") {
+                sent_pushes.push(sent);
+            }
+        }
+        sent_pushes
+    }
+
+    /// One run on CLOUD_EDGE, where the door is already and which IO.cloud trusts: the record, the
+    /// door and the apply answered, and the `pushes` its origins make. The answer, the token it
+    /// carries and the pushes; nothing else is sent.
+    async fn run_cloud_door_with(
+        ctx: &AdminContext,
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        params: Value,
+        pushes: usize,
+    ) -> (InternalAdminDispatchResult, String, Vec<Message>) {
+        let publish = handle_publish_cloud_endpoint(ctx, &ctx.rpc, params.clone());
+        let drive = async {
+            answer_cloud_edge_read(harness, json!({ "edge_node": CLOUD_EDGE })).await;
+            answer_cloud_edge_record(harness, cloud_edge_recorded()).await;
+            let token = open_cloud_door(harness).await;
+            let pushes = answer_apply_and_pushes(harness, pushes).await;
+            (token, pushes)
+        };
+        let (answer, (token, pushes)) = tokio::join!(publish, drive);
+        let answer = answer.expect("dispatch");
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "{params}: nothing more is sent"
+        );
+        (answer, token, pushes)
+    }
+
+    /// docs/io-web-v2-stage-2-2.md §2: a run that names cloud_origins keeps them once its door is
+    /// open, in SY.admin's exposures registry with a new generation, in memory and in its file
+    /// (which a start loads again), and pushes them at once beside the apply to IO.cloud: the
+    /// edge's routes carry them as frame_origins, io.web's set as cloud_origins. Its answer carries
+    /// the token as before, names the origins kept and says the file holds them. A run that names
+    /// none (absent, or the null the executor gives an optional field) keeps them, writes and
+    /// pushes nothing, and names them; [] clears them, and then neither push names the field.
+    #[tokio::test]
+    async fn publish_cloud_endpoint_keeps_the_origins_it_is_given() {
+        let (ctx, mut harness) = cloud_origins_admin("cloud-origins-kept");
+        let named = json!([CLOUD_PAGE, CLOUD_ROOT]);
+        let before = ctx.exposures.file().generation;
+        let (answer, token, pushes) = run_cloud_door_with(
+            &ctx,
+            &mut harness,
+            json!({ "edge_node": CLOUD_EDGE, "cloud_origins": named }),
+            2,
+        )
+        .await;
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        let payload = &answer.envelope["payload"];
+        assert!(payload["token"] == json!(token), "{shown}");
+        assert_eq!(payload["edge_applied"], json!(true), "{shown}");
+        assert_eq!(payload["cloud_origins"], named, "{shown}");
+        assert_eq!(payload["cloud_origins_persisted"], json!(true), "{shown}");
+        assert!(payload.get("warning").is_none(), "{shown}");
+        let kept = ctx.exposures.file();
+        assert_eq!(kept.cloud_origins, [CLOUD_PAGE, CLOUD_ROOT]);
+        assert!(kept.generation > before, "a new generation");
+        assert_eq!(exposures_on_disk(&ctx), kept);
+        let started = exposures::Exposures::load(&ctx.state_dir, None, Arc::new(now_epoch_ms));
+        assert_eq!(started.cloud_origins(), [CLOUD_PAGE, CLOUD_ROOT]);
+        assert_eq!(pushes.len(), 2);
+        assert_eq!(
+            sent_one(&pushes, MSG_EDGE_WEB_ROUTES).payload,
+            json!({ "routes": [], "frame_origins": named })
+        );
+        let set = &sent_one(&pushes, MSG_IO_WEB_EXPOSURES).payload;
+        assert_eq!(set["cloud_origins"], named);
+        assert_eq!(set["generation"], json!(kept.generation));
+        assert_eq!(ctx.web.status()["acknowledged_frame_origins"], named);
+
+        for params in [
+            json!({ "edge_node": CLOUD_EDGE }),
+            json!({ "edge_node": CLOUD_EDGE, "cloud_origins": null }),
+        ] {
+            let (answer, token, pushes) =
+                run_cloud_door_with(&ctx, &mut harness, params.clone(), 0).await;
+            let shown = without_token(&answer.envelope.to_string(), &token);
+            assert_eq!(answer.http_status, 200, "{params}: {shown}");
+            let payload = &answer.envelope["payload"];
+            assert!(payload["token"] == json!(token), "{params}: {shown}");
+            assert_eq!(payload["cloud_origins"], named, "{params}: {shown}");
+            assert!(
+                payload.get("cloud_origins_persisted").is_none(),
+                "{params}: {shown}"
+            );
+            assert!(pushes.is_empty(), "{params}: nothing pushed");
+            assert_eq!(ctx.exposures.file(), kept, "{params}: nothing changed");
+            assert_eq!(exposures_on_disk(&ctx), kept, "{params}: nothing written");
+        }
+
+        let (answer, token, pushes) = run_cloud_door_with(
+            &ctx,
+            &mut harness,
+            json!({ "edge_node": CLOUD_EDGE, "cloud_origins": [] }),
+            2,
+        )
+        .await;
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        assert_eq!(answer.envelope["payload"]["cloud_origins"], json!([]));
+        assert_eq!(
+            answer.envelope["payload"]["cloud_origins_persisted"],
+            json!(true)
+        );
+        let cleared = ctx.exposures.file();
+        assert!(cleared.cloud_origins.is_empty());
+        assert!(cleared.generation > kept.generation, "a new generation");
+        assert_eq!(exposures_on_disk(&ctx), cleared);
+        assert_eq!(
+            sent_one(&pushes, MSG_EDGE_WEB_ROUTES).payload,
+            json!({ "routes": [] })
+        );
+        let set = &sent_one(&pushes, MSG_IO_WEB_EXPOSURES).payload;
+        assert!(set.get("cloud_origins").is_none(), "{set}");
+        assert_eq!(set["generation"], json!(cleared.generation));
+        assert_eq!(ctx.web.status()["acknowledged_frame_origins"], json!([]));
+    }
+
+    /// docs/io-web-v2-stage-2-2.md §2: each origin is https:// and a DNS host, lowercase as given,
+    /// with an optional port, as a browser writes an origin; no user, path, query, fragment or
+    /// wildcard, never an IP literal; at most 4, none twice. Anything else is refused,
+    /// INVALID_REQUEST naming the origin and the rule, before anything is read, recorded, minted
+    /// or pushed, as edge_node is.
+    #[tokio::test]
+    async fn publish_cloud_endpoint_refuses_an_origin_that_is_not_https_host_only() {
+        let (ctx, mut harness) = cloud_origins_admin("cloud-origins-refused");
+        let five: Vec<String> = (1..=5)
+            .map(|n| format!("https://cloud{n}.fluxbee.ai"))
+            .collect();
+        for (origins, rule) in [
+            (
+                json!(["http://cloud.fluxbee.ai"]),
+                "it begins with https://, in lowercase",
+            ),
+            (
+                json!(["HTTPS://cloud.fluxbee.ai"]),
+                "it begins with https://, in lowercase",
+            ),
+            (
+                json!(["cloud.fluxbee.ai"]),
+                "it begins with https://, in lowercase",
+            ),
+            (
+                json!(["https://Cloud.fluxbee.ai"]),
+                "its host is lowercase, taken as given and never folded",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai/"]),
+                "it has no path, not even '/'",
+            ),
+            (json!(["https://cloud.fluxbee.ai/app"]), "it has no path"),
+            (
+                json!(["https://cloud.fluxbee.ai?hive=1"]),
+                "it has no query",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai#top"]),
+                "it has no fragment",
+            ),
+            (
+                json!(["https://operator@cloud.fluxbee.ai"]),
+                "it has no user",
+            ),
+            (json!(["https://*.fluxbee.ai"]), "it has no wildcard"),
+            (json!(["https://192.0.2.10"]), "never an IP literal"),
+            (json!(["https://[::1]:8443"]), "never an IP literal"),
+            (json!(["https://cloud.1"]), "never an IP literal"),
+            (json!(["https://cloud.fluxbee.ai."]), "no trailing dot"),
+            (
+                json!(["https://cloud_page.fluxbee.ai"]),
+                "its host is a DNS name",
+            ),
+            (
+                json!(["https://-cloud.fluxbee.ai"]),
+                "no hyphen at either end",
+            ),
+            (json!(["https://"]), "its host is a DNS name"),
+            (
+                json!(["https://cloud.fluxbee.ai:443"]),
+                "it leaves out the port 443",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai:0"]),
+                "its port is 1 to 65535",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai:08443"]),
+                "with no leading zero",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai:+8443"]),
+                "its port is 1 to 65535",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai:65536"]),
+                "its port is 1 to 65535",
+            ),
+            (
+                json!(["https://cloud.fluxbee.ai:"]),
+                "its port is 1 to 65535",
+            ),
+            (json!(five), "cloud_origins holds at most 4 origins, got 5"),
+            (
+                json!([CLOUD_PAGE, CLOUD_ROOT, CLOUD_PAGE]),
+                "cloud_origins: 'https://cloud.fluxbee.ai' is named twice",
+            ),
+            (json!([7]), "cloud_origins: 7 is not an origin"),
+            (json!(CLOUD_PAGE), "cloud_origins is a list of origins"),
+            (
+                json!({ "origin": CLOUD_PAGE }),
+                "cloud_origins is a list of origins",
+            ),
+        ] {
+            let answer = handle_publish_cloud_endpoint(
+                &ctx,
+                &ctx.rpc,
+                json!({ "edge_node": CLOUD_EDGE, "cloud_origins": origins }),
+            )
+            .await
+            .expect("dispatch");
+            assert_eq!(answer.http_status, 400, "{origins}: {}", answer.envelope);
+            assert_eq!(answer.envelope["error_code"], json!("INVALID_REQUEST"));
+            let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+            assert!(detail.contains(rule), "{origins}: {detail}");
+            if let Some([one]) = origins.as_array().map(Vec::as_slice) {
+                let named = one
+                    .as_str()
+                    .map_or_else(|| one.to_string(), |one| format!("'{one}'"));
+                assert!(detail.contains(&named), "{origins}: {detail}");
+            }
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing read, recorded, minted or pushed"
+        );
+        assert!(ctx.exposures.cloud_origins().is_empty());
+        assert!(
+            !exposures::registry_path(&ctx.state_dir).exists(),
+            "nothing written"
+        );
+        // What a browser writes passes: four origins, ports of their own, a punycode label.
+        let four = json!([
+            CLOUD_PAGE,
+            CLOUD_ROOT,
+            "https://xn--flxbee-5ya.ai",
+            "https://dev.cloud.fluxbee.ai:65535"
+        ]);
+        assert_eq!(
+            exposures::cloud_origins_param(&json!({ "cloud_origins": four })),
+            Ok(Some(
+                four.as_array()
+                    .expect("a list")
+                    .iter()
+                    .map(|origin| origin.as_str().expect("a string").to_string())
+                    .collect()
+            ))
+        );
+        for none in [json!({}), json!({ "cloud_origins": null }), Value::Null] {
+            assert_eq!(exposures::cloud_origins_param(&none), Ok(None), "{none}");
+        }
+        assert_eq!(
+            exposures::cloud_origins_param(&json!({ "cloud_origins": [] })),
+            Ok(Some(Vec::new()))
+        );
+    }
+
+    /// docs/io-web-v2-stage-2-2.md §2: a registry SY.admin could not read at its start keeps no
+    /// origins and is never written until the operator removes it, so a run that names them, even
+    /// [], is refused, 500 RECORD_FAILED, before anything is read or minted: no token rotates for
+    /// origins it could not keep. A run that names none goes on as before, and names none kept.
+    #[tokio::test]
+    async fn a_run_that_names_origins_is_refused_while_the_registry_cannot_be_read() {
+        let (mut ctx, mut harness) = cloud_origins_admin("cloud-origins-unreadable");
+        let path = exposures::registry_path(&ctx.state_dir);
+        fs::create_dir_all(path.parent().expect("its directory")).expect("the directory");
+        fs::write(&path, "{ not json").expect("a broken registry");
+        ctx.exposures = exposures::Exposures::load(&ctx.state_dir, None, Arc::new(now_epoch_ms));
+        ctx.web = Arc::new(WebRoutes::new(
+            Arc::clone(&ctx.exposures),
+            Arc::new(|| Ok(CLOUD_EDGE.to_string())),
+        ));
+        for origins in [json!([CLOUD_PAGE]), json!([])] {
+            let answer = handle_publish_cloud_endpoint(
+                &ctx,
+                &ctx.rpc,
+                json!({ "edge_node": CLOUD_EDGE, "cloud_origins": origins }),
+            )
+            .await
+            .expect("dispatch");
+            assert_eq!(answer.http_status, 500, "{origins}: {}", answer.envelope);
+            assert_eq!(answer.envelope["error_code"], json!("RECORD_FAILED"));
+            let detail = answer.envelope["error_detail"].as_str().unwrap_or_default();
+            for what in [
+                "could not be read at SY.admin's start",
+                "so it keeps no cloud_origins: nothing was read or minted, and the token the Cloud \
+                 holds works as before",
+                "The operator removes the file, never repairs it, restarts SY.admin, then runs \
+                 publish_cloud_endpoint again with cloud_origins.",
+            ] {
+                assert!(detail.contains(what), "{what}: {detail}");
+            }
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "nothing read, recorded or minted"
+        );
+        let (answer, token, pushes) =
+            run_cloud_door_with(&ctx, &mut harness, json!({ "edge_node": CLOUD_EDGE }), 0).await;
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        assert!(
+            answer.envelope["payload"]["token"] == json!(token),
+            "{shown}"
+        );
+        assert_eq!(answer.envelope["payload"]["cloud_origins"], json!([]));
+        assert!(pushes.is_empty());
+        assert_eq!(fs::read_to_string(&path).expect("kept"), "{ not json");
+    }
+
+    /// docs/io-web-v2-stage-2-2.md §2: a door that does not open changes none of Cloud's origins.
+    /// Whether the vault refused the token, the edge refused the open, the router did not reach the
+    /// edge or the edge never answered, the registry holds the origins it held, at the generation
+    /// it had, in memory and in its file, and nothing is pushed; the run's error is the
+    /// externalize's, as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_door_that_does_not_open_changes_no_origin() {
+        let (ctx, mut harness) = cloud_origins_admin("cloud-origins-door-fails");
+        {
+            let _one_write = ctx.exposures.lock().await;
+            ctx.exposures
+                .set_cloud_origins(vec![CLOUD_PAGE.to_string()])
+                .expect("written");
+        }
+        let kept = ctx.exposures.file();
+        for how in [
+            DoorFails::VaultRefuses,
+            DoorFails::EdgeRefuses,
+            DoorFails::EdgeUnreachable,
+            DoorFails::EdgeSilent,
+        ] {
+            let publish = handle_publish_cloud_endpoint(
+                &ctx,
+                &ctx.rpc,
+                json!({ "edge_node": CLOUD_EDGE, "cloud_origins": [CLOUD_ROOT] }),
+            );
+            let drive = async {
+                answer_cloud_edge_read(&mut harness, json!({ "edge_node": CLOUD_EDGE })).await;
+                answer_cloud_edge_record(&mut harness, cloud_edge_recorded()).await;
+                let token = fail_cloud_door(&mut harness, how).await;
+                if how != DoorFails::VaultRefuses {
+                    answer_cloud_token_rollback(
+                        &mut harness,
+                        Some((MSG_VAULT_ROLLBACK_RESPONSE, cloud_token_rolled_back())),
+                    )
+                    .await;
+                }
+                token
+            };
+            let (answer, token) = tokio::join!(publish, drive);
+            let answer = answer.expect("dispatch");
+            let text = without_token(&answer.envelope.to_string(), &token);
+            assert_eq!(answer.http_status, 400, "{how:?}: {text}");
+            assert_eq!(answer.envelope["status"], json!("error"), "{how:?}: {text}");
+            assert!(!text.contains(CLOUD_ROOT), "{how:?}: {text}");
+            assert!(
+                harness
+                    .next_outgoing_within(Duration::from_millis(200))
+                    .await
+                    .is_none(),
+                "{how:?}: nothing pushed"
+            );
+            assert_eq!(ctx.exposures.file(), kept, "{how:?}");
+            assert_eq!(exposures_on_disk(&ctx), kept, "{how:?}");
+        }
+    }
+
+    /// docs/io-web-v2-stage-2-2.md §2: a write of the origins that fails is in the answer,
+    /// cloud_origins_persisted false with a warning, and the run goes on: memory holds them, both
+    /// pushes carry them, and the registry's next write (the loop's, every minute) writes them.
+    #[tokio::test]
+    async fn a_write_of_the_origins_that_fails_is_answered_and_written_again() {
+        let (ctx, mut harness) = cloud_origins_admin("cloud-origins-write-fails");
+        // A directory where the file goes: no write lands.
+        let path = exposures::registry_path(&ctx.state_dir);
+        fs::create_dir_all(path.join("in-the-way")).expect("a directory");
+        let (answer, token, pushes) = run_cloud_door_with(
+            &ctx,
+            &mut harness,
+            json!({ "edge_node": CLOUD_EDGE, "cloud_origins": [CLOUD_PAGE] }),
+            2,
+        )
+        .await;
+        let shown = without_token(&answer.envelope.to_string(), &token);
+        assert_eq!(answer.http_status, 200, "{shown}");
+        let payload = &answer.envelope["payload"];
+        assert!(payload["token"] == json!(token), "{shown}");
+        assert_eq!(payload["cloud_origins"], json!([CLOUD_PAGE]));
+        assert_eq!(payload["cloud_origins_persisted"], json!(false));
+        let warning = payload["warning"].as_str().expect("a warning");
+        for what in [
+            "Fluxbee Cloud's origins are in SY.admin's memory and pushed to the edge and io.web, \
+             but the exposures registry could not be written (",
+            "SY.admin writes it again every minute",
+            "A restart of SY.admin before then loses them",
+        ] {
+            assert!(warning.contains(what), "{what}: {warning}");
+        }
+        assert!(!warning.contains(&token), "the warning carries no token");
+        assert_eq!(
+            sent_one(&pushes, MSG_EDGE_WEB_ROUTES).payload["frame_origins"],
+            json!([CLOUD_PAGE])
+        );
+        assert_eq!(
+            sent_one(&pushes, MSG_IO_WEB_EXPOSURES).payload["cloud_origins"],
+            json!([CLOUD_PAGE])
+        );
+        assert!(!ctx.exposures.persisted());
+        assert!(!ctx.exposures.retry_persist(), "the way is still blocked");
+        fs::remove_dir_all(&path).expect("the directory");
+        assert!(ctx.exposures.retry_persist());
+        assert_eq!(exposures_on_disk(&ctx).cloud_origins, [CLOUD_PAGE]);
+        assert_eq!(exposures_on_disk(&ctx), ctx.exposures.file());
+    }
+
+    /// docs/io-web-v2-stage-2-2.md §2: the action's help names cloud_origins, an optional list of
+    /// strings, and the executor's schema takes it (a list, or null for none named), so a plan
+    /// Archi stages from the help reaches the handler with it; a field the schema did not name
+    /// would be refused.
+    #[test]
+    fn the_cloud_endpoint_contract_names_cloud_origins() {
+        let optional = admin_action_body_optional_fields("publish_cloud_endpoint");
+        let field = optional
+            .iter()
+            .find(|field| field["name"] == json!("cloud_origins"))
+            .expect("cloud_origins in the help");
+        assert_eq!(field["type"], json!("string[]"));
+        let described = field["description"].as_str().unwrap_or_default();
+        for what in [
+            "the Fluxbee Cloud page that manages the hive",
+            "Absent or null keeps the origins kept; [] clears them",
+            "at most 4",
+            "frames a page whose session cookie does not travel",
+        ] {
+            assert!(described.contains(what), "{what}: {described}");
+        }
+        assert!(admin_action_summary("publish_cloud_endpoint").contains("cloud_origins"));
+        assert!(admin_action_request_notes("publish_cloud_endpoint")
+            .iter()
+            .any(|note| note.contains(
+                "Changing them is running publish_cloud_endpoint again, which rotates the token"
+            )));
+        let spec = resolve_internal_action_spec("publish_cloud_endpoint")
+            .expect("an action of the catalog");
+        let schema = build_admin_executor_function_definition(spec).parameters_json_schema;
+        assert_eq!(
+            schema["properties"]["cloud_origins"]["type"],
+            json!(["array", "null"])
+        );
+        assert_eq!(
+            schema["properties"]["cloud_origins"]["items"]["type"],
+            json!("string")
+        );
+        let args = |origins: Value| json!({ "edge_node": CLOUD_EDGE, "cloud_node": CLOUD_NODE, "cloud_origins": origins });
+        for origins in [json!([CLOUD_PAGE, CLOUD_ROOT]), json!([]), Value::Null] {
+            assert_eq!(
+                validate_value_against_schema(&args(origins.clone()), &schema, "args"),
+                Ok(()),
+                "{origins}"
+            );
+        }
+        assert!(validate_value_against_schema(&args(json!(CLOUD_PAGE)), &schema, "args").is_err());
     }
 
     /// The old edge's answer, `answer_msg` with `answer`, to the close of IO.cloud's door on it
