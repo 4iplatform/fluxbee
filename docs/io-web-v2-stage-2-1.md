@@ -87,8 +87,9 @@ Asked with their options and recommendations; the operator took every recommenda
 
 - `exposure_id`: `exp:<uuid v4>`, minted by SY.admin at publish and never reused.
 - `label`: chosen by Cloud, one DNS label: lowercase ASCII letters, digits and hyphens, 1 to 63
-  characters, starting and ending with a letter or a digit; taken as given (an uppercase label is
-  refused, never folded).
+  characters, starting and ending with a letter or a digit, and never with `--` as its 3rd and 4th
+  characters (Let's Encrypt refuses such a name when the order is created, R-LDH; R3's review);
+  taken as given (an uppercase label is refused, never folded).
 - `host`: `<label>.<main>`, main being `acme::certified_name(admin.public_base_url)` (acme:242-313):
   the derivation `web:` uses for `archi.`, with its 253-character check (admin:953-964). Cloud names
   no domain, and the domain never comes from code (§11.1).
@@ -103,7 +104,7 @@ Asked with their options and recommendations; the operator took every recommenda
 | --- | --- | --- |
 | `archi` | none | Archi on the motherbee's loopback (D4). Its address is io.web's own constant in 2.2 and never comes from Cloud |
 | `hive` | `hive`, `port` | `hive` is a valid hive id (sdk/mesh/registry.rs:22). The registry's strict reading gives it the role `worker` (registry.rs:143-). Never the motherbee, an ingress or an egress. In 2.2 its address is the registry's `address` (registry.rs:134-136; sy_orchestrator.rs:24243) |
-| `address` | `address`, `port` | An IP literal, never a name (no DNS rebinding), in 10/8, 172.16/12, 192.168/16 or fc00::/7. Never loopback, link-local, unspecified, multicast or broadcast. Never the `address` of a hive of the registry: name the hive instead |
+| `address` | `address`, `port` | An IP literal, never a name (no DNS rebinding), in 10/8, 172.16/12, 192.168/16 or fc00::/7. Never loopback, link-local, unspecified, multicast or broadcast. Never the `address` of a hive of the registry: name the hive instead. Never an address the motherbee holds itself (it is in no registry: a UDP bind of the address tells, which fails closed; R3's review), and nothing while the registry cannot be read |
 
 **Fluxbee's own ports are refused for every kind:**
 
@@ -593,9 +594,11 @@ result | error_code, error_detail}`. `result` is SY.admin's `payload`.
 | `RECORD_FAILED` | writes | nothing opened | yes |
 | `IO_WEB_UNAVAILABLE` | link | io.web did not answer, or holds no key yet (`retryable`) | yes |
 
-**Retries after `ADMIN_UNAVAILABLE`** are safe: publish answers the same exposure again; enable makes
-one more enablement, which is harmless; disable answers `was_enabled: false`; unpublish answers
-`EXPOSURE_NOT_FOUND`; a new link leaves the unused one to expire.
+**Retries after `ADMIN_UNAVAILABLE`**: publish answers the same exposure again; enable makes one more
+enablement, harmless for a first enable, but a retried renewal ends at once the enablement the lost
+one renewed, with its sessions (at most two live, §2.3; R3's review); disable answers
+`was_enabled: false`; unpublish answers `EXPOSURE_NOT_FOUND`; a new link leaves the unused one to
+expire.
 
 **The flow:** publish → `list_exposures` until `certificate.state` is `covered` → enable with the
 duration → link → open it → renew before `enabled_until` → disable.

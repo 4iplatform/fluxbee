@@ -1140,17 +1140,18 @@ SY.admin follow:
 
 ```text
 edge-cert  acme=on names=hive-k3m9x7q2.fluxbee.ai,archi.hive-k3m9x7q2.fluxbee.ai conditions=none
-web        host=archi.hive-k3m9x7q2.fluxbee.ai route=acknowledged upstream=ready io.web=running
+web        exposures=1 enabled=1 cert=covered:1 route=acknowledged io.web=running(ack 1763121600123 of 1763121600123)
 ```
 
 - `edge-cert` (`GET /acme/status`): a `critical` condition fails the check.
-- `web` (`GET /web/status`): the declared host (`none` without `web:`, `invalid` for a section
-  that cannot work), the edge's answer to the routes (`routes.state`), the edge's way to io.web
-  (`routes.upstream.state`: `ready`, `unavailable`, or `unknown` when the last push was not
-  acknowledged), with the kind and time of its last failure when there is one
-  (`upstream=ready(head@2026-10-23T14:02:11Z)`), and io.web's state, with its health when it
-  reports one other than `HEALTHY` (`io.web=running(DEGRADED)`). It never fails the check: io.web
-  runs only once the operator starts it, and the edge answers again within a minute of a restart.
+- `web` (`GET /web/status`; [io-web-v2-stage-2-1](../io-web-v2-stage-2-1.md) §5.10): the exposures
+  Fluxbee Cloud published, how many are enabled, their certificates by state (`covered`,
+  `pending`, `waiting_dns`, `failed`, `held`, `off`), the edge's answer to the routes
+  (`routes.state`), and io.web's state, with its health when it reports one other than `HEALTHY`,
+  and the generation of the exposures' set it acknowledged of the one SY.admin pushed last
+  (`ack <held> of <pushed>`); ` registry=unreadable` when SY.admin cannot read its
+  `exposures.json`. It never fails the check: io.web runs only once the operator starts it, and
+  the edge and io.web answer again within a minute of a restart.
 
 `lab/ops.py versions` and `lab/ops.py opa-status` print the version and policy view per hive.
 
