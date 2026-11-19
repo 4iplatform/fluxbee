@@ -17828,18 +17828,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "Admin SSH login on the empty target box for the initial bootstrap. Required (no default). The orchestrator uses it key-first, falling back to the password channel (ssh_password) only on a fresh box; it is never stored.",
             ),
         ],
-        "publish_cloud_endpoint" => vec![
-            admin_action_body_field(
-                "edge_node",
-                "string",
-                "Required. The SY.edge L2 name to publish on, SY.edge@<hive> (e.g. SY.edge@ingress1); any other name is refused (INVALID_REQUEST) before anything is read or recorded (FINDINGS A-317, since 0.1.139).",
-            ),
-            admin_action_body_field(
-                "cloud_node",
-                "string",
-                "Optional. The IO.cloud instance to publish, IO.cloud@<hive>; any other node is refused (INVALID_REQUEST) before anything is opened. Defaults to IO.cloud@<hive>.",
-            ),
-        ],
+        "publish_cloud_endpoint" => vec![admin_action_body_field(
+            "edge_node",
+            "string",
+            "Required. The SY.edge L2 name to publish on, SY.edge@<hive> (e.g. SY.edge@ingress1); any other name is refused (INVALID_REQUEST) before anything is read or recorded (FINDINGS A-317, since 0.1.139).",
+        )],
         "publish_runtime_package" => vec![admin_action_body_field(
             "source",
             "object",
@@ -18045,11 +18038,18 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             "string",
             "compact (each action's name, description and read_only) or full (every field). Over HTTP the default is full, and ?view=compact asks the compact one; over the mesh and to the executor the default and the only view is compact, since the full catalog does not fit in one mesh frame (CATALOG_TOO_LARGE_FOR_MESH).",
         )],
-        "publish_cloud_endpoint" => vec![admin_action_body_field(
-            "cloud_origins",
-            "string[]",
-            "Optional. The origins of the Fluxbee Cloud page that manages the hive, which may frame its exposures (docs/io-web-v2-stage-2-2.md §2, since 0.1.150): each https://<host> with an optional port, as a browser writes an origin (lowercase, no user, path, query, fragment or wildcard, never an IP literal, never :443), at most 4, none twice; anything else is refused (INVALID_REQUEST, naming the origin and the rule) before anything is read or minted. Absent or null keeps the origins kept; [] clears them, and nobody frames. SY.admin keeps them in its exposures registry once the door is open (a door that does not open changes none) and pushes them to the edge and io.web; the answer names them (cloud_origins) and whether the registry's file holds them (cloud_origins_persisted). An origin outside the hive's own domain is taken, but frames a page whose session cookie does not travel.",
-        )],
+        "publish_cloud_endpoint" => vec![
+            admin_action_body_field(
+                "cloud_node",
+                "string",
+                "Optional. The IO.cloud instance to publish, IO.cloud@<hive>; any other node is refused (INVALID_REQUEST) before anything is opened. Defaults to IO.cloud@<hive> (FINDINGS A-356: an optional field, never one every plan step must name).",
+            ),
+            admin_action_body_field(
+                "cloud_origins",
+                "string[]",
+                "Optional. The origins of the Fluxbee Cloud page that manages the hive, which may frame its exposures (docs/io-web-v2-stage-2-2.md §2, since 0.1.150): each https://<host> with an optional port, as a browser writes an origin (lowercase, no user, path, query, fragment or wildcard, never an IP literal, never :443), at most 4, none twice; anything else is refused (INVALID_REQUEST, naming the origin and the rule) before anything is read or minted. Absent or null keeps the origins kept; [] clears them, and nobody frames. SY.admin keeps them in its exposures registry once the door is open (a door that does not open changes none) and pushes them to the edge and io.web; the answer names them (cloud_origins) and whether the registry's file holds them (cloud_origins_persisted). An origin outside the hive's own domain is taken, but frames a page whose session cookie does not travel.",
+            ),
+        ],
         "vault_delete" | "vault_rotate" | "vault_rollback" => vec![admin_action_body_field(
                 "tenant_id",
                 "string",
@@ -18063,12 +18063,12 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
             admin_action_body_field(
                 "assigned_nodes",
-                "array<string>",
+                "string[]",
                 "Node names (IO.slack.sales@motherbee) the secret is assigned to; each must be charged to the key's tenant.",
             ),
             admin_action_body_field(
                 "assigned_ilks",
-                "array<string>",
+                "string[]",
                 "ILK ids of nodes the secret is assigned to; each must be charged to the key's tenant. Both lists together replace the assignment; none leaves the secret unassigned (its tenant's general secret if it has no owner).",
             ),
         ],
@@ -34632,6 +34632,39 @@ mod tests {
             vec!["GET /hives/{hive}/commands"]
         );
         assert!(!admin_action_summary("list_recent_commands").is_empty());
+    }
+
+    /// FINDINGS A-356 and A-357: the executor's schema gives a list field an array, where
+    /// vault_assign's lists were typed `array<string>`, which `admin_contract_field_schema` read as a
+    /// string, so a plan step that passed a list was refused; and publish_cloud_endpoint's
+    /// `cloud_node` is optional, never a field every plan step must name.
+    #[test]
+    fn the_executor_s_schemas_take_lists_as_arrays_and_cloud_node_as_optional() {
+        let assign = resolve_internal_action_spec("vault_assign").expect("vault_assign action");
+        let schema = build_admin_executor_function_definition(assign).parameters_json_schema;
+        for field in ["assigned_nodes", "assigned_ilks"] {
+            assert_eq!(
+                schema["properties"][field]["type"],
+                json!(["array", "null"]),
+                "{field}"
+            );
+            assert_eq!(
+                schema["properties"][field]["items"]["type"], "string",
+                "{field}"
+            );
+        }
+        let publish = resolve_internal_action_spec("publish_cloud_endpoint")
+            .expect("publish_cloud_endpoint action");
+        let schema = build_admin_executor_function_definition(publish).parameters_json_schema;
+        assert_eq!(schema["required"], json!(["edge_node"]));
+        assert_eq!(
+            schema["properties"]["cloud_node"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            schema["properties"]["cloud_origins"]["type"],
+            json!(["array", "null"])
+        );
     }
 
     #[test]
