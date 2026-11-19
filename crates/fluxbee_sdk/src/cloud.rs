@@ -56,6 +56,15 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     // The tenant's LLM usage, one record per model call (docs/router-stream-v1.md §7.6): a read,
     // always of the tenant Cloud claims, never every tenant's nor the root tenant's.
     ("get_usage", "get_llm_usage"),
+    // io.web's exposures (docs/io-web-v2-stage-2-1.md §5.3): web hosts of the installation, never
+    // a tenant's, so io.cloud refuses an envelope tenant_id; SY.admin's handlers take them from
+    // IO.cloud@motherbee alone (`MeshAccess::Cloud`).
+    ("publish_exposure", "publish_exposure"),
+    ("enable_exposure", "enable_exposure"),
+    ("disable_exposure", "disable_exposure"),
+    ("unpublish_exposure", "unpublish_exposure"),
+    ("issue_exposure_link", "issue_exposure_link"),
+    ("list_exposures", "list_exposures"),
 ];
 
 /// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces for
@@ -83,6 +92,12 @@ pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
     "start_node",
     "kill_node",
     "get_llm_usage",
+    "publish_exposure",
+    "enable_exposure",
+    "disable_exposure",
+    "unpublish_exposure",
+    "issue_exposure_link",
+    "list_exposures",
 ];
 
 /// The [`CLOUD_EXPOSED_ACTIONS`] set computed from [`CLOUD_OP_ACTIONS`] (deduped, first-seen order).
@@ -180,7 +195,19 @@ pub fn cloud_action_catalog() -> Value {
         { "op": "restore_tenant", "category": "relay",
           "summary": "Undo delete_tenant for YOUR tenant: it comes back as it was." },
         { "op": "get_usage", "category": "relay",
-          "summary": "Read YOUR tenant's LLM usage (the envelope tenant_id), one record per model call: a period (params.from + params.to, RFC 3339, at most 92 days) grouped by params.group_by (day, model or node) or record by record, or params.since for the records stored after a cursor, to sync as they arrive (they arrive late: a period is final only later). The answer's next is params.after for the next page or params.since for the next sync; params.limit 1 to 1000. Never another tenant's records, nor the root tenant's." }
+          "summary": "Read YOUR tenant's LLM usage (the envelope tenant_id), one record per model call: a period (params.from + params.to, RFC 3339, at most 92 days) grouped by params.group_by (day, model or node) or record by record, or params.since for the records stored after a cursor, to sync as they arrive (they arrive late: a period is final only later). The answer's next is params.after for the next page or params.since for the next sync; params.limit 1 to 1000. Never another tenant's records, nor the root tenant's." },
+        { "op": "publish_exposure", "category": "relay",
+          "summary": "Publish a web host of the hive, <label>.<hive public host>, that leads to one fixed upstream. No envelope tenant_id: an exposure is the installation's (one is refused). params.label (lowercase ASCII letters, digits and hyphens, 1 to 63, starting and ending with a letter or a digit, never '--' as its 3rd and 4th characters; taken as given, never lowered) + params.upstream: {kind: archi}, {kind: hive, hive, port} (a worker, by its hive id) or {kind: address, address, port} (a private IP literal); Fluxbee's own ports are refused. Returns {exposure: the view, created}: the same label and upstream again answers created false; another upstream EXPOSURE_EXISTS; EXPOSURE_LIMIT at 16; NO_MAIN_HOST is the operator's; BUSY and RECORD_FAILED: send it again. A new exposure is closed: read list_exposures until its certificate.state is covered before you let anyone in." },
+        { "op": "enable_exposure", "category": "relay",
+          "summary": "Open an exposure until enabled_until. No envelope tenant_id. params.exposure_id (exp:<uuid>) + params.duration_s (60 to 28800). Each enable is a new enablement with a new secret that never leaves the hive; one before enabled_until renews it (renewed true), with no gap. At most two stay live: renew once, well before the end, and send it again only after ADMIN_UNAVAILABLE. Returns {exposure: the view (state enabled, enabled_until, io_web.state acknowledged or pending), renewed}. IO_WEB_ABSENT is the operator's; VAULT_UNAVAILABLE, RECORD_FAILED and BUSY: nothing changed, send it again; EXPOSURE_NOT_FOUND." },
+        { "op": "issue_exposure_link", "category": "relay",
+          "summary": "A one-time link into an enabled exposure, from its newest enablement. No envelope tenant_id. params.exposure_id. Returns {exposure_id, url, expires_at (RFC 3339), link_id}: open url once, top-level, in Cloud's own tab, within about 120 s; never fetch, log or store it (log link_id). EXPOSURE_CLOSED: enable it first; IO_WEB_UNAVAILABLE: send it again shortly; EXPOSURE_NOT_FOUND. Never BUSY." },
+        { "op": "disable_exposure", "category": "relay",
+          "summary": "Close an exposure: every link and session of it stops working, and it stays published (enable it again at will). No envelope tenant_id. params.exposure_id. Returns {exposure, was_enabled, persisted}: a closed one answers was_enabled false; persisted false means it took effect and the hive records it again every minute. BUSY and RECORD_FAILED: send it again; EXPOSURE_NOT_FOUND." },
+        { "op": "unpublish_exposure", "category": "relay",
+          "summary": "Remove an exposure: it closes and its host answers 404; its label can be published again, as a new exposure. No envelope tenant_id. params.exposure_id. Returns {exposure_id, host, removed, route, io_web, persisted}. EXPOSURE_NOT_FOUND: no such exposure (after an unpublish sent again, done). BUSY and RECORD_FAILED: send it again." },
+        { "op": "list_exposures", "category": "relay",
+          "summary": "Every published exposure, the closed ones included: {exposures: [view], count, max: 16}. Each view: exposure_id, label, host, url, upstream, state (closed, or enabled with enabled_until), published_at, certificate.state (covered, pending, waiting_dns, failed, held, off), route.state (acknowledged, pending, no_edge) and io_web.state (acknowledged, pending, absent). No envelope tenant_id, no params. Never BUSY." }
     ])
 }
 
@@ -213,7 +240,13 @@ mod tests {
                 "get_node_status",
                 "start_node",
                 "kill_node",
-                "get_llm_usage"
+                "get_llm_usage",
+                "publish_exposure",
+                "enable_exposure",
+                "disable_exposure",
+                "unpublish_exposure",
+                "issue_exposure_link",
+                "list_exposures"
             ]
         );
     }
@@ -317,6 +350,58 @@ mod tests {
                 summary.contains("SERVICE_FAILED") && summary.contains("send it again"),
                 "{op} names SERVICE_FAILED and what to do"
             );
+        }
+    }
+
+    /// io.web's exposures (docs/io-web-v2-stage-2-1.md §5.3): each op relays to SY.admin's action
+    /// of its own name, and its summary says it takes no tenant and names its own codes.
+    #[test]
+    fn the_exposure_ops_take_no_tenant_and_name_their_codes() {
+        let catalog = cloud_action_catalog();
+        let summary = |op: &str| -> String {
+            catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["op"] == op)
+                .and_then(|entry| entry["summary"].as_str())
+                .unwrap_or_else(|| panic!("catalog has no {op}"))
+                .to_string()
+        };
+        let codes: &[(&str, &[&str])] = &[
+            (
+                "publish_exposure",
+                &["EXPOSURE_EXISTS", "EXPOSURE_LIMIT", "NO_MAIN_HOST", "BUSY"],
+            ),
+            (
+                "enable_exposure",
+                &["IO_WEB_ABSENT", "VAULT_UNAVAILABLE", "RECORD_FAILED"],
+            ),
+            (
+                "issue_exposure_link",
+                &["EXPOSURE_CLOSED", "IO_WEB_UNAVAILABLE", "Never BUSY"],
+            ),
+            ("disable_exposure", &["was_enabled", "EXPOSURE_NOT_FOUND"]),
+            (
+                "unpublish_exposure",
+                &["EXPOSURE_NOT_FOUND", "RECORD_FAILED"],
+            ),
+            ("list_exposures", &["waiting_dns", "absent", "Never BUSY"]),
+        ];
+        for (op, names) in codes {
+            assert_eq!(
+                admin_action_for_cloud_op(op),
+                Some(*op),
+                "{op} relays to its own name"
+            );
+            let summary = summary(op);
+            assert!(
+                summary.contains("No envelope tenant_id"),
+                "{op} takes no tenant"
+            );
+            for name in *names {
+                assert!(summary.contains(name), "{op}'s summary names {name}");
+            }
         }
     }
 
