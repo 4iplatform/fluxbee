@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! `IO.web` is the motherbee's web node behind the edge (docs/io-web-v2.md §11.2 item 3, §12;
-//! docs/io-web-v2-stage-2-1.md; the operator's page is docs/io/io-web.md).
+//! `IO.web` is the motherbee's web node behind the edge (docs/io-web-v2.md §11.2 item 3, §12, §13;
+//! docs/io-web-v2-stage-2-1.md, docs/io-web-v2-stage-2-2.md; the operator's page is
+//! docs/io/io-web.md).
 //!
 //! The edge on the ingress proxies each exposure's host to it over the mesh's mutual TLS, on
-//! `fluxbee_sdk::mesh::IO_WEB_PORT` (`web`). In stage 2.1 it holds the exposures SY.admin pushes
-//! and their keys (`exposures`), mints and redeems their one-time links, and serves its placeholder
-//! page to a valid session (`access`); the upstreams behind the exposures come in stage 2.2. The
+//! `fluxbee_sdk::mesh::IO_WEB_PORT` (`web`). It holds the exposures SY.admin pushes and their keys
+//! (`exposures`), mints and redeems their one-time links (`access`), and is a transparent reverse
+//! proxy for a valid session: to its exposure's upstream (`proxy`, `upstream`), with §13.7's
+//! headers (`headers`), cutting what is open once the exposure is left without access (`open`). The
 //! exposures' two commands come on a channel of their own, from `SY.admin@motherbee` alone
 //! (`run_exposure_commands`).
 //!
